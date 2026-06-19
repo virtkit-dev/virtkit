@@ -1,0 +1,73 @@
+name: Release
+
+# Publish a GitHub release whenever a version tag (v*) is pushed.
+#
+# virtkit's artifacts are produced by the same reproducible, Docker-based scripts
+# we use locally — build.sh (the static-musl binaries) and build-kernel.sh (the
+# guest vmlinux). GitHub-hosted ubuntu runners ship Docker, so the workflow just
+# runs those two scripts and uploads everything they drop in dist/. The pinned
+# toolchain lives in the images, not here, so the runner needs no Rust setup.
+#
+# build and build_kernel run in parallel after quality; release downloads their
+# artifacts and publishes. Each binary ships with its own .sha256 sidecar
+# (virtkit.sha256, virtkit-agent.sha256, vmlinux.sha256) so users can verify
+# just the file they downloaded without fetching a combined manifest.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Default to read-only; the release job opts up to contents: write below.
+permissions:
+  contents: read
+
+jobs:
+  # Gate: run the same lint + audit checks as CI against the tagged commit.
+  quality:
+    uses: ./.github/workflows/quality.yml
+
+  build:
+    needs: [quality]
+    uses: ./.github/workflows/build.yml
+    with:
+      artifact-prefix: release
+      build-kernel: true
+      retention-days: 1
+
+  release:
+    needs: [build]
+    runs-on: ubuntu-latest
+    # gh release create needs write access to the repo's releases.
+    permissions:
+      contents: write
+    steps:
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: release-binaries-${{ github.sha }}
+          path: dist
+
+      - name: Download kernel artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: release-kernel-${{ github.sha }}
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          gh release create "$tag" \
+            dist/virtkit \
+            dist/virtkit.sha256 \
+            dist/virtkit-agent \
+            dist/virtkit-agent.sha256 \
+            dist/vmlinux \
+            dist/vmlinux.sha256 \
+            dist/build-info.txt \
+            dist/kernel-build-info.txt \
+            --title "$tag" \
+            --generate-notes

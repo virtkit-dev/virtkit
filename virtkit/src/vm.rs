@@ -1,0 +1,661 @@
+//! microVM lifecycle: prepare (overlay + cloud-hypervisor + wait for the in-guest
+//! agent) and cleanup (ACPI poweroff, escalation, state removal). One VM per job.
+
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, anyhow, bail};
+use virtkit_agent::addr::SocketAddr;
+
+use crate::image::ResolvedImage;
+use crate::jobctx::JobCtx;
+
+/// A job VM's boot medium: a copy-on-write ext4 disk (with an optional initrd —
+/// a self-booting image ships one; a generic guest on the all-built-in pinned
+/// kernel needs none) or a cpio initramfs held in RAM.
+enum Media {
+    Disk {
+        rootfs: PathBuf,
+        initrd: Option<PathBuf>,
+    },
+    Initramfs {
+        cpio: PathBuf,
+    },
+}
+
+impl Media {
+    fn files(&self) -> Vec<&Path> {
+        match self {
+            Media::Disk { rootfs, initrd } => {
+                let mut v = vec![rootfs.as_path()];
+                v.extend(initrd.as_deref());
+                v
+            }
+            Media::Initramfs { cpio } => vec![cpio.as_path()],
+        }
+    }
+}
+
+pub async fn prepare(ctx: &JobCtx) -> Result<()> {
+    let cfg = &ctx.cfg;
+    // MICROVM_IMAGE (OCI store) wins; the static [image] paths are the default
+    let resolved = crate::image::resolve(ctx)?;
+    let (kernel, media, generic) = match resolved {
+        Some(ResolvedImage::Disk {
+            rootfs,
+            kernel,
+            initrd,
+            generic,
+        }) => (kernel, Media::Disk { rootfs, initrd }, generic),
+        Some(ResolvedImage::Initramfs { kernel, initramfs }) => {
+            (kernel, Media::Initramfs { cpio: initramfs }, true)
+        }
+        None => {
+            // the baked default bundle (systemd + runner-vm-init), from [image].
+            // initrd is optional: a kernel-less guest boots the shared kernel.
+            let (Some(rootfs), Some(kernel)) = (cfg.image.rootfs.clone(), cfg.image.kernel.clone())
+            else {
+                bail!("image.rootfs/kernel not configured (VIRTKIT_CONFIG)");
+            };
+            (
+                kernel,
+                Media::Disk {
+                    rootfs,
+                    initrd: cfg.image.initrd.clone(),
+                },
+                false,
+            )
+        }
+    };
+    // generic guests (cpio, or ext4 on the pinned guest kernel) boot virtkit-agent as PID 1;
+    // self-booting images boot their own init off a disk.
+    for p in media
+        .files()
+        .into_iter()
+        .chain(std::iter::once(kernel.as_path()))
+    {
+        if !p.is_file() {
+            bail!("image file missing: {}", p.display());
+        }
+    }
+    if unsafe { libc::access(c"/dev/kvm".as_ptr(), libc::R_OK | libc::W_OK) } != 0 {
+        bail!("no rw access to /dev/kvm (is the runner user in the kvm group?)");
+    }
+    let (cpus, mem) = vm_size(ctx)?;
+
+    // A leftover job dir (failed cleanup, retried job id) must not leak a VM
+    // or keep its tap leased.
+    stop_vm(ctx);
+    crate::net::release(ctx);
+    if ctx.job_dir.exists() {
+        std::fs::remove_dir_all(&ctx.job_dir)
+            .with_context(|| format!("removing stale {}", ctx.job_dir.display()))?;
+    }
+    std::fs::create_dir_all(&ctx.job_dir)
+        .with_context(|| format!("creating {}", ctx.job_dir.display()))?;
+    // record the boot flavour for the run stage (a separate process) to pick the
+    // guest shell: a generic OCI guest has no bash.
+    let _ = std::fs::write(
+        ctx.job_dir.join("boot.kind"),
+        if generic { "generic-init" } else { "systemd" },
+    );
+
+    // Disk guests get a throwaway CoW overlay over the ro base; initramfs guests
+    // have no disk at all (the rootfs is the cpio, in RAM).
+    let overlay = ctx.overlay();
+    if let Media::Disk { rootfs, .. } = &media {
+        let status = Command::new(cfg.qemu_img())
+            .args(["create", "-q", "-f", "qcow2", "-F", "raw", "-b"])
+            .arg(rootfs)
+            .arg(&overlay)
+            .status()
+            .with_context(|| format!("running {}", cfg.qemu_img().display()))?;
+        if !status.success() {
+            bail!("qemu-img create failed ({status})");
+        }
+    }
+
+    let mut cmdline = if generic {
+        // virtkit-agent is PID 1 in the initramfs (no disk root); it reads the vsock
+        // port off the cmdline and serves directly (default mode).
+        format!(
+            "console=ttyS0 rdinit=/usr/local/bin/virtkit-agent VIRTKIT_HOSTNAME={} \
+             VIRTKIT_VSOCK_PORT={}",
+            cfg.vm.hostname, cfg.vm.vsock_port
+        )
+    } else {
+        // self-booting image: virtkit-agent is PID 1, execs the image's captured
+        // entrypoint (VIRTKIT_MODE=service) which brings up systemd; the in-guest
+        // serve agent then runs as a systemd unit.
+        format!(
+            "console=ttyS0 root=/dev/vda rw rootfstype=ext4 init=/usr/local/bin/virtkit-agent \
+             VIRTKIT_MODE=service VIRTKIT_HOSTNAME={}",
+            cfg.vm.hostname
+        )
+    };
+
+    let mut fs_args: Vec<String> = Vec::new();
+    if let Some(share) = &cfg.share {
+        let vfsd_sock = ctx.vfsd_sock();
+        let mut vfsd = cfg.virtiofsd_command(); // bundled `virtkit virtiofsd` unless configured
+        vfsd.arg(format!("--socket-path={}", vfsd_sock.display()))
+            .arg(format!("--shared-dir={}", share.dir.display()))
+            .args(["--cache=auto", "--sandbox=none"]);
+        if share.readonly {
+            vfsd.arg("--readonly");
+        }
+        let child = spawn_detached(vfsd, &ctx.vfsd_log()).context("spawning virtiofsd")?;
+        std::fs::write(ctx.vfsd_pidfile(), child.id().to_string())?;
+        wait_for_socket(&vfsd_sock, Duration::from_secs(5))
+            .context("virtiofsd did not create its socket")?;
+        fs_args.push("--fs".into());
+        fs_args.push(format!("tag=workdir,socket={}", vfsd_sock.display()));
+    }
+
+    let mut net_args: Vec<String> = Vec::new();
+    // (ip, prefix, gw, dns) once a tap is wired, rendered onto the cmdline below
+    // in the form the chosen init understands.
+    let mut net_info: Option<(String, u32, String, String)> = None;
+    match cfg.net.mode.as_str() {
+        "none" => {}
+        "tap" => {
+            if cfg.net.tap.is_empty() {
+                bail!("net.mode = \"tap\" requires net.tap");
+            }
+            net_args.push("--net".into());
+            net_args.push(format!("tap={},mac={}", cfg.net.tap, cfg.net.mac));
+            if !cfg.net.ip.is_empty() {
+                let (ip, prefix) = split_cidr(&cfg.net.ip)?;
+                net_info = Some((ip, prefix, cfg.net.gw.clone(), cfg.net.dns.clone()));
+            }
+        }
+        "pool" => {
+            let lease = crate::net::allocate(ctx)?;
+            net_args.push("--net".into());
+            net_args.push(format!("tap={},mac={}", lease.tap, lease.mac));
+            net_info = Some((lease.ip, lease.prefix.into(), lease.gw, lease.dns));
+        }
+        other => bail!("unsupported net.mode {other:?} (none|tap|pool)"),
+    }
+    if let Some((ip, prefix, gw, dns)) = net_info {
+        // Both flavours bring eth0 up from the kernel `ip=` autoconfig param
+        // (CONFIG_IP_PNP) at boot — earlier and more reliable than configuring it
+        // from a userspace init. Format:
+        // <client>:<server>:<gw>:<netmask>:<host>:<device>:<autoconf>.
+        // The agent writes resolv.conf from VIRTKIT_VM_DNS.
+        cmdline.push_str(" net.ifnames=0 biosdevname=0");
+        cmdline.push_str(&format!(
+            " ip={ip}::{gw}:{}::eth0:off",
+            prefix_to_netmask(prefix)
+        ));
+        if !dns.is_empty() {
+            cmdline.push_str(&format!(" VIRTKIT_VM_DNS={dns}"));
+        }
+    }
+
+    // RAM scratch mounts (e.g. CI /builds): the agent mounts these (VIRTKIT_TMPFS)
+    // before handing off to the payload, in any mode.
+    if !cfg.guest.tmpfs.is_empty() {
+        // lands on the kernel cmdline: a space or comma in an entry would split
+        // or corrupt the VIRTKIT_TMPFS list the agent parses
+        for entry in &cfg.guest.tmpfs {
+            if !entry.starts_with('/')
+                || !entry.contains(':')
+                || entry.contains(|c: char| c.is_whitespace() || c == ',')
+            {
+                bail!("invalid guest.tmpfs entry {entry:?} (want \"/path:size\")");
+            }
+        }
+        cmdline.push_str(&format!(" VIRTKIT_TMPFS={}", cfg.guest.tmpfs.join(",")));
+    }
+
+    if !cfg.vm.cmdline_extra.is_empty() {
+        cmdline.push(' ');
+        cmdline.push_str(&cfg.vm.cmdline_extra);
+    }
+
+    // kernel is common; the boot medium is either a CoW disk overlay + its initrd
+    // or a single cpio initramfs (the rootfs in RAM).
+    let mut boot_args: Vec<std::ffi::OsString> =
+        vec!["--kernel".into(), kernel.clone().into_os_string()];
+    match &media {
+        Media::Disk { initrd, .. } => {
+            boot_args.push("--disk".into());
+            boot_args.push(
+                format!(
+                    "path={},readonly=off,backing_files=on,image_type=qcow2",
+                    overlay.display()
+                )
+                .into(),
+            );
+            // self-booting images ship an initrd; a generic guest on the pinned
+            // kernel mounts /dev/vda directly (virtio-blk + ext4 built in)
+            if let Some(initrd) = initrd {
+                boot_args.push("--initramfs".into());
+                boot_args.push(initrd.clone().into_os_string());
+            }
+        }
+        Media::Initramfs { cpio } => {
+            boot_args.push("--initramfs".into());
+            boot_args.push(cpio.clone().into_os_string());
+        }
+    }
+
+    let mut ch = Command::new(cfg.cloud_hypervisor());
+    ch.arg("--api-socket")
+        .arg(ctx.api_sock())
+        .args(&boot_args)
+        .args(&fs_args)
+        .arg("--vsock")
+        .arg(format!("cid=3,socket={}", ctx.vsock_sock().display()))
+        .arg("--cpus")
+        .arg(format!("boot={cpus}"))
+        .arg("--memory")
+        // shared=on: required by virtio-fs, harmless without
+        .arg(format!("size={mem},shared=on"))
+        .arg("--serial")
+        .arg(format!("file={}", ctx.console_log().display()))
+        .arg("--console")
+        .arg("off")
+        .arg("--cmdline")
+        .arg(&cmdline)
+        .args(&net_args);
+    if cfg.vm.balloon {
+        // size=0: no static balloon, just give freed guest pages back to the
+        // host so concurrent jobs overcommit safely (CONFIG_PAGE_REPORTING
+        // guest side, Debian kernels have it)
+        ch.arg("--balloon")
+            .arg("size=0,deflate_on_oom=on,free_page_reporting=on");
+    }
+    let mut ch_child = spawn_detached(ch, &ctx.ch_log())
+        .with_context(|| format!("spawning {}", cfg.cloud_hypervisor().display()))?;
+    std::fs::write(ctx.ch_pidfile(), ch_child.id().to_string())?;
+
+    println!(
+        "virtkit: booting microVM (cpus={cpus}, mem={mem}, {})",
+        if generic { "cpio initramfs" } else { "disk" }
+    );
+
+    // Ready = the in-guest virtkit-agent answers on vsock (systemd is up, the agent
+    // socket is active). Each status attempt has its own internal timeout.
+    let addr = SocketAddr::VsockMux {
+        path: ctx.vsock_sock(),
+        port: cfg.vm.vsock_port,
+    };
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(cfg.vm.boot_timeout_secs);
+    loop {
+        // try_wait on the held Child: exact (no /proc parsing, no pid-reuse race)
+        if let Some(status) = ch_child.try_wait()? {
+            log_tail(&ctx.console_log(), 30);
+            bail!(
+                "cloud-hypervisor exited during boot ({status}, see {})",
+                ctx.ch_log().display()
+            );
+        }
+        match virtkit_agent::status::get_status(&addr).await {
+            Ok(status) => {
+                // Fail fast on a wire-protocol skew (the guest bundle's virtkit-agent
+                // predates this virtkit, or vice versa): rmp_serde structs are
+                // fixed-length arrays, so a mismatched virtkit-agent cannot decode our
+                // commands and would otherwise drop the connection mid-command with
+                // an opaque "connection to the VM lost". A pre-versioning virtkit-agent
+                // reports protocol 0.
+                let want = virtkit_agent::messages::PROTOCOL_VERSION;
+                if status.protocol() != want {
+                    bail!(
+                        "guest virtkit-agent wire protocol v{} != virtkit v{want} — the guest \
+                         bundle and the host are out of sync; rebuild/republish the guest \
+                         bundle with a matching virtkit-agent",
+                        status.protocol(),
+                    );
+                }
+                println!(
+                    "virtkit: VM ready in {:.1}s (virtkit-agent {status})",
+                    start.elapsed().as_secs_f32()
+                );
+                start_services(ctx).await?;
+                return Ok(());
+            }
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    log_tail(&ctx.console_log(), 30);
+                    bail!(
+                        "VM not ready after {}s ({e}) — console tail above, logs in {}",
+                        cfg.vm.boot_timeout_secs,
+                        ctx.job_dir.display()
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Bring up the job's CI `services:` once the VM is ready (no-op without any).
+/// A host-side forward bridges the VMM's per-port vsock socket to the registry
+/// proxy; then a root script in the guest starts the guest-side forward and each
+/// service container (see services.rs). The registry credential lives only on
+/// the host proxy — it never reaches the guest or the job.
+async fn start_services(ctx: &JobCtx) -> Result<()> {
+    let services = crate::services::from_env()?;
+    if services.is_empty() {
+        return Ok(());
+    }
+    let scfg = ctx.cfg.services.as_ref().ok_or_else(|| {
+        anyhow!(
+            "job declares services: but virtkit has no [services] config — \
+             cannot satisfy them (configure the registry proxy)"
+        )
+    })?;
+
+    // Host side of the registry forward. A guest connection to host vsock port
+    // <port> is surfaced by Cloud Hypervisor as the unix socket
+    // <vsock.sock>_<port>; our forward binds it and splices to the proxy.
+    let mut listen = ctx.vsock_sock().into_os_string();
+    listen.push(format!("_{}", scfg.port));
+    let listen = std::path::PathBuf::from(listen);
+
+    let exe = std::env::current_exe().context("locating the virtkit binary")?;
+    let mut fwd = Command::new(exe);
+    fwd.arg("forward")
+        .arg("--listen")
+        .arg(&listen)
+        .arg("--to")
+        .arg(format!("tcp://{}", scfg.registry_proxy));
+    let child =
+        spawn_detached(fwd, &ctx.svc_forward_log()).context("spawning the services forward")?;
+    std::fs::write(ctx.svc_forward_pidfile(), child.id().to_string())?;
+    // the guest's first pull must not race the host listener coming up
+    wait_for_socket(&listen, Duration::from_secs(5))
+        .context("services forward did not bind its socket")?;
+
+    println!("virtkit: bringing up {} service(s)", services.len());
+    let script = crate::services::setup_script(scfg, &services);
+    // services are a systemd-guest feature (in-VM dockerd); use the configured shell
+    let result = crate::run::exec_script(
+        &crate::run::vsock_addr(ctx),
+        &ctx.cfg.guest.run_command,
+        script.into_bytes(),
+        Some("root".into()),
+    )
+    .await
+    .context("running the services setup in the guest")?;
+    match (result.code, result.signal) {
+        (Some(0), _) => Ok(()),
+        (Some(c), _) => bail!("services setup failed in the guest (exit {c})"),
+        (None, sig) => bail!("services setup killed in the guest (signal {sig:?})"),
+    }
+}
+
+/// Effective vCPU count and memory size: the job's MICROVM_CPUS/MICROVM_MEM
+/// requests, silently clamped to the host ceilings (vm.max_cpus/max_mem,
+/// defaulting to the base values — config opt-in for any elevation).
+fn vm_size(ctx: &JobCtx) -> Result<(u32, String)> {
+    let vm = &ctx.cfg.vm;
+    let cpus = match &ctx.cpus_req {
+        None => vm.cpus,
+        Some(s) => {
+            let n: u32 = s
+                .parse()
+                .ok()
+                .filter(|n| *n > 0)
+                .with_context(|| format!("invalid MICROVM_CPUS {s:?}"))?;
+            n.min(vm.max_cpus.unwrap_or(vm.cpus))
+        }
+    };
+    let mem = match &ctx.mem_req {
+        None => vm.mem.clone(),
+        Some(s) => {
+            let req = parse_gib(s).with_context(|| format!("invalid MICROVM_MEM {s:?}"))?;
+            let max = match &vm.max_mem {
+                Some(m) => parse_gib(m).context("invalid vm.max_mem")?,
+                None => parse_gib(&vm.mem).context("invalid vm.mem")?,
+            };
+            format!("{}G", req.min(max))
+        }
+    };
+    Ok((cpus, mem))
+}
+
+/// "<n>G" (GiB) — the only size format the sizing variables accept
+fn parse_gib(s: &str) -> Result<u64> {
+    let n = s
+        .strip_suffix('G')
+        .ok_or_else(|| anyhow!("expected <n>G"))?
+        .parse::<u64>()?;
+    if n == 0 {
+        bail!("expected a non-zero size");
+    }
+    Ok(n)
+}
+
+/// Split "a.b.c.d/prefix" into (ip, prefix).
+fn split_cidr(cidr: &str) -> Result<(String, u32)> {
+    let (ip, p) = cidr
+        .split_once('/')
+        .ok_or_else(|| anyhow!("net.ip {cidr:?} is not CIDR (a.b.c.d/prefix)"))?;
+    let prefix: u32 = p
+        .parse()
+        .ok()
+        .filter(|p| *p <= 32)
+        .with_context(|| format!("invalid prefix in {cidr:?}"))?;
+    Ok((ip.to_string(), prefix))
+}
+
+/// IPv4 prefix length → dotted netmask, for the kernel `ip=` autoconf param.
+fn prefix_to_netmask(prefix: u32) -> String {
+    let bits: u32 = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix.min(32))
+    };
+    format!(
+        "{}.{}.{}.{}",
+        (bits >> 24) & 0xff,
+        (bits >> 16) & 0xff,
+        (bits >> 8) & 0xff,
+        bits & 0xff
+    )
+}
+
+/// Stop the job's VM (and virtiofsd) if running: graceful ACPI power-button,
+/// then forced VMM shutdown, then SIGKILL. Idempotent — every step tolerates an
+/// already-gone process or a partial prepare.
+pub fn stop_vm(ctx: &JobCtx) {
+    if let Some(pid) = read_pidfile(&ctx.ch_pidfile()) {
+        let tag = ctx.job_dir.to_string_lossy().into_owned();
+        if pid_running(pid, &tag) {
+            let api = ctx.api_sock();
+            let _ = ch_api_put(&api, "vm.power-button");
+            if !wait_gone(
+                pid,
+                &tag,
+                Duration::from_secs(ctx.cfg.vm.shutdown_timeout_secs),
+            ) {
+                let _ = ch_api_put(&api, "vm.shutdown");
+                if !wait_gone(pid, &tag, Duration::from_secs(5)) {
+                    unsafe { libc::kill(pid, libc::SIGTERM) };
+                    if !wait_gone(pid, &tag, Duration::from_secs(3)) {
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                        wait_gone(pid, &tag, Duration::from_secs(3));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(pid) = read_pidfile(&ctx.vfsd_pidfile())
+        && pid_running(pid, &ctx.job_dir.to_string_lossy())
+    {
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+    // the services registry forward (detached virtkit child) if it was started
+    if let Some(pid) = read_pidfile(&ctx.svc_forward_pidfile())
+        && pid_running(pid, &ctx.job_dir.to_string_lossy())
+    {
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+}
+
+pub fn cleanup(ctx: &JobCtx) -> Result<()> {
+    stop_vm(ctx);
+    crate::net::release(ctx);
+    match std::fs::remove_dir_all(&ctx.job_dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", ctx.job_dir.display())),
+    }
+}
+
+/// Spawn a long-lived child in its own process group (it must survive this
+/// short-lived executor stage and never receive its signals), stdout+stderr
+/// appended to a log file. The returned Child is never killed on drop; later
+/// stages find the process again through its pidfile.
+fn spawn_detached(mut cmd: Command, log: &Path) -> Result<std::process::Child> {
+    let logfile = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .with_context(|| format!("opening {}", log.display()))?;
+    Ok(cmd
+        .stdin(Stdio::null())
+        .stdout(logfile.try_clone()?)
+        .stderr(logfile)
+        .process_group(0)
+        .spawn()?)
+}
+
+fn wait_for_socket(path: &Path, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while !path.exists() {
+        if Instant::now() >= deadline {
+            bail!("{} did not appear within {timeout:?}", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+fn read_pidfile(path: &Path) -> Option<i32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// A recorded pid counts as ours only while its cmdline still references the job
+/// dir — guards the kill/wait logic against pid reuse after a crash.
+fn pid_running(pid: i32, expect_in_cmdline: &str) -> bool {
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    String::from_utf8_lossy(&cmdline)
+        .replace('\0', " ")
+        .contains(expect_in_cmdline)
+}
+
+fn wait_gone(pid: i32, expect_in_cmdline: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while pid_running(pid, expect_in_cmdline) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    true
+}
+
+/// Minimal HTTP PUT on the Cloud Hypervisor API socket (same calls as
+/// shutdown.sh's `curl --unix-socket`); not worth an HTTP client dependency.
+fn ch_api_put(sock: &Path, endpoint: &str) -> Result<()> {
+    let mut stream = UnixStream::connect(sock)?;
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    write!(
+        stream,
+        "PUT /api/v1/{endpoint} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+    )?;
+    let mut buf = [0u8; 256];
+    let n = stream.read(&mut buf)?;
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    if resp.starts_with("HTTP/1.1 2") {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{endpoint}: {}",
+            resp.lines().next().unwrap_or("no response")
+        ))
+    }
+}
+
+/// Dump the end of the serial console to stderr — the only useful trace when the
+/// guest never brings virtkit-agent up.
+fn log_tail(path: &Path, lines: usize) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let all: Vec<&str> = text.lines().collect();
+    let tail = &all[all.len().saturating_sub(lines)..];
+    if !tail.is_empty() {
+        eprintln!("--- console tail ({}) ---", path.display());
+        for line in tail {
+            eprintln!("{line}");
+        }
+        eprintln!("--- end console tail ---");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::jobctx::JobCtx;
+
+    fn ctx(cpus_req: Option<&str>, mem_req: Option<&str>) -> JobCtx {
+        let mut cfg = Config::default();
+        cfg.vm.cpus = 4;
+        cfg.vm.mem = "8G".into();
+        cfg.vm.max_cpus = Some(16);
+        cfg.vm.max_mem = Some("64G".into());
+        let mut ctx = JobCtx::new_for_job(cfg, "42".into()).unwrap();
+        ctx.cpus_req = cpus_req.map(String::from);
+        ctx.mem_req = mem_req.map(String::from);
+        ctx
+    }
+
+    #[test]
+    fn sizing() {
+        assert_eq!(vm_size(&ctx(None, None)).unwrap(), (4, "8G".into()));
+        assert_eq!(
+            vm_size(&ctx(Some("12"), Some("32G"))).unwrap(),
+            (12, "32G".into())
+        );
+        // clamped to the ceilings
+        assert_eq!(
+            vm_size(&ctx(Some("64"), Some("256G"))).unwrap(),
+            (16, "64G".into())
+        );
+        // garbage rejected
+        assert!(vm_size(&ctx(Some("zero"), None)).is_err());
+        assert!(vm_size(&ctx(Some("0"), None)).is_err());
+        assert!(vm_size(&ctx(None, Some("64"))).is_err());
+        assert!(vm_size(&ctx(None, Some("4096M"))).is_err());
+    }
+
+    #[test]
+    fn cidr_and_netmask() {
+        assert_eq!(
+            split_cidr("192.168.231.16/24").unwrap(),
+            ("192.168.231.16".into(), 24)
+        );
+        assert_eq!(split_cidr("10.0.0.1/8").unwrap(), ("10.0.0.1".into(), 8));
+        assert!(split_cidr("10.0.0.1").is_err());
+        assert!(split_cidr("10.0.0.1/33").is_err());
+        assert_eq!(prefix_to_netmask(24), "255.255.255.0");
+        assert_eq!(prefix_to_netmask(16), "255.255.0.0");
+        assert_eq!(prefix_to_netmask(8), "255.0.0.0");
+        assert_eq!(prefix_to_netmask(0), "0.0.0.0");
+        assert_eq!(prefix_to_netmask(32), "255.255.255.255");
+    }
+}

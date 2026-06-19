@@ -1,0 +1,83 @@
+# virtkit configuration — /etc/virtkit/config.toml (or VIRTKIT_CONFIG=).
+# Example targeting a bootable guest bundle; every key is optional.
+
+# state_dir = "/var/lib/virtkit"          # job state: <state_dir>/jobs/<job id>/
+# cloud_hypervisor = "/usr/local/bin/cloud-hypervisor"
+# qemu_img = "qemu-img"
+# virtiofsd = "/usr/local/bin/virtiofsd"      # external virtiofsd (default: bundled)
+
+[image]
+# A bootable guest bundle, booted ro with a per-job qcow2 overlay. kernel = the shared
+# guest kernel (guest carries none); initrd only if the image ships one.
+# These are static installed artifacts → /usr/local/lib/virtkit/ (not under state_dir).
+rootfs = "/usr/local/lib/virtkit/images/default/rootfs.ext4"
+kernel = "/usr/local/lib/virtkit/vmlinux"
+# initrd = "/usr/local/lib/virtkit/images/default/initrd.img"
+
+[vm]
+# cpus = 4
+# mem = "4G"           # lazily allocated (memfd); size it for the job + [guest] tmpfs
+# hostname = "runner"
+# vsock_port = 4444
+# balloon = true       # free_page_reporting: freed guest RAM returns to the host
+# max_cpus = 32        # ceilings for the per-job MICROVM_CPUS/MICROVM_MEM
+# max_mem = "128G"     # variables (unset = jobs cannot exceed cpus/mem above)
+# cmdline_extra = ""
+# boot_timeout_secs = 120
+# shutdown_timeout_secs = 15
+
+[guest]
+# builds_dir = "/builds"
+# cache_dir = "/cache"
+# run_command = ["bash"]
+# tmpfs = ["/builds:64G", "/rd:16G"]   # RAM-backed scratch (slow disks); needs vm.mem sized for it
+
+# Dev only — a guest image that assembles itself from a directory mounted as
+# /workdir. CI images must not share anything from the host.
+# [share]
+# dir = "/path/to/repo"
+# readonly = true
+
+[net]
+# mode = "none"                # none | tap (single, dev) | pool (production)
+#
+# mode = "tap": one pre-created tap, one VM at a time
+# tap = "tap0"                 # pre-create the tap on a bridge yourself
+# mac = "52:54:00:d2:f0:01"
+# ip = "172.18.0.250/16"       # static guest config via the kernel `ip=` param
+# gw = "172.18.0.1"
+# dns = "172.18.0.1"
+#
+# mode = "pool": taps <tap_prefix>0..<count-1> pre-created on a NATed bridge;
+# VM i gets subnet .16+i, gw/dns default to the subnet's .1
+# tap_prefix = "civtap"
+# count = 32
+# subnet = "192.168.231.0/24"
+
+# [convert]              # docker images → bootable bundles on demand: the only
+#                        # registry-backed guest source. MICROVM_IMAGE is either
+#                        # `default` (the builtin [image] bundle, bootstrap guest)
+#                        # or `docker/<name>[:tag|@digest]`.
+# repo = "registry.example.com/team"   # fixed host-side = the image allowlist
+# docker = "/usr/bin/docker"       # host daemon: pull + the root conversion container
+# agent = "/usr/local/lib/virtkit/virtkit-agent"  # the agent, injected as PID 1
+# rootfs_size = "32G"              # ext4 size of the converted rootfs (sparse)
+# generic_kernel = "/usr/local/lib/virtkit/vmlinux"  # shared kernel for
+#                                  # kernel-less OCI images (alpine/distroless)
+# generic_disk = false             # generic images: ext4 disk (true) vs cpio in RAM
+# oras = "/usr/local/bin/oras"     # tag → digest resolution
+# ca_file = "/etc/virtkit/registry-ca.crt"
+# username = "ci-push"             # also drives docker pull (--config); the
+# password_file = "/etc/virtkit/registry-password"  # daemon must trust the
+#                                  # registry cert (/etc/docker/certs.d)
+# keep = 3                         # cached conversions per image (GC)
+
+# [services]            # CI `services:` support. Each declared service runs as a
+#                       # container inside the job VM, its image pulled through a
+#                       # host registry pull-through proxy over a per-job vsock
+#                       # forward — the registry credential stays on the proxy and
+#                       # never enters the guest. Present at all = enabled (a job
+#                       # declaring services without this section fails in prepare).
+# registry_proxy = "127.0.0.1:5000"   # host proxy the per-job forward targets
+# port = 5000                         # guest tcp listen + vsock port for the forward
+# ready_timeout_secs = 60             # wait per service for its first port to open

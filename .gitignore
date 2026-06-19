@@ -1,0 +1,8 @@
+# Build outputs
+/target
+/dist
+
+# Editor / OS cruft
+*.swp
+*.rs.bk
+.DS_Store

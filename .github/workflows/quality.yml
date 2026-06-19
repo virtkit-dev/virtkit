@@ -1,0 +1,68 @@
+name: Quality
+
+# Reusable lint + audit checks, called by ci.yml (push/PR) and release.yml (tag gate).
+#
+# Everything runs inside the pinned virtkit-build devcontainer image (same one
+# build.sh uses), so clippy/rustfmt are the exact versions from rust-toolchain.toml
+# and the static libseccomp/libcap-ng FFI env clippy needs to compile is present.
+# Audit shells out to ./audit.sh so .cargo/audit.toml (the RUSTSEC ignore list) stays
+# the single source of truth shared with local runs.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build toolchain image
+        run: docker build -t virtkit-build -f .devcontainer/Dockerfile .devcontainer
+
+      - name: rustfmt
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -v "$PWD":/work -w /work \
+            virtkit-build \
+            cargo fmt --all -- --check
+
+      # clippy compiles the workspace, so it needs the same writable cargo home and
+      # static-FFI env as build.sh (the seccomp/cap-ng crates link statically).
+      - name: clippy
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -e CARGO_HOME=/work/target/.cargo-home \
+            -e CARGO_TARGET_DIR=/work/target \
+            -e LIBSECCOMP_LINK_TYPE=static -e LIBSECCOMP_LIB_PATH=/usr/lib \
+            -e LIBCAPNG_LINK_TYPE=static -e LIBCAPNG_LIB_PATH=/usr/lib \
+            -v "$PWD":/work -w /work \
+            virtkit-build \
+            cargo clippy --workspace --all-targets -- -D warnings
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build toolchain image
+        run: docker build -t virtkit-build -f .devcontainer/Dockerfile .devcontainer
+
+      # audit.sh installs cargo-audit on demand (into the writable cargo home) and
+      # reads .cargo/audit.toml. --deny warnings fails the job on any advisory.
+      # Invoked via `sh` because the Alpine image has no bash for the script's
+      # shebang; audit.sh is POSIX-clean so busybox sh runs it fine.
+      - name: cargo audit
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -e CARGO_HOME=/work/target/.cargo-home \
+            -e CARGO_TARGET_DIR=/work/target \
+            -v "$PWD":/work -w /work \
+            virtkit-build \
+            sh audit.sh --deny warnings

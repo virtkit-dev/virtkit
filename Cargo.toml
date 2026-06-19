@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = ["virtkit", "virtkit-agent"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Vincent Vanackere <vincent.vanackere@gmail.com>"]
+license = "Apache-2.0"
+
+# Reproducible release builds: strip inside the toolchain (not the host strip).
+# Path-independence comes from --remap-path-prefix / -ffile-prefix-map applied at
+# build time (see build.sh and .gitlab-ci.yml), since trim-paths is not yet
+# stabilized in this toolchain.
+[profile.release]
+strip = true
+
+# Single source of truth for dependency versions. Members reference these with
+# `<dep>.workspace = true` and only add the per-crate features they need.
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0"
+libc = "0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# read a `docker export` stream and transcode it into a cpio initramfs (cpio.rs)
+tar = "0.4"
+# pull OCI images straight from a registry (no docker daemon); rustls so the
+# binary stays musl-static (no openssl). flate2 gunzips the layer tars.
+oci-client = { version = "0.15", default-features = false, features = ["rustls-tls"] }
+flate2 = "1"
+# docker-hash: content hashing of a (Dockerfile, stage) for image-tag resolution
+sha2 = "0.10"
+regex = "1"
+# tokio features are member-specific; only the version is pinned here.
+tokio = { version = "1" }
+toml = "0"
+# fleet switch (`switch`): a userspace L2 gateway for microVMs. etherparse parses
+# and builds ethernet/ARP/IPv4/UDP (checksums); ipstack terminates arbitrary guest
+# TCP/UDP for transparent egress through the host's sockets (the gvproxy replacement).
+etherparse = "0.20"
+ipstack = "1"
+listenfd = "1"
+log = "0"
+rand = "0.10"
+# default-features off to use the `ring` backend (consistent with oci-client)
+# rather than russh's default aws-lc-rs, while keeping `rsa` so the SSH server can
+# accept clients' RSA keys. The rsa crate carries RUSTSEC-2023-0071 (Marvin, no
+# fixed release); it is suppressed in .cargo/audit.toml (see that file).
+russh = { version = "0.61.2", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh-sftp = "2"
+simplelog = "0"
+thiserror = "2"
+tokio-serde = { version = "0", features = ["messagepack"] }
+tokio-util = { version = "0", features = ["codec"] }
+tokio-vsock = "0.7"
+# the messagepack codec tokio-serde uses, to assert the on-wire Status layout
+rmp-serde = "1"

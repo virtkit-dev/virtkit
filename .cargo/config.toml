@@ -1,0 +1,10 @@
+# Build static-musl by default: both binaries ship into the microVM image, so
+# the default `cargo build` should produce the artifact we actually deploy.
+[build]
+target = "x86_64-unknown-linux-musl"
+
+# ring (rustls' crypto backend, pulled via oci-client) compiles C in its build
+# script; cc-rs looks for `x86_64-linux-musl-gcc` by default, which the Alpine
+# devcontainer doesn't have — its `gcc` is musl-native, so point cc-rs at it.
+[env]
+CC_x86_64_unknown_linux_musl = "gcc"

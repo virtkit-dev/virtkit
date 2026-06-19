@@ -1,0 +1,103 @@
+# Reproducible build + external attestation pipeline.
+#
+# Flow: build the pinned toolchain image -> build the release artifacts ->
+# independently rebuild on another runner and assert byte-identical output ->
+# sign the checksums keylessly (Sigstore/Rekor) so a third party can verify.
+#
+# Assumes: GitLab Container Registry enabled; a runner that can run kaniko and
+# pull from the registry; pipeline OIDC (id_tokens) for keyless signing. The
+# build logic mirrors build.sh and was validated locally; the GitLab wiring is
+# not executed here, so adjust runner tags / image users to your runners.
+# Non-root note: the toolchain image ends with USER dev; if your runner checks
+# out as root, give it `[runners.docker] user = "root"` or chown $CI_PROJECT_DIR.
+
+stages:
+  - toolchain
+  - build
+  - attest
+
+variables:
+  TOOLCHAIN_IMAGE: $CI_REGISTRY_IMAGE/devcontainer:$CI_COMMIT_SHA
+  TARGET: x86_64-unknown-linux-musl
+  # Self-contained, reproducible cargo env. The remap prefixes match build.sh so
+  # CI and local builds produce the same bytes regardless of checkout path.
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo-home
+  CARGO_TARGET_DIR: $CI_PROJECT_DIR/target
+  SOURCE_DATE_EPOCH: "0"
+  RUSTFLAGS: "--remap-path-prefix=$CI_PROJECT_DIR=/src --remap-path-prefix=$CI_PROJECT_DIR/.cargo-home=/cargo"
+  CFLAGS_x86_64_unknown_linux_musl: "-ffile-prefix-map=$CI_PROJECT_DIR=/src -ffile-prefix-map=$CI_PROJECT_DIR/.cargo-home=/cargo"
+
+# Build & push the pinned toolchain image straight from the devcontainer
+# Dockerfile (kaniko, no privileged dind). Everything downstream uses it.
+toolchain:
+  stage: toolchain
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    - >-
+      /kaniko/executor
+      --context "$CI_PROJECT_DIR/.devcontainer"
+      --dockerfile "$CI_PROJECT_DIR/.devcontainer/Dockerfile"
+      --destination "$TOOLCHAIN_IMAGE"
+
+# Shared build recipe: produce dist/ with the binaries, SHA256SUMS and manifest.
+.build_artifacts:
+  script:
+    - cargo build --release --workspace
+    - mkdir -p dist
+    - cp "target/$TARGET/release/virtkit" "target/$TARGET/release/virtkit-agent" dist/
+    - (cd dist && sha256sum virtkit virtkit-agent > SHA256SUMS)
+    - cat dist/SHA256SUMS
+
+# Build the artifacts (the canonical ones, published as job artifacts).
+build:
+  stage: build
+  image: $TOOLCHAIN_IMAGE
+  needs: [toolchain]
+  extends: .build_artifacts
+  artifacts:
+    paths:
+      - dist/
+
+# Independent rebuild on a (potentially) different runner; fail unless the bytes
+# match build's. This IS the reproducibility attestation: same inputs -> same
+# hashes, proven by two independent builds.
+verify-reproducible:
+  stage: build
+  image: $TOOLCHAIN_IMAGE
+  needs: [toolchain, build]
+  dependencies: [build]
+  script:
+    - mv dist build-dist
+    - !reference [.build_artifacts, script]
+    - echo "comparing independent rebuild against the build job..."
+    - diff <(sort build-dist/SHA256SUMS) <(sort dist/SHA256SUMS)
+    - echo "REPRODUCIBLE: independent rebuild is byte-identical"
+
+# Keyless Sigstore signature over the checksums, using GitLab's pipeline OIDC.
+# The signature + certificate + Rekor proof land in dist/SHA256SUMS.cosign.bundle.
+# Verify (third party):
+#   cosign verify-blob \
+#     --bundle dist/SHA256SUMS.cosign.bundle \
+#     --certificate-oidc-issuer "$CI_SERVER_URL" \
+#     --certificate-identity-regexp "^$CI_SERVER_URL/$CI_PROJECT_PATH//.gitlab-ci.yml@refs/.*" \
+#     dist/SHA256SUMS
+attest:
+  stage: attest
+  image:
+    name: gcr.io/projectsigstore/cosign:v2.4.1
+    entrypoint: [""]
+  needs: [verify-reproducible, build]
+  dependencies: [build]
+  id_tokens:
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  script:
+    - cosign sign-blob --yes dist/SHA256SUMS --bundle dist/SHA256SUMS.cosign.bundle
+  artifacts:
+    paths:
+      - dist/SHA256SUMS
+      - dist/SHA256SUMS.cosign.bundle

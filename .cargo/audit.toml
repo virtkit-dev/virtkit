@@ -1,0 +1,33 @@
+# cargo-audit configuration (consumed by ./audit.sh).
+#
+# RUSTSEC-2023-0071 — Marvin attack on the `rsa` crate. `rsa` is pulled
+# transitively by russh, only under virtkit-agent's optional `ssh` feature, so
+# the embedded SSH server can accept clients' RSA public keys. There is no fixed
+# release: the constant-time fixes are split across upstream issues #626
+# (padding) and PR #680 (the decrypt Ok/Err oracle) and currently exist only in
+# unreleased rsa 0.10 release candidates.
+#
+# Residual risk here is low: our SSH host key is Ed25519, and the server does RSA
+# signature *verification* (public-key side), not the private-key decryption that
+# is Marvin's sharpest edge. Revisit and drop this entry when rsa 0.10 ships.
+#
+# The three entries below are unmaintained/unsound *warnings* (not vulnerabilities)
+# on transitive deps locked by virtiofsd 1.13.3 — the latest release. They cannot be
+# bumped away: postcard 1.1.3 pins heapless "^0.7" (which pulls atomic-polyfill) and
+# virtiofsd pins env_logger "^0.8" (which pulls atty); both newer lines dropped those
+# crates, so the warnings clear themselves once virtiofsd updates. Revisit on its next
+# release. Neither flagged crate is even reachable in our build (notes below).
+#
+#   RUSTSEC-2023-0089 — atomic-polyfill unmaintained. Via heapless 0.7 <- postcard, and
+#     only on targets lacking native atomics; x86_64 (our only target) takes the native
+#     path, so atomic-polyfill is never compiled in.
+#   RUSTSEC-2024-0375 — atty unmaintained.    \ both via env_logger 0.8 (virtiofsd's
+#   RUSTSEC-2021-0145 — atty unaligned read.  / logger). The unsound read is on the
+#     Windows console path; we build only x86_64-linux-musl, so it is unreachable.
+[advisories]
+ignore = [
+    "RUSTSEC-2023-0071", # rsa: Marvin attack (see above)
+    "RUSTSEC-2023-0089", # atomic-polyfill: unmaintained (transitive via virtiofsd)
+    "RUSTSEC-2024-0375", # atty: unmaintained (transitive via virtiofsd)
+    "RUSTSEC-2021-0145", # atty: unaligned read, Windows-only (transitive via virtiofsd)
+]

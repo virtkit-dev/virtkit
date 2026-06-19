@@ -1,0 +1,65 @@
+name: Build
+
+# Reusable workflow: build binaries and/or the guest kernel.
+# Called by ci.yml (on push/PR/dispatch) and release.yml (on tag).
+#
+# Inputs
+#   artifact-prefix  — prefix for uploaded artifact names; callers set this to
+#                      avoid collisions between CI and release runs on the same SHA.
+#   build-kernel     — whether to run the kernel build job (default: false).
+
+on:
+  workflow_call:
+    inputs:
+      artifact-prefix:
+        type: string
+        required: true
+      build-kernel:
+        type: boolean
+        default: false
+      retention-days:
+        type: number
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build_virtkit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build binaries (virtkit, virtkit-agent)
+        run: ./build.sh
+
+      - name: Upload binary artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact-prefix }}-binaries-${{ github.sha }}
+          path: |
+            dist/virtkit
+            dist/virtkit-agent
+            dist/virtkit.sha256
+            dist/virtkit-agent.sha256
+            dist/build-info.txt
+          retention-days: ${{ inputs.retention-days }}
+
+  build_kernel:
+    if: inputs.build-kernel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build guest kernel (vmlinux)
+        run: ./build-kernel.sh
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact-prefix }}-kernel-${{ github.sha }}
+          path: |
+            dist/vmlinux
+            dist/vmlinux.sha256
+            dist/kernel-build-info.txt
+          retention-days: ${{ inputs.retention-days }}

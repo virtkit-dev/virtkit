@@ -1,0 +1,22 @@
+{
+	"name": "virtkit (rust/musl)",
+	"build": {
+		"dockerfile": "Dockerfile"
+	},
+	"remoteUser": "dev",
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"rust-lang.rust-analyzer",
+				"tamasfe.even-better-toml",
+				"editorconfig.editorconfig",
+				"timonwong.shellcheck"
+			],
+			"settings": {
+				"extensions.ignoreRecommendations": true,
+				"extensions.autoCheckUpdates": false,
+				"extensions.autoUpdate": false
+			}
+		}
+	}
+}

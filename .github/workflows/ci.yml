@@ -1,0 +1,36 @@
+name: CI
+
+# Lint + audit on every branch push and pull request. Tag pushes are excluded
+# (branches: '**' matches branches, not tags) — release.yml runs the same checks
+# as a gate before publishing, so a tag build does not double-run them here.
+#
+# A build job runs after quality and uploads the binaries as a GitHub Actions
+# artifact (retention: 1 day). This lets you grab a build from any commit
+# without waiting for a release tag. The guest kernel is excluded — it compiles
+# a full Linux kernel (tens of minutes) and changes infrequently; use release.yml
+# or build-kernel.sh locally when you need a new vmlinux.
+#
+# build_kernel is included when the workflow is triggered manually
+# (workflow_dispatch) for testing kernel config changes without cutting a release.
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    uses: ./.github/workflows/quality.yml
+
+  build:
+    needs: [quality]
+    uses: ./.github/workflows/build.yml
+    with:
+      artifact-prefix: ci
+      build-kernel: ${{ github.event_name == 'workflow_dispatch' }}
+      retention-days: 1
