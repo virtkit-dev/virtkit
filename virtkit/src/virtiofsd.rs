@@ -24,6 +24,7 @@ use virtiofsd::passthrough::read_only::PassthroughFsRo;
 use virtiofsd::passthrough::{self, CachePolicy, PassthroughFs};
 use virtiofsd::sandbox::{Sandbox, SandboxMode};
 use virtiofsd::seccomp::{SeccompAction, enable_seccomp};
+use virtiofsd::soft_idmap::cmdline::IdMap;
 use virtiofsd::vhost_user::VhostUserFsBackendBuilder;
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 
@@ -57,6 +58,14 @@ struct Opt {
     /// worker thread pool size (0 = synchronous)
     #[arg(long = "thread-pool-size", default_value_t = 0)]
     thread_pool_size: usize,
+    /// UID translation rule for the guest↔host boundary (repeatable);
+    /// format: `type:from:to[:count]` where type is one of:
+    /// `map` (bidirectional), `guest`, `host`, `squash-guest`, `squash-host`, `forbid-guest`
+    #[arg(long = "uid-map")]
+    uid_map: Vec<IdMap>,
+    /// GID translation rule (same format as --uid-map, repeatable)
+    #[arg(long = "gid-map")]
+    gid_map: Vec<IdMap>,
 }
 
 /// Run the daemon. `argv` starts with the program name (e.g. ["virtiofsd", "--shared-dir", …]).
@@ -93,6 +102,16 @@ pub fn run(argv: Vec<String>) -> Result<()> {
         entry_timeout: timeout,
         attr_timeout: timeout,
         cache_policy: cache,
+        uid_map: if opt.uid_map.is_empty() {
+            None
+        } else {
+            Some(opt.uid_map)
+        },
+        gid_map: if opt.gid_map.is_empty() {
+            None
+        } else {
+            Some(opt.gid_map)
+        },
         ..Default::default()
     };
 

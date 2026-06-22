@@ -58,6 +58,18 @@ impl Service {
     }
 }
 
+/// One extra host directory to share into the builder via virtiofs.
+pub struct ShareSpec {
+    pub host_dir: PathBuf,
+    pub guest_path: String,
+    pub readonly: bool,
+    /// soft_idmap UID map specs (format: `type:from:to[:count]`), passed as
+    /// `--uid-map` to virtiofsd. Empty = identity (no remapping).
+    pub uid_maps: Vec<String>,
+    /// soft_idmap GID map specs, passed as `--gid-map` to virtiofsd.
+    pub gid_maps: Vec<String>,
+}
+
 /// The builder VM: shares /workdir (+ the git worktree) over virtiofs and DHCPs an
 /// address on the shared LAN. Booted in-process when `--builder` is given.
 pub struct BuilderOpts {
@@ -73,9 +85,8 @@ pub struct BuilderOpts {
     pub mem: String,
     /// build-builder-image.sh to (re)build the ext4 when stale; None skips the check
     pub build_script: Option<PathBuf>,
-    /// extra host directories to share into the builder via virtiofs:
-    /// (host_dir, guest_path, readonly)
-    pub extra_shares: Vec<(PathBuf, String, bool)>,
+    /// extra host directories to share into the builder via virtiofs
+    pub extra_shares: Vec<ShareSpec>,
     /// symlinks to create inside the guest after virtiofs mounts: "src:dest" pairs
     pub extra_symlinks: Vec<String>,
 }
@@ -490,14 +501,14 @@ fn boot_service(
         let workdir = workdir
             .context("a `workdir` unit needs the repo share, but the fleet has no builder")?;
         let workdir_sock = dir.join("vfsd-workdir.sock");
-        aux.push(spawn_virtiofsd(&workdir_sock, workdir, true)?);
+        aux.push(spawn_virtiofsd(&workdir_sock, workdir, true, &[], &[])?);
         fs_args.push(format!("tag=workdir,socket={}", workdir_sock.display()));
         virtiofs.push_str("workdir:/workdir");
         // git worktree: share the main repo's git dir at the SAME guest path so the
         // worktree's .git -> commondir chain resolves (the assembly reads git).
         if let Some(gs) = git_share {
             let git_sock = dir.join("vfsd-git.sock");
-            aux.push(spawn_virtiofsd(&git_sock, gs, true)?);
+            aux.push(spawn_virtiofsd(&git_sock, gs, true, &[], &[])?);
             fs_args.push(format!("tag=gitdir,socket={}", git_sock.display()));
             virtiofs.push_str(&format!(",gitdir:{}", gs.display()));
         }
@@ -564,7 +575,7 @@ fn boot_builder(
 
     // virtiofsd on /workdir — READ-WRITE (no --readonly): live editing both ways.
     let workdir_sock = dir.join("vfsd-workdir.sock");
-    aux.push(spawn_virtiofsd(&workdir_sock, &b.workdir, false)?);
+    aux.push(spawn_virtiofsd(&workdir_sock, &b.workdir, false, &[], &[])?);
     let mut fs_args: Vec<String> = vec![format!("tag=workdir,socket={}", workdir_sock.display())];
     let mut virtiofs = String::from("workdir:/workdir");
 
@@ -573,18 +584,24 @@ fn boot_builder(
     let git_share = git_share_for(&b.workdir, b.git_dir.as_deref());
     if let Some(gs) = &git_share {
         let git_sock = dir.join("vfsd-git.sock");
-        aux.push(spawn_virtiofsd(&git_sock, gs, false)?);
+        aux.push(spawn_virtiofsd(&git_sock, gs, false, &[], &[])?);
         fs_args.push(format!("tag=gitdir,socket={}", git_sock.display()));
         virtiofs.push_str(&format!(",gitdir:{}", gs.display()));
     }
 
     // Extra host directories shared into the builder (--builder-share host:guest[:ro]).
-    for (i, (host_dir, guest_path, readonly)) in b.extra_shares.iter().enumerate() {
+    for (i, share) in b.extra_shares.iter().enumerate() {
         let tag = format!("share{i}");
         let sock = dir.join(format!("vfsd-share{i}.sock"));
-        aux.push(spawn_virtiofsd(&sock, host_dir, *readonly)?);
+        aux.push(spawn_virtiofsd(
+            &sock,
+            &share.host_dir,
+            share.readonly,
+            &share.uid_maps,
+            &share.gid_maps,
+        )?);
         fs_args.push(format!("tag={tag},socket={}", sock.display()));
-        virtiofs.push_str(&format!(",{tag}:{guest_path}"));
+        virtiofs.push_str(&format!(",{tag}:{}", share.guest_path));
     }
 
     // Symlinks to create inside the guest after virtiofs mounts (--builder-symlink).
@@ -675,7 +692,15 @@ fn create_overlay(ext4: &Path, overlay: &Path) -> Result<()> {
 /// `shared_dir` (optionally read-only) and wait for its socket to appear. RO shares
 /// (the runner's repo) are a host-side guarantee the guest can never write back to the
 /// repo, even via the assembly's symlink chmod hardening.
-fn spawn_virtiofsd(sock: &Path, shared_dir: &Path, readonly: bool) -> Result<Child> {
+/// `uid_maps` / `gid_maps` are soft_idmap spec strings (`type:from:to[:count]`) forwarded
+/// as `--uid-map` / `--gid-map` to virtiofsd; empty slices = identity (no remapping).
+fn spawn_virtiofsd(
+    sock: &Path,
+    shared_dir: &Path,
+    readonly: bool,
+    uid_maps: &[String],
+    gid_maps: &[String],
+) -> Result<Child> {
     let _ = std::fs::remove_file(sock);
     let exe = std::env::current_exe().context("locating the virtkit binary for virtiofsd")?;
     let mut cmd = Command::new(exe);
@@ -686,6 +711,12 @@ fn spawn_virtiofsd(sock: &Path, shared_dir: &Path, readonly: bool) -> Result<Chi
         .arg("--sandbox=none");
     if readonly {
         cmd.arg("--readonly");
+    }
+    for m in uid_maps {
+        cmd.arg(format!("--uid-map={m}"));
+    }
+    for m in gid_maps {
+        cmd.arg(format!("--gid-map={m}"));
     }
     let child = cmd
         .stdin(Stdio::null())

@@ -177,6 +177,13 @@ enum Cmd {
         /// symlink to create inside the builder after virtiofs mounts: src:dest (repeatable)
         #[arg(long = "builder-symlink", value_name = "SRC:DEST")]
         builder_symlink: Vec<String>,
+        /// UID translation for extra builder shares (repeatable; applies to all --builder-share);
+        /// format: `type:from:to[:count]` — types: map, guest, host, squash-guest, squash-host, forbid-guest
+        #[arg(long = "builder-uid-map", value_name = "MAP")]
+        builder_uid_map: Vec<String>,
+        /// GID translation for extra builder shares (repeatable; same format as --builder-uid-map)
+        #[arg(long = "builder-gid-map", value_name = "MAP")]
+        builder_gid_map: Vec<String>,
     },
     /// Dev: boot a (generic, kernel-less) docker image as a microVM — cpio
     /// initramfs in RAM, virtkit-agent as PID 1, vsock — with no gitlab-runner and
@@ -534,6 +541,8 @@ async fn main() -> ExitCode {
         builder_mem,
         builder_share,
         builder_symlink,
+        builder_uid_map,
+        builder_gid_map,
     } = &cli.cmd
     {
         // Parse --builder-share host:guest[:ro] entries.
@@ -564,7 +573,13 @@ async fn main() -> ExitCode {
                     2,
                 );
             }
-            extra_shares.push((PathBuf::from(host), guest.to_string(), readonly));
+            extra_shares.push(fleet::ShareSpec {
+                host_dir: PathBuf::from(host),
+                guest_path: guest.to_string(),
+                readonly,
+                uid_maps: builder_uid_map.clone(),
+                gid_maps: builder_gid_map.clone(),
+            });
         }
         for spec in builder_symlink.iter() {
             if spec.contains(' ') {
