@@ -82,4 +82,4 @@ update.sh        bump + re-pin toolchain / base image / apk versions
 
 ## License
 
-Copyright © Vincent Vanackere. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Copyright © Vincent Vanackere and WALLIX. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

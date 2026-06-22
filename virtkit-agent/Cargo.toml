@@ -39,6 +39,9 @@ tokio-serde.workspace = true
 tokio-util.workspace = true
 tokio-vsock.workspace = true
 
+[target.'cfg(target_env = "musl")'.dependencies]
+jemallocator.workspace = true
+
 [features]
 # Embedded SSH server (`ssh-serve`), for the VS Code Remote-SSH path. ON by
 # default: the builder VM needs it and one dist binary then serves builder and

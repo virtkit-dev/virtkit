@@ -12,6 +12,10 @@
 //!     cleanup_exec  = "/usr/local/bin/virtkit"
 //!     cleanup_args  = ["gitlab", "cleanup"]
 
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 mod config;
 mod convert;
 mod cpio;

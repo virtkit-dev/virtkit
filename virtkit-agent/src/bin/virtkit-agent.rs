@@ -1,3 +1,7 @@
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 use clap::{Parser, Subcommand};
 use log::{LevelFilter, error, info};
 use simplelog::{ColorChoice, Config, TermLogger, TerminalMode, WriteLogger};

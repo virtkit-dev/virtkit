@@ -5,7 +5,11 @@ members = ["virtkit", "virtkit-agent"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-authors = ["Vincent Vanackere <vincent.vanackere@gmail.com>"]
+authors = [
+    "Vincent Vanackere <vincent.vanackere@gmail.com>",
+    "Vincent Vanackere <vvanackere@wallix.com>",
+    "WALLIX",
+]
 license = "Apache-2.0"
 
 # Reproducible release builds: strip inside the toolchain (not the host strip).
@@ -57,3 +61,5 @@ tokio-util = { version = "0", features = ["codec"] }
 tokio-vsock = "0.7"
 # the messagepack codec tokio-serde uses, to assert the on-wire Status layout
 rmp-serde = "1"
+# musl builds use jemalloc instead of the default musl allocator (same approach as ripgrep)
+jemallocator = "0.5"

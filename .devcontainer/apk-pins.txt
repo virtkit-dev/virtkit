@@ -9,4 +9,5 @@ libcap-ng-dev=0.8.5-r0
 libcap-ng-static=0.8.5-r0
 libseccomp-dev=2.5.5-r1
 libseccomp-static=2.5.5-r1
+make=4.4.1-r2
 musl-dev=1.2.5-r11
