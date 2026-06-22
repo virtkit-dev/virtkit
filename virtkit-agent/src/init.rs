@@ -24,9 +24,12 @@
 //!   VIRTKIT_SSH=1        also run ssh-serve (vsock 2222); keys VIRTKIT_SSH_KEYS
 //!                        (default /workdir/docker/runner/authorized_keys), user
 //!                        VIRTKIT_SSH_USER (default dev)
-//!   VIRTKIT_MODE=service exec the captured entrypoint instead of serving (a systemd
-//!                        image uses this: its entrypoint execs /sbin/init)
-//!   VIRTKIT_DEBUG=1      (service) don't exec — run, report, hold a shell
+//!   VIRTKIT_MODE=service fork the captured entrypoint; the agent stays as PID 1 and
+//!                        reaps orphans. A systemd image hands off via its entrypoint.
+//!   VIRTKIT_SERVE=1      (service) also start the vsock exec server (port 4444) for
+//!                        live debugging: `virtkit-agent -s vsock-mux://<vsock.sock>:4444 exec`
+//!   VIRTKIT_DEBUG=1      (service) fork+wait the entrypoint, then hold the VM on exit
+//!                        for post-mortem inspection (overrides VIRTKIT_SERVE)
 //!
 //! The whole module is sync: no tokio in PID 1.
 
@@ -67,10 +70,9 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     // orphans reparent to PID 1 (this process): reap them.
     set_child_subreaper();
 
-    // VIRTKIT_MODE=service: exec the image's captured entrypoint instead of serving.
-    // A systemd image uses this too — its entrypoint execs /sbin/init (or a wrapper
-    // that does), so the agent needs no dedicated "systemd" mode: handing off to the
-    // image entrypoint is handing off to systemd.
+    // VIRTKIT_MODE=service: fork the image's captured entrypoint and supervise it as
+    // PID 1 (reaps orphans). A systemd image uses this too — its entrypoint execs
+    // /sbin/init, handing off to systemd which then takes over process supervision.
     if cmdline.get("VIRTKIT_MODE").map(String::as_str) == Some("service") {
         return run_service(&cmdline);
     }
@@ -509,10 +511,10 @@ fn run_service(cmdline: &HashMap<String, String>) -> Result<()> {
         // No captured entrypoint: a self-booting image (systemd) has its init at
         // /sbin/init — hand off to it; otherwise drop to a shell.
         if Path::new("/sbin/init").exists() {
-            warn!("virtkit-agent init: no captured command — exec /sbin/init");
+            warn!("virtkit-agent init: no captured command — forking /sbin/init");
             argv = vec!["/sbin/init".into()];
         } else {
-            warn!("virtkit-agent init: no captured command (/etc/virtkit/cmd) — exec /bin/sh");
+            warn!("virtkit-agent init: no captured command (/etc/virtkit/cmd) — forking /bin/sh");
             argv = vec!["/bin/sh".into()];
         }
     }
@@ -521,11 +523,12 @@ fn run_service(cmdline: &HashMap<String, String>) -> Result<()> {
         .unwrap_or_default();
     let argv = wrap_user(argv, &user);
     info!(
-        "virtkit-agent init: service exec as {}: {:?}",
+        "virtkit-agent init: service as {}: {:?}",
         if user.is_empty() { "root" } else { &user },
         argv
     );
 
+    // VIRTKIT_DEBUG=1: fork+wait, then hold for post-mortem inspection.
     if cmdline.get("VIRTKIT_DEBUG").map(String::as_str) == Some("1") {
         match fork_exec_wait(&argv) {
             Ok(code) => {
@@ -537,7 +540,62 @@ fn run_service(cmdline: &HashMap<String, String>) -> Result<()> {
             std::thread::sleep(Duration::from_secs(3600));
         }
     }
-    exec_argv(&argv); // never returns
+
+    // Fork the service as a child — the agent (PID 1) stays to reap orphans.
+    let service_pid = fork_exec(&argv)?;
+    info!("virtkit-agent init: service pid {service_pid}");
+
+    // VIRTKIT_SERVE=1: optionally start the vsock exec server for live debugging.
+    // Connect with: virtkit-agent -s vsock-mux://<vsock.sock>:4444 exec -- <cmd>
+    let serve_pid = if cmdline.get("VIRTKIT_SERVE").map(String::as_str) == Some("1") {
+        let socket = socket_from_cmdline();
+        match spawn_serve(&socket, None) {
+            Ok(pid) => {
+                info!("virtkit-agent init: exec server up on {socket} (pid {pid})");
+                Some(pid)
+            }
+            Err(e) => {
+                warn!("virtkit-agent init: exec server failed to start: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    install_term_handler();
+    supervise_service(service_pid, serve_pid)
+}
+
+/// Reap orphaned processes as PID 1; power off when the service child exits.
+/// If the optional exec server exits, log it and continue (service is the primary).
+fn supervise_service(service_pid: libc::pid_t, serve_pid: Option<libc::pid_t>) -> Result<()> {
+    loop {
+        let mut status: libc::c_int = 0;
+        let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+        if pid < 0 {
+            let e = io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                _ => break, // ECHILD: nothing left to wait on
+            }
+        }
+        let code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            -libc::WTERMSIG(status)
+        };
+        if pid == service_pid {
+            info!("virtkit-agent init: service exited (code {code}); powering off");
+            break;
+        }
+        if Some(pid) == serve_pid {
+            info!("virtkit-agent init: exec server exited (code {code})");
+            continue; // service is still running; keep supervising
+        }
+        // an orphan was reaped — keep supervising
+    }
+    poweroff();
 }
 
 /// Wrap argv to drop to `user` via setpriv (when non-root and setpriv is present).
@@ -619,6 +677,20 @@ fn fork_agent(args: &[String]) -> Result<libc::pid_t> {
     if pid == 0 {
         unsafe { libc::execv(argv_owned[0].as_ptr(), argv.as_ptr()) };
         unsafe { libc::_exit(127) };
+    }
+    Ok(pid)
+}
+
+/// fork() + exec `argv`; return the child pid in the parent without waiting.
+fn fork_exec(argv: &[String]) -> Result<libc::pid_t> {
+    // SAFETY: fork in a sync, single-threaded PID 1 (no tokio runtime here); the
+    // child only calls exec_argv before touching anything else.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        bail!("fork failed: {}", io::Error::last_os_error());
+    }
+    if pid == 0 {
+        exec_argv(argv); // never returns
     }
     Ok(pid)
 }
