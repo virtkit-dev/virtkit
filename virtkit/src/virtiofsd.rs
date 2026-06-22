@@ -5,9 +5,9 @@
 //! This is a slim wrapper over the `virtiofsd` library exposing only the flags the
 //! fleet/executor pass (`--shared-dir`, `--socket-path`, `--cache`, `--sandbox`,
 //! `--readonly`, `--tag`). The daemon setup mirrors virtiofsd's own `main.rs`
-//! (Sandbox → Listener → PassthroughFs → VhostUserDaemon); it deliberately omits the
-//! seccomp / capability-dropping / rlimit tuning of the full CLI — the shares are
-//! mounted `--sandbox=none` and Cloud Hypervisor already confines the guest.
+//! (Sandbox → Listener → PassthroughFs → VhostUserDaemon); it deliberately omits
+//! capability-dropping — the shares are mounted `--sandbox=none` and Cloud Hypervisor
+//! already confines the guest. RLIMIT_NOFILE and seccomp are applied like upstream.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -19,6 +19,7 @@ use clap::Parser;
 use vhost::vhost_user::Listener;
 use vhost_user_backend::VhostUserDaemon;
 use virtiofsd::filesystem::{FileSystem, SerializableFileSystem};
+use virtiofsd::limits;
 use virtiofsd::passthrough::read_only::PassthroughFsRo;
 use virtiofsd::passthrough::{self, CachePolicy, PassthroughFs};
 use virtiofsd::sandbox::{Sandbox, SandboxMode};
@@ -61,6 +62,10 @@ struct Opt {
 /// Run the daemon. `argv` starts with the program name (e.g. ["virtiofsd", "--shared-dir", …]).
 pub fn run(argv: Vec<String>) -> Result<()> {
     let opt = Opt::parse_from(argv);
+
+    // Raise RLIMIT_NOFILE to 1_000_000 (virtiofsd default) so large shared directories
+    // with many open files don't hit the shell default of ~1024.
+    limits::setup_rlimit_nofile(None).map_err(|e| anyhow!("raising RLIMIT_NOFILE: {e}"))?;
 
     let cache = CachePolicy::from_str(&opt.cache)
         .map_err(|_| anyhow!("invalid --cache {:?}", opt.cache))?;
