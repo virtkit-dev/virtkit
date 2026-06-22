@@ -17,6 +17,9 @@
 //!                        vsock port; then DHCP (VIRTKIT_NET_DHCP=1) or a static
 //!                        VIRTKIT_VM_IP / VIRTKIT_VM_GW / VIRTKIT_VM_DNS
 //!   VIRTKIT_VIRTIOFS     tag:path[,tag:path] virtiofs shares to mount
+//!   VIRTKIT_SYMLINKS     src:dest[,src:dest] — after virtiofs mounts, create each
+//!                        `dest` as a symlink pointing to `src`. Entries where `src`
+//!                        does not exist are silently skipped.
 //!   VIRTKIT_TMPFS        /path:size[,/path:size] RAM scratch dirs (e.g. CI /builds)
 //!   VIRTKIT_SSH=1        also run ssh-serve (vsock 2222); keys VIRTKIT_SSH_KEYS
 //!                        (default /workdir/docker/runner/authorized_keys), user
@@ -58,6 +61,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     load_image_env(); // so served/exec'd commands inherit the image PATH etc.
     ensure_virtctl_symlink(); // /usr/local/bin/virtctl -> the agent (fleet control client)
     mount_virtiofs(&cmdline);
+    apply_symlinks(&cmdline);
     configure_network(&cmdline);
     apply_tmpfs(&cmdline); // RAM scratch dirs (e.g. CI /builds) before the payload starts
     // orphans reparent to PID 1 (this process): reap them.
@@ -386,6 +390,31 @@ fn mount_virtiofs(cmdline: &HashMap<String, String>) {
         let _ = std::fs::create_dir_all(path);
         if let Err(e) = mount(tag, path, "virtiofs", 0) {
             warn!("virtkit-agent init: mount virtiofs {tag} at {path} failed: {e}");
+        }
+    }
+}
+
+/// Create symlinks declared in VIRTKIT_SYMLINKS=src:dest[,src:dest,...].
+/// Called after virtiofs mounts so the sources are accessible. Entries whose
+/// source path does not exist are silently skipped (e.g. optional host files).
+fn apply_symlinks(cmdline: &HashMap<String, String>) {
+    let Some(spec) = cmdline.get("VIRTKIT_SYMLINKS") else {
+        return;
+    };
+    for entry in spec.split(',').filter(|e| !e.is_empty()) {
+        let Some((src, dest)) = entry.split_once(':') else {
+            warn!("virtkit-agent init: bad VIRTKIT_SYMLINKS entry {entry:?} (want src:dest)");
+            continue;
+        };
+        if !Path::new(src).exists() {
+            continue;
+        }
+        if let Some(parent) = Path::new(dest).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(dest);
+        if let Err(e) = std::os::unix::fs::symlink(src, dest) {
+            warn!("virtkit-agent init: symlink {src} -> {dest}: {e}");
         }
     }
 }

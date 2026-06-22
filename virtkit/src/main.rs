@@ -171,6 +171,12 @@ enum Cmd {
         /// builder RAM
         #[arg(long, default_value = "8G")]
         builder_mem: String,
+        /// extra host directory to share into the builder: host_path:guest_path[:ro] (repeatable)
+        #[arg(long = "builder-share", value_name = "HOST:GUEST[:ro]")]
+        builder_share: Vec<String>,
+        /// symlink to create inside the builder after virtiofs mounts: src:dest (repeatable)
+        #[arg(long = "builder-symlink", value_name = "SRC:DEST")]
+        builder_symlink: Vec<String>,
     },
     /// Dev: boot a (generic, kernel-less) docker image as a microVM — cpio
     /// initramfs in RAM, virtkit-agent as PID 1, vsock — with no gitlab-runner and
@@ -526,8 +532,50 @@ async fn main() -> ExitCode {
         builder_cid,
         builder_cpus,
         builder_mem,
+        builder_share,
+        builder_symlink,
     } = &cli.cmd
     {
+        // Parse --builder-share host:guest[:ro] entries.
+        let mut extra_shares = Vec::new();
+        for spec in builder_share {
+            let parts: Vec<&str> = spec.splitn(3, ':').collect();
+            let (host, guest, readonly) = match parts.as_slice() {
+                [host, guest] => (*host, *guest, false),
+                [host, guest, ro] if *ro == "ro" => (*host, *guest, true),
+                [_, _, flag] => {
+                    return fail(
+                        &anyhow::anyhow!("bad --builder-share flag {flag:?} (want `ro`)"),
+                        2,
+                    );
+                }
+                _ => {
+                    return fail(
+                        &anyhow::anyhow!("bad --builder-share {spec:?} (want host:guest[:ro])"),
+                        2,
+                    );
+                }
+            };
+            if guest.contains(' ') {
+                return fail(
+                    &anyhow::anyhow!(
+                        "bad --builder-share {spec:?}: guest path may not contain spaces"
+                    ),
+                    2,
+                );
+            }
+            extra_shares.push((PathBuf::from(host), guest.to_string(), readonly));
+        }
+        for spec in builder_symlink.iter() {
+            if spec.contains(' ') {
+                return fail(
+                    &anyhow::anyhow!(
+                        "bad --builder-symlink {spec:?}: src:dest may not contain spaces"
+                    ),
+                    2,
+                );
+            }
+        }
         let builder_opts = builder.as_ref().map(|ext4| fleet::BuilderOpts {
             ext4: ext4.clone(),
             name: builder_name.clone(),
@@ -537,6 +585,8 @@ async fn main() -> ExitCode {
             cpus: *builder_cpus,
             mem: builder_mem.clone(),
             build_script: builder_build.clone(),
+            extra_shares,
+            extra_symlinks: builder_symlink.clone(),
         });
         return match fleet::run(
             *gateway,

@@ -73,6 +73,11 @@ pub struct BuilderOpts {
     pub mem: String,
     /// build-builder-image.sh to (re)build the ext4 when stale; None skips the check
     pub build_script: Option<PathBuf>,
+    /// extra host directories to share into the builder via virtiofs:
+    /// (host_dir, guest_path, readonly)
+    pub extra_shares: Vec<(PathBuf, String, bool)>,
+    /// symlinks to create inside the guest after virtiofs mounts: "src:dest" pairs
+    pub extra_symlinks: Vec<String>,
 }
 
 impl BuilderOpts {
@@ -561,6 +566,7 @@ fn boot_builder(
     let workdir_sock = dir.join("vfsd-workdir.sock");
     aux.push(spawn_virtiofsd(&workdir_sock, &b.workdir, false)?);
     let mut fs_args: Vec<String> = vec![format!("tag=workdir,socket={}", workdir_sock.display())];
+    let mut virtiofs = String::from("workdir:/workdir");
 
     // git worktree: share the main repo's git dir at the SAME guest path so the
     // worktree's .git -> commondir chain resolves.
@@ -569,7 +575,24 @@ fn boot_builder(
         let git_sock = dir.join("vfsd-git.sock");
         aux.push(spawn_virtiofsd(&git_sock, gs, false)?);
         fs_args.push(format!("tag=gitdir,socket={}", git_sock.display()));
+        virtiofs.push_str(&format!(",gitdir:{}", gs.display()));
     }
+
+    // Extra host directories shared into the builder (--builder-share host:guest[:ro]).
+    for (i, (host_dir, guest_path, readonly)) in b.extra_shares.iter().enumerate() {
+        let tag = format!("share{i}");
+        let sock = dir.join(format!("vfsd-share{i}.sock"));
+        aux.push(spawn_virtiofsd(&sock, host_dir, *readonly)?);
+        fs_args.push(format!("tag={tag},socket={}", sock.display()));
+        virtiofs.push_str(&format!(",{tag}:{guest_path}"));
+    }
+
+    // Symlinks to create inside the guest after virtiofs mounts (--builder-symlink).
+    let symlinks_param = if !b.extra_symlinks.is_empty() {
+        format!(" VIRTKIT_SYMLINKS={}", b.extra_symlinks.join(","))
+    } else {
+        String::new()
+    };
 
     // Copy-on-write overlay tied to the base fs UUID via its NAME: a rebuilt base
     // (new UUID) maps to a different filename, so a stale overlay is never reused.
@@ -591,14 +614,10 @@ fn boot_builder(
     // (VIRTKIT_SSH for VS Code Remote-SSH). The git worktree share, when present, is
     // mounted at the same guest path so the worktree resolves. DNS comes from DHCP
     // (the gateway resolver), so no /etc/hosts injection.
-    let mut virtiofs = String::from("workdir:/workdir");
-    if let Some(gs) = &git_share {
-        virtiofs.push_str(&format!(",gitdir:{}", gs.display()));
-    }
     let cmdline = format!(
         "console=ttyS0 root=/dev/vda rw rootfstype=ext4 init=/usr/local/bin/virtkit-agent \
          VIRTKIT_HOSTNAME={} VIRTKIT_NET_PORT={net_port} VIRTKIT_NET_DHCP=1 \
-         VIRTKIT_VIRTIOFS={virtiofs} VIRTKIT_SSH=1",
+         VIRTKIT_VIRTIOFS={virtiofs} VIRTKIT_SSH=1{symlinks_param}",
         b.name
     );
 
