@@ -32,14 +32,14 @@ serde_json = "1"
 tar = "0.4"
 # pull OCI images straight from a registry (no docker daemon); rustls so the
 # binary stays musl-static (no openssl). flate2 gunzips the layer tars.
-oci-client = { version = "0.15", default-features = false, features = ["rustls-tls"] }
+oci-client = { version = "0.17", default-features = false, features = ["rustls-tls"] }
 flate2 = "1"
 # docker-hash: content hashing of a (Dockerfile, stage) for image-tag resolution
-sha2 = "0.10"
+sha2 = "0.11"
 regex = "1"
 # tokio features are member-specific; only the version is pinned here.
 tokio = { version = "1" }
-toml = "0"
+toml = "1"
 # fleet switch (`switch`): a userspace L2 gateway for microVMs. etherparse parses
 # and builds ethernet/ARP/IPv4/UDP (checksums); ipstack terminates arbitrary guest
 # TCP/UDP for transparent egress through the host's sockets (the gvproxy replacement).

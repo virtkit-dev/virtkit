@@ -13,6 +13,16 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
+fn sha256_hex(data: impl AsRef<[u8]>) -> String {
+    let d = Sha256::digest(data);
+    let mut s = String::with_capacity(64);
+    for b in d {
+        use std::fmt::Write;
+        write!(s, "{b:02x}").unwrap();
+    }
+    s
+}
+
 /// Rebuild builder.ext4 via `build_script` when it is missing or when its UUID no
 /// longer matches the fingerprint of the build inputs (the agent binary baked in as
 /// PID 1, the build script, the profile-env shim). Docker-image staleness is the
@@ -73,7 +83,7 @@ fn ensure(ext4: &Path, want: &str, build_script: &Path, args: &[&str], label: &s
 /// first 16 bytes formatted 8-4-4-4-12. The build scripts compute the SAME value and
 /// stamp it as the ext4 UUID (`mkext-tar --uuid`), so a mismatch means stale.
 fn fingerprint(parts: &[String]) -> String {
-    let hex = format!("{:x}", Sha256::digest(parts.join("\n").as_bytes()));
+    let hex = sha256_hex(parts.join("\n"));
     format!(
         "{}-{}-{}-{}-{}",
         &hex[0..8],
@@ -87,7 +97,7 @@ fn fingerprint(parts: &[String]) -> String {
 /// sha256 (hex) of a file's contents, matching `sha256sum | cut -d' ' -f1`.
 fn file_sha256(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(format!("{:x}", Sha256::digest(&bytes)))
+    Ok(sha256_hex(&bytes))
 }
 
 fn run_build(script: &Path, args: &[&str]) -> Result<()> {
