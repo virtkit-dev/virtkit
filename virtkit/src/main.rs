@@ -138,10 +138,6 @@ enum Cmd {
         /// docker image a service ext4 is built from: name=ref (repeatable)
         #[arg(long = "service-image")]
         service_image: Vec<String>,
-        /// the agent binary baked into the images as PID 1 — part of each ext4's
-        /// build fingerprint (required when --builder-build/--service-build is used)
-        #[arg(long)]
-        agent: Option<PathBuf>,
         /// ensure the ext4 images are current (build the stale ones) and exit, without
         /// starting the switch or booting any VM
         #[arg(long)]
@@ -245,6 +241,17 @@ enum Cmd {
         blacklist: Vec<String>,
         /// Stages to print (default: all, in definition order)
         stages: Vec<String>,
+    },
+    /// Check whether an ext4 image is fresh given a list of content-fingerprint parts
+    /// (pre-hashed strings or raw values): computes sha256(parts joined by '\n')
+    /// formatted 8-4-4-4-12, reads the image's UUID, and exits 0 if they match (fresh)
+    /// or 1 if they differ or the image is missing (stale). Always prints the UUID on
+    /// stdout so the caller can pass it to `mkext-tar --uuid` on a stale build.
+    Fingerprint {
+        /// ext4 image to check for freshness
+        ext4: PathBuf,
+        /// Parts to hash (pre-computed hashes or raw strings), joined by '\n'
+        parts: Vec<String>,
     },
     /// Dev: build an ext4 image from a directory tree (native, no mke2fs).
     Mkext { src: PathBuf, out: PathBuf },
@@ -463,6 +470,15 @@ async fn main() -> ExitCode {
             Err(e) => fail(&e, 1),
         };
     }
+    if let Cmd::Fingerprint { ext4, parts } = &cli.cmd {
+        let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+        let uuid = ensure::fingerprint(&refs);
+        println!("{uuid}");
+        if fleet::fs_uuid(ext4).as_deref() == Some(uuid.as_str()) {
+            return ExitCode::SUCCESS;
+        }
+        return exit_code(1);
+    }
     if let Cmd::OciPull {
         reference,
         out,
@@ -529,7 +545,6 @@ async fn main() -> ExitCode {
         service,
         service_build,
         service_image,
-        agent,
         ensure_only,
         builder,
         builder_build,
@@ -615,7 +630,6 @@ async fn main() -> ExitCode {
             builder_opts,
             service_build.clone(),
             service_image.clone(),
-            agent.clone(),
             *ensure_only,
         )
         .await
@@ -682,7 +696,8 @@ async fn main() -> ExitCode {
         | Cmd::Mkext { .. }
         | Cmd::MkextTar { .. }
         | Cmd::OciPull { .. }
-        | Cmd::DockerHash { .. } => {
+        | Cmd::DockerHash { .. }
+        | Cmd::Fingerprint { .. } => {
             unreachable!()
         }
     }

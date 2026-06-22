@@ -139,7 +139,6 @@ pub async fn run(
     builder: Option<BuilderOpts>,
     service_build: Option<PathBuf>,
     service_images: Vec<String>,
-    agent: Option<PathBuf>,
     ensure_only: bool,
 ) -> Result<()> {
     let services: Vec<Service> = services
@@ -147,27 +146,21 @@ pub async fn run(
         .map(|s| Service::parse(s))
         .collect::<Result<_>>()?;
 
-    // Ensure each VM's ext4 is current before boot: the staleness check compares the
-    // image's UUID to a fingerprint of its build inputs (which include the agent
-    // binary baked in as PID 1); the build itself stays the shell script.
+    // Ensure each VM's ext4 is current before boot. The build script owns the
+    // staleness check (UUID compare via blkid) and fingerprint recipe, and exits
+    // 0 immediately when the image is fresh — no hardcoded input list here.
     if let Some(b) = &builder
         && let Some(script) = &b.build_script
     {
-        let agent = agent
-            .as_deref()
-            .context("--agent is required with --builder-build")?;
-        crate::ensure::ensure_builder(&b.ext4, script, agent)?;
+        crate::ensure::ensure_builder(script)?;
     }
     if let Some(script) = &service_build {
-        let agent = agent
-            .as_deref()
-            .context("--agent is required with --service-build")?;
         let images = parse_service_images(&service_images)?;
         for svc in &services {
             let image = images
                 .get(svc.name.as_str())
                 .with_context(|| format!("no --service-image for service {}", svc.name))?;
-            crate::ensure::ensure_service(&svc.name, image, &svc.ext4, script, agent)?;
+            crate::ensure::ensure_service(&svc.name, image, script)?;
         }
     }
     if ensure_only {
