@@ -6,8 +6,9 @@
 //!
 //! Feature set, all of which the ext4 kernel driver mounts and e2fsck accepts:
 //! 4 KiB blocks, 256-byte inodes, **extents**, `filetype`, `sparse_super`,
-//! `large_file`. No journal (the rootfs is read-only under a CoW overlay), no
-//! metadata_csum, no 64bit, no flex_bg.
+//! `large_file`, optional **journal** (JBD2, inode 8, 4 MiB, enabled on the
+//! export paths via [`FsId::with_journal`]). No metadata_csum, no 64bit, no
+//! flex_bg.
 //!
 //! Multi-block-group: standard per-group layout (each group carries its own block
 //! bitmap, inode bitmap and inode-table slice; sparse_super groups also hold a
@@ -30,6 +31,12 @@ const ROOT_INO: u32 = 2;
 const LOST_FOUND_INO: u32 = 11;
 const FIRST_FREE_INO: u32 = 12;
 const BLOCKS_PER_GROUP: u64 = BLOCK * 8; // 32768 (one block of bitmap)
+
+const JOURNAL_INO: u32 = 8;
+const JOURNAL_BLOCKS: u64 = 1024; // 4 MiB journal
+const EXT4_FEATURE_COMPAT_HAS_JOURNAL: u32 = 0x0004;
+const JBD2_MAGIC: u32 = 0xC03B_3998;
+const JBD2_SUPERBLOCK_V2: u32 = 4;
 
 // inode i_flags
 const EXTENTS_FL: u32 = 0x0008_0000;
@@ -104,13 +111,25 @@ pub fn build_from_dir(src_dir: &Path, out: &Path) -> Result<()> {
 pub struct FsId {
     pub uuid: Option<[u8; 16]>,
     pub label: Option<String>,
+    /// Embed a 4 MiB JBD2 journal (inode 8). Enables crash recovery when the
+    /// image is mounted read-write via a CoW overlay.
+    pub with_journal: bool,
 }
 
 /// Build an ext4 image at `out` from the rootfs `tar_path`, injecting the static
 /// agent (PID 1). Convenience wrapper over [`build_from_tar_injecting`].
 pub fn build_from_tar(tar_path: &Path, agent: &Path, out: &Path) -> Result<()> {
     let inj = [("usr/local/bin/virtkit-agent", agent, 0o755)];
-    build_from_tar_injecting(tar_path, &inj, 0, &FsId::default(), out)
+    build_from_tar_injecting(
+        tar_path,
+        &inj,
+        0,
+        &FsId {
+            with_journal: true,
+            ..Default::default()
+        },
+        out,
+    )
 }
 
 /// Build an ext4 image at `out` from the rootfs `tar_path`, injecting each host
@@ -132,6 +151,7 @@ pub fn build_from_tar_injecting(
     t.tar_path = Some(tar_path.to_path_buf());
     t.uuid = fsid.uuid;
     t.label = fsid.label.clone();
+    t.with_journal = fsid.with_journal;
     t.ensure_dir("")?; // root (+ lost+found)
 
     let mut ar = tar::Archive::new(
@@ -212,18 +232,35 @@ pub fn build_from_tar_stream(
 ) -> Result<()> {
     let data_est = image_bytes.div_ceil(BLOCK);
     let want_inodes = inodes_hint.unwrap_or((data_est / 4).max(4096));
+    let journal_reserve = if fsid.with_journal {
+        JOURNAL_BLOCKS + 1
+    } else {
+        0
+    };
     let (layout, total_blocks, inodes_count) =
-        plan_layout(data_est, want_inodes, extra_free_blocks);
+        plan_layout(data_est + journal_reserve, want_inodes, extra_free_blocks);
 
     let file = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
     file.set_len(total_blocks * BLOCK)?;
     let mut w = ImageWriter { file };
     let mut alloc = Allocator::new(&layout, total_blocks);
 
+    // Allocate journal blocks before any file data so they land at a fixed,
+    // low address (inode 8 extents point at these blocks).
+    let mut journal_runs: Vec<Range<u64>> = Vec::new();
+    let mut journal_leaf: Option<u64> = None;
+    if fsid.with_journal {
+        journal_runs = alloc.take(JOURNAL_BLOCKS)?;
+        if journal_runs.len() > INLINE_EXTENTS {
+            journal_leaf = Some(alloc.take(1)?[0].start);
+        }
+    }
+
     let mut t = Tree::default();
     t.add_reserved();
     t.uuid = fsid.uuid;
     t.label = fsid.label.clone();
+    t.with_journal = fsid.with_journal;
     t.ensure_dir("")?;
 
     let mut ar = tar::Archive::new(reader);
@@ -318,6 +355,9 @@ pub fn build_from_tar_stream(
         }
     }
 
+    t.journal_runs = journal_runs;
+    t.journal_leaf = journal_leaf;
+
     let used_inodes = u64::from(t.next_ino - 1);
     t.finalize(&mut w, &layout, total_blocks, inodes_count, used_inodes)
 }
@@ -361,6 +401,9 @@ struct Tree {
     uuid: Option<[u8; 16]>,
     /// s_volume_name to write (a human-readable name for blkid/lsblk; ≤16 bytes)
     label: Option<String>,
+    with_journal: bool,
+    journal_runs: Vec<Range<u64>>,
+    journal_leaf: Option<u64>,
 }
 
 impl Tree {
@@ -732,13 +775,29 @@ impl Tree {
         let data_logical: u64 = logical.iter().sum();
 
         let want_inodes = used_inodes + used_inodes / 4 + 64;
-        let (layout, total_blocks, inodes_count) =
-            plan_layout(data_logical, want_inodes, extra_free_blocks);
+        let journal_reserve = if self.with_journal {
+            JOURNAL_BLOCKS + 1
+        } else {
+            0
+        };
+        let (layout, total_blocks, inodes_count) = plan_layout(
+            data_logical + journal_reserve,
+            want_inodes,
+            extra_free_blocks,
+        );
         let groups = layout.groups;
 
         // Allocate data block runs to every inode, drawing from each group's free
         // data region in order and skipping the metadata holes.
         let mut alloc = Allocator::new(&layout, total_blocks);
+
+        // Journal blocks first so they land at a predictable low address.
+        if self.with_journal {
+            self.journal_runs = alloc.take(JOURNAL_BLOCKS)?;
+            if self.journal_runs.len() > INLINE_EXTENTS {
+                self.journal_leaf = Some(alloc.take(1)?[0].start);
+            }
+        }
         for (n, &nb) in self.nodes.iter_mut().zip(&logical) {
             if nb == 0 {
                 continue;
@@ -776,6 +835,10 @@ impl Tree {
         inodes_count: u64,
         used_inodes: u64,
     ) -> Result<()> {
+        // Generate the filesystem UUID once so both the ext4 superblock and the
+        // JBD2 journal superblock record the same identity.
+        let fs_uuid = self.uuid.unwrap_or_else(random_uuid);
+
         // One global block-usage bitmap is the single source of truth for the free
         // counts (superblock total and per-group descriptors must agree).
         let mut block_used = BitVec::new(total_blocks);
@@ -783,6 +846,15 @@ impl Tree {
             for b in layout.group_meta_range(g) {
                 block_used.set(b);
             }
+        }
+        // Journal blocks (allocated before regular data).
+        for r in &self.journal_runs {
+            for b in r.clone() {
+                block_used.set(b);
+            }
+        }
+        if let Some(b) = self.journal_leaf {
+            block_used.set(b);
         }
         for n in &self.nodes {
             for r in &n.runs {
@@ -804,16 +876,22 @@ impl Tree {
             inodes_count,
             free_blocks,
             free_inodes,
+            &fs_uuid,
         )?;
         self.write_group_descs(w, layout, &block_used, inodes_count)?;
         self.write_block_bitmaps(w, layout, &block_used)?;
         self.write_inode_bitmaps(w, layout, inodes_count)?;
         self.write_inodes(w, layout)?;
         self.write_data(w)?;
+        if self.with_journal {
+            self.write_journal_inode(w, layout)?;
+            self.write_journal_data(w, &fs_uuid)?;
+        }
         w.file.flush()?;
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_superblocks(
         &self,
         w: &mut ImageWriter,
@@ -822,6 +900,7 @@ impl Tree {
         inodes_count: u64,
         free_blocks: u64,
         free_inodes: u64,
+        uuid: &[u8; 16],
     ) -> Result<()> {
         let mut sb = [0u8; 1024];
         le32(&mut sb, 0x00, inodes_count as u32);
@@ -841,18 +920,29 @@ impl Tree {
         le32(&mut sb, 0x4c, 1); // s_rev_level = dynamic
         le32(&mut sb, 0x54, LOST_FOUND_INO); // s_first_ino
         le16(&mut sb, 0x58, INODE_SIZE as u16); // s_inode_size
-        le32(&mut sb, 0x5c, 0); // s_feature_compat
+        le32(
+            &mut sb,
+            0x5c,
+            if self.with_journal {
+                EXT4_FEATURE_COMPAT_HAS_JOURNAL
+            } else {
+                0
+            },
+        ); // s_feature_compat
         le32(&mut sb, 0x60, 0x42); // s_feature_incompat = filetype|extents
         le32(&mut sb, 0x64, 0x3); // s_feature_ro_compat = sparse_super|large_file
         // s_uuid (0x68, 16 bytes): the image's identity, used to detect a stale CoW
         // overlay AND (when set to a content fingerprint) to decide a rebuild. A
         // random one (like mke2fs) is the fallback when no fingerprint is given.
-        sb[0x68..0x78].copy_from_slice(&self.uuid.unwrap_or_else(random_uuid));
+        sb[0x68..0x78].copy_from_slice(uuid);
         // s_volume_name (0x78, 16 bytes): an optional human-readable label (blkid).
         if let Some(label) = &self.label {
             let b = label.as_bytes();
             let n = b.len().min(16);
             sb[0x78..0x78 + n].copy_from_slice(&b[..n]);
+        }
+        if self.with_journal {
+            le32(&mut sb, 0xe0, JOURNAL_INO); // s_journal_inum
         }
 
         // Primary at byte 1024; backups at the start of each sparse_super group,
@@ -1039,6 +1129,80 @@ impl Tree {
                 }
                 _ => {}
             }
+        }
+        Ok(())
+    }
+
+    // ---- journal write helpers ----
+
+    /// Write inode 8 (EXT2_JOURNAL_INO) pointing at the pre-allocated journal runs.
+    fn write_journal_inode(&self, w: &mut ImageWriter, layout: &Layout) -> Result<()> {
+        debug_assert!(!self.journal_runs.is_empty());
+        let data_blocks: u64 = self.journal_runs.iter().map(|r| r.end - r.start).sum();
+        let phys = data_blocks + u64::from(self.journal_leaf.is_some());
+
+        let mut ino = [0u8; INODE_SIZE as usize];
+        le16(&mut ino, 0x00, S_IFREG | 0o600);
+        le16(&mut ino, 0x1a, 1); // i_links_count
+        le32(&mut ino, 0x04, (data_blocks * BLOCK) as u32); // i_size_lo
+        le32(&mut ino, 0x1c, (phys * (BLOCK / 512)) as u32); // i_blocks_lo
+        le16(&mut ino, 0x80, 32); // i_extra_isize
+        le32(&mut ino, 0x20, EXTENTS_FL);
+
+        // Reuse the inode extent writer via a temporary Node.
+        let jnode = Node {
+            ino: JOURNAL_INO,
+            parent: 0,
+            mode: S_IFREG | 0o600,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            links: 1,
+            kind: Kind::File {
+                src: Src::Written,
+                size: data_blocks * BLOCK,
+            },
+            runs: self.journal_runs.clone(),
+            leaf: self.journal_leaf,
+        };
+        write_inode_extents(&mut ino, &jnode);
+
+        w.file
+            .seek(SeekFrom::Start(layout.inode_offset(JOURNAL_INO)))?;
+        w.file.write_all(&ino)?;
+        Ok(())
+    }
+
+    /// Write the JBD2 superblock into the first journal block, and the inode's
+    /// extent-tree leaf block if the runs didn't fit inline.
+    fn write_journal_data(&self, w: &mut ImageWriter, uuid: &[u8; 16]) -> Result<()> {
+        debug_assert!(!self.journal_runs.is_empty());
+        let first_block = self.journal_runs[0].start;
+
+        // JBD2 uses big-endian throughout.
+        let mut jb = [0u8; BLOCK as usize];
+        be32(&mut jb, 0x00, JBD2_MAGIC);
+        be32(&mut jb, 0x04, JBD2_SUPERBLOCK_V2);
+        be32(&mut jb, 0x08, 1); // h_sequence
+        be32(&mut jb, 0x0c, BLOCK as u32); // s_blocksize
+        be32(&mut jb, 0x10, JOURNAL_BLOCKS as u32); // s_maxlen
+        be32(&mut jb, 0x14, 1); // s_first: first usable block after the superblock
+        be32(&mut jb, 0x18, 1); // s_sequence
+        // s_start = 0: journal is empty/clean, no recovery needed on mount
+        // s_errno, s_feature_{compat,incompat,ro_compat} = 0
+        jb[0x30..0x40].copy_from_slice(uuid); // s_uuid (journal UUID = filesystem UUID)
+        be32(&mut jb, 0x40, 1); // s_nr_users = 1
+        // s_users[0..16]: filesystem UUID (links the journal back to its owner)
+        jb[0x100..0x110].copy_from_slice(uuid);
+
+        w.file.seek(SeekFrom::Start(first_block * BLOCK))?;
+        w.file.write_all(&jb)?;
+
+        if let Some(leaf) = self.journal_leaf {
+            let mut buf = vec![0u8; BLOCK as usize];
+            write_extent_entries(&mut buf, 0, &self.journal_runs);
+            w.file.seek(SeekFrom::Start(leaf * BLOCK))?;
+            w.file.write_all(&buf)?;
         }
         Ok(())
     }
@@ -1472,6 +1636,10 @@ fn le32(buf: &mut [u8], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 
+fn be32(buf: &mut [u8], off: usize, v: u32) {
+    buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1600,6 +1768,152 @@ mod tests {
         assert!(
             content.contains("hello-ext4-multigroup"),
             "content readback: {content:?}"
+        );
+    }
+
+    // Build a journaled ext4 image from a tar and verify it is e2fsck-clean and
+    // carries a readable JBD2 journal. Run with:
+    //   cargo test -- --ignored ext4::tests::journal_e2fsck
+    #[test]
+    #[ignore]
+    fn journal_e2fsck() {
+        let base = std::env::temp_dir().join(format!("ext4j-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let tar_path = base.join("rootfs.tar");
+        let img = base.join("fs.img");
+        let agent = base.join("agent");
+        std::fs::write(&agent, b"#!/bin/sh\nexec /sbin/init\n").unwrap();
+
+        // Build a minimal tar: one directory and one file.
+        let tar_file = std::fs::File::create(&tar_path).unwrap();
+        let mut ar = tar::Builder::new(tar_file);
+        // directory entry
+        let mut h = tar::Header::new_gnu();
+        h.set_path("etc/").unwrap();
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_mode(0o755);
+        h.set_size(0);
+        h.set_cksum();
+        ar.append(&h, std::io::Cursor::new(b"")).unwrap();
+        // file entry
+        let content = b"hello-journal\n";
+        let mut h = tar::Header::new_gnu();
+        h.set_path("etc/greeting").unwrap();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o644);
+        h.set_size(content.len() as u64);
+        h.set_cksum();
+        ar.append(&h, std::io::Cursor::new(content)).unwrap();
+        ar.finish().unwrap();
+
+        let fsid = FsId {
+            with_journal: true,
+            uuid: Some([0x42u8; 16]),
+            ..Default::default()
+        };
+        let inj = [("usr/local/bin/virtkit-agent", agent.as_path(), 0o755u16)];
+        build_from_tar_injecting(&tar_path, &inj, 0, &fsid, &img)
+            .expect("build_from_tar_injecting");
+
+        // Verify e2fsck sees a clean filesystem.
+        let out = std::process::Command::new("e2fsck")
+            .arg("-fn")
+            .arg(&img)
+            .output()
+            .expect("run e2fsck");
+        println!(
+            "e2fsck rc={:?}\n{}\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Verify the journal is recognised: dumpe2fs reports has_journal.
+        let dump = std::process::Command::new("dumpe2fs")
+            .arg("-h")
+            .arg(&img)
+            .output()
+            .expect("run dumpe2fs");
+        let info = String::from_utf8_lossy(&dump.stdout);
+        println!("dumpe2fs:\n{info}");
+
+        // Read image bytes to verify superblock features and JBD2 magic.
+        let img_bytes = std::fs::read(&img).unwrap();
+        // s_feature_compat at SB offset 0x5c (SB starts at byte 1024)
+        let feat_compat =
+            u32::from_le_bytes(img_bytes[1024 + 0x5c..1024 + 0x60].try_into().unwrap());
+        assert_eq!(
+            feat_compat & EXT4_FEATURE_COMPAT_HAS_JOURNAL,
+            EXT4_FEATURE_COMPAT_HAS_JOURNAL,
+            "has_journal not set in s_feature_compat"
+        );
+        // s_journal_inum at SB offset 0xe0
+        let jino = u32::from_le_bytes(img_bytes[1024 + 0xe0..1024 + 0xe4].try_into().unwrap());
+        assert_eq!(jino, JOURNAL_INO, "s_journal_inum mismatch");
+        // JBD2 magic: search for it in the image (journal is the first data block).
+        let jbd2_magic = JBD2_MAGIC.to_be_bytes();
+        let found = img_bytes.windows(4).any(|w| w == jbd2_magic);
+        assert!(found, "JBD2 magic not found in image");
+
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(out.status.success(), "e2fsck reported errors");
+        assert!(
+            info.contains("has_journal"),
+            "dumpe2fs does not report has_journal"
+        );
+    }
+
+    #[test]
+    fn journal_superblock_fields() {
+        // Fast unit test: build a tiny journaled image and verify the key on-disk
+        // fields without needing e2fsck.
+        let base = std::env::temp_dir().join(format!("ext4jf-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let tar_path = base.join("rootfs.tar");
+        let img = base.join("fs.img");
+        let agent = base.join("agent");
+        std::fs::write(&agent, b"dummy").unwrap();
+
+        let tar_file = std::fs::File::create(&tar_path).unwrap();
+        let mut ar = tar::Builder::new(tar_file);
+        let content = b"hi\n";
+        let mut h = tar::Header::new_gnu();
+        h.set_path("hi.txt").unwrap();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o644);
+        h.set_size(content.len() as u64);
+        h.set_cksum();
+        ar.append(&h, std::io::Cursor::new(content)).unwrap();
+        ar.finish().unwrap();
+
+        let uuid = [0xABu8; 16];
+        let fsid = FsId {
+            with_journal: true,
+            uuid: Some(uuid),
+            ..Default::default()
+        };
+        let inj = [("usr/local/bin/agent", agent.as_path(), 0o755u16)];
+        build_from_tar_injecting(&tar_path, &inj, 0, &fsid, &img).expect("build");
+
+        let bytes = std::fs::read(&img).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+
+        // ext4 superblock starts at byte 1024.
+        let sb = &bytes[1024..];
+        let feat_compat = u32::from_le_bytes(sb[0x5c..0x60].try_into().unwrap());
+        assert_eq!(
+            feat_compat & EXT4_FEATURE_COMPAT_HAS_JOURNAL,
+            EXT4_FEATURE_COMPAT_HAS_JOURNAL
+        );
+        assert_eq!(sb[0x68..0x78], uuid, "filesystem UUID mismatch");
+        let jino = u32::from_le_bytes(sb[0xe0..0xe4].try_into().unwrap());
+        assert_eq!(jino, JOURNAL_INO);
+
+        // JBD2 magic must appear somewhere in the image.
+        let jbd2_magic = JBD2_MAGIC.to_be_bytes();
+        assert!(
+            bytes.windows(4).any(|w| w == jbd2_magic),
+            "JBD2 magic not found"
         );
     }
 

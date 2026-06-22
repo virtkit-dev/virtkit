@@ -70,6 +70,7 @@ enum GitlabCmd {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// GitLab custom-executor lifecycle (config / prepare / run / cleanup)
     Gitlab {
@@ -390,6 +391,7 @@ async fn main() -> ExitCode {
             ext4::FsId {
                 uuid,
                 label: label.clone(),
+                with_journal: true,
             }
         };
         // each spec is HOST:GUEST:OCTAL_MODE; the guest path is normalized to the
