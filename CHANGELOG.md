@@ -4,6 +4,25 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-06-22
+
+### Added
+
+- `fleet --builder-share HOST:GUEST[:ro]`: share arbitrary host directories into the
+  builder VM via virtiofs (repeatable).
+- `fleet --builder-symlink SRC:DEST`: create guest symlinks after virtiofs mounts,
+  driven by `VIRTKIT_SYMLINKS` on the kernel cmdline (repeatable).
+- `fleet --builder-uid-map` / `--builder-gid-map`: per-share UID/GID translation for
+  extra builder shares using virtiofsd's `soft_idmap` (PassthroughFs) mechanism.
+
+### Changed
+
+- ext4 images built from a tar archive now embed a 4 MiB JBD2 journal (inode 8),
+  enabling crash recovery when the image is mounted read-write via a CoW overlay.
+- `virtkit-agent` service mode (`VIRTKIT_MODE=service`) now forks the entrypoint
+  instead of exec-ing it, keeping the agent as PID 1 to reap orphaned processes.
+  `VIRTKIT_SERVE=1` optionally starts the vsock exec server alongside the service.
+
 ## [0.1.1] - 2026-06-22
 
 ### Changed
@@ -28,6 +47,7 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/wallix/virtkit/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/wallix/virtkit/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/wallix/virtkit/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/wallix/virtkit/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/wallix/virtkit/releases/tag/v0.1.0
