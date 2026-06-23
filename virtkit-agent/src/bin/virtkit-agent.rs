@@ -77,6 +77,11 @@ enum Commands {
         debug: bool,
         #[arg(short, long)]
         inactivity_timeout: Option<u64>,
+        /// Force every exec through this program (like SSH's ForceCommand): it
+        /// receives the requested command line as its arguments and decides what to
+        /// run. Use it to enforce an allowlist. Omitted = run commands directly.
+        #[arg(long)]
+        exec_wrapper: Option<PathBuf>,
     },
     Status,
     /// Forward a local listener to the --socket target, splicing raw bytes
@@ -273,6 +278,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
         Commands::Serve {
             debug,
             inactivity_timeout,
+            exec_wrapper,
         } => {
             let log_level = if debug {
                 LevelFilter::Debug
@@ -299,7 +305,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
             } else {
                 None
             };
-            if let Err(e) = run_server(&socket, duration).await {
+            if let Err(e) = run_server(&socket, duration, exec_wrapper).await {
                 error!("run_server: {e}");
                 std::process::exit(1)
             };

@@ -27,7 +27,7 @@ async fn start_server(tag: &str) -> SocketAddr {
     let addr = SocketAddr::Unix(path.clone());
     let server_addr = addr.clone();
     tokio::spawn(async move {
-        run_server(&server_addr, Some(Duration::from_secs(60)))
+        run_server(&server_addr, Some(Duration::from_secs(60)), None)
             .await
             .unwrap();
     });

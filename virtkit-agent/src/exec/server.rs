@@ -8,6 +8,7 @@ use anyhow::anyhow;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use log::{debug, error, info};
 use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::process::Stdio;
 use std::sync::atomic::AtomicUsize;
@@ -64,8 +65,13 @@ impl TaskState {
 pub async fn run_server(
     socket: &SocketAddr,
     inactivity_timeout: Option<Duration>,
+    exec_wrapper: Option<PathBuf>,
 ) -> Result<(), anyhow::Error> {
     let status = Status::default();
+    // Force every exec through this program (like SSH's ForceCommand): it receives
+    // the requested command line as its arguments and decides what to run.
+    // None = run requested commands directly (the default, unrestricted).
+    let exec_wrapper = Arc::new(exec_wrapper);
 
     let listener = listen(socket)?;
 
@@ -104,6 +110,7 @@ pub async fn run_server(
                 Ok((stream, sink)) => {
                     let c_state = Arc::clone(&state);
                     let status = status.clone();
+                    let exec_wrapper = Arc::clone(&exec_wrapper);
                     {
                         let mut lock = c_state.lock().unwrap();
                         lock.inc();
@@ -111,7 +118,7 @@ pub async fn run_server(
                     // A new task is spawned for each socket. The socket is moved to the new task and processed there.
                     tokio::spawn(async move {
                         let mut update_last = true;
-                        match do_handle_conn(&status, stream, sink).await {
+                        match do_handle_conn(&status, stream, sink, exec_wrapper.as_deref()).await {
                             Err(e) => info!("{e}"),
                             Ok(skip_update) => {
                                 if skip_update {
@@ -172,15 +179,33 @@ fn start_watchdog(status: Status, socket: SocketAddr) {
 
 static REQUEST_ID: AtomicUsize = AtomicUsize::new(1);
 
+/// Rewrite a request to run through the exec wrapper: the wrapper becomes the
+/// command, and the originally-requested name + args become its arguments. dir,
+/// env, user and tty are untouched, so the real command the wrapper execs runs in
+/// the same environment the client asked for.
+fn wrap_cmd(mut cmd: CmdExec, wrapper: &Path) -> CmdExec {
+    let mut args = Vec::with_capacity(cmd.args.len() + 1);
+    args.push(std::mem::take(&mut cmd.name));
+    args.append(&mut cmd.args);
+    cmd.name = wrapper.to_string_lossy().into_owned();
+    cmd.args = args;
+    cmd
+}
+
 async fn do_handle_conn(
     status: &Status,
     mut stream: SerStream,
     mut sink: DeSink,
+    exec_wrapper: Option<&Path>,
 ) -> Result<bool, anyhow::Error> {
     let client_request = stream.next().await.ok_or(anyhow!("no data"))??;
 
     match client_request {
         Message::CmdExec(cmd) => {
+            let cmd = match exec_wrapper {
+                Some(w) => wrap_cmd(cmd, w),
+                None => cmd,
+            };
             let req_id = REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if cmd.tty.is_some() {
                 srv_run_cmd_tty(req_id, stream, sink, cmd)
@@ -764,8 +789,33 @@ async fn writer_task(
 
 #[cfg(test)]
 mod tests {
-    use super::TaskState;
+    use super::{TaskState, wrap_cmd};
+    use crate::messages::{CmdExec, RunMode};
+    use std::path::Path;
     use std::time::Duration;
+
+    fn sample_cmd() -> CmdExec {
+        CmdExec {
+            name: "git".into(),
+            args: vec!["status".into()],
+            env: vec![],
+            clear_env: false,
+            mode: RunMode::Interactive,
+            dir: Some("./sub".into()),
+            tty: None,
+            user: None,
+        }
+    }
+
+    #[test]
+    fn wrap_cmd_prepends_original_command_as_args() {
+        let wrapped = wrap_cmd(sample_cmd(), Path::new("/run/host-dispatch"));
+        assert_eq!(wrapped.name, "/run/host-dispatch");
+        // the requested command line becomes the wrapper's argv
+        assert_eq!(wrapped.args, vec!["git", "status"]);
+        // dir/env/user are preserved so the real command runs as the client asked
+        assert_eq!(wrapped.dir.as_deref(), Some("./sub"));
+    }
 
     #[test]
     fn busy_then_idle() {
