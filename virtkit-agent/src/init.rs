@@ -22,8 +22,8 @@
 //!                        does not exist are silently skipped.
 //!   VIRTKIT_TMPFS        /path:size[,/path:size] RAM scratch dirs (e.g. CI /builds)
 //!   VIRTKIT_SSH=1        also run ssh-serve (vsock 2222); keys VIRTKIT_SSH_KEYS
-//!                        (default /workdir/docker/runner/authorized_keys), user
-//!                        VIRTKIT_SSH_USER (default dev)
+//!                        (comma-separated `type:base64` entries, no spaces),
+//!                        user VIRTKIT_SSH_USER (default dev)
 //!   VIRTKIT_MODE=service fork the captured entrypoint; the agent stays as PID 1 and
 //!                        reaps orphans. A systemd image hands off via its entrypoint.
 //!   VIRTKIT_SERVE=1      (service) also start the vsock exec server (port 4444) for
@@ -477,27 +477,43 @@ fn maybe_ssh_serve(cmdline: &HashMap<String, String>) {
     if cmdline.get("VIRTKIT_SSH").map(String::as_str) != Some("1") {
         return;
     }
-    let keys = cmdline
+    // VIRTKIT_SSH_KEYS: comma-separated public keys encoded as `type:base64`
+    // (spaces stripped so they fit on the kernel cmdline).
+    let keys_raw = cmdline
         .get("VIRTKIT_SSH_KEYS")
-        .cloned()
-        .unwrap_or_else(|| "/workdir/docker/runner/authorized_keys".into());
+        .map(String::as_str)
+        .unwrap_or("");
+    let keys: Vec<String> = keys_raw
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .filter_map(|entry| match entry.split_once(':') {
+            Some((t, b)) => Some(format!("{t} {b}")),
+            None => {
+                warn!("virtkit-agent init: skipping malformed VIRTKIT_SSH_KEYS entry (no `:`)");
+                None
+            }
+        })
+        .collect();
+    if keys.is_empty() {
+        warn!("virtkit-agent init: VIRTKIT_SSH_KEYS empty — ssh server disabled");
+        return;
+    }
     let user = cmdline
         .get("VIRTKIT_SSH_USER")
         .cloned()
         .unwrap_or_else(|| "dev".into());
-    if !Path::new(&keys).exists() {
-        warn!("virtkit-agent init: {keys} missing — ssh server disabled");
-        return;
-    }
-    if let Err(e) = fork_agent(&[
+    let mut args = vec![
         "--socket".into(),
         format!("vsock://{SSH_VSOCK_PORT}"),
         "ssh-serve".into(),
-        "--authorized-keys".into(),
-        keys,
-        "--user".into(),
-        user,
-    ]) {
+    ];
+    for key in &keys {
+        args.push("--authorized-key".into());
+        args.push(key.clone());
+    }
+    args.push("--user".into());
+    args.push(user);
+    if let Err(e) = fork_agent(&args) {
         warn!("virtkit-agent init: ssh server failed to start: {e}");
     }
 }

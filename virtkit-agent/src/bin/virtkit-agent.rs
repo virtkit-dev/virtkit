@@ -111,9 +111,9 @@ enum Commands {
     /// with no sshd in the image. Pair with `connect` as the host ProxyCommand.
     #[cfg(feature = "ssh")]
     SshServe {
-        /// authorized_keys file (OpenSSH format) of accepted public keys
-        #[arg(long)]
-        authorized_keys: PathBuf,
+        /// public key to accept (OpenSSH format: type base64 [comment]), repeatable
+        #[arg(long = "authorized-key", value_name = "PUBKEY")]
+        authorized_keys: Vec<String>,
 
         /// run sessions as this Unix user (default: the SSH login username)
         #[arg(long)]
@@ -363,9 +363,8 @@ async fn async_main(socket: SocketAddr, command: Commands) {
                 },
             )
             .unwrap();
-            if let Err(e) =
-                virtkit_agent::ssh::run_ssh_server(&socket, &authorized_keys, user).await
-            {
+            let keys = virtkit_agent::ssh::parse_authorized_keys(authorized_keys.as_slice());
+            if let Err(e) = virtkit_agent::ssh::run_ssh_server(&socket, &keys, user).await {
                 error!("ssh-serve: {e:#}");
                 std::process::exit(1)
             }

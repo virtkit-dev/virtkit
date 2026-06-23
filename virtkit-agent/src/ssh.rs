@@ -11,7 +11,6 @@
 
 use std::collections::HashMap;
 use std::os::unix::process::ExitStatusExt;
-use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,15 +35,12 @@ use crate::pty::{self, PtyMaster};
 /// when `force_user` is None).
 pub async fn run_ssh_server(
     socket: &SocketAddr,
-    authorized_keys: &Path,
+    authorized_keys: &[PublicKey],
     force_user: Option<String>,
 ) -> Result<()> {
-    let keys = Arc::new(load_authorized_keys(authorized_keys)?);
+    let keys = Arc::new(authorized_keys.to_vec());
     if keys.is_empty() {
-        return Err(anyhow!(
-            "no usable public keys in {}",
-            authorized_keys.display()
-        ));
+        return Err(anyhow!("no authorized keys provided"));
     }
     // Ephemeral host key: clients reach us over a private vsock channel and pin
     // nothing (StrictHostKeyChecking=no in ssh-vsock.sh), so a fresh key per boot
@@ -90,21 +86,20 @@ pub async fn run_ssh_server(
     }
 }
 
-fn load_authorized_keys(path: &Path) -> Result<Vec<PublicKey>> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+/// Parse public key strings (OpenSSH format: `type base64 [comment]`).
+pub fn parse_authorized_keys(lines: &[String]) -> Vec<PublicKey> {
     let mut keys = Vec::new();
-    for line in text.lines() {
+    for line in lines {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         match PublicKey::from_openssh(line) {
             Ok(k) => keys.push(k),
-            Err(e) => warn!("ssh: skipping unparseable authorized_keys line: {e}"),
+            Err(e) => warn!("ssh: skipping unparseable key: {e}"),
         }
     }
-    Ok(keys)
+    keys
 }
 
 #[derive(Clone)]
