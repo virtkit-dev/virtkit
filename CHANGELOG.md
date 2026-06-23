@@ -4,6 +4,20 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-06-23
+
+### Added
+
+- `virtkit fingerprint <ext4> <parts>...`: new subcommand for build scripts to check
+  freshness and compute the content UUID without reimplementing the algorithm.
+
+### Changed
+
+- Staleness check and fingerprint recipe moved from `ensure`/`fleet` into the build
+  scripts; build scripts call `virtkit fingerprint` and own the UUID comparison.
+- `fleet --agent` flag removed — build scripts no longer need to be told the agent
+  binary path; they hash their own inputs directly.
+
 ## [0.1.2] - 2026-06-22
 
 ### Added
@@ -47,7 +61,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/wallix/virtkit/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/wallix/virtkit/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/wallix/virtkit/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/wallix/virtkit/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/wallix/virtkit/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/wallix/virtkit/releases/tag/v0.1.0
