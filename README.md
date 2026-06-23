@@ -6,7 +6,7 @@ microVMs**, in two small static binaries.
 virtkit boots OCI/Docker images (or assembled rootfs) as fast Cloud Hypervisor
 microVMs, gives them a shared LAN with egress through ordinary host sockets (no tap,
 no bridge, no `CAP_NET_ADMIN`, no root), and drives commands into them over `vsock`.
-From one codebase it powers, for example, a local **dev fleet** (a builder VM + service
+From one codebase it powers, for example, a local **dev fleet** (a dev VM + service
 VMs, like docker-compose but as VMs) and a **GitLab custom executor** (one throwaway VM
 per CI job) — but the pieces (image building, the network switch, the in-VM agent) are
 usable on their own.
@@ -23,7 +23,7 @@ usable on their own.
 - **No host privileges.** A userspace L2 switch (ARP + DHCP + a DNS gateway, with
   transparent TCP/UDP egress via [`ipstack`](https://crates.io/crates/ipstack))
   carries guest traffic over `vsock` — no tap devices, bridges, or root.
-- **microVM fleet.** Boot a builder + service VMs (redis, mysql, …) on one shared
+- **microVM fleet.** Boot a dev VM + service VMs (redis, mysql, …) on one shared
   `*.lan` network; start/stop them on demand with the in-VM `virtctl` client.
 - **GitLab CI executor.** A custom executor that boots a fresh microVM per job, runs
   each stage over `vsock`, and tears it down — with a tap pool for concurrent jobs and
@@ -52,7 +52,7 @@ base-image digest and the apk pins together.
 
 `virtkit`:
 
-- `fleet` — orchestrate the dev fleet (builder + service VMs on one LAN).
+- `fleet` — orchestrate the dev fleet (dev VM + service VMs on one LAN).
 - `gitlab config` / `gitlab prepare` / `gitlab run` / `gitlab cleanup` — the GitLab custom-executor lifecycle.
 - `switch` — the userspace L2 network gateway (run in-process by `fleet`).
 - `mkext-tar` / `mkext` — build an ext4 image from a rootfs tar / directory.

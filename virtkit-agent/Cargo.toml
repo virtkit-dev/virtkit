@@ -44,7 +44,7 @@ jemallocator.workspace = true
 
 [features]
 # Embedded SSH server (`ssh-serve`), for the VS Code Remote-SSH path. ON by
-# default: the builder VM needs it and one dist binary then serves builder and
+# default: the dev VM needs it and one dist binary then serves the VM and
 # services alike. russh's ring backend (C) is built by the devcontainer's musl
 # toolchain. Build --no-default-features for a leaner agent when ssh isn't needed.
 default = ["ssh"]

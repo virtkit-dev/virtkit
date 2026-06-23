@@ -355,7 +355,7 @@ fn write_self_hosts(cmdline: &HashMap<String, String>) {
 }
 
 /// Expose the agent under the `virtctl` name (the fleet control client): a symlink
-/// next to it, so `virtctl start mysql` works from the builder's PATH. Best effort;
+/// next to it, so `virtctl start mysql` works from the VM's PATH. Best effort;
 /// the rootfs is writable (CoW), and it's recreated each boot if missing.
 fn ensure_virtctl_symlink() {
     let link = "/usr/local/bin/virtctl";

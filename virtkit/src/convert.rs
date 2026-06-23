@@ -459,10 +459,10 @@ mod tests {
     fn env_file_rendering() {
         // raw KEY=VALUE (the agent splits on the first '='); lines without '=' dropped
         let rendered =
-            render_env_file("WABDIR=/workdir\nLS_OPTS=--color=auto -F\nnoequal\nEMPTY=\n");
+            render_env_file("APPDIR=/workdir\nLS_OPTS=--color=auto -F\nnoequal\nEMPTY=\n");
         assert_eq!(
             rendered,
-            "WABDIR=/workdir\nLS_OPTS=--color=auto -F\nEMPTY=\n"
+            "APPDIR=/workdir\nLS_OPTS=--color=auto -F\nEMPTY=\n"
         );
     }
 }

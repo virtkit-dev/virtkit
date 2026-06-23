@@ -15,12 +15,12 @@ minimal working configs for each mode are shown below.
 
 ### Fleet orchestrator
 
-Boots a builder VM + named service VMs on one shared `*.lan` LAN (like
+Boots a dev VM + named service VMs on one shared `*.lan` LAN (like
 docker-compose but as real VMs). Runs the network switch in-process.
 
 ```sh
 virtkit fleet \
-  --builder builder.ext4 \
+  --vm vm.ext4 \
   --workdir /path/to/repo \
   --service redis:redis.ext4:192.168.127.10/24:3 \
   --service mysql:mysql.ext4:192.168.127.11/24:4 \

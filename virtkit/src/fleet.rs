@@ -1,13 +1,13 @@
 //! `virtkit fleet` — orchestrate a fleet of microVMs on one shared LAN, in
 //! Rust: run the userspace switch in-process (no subprocess) and boot the VMs
-//! natively (the Rust successor of the former launch-{service,builder}.sh). The builder
-//! (`--builder`) shares /workdir + the git worktree over virtiofs and DHCPs an
+//! natively (the Rust successor of the former launch-{service,builder}.sh). The VM
+//! (`--vm`) shares /workdir + the git worktree over virtiofs and DHCPs an
 //! address; declared services (`--service`) get static *.lan addresses.
 //!
 //! Both boot init=/usr/local/bin/virtkit-agent (the agent's init modes). Each
 //! service: a throwaway CoW overlay over its ext4, the agent execs the image's
 //! captured entrypoint (VIRTKIT_MODE=service) on a static *.lan address. The
-//! builder: a CoW overlay (keyed on the base fs UUID), the agent serves vsock +
+//! VM: a CoW overlay (keyed on the base fs UUID), the agent serves vsock +
 //! ssh with two virtiofs shares (workdir + gitdir) and DHCP.
 
 use std::collections::HashMap;
@@ -58,7 +58,7 @@ impl Service {
     }
 }
 
-/// One extra host directory to share into the builder via virtiofs.
+/// One extra host directory to share into the VM via virtiofs.
 pub struct ShareSpec {
     pub host_dir: PathBuf,
     pub guest_path: String,
@@ -70,9 +70,9 @@ pub struct ShareSpec {
     pub gid_maps: Vec<String>,
 }
 
-/// The builder VM: shares /workdir (+ the git worktree) over virtiofs and DHCPs an
-/// address on the shared LAN. Booted in-process when `--builder` is given.
-pub struct BuilderOpts {
+/// The interactive dev VM: shares /workdir (+ the git worktree) over virtiofs and DHCPs an
+/// address on the shared LAN. Booted in-process when `--vm` is given.
+pub struct VmOpts {
     pub ext4: PathBuf,
     pub name: String,
     /// host dir shared rw as /workdir
@@ -83,15 +83,15 @@ pub struct BuilderOpts {
     pub cid: u32,
     pub cpus: u32,
     pub mem: String,
-    /// build-builder-image.sh to (re)build the ext4 when stale; None skips the check
+    /// build script to (re)build the ext4 when stale; None skips the check
     pub build_script: Option<PathBuf>,
-    /// extra host directories to share into the builder via virtiofs
+    /// extra host directories to share into the VM via virtiofs
     pub extra_shares: Vec<ShareSpec>,
     /// symlinks to create inside the guest after virtiofs mounts: "src:dest" pairs
     pub extra_symlinks: Vec<String>,
 }
 
-impl BuilderOpts {
+impl VmOpts {
     fn dir(&self) -> &Path {
         self.ext4.parent().unwrap_or(Path::new("."))
     }
@@ -136,7 +136,7 @@ pub async fn run(
     cloud_hypervisor: PathBuf,
     extra_listen: Vec<PathBuf>,
     services: Vec<String>,
-    builder: Option<BuilderOpts>,
+    vm: Option<VmOpts>,
     service_build: Option<PathBuf>,
     service_images: Vec<String>,
     ensure_only: bool,
@@ -149,10 +149,10 @@ pub async fn run(
     // Ensure each VM's ext4 is current before boot. The build script owns the
     // staleness check (UUID compare via blkid) and fingerprint recipe, and exits
     // 0 immediately when the image is fresh — no hardcoded input list here.
-    if let Some(b) = &builder
+    if let Some(b) = &vm
         && let Some(script) = &b.build_script
     {
-        crate::ensure::ensure_builder(script)?;
+        crate::ensure::ensure_vm(script)?;
     }
     if let Some(script) = &service_build {
         let images = parse_service_images(&service_images)?;
@@ -172,12 +172,12 @@ pub async fn run(
     }
 
     // The switch listens on every VM's hybrid-vsock guest-port socket: the services
-    // we boot, the builder (if any), and anything extra passed via --listen.
+    // we boot, the VM (if any), and anything extra passed via --listen.
     let mut listen = extra_listen;
     for svc in &services {
         listen.push(svc.dir().join(format!("vsock.sock_{net_port}")));
     }
-    if let Some(b) = &builder {
+    if let Some(b) = &vm {
         listen.push(b.dir().join(format!("vsock.sock_{net_port}")));
     }
     // The fleet name map (name=ip,...) is served by the switch's gateway resolver, so
@@ -192,24 +192,24 @@ pub async fn run(
     // Give the switch a moment to bind before the guests dial it.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Boot the builder eagerly (you drive the fleet from it); the services are
+    // Boot the VM eagerly (you drive the fleet from it); the services are
     // declared and started on demand via `virtctl` (the control server below).
-    let mut builder_ch: Option<Child> = None;
+    let mut vm_ch: Option<Child> = None;
     let mut aux: Vec<Child> = Vec::new();
-    if let Some(b) = &builder {
-        let (ch, virtiofsds) = boot_builder(b, &kernel, &cloud_hypervisor, net_port)
-            .with_context(|| format!("booting builder {}", b.name))?;
+    if let Some(b) = &vm {
+        let (ch, virtiofsds) = boot_vm(b, &kernel, &cloud_hypervisor, net_port)
+            .with_context(|| format!("booting vm {}", b.name))?;
         println!("fleet: {} (DHCP) booting", b.name);
-        builder_ch = Some(ch);
+        vm_ch = Some(ch);
         aux.extend(virtiofsds);
     }
 
     // The manager owns the declared service units; the control server starts/stops
     // them on request. The switch already pre-listens on every unit's socket, so an
     // on-demand boot just dials a listening socket — no dynamic switch changes. A
-    // `workdir` unit (the runner) shares the live repo read-only, reusing the builder's
+    // `workdir` unit (the runner) shares the live repo read-only, reusing the VM's
     // workdir + derived git dir (virtiofsd itself is the bundled `virtkit virtiofsd`).
-    let (share_workdir, share_git) = match &builder {
+    let (share_workdir, share_git) = match &vm {
         Some(b) => (
             Some(b.workdir.clone()),
             git_share_for(&b.workdir, b.git_dir.as_deref()),
@@ -241,9 +241,9 @@ pub async fn run(
     });
     let declared = mgr.units.lock().unwrap().len();
 
-    // Control server on the builder's hybrid-vsock control socket — only the builder
+    // Control server on the VM's hybrid-vsock control socket — only the VM
     // can reach it, so the control plane is scoped to the dev VM by construction.
-    if let Some(b) = &builder {
+    if let Some(b) = &vm {
         let ctrl = b.dir().join(format!(
             "vsock.sock_{}",
             virtkit_agent::fleetctl::CONTROL_PORT
@@ -258,7 +258,7 @@ pub async fn run(
 
     println!(
         "fleet: switch{} up on {gateway}/{prefix}; {declared} service(s) declared — start with virtctl",
-        if builder.is_some() { " + builder" } else { "" }
+        if vm.is_some() { " + vm" } else { "" }
     );
     // Run until interrupted, then stop everything (the switch task dies with us).
     tokio::signal::ctrl_c().await.ok();
@@ -273,7 +273,7 @@ pub async fn run(
             let _ = a.wait();
         }
     }
-    if let Some(mut ch) = builder_ch {
+    if let Some(mut ch) = vm_ch {
         let _ = ch.kill();
         let _ = ch.wait();
     }
@@ -301,7 +301,7 @@ struct Manager {
     net_port: u32,
     gateway: Ipv4Addr,
     /// repo share for `workdir` units (host /workdir + derived git dir) — taken from
-    /// the builder; None when the fleet has no builder.
+    /// the VM; None when the fleet has no VM.
     workdir: Option<PathBuf>,
     git_share: Option<PathBuf>,
     units: Mutex<HashMap<String, UnitState>>,
@@ -431,7 +431,7 @@ fn state_of(st: &mut UnitState) -> &'static str {
     }
 }
 
-/// Accept control connections on the builder's hybrid-vsock control socket and serve
+/// Accept control connections on the VM's hybrid-vsock control socket and serve
 /// the virtctl protocol (one request, one reply per connection).
 async fn control_server(listen: &Path, mgr: Arc<Manager>) -> Result<()> {
     let _ = std::fs::remove_file(listen);
@@ -482,7 +482,7 @@ fn boot_service(
     create_overlay(&svc.ext4, &overlay)?;
     let _ = std::fs::remove_file(&vsock);
 
-    // A `workdir` unit shares the live repo READ-ONLY (own virtiofsd), like the builder
+    // A `workdir` unit shares the live repo READ-ONLY (own virtiofsd), like the VM
     // but never writable: the runner's assembly hardens permissions by following
     // symlinks into the repo, so RO makes those chmod no-ops and protects the host tree.
     // Plain services get no share and the default small VM.
@@ -491,8 +491,8 @@ fn boot_service(
     let mut virtiofs = String::new();
     let (mut cpus, mut mem) = ("boot=2".to_string(), "size=1G".to_string());
     if svc.workdir {
-        let workdir = workdir
-            .context("a `workdir` unit needs the repo share, but the fleet has no builder")?;
+        let workdir =
+            workdir.context("a `workdir` unit needs the repo share, but the fleet has no VM")?;
         let workdir_sock = dir.join("vfsd-workdir.sock");
         aux.push(spawn_virtiofsd(&workdir_sock, workdir, true, &[], &[])?);
         fs_args.push(format!("tag=workdir,socket={}", workdir_sock.display()));
@@ -550,18 +550,18 @@ fn boot_service(
     Ok((ch, aux))
 }
 
-/// Boot the builder VM (the former launch-builder.sh NET=lan, in Rust): two virtiofs shares
+/// Boot the interactive dev VM (the former launch-builder.sh NET=lan, in Rust): two virtiofs shares
 /// (workdir + the git worktree), a CoW overlay keyed on the base fs UUID, and
-/// init=/sbin/builder-vm-init with DHCP networking. Returns the cloud-hypervisor
+/// DHCP networking. Returns the cloud-hypervisor
 /// child plus the virtiofsd children (so the caller can stop them on shutdown).
-fn boot_builder(
-    b: &BuilderOpts,
+fn boot_vm(
+    b: &VmOpts,
     kernel: &Path,
     cloud_hypervisor: &Path,
     net_port: u32,
 ) -> Result<(Child, Vec<Child>)> {
     if !b.ext4.is_file() {
-        bail!("builder ext4 not found at {}", b.ext4.display());
+        bail!("vm ext4 not found at {}", b.ext4.display());
     }
     let dir = b.dir();
     let mut aux: Vec<Child> = Vec::new();
@@ -582,7 +582,7 @@ fn boot_builder(
         virtiofs.push_str(&format!(",gitdir:{}", gs.display()));
     }
 
-    // Extra host directories shared into the builder (--builder-share host:guest[:ro]).
+    // Extra host directories shared into the VM (--vm-share host:guest[:ro]).
     for (i, share) in b.extra_shares.iter().enumerate() {
         let tag = format!("share{i}");
         let sock = dir.join(format!("vfsd-share{i}.sock"));
@@ -597,7 +597,7 @@ fn boot_builder(
         virtiofs.push_str(&format!(",{tag}:{}", share.guest_path));
     }
 
-    // Symlinks to create inside the guest after virtiofs mounts (--builder-symlink).
+    // Symlinks to create inside the guest after virtiofs mounts (--vm-symlink).
     let symlinks_param = if !b.extra_symlinks.is_empty() {
         format!(" VIRTKIT_SYMLINKS={}", b.extra_symlinks.join(","))
     } else {
@@ -608,10 +608,10 @@ fn boot_builder(
     // (new UUID) maps to a different filename, so a stale overlay is never reused.
     let uuid = fs_uuid(&b.ext4);
     let overlay = match &uuid {
-        Some(u) => dir.join(format!("builder-overlay-{u}.qcow2")),
-        None => dir.join("builder-overlay.qcow2"),
+        Some(u) => dir.join(format!("vm-overlay-{u}.qcow2")),
+        None => dir.join("vm-overlay.qcow2"),
     };
-    prune_builder_overlays(dir, &overlay);
+    prune_vm_overlays(dir, &overlay);
     if !overlay.exists() {
         create_overlay(&b.ext4, &overlay)?;
     }
@@ -729,7 +729,7 @@ fn spawn_virtiofsd(
 /// Decide whether a separate git-dir share is needed for `workdir` (i.e. it is a linked
 /// git worktree whose git dir lives outside the share). Returns the host path to share
 /// at the same guest path, or None when no separate share is needed. Shared by the
-/// builder and any workdir unit (both mount the live repo).
+/// VM and any workdir unit (both mount the live repo).
 fn git_share_for(workdir: &Path, git_dir: Option<&Path>) -> Option<PathBuf> {
     let host_git_dir = match git_dir {
         Some(g) => g.to_path_buf(),
@@ -802,16 +802,15 @@ pub(crate) fn fs_uuid(ext4: &Path) -> Option<String> {
     None
 }
 
-/// Remove builder overlays bound to other (old) base UUIDs.
-fn prune_builder_overlays(dir: &Path, keep: &Path) {
+/// Remove VM overlays bound to other (old) base UUIDs.
+fn prune_vm_overlays(dir: &Path, keep: &Path) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in rd.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with("builder-overlay-") && name.ends_with(".qcow2") && entry.path() != keep
-        {
+        if name.starts_with("vm-overlay-") && name.ends_with(".qcow2") && entry.path() != keep {
             let _ = std::fs::remove_file(entry.path());
         }
     }

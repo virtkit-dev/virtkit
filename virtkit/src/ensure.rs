@@ -37,9 +37,9 @@ pub fn fingerprint(parts: &[&str]) -> String {
     )
 }
 
-/// Run build-builder-image.sh. The script owns the staleness check (UUID compare)
+/// Run the VM's build script. The script owns the staleness check (UUID compare)
 /// and exits 0 immediately when the image is already fresh.
-pub fn ensure_builder(build_script: &Path) -> Result<()> {
+pub fn ensure_vm(build_script: &Path) -> Result<()> {
     run_build(build_script, &[])
 }
 
@@ -66,7 +66,7 @@ mod tests {
 
     #[test]
     fn fingerprint_is_a_canonical_uuid_and_stable() {
-        let fp = fingerprint(&["wabredis:tag", "abc123"]);
+        let fp = fingerprint(&["myservice:tag", "abc123"]);
         // 8-4-4-4-12 lowercase hex
         let parts: Vec<&str> = fp.split('-').collect();
         assert_eq!(
@@ -75,7 +75,7 @@ mod tests {
         );
         assert!(fp.chars().all(|c| c == '-' || c.is_ascii_hexdigit()));
         // deterministic + order-sensitive
-        assert_eq!(fp, fingerprint(&["wabredis:tag", "abc123"]));
-        assert_ne!(fp, fingerprint(&["abc123", "wabredis:tag"]));
+        assert_eq!(fp, fingerprint(&["myservice:tag", "abc123"]));
+        assert_ne!(fp, fingerprint(&["abc123", "myservice:tag"]));
     }
 }

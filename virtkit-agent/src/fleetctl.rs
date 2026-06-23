@@ -1,10 +1,10 @@
-//! virtctl control protocol — the builder's `virtctl` client and the fleet
-//! manager's server speak this over vsock. The builder dials host:CONTROL_PORT;
-//! the manager (listening on the builder's hybrid-vsock socket for that port)
+//! virtctl control protocol — the VM's `virtctl` client and the fleet
+//! manager's server speak this over vsock. The VM dials host:CONTROL_PORT;
+//! the manager (listening on the VM's hybrid-vsock socket for that port)
 //! starts/stops/queries the declared service VMs. One newline-delimited JSON
 //! request, one reply. The types + framing are shared; the client lives here, the
-//! server loop in the fleet crate. Scoped to the builder by construction — only the
-//! builder's vsock reaches the control socket.
+//! server loop in the fleet crate. Scoped to the VM by construction — only the
+//! VM's vsock reaches the control socket.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -85,7 +85,7 @@ where
     serde_json::from_str(line.trim_end()).context("decoding control message")
 }
 
-/// `virtctl` — the builder CLI. Parse args into one request, send it to the manager
+/// `virtctl` — the VM CLI. Parse args into one request, send it to the manager
 /// (vsock host:CONTROL_PORT), and render the reply. `argv` is the args after the
 /// program name (e.g. ["start", "mysql"]).
 pub async fn run_client(argv: &[String]) -> Result<()> {

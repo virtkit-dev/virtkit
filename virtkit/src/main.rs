@@ -110,8 +110,8 @@ enum Cmd {
     },
     /// Orchestrate a fleet of microVMs on one shared LAN: ensure each ext4 is current,
     /// run the switch in-process, and boot the service VMs (init=service-vm-init,
-    /// static *.lan addresses) plus the builder (--builder; init=builder-vm-init,
-    /// DHCP, virtiofs /workdir + git worktree). --listen adds any extra VM's vsock.
+    /// static *.lan addresses) plus the interactive dev VM (--vm; DHCP,
+    /// virtiofs /workdir + git worktree). --listen adds any extra VM's vsock.
     Fleet {
         #[arg(long, default_value = "192.168.127.1")]
         gateway: std::net::Ipv4Addr,
@@ -126,7 +126,7 @@ enum Cmd {
         kernel: PathBuf,
         #[arg(long, default_value = "cloud-hypervisor")]
         cloud_hypervisor: PathBuf,
-        /// extra vsock socket(s) the switch should also listen on (e.g. the builder's)
+        /// extra vsock socket(s) the switch should also listen on (e.g. the VM's)
         #[arg(long = "listen")]
         listen: Vec<PathBuf>,
         /// service VM to boot: name:ext4:ip/cidr:cid (repeatable)
@@ -142,44 +142,44 @@ enum Cmd {
         /// starting the switch or booting any VM
         #[arg(long)]
         ensure_only: bool,
-        /// builder ext4 to boot in-process (omit to boot the builder separately)
+        /// interactive dev VM ext4 to boot in-process (omit to boot the VM separately)
         #[arg(long)]
-        builder: Option<PathBuf>,
-        /// build-builder-image.sh to (re)build a stale/missing builder ext4
+        vm: Option<PathBuf>,
+        /// build script to (re)build a stale/missing VM ext4
         #[arg(long)]
-        builder_build: Option<PathBuf>,
-        /// builder hostname
-        #[arg(long, default_value = "builder")]
-        builder_name: String,
-        /// host dir shared rw as /workdir in the builder [current dir]
+        vm_build: Option<PathBuf>,
+        /// VM hostname
+        #[arg(long, default_value = "vm")]
+        vm_name: String,
+        /// host dir shared rw as /workdir in the VM [current dir]
         #[arg(long)]
         workdir: Option<PathBuf>,
-        /// builder's git dir to share at the same guest path (worktree); derived from
+        /// VM's git dir to share at the same guest path (worktree); derived from
         /// the workdir when omitted
         #[arg(long)]
         git_dir: Option<PathBuf>,
-        /// builder vsock CID
+        /// VM vsock CID
         #[arg(long, default_value_t = 3)]
-        builder_cid: u32,
-        /// builder vCPUs
+        vm_cid: u32,
+        /// VM vCPUs
         #[arg(long, default_value_t = 4)]
-        builder_cpus: u32,
-        /// builder RAM
+        vm_cpus: u32,
+        /// VM RAM
         #[arg(long, default_value = "8G")]
-        builder_mem: String,
-        /// extra host directory to share into the builder: host_path:guest_path[:ro] (repeatable)
-        #[arg(long = "builder-share", value_name = "HOST:GUEST[:ro]")]
-        builder_share: Vec<String>,
-        /// symlink to create inside the builder after virtiofs mounts: src:dest (repeatable)
-        #[arg(long = "builder-symlink", value_name = "SRC:DEST")]
-        builder_symlink: Vec<String>,
-        /// UID translation for extra builder shares (repeatable; applies to all --builder-share);
+        vm_mem: String,
+        /// extra host directory to share into the VM: host_path:guest_path[:ro] (repeatable)
+        #[arg(long = "vm-share", value_name = "HOST:GUEST[:ro]")]
+        vm_share: Vec<String>,
+        /// symlink to create inside the VM after virtiofs mounts: src:dest (repeatable)
+        #[arg(long = "vm-symlink", value_name = "SRC:DEST")]
+        vm_symlink: Vec<String>,
+        /// UID translation for extra VM shares (repeatable; applies to all --vm-share);
         /// format: `type:from:to[:count]` — types: map, guest, host, squash-guest, squash-host, forbid-guest
-        #[arg(long = "builder-uid-map", value_name = "MAP")]
-        builder_uid_map: Vec<String>,
-        /// GID translation for extra builder shares (repeatable; same format as --builder-uid-map)
-        #[arg(long = "builder-gid-map", value_name = "MAP")]
-        builder_gid_map: Vec<String>,
+        #[arg(long = "vm-uid-map", value_name = "MAP")]
+        vm_uid_map: Vec<String>,
+        /// GID translation for extra VM shares (repeatable; same format as --vm-uid-map)
+        #[arg(long = "vm-gid-map", value_name = "MAP")]
+        vm_gid_map: Vec<String>,
     },
     /// Dev: boot a (generic, kernel-less) docker image as a microVM — cpio
     /// initramfs in RAM, virtkit-agent as PID 1, vsock — with no gitlab-runner and
@@ -546,45 +546,43 @@ async fn main() -> ExitCode {
         service_build,
         service_image,
         ensure_only,
-        builder,
-        builder_build,
-        builder_name,
+        vm,
+        vm_build,
+        vm_name,
         workdir,
         git_dir,
-        builder_cid,
-        builder_cpus,
-        builder_mem,
-        builder_share,
-        builder_symlink,
-        builder_uid_map,
-        builder_gid_map,
+        vm_cid,
+        vm_cpus,
+        vm_mem,
+        vm_share,
+        vm_symlink,
+        vm_uid_map,
+        vm_gid_map,
     } = &cli.cmd
     {
-        // Parse --builder-share host:guest[:ro] entries.
+        // Parse --vm-share host:guest[:ro] entries.
         let mut extra_shares = Vec::new();
-        for spec in builder_share {
+        for spec in vm_share {
             let parts: Vec<&str> = spec.splitn(3, ':').collect();
             let (host, guest, readonly) = match parts.as_slice() {
                 [host, guest] => (*host, *guest, false),
                 [host, guest, ro] if *ro == "ro" => (*host, *guest, true),
                 [_, _, flag] => {
                     return fail(
-                        &anyhow::anyhow!("bad --builder-share flag {flag:?} (want `ro`)"),
+                        &anyhow::anyhow!("bad --vm-share flag {flag:?} (want `ro`)"),
                         2,
                     );
                 }
                 _ => {
                     return fail(
-                        &anyhow::anyhow!("bad --builder-share {spec:?} (want host:guest[:ro])"),
+                        &anyhow::anyhow!("bad --vm-share {spec:?} (want host:guest[:ro])"),
                         2,
                     );
                 }
             };
             if guest.contains(' ') {
                 return fail(
-                    &anyhow::anyhow!(
-                        "bad --builder-share {spec:?}: guest path may not contain spaces"
-                    ),
+                    &anyhow::anyhow!("bad --vm-share {spec:?}: guest path may not contain spaces"),
                     2,
                 );
             }
@@ -592,31 +590,29 @@ async fn main() -> ExitCode {
                 host_dir: PathBuf::from(host),
                 guest_path: guest.to_string(),
                 readonly,
-                uid_maps: builder_uid_map.clone(),
-                gid_maps: builder_gid_map.clone(),
+                uid_maps: vm_uid_map.clone(),
+                gid_maps: vm_gid_map.clone(),
             });
         }
-        for spec in builder_symlink.iter() {
+        for spec in vm_symlink.iter() {
             if spec.contains(' ') {
                 return fail(
-                    &anyhow::anyhow!(
-                        "bad --builder-symlink {spec:?}: src:dest may not contain spaces"
-                    ),
+                    &anyhow::anyhow!("bad --vm-symlink {spec:?}: src:dest may not contain spaces"),
                     2,
                 );
             }
         }
-        let builder_opts = builder.as_ref().map(|ext4| fleet::BuilderOpts {
+        let vm_opts = vm.as_ref().map(|ext4| fleet::VmOpts {
             ext4: ext4.clone(),
-            name: builder_name.clone(),
+            name: vm_name.clone(),
             workdir: workdir.clone().unwrap_or_else(|| PathBuf::from(".")),
             git_dir: git_dir.clone(),
-            cid: *builder_cid,
-            cpus: *builder_cpus,
-            mem: builder_mem.clone(),
-            build_script: builder_build.clone(),
+            cid: *vm_cid,
+            cpus: *vm_cpus,
+            mem: vm_mem.clone(),
+            build_script: vm_build.clone(),
             extra_shares,
-            extra_symlinks: builder_symlink.clone(),
+            extra_symlinks: vm_symlink.clone(),
         });
         return match fleet::run(
             *gateway,
@@ -627,7 +623,7 @@ async fn main() -> ExitCode {
             cloud_hypervisor.clone(),
             listen.clone(),
             service.clone(),
-            builder_opts,
+            vm_opts,
             service_build.clone(),
             service_image.clone(),
             *ensure_only,
