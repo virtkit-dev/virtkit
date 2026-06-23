@@ -4,6 +4,27 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-06-23
+
+### Added
+
+- `fleet --vm-ssh-key PUBKEY`: authorise an SSH public key for the dev VM (repeatable).
+  Keys are passed inline on the kernel cmdline (`VIRTKIT_SSH_KEYS`), not via a file on
+  disk; `fleet` rejects keys that are not in OpenSSH `type base64 [comment]` format.
+
+### Changed
+
+- **Breaking:** renamed the dev VM from "builder" to "vm" throughout — every `fleet
+  --builder*` flag is now `--vm*` (`--builder` → `--vm`, `--builder-share` →
+  `--vm-share`, `--builder-symlink`, `--builder-uid-map`, `--builder-gid-map`). Update
+  invocations accordingly.
+- `fleet --vm-name` is now optional; when omitted the VM hostname is derived from the
+  ext4 filename stem (was a fixed `builder` default). The name is validated as a
+  hostname (`[A-Za-z0-9-]`).
+- `virtkit-agent ssh-serve`: replaced `--authorized-keys <file>` with a repeatable
+  `--authorized-key <key>` taking inline OpenSSH keys; `init` decodes them from the
+  `VIRTKIT_SSH_KEYS` cmdline parameter, so no `authorized_keys` file is read from disk.
+
 ## [0.1.3] - 2026-06-23
 
 ### Added
@@ -61,7 +82,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/wallix/virtkit/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/wallix/virtkit/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/wallix/virtkit/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/wallix/virtkit/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/wallix/virtkit/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/wallix/virtkit/compare/v0.1.0...v0.1.1
