@@ -173,6 +173,9 @@ enum Cmd {
         /// symlink to create inside the VM after virtiofs mounts: src:dest (repeatable)
         #[arg(long = "vm-symlink", value_name = "SRC:DEST")]
         vm_symlink: Vec<String>,
+        /// public key to authorise for ssh-serve (OpenSSH format, repeatable)
+        #[arg(long = "vm-ssh-key", value_name = "PUBKEY")]
+        vm_ssh_keys: Vec<String>,
         /// UID translation for extra VM shares (repeatable; applies to all --vm-share);
         /// format: `type:from:to[:count]` — types: map, guest, host, squash-guest, squash-host, forbid-guest
         #[arg(long = "vm-uid-map", value_name = "MAP")]
@@ -558,6 +561,7 @@ async fn main() -> ExitCode {
         vm_symlink,
         vm_uid_map,
         vm_gid_map,
+        vm_ssh_keys,
     } = &cli.cmd
     {
         // Parse --vm-share host:guest[:ro] entries.
@@ -634,6 +638,7 @@ async fn main() -> ExitCode {
             build_script: vm_build.clone(),
             extra_shares,
             extra_symlinks: vm_symlink.clone(),
+            ssh_keys: vm_ssh_keys.to_vec(),
         });
         return match fleet::run(
             *gateway,

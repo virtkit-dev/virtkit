@@ -89,6 +89,8 @@ pub struct VmOpts {
     pub extra_shares: Vec<ShareSpec>,
     /// symlinks to create inside the guest after virtiofs mounts: "src:dest" pairs
     pub extra_symlinks: Vec<String>,
+    /// public key(s) to authorise for ssh-serve (written to the VM's state dir)
+    pub ssh_keys: Vec<String>,
 }
 
 impl VmOpts {
@@ -624,10 +626,34 @@ fn boot_vm(
     // (VIRTKIT_SSH for VS Code Remote-SSH). The git worktree share, when present, is
     // mounted at the same guest path so the worktree resolves. DNS comes from DHCP
     // (the gateway resolver), so no /etc/hosts injection.
+    // Encode public keys as `type:base64,...` (no spaces — kernel cmdline is
+    // whitespace-split). init decodes back to `type base64` and passes each as
+    // --authorized-key to ssh-serve, with no file written.
+    let ssh_keys_param = if !b.ssh_keys.is_empty() {
+        let encoded: Vec<String> = b
+            .ssh_keys
+            .iter()
+            .filter_map(|k| {
+                let mut parts = k.split_whitespace();
+                let key_type = parts.next()?;
+                let base64 = parts.next()?;
+                Some(format!("{key_type}:{base64}"))
+            })
+            .collect();
+        if encoded.len() != b.ssh_keys.len() {
+            bail!(
+                "--vm-ssh-key: one or more keys are not in OpenSSH format (expected `type base64 ...`)"
+            );
+        }
+        format!(" VIRTKIT_SSH_KEYS={}", encoded.join(","))
+    } else {
+        String::new()
+    };
+
     let cmdline = format!(
         "console=ttyS0 root=/dev/vda rw rootfstype=ext4 init=/usr/local/bin/virtkit-agent \
          VIRTKIT_HOSTNAME={} VIRTKIT_NET_PORT={net_port} VIRTKIT_NET_DHCP=1 \
-         VIRTKIT_VIRTIOFS={virtiofs} VIRTKIT_SSH=1{symlinks_param}",
+         VIRTKIT_VIRTIOFS={virtiofs} VIRTKIT_SSH=1{symlinks_param}{ssh_keys_param}",
         b.name
     );
 
