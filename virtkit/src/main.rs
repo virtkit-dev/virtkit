@@ -148,9 +148,9 @@ enum Cmd {
         /// build script to (re)build a stale/missing VM ext4
         #[arg(long)]
         vm_build: Option<PathBuf>,
-        /// VM hostname
-        #[arg(long, default_value = "vm")]
-        vm_name: String,
+        /// VM hostname [derived from ext4 filename when omitted]
+        #[arg(long)]
+        vm_name: Option<String>,
         /// host dir shared rw as /workdir in the VM [current dir]
         #[arg(long)]
         workdir: Option<PathBuf>,
@@ -602,9 +602,30 @@ async fn main() -> ExitCode {
                 );
             }
         }
+        // Resolve the VM hostname (explicit --vm-name, else the ext4 file stem) and
+        // validate it: it lands unquoted in VIRTKIT_HOSTNAME on the kernel cmdline, so
+        // only RFC-1123 chars are allowed — no spaces or `=` to inject extra params.
+        let vm_name = vm.as_ref().map(|ext4| {
+            vm_name.clone().unwrap_or_else(|| {
+                ext4.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("vm")
+                    .to_string()
+            })
+        });
+        if let Some(name) = &vm_name
+            && (name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+        {
+            return fail(
+                &anyhow::anyhow!(
+                    "vm name {name:?} is not a valid hostname (allowed: [A-Za-z0-9-]); pass --vm-name"
+                ),
+                2,
+            );
+        }
         let vm_opts = vm.as_ref().map(|ext4| fleet::VmOpts {
             ext4: ext4.clone(),
-            name: vm_name.clone(),
+            name: vm_name.clone().unwrap(),
             workdir: workdir.clone().unwrap_or_else(|| PathBuf::from(".")),
             git_dir: git_dir.clone(),
             cid: *vm_cid,
