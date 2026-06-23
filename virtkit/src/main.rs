@@ -129,7 +129,8 @@ enum Cmd {
         /// extra vsock socket(s) the switch should also listen on (e.g. the VM's)
         #[arg(long = "listen")]
         listen: Vec<PathBuf>,
-        /// service VM to boot: name:ext4:ip/cidr:cid (repeatable)
+        /// service VM to boot: name:ext4:ip/cidr:cid[:flags] where flags is a
+        /// comma-separated subset of workdir,autostart (repeatable)
         #[arg(long = "service")]
         service: Vec<String>,
         /// build-service-image.sh to (re)build a stale/missing service ext4

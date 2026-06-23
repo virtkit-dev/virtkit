@@ -20,11 +20,13 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use virtkit_agent::fleetctl::{Reply, Request, UnitStatus};
 
-/// One fleet VM unit: `name:ext4:ip/cidr:cid[:workdir]`. The agent (PID 1) always
-/// execs the image's captured entrypoint (VIRTKIT_MODE=service). The optional
-/// `workdir` flag also shares the live repo READ-ONLY into the unit (for an image
-/// whose entrypoint assembles itself from /workdir and then execs systemd) —
-/// otherwise it is a plain service (redis, mysql) that just runs its image.
+/// One fleet VM unit: `name:ext4:ip/cidr:cid[:flags]`, where `flags` is a
+/// comma-separated subset of `workdir`/`autostart`. The agent (PID 1) always
+/// execs the image's captured entrypoint (VIRTKIT_MODE=service). The `workdir`
+/// flag also shares the live repo READ-ONLY into the unit (for an image whose
+/// entrypoint assembles itself from /workdir and then execs systemd) — otherwise
+/// it is a plain service (redis, mysql) that just runs its image. The `autostart`
+/// flag boots the unit when the fleet comes up instead of waiting for `virtctl start`.
 struct Service {
     name: String,
     ext4: PathBuf,
@@ -32,23 +34,33 @@ struct Service {
     cid: u32,
     /// share the live repo (workdir + git dir) read-only into the unit
     workdir: bool,
+    /// boot the unit at fleet start, not on demand via `virtctl`
+    autostart: bool,
 }
 
 impl Service {
     fn parse(spec: &str) -> Result<Self> {
         let parts: Vec<&str> = spec.split(':').collect();
-        let (name, ext4, ip, cid, workdir) = match parts.as_slice() {
-            [name, ext4, ip, cid] => (*name, *ext4, *ip, *cid, false),
-            [name, ext4, ip, cid, "workdir"] => (*name, *ext4, *ip, *cid, true),
-            [_, _, _, _, flag] => bail!("bad --service flag {flag:?} (want `workdir`)"),
-            _ => bail!("bad --service {spec:?} (want name:ext4:ip/cidr:cid[:workdir])"),
+        let (name, ext4, ip, cid, flags) = match parts.as_slice() {
+            [name, ext4, ip, cid] => (*name, *ext4, *ip, *cid, ""),
+            [name, ext4, ip, cid, flags] => (*name, *ext4, *ip, *cid, *flags),
+            _ => bail!("bad --service {spec:?} (want name:ext4:ip/cidr:cid[:flags])"),
         };
+        let (mut workdir, mut autostart) = (false, false);
+        for flag in flags.split(',').filter(|f| !f.is_empty()) {
+            match flag {
+                "workdir" => workdir = true,
+                "autostart" => autostart = true,
+                other => bail!("bad --service flag {other:?} (want `workdir` or `autostart`)"),
+            }
+        }
         Ok(Service {
             name: name.to_string(),
             ext4: PathBuf::from(ext4),
             ip: ip.to_string(),
             cid: cid.parse().with_context(|| format!("cid in {spec:?}"))?,
             workdir,
+            autostart,
         })
     }
 
@@ -258,9 +270,29 @@ pub async fn run(
         });
     }
 
+    // Boot the units flagged `autostart` now, rather than waiting for `virtctl
+    // start`. Same path the control server takes — the switch already pre-listens
+    // on every unit's socket, so this just dials a listening socket.
+    let autostart: Vec<String> = {
+        let units = mgr.units.lock().unwrap();
+        let mut names: Vec<String> = units
+            .values()
+            .filter(|st| st.svc.autostart)
+            .map(|st| st.svc.name.clone())
+            .collect();
+        names.sort();
+        names
+    };
+    for name in &autostart {
+        let reply = mgr.start(name);
+        println!("fleet: autostart {name}: {}", reply.message);
+    }
+
     println!(
-        "fleet: switch{} up on {gateway}/{prefix}; {declared} service(s) declared — start with virtctl",
-        if vm.is_some() { " + vm" } else { "" }
+        "fleet: switch{} up on {gateway}/{prefix}; {declared} service(s) declared, \
+         {} autostarted — others start with virtctl",
+        if vm.is_some() { " + vm" } else { "" },
+        autostart.len(),
     );
     // Run until interrupted, then stop everything (the switch task dies with us).
     tokio::signal::ctrl_c().await.ok();
@@ -865,11 +897,31 @@ mod tests {
             s.workdir,
             "the `workdir` flag shares the live repo read-only"
         );
+        assert!(!s.autostart);
+    }
+
+    #[test]
+    fn service_parse_autostart_flag() {
+        let s = Service::parse("redis:/out/redis.ext4:192.168.127.3/24:4:autostart").unwrap();
+        assert!(
+            s.autostart,
+            "the `autostart` flag boots the unit at fleet start"
+        );
+        assert!(!s.workdir);
+    }
+
+    #[test]
+    fn service_parse_combined_flags() {
+        let s =
+            Service::parse("runner:/out/runner.ext4:192.168.127.5/24:6:workdir,autostart").unwrap();
+        assert!(s.workdir);
+        assert!(s.autostart);
     }
 
     #[test]
     fn service_parse_rejects_unknown_flag() {
         assert!(Service::parse("runner:/out/r.ext4:192.168.127.5/24:6:systemd").is_err());
+        assert!(Service::parse("runner:/out/r.ext4:192.168.127.5/24:6:workdir,bad").is_err());
     }
 
     #[test]
