@@ -16,6 +16,7 @@
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+mod buildkit;
 mod config;
 mod convert;
 mod cpio;
@@ -27,6 +28,7 @@ mod image;
 mod initramfs;
 mod jobctx;
 mod launch;
+mod mkoci;
 mod net;
 mod oci;
 mod run;
@@ -37,7 +39,7 @@ mod switch;
 mod virtiofsd;
 mod vm;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -288,6 +290,84 @@ enum Cmd {
         #[arg(long)]
         label: Option<String>,
     },
+    /// Build an ext4 image straight from a local OCI image archive (the tar
+    /// `buildctl --output type=oci` produces): flatten its layers AND extract the
+    /// image config (Env/User/Entrypoint/Cmd into /etc/virtkit/{env,user,cmd}),
+    /// no docker/podman. Replaces the podman load→create→export→mkext-tar chain.
+    MkextOci {
+        /// OCI image archive (tar), or "-" to STREAM stdin (spooled to a temp
+        /// file first: OCI archives need random access, index.json is last)
+        archive: PathBuf,
+        /// output ext4 image
+        out: PathBuf,
+        /// inject a host file at a guest path, HOST:GUEST:OCTAL_MODE (repeatable)
+        #[arg(long = "inject", value_name = "HOST:GUEST:MODE")]
+        inject: Vec<String>,
+        /// spare free space (GiB) left in the filesystem for the guest to write
+        #[arg(long, default_value_t = 0)]
+        free_gib: u64,
+        /// filesystem UUID to stamp (32 hex digits, dashes optional) — set it to a
+        /// content fingerprint to make the image's identity == what it was built from
+        #[arg(long)]
+        uuid: Option<String>,
+        /// filesystem label to stamp (≤16 bytes; for blkid/lsblk)
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Build a bootable ext4 straight from a Dockerfile target: drive buildkit to
+    /// an OCI archive, then flatten + extract its config into an ext4 (the
+    /// `mkext-oci` machinery). Ensures a rootless buildkitd unless one is given.
+    /// The output's UUID is stamped to a content fingerprint of the resolved stage
+    /// tag (+ injected agent), so a re-run with no changes is a no-op ("fresh").
+    Build {
+        /// Dockerfile(s) (repeatable; default: Dockerfile). Multiple are merged so
+        /// cross-file stage deps fold transitively (like `docker-hash`).
+        #[arg(short = 'f', long = "file", default_value = "Dockerfile")]
+        file: Vec<PathBuf>,
+        /// build context dir (default: the dir of the first -f)
+        #[arg(long)]
+        context: Option<PathBuf>,
+        /// target stage to build (required)
+        #[arg(long)]
+        target: String,
+        /// output ext4 image (required)
+        #[arg(long)]
+        out: PathBuf,
+        /// build arg KEY=VAL passed through where the target's closure declares it
+        /// (repeatable)
+        #[arg(long = "build-arg")]
+        build_arg: Vec<String>,
+        /// extra host entry HOST=IP for the build (repeatable)
+        #[arg(long = "add-host")]
+        add_host: Vec<String>,
+        /// image label KEY=VAL (repeatable)
+        #[arg(long = "label")]
+        label: Vec<String>,
+        /// inject a host file at a guest path, HOST:GUEST:OCTAL_MODE (repeatable)
+        #[arg(long = "inject", value_name = "HOST:GUEST:MODE")]
+        inject: Vec<String>,
+        /// spare free space (GiB) left in the filesystem for the guest to write
+        #[arg(long, default_value_t = 0)]
+        free_gib: u64,
+        /// tag/fingerprint name (the `<name>:<hash>` tag identity and fs label)
+        #[arg(long)]
+        name: String,
+        /// rebuild even if the image is already fresh
+        #[arg(long)]
+        force: bool,
+        /// dial this buildkit address instead of the ensured one
+        #[arg(long)]
+        buildkit_addr: Option<String>,
+        /// buildctl binary (default: next to virtkit, then PATH)
+        #[arg(long)]
+        buildctl: Option<PathBuf>,
+        /// buildkitd binary (default: next to virtkit, then PATH)
+        #[arg(long)]
+        buildkitd: Option<PathBuf>,
+        /// do not launch a daemon; just dial --buildkit-addr
+        #[arg(long)]
+        no_ensure_daemon: bool,
+    },
     /// Dev: pull an OCI image from a registry (no docker) and flatten it to a
     /// rootfs tar.
     OciPull {
@@ -418,28 +498,11 @@ async fn main() -> ExitCode {
                 with_journal: true,
             }
         };
-        // each spec is HOST:GUEST:OCTAL_MODE; the guest path is normalized to the
-        // image-relative form (no leading slash) the writer expects.
-        let mut parsed: Vec<(String, PathBuf, u16)> = Vec::new();
-        for spec in inject {
-            let p: Vec<&str> = spec.splitn(3, ':').collect();
-            if p.len() != 3 {
-                return fail(
-                    &anyhow::anyhow!("--inject must be HOST:GUEST:MODE, got {spec:?}"),
-                    2,
-                );
-            }
-            let mode = match u16::from_str_radix(p[2], 8) {
-                Ok(m) => m,
-                Err(_) => return fail(&anyhow::anyhow!("bad octal mode in {spec:?}"), 2),
-            };
-            parsed.push((
-                p[1].trim_start_matches('/').to_string(),
-                PathBuf::from(p[0]),
-                mode,
-            ));
-        }
-        let injects: Vec<(&str, &std::path::Path, u16)> = parsed
+        let parsed = match parse_injects(inject) {
+            Ok(p) => p,
+            Err(e) => return fail(&e, 2),
+        };
+        let injects: Vec<(&str, &Path, u16)> = parsed
             .iter()
             .map(|(g, h, m)| (g.as_str(), h.as_path(), *m))
             .collect();
@@ -470,6 +533,51 @@ async fn main() -> ExitCode {
             ext4::build_from_tar_injecting(tar, &injects, extra_free, &fsid, out)
         };
         return match r {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        };
+    }
+    if let Cmd::MkextOci {
+        archive,
+        out,
+        inject,
+        free_gib,
+        uuid,
+        label,
+    } = &cli.cmd
+    {
+        let fsid = {
+            let uuid = match uuid {
+                Some(s) => match parse_uuid(s) {
+                    Some(u) => Some(u),
+                    None => {
+                        return fail(&anyhow::anyhow!("bad --uuid {s:?} (want 32 hex digits)"), 2);
+                    }
+                },
+                None => None,
+            };
+            ext4::FsId {
+                uuid,
+                label: label.clone(),
+                with_journal: true,
+            }
+        };
+        let parsed = match parse_injects(inject) {
+            Ok(p) => p,
+            Err(e) => return fail(&e, 2),
+        };
+        let injects: Vec<(&str, &Path, u16)> = parsed
+            .iter()
+            .map(|(g, h, m)| (g.as_str(), h.as_path(), *m))
+            .collect();
+        let extra_free = free_gib * (1024 * 1024 * 1024 / 4096); // GiB -> 4 KiB blocks
+        return match mkoci::archive_to_ext4(archive, out, &injects, extra_free, &fsid) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        };
+    }
+    if let Cmd::Build { .. } = &cli.cmd {
+        return match run_build(&cli.cmd) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         };
@@ -718,12 +826,169 @@ async fn main() -> ExitCode {
         | Cmd::Launch { .. }
         | Cmd::Mkext { .. }
         | Cmd::MkextTar { .. }
+        | Cmd::MkextOci { .. }
+        | Cmd::Build { .. }
         | Cmd::OciPull { .. }
         | Cmd::DockerHash { .. }
         | Cmd::Fingerprint { .. } => {
             unreachable!()
         }
     }
+}
+
+/// `virtkit build`: Dockerfile target -> bootable ext4 in one tool. Resolves the
+/// stage's content hash to a `<name>:<hash>` tag + fingerprint UUID (skips the
+/// build when the existing image already carries it), ensures a buildkitd, drives
+/// buildctl to an OCI archive, then flattens it to ext4 via the `mkext-oci` path.
+fn run_build(cmd: &Cmd) -> anyhow::Result<()> {
+    let Cmd::Build {
+        file,
+        context,
+        target,
+        out,
+        build_arg,
+        add_host,
+        label,
+        inject,
+        free_gib,
+        name,
+        force,
+        buildkit_addr,
+        buildctl,
+        buildkitd,
+        no_ensure_daemon,
+    } = cmd
+    else {
+        unreachable!("run_build dispatched on non-Build cmd")
+    };
+    use anyhow::{Context, bail};
+
+    // 1. analyze + hash the target stage -> tag identity.
+    let mut user_args = std::collections::BTreeMap::new();
+    for a in build_arg {
+        let (k, v) = a.split_once('=').unwrap_or((a.as_str(), ""));
+        user_args.insert(k.to_string(), v.to_string());
+    }
+    let analysis = dockerhash::merge_analyses(file, &[])?;
+    let hashes = dockerhash::hash_all(&analysis, &user_args)?;
+    let hash = hashes
+        .get(target)
+        .with_context(|| format!("stage '{target}' not found in {file:?}"))?;
+    let tag = format!("{name}:{hash}");
+
+    // 2. freshness: fingerprint = [tag, sha256(injected agent)] vs the image UUID.
+    let injects = parse_injects(inject)?;
+    let agent_hash = injects
+        .iter()
+        .find(|(g, _, _)| g == "usr/local/bin/virtkit-agent")
+        .map(|(_, h, _)| sha256_file(h))
+        .transpose()?;
+    let mut fp_parts: Vec<&str> = vec![tag.as_str()];
+    if let Some(h) = &agent_hash {
+        fp_parts.push(h.as_str());
+    }
+    let uuid = ensure::fingerprint(&fp_parts);
+    if !force && fleet::fs_uuid(out).as_deref() == Some(uuid.as_str()) {
+        println!("virtkit: {tag} fresh ({})", out.display());
+        return Ok(());
+    }
+
+    // 3. resolve the daemon tools (also gives us buildctl), then ensure a buildkitd
+    // unless told to just dial a given address.
+    let bk = buildkit::Buildkit::resolve(buildctl.as_deref(), buildkitd.as_deref())?;
+    let buildctl_bin = bk.buildctl.clone();
+    let addr = if *no_ensure_daemon {
+        buildkit_addr
+            .clone()
+            .context("--no-ensure-daemon needs --buildkit-addr")?
+    } else if let Some(a) = buildkit_addr {
+        a.clone()
+    } else {
+        bk.ensure()?
+    };
+
+    // 4. project the build args for buildctl.
+    let hashes_map: std::collections::HashMap<String, String> =
+        hashes.clone().into_iter().collect();
+    let proj = dockerhash::build_args_for(&analysis, &hashes_map, target, &user_args)?;
+
+    // 5. drive buildctl to a temp OCI archive.
+    let first = file.first().context("no -f Dockerfile")?;
+    let df_dir = first.parent().unwrap_or_else(|| Path::new("."));
+    let df_name = first
+        .file_name()
+        .context("Dockerfile path has no file name")?;
+    let ctx_dir = context.clone().unwrap_or_else(|| df_dir.to_path_buf());
+
+    std::fs::create_dir_all(out.parent().unwrap_or_else(|| Path::new(".")))
+        .with_context(|| format!("creating output dir for {}", out.display()))?;
+    let tmp_oci = out.with_extension("build.oci");
+    let _ = std::fs::remove_file(&tmp_oci);
+
+    let mut bc = std::process::Command::new(&buildctl_bin);
+    bc.arg("--addr").arg(&addr).arg("build");
+    bc.arg("--frontend").arg("dockerfile.v0");
+    bc.arg("--local")
+        .arg(format!("context={}", ctx_dir.display()));
+    bc.arg("--local")
+        .arg(format!("dockerfile={}", df_dir.display()));
+    bc.arg("--opt")
+        .arg(format!("filename={}", df_name.to_string_lossy()));
+    bc.arg("--opt").arg(format!("target={target}"));
+    for (k, v) in &proj {
+        bc.arg("--opt").arg(format!("build-arg:{k}={v}"));
+    }
+    if !add_host.is_empty() {
+        // buildkit wants HOST=IP entries comma-joined in one add-hosts opt.
+        let hosts = add_host.join(",");
+        bc.arg("--opt").arg(format!("add-hosts={hosts}"));
+    }
+    for l in label {
+        let (k, v) = l.split_once('=').unwrap_or((l.as_str(), ""));
+        bc.arg("--opt").arg(format!("label:{k}={v}"));
+    }
+    bc.arg("--output")
+        .arg(format!("type=oci,dest={}", tmp_oci.display()));
+
+    eprintln!("virtkit: building {tag} (target {target}) via {addr}");
+    let st = bc
+        .status()
+        .with_context(|| format!("running {}", buildctl_bin.display()))?;
+    if !st.success() {
+        let _ = std::fs::remove_file(&tmp_oci);
+        bail!("buildctl build failed ({st})");
+    }
+
+    // 6. OCI archive -> ext4, stamping the fingerprint UUID + name label.
+    let fsid = ext4::FsId {
+        uuid: parse_uuid(&uuid),
+        label: Some(name.clone()),
+        with_journal: true,
+    };
+    let inj: Vec<(&str, &Path, u16)> = injects
+        .iter()
+        .map(|(g, h, m)| (g.as_str(), h.as_path(), *m))
+        .collect();
+    let free_blocks = free_gib * (1024 * 1024 * 1024 / 4096);
+    let r = mkoci::archive_to_ext4(&tmp_oci, out, &inj, free_blocks, &fsid);
+    let _ = std::fs::remove_file(&tmp_oci);
+    r?;
+    println!("virtkit: built {tag} -> {} (uuid {uuid})", out.display());
+    Ok(())
+}
+
+/// sha256 hex of a host file's contents (the agent fingerprint part).
+fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    use anyhow::Context;
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let d = Sha256::digest(&bytes);
+    let mut s = String::with_capacity(64);
+    for b in d {
+        use std::fmt::Write;
+        write!(s, "{b:02x}").unwrap();
+    }
+    Ok(s)
 }
 
 fn fail(e: &anyhow::Error, code: i32) -> ExitCode {
@@ -746,6 +1011,27 @@ fn parse_uuid(s: &str) -> Option<[u8; 16]> {
 
 fn exit_code(code: i32) -> ExitCode {
     ExitCode::from(code.clamp(1, 255) as u8)
+}
+
+/// Parse `--inject HOST:GUEST:OCTAL_MODE` specs into `(guest, host, mode)`, with
+/// the guest path normalized to the image-relative form (no leading slash) the
+/// ext4 writer expects. Shared by `mkext-tar`, `mkext-oci`, and `build`.
+fn parse_injects(specs: &[String]) -> anyhow::Result<Vec<(String, PathBuf, u16)>> {
+    let mut out = Vec::new();
+    for spec in specs {
+        let p: Vec<&str> = spec.splitn(3, ':').collect();
+        if p.len() != 3 {
+            anyhow::bail!("--inject must be HOST:GUEST:MODE, got {spec:?}");
+        }
+        let mode = u16::from_str_radix(p[2], 8)
+            .map_err(|_| anyhow::anyhow!("bad octal mode in {spec:?}"))?;
+        out.push((
+            p[1].trim_start_matches('/').to_string(),
+            PathBuf::from(p[0]),
+            mode,
+        ));
+    }
+    Ok(out)
 }
 
 /// Wraps a reader to print a bytes-streamed indicator to stderr (so streaming a

@@ -57,7 +57,7 @@ pub async fn pull_flatten(
     let blob_path = out_tar.with_extension("blob");
     let mut merger = Merger::new(&blob_path)?;
     for layer in &image.layers {
-        merger.apply_layer(&layer.data, &layer.media_type)?;
+        merger.apply_layer(&layer.data[..], &layer.media_type)?;
     }
     let n = merger.finish(out_tar)?;
     let _ = std::fs::remove_file(&blob_path);
@@ -74,14 +74,18 @@ struct Entry {
     data: Option<(u64, u64)>,
 }
 
-struct Merger {
+/// Accumulates OCI layers into a single flattened rootfs, applying whiteouts and
+/// opaque dirs. Shared by the registry path (`pull_flatten`) and the local-archive
+/// path (`mkoci`); `apply_layer` is reader-generic so callers feed it either an
+/// in-memory layer slice or a seeked file range over an OCI tar.
+pub(crate) struct Merger {
     entries: BTreeMap<String, Entry>,
     blob: std::fs::File,
     off: u64,
 }
 
 impl Merger {
-    fn new(blob_path: &Path) -> Result<Self> {
+    pub(crate) fn new(blob_path: &Path) -> Result<Self> {
         // read+write: apply_layer appends file data, finish seeks back to read it
         Ok(Merger {
             entries: BTreeMap::new(),
@@ -98,11 +102,11 @@ impl Merger {
 
     /// Apply one layer: collect its entries + whiteouts, remove whited-out paths
     /// from the accumulated set, then merge this layer's entries (override).
-    fn apply_layer(&mut self, blob: &[u8], media_type: &str) -> Result<()> {
+    pub(crate) fn apply_layer(&mut self, reader: impl Read, media_type: &str) -> Result<()> {
         let reader: Box<dyn Read> = if media_type.contains("gzip") {
-            Box::new(GzDecoder::new(blob))
+            Box::new(GzDecoder::new(reader))
         } else {
-            Box::new(blob)
+            Box::new(reader)
         };
         let mut ar = tar::Archive::new(reader);
         let mut adds: Vec<(String, Entry)> = Vec::new();
@@ -149,7 +153,7 @@ impl Merger {
     }
 
     /// Write the merged set as a single rootfs tar; returns the entry count.
-    fn finish(mut self, out_tar: &Path) -> Result<usize> {
+    pub(crate) fn finish(mut self, out_tar: &Path) -> Result<usize> {
         let file = std::fs::File::create(out_tar)
             .with_context(|| format!("creating {}", out_tar.display()))?;
         let mut builder = tar::Builder::new(file);

@@ -27,6 +27,14 @@ pub struct Analysis {
     dockerfile: HashMap<String, String>,
     /// closure context files per stage, sorted (absolute paths)
     context: HashMap<String, Vec<PathBuf>>,
+    /// parent stage of each stage (the `FROM <parent>` ref), stages only — the
+    /// edge `build_args_for` walks to find the root-nearest DOCKER_STAGE_HASH.
+    parent: HashMap<String, String>,
+    /// every name that is a stage (so non-stage `FROM` refs like `scratch` or a
+    /// registry image are excluded from the parent walk).
+    is_stage: BTreeSet<String>,
+    /// stage names reachable from each output stage (its build closure).
+    closure: HashMap<String, BTreeSet<String>>,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -342,10 +350,12 @@ pub fn analyze(dockerfile: &Path, blacklist: &[String]) -> Result<Analysis> {
 
     let mut dockerfile_out: HashMap<String, String> = HashMap::new();
     let mut context_out: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let mut closure_out: HashMap<String, BTreeSet<String>> = HashMap::new();
 
     for stage in &out_stages {
         // -- closure names (DFS over parent + refs, stages only) --
         let closure = walk_closure(stage, &parent, &refs, &is_stage, false, &mut az, &srcs).0;
+        closure_out.insert(stage.clone(), closure.clone());
 
         // -- closure files --
         let mut all_f: BTreeSet<String> = BTreeSet::new();
@@ -416,6 +426,9 @@ pub fn analyze(dockerfile: &Path, blacklist: &[String]) -> Result<Analysis> {
         stages: out_stages,
         dockerfile: dockerfile_out,
         context: context_out,
+        parent,
+        is_stage,
+        closure: closure_out,
     })
 }
 
@@ -593,6 +606,126 @@ pub fn hash_all(
     Ok(hashes)
 }
 
+/// Analyze one or more Dockerfiles into a single merged [`Analysis`]: stages from
+/// every file are merged (first definition wins) so cross-file stage deps fold
+/// transitively. Shared by the `docker-hash` CLI and the `build` subcommand.
+pub fn merge_analyses(dockerfiles: &[PathBuf], blacklist: &[String]) -> Result<Analysis> {
+    if dockerfiles.len() == 1 {
+        return analyze(&dockerfiles[0], blacklist);
+    }
+    let mut stages: Vec<String> = Vec::new();
+    let mut dockerfile_map: HashMap<String, String> = HashMap::new();
+    let mut context_map: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let mut parent_map: HashMap<String, String> = HashMap::new();
+    let mut is_stage: BTreeSet<String> = BTreeSet::new();
+    let mut closure_map: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for df in dockerfiles {
+        let mut part = analyze(df, blacklist)?;
+        is_stage.extend(part.is_stage.iter().cloned());
+        for (k, v) in part.parent.drain() {
+            parent_map.entry(k).or_insert(v);
+        }
+        for s in part.stages {
+            if !dockerfile_map.contains_key(&s) {
+                stages.push(s.clone());
+                if let (Some(d), Some(c), Some(cl)) = (
+                    part.dockerfile.remove(&s),
+                    part.context.remove(&s),
+                    part.closure.remove(&s),
+                ) {
+                    dockerfile_map.insert(s.clone(), d);
+                    context_map.insert(s.clone(), c);
+                    closure_map.insert(s, cl);
+                }
+            }
+        }
+    }
+    Ok(Analysis {
+        stages,
+        dockerfile: dockerfile_map,
+        context: context_map,
+        parent: parent_map,
+        is_stage,
+        closure: closure_map,
+    })
+}
+
+/// Magic build-arg the build pipeline injects so a stage can stamp the content
+/// hash of the core builder it descends from into its own tag.
+const DOCKER_STAGE_HASH: &str = "DOCKER_STAGE_HASH";
+
+/// Depth of a stage from the closure root: number of `FROM <parent-stage>` hops
+/// until a parent that is not itself a stage (a real base image like `scratch` or
+/// `debian:…`). Root stages are depth 0; their stage children depth 1; etc.
+fn depth_from_root(stage: &str, a: &Analysis) -> usize {
+    let mut depth = 0;
+    let mut cur = stage.to_string();
+    // bounded by the number of stages — the parent graph is a DAG, no cycles
+    while let Some(p) = a.parent.get(&cur) {
+        if !a.is_stage.contains(p) {
+            break;
+        }
+        depth += 1;
+        cur = p.clone();
+    }
+    depth
+}
+
+/// Project the build args to feed buildctl for `target`. For every `ARG` declared
+/// anywhere in `target`'s closure: `DOCKER_STAGE_HASH` resolves to the hash of the
+/// root-nearest closure stage that declares it (so it identifies the core builder
+/// even when a deeper child is the target); a user-supplied arg passes through;
+/// anything else is omitted so the Dockerfile default applies.
+pub fn build_args_for(
+    a: &Analysis,
+    hashes: &HashMap<String, String>,
+    target: &str,
+    user_args: &BTreeMap<String, String>,
+) -> Result<Vec<(String, String)>> {
+    let known: BTreeSet<String> = a.stages.iter().cloned().collect();
+    let closure = a
+        .closure
+        .get(target)
+        .with_context(|| format!("stage '{target}' not found"))?;
+
+    // declared ARG names per closure stage (deduped, union over the closure), and
+    // for DOCKER_STAGE_HASH the root-nearest declaring stage.
+    let mut declared: BTreeSet<String> = BTreeSet::new();
+    let mut hash_stage: Option<(usize, String)> = None;
+    for stage in closure {
+        let Some(df) = a.dockerfile.get(stage) else {
+            continue;
+        };
+        let (_, args) = stage_deps_and_args(df, stage, &known);
+        for arg in args {
+            if arg == DOCKER_STAGE_HASH {
+                let d = depth_from_root(stage, a);
+                // strictly-less keeps the first (definition order) on ties
+                if hash_stage.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                    hash_stage = Some((d, stage.clone()));
+                }
+            }
+            declared.insert(arg);
+        }
+    }
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    for arg in &declared {
+        if arg == DOCKER_STAGE_HASH {
+            if let Some((_, stage)) = &hash_stage {
+                let h = hashes.get(stage).with_context(|| {
+                    format!("no hash computed for stage '{stage}' (DOCKER_STAGE_HASH source)")
+                })?;
+                out.push((DOCKER_STAGE_HASH.to_string(), h.clone()));
+            }
+        } else if let Some(v) = user_args.get(arg) {
+            out.push((arg.clone(), v.clone()));
+        }
+        // else: omit — the Dockerfile default applies.
+    }
+    Ok(out)
+}
+
 /// CLI entry: print `stage:hash` for the requested stages (or all, in
 /// definition order, if none requested). Accepts one or more Dockerfiles;
 /// stages from all files are merged and cross-file deps fold transitively.
@@ -602,32 +735,7 @@ pub fn run(
     blacklist: &[String],
     requested: &[String],
 ) -> Result<()> {
-    let a = if dockerfiles.len() == 1 {
-        analyze(&dockerfiles[0], blacklist)?
-    } else {
-        let mut stages: Vec<String> = Vec::new();
-        let mut dockerfile_map: HashMap<String, String> = HashMap::new();
-        let mut context_map: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        for df in dockerfiles {
-            let mut part = analyze(df, blacklist)?;
-            for s in part.stages {
-                if !dockerfile_map.contains_key(&s) {
-                    stages.push(s.clone());
-                    if let (Some(d), Some(c)) =
-                        (part.dockerfile.remove(&s), part.context.remove(&s))
-                    {
-                        dockerfile_map.insert(s.clone(), d);
-                        context_map.insert(s, c);
-                    }
-                }
-            }
-        }
-        Analysis {
-            stages,
-            dockerfile: dockerfile_map,
-            context: context_map,
-        }
-    };
+    let a = merge_analyses(dockerfiles, blacklist)?;
     let hashes = hash_all(&a, build_args)?;
     let want: Vec<String> = if requested.is_empty() {
         a.stages.clone()
@@ -695,6 +803,59 @@ RUN --mount=type=bind,source=f1.txt,target=/m true\n";
         let h = hash_all(&a, &args).unwrap();
         assert_eq!(h["base"], "cf2f8b6");
         assert_eq!(h["app"], "ce54db3");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // An ancestor `builder` declares DOCKER_STAGE_HASH (consumed by a deeper target
+    // `svc`), `svc` itself declares a user arg, and an unrelated `other` stage
+    // (outside svc's closure) declares another user arg.
+    const ARGS_FIXTURE: &str = "\
+FROM alpine:3.20 AS builder\n\
+ARG DOCKER_STAGE_HASH\n\
+RUN echo $DOCKER_STAGE_HASH > /tag\n\
+\n\
+FROM builder AS mid\n\
+RUN true\n\
+\n\
+FROM mid AS svc\n\
+ARG IN_CLOSURE\n\
+RUN echo $IN_CLOSURE\n\
+\n\
+FROM alpine:3.20 AS other\n\
+ARG OUTSIDE\n\
+RUN echo $OUTSIDE\n";
+
+    #[test]
+    fn build_args_for_projects_stage_hash_and_user_args() {
+        let dir = std::env::temp_dir().join(format!("vmx-buildargs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Dockerfile"), ARGS_FIXTURE).unwrap();
+
+        let a = analyze(&dir.join("Dockerfile"), &[]).unwrap();
+        let hashes_b = hash_all(&a, &BTreeMap::new()).unwrap();
+        let hashes: HashMap<String, String> = hashes_b.into_iter().collect();
+
+        let mut user = BTreeMap::new();
+        user.insert("IN_CLOSURE".to_string(), "yes".to_string());
+        user.insert("OUTSIDE".to_string(), "no".to_string());
+
+        let out = build_args_for(&a, &hashes, "svc", &user).unwrap();
+
+        // DOCKER_STAGE_HASH resolves to the root-nearest declaring stage (`builder`,
+        // depth 0), not `mid`/`svc`.
+        assert_eq!(
+            out.iter().find(|(k, _)| k == "DOCKER_STAGE_HASH"),
+            Some(&("DOCKER_STAGE_HASH".to_string(), hashes["builder"].clone()))
+        );
+        // a user arg declared inside the closure passes through.
+        assert_eq!(
+            out.iter().find(|(k, _)| k == "IN_CLOSURE"),
+            Some(&("IN_CLOSURE".to_string(), "yes".to_string()))
+        );
+        // a user arg declared only in `other` (outside svc's closure) is omitted.
+        assert!(out.iter().all(|(k, _)| k != "OUTSIDE"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
