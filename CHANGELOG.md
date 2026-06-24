@@ -4,6 +4,19 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-06-24
+
+### Changed
+
+- `virtkit build`/`mkext-oci`: the flattened rootfs is now streamed straight into the
+  ext4 builder over an OS pipe instead of being written to an intermediate rootfs tar
+  and read back. For a large image (the dev VM is ~8 GB / 200k+ entries) this drops a
+  multi-GB write+read pass.
+- The rootless buildkit daemon root now lives under `XDG_CACHE_HOME` (`~/.cache/virtkit-buildkit`)
+  instead of `XDG_DATA_HOME` (`~/.local/share`). It holds a purely regenerable, GC-bounded
+  build cache, so it belongs under the cache hierarchy and can be reclaimed by cache-clearing
+  tools.
+
 ## [0.1.5] - 2026-06-24
 
 ### Added
@@ -113,7 +126,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/wallix/virtkit/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/wallix/virtkit/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/wallix/virtkit/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/wallix/virtkit/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/wallix/virtkit/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/wallix/virtkit/compare/v0.1.2...v0.1.3
