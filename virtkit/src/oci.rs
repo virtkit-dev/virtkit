@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
@@ -72,6 +72,10 @@ struct Entry {
     header: tar::Header,
     /// (offset, len) in the spill blob for regular files
     data: Option<(u64, u64)>,
+    /// full link target for hardlinks/symlinks — captured from the entry (which
+    /// resolves PAX/GNU extensions), since the cloned fixed header truncates names
+    /// over 100 bytes. Re-emitted via `append_link` so long targets survive.
+    link: Option<PathBuf>,
 }
 
 /// Accumulates OCI layers into a single flattened rootfs, applying whiteouts and
@@ -128,14 +132,19 @@ impl Merger {
                 continue;
             }
             let header = e.header().clone();
-            let data = if header.entry_type().is_file() {
+            let et = header.entry_type();
+            let mut data = None;
+            let mut link = None;
+            if et.is_file() {
                 let start = self.off;
                 self.off += std::io::copy(&mut e, &mut self.blob)?;
-                Some((start, self.off - start))
-            } else {
-                None
-            };
-            adds.push((path, Entry { header, data }));
+                data = Some((start, self.off - start));
+            } else if et.is_hard_link() || et.is_symlink() {
+                // capture the full (PAX/GNU-resolved) target; the fixed header alone
+                // truncates targets over 100 bytes (e.g. uv's deep tool hardlinks).
+                link = e.link_name()?.map(|p| p.into_owned());
+            }
+            adds.push((path, Entry { header, data, link }));
         }
         for dir in opaque {
             let prefix = format!("{dir}/");
@@ -162,13 +171,18 @@ impl Merger {
         let entries = std::mem::take(&mut self.entries);
         for (path, entry) in entries {
             let mut header = entry.header;
-            match entry.data {
-                Some((off, len)) => {
+            match (entry.data, entry.link) {
+                (Some((off, len)), _) => {
                     self.blob.seek(SeekFrom::Start(off))?;
                     let mut r = (&mut self.blob).take(len);
                     builder.append_data(&mut header, &path, &mut r)?;
                 }
-                None => {
+                // hardlink/symlink: append_link emits a GNU long-link extension when
+                // the target exceeds the 100-byte header field, so it isn't truncated.
+                (None, Some(target)) => {
+                    builder.append_link(&mut header, &path, &target)?;
+                }
+                (None, None) => {
                     builder.append_data(&mut header, &path, std::io::empty())?;
                 }
             }
