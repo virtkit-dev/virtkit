@@ -4,6 +4,37 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-06-24
+
+### Added
+
+- `virtkit build`: build a bootable ext4 straight from a Dockerfile target with no
+  docker or podman in the image path. It drives a rootless `buildkitd` (launched
+  automatically — a native user-namespace unshare, falling back to `podman unshare`
+  on AppArmor-restricted hosts) to an OCI archive, then flattens it to ext4. The
+  output's UUID is a content fingerprint of the resolved stage tag plus injected
+  files, so an unchanged rebuild is a fast no-op. Supports `--build-arg`, `--add-host`,
+  `--label`, `--inject`, `--env-file`, `--free-gib` and `--force`.
+- `virtkit mkext-oci`: flatten a local OCI image archive (the tar `buildctl --output
+  type=oci` produces) into a bootable ext4, extracting the image config
+  (Env/User/Entrypoint/Cmd) into `/etc/virtkit/{env,user,cmd}`. Replaces the
+  `podman load → create → export → mkext-tar` chain.
+- `fleet` can build each unit's ext4 in-process via the `virtkit build` machinery
+  instead of shelling out to the `build-{service,vm}-image.sh` scripts: `--build-dockerfile`,
+  `--build-context`, `--build-arg`, `--build-add-host`, `--build-free-gib`, per-unit
+  `--unit-target NAME=STAGE`, `--unit-inject NAME=H:G:M`, `--unit-env-file NAME=PATH`,
+  `--unit-free-gib NAME=N` and `--agent`. Units without a recipe keep the build-script path.
+- `fleet --service NAME:EXT4:IP/CIDR:CID:autostart`: the `autostart` unit flag boots the
+  service at fleet start.
+- `virtkit-agent serve --exec-wrapper`: gate which commands the agent may execute, with
+  the inherited environment filtered to an allowlist.
+
+### Fixed
+
+- OCI layer flattening now preserves hard/symlink targets longer than 100 bytes (the tar
+  header field limit), which previously truncated long targets (e.g. uv's deep tool
+  hardlinks) and made flattening fail.
+
 ## [0.1.4] - 2026-06-23
 
 ### Added
@@ -82,7 +113,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/wallix/virtkit/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/wallix/virtkit/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/wallix/virtkit/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/wallix/virtkit/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/wallix/virtkit/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/wallix/virtkit/compare/v0.1.1...v0.1.2
