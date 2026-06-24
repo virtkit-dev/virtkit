@@ -82,6 +82,12 @@ enum Commands {
         /// run. Use it to enforce an allowlist. Omitted = run commands directly.
         #[arg(long)]
         exec_wrapper: Option<PathBuf>,
+        /// Allow these client-supplied environment variables through to the
+        /// --exec-wrapper (repeatable; shell-style `*`/`?` globs, e.g. `LC_*`).
+        /// LANG, LANGUAGE, LC_*, TZ are always allowed; everything else the client
+        /// sends is dropped so it cannot subvert the wrapper (e.g. LD_PRELOAD).
+        #[arg(long, requires = "exec_wrapper")]
+        exec_wrapper_env: Vec<String>,
     },
     Status,
     /// Forward a local listener to the --socket target, splicing raw bytes
@@ -279,6 +285,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
             debug,
             inactivity_timeout,
             exec_wrapper,
+            exec_wrapper_env,
         } => {
             let log_level = if debug {
                 LevelFilter::Debug
@@ -305,7 +312,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
             } else {
                 None
             };
-            if let Err(e) = run_server(&socket, duration, exec_wrapper).await {
+            if let Err(e) = run_server(&socket, duration, exec_wrapper, exec_wrapper_env).await {
                 error!("run_server: {e}");
                 std::process::exit(1)
             };

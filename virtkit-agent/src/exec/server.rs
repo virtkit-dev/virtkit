@@ -8,7 +8,7 @@ use anyhow::anyhow;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use log::{debug, error, info};
 use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process;
 use std::process::Stdio;
 use std::sync::atomic::AtomicUsize;
@@ -66,12 +66,13 @@ pub async fn run_server(
     socket: &SocketAddr,
     inactivity_timeout: Option<Duration>,
     exec_wrapper: Option<PathBuf>,
+    exec_wrapper_env: Vec<String>,
 ) -> Result<(), anyhow::Error> {
     let status = Status::default();
     // Force every exec through this program (like SSH's ForceCommand): it receives
     // the requested command line as its arguments and decides what to run.
     // None = run requested commands directly (the default, unrestricted).
-    let exec_wrapper = Arc::new(exec_wrapper);
+    let exec_wrapper = Arc::new(exec_wrapper.map(|path| ExecWrapper::new(path, exec_wrapper_env)));
 
     let listener = listen(socket)?;
 
@@ -118,7 +119,7 @@ pub async fn run_server(
                     // A new task is spawned for each socket. The socket is moved to the new task and processed there.
                     tokio::spawn(async move {
                         let mut update_last = true;
-                        match do_handle_conn(&status, stream, sink, exec_wrapper.as_deref()).await {
+                        match do_handle_conn(&status, stream, sink, (*exec_wrapper).as_ref()).await {
                             Err(e) => info!("{e}"),
                             Ok(skip_update) => {
                                 if skip_update {
@@ -179,16 +180,84 @@ fn start_watchdog(status: Status, socket: SocketAddr) {
 
 static REQUEST_ID: AtomicUsize = AtomicUsize::new(1);
 
+/// Client-supplied env var names always allowed through to the wrapper. These are
+/// locale/timezone hints with no influence on how the wrapper resolves or loads
+/// code, so they are safe to honour by default. Supports shell-style globs.
+const WRAPPER_ENV_ALLOW_DEFAULTS: &[&str] = &["LANG", "LANGUAGE", "LC_*", "TZ"];
+
+/// A configured exec wrapper: the program every exec is forced through, plus the
+/// allowlist of client-supplied env var names permitted to reach it.
+pub(crate) struct ExecWrapper {
+    path: PathBuf,
+    /// Glob patterns (defaults + admin `--exec-wrapper-env`) matched against env
+    /// var names; client env not matching any pattern is dropped before the
+    /// wrapper runs, so it cannot be subverted (LD_PRELOAD, BASH_ENV, ...).
+    env_allow: Vec<String>,
+}
+
+impl ExecWrapper {
+    pub(crate) fn new(path: PathBuf, extra_env_allow: Vec<String>) -> Self {
+        let mut env_allow: Vec<String> = WRAPPER_ENV_ALLOW_DEFAULTS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        env_allow.extend(extra_env_allow);
+        Self { path, env_allow }
+    }
+
+    fn env_allowed(&self, name: &str) -> bool {
+        self.env_allow.iter().any(|pat| glob_match(pat, name))
+    }
+}
+
+/// Minimal shell-style glob match supporting `*` (any run, incl. empty) and `?`
+/// (one char), used to match env var names against the wrapper allowlist (like
+/// SSH's `AcceptEnv`). No character classes — env var names don't need them.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let s: Vec<char> = name.chars().collect();
+    let (mut pi, mut si) = (0, 0);
+    // Position to backtrack to when a `*` needs to consume one more char.
+    let (mut star, mut star_si) = (None, 0);
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == s[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            star_si = si;
+            pi += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            star_si += 1;
+            si = star_si;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 /// Rewrite a request to run through the exec wrapper: the wrapper becomes the
 /// command, and the originally-requested name + args become its arguments. dir,
-/// env, user and tty are untouched, so the real command the wrapper execs runs in
-/// the same environment the client asked for.
-fn wrap_cmd(mut cmd: CmdExec, wrapper: &Path) -> CmdExec {
+/// user and tty are untouched, so the real command the wrapper execs runs as the
+/// client asked. Client-supplied env is filtered to the wrapper's allowlist, and
+/// the client cannot clear the (trusted) server env the wrapper inherits — so
+/// neither path lets it tamper with how the wrapper itself runs.
+fn wrap_cmd(mut cmd: CmdExec, wrapper: &ExecWrapper) -> CmdExec {
     let mut args = Vec::with_capacity(cmd.args.len() + 1);
     args.push(std::mem::take(&mut cmd.name));
     args.append(&mut cmd.args);
-    cmd.name = wrapper.to_string_lossy().into_owned();
+    cmd.name = wrapper.path.to_string_lossy().into_owned();
     cmd.args = args;
+    cmd.env.retain(|e| {
+        let key = e.split_once('=').map_or(e.as_str(), |(k, _)| k);
+        wrapper.env_allowed(key)
+    });
+    cmd.clear_env = false;
     cmd
 }
 
@@ -196,7 +265,7 @@ async fn do_handle_conn(
     status: &Status,
     mut stream: SerStream,
     mut sink: DeSink,
-    exec_wrapper: Option<&Path>,
+    exec_wrapper: Option<&ExecWrapper>,
 ) -> Result<bool, anyhow::Error> {
     let client_request = stream.next().await.ok_or(anyhow!("no data"))??;
 
@@ -789,9 +858,9 @@ async fn writer_task(
 
 #[cfg(test)]
 mod tests {
-    use super::{TaskState, wrap_cmd};
+    use super::{ExecWrapper, TaskState, glob_match, wrap_cmd};
     use crate::messages::{CmdExec, RunMode};
-    use std::path::Path;
+    use std::path::PathBuf;
     use std::time::Duration;
 
     fn sample_cmd() -> CmdExec {
@@ -807,14 +876,49 @@ mod tests {
         }
     }
 
+    fn wrapper(extra_env_allow: Vec<String>) -> ExecWrapper {
+        ExecWrapper::new(PathBuf::from("/run/host-dispatch"), extra_env_allow)
+    }
+
     #[test]
     fn wrap_cmd_prepends_original_command_as_args() {
-        let wrapped = wrap_cmd(sample_cmd(), Path::new("/run/host-dispatch"));
+        let wrapped = wrap_cmd(sample_cmd(), &wrapper(vec![]));
         assert_eq!(wrapped.name, "/run/host-dispatch");
         // the requested command line becomes the wrapper's argv
         assert_eq!(wrapped.args, vec!["git", "status"]);
-        // dir/env/user are preserved so the real command runs as the client asked
+        // dir/user are preserved so the real command runs as the client asked
         assert_eq!(wrapped.dir.as_deref(), Some("./sub"));
+    }
+
+    #[test]
+    fn wrap_cmd_filters_client_env_to_the_allowlist() {
+        let mut cmd = sample_cmd();
+        cmd.clear_env = true;
+        cmd.env = vec![
+            "LD_PRELOAD=/tmp/evil.so".into(), // injection vector: must be dropped
+            "BASH_ENV=/tmp/rc".into(),        // ditto
+            "LANG=en_US.UTF-8".into(),        // default allowlist
+            "LC_ALL=C".into(),                // default allowlist glob LC_*
+            "MYAPP_TOKEN=abc".into(),         // admin-allowed below
+        ];
+        let wrapped = wrap_cmd(cmd, &wrapper(vec!["MYAPP_*".into()]));
+        assert_eq!(
+            wrapped.env,
+            vec!["LANG=en_US.UTF-8", "LC_ALL=C", "MYAPP_TOKEN=abc"],
+        );
+        // the client cannot clear the trusted server env the wrapper inherits
+        assert!(!wrapped.clear_env);
+    }
+
+    #[test]
+    fn glob_match_handles_wildcards() {
+        assert!(glob_match("LC_*", "LC_ALL"));
+        assert!(glob_match("LC_*", "LC_")); // `*` matches empty
+        assert!(!glob_match("LC_*", "LANG"));
+        assert!(glob_match("LANG", "LANG"));
+        assert!(!glob_match("LANG", "LANGUAGE"));
+        assert!(glob_match("MYAPP_?", "MYAPP_X"));
+        assert!(!glob_match("MYAPP_?", "MYAPP_XY"));
     }
 
     #[test]
