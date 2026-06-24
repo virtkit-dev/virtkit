@@ -66,17 +66,37 @@ pub struct BuildRecipe {
     pub buildkitd: Option<PathBuf>,
 }
 
+/// Per-unit build overrides layered on top of the fleet-level [`BuildRecipe`]: extra
+/// injects (in addition to the agent), extra env-files appended to `/etc/virtkit/env`,
+/// and an optional free-gib override (else the recipe's `free_gib`). The services pass
+/// the default (empty) value, so their build is identical to before.
+#[derive(Default, Clone)]
+pub struct UnitOverrides {
+    pub injects: Vec<(String, PathBuf, u16)>,
+    pub env_files: Vec<PathBuf>,
+    pub free_gib: Option<u64>,
+}
+
 /// Ensure a unit's ext4 in-process via the `virtkit build` machinery (instead of
 /// shelling to build-service-image.sh). `target` is the unit's Dockerfile stage,
 /// `name` the tag/label NAME (the `:<tag>`-stripped `--service-image` value), `out`
 /// the unit ext4, `agent` the static musl agent injected at the standard guest path.
+/// `overrides` layers per-unit injects/env-files/free-gib on top of the recipe.
 pub fn ensure_service_build(
     recipe: &BuildRecipe,
     target: &str,
     name: &str,
     out: &Path,
     agent: &Path,
+    overrides: &UnitOverrides,
 ) -> Result<()> {
+    // The agent inject is always present; per-unit --unit-inject entries are layered on.
+    let mut injects = vec![(
+        "usr/local/bin/virtkit-agent".to_string(),
+        agent.to_path_buf(),
+        0o755,
+    )];
+    injects.extend(overrides.injects.iter().cloned());
     let spec = BuildSpec {
         dockerfiles: recipe.dockerfiles.clone(),
         context: recipe.context.clone(),
@@ -86,12 +106,9 @@ pub fn ensure_service_build(
         build_args: recipe.build_args.clone(),
         add_hosts: recipe.add_hosts.clone(),
         labels: Vec::new(),
-        injects: vec![(
-            "usr/local/bin/virtkit-agent".to_string(),
-            agent.to_path_buf(),
-            0o755,
-        )],
-        free_gib: recipe.free_gib,
+        injects,
+        env_files: overrides.env_files.clone(),
+        free_gib: overrides.free_gib.unwrap_or(recipe.free_gib),
         buildkit_addr: recipe.buildkit_addr.clone(),
         buildctl: recipe.buildctl.clone(),
         buildkitd: recipe.buildkitd.clone(),

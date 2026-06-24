@@ -162,6 +162,16 @@ enum Cmd {
         /// in-process build: per-unit target stage NAME=STAGE (repeatable)
         #[arg(long = "unit-target")]
         unit_target: Vec<String>,
+        /// in-process build: extra inject for unit NAME=HOST:GUEST:MODE (repeatable;
+        /// in addition to the agent)
+        #[arg(long = "unit-inject", value_name = "NAME=HOST:GUEST:MODE")]
+        unit_inject: Vec<String>,
+        /// in-process build: extra env-file for unit NAME=PATH (repeatable)
+        #[arg(long = "unit-env-file", value_name = "NAME=PATH")]
+        unit_env_file: Vec<String>,
+        /// in-process build: per-unit free-gib override NAME=N (else --build-free-gib)
+        #[arg(long = "unit-free-gib", value_name = "NAME=N")]
+        unit_free_gib: Vec<String>,
         /// in-process build: dial this buildkit address instead of the ensured one
         #[arg(long = "build-buildkit-addr")]
         build_buildkit_addr: Option<String>,
@@ -379,6 +389,10 @@ enum Cmd {
         /// inject a host file at a guest path, HOST:GUEST:OCTAL_MODE (repeatable)
         #[arg(long = "inject", value_name = "HOST:GUEST:MODE")]
         inject: Vec<String>,
+        /// env-file whose `KEY=VAL` lines are appended to /etc/virtkit/env after the
+        /// image-config env (non-`=` lines dropped); repeatable, applied in order
+        #[arg(long = "env-file", value_name = "PATH")]
+        env_file: Vec<PathBuf>,
         /// spare free space (GiB) left in the filesystem for the guest to write
         #[arg(long, default_value_t = 0)]
         free_gib: u64,
@@ -604,7 +618,7 @@ async fn main() -> ExitCode {
             .map(|(g, h, m)| (g.as_str(), h.as_path(), *m))
             .collect();
         let extra_free = free_gib * (1024 * 1024 * 1024 / 4096); // GiB -> 4 KiB blocks
-        return match mkoci::archive_to_ext4(archive, out, &injects, extra_free, &fsid) {
+        return match mkoci::archive_to_ext4(archive, out, &injects, &[], extra_free, &fsid) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         };
@@ -618,6 +632,7 @@ async fn main() -> ExitCode {
         add_host,
         label,
         inject,
+        env_file,
         free_gib,
         name,
         force,
@@ -664,6 +679,7 @@ async fn main() -> ExitCode {
             add_hosts,
             labels,
             injects,
+            env_files: env_file.clone(),
             free_gib: *free_gib,
             buildkit_addr: buildkit_addr.clone(),
             buildctl: buildctl.clone(),
@@ -757,6 +773,9 @@ async fn main() -> ExitCode {
         build_add_host,
         build_free_gib,
         unit_target,
+        unit_inject,
+        unit_env_file,
+        unit_free_gib,
         build_buildkit_addr,
         build_buildctl,
         build_buildkitd,
@@ -901,6 +920,56 @@ async fn main() -> ExitCode {
                 }
             }
         }
+        // Per-unit build overrides, keyed by unit NAME. Each --unit-* flag is a
+        // NAME=VALUE pair (split on the first '=', like --unit-target); the VALUE is
+        // then parsed in the flag's own format. Units with no override build as before.
+        let mut unit_overrides: std::collections::HashMap<String, ensure::UnitOverrides> =
+            std::collections::HashMap::new();
+        for spec in unit_inject {
+            match split_unit(spec, "--unit-inject", "NAME=HOST:GUEST:MODE") {
+                Ok((name, value)) => {
+                    match parse_injects(std::slice::from_ref(&value.to_string())) {
+                        Ok(mut parsed) => {
+                            unit_overrides
+                                .entry(name.to_string())
+                                .or_default()
+                                .injects
+                                .append(&mut parsed);
+                        }
+                        Err(e) => return fail(&e, 2),
+                    }
+                }
+                Err(e) => return fail(&e, 2),
+            }
+        }
+        for spec in unit_env_file {
+            match split_unit(spec, "--unit-env-file", "NAME=PATH") {
+                Ok((name, value)) => {
+                    unit_overrides
+                        .entry(name.to_string())
+                        .or_default()
+                        .env_files
+                        .push(PathBuf::from(value));
+                }
+                Err(e) => return fail(&e, 2),
+            }
+        }
+        for spec in unit_free_gib {
+            match split_unit(spec, "--unit-free-gib", "NAME=N") {
+                Ok((name, value)) => match value.parse::<u64>() {
+                    Ok(n) => {
+                        unit_overrides.entry(name.to_string()).or_default().free_gib = Some(n);
+                    }
+                    Err(_) => {
+                        return fail(
+                            &anyhow::anyhow!("bad --unit-free-gib {spec:?} (N must be an integer)"),
+                            2,
+                        );
+                    }
+                },
+                Err(e) => return fail(&e, 2),
+            }
+        }
         return match fleet::run(
             *gateway,
             *prefix,
@@ -915,6 +984,7 @@ async fn main() -> ExitCode {
             service_image.clone(),
             build_recipe,
             unit_targets,
+            unit_overrides,
             agent.clone(),
             *ensure_only,
         )
@@ -1013,6 +1083,14 @@ fn exit_code(code: i32) -> ExitCode {
     ExitCode::from(code.clamp(1, 255) as u8)
 }
 
+/// Split a per-unit `NAME=VALUE` flag on the first '=' (the same rule as
+/// `--unit-target`), returning `(name, value)`. `flag`/`fmt` shape the error.
+fn split_unit<'a>(spec: &'a str, flag: &str, fmt: &str) -> anyhow::Result<(&'a str, &'a str)> {
+    spec.split_once('=')
+        .filter(|(name, _)| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("bad {flag} {spec:?} (want {fmt})"))
+}
+
 /// Parse `--inject HOST:GUEST:OCTAL_MODE` specs into `(guest, host, mode)`, with
 /// the guest path normalized to the image-relative form (no leading slash) the
 /// ext4 writer expects. Shared by `mkext-tar`, `mkext-oci`, and `build`.
@@ -1066,5 +1144,52 @@ impl<R: std::io::Read> std::io::Read for ProgressReader<R> {
             self.next_report = self.bytes + (512 << 20); // report every 512 MiB
         }
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Per-unit override flags (--unit-inject/--unit-env-file/--unit-free-gib) are
+    // NAME=VALUE pairs split on the first '=' (like --unit-target), with the VALUE
+    // then parsed in the flag's own format.
+    #[test]
+    fn split_unit_takes_first_equals_and_requires_name() {
+        // first '=' only — the value (here a HOST:GUEST:MODE inject) keeps its own '='
+        // were it present, and a PATH value is returned verbatim.
+        assert_eq!(
+            split_unit("mysql=/h/agent:/g/agent:0755", "--unit-inject", "fmt").unwrap(),
+            ("mysql", "/h/agent:/g/agent:0755")
+        );
+        assert_eq!(
+            split_unit("vm=/tmp/dev.env", "--unit-env-file", "fmt").unwrap(),
+            ("vm", "/tmp/dev.env")
+        );
+        // empty name or no '=' is rejected.
+        assert!(split_unit("=stage", "--unit-target", "fmt").is_err());
+        assert!(split_unit("noeq", "--unit-target", "fmt").is_err());
+    }
+
+    // A --unit-inject value parses through parse_injects to a single (guest, host, mode)
+    // entry with the guest path normalized to image-relative form.
+    #[test]
+    fn unit_inject_value_parses_as_inject() {
+        let (name, value) = split_unit(
+            "vm=/host/x.sh:/etc/profile.d/x.sh:0644",
+            "--unit-inject",
+            "f",
+        )
+        .unwrap();
+        assert_eq!(name, "vm");
+        let parsed = parse_injects(std::slice::from_ref(&value.to_string())).unwrap();
+        assert_eq!(
+            parsed,
+            vec![(
+                "etc/profile.d/x.sh".to_string(),
+                PathBuf::from("/host/x.sh"),
+                0o644
+            )]
+        );
     }
 }

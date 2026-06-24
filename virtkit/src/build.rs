@@ -27,6 +27,7 @@ pub struct BuildSpec {
     pub add_hosts: Vec<(String, String)>, // (host, ip)
     pub labels: Vec<(String, String)>,
     pub injects: Vec<(String, PathBuf, u16)>, // (guest-path-relative, host, mode)
+    pub env_files: Vec<PathBuf>,              // appended to /etc/virtkit/env, in order
     pub free_gib: u64,
     pub buildkit_addr: Option<String>,
     pub buildctl: Option<PathBuf>,
@@ -49,17 +50,11 @@ pub fn run(spec: &BuildSpec) -> Result<()> {
     })?;
     let tag = format!("{}:{hash}", spec.name);
 
-    // 2. freshness: fingerprint = [tag, sha256(injected agent)] vs the image UUID.
-    let agent_hash = spec
-        .injects
-        .iter()
-        .find(|(g, _, _)| g == "usr/local/bin/virtkit-agent")
-        .map(|(_, h, _)| sha256_file(h))
-        .transpose()?;
+    // 2. freshness: the fingerprint reflects everything baked into the ext4, not just
+    // the agent (see [`fingerprint_hashes`]), vs the image UUID.
+    let part_hashes = fingerprint_hashes(spec)?;
     let mut fp_parts: Vec<&str> = vec![tag.as_str()];
-    if let Some(h) = &agent_hash {
-        fp_parts.push(h.as_str());
-    }
+    fp_parts.extend(part_hashes.iter().map(String::as_str));
     let uuid = ensure::fingerprint(&fp_parts);
     if !spec.force && fleet::fs_uuid(&spec.out).as_deref() == Some(uuid.as_str()) {
         println!("virtkit: {tag} fresh ({})", spec.out.display());
@@ -151,7 +146,14 @@ pub fn run(spec: &BuildSpec) -> Result<()> {
         .map(|(g, h, m)| (g.as_str(), h.as_path(), *m))
         .collect();
     let free_blocks = spec.free_gib * (1024 * 1024 * 1024 / 4096);
-    let r = mkoci::archive_to_ext4(&tmp_oci, &spec.out, &inj, free_blocks, &fsid);
+    let r = mkoci::archive_to_ext4(
+        &tmp_oci,
+        &spec.out,
+        &inj,
+        &spec.env_files,
+        free_blocks,
+        &fsid,
+    );
     let _ = std::fs::remove_file(&tmp_oci);
     r?;
     println!(
@@ -161,7 +163,25 @@ pub fn run(spec: &BuildSpec) -> Result<()> {
     Ok(())
 }
 
-/// sha256 hex of a host file's contents (the agent fingerprint part).
+/// The fingerprint parts (after the tag) for a spec: each inject's host-file sha256
+/// sorted by guest path, then each env-file's sha256 in order. This reflects
+/// everything baked into the ext4. For a unit whose only inject is the agent and with
+/// no env-files (the services), this is exactly `[sha256(agent)]`, so prepending the
+/// tag yields `[tag, sha256(agent)]` and existing service ext4s stay fresh.
+fn fingerprint_hashes(spec: &BuildSpec) -> Result<Vec<String>> {
+    let mut injects_sorted: Vec<&(String, PathBuf, u16)> = spec.injects.iter().collect();
+    injects_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut parts: Vec<String> = Vec::with_capacity(injects_sorted.len() + spec.env_files.len());
+    for (_, host, _) in injects_sorted {
+        parts.push(sha256_file(host)?);
+    }
+    for ef in &spec.env_files {
+        parts.push(sha256_file(ef)?);
+    }
+    Ok(parts)
+}
+
+/// sha256 hex of a host file's contents (a fingerprint part).
 fn sha256_file(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let d = Sha256::digest(&bytes);
@@ -171,4 +191,65 @@ fn sha256_file(path: &Path) -> Result<String> {
         write!(s, "{b:02x}").unwrap();
     }
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec_with(injects: Vec<(String, PathBuf, u16)>, env_files: Vec<PathBuf>) -> BuildSpec {
+        BuildSpec {
+            dockerfiles: vec![],
+            context: PathBuf::from("."),
+            target: String::new(),
+            name: String::new(),
+            out: PathBuf::from("out.ext4"),
+            build_args: BTreeMap::new(),
+            add_hosts: vec![],
+            labels: vec![],
+            injects,
+            env_files,
+            free_gib: 0,
+            buildkit_addr: None,
+            buildctl: None,
+            buildkitd: None,
+            ensure_daemon: true,
+            force: false,
+        }
+    }
+
+    // A unit whose only inject is the agent and with no env-files (the services) must
+    // fingerprint to exactly [tag, sha256(agent)] — the same value as before this
+    // generalization — so existing service ext4s stay fresh.
+    #[test]
+    fn agent_only_fingerprint_matches_legacy() {
+        let dir = std::env::temp_dir().join(format!("virtkit-fp-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let agent = dir.join("virtkit-agent");
+        std::fs::write(&agent, b"fake agent bytes").unwrap();
+
+        let spec = spec_with(
+            vec![(
+                "usr/local/bin/virtkit-agent".to_string(),
+                agent.clone(),
+                0o755,
+            )],
+            vec![],
+        );
+
+        let agent_sha = sha256_file(&agent).unwrap();
+        // legacy recipe: [tag, sha256(agent)]
+        let tag = "wabmysql-bookworm:abc123";
+        let legacy = ensure::fingerprint(&[tag, agent_sha.as_str()]);
+
+        let part_hashes = fingerprint_hashes(&spec).unwrap();
+        let mut parts: Vec<&str> = vec![tag];
+        parts.extend(part_hashes.iter().map(String::as_str));
+        let got = ensure::fingerprint(&parts);
+
+        assert_eq!(part_hashes, vec![agent_sha]);
+        assert_eq!(got, legacy);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

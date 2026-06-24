@@ -155,6 +155,7 @@ pub async fn run(
     service_images: Vec<String>,
     build_recipe: Option<crate::ensure::BuildRecipe>,
     unit_targets: HashMap<String, String>,
+    unit_overrides: HashMap<String, crate::ensure::UnitOverrides>,
     agent: PathBuf,
     ensure_only: bool,
 ) -> Result<()> {
@@ -176,7 +177,8 @@ pub async fn run(
                 let name = images
                     .get(b.name.as_str())
                     .map_or(b.name.as_str(), |r| crate::ensure::image_name(r));
-                crate::ensure::ensure_service_build(recipe, target, name, &b.ext4, &agent)?;
+                let ov = unit_overrides.get(&b.name).cloned().unwrap_or_default();
+                crate::ensure::ensure_service_build(recipe, target, name, &b.ext4, &agent, &ov)?;
             }
             None => {
                 if let Some(script) = &b.build_script {
@@ -192,7 +194,8 @@ pub async fn run(
                     .get(svc.name.as_str())
                     .with_context(|| format!("no --service-image for service {}", svc.name))?;
                 let name = crate::ensure::image_name(image);
-                crate::ensure::ensure_service_build(recipe, target, name, &svc.ext4, &agent)?;
+                let ov = unit_overrides.get(&svc.name).cloned().unwrap_or_default();
+                crate::ensure::ensure_service_build(recipe, target, name, &svc.ext4, &agent, &ov)?;
             }
             None => {
                 if let Some(script) = &service_build {

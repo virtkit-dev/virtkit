@@ -80,6 +80,7 @@ pub(crate) fn archive_to_ext4(
     archive: &Path,
     out: &Path,
     injects: &[(&str, &Path, u16)],
+    env_files: &[PathBuf],
     extra_free_blocks: u64,
     fsid: &ext4::FsId,
 ) -> Result<()> {
@@ -87,7 +88,15 @@ pub(crate) fn archive_to_ext4(
     // flattened rootfs tar, and generated config files; removed on the way out.
     let work = out.with_extension("mkoci.tmp");
     std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
-    let r = build_inner(archive, out, injects, extra_free_blocks, fsid, &work);
+    let r = build_inner(
+        archive,
+        out,
+        injects,
+        env_files,
+        extra_free_blocks,
+        fsid,
+        &work,
+    );
     let _ = std::fs::remove_dir_all(&work);
     r
 }
@@ -96,6 +105,7 @@ fn build_inner(
     archive: &Path,
     out: &Path,
     injects: &[(&str, &Path, u16)],
+    env_files: &[PathBuf],
     extra_free_blocks: u64,
     fsid: &ext4::FsId,
     work: &Path,
@@ -168,8 +178,11 @@ fn build_inner(
     let env_file = work.join("env");
     let user_file = work.join("user");
     let cmd_file = work.join("cmd");
-    std::fs::write(&env_file, render_env_file(ic.env.as_deref().unwrap_or(&[])))
-        .with_context(|| format!("writing {}", env_file.display()))?;
+    std::fs::write(
+        &env_file,
+        render_env_with_files(ic.env.as_deref().unwrap_or(&[]), env_files)?,
+    )
+    .with_context(|| format!("writing {}", env_file.display()))?;
     std::fs::write(
         &user_file,
         format!("{}\n", ic.user.as_deref().unwrap_or("")),
@@ -218,6 +231,20 @@ fn render_env_file(env: &[String]) -> String {
         }
     }
     out
+}
+
+/// Render `/etc/virtkit/env` from the image-config env first, then each caller
+/// env-file's lines appended in order — all under the same `=`-only rule: lines
+/// without an `=` are dropped (blank lines and typical `#` comments).
+fn render_env_with_files(env: &[String], env_files: &[PathBuf]) -> Result<String> {
+    let mut out = render_env_file(env);
+    for ef in env_files {
+        let raw = std::fs::read_to_string(ef)
+            .with_context(|| format!("reading env-file {}", ef.display()))?;
+        let lines: Vec<String> = raw.lines().map(str::to_string).collect();
+        out.push_str(&render_env_file(&lines));
+    }
+    Ok(out)
 }
 
 /// Render `/etc/virtkit/cmd`: Entrypoint argv then Cmd argv, one element per line.
@@ -459,6 +486,26 @@ mod tests {
             ),
             "/app/main\n--serve\n--port\n8080\n"
         );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // An env-file appends its `=`-lines to the rendered image-config env, in order,
+    // dropping any non-`=` line (blanks, comments, bare tokens).
+    #[test]
+    fn env_file_appends_eq_lines_and_drops_others() {
+        let dir = std::env::temp_dir().join(format!("virtkit-envfile-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ef = dir.join("dev.env");
+        std::fs::write(&ef, "FOO_TEST=bar\n# comment\nNOEQ\n\nBAZ=1\n").unwrap();
+
+        let image_env = vec!["PATH=/usr/bin".to_string()];
+        let rendered = render_env_with_files(&image_env, std::slice::from_ref(&ef)).unwrap();
+
+        // image-config env first, then the env-file's `=`-lines in order; NOEQ/comment/
+        // blank dropped.
+        assert_eq!(rendered, "PATH=/usr/bin\nFOO_TEST=bar\nBAZ=1\n");
+        assert!(!rendered.contains("NOEQ"));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
