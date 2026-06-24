@@ -53,7 +53,15 @@ impl Buildkit {
     pub(crate) fn resolve(buildctl: Option<&Path>, buildkitd: Option<&Path>) -> Result<Self> {
         let buildctl = locate("buildctl", buildctl)?;
         let buildkitd = locate("buildkitd", buildkitd)?;
-        let runc = locate("buildkit-runc", None)?;
+        // buildkit-runc ships in the same dir as buildctl/buildkitd; prefer that
+        // (the caller points --build-buildctl/-buildkitd at it) before the generic
+        // next-to-virtkit / $PATH lookup, so a caller need only locate the suite once.
+        let runc = [buildkitd.parent(), buildctl.parent()]
+            .into_iter()
+            .flatten()
+            .map(|d| d.join("buildkit-runc"))
+            .find(|p| p.is_file())
+            .map_or_else(|| locate("buildkit-runc", None), Ok)?;
 
         let data = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
