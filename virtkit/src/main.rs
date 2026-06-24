@@ -16,6 +16,7 @@
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+mod build;
 mod buildkit;
 mod config;
 mod convert;
@@ -576,8 +577,69 @@ async fn main() -> ExitCode {
             Err(e) => fail(&e, 1),
         };
     }
-    if let Cmd::Build { .. } = &cli.cmd {
-        return match run_build(&cli.cmd) {
+    if let Cmd::Build {
+        file,
+        context,
+        target,
+        out,
+        build_arg,
+        add_host,
+        label,
+        inject,
+        free_gib,
+        name,
+        force,
+        buildkit_addr,
+        buildctl,
+        buildkitd,
+        no_ensure_daemon,
+    } = &cli.cmd
+    {
+        let mut build_args = std::collections::BTreeMap::new();
+        for a in build_arg {
+            let (k, v) = a.split_once('=').unwrap_or((a.as_str(), ""));
+            build_args.insert(k.to_string(), v.to_string());
+        }
+        let mut add_hosts = Vec::new();
+        for h in add_host {
+            let (host, ip) = h.split_once('=').unwrap_or((h.as_str(), ""));
+            add_hosts.push((host.to_string(), ip.to_string()));
+        }
+        let mut labels = Vec::new();
+        for l in label {
+            let (k, v) = l.split_once('=').unwrap_or((l.as_str(), ""));
+            labels.push((k.to_string(), v.to_string()));
+        }
+        let injects = match parse_injects(inject) {
+            Ok(p) => p,
+            Err(e) => return fail(&e, 2),
+        };
+        let first = file.first().cloned();
+        let context = context.clone().unwrap_or_else(|| {
+            first
+                .as_deref()
+                .and_then(Path::parent)
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        });
+        let spec = build::BuildSpec {
+            dockerfiles: file.clone(),
+            context,
+            target: target.clone(),
+            name: name.clone(),
+            out: out.clone(),
+            build_args,
+            add_hosts,
+            labels,
+            injects,
+            free_gib: *free_gib,
+            buildkit_addr: buildkit_addr.clone(),
+            buildctl: buildctl.clone(),
+            buildkitd: buildkitd.clone(),
+            ensure_daemon: !*no_ensure_daemon,
+            force: *force,
+        };
+        return match build::run(&spec) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         };
@@ -834,161 +896,6 @@ async fn main() -> ExitCode {
             unreachable!()
         }
     }
-}
-
-/// `virtkit build`: Dockerfile target -> bootable ext4 in one tool. Resolves the
-/// stage's content hash to a `<name>:<hash>` tag + fingerprint UUID (skips the
-/// build when the existing image already carries it), ensures a buildkitd, drives
-/// buildctl to an OCI archive, then flattens it to ext4 via the `mkext-oci` path.
-fn run_build(cmd: &Cmd) -> anyhow::Result<()> {
-    let Cmd::Build {
-        file,
-        context,
-        target,
-        out,
-        build_arg,
-        add_host,
-        label,
-        inject,
-        free_gib,
-        name,
-        force,
-        buildkit_addr,
-        buildctl,
-        buildkitd,
-        no_ensure_daemon,
-    } = cmd
-    else {
-        unreachable!("run_build dispatched on non-Build cmd")
-    };
-    use anyhow::{Context, bail};
-
-    // 1. analyze + hash the target stage -> tag identity.
-    let mut user_args = std::collections::BTreeMap::new();
-    for a in build_arg {
-        let (k, v) = a.split_once('=').unwrap_or((a.as_str(), ""));
-        user_args.insert(k.to_string(), v.to_string());
-    }
-    let analysis = dockerhash::merge_analyses(file, &[])?;
-    let hashes = dockerhash::hash_all(&analysis, &user_args)?;
-    let hash = hashes
-        .get(target)
-        .with_context(|| format!("stage '{target}' not found in {file:?}"))?;
-    let tag = format!("{name}:{hash}");
-
-    // 2. freshness: fingerprint = [tag, sha256(injected agent)] vs the image UUID.
-    let injects = parse_injects(inject)?;
-    let agent_hash = injects
-        .iter()
-        .find(|(g, _, _)| g == "usr/local/bin/virtkit-agent")
-        .map(|(_, h, _)| sha256_file(h))
-        .transpose()?;
-    let mut fp_parts: Vec<&str> = vec![tag.as_str()];
-    if let Some(h) = &agent_hash {
-        fp_parts.push(h.as_str());
-    }
-    let uuid = ensure::fingerprint(&fp_parts);
-    if !force && fleet::fs_uuid(out).as_deref() == Some(uuid.as_str()) {
-        println!("virtkit: {tag} fresh ({})", out.display());
-        return Ok(());
-    }
-
-    // 3. resolve the daemon tools (also gives us buildctl), then ensure a buildkitd
-    // unless told to just dial a given address.
-    let bk = buildkit::Buildkit::resolve(buildctl.as_deref(), buildkitd.as_deref())?;
-    let buildctl_bin = bk.buildctl.clone();
-    let addr = if *no_ensure_daemon {
-        buildkit_addr
-            .clone()
-            .context("--no-ensure-daemon needs --buildkit-addr")?
-    } else if let Some(a) = buildkit_addr {
-        a.clone()
-    } else {
-        bk.ensure()?
-    };
-
-    // 4. project the build args for buildctl.
-    let hashes_map: std::collections::HashMap<String, String> =
-        hashes.clone().into_iter().collect();
-    let proj = dockerhash::build_args_for(&analysis, &hashes_map, target, &user_args)?;
-
-    // 5. drive buildctl to a temp OCI archive.
-    let first = file.first().context("no -f Dockerfile")?;
-    let df_dir = first.parent().unwrap_or_else(|| Path::new("."));
-    let df_name = first
-        .file_name()
-        .context("Dockerfile path has no file name")?;
-    let ctx_dir = context.clone().unwrap_or_else(|| df_dir.to_path_buf());
-
-    std::fs::create_dir_all(out.parent().unwrap_or_else(|| Path::new(".")))
-        .with_context(|| format!("creating output dir for {}", out.display()))?;
-    let tmp_oci = out.with_extension("build.oci");
-    let _ = std::fs::remove_file(&tmp_oci);
-
-    let mut bc = std::process::Command::new(&buildctl_bin);
-    bc.arg("--addr").arg(&addr).arg("build");
-    bc.arg("--frontend").arg("dockerfile.v0");
-    bc.arg("--local")
-        .arg(format!("context={}", ctx_dir.display()));
-    bc.arg("--local")
-        .arg(format!("dockerfile={}", df_dir.display()));
-    bc.arg("--opt")
-        .arg(format!("filename={}", df_name.to_string_lossy()));
-    bc.arg("--opt").arg(format!("target={target}"));
-    for (k, v) in &proj {
-        bc.arg("--opt").arg(format!("build-arg:{k}={v}"));
-    }
-    if !add_host.is_empty() {
-        // buildkit wants HOST=IP entries comma-joined in one add-hosts opt.
-        let hosts = add_host.join(",");
-        bc.arg("--opt").arg(format!("add-hosts={hosts}"));
-    }
-    for l in label {
-        let (k, v) = l.split_once('=').unwrap_or((l.as_str(), ""));
-        bc.arg("--opt").arg(format!("label:{k}={v}"));
-    }
-    bc.arg("--output")
-        .arg(format!("type=oci,dest={}", tmp_oci.display()));
-
-    eprintln!("virtkit: building {tag} (target {target}) via {addr}");
-    let st = bc
-        .status()
-        .with_context(|| format!("running {}", buildctl_bin.display()))?;
-    if !st.success() {
-        let _ = std::fs::remove_file(&tmp_oci);
-        bail!("buildctl build failed ({st})");
-    }
-
-    // 6. OCI archive -> ext4, stamping the fingerprint UUID + name label.
-    let fsid = ext4::FsId {
-        uuid: parse_uuid(&uuid),
-        label: Some(name.clone()),
-        with_journal: true,
-    };
-    let inj: Vec<(&str, &Path, u16)> = injects
-        .iter()
-        .map(|(g, h, m)| (g.as_str(), h.as_path(), *m))
-        .collect();
-    let free_blocks = free_gib * (1024 * 1024 * 1024 / 4096);
-    let r = mkoci::archive_to_ext4(&tmp_oci, out, &inj, free_blocks, &fsid);
-    let _ = std::fs::remove_file(&tmp_oci);
-    r?;
-    println!("virtkit: built {tag} -> {} (uuid {uuid})", out.display());
-    Ok(())
-}
-
-/// sha256 hex of a host file's contents (the agent fingerprint part).
-fn sha256_file(path: &Path) -> anyhow::Result<String> {
-    use anyhow::Context;
-    use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let d = Sha256::digest(&bytes);
-    let mut s = String::with_capacity(64);
-    for b in d {
-        use std::fmt::Write;
-        write!(s, "{b:02x}").unwrap();
-    }
-    Ok(s)
 }
 
 fn fail(e: &anyhow::Error, code: i32) -> ExitCode {
