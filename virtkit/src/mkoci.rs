@@ -10,7 +10,8 @@
 //! ranges are indexed in one scan and read back by seeking.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom};
+use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -84,8 +85,9 @@ pub(crate) fn archive_to_ext4(
     extra_free_blocks: u64,
     fsid: &ext4::FsId,
 ) -> Result<()> {
-    // staging dir next to the output for the spooled archive, blob spill,
-    // flattened rootfs tar, and generated config files; removed on the way out.
+    // staging dir next to the output for the spooled archive, blob spill, and
+    // generated config files; removed on the way out. (The flattened rootfs is
+    // streamed straight into the ext4 builder, not staged.)
     let work = out.with_extension("mkoci.tmp");
     std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
     let r = build_inner(
@@ -151,24 +153,9 @@ fn build_inner(
     let manifest: Manifest = ar.read_json(&blob_path(&manifest_digest))?;
     let config: ConfigFile = ar.read_json(&blob_path(&manifest.config.digest))?;
 
-    // flatten layers in manifest order through the shared Merger.
-    let blob_spill = work.join("rootfs.blob");
-    let mut merger = Merger::new(&blob_spill)?;
-    for layer in &manifest.layers {
-        let (off, size) = ar.blob_range(&blob_path(&layer.digest))?;
-        ar.file.seek(SeekFrom::Start(off))?;
-        let reader = (&mut ar.file).take(size);
-        merger.apply_layer(reader, &layer.media_type)?;
-    }
-    let rootfs_tar = work.join("rootfs.tar");
-    let n = merger.finish(&rootfs_tar)?;
-    println!(
-        "virtkit: flattened {} layers -> {n} entries",
-        manifest.layers.len()
-    );
-
-    // auto-generate the three config files dropped by the layer flattening but
-    // restored at boot by the agent (VIRTKIT_MODE=service).
+    // Auto-generate the three config files (dropped by the layer flattening,
+    // restored at boot by the agent, VIRTKIT_MODE=service) up front, so they are
+    // ready as injects before we start streaming the rootfs.
     let ic = config.config.unwrap_or(ImageConfig {
         env: None,
         user: None,
@@ -203,7 +190,67 @@ fn build_inner(
     all.push(("etc/virtkit/user", user_file.as_path(), 0o644));
     all.push(("etc/virtkit/cmd", cmd_file.as_path(), 0o644));
 
-    ext4::build_from_tar_injecting(&rootfs_tar, &all, extra_free_blocks, fsid, out)
+    // flatten layers in manifest order through the shared Merger.
+    let blob_spill = work.join("rootfs.blob");
+    let mut merger = Merger::new(&blob_spill)?;
+    for layer in &manifest.layers {
+        let (off, size) = ar.blob_range(&blob_path(&layer.digest))?;
+        ar.file.seek(SeekFrom::Start(off))?;
+        let reader = (&mut ar.file).take(size);
+        merger.apply_layer(reader, &layer.media_type)?;
+    }
+
+    let layers_n = manifest.layers.len();
+    let entry_count = merger.entry_count();
+    // Sparse upper bound for the streamed ext4: file-content bytes + per-file
+    // block-rounding slack + a fixed margin (the image is sparse, so over-sizing
+    // is free). inodes: one per entry plus the injects and headroom.
+    let image_bytes = merger.data_bytes() + (entry_count as u64) * 4096 + 256 * 1024 * 1024;
+    let inodes = entry_count as u64 + all.len() as u64 + 4096;
+
+    // Stream the flattened rootfs straight from the Merger into the ext4 builder
+    // through an OS pipe — no intermediate rootfs tar on disk (saves a multi-GB
+    // write+read pass on large images). A writer thread emits the tar; this thread
+    // consumes it and writes the ext4.
+    let (rd, wr) = os_pipe()?;
+    let writer = std::thread::spawn(move || -> Result<usize> {
+        merger.finish_to(BufWriter::with_capacity(1 << 20, wr))
+    });
+    let build = ext4::build_from_tar_stream(
+        BufReader::with_capacity(1 << 20, rd),
+        &all,
+        image_bytes,
+        extra_free_blocks,
+        Some(inodes),
+        fsid,
+        out,
+    );
+    // Surface the build error first (a writer BrokenPipe would just be its symptom);
+    // otherwise propagate a merger failure. join() can't deadlock: when the ext4
+    // builder returns it has dropped the read end, so a still-writing merger unblocks
+    // with EPIPE.
+    let merged = writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("rootfs merger thread panicked"))?;
+    build?;
+    let n = merged?;
+    println!("virtkit: flattened {layers_n} layers -> {n} entries");
+    Ok(())
+}
+
+/// A unidirectional OS pipe as a (read, write) pair of owned files, for streaming
+/// the flattened rootfs from the merger thread into the ext4 builder.
+fn os_pipe() -> Result<(std::fs::File, std::fs::File)> {
+    let mut fds = [0i32; 2];
+    // SAFETY: pipe2(2) writes two fresh fds into the array on success. O_CLOEXEC
+    // keeps them from leaking into any concurrent fork+exec.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("creating pipe");
+    }
+    // SAFETY: both fds are freshly created and owned; wrap them in Files.
+    let read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let write = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    Ok((read, write))
 }
 
 const INDEX_PATH: &str = "index.json";

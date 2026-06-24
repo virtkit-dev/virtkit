@@ -161,11 +161,30 @@ impl Merger {
         Ok(())
     }
 
-    /// Write the merged set as a single rootfs tar; returns the entry count.
-    pub(crate) fn finish(mut self, out_tar: &Path) -> Result<usize> {
+    /// Total file-content bytes accumulated in the spill (an upper bound on the
+    /// rootfs data size, for sizing a streamed ext4).
+    pub(crate) fn data_bytes(&self) -> u64 {
+        self.off
+    }
+
+    /// Number of merged entries (files + dirs + links), for sizing the inode table.
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Write the merged set as a single rootfs tar to `out_tar`; returns the entry
+    /// count.
+    pub(crate) fn finish(self, out_tar: &Path) -> Result<usize> {
         let file = std::fs::File::create(out_tar)
             .with_context(|| format!("creating {}", out_tar.display()))?;
-        let mut builder = tar::Builder::new(file);
+        self.finish_to(file)
+    }
+
+    /// Write the merged set as a single rootfs tar to any writer; returns the entry
+    /// count. Lets the caller stream the flattened rootfs straight into the ext4
+    /// builder (via a pipe) instead of materialising an intermediate tar file.
+    pub(crate) fn finish_to<W: Write>(mut self, w: W) -> Result<usize> {
+        let mut builder = tar::Builder::new(w);
         let n = self.entries.len();
         // BTreeMap iterates in path order, so parents precede children
         let entries = std::mem::take(&mut self.entries);
