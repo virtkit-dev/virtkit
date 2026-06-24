@@ -63,15 +63,17 @@ impl Buildkit {
             .find(|p| p.is_file())
             .map_or_else(|| locate("buildkit-runc", None), Ok)?;
 
-        let data = std::env::var_os("XDG_DATA_HOME")
+        // The buildkit root is a purely regenerable, GC-bounded build cache, so it
+        // belongs under XDG_CACHE_HOME rather than XDG_DATA_HOME (persistent data).
+        let cache = std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|| home().join(".local/share"));
-        let root = data.join("virtkit-buildkit");
+            .unwrap_or_else(|| home().join(".cache"));
+        let root = cache.join("virtkit-buildkit");
         let runtime = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
         let sock = runtime.join("virtkit-buildkit.sock");
-        let config = data.join("virtkit-buildkit.gc.toml");
+        let config = cache.join("virtkit-buildkit.gc.toml");
 
         Ok(Buildkit {
             buildctl,
