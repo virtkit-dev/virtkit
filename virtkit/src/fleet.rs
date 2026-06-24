@@ -153,6 +153,9 @@ pub async fn run(
     vm: Option<VmOpts>,
     service_build: Option<PathBuf>,
     service_images: Vec<String>,
+    build_recipe: Option<crate::ensure::BuildRecipe>,
+    unit_targets: HashMap<String, String>,
+    agent: PathBuf,
     ensure_only: bool,
 ) -> Result<()> {
     let services: Vec<Service> = services
@@ -160,21 +163,45 @@ pub async fn run(
         .map(|s| Service::parse(s))
         .collect::<Result<_>>()?;
 
-    // Ensure each VM's ext4 is current before boot. The build script owns the
-    // staleness check (UUID compare via blkid) and fingerprint recipe, and exits
-    // 0 immediately when the image is fresh — no hardcoded input list here.
-    if let Some(b) = &vm
-        && let Some(script) = &b.build_script
-    {
-        crate::ensure::ensure_vm(script)?;
+    // Ensure each unit's ext4 is current before boot. With an in-process build
+    // recipe (--build-dockerfile) AND a --unit-target for the unit, build via the
+    // `virtkit build` machinery; otherwise fall back to the build script (which owns
+    // its own staleness check + fingerprint recipe and exits 0 when fresh).
+    let images = parse_service_images(&service_images)?;
+    // VM: build in-process when the recipe + a --unit-target for its name are present.
+    if let Some(b) = &vm {
+        match build_recipe.as_ref().zip(unit_targets.get(&b.name)) {
+            Some((recipe, target)) => {
+                // The VM has no --service-image; fall back to its name as the NAME.
+                let name = images
+                    .get(b.name.as_str())
+                    .map_or(b.name.as_str(), |r| crate::ensure::image_name(r));
+                crate::ensure::ensure_service_build(recipe, target, name, &b.ext4, &agent)?;
+            }
+            None => {
+                if let Some(script) = &b.build_script {
+                    crate::ensure::ensure_vm(script)?;
+                }
+            }
+        }
     }
-    if let Some(script) = &service_build {
-        let images = parse_service_images(&service_images)?;
-        for svc in &services {
-            let image = images
-                .get(svc.name.as_str())
-                .with_context(|| format!("no --service-image for service {}", svc.name))?;
-            crate::ensure::ensure_service(&svc.name, image, script)?;
+    for svc in &services {
+        match build_recipe.as_ref().zip(unit_targets.get(&svc.name)) {
+            Some((recipe, target)) => {
+                let image = images
+                    .get(svc.name.as_str())
+                    .with_context(|| format!("no --service-image for service {}", svc.name))?;
+                let name = crate::ensure::image_name(image);
+                crate::ensure::ensure_service_build(recipe, target, name, &svc.ext4, &agent)?;
+            }
+            None => {
+                if let Some(script) = &service_build {
+                    let image = images
+                        .get(svc.name.as_str())
+                        .with_context(|| format!("no --service-image for service {}", svc.name))?;
+                    crate::ensure::ensure_service(&svc.name, image, script)?;
+                }
+            }
         }
     }
     if ensure_only {

@@ -6,11 +6,14 @@
 //! image. This module just invokes the build script; the script exits 0 immediately
 //! when the image is already fresh.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
+
+use crate::build::{self, BuildSpec};
 
 fn sha256_hex(data: impl AsRef<[u8]>) -> String {
     let d = Sha256::digest(data);
@@ -49,6 +52,62 @@ pub fn ensure_service(name: &str, image: &str, build_script: &Path) -> Result<()
     run_build(build_script, &[image, name])
 }
 
+/// A fleet-level build recipe shared by every unit built in-process: the
+/// Dockerfile(s), context, and global build inputs. The per-unit `target` stage,
+/// tag NAME, output ext4 and injected agent are supplied per call.
+pub struct BuildRecipe {
+    pub dockerfiles: Vec<PathBuf>,
+    pub context: PathBuf,
+    pub build_args: BTreeMap<String, String>,
+    pub add_hosts: Vec<(String, String)>,
+    pub free_gib: u64,
+    pub buildkit_addr: Option<String>,
+    pub buildctl: Option<PathBuf>,
+    pub buildkitd: Option<PathBuf>,
+}
+
+/// Ensure a unit's ext4 in-process via the `virtkit build` machinery (instead of
+/// shelling to build-service-image.sh). `target` is the unit's Dockerfile stage,
+/// `name` the tag/label NAME (the `:<tag>`-stripped `--service-image` value), `out`
+/// the unit ext4, `agent` the static musl agent injected at the standard guest path.
+pub fn ensure_service_build(
+    recipe: &BuildRecipe,
+    target: &str,
+    name: &str,
+    out: &Path,
+    agent: &Path,
+) -> Result<()> {
+    let spec = BuildSpec {
+        dockerfiles: recipe.dockerfiles.clone(),
+        context: recipe.context.clone(),
+        target: target.to_string(),
+        name: name.to_string(),
+        out: out.to_path_buf(),
+        build_args: recipe.build_args.clone(),
+        add_hosts: recipe.add_hosts.clone(),
+        labels: Vec::new(),
+        injects: vec![(
+            "usr/local/bin/virtkit-agent".to_string(),
+            agent.to_path_buf(),
+            0o755,
+        )],
+        free_gib: recipe.free_gib,
+        buildkit_addr: recipe.buildkit_addr.clone(),
+        buildctl: recipe.buildctl.clone(),
+        buildkitd: recipe.buildkitd.clone(),
+        ensure_daemon: true,
+        force: false,
+    };
+    build::run(&spec)
+}
+
+/// Derive the tag/label NAME from a `--service-image NAME=<image-ref>` value by
+/// stripping the `:<tag>` suffix (e.g. `wabmysql-bookworm:716aecf` ->
+/// `wabmysql-bookworm`); no colon -> the value verbatim.
+pub fn image_name(image_ref: &str) -> &str {
+    image_ref.split_once(':').map_or(image_ref, |(n, _)| n)
+}
+
 fn run_build(script: &Path, args: &[&str]) -> Result<()> {
     let st = Command::new(script)
         .args(args)
@@ -77,5 +136,13 @@ mod tests {
         // deterministic + order-sensitive
         assert_eq!(fp, fingerprint(&["myservice:tag", "abc123"]));
         assert_ne!(fp, fingerprint(&["abc123", "myservice:tag"]));
+    }
+
+    #[test]
+    fn image_name_strips_tag_suffix() {
+        // `:<tag>` suffix dropped -> the tag/label NAME.
+        assert_eq!(image_name("wabmysql-bookworm:716aecf"), "wabmysql-bookworm");
+        // no colon -> verbatim passthrough.
+        assert_eq!(image_name("wabmysql-bookworm"), "wabmysql-bookworm");
     }
 }

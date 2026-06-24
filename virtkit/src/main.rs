@@ -142,6 +142,38 @@ enum Cmd {
         /// docker image a service ext4 is built from: name=ref (repeatable)
         #[arg(long = "service-image")]
         service_image: Vec<String>,
+        /// in-process build recipe: Dockerfile(s) to build units from (repeatable).
+        /// When given (with a matching --unit-target), the unit's ext4 is built
+        /// in-process instead of via the build script.
+        #[arg(long = "build-dockerfile")]
+        build_dockerfile: Vec<PathBuf>,
+        /// in-process build: context dir (default: the dir of the first --build-dockerfile)
+        #[arg(long = "build-context")]
+        build_context: Option<PathBuf>,
+        /// in-process build: build arg KEY=VAL (repeatable)
+        #[arg(long = "build-arg")]
+        build_arg: Vec<String>,
+        /// in-process build: extra host entry HOST=IP (repeatable)
+        #[arg(long = "build-add-host")]
+        build_add_host: Vec<String>,
+        /// in-process build: spare free space (GiB) left in each unit's filesystem
+        #[arg(long = "build-free-gib", default_value_t = 0)]
+        build_free_gib: u64,
+        /// in-process build: per-unit target stage NAME=STAGE (repeatable)
+        #[arg(long = "unit-target")]
+        unit_target: Vec<String>,
+        /// in-process build: dial this buildkit address instead of the ensured one
+        #[arg(long = "build-buildkit-addr")]
+        build_buildkit_addr: Option<String>,
+        /// in-process build: buildctl binary (default: next to virtkit, then PATH)
+        #[arg(long = "build-buildctl")]
+        build_buildctl: Option<PathBuf>,
+        /// in-process build: buildkitd binary (default: next to virtkit, then PATH)
+        #[arg(long = "build-buildkitd")]
+        build_buildkitd: Option<PathBuf>,
+        /// static (musl) virtkit-agent injected into each in-process-built ext4
+        #[arg(long = "agent", default_value = "/usr/local/lib/virtkit/virtkit-agent")]
+        agent: PathBuf,
         /// ensure the ext4 images are current (build the stale ones) and exit, without
         /// starting the switch or booting any VM
         #[arg(long)]
@@ -719,6 +751,16 @@ async fn main() -> ExitCode {
         service,
         service_build,
         service_image,
+        build_dockerfile,
+        build_context,
+        build_arg,
+        build_add_host,
+        build_free_gib,
+        unit_target,
+        build_buildkit_addr,
+        build_buildctl,
+        build_buildkitd,
+        agent,
         ensure_only,
         vm,
         vm_build,
@@ -811,6 +853,54 @@ async fn main() -> ExitCode {
             extra_symlinks: vm_symlink.clone(),
             ssh_keys: vm_ssh_keys.to_vec(),
         });
+        // In-process build recipe: present only when --build-dockerfile is given. The
+        // per-unit target stage map (--unit-target NAME=STAGE) selects which units
+        // build in-process; units without an entry fall back to the build script.
+        let build_recipe = if build_dockerfile.is_empty() {
+            None
+        } else {
+            let mut build_args = std::collections::BTreeMap::new();
+            for a in build_arg {
+                let (k, v) = a.split_once('=').unwrap_or((a.as_str(), ""));
+                build_args.insert(k.to_string(), v.to_string());
+            }
+            let mut add_hosts = Vec::new();
+            for h in build_add_host {
+                let (host, ip) = h.split_once('=').unwrap_or((h.as_str(), ""));
+                add_hosts.push((host.to_string(), ip.to_string()));
+            }
+            let context = build_context.clone().unwrap_or_else(|| {
+                build_dockerfile
+                    .first()
+                    .and_then(|p| p.parent())
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf()
+            });
+            Some(ensure::BuildRecipe {
+                dockerfiles: build_dockerfile.clone(),
+                context,
+                build_args,
+                add_hosts,
+                free_gib: *build_free_gib,
+                buildkit_addr: build_buildkit_addr.clone(),
+                buildctl: build_buildctl.clone(),
+                buildkitd: build_buildkitd.clone(),
+            })
+        };
+        let mut unit_targets = std::collections::HashMap::new();
+        for spec in unit_target {
+            match spec.split_once('=') {
+                Some((name, stage)) => {
+                    unit_targets.insert(name.to_string(), stage.to_string());
+                }
+                None => {
+                    return fail(
+                        &anyhow::anyhow!("bad --unit-target {spec:?} (want NAME=STAGE)"),
+                        2,
+                    );
+                }
+            }
+        }
         return match fleet::run(
             *gateway,
             *prefix,
@@ -823,6 +913,9 @@ async fn main() -> ExitCode {
             vm_opts,
             service_build.clone(),
             service_image.clone(),
+            build_recipe,
+            unit_targets,
+            agent.clone(),
             *ensure_only,
         )
         .await
