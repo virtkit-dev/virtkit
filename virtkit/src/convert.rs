@@ -1,13 +1,13 @@
 //! On-demand docker-image → bootable-bundle conversion, backing the
-//! `MICROVM_IMAGE: docker:<name>[:tag|@sha256:…]` form.
+//! `MICROVM_IMAGE: docker/<name>[:tag|@sha256:…]` form.
 //!
 //! The reference is resolved against the host-configured `[convert] repo`
-//! (the allowlist, same model as `[store]`), pulled through the host docker
+//! (the allowlist, same model as `[registry]`), pulled through the host docker
 //! daemon, and flattened into a bootable rootfs: the rootfs is cloned and mkfs'ed
 //! INSIDE a root container of the image itself (no host privileges), the agent is
 //! injected, and the image's whole Config.Env is captured for the agent to restore
 //! at boot. Conversions are cached under <state_dir>/converted/<name>/<digest>/ with
-//! the same pull lock + GC as the bundle store; the docker-side image is removed
+//! the same pull lock + GC as the bundle registry; the docker-side image is removed
 //! after a successful conversion so the daemon's store stays lean.
 //!
 //! Two flavours, auto-detected from the `/etc/runner-vm.boot` marker the guest boot
@@ -57,7 +57,7 @@ chown "$HOST_UID:$HOST_GID" /out/runner.ext4 /out/virtkit.env /out/virtkit.user
 
 pub fn resolve(ctx: &JobCtx, docker_ref: &str) -> Result<ResolvedImage> {
     let Some(cv) = &ctx.cfg.convert else {
-        bail!("MICROVM_IMAGE uses the docker: form but the host has no [convert] configured");
+        bail!("MICROVM_IMAGE uses the docker/ form but the host has no [convert] configured");
     };
     let (name, reference) = image::parse_ref(docker_ref)?;
     let digest = match &reference {
@@ -89,8 +89,8 @@ pub fn resolve(ctx: &JobCtx, docker_ref: &str) -> Result<ResolvedImage> {
         convert(&ctx.cfg, cv, &name, &digest, &dir)?;
         image::gc(&images_dir, &dir, cv.keep);
     }
-    let boot_kind = read_boot_kind(&dir);
-    println!("virtkit: image docker:{name}@{digest} (converted bundle, {boot_kind:?})");
+    let boot_kind = image::read_boot_kind(&dir);
+    println!("virtkit: image docker/{name}@{digest} (converted bundle, {boot_kind:?})");
     Ok(match boot_kind {
         // self-booting (systemd) guest: the image's own kernel + initrd if it
         // shipped one, otherwise the shared host kernel with no initrd
@@ -126,7 +126,7 @@ pub fn resolve(ctx: &JobCtx, docker_ref: &str) -> Result<ResolvedImage> {
 /// (recorded in `boot.kind`): only a self-booting systemd bundle carries its
 /// own kernel; generic bundles boot the shared pinned guest kernel.
 fn bundle_complete(dir: &Path) -> bool {
-    match read_boot_kind(dir) {
+    match image::read_boot_kind(dir) {
         // a systemd bundle always has the rootfs; vmlinuz/initrd only when the
         // image shipped its own kernel (else it boots the shared host kernel)
         BootKind::Systemd => dir.join("runner.ext4").is_file(),
@@ -276,21 +276,8 @@ fn image_is_systemd(cv: &Convert, img: &str, tmp: &Path) -> Result<bool> {
 /// Record the boot flavour in the bundle so a cache hit (which skips conversion)
 /// still knows how to boot it. Absent marker = systemd (older bundles).
 fn write_boot_kind(dir: &Path, kind: BootKind) -> Result<()> {
-    let tag = match kind {
-        BootKind::Systemd => "systemd",
-        BootKind::GenericCpio => "generic-cpio",
-        BootKind::GenericDisk => "generic-disk",
-    };
-    std::fs::write(dir.join("boot.kind"), tag)
+    std::fs::write(dir.join("boot.kind"), image::boot_kind_tag(kind))
         .with_context(|| format!("writing the boot marker in {}", dir.display()))
-}
-
-fn read_boot_kind(dir: &Path) -> BootKind {
-    match std::fs::read_to_string(dir.join("boot.kind")).as_deref() {
-        Ok("generic-cpio") => BootKind::GenericCpio,
-        Ok("generic-disk") => BootKind::GenericDisk,
-        _ => BootKind::Systemd,
-    }
 }
 
 /// Fingerprint of the host-side conversion inputs baked into the result; part

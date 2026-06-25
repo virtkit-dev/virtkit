@@ -73,6 +73,26 @@ pub fn resolve(ctx: &JobCtx) -> Result<Option<ResolvedImage>> {
     );
 }
 
+/// Read the boot flavour recorded in a bundle dir's `boot.kind` marker; an
+/// unknown/absent marker reads as systemd (older bundles).
+pub(crate) fn read_boot_kind(dir: &Path) -> BootKind {
+    match std::fs::read_to_string(dir.join("boot.kind")).as_deref() {
+        Ok("generic-cpio") => BootKind::GenericCpio,
+        Ok("generic-disk") => BootKind::GenericDisk,
+        _ => BootKind::Systemd,
+    }
+}
+
+/// The `boot.kind` marker string for a boot flavour (the value recorded in the
+/// bundle marker).
+pub(crate) fn boot_kind_tag(kind: BootKind) -> &'static str {
+    match kind {
+        BootKind::Systemd => "systemd",
+        BootKind::GenericCpio => "generic-cpio",
+        BootKind::GenericDisk => "generic-disk",
+    }
+}
+
 pub(crate) enum Reference {
     Tag(String),
     Digest(String),
