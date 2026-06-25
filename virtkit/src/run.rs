@@ -41,14 +41,15 @@ pub fn vsock_addr(ctx: &JobCtx) -> SocketAddr {
 }
 
 /// The shell stage scripts are piped into. The configured run_command (bash)
-/// targets the systemd guests; a generic OCI guest (alpine/distroless) has no
-/// bash, so fall back to POSIX sh there. prepare records the boot flavour in
-/// the job dir (run is a separate process and cannot recompute it cheaply).
+/// targets disk guests (the default bundle and systemd images); only a cpio/OCI
+/// guest (alpine/distroless in RAM) lacks bash, so fall back to POSIX sh there.
+/// prepare records the boot flavour in the job dir (run is a separate process and
+/// cannot recompute it cheaply).
 pub fn guest_shell(ctx: &JobCtx) -> Vec<String> {
-    let generic = std::fs::read_to_string(ctx.job_dir.join("boot.kind"))
-        .map(|s| s.trim() == "generic-init")
+    let cpio = std::fs::read_to_string(ctx.job_dir.join("boot.kind"))
+        .map(|s| s.trim() == "generic-cpio")
         .unwrap_or(false);
-    if generic {
+    if cpio {
         vec!["sh".into()]
     } else {
         ctx.cfg.guest.run_command.clone()

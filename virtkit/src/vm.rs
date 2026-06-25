@@ -55,8 +55,10 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             (kernel, Media::Initramfs { cpio: initramfs }, true)
         }
         None => {
-            // the baked default bundle (systemd + runner-vm-init), from [image].
-            // initrd is optional: a kernel-less guest boots the shared kernel.
+            // the baked default bundle from [image], booted as a generic disk guest:
+            // virtkit-agent is PID 1 on the ext4 root and serves the exec channel
+            // directly (no systemd handoff). initrd is optional — a kernel-less guest
+            // boots the shared kernel (virtio-blk + ext4 built in).
             let (Some(rootfs), Some(kernel)) = (cfg.image.rootfs.clone(), cfg.image.kernel.clone())
             else {
                 bail!("image.rootfs/kernel not configured (VIRTKIT_CONFIG)");
@@ -67,7 +69,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
                     rootfs,
                     initrd: cfg.image.initrd.clone(),
                 },
-                false,
+                true,
             )
         }
     };
@@ -98,10 +100,14 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     std::fs::create_dir_all(&ctx.job_dir)
         .with_context(|| format!("creating {}", ctx.job_dir.display()))?;
     // record the boot flavour for the run stage (a separate process) to pick the
-    // guest shell: a generic OCI guest has no bash.
+    // guest shell: a cpio/OCI guest (alpine/distroless in RAM) has no bash.
     let _ = std::fs::write(
         ctx.job_dir.join("boot.kind"),
-        if generic { "generic-init" } else { "systemd" },
+        match (generic, &media) {
+            (true, Media::Disk { .. }) => "generic-disk",
+            (true, Media::Initramfs { .. }) => "generic-cpio",
+            (false, _) => "systemd",
+        },
     );
 
     // Disk guests get a throwaway CoW overlay over the ro base; initramfs guests
@@ -119,23 +125,30 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         }
     }
 
-    let mut cmdline = if generic {
-        // virtkit-agent is PID 1 in the initramfs (no disk root); it reads the vsock
-        // port off the cmdline and serves directly (default mode).
-        format!(
+    let mut cmdline = match (generic, &media) {
+        // generic disk guest (the default bundle): virtkit-agent is PID 1 on the ext4
+        // root (virtio-blk + ext4 built into the pinned kernel) and serves the exec
+        // channel directly — no systemd.
+        (true, Media::Disk { .. }) => format!(
+            "console=ttyS0 root=/dev/vda rw rootfstype=ext4 init=/usr/local/bin/virtkit-agent \
+             VIRTKIT_HOSTNAME={} VIRTKIT_VSOCK_PORT={}",
+            cfg.vm.hostname, cfg.vm.vsock_port
+        ),
+        // generic cpio guest: virtkit-agent is PID 1 in the initramfs (no disk root)
+        // and serves directly.
+        (true, Media::Initramfs { .. }) => format!(
             "console=ttyS0 rdinit=/usr/local/bin/virtkit-agent VIRTKIT_HOSTNAME={} \
              VIRTKIT_VSOCK_PORT={}",
             cfg.vm.hostname, cfg.vm.vsock_port
-        )
-    } else {
+        ),
         // self-booting image: virtkit-agent is PID 1, execs the image's captured
         // entrypoint (VIRTKIT_MODE=service) which brings up systemd; the in-guest
         // serve agent then runs as a systemd unit.
-        format!(
+        (false, _) => format!(
             "console=ttyS0 root=/dev/vda rw rootfstype=ext4 init=/usr/local/bin/virtkit-agent \
              VIRTKIT_MODE=service VIRTKIT_HOSTNAME={}",
             cfg.vm.hostname
-        )
+        ),
     };
 
     let mut fs_args: Vec<String> = Vec::new();
@@ -277,7 +290,10 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
 
     println!(
         "virtkit: booting microVM (cpus={cpus}, mem={mem}, {})",
-        if generic { "cpio initramfs" } else { "disk" }
+        match &media {
+            Media::Disk { .. } => "disk",
+            Media::Initramfs { .. } => "cpio initramfs",
+        }
     );
 
     // Ready = the in-guest virtkit-agent answers on vsock (systemd is up, the agent

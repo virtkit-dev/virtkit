@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- The default guest bundle now boots as a generic, agent-served disk guest
+  (virtkit-agent is PID 1 on the ext4 root and serves the exec channel over vsock)
+  instead of a self-booting systemd image. The run stage falls back to POSIX `sh`
+  only for cpio/OCI guests; disk guests keep the configured `run_command` (bash).
+
 ## [0.1.6] - 2026-06-24
 
 ### Changed
