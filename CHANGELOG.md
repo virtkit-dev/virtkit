@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-06-25
+
 ### Added
 
 - Native OCI bundle registry: `virtkit registry push <dir> <name>:<tag>` and `virtkit
@@ -157,7 +159,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/wallix/virtkit/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/wallix/virtkit/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/wallix/virtkit/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/wallix/virtkit/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/wallix/virtkit/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/wallix/virtkit/compare/v0.1.3...v0.1.4
