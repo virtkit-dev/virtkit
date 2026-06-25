@@ -29,6 +29,7 @@ mod image;
 mod initramfs;
 mod jobctx;
 mod launch;
+mod local;
 mod mkoci;
 mod net;
 mod oci;

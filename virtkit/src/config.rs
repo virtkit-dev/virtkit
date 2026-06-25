@@ -21,7 +21,6 @@ pub struct Config {
     pub qemu_img: Option<PathBuf>,
     /// virtiofsd binary, only needed when [share] is set
     pub virtiofsd: Option<PathBuf>,
-    pub image: Image,
     pub vm: Vm,
     pub guest: Guest,
     /// Dev only: host dir shared as the guest's /workdir over virtio-fs (the POC
@@ -37,6 +36,9 @@ pub struct Config {
     /// `MICROVM_IMAGE: registry/<name>[:tag|@sha256:…]` form; absent = that form
     /// is rejected
     pub registry: Option<Registry>,
+    /// Local guest bundles on the host filesystem, backing the
+    /// `MICROVM_IMAGE: local/<name>` form (and the `local/default` default).
+    pub local: Local,
     /// CI `services:` support: each declared service runs as a container inside
     /// the job VM, its image pulled through the host registry proxy over a vsock
     /// forward (so the registry credential never enters the guest). Absent = a
@@ -44,41 +46,26 @@ pub struct Config {
     pub services: Option<Services>,
 }
 
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct Image {
-    /// Read-only ext4 rootfs (build-image.sh bundle); each job boots a throwaway
-    /// qcow2 overlay backed by it
-    pub rootfs: Option<PathBuf>,
-    pub kernel: Option<PathBuf>,
-    pub initrd: Option<PathBuf>,
-}
-
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Registry {
-    /// Registry repository prefix for the bundles — fixed host side: the
-    /// allowlist (jobs only pick name[:ref]), e.g. "registry.example.com/team"
-    pub repo: String,
-    /// PEM CA bundle the registry's TLS cert chains to (rustls; the binary stays
-    /// musl-static). Absent = the system roots.
-    #[serde(default)]
-    pub ca_file: Option<PathBuf>,
-    /// Registry credentials (empty username = anonymous)
-    #[serde(default)]
-    pub username: String,
-    #[serde(default)]
-    pub password_file: Option<PathBuf>,
-    /// Plain HTTP registry (a local/insecure registry); default TLS
-    #[serde(default)]
-    pub insecure: bool,
+#[serde(deny_unknown_fields, default)]
+pub struct Local {
+    /// Directory of local guest bundles: each `<dir>/<name>/` is a bundle
+    /// (`runner.ext4` + `boot.kind` [+ `vmlinuz` + `initrd.img`]). Unset =
+    /// `<state_dir>/images` (see `Local::dir`).
+    pub dir: Option<PathBuf>,
     /// Pinned guest kernel for generic (kernel-less) bundles — the shared vmlinux
     /// with virtio + ext4 built in, booted directly when a bundle ships no kernel.
     #[serde(default = "default_generic_kernel")]
     pub generic_kernel: PathBuf,
-    /// Cached pulled bundles kept per image
-    #[serde(default = "default_keep")]
-    pub keep: u32,
+}
+
+impl Default for Local {
+    fn default() -> Self {
+        Local {
+            dir: None,
+            generic_kernel: default_generic_kernel(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,7 +161,7 @@ pub struct Convert {
     /// (false). Disk suits larger images; RAM is faster for small ones.
     #[serde(default)]
     pub generic_disk: bool,
-    /// tag → digest resolution (same wiring as [store])
+    /// tag → digest resolution (same wiring as [registry])
     #[serde(default = "default_oras")]
     pub oras: PathBuf,
     #[serde(default)]
@@ -209,6 +196,37 @@ fn default_oras() -> PathBuf {
 }
 fn default_keep() -> u32 {
     3
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Registry {
+    /// Registry repository prefix for the bundles — fixed host side: the
+    /// allowlist (jobs only pick name[:ref]), e.g. "registry.example.com/team"
+    pub repo: String,
+    /// PEM CA bundle the registry's TLS cert chains to (rustls; the binary stays
+    /// musl-static). Absent = the system roots.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// HTTP Basic username. Empty = anonymous (no Authorization header sent).
+    #[serde(default)]
+    pub username: String,
+    /// Path to a file holding the Basic-auth password — the secret stays OUT of
+    /// this config; it is read at runtime (trailing newline trimmed) only when
+    /// `username` is set. Provision it out of band with restrictive perms (0600).
+    /// Sent over the (TLS, see `ca_file`) connection; pair with an HTTPS `repo`.
+    #[serde(default)]
+    pub password_file: Option<PathBuf>,
+    /// Plain HTTP registry (a local/insecure registry); default TLS
+    #[serde(default)]
+    pub insecure: bool,
+    /// Pinned guest kernel for generic (kernel-less) bundles — the shared vmlinux
+    /// with virtio + ext4 built in, booted directly when a bundle ships no kernel.
+    #[serde(default = "default_generic_kernel")]
+    pub generic_kernel: PathBuf,
+    /// Cached pulled bundles kept per image
+    #[serde(default = "default_keep")]
+    pub keep: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -306,6 +324,14 @@ impl Config {
         self.state_dir
             .as_deref()
             .unwrap_or(Path::new("/var/lib/virtkit"))
+    }
+
+    /// The local-bundles directory: `[local] dir` if set, else `<state_dir>/images`.
+    pub fn local_dir(&self) -> PathBuf {
+        match &self.local.dir {
+            Some(dir) => dir.clone(),
+            None => self.state_dir().join("images"),
+        }
     }
 
     pub fn cloud_hypervisor(&self) -> &Path {

@@ -42,35 +42,16 @@ impl Media {
 
 pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     let cfg = &ctx.cfg;
-    // MICROVM_IMAGE (OCI store) wins; the static [image] paths are the default
-    let resolved = crate::image::resolve(ctx)?;
-    let (kernel, media, generic) = match resolved {
-        Some(ResolvedImage::Disk {
+    // MICROVM_IMAGE selects the guest image (prefix-based); unset = local/default.
+    let (kernel, media, generic) = match crate::image::resolve(ctx)? {
+        ResolvedImage::Disk {
             rootfs,
             kernel,
             initrd,
             generic,
-        }) => (kernel, Media::Disk { rootfs, initrd }, generic),
-        Some(ResolvedImage::Initramfs { kernel, initramfs }) => {
+        } => (kernel, Media::Disk { rootfs, initrd }, generic),
+        ResolvedImage::Initramfs { kernel, initramfs } => {
             (kernel, Media::Initramfs { cpio: initramfs }, true)
-        }
-        None => {
-            // the baked default bundle from [image], booted as a generic disk guest:
-            // virtkit-agent is PID 1 on the ext4 root and serves the exec channel
-            // directly (no systemd handoff). initrd is optional — a kernel-less guest
-            // boots the shared kernel (virtio-blk + ext4 built in).
-            let (Some(rootfs), Some(kernel)) = (cfg.image.rootfs.clone(), cfg.image.kernel.clone())
-            else {
-                bail!("image.rootfs/kernel not configured (VIRTKIT_CONFIG)");
-            };
-            (
-                kernel,
-                Media::Disk {
-                    rootfs,
-                    initrd: cfg.image.initrd.clone(),
-                },
-                true,
-            )
         }
     };
     // generic guests (cpio, or ext4 on the pinned guest kernel) boot virtkit-agent as PID 1;

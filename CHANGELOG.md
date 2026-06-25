@@ -14,6 +14,14 @@ All notable changes to virtkit will be documented in this file.
   compressed bytes, so bundles that share data share blobs: pushes skip blobs the
   registry already has, and pulls skip chunks already in a local content-addressed
   cache. A new `[registry]` config section (registry repo allowlist + auth/TLS) gates it.
+- New `local/` source for guest bundles baked on the host filesystem, configured by a
+  new `[local]` section (`dir`, defaulting to `<state_dir>/images`, + `generic_kernel`).
+  Each `<dir>/<name>/` is a bundle resolved straight from disk (no fetch).
+- `MICROVM_IMAGE` is now fully prefix-based (the prefix names the source, split on the
+  first `/`): `local/<name>` (a `[local]` bundle), `registry/<name>[:tag|@sha256:…]` (a
+  `[registry]` bundle, pulled+cached like `[convert]` caches conversions), or
+  `docker/<name>[:tag|@sha256:…]` (an on-demand `[convert]` conversion). Unset =
+  `local/default`.
 
 ### Changed
 
@@ -21,6 +29,11 @@ All notable changes to virtkit will be documented in this file.
   (virtkit-agent is PID 1 on the ext4 root and serves the exec channel over vsock)
   instead of a self-booting systemd image. The run stage falls back to POSIX `sh`
   only for cpio/OCI guests; disk guests keep the configured `run_command` (bash).
+- **Breaking:** the `MICROVM_IMAGE: default` keyword AND the single `[image]` config
+  section are both removed. The builtin bundle is replaced by the `[local]` source: a
+  default guest is now the `local/default` bundle (selected by leaving `MICROVM_IMAGE`
+  unset, or explicitly). A bare `<name>` is no longer a registry image — registry
+  bundles now require the explicit `registry/` prefix.
 
 ## [0.1.6] - 2026-06-24
 

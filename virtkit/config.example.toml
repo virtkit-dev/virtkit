@@ -6,14 +6,6 @@
 # qemu_img = "qemu-img"
 # virtiofsd = "/usr/local/bin/virtiofsd"      # external virtiofsd (default: bundled)
 
-[image]
-# A bootable guest bundle, booted ro with a per-job qcow2 overlay. kernel = the shared
-# guest kernel (guest carries none); initrd only if the image ships one.
-# These are static installed artifacts → /usr/local/lib/virtkit/ (not under state_dir).
-rootfs = "/usr/local/lib/virtkit/images/default/rootfs.ext4"
-kernel = "/usr/local/lib/virtkit/vmlinux"
-# initrd = "/usr/local/lib/virtkit/images/default/initrd.img"
-
 [vm]
 # cpus = 4
 # mem = "4G"           # lazily allocated (memfd); size it for the job + [guest] tmpfs
@@ -54,10 +46,34 @@ kernel = "/usr/local/lib/virtkit/vmlinux"
 # count = 32
 # subnet = "192.168.231.0/24"
 
-# [convert]              # docker images → bootable bundles on demand: the only
-#                        # registry-backed guest source. MICROVM_IMAGE is either
-#                        # `default` (the builtin [image] bundle, bootstrap guest)
-#                        # or `docker/<name>[:tag|@digest]`.
+# MICROVM_IMAGE is prefix-based (the prefix names the source): unset = local/default;
+# `local/<name>` = a bundle dir under [local] dir; `registry/<name>[:tag|@digest]` =
+# a [registry] bundle; `docker/<name>[:tag|@digest]` = an on-demand [convert]
+# conversion.
+
+# [local]                # local guest bundles on the host filesystem. Each
+#                        # <dir>/<name>/ is a baked bundle (runner.ext4 + boot.kind
+#                        # [+ vmlinuz + initrd.img]). Backs the local/<name> form.
+# dir = "/usr/local/lib/virtkit/images"   # default: <state_dir>/images
+# generic_kernel = "/usr/local/lib/virtkit/vmlinux"  # shared kernel for
+#                                  # generic (kernel-less) bundles
+
+# [registry]             # native OCI bundle registry: push/pull guest bundles with
+#                        # content-defined chunk dedup (CDC + per-chunk zstd), no
+#                        # oras, no docker. Backs the registry/<name> MICROVM_IMAGE form.
+# repo = "registry.example.com/team"   # fixed host-side = the image allowlist
+# ca_file = "/etc/virtkit/registry-ca.crt"  # PEM CA the registry TLS chains to
+# username = "ci-push"             # HTTP Basic; empty = anonymous (no auth)
+# password_file = "/etc/virtkit/registry-password"   # file holding the password
+#                                  # (kept out of this config); read at runtime,
+#                                  # provision it 0600. Sent over TLS — see ca_file.
+# insecure = false                 # plain HTTP (a local/insecure registry)
+# generic_kernel = "/usr/local/lib/virtkit/vmlinux"  # shared kernel for
+#                                  # generic (kernel-less) bundles
+# keep = 3                         # cached pulled bundles per image (GC)
+
+# [convert]              # docker images → bootable bundles on demand. MICROVM_IMAGE
+#                        # is `docker/<name>[:tag|@digest]`.
 # repo = "registry.example.com/team"   # fixed host-side = the image allowlist
 # docker = "/usr/bin/docker"       # host daemon: pull + the root conversion container
 # agent = "/usr/local/lib/virtkit/virtkit-agent"  # the agent, injected as PID 1

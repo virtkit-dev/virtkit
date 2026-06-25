@@ -65,7 +65,9 @@ virtkit oci-pull alpine:3.21 rootfs.tar
 
 # Push/pull a guest bundle to an OCI registry with content-defined chunk dedup
 # (CDC + per-chunk zstd; needs a [registry] config). push takes a :tag; pull prints
-# the resolved cache dir:
+# the resolved cache dir. Auth is HTTP Basic from [registry]: `username` +
+# `password_file` (the password lives in that 0600 file, not in the config), over
+# TLS (`ca_file` for a private CA); an empty username means anonymous.
 virtkit registry push ./bundle-dir runner:20260625
 virtkit registry pull runner:20260625
 ```
@@ -106,9 +108,10 @@ Minimal `config.toml`:
 ```toml
 state_dir = "/var/lib/virtkit"
 
-[image]
-rootfs  = "/usr/local/lib/virtkit/images/default/rootfs.ext4"
-kernel  = "/usr/local/lib/virtkit/vmlinux"
+[local]
+# baked guest bundles live under <dir>/<name>/; the default guest is local/default
+dir = "/usr/local/lib/virtkit/images"
+generic_kernel = "/usr/local/lib/virtkit/vmlinux"
 
 [net]
 mode = "pool"
@@ -137,15 +140,24 @@ Exit codes follow the custom-executor contract: script failures exit with
 
 #### Guest image selection
 
-With a `[store]` configured, jobs pick their image:
+`MICROVM_IMAGE` is prefix-based — the part before the first `/` names the source:
+
+- unset → `local/default`.
+- `local/<name>` — a bundle directory under `[local] dir` (`<dir>/<name>/`), resolved
+  straight from disk. `<name>` is a single safe component; local bundles are never
+  tagged or digested.
+- `registry/<name>[:tag|@sha256:…]` — a bundle in the `[registry]` repo, pulled+cached
+  natively with content-defined chunk dedup (CDC + per-chunk zstd).
+- `docker/<name>[:tag|@sha256:…]` — an on-demand `[convert]` conversion of a docker
+  image (see below).
 
 ```yaml
 my-job:
   variables:
-    MICROVM_IMAGE: myimage     # :tag (default latest) or @sha256:…
+    MICROVM_IMAGE: registry/myimage     # :tag (default latest) or @sha256:…
 ```
 
-With `[convert]` configured, `MICROVM_IMAGE: docker:<name>[:tag|@sha256:…]`
+With `[convert]` configured, `MICROVM_IMAGE: docker/<name>[:tag|@sha256:…]`
 boots a Docker image on demand: the executor resolves the tag, pulls the image
 through the host daemon, and streams it into a sparse ext4 (injecting
 `virtkit-agent` as PID 1). Conversions are cached and GC'd; staleness is a

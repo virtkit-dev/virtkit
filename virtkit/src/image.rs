@@ -1,14 +1,20 @@
 //! MICROVM_IMAGE resolution.
 //!
-//! Jobs select a guest image with `MICROVM_IMAGE`:
-//!   - `default` — the builtin bundle baked into the runner host (the static
-//!     `[image]` paths): the bootstrap guest, never fetched from a registry.
+//! `MICROVM_IMAGE` is prefix-based: the part before the first `/` names the
+//! source, the rest is source-specific. Jobs select a guest image with it:
+//!   - unset — treated as `local/default`.
+//!   - `local/<name>` — a bundle directory under the host-configured
+//!     `[local] dir` (see local.rs). `<name>` is a single safe path component;
+//!     local bundles are never tagged or digested.
+//!   - `registry/<name>[:tag|@sha256:…]` — a bundle in the host-configured
+//!     `[registry] repo` (the allowlist), pulled+cached natively with CDC+zstd
+//!     chunk dedup (see registry.rs). Only the name/reference is job-controlled.
 //!   - `docker/<name>[:tag|@sha256:…]` — a docker image of the host-configured
 //!     `[convert] repo` (the allowlist), turned into a bootable bundle on demand
 //!     (see convert.rs). Only the name/reference is job-controlled.
 //!
 //! This module is the thin dispatcher plus the reference-parsing, oras and
-//! local-cache helpers shared with the conversion path.
+//! local-cache helpers shared with the conversion, registry and local paths.
 
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::OsStrExt;
@@ -51,26 +57,31 @@ pub enum ResolvedImage {
     Initramfs { kernel: PathBuf, initramfs: PathBuf },
 }
 
-/// Resolve the job's MICROVM_IMAGE, if any. None = no variable set, the
-/// caller falls back to the static [image] paths.
-pub fn resolve(ctx: &JobCtx) -> Result<Option<ResolvedImage>> {
-    let Some(image_ref) = ctx.image_ref.as_deref() else {
-        return Ok(None);
+/// Resolve the job's MICROVM_IMAGE to a concrete bootable image. The variable is
+/// prefix-based (the prefix names the source, split on the FIRST `/`); unset is
+/// treated as `local/default`.
+pub fn resolve(ctx: &JobCtx) -> Result<ResolvedImage> {
+    let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
+    let Some((prefix, rest)) = image_ref.split_once('/') else {
+        bail!(
+            "invalid MICROVM_IMAGE {image_ref:?} (want local/<name>, \
+             registry/<name>[:tag|@sha256:…], or docker/<name>[:tag|@sha256:…])"
+        );
     };
-    // `default` = the builtin host bundle, never the registry: the bootstrap
-    // guest, works with no registry access and cannot be silently overridden.
-    if image_ref == "default" {
-        println!("virtkit: image default (builtin host bundle)");
-        return Ok(None);
+    match prefix {
+        // local/<name> = a bundle directory under [local] dir.
+        "local" => crate::local::resolve(ctx, rest),
+        // registry/<name>[:tag|@digest] = a bundle in the [registry] repo,
+        // pulled+cached natively (CDC+zstd chunk dedup).
+        "registry" => crate::registry::resolve(ctx, rest),
+        // docker/<name>[:tag|@digest] = a docker image of the [convert] repo,
+        // turned into a bootable bundle on demand (digest-keyed local cache).
+        "docker" => crate::convert::resolve(ctx, rest),
+        _ => bail!(
+            "invalid MICROVM_IMAGE {image_ref:?} (want local/<name>, \
+             registry/<name>[:tag|@sha256:…], or docker/<name>[:tag|@sha256:…])"
+        ),
     }
-    // docker/<name>[:tag|@digest] = a docker image of the [convert] repo, turned
-    // into a bootable bundle on demand (digest-keyed local cache).
-    if let Some(docker_ref) = image_ref.strip_prefix("docker/") {
-        return crate::convert::resolve(ctx, docker_ref).map(Some);
-    }
-    bail!(
-        "invalid MICROVM_IMAGE {image_ref:?} (want `default` or `docker/<name>[:tag|@sha256:…]`)"
-    );
 }
 
 /// Return a `ResolvedImage` from a cached/baked bundle dir, shared by the
@@ -110,8 +121,8 @@ pub(crate) fn resolved_from_dir(
     }
 }
 
-/// Read the boot flavour recorded in a bundle dir's `boot.kind` marker; an
-/// unknown/absent marker reads as systemd (older bundles).
+/// Read the boot flavour from a bundle dir (matching `convert::read_boot_kind`'s
+/// tags); an unknown/absent marker reads as systemd.
 pub(crate) fn read_boot_kind(dir: &Path) -> BootKind {
     match std::fs::read_to_string(dir.join("boot.kind")).as_deref() {
         Ok("generic-cpio") => BootKind::GenericCpio,
@@ -120,8 +131,8 @@ pub(crate) fn read_boot_kind(dir: &Path) -> BootKind {
     }
 }
 
-/// The `boot.kind` marker string for a boot flavour (the value recorded in the
-/// bundle marker).
+/// The `boot.kind` marker string for a boot flavour (the value the registry
+/// config blob and the bundle marker record).
 pub(crate) fn boot_kind_tag(kind: BootKind) -> &'static str {
     match kind {
         BootKind::Systemd => "systemd",
@@ -295,14 +306,13 @@ mod tests {
 
     #[test]
     fn parse_refs() {
-        // bare `default` never reaches parse_ref (resolve() short-circuits it
-        // to the builtin bundle); any other bare name defaults to :latest
+        // a bare name defaults to :latest
         let (n, r) = parse_ref("myimage").unwrap();
         assert_eq!(n, "myimage");
         assert!(matches!(r, Reference::Tag(t) if t == "latest"));
 
-        let (n, r) = parse_ref("default:20260610-abc").unwrap();
-        assert_eq!(n, "default");
+        let (n, r) = parse_ref("runner:20260610-abc").unwrap();
+        assert_eq!(n, "runner");
         assert!(matches!(r, Reference::Tag(t) if t == "20260610-abc"));
 
         let digest = format!("sha256:{}", "a".repeat(64));
