@@ -33,6 +33,10 @@ pub struct Config {
     /// `MICROVM_IMAGE: docker/<name>[:tag|@sha256:…]` form; absent = that
     /// form is rejected
     pub convert: Option<Convert>,
+    /// Native OCI bundle registry (push/pull with CDC+zstd chunk dedup), backing the
+    /// `MICROVM_IMAGE: registry/<name>[:tag|@sha256:…]` form; absent = that form
+    /// is rejected
+    pub registry: Option<Registry>,
     /// CI `services:` support: each declared service runs as a container inside
     /// the job VM, its image pulled through the host registry proxy over a vsock
     /// forward (so the registry credential never enters the guest). Absent = a
@@ -48,6 +52,33 @@ pub struct Image {
     pub rootfs: Option<PathBuf>,
     pub kernel: Option<PathBuf>,
     pub initrd: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Registry {
+    /// Registry repository prefix for the bundles — fixed host side: the
+    /// allowlist (jobs only pick name[:ref]), e.g. "registry.example.com/team"
+    pub repo: String,
+    /// PEM CA bundle the registry's TLS cert chains to (rustls; the binary stays
+    /// musl-static). Absent = the system roots.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// Registry credentials (empty username = anonymous)
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password_file: Option<PathBuf>,
+    /// Plain HTTP registry (a local/insecure registry); default TLS
+    #[serde(default)]
+    pub insecure: bool,
+    /// Pinned guest kernel for generic (kernel-less) bundles — the shared vmlinux
+    /// with virtio + ext4 built in, booted directly when a bundle ships no kernel.
+    #[serde(default = "default_generic_kernel")]
+    pub generic_kernel: PathBuf,
+    /// Cached pulled bundles kept per image
+    #[serde(default = "default_keep")]
+    pub keep: u32,
 }
 
 #[derive(Debug, Deserialize)]

@@ -32,6 +32,7 @@ mod launch;
 mod mkoci;
 mod net;
 mod oci;
+mod registry;
 mod run;
 mod services;
 mod source;
@@ -73,12 +74,35 @@ enum GitlabCmd {
 }
 
 #[derive(Subcommand)]
+enum RegistryCmd {
+    /// Push a local bundle dir (runner.ext4 + boot.kind [+ vmlinuz + initrd.img])
+    /// to the [registry] repo at <name>:<tag>, with CDC+zstd chunk dedup.
+    Push {
+        /// Local bundle directory
+        dir: PathBuf,
+        /// Target reference, <name>:<tag> (a :tag is required for a push)
+        reference: String,
+    },
+    /// Pull+cache a bundle from the [registry] repo and print its cache dir.
+    Pull {
+        /// Source reference, <name>[:tag|@sha256:…]
+        reference: String,
+    },
+}
+
+#[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// GitLab custom-executor lifecycle (config / prepare / run / cleanup)
     Gitlab {
         #[command(subcommand)]
         cmd: GitlabCmd,
+    },
+    /// Native OCI bundle registry: push/pull guest bundles with content-defined chunk
+    /// deduplication (CDC + per-chunk zstd), no oras, no docker.
+    Registry {
+        #[command(subcommand)]
+        cmd: RegistryCmd,
     },
     /// Host side of a forward (companion of `virtkit-agent forward`): accept on
     /// `--listen` and splice each connection to `--to`, opaque to the protocol.
@@ -731,6 +755,22 @@ async fn main() -> ExitCode {
             Err(e) => fail(&e, 1),
         };
     }
+    if let Cmd::Registry { cmd } = &cli.cmd {
+        return match cmd {
+            RegistryCmd::Push { dir, reference } => match registry::push(&cfg, dir, reference) {
+                Ok(_digest) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, 1),
+            },
+            // pull consumes cfg (it builds a throwaway JobCtx to share the cache layout)
+            RegistryCmd::Pull { reference } => match registry::pull(cfg, reference) {
+                Ok(dir) => {
+                    println!("{}", dir.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(&e, 1),
+            },
+        };
+    }
     if let Cmd::Switch {
         listen,
         gateway,
@@ -1046,7 +1086,8 @@ async fn main() -> ExitCode {
             }
         }
         // handled above, before JobCtx
-        Cmd::Switch { .. }
+        Cmd::Registry { .. }
+        | Cmd::Switch { .. }
         | Cmd::Fleet { .. }
         | Cmd::Launch { .. }
         | Cmd::Mkext { .. }

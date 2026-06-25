@@ -73,6 +73,43 @@ pub fn resolve(ctx: &JobCtx) -> Result<Option<ResolvedImage>> {
     );
 }
 
+/// Return a `ResolvedImage` from a cached/baked bundle dir, shared by the
+/// registry and local paths: Disk vs Initramfs from the recorded `boot.kind`,
+/// and which kernel/initrd files the bundle ships. `generic_kernel` is the
+/// shared pinned kernel a kernel-less bundle boots.
+pub(crate) fn resolved_from_dir(
+    generic_kernel: &Path,
+    dir: &Path,
+    kind: BootKind,
+) -> ResolvedImage {
+    let rootfs = dir.join("runner.ext4");
+    let vmlinuz = dir.join("vmlinuz");
+    match kind {
+        // self-booting (systemd): the image's own kernel + initrd if it shipped
+        // one, otherwise the shared host kernel with no initrd.
+        BootKind::Systemd => {
+            let (kernel, initrd) = if vmlinuz.is_file() {
+                (vmlinuz, Some(dir.join("initrd.img")))
+            } else {
+                (generic_kernel.to_path_buf(), None)
+            };
+            ResolvedImage::Disk {
+                rootfs,
+                kernel,
+                initrd,
+                generic: false,
+            }
+        }
+        // generic: the pinned shared kernel (virtio + ext4 built in, no initrd).
+        BootKind::GenericDisk | BootKind::GenericCpio => ResolvedImage::Disk {
+            rootfs,
+            kernel: generic_kernel.to_path_buf(),
+            initrd: None,
+            generic: true,
+        },
+    }
+}
+
 /// Read the boot flavour recorded in a bundle dir's `boot.kind` marker; an
 /// unknown/absent marker reads as systemd (older bundles).
 pub(crate) fn read_boot_kind(dir: &Path) -> BootKind {

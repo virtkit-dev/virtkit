@@ -37,6 +37,12 @@ flate2 = "1"
 # docker-hash: content hashing of a (Dockerfile, stage) for image-tag resolution
 sha2 = "0.11"
 regex = "1"
+# native OCI bundle store (registry.rs): content-defined chunking of runner.ext4 for
+# block-level dedup, each chunk zstd-compressed independently. fastcdc is pure Rust;
+# zstd vendors its C (gcc/musl-dev are in the build image), so the binary stays
+# musl-static.
+fastcdc = "3"
+zstd = "0.13"
 # tokio features are member-specific; only the version is pinned here.
 tokio = { version = "1" }
 toml = "1"

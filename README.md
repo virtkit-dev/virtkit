@@ -56,7 +56,9 @@ base-image digest and the apk pins together.
 - `gitlab config` / `gitlab prepare` / `gitlab run` / `gitlab cleanup` — the GitLab custom-executor lifecycle.
 - `switch` — the userspace L2 network gateway (run in-process by `fleet`).
 - `mkext-tar` / `mkext` — build an ext4 image from a rootfs tar / directory.
-- `convert` / `oci-pull` — pull and convert OCI images to bootable bundles.
+- `oci-pull` — pull and flatten an OCI image to a rootfs tar.
+- `registry push` / `registry pull` — push/pull guest bundles to/from an OCI registry
+  with content-defined chunk dedup (CDC + per-chunk zstd).
 - `virtiofsd` — the bundled vhost-user virtio-fs daemon.
 - `forward` / `launch` — byte forwarder / standalone microVM launcher.
 

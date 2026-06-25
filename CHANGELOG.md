@@ -4,6 +4,17 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Native OCI bundle registry: `virtkit registry push <dir> <name>:<tag>` and `virtkit
+  registry pull <name>[:tag|@sha256:…]` push/pull guest bundles (`runner.ext4` +
+  `boot.kind` [+ `vmlinuz` + `initrd.img`]) straight to/from an OCI registry — no
+  `oras`, no docker. `runner.ext4` is split with content-defined chunking (FastCDC) and
+  each chunk is zstd-compressed and stored as its own blob keyed by the sha256 of the
+  compressed bytes, so bundles that share data share blobs: pushes skip blobs the
+  registry already has, and pulls skip chunks already in a local content-addressed
+  cache. A new `[registry]` config section (registry repo allowlist + auth/TLS) gates it.
+
 ### Changed
 
 - The default guest bundle now boots as a generic, agent-served disk guest

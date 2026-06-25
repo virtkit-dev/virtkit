@@ -62,6 +62,12 @@ virtkit mkext src/ out.ext4
 
 # Pull an OCI image to a rootfs tar (no docker daemon):
 virtkit oci-pull alpine:3.21 rootfs.tar
+
+# Push/pull a guest bundle to an OCI registry with content-defined chunk dedup
+# (CDC + per-chunk zstd; needs a [registry] config). push takes a :tag; pull prints
+# the resolved cache dir:
+virtkit registry push ./bundle-dir runner:20260625
+virtkit registry pull runner:20260625
 ```
 
 ---
