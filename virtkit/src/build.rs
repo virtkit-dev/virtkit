@@ -15,6 +15,16 @@ use sha2::{Digest, Sha256};
 
 use crate::{buildkit, dockerhash, ensure, ext4, fleet, mkoci};
 
+/// Where a build puts its result.
+pub enum BuildOutput {
+    /// Flatten the target stage into a bootable ext4 image at this path.
+    Ext4(PathBuf),
+    /// Export the target stage's rootfs to this host dir (buildctl `type=local`) —
+    /// used to extract a built artifact (e.g. a static binary) from a scratch-final
+    /// stage. No ext4, no fingerprint-skip (always rebuilds).
+    Local(PathBuf),
+}
+
 /// A resolved build request: the CLI layer (and `fleet`) parse their flags into
 /// this, then call [`run`]. Paths/args carry no further parsing.
 pub struct BuildSpec {
@@ -22,7 +32,7 @@ pub struct BuildSpec {
     pub context: PathBuf,
     pub target: String,
     pub name: String,
-    pub out: PathBuf,
+    pub output: BuildOutput,
     pub build_args: BTreeMap<String, String>,
     pub add_hosts: Vec<(String, String)>, // (host, ip)
     pub labels: Vec<(String, String)>,
@@ -56,8 +66,14 @@ pub fn run(spec: &BuildSpec) -> Result<()> {
     let mut fp_parts: Vec<&str> = vec![tag.as_str()];
     fp_parts.extend(part_hashes.iter().map(String::as_str));
     let uuid = ensure::fingerprint(&fp_parts);
-    if !spec.force && fleet::fs_uuid(&spec.out).as_deref() == Some(uuid.as_str()) {
-        println!("virtkit: {tag} fresh ({})", spec.out.display());
+    // ext4 mode only: skip the rebuild when the output already carries this
+    // fingerprint. Local (artifact export) always rebuilds — there is no ext4 to
+    // compare against.
+    if let BuildOutput::Ext4(out) = &spec.output
+        && !spec.force
+        && fleet::fs_uuid(out).as_deref() == Some(uuid.as_str())
+    {
+        println!("virtkit: {tag} fresh ({})", out.display());
         return Ok(());
     }
 
@@ -88,11 +104,6 @@ pub fn run(spec: &BuildSpec) -> Result<()> {
         .context("Dockerfile path has no file name")?;
     let ctx_dir = &spec.context;
 
-    std::fs::create_dir_all(spec.out.parent().unwrap_or_else(|| Path::new(".")))
-        .with_context(|| format!("creating output dir for {}", spec.out.display()))?;
-    let tmp_oci = spec.out.with_extension("build.oci");
-    let _ = std::fs::remove_file(&tmp_oci);
-
     let mut bc = std::process::Command::new(&buildctl_bin);
     bc.arg("--addr").arg(&addr).arg("build");
     bc.arg("--frontend").arg("dockerfile.v0");
@@ -119,6 +130,36 @@ pub fn run(spec: &BuildSpec) -> Result<()> {
     for (k, v) in &spec.labels {
         bc.arg("--opt").arg(format!("label:{k}={v}"));
     }
+
+    // Local: export the target stage's rootfs to a host dir and stop — no ext4,
+    // no fingerprint. A scratch-final stage yields just the built artifact(s).
+    if let BuildOutput::Local(dir) = &spec.output {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        bc.arg("--output")
+            .arg(format!("type=local,dest={}", dir.display()));
+        eprintln!(
+            "virtkit: building {tag} (target {}) -> {} via {addr}",
+            spec.target,
+            dir.display()
+        );
+        let st = bc
+            .status()
+            .with_context(|| format!("running {}", buildctl_bin.display()))?;
+        if !st.success() {
+            bail!("buildctl build failed ({st})");
+        }
+        println!("virtkit: exported {tag} rootfs -> {}", dir.display());
+        return Ok(());
+    }
+
+    // 5b. ext4 mode: build to a temp OCI archive, then flatten it.
+    let BuildOutput::Ext4(out) = &spec.output else {
+        unreachable!("Local handled above");
+    };
+    std::fs::create_dir_all(out.parent().unwrap_or_else(|| Path::new(".")))
+        .with_context(|| format!("creating output dir for {}", out.display()))?;
+    let tmp_oci = out.with_extension("build.oci");
+    let _ = std::fs::remove_file(&tmp_oci);
     bc.arg("--output")
         .arg(format!("type=oci,dest={}", tmp_oci.display()));
 
@@ -146,20 +187,10 @@ pub fn run(spec: &BuildSpec) -> Result<()> {
         .map(|(g, h, m)| (g.as_str(), h.as_path(), *m))
         .collect();
     let free_blocks = spec.free_gib * (1024 * 1024 * 1024 / 4096);
-    let r = mkoci::archive_to_ext4(
-        &tmp_oci,
-        &spec.out,
-        &inj,
-        &spec.env_files,
-        free_blocks,
-        &fsid,
-    );
+    let r = mkoci::archive_to_ext4(&tmp_oci, out, &inj, &spec.env_files, free_blocks, &fsid);
     let _ = std::fs::remove_file(&tmp_oci);
     r?;
-    println!(
-        "virtkit: built {tag} -> {} (uuid {uuid})",
-        spec.out.display()
-    );
+    println!("virtkit: built {tag} -> {} (uuid {uuid})", out.display());
     Ok(())
 }
 
@@ -203,7 +234,7 @@ mod tests {
             context: PathBuf::from("."),
             target: String::new(),
             name: String::new(),
-            out: PathBuf::from("out.ext4"),
+            output: BuildOutput::Ext4(PathBuf::from("out.ext4")),
             build_args: BTreeMap::new(),
             add_hosts: vec![],
             labels: vec![],

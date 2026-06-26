@@ -398,9 +398,14 @@ enum Cmd {
         /// target stage to build (required)
         #[arg(long)]
         target: String,
-        /// output ext4 image (required)
+        /// output ext4 image (required unless --local-out is given)
         #[arg(long)]
-        out: PathBuf,
+        out: Option<PathBuf>,
+        /// instead of an ext4, export the target stage's rootfs to this host dir
+        /// (buildctl type=local) — e.g. to extract a built static binary from a
+        /// scratch-final stage
+        #[arg(long = "local-out", value_name = "DIR")]
+        local_out: Option<PathBuf>,
         /// build arg KEY=VAL passed through where the target's closure declares it
         /// (repeatable)
         #[arg(long = "build-arg")]
@@ -653,6 +658,7 @@ async fn main() -> ExitCode {
         context,
         target,
         out,
+        local_out,
         build_arg,
         add_host,
         label,
@@ -667,6 +673,17 @@ async fn main() -> ExitCode {
         no_ensure_daemon,
     } = &cli.cmd
     {
+        let output = match (out, local_out) {
+            (Some(o), None) => build::BuildOutput::Ext4(o.clone()),
+            (None, Some(d)) => build::BuildOutput::Local(d.clone()),
+            (None, None) => return fail(&anyhow::anyhow!("build needs --out or --local-out"), 2),
+            (Some(_), Some(_)) => {
+                return fail(
+                    &anyhow::anyhow!("build takes --out or --local-out, not both"),
+                    2,
+                );
+            }
+        };
         let mut build_args = std::collections::BTreeMap::new();
         for a in build_arg {
             let (k, v) = a.split_once('=').unwrap_or((a.as_str(), ""));
@@ -699,7 +716,7 @@ async fn main() -> ExitCode {
             context,
             target: target.clone(),
             name: name.clone(),
-            out: out.clone(),
+            output,
             build_args,
             add_hosts,
             labels,

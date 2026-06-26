@@ -102,7 +102,7 @@ pub fn ensure_service_build(
         context: recipe.context.clone(),
         target: target.to_string(),
         name: name.to_string(),
-        out: out.to_path_buf(),
+        output: build::BuildOutput::Ext4(out.to_path_buf()),
         build_args: recipe.build_args.clone(),
         add_hosts: recipe.add_hosts.clone(),
         labels: Vec::new(),

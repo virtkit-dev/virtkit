@@ -13,6 +13,10 @@ All notable changes to virtkit will be documented in this file.
   (per-image opt-out, checked in-guest). Dynamic: the binaries stay on the host
   and are baked into no bundle, so updating them needs no re-conversion
   (`VIRTKIT_TOOLS=tag:mountpoint` drives the in-guest mount + link).
+- `virtkit build --local-out <dir>` exports the target stage's rootfs to a host
+  directory (buildctl `type=local`) instead of building an ext4 — e.g. to extract
+  a built static binary from a scratch-final stage. `--out` and `--local-out` are
+  mutually exclusive.
 
 ## [0.1.7] - 2026-06-25
 
