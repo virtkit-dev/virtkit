@@ -240,12 +240,39 @@ fn assemble_generic(cv: &Convert, img: &str, tmp: &Path, disk: bool) -> Result<(
     let _ = docker(cv, None, &["rm", "-f", &cid]);
     export?;
 
+    // capture the image config a `docker export` tar drops, so a generic guest runs
+    // exactly like `docker run` would: the agent restores Config.Env (PATH, …) and
+    // drops the stage scripts to Config.User. `docker export` loses both, so they are
+    // injected as /etc/virtkit/{env,user} next to the agent (the systemd path installs
+    // the same files via its in-container script).
+    let env_file = tmp.join("virtkit.env");
+    let user_file = tmp.join("virtkit.user");
+    write_env_file(cv, img, &env_file)?;
+    write_user_file(cv, img, &user_file)?;
+    let injects: [(&str, &Path, u16); 3] = [
+        ("usr/local/bin/virtkit-agent", cv.agent.as_path(), 0o755),
+        ("etc/virtkit/env", env_file.as_path(), 0o644),
+        ("etc/virtkit/user", user_file.as_path(), 0o644),
+    ];
+
     if disk {
-        crate::ext4::build_from_tar(&tar, &cv.agent, &tmp.join("runner.ext4"))?;
+        crate::ext4::build_from_tar_injecting(
+            &tar,
+            &injects,
+            0,
+            &crate::ext4::FsId {
+                with_journal: true,
+                ..Default::default()
+            },
+            &tmp.join("runner.ext4"),
+        )?;
     } else {
-        crate::initramfs::build_initramfs(&tar, &cv.agent, &tmp.join("initramfs.cpio"))?;
+        crate::initramfs::build_initramfs_injecting(&tar, &injects, &tmp.join("initramfs.cpio"))?;
     }
+    // the captures are baked into the rootfs now; drop the loose copies
     let _ = std::fs::remove_file(&tar);
+    let _ = std::fs::remove_file(&env_file);
+    let _ = std::fs::remove_file(&user_file);
     Ok(())
 }
 
@@ -327,8 +354,8 @@ fn write_env_file(cv: &Convert, img: &str, path: &Path) -> Result<()> {
 }
 
 /// Capture the image's Config.User (its last USER directive) — the user the
-/// stage scripts run as, mirroring a `docker run`. Empty when the image sets
-/// none; runner-vm-init turns it into CMDRUNNER_DEFAULT_RUN_USER.
+/// stage scripts run as, mirroring a `docker run`. Empty when the image sets none;
+/// the agent exports it as VIRTKIT_DEFAULT_RUN_USER so the exec server drops to it.
 fn write_user_file(cv: &Convert, img: &str, path: &Path) -> Result<()> {
     let out = docker(
         cv,

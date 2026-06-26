@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Generic (`docker/`) converted guests now capture the image's `Config.User` and
+  `Config.Env` into `/etc/virtkit/{user,env}` (which `docker export` drops), like
+  the systemd path. The serve-mode agent restores the env and drops each stage to
+  the image USER, so a plain image booted via `docker/<image>` runs exactly like
+  `docker run` — as its USER, with its env — with no bespoke bootable variant.
+
 ### Changed
 
 - Renamed the guest run-user env var `CMDRUNNER_DEFAULT_RUN_USER` →

@@ -7,7 +7,8 @@
 //! booted `init=/usr/local/bin/virtkit-agent` gets no usable argv) and from capture
 //! files written at image-build time:
 //!   /etc/virtkit/env    image ENV (KEY=VALUE per line; lost by `docker export`)
-//!   /etc/virtkit/user   image USER to drop to (service mode)
+//!   /etc/virtkit/user   image USER: exported as VIRTKIT_DEFAULT_RUN_USER so served
+//!                       stages drop to it (serve mode), and dropped to in service mode
 //!   /etc/virtkit/cmd    Entrypoint+Cmd, one argv element per line (service mode)
 //!
 //! Cmdline params (all VIRTKIT_*):
@@ -65,6 +66,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     set_hostname(&cmdline);
     write_self_hosts(&cmdline);
     load_image_env(); // so served/exec'd commands inherit the image PATH etc.
+    export_default_run_user(); // so served stages drop to the image's USER
     ensure_virtctl_symlink(); // /usr/local/bin/virtctl -> the agent (fleet control client)
     mount_virtiofs(&cmdline);
     apply_symlinks(&cmdline);
@@ -379,6 +381,21 @@ fn load_image_env() {
             // SAFETY: still single-threaded (before any fork).
             unsafe { std::env::set_var(k, v) };
         }
+    }
+}
+
+/// Export the image's USER (captured into /etc/virtkit/user) as
+/// VIRTKIT_DEFAULT_RUN_USER, so the serve agent's exec server drops each stage to it
+/// — a generic guest then runs like `docker run` would. Empty/root is left unset (the
+/// agent already runs as root). The serve child inherits this env across the fork.
+fn export_default_run_user() {
+    let user = std::fs::read_to_string("/etc/virtkit/user")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if !user.is_empty() && user != "root" {
+        // SAFETY: still single-threaded init, before any serve/service fork.
+        unsafe { std::env::set_var("VIRTKIT_DEFAULT_RUN_USER", &user) };
+        info!("virtkit-agent init: VIRTKIT_DEFAULT_RUN_USER={user}");
     }
 }
 
