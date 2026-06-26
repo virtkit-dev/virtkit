@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Renamed the guest run-user env var `CMDRUNNER_DEFAULT_RUN_USER` →
+  `VIRTKIT_DEFAULT_RUN_USER` (a leftover from the cmdrunner era).
+
 ## [0.1.8] - 2026-06-26
 
 ### Added

@@ -311,12 +311,12 @@ fn build_command(cmd: &CmdExec) -> Command {
         command.current_dir(dir);
     }
     // Drop to the requested user (per-command override) or the guest's default
-    // (the image's USER, exported as CMDRUNNER_DEFAULT_RUN_USER by the microVM
+    // (the image's USER, exported as VIRTKIT_DEFAULT_RUN_USER by the microVM
     // init). Unset/empty => keep running as the virtkit-agent user (root).
     let run_as = cmd
         .user
         .clone()
-        .or_else(|| std::env::var("CMDRUNNER_DEFAULT_RUN_USER").ok())
+        .or_else(|| std::env::var("VIRTKIT_DEFAULT_RUN_USER").ok())
         .filter(|u| !u.is_empty());
     if let Some(user) = run_as {
         apply_user(&mut command, cmd, &user);

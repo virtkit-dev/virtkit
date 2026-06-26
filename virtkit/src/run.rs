@@ -21,7 +21,7 @@ const STDIN_CHUNK: usize = 4096;
 pub async fn run_stage(ctx: &JobCtx, script_path: &Path) -> Result<CmdResult> {
     let script = std::fs::read(script_path)
         .with_context(|| format!("reading stage script {}", script_path.display()))?;
-    // None => virtkit-agent falls back to CMDRUNNER_DEFAULT_RUN_USER (the guest
+    // None => virtkit-agent falls back to VIRTKIT_DEFAULT_RUN_USER (the guest
     // image's USER), so an unset MICROVM_USER runs as the image default.
     exec_script(
         &vsock_addr(ctx),

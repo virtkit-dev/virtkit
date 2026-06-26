@@ -17,7 +17,7 @@ pub struct JobCtx {
     pub cpus_req: Option<String>,
     pub mem_req: Option<String>,
     /// MICROVM_USER job variable: run the stage scripts as this user, overriding
-    /// the guest image's baked default (CMDRUNNER_DEFAULT_RUN_USER). None = use
+    /// the guest image's baked default (VIRTKIT_DEFAULT_RUN_USER). None = use
     /// that default.
     pub user_req: Option<String>,
     /// Exit code telling gitlab-runner the *script* failed (job failure)
