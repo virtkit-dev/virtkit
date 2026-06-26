@@ -14,9 +14,20 @@ use crate::cpio::CpioWriter;
 pub const CMDRUNNER_PATH: &str = "usr/local/bin/virtkit-agent";
 
 /// Build a cpio initramfs at `out` from the rootfs `tar_path`, injecting the
-/// static agent as PID 1. Hardlinks/device nodes/fifos are skipped — a
-/// generic rootfs (alpine, distroless) has none that matter for booting + agent.
+/// static agent as PID 1. Convenience wrapper over [`build_initramfs_injecting`].
 pub fn build_initramfs(tar_path: &Path, agent: &Path, out: &Path) -> Result<()> {
+    build_initramfs_injecting(tar_path, &[(CMDRUNNER_PATH, agent, 0o755)], out)
+}
+
+/// Build a cpio initramfs at `out` from the rootfs `tar_path`, injecting each host
+/// file in `injects` at its guest path with the given mode (the agent PID 1, plus
+/// e.g. the captured `/etc/virtkit/{env,user}`). Hardlinks/device nodes/fifos are
+/// skipped — a generic rootfs (alpine, distroless) has none that matter for booting.
+pub fn build_initramfs_injecting(
+    tar_path: &Path,
+    injects: &[(&str, &Path, u16)],
+    out: &Path,
+) -> Result<()> {
     let file = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
     let mut cpio = CpioWriter::new(std::io::BufWriter::new(file));
 
@@ -48,12 +59,13 @@ pub fn build_initramfs(tar_path: &Path, agent: &Path, out: &Path) -> Result<()> 
         }
     }
 
-    // inject the agent as PID 1
-    cpio.dirs_for(CMDRUNNER_PATH, 0o755)?;
-    let bin =
-        std::fs::File::open(agent).with_context(|| format!("opening agent {}", agent.display()))?;
-    let size = bin.metadata()?.len();
-    cpio.file(CMDRUNNER_PATH, 0o755, size as u32, bin)?;
+    for (guest, host, mode) in injects {
+        cpio.dirs_for(guest, 0o755)?;
+        let f = std::fs::File::open(host)
+            .with_context(|| format!("opening inject {}", host.display()))?;
+        let size = f.metadata()?.len();
+        cpio.file(guest, u32::from(*mode), size as u32, f)?;
+    }
     cpio.finish()?;
     Ok(())
 }
