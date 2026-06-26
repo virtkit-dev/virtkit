@@ -150,6 +150,27 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         fs_args.push(format!("tag=workdir,socket={}", vfsd_sock.display()));
     }
 
+    // GitLab CI tools ([gitlab] dir): a second, read-only virtio-fs share. The
+    // in-guest agent links the tools the job image lacks onto its PATH — dynamic,
+    // so nothing is baked into the bundle and a host update needs no re-conversion.
+    if let Some(gl) = &cfg.gitlab
+        && let Some(dir) = &gl.dir
+    {
+        let sock = ctx.tools_vfsd_sock();
+        let mut vfsd = cfg.virtiofsd_command();
+        vfsd.arg(format!("--socket-path={}", sock.display()))
+            .arg(format!("--shared-dir={}", dir.display()))
+            .args(["--cache=auto", "--sandbox=none", "--readonly"]);
+        let child =
+            spawn_detached(vfsd, &ctx.tools_vfsd_log()).context("spawning the tools virtiofsd")?;
+        std::fs::write(ctx.tools_vfsd_pidfile(), child.id().to_string())?;
+        wait_for_socket(&sock, Duration::from_secs(5))
+            .context("the tools virtiofsd did not create its socket")?;
+        fs_args.push("--fs".into());
+        fs_args.push(format!("tag=vktools,socket={}", sock.display()));
+        cmdline.push_str(" VIRTKIT_TOOLS=vktools:/run/virtkit-tools");
+    }
+
     let mut net_args: Vec<String> = Vec::new();
     // (ip, prefix, gw, dns) once a tap is wired, rendered onto the cmdline below
     // in the form the chosen init understands.
@@ -485,10 +506,12 @@ pub fn stop_vm(ctx: &JobCtx) {
             }
         }
     }
-    if let Some(pid) = read_pidfile(&ctx.vfsd_pidfile())
-        && pid_running(pid, &ctx.job_dir.to_string_lossy())
-    {
-        unsafe { libc::kill(pid, libc::SIGTERM) };
+    for pidfile in [ctx.vfsd_pidfile(), ctx.tools_vfsd_pidfile()] {
+        if let Some(pid) = read_pidfile(&pidfile)
+            && pid_running(pid, &ctx.job_dir.to_string_lossy())
+        {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
     }
     // the services registry forward (detached virtkit child) if it was started
     if let Some(pid) = read_pidfile(&ctx.svc_forward_pidfile())

@@ -4,6 +4,16 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- New `[gitlab]` config section with a `dir` of static CI tool binaries (e.g.
+  `git`, `git-lfs`, `gitlab-runner`) that the GitLab executor shares **read-only
+  over virtio-fs** into every job VM. The in-guest agent links each tool onto the
+  guest PATH (`/usr/local/bin`), skipping any the job image already provides
+  (per-image opt-out, checked in-guest). Dynamic: the binaries stay on the host
+  and are baked into no bundle, so updating them needs no re-conversion
+  (`VIRTKIT_TOOLS=tag:mountpoint` drives the in-guest mount + link).
+
 ## [0.1.7] - 2026-06-25
 
 ### Added

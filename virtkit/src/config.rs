@@ -44,6 +44,21 @@ pub struct Config {
     /// forward (so the registry credential never enters the guest). Absent = a
     /// job that declares services fails in prepare.
     pub services: Option<Services>,
+    /// CI tools shared into GitLab job VMs over virtio-fs; see [`Gitlab`]. Absent =
+    /// no share (the job image must carry its own git/git-lfs/gitlab-runner).
+    pub gitlab: Option<Gitlab>,
+}
+
+/// GitLab job tooling. `dir` is a host directory of static tool binaries (e.g.
+/// `git`, `git-lfs`, `gitlab-runner`) that virtkit shares **read-only over
+/// virtio-fs** into every job VM; the in-guest agent links each one onto the guest
+/// PATH (`/usr/local/bin`), but only for a tool the job image does not already
+/// provide (per-image opt-out, checked in-guest). Dynamic: the binaries stay on the
+/// host and are baked into no bundle, so updating them needs no re-conversion.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct Gitlab {
+    pub dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -357,5 +372,31 @@ impl Config {
                 c
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gitlab_tools_dir_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [gitlab]
+            dir = "/usr/local/lib/virtkit/ci-tools"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.gitlab.as_ref().unwrap().dir.as_deref(),
+            Some(Path::new("/usr/local/lib/virtkit/ci-tools"))
+        );
+    }
+
+    #[test]
+    fn no_gitlab_section_means_no_tools() {
+        let cfg = Config::default();
+        assert!(cfg.gitlab.is_none());
     }
 }

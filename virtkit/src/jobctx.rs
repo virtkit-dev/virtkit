@@ -101,6 +101,18 @@ impl JobCtx {
     pub fn vfsd_log(&self) -> PathBuf {
         self.job_dir.join("vfsd.log")
     }
+    /// Second virtiofsd, read-only, exporting the `[gitlab] dir` CI tools into the
+    /// job VM (the agent links them onto the guest PATH). Separate socket/pid/log
+    /// from the dev `[share]` virtiofsd.
+    pub fn tools_vfsd_sock(&self) -> PathBuf {
+        self.job_dir.join("tools-vfsd.sock")
+    }
+    pub fn tools_vfsd_pidfile(&self) -> PathBuf {
+        self.job_dir.join("tools-vfsd.pid")
+    }
+    pub fn tools_vfsd_log(&self) -> PathBuf {
+        self.job_dir.join("tools-vfsd.log")
+    }
     /// Host side of the services registry forward (a detached `virtkit
     /// forward` child, like the VMM): killed in cleanup, found via its pidfile.
     pub fn svc_forward_pidfile(&self) -> PathBuf {

@@ -20,6 +20,9 @@
 //!   VIRTKIT_SYMLINKS     src:dest[,src:dest] — after virtiofs mounts, create each
 //!                        `dest` as a symlink pointing to `src`. Entries where `src`
 //!                        does not exist are silently skipped.
+//!   VIRTKIT_TOOLS        tag:mountpoint — mount this virtio-fs share (read-only)
+//!                        and link the CI tools it carries (git/git-lfs/…) onto
+//!                        the PATH, skipping any the image already provides
 //!   VIRTKIT_TMPFS        /path:size[,/path:size] RAM scratch dirs (e.g. CI /builds)
 //!   VIRTKIT_SSH=1        also run ssh-serve (vsock 2222); keys VIRTKIT_SSH_KEYS
 //!                        (comma-separated `type:base64` entries, no spaces),
@@ -65,6 +68,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     ensure_virtctl_symlink(); // /usr/local/bin/virtctl -> the agent (fleet control client)
     mount_virtiofs(&cmdline);
     apply_symlinks(&cmdline);
+    link_ci_tools(&cmdline); // host CI tools (git/git-lfs/…) onto PATH, if the image lacks them
     configure_network(&cmdline);
     apply_tmpfs(&cmdline); // RAM scratch dirs (e.g. CI /builds) before the payload starts
     // orphans reparent to PID 1 (this process): reap them.
@@ -417,6 +421,81 @@ fn apply_symlinks(cmdline: &HashMap<String, String>) {
         let _ = std::fs::remove_file(dest);
         if let Err(e) = std::os::unix::fs::symlink(src, dest) {
             warn!("virtkit-agent init: symlink {src} -> {dest}: {e}");
+        }
+    }
+}
+
+/// Mount the host CI-tools virtio-fs share (VIRTKIT_TOOLS=tag:mountpoint, set by the
+/// GitLab executor) read-only, then link each tool it carries onto the guest PATH
+/// (/usr/local/bin) — but only when the job image does not already provide that
+/// command (per-image opt-out, checked here in-guest where PATH is accurate). The
+/// host keeps the binaries; nothing is copied into the guest or baked into a bundle.
+fn link_ci_tools(cmdline: &HashMap<String, String>) {
+    let Some(spec) = cmdline.get("VIRTKIT_TOOLS") else {
+        return;
+    };
+    let Some((tag, mnt)) = spec.split_once(':') else {
+        warn!("virtkit-agent init: bad VIRTKIT_TOOLS {spec:?} (want tag:mountpoint)");
+        return;
+    };
+    let _ = run_cmd("modprobe", &["virtiofs"]); // built-in on our kernel; harmless
+    let _ = std::fs::create_dir_all(mnt);
+    if let Err(e) = mount(tag, mnt, "virtiofs", 0) {
+        warn!("virtkit-agent init: mount CI tools {tag} at {mnt} failed: {e}");
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(mnt) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all("/usr/local/bin");
+    // `git` ships with its `git-remote-http(s)` helpers (https is not a builtin); the
+    // family is all-or-nothing, governed by whether the image already has git, so we
+    // never mix our helpers with the image's git. Captured before we link anything.
+    let image_has_git = which("git");
+    let mut linked_git = false;
+    for entry in entries.flatten() {
+        let src = entry.path();
+        let Some(name) = src.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !src.is_file() {
+            continue; // is_file follows the symlink (git-remote-https -> git-remote-http)
+        }
+        // per-image opt-out: leave a tool to the image when it already provides it
+        let skip = if name == "git" || name.starts_with("git-remote") {
+            image_has_git
+        } else {
+            which(name)
+        };
+        if skip {
+            continue;
+        }
+        let link = format!("/usr/local/bin/{name}");
+        let _ = std::fs::remove_file(&link);
+        match std::os::unix::fs::symlink(&src, &link) {
+            Ok(()) => {
+                info!("virtkit-agent init: CI tool {name} -> {link}");
+                if name == "git" {
+                    linked_git = true;
+                }
+            }
+            Err(e) => warn!("virtkit-agent init: link {} -> {link}: {e}", src.display()),
+        }
+    }
+    // The injected static git's compiled-in CA bundle is Alpine's /etc/ssl/cert.pem,
+    // absent in most job images. Point it at the image's own CA store so https clones
+    // work; only when we linked our git and the job has not set its own.
+    if linked_git && std::env::var_os("GIT_SSL_CAINFO").is_none() {
+        const CA_CANDIDATES: &[&str] = &[
+            "/etc/ssl/certs/ca-certificates.crt", // debian/ubuntu/alpine
+            "/etc/pki/tls/certs/ca-bundle.crt",   // rhel/fedora
+            "/etc/ssl/ca-bundle.pem",             // suse
+            "/etc/ssl/cert.pem",                  // alpine/busybox default
+        ];
+        if let Some(ca) = CA_CANDIDATES.iter().find(|p| Path::new(p).exists()) {
+            // SAFETY: still single-threaded init, before any serve/service fork.
+            unsafe { std::env::set_var("GIT_SSL_CAINFO", ca) };
+            info!("virtkit-agent init: GIT_SSL_CAINFO={ca}");
         }
     }
 }
