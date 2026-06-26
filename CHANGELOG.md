@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- `read_boot_kind` trims the `boot.kind` marker before matching, so a marker
+  written with a trailing newline (e.g. via `echo`) is read as the intended boot
+  flavour instead of falling back to the systemd default.
+
 ## [0.1.9] - 2026-06-26
 
 ### Added

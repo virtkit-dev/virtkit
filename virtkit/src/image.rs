@@ -121,12 +121,21 @@ pub(crate) fn resolved_from_dir(
     }
 }
 
-/// Read the boot flavour from a bundle dir (matching `convert::read_boot_kind`'s
-/// tags); an unknown/absent marker reads as systemd.
+/// Read the boot flavour from a bundle dir; an unknown/absent marker reads as
+/// systemd. The marker is trimmed before matching, so a file written with a
+/// trailing newline (e.g. `echo generic-disk > boot.kind`) is read correctly.
 pub(crate) fn read_boot_kind(dir: &Path) -> BootKind {
-    match std::fs::read_to_string(dir.join("boot.kind")).as_deref() {
-        Ok("generic-cpio") => BootKind::GenericCpio,
-        Ok("generic-disk") => BootKind::GenericDisk,
+    parse_boot_kind(
+        std::fs::read_to_string(dir.join("boot.kind"))
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_boot_kind(marker: Option<&str>) -> BootKind {
+    match marker.map(str::trim) {
+        Some("generic-cpio") => BootKind::GenericCpio,
+        Some("generic-disk") => BootKind::GenericDisk,
         _ => BootKind::Systemd,
     }
 }
@@ -292,6 +301,35 @@ pub(crate) fn oras_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boot_kind_marker_is_trimmed() {
+        // exact tags
+        assert!(matches!(
+            parse_boot_kind(Some("generic-disk")),
+            BootKind::GenericDisk
+        ));
+        assert!(matches!(
+            parse_boot_kind(Some("generic-cpio")),
+            BootKind::GenericCpio
+        ));
+        // trailing newline (echo) / surrounding whitespace must still match
+        assert!(matches!(
+            parse_boot_kind(Some("generic-disk\n")),
+            BootKind::GenericDisk
+        ));
+        assert!(matches!(
+            parse_boot_kind(Some("  generic-cpio \n")),
+            BootKind::GenericCpio
+        ));
+        // absent / unknown -> systemd default
+        assert!(matches!(parse_boot_kind(None), BootKind::Systemd));
+        assert!(matches!(
+            parse_boot_kind(Some("systemd")),
+            BootKind::Systemd
+        ));
+        assert!(matches!(parse_boot_kind(Some("bogus")), BootKind::Systemd));
+    }
 
     #[test]
     fn pull_lock_excludes_and_releases() {
