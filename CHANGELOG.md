@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-06-26
+
 ### Added
 
 - Generic (`docker/`) converted guests now capture the image's `Config.User` and
@@ -188,7 +190,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/wallix/virtkit/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/wallix/virtkit/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/wallix/virtkit/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/wallix/virtkit/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/wallix/virtkit/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/wallix/virtkit/compare/v0.1.5...v0.1.6

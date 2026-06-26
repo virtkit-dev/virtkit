@@ -3,7 +3,7 @@ resolver = "2"
 members = ["virtkit", "virtkit-agent"]
 
 [workspace.package]
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 authors = [
     "Vincent Vanackere <vincent.vanackere@gmail.com>",
