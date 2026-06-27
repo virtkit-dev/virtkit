@@ -1566,7 +1566,7 @@ const XATTR_PREFIXES: &[(u8, &str)] = &[
 /// Collect the xattrs a tar entry carries as PAX `SCHILY.xattr.<name>` records
 /// (docker export emits these) — e.g. /usr/bin/ping's security.capability, which
 /// would otherwise be dropped on the way into the ext4 inode.
-fn tar_xattrs<R: Read>(e: &mut tar::Entry<'_, R>) -> Vec<(String, Vec<u8>)> {
+pub(crate) fn tar_xattrs<R: Read>(e: &mut tar::Entry<'_, R>) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
     if let Ok(Some(exts)) = e.pax_extensions() {
         for ext in exts.flatten() {
