@@ -21,7 +21,8 @@
 
 use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use oci_client::Reference as OciReference;
@@ -278,6 +279,13 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
     // results are collected as they complete.
     use futures::StreamExt;
     const CHUNK_CONCURRENCY: usize = 16;
+    // Host-global cache mapping a raw chunk's sha256 -> the (digest, size) of its zstd
+    // blob, so an unchanged chunk on a re-push needs no recompression: we hash the raw
+    // bytes (cheaper than compressing), and if the mapped blob is already in the
+    // registry we emit its descriptor directly. A miss (or an evicted blob) falls back
+    // to compress + record. zstd at a fixed level is deterministic, so the mapping is
+    // stable; an entry pointing at an evicted blob just triggers a rebuild.
+    let chunkmap = chunkmap_dir();
     let file = std::fs::File::open(&ext4).with_context(|| format!("opening {}", ext4.display()))?;
     let chunker =
         fastcdc::v2020::StreamCDC::new(std::io::BufReader::new(file), CDC_MIN, CDC_AVG, CDC_MAX);
@@ -286,26 +294,43 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
             let client = &client;
             let image = &image;
             let ext4 = &ext4;
+            let chunkmap = &chunkmap;
             async move {
                 let chunk = chunk.with_context(|| format!("chunking {}", ext4.display()))?;
-                let (offset, length) = (chunk.offset, chunk.length);
+                let (offset, length) = (chunk.offset, chunk.length as u64);
                 let data = chunk.data;
+                // hash the raw chunk (blocking pool, spread over cores); hand the
+                // buffer back for a possible compress.
+                let (raw_hex, data) = tokio::task::spawn_blocking(move || {
+                    let h = sha256_hex_raw(&data);
+                    (h, data)
+                })
+                .await
+                .context("joining the hash task")?;
+
+                // fast path: a known blob already in the registry -> no recompression.
+                let mut cached = None;
+                if let Some(dir) = chunkmap.as_deref()
+                    && let Some((digest, size)) = chunkmap_get(dir, &raw_hex)
+                    && client.blob_exists(image, &digest).await?
+                {
+                    cached = Some((digest, size));
+                }
+                if let Some((digest, size)) = cached {
+                    return Ok((chunk_descriptor(&digest, size, offset, length), false));
+                }
+
+                // miss: compress, record the mapping, upload if absent.
                 let compressed =
                     tokio::task::spawn_blocking(move || zstd::encode_all(&data[..], ZSTD_LEVEL))
                         .await
                         .context("joining the compress task")?
                         .context("zstd-compressing a chunk")?;
                 let digest = sha256_hex(&compressed);
-                let mut annotations = BTreeMap::new();
-                annotations.insert(ANN_OFFSET.to_string(), offset.to_string());
-                annotations.insert(ANN_LENGTH.to_string(), length.to_string());
-                let desc = OciDescriptor {
-                    media_type: CHUNK_MEDIA_TYPE.to_string(),
-                    digest: digest.clone(),
-                    size: compressed.len() as i64,
-                    annotations: Some(annotations),
-                    ..Default::default()
-                };
+                let size = compressed.len() as i64;
+                if let Some(dir) = chunkmap.as_deref() {
+                    chunkmap_put(dir, &raw_hex, &digest, size);
+                }
                 let uploaded = if client.blob_exists(image, &digest).await? {
                     false
                 } else {
@@ -315,7 +340,7 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
                         .with_context(|| format!("pushing chunk {digest}"))?;
                     true
                 };
-                Ok((desc, uploaded))
+                Ok((chunk_descriptor(&digest, size, offset, length), uploaded))
             }
         })
         .buffer_unordered(CHUNK_CONCURRENCY)
@@ -665,9 +690,95 @@ fn sha256_hex(data: &[u8]) -> String {
     s
 }
 
+/// Bare lowercase-hex sha256 (no `sha256:` prefix) — the raw-chunk cache key.
+fn sha256_hex_raw(data: &[u8]) -> String {
+    let d = Sha256::digest(data);
+    let mut s = String::with_capacity(64);
+    for b in d {
+        use std::fmt::Write;
+        write!(s, "{b:02x}").unwrap();
+    }
+    s
+}
+
+/// One ext4-chunk layer descriptor: its blob digest/size plus the offset+length
+/// annotations the pull path reassembles from.
+fn chunk_descriptor(digest: &str, size: i64, offset: u64, length: u64) -> OciDescriptor {
+    let mut annotations = BTreeMap::new();
+    annotations.insert(ANN_OFFSET.to_string(), offset.to_string());
+    annotations.insert(ANN_LENGTH.to_string(), length.to_string());
+    OciDescriptor {
+        media_type: CHUNK_MEDIA_TYPE.to_string(),
+        digest: digest.to_string(),
+        size,
+        annotations: Some(annotations),
+        ..Default::default()
+    }
+}
+
+/// Host-global raw-chunk cache dir (`$XDG_CACHE_HOME/virtkit/chunkmap`, else
+/// `~/.cache/...`). None if neither is set (caching then disabled). Shared across all
+/// worktrees/pushes: a chunk compressed once is never recompressed on the host again.
+fn chunkmap_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(base.join("virtkit/chunkmap"))
+}
+
+/// Path of a raw-chunk cache entry, sharded by the first two hex chars so the dir
+/// never holds a flat pile of entries.
+fn chunkmap_path(dir: &Path, raw_hex: &str) -> PathBuf {
+    let (shard, rest) = raw_hex.split_at(2.min(raw_hex.len()));
+    dir.join(shard).join(rest)
+}
+
+/// Look up a raw chunk's cached blob (digest, size); None on any miss/parse failure.
+fn chunkmap_get(dir: &Path, raw_hex: &str) -> Option<(String, i64)> {
+    let text = std::fs::read_to_string(chunkmap_path(dir, raw_hex)).ok()?;
+    let (digest, size) = text.trim().split_once(' ')?;
+    Some((digest.to_string(), size.parse().ok()?))
+}
+
+/// Record a raw chunk -> (blob digest, size). Best-effort + atomic (tmp + rename),
+/// safe for the concurrent push tasks and for several pushes sharing the cache.
+fn chunkmap_put(dir: &Path, raw_hex: &str, digest: &str, size: i64) {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let path = chunkmap_path(dir, raw_hex);
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let tmp = parent.join(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    if std::fs::write(&tmp, format!("{digest} {size}")).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunkmap_round_trip_and_sharding() {
+        let dir = std::env::temp_dir().join(format!("virtkit-chunkmap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hex = format!("ab{}", "c".repeat(62)); // 64 hex chars
+        assert_eq!(chunkmap_get(&dir, &hex), None); // miss before any write
+        chunkmap_put(&dir, &hex, "sha256:deadbeef", 1234);
+        assert_eq!(
+            chunkmap_get(&dir, &hex),
+            Some(("sha256:deadbeef".to_string(), 1234))
+        );
+        // sharded by the first two hex chars (no flat pile of entries)
+        assert!(dir.join("ab").join(&hex[2..]).is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// High-entropy pseudo-random bytes (a splitmix64 stream) so the CDC gear-hash
     /// hits cut points like real ext4 content would — a low-entropy/periodic buffer
