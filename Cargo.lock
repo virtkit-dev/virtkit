@@ -3811,7 +3811,7 @@ dependencies = [
 
 [[package]]
 name = "virtkit"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "clap",
@@ -3840,7 +3840,7 @@ dependencies = [
 
 [[package]]
 name = "virtkit-agent"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "clap",

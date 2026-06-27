@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-06-27
+
 ### Fixed
 
 - `read_boot_kind` trims the `boot.kind` marker before matching, so a marker
@@ -200,7 +202,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/wallix/virtkit/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/wallix/virtkit/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/wallix/virtkit/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/wallix/virtkit/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/wallix/virtkit/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/wallix/virtkit/compare/v0.1.6...v0.1.7
