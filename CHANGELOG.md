@@ -4,6 +4,49 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-27
+
+### Added
+
+- **Per-job `switch` networking for the gitlab executor** (`net.mode = "switch"`):
+  each job runs on its own userspace switch over vsock instead of a host tap — no
+  host privileges and no virtio-net device. The in-guest agent bridges eth0 over
+  vsock and takes a static address; the switch is spawned on `prepare` and torn
+  down on `cleanup`.
+- **DNS-pinned egress allowlist** for the switch (`virtkit switch --allow-ip
+  <CIDR>` / `--allow-name <suffix>`, and the executor `[egress]` section): names
+  outside the allowlist are refused (NXDOMAIN) and the A-records of allowed names
+  are pinned for their TTL, so a guest can only reach a static allowed CIDR or a
+  freshly resolved allowed name. Transparent; the default is unrestricted.
+- **`virtkit build --push <registry>/<name>:<tag>`**: build a Dockerfile target and
+  push it to a registry as an OCI image (no docker).
+- **Embedded local OCI registry** (`virtkit registry serve` / `install-service`):
+  a minimal v2 server over a content-addressed store, so dev worktrees share one
+  bundle pool with no docker. Single musl-static binary.
+- **Fleet bundle sharing** (`virtkit fleet --registry <repo>` / `--registry-serve
+  <dir>`): build each unit's ext4 once and pull/push it across worktrees keyed by
+  its content fingerprint; `--registry-serve` starts an inline ephemeral server
+  over a shared store with no daemon. Best-effort — a registry failure never fails
+  the build.
+- **Transparent-zstd chunks** (`[registry] transparent_zstd`): chunks addressed by
+  the *uncompressed* digest with the registry storing them zstd and negotiating
+  `Content-Encoding` on the wire — compression-level-independent dedup, still
+  OCI-interoperable. Auto-negotiated: used against a cooperating registry
+  (virtkit's `regserve`, which advertises support on `/v2/`), with the
+  compressed-digest layers as the fallback any dumb OCI registry stores compactly.
+
+### Changed
+
+- The bundle push compresses and uploads chunks concurrently (streaming, bounded),
+  and caches each raw chunk's blob digest (`$XDG_CACHE_HOME/virtkit/chunkmap`) so a
+  re-push skips recompressing unchanged chunks.
+
+### Fixed
+
+- File-capability xattrs (e.g. `/usr/bin/ping`'s `security.capability`) are
+  preserved through the OCI layer flatten — they were dropped when the merger
+  re-emitted the rootfs tar, leaving `ping` without `cap_net_raw`.
+
 ## [0.1.10] - 2026-06-27
 
 ### Fixed
