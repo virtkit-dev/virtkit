@@ -46,6 +46,13 @@ zstd = "0.13"
 # tokio features are member-specific; only the version is pinned here.
 tokio = { version = "1" }
 toml = "1"
+# embedded local OCI registry server (`virtkit registry serve`): a minimal v2
+# distribution API over hyper (already in the tree via oci-client). Pure Rust, so
+# the binary stays musl-static.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 # fleet switch (`switch`): a userspace L2 gateway for microVMs. etherparse parses
 # and builds ethernet/ARP/IPv4/UDP (checksums); ipstack terminates arbitrary guest
 # TCP/UDP for transparent egress through the host's sockets (the gvproxy replacement).

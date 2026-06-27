@@ -24,6 +24,10 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "ne
 toml.workspace = true
 etherparse.workspace = true
 ipstack.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
 
 # Bundled vhost-user virtio-fs daemon (the `virtkit virtiofsd` subcommand) — a default
 # feature, disable with --no-default-features. Versions are pinned to match what

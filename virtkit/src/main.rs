@@ -34,6 +34,7 @@ mod mkoci;
 mod net;
 mod oci;
 mod registry;
+mod regserve;
 mod run;
 mod services;
 mod source;
@@ -88,6 +89,26 @@ enum RegistryCmd {
     Pull {
         /// Source reference, <name>[:tag|@sha256:…]
         reference: String,
+    },
+    /// Run a local OCI registry server backed by a content-addressed store, so
+    /// every worktree pointing its [registry] here shares one bundle pool (a
+    /// chunk pushed from one is reused by the rest). Loopback, no auth/TLS — pair
+    /// with `[registry] insecure = true`.
+    Serve {
+        /// Listen address (use a loopback address — there is no auth).
+        #[arg(long, default_value = "127.0.0.1:5000")]
+        addr: std::net::SocketAddr,
+        /// Store directory [default: $XDG_DATA_HOME/virtkit/registry].
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Install + start a `systemd --user` unit running `registry serve`, so the
+    /// shared store is always available (survives logout/reboot).
+    InstallService {
+        #[arg(long, default_value = "127.0.0.1:5000")]
+        addr: std::net::SocketAddr,
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
 }
 
@@ -806,6 +827,26 @@ async fn main() -> ExitCode {
                 }
                 Err(e) => fail(&e, 1),
             },
+            RegistryCmd::Serve { addr, root } => {
+                let root = match root.clone().map(Ok).unwrap_or_else(regserve::default_root) {
+                    Ok(r) => r,
+                    Err(e) => return fail(&e, 2),
+                };
+                match regserve::serve(*addr, root).await {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => fail(&e, 1),
+                }
+            }
+            RegistryCmd::InstallService { addr, root } => {
+                let root = match root.clone().map(Ok).unwrap_or_else(regserve::default_root) {
+                    Ok(r) => r,
+                    Err(e) => return fail(&e, 2),
+                };
+                match regserve::install_service(*addr, &root) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => fail(&e, 1),
+                }
+            }
         };
     }
     if let Cmd::Switch {
