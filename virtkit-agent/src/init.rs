@@ -72,6 +72,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     apply_symlinks(&cmdline);
     link_ci_tools(&cmdline); // host CI tools (git/git-lfs/…) onto PATH, if the image lacks them
     configure_network(&cmdline);
+    write_resolv_conf(&cmdline); // DNS for every net mode (kernel `ip=` pool + static bridge)
     apply_tmpfs(&cmdline); // RAM scratch dirs (e.g. CI /builds) before the payload starts
     // orphans reparent to PID 1 (this process): reap them.
     set_child_subreaper();
@@ -550,10 +551,37 @@ fn configure_network(cmdline: &HashMap<String, String>) {
             .map_or("192.168.127.1", String::as_str);
         let _ = run_cmd("ip", &["addr", "add", ip, "dev", "eth0"]);
         let _ = run_cmd("ip", &["route", "add", "default", "via", gw]);
-        if let Some(dns) = cmdline.get("VIRTKIT_VM_DNS") {
-            let _ = std::fs::write("/etc/resolv.conf", format!("nameserver {dns}\n"));
-        }
     }
+    // DNS is written separately (write_resolv_conf) so it applies to the kernel `ip=`
+    // pool net too, not just this vsock-bridge static path.
+}
+
+/// Write /etc/resolv.conf from VIRTKIT_VM_DNS (comma-separated nameservers), set by
+/// the executor for both the kernel `ip=` pool net and the static vsock bridge — the
+/// kernel `ip=` autoconf brings the interface up but carries no resolver, and a
+/// generic guest has no initramfs/userland to write one. DHCP guests get their
+/// resolver from dhclient (no VIRTKIT_VM_DNS), so this is a no-op there.
+fn write_resolv_conf(cmdline: &HashMap<String, String>) {
+    let Some(dns) = cmdline.get("VIRTKIT_VM_DNS") else {
+        return;
+    };
+    let conf = resolv_conf(dns);
+    if conf.is_empty() {
+        return;
+    }
+    match std::fs::write("/etc/resolv.conf", &conf) {
+        Ok(()) => info!("virtkit-agent init: resolv.conf nameservers {dns}"),
+        Err(e) => warn!("virtkit-agent init: writing /etc/resolv.conf failed: {e}"),
+    }
+}
+
+/// Render a resolv.conf body from a `VIRTKIT_VM_DNS` value: one `nameserver` line
+/// per comma-separated entry (the cmdline allows `1.1.1.1,8.8.8.8`). Empty in, empty out.
+fn resolv_conf(dns: &str) -> String {
+    dns.split(',')
+        .filter(|s| !s.is_empty())
+        .map(|ns| format!("nameserver {ns}\n"))
+        .collect()
 }
 
 /// Wait up to `tries` × 100 ms for a network interface to appear.
@@ -935,6 +963,16 @@ mod tests {
         assert_eq!(m.get("VIRTKIT_HOSTNAME").unwrap(), "runner");
         assert_eq!(m.get("VIRTKIT_VM_DNS").unwrap(), "1.1.1.1,8.8.8.8");
         assert!(!m.contains_key("ro"));
+    }
+
+    #[test]
+    fn resolv_conf_one_line_per_nameserver() {
+        assert_eq!(resolv_conf("192.168.231.1"), "nameserver 192.168.231.1\n");
+        assert_eq!(
+            resolv_conf("1.1.1.1,8.8.8.8"),
+            "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+        );
+        assert_eq!(resolv_conf(""), "");
     }
 
     #[test]

@@ -9,6 +9,10 @@ All notable changes to virtkit will be documented in this file.
 - `read_boot_kind` trims the `boot.kind` marker before matching, so a marker
   written with a trailing newline (e.g. via `echo`) is read as the intended boot
   flavour instead of falling back to the systemd default.
+- The guest agent writes `/etc/resolv.conf` from `VIRTKIT_VM_DNS` for every net
+  mode, not only the vsock-bridge path. A guest on the kernel `ip=` (tap/pool) net
+  previously got no resolver; it now gets one `nameserver` line per comma-separated
+  entry.
 
 ## [0.1.9] - 2026-06-26
 
