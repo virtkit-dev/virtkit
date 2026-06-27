@@ -252,6 +252,18 @@ pub struct Registry {
     /// Plain HTTP registry (a local/insecure registry); default TLS
     #[serde(default)]
     pub insecure: bool,
+    /// Push ext4 chunks addressed by the **uncompressed** chunk digest (the casync
+    /// model): the client uploads raw chunks and the registry stores them zstd —
+    /// dedup becomes compression-level-independent and the client never compresses
+    /// to learn a digest (no chunkmap). Requires a cooperating registry that
+    /// understands the encoding (virtkit's own `regserve`); a dumb OCI registry
+    /// rejects it (the wire bytes don't hash to the uncompressed digest). Tri-state:
+    /// unset = **auto** (probe the registry's `/v2/` for the capability and use
+    /// transparent-zstd only if advertised, else the compressed-digest layers any OCI
+    /// registry stores compactly); `true`/`false` force the choice. Pull auto-detects
+    /// either form from the chunk media type regardless.
+    #[serde(default)]
+    pub transparent_zstd: Option<bool>,
     /// Pinned guest kernel for generic (kernel-less) bundles — the shared vmlinux
     /// with virtio + ext4 built in, booted directly when a bundle ships no kernel.
     #[serde(default = "default_generic_kernel")]
@@ -271,6 +283,7 @@ impl Registry {
         ca_file: Option<PathBuf>,
         username: String,
         password_file: Option<PathBuf>,
+        transparent_zstd: Option<bool>,
     ) -> Registry {
         Registry {
             repo,
@@ -278,6 +291,7 @@ impl Registry {
             username,
             password_file,
             insecure,
+            transparent_zstd,
             generic_kernel: default_generic_kernel(),
             keep: default_keep(),
         }

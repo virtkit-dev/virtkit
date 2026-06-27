@@ -48,7 +48,7 @@ struct Store {
 
 impl Store {
     fn new(root: PathBuf) -> Result<Arc<Self>> {
-        for sub in ["blobs/sha256", "uploads", "repos"] {
+        for sub in ["blobs/sha256", "blobs/zstd", "uploads", "repos"] {
             let p = root.join(sub);
             std::fs::create_dir_all(&p).with_context(|| format!("creating {}", p.display()))?;
         }
@@ -57,8 +57,24 @@ impl Store {
             next_upload: AtomicU64::new(0),
         }))
     }
+    /// Identity blob: the stored bytes ARE the canonical (digested) bytes.
     fn blob_path(&self, hex: &str) -> PathBuf {
         self.root.join("blobs/sha256").join(hex)
+    }
+    /// Transparently-compressed blob: the stored bytes are a zstd frame; the canonical
+    /// (digested) bytes are its decompression (hex = sha256 of the decompressed form).
+    fn zstd_blob_path(&self, hex: &str) -> PathBuf {
+        self.root.join("blobs/zstd").join(hex)
+    }
+    /// Locate a blob by digest hex: `(path, stored_as_zstd)`. Checks the zstd store
+    /// then the identity store.
+    fn find_blob(&self, hex: &str) -> Option<(PathBuf, bool)> {
+        let z = self.zstd_blob_path(hex);
+        if z.is_file() {
+            return Some((z, true));
+        }
+        let p = self.blob_path(hex);
+        p.is_file().then_some((p, false))
     }
     fn upload_path(&self, id: &str) -> PathBuf {
         self.root.join("uploads").join(id)
@@ -151,12 +167,20 @@ async fn route(req: Request<Incoming>, store: Arc<Store>) -> Result<Response<Ful
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
+    // transparent-zstd negotiation: a PUT body may already be a zstd frame
+    // (`Content-Encoding: zstd`), and a GET may accept the stored frame verbatim
+    // (`Accept-Encoding: …zstd…`).
+    let put_is_zstd = header_has(&req, hyper::header::CONTENT_ENCODING, "zstd");
+    let accept_zstd = header_has(&req, hyper::header::ACCEPT_ENCODING, "zstd");
 
-    // GET /v2/ — the API version probe.
+    // GET /v2/ — the API version probe. We also advertise transparent-zstd support
+    // so an auto-mode client uploads uncompressed-digest chunks (this store stores
+    // them compressed and serves canonical bytes to plain clients).
     if path == "/v2" || path == "/v2/" {
         return Response::builder()
             .status(StatusCode::OK)
             .header("Docker-Distribution-Api-Version", "registry/2.0")
+            .header(crate::registry::TRANSPARENT_ZSTD_HEADER, "1")
             .body(Full::new(Bytes::from_static(b"{}")))
             .map_err(Into::into);
     }
@@ -188,7 +212,7 @@ async fn route(req: Request<Incoming>, store: Arc<Store>) -> Result<Response<Ful
             }
             Method::PUT => {
                 let body = collect(req).await?;
-                finish_upload(&store, name, after, &query, &body)
+                finish_upload(&store, name, after, &query, &body, put_is_zstd)
             }
             _ => Ok(error_response(
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -211,7 +235,7 @@ async fn route(req: Request<Incoming>, store: Arc<Store>) -> Result<Response<Ful
         }
         let head = method == Method::HEAD;
         return match method {
-            Method::GET | Method::HEAD => get_blob(&store, digest, head),
+            Method::GET | Method::HEAD => get_blob(&store, digest, head, accept_zstd),
             _ => Ok(error_response(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "UNSUPPORTED",
@@ -302,16 +326,20 @@ fn patch_upload(store: &Store, name: &str, id: &str, body: &[u8]) -> Result<Resp
 }
 
 /// PUT /v2/<name>/blobs/uploads/<id>?digest=<d> — append the final bytes (if any) and
-/// promote the session file to the content-addressed store under the client's digest.
-/// The digest is trusted (this is a local, single-user registry, and oci-client
-/// re-verifies every blob against its descriptor on pull) — so we skip a full re-read
-/// + re-hash of each blob here, which roughly halves the per-blob I/O on a large push.
+/// promote the session file to the store under the client's digest. The digest is
+/// trusted (local single-user registry; oci-client re-verifies on pull). Storage is
+/// transparently compressed: if the body is already a zstd frame (`Content-Encoding:
+/// zstd`, an aware client) it is stored verbatim in the zstd store; otherwise the raw
+/// body is zstd'd and stored compressed when that's actually smaller (so an
+/// already-compressed blob — a compressed-digest chunk — is kept as-is). Either way
+/// the digest indexes the *canonical* (decompressed) bytes.
 fn finish_upload(
     store: &Store,
     name: &str,
     id: &str,
     query: &str,
     body: &[u8],
+    body_is_zstd: bool,
 ) -> Result<Response<Full<Bytes>>> {
     if !valid_upload_id(id) {
         return Ok(error_response(
@@ -334,6 +362,7 @@ fn finish_upload(
             &digest,
         ));
     }
+    let hex = digest.trim_start_matches("sha256:").to_string();
     let upload = store.upload_path(id);
     if !body.is_empty() {
         use std::io::Write;
@@ -343,15 +372,30 @@ fn finish_upload(
             .with_context(|| format!("opening {}", upload.display()))?;
         f.write_all(body).context("appending the final chunk")?;
     }
-    let hex = digest.trim_start_matches("sha256:");
-    let dest = store.blob_path(hex);
-    // promote into the shared store (idempotent: a concurrent push may have landed it)
-    if dest.exists() {
+
+    // already stored (either form)? idempotent — drop the upload.
+    if store.find_blob(&hex).is_some() {
         let _ = std::fs::remove_file(&upload);
+    } else if body_is_zstd {
+        // the upload is a zstd frame whose decompression hashes to the digest: store
+        // it verbatim in the zstd store (no re-compression).
+        std::fs::rename(&upload, store.zstd_blob_path(&hex))
+            .with_context(|| format!("promoting zstd upload {hex}"))?;
     } else {
-        std::fs::rename(&upload, &dest)
-            .with_context(|| format!("promoting upload to {}", dest.display()))?;
+        // raw canonical bytes: compress; keep compressed only if it actually shrinks
+        // (a compressed-digest chunk won't, and stays identity — no double-compress).
+        let raw =
+            std::fs::read(&upload).with_context(|| format!("reading {}", upload.display()))?;
+        let z = crate::registry::zstd_with_size(&raw)?;
+        if z.len() < raw.len() {
+            atomic_write(&store.zstd_blob_path(&hex), &z)?;
+            let _ = std::fs::remove_file(&upload);
+        } else {
+            std::fs::rename(&upload, store.blob_path(&hex))
+                .with_context(|| format!("promoting blob {hex}"))?;
+        }
     }
+
     Response::builder()
         .status(StatusCode::CREATED)
         .header("Location", format!("/v2/{name}/blobs/{digest}"))
@@ -361,28 +405,79 @@ fn finish_upload(
         .map_err(Into::into)
 }
 
-/// GET/HEAD /v2/<name>/blobs/<digest>.
-fn get_blob(store: &Store, digest: &str, head: bool) -> Result<Response<Full<Bytes>>> {
+/// GET/HEAD /v2/<name>/blobs/<digest>. The digest names the *canonical* bytes. An
+/// identity blob is served verbatim. A zstd-stored blob is served verbatim (with
+/// `Content-Encoding: zstd`) when the client accepts zstd, else decompressed — so a
+/// plain OCI client always gets the canonical bytes and verifies the digest.
+fn get_blob(
+    store: &Store,
+    digest: &str,
+    head: bool,
+    accept_zstd: bool,
+) -> Result<Response<Full<Bytes>>> {
     let hex = digest.trim_start_matches("sha256:");
-    let path = store.blob_path(hex);
-    let Ok(data) = std::fs::read(&path) else {
+    let Some((path, is_zstd)) = store.find_blob(hex) else {
         return Ok(error_response(
             StatusCode::NOT_FOUND,
             "BLOB_UNKNOWN",
             digest,
         ));
     };
-    let len = data.len();
-    Response::builder()
+
+    let builder = Response::builder()
         .status(StatusCode::OK)
         .header("Docker-Content-Digest", digest)
-        .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
-        .header(hyper::header::CONTENT_LENGTH, len.to_string())
-        .body(Full::new(if head {
-            Bytes::new()
-        } else {
-            Bytes::from(data)
-        }))
+        .header(hyper::header::CONTENT_TYPE, "application/octet-stream");
+
+    // serve the stored frame as-is; the client decodes it back to canonical. The
+    // wire length is the stored (compressed) size — `stat` it; HEAD reads nothing.
+    if is_zstd && accept_zstd {
+        let builder = builder.header(hyper::header::CONTENT_ENCODING, "zstd");
+        if head {
+            return builder
+                .header(hyper::header::CONTENT_LENGTH, blob_len(&path)?.to_string())
+                .body(Full::new(Bytes::new()))
+                .map_err(Into::into);
+        }
+        let stored = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        return builder
+            .header(hyper::header::CONTENT_LENGTH, stored.len().to_string())
+            .body(Full::new(Bytes::from(stored)))
+            .map_err(Into::into);
+    }
+
+    // serve the canonical (decompressed, for a zstd blob) bytes.
+    if is_zstd {
+        // HEAD only needs the canonical length, read from the frame header (a handful
+        // of bytes) without touching the rest; GET decompresses the whole body.
+        if head {
+            return builder
+                .header(
+                    hyper::header::CONTENT_LENGTH,
+                    zstd_canonical_len(&path)?.to_string(),
+                )
+                .body(Full::new(Bytes::new()))
+                .map_err(Into::into);
+        }
+        let stored = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let raw = zstd::decode_all(&stored[..]).context("decompressing a stored blob")?;
+        return builder
+            .header(hyper::header::CONTENT_LENGTH, raw.len().to_string())
+            .body(Full::new(Bytes::from(raw)))
+            .map_err(Into::into);
+    }
+
+    // identity blob: HEAD needs only the size (`stat`); GET serves the bytes.
+    if head {
+        return builder
+            .header(hyper::header::CONTENT_LENGTH, blob_len(&path)?.to_string())
+            .body(Full::new(Bytes::new()))
+            .map_err(Into::into);
+    }
+    let stored = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    builder
+        .header(hyper::header::CONTENT_LENGTH, stored.len().to_string())
+        .body(Full::new(Bytes::from(stored)))
         .map_err(Into::into)
 }
 
@@ -508,6 +603,54 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response<Ful
 /// client's chunk size (≤ one FastCDC chunk, ≤16 MiB) plus small manifests.
 async fn collect(req: Request<Incoming>) -> Result<Bytes> {
     Ok(req.into_body().collect().await?.to_bytes())
+}
+
+/// True if request header `name` lists `needle` (e.g. `Accept-Encoding: zstd`).
+/// Substring match — fine for the single token we negotiate.
+fn header_has(req: &Request<Incoming>, name: hyper::header::HeaderName, needle: &str) -> bool {
+    req.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains(needle))
+}
+
+/// The decompressed length of a zstd frame, read from its header (no full decode);
+/// `None` if the frame doesn't record it (see [`crate::registry::zstd_with_size`]).
+fn zstd_frame_len(frame: &[u8]) -> Option<u64> {
+    zstd::zstd_safe::get_frame_content_size(frame)
+        .ok()
+        .flatten()
+}
+
+/// A zstd frame header is at most 18 bytes (4-byte magic + ≤14-byte header), enough
+/// for [`zstd_frame_len`] to read the embedded content size.
+const ZSTD_HEADER_MAX: usize = 18;
+
+/// Size of a stored blob on disk, from `stat` — no read.
+fn blob_len(path: &Path) -> Result<u64> {
+    Ok(std::fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .len())
+}
+
+/// Canonical (decompressed) length of a stored zstd blob, read from the frame header
+/// alone. Our encoder always records the content size, so the full-decode fallback
+/// (for a frame that omits it) is only a correctness backstop.
+fn zstd_canonical_len(path: &Path) -> Result<u64> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut head = Vec::with_capacity(ZSTD_HEADER_MAX);
+    f.by_ref()
+        .take(ZSTD_HEADER_MAX as u64)
+        .read_to_end(&mut head)
+        .with_context(|| format!("reading the zstd header of {}", path.display()))?;
+    if let Some(len) = zstd_frame_len(&head) {
+        return Ok(len);
+    }
+    let stored = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(zstd::decode_all(&stored[..])
+        .context("decompressing a stored blob")?
+        .len() as u64)
 }
 
 /// Monotonic suffix source for [`atomic_write`] temp files (unique within a process;
@@ -685,6 +828,70 @@ pub fn install_service(addr: SocketAddr, root: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// finish_upload stores a compressible raw blob zstd-compressed (smaller, in the
+    /// zstd store) and an incompressible one verbatim (identity store), and find_blob
+    /// resolves both with the canonical bytes recoverable. Exercises the transparent
+    /// adaptive storage without an HTTP round-trip.
+    #[test]
+    fn adaptive_store_compresses_then_serves_canonical() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        // compressible raw blob -> stored zstd, smaller, canonical decompresses back.
+        let raw = vec![7u8; 100_000];
+        let digest = format!("sha256:{}", sha256_hex_raw(&raw));
+        let hex = digest.trim_start_matches("sha256:");
+        std::fs::write(store.upload_path("1-0"), b"").unwrap();
+        let resp = finish_upload(
+            &store,
+            "img",
+            "1-0",
+            &format!("digest={digest}"),
+            &raw,
+            false,
+        )
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let (path, is_zstd) = store.find_blob(hex).expect("blob stored");
+        assert!(is_zstd, "a compressible blob should be stored zstd");
+        assert!(std::fs::metadata(&path).unwrap().len() < raw.len() as u64);
+        assert_eq!(
+            zstd::decode_all(&std::fs::read(&path).unwrap()[..]).unwrap(),
+            raw
+        );
+
+        // incompressible blob -> stored verbatim (identity), no zstd dir entry.
+        // a high-entropy splitmix64 stream — zstd cannot shrink it.
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let rnd: Vec<u8> = (0..50_000)
+            .map(|_| {
+                state = state.wrapping_add(0x9e3779b97f4a7c15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+                (z ^ (z >> 31)) as u8
+            })
+            .collect();
+        let rdigest = format!("sha256:{}", sha256_hex_raw(&rnd));
+        let rhex = rdigest.trim_start_matches("sha256:");
+        std::fs::write(store.upload_path("1-1"), b"").unwrap();
+        finish_upload(
+            &store,
+            "img",
+            "1-1",
+            &format!("digest={rdigest}"),
+            &rnd,
+            false,
+        )
+        .unwrap();
+        let (rpath, ris_zstd) = store.find_blob(rhex).expect("blob stored");
+        assert!(!ris_zstd, "an incompressible blob should stay identity");
+        assert_eq!(std::fs::read(&rpath).unwrap(), rnd);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn name_validation_blocks_traversal() {
         assert!(valid_name("bundles/wabbuilder"));
@@ -714,6 +921,21 @@ mod tests {
         assert!(!valid_upload_id("../escape"));
         assert!(!valid_upload_id("a/b"));
         assert!(!valid_upload_id("abc")); // letters are not minted ids
+    }
+
+    #[test]
+    fn zstd_frame_len_reads_embedded_content_size() {
+        // the shared encoder embeds the content size (encode_all does not), so HEAD can
+        // read the canonical length from the frame header without decompressing.
+        let raw = vec![7u8; 50_000];
+        let frame = crate::registry::zstd_with_size(&raw).unwrap();
+        assert_eq!(zstd_frame_len(&frame), Some(50_000));
+        assert_eq!(zstd::decode_all(&frame[..]).unwrap(), raw);
+        // encode_all (no pledged size) omits it — the reason that helper exists.
+        assert_eq!(
+            zstd_frame_len(&zstd::encode_all(&raw[..], crate::registry::ZSTD_LEVEL).unwrap()),
+            None
+        );
     }
 
     #[test]

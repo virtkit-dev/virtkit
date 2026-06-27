@@ -41,13 +41,22 @@ const CDC_MIN: u32 = 1 << 20;
 const CDC_AVG: u32 = 4 << 20;
 const CDC_MAX: u32 = 16 << 20;
 // Fixed zstd level: identical raw chunks must compress to identical bytes for the
-// blob digest (sha256 of the compressed bytes) to dedup.
-const ZSTD_LEVEL: i32 = 3;
+// blob digest (sha256 of the compressed bytes) to dedup. Shared with regserve's
+// transparent storage compression.
+pub(crate) const ZSTD_LEVEL: i32 = 3;
 
 // Media types for the bundle artifact.
 const ARTIFACT_TYPE: &str = "application/vnd.wallix.microvm.bundle";
 const CONFIG_MEDIA_TYPE: &str = "application/vnd.wallix.microvm.bundle.config.v1+json";
+// Compressed-digest chunk: the blob IS the zstd bytes, digest over them (any OCI
+// registry stores it compactly). `transparent_zstd` mode instead uses the raw
+// chunk: digest over the *uncompressed* bytes, the registry stores them zstd.
 const CHUNK_MEDIA_TYPE: &str = "application/vnd.wallix.microvm.ext4.chunk.zstd";
+const CHUNK_MEDIA_TYPE_RAW: &str = "application/vnd.wallix.microvm.ext4.chunk";
+// Capability header a cooperating `regserve` sets on its `GET /v2/` probe response,
+// so an auto-mode client knows it can push transparent-zstd (uncompressed-digest)
+// chunks. Absent on any dumb OCI registry.
+pub(crate) const TRANSPARENT_ZSTD_HEADER: &str = "x-virtkit-transparent-zstd";
 const KERNEL_MEDIA_TYPE: &str = "application/vnd.wallix.microvm.kernel";
 const INITRD_MEDIA_TYPE: &str = "application/vnd.wallix.microvm.initrd";
 
@@ -279,13 +288,30 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
     // results are collected as they complete.
     use futures::StreamExt;
     const CHUNK_CONCURRENCY: usize = 16;
-    // Host-global cache mapping a raw chunk's sha256 -> the (digest, size) of its zstd
-    // blob, so an unchanged chunk on a re-push needs no recompression: we hash the raw
-    // bytes (cheaper than compressing), and if the mapped blob is already in the
-    // registry we emit its descriptor directly. A miss (or an evicted blob) falls back
-    // to compress + record. zstd at a fixed level is deterministic, so the mapping is
-    // stable; an entry pointing at an evicted blob just triggers a rebuild.
-    let chunkmap = chunkmap_dir();
+    // Host-global cache mapping a raw chunk's sha256 -> the (digest, size) of its
+    // zstd blob, so an unchanged chunk on a re-push needs no recompression: we hash
+    // the raw bytes (cheaper than compressing), and if the mapped blob is already in
+    // the registry we emit its descriptor directly. A miss (or an evicted blob)
+    // falls back to compress + record. zstd at a fixed level is deterministic, so the
+    // mapping is stable; an entry pointing at an evicted blob just triggers a rebuild.
+    // `transparent_zstd`: the registry stores chunks compressed and indexes them by
+    // the *uncompressed* digest, so the client uploads raw (no client-side compress,
+    // no chunkmap) and dedup is compression-independent. Otherwise the client
+    // compresses and the blob is the zstd bytes (the chunkmap skips recompression).
+    // Unset = auto: probe the registry's capability (a cooperating regserve), falling
+    // back to the compressed-digest path any dumb OCI registry accepts.
+    let transparent = match rg.transparent_zstd {
+        Some(b) => b,
+        None => detect_transparent_zstd(rg, &image).await,
+    };
+    let chunkmap = if transparent { None } else { chunkmap_dir() };
+    // transparent mode uploads zstd frames tagged `Content-Encoding: zstd` via a
+    // direct HTTP client (oci-client can't set per-request encodings).
+    let http = if transparent {
+        Some(http_client(rg)?)
+    } else {
+        None
+    };
     let file = std::fs::File::open(&ext4).with_context(|| format!("opening {}", ext4.display()))?;
     let chunker =
         fastcdc::v2020::StreamCDC::new(std::io::BufReader::new(file), CDC_MIN, CDC_AVG, CDC_MAX);
@@ -295,12 +321,13 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
             let image = &image;
             let ext4 = &ext4;
             let chunkmap = &chunkmap;
+            let http = &http;
             async move {
                 let chunk = chunk.with_context(|| format!("chunking {}", ext4.display()))?;
                 let (offset, length) = (chunk.offset, chunk.length as u64);
                 let data = chunk.data;
                 // hash the raw chunk (blocking pool, spread over cores); hand the
-                // buffer back for a possible compress.
+                // buffer back for a possible compress/upload.
                 let (raw_hex, data) = tokio::task::spawn_blocking(move || {
                     let h = sha256_hex_raw(&data);
                     (h, data)
@@ -308,7 +335,38 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
                 .await
                 .context("joining the hash task")?;
 
-                // fast path: a known blob already in the registry -> no recompression.
+                // transparent mode: digest = raw chunk. Dedup on the raw digest, so a
+                // re-push skips both compression and upload. A new chunk is compressed
+                // (content-size embedded) and uploaded with `Content-Encoding: zstd` —
+                // compressed on the wire; the registry stores the frame verbatim.
+                if transparent {
+                    let digest = format!("sha256:{raw_hex}");
+                    let size = data.len() as i64;
+                    let uploaded = if client.blob_exists(image, &digest).await? {
+                        false
+                    } else {
+                        let frame = tokio::task::spawn_blocking(move || zstd_with_size(&data))
+                            .await
+                            .context("joining the compress task")??;
+                        push_blob_zstd(
+                            http.as_ref().expect("http client"),
+                            rg,
+                            image,
+                            &digest,
+                            frame,
+                        )
+                        .await
+                        .with_context(|| format!("pushing chunk {digest}"))?;
+                        true
+                    };
+                    return Ok((
+                        chunk_descriptor(CHUNK_MEDIA_TYPE_RAW, &digest, size, offset, length),
+                        uploaded,
+                    ));
+                }
+
+                // compressed-digest mode — fast path: a known blob already in the
+                // registry -> no recompression (via the chunkmap).
                 let mut cached = None;
                 if let Some(dir) = chunkmap.as_deref()
                     && let Some((digest, size)) = chunkmap_get(dir, &raw_hex)
@@ -317,7 +375,10 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
                     cached = Some((digest, size));
                 }
                 if let Some((digest, size)) = cached {
-                    return Ok((chunk_descriptor(&digest, size, offset, length), false));
+                    return Ok((
+                        chunk_descriptor(CHUNK_MEDIA_TYPE, &digest, size, offset, length),
+                        false,
+                    ));
                 }
 
                 // miss: compress, record the mapping, upload if absent.
@@ -340,7 +401,10 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
                         .with_context(|| format!("pushing chunk {digest}"))?;
                     true
                 };
-                Ok((chunk_descriptor(&digest, size, offset, length), uploaded))
+                Ok((
+                    chunk_descriptor(CHUNK_MEDIA_TYPE, &digest, size, offset, length),
+                    uploaded,
+                ))
             }
         })
         .buffer_unordered(CHUNK_CONCURRENCY)
@@ -525,11 +589,16 @@ async fn pull_into(
     let chunks_cache = chunks_cache_dir(dir);
     let (mut fetched, mut reused) = (0usize, 0usize);
     for layer in &manifest.layers {
-        if layer.media_type != CHUNK_MEDIA_TYPE {
-            continue;
-        }
+        // A chunk is either compressed-digest (blob = zstd, decode here) or raw
+        // (`transparent_zstd`: blob is the canonical raw bytes — the registry already
+        // served them decompressed, so write as-is). Self-describing via media type.
+        let compressed = match layer.media_type.as_str() {
+            CHUNK_MEDIA_TYPE => true,
+            CHUNK_MEDIA_TYPE_RAW => false,
+            _ => continue,
+        };
         let (offset, _len) = chunk_placement(layer)?;
-        let compressed = pull_chunk(
+        let bytes = pull_chunk(
             client,
             image,
             layer,
@@ -538,8 +607,12 @@ async fn pull_into(
             &mut reused,
         )
         .await?;
-        let raw = zstd::decode_all(&compressed[..])
-            .with_context(|| format!("zstd-decompressing chunk {}", layer.digest))?;
+        let raw = if compressed {
+            zstd::decode_all(&bytes[..])
+                .with_context(|| format!("zstd-decompressing chunk {}", layer.digest))?
+        } else {
+            bytes
+        };
         write_chunk_sparse(&mut out, offset, &raw)
             .with_context(|| format!("writing a chunk into {}", ext4.display()))?;
     }
@@ -690,6 +763,129 @@ fn sha256_hex(data: &[u8]) -> String {
     s
 }
 
+/// zstd-compress `raw`, embedding the decompressed size in the frame header so the
+/// registry can report a canonical `Content-Length` on HEAD without decompressing
+/// (`zstd::encode_all` omits the content size). Shared by the transparent-zstd client
+/// push and regserve's storage compression.
+pub(crate) fn zstd_with_size(raw: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let mut enc = zstd::stream::write::Encoder::new(Vec::new(), ZSTD_LEVEL)
+        .context("creating the zstd encoder")?;
+    enc.set_pledged_src_size(Some(raw.len() as u64))
+        .context("setting the zstd pledged size")?;
+    enc.include_contentsize(true)
+        .context("enabling the zstd content size")?;
+    enc.write_all(raw).context("zstd-compressing")?;
+    enc.finish().context("finishing the zstd frame")
+}
+
+/// Probe `GET /v2/` for the [`TRANSPARENT_ZSTD_HEADER`] a cooperating `regserve`
+/// advertises. Any failure — a dumb registry, a network/TLS error, a missing CA —
+/// yields `false`: fall back to the compressed-digest path. Only called in auto mode
+/// (`transparent_zstd` unset); the probe needs no auth (we only read our own header).
+async fn detect_transparent_zstd(rg: &Registry, image: &OciReference) -> bool {
+    let Ok(http) = http_client(rg) else {
+        return false;
+    };
+    let scheme = if rg.insecure { "http" } else { "https" };
+    let url = format!("{scheme}://{}/v2/", image.resolve_registry());
+    match http.get(&url).send().await {
+        Ok(resp) => resp.headers().contains_key(TRANSPARENT_ZSTD_HEADER),
+        Err(_) => false,
+    }
+}
+
+/// A reqwest client honoring the registry's TLS settings (rustls + optional PEM CA),
+/// for the transparent-zstd blob push that needs a per-request `Content-Encoding`.
+fn http_client(rg: &Registry) -> Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder();
+    if let Some(ca) = &rg.ca_file {
+        let pem = std::fs::read(ca).with_context(|| format!("reading {}", ca.display()))?;
+        b = b.add_root_certificate(
+            reqwest::Certificate::from_pem(&pem).context("parsing the registry CA")?,
+        );
+    }
+    b.build().context("building the registry HTTP client")
+}
+
+/// Optional HTTP Basic credentials from the registry config (username + password
+/// file). None when no username is set (anonymous).
+fn basic_auth(rg: &Registry) -> Result<Option<(String, String)>> {
+    if rg.username.is_empty() {
+        return Ok(None);
+    }
+    let file = rg
+        .password_file
+        .as_ref()
+        .context("registry.username set but no registry.password_file")?;
+    let pw = std::fs::read_to_string(file)
+        .with_context(|| format!("reading {}", file.display()))?
+        .trim_end()
+        .to_string();
+    Ok(Some((rg.username.clone(), pw)))
+}
+
+/// Upload an already-zstd-compressed blob under `digest` (the digest of its
+/// *decompressed* form) with `Content-Encoding: zstd`, so the wire stays compressed
+/// and the registry stores the frame verbatim. Monolithic OCI upload: POST a session,
+/// then PUT the frame. Used only in `transparent_zstd` mode (a registry that
+/// understands the encoding — virtkit's `regserve`).
+async fn push_blob_zstd(
+    http: &reqwest::Client,
+    rg: &Registry,
+    image: &OciReference,
+    digest: &str,
+    frame: Vec<u8>,
+) -> Result<()> {
+    let scheme = if rg.insecure { "http" } else { "https" };
+    let registry = image.resolve_registry();
+    let repo = image.repository();
+    let auth = basic_auth(rg)?;
+    let with_auth = |req: reqwest::RequestBuilder| match &auth {
+        Some((u, p)) => req.basic_auth(u, Some(p)),
+        None => req,
+    };
+
+    // 1. begin an upload session.
+    let uploads = format!("{scheme}://{registry}/v2/{repo}/blobs/uploads/");
+    let resp = with_auth(
+        http.post(&uploads)
+            .header(reqwest::header::CONTENT_LENGTH, "0"),
+    )
+    .send()
+    .await
+    .context("POST blob upload")?;
+    if resp.status() != reqwest::StatusCode::ACCEPTED {
+        bail!("begin blob upload: HTTP {}", resp.status());
+    }
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .context("upload session returned no Location")?;
+    // Location may be relative to the registry root.
+    let location = if location.starts_with('/') {
+        format!("{scheme}://{registry}{location}")
+    } else {
+        location.to_string()
+    };
+
+    // 2. PUT the compressed frame, tagged with its encoding and the canonical digest.
+    let resp = with_auth(
+        http.put(location)
+            .query(&[("digest", digest)])
+            .header(reqwest::header::CONTENT_ENCODING, "zstd")
+            .body(frame),
+    )
+    .send()
+    .await
+    .context("PUT blob")?;
+    if resp.status() != reqwest::StatusCode::CREATED {
+        bail!("blob PUT: HTTP {}", resp.status());
+    }
+    Ok(())
+}
+
 /// Bare lowercase-hex sha256 (no `sha256:` prefix) — the raw-chunk cache key.
 fn sha256_hex_raw(data: &[u8]) -> String {
     let d = Sha256::digest(data);
@@ -702,13 +898,20 @@ fn sha256_hex_raw(data: &[u8]) -> String {
 }
 
 /// One ext4-chunk layer descriptor: its blob digest/size plus the offset+length
-/// annotations the pull path reassembles from.
-fn chunk_descriptor(digest: &str, size: i64, offset: u64, length: u64) -> OciDescriptor {
+/// annotations the pull path reassembles from. `media_type` distinguishes a
+/// compressed-digest chunk from a raw (`transparent_zstd`) one.
+fn chunk_descriptor(
+    media_type: &str,
+    digest: &str,
+    size: i64,
+    offset: u64,
+    length: u64,
+) -> OciDescriptor {
     let mut annotations = BTreeMap::new();
     annotations.insert(ANN_OFFSET.to_string(), offset.to_string());
     annotations.insert(ANN_LENGTH.to_string(), length.to_string());
     OciDescriptor {
-        media_type: CHUNK_MEDIA_TYPE.to_string(),
+        media_type: media_type.to_string(),
         digest: digest.to_string(),
         size,
         annotations: Some(annotations),

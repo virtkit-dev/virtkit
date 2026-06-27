@@ -1064,16 +1064,23 @@ async fn main() -> ExitCode {
             }
             let registry = if let Some(root) = registry_serve {
                 match regserve::start_inline(root.clone()).await {
+                    // inline regserve compresses storage itself, so use the
+                    // uncompressed-digest (transparent-zstd) chunk format. We spawned
+                    // it, so force it on rather than paying a loopback probe.
                     Ok(addr) => Some(config::Registry::for_share(
                         format!("{addr}/bundles"),
                         true, // loopback HTTP
                         None,
                         String::new(),
                         None,
+                        Some(true), // transparent_zstd: force on
                     )),
                     Err(e) => return fail(&e, 1),
                 }
             } else {
+                // an external registry may be a cooperating regserve or a dumb OCI
+                // store: auto-detect (None) — probe its capability and pick the chunk
+                // format accordingly.
                 registry.as_ref().map(|repo| {
                     config::Registry::for_share(
                         repo.clone(),
@@ -1081,6 +1088,7 @@ async fn main() -> ExitCode {
                         registry_ca.clone(),
                         registry_username.clone(),
                         registry_password_file.clone(),
+                        None, // transparent_zstd: auto-detect
                     )
                 })
             };

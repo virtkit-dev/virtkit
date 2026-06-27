@@ -53,6 +53,10 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
+# direct HTTP client for the transparent-zstd blob push (oci-client can't set a
+# per-request Content-Encoding). rustls so the binary stays musl-static (matches
+# oci-client); already in the tree via oci-client.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "query"] }
 # fleet switch (`switch`): a userspace L2 gateway for microVMs. etherparse parses
 # and builds ethernet/ARP/IPv4/UDP (checksums); ipstack terminates arbitrary guest
 # TCP/UDP for transparent egress through the host's sockets (the gvproxy replacement).

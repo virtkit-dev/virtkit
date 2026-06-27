@@ -28,6 +28,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
+reqwest.workspace = true
 
 # Bundled vhost-user virtio-fs daemon (the `virtkit virtiofsd` subcommand) — a default
 # feature, disable with --no-default-features. Versions are pinned to match what
