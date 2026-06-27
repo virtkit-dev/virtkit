@@ -186,8 +186,9 @@ fn sanitize_component(name: &str) -> String {
 
 /// Drive a registry future to completion from a sync entry point. The executor's
 /// prepare/run path (and `main`) already run inside a tokio runtime, so this runs
-/// the future on a dedicated OS thread with its own current-thread runtime — a
-/// nested `Runtime::block_on` on the calling thread would panic.
+/// the future on a dedicated OS thread with its own runtime — a nested
+/// `Runtime::block_on` on the calling thread would panic. A multi-thread runtime
+/// (+ its blocking pool) lets the push fan out chunk compression and uploads.
 fn block_on<F>(fut: F) -> F::Output
 where
     F: std::future::Future + Send,
@@ -195,7 +196,7 @@ where
 {
     std::thread::scope(|s| {
         s.spawn(|| {
-            tokio::runtime::Builder::new_current_thread()
+            tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .expect("building the registry tokio runtime")
@@ -269,42 +270,70 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
         .len();
 
     // CDC + per-chunk zstd, STREAMED from the file: StreamCDC buffers at most ~CDC_MAX
-    // at a time, so a multi-GB rootfs is never held in RAM. Sequential is fine for now
-    // (the registry round-trip is serialized too); concurrent uploads are a future
-    // optimization.
-    let mut layers: Vec<OciDescriptor> = Vec::new();
-    let (mut uploaded, mut skipped) = (0usize, 0usize);
+    // at a time, so a multi-GB rootfs is never held in RAM. Chunking is sequential
+    // (it has to scan the file for cut points), but each chunk's zstd compression
+    // (spawn_blocking, so it spreads over cores) and upload run concurrently, up to
+    // CHUNK_CONCURRENCY in flight — so at most that many chunks are buffered. Layer
+    // order is irrelevant (reassembly uses each chunk's offset annotation), so the
+    // results are collected as they complete.
+    use futures::StreamExt;
+    const CHUNK_CONCURRENCY: usize = 16;
     let file = std::fs::File::open(&ext4).with_context(|| format!("opening {}", ext4.display()))?;
     let chunker =
         fastcdc::v2020::StreamCDC::new(std::io::BufReader::new(file), CDC_MIN, CDC_AVG, CDC_MAX);
-    let mut chunk_count = 0usize;
-    for chunk in chunker {
-        let chunk = chunk.with_context(|| format!("chunking {}", ext4.display()))?;
-        chunk_count += 1;
-        let compressed =
-            zstd::encode_all(&chunk.data[..], ZSTD_LEVEL).context("zstd-compressing a chunk")?;
-        let digest = sha256_hex(&compressed);
-        let mut annotations = BTreeMap::new();
-        annotations.insert(ANN_OFFSET.to_string(), chunk.offset.to_string());
-        annotations.insert(ANN_LENGTH.to_string(), chunk.length.to_string());
-        let desc = OciDescriptor {
-            media_type: CHUNK_MEDIA_TYPE.to_string(),
-            digest: digest.clone(),
-            size: compressed.len() as i64,
-            annotations: Some(annotations),
-            ..Default::default()
-        };
-        if client.blob_exists(&image, &digest).await? {
-            skipped += 1;
-        } else {
-            client
-                .push_blob(&image, compressed, &digest)
-                .await
-                .with_context(|| format!("pushing chunk {digest}"))?;
+    let results: Vec<Result<(OciDescriptor, bool)>> = futures::stream::iter(chunker)
+        .map(|chunk| {
+            let client = &client;
+            let image = &image;
+            let ext4 = &ext4;
+            async move {
+                let chunk = chunk.with_context(|| format!("chunking {}", ext4.display()))?;
+                let (offset, length) = (chunk.offset, chunk.length);
+                let data = chunk.data;
+                let compressed =
+                    tokio::task::spawn_blocking(move || zstd::encode_all(&data[..], ZSTD_LEVEL))
+                        .await
+                        .context("joining the compress task")?
+                        .context("zstd-compressing a chunk")?;
+                let digest = sha256_hex(&compressed);
+                let mut annotations = BTreeMap::new();
+                annotations.insert(ANN_OFFSET.to_string(), offset.to_string());
+                annotations.insert(ANN_LENGTH.to_string(), length.to_string());
+                let desc = OciDescriptor {
+                    media_type: CHUNK_MEDIA_TYPE.to_string(),
+                    digest: digest.clone(),
+                    size: compressed.len() as i64,
+                    annotations: Some(annotations),
+                    ..Default::default()
+                };
+                let uploaded = if client.blob_exists(image, &digest).await? {
+                    false
+                } else {
+                    client
+                        .push_blob(image, compressed, &digest)
+                        .await
+                        .with_context(|| format!("pushing chunk {digest}"))?;
+                    true
+                };
+                Ok((desc, uploaded))
+            }
+        })
+        .buffer_unordered(CHUNK_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut layers: Vec<OciDescriptor> = Vec::with_capacity(results.len());
+    let (mut uploaded, mut skipped) = (0usize, 0usize);
+    for r in results {
+        let (desc, was_uploaded) = r?;
+        if was_uploaded {
             uploaded += 1;
+        } else {
+            skipped += 1;
         }
         layers.push(desc);
     }
+    let chunk_count = layers.len();
     println!(
         "virtkit: registry: {chunk_count} ext4 chunks ({uploaded} uploaded, {skipped} deduped)"
     );

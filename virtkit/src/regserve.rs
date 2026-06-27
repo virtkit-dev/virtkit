@@ -301,8 +301,11 @@ fn patch_upload(store: &Store, name: &str, id: &str, body: &[u8]) -> Result<Resp
     accepted_upload(name, id, size)
 }
 
-/// PUT /v2/<name>/blobs/uploads/<id>?digest=<d> — append the final bytes (if any),
-/// verify the digest, and promote the session file to the content-addressed store.
+/// PUT /v2/<name>/blobs/uploads/<id>?digest=<d> — append the final bytes (if any) and
+/// promote the session file to the content-addressed store under the client's digest.
+/// The digest is trusted (this is a local, single-user registry, and oci-client
+/// re-verifies every blob against its descriptor on pull) — so we skip a full re-read
+/// + re-hash of each blob here, which roughly halves the per-blob I/O on a large push.
 fn finish_upload(
     store: &Store,
     name: &str,
@@ -339,16 +342,6 @@ fn finish_upload(
             .open(&upload)
             .with_context(|| format!("opening {}", upload.display()))?;
         f.write_all(body).context("appending the final chunk")?;
-    }
-    let data = std::fs::read(&upload).with_context(|| format!("reading {}", upload.display()))?;
-    let actual = sha256_hex(&data);
-    if actual != digest {
-        let _ = std::fs::remove_file(&upload);
-        return Ok(error_response(
-            StatusCode::BAD_REQUEST,
-            "DIGEST_INVALID",
-            &format!("computed {actual}, expected {digest}"),
-        ));
     }
     let hex = digest.trim_start_matches("sha256:");
     let dest = store.blob_path(hex);
@@ -541,10 +534,6 @@ fn sha256_hex_raw(data: &[u8]) -> String {
         write!(s, "{b:02x}").unwrap();
     }
     s
-}
-
-fn sha256_hex(data: &[u8]) -> String {
-    format!("sha256:{}", sha256_hex_raw(data))
 }
 
 /// A repository name: one or more `/`-separated path components, each a non-empty
@@ -746,10 +735,10 @@ mod tests {
     }
 
     #[test]
-    fn sha256_hex_has_prefix() {
+    fn sha256_hex_raw_matches_known_vector() {
         assert_eq!(
-            sha256_hex(b""),
-            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            sha256_hex_raw(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
 }
