@@ -17,14 +17,14 @@
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context as TaskCtx, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ipstack::{IpStack, IpStackConfig, IpStackStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -56,6 +56,165 @@ struct Cfg {
 type Mac = [u8; 6];
 type PortId = u32;
 
+/// Egress policy — which off-subnet destinations the switch originates flows to.
+/// Default `AllowAll` (the dev fleet is unrestricted); CI passes an allowlist.
+/// Direct (non-proxied) TCP/UDP egress is gated by destination IP (`allows_ip`);
+/// the in-switch http(s) proxy gates web egress by hostname (`allows_host`).
+#[derive(Clone, Default)]
+pub enum Egress {
+    #[default]
+    AllowAll,
+    Allow {
+        /// allowed destination IPv4 ranges for direct (non-proxied) egress
+        ips: Vec<Cidr4>,
+        /// allowed hostname suffixes for the http(s) proxy, dot-anchored:
+        /// `corp.wallix.com` allows that host and `*.corp.wallix.com`
+        names: Vec<String>,
+    },
+}
+
+/// An IPv4 CIDR (`a.b.c.d/prefix`) for the egress IP allowlist.
+#[derive(Clone, Copy)]
+pub struct Cidr4 {
+    net: u32,
+    prefix: u8,
+}
+
+impl Cidr4 {
+    fn parse(s: &str) -> Result<Self> {
+        let (addr, prefix) = s.split_once('/').unwrap_or((s, "32"));
+        let ip: Ipv4Addr = addr
+            .parse()
+            .with_context(|| format!("bad CIDR address in {s:?}"))?;
+        let prefix: u8 = prefix
+            .parse()
+            .ok()
+            .filter(|p| *p <= 32)
+            .with_context(|| format!("bad CIDR prefix in {s:?}"))?;
+        Ok(Cidr4 {
+            net: u32::from(ip) & mask4(prefix),
+            prefix,
+        })
+    }
+    fn contains(&self, ip: Ipv4Addr) -> bool {
+        (u32::from(ip) & mask4(self.prefix)) == self.net
+    }
+}
+
+/// IPv4 netmask for a prefix length (0 => 0.0.0.0, avoiding the `u32 << 32` UB).
+fn mask4(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
+}
+
+impl Egress {
+    /// Build a policy from `--allow-ip` CIDRs + `--allow-name` suffixes; empty both
+    /// => `AllowAll`.
+    pub fn new(ips: &[String], names: &[String]) -> Result<Egress> {
+        if ips.is_empty() && names.is_empty() {
+            return Ok(Egress::AllowAll);
+        }
+        let ips = ips.iter().map(|s| Cidr4::parse(s)).collect::<Result<_>>()?;
+        let names = names
+            .iter()
+            .map(|s| s.trim_start_matches('.').to_ascii_lowercase())
+            .collect();
+        Ok(Egress::Allow { ips, names })
+    }
+    /// Direct (non-proxied) egress: allow only listed IPv4 ranges (IPv6 denied).
+    fn allows_ip(&self, ip: IpAddr) -> bool {
+        match self {
+            Egress::AllowAll => true,
+            Egress::Allow { ips, .. } => match ip {
+                IpAddr::V4(v4) => ips.iter().any(|c| c.contains(v4)),
+                IpAddr::V6(_) => false,
+            },
+        }
+    }
+    /// Resolver name check: allow a host equal to or under an allowed suffix.
+    fn allows_host(&self, host: &str) -> bool {
+        match self {
+            Egress::AllowAll => true,
+            Egress::Allow { names, .. } => {
+                let h = host.trim_end_matches('.').to_ascii_lowercase();
+                names
+                    .iter()
+                    .any(|n| h == *n || h.ends_with(&format!(".{n}")))
+            }
+        }
+    }
+}
+
+/// Runtime egress enforcement: the static [`Egress`] policy + the set of IPs the
+/// DNS resolver dynamically pinned (the A-records it returned for allowed names,
+/// with their TTL). Transparent — the guest needs no proxy env: it resolves through
+/// us (we refuse names outside the allowlist) and we only let it connect to a static
+/// allowed CIDR or an IP we just resolved for an allowed name. A restricted switch
+/// serves a single job VM, so the pin set is per-switch (not keyed by VM).
+struct EgressGuard {
+    policy: Egress,
+    gateway: Ipv4Addr,
+    pinned: Mutex<HashMap<Ipv4Addr, Instant>>,
+}
+
+impl EgressGuard {
+    fn new(policy: Egress, gateway: Ipv4Addr) -> Self {
+        EgressGuard {
+            policy,
+            gateway,
+            pinned: Mutex::new(HashMap::new()),
+        }
+    }
+    fn restricted(&self) -> bool {
+        !matches!(self.policy, Egress::AllowAll)
+    }
+    /// May the resolver answer this name? (allowed names get forwarded + pinned.)
+    fn name_allowed(&self, host: &str) -> bool {
+        self.policy.allows_host(host)
+    }
+    /// Pin the A-records returned for an allowed name for its TTL (+ a small grace),
+    /// so the guest's imminent connection to one of them is permitted.
+    fn record(&self, ips: &[Ipv4Addr], ttl: u32) {
+        if !self.restricted() || ips.is_empty() {
+            return;
+        }
+        let until = Instant::now() + Duration::from_secs(u64::from(ttl).max(30) + 60);
+        let mut pinned = self.pinned.lock().unwrap();
+        for ip in ips {
+            pinned.insert(*ip, until);
+        }
+    }
+    /// May the guest open a direct flow to `dst`? Unrestricted => yes. Otherwise DNS
+    /// must go to our resolver (so pinning holds), and the dst must be in the static
+    /// allowlist or freshly pinned by an allowed-name lookup.
+    fn allows(&self, dst: SocketAddr) -> bool {
+        if !self.restricted() {
+            return true;
+        }
+        if dst.port() == DNS_PORT && dst.ip() != IpAddr::V4(self.gateway) {
+            return false; // force DNS through the switch
+        }
+        if self.policy.allows_ip(dst.ip()) {
+            return true;
+        }
+        let IpAddr::V4(v4) = dst.ip() else {
+            return false;
+        };
+        let mut pinned = self.pinned.lock().unwrap();
+        match pinned.get(&v4) {
+            Some(&until) if until > Instant::now() => true,
+            Some(_) => {
+                pinned.remove(&v4);
+                false
+            }
+            None => false,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     /// frame sink for each connected VM (its writer task)
@@ -79,6 +238,8 @@ struct Switch {
     hosts: Arc<HashMap<String, Ipv4Addr>>,
     /// upstream resolver (the host's own) for everything else
     upstream: SocketAddr,
+    /// egress policy + the DNS-pinned IP set (shared with the ipstack egress tasks)
+    egress: Arc<EgressGuard>,
 }
 
 pub async fn run(
@@ -86,6 +247,7 @@ pub async fn run(
     gateway: Ipv4Addr,
     prefix: u8,
     hosts: HashMap<String, Ipv4Addr>,
+    egress: Egress,
 ) -> Result<()> {
     if listen.is_empty() {
         bail!("switch: at least one --listen is required");
@@ -104,7 +266,9 @@ pub async fn run(
             tx: ret_tx,
         },
     );
-    tokio::spawn(accept_loop(ip_stack));
+    let guard = Arc::new(EgressGuard::new(egress, gateway));
+    let restricted = guard.restricted();
+    tokio::spawn(accept_loop(ip_stack, guard.clone()));
 
     let upstream = host_upstream();
     let sw = Arc::new(Switch {
@@ -117,6 +281,7 @@ pub async fn run(
         next_port: AtomicU32::new(0),
         hosts: Arc::new(hosts),
         upstream,
+        egress: guard,
     });
 
     // ipstack egress replies -> the owning VM port.
@@ -131,12 +296,17 @@ pub async fn run(
 
     eprintln!(
         "switch: {} port(s), gateway {}/{} (ARP + DHCP + DNS + egress, shared LAN); \
-         resolver: {} fleet name(s), upstream {}",
+         resolver: {} fleet name(s), upstream {}; egress: {}",
         listen.len(),
         gateway,
         prefix,
         sw.hosts.len(),
         upstream,
+        if restricted {
+            "allowlist"
+        } else {
+            "unrestricted"
+        },
     );
     let mut accepts = Vec::new();
     for path in listen {
@@ -246,10 +416,11 @@ impl Switch {
                     if let (Some(tx), Some(cip)) = (inner.ports.get(&port).cloned(), ipv4_src(ip)) {
                         let mac: Mac = frame[6..12].try_into().unwrap();
                         let hosts = self.hosts.clone();
+                        let egress = self.egress.clone();
                         let (gw, upstream, query) =
                             (self.cfg.gateway, self.upstream, query.to_vec());
                         tokio::spawn(handle_dns(
-                            query, hosts, upstream, gw, cip, src_port, mac, tx,
+                            query, hosts, upstream, gw, cip, src_port, mac, tx, egress,
                         ));
                     }
                 } else {
@@ -305,15 +476,16 @@ fn flood(inner: &Inner, from: PortId, frame: &[u8]) {
     }
 }
 
-/// ipstack's accept loop: each guest flow becomes a host-side proxy.
-async fn accept_loop(mut ip_stack: IpStack) {
+/// ipstack's accept loop: each guest flow becomes a host-side proxy, gated by the
+/// egress policy (static IP allowlist + DNS-pinned IPs).
+async fn accept_loop(mut ip_stack: IpStack, egress: Arc<EgressGuard>) {
     loop {
         match ip_stack.accept().await {
             Ok(IpStackStream::Tcp(tcp)) => {
-                tokio::spawn(proxy_tcp(tcp));
+                tokio::spawn(proxy_tcp(tcp, egress.clone()));
             }
             Ok(IpStackStream::Udp(udp)) => {
-                tokio::spawn(proxy_udp(udp));
+                tokio::spawn(proxy_udp(udp, egress.clone()));
             }
             Ok(_) => {} // UnknownTransport (ICMP, ...) / UnknownNetwork: dropped
             Err(e) => {
@@ -326,8 +498,12 @@ async fn accept_loop(mut ip_stack: IpStack) {
 
 /// Terminate a guest TCP flow and splice it to a host connection to its original
 /// destination (egress through the host's own socket).
-async fn proxy_tcp(mut guest: ipstack::IpStackTcpStream) {
+async fn proxy_tcp(mut guest: ipstack::IpStackTcpStream, egress: Arc<EgressGuard>) {
     let dst = guest.peer_addr();
+    if !egress.allows(dst) {
+        eprintln!("switch: egress denied (tcp) {dst}");
+        return;
+    }
     match TcpStream::connect(dst).await {
         Ok(mut host) => {
             let _ = tokio::io::copy_bidirectional(&mut guest, &mut host).await;
@@ -338,8 +514,12 @@ async fn proxy_tcp(mut guest: ipstack::IpStackTcpStream) {
 
 /// Relay a guest UDP flow (e.g. DNS) to its destination via a host socket. ipstack
 /// closes the stream after its udp_timeout, ending the task.
-async fn proxy_udp(mut guest: ipstack::IpStackUdpStream) {
+async fn proxy_udp(mut guest: ipstack::IpStackUdpStream, egress: Arc<EgressGuard>) {
     let dst = guest.peer_addr();
+    if !egress.allows(dst) {
+        eprintln!("switch: egress denied (udp) {dst}");
+        return;
+    }
     let bind: SocketAddr = if dst.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }
         .parse()
         .unwrap();
@@ -394,10 +574,25 @@ async fn handle_dns(
     client_port: u16,
     client_mac: Mac,
     tx: UnboundedSender<Vec<u8>>,
+    egress: Arc<EgressGuard>,
 ) {
-    let response = match local_answer(&query, &hosts) {
-        Some(r) => Some(r),
-        None => forward_upstream(&query, upstream).await,
+    let response = if let Some(r) = local_answer(&query, &hosts) {
+        Some(r) // fleet name: on-subnet, not subject to egress pinning
+    } else if let Some((name, _qtype, qend)) = parse_question(&query) {
+        if egress.name_allowed(&name) {
+            // forward, then pin the A-records so the guest's connection is allowed
+            let resp = forward_upstream(&query, upstream).await;
+            if let Some(r) = &resp {
+                let (ips, ttl) = parse_a_records(r);
+                egress.record(&ips, ttl);
+            }
+            resp
+        } else {
+            eprintln!("switch: dns refused (egress allowlist): {name}");
+            Some(dns_nxdomain(&query, qend))
+        }
+    } else {
+        forward_upstream(&query, upstream).await
     };
     if let Some(resp) = response
         && let Some(frame) = dns_frame(gateway, client_ip, client_port, client_mac, &resp)
@@ -497,6 +692,71 @@ fn dns_response(query: &[u8], qend: usize, qtype: u16, ip: Ipv4Addr) -> Vec<u8> 
         out.extend_from_slice(&ip.octets());
     }
     out
+}
+
+/// An NXDOMAIN response echoing the question — refuses a name outside the egress
+/// allowlist (the guest sees "could not resolve"; the name never leaks upstream).
+fn dns_nxdomain(query: &[u8], qend: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(qend);
+    out.extend_from_slice(&query[0..2]); // transaction id
+    out.push(0x84 | (query[2] & 0x01)); // QR=1, AA=1, RD copied
+    out.push(0x83); // RA=1, rcode=3 (NXDOMAIN)
+    out.extend_from_slice(&[0, 1]); // QDCOUNT
+    out.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // ANCOUNT + NSCOUNT + ARCOUNT
+    out.extend_from_slice(&query[12..qend]); // echo the question
+    out
+}
+
+/// Advance past a DNS name at `i`, returning the offset just after it. A compression
+/// pointer (0xc0) ends the name in two bytes. Bounds-safe: returns msg.len() if it
+/// runs off the end.
+fn skip_name(msg: &[u8], mut i: usize) -> usize {
+    while let Some(&len) = msg.get(i) {
+        if len == 0 {
+            return i + 1;
+        }
+        if len & 0xc0 == 0xc0 {
+            return i + 2; // compression pointer: name ends here
+        }
+        i += 1 + len as usize;
+    }
+    msg.len()
+}
+
+/// Extract the A-record IPs (and the smallest TTL) from a DNS response, for pinning.
+/// Best-effort + bounds-safe: stops at the first truncated/malformed record.
+fn parse_a_records(msg: &[u8]) -> (Vec<Ipv4Addr>, u32) {
+    const TYPE_A: u16 = 1;
+    const CLASS_IN: u16 = 1;
+    let mut ips = Vec::new();
+    let mut min_ttl = u32::MAX;
+    if msg.len() < 12 {
+        return (ips, 60);
+    }
+    let qd = u16::from_be_bytes([msg[4], msg[5]]) as usize;
+    let an = u16::from_be_bytes([msg[6], msg[7]]) as usize;
+    let mut i = 12;
+    for _ in 0..qd {
+        i = skip_name(msg, i) + 4; // qtype(2) + qclass(2)
+    }
+    for _ in 0..an {
+        i = skip_name(msg, i);
+        let Some(hdr) = msg.get(i..i + 10) else { break };
+        let rtype = u16::from_be_bytes([hdr[0], hdr[1]]);
+        let class = u16::from_be_bytes([hdr[2], hdr[3]]);
+        let ttl = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        let rdlen = u16::from_be_bytes([hdr[8], hdr[9]]) as usize;
+        let rdata_at = i + 10;
+        let Some(rdata) = msg.get(rdata_at..rdata_at + rdlen) else {
+            break;
+        };
+        if rtype == TYPE_A && class == CLASS_IN && rdlen == 4 {
+            ips.push(Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]));
+            min_ttl = min_ttl.min(ttl);
+        }
+        i = rdata_at + rdlen;
+    }
+    (ips, if min_ttl == u32::MAX { 60 } else { min_ttl })
 }
 
 /// Wrap a DNS response payload as gateway:53 -> client:port over UDP/IPv4/ethernet.
@@ -754,6 +1014,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn egress_allowlist() {
+        let e = Egress::new(
+            &["10.0.0.0/8".into(), "192.168.231.1/32".into()],
+            &["corp.wallix.com".into(), ".github.com".into()],
+        )
+        .unwrap();
+        // direct-egress IP allowlist
+        assert!(e.allows_ip("10.1.2.3".parse().unwrap()));
+        assert!(e.allows_ip("192.168.231.1".parse().unwrap()));
+        assert!(!e.allows_ip("8.8.8.8".parse().unwrap()));
+        assert!(!e.allows_ip("::1".parse().unwrap())); // v6 denied under an allowlist
+        // proxy host allowlist (suffix-anchored)
+        assert!(e.allows_host("gitlab.corp.wallix.com"));
+        assert!(e.allows_host("corp.wallix.com"));
+        assert!(e.allows_host("api.github.com"));
+        assert!(!e.allows_host("evil.com"));
+        assert!(!e.allows_host("corp.wallix.com.evil.com")); // not a real suffix match
+        // no rules => allow all (the dev fleet default)
+        assert!(matches!(Egress::new(&[], &[]).unwrap(), Egress::AllowAll));
+        let any = Egress::default();
+        assert!(any.allows_ip("8.8.8.8".parse().unwrap()) && any.allows_host("evil.com"));
+    }
+
+    #[test]
+    fn parse_a_records_extracts_ips_and_ttl() {
+        // header (qd=1, an=1) + question (a. A IN) + answer (A IN ttl=300 -> the IP)
+        let msg: Vec<u8> = vec![
+            0, 0, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0, // header
+            1, b'a', 0, 0, 1, 0, 1, // question "a" A IN
+            0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4, 93, 184, 216, 34, // answer
+        ];
+        let (ips, ttl) = parse_a_records(&msg);
+        assert_eq!(ips, vec![Ipv4Addr::new(93, 184, 216, 34)]);
+        assert_eq!(ttl, 300);
+        assert!(parse_a_records(&[0u8; 12]).0.is_empty()); // no answers
+    }
+
+    #[test]
+    fn egress_guard_pins_and_blocks() {
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let g = EgressGuard::new(Egress::new(&[], &["corp.wallix.com".into()]).unwrap(), gw);
+        let corp: SocketAddr = "10.20.30.40:443".parse().unwrap();
+        assert!(!g.allows(corp)); // not resolved yet
+        g.record(&[Ipv4Addr::new(10, 20, 30, 40)], 300); // resolver pinned it
+        assert!(g.allows(corp)); // now allowed
+        assert!(!g.allows("8.8.8.8:443".parse().unwrap())); // unrelated dst
+        assert!(!g.allows("8.8.8.8:53".parse().unwrap())); // DNS forced through the switch
+        // unrestricted guard allows anything
+        let any = EgressGuard::new(Egress::AllowAll, gw);
+        assert!(any.allows("8.8.8.8:443".parse().unwrap()));
+        assert!(any.allows("8.8.8.8:53".parse().unwrap()));
+    }
+
+    #[test]
     fn netmask_and_host() {
         assert_eq!(netmask(24), [255, 255, 255, 0]);
         assert_eq!(
@@ -837,7 +1151,14 @@ mod tests {
         let (sa, sb) = (dir.join("a.sock"), dir.join("b.sock"));
         let listen = vec![sa.clone(), sb.clone()];
         tokio::spawn(async move {
-            let _ = run(&listen, Ipv4Addr::new(192, 168, 127, 1), 24, HashMap::new()).await;
+            let _ = run(
+                &listen,
+                Ipv4Addr::new(192, 168, 127, 1),
+                24,
+                HashMap::new(),
+                Egress::AllowAll,
+            )
+            .await;
         });
         for _ in 0..100 {
             if sa.exists() && sb.exists() {

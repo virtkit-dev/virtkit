@@ -229,7 +229,16 @@ pub async fn run(
     let host_map = parse_hosts(hosts.as_deref())?;
     let switch_listen = listen.clone();
     tokio::spawn(async move {
-        if let Err(e) = crate::switch::run(&switch_listen, gateway, prefix, host_map).await {
+        // dev fleet: unrestricted egress (the CI executor passes an allowlist).
+        if let Err(e) = crate::switch::run(
+            &switch_listen,
+            gateway,
+            prefix,
+            host_map,
+            Default::default(),
+        )
+        .await
+        {
             eprintln!("fleet: switch exited: {e:#}");
         }
     });

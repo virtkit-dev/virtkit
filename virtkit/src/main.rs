@@ -135,6 +135,14 @@ enum Cmd {
         /// fleet name the gateway resolver answers locally: name=ip (repeatable)
         #[arg(long = "host")]
         host: Vec<String>,
+        /// egress allowlist — destination IPv4 CIDR for direct (non-proxied) egress
+        /// (repeatable). With no --allow-ip/--allow-name, egress is unrestricted.
+        #[arg(long = "allow-ip", value_name = "CIDR")]
+        allow_ip: Vec<String>,
+        /// egress allowlist — hostname suffix the http(s) proxy permits, e.g.
+        /// `corp.wallix.com` (repeatable).
+        #[arg(long = "allow-name", value_name = "SUFFIX")]
+        allow_name: Vec<String>,
     },
     /// Orchestrate a fleet of microVMs on one shared LAN: ensure each ext4 is current,
     /// run the switch in-process, and boot the service VMs (init=service-vm-init,
@@ -794,6 +802,8 @@ async fn main() -> ExitCode {
         gateway,
         prefix,
         host,
+        allow_ip,
+        allow_name,
     } = &cli.cmd
     {
         let mut hosts = std::collections::HashMap::new();
@@ -809,7 +819,11 @@ async fn main() -> ExitCode {
                 None => return fail(&anyhow::anyhow!("bad --host {h:?} (want name=ip)"), 2),
             }
         }
-        return match switch::run(listen, *gateway, *prefix, hosts).await {
+        let egress = match switch::Egress::new(allow_ip, allow_name) {
+            Ok(e) => e,
+            Err(e) => return fail(&e, 2),
+        };
+        return match switch::run(listen, *gateway, *prefix, hosts, egress).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         };
