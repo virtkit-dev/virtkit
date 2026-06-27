@@ -28,6 +28,11 @@ pub struct Config {
     /// the job clones into the VM, nothing of the host is exposed.
     pub share: Option<Share>,
     pub net: Net,
+    /// Egress allowlist for `net.mode = "switch"`: the per-job switch refuses DNS
+    /// names outside `allow_name` and direct connections outside `allow_ip` (plus
+    /// the IPs it resolved for an allowed name). Empty (the default) = unrestricted
+    /// — the dev fleet leaves it empty; CI sets it as the corp egress gate.
+    pub egress: Egress,
     /// On-demand docker-image → bootable-bundle conversion, backing the
     /// `MICROVM_IMAGE: docker/<name>[:tag|@sha256:…]` form; absent = that
     /// form is rejected
@@ -59,6 +64,18 @@ pub struct Config {
 #[serde(deny_unknown_fields, default)]
 pub struct Gitlab {
     pub dir: Option<PathBuf>,
+}
+
+/// Egress allowlist for the per-job switch (`net.mode = "switch"`). Both lists
+/// empty = unrestricted; passed through to `virtkit switch --allow-ip/--allow-name`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct Egress {
+    /// Allowed destination IPv4 CIDRs for direct (non-DNS-resolved) egress.
+    pub allow_ip: Vec<String>,
+    /// Allowed DNS name suffixes, dot-anchored (e.g. `corp.wallix.com` also
+    /// allows `*.corp.wallix.com`).
+    pub allow_name: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,11 +301,19 @@ fn default_true() -> bool {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Net {
-    /// "none", or "tap" (pre-created persistent tap; one VM at a time per tap —
-    /// the tap pool arrives with the hardened host networking)
+    /// "none"; "tap" (pre-created persistent tap; one VM at a time per tap);
+    /// "pool" (a leased tap from the host pool — the hardened host networking);
+    /// or "switch" (a per-job userspace switch over vsock, no host privileges
+    /// and no virtio-net device — the in-guest agent bridges eth0 to it, and the
+    /// `[egress]` allowlist gates egress in-switch).
     pub mode: String,
     pub tap: String,
     pub mac: String,
+    /// mode = "switch": vsock port the in-guest agent bridges eth0 to the
+    /// per-job switch over (the guest dials host CID 2 on this port; Cloud
+    /// Hypervisor surfaces it as `<vsock.sock>_<net_port>`, where the switch
+    /// listens). Must differ from the services port.
+    pub net_port: u32,
     /// Static guest config passed on the kernel command line (the kernel `ip=`
     /// autoconfig param + VIRTKIT_VM_DNS); ip is CIDR ("172.18.0.250/16")
     pub ip: String,
@@ -308,6 +333,7 @@ impl Default for Net {
             mode: "none".into(),
             tap: String::new(),
             mac: "52:54:00:d2:f0:01".into(),
+            net_port: 1024,
             ip: String::new(),
             gw: String::new(),
             dns: String::new(),
@@ -398,5 +424,27 @@ mod tests {
     fn no_gitlab_section_means_no_tools() {
         let cfg = Config::default();
         assert!(cfg.gitlab.is_none());
+    }
+
+    #[test]
+    fn egress_allowlist_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [egress]
+            allow_ip = ["10.0.0.0/8", "192.168.1.1/32"]
+            allow_name = ["corp.wallix.com", "github.com"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.egress.allow_ip, ["10.0.0.0/8", "192.168.1.1/32"]);
+        assert_eq!(cfg.egress.allow_name, ["corp.wallix.com", "github.com"]);
+        // absent [egress] = unrestricted (both lists empty)
+        let none = Config::default();
+        assert!(none.egress.allow_ip.is_empty() && none.egress.allow_name.is_empty());
+    }
+
+    #[test]
+    fn net_port_default() {
+        assert_eq!(Net::default().net_port, 1024);
     }
 }

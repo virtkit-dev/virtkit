@@ -2,6 +2,7 @@
 //! agent) and cleanup (ACPI poweroff, escalation, state removal). One VM per job.
 
 use std::io::{Read, Write};
+use std::net::Ipv4Addr;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -194,7 +195,22 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             net_args.push(format!("tap={},mac={}", lease.tap, lease.mac));
             net_info = Some((lease.ip, lease.prefix.into(), lease.gw, lease.dns));
         }
-        other => bail!("unsupported net.mode {other:?} (none|tap|pool)"),
+        "switch" => {
+            // Per-job userspace switch: no virtio-net device and no kernel `ip=`
+            // (eth0 does not exist at kernel init) — the in-guest agent forks a
+            // tap bridged to the switch over vsock, then sets a static address.
+            // Spawn the switch (with the egress allowlist) so it is listening
+            // before the guest dials it; then point the agent at it. The same
+            // shared LAN/egress core the dev `fleet` uses.
+            let (gateway, prefix, guest_ip) = crate::net::switch_addrs(&cfg.net.subnet)?;
+            spawn_switch(ctx, gateway, prefix)?;
+            cmdline.push_str(&format!(
+                " VIRTKIT_NET_PORT={} VIRTKIT_VM_IP={guest_ip}/{prefix} \
+                 VIRTKIT_VM_GW={gateway} VIRTKIT_VM_DNS={gateway}",
+                cfg.net.net_port
+            ));
+        }
+        other => bail!("unsupported net.mode {other:?} (none|tap|pool|switch)"),
     }
     if let Some((ip, prefix, gw, dns)) = net_info {
         // Both flavours bring eth0 up from the kernel `ip=` autoconfig param
@@ -410,6 +426,37 @@ async fn start_services(ctx: &JobCtx) -> Result<()> {
     }
 }
 
+/// Spawn the per-job userspace switch (net.mode = "switch") as a detached child,
+/// listening on the guest's vsock-bridge socket (`<vsock.sock>_<net_port>`) with
+/// the `[egress]` allowlist, and wait for it to bind before the guest dials it.
+/// Long-lived (it serves the VM's whole life); torn down in cleanup via its
+/// pidfile. The switch is this same `virtkit` binary's `switch` subcommand.
+fn spawn_switch(ctx: &JobCtx, gateway: Ipv4Addr, prefix: u8) -> Result<()> {
+    let cfg = &ctx.cfg;
+    let listen = ctx.net_vsock_sock(cfg.net.net_port);
+    let _ = std::fs::remove_file(&listen);
+    let exe = std::env::current_exe().context("locating the virtkit binary")?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("switch")
+        .arg("--listen")
+        .arg(&listen)
+        .arg("--gateway")
+        .arg(gateway.to_string())
+        .arg("--prefix")
+        .arg(prefix.to_string());
+    for cidr in &cfg.egress.allow_ip {
+        cmd.arg("--allow-ip").arg(cidr);
+    }
+    for name in &cfg.egress.allow_name {
+        cmd.arg("--allow-name").arg(name);
+    }
+    let child = spawn_detached(cmd, &ctx.switch_log()).context("spawning the per-job switch")?;
+    std::fs::write(ctx.switch_pidfile(), child.id().to_string())?;
+    wait_for_socket(&listen, Duration::from_secs(5))
+        .context("the per-job switch did not bind its socket")?;
+    Ok(())
+}
+
 /// Effective vCPU count and memory size: the job's MICROVM_CPUS/MICROVM_MEM
 /// requests, silently clamped to the host ceilings (vm.max_cpus/max_mem,
 /// defaulting to the base values — config opt-in for any elevation).
@@ -506,7 +553,11 @@ pub fn stop_vm(ctx: &JobCtx) {
             }
         }
     }
-    for pidfile in [ctx.vfsd_pidfile(), ctx.tools_vfsd_pidfile()] {
+    for pidfile in [
+        ctx.vfsd_pidfile(),
+        ctx.tools_vfsd_pidfile(),
+        ctx.switch_pidfile(),
+    ] {
         if let Some(pid) = read_pidfile(&pidfile)
             && pid_running(pid, &ctx.job_dir.to_string_lossy())
         {

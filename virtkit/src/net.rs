@@ -126,6 +126,19 @@ fn pool_entry(net: &crate::config::Net, base: Ipv4Addr, prefix: u8, i: u32) -> L
     }
 }
 
+/// Derive the per-job switch addresses from `net.subnet` (net.mode = "switch"):
+/// the gateway is `.1` (DHCP/DNS/router, as in pool mode) and the single job VM
+/// is `.2`. Reuses the pool subnet parser (a.b.c.0/17..24). Unlike pool mode the
+/// subnet is internal to the VM (a userspace vsock LAN), so it never touches the
+/// host network and need not match any host bridge.
+pub fn switch_addrs(subnet: &str) -> Result<(Ipv4Addr, u8, Ipv4Addr)> {
+    let (base, prefix) = parse_subnet(subnet)?;
+    let o = base.octets();
+    let gateway = Ipv4Addr::new(o[0], o[1], o[2], 1);
+    let guest = Ipv4Addr::new(o[0], o[1], o[2], 2);
+    Ok((gateway, prefix, guest))
+}
+
 /// "a.b.c.0/p" — only /17..=/24 subnets (hosts within the last octet, which is
 /// all the pool addressing scheme supports).
 fn parse_subnet(s: &str) -> Result<(Ipv4Addr, u8)> {
@@ -180,6 +193,17 @@ mod tests {
         assert_eq!(e.gw, "192.168.231.1");
         assert_eq!(e.dns, "192.168.231.1");
         assert_eq!(e.mac, "52:54:00:c1:00:02");
+    }
+
+    #[test]
+    fn switch_addrs_derives_gateway_and_guest() {
+        let (gw, prefix, guest) = switch_addrs("192.168.127.0/24").unwrap();
+        assert_eq!(gw, Ipv4Addr::new(192, 168, 127, 1));
+        assert_eq!(prefix, 24);
+        assert_eq!(guest, Ipv4Addr::new(192, 168, 127, 2));
+        // same parser/validation as the pool subnet
+        assert!(switch_addrs("10.0.0.1/24").is_err());
+        assert!(switch_addrs("10.0.0.0/25").is_err());
     }
 
     #[test]

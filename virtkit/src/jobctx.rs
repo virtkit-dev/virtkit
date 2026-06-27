@@ -121,6 +121,23 @@ impl JobCtx {
     pub fn svc_forward_log(&self) -> PathBuf {
         self.job_dir.join("svc-forward.log")
     }
+    /// Per-job switch (net.mode = "switch"): a detached `virtkit switch` child
+    /// giving the VM a userspace LAN over vsock + the egress allowlist; killed
+    /// in cleanup, found via its pidfile.
+    pub fn switch_pidfile(&self) -> PathBuf {
+        self.job_dir.join("switch.pid")
+    }
+    pub fn switch_log(&self) -> PathBuf {
+        self.job_dir.join("switch.log")
+    }
+    /// The host unix socket Cloud Hypervisor surfaces a guest connection to host
+    /// vsock port `port` on (`<vsock.sock>_<port>`) — where the switch listens
+    /// for the in-guest agent's eth0 bridge.
+    pub fn net_vsock_sock(&self, port: u32) -> PathBuf {
+        let mut p = self.vsock_sock().into_os_string();
+        p.push(format!("_{port}"));
+        PathBuf::from(p)
+    }
 }
 
 fn exit_code_env(name: &str, fallback: i32) -> i32 {
