@@ -230,7 +230,7 @@ fn default_keep() -> u32 {
     3
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Registry {
     /// Registry repository prefix for the bundles — fixed host side: the
@@ -259,6 +259,29 @@ pub struct Registry {
     /// Cached pulled bundles kept per image
     #[serde(default = "default_keep")]
     pub keep: u32,
+}
+
+impl Registry {
+    /// Build a `Registry` for the build-sharing path (`fleet --registry`), from the
+    /// CLI flags rather than a config file. `generic_kernel`/`keep` are irrelevant to
+    /// push/pull-by-fingerprint (only `resolve` boots), so they take their defaults.
+    pub fn for_share(
+        repo: String,
+        insecure: bool,
+        ca_file: Option<PathBuf>,
+        username: String,
+        password_file: Option<PathBuf>,
+    ) -> Registry {
+        Registry {
+            repo,
+            ca_file,
+            username,
+            password_file,
+            insecure,
+            generic_kernel: default_generic_kernel(),
+            keep: default_keep(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

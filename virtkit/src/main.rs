@@ -238,6 +238,30 @@ enum Cmd {
         /// static (musl) virtkit-agent injected into each in-process-built ext4
         #[arg(long = "agent", default_value = "/usr/local/lib/virtkit/virtkit-agent")]
         agent: PathBuf,
+        /// shared bundle registry (e.g. a local `virtkit registry serve`): build each
+        /// unit's ext4 once and share it across worktrees — pull `<name>:<fingerprint>`
+        /// instead of building when a sibling already pushed it, push after a build.
+        /// Best-effort; omit to build locally only.
+        #[arg(long = "registry", value_name = "REPO")]
+        registry: Option<String>,
+        /// like --registry, but start an inline registry over this store dir on an
+        /// ephemeral loopback port for the build, with no persistent daemon (it dies
+        /// with this process). The on-demand local-dev path; several worktrees can
+        /// share one store dir concurrently. Mutually exclusive with --registry.
+        #[arg(long = "registry-serve", value_name = "DIR")]
+        registry_serve: Option<PathBuf>,
+        /// the shared registry speaks plain HTTP (a local insecure registry)
+        #[arg(long = "registry-insecure")]
+        registry_insecure: bool,
+        /// PEM CA bundle the shared registry's TLS cert chains to
+        #[arg(long = "registry-ca", value_name = "PATH")]
+        registry_ca: Option<PathBuf>,
+        /// shared registry HTTP Basic username (empty = anonymous)
+        #[arg(long = "registry-username", value_name = "USER", default_value = "")]
+        registry_username: String,
+        /// file holding the shared registry's Basic-auth password
+        #[arg(long = "registry-password-file", value_name = "PATH")]
+        registry_password_file: Option<PathBuf>,
         /// ensure the ext4 images are current (build the stale ones) and exit, without
         /// starting the switch or booting any VM
         #[arg(long)]
@@ -768,6 +792,9 @@ async fn main() -> ExitCode {
             buildkitd: buildkitd.clone(),
             ensure_daemon: !*no_ensure_daemon,
             force: *force,
+            // the standalone `build` CLI does not share through a registry (the fleet
+            // path passes one); push explicitly with `--push` or `registry push`.
+            registry: None,
         };
         return match build::run(&spec) {
             Ok(()) => ExitCode::SUCCESS,
@@ -904,6 +931,12 @@ async fn main() -> ExitCode {
         build_buildctl,
         build_buildkitd,
         agent,
+        registry,
+        registry_serve,
+        registry_insecure,
+        registry_ca,
+        registry_username,
+        registry_password_file,
         ensure_only,
         vm,
         vm_build,
@@ -1019,6 +1052,38 @@ async fn main() -> ExitCode {
                     .unwrap_or_else(|| Path::new("."))
                     .to_path_buf()
             });
+            // Shared bundle registry: --registry REPO points at an existing one;
+            // --registry-serve DIR starts an inline ephemeral one over a shared store
+            // (no daemon) and uses it. Either way each unit's ext4 is built once and
+            // shared across worktrees.
+            if registry.is_some() && registry_serve.is_some() {
+                return fail(
+                    &anyhow::anyhow!("use one of --registry or --registry-serve, not both"),
+                    2,
+                );
+            }
+            let registry = if let Some(root) = registry_serve {
+                match regserve::start_inline(root.clone()).await {
+                    Ok(addr) => Some(config::Registry::for_share(
+                        format!("{addr}/bundles"),
+                        true, // loopback HTTP
+                        None,
+                        String::new(),
+                        None,
+                    )),
+                    Err(e) => return fail(&e, 1),
+                }
+            } else {
+                registry.as_ref().map(|repo| {
+                    config::Registry::for_share(
+                        repo.clone(),
+                        *registry_insecure,
+                        registry_ca.clone(),
+                        registry_username.clone(),
+                        registry_password_file.clone(),
+                    )
+                })
+            };
             Some(ensure::BuildRecipe {
                 dockerfiles: build_dockerfile.clone(),
                 context,
@@ -1028,6 +1093,7 @@ async fn main() -> ExitCode {
                 buildkit_addr: build_buildkit_addr.clone(),
                 buildctl: build_buildctl.clone(),
                 buildkitd: build_buildkitd.clone(),
+                registry,
             })
         };
         let mut unit_targets = std::collections::HashMap::new();

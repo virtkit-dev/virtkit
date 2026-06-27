@@ -64,6 +64,10 @@ pub struct BuildRecipe {
     pub buildkit_addr: Option<String>,
     pub buildctl: Option<PathBuf>,
     pub buildkitd: Option<PathBuf>,
+    /// Shared bundle registry: when set, each unit's ext4 is pulled (if a sibling
+    /// worktree already built this exact fingerprint) or pushed after a build, so the
+    /// fleet shares one bundle pool across worktrees. `None` = build locally only.
+    pub registry: Option<crate::config::Registry>,
 }
 
 /// Per-unit build overrides layered on top of the fleet-level [`BuildRecipe`]: extra
@@ -114,6 +118,7 @@ pub fn ensure_service_build(
         buildkitd: recipe.buildkitd.clone(),
         ensure_daemon: true,
         force: false,
+        registry: recipe.registry.clone(),
     };
     build::run(&spec)
 }

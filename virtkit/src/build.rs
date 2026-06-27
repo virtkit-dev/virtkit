@@ -49,6 +49,11 @@ pub struct BuildSpec {
     pub buildkitd: Option<PathBuf>,
     pub ensure_daemon: bool,
     pub force: bool,
+    /// Shared bundle registry (Ext4 output only): when set, the build is content
+    /// shared across worktrees — pull `<name>:<fingerprint>` instead of building if
+    /// present, and push the result after a build. Best-effort (a registry failure
+    /// never fails the build). `None` = build locally only.
+    pub registry: Option<crate::config::Registry>,
 }
 
 /// Drive a [`BuildSpec`] to a bootable ext4. Identical behavior/staleness contract
@@ -72,14 +77,33 @@ pub fn run(spec: &BuildSpec) -> Result<()> {
     fp_parts.extend(part_hashes.iter().map(String::as_str));
     let uuid = ensure::fingerprint(&fp_parts);
     // ext4 mode only: skip the rebuild when the output already carries this
-    // fingerprint. Local (artifact export) always rebuilds — there is no ext4 to
-    // compare against.
+    // fingerprint (local cache), else try the shared registry before building. Local
+    // (artifact export) always rebuilds — there is no ext4 to compare against.
     if let BuildOutput::Ext4(out) = &spec.output
         && !spec.force
-        && fleet::fs_uuid(out).as_deref() == Some(uuid.as_str())
     {
-        println!("virtkit: {tag} fresh ({})", out.display());
-        return Ok(());
+        if fleet::fs_uuid(out).as_deref() == Some(uuid.as_str()) {
+            println!("virtkit: {tag} fresh ({})", out.display());
+            return Ok(());
+        }
+        // shared registry: a sibling worktree may have built this exact fingerprint —
+        // pull it instead of rebuilding. The placed ext4 keeps its UUID (fresh next time).
+        if let Some(rg) = &spec.registry {
+            match crate::registry::try_pull_ext4(rg, &spec.name, &uuid, out) {
+                Ok(true) => {
+                    println!(
+                        "virtkit: {tag} pulled from shared registry -> {}",
+                        out.display()
+                    );
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(e) => eprintln!(
+                    "virtkit: shared-registry pull of {}:{uuid} failed ({e:#}); building",
+                    spec.name
+                ),
+            }
+        }
     }
 
     // 3. resolve the daemon tools (also gives us buildctl), then ensure a buildkitd
@@ -215,6 +239,22 @@ pub fn run(spec: &BuildSpec) -> Result<()> {
     let _ = std::fs::remove_file(&tmp_oci);
     r?;
     println!("virtkit: built {tag} -> {} (uuid {uuid})", out.display());
+
+    // shared registry: publish the freshly built bundle so sibling worktrees can pull
+    // it. Best-effort — a registry hiccup must not fail an otherwise-good build.
+    if let Some(rg) = &spec.registry {
+        let boot_kind = crate::image::boot_kind_tag(crate::image::BootKind::GenericDisk);
+        match crate::registry::push_ext4(rg, &spec.name, &uuid, out, boot_kind) {
+            Ok(()) => println!(
+                "virtkit: pushed {}:{uuid} to the shared registry",
+                spec.name
+            ),
+            Err(e) => eprintln!(
+                "virtkit: shared-registry push of {}:{uuid} failed ({e:#}) — built locally",
+                spec.name
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -270,6 +310,7 @@ mod tests {
             buildkitd: None,
             ensure_daemon: true,
             force: false,
+            registry: None,
         }
     }
 
