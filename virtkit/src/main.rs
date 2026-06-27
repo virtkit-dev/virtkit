@@ -414,6 +414,10 @@ enum Cmd {
         /// scratch-final stage
         #[arg(long = "local-out", value_name = "DIR")]
         local_out: Option<PathBuf>,
+        /// instead of an ext4, push the target stage to a registry as an OCI image
+        /// (buildctl type=image,push) — build a container image with no docker
+        #[arg(long = "push", value_name = "REGISTRY/NAME:TAG")]
+        push: Option<String>,
         /// build arg KEY=VAL passed through where the target's closure declares it
         /// (repeatable)
         #[arg(long = "build-arg")]
@@ -667,6 +671,7 @@ async fn main() -> ExitCode {
         target,
         out,
         local_out,
+        push,
         build_arg,
         add_host,
         label,
@@ -681,13 +686,19 @@ async fn main() -> ExitCode {
         no_ensure_daemon,
     } = &cli.cmd
     {
-        let output = match (out, local_out) {
-            (Some(o), None) => build::BuildOutput::Ext4(o.clone()),
-            (None, Some(d)) => build::BuildOutput::Local(d.clone()),
-            (None, None) => return fail(&anyhow::anyhow!("build needs --out or --local-out"), 2),
-            (Some(_), Some(_)) => {
+        let output = match (out, local_out, push) {
+            (Some(o), None, None) => build::BuildOutput::Ext4(o.clone()),
+            (None, Some(d), None) => build::BuildOutput::Local(d.clone()),
+            (None, None, Some(r)) => build::BuildOutput::Push(r.clone()),
+            (None, None, None) => {
                 return fail(
-                    &anyhow::anyhow!("build takes --out or --local-out, not both"),
+                    &anyhow::anyhow!("build needs one of --out, --local-out, --push"),
+                    2,
+                );
+            }
+            _ => {
+                return fail(
+                    &anyhow::anyhow!("build takes exactly one of --out, --local-out, --push"),
                     2,
                 );
             }

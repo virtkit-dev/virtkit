@@ -23,6 +23,11 @@ pub enum BuildOutput {
     /// used to extract a built artifact (e.g. a static binary) from a scratch-final
     /// stage. No ext4, no fingerprint-skip (always rebuilds).
     Local(PathBuf),
+    /// Push the target stage to a registry as an OCI image (buildctl
+    /// `type=image,push=true`) — build a normal container image from a Dockerfile
+    /// with no docker. No ext4, no fingerprint-skip (always builds). The string is
+    /// the image reference `<registry>/<name>:<tag>`.
+    Push(String),
 }
 
 /// A resolved build request: the CLI layer (and `fleet`) parse their flags into
@@ -152,9 +157,28 @@ pub fn run(spec: &BuildSpec) -> Result<()> {
         return Ok(());
     }
 
+    // Push: build the target stage and push it to a registry as an OCI image — a
+    // normal container image from a Dockerfile, no docker. No ext4.
+    if let BuildOutput::Push(reference) = &spec.output {
+        bc.arg("--output")
+            .arg(format!("type=image,name={reference},push=true"));
+        eprintln!(
+            "virtkit: building {tag} (target {}) -> push {reference} via {addr}",
+            spec.target
+        );
+        let st = bc
+            .status()
+            .with_context(|| format!("running {}", buildctl_bin.display()))?;
+        if !st.success() {
+            bail!("buildctl build/push failed ({st})");
+        }
+        println!("virtkit: pushed {tag} -> {reference}");
+        return Ok(());
+    }
+
     // 5b. ext4 mode: build to a temp OCI archive, then flatten it.
     let BuildOutput::Ext4(out) = &spec.output else {
-        unreachable!("Local handled above");
+        unreachable!("Local and Push handled above");
     };
     std::fs::create_dir_all(out.parent().unwrap_or_else(|| Path::new(".")))
         .with_context(|| format!("creating output dir for {}", out.display()))?;
