@@ -14,6 +14,11 @@ All notable changes to virtkit will be documented in this file.
   job may restrict its switch egress to a subset of the host `[egress] allow_name`
   cap. The cap stays host-only, so a job can drop down to least privilege but never
   widen its egress; a requested name outside the cap fails the job.
+- **`virtkit build --push-bundle <name>:<tag>`**: build a Dockerfile target and push
+  the resulting ext4 straight to the `[registry]` as a bundle, in one process — no
+  kept ext4 and no separate `registry push`. The fused buildkit → bundle path: the
+  ext4 is materialized only transiently (point `TMPDIR` at tmpfs to keep it in RAM)
+  and removed after the upload. A push failure fails the build.
 
 ## [0.2.0] - 2026-06-27
 

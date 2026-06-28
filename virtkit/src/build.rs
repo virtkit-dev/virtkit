@@ -28,6 +28,11 @@ pub enum BuildOutput {
     /// with no docker. No ext4, no fingerprint-skip (always builds). The string is
     /// the image reference `<registry>/<name>:<tag>`.
     Push(String),
+    /// Build the ext4 and push it straight to the `[registry]` as a bundle tagged
+    /// `<name>:<tag>`, materializing the ext4 only transiently (no kept artifact) —
+    /// the direct buildkit → bundle-registry path. Requires `spec.registry`. The
+    /// string is the bundle reference `<name>:<tag>`.
+    Bundle(String),
 }
 
 /// A resolved build request: the CLI layer (and `fleet`) parse their flags into
@@ -200,10 +205,15 @@ pub fn run(spec: &BuildSpec) -> Result<()> {
         return Ok(());
     }
 
-    // 5b. ext4 mode: build to a temp OCI archive, then flatten it.
-    let BuildOutput::Ext4(out) = &spec.output else {
-        unreachable!("Local and Push handled above");
+    // 5b. ext4 mode: build to a temp OCI archive, then flatten it. Ext4 and Bundle
+    // both flatten to an ext4; Bundle materializes it transiently (a temp file, ideal
+    // on tmpfs) and pushes it as a stable tag, keeping no artifact.
+    let out_buf = match &spec.output {
+        BuildOutput::Ext4(o) => o.clone(),
+        BuildOutput::Bundle(_) => bundle_tmp_path(&spec.name),
+        _ => unreachable!("Local and Push handled above"),
     };
+    let out = &out_buf;
     std::fs::create_dir_all(out.parent().unwrap_or_else(|| Path::new(".")))
         .with_context(|| format!("creating output dir for {}", out.display()))?;
     let tmp_oci = out.with_extension("build.oci");
@@ -238,6 +248,18 @@ pub fn run(spec: &BuildSpec) -> Result<()> {
     let r = mkoci::archive_to_ext4(&tmp_oci, out, &inj, &spec.env_files, free_blocks, &fsid);
     let _ = std::fs::remove_file(&tmp_oci);
     r?;
+
+    // Bundle: chunk + upload the ext4 to the [registry] as a stable tag, then drop
+    // the transient image. A failed push fails the build (this IS the build product),
+    // unlike the best-effort fleet share below.
+    if let BuildOutput::Bundle(reference) = &spec.output {
+        let boot_kind = crate::image::boot_kind_tag(crate::image::BootKind::GenericDisk);
+        let r = push_bundle(spec, reference, out, boot_kind);
+        let _ = std::fs::remove_file(out); // transient — never kept
+        r?;
+        return Ok(());
+    }
+
     println!("virtkit: built {tag} -> {} (uuid {uuid})", out.display());
 
     // shared registry: publish the freshly built bundle so sibling worktrees can pull
@@ -256,6 +278,33 @@ pub fn run(spec: &BuildSpec) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Push a freshly built ext4 to the `[registry]` as the stable bundle `<name>:<tag>`
+/// (the fused build → bundle path). The reference must carry a `:tag`.
+fn push_bundle(spec: &BuildSpec, reference: &str, ext4: &Path, boot_kind: &str) -> Result<()> {
+    let rg = spec
+        .registry
+        .as_ref()
+        .context("--push-bundle needs a [registry] section in the host config")?;
+    let (name, refr) = crate::image::parse_ref(reference)?;
+    let tag = match refr {
+        crate::image::Reference::Tag(t) => t,
+        crate::image::Reference::Digest(_) => {
+            bail!("--push-bundle needs a :tag, not an @digest ({reference:?})")
+        }
+    };
+    crate::registry::push_ext4(rg, &name, &tag, ext4, boot_kind)?;
+    println!("virtkit: built + pushed bundle {name}:{tag}");
+    Ok(())
+}
+
+/// A transient ext4 path for a `--push-bundle` build: under the system temp dir
+/// (point `TMPDIR` at tmpfs to keep it in RAM), name-sanitized + pid-scoped so
+/// concurrent builds don't collide.
+fn bundle_tmp_path(name: &str) -> PathBuf {
+    let safe = name.replace(['/', '\\', ':'], "_");
+    std::env::temp_dir().join(format!("virtkit-bundle-{safe}-{}.ext4", std::process::id()))
 }
 
 /// The fingerprint parts (after the tag) for a spec: each inject's host-file sha256
@@ -291,6 +340,18 @@ fn sha256_file(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundle_tmp_path_is_a_single_safe_component() {
+        // a repo-qualified name must not leak path separators into the temp path
+        let p = bundle_tmp_path("common/ci-bundles/appbuilder");
+        let file = p.file_name().unwrap().to_str().unwrap();
+        assert!(file.starts_with("virtkit-bundle-"));
+        assert!(file.ends_with(".ext4"));
+        assert!(!file.contains('/') && !file.contains('\\') && !file.contains(':'));
+        // it lands under the system temp dir, not the cwd
+        assert_eq!(p.parent().unwrap(), std::env::temp_dir());
+    }
 
     fn spec_with(injects: Vec<(String, PathBuf, u16)>, env_files: Vec<PathBuf>) -> BuildSpec {
         BuildSpec {

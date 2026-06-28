@@ -470,6 +470,12 @@ enum Cmd {
         /// (buildctl type=image,push) — build a container image with no docker
         #[arg(long = "push", value_name = "REGISTRY/NAME:TAG")]
         push: Option<String>,
+        /// instead of a kept ext4, build the ext4 and push it straight to the
+        /// [registry] as a bundle <name>:<tag>, keeping no local image — the direct
+        /// buildkit -> bundle-registry path (the ext4 is transient; point TMPDIR at
+        /// tmpfs to keep it in RAM). Needs a [registry] section in the host config.
+        #[arg(long = "push-bundle", value_name = "NAME:TAG")]
+        push_bundle: Option<String>,
         /// build arg KEY=VAL passed through where the target's closure declares it
         /// (repeatable)
         #[arg(long = "build-arg")]
@@ -724,6 +730,7 @@ async fn main() -> ExitCode {
         out,
         local_out,
         push,
+        push_bundle,
         build_arg,
         add_host,
         label,
@@ -738,22 +745,33 @@ async fn main() -> ExitCode {
         no_ensure_daemon,
     } = &cli.cmd
     {
-        let output = match (out, local_out, push) {
-            (Some(o), None, None) => build::BuildOutput::Ext4(o.clone()),
-            (None, Some(d), None) => build::BuildOutput::Local(d.clone()),
-            (None, None, Some(r)) => build::BuildOutput::Push(r.clone()),
-            (None, None, None) => {
+        let output = match (out, local_out, push, push_bundle) {
+            (Some(o), None, None, None) => build::BuildOutput::Ext4(o.clone()),
+            (None, Some(d), None, None) => build::BuildOutput::Local(d.clone()),
+            (None, None, Some(r), None) => build::BuildOutput::Push(r.clone()),
+            (None, None, None, Some(b)) => build::BuildOutput::Bundle(b.clone()),
+            (None, None, None, None) => {
                 return fail(
-                    &anyhow::anyhow!("build needs one of --out, --local-out, --push"),
+                    &anyhow::anyhow!(
+                        "build needs one of --out, --local-out, --push, --push-bundle"
+                    ),
                     2,
                 );
             }
             _ => {
                 return fail(
-                    &anyhow::anyhow!("build takes exactly one of --out, --local-out, --push"),
+                    &anyhow::anyhow!(
+                        "build takes exactly one of --out, --local-out, --push, --push-bundle"
+                    ),
                     2,
                 );
             }
+        };
+        // --push-bundle uploads to the host [registry]; the other modes keep no
+        // registry (a standalone --out build does not publish).
+        let registry = match &output {
+            build::BuildOutput::Bundle(_) => cfg.registry.clone(),
+            _ => None,
         };
         let mut build_args = std::collections::BTreeMap::new();
         for a in build_arg {
@@ -799,9 +817,9 @@ async fn main() -> ExitCode {
             buildkitd: buildkitd.clone(),
             ensure_daemon: !*no_ensure_daemon,
             force: *force,
-            // the standalone `build` CLI does not share through a registry (the fleet
-            // path passes one); push explicitly with `--push` or `registry push`.
-            registry: None,
+            // set only for --push-bundle (the fused build → bundle path); the other
+            // modes keep no registry — push explicitly with `--push`/`registry push`.
+            registry,
         };
         return match build::run(&spec) {
             Ok(()) => ExitCode::SUCCESS,
