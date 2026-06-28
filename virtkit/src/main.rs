@@ -17,6 +17,7 @@
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 mod build;
+mod buildconf;
 mod buildkit;
 mod config;
 mod convert;
@@ -455,9 +456,10 @@ enum Cmd {
         /// build context dir (default: the dir of the first -f)
         #[arg(long)]
         context: Option<PathBuf>,
-        /// target stage to build (required)
+        /// target to build: the Dockerfile stage (flag mode), or the virtkit.conf
+        /// `[targets.<name>]` entry (--conf mode). Required unless --conf --versions.
         #[arg(long)]
-        target: String,
+        target: Option<String>,
         /// output ext4 image (required unless --local-out is given)
         #[arg(long)]
         out: Option<PathBuf>,
@@ -496,9 +498,22 @@ enum Cmd {
         /// spare free space (GiB) left in the filesystem for the guest to write
         #[arg(long, default_value_t = 0)]
         free_gib: u64,
-        /// tag/fingerprint name (the `<name>:<hash>` tag identity and fs label)
+        /// tag/fingerprint name (the `<name>:<hash>` tag identity and fs label).
+        /// Required unless --conf is given (then the name is the --target entry).
         #[arg(long)]
-        name: String,
+        name: Option<String>,
+        /// build a target declared in a virtkit.conf manifest: --target names the
+        /// `[targets.<name>]` entry; its stage, dockerfiles, build args and version
+        /// tag come from the conf (hashes computed by virtkit, no external driver).
+        /// Output defaults to a bundle pushed to the [registry] under the rendered
+        /// version; pass --push <ref> for an OCI image or --out for a local ext4.
+        /// Ignores -f/--context; rejects --name/--push-bundle/--local-out.
+        #[arg(long = "conf", value_name = "PATH")]
+        conf: Option<PathBuf>,
+        /// with --conf: print `<name> <version>` for every manifest target and exit
+        /// (no build) — the build's already-built / out.env source.
+        #[arg(long = "versions", requires = "conf")]
+        versions: bool,
         /// rebuild even if the image is already fresh
         #[arg(long)]
         force: bool,
@@ -738,6 +753,8 @@ async fn main() -> ExitCode {
         env_file,
         free_gib,
         name,
+        conf,
+        versions,
         force,
         buildkit_addr,
         buildctl,
@@ -745,39 +762,7 @@ async fn main() -> ExitCode {
         no_ensure_daemon,
     } = &cli.cmd
     {
-        let output = match (out, local_out, push, push_bundle) {
-            (Some(o), None, None, None) => build::BuildOutput::Ext4(o.clone()),
-            (None, Some(d), None, None) => build::BuildOutput::Local(d.clone()),
-            (None, None, Some(r), None) => build::BuildOutput::Push(r.clone()),
-            (None, None, None, Some(b)) => build::BuildOutput::Bundle(b.clone()),
-            (None, None, None, None) => {
-                return fail(
-                    &anyhow::anyhow!(
-                        "build needs one of --out, --local-out, --push, --push-bundle"
-                    ),
-                    2,
-                );
-            }
-            _ => {
-                return fail(
-                    &anyhow::anyhow!(
-                        "build takes exactly one of --out, --local-out, --push, --push-bundle"
-                    ),
-                    2,
-                );
-            }
-        };
-        // --push-bundle uploads to the host [registry]; the other modes keep no
-        // registry (a standalone --out build does not publish).
-        let registry = match &output {
-            build::BuildOutput::Bundle(_) => cfg.registry.clone(),
-            _ => None,
-        };
-        let mut build_args = std::collections::BTreeMap::new();
-        for a in build_arg {
-            let (k, v) = a.split_once('=').unwrap_or((a.as_str(), ""));
-            build_args.insert(k.to_string(), v.to_string());
-        }
+        // arg parsing shared by both sources (conf manifest / explicit flags)
         let mut add_hosts = Vec::new();
         for h in add_host {
             let (host, ip) = h.split_once('=').unwrap_or((h.as_str(), ""));
@@ -792,21 +777,150 @@ async fn main() -> ExitCode {
             Ok(p) => p,
             Err(e) => return fail(&e, 2),
         };
-        let first = file.first().cloned();
-        let context = context.clone().unwrap_or_else(|| {
-            first
-                .as_deref()
-                .and_then(Path::parent)
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf()
-        });
+        // CLI --build-arg KEY=VAL — overrides the conf [build_args] in --conf mode
+        // (fed into the stage hash + version tokens so the tag matches what is built).
+        let mut cli_args = std::collections::BTreeMap::new();
+        for a in build_arg {
+            let (k, v) = a.split_once('=').unwrap_or((a.as_str(), ""));
+            cli_args.insert(k.to_string(), v.to_string());
+        }
+
+        // Resolve the build inputs either from a virtkit.conf target (--conf) or from
+        // the explicit flags. The conf path computes the stage hash + version tag
+        // itself (no external driver); the bundle sink is implied (--push/--out opt out).
+        struct BuildInputs {
+            dockerfiles: Vec<PathBuf>,
+            context: PathBuf,
+            stage: String,
+            name: String,
+            output: build::BuildOutput,
+            registry: Option<config::Registry>,
+            build_args: std::collections::BTreeMap<String, String>,
+        }
+        let inputs: BuildInputs = if let Some(conf_path) = conf {
+            if name.is_some() || local_out.is_some() || push_bundle.is_some() {
+                return fail(
+                    &anyhow::anyhow!(
+                        "--conf takes no --name/--push-bundle/--local-out: the name is the \
+                         --target entry, and it push-bundles by the conf version (default), \
+                         --push <ref> for an OCI image, or --out for a local ext4"
+                    ),
+                    2,
+                );
+            }
+            let bc = match buildconf::BuildConf::load(conf_path) {
+                Ok(b) => b,
+                Err(e) => return fail(&e, 2),
+            };
+            let base = conf_path.parent().unwrap_or_else(|| Path::new("."));
+            // --versions: list every target's version and exit (no build).
+            if *versions {
+                match bc.versions(base) {
+                    Ok(list) => {
+                        for (name, version) in list {
+                            println!("{name} {version}");
+                        }
+                        return ExitCode::SUCCESS;
+                    }
+                    Err(e) => return fail(&e, 1),
+                }
+            }
+            let target = match target {
+                Some(t) => t,
+                None => return fail(&anyhow::anyhow!("build --conf needs --target <name>"), 2),
+            };
+            let r = match bc.resolve(target, base, &cli_args) {
+                Ok(r) => r,
+                Err(e) => return fail(&e, 2),
+            };
+            // sink: --push <ref> (OCI image, e.g. service images) | --out (local ext4) |
+            // default = push-bundle to [registry] under the rendered version.
+            let output = match (push, out) {
+                (Some(reference), None) => build::BuildOutput::Push(reference.clone()),
+                (None, Some(o)) => build::BuildOutput::Ext4(o.clone()),
+                (None, None) => build::BuildOutput::Bundle(r.version.clone()),
+                (Some(_), Some(_)) => {
+                    return fail(
+                        &anyhow::anyhow!("--push and --out are mutually exclusive"),
+                        2,
+                    );
+                }
+            };
+            let registry = match &output {
+                build::BuildOutput::Bundle(_) => cfg.registry.clone(),
+                _ => None,
+            };
+            BuildInputs {
+                dockerfiles: r.dockerfiles,
+                context: r.context,
+                stage: r.stage,
+                name: r.name,
+                output,
+                registry,
+                build_args: r.build_args,
+            }
+        } else {
+            let name = match name {
+                Some(n) => n.clone(),
+                None => return fail(&anyhow::anyhow!("build needs --name (or --conf)"), 2),
+            };
+            let stage = match target {
+                Some(t) => t.clone(),
+                None => return fail(&anyhow::anyhow!("build needs --target <stage>"), 2),
+            };
+            let output = match (out, local_out, push, push_bundle) {
+                (Some(o), None, None, None) => build::BuildOutput::Ext4(o.clone()),
+                (None, Some(d), None, None) => build::BuildOutput::Local(d.clone()),
+                (None, None, Some(r), None) => build::BuildOutput::Push(r.clone()),
+                (None, None, None, Some(b)) => build::BuildOutput::Bundle(b.clone()),
+                (None, None, None, None) => {
+                    return fail(
+                        &anyhow::anyhow!(
+                            "build needs one of --out, --local-out, --push, --push-bundle, --conf"
+                        ),
+                        2,
+                    );
+                }
+                _ => {
+                    return fail(
+                        &anyhow::anyhow!(
+                            "build takes exactly one of --out, --local-out, --push, --push-bundle"
+                        ),
+                        2,
+                    );
+                }
+            };
+            // --push-bundle uploads to the host [registry]; the other flag modes keep
+            // no registry (a standalone --out build does not publish).
+            let registry = match &output {
+                build::BuildOutput::Bundle(_) => cfg.registry.clone(),
+                _ => None,
+            };
+            let first = file.first().cloned();
+            let context = context.clone().unwrap_or_else(|| {
+                first
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf()
+            });
+            BuildInputs {
+                dockerfiles: file.clone(),
+                context,
+                stage,
+                name,
+                output,
+                registry,
+                build_args: cli_args,
+            }
+        };
         let spec = build::BuildSpec {
-            dockerfiles: file.clone(),
-            context,
-            target: target.clone(),
-            name: name.clone(),
-            output,
-            build_args,
+            dockerfiles: inputs.dockerfiles,
+            context: inputs.context,
+            target: inputs.stage,
+            name: inputs.name,
+            output: inputs.output,
+            build_args: inputs.build_args,
             add_hosts,
             labels,
             injects,
@@ -817,9 +931,7 @@ async fn main() -> ExitCode {
             buildkitd: buildkitd.clone(),
             ensure_daemon: !*no_ensure_daemon,
             force: *force,
-            // set only for --push-bundle (the fused build → bundle path); the other
-            // modes keep no registry — push explicitly with `--push`/`registry push`.
-            registry,
+            registry: inputs.registry,
         };
         return match build::run(&spec) {
             Ok(()) => ExitCode::SUCCESS,

@@ -19,6 +19,19 @@ All notable changes to virtkit will be documented in this file.
   kept ext4 and no separate `registry push`. The fused buildkit → bundle path: the
   ext4 is materialized only transiently (point `TMPDIR` at tmpfs to keep it in RAM)
   and removed after the upload. A push failure fails the build.
+- **`virtkit build --conf <virtkit.conf>`**: build a target declared in a project
+  manifest with no external driver. The TOML manifest holds `dockerfiles`, a
+  `[build_args]` table, and `[targets.<name>]` entries (`stage` + a `version`
+  template); virtkit computes the stage hash (byte-for-byte matching the existing
+  pipeline) and renders the tag from `{name}`/`{hash}`/`{ARG[<name>]}` tokens
+  (`{ARG[debversion]}` → the effective `debversion` build-arg value), with optional
+  bash-style strip transforms on `{ARG[...]}` — `%%<sep>*`/`%<sep>*` (before the
+  first/last `sep`) and `##*<sep>`/`#*<sep>` (after the last/first `sep`), e.g.
+  `{ARG[debversion]%%-*}` → the distro codename. It then
+  push-bundles it to the `[registry]` (default), pushes an OCI image with
+  `--push <ref>` (service images), or writes a local ext4 with `--out`.
+  `--conf --versions` lists every target's `<name> <version>` (the build's
+  already-built / out.env source).
 
 ## [0.2.0] - 2026-06-27
 
