@@ -478,6 +478,11 @@ enum Cmd {
         /// tmpfs to keep it in RAM). Needs a [registry] section in the host config.
         #[arg(long = "push-bundle", value_name = "NAME:TAG")]
         push_bundle: Option<String>,
+        /// instead of an ext4, build the target stage and load it into the local
+        /// container daemon (buildkit type=docker -> `docker load`; loader override
+        /// VIRTKIT_CONTAINER_CLI). Tagged by the --conf version, else by --name.
+        #[arg(long = "load")]
+        load: bool,
         /// build arg KEY=VAL passed through where the target's closure declares it
         /// (repeatable)
         #[arg(long = "build-arg")]
@@ -746,6 +751,7 @@ async fn main() -> ExitCode {
         local_out,
         push,
         push_bundle,
+        load,
         build_arg,
         add_host,
         label,
@@ -833,17 +839,28 @@ async fn main() -> ExitCode {
                 Ok(r) => r,
                 Err(e) => return fail(&e, 2),
             };
-            // sink: --push <ref> (OCI image, e.g. service images) | --out (local ext4) |
-            // default = push-bundle to [registry] under the rendered version.
-            let output = match (push, out) {
-                (Some(reference), None) => build::BuildOutput::Push(reference.clone()),
-                (None, Some(o)) => build::BuildOutput::Ext4(o.clone()),
-                (None, None) => build::BuildOutput::Bundle(r.version.clone()),
-                (Some(_), Some(_)) => {
+            // sink: --load (local docker image) | --push <ref> (OCI image, e.g. service
+            // images) | --out (local ext4) | default = push-bundle to [registry] under
+            // the rendered version. All tagged by the conf version where applicable.
+            let output = if *load {
+                if push.is_some() || out.is_some() {
                     return fail(
-                        &anyhow::anyhow!("--push and --out are mutually exclusive"),
+                        &anyhow::anyhow!("--load is mutually exclusive with --push/--out"),
                         2,
                     );
+                }
+                build::BuildOutput::Load(r.version.clone())
+            } else {
+                match (push, out) {
+                    (Some(reference), None) => build::BuildOutput::Push(reference.clone()),
+                    (None, Some(o)) => build::BuildOutput::Ext4(o.clone()),
+                    (None, None) => build::BuildOutput::Bundle(r.version.clone()),
+                    (Some(_), Some(_)) => {
+                        return fail(
+                            &anyhow::anyhow!("--push and --out are mutually exclusive"),
+                            2,
+                        );
+                    }
                 }
             };
             let registry = match &output {
@@ -868,26 +885,38 @@ async fn main() -> ExitCode {
                 Some(t) => t.clone(),
                 None => return fail(&anyhow::anyhow!("build needs --target <stage>"), 2),
             };
-            let output = match (out, local_out, push, push_bundle) {
-                (Some(o), None, None, None) => build::BuildOutput::Ext4(o.clone()),
-                (None, Some(d), None, None) => build::BuildOutput::Local(d.clone()),
-                (None, None, Some(r), None) => build::BuildOutput::Push(r.clone()),
-                (None, None, None, Some(b)) => build::BuildOutput::Bundle(b.clone()),
-                (None, None, None, None) => {
+            let output = if *load {
+                if out.is_some() || local_out.is_some() || push.is_some() || push_bundle.is_some() {
                     return fail(
                         &anyhow::anyhow!(
-                            "build needs one of --out, --local-out, --push, --push-bundle, --conf"
+                            "--load is mutually exclusive with --out/--local-out/--push/--push-bundle"
                         ),
                         2,
                     );
                 }
-                _ => {
-                    return fail(
-                        &anyhow::anyhow!(
-                            "build takes exactly one of --out, --local-out, --push, --push-bundle"
-                        ),
-                        2,
-                    );
+                build::BuildOutput::Load(name.clone())
+            } else {
+                match (out, local_out, push, push_bundle) {
+                    (Some(o), None, None, None) => build::BuildOutput::Ext4(o.clone()),
+                    (None, Some(d), None, None) => build::BuildOutput::Local(d.clone()),
+                    (None, None, Some(r), None) => build::BuildOutput::Push(r.clone()),
+                    (None, None, None, Some(b)) => build::BuildOutput::Bundle(b.clone()),
+                    (None, None, None, None) => {
+                        return fail(
+                            &anyhow::anyhow!(
+                                "build needs one of --out, --local-out, --push, --push-bundle, --load, --conf"
+                            ),
+                            2,
+                        );
+                    }
+                    _ => {
+                        return fail(
+                            &anyhow::anyhow!(
+                                "build takes exactly one of --out, --local-out, --push, --push-bundle, --load"
+                            ),
+                            2,
+                        );
+                    }
                 }
             };
             // --push-bundle uploads to the host [registry]; the other flag modes keep

@@ -29,9 +29,14 @@ All notable changes to virtkit will be documented in this file.
   first/last `sep`) and `##*<sep>`/`#*<sep>` (after the last/first `sep`), e.g.
   `{ARG[debversion]%%-*}` → the distro codename. It then
   push-bundles it to the `[registry]` (default), pushes an OCI image with
-  `--push <ref>` (service images), or writes a local ext4 with `--out`.
+  `--push <ref>` (service images), loads it into the local container daemon with
+  `--load` (the local-dev / docker-mode path), or writes a local ext4 with `--out`.
   `--conf --versions` lists every target's `<name> <version>` (the build's
   already-built / out.env source).
+- **`virtkit build --load`**: build a Dockerfile target and load it straight into the
+  local container daemon (buildkit `type=docker` streamed to `<cli> load`, no kept
+  ext4/registry) — a normal local image, tagged by the `--conf` version (else
+  `--name`). The loader is `docker`, overridable via `VIRTKIT_CONTAINER_CLI`.
 
 ## [0.2.0] - 2026-06-27
 

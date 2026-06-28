@@ -447,7 +447,11 @@ mod tests {
         ovr.insert("flavor".to_string(), "custom".to_string());
         let overridden = bc.resolve("app", base, &ovr).unwrap();
         // the {ARG[flavor]} token reflects the override...
-        assert!(default.version.starts_with("app-base:"), "{}", default.version);
+        assert!(
+            default.version.starts_with("app-base:"),
+            "{}",
+            default.version
+        );
         assert!(
             overridden.version.starts_with("app-custom:"),
             "{}",
@@ -457,7 +461,10 @@ mod tests {
         // stage hash, so the published tag matches what is actually built (Fix-1).
         let dh = default.version.rsplit(':').next().unwrap();
         let oh = overridden.version.rsplit(':').next().unwrap();
-        assert_ne!(dh, oh, "stage hash must change when a build-arg override does");
+        assert_ne!(
+            dh, oh,
+            "stage hash must change when a build-arg override does"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

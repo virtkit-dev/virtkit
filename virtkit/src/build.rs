@@ -33,6 +33,11 @@ pub enum BuildOutput {
     /// the direct buildkit → bundle-registry path. Requires `spec.registry`. The
     /// string is the bundle reference `<name>:<tag>`.
     Bundle(String),
+    /// Build the target stage and load it into the local container daemon (buildkit
+    /// `type=docker` streamed to `<cli> load`) — a normal local image, no registry,
+    /// no ext4. The string is the image reference `<name>:<tag>`. The loader defaults
+    /// to `docker`, overridable via `VIRTKIT_CONTAINER_CLI` (e.g. `podman`).
+    Load(String),
 }
 
 /// A resolved build request: the CLI layer (and `fleet`) parse their flags into
@@ -202,6 +207,42 @@ pub fn run(spec: &BuildSpec) -> Result<()> {
             bail!("buildctl build/push failed ({st})");
         }
         println!("virtkit: pushed {tag} -> {reference}");
+        return Ok(());
+    }
+
+    // Load: build the target stage and stream the docker-format archive straight into
+    // the local container daemon (`buildctl … --output type=docker | <cli> load`) — a
+    // normal local image, no registry, no ext4 (the `--vm`/CI side uses bundles).
+    if let BuildOutput::Load(reference) = &spec.output {
+        let cli = std::env::var("VIRTKIT_CONTAINER_CLI").unwrap_or_else(|_| "docker".into());
+        bc.arg("--output")
+            .arg(format!("type=docker,name={reference}"));
+        bc.stdout(std::process::Stdio::piped());
+        eprintln!(
+            "virtkit: building {tag} (target {}) -> {cli} load {reference} via {addr}",
+            spec.target
+        );
+        let mut builder = bc
+            .spawn()
+            .with_context(|| format!("running {}", buildctl_bin.display()))?;
+        let archive = builder.stdout.take().expect("piped buildctl stdout");
+        let mut loader = std::process::Command::new(&cli)
+            .arg("load")
+            .stdin(archive)
+            .spawn()
+            .with_context(|| format!("running `{cli} load`"))?;
+        // wait for both ends; report whichever failed.
+        let build_st = builder.wait().context("waiting for buildctl")?;
+        let load_st = loader
+            .wait()
+            .with_context(|| format!("waiting for `{cli} load`"))?;
+        if !build_st.success() {
+            bail!("buildctl build failed ({build_st})");
+        }
+        if !load_st.success() {
+            bail!("`{cli} load` failed ({load_st})");
+        }
+        println!("virtkit: built + loaded {tag} -> {reference}");
         return Ok(());
     }
 
