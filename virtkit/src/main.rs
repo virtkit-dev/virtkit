@@ -161,7 +161,7 @@ enum Cmd {
         #[arg(long = "allow-ip", value_name = "CIDR")]
         allow_ip: Vec<String>,
         /// egress allowlist — hostname suffix the http(s) proxy permits, e.g.
-        /// `corp.wallix.com` (repeatable).
+        /// `corp.example.com` (repeatable).
         #[arg(long = "allow-name", value_name = "SUFFIX")]
         allow_name: Vec<String>,
     },

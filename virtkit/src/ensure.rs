@@ -124,8 +124,8 @@ pub fn ensure_service_build(
 }
 
 /// Derive the tag/label NAME from a `--service-image NAME=<image-ref>` value by
-/// stripping the `:<tag>` suffix (e.g. `wabmysql-bookworm:716aecf` ->
-/// `wabmysql-bookworm`); no colon -> the value verbatim.
+/// stripping the `:<tag>` suffix (e.g. `appmysql-bookworm:716aecf` ->
+/// `appmysql-bookworm`); no colon -> the value verbatim.
 pub fn image_name(image_ref: &str) -> &str {
     image_ref.split_once(':').map_or(image_ref, |(n, _)| n)
 }
@@ -163,8 +163,8 @@ mod tests {
     #[test]
     fn image_name_strips_tag_suffix() {
         // `:<tag>` suffix dropped -> the tag/label NAME.
-        assert_eq!(image_name("wabmysql-bookworm:716aecf"), "wabmysql-bookworm");
+        assert_eq!(image_name("appmysql-bookworm:716aecf"), "appmysql-bookworm");
         // no colon -> verbatim passthrough.
-        assert_eq!(image_name("wabmysql-bookworm"), "wabmysql-bookworm");
+        assert_eq!(image_name("appmysql-bookworm"), "appmysql-bookworm");
     }
 }

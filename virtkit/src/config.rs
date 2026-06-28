@@ -73,8 +73,8 @@ pub struct Gitlab {
 pub struct Egress {
     /// Allowed destination IPv4 CIDRs for direct (non-DNS-resolved) egress.
     pub allow_ip: Vec<String>,
-    /// Allowed DNS name suffixes, dot-anchored (e.g. `corp.wallix.com` also
-    /// allows `*.corp.wallix.com`).
+    /// Allowed DNS name suffixes, dot-anchored (e.g. `corp.example.com` also
+    /// allows `*.corp.example.com`).
     pub allow_name: Vec<String>,
 }
 
@@ -469,12 +469,12 @@ mod tests {
             r#"
             [egress]
             allow_ip = ["10.0.0.0/8", "192.168.1.1/32"]
-            allow_name = ["corp.wallix.com", "github.com"]
+            allow_name = ["corp.example.com", "github.com"]
             "#,
         )
         .unwrap();
         assert_eq!(cfg.egress.allow_ip, ["10.0.0.0/8", "192.168.1.1/32"]);
-        assert_eq!(cfg.egress.allow_name, ["corp.wallix.com", "github.com"]);
+        assert_eq!(cfg.egress.allow_name, ["corp.example.com", "github.com"]);
         // absent [egress] = unrestricted (both lists empty)
         let none = Config::default();
         assert!(none.egress.allow_ip.is_empty() && none.egress.allow_name.is_empty());

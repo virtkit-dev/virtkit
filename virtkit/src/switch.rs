@@ -68,7 +68,7 @@ pub enum Egress {
         /// allowed destination IPv4 ranges for direct (non-proxied) egress
         ips: Vec<Cidr4>,
         /// allowed hostname suffixes for the http(s) proxy, dot-anchored:
-        /// `corp.wallix.com` allows that host and `*.corp.wallix.com`
+        /// `corp.example.com` allows that host and `*.corp.example.com`
         names: Vec<String>,
     },
 }
@@ -1017,7 +1017,7 @@ mod tests {
     fn egress_allowlist() {
         let e = Egress::new(
             &["10.0.0.0/8".into(), "192.168.231.1/32".into()],
-            &["corp.wallix.com".into(), ".github.com".into()],
+            &["corp.example.com".into(), ".github.com".into()],
         )
         .unwrap();
         // direct-egress IP allowlist
@@ -1026,11 +1026,11 @@ mod tests {
         assert!(!e.allows_ip("8.8.8.8".parse().unwrap()));
         assert!(!e.allows_ip("::1".parse().unwrap())); // v6 denied under an allowlist
         // proxy host allowlist (suffix-anchored)
-        assert!(e.allows_host("gitlab.corp.wallix.com"));
-        assert!(e.allows_host("corp.wallix.com"));
+        assert!(e.allows_host("gitlab.corp.example.com"));
+        assert!(e.allows_host("corp.example.com"));
         assert!(e.allows_host("api.github.com"));
         assert!(!e.allows_host("evil.com"));
-        assert!(!e.allows_host("corp.wallix.com.evil.com")); // not a real suffix match
+        assert!(!e.allows_host("corp.example.com.evil.com")); // not a real suffix match
         // no rules => allow all (the dev fleet default)
         assert!(matches!(Egress::new(&[], &[]).unwrap(), Egress::AllowAll));
         let any = Egress::default();
@@ -1054,7 +1054,7 @@ mod tests {
     #[test]
     fn egress_guard_pins_and_blocks() {
         let gw = Ipv4Addr::new(192, 168, 231, 1);
-        let g = EgressGuard::new(Egress::new(&[], &["corp.wallix.com".into()]).unwrap(), gw);
+        let g = EgressGuard::new(Egress::new(&[], &["corp.example.com".into()]).unwrap(), gw);
         let corp: SocketAddr = "10.20.30.40:443".parse().unwrap();
         assert!(!g.allows(corp)); // not resolved yet
         g.record(&[Ipv4Addr::new(10, 20, 30, 40)], 300); // resolver pinned it

@@ -335,7 +335,7 @@ mod tests {
 
         let agent_sha = sha256_file(&agent).unwrap();
         // legacy recipe: [tag, sha256(agent)]
-        let tag = "wabmysql-bookworm:abc123";
+        let tag = "appmysql-bookworm:abc123";
         let legacy = ensure::fingerprint(&[tag, agent_sha.as_str()]);
 
         let part_hashes = fingerprint_hashes(&spec).unwrap();

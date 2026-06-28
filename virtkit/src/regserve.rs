@@ -894,7 +894,7 @@ mod tests {
 
     #[test]
     fn name_validation_blocks_traversal() {
-        assert!(valid_name("bundles/wabbuilder"));
+        assert!(valid_name("bundles/appbuilder"));
         assert!(valid_name("redis"));
         assert!(!valid_name("../etc"));
         assert!(!valid_name("a//b"));
