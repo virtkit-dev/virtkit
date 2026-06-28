@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-28
+
 ### Added
 
 - **`virtkit registry inspect <name>[:tag|@digest]`**: check a bundle exists in the
