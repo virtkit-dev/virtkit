@@ -135,7 +135,9 @@ impl Egress {
         }
     }
     /// Resolver name check: allow a host equal to or under an allowed suffix.
-    fn allows_host(&self, host: &str) -> bool {
+    /// Also used host-side to validate a per-job allow_name request stays within
+    /// the configured cap (the executor's `effective_allow_names`).
+    pub fn allows_host(&self, host: &str) -> bool {
         match self {
             Egress::AllowAll => true,
             Egress::Allow { names, .. } => {

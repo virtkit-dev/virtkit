@@ -20,6 +20,11 @@ pub struct JobCtx {
     /// the guest image's baked default (VIRTKIT_DEFAULT_RUN_USER). None = use
     /// that default.
     pub user_req: Option<String>,
+    /// MICROVM_EGRESS_ALLOW_NAME job variable (space/comma separated): narrow this
+    /// job's switch egress to a subset of the host [egress] allow_name cap. None =
+    /// use the full cap. A name outside the cap fails the job (a job can narrow but
+    /// never widen its egress).
+    pub egress_allow_name_req: Option<String>,
     /// Exit code telling gitlab-runner the *script* failed (job failure)
     pub build_failure: i32,
     /// Exit code telling gitlab-runner the *environment* failed (retryable)
@@ -66,6 +71,7 @@ impl JobCtx {
             cpus_req: job_var("MICROVM_CPUS"),
             mem_req: job_var("MICROVM_MEM"),
             user_req: job_var("MICROVM_USER"),
+            egress_allow_name_req: job_var("MICROVM_EGRESS_ALLOW_NAME"),
             build_failure: exit_code_env("BUILD_FAILURE_EXIT_CODE", 1),
             system_failure: exit_code_env("SYSTEM_FAILURE_EXIT_CODE", 2),
         })

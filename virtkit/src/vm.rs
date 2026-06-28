@@ -444,10 +444,12 @@ fn spawn_switch(ctx: &JobCtx, gateway: Ipv4Addr, prefix: u8) -> Result<()> {
         .arg(gateway.to_string())
         .arg("--prefix")
         .arg(prefix.to_string());
+    // allow_ip stays host-controlled; allow_name is the host cap by default, or a
+    // job-narrowed subset of it (MICROVM_EGRESS_ALLOW_NAME).
     for cidr in &cfg.egress.allow_ip {
         cmd.arg("--allow-ip").arg(cidr);
     }
-    for name in &cfg.egress.allow_name {
+    for name in effective_allow_names(cfg, ctx)? {
         cmd.arg("--allow-name").arg(name);
     }
     let child = spawn_detached(cmd, &ctx.switch_log()).context("spawning the per-job switch")?;
@@ -455,6 +457,43 @@ fn spawn_switch(ctx: &JobCtx, gateway: Ipv4Addr, prefix: u8) -> Result<()> {
     wait_for_socket(&listen, Duration::from_secs(5))
         .context("the per-job switch did not bind its socket")?;
     Ok(())
+}
+
+/// The switch `--allow-name` list for this job: the host `[egress]` cap by default,
+/// or the job's `MICROVM_EGRESS_ALLOW_NAME` subset of it. The cap is host-only, so a
+/// job can restrict its own egress (least privilege) but never widen it.
+fn effective_allow_names(cfg: &crate::config::Config, ctx: &JobCtx) -> Result<Vec<String>> {
+    match &ctx.egress_allow_name_req {
+        None => Ok(cfg.egress.allow_name.clone()),
+        Some(req) => narrow_allow_names(&cfg.egress.allow_ip, &cfg.egress.allow_name, req),
+    }
+}
+
+/// Parse a space/comma separated `MICROVM_EGRESS_ALLOW_NAME` request and check each
+/// name falls within the host `[egress]` cap, using the switch's own suffix
+/// semantics. A name outside the cap is an error — the job cannot widen its egress.
+///
+/// The check is against the *full* host policy `Egress::new(allow_ip, allow_name)`,
+/// not `allow_name` alone: the host egress is unrestricted only when both lists are
+/// empty (`Egress::AllowAll`). An empty `allow_name` with a non-empty `allow_ip`
+/// denies all names, so the job cannot add any — otherwise a job could append a name
+/// to an IP-only cap and widen its egress.
+fn narrow_allow_names(allow_ip: &[String], cap: &[String], req: &str) -> Result<Vec<String>> {
+    let requested: Vec<String> = req
+        .split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let policy = crate::switch::Egress::new(allow_ip, cap)?;
+    for name in &requested {
+        if !policy.allows_host(name) {
+            bail!(
+                "MICROVM_EGRESS_ALLOW_NAME {name:?} is not within the host [egress] allow_name cap"
+            );
+        }
+    }
+    Ok(requested)
 }
 
 /// Effective vCPU count and memory size: the job's MICROVM_CPUS/MICROVM_MEM
@@ -712,6 +751,31 @@ mod tests {
         assert!(vm_size(&ctx(Some("0"), None)).is_err());
         assert!(vm_size(&ctx(None, Some("64"))).is_err());
         assert!(vm_size(&ctx(None, Some("4096M"))).is_err());
+    }
+
+    #[test]
+    fn per_job_allow_name_narrows_within_cap() {
+        let cap = vec!["corp.example.com".to_string(), "github.com".to_string()];
+        // a subset (exact + under a suffix) is accepted, returned as the job's set
+        assert_eq!(
+            narrow_allow_names(&[], &cap, "gitlab.corp.example.com, github.com").unwrap(),
+            vec![
+                "gitlab.corp.example.com".to_string(),
+                "github.com".to_string()
+            ]
+        );
+        // a name outside the cap fails the job (no widening)
+        assert!(narrow_allow_names(&[], &cap, "pypi.org").is_err());
+        assert!(narrow_allow_names(&[], &cap, "gitlab.corp.example.com pypi.org").is_err());
+        // both caps empty = unrestricted host egress (AllowAll), so any name is within it
+        assert_eq!(
+            narrow_allow_names(&[], &[], "anything.example").unwrap(),
+            vec!["anything.example".to_string()]
+        );
+        // an IP-only cap (allow_ip set, allow_name empty) allows NO names: the host
+        // permits no name egress, so a job cannot add one and widen past the cap.
+        let ip_cap = vec!["10.0.0.0/8".to_string()];
+        assert!(narrow_allow_names(&ip_cap, &[], "evil.example").is_err());
     }
 
     #[test]

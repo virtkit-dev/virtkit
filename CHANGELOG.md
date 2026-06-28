@@ -10,6 +10,10 @@ All notable changes to virtkit will be documented in this file.
   `[registry]` repo without pulling it — prints the manifest digest and exits 0, or
   exits non-zero if absent. The CI build's already-built check, replacing
   `docker manifest inspect`.
+- **Per-job egress narrowing** (`MICROVM_EGRESS_ALLOW_NAME` job variable): a gitlab
+  job may restrict its switch egress to a subset of the host `[egress] allow_name`
+  cap. The cap stays host-only, so a job can drop down to least privilege but never
+  widen its egress; a requested name outside the cap fails the job.
 
 ## [0.2.0] - 2026-06-27
 
