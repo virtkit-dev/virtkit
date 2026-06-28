@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`virtkit registry inspect <name>[:tag|@digest]`**: check a bundle exists in the
+  `[registry]` repo without pulling it — prints the manifest digest and exits 0, or
+  exits non-zero if absent. The CI build's already-built check, replacing
+  `docker manifest inspect`.
+
 ## [0.2.0] - 2026-06-27
 
 ### Added

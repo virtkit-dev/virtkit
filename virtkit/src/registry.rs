@@ -128,6 +128,31 @@ pub fn pull(cfg: Config, image_ref: &str) -> Result<std::path::PathBuf> {
     Ok(dir)
 }
 
+/// Resolve a reference to its manifest digest without pulling any blobs — the CLI
+/// existence check (`registry inspect`). CI uses it to skip rebuilding a bundle
+/// already in the store. Returns the manifest digest; errors (non-zero exit) when
+/// the reference is absent or the registry is unreachable.
+pub fn inspect(cfg: &Config, image_ref: &str) -> Result<String> {
+    let rg = cfg
+        .registry
+        .as_ref()
+        .context("`registry inspect` needs a [registry] section in the config")?;
+    let (name, reference) = image::parse_ref(image_ref)?;
+    block_on(inspect_async(rg, &name, &reference))
+}
+
+async fn inspect_async(rg: &Registry, name: &str, reference: &Reference) -> Result<String> {
+    let (client, auth) = client(rg)?;
+    let image = match reference {
+        Reference::Tag(t) => make_ref(rg, name, t)?,
+        Reference::Digest(d) => make_digest_ref(rg, name, d)?,
+    };
+    client
+        .fetch_manifest_digest(&image, &auth)
+        .await
+        .with_context(|| format!("{}/{name}: reference not found in the registry", rg.repo))
+}
+
 /// Try to pull a bundle tagged `<name>:<tag>` (a content fingerprint) and place its
 /// `runner.ext4` at `dest`, for the build-sharing path (`fleet --registry`): a
 /// worktree reuses a bundle another already built+pushed instead of rebuilding.
@@ -966,6 +991,18 @@ fn chunkmap_put(dir: &Path, raw_hex: &str, digest: &str, size: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inspect_without_registry_section_errs() {
+        // The existence-check CLI fails clearly (before any network) when the
+        // host config carries no [registry] section.
+        let cfg = crate::config::Config::default();
+        let err = inspect(&cfg, "appbuilder:latest").unwrap_err();
+        assert!(
+            err.to_string().contains("[registry]"),
+            "expected a missing-[registry] error, got: {err}"
+        );
+    }
 
     #[test]
     fn chunkmap_round_trip_and_sharding() {

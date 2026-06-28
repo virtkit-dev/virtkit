@@ -90,6 +90,13 @@ enum RegistryCmd {
         /// Source reference, <name>[:tag|@sha256:…]
         reference: String,
     },
+    /// Check a bundle exists in the [registry] repo without pulling it: print its
+    /// manifest digest and exit 0, or exit non-zero if absent (the CI build's
+    /// already-built check, replacing `docker manifest inspect`).
+    Inspect {
+        /// Source reference, <name>[:tag|@sha256:…]
+        reference: String,
+    },
     /// Run a local OCI registry server backed by a content-addressed store, so
     /// every worktree pointing its [registry] here shares one bundle pool (a
     /// chunk pushed from one is reused by the rest). Loopback, no auth/TLS — pair
@@ -844,6 +851,13 @@ async fn main() -> ExitCode {
         return match cmd {
             RegistryCmd::Push { dir, reference } => match registry::push(&cfg, dir, reference) {
                 Ok(_digest) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, 1),
+            },
+            RegistryCmd::Inspect { reference } => match registry::inspect(&cfg, reference) {
+                Ok(digest) => {
+                    println!("{digest}");
+                    ExitCode::SUCCESS
+                }
                 Err(e) => fail(&e, 1),
             },
             // pull consumes cfg (it builds a throwaway JobCtx to share the cache layout)
