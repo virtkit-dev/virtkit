@@ -209,9 +209,10 @@ enum Cmd {
         /// fleet name the gateway resolver answers locally: name=ip (repeatable)
         #[arg(long = "host")]
         host: Vec<String>,
-        /// egress allowlist — destination IPv4 CIDR for direct (non-proxied) egress
-        /// (repeatable). With no --allow-ip/--allow-name, egress is unrestricted.
-        #[arg(long = "allow-ip", value_name = "CIDR")]
+        /// egress allowlist — destination IPv4 CIDR for direct (non-proxied) egress,
+        /// optionally port-scoped as CIDR:port (repeatable). With no
+        /// --allow-ip/--allow-name, egress is unrestricted.
+        #[arg(long = "allow-ip", value_name = "CIDR[:PORT]")]
         allow_ip: Vec<String>,
         /// egress allowlist — hostname suffix the http(s) proxy permits, e.g.
         /// `corp.example.com` (repeatable).

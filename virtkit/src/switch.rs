@@ -65,7 +65,8 @@ pub enum Egress {
     #[default]
     AllowAll,
     Allow {
-        /// allowed destination IPv4 ranges for direct (non-proxied) egress
+        /// allowed destination IPv4 ranges for direct (non-proxied) egress, each
+        /// optionally scoped to a single destination port (`CIDR:port`)
         ips: Vec<Cidr4>,
         /// allowed hostname suffixes for the http(s) proxy, dot-anchored:
         /// `corp.example.com` allows that host and `*.corp.example.com`
@@ -73,16 +74,26 @@ pub enum Egress {
     },
 }
 
-/// An IPv4 CIDR (`a.b.c.d/prefix`) for the egress IP allowlist.
+/// An egress IP allowlist rule: an IPv4 CIDR (`a.b.c.d/prefix`), optionally scoped to a
+/// single destination port (`a.b.c.d/prefix:port`). `port = None` allows any port.
 #[derive(Clone, Copy)]
 pub struct Cidr4 {
     net: u32,
     prefix: u8,
+    port: Option<u16>,
 }
 
 impl Cidr4 {
     fn parse(s: &str) -> Result<Self> {
-        let (addr, prefix) = s.split_once('/').unwrap_or((s, "32"));
+        // Optional `:port` suffix; IPv4 has no colons, so a colon unambiguously starts it.
+        let (cidr, port) = match s.rsplit_once(':') {
+            Some((c, p)) => (
+                c,
+                Some(p.parse().with_context(|| format!("bad port in {s:?}"))?),
+            ),
+            None => (s, None),
+        };
+        let (addr, prefix) = cidr.split_once('/').unwrap_or((cidr, "32"));
         let ip: Ipv4Addr = addr
             .parse()
             .with_context(|| format!("bad CIDR address in {s:?}"))?;
@@ -94,10 +105,13 @@ impl Cidr4 {
         Ok(Cidr4 {
             net: u32::from(ip) & mask4(prefix),
             prefix,
+            port,
         })
     }
-    fn contains(&self, ip: Ipv4Addr) -> bool {
-        (u32::from(ip) & mask4(self.prefix)) == self.net
+    /// Does this rule admit `ip:port`? The IP must fall in the CIDR and, if the rule is
+    /// port-scoped, the port must match (an unscoped rule admits any port).
+    fn matches(&self, ip: Ipv4Addr, port: u16) -> bool {
+        (u32::from(ip) & mask4(self.prefix)) == self.net && self.port.is_none_or(|p| p == port)
     }
 }
 
@@ -124,12 +138,13 @@ impl Egress {
             .collect();
         Ok(Egress::Allow { ips, names })
     }
-    /// Direct (non-proxied) egress: allow only listed IPv4 ranges (IPv6 denied).
-    fn allows_ip(&self, ip: IpAddr) -> bool {
+    /// Direct (non-proxied) egress: allow only listed IPv4 ranges, each optionally scoped
+    /// to a destination port (IPv6 denied under an allowlist).
+    fn allows_ip(&self, ip: IpAddr, port: u16) -> bool {
         match self {
             Egress::AllowAll => true,
             Egress::Allow { ips, .. } => match ip {
-                IpAddr::V4(v4) => ips.iter().any(|c| c.contains(v4)),
+                IpAddr::V4(v4) => ips.iter().any(|c| c.matches(v4, port)),
                 IpAddr::V6(_) => false,
             },
         }
@@ -199,7 +214,7 @@ impl EgressGuard {
         if dst.port() == DNS_PORT && dst.ip() != IpAddr::V4(self.gateway) {
             return false; // force DNS through the switch
         }
-        if self.policy.allows_ip(dst.ip()) {
+        if self.policy.allows_ip(dst.ip(), dst.port()) {
             return true;
         }
         let IpAddr::V4(v4) = dst.ip() else {
@@ -1022,11 +1037,11 @@ mod tests {
             &["corp.example.com".into(), ".github.com".into()],
         )
         .unwrap();
-        // direct-egress IP allowlist
-        assert!(e.allows_ip("10.1.2.3".parse().unwrap()));
-        assert!(e.allows_ip("192.168.231.1".parse().unwrap()));
-        assert!(!e.allows_ip("8.8.8.8".parse().unwrap()));
-        assert!(!e.allows_ip("::1".parse().unwrap())); // v6 denied under an allowlist
+        // direct-egress IP allowlist (unscoped rules => any port)
+        assert!(e.allows_ip("10.1.2.3".parse().unwrap(), 443));
+        assert!(e.allows_ip("192.168.231.1".parse().unwrap(), 22));
+        assert!(!e.allows_ip("8.8.8.8".parse().unwrap(), 443));
+        assert!(!e.allows_ip("::1".parse().unwrap(), 443)); // v6 denied under an allowlist
         // proxy host allowlist (suffix-anchored)
         assert!(e.allows_host("gitlab.corp.example.com"));
         assert!(e.allows_host("corp.example.com"));
@@ -1036,7 +1051,25 @@ mod tests {
         // no rules => allow all (the dev fleet default)
         assert!(matches!(Egress::new(&[], &[]).unwrap(), Egress::AllowAll));
         let any = Egress::default();
-        assert!(any.allows_ip("8.8.8.8".parse().unwrap()) && any.allows_host("evil.com"));
+        assert!(any.allows_ip("8.8.8.8".parse().unwrap(), 443) && any.allows_host("evil.com"));
+    }
+
+    #[test]
+    fn egress_ip_port_scoping() {
+        // a port-scoped rule alongside an any-port rule
+        let e = Egress::new(&["10.0.0.0/8:443".into(), "192.168.0.0/16".into()], &[]).unwrap();
+        // port-scoped: only 443 to 10/8
+        assert!(e.allows_ip("10.1.2.3".parse().unwrap(), 443));
+        assert!(!e.allows_ip("10.1.2.3".parse().unwrap(), 22));
+        // unscoped: any port to 192.168/16
+        assert!(e.allows_ip("192.168.5.5".parse().unwrap(), 22));
+        assert!(e.allows_ip("192.168.5.5".parse().unwrap(), 443));
+        // a bare host with a port (implied /32)
+        let h = Egress::new(&["1.2.3.4:5432".into()], &[]).unwrap();
+        assert!(h.allows_ip("1.2.3.4".parse().unwrap(), 5432));
+        assert!(!h.allows_ip("1.2.3.4".parse().unwrap(), 5433));
+        // a bad port is rejected at parse time
+        assert!(Egress::new(&["1.2.3.4:notaport".into()], &[]).is_err());
     }
 
     #[test]

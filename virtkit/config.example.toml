@@ -45,6 +45,11 @@
 # count = 32
 # subnet = "192.168.231.0/24"
 
+# [egress]               # allowlist for net.mode = "switch" (empty = unrestricted).
+# allow_ip = ["10.0.0.0/8", "1.2.3.4:5432"]  # direct (non-DNS) egress CIDRs, optionally
+#                                            # port-scoped as CIDR:port (else any port)
+# allow_name = ["corp.example.com"]    # DNS suffixes (dot-anchored: also *.corp.example.com)
+
 # [build]                # defaults for `virtkit build` (a CLI flag always overrides).
 # cloud_hypervisor = "/usr/local/bin/cloud-hypervisor"  # default: top-level cloud_hypervisor
 # kernel = "/usr/local/lib/virtkit/vmlinux"             # build guest kernel

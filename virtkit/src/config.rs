@@ -92,7 +92,8 @@ pub struct Gitlab {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Egress {
-    /// Allowed destination IPv4 CIDRs for direct (non-DNS-resolved) egress.
+    /// Allowed destination IPv4 CIDRs for direct (non-DNS-resolved) egress, each
+    /// optionally scoped to a single port as `CIDR:port` (e.g. `10.0.0.0/8:443`).
     pub allow_ip: Vec<String>,
     /// Allowed DNS name suffixes, dot-anchored (e.g. `corp.example.com` also
     /// allows `*.corp.example.com`).
