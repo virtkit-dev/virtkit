@@ -319,7 +319,7 @@ enum Cmd {
     /// Dev: boot a (generic, kernel-less) docker image as a microVM — cpio
     /// initramfs in RAM, virtkit-agent as PID 1, vsock — with no gitlab-runner and
     /// no assembly tools. Only docker (rootfs/kernel source) + cloud-hypervisor.
-    Launch {
+    Run {
         /// Image to boot (docker ref, or OCI reference with --oci), e.g. alpine:3.20
         image: String,
         /// Pinned guest kernel (the pinned vmlinux: virtio + ext4 built in)
@@ -575,7 +575,7 @@ async fn main() -> ExitCode {
         Err(e) => return fail(&e, 2),
     };
     // `launch` is a standalone dev path: no JobCtx (no CUSTOM_ENV_* job context).
-    if let Cmd::Launch {
+    if let Cmd::Run {
         image,
         kernel,
         oci,
@@ -593,7 +593,7 @@ async fn main() -> ExitCode {
         command,
     } = &cli.cmd
     {
-        let args = run::LaunchArgs {
+        let args = run::RunArgs {
             image: image.clone(),
             kernel: kernel.clone(),
             agent: agent.clone(),
@@ -1420,7 +1420,7 @@ async fn main() -> ExitCode {
         Cmd::Registry { .. }
         | Cmd::Switch { .. }
         | Cmd::Fleet { .. }
-        | Cmd::Launch { .. }
+        | Cmd::Run { .. }
         | Cmd::Mkext { .. }
         | Cmd::MkextTar { .. }
         | Cmd::MkextOci { .. }

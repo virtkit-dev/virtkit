@@ -17,7 +17,7 @@ use crate::source::Source;
 
 const VSOCK_PORT: u32 = 4444;
 
-pub struct LaunchArgs {
+pub struct RunArgs {
     pub image: String,
     pub kernel: PathBuf,
     pub agent: PathBuf,
@@ -38,7 +38,7 @@ pub struct LaunchArgs {
     pub command: Vec<String>,
 }
 
-pub async fn run(args: &LaunchArgs) -> Result<()> {
+pub async fn run(args: &RunArgs) -> Result<()> {
     if !args.agent.is_file() {
         bail!(
             "virtkit-agent not found at {} (build it: ./build.sh)",
@@ -62,7 +62,7 @@ pub async fn run(args: &LaunchArgs) -> Result<()> {
     result
 }
 
-async fn build_and_boot(args: &LaunchArgs, work: &Path) -> Result<()> {
+async fn build_and_boot(args: &RunArgs, work: &Path) -> Result<()> {
     // 1. fetch the rootfs (docker export or registry pull) as a tar
     let source = if args.oci {
         let ca_pem = match &args.ca {
@@ -158,7 +158,7 @@ async fn build_and_boot(args: &LaunchArgs, work: &Path) -> Result<()> {
 }
 
 /// Wait for the in-guest virtkit-agent, run the command, relay its output.
-async fn drive(ch: &mut Child, addr: &SocketAddr, console: &Path, args: &LaunchArgs) -> Result<()> {
+async fn drive(ch: &mut Child, addr: &SocketAddr, console: &Path, args: &RunArgs) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(args.boot_timeout_secs);
     loop {
         if let Some(status) = ch.try_wait()? {
