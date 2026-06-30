@@ -31,6 +31,7 @@ mod local;
 mod mkoci;
 mod net;
 mod oci;
+mod qcow2;
 mod registry;
 mod regserve;
 mod run;
@@ -321,6 +322,8 @@ enum Cmd {
     },
     /// Dev: build an ext4 image from a directory tree (native, no mke2fs).
     Mkext { src: PathBuf, out: PathBuf },
+    /// Dev: verify the native qcow2 reader against `qemu-img convert` for an image.
+    Qcow2Verify { path: PathBuf },
     /// Build an ext4 image from a rootfs tar (e.g. `docker export`), injecting
     /// host files at guest paths. Native, no mke2fs, no root.
     MkextTar {
@@ -473,6 +476,12 @@ async fn main() -> ExitCode {
     }
     if let Cmd::Mkext { src, out } = &cli.cmd {
         return match ext4::build_from_dir(src, out) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        };
+    }
+    if let Cmd::Qcow2Verify { path } = &cli.cmd {
+        return match qcow2::verify_against_convert(path) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         };
@@ -875,6 +884,7 @@ async fn main() -> ExitCode {
         | Cmd::Fleet { .. }
         | Cmd::Run { .. }
         | Cmd::Mkext { .. }
+        | Cmd::Qcow2Verify { .. }
         | Cmd::MkextTar { .. }
         | Cmd::MkextOci { .. }
         | Cmd::OciPull { .. }
