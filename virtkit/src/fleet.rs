@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -743,6 +744,53 @@ fn create_overlay(ext4: &Path, overlay: &Path) -> Result<()> {
 /// repo, even via the assembly's symlink chmod hardening.
 /// `uid_maps` / `gid_maps` are soft_idmap spec strings (`type:from:to[:count]`) forwarded
 /// as `--uid-map` / `--gid-map` to virtiofsd; empty slices = identity (no remapping).
+/// Spawn a foreground-owned helper tied to this process: a pre-exec hook asks the kernel to
+/// SIGTERM the child when its parent dies, so a crashed or `kill -9`'d virtkit cannot leak it
+/// (a stuck virtiofsd would, e.g., keep this binary's file busy for the next build). For
+/// foreground owners only — the `run`/build VM and the dev fleet, where one virtkit process
+/// owns the helper for its whole lifetime. NOT for the gitlab job VM, whose helpers are
+/// deliberately detached (`spawn_detached`) to outlive the short `prepare`.
+///
+/// PR_SET_PDEATHSIG ties the death signal to the SPAWNING THREAD, not the process. These
+/// helpers are spawned from async code that tokio may run on a blocking-pool thread, which
+/// the runtime retires after an idle keepalive — spawning inline would then fire the signal
+/// and kill a perfectly healthy guest mid-boot. So the spawn is done from a dedicated
+/// process-lifetime thread, leaving the signal tied to a thread that lives exactly as long
+/// as virtkit. The caller configures `cmd` (args + stdio) first, then hands it over.
+pub(crate) fn spawn_tied(mut cmd: Command) -> std::io::Result<Child> {
+    use std::sync::OnceLock;
+    use std::sync::mpsc::{Sender, channel};
+
+    // SAFETY: prctl(PR_SET_PDEATHSIG) is async-signal-safe, so it is valid in a pre-exec
+    // hook (which runs in the forked child between fork and exec).
+    unsafe {
+        cmd.pre_exec(
+            || match libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            },
+        );
+    }
+
+    type Reply = Sender<std::io::Result<Child>>;
+    static SPAWNER: OnceLock<Sender<(Command, Reply)>> = OnceLock::new();
+    let tx = SPAWNER.get_or_init(|| {
+        let (tx, rx) = channel::<(Command, Reply)>();
+        std::thread::Builder::new()
+            .name("vk-helper-spawner".into())
+            .spawn(move || {
+                while let Ok((mut cmd, reply)) = rx.recv() {
+                    let _ = reply.send(cmd.spawn());
+                }
+            })
+            .expect("spawning the vk-helper-spawner thread");
+        tx
+    });
+    let (rtx, rrx) = channel();
+    tx.send((cmd, rtx)).expect("vk-helper-spawner thread alive");
+    rrx.recv().expect("vk-helper-spawner thread replied")
+}
+
 pub(crate) fn spawn_virtiofsd(
     sock: &Path,
     shared_dir: &Path,
@@ -767,12 +815,11 @@ pub(crate) fn spawn_virtiofsd(
     for m in gid_maps {
         cmd.arg(format!("--gid-map={m}"));
     }
-    let child = cmd
-        .stdin(Stdio::null())
+    // self-reap if virtkit dies before the normal teardown runs (spawn_tied)
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("spawning the bundled virtiofsd (virtkit virtiofsd)")?;
+        .stderr(Stdio::null());
+    let child = spawn_tied(cmd).context("spawning the bundled virtiofsd (virtkit virtiofsd)")?;
     for _ in 0..50 {
         if sock.exists() {
             return Ok(child);

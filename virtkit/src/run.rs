@@ -389,16 +389,16 @@ fn spawn_ssh_agent_forward(vsock: &Path, host_sock: &OsStr, work: &Path) -> Resu
     let exe = std::env::current_exe().context("locating the virtkit binary")?;
     let log = std::fs::File::create(work.join("ssh-agent-forward.log"))
         .context("creating the ssh-agent forward log")?;
-    Command::new(exe)
-        .arg("forward")
+    let mut cmd = Command::new(exe);
+    cmd.arg("forward")
         .arg("--listen")
         .arg(&listen)
         .arg("--to")
         .arg(host_sock)
         .stdout(log.try_clone()?)
-        .stderr(log)
-        .spawn()
-        .context("spawning the ssh-agent forward")
+        .stderr(log);
+    // self-reap if virtkit dies before teardown (spawn_tied)
+    crate::fleet::spawn_tied(cmd).context("spawning the ssh-agent forward")
 }
 
 /// How `--ssh-agent`/`--ssh-host` resolve for a launch: the host agent socket to expose,
@@ -485,10 +485,9 @@ fn spawn_ssh_agent_proxy(
     for p in allow_pub {
         cmd.arg("--allow").arg(p);
     }
-    cmd.stdout(log.try_clone()?)
-        .stderr(log)
-        .spawn()
-        .context("spawning the ssh-agent proxy")
+    // self-reap if virtkit dies before teardown (spawn_tied)
+    cmd.stdout(log.try_clone()?).stderr(log);
+    crate::fleet::spawn_tied(cmd).context("spawning the ssh-agent proxy")
 }
 
 /// Wait for the in-guest virtkit-agent, run the command, relay its output. `ssh_config`, if
@@ -631,8 +630,8 @@ fn spawn_ch(
     mem: &str,
 ) -> Result<Child> {
     let log = std::fs::File::create(console.with_extension("ch.log"))?;
-    Command::new(cloud_hypervisor)
-        .arg("--kernel")
+    let mut cmd = Command::new(cloud_hypervisor);
+    cmd.arg("--kernel")
         .arg(kernel)
         .args(boot_args)
         .arg("--vsock")
@@ -649,8 +648,10 @@ fn spawn_ch(
         .arg(cmdline)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log)
-        .spawn()
+        .stderr(log);
+    // Self-reap the VM if virtkit dies before teardown — a leaked cloud-hypervisor is a
+    // whole running guest, not just an idle helper (spawn_tied).
+    crate::fleet::spawn_tied(cmd)
         .with_context(|| format!("spawning {}", cloud_hypervisor.display()))
 }
 
@@ -691,8 +692,8 @@ async fn spawn_vm_switch(vsock: &Path, work: &Path, net_port: u32) -> Result<(Ch
     let _ = std::fs::remove_file(&listen);
     let exe = std::env::current_exe().context("locating the virtkit binary")?;
     let swlog = std::fs::File::create(work.join("switch.log"))?;
-    let mut child = Command::new(&exe)
-        .arg("switch")
+    let mut cmd = Command::new(&exe);
+    cmd.arg("switch")
         .arg("--listen")
         .arg(&listen)
         .arg("--gateway")
@@ -701,8 +702,9 @@ async fn spawn_vm_switch(vsock: &Path, work: &Path, net_port: u32) -> Result<(Ch
         .arg(prefix.to_string())
         .stdin(Stdio::null())
         .stdout(swlog.try_clone()?)
-        .stderr(swlog)
-        .spawn()
+        .stderr(swlog);
+    // self-reap if virtkit dies before teardown (spawn_tied)
+    let mut child = crate::fleet::spawn_tied(cmd)
         .with_context(|| format!("spawning {} switch", exe.display()))?;
     let dl = Instant::now() + Duration::from_secs(5);
     while !listen.exists() {
