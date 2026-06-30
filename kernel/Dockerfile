@@ -1,7 +1,11 @@
 # The microVM guest kernel (vmlinux): vanilla Linux + a vendored config fragment
 # (kernel-fragment.config — kata's non-confidential x86_64 set: virtio blk/net/vsock/pci
-# + ext4 + virtio-fs/FUSE + IP autoconfig, all built in, CONFIG_MODULES off). The result
-# is the pinned vmlinux a generic guest boots — no per-image kernel, initrd or modules.
+# + ext4 + virtio-fs/FUSE + IP autoconfig, all built in, CONFIG_MODULES off) + virtkit's
+# removals overlay (kernel-removals.config — drops options virtkit never uses:
+# Mellanox/VFIO/SGX/NVDIMM/CIFS/9p/XFS/SCSI/FIPS, debug, exotic netfilter, CPU-freq/
+# thermal/NUMA, and WireGuard/IPsec/VXLAN/tunnels — networking is host-side via the
+# switch, and jobs needing those ship their own per-bundle kernel). The result is the
+# pinned vmlinux a generic guest boots — no per-image kernel, initrd or modules.
 #
 # Built in the SAME image as the binaries (virtkit-build, the .devcontainer rust:alpine
 # image — digest- + apk-pinned, and it carries the rust toolchain recent kernels want for
@@ -28,24 +32,35 @@ RUN curl -fsSLO "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VER
     && rm "linux-${KERNEL_VERSION}.tar.xz"
 
 COPY kernel-fragment.config /build/kernel-fragment.config
+# Removals overlay: base-config options virtkit does not use. Merged AFTER the
+# base fragment so it overrides those defaults (see kernel-removals.config).
+COPY kernel-removals.config /build/kernel-removals.config
 
 WORKDIR /build/linux-${KERNEL_VERSION}
 # Reproducible build metadata: no current date / user@host baked into the kernel banner.
 ENV KBUILD_BUILD_TIMESTAMP="@0" KBUILD_BUILD_USER=virtkit KBUILD_BUILD_HOST=virtkit \
     SOURCE_DATE_EPOCH=0
-# allnoconfig base + our fragment, then let kconfig resolve dependencies. Verify the
-# load-bearing options survived before the (long) compile, so a dropped dependency fails
-# loudly here rather than at boot.
+# allnoconfig + the config fragment + virtkit's removals, then let kconfig resolve
+# dependencies. Verify before the (long) compile that the load-bearing options survived
+# AND that the removed options stayed disabled (olddefconfig can resurrect a symbol that
+# something still selects) — so either failure is loud here, not at boot.
 RUN export ARCH=x86_64 \
-    && scripts/kconfig/merge_config.sh -n /build/kernel-fragment.config \
+    && scripts/kconfig/merge_config.sh -n /build/kernel-fragment.config /build/kernel-removals.config \
     && make ARCH=x86_64 olddefconfig \
     && for opt in CONFIG_64BIT CONFIG_SMP CONFIG_EXT4_FS CONFIG_VIRTIO_BLK \
                   CONFIG_VIRTIO_NET CONFIG_VIRTIO_PCI CONFIG_VIRTIO_VSOCKETS \
                   CONFIG_VIRTIO_FS CONFIG_FUSE_FS CONFIG_IP_PNP CONFIG_OVERLAY_FS \
                   CONFIG_BLK_DEV_INITRD CONFIG_DEVTMPFS_MOUNT \
-                  CONFIG_KVM CONFIG_KVM_INTEL CONFIG_KVM_AMD \
-                  CONFIG_WIREGUARD CONFIG_DUMMY; do \
+                  CONFIG_KVM CONFIG_KVM_INTEL CONFIG_KVM_AMD CONFIG_DUMMY; do \
            grep -q "^${opt}=y" .config || { echo "missing ${opt}=y in .config"; exit 1; }; \
+       done \
+    && for opt in CONFIG_MLX5_CORE CONFIG_VFIO CONFIG_X86_SGX CONFIG_VIRTIO_PMEM \
+                  CONFIG_CIFS CONFIG_NET_9P CONFIG_XFS_FS CONFIG_CRYPTO_FIPS \
+                  CONFIG_SCSI CONFIG_DEBUG_FS CONFIG_IP_VS CONFIG_IP_SET \
+                  CONFIG_NETFILTER_XT_MATCH_RECENT CONFIG_CPU_FREQ \
+                  CONFIG_NUMA CONFIG_VIRTIO_MEM CONFIG_XFRM CONFIG_WIREGUARD \
+                  CONFIG_VXLAN CONFIG_NET_UDP_TUNNEL; do \
+           grep -q "^${opt}=y" .config && { echo "removed option ${opt} resurrected by olddefconfig"; exit 1; } || true; \
        done \
     && make ARCH=x86_64 -j"$(nproc)" vmlinux \
     && cp vmlinux /build/vmlinux
