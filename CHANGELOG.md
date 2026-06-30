@@ -4,6 +4,34 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-30
+
+### Added
+
+- **microVM Dockerfile builder** (`virtkit build`): builds a bootable ext4 from a
+  Dockerfile with no buildkit and no docker — each `RUN` runs in a Cloud Hypervisor guest,
+  with a content-addressed instruction cache.
+- **`virtkit run` boots a Dockerfile target or an image**: `-f <Dockerfile>` builds and
+  boots a target; `--source oci|docker|auto` picks an image's rootfs. The command inherits
+  the image environment, with `--workdir` for a shared cwd and `--net` for egress.
+- **SSH-agent forwarding into guests**: host keys are relayed over vsock and never enter
+  the guest — jobs via `[auth] ssh_agent`, `run` via `--ssh-agent` / `--ssh-host`.
+- **Port-scoped egress** allowlist rules (`CIDR:port`).
+- **`build.sh --use-virtkit`** builds virtkit with itself, and **`--bootstrap-check`**
+  asserts the result is byte-for-byte identical to the Docker build.
+
+### Changed
+
+- **Breaking:** the `launch` subcommand is renamed to `run`.
+- CoW overlays are created with an in-tree qcow2 writer instead of `qemu-img` (dropping
+  that dependency).
+- `virtkit docker-hash` now prints each stage's instruction-cache key.
+
+### Removed
+
+- **Breaking:** the buildkit-based `virtkit build` and its flags, superseded by the
+  microVM builder above.
+
 ## [0.2.1] - 2026-06-28
 
 ### Added
@@ -281,7 +309,10 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/wallix/virtkit/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/wallix/virtkit/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/wallix/virtkit/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/wallix/virtkit/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/wallix/virtkit/compare/v0.1.10...v0.2.0
 [0.1.10]: https://github.com/wallix/virtkit/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/wallix/virtkit/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/wallix/virtkit/compare/v0.1.7...v0.1.8
