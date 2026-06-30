@@ -24,6 +24,7 @@ mod convert;
 mod cpio;
 mod dockerhash;
 mod ensure;
+mod executor;
 mod ext4;
 mod fleet;
 mod image;
@@ -36,7 +37,6 @@ mod net;
 mod oci;
 mod registry;
 mod regserve;
-mod run;
 mod services;
 mod source;
 mod switch;
@@ -1389,7 +1389,7 @@ async fn main() -> ExitCode {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(&e, ctx.system_failure),
             },
-            GitlabCmd::Run { script, stage: _ } => match run::run_stage(&ctx, &script).await {
+            GitlabCmd::Run { script, stage: _ } => match executor::run_stage(&ctx, &script).await {
                 Ok(result) => match (result.code, result.signal) {
                     (Some(0), _) => ExitCode::SUCCESS,
                     // non-zero exit: the script already reported its error

@@ -411,8 +411,8 @@ async fn start_services(ctx: &JobCtx) -> Result<()> {
     println!("virtkit: bringing up {} service(s)", services.len());
     let script = crate::services::setup_script(scfg, &services);
     // services are a systemd-guest feature (in-VM dockerd); use the configured shell
-    let result = crate::run::exec_script(
-        &crate::run::vsock_addr(ctx),
+    let result = crate::executor::exec_script(
+        &crate::executor::vsock_addr(ctx),
         &ctx.cfg.guest.run_command,
         script.into_bytes(),
         Some("root".into()),

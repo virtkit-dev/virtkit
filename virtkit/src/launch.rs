@@ -191,7 +191,7 @@ async fn drive(ch: &mut Child, addr: &SocketAddr, console: &Path, args: &LaunchA
     } else {
         vec!["sh".into(), "-c".into(), args.command.join(" ")]
     };
-    let result = crate::run::exec_script(addr, &command, Vec::new(), None)
+    let result = crate::executor::exec_script(addr, &command, Vec::new(), None)
         .await
         .context("running the command in the guest")?;
     match result.code {
