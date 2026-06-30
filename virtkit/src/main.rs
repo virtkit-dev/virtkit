@@ -378,6 +378,30 @@ enum Cmd {
         #[arg(long)]
         label: Option<String>,
     },
+    /// Build a Dockerfile target and export it as a bootable ext4 image — a from-scratch
+    /// builder (no docker, no buildkit). The host backend handles the `FROM scratch` +
+    /// COPY subset; `--print-plan` parses + plans + prints the build without running it.
+    /// (The microVM backend for `FROM <image>` + RUN is added in a following commit.)
+    Build {
+        /// Dockerfile to build
+        #[arg(short = 'f', long = "file", default_value = "Dockerfile")]
+        file: PathBuf,
+        /// target stage (AS name or index; default: the last stage)
+        #[arg(long)]
+        target: Option<String>,
+        /// build context for COPY (default: the Dockerfile's directory)
+        #[arg(long)]
+        context: Option<PathBuf>,
+        /// ext4 output path
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// parse + plan + print the build order and primitives; build nothing
+        #[arg(long = "print-plan")]
+        print_plan: bool,
+        /// override an ARG default: NAME=VALUE (repeatable)
+        #[arg(long = "build-arg", value_name = "NAME=VALUE")]
+        build_arg: Vec<String>,
+    },
     /// Dev: pull an OCI image from a registry (no docker) and flatten it to a
     /// rootfs tar.
     OciPull {
@@ -588,6 +612,36 @@ async fn main() -> ExitCode {
             .collect();
         let extra_free = free_gib * (1024 * 1024 * 1024 / 4096); // GiB -> 4 KiB blocks
         return match mkoci::archive_to_ext4(archive, out, &injects, &[], extra_free, &fsid) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        };
+    }
+    if let Cmd::Build {
+        file,
+        target,
+        context,
+        out,
+        print_plan,
+        build_arg,
+    } = &cli.cmd
+    {
+        // each --build-arg is NAME=VALUE; a bare NAME means an empty value.
+        let build_args: Vec<(String, String)> = build_arg
+            .iter()
+            .map(|a| match a.split_once('=') {
+                Some((k, v)) => (k.to_string(), v.to_string()),
+                None => (a.clone(), String::new()),
+            })
+            .collect();
+        let opts = build::Options {
+            dockerfile: file.clone(),
+            target: target.clone(),
+            context: context.clone(),
+            out: out.clone(),
+            print_plan: *print_plan,
+            build_args,
+        };
+        return match build::build(&opts) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         };
@@ -888,6 +942,7 @@ async fn main() -> ExitCode {
         | Cmd::Qcow2Verify { .. }
         | Cmd::MkextTar { .. }
         | Cmd::MkextOci { .. }
+        | Cmd::Build { .. }
         | Cmd::OciPull { .. }
         | Cmd::DockerHash { .. }
         | Cmd::Fingerprint { .. } => {

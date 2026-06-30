@@ -15,6 +15,15 @@ use oci_client::client::{Certificate, CertificateEncoding, ClientConfig, ClientP
 use oci_client::manifest;
 use oci_client::secrets::RegistryAuth;
 
+/// The parts of an OCI image's config a build inherits into a stage: environment
+/// (notably `PATH`), default user and working directory.
+#[derive(Default, Debug, Clone)]
+pub struct ImageConfig {
+    pub env: Vec<(String, String)>,
+    pub user: Option<String>,
+    pub workdir: Option<String>,
+}
+
 /// Pull `reference` and flatten it into a rootfs tar at `out_tar`.
 pub async fn pull_flatten(
     reference: &str,
