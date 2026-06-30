@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
-# Build the production static-musl binaries inside Docker.
+# Build the production static-musl binaries.
 #
-# Uses the devcontainer image (pinned Rust + musl toolchain) so the release
-# artifacts are produced with the exact toolchain we develop against. Output is
-# written to ./dist as stripped, static-pie musl ELF binaries.
+# Two backends produce the same artifact with the same toolchain:
+#   - default: Docker — `docker build` the devcontainer image, then `docker run`
+#     the compile in it.
+#   - --use-virtkit=<DIST>: dogfood — use the virtkit binary in <DIST> to build the
+#     devcontainer Dockerfile into a microVM and compile a shared checkout inside it
+#     (DIST also supplies vmlinux + virtkit-agent; cloud-hypervisor comes from PATH,
+#     or DIST/cloud-hypervisor if present). Set VK_CACHE=host:port to push/pull the
+#     build image from a `virtkit registry serve` by its content key.
+#
+# Output goes to ./dist as stripped, static-pie musl ELF binaries. Both backends
+# mount the repo at /work and pass identical flags, so the bytes match either way.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -11,33 +19,90 @@ IMAGE=virtkit-build
 TARGET=x86_64-unknown-linux-musl
 OUT=dist
 
-docker build -t "$IMAGE" -f .devcontainer/Dockerfile .devcontainer
+USE_VIRTKIT=""
+for arg in "$@"; do
+  case "$arg" in
+    --use-virtkit=*) USE_VIRTKIT="${arg#*=}" ;;
+    *) echo "unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
 
-# Build as the host user so target/ and the cargo cache stay writable and no
-# root-owned files leak onto the host. RUSTUP_HOME is read-only here — the
-# pinned toolchain is already baked into the image.
-#
-# Reproducibility: SOURCE_DATE_EPOCH neutralises any build timestamp, and the
-# build dir and cargo home are remapped to stable virtual prefixes (/src, /cargo)
-# so the binary is independent of where it was built — this script and a
-# teammate's checkout produce identical bytes. Stripping is done by the release
-# profile, not the host strip.
-docker run --rm \
-  --user "$(id -u):$(id -g)" \
-  -e HOME=/tmp \
-  -e CARGO_HOME=/work/target/.cargo-home \
-  -e CARGO_TARGET_DIR=/work/target \
-  -e SOURCE_DATE_EPOCH=0 \
-  -e RUSTFLAGS="--remap-path-prefix=/work=/src --remap-path-prefix=/work/target/.cargo-home=/cargo" \
-  -e CFLAGS_x86_64_unknown_linux_musl="-ffile-prefix-map=/work=/src -ffile-prefix-map=/work/target/.cargo-home=/cargo" \
-  -e LIBSECCOMP_LINK_TYPE=static -e LIBSECCOMP_LIB_PATH=/usr/lib \
-  -e LIBCAPNG_LINK_TYPE=static -e LIBCAPNG_LIB_PATH=/usr/lib \
-  -v "$PWD":/work -w /work \
-  "$IMAGE" \
-  cargo build --release --workspace
+# Reproducibility: SOURCE_DATE_EPOCH neutralises any build timestamp, and the build
+# dir and cargo home are remapped to stable virtual prefixes (/src, /cargo) so the
+# binary is independent of where it was built — this script and a teammate's checkout
+# produce identical bytes. The repo is always mounted at /work, so these /work-relative
+# values hold for both backends. Stripping is done by the release profile, not the host
+# strip.
+BUILD_ENV=(
+  HOME=/tmp
+  CARGO_HOME=/work/target/.cargo-home
+  CARGO_TARGET_DIR=/work/target
+  SOURCE_DATE_EPOCH=0
+  "RUSTFLAGS=--remap-path-prefix=/work=/src --remap-path-prefix=/work/target/.cargo-home=/cargo"
+  "CFLAGS_x86_64_unknown_linux_musl=-ffile-prefix-map=/work=/src -ffile-prefix-map=/work/target/.cargo-home=/cargo"
+  LIBSECCOMP_LINK_TYPE=static
+  LIBSECCOMP_LIB_PATH=/usr/lib
+  LIBCAPNG_LINK_TYPE=static
+  LIBCAPNG_LIB_PATH=/usr/lib
+)
+
+if [ -n "$USE_VIRTKIT" ]; then
+  # ---- dogfood backend: virtkit builds the env image + compiles in a microVM ----
+  VK="$USE_VIRTKIT/virtkit"
+  KERNEL="$USE_VIRTKIT/vmlinux"
+  AGENT="$USE_VIRTKIT/virtkit-agent"
+  for f in "$VK" "$KERNEL" "$AGENT"; do
+    [ -e "$f" ] || { echo "missing $f (need a populated --use-virtkit dir)" >&2; exit 1; }
+  done
+  ch_args=()
+  [ -x "$USE_VIRTKIT/cloud-hypervisor" ] && ch_args=(--cloud-hypervisor "$USE_VIRTKIT/cloud-hypervisor")
+  cache_args=()
+  [ -n "${VK_CACHE:-}" ] && cache_args=(--cache-registry "$VK_CACHE")
+
+  # The guest command runs under `sh -c` in /work (the shared checkout); export the
+  # build env there, then compile. Build the env image from .devcontainer/Dockerfile
+  # (its RUN steps get egress for apk); --net gives the compile egress for cargo.
+  exports=""
+  for e in "${BUILD_ENV[@]}"; do
+    v="${e#*=}"; v="${v//\'/\'\\\'\'}"   # escape embedded single quotes for the sh -c body
+    exports+="export ${e%%=*}='$v'; "
+  done
+
+  "$VK" run \
+    --file .devcontainer/Dockerfile \
+    --context .devcontainer \
+    --workdir "$PWD" \
+    --net \
+    --kernel "$KERNEL" \
+    --agent "$AGENT" \
+    "${ch_args[@]}" \
+    "${cache_args[@]}" \
+    -- "${exports}cargo build --release --workspace"
+else
+  # ---- default backend: Docker ----
+  docker build -t "$IMAGE" -f .devcontainer/Dockerfile .devcontainer
+
+  # Build as the host user so target/ and the cargo cache stay writable and no
+  # root-owned files leak onto the host. RUSTUP_HOME is read-only here — the
+  # pinned toolchain is already baked into the image.
+  docker_env=()
+  for e in "${BUILD_ENV[@]}"; do docker_env+=(-e "$e"); done
+  docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    "${docker_env[@]}" \
+    -v "$PWD":/work -w /work \
+    "$IMAGE" \
+    cargo build --release --workspace
+fi
 
 mkdir -p "$OUT"
-cp "target/$TARGET/release/virtkit" "target/$TARGET/release/virtkit-agent" "$OUT/"
+# Replace atomically (write a temp, then rename): a plain cp truncates the destination and
+# would fail "Text file busy" if the old $OUT/virtkit is still being executed (e.g. by a
+# previous --use-virtkit / --bootstrap-check run); rename never does.
+for b in virtkit virtkit-agent; do
+  cp "target/$TARGET/release/$b" "$OUT/.$b.tmp"
+  mv -f "$OUT/.$b.tmp" "$OUT/$b"
+done
 
 # Reproducibility manifest: the pinned inputs and the artifact hashes. Anyone can
 # rebuild from the same commit + inputs and confirm byte-for-byte:
