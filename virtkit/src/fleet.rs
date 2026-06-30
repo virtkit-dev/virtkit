@@ -753,7 +753,7 @@ fn create_overlay(ext4: &Path, overlay: &Path) -> Result<()> {
 /// repo, even via the assembly's symlink chmod hardening.
 /// `uid_maps` / `gid_maps` are soft_idmap spec strings (`type:from:to[:count]`) forwarded
 /// as `--uid-map` / `--gid-map` to virtiofsd; empty slices = identity (no remapping).
-fn spawn_virtiofsd(
+pub(crate) fn spawn_virtiofsd(
     sock: &Path,
     shared_dir: &Path,
     readonly: bool,

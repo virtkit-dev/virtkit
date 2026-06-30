@@ -38,13 +38,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use exec::{DryRun, Executor, Host, ResolvedMount, Rootfs, ShellState};
+use exec::{DryRun, Executor, Host, MicroVm, ResolvedMount, Rootfs, ShellState};
 use interp::Vars;
 use parser::Instruction;
 use plan::{Base, Plan};
 
-/// What/how to build. (The microVM backend and its options — cloud-hypervisor/kernel/
-/// agent/cache registry/journal — are added with that backend in a following commit.)
+/// What/how to build.
 pub struct Options {
     pub dockerfile: PathBuf,
     /// Stage selector: an `AS` name or index; `None` = the last stage.
@@ -55,6 +54,19 @@ pub struct Options {
     pub out: Option<PathBuf>,
     /// Parse + plan + print the build order and primitives, build nothing.
     pub print_plan: bool,
+    /// Use the microVM backend (RUN executes in a Cloud Hypervisor guest) instead of
+    /// the host backend (FROM scratch + COPY only). Needs the three tool paths.
+    pub microvm: bool,
+    pub cloud_hypervisor: Option<PathBuf>,
+    pub kernel: Option<PathBuf>,
+    pub agent: Option<PathBuf>,
+    /// instruction-cache registry repo (e.g. a `virtkit registry serve` at
+    /// `127.0.0.1:5000`); each instruction's ext4 is pushed/pulled here. None = off.
+    pub cache_registry: Option<String>,
+    /// the cache registry speaks plain HTTP (a loopback regserve).
+    pub cache_insecure: bool,
+    /// add an ext4 journal to the exported image (the build stays journal-less).
+    pub journal: bool,
     /// `--build-arg NAME=VALUE` overrides for ARG defaults.
     pub build_args: Vec<(String, String)>,
 }
@@ -86,17 +98,48 @@ pub fn build(opts: &Options) -> Result<()> {
         return Ok(());
     }
 
-    // Only the host backend (FROM scratch + COPY, exported via virtkit's own pure-Rust
-    // ext4 builder — no docker/buildkit/mke2fs/VM) is wired; the microVM backend
-    // (FROM <image> + RUN in a Cloud Hypervisor guest) is added in a following commit.
+    // Real build: the host backend (FROM scratch + COPY) or the microVM backend
+    // (FROM <image> + RUN in a Cloud Hypervisor guest, instruction snapshots cached).
     let out = opts
         .out
         .as_deref()
         .context("build needs --out <file> (or --print-plan)")?;
-    let scratch = std::env::temp_dir().join(format!("virtkit-build-{}", std::process::id()));
-    let mut ex = Host::new(context.clone(), scratch.clone());
+    // microVM scratch holds each stage's raw ext4 (booted read-write — keep it off
+    // tmpfs), so place it next to the output; the host backend's scratch is just dirs.
+    let scratch = if opts.microvm {
+        out.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!(".build-{}", std::process::id()))
+    } else {
+        std::env::temp_dir().join(format!("virtkit-build-{}", std::process::id()))
+    };
+    let mut ex: Box<dyn Executor> = if opts.microvm {
+        let cache = opts.cache_registry.clone().map(|repo| {
+            crate::config::Registry::for_share(
+                repo,
+                opts.cache_insecure,
+                None,
+                String::new(),
+                None,
+                None,
+            )
+        });
+        Box::new(MicroVm::new(
+            opts.cloud_hypervisor
+                .clone()
+                .context("--microvm needs --cloud-hypervisor")?,
+            opts.kernel.clone().context("--microvm needs --kernel")?,
+            opts.agent.clone().context("--microvm needs --agent")?,
+            scratch.clone(),
+            cache,
+            opts.journal,
+            context.clone(),
+        ))
+    } else {
+        Box::new(Host::new(context.clone(), scratch.clone()))
+    };
     let result = (|| -> Result<()> {
-        let committed = drive(&plan, &order, &build_args, &mut ex, &context)?;
+        let committed = drive(&plan, &order, &build_args, ex.as_mut(), &context)?;
         let fs = committed
             .get(&target)
             .context("internal: target stage not committed")?;

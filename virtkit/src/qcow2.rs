@@ -9,11 +9,6 @@
 //! no extended L2, standard refcounts. Anything outside that is rejected rather than
 //! mis-read. Read-only: writing/creating overlays stays with `qemu-img`.
 
-// The writer/extent API (create_overlay, flatten_to_raw, data_extents, RegionReader, …)
-// is consumed by the build backend, added in the following commits; until then only the
-// reader (`Qcow2Verify`) is reachable, so allow the not-yet-wired items.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::fs::FileExt;

@@ -20,7 +20,7 @@
 //! a `ResolvedImage` returned from the cached dir keyed on `boot.kind`.
 
 use std::collections::BTreeMap;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -153,6 +153,486 @@ async fn inspect_async(rg: &Registry, name: &str, reference: &Reference) -> Resu
         .with_context(|| format!("{}/{name}: reference not found in the registry", rg.repo))
 }
 
+/// True if `<name>:<tag>` resolves in the registry — a cheap manifest HEAD, no pull.
+/// The build instruction-cache existence check; a registry error reads as "absent".
+pub fn exists(rg: &Registry, name: &str, tag: &str) -> bool {
+    block_on(async {
+        let Ok((client, auth)) = client(rg) else {
+            return false;
+        };
+        let Ok(image) = make_ref(rg, name, tag) else {
+            return false;
+        };
+        client.fetch_manifest_digest(&image, &auth).await.is_ok()
+    })
+}
+
+/// Try to pull a bundle tagged `<name>:<tag>` (a content fingerprint) and place its
+/// `runner.ext4` at `dest`, for the build-sharing path (`fleet --registry`): a
+/// worktree reuses a bundle another already built+pushed instead of rebuilding.
+/// Returns `Ok(false)` when the tag is absent (or the registry is unreachable) — the
+/// caller then builds. The sparse reassembly is byte-exact, so the placed ext4 keeps
+/// its fingerprint UUID and reads as fresh on the next run.
+pub fn try_pull_ext4(rg: &Registry, name: &str, tag: &str, dest: &Path) -> Result<bool> {
+    block_on(try_pull_ext4_async(rg, name, tag, dest))
+}
+
+async fn try_pull_ext4_async(rg: &Registry, name: &str, tag: &str, dest: &Path) -> Result<bool> {
+    let (client, auth) = client(rg)?;
+    let image = make_ref(rg, name, tag)?;
+    // Absent tag (or an unreachable registry) -> build locally; only a *found* bundle
+    // that then fails to pull is a hard error.
+    let Ok(digest) = client.fetch_manifest_digest(&image, &auth).await else {
+        return Ok(false);
+    };
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    let bundle = parent.join(format!(".vkpull-{}", sanitize_component(name)));
+    let _ = std::fs::remove_dir_all(&bundle);
+    let dref = make_digest_ref(rg, name, &digest)?;
+    pull_into(&client, &auth, &dref, name, &digest, &bundle).await?;
+    let runner = bundle.join("runner.ext4");
+    let _ = std::fs::remove_file(dest);
+    std::fs::rename(&runner, dest)
+        .with_context(|| format!("placing pulled ext4 at {}", dest.display()))?;
+    let _ = std::fs::remove_dir_all(&bundle);
+    Ok(true)
+}
+
+/// Push a built `ext4` to the registry as a bundle tagged `<name>:<tag>` (its content
+/// fingerprint), so other worktrees can pull it instead of rebuilding. Best-effort:
+/// the caller treats a failure as non-fatal (the image was built locally regardless).
+pub fn push_ext4(rg: &Registry, name: &str, tag: &str, ext4: &Path, boot_kind: &str) -> Result<()> {
+    block_on(push_ext4_async(rg, name, tag, ext4, boot_kind))
+}
+
+async fn push_ext4_async(
+    rg: &Registry,
+    name: &str,
+    tag: &str,
+    ext4: &Path,
+    boot_kind: &str,
+) -> Result<()> {
+    let parent = ext4.parent().unwrap_or_else(|| Path::new("."));
+    let bundle = parent.join(format!(".vkpush-{}", sanitize_component(name)));
+    let _ = std::fs::remove_dir_all(&bundle);
+    std::fs::create_dir_all(&bundle).with_context(|| format!("creating {}", bundle.display()))?;
+    let runner = bundle.join("runner.ext4");
+    // hardlink the ext4 into the staging bundle to avoid copying a multi-GB file;
+    // fall back to a copy if hardlinking is not possible (different filesystem).
+    if std::fs::hard_link(ext4, &runner).is_err() {
+        std::fs::copy(ext4, &runner).with_context(|| format!("copying {}", ext4.display()))?;
+    }
+    std::fs::write(bundle.join("boot.kind"), boot_kind).context("writing boot.kind")?;
+    let r = push_async(rg, &bundle, name, tag).await;
+    let _ = std::fs::remove_dir_all(&bundle);
+    r.map(|_digest| ())
+}
+
+/// Fetch a cached bundle's chunk layer descriptors (with their offset/length
+/// annotations) plus its total size, *without* reassembling the image — the parent
+/// state a diff push builds on. Returns `None` if the tag is absent.
+pub fn fetch_chunks(
+    rg: &Registry,
+    name: &str,
+    tag: &str,
+) -> Result<Option<(Vec<OciDescriptor>, u64)>> {
+    block_on(fetch_chunks_async(rg, name, tag))
+}
+
+async fn fetch_chunks_async(
+    rg: &Registry,
+    name: &str,
+    tag: &str,
+) -> Result<Option<(Vec<OciDescriptor>, u64)>> {
+    let (client, auth) = client(rg)?;
+    let image = make_ref(rg, name, tag)?;
+    let Ok(digest) = client.fetch_manifest_digest(&image, &auth).await else {
+        return Ok(None);
+    };
+    let dref = make_digest_ref(rg, name, &digest)?;
+    let (manifest, _) = client
+        .pull_manifest(&dref, &auth)
+        .await
+        .with_context(|| format!("pulling the manifest of {name}@{digest}"))?;
+    let manifest = match manifest {
+        OciManifest::Image(m) => m,
+        OciManifest::ImageIndex(_) => bail!("{name}@{digest} is an image index, not a bundle"),
+    };
+    let config = pull_blob_bytes(&client, &dref, &manifest.config).await?;
+    let config: BundleConfig =
+        serde_json::from_slice(&config).context("parsing the bundle config blob")?;
+    let chunks: Vec<OciDescriptor> = manifest
+        .layers
+        .into_iter()
+        .filter(|l| {
+            matches!(
+                l.media_type.as_str(),
+                CHUNK_MEDIA_TYPE | CHUNK_MEDIA_TYPE_RAW
+            )
+        })
+        .collect();
+    Ok(Some((chunks, config.total_size)))
+}
+
+/// Push `ext4` as a new bundle tagged `<name>:<tag>`, reusing `parent_layers` for every
+/// chunk whose byte range is untouched by `dirty` and re-chunking only the dirty ranges.
+/// `parent_layers` tile the image (CDC covers it contiguously), so a parent chunk that
+/// overlaps a dirty extent is regenerated whole (one chunk, same offset/length) and the
+/// rest are reused verbatim — only the dirty bytes are read, hashed and (if new)
+/// compressed/uploaded. `dirty` is the set of cluster ranges the guest wrote (from
+/// `qemu-img map`); `total_size` is the parent's (the ext4 size is fixed across RUNs).
+#[allow(clippy::too_many_arguments)]
+pub fn push_ext4_diff(
+    rg: &Registry,
+    name: &str,
+    tag: &str,
+    ext4: &Path,
+    boot_kind: &str,
+    total_size: u64,
+    dirty: &[(u64, u64)],
+    parent_layers: &[OciDescriptor],
+) -> Result<(Vec<OciDescriptor>, u64)> {
+    block_on(push_ext4_diff_async(
+        rg,
+        name,
+        tag,
+        ext4,
+        boot_kind,
+        total_size,
+        dirty,
+        parent_layers,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn push_ext4_diff_async(
+    rg: &Registry,
+    name: &str,
+    tag: &str,
+    ext4: &Path,
+    boot_kind: &str,
+    total_size: u64,
+    dirty: &[(u64, u64)],
+    parent_layers: &[OciDescriptor],
+) -> Result<(Vec<OciDescriptor>, u64)> {
+    let (client, auth) = client(rg)?;
+    let image = make_ref(rg, name, tag)?;
+    client
+        .store_auth_if_needed(image.resolve_registry(), &auth)
+        .await;
+    let transparent = match rg.transparent_zstd {
+        Some(b) => b,
+        None => detect_transparent_zstd(rg, &image).await,
+    };
+    let chunkmap = if transparent { None } else { chunkmap_dir() };
+    let http = if transparent {
+        Some(http_client(rg)?)
+    } else {
+        None
+    };
+
+    // `ext4` is the stage's captured overlay (a qcow2 over the stage image); read changed
+    // regions from it directly via the native reader — no flat-raw `qemu-img convert`. A
+    // parent chunk straddling a dirty extent still reads correctly: `read_at` resolves the
+    // unchanged part through the backing chain.
+    let mut q = crate::qcow2::Qcow2::open(ext4)?;
+    let mut layers: Vec<OciDescriptor> = Vec::with_capacity(parent_layers.len());
+    let (mut uploaded, mut reused, mut regened, mut added) = (0usize, 0usize, 0usize, 0usize);
+    let mut covered: Vec<(u64, u64)> = Vec::with_capacity(parent_layers.len());
+    for layer in parent_layers {
+        let (offset, length) = chunk_placement(layer)?;
+        covered.push((offset, length));
+        // overlap test against the dirty cluster ranges (half-open intervals).
+        let is_dirty = dirty
+            .iter()
+            .any(|&(ds, dl)| offset < ds + dl && ds < offset + length);
+        if !is_dirty {
+            layers.push(layer.clone());
+            reused += 1;
+            continue;
+        }
+        let mut buf = vec![0u8; length as usize];
+        q.read_at(offset, &mut buf).with_context(|| {
+            format!("reading {length} bytes at {offset} from {}", ext4.display())
+        })?;
+        regened += 1;
+        if buf.iter().all(|&b| b == 0) {
+            continue; // freed/zeroed since the parent — drop it, the pull leaves a hole
+        }
+        let (desc, was_uploaded) = put_raw_chunk(
+            &client,
+            http.as_ref(),
+            rg,
+            &image,
+            transparent,
+            chunkmap.as_deref(),
+            buf,
+            offset,
+            length,
+        )
+        .await?;
+        if was_uploaded {
+            uploaded += 1;
+        }
+        layers.push(desc);
+    }
+    // Writes into regions that were holes in the parent (e.g. new files in former free
+    // space): dirty and covered by no parent chunk. The dirty extents are already a subset
+    // of the overlay's own data, so no separate data scan is needed (chunk_region drops the
+    // all-zero chunks). Without this such writes would be lost — the parent has no chunk
+    // there to regenerate.
+    covered.sort_unstable();
+    let mut dirty_sorted = dirty.to_vec();
+    dirty_sorted.sort_unstable();
+    let new_regions = subtract_extents(&dirty_sorted, &covered);
+    for (start, len) in new_regions {
+        // stream this region from the captured overlay (qcow2) via the native reader.
+        let reader: Box<dyn std::io::Read + Send> = Box::new(crate::qcow2::RegionReader::new(
+            crate::qcow2::Qcow2::open(ext4)?,
+            start,
+            len,
+        ));
+        for (desc, was_uploaded) in chunk_region(
+            &client,
+            http.as_ref(),
+            rg,
+            &image,
+            transparent,
+            chunkmap.as_deref(),
+            reader,
+            start,
+            ext4,
+        )
+        .await?
+        {
+            if was_uploaded {
+                uploaded += 1;
+            }
+            layers.push(desc);
+            added += 1;
+        }
+    }
+    println!(
+        "virtkit: registry: {} ext4 chunks ({reused} reused, {regened} re-chunked, {added} added, {uploaded} uploaded)",
+        layers.len()
+    );
+
+    let config = BundleConfig {
+        total_size,
+        chunk_count: layers.len(),
+        boot_kind: boot_kind.to_string(),
+        compression: "zstd".to_string(),
+        has_kernel: false,
+        has_initrd: false,
+    };
+    let config_json = serde_json::to_vec(&config).context("serializing the bundle config")?;
+    let config_digest = sha256_hex(&config_json);
+    let config_desc = OciDescriptor {
+        media_type: CONFIG_MEDIA_TYPE.to_string(),
+        digest: config_digest.clone(),
+        size: config_json.len() as i64,
+        ..Default::default()
+    };
+    if !client.blob_exists(&image, &config_digest).await? {
+        client
+            .push_blob(&image, config_json, &config_digest)
+            .await
+            .context("pushing the bundle config blob")?;
+    }
+    // Keep the layer list to hand back: the next instruction's diff push uses it as its
+    // parent in-memory, skipping a re-fetch of this manifest from the registry.
+    let ret_layers = layers.clone();
+    let manifest = OciManifest::Image(OciImageManifest {
+        schema_version: 2,
+        media_type: Some(OCI_IMAGE_MEDIA_TYPE.to_string()),
+        artifact_type: Some(ARTIFACT_TYPE.to_string()),
+        config: config_desc,
+        layers,
+        subject: None,
+        annotations: None,
+    });
+    let digest = client
+        .push_manifest(&image, &manifest)
+        .await
+        .with_context(|| format!("pushing the bundle manifest to {image}"))?;
+    println!(
+        "virtkit: registry: pushed {}/{name}:{tag} -> {digest}",
+        rg.repo
+    );
+    Ok((ret_layers, total_size))
+}
+
+/// Process one raw chunk for a push: dedup on its content (raw digest in transparent
+/// mode, else the chunkmap over the compressed-digest path), uploading the blob only if
+/// absent. Returns the layer descriptor (carrying `offset`/`length`) and whether a blob
+/// was uploaded. The single-chunk counterpart of `push_async`'s streaming loop, used by
+/// the diff push.
+#[allow(clippy::too_many_arguments)]
+async fn put_raw_chunk(
+    client: &oci_client::Client,
+    http: Option<&reqwest::Client>,
+    rg: &Registry,
+    image: &OciReference,
+    transparent: bool,
+    chunkmap: Option<&Path>,
+    raw: Vec<u8>,
+    offset: u64,
+    length: u64,
+) -> Result<(OciDescriptor, bool)> {
+    let raw_hex = sha256_hex_raw(&raw);
+    if transparent {
+        let digest = format!("sha256:{raw_hex}");
+        let size = raw.len() as i64;
+        let uploaded = if client.blob_exists(image, &digest).await? {
+            false
+        } else {
+            let frame = zstd_with_size(&raw)?;
+            push_blob_zstd(http.expect("http client"), rg, image, &digest, frame)
+                .await
+                .with_context(|| format!("pushing chunk {digest}"))?;
+            true
+        };
+        return Ok((
+            chunk_descriptor(CHUNK_MEDIA_TYPE_RAW, &digest, size, offset, length),
+            uploaded,
+        ));
+    }
+    if let Some(dir) = chunkmap
+        && let Some((digest, size)) = chunkmap_get(dir, &raw_hex)
+        && client.blob_exists(image, &digest).await?
+    {
+        return Ok((
+            chunk_descriptor(CHUNK_MEDIA_TYPE, &digest, size, offset, length),
+            false,
+        ));
+    }
+    let compressed = zstd::encode_all(&raw[..], ZSTD_LEVEL).context("zstd-compressing a chunk")?;
+    let digest = sha256_hex(&compressed);
+    let size = compressed.len() as i64;
+    if let Some(dir) = chunkmap {
+        chunkmap_put(dir, &raw_hex, &digest, size);
+    }
+    let uploaded = if client.blob_exists(image, &digest).await? {
+        false
+    } else {
+        client
+            .push_blob(image, compressed, &digest)
+            .await
+            .with_context(|| format!("pushing chunk {digest}"))?;
+        true
+    };
+    Ok((
+        chunk_descriptor(CHUNK_MEDIA_TYPE, &digest, size, offset, length),
+        uploaded,
+    ))
+}
+
+/// The `(start, len)` byte ranges of `path` that hold data (not holes), via
+/// `SEEK_DATA`/`SEEK_HOLE`. The ext4 images are sparse — their free space is a hole —
+/// so chunking only these extents skips reading/hashing/compressing the (often
+/// gigabyte-scale) free region entirely; the pull recreates the gaps as holes.
+fn file_data_extents(path: &Path, total_size: u64) -> Result<Vec<(u64, u64)>> {
+    use std::os::fd::AsRawFd;
+    let f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let fd = f.as_raw_fd();
+    let mut extents = Vec::new();
+    let mut pos: libc::off_t = 0;
+    let total = total_size as libc::off_t;
+    while pos < total {
+        // next data at/after pos; ENXIO (or -1) => no more data before EOF.
+        let data = unsafe { libc::lseek(fd, pos, libc::SEEK_DATA) };
+        if data < 0 {
+            break;
+        }
+        // end of that data run = the next hole (clamped to EOF).
+        let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+        let end = if hole < 0 { total } else { hole.min(total) };
+        if end > data {
+            extents.push((data as u64, (end - data) as u64));
+        }
+        pos = end;
+    }
+    Ok(extents)
+}
+
+/// `a − b` over half-open `(start, len)` interval lists (inputs sorted, disjoint).
+fn subtract_extents(a: &[(u64, u64)], b: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for &(s, l) in a {
+        let mut cur = s;
+        let end = s + l;
+        for &(bs, bl) in b {
+            let (bs, be) = (bs, bs + bl);
+            if be <= cur || bs >= end {
+                continue;
+            }
+            if bs > cur {
+                out.push((cur, bs - cur));
+            }
+            cur = cur.max(be);
+            if cur >= end {
+                break;
+            }
+        }
+        if cur < end {
+            out.push((cur, end - cur));
+        }
+    }
+    out
+}
+
+/// Content-defined-chunk a `[start, start+len)` region streamed from `reader` (a raw file
+/// slice for a full push, or a qcow2 region reader for a diff push), uploading each new
+/// chunk. `label` is only for error context.
+#[allow(clippy::too_many_arguments)]
+async fn chunk_region(
+    client: &oci_client::Client,
+    http: Option<&reqwest::Client>,
+    rg: &Registry,
+    image: &OciReference,
+    transparent: bool,
+    chunkmap: Option<&Path>,
+    reader: Box<dyn std::io::Read + Send>,
+    start: u64,
+    label: &Path,
+) -> Result<Vec<(OciDescriptor, bool)>> {
+    use futures::StreamExt;
+    const CHUNK_CONCURRENCY: usize = 16;
+    let chunker =
+        fastcdc::v2020::StreamCDC::new(std::io::BufReader::new(reader), CDC_MIN, CDC_AVG, CDC_MAX);
+    let results: Vec<Result<Option<(OciDescriptor, bool)>>> = futures::stream::iter(chunker)
+        .map(|chunk| async move {
+            let chunk = chunk.with_context(|| format!("chunking {}", label.display()))?;
+            if chunk.data.iter().all(|&b| b == 0) {
+                return Ok(None); // hole — leave a gap, the pull fills it with zeros
+            }
+            let offset = start + chunk.offset;
+            let length = chunk.length as u64;
+            let r = put_raw_chunk(
+                client,
+                http,
+                rg,
+                image,
+                transparent,
+                chunkmap,
+                chunk.data,
+                offset,
+                length,
+            )
+            .await?;
+            Ok(Some(r))
+        })
+        .buffer_unordered(CHUNK_CONCURRENCY)
+        .collect()
+        .await;
+    results.into_iter().filter_map(Result::transpose).collect()
+}
+
+/// Flatten a name to a safe single path component for a scratch dir (no separators).
+fn sanitize_component(name: &str) -> String {
+    name.replace(['/', '\\'], "_")
+}
+
 /// Drive a registry future to completion from a sync entry point. The executor's
 /// prepare/run path (and `main`) already run inside a tokio runtime, so this runs
 /// the future on a dedicated OS thread with its own runtime — a nested
@@ -238,15 +718,10 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
         .with_context(|| format!("stat {}", ext4.display()))?
         .len();
 
-    // CDC + per-chunk zstd, STREAMED from the file: StreamCDC buffers at most ~CDC_MAX
-    // at a time, so a multi-GB rootfs is never held in RAM. Chunking is sequential
-    // (it has to scan the file for cut points), but each chunk's zstd compression
-    // (spawn_blocking, so it spreads over cores) and upload run concurrently, up to
-    // CHUNK_CONCURRENCY in flight — so at most that many chunks are buffered. Layer
-    // order is irrelevant (reassembly uses each chunk's offset annotation), so the
-    // results are collected as they complete.
-    use futures::StreamExt;
-    const CHUNK_CONCURRENCY: usize = 16;
+    // CDC + per-chunk zstd, hole-aware: only the file's data extents are read and
+    // chunked (the sparse free region — often most of the image — is skipped, the pull
+    // recreates it as holes). Each extent's chunks compress + upload concurrently; layer
+    // order is irrelevant (reassembly uses each chunk's offset annotation).
     // Host-global cache mapping a raw chunk's sha256 -> the (digest, size) of its
     // zstd blob, so an unchanged chunk on a re-push needs no recompression: we hash
     // the raw bytes (cheaper than compressing), and if the mapped blob is already in
@@ -271,115 +746,36 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
     } else {
         None
     };
-    let file = std::fs::File::open(&ext4).with_context(|| format!("opening {}", ext4.display()))?;
-    let chunker =
-        fastcdc::v2020::StreamCDC::new(std::io::BufReader::new(file), CDC_MIN, CDC_AVG, CDC_MAX);
-    let results: Vec<Result<(OciDescriptor, bool)>> = futures::stream::iter(chunker)
-        .map(|chunk| {
-            let client = &client;
-            let image = &image;
-            let ext4 = &ext4;
-            let chunkmap = &chunkmap;
-            let http = &http;
-            async move {
-                let chunk = chunk.with_context(|| format!("chunking {}", ext4.display()))?;
-                let (offset, length) = (chunk.offset, chunk.length as u64);
-                let data = chunk.data;
-                // hash the raw chunk (blocking pool, spread over cores); hand the
-                // buffer back for a possible compress/upload.
-                let (raw_hex, data) = tokio::task::spawn_blocking(move || {
-                    let h = sha256_hex_raw(&data);
-                    (h, data)
-                })
-                .await
-                .context("joining the hash task")?;
-
-                // transparent mode: digest = raw chunk. Dedup on the raw digest, so a
-                // re-push skips both compression and upload. A new chunk is compressed
-                // (content-size embedded) and uploaded with `Content-Encoding: zstd` —
-                // compressed on the wire; the registry stores the frame verbatim.
-                if transparent {
-                    let digest = format!("sha256:{raw_hex}");
-                    let size = data.len() as i64;
-                    let uploaded = if client.blob_exists(image, &digest).await? {
-                        false
-                    } else {
-                        let frame = tokio::task::spawn_blocking(move || zstd_with_size(&data))
-                            .await
-                            .context("joining the compress task")??;
-                        push_blob_zstd(
-                            http.as_ref().expect("http client"),
-                            rg,
-                            image,
-                            &digest,
-                            frame,
-                        )
-                        .await
-                        .with_context(|| format!("pushing chunk {digest}"))?;
-                        true
-                    };
-                    return Ok((
-                        chunk_descriptor(CHUNK_MEDIA_TYPE_RAW, &digest, size, offset, length),
-                        uploaded,
-                    ));
-                }
-
-                // compressed-digest mode — fast path: a known blob already in the
-                // registry -> no recompression (via the chunkmap).
-                let mut cached = None;
-                if let Some(dir) = chunkmap.as_deref()
-                    && let Some((digest, size)) = chunkmap_get(dir, &raw_hex)
-                    && client.blob_exists(image, &digest).await?
-                {
-                    cached = Some((digest, size));
-                }
-                if let Some((digest, size)) = cached {
-                    return Ok((
-                        chunk_descriptor(CHUNK_MEDIA_TYPE, &digest, size, offset, length),
-                        false,
-                    ));
-                }
-
-                // miss: compress, record the mapping, upload if absent.
-                let compressed =
-                    tokio::task::spawn_blocking(move || zstd::encode_all(&data[..], ZSTD_LEVEL))
-                        .await
-                        .context("joining the compress task")?
-                        .context("zstd-compressing a chunk")?;
-                let digest = sha256_hex(&compressed);
-                let size = compressed.len() as i64;
-                if let Some(dir) = chunkmap.as_deref() {
-                    chunkmap_put(dir, &raw_hex, &digest, size);
-                }
-                let uploaded = if client.blob_exists(image, &digest).await? {
-                    false
-                } else {
-                    client
-                        .push_blob(image, compressed, &digest)
-                        .await
-                        .with_context(|| format!("pushing chunk {digest}"))?;
-                    true
-                };
-                Ok((
-                    chunk_descriptor(CHUNK_MEDIA_TYPE, &digest, size, offset, length),
-                    uploaded,
-                ))
-            }
-        })
-        .buffer_unordered(CHUNK_CONCURRENCY)
-        .collect()
-        .await;
-
-    let mut layers: Vec<OciDescriptor> = Vec::with_capacity(results.len());
+    let mut layers: Vec<OciDescriptor> = Vec::new();
     let (mut uploaded, mut skipped) = (0usize, 0usize);
-    for r in results {
-        let (desc, was_uploaded) = r?;
-        if was_uploaded {
-            uploaded += 1;
-        } else {
-            skipped += 1;
+    for (start, len) in file_data_extents(&ext4, total_size)? {
+        // stream this data extent from the raw image file.
+        let reader: Box<dyn std::io::Read + Send> = {
+            let mut f = std::fs::File::open(&ext4)
+                .with_context(|| format!("opening {}", ext4.display()))?;
+            f.seek(SeekFrom::Start(start))?;
+            Box::new(f.take(len))
+        };
+        for (desc, was_uploaded) in chunk_region(
+            &client,
+            http.as_ref(),
+            rg,
+            &image,
+            transparent,
+            chunkmap.as_deref(),
+            reader,
+            start,
+            &ext4,
+        )
+        .await?
+        {
+            if was_uploaded {
+                uploaded += 1;
+            } else {
+                skipped += 1;
+            }
+            layers.push(desc);
         }
-        layers.push(desc);
     }
     let chunk_count = layers.len();
     println!(

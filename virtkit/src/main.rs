@@ -380,9 +380,10 @@ enum Cmd {
         label: Option<String>,
     },
     /// Build a Dockerfile target and export it as a bootable ext4 image — a from-scratch
-    /// builder (no docker, no buildkit). The host backend handles the `FROM scratch` +
-    /// COPY subset; `--print-plan` parses + plans + prints the build without running it.
-    /// (The microVM backend for `FROM <image>` + RUN is added in a following commit.)
+    /// builder (no docker, no buildkit). With `--microvm`, each RUN executes in a Cloud
+    /// Hypervisor guest and instruction snapshots are cached (`--cache-registry`); the
+    /// default host backend handles the `FROM scratch` + COPY subset. `--print-plan` parses
+    /// + plans + prints the build without running it.
     Build {
         /// Dockerfile to build
         #[arg(short = 'f', long = "file", default_value = "Dockerfile")]
@@ -399,6 +400,27 @@ enum Cmd {
         /// parse + plan + print the build order and primitives; build nothing
         #[arg(long = "print-plan")]
         print_plan: bool,
+        /// run the build in a microVM (RUN executes in a Cloud Hypervisor guest);
+        /// needs --cloud-hypervisor/--kernel/--agent. Default: host backend
+        /// (FROM scratch + COPY only).
+        #[arg(long)]
+        microvm: bool,
+        #[arg(long = "cloud-hypervisor")]
+        cloud_hypervisor: Option<PathBuf>,
+        #[arg(long)]
+        kernel: Option<PathBuf>,
+        #[arg(long)]
+        agent: Option<PathBuf>,
+        /// instruction-cache registry repo (e.g. 127.0.0.1:5000 of a `virtkit
+        /// registry serve`): each instruction's ext4 is pushed/pulled there
+        #[arg(long = "cache-registry")]
+        cache_registry: Option<String>,
+        /// the cache registry speaks plain HTTP (a loopback regserve)
+        #[arg(long = "cache-insecure")]
+        cache_insecure: bool,
+        /// add an ext4 journal to the exported image (the build stays journal-less)
+        #[arg(long)]
+        journal: bool,
         /// override an ARG default: NAME=VALUE (repeatable)
         #[arg(long = "build-arg", value_name = "NAME=VALUE")]
         build_arg: Vec<String>,
@@ -625,6 +647,13 @@ async fn main() -> ExitCode {
         context,
         out,
         print_plan,
+        microvm,
+        cloud_hypervisor,
+        kernel,
+        agent,
+        cache_registry,
+        cache_insecure,
+        journal,
         build_arg,
     } = &cli.cmd
     {
@@ -642,6 +671,13 @@ async fn main() -> ExitCode {
             context: context.clone(),
             out: out.clone(),
             print_plan: *print_plan,
+            microvm: *microvm,
+            cloud_hypervisor: cloud_hypervisor.clone(),
+            kernel: kernel.clone(),
+            agent: agent.clone(),
+            cache_registry: cache_registry.clone(),
+            cache_insecure: *cache_insecure,
+            journal: *journal,
             build_args,
         };
         return match build::build(&opts) {

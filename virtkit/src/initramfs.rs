@@ -19,6 +19,22 @@ pub fn build_initramfs(tar_path: &Path, agent: &Path, out: &Path) -> Result<()> 
     build_initramfs_injecting(tar_path, &[(CMDRUNNER_PATH, agent, 0o755)], out)
 }
 
+/// Build a *minimal* cpio initramfs at `out` containing only the agent as `/init`.
+/// Used by the disk-boot path (e.g. build): the kernel runs this agent as PID 1
+/// from RAM, which then mounts the real image ext4 and `pivot_root`s into it (see
+/// `init::run_init`). This keeps the agent out of every built image — it is supplied
+/// by the boot medium, never written into the rootfs. The kernel auto-mounts devtmpfs,
+/// so no `/dev/console` node is needed in the archive.
+pub fn build_agent_initramfs(agent: &Path, out: &Path) -> Result<()> {
+    let file = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
+    let mut cpio = CpioWriter::new(std::io::BufWriter::new(file));
+    let f = std::fs::File::open(agent).with_context(|| format!("opening {}", agent.display()))?;
+    let size = f.metadata()?.len();
+    cpio.file("init", 0o755, size as u32, f)?;
+    cpio.finish()?;
+    Ok(())
+}
+
 /// Build a cpio initramfs at `out` from the rootfs `tar_path`, injecting each host
 /// file in `injects` at its guest path with the given mode (the agent PID 1, plus
 /// e.g. the captured `/etc/virtkit/{env,user}`). Hardlinks/device nodes/fifos are
