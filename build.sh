@@ -12,6 +12,11 @@
 #
 # Output goes to ./dist as stripped, static-pie musl ELF binaries. Both backends
 # mount the repo at /work and pass identical flags, so the bytes match either way.
+#
+# --bootstrap-check: after the default Docker build, rebuild with the just-built virtkit
+# (the dogfood backend, on a clean copy of the tree in a tmp dir) and assert the binaries
+# are byte-for-byte identical — proof the microVM backend reproduces Docker, i.e. virtkit
+# can rebuild itself. Needs dist/vmlinux (run ./build-kernel.sh first).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -20,12 +25,33 @@ TARGET=x86_64-unknown-linux-musl
 OUT=dist
 
 USE_VIRTKIT=""
+BOOTSTRAP_CHECK=""
 for arg in "$@"; do
   case "$arg" in
     --use-virtkit=*) USE_VIRTKIT="${arg#*=}" ;;
+    --bootstrap-check) BOOTSTRAP_CHECK=1 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
+if [ -n "$USE_VIRTKIT" ] && [ -n "$BOOTSTRAP_CHECK" ]; then
+  echo "--bootstrap-check runs the Docker build first; it cannot be combined with --use-virtkit" >&2
+  exit 2
+fi
+
+# Fail fast: check the dogfood-rebuild prerequisites up front, before the slow Docker build
+# and compile — not three minutes later when the rebuild starts. The fresh virtkit +
+# virtkit-agent come from the Docker build below; only the guest kernel and the VMM are
+# external to it.
+if [ -n "$BOOTSTRAP_CHECK" ]; then
+  [ -e "$OUT/vmlinux" ] || {
+    echo "--bootstrap-check needs $OUT/vmlinux (run ./build-kernel.sh first)" >&2
+    exit 1
+  }
+  [ -x "$OUT/cloud-hypervisor" ] || command -v cloud-hypervisor >/dev/null || {
+    echo "--bootstrap-check needs cloud-hypervisor (in PATH or at $OUT/cloud-hypervisor)" >&2
+    exit 1
+  }
+fi
 
 # Reproducibility: SOURCE_DATE_EPOCH neutralises any build timestamp, and the build
 # dir and cargo home are remapped to stable virtual prefixes (/src, /cargo) so the
@@ -55,7 +81,12 @@ if [ -n "$USE_VIRTKIT" ]; then
     [ -e "$f" ] || { echo "missing $f (need a populated --use-virtkit dir)" >&2; exit 1; }
   done
   ch_args=()
-  [ -x "$USE_VIRTKIT/cloud-hypervisor" ] && ch_args=(--cloud-hypervisor "$USE_VIRTKIT/cloud-hypervisor")
+  if [ -x "$USE_VIRTKIT/cloud-hypervisor" ]; then
+    ch_args=(--cloud-hypervisor "$USE_VIRTKIT/cloud-hypervisor")
+  elif ! command -v cloud-hypervisor >/dev/null; then
+    echo "missing cloud-hypervisor (in PATH or at $USE_VIRTKIT/cloud-hypervisor)" >&2
+    exit 1
+  fi
   cache_args=()
   [ -n "${VK_CACHE:-}" ] && cache_args=(--cache-registry "$VK_CACHE")
 
@@ -128,3 +159,40 @@ echo "built into $OUT/:"
 file "$OUT/virtkit" "$OUT/virtkit-agent"
 echo
 cat "$OUT/build-info.txt"
+
+if [ -n "$BOOTSTRAP_CHECK" ]; then
+  # Rebuild with the virtkit we just produced (the dogfood backend) and confirm it
+  # reproduces the Docker build bit-for-bit. The just-built $OUT is itself a valid
+  # --use-virtkit toolchain (virtkit + virtkit-agent built above, vmlinux from
+  # build-kernel.sh). The second build runs on a clean copy of the tree in a tmp dir —
+  # a full independent compile, mounted at the same /work path so the container-side
+  # paths (and thus the reproducible bytes) match the Docker build.
+  echo
+  echo "bootstrap check: rebuilding with the freshly built virtkit in a microVM…"
+  boot_dist="$PWD/$OUT"
+  boot_tmp=$(mktemp -d)
+  trap 'rm -rf "$boot_tmp"' EXIT
+  # Clean working-tree copy (no target/.git/dist) so the rebuild can't reuse this build's
+  # target/ and is a genuine from-scratch compile.
+  tar -c --exclude=./.git --exclude=./target --exclude="./$OUT" . | tar -x -C "$boot_tmp"
+  ( cd "$boot_tmp" && ./build.sh --use-virtkit="$boot_dist" )
+
+  echo
+  echo "bootstrap check: comparing sha256…"
+  mismatch=""
+  for b in virtkit virtkit-agent; do
+    docker_sha=$(sha256sum < "$OUT/$b" | cut -d' ' -f1)
+    virtkit_sha=$(sha256sum < "$boot_tmp/$OUT/$b" | cut -d' ' -f1)
+    if [ "$docker_sha" = "$virtkit_sha" ]; then
+      echo "  $b: OK      $docker_sha"
+    else
+      echo "  $b: DIFFER  docker=$docker_sha  virtkit=$virtkit_sha" >&2
+      mismatch=1
+    fi
+  done
+  if [ -n "$mismatch" ]; then
+    echo "bootstrap check FAILED: the virtkit backend did not reproduce the Docker build" >&2
+    exit 1
+  fi
+  echo "bootstrap check passed: Docker and virtkit backends produce identical binaries"
+fi
