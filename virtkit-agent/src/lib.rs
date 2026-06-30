@@ -1,8 +1,10 @@
 pub mod addr;
+pub mod diskmount;
 pub mod exec;
 pub mod fleetctl;
 pub mod forward;
 pub mod framing;
+pub mod fsfreeze;
 pub mod init;
 pub mod messages;
 pub mod net;
