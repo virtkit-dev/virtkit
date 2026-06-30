@@ -127,6 +127,14 @@ impl JobCtx {
     pub fn svc_forward_log(&self) -> PathBuf {
         self.job_dir.join("svc-forward.log")
     }
+    /// Host side of the SSH-agent forward (a detached `virtkit forward` child splicing
+    /// to the runner's `$SSH_AUTH_SOCK`): killed in cleanup, found via its pidfile.
+    pub fn ssh_agent_forward_pidfile(&self) -> PathBuf {
+        self.job_dir.join("ssh-agent-forward.pid")
+    }
+    pub fn ssh_agent_forward_log(&self) -> PathBuf {
+        self.job_dir.join("ssh-agent-forward.log")
+    }
     /// Per-job switch (net.mode = "switch"): a detached `virtkit switch` child
     /// giving the VM a userspace LAN over vsock + the egress allowlist; killed
     /// in cleanup, found via its pidfile.

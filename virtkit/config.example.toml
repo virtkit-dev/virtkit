@@ -50,6 +50,11 @@
 #                                            # port-scoped as CIDR:port (else any port)
 # allow_name = ["corp.example.com"]    # DNS suffixes (dot-anchored: also *.corp.example.com)
 
+# [auth]                 # host credentials forwarded into job VMs.
+# ssh_agent = true       # forward the runner's $SSH_AUTH_SOCK so the guest's ssh/git use
+#                        # the host keys; keys never enter the guest (no-op if unset on
+#                        # the runner). Same vsock-forward model as [services].
+
 # [build]                # defaults for `virtkit build` (a CLI flag always overrides).
 # cloud_hypervisor = "/usr/local/bin/cloud-hypervisor"  # default: top-level cloud_hypervisor
 # kernel = "/usr/local/lib/virtkit/vmlinux"             # build guest kernel

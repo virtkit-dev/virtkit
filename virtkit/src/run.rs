@@ -6,6 +6,7 @@
 //! for the disk path (virtio-blk + ext4 are built in). docker/cloud-hypervisor
 //! aside (docker only with `--source docker`/`auto`), nothing else is needed.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -16,6 +17,8 @@ use virtkit_agent::addr::SocketAddr;
 use crate::source::Source;
 
 const VSOCK_PORT: u32 = 4444;
+/// vsock port the guest SSH-agent forwarder dials; the host splices it to `$SSH_AUTH_SOCK`.
+pub(crate) const SSH_AGENT_VSOCK_PORT: u32 = 2223;
 /// vsock port the guest's tap bridge dials to reach the userspace switch.
 const NET_VSOCK_PORT: u32 = 1024;
 
@@ -79,6 +82,11 @@ pub struct RunArgs {
     pub shell: bool,
     /// give the guest egress via a userspace `virtkit switch` (DHCP + DNS + proxy)
     pub net: bool,
+    /// forward the host SSH agent into the guest (keys never enter the guest)
+    pub ssh_agent: bool,
+    /// expose only these ~/.ssh/config host aliases (filtered agent + injected config);
+    /// implies SSH-agent forwarding
+    pub ssh_hosts: Vec<String>,
     pub command: Vec<String>,
 }
 
@@ -258,7 +266,14 @@ async fn build_and_boot(args: &RunArgs, work: &Path) -> Result<()> {
         )
     };
 
+    // SSH-agent forwarding: tell the guest agent to present SSH_AUTH_SOCK and relay it over
+    // a vsock port, which the host side (started below) bridges to the host's real agent —
+    // either the whole agent (--ssh-agent) or a key-filtered subset (--ssh-host).
     let vsock = work.join("vsock.sock");
+    let ssh = ssh_agent_setup(args);
+    if ssh.is_some() {
+        cmdline.push_str(&format!(" VIRTKIT_SSH_AGENT_PORT={SSH_AGENT_VSOCK_PORT}"));
+    }
 
     // Networking: a userspace `virtkit switch` over vsock gives the guest egress (the agent
     // forks a tap bridged to it and takes the static address from the cmdline fragment).
@@ -322,11 +337,40 @@ async fn build_and_boot(args: &RunArgs, work: &Path) -> Result<()> {
         }
     };
 
+    // Host side of the SSH-agent forward: the guest dials vsock port SSH_AGENT_VSOCK_PORT,
+    // surfaced by cloud-hypervisor as <vsock.sock>_<port>. With --ssh-host a filtering proxy
+    // exposes only the chosen keys; a bare --ssh-agent splices the whole agent through.
+    let mut ssh_forward = match &ssh {
+        Some(s) if s.allow_pub.is_empty() && s.guest_config.is_none() => {
+            Some(spawn_ssh_agent_forward(&vsock, &s.upstream, work)?)
+        }
+        Some(s) => Some(spawn_ssh_agent_proxy(
+            &vsock,
+            &s.upstream,
+            &s.allow_pub,
+            work,
+        )?),
+        None => None,
+    };
+    let ssh_config = ssh.and_then(|s| s.guest_config);
+
     let addr = SocketAddr::VsockMux {
         path: vsock,
         port: VSOCK_PORT,
     };
-    let result = drive(&mut ch, &addr, &console, args, &image_env).await;
+    let result = drive(
+        &mut ch,
+        &addr,
+        &console,
+        args,
+        ssh_config.as_deref(),
+        &image_env,
+    )
+    .await;
+    if let Some(mut f) = ssh_forward.take() {
+        let _ = f.kill();
+        let _ = f.wait();
+    }
     let _ = ch.kill();
     let _ = ch.wait();
     for mut child in [switch.take(), virtiofsd.take()].into_iter().flatten() {
@@ -336,17 +380,130 @@ async fn build_and_boot(args: &RunArgs, work: &Path) -> Result<()> {
     result
 }
 
+/// Spawn the host side of the SSH-agent forward: `virtkit forward` binds the VMM's per-port
+/// vsock socket (`<vsock.sock>_<port>`) and splices every guest connection to the host's
+/// `$SSH_AUTH_SOCK`. Long-lived for the VM's lifetime; the caller kills it on teardown.
+fn spawn_ssh_agent_forward(vsock: &Path, host_sock: &OsStr, work: &Path) -> Result<Child> {
+    let mut listen = vsock.to_path_buf().into_os_string();
+    listen.push(format!("_{SSH_AGENT_VSOCK_PORT}"));
+    let exe = std::env::current_exe().context("locating the virtkit binary")?;
+    let log = std::fs::File::create(work.join("ssh-agent-forward.log"))
+        .context("creating the ssh-agent forward log")?;
+    Command::new(exe)
+        .arg("forward")
+        .arg("--listen")
+        .arg(&listen)
+        .arg("--to")
+        .arg(host_sock)
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .spawn()
+        .context("spawning the ssh-agent forward")
+}
+
+/// How `--ssh-agent`/`--ssh-host` resolve for a launch: the host agent socket to expose,
+/// the public keys it may offer (empty = the whole agent), and the `~/.ssh/config` stanzas
+/// to inject into the guest (only for `--ssh-host`).
+struct SshAgentSetup {
+    upstream: std::ffi::OsString,
+    allow_pub: Vec<PathBuf>,
+    guest_config: Option<String>,
+}
+
+/// Resolve the SSH-agent forwarding for this launch. `--ssh-host` implies forwarding and
+/// restricts it to the named `~/.ssh/config` aliases (their keys + injected config); a bare
+/// `--ssh-agent` forwards the whole agent. Returns `None` if forwarding is off or the host
+/// has no `$SSH_AUTH_SOCK`.
+fn ssh_agent_setup(args: &RunArgs) -> Option<SshAgentSetup> {
+    if !args.ssh_agent && args.ssh_hosts.is_empty() {
+        return None;
+    }
+    let Some(upstream) = std::env::var_os("SSH_AUTH_SOCK") else {
+        eprintln!("virtkit: SSH agent requested but SSH_AUTH_SOCK is unset — not forwarding");
+        return None;
+    };
+    if args.ssh_hosts.is_empty() {
+        return Some(SshAgentSetup {
+            upstream,
+            allow_pub: Vec::new(),
+            guest_config: None,
+        });
+    }
+    // --ssh-host: resolve the chosen aliases, collect their keys' .pub files (the agent
+    // filter allowlist) and a minimal guest config so `ssh <alias>` resolves in the VM.
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let cfg = std::fs::read_to_string(home.join(".ssh/config")).unwrap_or_default();
+    let entries = crate::sshconf::resolve(&cfg, &args.ssh_hosts, &home);
+    for want in &args.ssh_hosts {
+        if !entries.iter().any(|e| &e.alias == want) {
+            eprintln!("virtkit: --ssh-host {want}: not found in ~/.ssh/config — skipped");
+        }
+    }
+    let mut allow_pub = Vec::new();
+    let mut guest_config = String::new();
+    for e in &entries {
+        guest_config.push_str(&e.stanza());
+        guest_config.push('\n');
+        if e.identity_files.is_empty() {
+            eprintln!(
+                "virtkit: --ssh-host {}: no IdentityFile — its key can't be exposed",
+                e.alias
+            );
+        }
+        for id in &e.identity_files {
+            let mut p = id.clone().into_os_string();
+            p.push(".pub");
+            allow_pub.push(PathBuf::from(p));
+        }
+    }
+    Some(SshAgentSetup {
+        upstream,
+        allow_pub,
+        guest_config: Some(guest_config),
+    })
+}
+
+/// Spawn the host side of a key-filtered SSH-agent forward: `virtkit ssh-agent-proxy` binds
+/// the VMM's per-port vsock socket and relays to `$SSH_AUTH_SOCK`, exposing only `allow_pub`.
+fn spawn_ssh_agent_proxy(
+    vsock: &Path,
+    upstream: &OsStr,
+    allow_pub: &[PathBuf],
+    work: &Path,
+) -> Result<Child> {
+    let mut listen = vsock.to_path_buf().into_os_string();
+    listen.push(format!("_{SSH_AGENT_VSOCK_PORT}"));
+    let exe = std::env::current_exe().context("locating the virtkit binary")?;
+    let log = std::fs::File::create(work.join("ssh-agent-forward.log"))
+        .context("creating the ssh-agent forward log")?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("ssh-agent-proxy")
+        .arg("--listen")
+        .arg(&listen)
+        .arg("--upstream")
+        .arg(upstream);
+    for p in allow_pub {
+        cmd.arg("--allow").arg(p);
+    }
+    cmd.stdout(log.try_clone()?)
+        .stderr(log)
+        .spawn()
+        .context("spawning the ssh-agent proxy")
+}
+
+/// Wait for the in-guest virtkit-agent, run the command, relay its output. `ssh_config`, if
+/// set, is written to the guest's `~/.ssh/config` once it is ready (the `--ssh-host` stanzas).
 /// Single-quote a value for a `/bin/sh` `export` (wrap in `'…'`, escaping embedded `'`).
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Wait for the in-guest virtkit-agent, run the command, relay its output.
 async fn drive(
     ch: &mut Child,
     addr: &SocketAddr,
     console: &Path,
     args: &RunArgs,
+    ssh_config: Option<&str>,
     image_env: &[(String, String)],
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(args.boot_timeout_secs);
@@ -368,6 +525,9 @@ async fn drive(
             );
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if let Some(cfg) = ssh_config {
+        write_guest_ssh_config(addr, cfg).await?;
     }
     if args.shell {
         return run_shell(addr).await;
@@ -410,6 +570,23 @@ async fn drive(
     match result.code {
         Some(0) | None => Ok(()),
         Some(c) => bail!("guest command exited {c}"),
+    }
+}
+
+/// Write the `--ssh-host` stanzas into the guest's `~/.ssh/config` (0600, dir 0700) so
+/// `ssh <alias>` resolves there. The config is piped on the command's stdin into `cat`.
+async fn write_guest_ssh_config(addr: &SocketAddr, config: &str) -> Result<()> {
+    let cmd = vec![
+        "sh".to_string(),
+        "-c".into(),
+        "umask 077 && mkdir -p ~/.ssh && cat > ~/.ssh/config".into(),
+    ];
+    let r = crate::executor::exec_script(addr, &cmd, config.as_bytes().to_vec(), None)
+        .await
+        .context("writing ~/.ssh/config in the guest")?;
+    match r.code {
+        Some(0) | None => Ok(()),
+        Some(c) => bail!("writing ~/.ssh/config in the guest failed (exit {c})"),
     }
 }
 

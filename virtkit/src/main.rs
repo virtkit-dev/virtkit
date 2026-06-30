@@ -38,6 +38,8 @@ mod regserve;
 mod run;
 mod services;
 mod source;
+mod sshagent;
+mod sshconf;
 mod switch;
 #[cfg(feature = "virtiofsd")]
 mod virtiofsd;
@@ -190,6 +192,21 @@ enum Cmd {
         /// Target each accepted connection is spliced to
         #[arg(long)]
         to: SocketAddr,
+    },
+    /// Filtering ssh-agent proxy: serve the ssh-agent protocol on `--listen`, relaying to
+    /// the real agent at `--upstream` but exposing only the keys in the `--allow` .pub
+    /// files (refusing to sign with or list any other key). The host side of forwarding a
+    /// subset of the agent into a guest.
+    SshAgentProxy {
+        /// Unix socket to serve on (the VMM's per-port vsock socket)
+        #[arg(long)]
+        listen: PathBuf,
+        /// The real ssh-agent socket to relay to (e.g. $SSH_AUTH_SOCK)
+        #[arg(long)]
+        upstream: PathBuf,
+        /// OpenSSH public-key file whose key may be exposed (repeatable)
+        #[arg(long = "allow", value_name = "PUBKEY")]
+        allow: Vec<PathBuf>,
     },
     /// Userspace L2 network gateway for microVM(s) — the fleet switch. Accepts the
     /// qemu vhost transport on each VM's hybrid-vsock guest-port socket, answers
@@ -367,6 +384,15 @@ enum Cmd {
         /// (DHCP + DNS + transparent proxy over vsock)
         #[arg(long)]
         net: bool,
+        /// Forward the host SSH agent ($SSH_AUTH_SOCK) into the guest, so ssh/git in the
+        /// guest use the host's keys without the keys ever entering the guest
+        #[arg(long = "ssh-agent")]
+        ssh_agent: bool,
+        /// Expose only these ~/.ssh/config Host aliases to the guest: a filtered agent
+        /// offers just their keys and their config stanzas are injected (repeatable).
+        /// Implies --ssh-agent.
+        #[arg(long = "ssh-host", value_name = "ALIAS")]
+        ssh_host: Vec<String>,
         /// Command to run in the guest (default: a boot-info probe)
         #[arg(last = true)]
         command: Vec<String>,
@@ -519,6 +545,8 @@ async fn main() -> ExitCode {
         disk,
         shell,
         net,
+        ssh_agent,
+        ssh_host,
         command,
     } = &cli.cmd
     {
@@ -558,6 +586,8 @@ async fn main() -> ExitCode {
             disk: *disk,
             shell: *shell,
             net: *net,
+            ssh_agent: *ssh_agent,
+            ssh_hosts: ssh_host.clone(),
             command: command.clone(),
         };
         return match run::run(&args).await {
@@ -1039,6 +1069,16 @@ async fn main() -> ExitCode {
                 Err(e) => fail(&e, 1),
             }
         }
+        Cmd::SshAgentProxy {
+            listen,
+            upstream,
+            allow,
+        } => match sshagent::load_allow(&allow)
+            .and_then(|keys| sshagent::run_proxy(&listen, &upstream, &keys))
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        },
         // handled above, before JobCtx
         Cmd::Registry { .. }
         | Cmd::Switch { .. }

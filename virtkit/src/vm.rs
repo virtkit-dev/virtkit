@@ -236,6 +236,18 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         cmdline.push_str(&format!(" VIRTKIT_TMPFS={}", cfg.guest.tmpfs.join(",")));
     }
 
+    // SSH-agent forwarding ([auth] ssh_agent): tell the guest agent to present
+    // SSH_AUTH_SOCK and relay it over a vsock port to the host side (start_ssh_agent_forward
+    // below). A no-op if the runner has no agent — warn so a misconfig is visible.
+    if ssh_agent_forwarding(cfg) {
+        cmdline.push_str(&format!(
+            " VIRTKIT_SSH_AGENT_PORT={}",
+            crate::run::SSH_AGENT_VSOCK_PORT
+        ));
+    } else if cfg.auth.ssh_agent {
+        eprintln!("virtkit: [auth] ssh_agent set but SSH_AUTH_SOCK is unset — not forwarding");
+    }
+
     if !cfg.vm.cmdline_extra.is_empty() {
         cmdline.push(' ');
         cmdline.push_str(&cfg.vm.cmdline_extra);
@@ -344,6 +356,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
                     "virtkit: VM ready in {:.1}s (virtkit-agent {status})",
                     start.elapsed().as_secs_f32()
                 );
+                start_ssh_agent_forward(ctx)?;
                 start_services(ctx).await?;
                 return Ok(());
             }
@@ -360,6 +373,41 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// SSH-agent forwarding is on when `[auth] ssh_agent` is set AND the runner actually has an
+/// agent (`$SSH_AUTH_SOCK`). The guest side is driven by the cmdline var; the host side is
+/// the forward started below.
+fn ssh_agent_forwarding(cfg: &crate::config::Config) -> bool {
+    cfg.auth.ssh_agent && std::env::var_os("SSH_AUTH_SOCK").is_some()
+}
+
+/// Host side of the SSH-agent forward ([auth] ssh_agent): the guest dials vsock port
+/// SSH_AGENT_VSOCK_PORT, surfaced by cloud-hypervisor as `<vsock.sock>_<port>`; a detached
+/// `virtkit forward` binds it and splices to the runner's `$SSH_AUTH_SOCK`. Only agent
+/// protocol bytes cross — the keys never enter the guest. Torn down in cleanup via its pidfile.
+fn start_ssh_agent_forward(ctx: &JobCtx) -> Result<()> {
+    if !ssh_agent_forwarding(&ctx.cfg) {
+        return Ok(());
+    }
+    let host_sock = std::env::var_os("SSH_AUTH_SOCK").expect("checked by ssh_agent_forwarding");
+    let mut listen = ctx.vsock_sock().into_os_string();
+    listen.push(format!("_{}", crate::run::SSH_AGENT_VSOCK_PORT));
+    let listen = std::path::PathBuf::from(listen);
+
+    let exe = std::env::current_exe().context("locating the virtkit binary")?;
+    let mut fwd = Command::new(exe);
+    fwd.arg("forward")
+        .arg("--listen")
+        .arg(&listen)
+        .arg("--to")
+        .arg(&host_sock);
+    let child = spawn_detached(fwd, &ctx.ssh_agent_forward_log())
+        .context("spawning the ssh-agent forward")?;
+    std::fs::write(ctx.ssh_agent_forward_pidfile(), child.id().to_string())?;
+    wait_for_socket(&listen, Duration::from_secs(5))
+        .context("ssh-agent forward did not bind its socket")?;
+    Ok(())
 }
 
 /// Bring up the job's CI `services:` once the VM is ready (no-op without any).
@@ -595,11 +643,13 @@ pub fn stop_vm(ctx: &JobCtx) {
             unsafe { libc::kill(pid, libc::SIGTERM) };
         }
     }
-    // the services registry forward (detached virtkit child) if it was started
-    if let Some(pid) = read_pidfile(&ctx.svc_forward_pidfile())
-        && pid_running(pid, &ctx.job_dir.to_string_lossy())
-    {
-        unsafe { libc::kill(pid, libc::SIGTERM) };
+    // the detached virtkit forward children (services registry proxy, ssh-agent) if started
+    for pidfile in [ctx.svc_forward_pidfile(), ctx.ssh_agent_forward_pidfile()] {
+        if let Some(pid) = read_pidfile(&pidfile)
+            && pid_running(pid, &ctx.job_dir.to_string_lossy())
+        {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
     }
 }
 

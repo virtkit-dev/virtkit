@@ -28,6 +28,10 @@
 //!   VIRTKIT_SSH=1        also run ssh-serve (vsock 2222); keys VIRTKIT_SSH_KEYS
 //!                        (comma-separated `type:base64` entries, no spaces),
 //!                        user VIRTKIT_SSH_USER (default dev)
+//!   VIRTKIT_SSH_AGENT_PORT  forward the host SSH agent: run a guest-side forwarder that
+//!                        presents SSH_AUTH_SOCK and relays it over this vsock port to the
+//!                        host (which splices to the host's real agent). Only agent
+//!                        protocol bytes cross — private keys never enter the guest.
 //!   VIRTKIT_MODE=service fork the captured entrypoint; the agent stays as PID 1 and
 //!                        reaps orphans. A systemd image hands off via its entrypoint.
 //!   VIRTKIT_SERVE=1      (service) also start the vsock exec server (port 4444) for
@@ -51,6 +55,8 @@ use crate::addr::SocketAddr;
 
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const SSH_VSOCK_PORT: u32 = 2222;
+/// Guest-side SSH_AUTH_SOCK the forwarder binds (on the /run tmpfs, never in the image).
+const SSH_AGENT_SOCK: &str = "/run/virtkit-ssh-agent.sock";
 
 /// Entry point for `… init`. Sets the guest up, then serves (default) or execs the
 /// image entrypoint (VIRTKIT_MODE=service).
@@ -98,6 +104,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     }
 
     maybe_ssh_serve(&cmdline);
+    maybe_ssh_agent(&cmdline);
     let serve = spawn_serve(socket, inactivity_timeout)?;
     install_term_handler();
     supervise(serve)
@@ -739,6 +746,33 @@ fn maybe_ssh_serve(cmdline: &HashMap<String, String>) {
     }
 }
 
+/// Argv for the guest-side SSH-agent forwarder: listen on the guest SSH_AUTH_SOCK and
+/// relay to the host over `port` (the host splices it to its real `$SSH_AUTH_SOCK`).
+fn ssh_agent_forward_args(port: &str) -> Vec<String> {
+    vec![
+        "--socket".into(),
+        format!("vsock://{port}"),
+        "forward".into(),
+        "--listen".into(),
+        SSH_AGENT_SOCK.into(),
+    ]
+}
+
+/// Optionally forward the host's SSH agent (`VIRTKIT_SSH_AGENT_PORT`): start the guest-side
+/// forwarder presenting a unix socket, then point `SSH_AUTH_SOCK` at it so served/exec'd
+/// commands (ssh, git) find it. Only agent protocol bytes cross the vsock — keys stay host-side.
+fn maybe_ssh_agent(cmdline: &HashMap<String, String>) {
+    let Some(port) = cmdline.get("VIRTKIT_SSH_AGENT_PORT") else {
+        return;
+    };
+    match fork_agent(&ssh_agent_forward_args(port)) {
+        // Set it before spawn_serve so the served stages inherit it (single-threaded here).
+        // SAFETY: PID 1, no other threads yet (serve/net not forked).
+        Ok(_) => unsafe { std::env::set_var("SSH_AUTH_SOCK", SSH_AGENT_SOCK) },
+        Err(e) => warn!("virtkit-agent init: ssh-agent forward failed to start: {e}"),
+    }
+}
+
 /// `VIRTKIT_MODE=service`: run the image's captured entrypoint as its user. Normally
 /// `exec` (the service becomes PID 1, like the container); under VIRTKIT_DEBUG it is
 /// run then held so a crash doesn't panic PID 1 and the console keeps the error.
@@ -1062,6 +1096,20 @@ mod tests {
         assert_eq!(m.get("VIRTKIT_HOSTNAME").unwrap(), "runner");
         assert_eq!(m.get("VIRTKIT_VM_DNS").unwrap(), "1.1.1.1,8.8.8.8");
         assert!(!m.contains_key("ro"));
+    }
+
+    #[test]
+    fn ssh_agent_forward_args_relay_to_host_port() {
+        assert_eq!(
+            ssh_agent_forward_args("2223"),
+            vec![
+                "--socket",
+                "vsock://2223",
+                "forward",
+                "--listen",
+                SSH_AGENT_SOCK,
+            ]
+        );
     }
 
     #[test]

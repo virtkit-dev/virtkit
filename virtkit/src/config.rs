@@ -50,6 +50,8 @@ pub struct Config {
     /// CI tools shared into GitLab job VMs over virtio-fs; see [`Gitlab`]. Absent =
     /// no share (the job image must carry its own git/git-lfs/gitlab-runner).
     pub gitlab: Option<Gitlab>,
+    /// Host credentials forwarded into job VMs (currently the SSH agent); see [`Auth`].
+    pub auth: Auth,
     /// Defaults for `virtkit build` so a runner need not pass them every invocation;
     /// see [`Build`]. A CLI flag always overrides the matching config value.
     pub build: Build,
@@ -73,6 +75,17 @@ pub struct Build {
     pub cache_insecure: bool,
     /// add an ext4 journal to the exported image (the build itself stays journal-less).
     pub journal: bool,
+}
+
+/// Host credentials forwarded into job VMs. The SSH agent is relayed over a vsock
+/// forward to the runner's `$SSH_AUTH_SOCK`, so the guest's ssh/git use the host keys
+/// without the keys ever entering the guest (same model as the services registry proxy).
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct Auth {
+    /// Forward the runner's SSH agent into every job VM (no-op if `$SSH_AUTH_SOCK` is
+    /// unset on the runner). Default off.
+    pub ssh_agent: bool,
 }
 
 /// GitLab job tooling. `dir` is a host directory of static tool binaries (e.g.
@@ -501,6 +514,14 @@ mod tests {
     #[test]
     fn net_port_default() {
         assert_eq!(Net::default().net_port, 1024);
+    }
+
+    #[test]
+    fn auth_ssh_agent_parses() {
+        let cfg: Config = toml::from_str("[auth]\nssh_agent = true\n").unwrap();
+        assert!(cfg.auth.ssh_agent);
+        // absent [auth] = off
+        assert!(!Config::default().auth.ssh_agent);
     }
 
     #[test]
