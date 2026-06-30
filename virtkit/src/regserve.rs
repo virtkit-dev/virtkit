@@ -101,8 +101,8 @@ pub async fn serve(addr: SocketAddr, root: PathBuf) -> Result<()> {
 }
 
 /// Serve on an already-bound listener (so the caller can pick an ephemeral port and
-/// learn it first — see [`start_inline`]). The store is content-addressed and written
-/// atomically, so several servers may serve the same `root` concurrently.
+/// learn it first). The store is content-addressed and written atomically, so several
+/// servers may serve the same `root` concurrently.
 pub async fn serve_on(listener: TcpListener, root: PathBuf) -> Result<()> {
     let store = Store::new(root)?;
     if let Ok(addr) = listener.local_addr() {
@@ -122,30 +122,6 @@ pub async fn serve_on(listener: TcpListener, root: PathBuf) -> Result<()> {
             }
         });
     }
-}
-
-/// Start an inline registry over `root` on an ephemeral loopback port and return its
-/// address, running as a background task for the life of the process. This is the
-/// on-demand local-dev path (`fleet --registry-serve`): no daemon — each build spins
-/// one up over the shared store and it dies with the process. Multiple inline servers
-/// may serve the same `root` at once (atomic, content-addressed writes).
-pub async fn start_inline(root: PathBuf) -> Result<SocketAddr> {
-    let std_listener =
-        std::net::TcpListener::bind(("127.0.0.1", 0)).context("binding the inline registry")?;
-    let addr = std_listener
-        .local_addr()
-        .context("inline registry local_addr")?;
-    std_listener
-        .set_nonblocking(true)
-        .context("inline registry set_nonblocking")?;
-    let listener =
-        TcpListener::from_std(std_listener).context("adopting the inline registry listener")?;
-    tokio::spawn(async move {
-        if let Err(e) = serve_on(listener, root).await {
-            eprintln!("virtkit: inline registry exited: {e:#}");
-        }
-    });
-    Ok(addr)
 }
 
 /// Wrap `route`, turning any internal error into a 500 (a handler never fails the

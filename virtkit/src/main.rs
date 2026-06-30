@@ -16,9 +16,6 @@
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
-mod build;
-mod buildconf;
-mod buildkit;
 mod config;
 mod convert;
 mod cpio;
@@ -204,72 +201,6 @@ enum Cmd {
         /// docker image a service ext4 is built from: name=ref (repeatable)
         #[arg(long = "service-image")]
         service_image: Vec<String>,
-        /// in-process build recipe: Dockerfile(s) to build units from (repeatable).
-        /// When given (with a matching --unit-target), the unit's ext4 is built
-        /// in-process instead of via the build script.
-        #[arg(long = "build-dockerfile")]
-        build_dockerfile: Vec<PathBuf>,
-        /// in-process build: context dir (default: the dir of the first --build-dockerfile)
-        #[arg(long = "build-context")]
-        build_context: Option<PathBuf>,
-        /// in-process build: build arg KEY=VAL (repeatable)
-        #[arg(long = "build-arg")]
-        build_arg: Vec<String>,
-        /// in-process build: extra host entry HOST=IP (repeatable)
-        #[arg(long = "build-add-host")]
-        build_add_host: Vec<String>,
-        /// in-process build: spare free space (GiB) left in each unit's filesystem
-        #[arg(long = "build-free-gib", default_value_t = 0)]
-        build_free_gib: u64,
-        /// in-process build: per-unit target stage NAME=STAGE (repeatable)
-        #[arg(long = "unit-target")]
-        unit_target: Vec<String>,
-        /// in-process build: extra inject for unit NAME=HOST:GUEST:MODE (repeatable;
-        /// in addition to the agent)
-        #[arg(long = "unit-inject", value_name = "NAME=HOST:GUEST:MODE")]
-        unit_inject: Vec<String>,
-        /// in-process build: extra env-file for unit NAME=PATH (repeatable)
-        #[arg(long = "unit-env-file", value_name = "NAME=PATH")]
-        unit_env_file: Vec<String>,
-        /// in-process build: per-unit free-gib override NAME=N (else --build-free-gib)
-        #[arg(long = "unit-free-gib", value_name = "NAME=N")]
-        unit_free_gib: Vec<String>,
-        /// in-process build: dial this buildkit address instead of the ensured one
-        #[arg(long = "build-buildkit-addr")]
-        build_buildkit_addr: Option<String>,
-        /// in-process build: buildctl binary (default: next to virtkit, then PATH)
-        #[arg(long = "build-buildctl")]
-        build_buildctl: Option<PathBuf>,
-        /// in-process build: buildkitd binary (default: next to virtkit, then PATH)
-        #[arg(long = "build-buildkitd")]
-        build_buildkitd: Option<PathBuf>,
-        /// static (musl) virtkit-agent injected into each in-process-built ext4
-        #[arg(long = "agent", default_value = "/usr/local/lib/virtkit/virtkit-agent")]
-        agent: PathBuf,
-        /// shared bundle registry (e.g. a local `virtkit registry serve`): build each
-        /// unit's ext4 once and share it across worktrees — pull `<name>:<fingerprint>`
-        /// instead of building when a sibling already pushed it, push after a build.
-        /// Best-effort; omit to build locally only.
-        #[arg(long = "registry", value_name = "REPO")]
-        registry: Option<String>,
-        /// like --registry, but start an inline registry over this store dir on an
-        /// ephemeral loopback port for the build, with no persistent daemon (it dies
-        /// with this process). The on-demand local-dev path; several worktrees can
-        /// share one store dir concurrently. Mutually exclusive with --registry.
-        #[arg(long = "registry-serve", value_name = "DIR")]
-        registry_serve: Option<PathBuf>,
-        /// the shared registry speaks plain HTTP (a local insecure registry)
-        #[arg(long = "registry-insecure")]
-        registry_insecure: bool,
-        /// PEM CA bundle the shared registry's TLS cert chains to
-        #[arg(long = "registry-ca", value_name = "PATH")]
-        registry_ca: Option<PathBuf>,
-        /// shared registry HTTP Basic username (empty = anonymous)
-        #[arg(long = "registry-username", value_name = "USER", default_value = "")]
-        registry_username: String,
-        /// file holding the shared registry's Basic-auth password
-        #[arg(long = "registry-password-file", value_name = "PATH")]
-        registry_password_file: Option<PathBuf>,
         /// ensure the ext4 images are current (build the stale ones) and exit, without
         /// starting the switch or booting any VM
         #[arg(long)]
@@ -442,98 +373,6 @@ enum Cmd {
         /// filesystem label to stamp (≤16 bytes; for blkid/lsblk)
         #[arg(long)]
         label: Option<String>,
-    },
-    /// Build a bootable ext4 straight from a Dockerfile target: drive buildkit to
-    /// an OCI archive, then flatten + extract its config into an ext4 (the
-    /// `mkext-oci` machinery). Ensures a rootless buildkitd unless one is given.
-    /// The output's UUID is stamped to a content fingerprint of the resolved stage
-    /// tag (+ injected agent), so a re-run with no changes is a no-op ("fresh").
-    Build {
-        /// Dockerfile(s) (repeatable; default: Dockerfile). Multiple are merged so
-        /// cross-file stage deps fold transitively (like `docker-hash`).
-        #[arg(short = 'f', long = "file", default_value = "Dockerfile")]
-        file: Vec<PathBuf>,
-        /// build context dir (default: the dir of the first -f)
-        #[arg(long)]
-        context: Option<PathBuf>,
-        /// target to build: the Dockerfile stage (flag mode), or the virtkit.conf
-        /// `[targets.<name>]` entry (--conf mode). Required unless --conf --versions.
-        #[arg(long)]
-        target: Option<String>,
-        /// output ext4 image (required unless --local-out is given)
-        #[arg(long)]
-        out: Option<PathBuf>,
-        /// instead of an ext4, export the target stage's rootfs to this host dir
-        /// (buildctl type=local) — e.g. to extract a built static binary from a
-        /// scratch-final stage
-        #[arg(long = "local-out", value_name = "DIR")]
-        local_out: Option<PathBuf>,
-        /// instead of an ext4, push the target stage to a registry as an OCI image
-        /// (buildctl type=image,push) — build a container image with no docker
-        #[arg(long = "push", value_name = "REGISTRY/NAME:TAG")]
-        push: Option<String>,
-        /// instead of a kept ext4, build the ext4 and push it straight to the
-        /// [registry] as a bundle <name>:<tag>, keeping no local image — the direct
-        /// buildkit -> bundle-registry path (the ext4 is transient; point TMPDIR at
-        /// tmpfs to keep it in RAM). Needs a [registry] section in the host config.
-        #[arg(long = "push-bundle", value_name = "NAME:TAG")]
-        push_bundle: Option<String>,
-        /// instead of an ext4, build the target stage and load it into the local
-        /// container daemon (buildkit type=docker -> `docker load`; loader override
-        /// VIRTKIT_CONTAINER_CLI). Tagged by the --conf version, else by --name.
-        #[arg(long = "load")]
-        load: bool,
-        /// build arg KEY=VAL passed through where the target's closure declares it
-        /// (repeatable)
-        #[arg(long = "build-arg")]
-        build_arg: Vec<String>,
-        /// extra host entry HOST=IP for the build (repeatable)
-        #[arg(long = "add-host")]
-        add_host: Vec<String>,
-        /// image label KEY=VAL (repeatable)
-        #[arg(long = "label")]
-        label: Vec<String>,
-        /// inject a host file at a guest path, HOST:GUEST:OCTAL_MODE (repeatable)
-        #[arg(long = "inject", value_name = "HOST:GUEST:MODE")]
-        inject: Vec<String>,
-        /// env-file whose `KEY=VAL` lines are appended to /etc/virtkit/env after the
-        /// image-config env (non-`=` lines dropped); repeatable, applied in order
-        #[arg(long = "env-file", value_name = "PATH")]
-        env_file: Vec<PathBuf>,
-        /// spare free space (GiB) left in the filesystem for the guest to write
-        #[arg(long, default_value_t = 0)]
-        free_gib: u64,
-        /// tag/fingerprint name (the `<name>:<hash>` tag identity and fs label).
-        /// Required unless --conf is given (then the name is the --target entry).
-        #[arg(long)]
-        name: Option<String>,
-        /// build a target declared in a virtkit.conf manifest: --target names the
-        /// `[targets.<name>]` entry; its stage, dockerfiles, build args and version
-        /// tag come from the conf (hashes computed by virtkit, no external driver).
-        /// Output defaults to a bundle pushed to the [registry] under the rendered
-        /// version; pass --push <ref> for an OCI image or --out for a local ext4.
-        /// Ignores -f/--context; rejects --name/--push-bundle/--local-out.
-        #[arg(long = "conf", value_name = "PATH")]
-        conf: Option<PathBuf>,
-        /// with --conf: print `<name> <version>` for every manifest target and exit
-        /// (no build) — the build's already-built / out.env source.
-        #[arg(long = "versions", requires = "conf")]
-        versions: bool,
-        /// rebuild even if the image is already fresh
-        #[arg(long)]
-        force: bool,
-        /// dial this buildkit address instead of the ensured one
-        #[arg(long)]
-        buildkit_addr: Option<String>,
-        /// buildctl binary (default: next to virtkit, then PATH)
-        #[arg(long)]
-        buildctl: Option<PathBuf>,
-        /// buildkitd binary (default: next to virtkit, then PATH)
-        #[arg(long)]
-        buildkitd: Option<PathBuf>,
-        /// do not launch a daemon; just dial --buildkit-addr
-        #[arg(long)]
-        no_ensure_daemon: bool,
     },
     /// Dev: pull an OCI image from a registry (no docker) and flatten it to a
     /// rootfs tar.
@@ -743,230 +582,6 @@ async fn main() -> ExitCode {
             Err(e) => fail(&e, 1),
         };
     }
-    if let Cmd::Build {
-        file,
-        context,
-        target,
-        out,
-        local_out,
-        push,
-        push_bundle,
-        load,
-        build_arg,
-        add_host,
-        label,
-        inject,
-        env_file,
-        free_gib,
-        name,
-        conf,
-        versions,
-        force,
-        buildkit_addr,
-        buildctl,
-        buildkitd,
-        no_ensure_daemon,
-    } = &cli.cmd
-    {
-        // arg parsing shared by both sources (conf manifest / explicit flags)
-        let mut add_hosts = Vec::new();
-        for h in add_host {
-            let (host, ip) = h.split_once('=').unwrap_or((h.as_str(), ""));
-            add_hosts.push((host.to_string(), ip.to_string()));
-        }
-        let mut labels = Vec::new();
-        for l in label {
-            let (k, v) = l.split_once('=').unwrap_or((l.as_str(), ""));
-            labels.push((k.to_string(), v.to_string()));
-        }
-        let injects = match parse_injects(inject) {
-            Ok(p) => p,
-            Err(e) => return fail(&e, 2),
-        };
-        // CLI --build-arg KEY=VAL — overrides the conf [build_args] in --conf mode
-        // (fed into the stage hash + version tokens so the tag matches what is built).
-        let mut cli_args = std::collections::BTreeMap::new();
-        for a in build_arg {
-            let (k, v) = a.split_once('=').unwrap_or((a.as_str(), ""));
-            cli_args.insert(k.to_string(), v.to_string());
-        }
-
-        // Resolve the build inputs either from a virtkit.conf target (--conf) or from
-        // the explicit flags. The conf path computes the stage hash + version tag
-        // itself (no external driver); the bundle sink is implied (--push/--out opt out).
-        struct BuildInputs {
-            dockerfiles: Vec<PathBuf>,
-            context: PathBuf,
-            stage: String,
-            name: String,
-            output: build::BuildOutput,
-            registry: Option<config::Registry>,
-            build_args: std::collections::BTreeMap<String, String>,
-        }
-        let inputs: BuildInputs = if let Some(conf_path) = conf {
-            if name.is_some() || local_out.is_some() || push_bundle.is_some() {
-                return fail(
-                    &anyhow::anyhow!(
-                        "--conf takes no --name/--push-bundle/--local-out: the name is the \
-                         --target entry, and it push-bundles by the conf version (default), \
-                         --push <ref> for an OCI image, or --out for a local ext4"
-                    ),
-                    2,
-                );
-            }
-            let bc = match buildconf::BuildConf::load(conf_path) {
-                Ok(b) => b,
-                Err(e) => return fail(&e, 2),
-            };
-            let base = conf_path.parent().unwrap_or_else(|| Path::new("."));
-            // --versions: list every target's version and exit (no build).
-            if *versions {
-                match bc.versions(base) {
-                    Ok(list) => {
-                        for (name, version) in list {
-                            println!("{name} {version}");
-                        }
-                        return ExitCode::SUCCESS;
-                    }
-                    Err(e) => return fail(&e, 1),
-                }
-            }
-            let target = match target {
-                Some(t) => t,
-                None => return fail(&anyhow::anyhow!("build --conf needs --target <name>"), 2),
-            };
-            let r = match bc.resolve(target, base, &cli_args) {
-                Ok(r) => r,
-                Err(e) => return fail(&e, 2),
-            };
-            // sink: --load (local docker image) | --push <ref> (OCI image, e.g. service
-            // images) | --out (local ext4) | default = push-bundle to [registry] under
-            // the rendered version. All tagged by the conf version where applicable.
-            let output = if *load {
-                if push.is_some() || out.is_some() {
-                    return fail(
-                        &anyhow::anyhow!("--load is mutually exclusive with --push/--out"),
-                        2,
-                    );
-                }
-                build::BuildOutput::Load(r.version.clone())
-            } else {
-                match (push, out) {
-                    (Some(reference), None) => build::BuildOutput::Push(reference.clone()),
-                    (None, Some(o)) => build::BuildOutput::Ext4(o.clone()),
-                    (None, None) => build::BuildOutput::Bundle(r.version.clone()),
-                    (Some(_), Some(_)) => {
-                        return fail(
-                            &anyhow::anyhow!("--push and --out are mutually exclusive"),
-                            2,
-                        );
-                    }
-                }
-            };
-            let registry = match &output {
-                build::BuildOutput::Bundle(_) => cfg.registry.clone(),
-                _ => None,
-            };
-            BuildInputs {
-                dockerfiles: r.dockerfiles,
-                context: r.context,
-                stage: r.stage,
-                name: r.name,
-                output,
-                registry,
-                build_args: r.build_args,
-            }
-        } else {
-            let name = match name {
-                Some(n) => n.clone(),
-                None => return fail(&anyhow::anyhow!("build needs --name (or --conf)"), 2),
-            };
-            let stage = match target {
-                Some(t) => t.clone(),
-                None => return fail(&anyhow::anyhow!("build needs --target <stage>"), 2),
-            };
-            let output = if *load {
-                if out.is_some() || local_out.is_some() || push.is_some() || push_bundle.is_some() {
-                    return fail(
-                        &anyhow::anyhow!(
-                            "--load is mutually exclusive with --out/--local-out/--push/--push-bundle"
-                        ),
-                        2,
-                    );
-                }
-                build::BuildOutput::Load(name.clone())
-            } else {
-                match (out, local_out, push, push_bundle) {
-                    (Some(o), None, None, None) => build::BuildOutput::Ext4(o.clone()),
-                    (None, Some(d), None, None) => build::BuildOutput::Local(d.clone()),
-                    (None, None, Some(r), None) => build::BuildOutput::Push(r.clone()),
-                    (None, None, None, Some(b)) => build::BuildOutput::Bundle(b.clone()),
-                    (None, None, None, None) => {
-                        return fail(
-                            &anyhow::anyhow!(
-                                "build needs one of --out, --local-out, --push, --push-bundle, --load, --conf"
-                            ),
-                            2,
-                        );
-                    }
-                    _ => {
-                        return fail(
-                            &anyhow::anyhow!(
-                                "build takes exactly one of --out, --local-out, --push, --push-bundle, --load"
-                            ),
-                            2,
-                        );
-                    }
-                }
-            };
-            // --push-bundle uploads to the host [registry]; the other flag modes keep
-            // no registry (a standalone --out build does not publish).
-            let registry = match &output {
-                build::BuildOutput::Bundle(_) => cfg.registry.clone(),
-                _ => None,
-            };
-            let first = file.first().cloned();
-            let context = context.clone().unwrap_or_else(|| {
-                first
-                    .as_deref()
-                    .and_then(Path::parent)
-                    .unwrap_or_else(|| Path::new("."))
-                    .to_path_buf()
-            });
-            BuildInputs {
-                dockerfiles: file.clone(),
-                context,
-                stage,
-                name,
-                output,
-                registry,
-                build_args: cli_args,
-            }
-        };
-        let spec = build::BuildSpec {
-            dockerfiles: inputs.dockerfiles,
-            context: inputs.context,
-            target: inputs.stage,
-            name: inputs.name,
-            output: inputs.output,
-            build_args: inputs.build_args,
-            add_hosts,
-            labels,
-            injects,
-            env_files: env_file.clone(),
-            free_gib: *free_gib,
-            buildkit_addr: buildkit_addr.clone(),
-            buildctl: buildctl.clone(),
-            buildkitd: buildkitd.clone(),
-            ensure_daemon: !*no_ensure_daemon,
-            force: *force,
-            registry: inputs.registry,
-        };
-        return match build::run(&spec) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => fail(&e, 1),
-        };
-    }
     if let Cmd::Fingerprint { ext4, parts } = &cli.cmd {
         let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
         let uuid = ensure::fingerprint(&refs);
@@ -1091,25 +706,6 @@ async fn main() -> ExitCode {
         service,
         service_build,
         service_image,
-        build_dockerfile,
-        build_context,
-        build_arg,
-        build_add_host,
-        build_free_gib,
-        unit_target,
-        unit_inject,
-        unit_env_file,
-        unit_free_gib,
-        build_buildkit_addr,
-        build_buildctl,
-        build_buildkitd,
-        agent,
-        registry,
-        registry_serve,
-        registry_insecure,
-        registry_ca,
-        registry_username,
-        registry_password_file,
         ensure_only,
         vm,
         vm_build,
@@ -1202,145 +798,6 @@ async fn main() -> ExitCode {
             extra_symlinks: vm_symlink.clone(),
             ssh_keys: vm_ssh_keys.to_vec(),
         });
-        // In-process build recipe: present only when --build-dockerfile is given. The
-        // per-unit target stage map (--unit-target NAME=STAGE) selects which units
-        // build in-process; units without an entry fall back to the build script.
-        let build_recipe = if build_dockerfile.is_empty() {
-            None
-        } else {
-            let mut build_args = std::collections::BTreeMap::new();
-            for a in build_arg {
-                let (k, v) = a.split_once('=').unwrap_or((a.as_str(), ""));
-                build_args.insert(k.to_string(), v.to_string());
-            }
-            let mut add_hosts = Vec::new();
-            for h in build_add_host {
-                let (host, ip) = h.split_once('=').unwrap_or((h.as_str(), ""));
-                add_hosts.push((host.to_string(), ip.to_string()));
-            }
-            let context = build_context.clone().unwrap_or_else(|| {
-                build_dockerfile
-                    .first()
-                    .and_then(|p| p.parent())
-                    .unwrap_or_else(|| Path::new("."))
-                    .to_path_buf()
-            });
-            // Shared bundle registry: --registry REPO points at an existing one;
-            // --registry-serve DIR starts an inline ephemeral one over a shared store
-            // (no daemon) and uses it. Either way each unit's ext4 is built once and
-            // shared across worktrees.
-            if registry.is_some() && registry_serve.is_some() {
-                return fail(
-                    &anyhow::anyhow!("use one of --registry or --registry-serve, not both"),
-                    2,
-                );
-            }
-            let registry = if let Some(root) = registry_serve {
-                match regserve::start_inline(root.clone()).await {
-                    // inline regserve compresses storage itself, so use the
-                    // uncompressed-digest (transparent-zstd) chunk format. We spawned
-                    // it, so force it on rather than paying a loopback probe.
-                    Ok(addr) => Some(config::Registry::for_share(
-                        format!("{addr}/bundles"),
-                        true, // loopback HTTP
-                        None,
-                        String::new(),
-                        None,
-                        Some(true), // transparent_zstd: force on
-                    )),
-                    Err(e) => return fail(&e, 1),
-                }
-            } else {
-                // an external registry may be a cooperating regserve or a dumb OCI
-                // store: auto-detect (None) — probe its capability and pick the chunk
-                // format accordingly.
-                registry.as_ref().map(|repo| {
-                    config::Registry::for_share(
-                        repo.clone(),
-                        *registry_insecure,
-                        registry_ca.clone(),
-                        registry_username.clone(),
-                        registry_password_file.clone(),
-                        None, // transparent_zstd: auto-detect
-                    )
-                })
-            };
-            Some(ensure::BuildRecipe {
-                dockerfiles: build_dockerfile.clone(),
-                context,
-                build_args,
-                add_hosts,
-                free_gib: *build_free_gib,
-                buildkit_addr: build_buildkit_addr.clone(),
-                buildctl: build_buildctl.clone(),
-                buildkitd: build_buildkitd.clone(),
-                registry,
-            })
-        };
-        let mut unit_targets = std::collections::HashMap::new();
-        for spec in unit_target {
-            match spec.split_once('=') {
-                Some((name, stage)) => {
-                    unit_targets.insert(name.to_string(), stage.to_string());
-                }
-                None => {
-                    return fail(
-                        &anyhow::anyhow!("bad --unit-target {spec:?} (want NAME=STAGE)"),
-                        2,
-                    );
-                }
-            }
-        }
-        // Per-unit build overrides, keyed by unit NAME. Each --unit-* flag is a
-        // NAME=VALUE pair (split on the first '=', like --unit-target); the VALUE is
-        // then parsed in the flag's own format. Units with no override build as before.
-        let mut unit_overrides: std::collections::HashMap<String, ensure::UnitOverrides> =
-            std::collections::HashMap::new();
-        for spec in unit_inject {
-            match split_unit(spec, "--unit-inject", "NAME=HOST:GUEST:MODE") {
-                Ok((name, value)) => {
-                    match parse_injects(std::slice::from_ref(&value.to_string())) {
-                        Ok(mut parsed) => {
-                            unit_overrides
-                                .entry(name.to_string())
-                                .or_default()
-                                .injects
-                                .append(&mut parsed);
-                        }
-                        Err(e) => return fail(&e, 2),
-                    }
-                }
-                Err(e) => return fail(&e, 2),
-            }
-        }
-        for spec in unit_env_file {
-            match split_unit(spec, "--unit-env-file", "NAME=PATH") {
-                Ok((name, value)) => {
-                    unit_overrides
-                        .entry(name.to_string())
-                        .or_default()
-                        .env_files
-                        .push(PathBuf::from(value));
-                }
-                Err(e) => return fail(&e, 2),
-            }
-        }
-        for spec in unit_free_gib {
-            match split_unit(spec, "--unit-free-gib", "NAME=N") {
-                Ok((name, value)) => match value.parse::<u64>() {
-                    Ok(n) => {
-                        unit_overrides.entry(name.to_string()).or_default().free_gib = Some(n);
-                    }
-                    Err(_) => {
-                        return fail(
-                            &anyhow::anyhow!("bad --unit-free-gib {spec:?} (N must be an integer)"),
-                            2,
-                        );
-                    }
-                },
-                Err(e) => return fail(&e, 2),
-            }
-        }
         return match fleet::run(
             *gateway,
             *prefix,
@@ -1353,10 +810,6 @@ async fn main() -> ExitCode {
             vm_opts,
             service_build.clone(),
             service_image.clone(),
-            build_recipe,
-            unit_targets,
-            unit_overrides,
-            agent.clone(),
             *ensure_only,
         )
         .await
@@ -1424,7 +877,6 @@ async fn main() -> ExitCode {
         | Cmd::Mkext { .. }
         | Cmd::MkextTar { .. }
         | Cmd::MkextOci { .. }
-        | Cmd::Build { .. }
         | Cmd::OciPull { .. }
         | Cmd::DockerHash { .. }
         | Cmd::Fingerprint { .. } => {
@@ -1455,17 +907,9 @@ fn exit_code(code: i32) -> ExitCode {
     ExitCode::from(code.clamp(1, 255) as u8)
 }
 
-/// Split a per-unit `NAME=VALUE` flag on the first '=' (the same rule as
-/// `--unit-target`), returning `(name, value)`. `flag`/`fmt` shape the error.
-fn split_unit<'a>(spec: &'a str, flag: &str, fmt: &str) -> anyhow::Result<(&'a str, &'a str)> {
-    spec.split_once('=')
-        .filter(|(name, _)| !name.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("bad {flag} {spec:?} (want {fmt})"))
-}
-
 /// Parse `--inject HOST:GUEST:OCTAL_MODE` specs into `(guest, host, mode)`, with
 /// the guest path normalized to the image-relative form (no leading slash) the
-/// ext4 writer expects. Shared by `mkext-tar`, `mkext-oci`, and `build`.
+/// ext4 writer expects. Shared by `mkext-tar` and `mkext-oci`.
 fn parse_injects(specs: &[String]) -> anyhow::Result<Vec<(String, PathBuf, u16)>> {
     let mut out = Vec::new();
     for spec in specs {
@@ -1523,38 +967,11 @@ impl<R: std::io::Read> std::io::Read for ProgressReader<R> {
 mod tests {
     use super::*;
 
-    // Per-unit override flags (--unit-inject/--unit-env-file/--unit-free-gib) are
-    // NAME=VALUE pairs split on the first '=' (like --unit-target), with the VALUE
-    // then parsed in the flag's own format.
+    // A --inject value parses to a single (guest, host, mode) entry with the guest path
+    // normalized to image-relative form.
     #[test]
-    fn split_unit_takes_first_equals_and_requires_name() {
-        // first '=' only — the value (here a HOST:GUEST:MODE inject) keeps its own '='
-        // were it present, and a PATH value is returned verbatim.
-        assert_eq!(
-            split_unit("mysql=/h/agent:/g/agent:0755", "--unit-inject", "fmt").unwrap(),
-            ("mysql", "/h/agent:/g/agent:0755")
-        );
-        assert_eq!(
-            split_unit("vm=/tmp/dev.env", "--unit-env-file", "fmt").unwrap(),
-            ("vm", "/tmp/dev.env")
-        );
-        // empty name or no '=' is rejected.
-        assert!(split_unit("=stage", "--unit-target", "fmt").is_err());
-        assert!(split_unit("noeq", "--unit-target", "fmt").is_err());
-    }
-
-    // A --unit-inject value parses through parse_injects to a single (guest, host, mode)
-    // entry with the guest path normalized to image-relative form.
-    #[test]
-    fn unit_inject_value_parses_as_inject() {
-        let (name, value) = split_unit(
-            "vm=/host/x.sh:/etc/profile.d/x.sh:0644",
-            "--unit-inject",
-            "f",
-        )
-        .unwrap();
-        assert_eq!(name, "vm");
-        let parsed = parse_injects(std::slice::from_ref(&value.to_string())).unwrap();
+    fn inject_value_parses() {
+        let parsed = parse_injects(&["/host/x.sh:/etc/profile.d/x.sh:0644".to_string()]).unwrap();
         assert_eq!(
             parsed,
             vec![(
