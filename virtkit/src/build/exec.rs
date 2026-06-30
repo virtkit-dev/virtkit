@@ -199,11 +199,12 @@ fn render_cmd(cmd: &Cmdline) -> String {
     }
 }
 
-/// A non-building backend that answers only the read-only queries the key/scope resolution
-/// needs — the base manifest digest and base image config, resolved over the network as a
-/// real build would. It never materializes a rootfs, so it lets `docker-hash` compute each
-/// stage's cache key (via `resolve_stages`) without pulling/running/copying. Memoizes both
-/// lookups so a base shared by several stages is fetched once.
+/// A non-building backend that answers only the read-only queries the key/scope
+/// resolution needs — the base manifest digest and base image config, resolved over the
+/// network exactly as a real build does. It never materializes a rootfs, so it lets
+/// `docker-hash` compute each stage's cache key (via `resolve_stages`) without pulling,
+/// running, or copying anything. Memoizes both lookups so a base shared by several stages
+/// is fetched once.
 #[derive(Default)]
 pub struct Planner {
     digests: HashMap<String, Option<String>>,
@@ -270,27 +271,6 @@ impl Executor for Planner {
     fn export_ext4(&mut self, _fs: &Rootfs, _out: &Path) -> Result<()> {
         bail!("Planner backend does not export")
     }
-}
-
-/// Drive an async future to completion from a sync context, even when already inside a
-/// tokio runtime (the CLI's async main): run it on a dedicated thread with its own runtime
-/// — a nested `block_on` on the calling thread would panic.
-fn block_on<F>(fut: F) -> F::Output
-where
-    F: std::future::Future + Send,
-    F::Output: Send,
-{
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("building the planner tokio runtime")
-                .block_on(fut)
-        })
-        .join()
-        .expect("the planner runtime thread panicked")
-    })
 }
 
 /// The microVM backend: a stage is a bootable ext4 (the OCI base pulled + flattened
@@ -1126,10 +1106,29 @@ fn shell_single_quote(s: &str) -> String {
 /// tokio runtime (the CLI's async main): run it on a dedicated thread with its own
 /// runtime — a nested `block_on` on the calling thread would panic. Mirrors
 /// `registry::block_on`.
-/// Host backend for the no-`RUN` subset (`FROM scratch` + `COPY`): each stage is a real
-/// host directory, `COPY` is a host-side file copy, and the export is virtkit's own
-/// pure-Rust ext4 builder — no docker, no buildkit, no `mke2fs`, no VM. `RUN` and
-/// `FROM <image>` need the microVM/OCI path (added next) and error here.
+fn block_on<F>(fut: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("building the build tokio runtime")
+                .block_on(fut)
+        })
+        .join()
+        .expect("the build runtime thread panicked")
+    })
+}
+
+/// Host backend for the no-`RUN` subset (`FROM scratch` + `COPY`): each stage is a
+/// real host directory, `COPY` is a host-side file copy, and the export is virtkit's
+/// own pure-Rust ext4 builder ([`crate::ext4::build_from_dir`]) — no docker, no
+/// buildkit, no `mke2fs`, no VM. `RUN` and `FROM <image>` need the microVM/OCI path
+/// and error here. This is the end-to-end "Dockerfile → ext4 with only virtkit" PoC.
 pub struct Host {
     /// Scratch root holding each stage's directory (`<scratch>/<stage>`).
     scratch: PathBuf,

@@ -59,6 +59,14 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     // SAFETY: single-threaded here (no tokio, no serve fork yet).
     unsafe { std::env::set_var("PATH", DEFAULT_PATH) };
 
+    // If booted from the agent-only initramfs (`VIRTKIT_PIVOT=<root dev>`), mount the
+    // real image ext4 and switch into it — keeping this process as PID 1 — so the agent
+    // never lives inside the image. A no-op on the legacy in-rootfs `init=` boot.
+    let pivoted = pivot_to_real_root().unwrap_or_else(|e| {
+        warn!("virtkit-agent init: pivot to real root failed: {e:#} — continuing in place");
+        false
+    });
+
     mount_api_filesystems();
     apply_sysctls(); // honor /etc/sysctl.d/*.conf — there is no systemd-sysctl here
     let cmdline = read_cmdline();
@@ -67,7 +75,12 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     write_self_hosts(&cmdline);
     load_image_env(); // so served/exec'd commands inherit the image PATH etc.
     export_default_run_user(); // so served stages drop to the image's USER
-    ensure_virtctl_symlink(); // /usr/local/bin/virtctl -> the agent (fleet control client)
+    // /usr/local/bin/virtctl -> the agent (fleet control client). Skipped when pivoted
+    // into a built image (dfbuild): the agent isn't in the rootfs, so the symlink would
+    // dangle and pollute the artifact.
+    if !pivoted {
+        ensure_virtctl_symlink();
+    }
     mount_virtiofs(&cmdline);
     apply_symlinks(&cmdline);
     link_ci_tools(&cmdline); // host CI tools (git/git-lfs/…) onto PATH, if the image lacks them
@@ -90,9 +103,48 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     supervise(serve)
 }
 
+/// When booted from the agent-only initramfs, mount the real root (an ext4 named by
+/// `VIRTKIT_PIVOT` on the kernel cmdline, e.g. `/dev/vda`) and switch into it while
+/// staying PID 1. Returns `Ok(false)` (a no-op) on the legacy boot where the agent was
+/// `init=`'d from inside the rootfs and `VIRTKIT_PIVOT` is absent.
+///
+/// This is the initramfs→real-root `switch_root` dance: the new root is mounted, moved
+/// onto `/`, and `chroot`'d into. The initramfs (carrying our `/init`) is left hidden
+/// underneath; this process keeps running and its binary stays reachable via
+/// `/proc/self/exe` even though the path is gone — which is how the host re-invokes the
+/// agent's `copy`/`mount`/`fsfreeze` subcommands without it being present in the image.
+fn pivot_to_real_root() -> Result<bool> {
+    // /proc to read the cmdline, /dev for the root block-device node.
+    let _ = std::fs::create_dir_all("/proc");
+    let _ = mount("proc", "/proc", "proc", 0);
+    let cmdline = read_cmdline();
+    let Some(dev) = cmdline.get("VIRTKIT_PIVOT").cloned() else {
+        return Ok(false);
+    };
+    let _ = std::fs::create_dir_all("/dev");
+    let _ = mount("devtmpfs", "/dev", "devtmpfs", 0);
+    std::fs::create_dir_all("/newroot")?;
+    mount(&dev, "/newroot", "ext4", 0).with_context(|| format!("mounting real root {dev}"))?;
+    std::env::set_current_dir("/newroot").context("chdir /newroot")?;
+    mount(".", "/", "", libc::MS_MOVE).context("mount --move /newroot /")?;
+    let rc = unsafe { libc::chroot(c".".as_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error()).context("chroot into the new root");
+    }
+    std::env::set_current_dir("/").context("chdir / after chroot")?;
+    info!("virtkit-agent init: pivoted into real root {dev}");
+    Ok(true)
+}
+
 /// Mount the kernel API filesystems a from-scratch rootfs lacks. Best effort:
 /// each may already be mounted (the initrd/kernel set some up) — tolerate it.
 fn mount_api_filesystems() {
+    // Mountpoint dirs we create here (that the base lacked, e.g. a FROM scratch image) are
+    // recorded so `cleanup` can drop them before commit — otherwise an empty /proc, /sys,
+    // /dev, /run, /tmp would litter the built image. Recorded after /run is mounted (the
+    // registry lives on it). Pre-existing dirs (a normal debian/alpine base ships them) are
+    // left untouched and kept.
+    let mut created: Vec<&str> = Vec::new();
     // (source, target, fstype, flags)
     let mounts: &[(&str, &str, &str, libc::c_ulong)] = &[
         ("proc", "/proc", "proc", 0),
@@ -101,6 +153,9 @@ fn mount_api_filesystems() {
         ("devpts", "/dev/pts", "devpts", 0),
     ];
     for (src, target, fstype, flags) in mounts {
+        if !std::path::Path::new(target).exists() {
+            created.push(target);
+        }
         let _ = std::fs::create_dir_all(target);
         if let Err(e) = mount(src, target, fstype, *flags)
             && e.raw_os_error() != Some(libc::EBUSY)
@@ -109,17 +164,40 @@ fn mount_api_filesystems() {
             warn!("virtkit-agent init: mount {fstype} on {target} failed: {e}");
         }
     }
+    // The standard /dev file-descriptor symlinks. devtmpfs does not create these (a
+    // container runtime/udev normally would), but shells rely on them: bash process
+    // substitution `<(…)` opens /dev/fd/<n>, and scripts read /dev/stdin et al.
+    for (link, target) in [
+        ("/dev/fd", "/proc/self/fd"),
+        ("/dev/stdin", "/proc/self/fd/0"),
+        ("/dev/stdout", "/proc/self/fd/1"),
+        ("/dev/stderr", "/proc/self/fd/2"),
+    ] {
+        if !std::path::Path::new(link).exists()
+            && let Err(e) = std::os::unix::fs::symlink(target, link)
+        {
+            warn!("virtkit-agent init: symlink {link} -> {target} failed: {e}");
+        }
+    }
     // /run and /tmp as fresh tmpfs, but recreate the image's baked top-level dirs so
     // a service's runtime dir survives — e.g. /run/redis (owned by redis) that redis
     // binds its unix socket into. systemd-tmpfiles would recreate these; we have no
     // systemd, and a bare tmpfs mount would hide them.
     for target in ["/run", "/tmp"] {
+        if !std::path::Path::new(target).exists() {
+            created.push(target);
+        }
         let _ = std::fs::create_dir_all(target);
         if let Err(e) = mount_tmpfs_keep_dirs(target, libc::MS_NOSUID | libc::MS_NODEV)
             && e.raw_os_error() != Some(libc::EBUSY)
         {
             warn!("virtkit-agent init: tmpfs on {target} failed: {e}");
         }
+    }
+    // Now that /run (the registry's tmpfs) is mounted, record the mountpoints we created
+    // so the pre-commit cleanup can remove them from a FROM scratch image.
+    for target in created {
+        crate::diskmount::note_created(std::path::Path::new(target));
     }
 }
 
@@ -318,10 +396,12 @@ pub fn socket_from_cmdline() -> SocketAddr {
     SocketAddr::Vsock { cid: None, port }
 }
 
-/// Bring loopback up (the VS Code server and many tools bind 127.0.0.1). Best effort.
+/// Bring loopback up (the VS Code server and many tools bind 127.0.0.1, and glibc's
+/// resolver needs it for source-address selection). Via ioctl so it works on guests
+/// without iproute2/net-tools (minimal glibc images). Best effort.
 fn bring_up_loopback() {
-    if !run_cmd("ip", &["link", "set", "dev", "lo", "up"]) && !run_cmd("ifconfig", &["lo", "up"]) {
-        warn!("virtkit-agent init: could not bring up loopback");
+    if let Err(e) = crate::netcfg::set_up("lo") {
+        warn!("virtkit-agent init: could not bring up loopback: {e:#}");
     }
 }
 
@@ -549,11 +629,28 @@ fn configure_network(cmdline: &HashMap<String, String>) {
         let gw = cmdline
             .get("VIRTKIT_VM_GW")
             .map_or("192.168.127.1", String::as_str);
-        let _ = run_cmd("ip", &["addr", "add", ip, "dev", "eth0"]);
-        let _ = run_cmd("ip", &["route", "add", "default", "via", gw]);
+        // ioctls, not `ip`: minimal glibc images (debian:*-slim) ship no iproute2, so
+        // shelling out left them with no address/route and a broken resolver.
+        if let Err(e) = set_static_network(ip, gw) {
+            warn!("virtkit-agent init: configuring eth0 {ip} via {gw} failed: {e:#}");
+        }
     }
     // DNS is written separately (write_resolv_conf) so it applies to the kernel `ip=`
     // pool net too, not just this vsock-bridge static path.
+}
+
+/// Apply a static `VIRTKIT_VM_IP` (`a.b.c.d/prefix`) + `VIRTKIT_VM_GW` to eth0 via
+/// ioctls (address, netmask, default route).
+fn set_static_network(ip_cidr: &str, gw: &str) -> Result<()> {
+    let (ip_str, prefix) = match ip_cidr.split_once('/') {
+        Some((ip, p)) => (ip, p.parse::<u32>().context("parsing the IP prefix")?),
+        None => (ip_cidr, 24),
+    };
+    let ip: std::net::Ipv4Addr = ip_str.parse().context("parsing VIRTKIT_VM_IP")?;
+    let gw: std::net::Ipv4Addr = gw.parse().context("parsing VIRTKIT_VM_GW")?;
+    crate::netcfg::set_addr("eth0", ip, prefix)?;
+    crate::netcfg::add_default_route(gw)?;
+    Ok(())
 }
 
 /// Write /etc/resolv.conf from VIRTKIT_VM_DNS (comma-separated nameservers), set by
@@ -802,8 +899,10 @@ fn spawn_serve(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<l
 /// fork() and exec this agent binary (/proc/self/exe) with `args`; return the child
 /// pid in the parent. For the long-running children init supervises (serve/net/ssh).
 fn fork_agent(args: &[String]) -> Result<libc::pid_t> {
-    let exe = std::fs::read_link("/proc/self/exe").context("reading /proc/self/exe")?;
-    let mut argv_owned = vec![cstr(&exe.to_string_lossy())];
+    // Exec the magic `/proc/self/exe` path directly rather than its readlink target:
+    // after an initramfs pivot the agent's on-disk path (the initramfs `/init`) is gone,
+    // but `/proc/self/exe` still execs the running binary in the forked child.
+    let mut argv_owned = vec![cstr("/proc/self/exe")];
     argv_owned.extend(args.iter().map(|a| cstr(a)));
     let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|s| s.as_ptr()).collect();
     argv.push(std::ptr::null());

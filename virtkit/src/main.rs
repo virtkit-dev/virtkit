@@ -133,6 +133,52 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RegistryCmd,
     },
+    /// Build a Dockerfile target and export it as a bootable ext4 image — a from-scratch
+    /// builder (no docker, no buildkit). With `--microvm`, each RUN executes in a Cloud
+    /// Hypervisor guest and instruction snapshots are cached (`--cache-registry`); the
+    /// default host backend handles the `FROM scratch` + COPY subset. `--print-plan` parses
+    /// + plans + prints the build without running it.
+    Build {
+        /// Dockerfile to build
+        #[arg(short = 'f', long = "file", default_value = "Dockerfile")]
+        file: PathBuf,
+        /// target stage (AS name or index; default: the last stage)
+        #[arg(long)]
+        target: Option<String>,
+        /// build context for COPY (default: the Dockerfile's directory)
+        #[arg(long)]
+        context: Option<PathBuf>,
+        /// ext4 output path
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// parse + plan + print the build order and primitives; build nothing
+        #[arg(long = "print-plan")]
+        print_plan: bool,
+        /// run the build in a microVM (RUN executes in a Cloud Hypervisor guest);
+        /// needs --cloud-hypervisor/--kernel/--agent. Default: host backend
+        /// (FROM scratch + COPY only).
+        #[arg(long)]
+        microvm: bool,
+        #[arg(long = "cloud-hypervisor")]
+        cloud_hypervisor: Option<PathBuf>,
+        #[arg(long)]
+        kernel: Option<PathBuf>,
+        #[arg(long)]
+        agent: Option<PathBuf>,
+        /// instruction-cache registry repo (e.g. 127.0.0.1:5000 of a `virtkit
+        /// registry serve`): each instruction's ext4 is pushed/pulled there
+        #[arg(long = "cache-registry")]
+        cache_registry: Option<String>,
+        /// the cache registry speaks plain HTTP (a loopback regserve)
+        #[arg(long = "cache-insecure")]
+        cache_insecure: bool,
+        /// add an ext4 journal to the exported image (the build stays journal-less)
+        #[arg(long)]
+        journal: bool,
+        /// override an ARG default: NAME=VALUE (repeatable)
+        #[arg(long = "build-arg", value_name = "NAME=VALUE")]
+        build_arg: Vec<String>,
+    },
     /// Host side of a forward (companion of `virtkit-agent forward`): accept on
     /// `--listen` and splice each connection to `--to`, opaque to the protocol.
     /// Long-running, spawned detached per job — e.g. the VMM's per-port vsock
@@ -249,26 +295,52 @@ enum Cmd {
         #[arg(long = "vm-gid-map", value_name = "MAP")]
         vm_gid_map: Vec<String>,
     },
-    /// Dev: boot a (generic, kernel-less) docker image as a microVM — cpio
-    /// initramfs in RAM, virtkit-agent as PID 1, vsock — with no gitlab-runner and
-    /// no assembly tools. Only docker (rootfs/kernel source) + cloud-hypervisor.
+    /// Dev: run a docker/OCI image as a microVM — boot it (cpio initramfs in RAM or an
+    /// ext4 disk), virtkit-agent as PID 1 over vsock, and run a command or interactive
+    /// shell. No gitlab-runner, no assembly tools; just an image source + cloud-hypervisor.
     Run {
-        /// Image to boot (docker ref, or OCI reference with --oci), e.g. alpine:3.20
-        image: String,
+        /// Image to boot (docker ref, or OCI reference with --source oci), e.g. alpine:3.20.
+        /// Omit when booting a Dockerfile target with --file.
+        image: Option<String>,
+        /// Boot a Dockerfile target instead of an image: build (or cache-restore, with
+        /// --cache-registry) the target into an ext4 and boot it — no explicit ext4 file
+        #[arg(short = 'f', long = "file")]
+        file: Option<PathBuf>,
+        /// target stage to boot (AS name or index; default: the last stage), with --file
+        #[arg(long)]
+        target: Option<String>,
+        /// build context for the Dockerfile's COPY (default: the Dockerfile's directory)
+        #[arg(long)]
+        context: Option<PathBuf>,
+        /// instruction-cache registry for the --file build (push/pull each stage's ext4
+        /// by content key, so a repeat boot restores the image instead of rebuilding)
+        #[arg(long = "cache-registry")]
+        cache_registry: Option<String>,
+        /// the cache registry speaks plain HTTP (a loopback regserve)
+        #[arg(long = "cache-insecure")]
+        cache_insecure: bool,
+        /// override an ARG default for the --file build: NAME=VALUE (repeatable)
+        #[arg(long = "build-arg", value_name = "NAME=VALUE")]
+        build_arg: Vec<String>,
+        /// share a host dir read-write into the guest (mounted at /work) and run the
+        /// command there, so its outputs land back on the host
+        #[arg(long, value_name = "DIR")]
+        workdir: Option<PathBuf>,
         /// Pinned guest kernel (the pinned vmlinux: virtio + ext4 built in)
         #[arg(long, default_value = "/usr/local/lib/virtkit/vmlinux")]
         kernel: PathBuf,
-        /// Pull the rootfs from a registry (no docker daemon)
-        #[arg(long)]
-        oci: bool,
-        /// PEM CA bundle the registry TLS cert chains to (with --oci)
+        /// Where the rootfs comes from: oci (registry pull, no docker daemon), docker
+        /// (docker export), or auto (registry, falling back to docker for an unpushed image)
+        #[arg(long, value_enum, default_value = "auto")]
+        source: run::SourceMode,
+        /// PEM CA bundle the registry TLS cert chains to (oci/auto)
         #[arg(long)]
         ca: Option<PathBuf>,
         #[arg(long)]
         username: Option<String>,
         #[arg(long)]
         password: Option<String>,
-        /// plain HTTP registry (with --oci)
+        /// plain HTTP registry (oci/auto)
         #[arg(long)]
         insecure: bool,
         /// Static (musl) virtkit-agent injected as PID 1
@@ -290,6 +362,10 @@ enum Cmd {
         /// ignores any trailing command
         #[arg(long)]
         shell: bool,
+        /// Give the guest network egress via a userspace `virtkit switch`
+        /// (DHCP + DNS + transparent proxy over vsock)
+        #[arg(long)]
+        net: bool,
         /// Command to run in the guest (default: a boot-info probe)
         #[arg(last = true)]
         command: Vec<String>,
@@ -379,52 +455,6 @@ enum Cmd {
         #[arg(long)]
         label: Option<String>,
     },
-    /// Build a Dockerfile target and export it as a bootable ext4 image — a from-scratch
-    /// builder (no docker, no buildkit). With `--microvm`, each RUN executes in a Cloud
-    /// Hypervisor guest and instruction snapshots are cached (`--cache-registry`); the
-    /// default host backend handles the `FROM scratch` + COPY subset. `--print-plan` parses
-    /// + plans + prints the build without running it.
-    Build {
-        /// Dockerfile to build
-        #[arg(short = 'f', long = "file", default_value = "Dockerfile")]
-        file: PathBuf,
-        /// target stage (AS name or index; default: the last stage)
-        #[arg(long)]
-        target: Option<String>,
-        /// build context for COPY (default: the Dockerfile's directory)
-        #[arg(long)]
-        context: Option<PathBuf>,
-        /// ext4 output path
-        #[arg(long)]
-        out: Option<PathBuf>,
-        /// parse + plan + print the build order and primitives; build nothing
-        #[arg(long = "print-plan")]
-        print_plan: bool,
-        /// run the build in a microVM (RUN executes in a Cloud Hypervisor guest);
-        /// needs --cloud-hypervisor/--kernel/--agent. Default: host backend
-        /// (FROM scratch + COPY only).
-        #[arg(long)]
-        microvm: bool,
-        #[arg(long = "cloud-hypervisor")]
-        cloud_hypervisor: Option<PathBuf>,
-        #[arg(long)]
-        kernel: Option<PathBuf>,
-        #[arg(long)]
-        agent: Option<PathBuf>,
-        /// instruction-cache registry repo (e.g. 127.0.0.1:5000 of a `virtkit
-        /// registry serve`): each instruction's ext4 is pushed/pulled there
-        #[arg(long = "cache-registry")]
-        cache_registry: Option<String>,
-        /// the cache registry speaks plain HTTP (a loopback regserve)
-        #[arg(long = "cache-insecure")]
-        cache_insecure: bool,
-        /// add an ext4 journal to the exported image (the build stays journal-less)
-        #[arg(long)]
-        journal: bool,
-        /// override an ARG default: NAME=VALUE (repeatable)
-        #[arg(long = "build-arg", value_name = "NAME=VALUE")]
-        build_arg: Vec<String>,
-    },
     /// Dev: pull an OCI image from a registry (no docker) and flatten it to a
     /// rootfs tar.
     OciPull {
@@ -464,11 +494,18 @@ async fn main() -> ExitCode {
         Ok(cfg) => cfg,
         Err(e) => return fail(&e, 2),
     };
-    // `launch` is a standalone dev path: no JobCtx (no CUSTOM_ENV_* job context).
+    // `run` is a standalone dev path: no JobCtx (no CUSTOM_ENV_* job context).
     if let Cmd::Run {
         image,
+        file,
+        target,
+        context,
+        cache_registry,
+        cache_insecure,
+        build_arg,
+        workdir,
         kernel,
-        oci,
+        source,
         ca,
         username,
         password,
@@ -480,15 +517,36 @@ async fn main() -> ExitCode {
         boot_timeout,
         disk,
         shell,
+        net,
         command,
     } = &cli.cmd
     {
+        if file.is_none() && image.is_none() {
+            return fail(
+                &anyhow::anyhow!("run needs an image or --file <Dockerfile>"),
+                2,
+            );
+        }
+        let build_args: Vec<(String, String)> = build_arg
+            .iter()
+            .map(|a| {
+                let (k, v) = a.split_once('=').unwrap_or((a.as_str(), ""));
+                (k.to_string(), v.to_string())
+            })
+            .collect();
         let args = run::RunArgs {
-            image: image.clone(),
+            image: image.clone().unwrap_or_default(),
+            dockerfile: file.clone(),
+            target: target.clone(),
+            context: context.clone(),
+            cache_registry: cache_registry.clone(),
+            cache_insecure: *cache_insecure,
+            build_args,
+            workdir: workdir.clone(),
             kernel: kernel.clone(),
             agent: agent.clone(),
             cloud_hypervisor: cloud_hypervisor.clone(),
-            oci: *oci,
+            source: *source,
             ca: ca.clone(),
             username: username.clone(),
             password: password.clone(),
@@ -498,6 +556,7 @@ async fn main() -> ExitCode {
             boot_timeout_secs: *boot_timeout,
             disk: *disk,
             shell: *shell,
+            net: *net,
             command: command.clone(),
         };
         return match run::run(&args).await {
@@ -665,6 +724,10 @@ async fn main() -> ExitCode {
                 None => (a.clone(), String::new()),
             })
             .collect();
+        // CLI flag wins; otherwise fall back to [build] config (and the top-level
+        // cloud_hypervisor for the build guest's VMM). bool flags are opt-in, so a set
+        // flag or a config `true` enables them.
+        let b = &cfg.build;
         let opts = build::Options {
             dockerfile: file.clone(),
             target: target.clone(),
@@ -672,16 +735,19 @@ async fn main() -> ExitCode {
             out: out.clone(),
             print_plan: *print_plan,
             microvm: *microvm,
-            cloud_hypervisor: cloud_hypervisor.clone(),
-            kernel: kernel.clone(),
-            agent: agent.clone(),
-            cache_registry: cache_registry.clone(),
-            cache_insecure: *cache_insecure,
-            journal: *journal,
+            cloud_hypervisor: cloud_hypervisor
+                .clone()
+                .or_else(|| b.cloud_hypervisor.clone())
+                .or_else(|| cfg.cloud_hypervisor.clone()),
+            kernel: kernel.clone().or_else(|| b.kernel.clone()),
+            agent: agent.clone().or_else(|| b.agent.clone()),
+            cache_registry: cache_registry.clone().or_else(|| b.cache_registry.clone()),
+            cache_insecure: *cache_insecure || b.cache_insecure,
+            journal: *journal || b.journal,
             build_args,
         };
         return match build::build(&opts) {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(_) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         };
     }

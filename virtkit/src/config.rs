@@ -50,6 +50,29 @@ pub struct Config {
     /// CI tools shared into GitLab job VMs over virtio-fs; see [`Gitlab`]. Absent =
     /// no share (the job image must carry its own git/git-lfs/gitlab-runner).
     pub gitlab: Option<Gitlab>,
+    /// Defaults for `virtkit build` so a runner need not pass them every invocation;
+    /// see [`Build`]. A CLI flag always overrides the matching config value.
+    pub build: Build,
+}
+
+/// Defaults for `virtkit build` (the experimental microVM Dockerfile builder). Every
+/// field backs a CLI flag; the flag wins when given, so this just sets a host's defaults
+/// (e.g. the shared instruction-cache registry and the build guest's kernel/agent).
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct Build {
+    /// cloud-hypervisor for the build guest (default: the top-level `cloud_hypervisor`).
+    pub cloud_hypervisor: Option<PathBuf>,
+    /// the build guest kernel (the pinned vmlinux with virtio + ext4 built in).
+    pub kernel: Option<PathBuf>,
+    /// the virtkit-agent injected into the build guest as PID 1.
+    pub agent: Option<PathBuf>,
+    /// instruction-cache registry repo (a `virtkit registry serve`); unset = no cache.
+    pub cache_registry: Option<String>,
+    /// the cache registry speaks plain HTTP (a loopback regserve).
+    pub cache_insecure: bool,
+    /// add an ext4 journal to the exported image (the build itself stays journal-less).
+    pub journal: bool,
 }
 
 /// GitLab job tooling. `dir` is a host directory of static tool binaries (e.g.
@@ -272,9 +295,9 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Build a `Registry` for the build-sharing path (the instruction cache), from
-    /// flags rather than a config file. `generic_kernel`/`keep` are irrelevant to
-    /// push/pull-by-key (only `resolve` boots), so they take their defaults.
+    /// Build a `Registry` for the build-sharing path (`fleet --registry`), from the
+    /// CLI flags rather than a config file. `generic_kernel`/`keep` are irrelevant to
+    /// push/pull-by-fingerprint (only `resolve` boots), so they take their defaults.
     pub fn for_share(
         repo: String,
         insecure: bool,
@@ -477,5 +500,24 @@ mod tests {
     #[test]
     fn net_port_default() {
         assert_eq!(Net::default().net_port, 1024);
+    }
+
+    #[test]
+    fn build_defaults_parse() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [build]
+            kernel = "/k/vmlinux"
+            agent = "/k/virtkit-agent"
+            cache_registry = "127.0.0.1:5000"
+            cache_insecure = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.build.kernel.as_deref(), Some(Path::new("/k/vmlinux")));
+        assert_eq!(cfg.build.cache_registry.as_deref(), Some("127.0.0.1:5000"));
+        assert!(cfg.build.cache_insecure && !cfg.build.journal);
+        // absent [build] = all unset
+        assert!(Config::default().build.cache_registry.is_none());
     }
 }

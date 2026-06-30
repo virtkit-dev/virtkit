@@ -8,6 +8,7 @@ pub mod fsfreeze;
 pub mod init;
 pub mod messages;
 pub mod net;
+pub mod netcfg;
 pub mod pty;
 #[cfg(feature = "ssh")]
 pub mod sftp;

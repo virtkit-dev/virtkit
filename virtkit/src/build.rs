@@ -71,8 +71,17 @@ pub struct Options {
     pub build_args: Vec<(String, String)>,
 }
 
+/// What a completed build exposes to its caller: the target stage's accumulated
+/// environment, so a caller booting the exported image can run a command with the image's
+/// configured environment — e.g. `run -f` putting the base image's `PATH` in scope so
+/// `cargo` resolves.
+#[derive(Default)]
+pub struct Built {
+    pub env: Vec<(String, String)>,
+}
+
 /// Entry point for the `build` subcommand.
-pub fn build(opts: &Options) -> Result<()> {
+pub fn build(opts: &Options) -> Result<Built> {
     let src = std::fs::read_to_string(&opts.dockerfile)
         .with_context(|| format!("reading {}", opts.dockerfile.display()))?;
     let df = parser::parse(&src)?;
@@ -95,11 +104,11 @@ pub fn build(opts: &Options) -> Result<()> {
         for line in &ex.transcript {
             println!("{line}");
         }
-        return Ok(());
+        return Ok(Built::default());
     }
 
-    // Real build: the host backend (FROM scratch + COPY) or the microVM backend
-    // (FROM <image> + RUN in a Cloud Hypervisor guest, instruction snapshots cached).
+    // Real build: the Host backend (FROM scratch + COPY, exported via virtkit's own
+    // ext4 builder — no docker/buildkit/mke2fs/VM). RUN / FROM <image> error here.
     let out = opts
         .out
         .as_deref()
@@ -138,21 +147,23 @@ pub fn build(opts: &Options) -> Result<()> {
     } else {
         Box::new(Host::new(context.clone(), scratch.clone()))
     };
-    let result = (|| -> Result<()> {
-        let committed = drive(&plan, &order, &build_args, ex.as_mut(), &context)?;
+    let result = (|| -> Result<Built> {
+        let (committed, states) = drive(&plan, &order, &build_args, ex.as_mut(), &context)?;
         let fs = committed
             .get(&target)
             .context("internal: target stage not committed")?;
-        ex.export_ext4(fs, out)
+        ex.export_ext4(fs, out)?;
+        let st = states.get(&target).cloned().unwrap_or_default();
+        Ok(Built { env: st.env })
     })();
     let _ = std::fs::remove_dir_all(&scratch); // best-effort scratch cleanup
-    result?;
+    let built = result?;
     println!(
         "virtkit: built {} -> {}",
         opts.dockerfile.display(),
         out.display()
     );
-    Ok(())
+    Ok(built)
 }
 
 /// One resolved instruction ready to apply: the interpolated instruction, its chain key
@@ -424,7 +435,7 @@ fn drive(
     build_args: &Vars,
     ex: &mut dyn Executor,
     context: &Path,
-) -> Result<HashMap<usize, Rootfs>> {
+) -> Result<(HashMap<usize, Rootfs>, HashMap<usize, ShellState>)> {
     // Canonical, value-independent keys (DOCKER_STAGE_HASH forced empty while keying).
     let keyed = resolve_stages(plan, order, build_args, context, ex, None)?;
     // Auto-inject DOCKER_STAGE_HASH for execution: its value is the stage_key of the
@@ -496,7 +507,13 @@ fn drive(
         ex.stage_end(&final_fs)?;
         committed.insert(idx, final_fs);
     }
-    Ok(committed)
+    // Each stage's final ENV/USER/WORKDIR, so a caller booting the exported image can run
+    // a command with the image's environment (e.g. `run -f` applying PATH).
+    let states = resolved
+        .into_iter()
+        .map(|(idx, r)| (idx, r.final_state))
+        .collect();
+    Ok((committed, states))
 }
 
 /// The committed rootfs of the stages an instruction list references via `COPY --from`

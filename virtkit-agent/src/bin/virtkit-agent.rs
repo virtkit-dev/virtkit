@@ -160,6 +160,24 @@ fn main() {
         }
         return;
     }
+    // Local fs freeze/thaw, no socket: the host runs `virtkit-agent fsfreeze -f|-u
+    // <mountpoint>` in the guest over the exec channel to quiesce the root fs for a
+    // consistent snapshot. Built in (vs util-linux) so it works on any guest; handled
+    // before clap since it takes no --socket.
+    let mut argv = std::env::args();
+    if argv.nth(1).as_deref() == Some("fsfreeze") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(virtkit_agent::fsfreeze::main(&rest));
+    }
+    // Local block-device mount/unmount (no socket): the host attaches a source stage's
+    // ext4 read-only and runs `virtkit-agent mount|umount …` in the guest to read it.
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("mount") | Some("umount") | Some("copy") | Some("cleanup")
+    ) {
+        let rest: Vec<String> = std::env::args().skip(1).collect();
+        std::process::exit(virtkit_agent::diskmount::main(&rest));
+    }
     // PID 1: the guest was booted `init=/usr/local/bin/virtkit-agent` (a systemd-less
     // image). The kernel/initramfs passes no usable argv, so bypass clap entirely
     // and derive the vsock socket from the kernel cmdline. Equivalent to the

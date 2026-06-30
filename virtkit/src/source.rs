@@ -44,6 +44,57 @@ impl Source {
             }
         }
     }
+
+    /// The image's configured environment (`Config.Env` as `(KEY, VALUE)` pairs), so a
+    /// command run in the booted guest sees the image's `PATH` etc. — as `docker run`
+    /// does. From the registry config (OCI) or `docker image inspect` (docker).
+    pub async fn config_env(&self) -> Result<Vec<(String, String)>> {
+        match self {
+            Source::Docker { docker, image } => docker_config_env(docker, image),
+            Source::Oci {
+                reference,
+                username,
+                password,
+                ca_pem,
+                insecure,
+            } => Ok(crate::oci::pull_config(
+                reference,
+                username.as_deref(),
+                password.as_deref(),
+                ca_pem.clone(),
+                *insecure,
+            )
+            .await?
+            .env),
+        }
+    }
+}
+
+/// `docker image inspect` an image's `Config.Env` (one `KEY=VALUE` per line).
+fn docker_config_env(docker: &Path, image: &str) -> Result<Vec<(String, String)>> {
+    let out = Command::new(docker)
+        .args([
+            "image",
+            "inspect",
+            "--format",
+            "{{range .Config.Env}}{{println .}}{{end}}",
+            image,
+        ])
+        .output()
+        .with_context(|| format!("running {} image inspect", docker.display()))?;
+    if !out.status.success() {
+        bail!(
+            "docker image inspect {image} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            l.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        })
+        .collect())
 }
 
 /// `docker export` a local image's rootfs to `out` (a tar file). The trailing

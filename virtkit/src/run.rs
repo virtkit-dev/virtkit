@@ -1,10 +1,10 @@
-//! `virtkit launch` — dev: boot a generic OCI image as a microVM directly,
-//! no gitlab-runner. The rootfs comes from a `source::Source` (docker export or
-//! a registry pull, `--oci`); it is turned into a cpio initramfs (RAM) or a
+//! `virtkit run` — dev: boot a generic OCI image as a microVM directly,
+//! no gitlab-runner. The rootfs comes from a `source::Source` (a registry pull or
+//! `docker export`, chosen by `--source`); it is turned into a cpio initramfs (RAM) or a
 //! native ext4 disk, with the static virtkit-agent injected as PID 1; and booted on
 //! an all-built-in kernel (the pinned `vmlinux`) — no modules, and no initrd
 //! for the disk path (virtio-blk + ext4 are built in). docker/cloud-hypervisor
-//! aside (and docker only without `--oci`), nothing else is needed.
+//! aside (docker only with `--source docker`/`auto`), nothing else is needed.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -16,19 +16,56 @@ use virtkit_agent::addr::SocketAddr;
 use crate::source::Source;
 
 const VSOCK_PORT: u32 = 4444;
-/// vsock port the guest tap bridge dials to reach the userspace switch.
+/// vsock port the guest's tap bridge dials to reach the userspace switch.
 const NET_VSOCK_PORT: u32 = 1024;
-/// How the host re-invokes the agent's native helpers inside the guest: /proc/self/exe
-/// is the running agent in the forked child, present even after the initramfs pivot.
+
+/// How the host re-invokes the agent's native subcommands (`fsfreeze`, `mount`,
+/// `copy`) inside the guest. `/proc/self/exe` resolves, in the forked child, to the
+/// running agent binary — so this works whether the agent was injected into the rootfs
+/// (legacy) or booted from an initramfs and pivoted in (its on-disk path then gone).
 const GUEST_AGENT: &str = "/proc/self/exe";
 
+/// Guest mountpoint of a `--workdir` host-dir share (the live tree the command runs in).
+const WORKDIR_MOUNT: &str = "/work";
+
+/// Where a `run <image>` rootfs comes from.
+#[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
+pub enum SourceMode {
+    /// Pull straight from a registry (no docker daemon).
+    Oci,
+    /// Export from the local docker daemon (`docker export`).
+    Docker,
+    /// Resolve over the registry, falling back to docker for an image that is not pushed
+    /// (a registry not-found); auth/network errors surface rather than silently fall back.
+    Auto,
+}
+
 pub struct RunArgs {
+    /// Image to boot (a docker ref or an OCI reference). Ignored when `dockerfile` is set
+    /// — the rootfs is then built from the Dockerfile target.
     pub image: String,
+    /// Boot a Dockerfile target instead of an image: build (or cache-restore, with
+    /// `cache_registry`) the target into an ext4 and boot it — no explicit `--out` ext4.
+    pub dockerfile: Option<PathBuf>,
+    /// Target stage to boot (AS name or index; default: the last stage), with `dockerfile`.
+    pub target: Option<String>,
+    /// Build context for the Dockerfile's `COPY` (default: the Dockerfile's directory).
+    pub context: Option<PathBuf>,
+    /// Instruction-cache registry: the Dockerfile build pushes/pulls each stage's ext4
+    /// there by its content key, so a repeat boot restores the image instead of rebuilding.
+    pub cache_registry: Option<String>,
+    /// the cache registry speaks plain HTTP (a loopback regserve).
+    pub cache_insecure: bool,
+    /// `--build-arg NAME=VALUE` overrides for the Dockerfile build.
+    pub build_args: Vec<(String, String)>,
+    /// host dir shared read-write into the guest (at WORKDIR_MOUNT); the command runs
+    /// there, so its outputs land back on the host. `None` = no share.
+    pub workdir: Option<PathBuf>,
     pub kernel: PathBuf,
     pub agent: PathBuf,
     pub cloud_hypervisor: PathBuf,
-    /// pull from a registry (oci.rs) instead of `docker export`
-    pub oci: bool,
+    /// where the rootfs comes from for an image boot (registry pull / docker export / auto)
+    pub source: SourceMode,
     pub ca: Option<PathBuf>,
     pub username: Option<String>,
     pub password: Option<String>,
@@ -40,6 +77,8 @@ pub struct RunArgs {
     pub disk: bool,
     /// attach an interactive shell once the guest is up (needs a terminal)
     pub shell: bool,
+    /// give the guest egress via a userspace `virtkit switch` (DHCP + DNS + proxy)
+    pub net: bool,
     pub command: Vec<String>,
 }
 
@@ -67,31 +106,124 @@ pub async fn run(args: &RunArgs) -> Result<()> {
     result
 }
 
-async fn build_and_boot(args: &RunArgs, work: &Path) -> Result<()> {
-    // 1. fetch the rootfs (docker export or registry pull) as a tar
-    let source = if args.oci {
-        let ca_pem = match &args.ca {
-            Some(p) => Some(std::fs::read(p).with_context(|| format!("reading {}", p.display()))?),
-            None => None,
-        };
-        Source::Oci {
+/// Pick the rootfs source for an image boot per `--source`. `auto` prefers the registry
+/// (daemonless) and falls back to `docker export` only when the image is not in a registry
+/// (a not-found resolve); auth/network errors propagate rather than silently using docker.
+async fn resolve_source(args: &RunArgs) -> Result<Source> {
+    let ca_pem = match &args.ca {
+        Some(p) => Some(std::fs::read(p).with_context(|| format!("reading {}", p.display()))?),
+        None => None,
+    };
+    let use_oci = match args.source {
+        SourceMode::Oci => true,
+        SourceMode::Docker => false,
+        SourceMode::Auto => {
+            let exists = crate::oci::manifest_exists(
+                &args.image,
+                args.username.as_deref(),
+                args.password.as_deref(),
+                ca_pem.clone(),
+                args.insecure,
+            )
+            .await
+            .with_context(|| format!("checking the registry for {}", args.image))?;
+            if !exists {
+                println!(
+                    "virtkit: {} is not in a registry — falling back to docker",
+                    args.image
+                );
+            }
+            exists
+        }
+    };
+    if use_oci {
+        Ok(Source::Oci {
             reference: args.image.clone(),
             username: args.username.clone(),
             password: args.password.clone(),
             ca_pem,
             insecure: args.insecure,
-        }
+        })
     } else {
-        Source::Docker {
+        Ok(Source::Docker {
             docker: "docker".into(),
             image: args.image.clone(),
-        }
-    };
-    let rootfs_tar = work.join("rootfs.tar");
-    source.to_tar(&rootfs_tar).await?;
+        })
+    }
+}
 
-    // 2. assemble the boot medium (virtkit-agent injected as PID 1)
-    let (boot_args, cmdline) = if args.disk {
+async fn build_and_boot(args: &RunArgs, work: &Path) -> Result<()> {
+    // A Dockerfile boot reuses the build pipeline: build (or cache-restore, with a
+    // registry) the target into an ext4, then boot it through the disk path below — so
+    // `run -f Dockerfile` needs no explicit `--out` ext4. Otherwise fetch the rootfs tar
+    // (docker export / registry pull) and assemble the boot medium.
+    // The image's environment (PATH, etc.) applied to the guest command so it runs like
+    // `docker run` does — e.g. the base image's PATH puts `cargo` in scope. For a `-f`
+    // Dockerfile boot it is the target stage's accumulated ENV; for an image boot it is the
+    // image's configured `Config.Env`.
+    let mut image_env: Vec<(String, String)> = Vec::new();
+    let dockerfile_ext4 = match &args.dockerfile {
+        Some(file) => {
+            let out = work.join("root.ext4");
+            let opts = crate::build::Options {
+                dockerfile: file.clone(),
+                target: args.target.clone(),
+                context: args.context.clone(),
+                out: Some(out.clone()),
+                print_plan: false,
+                microvm: true,
+                cloud_hypervisor: Some(args.cloud_hypervisor.clone()),
+                kernel: Some(args.kernel.clone()),
+                agent: Some(args.agent.clone()),
+                cache_registry: args.cache_registry.clone(),
+                cache_insecure: args.cache_insecure,
+                journal: false,
+                build_args: args.build_args.clone(),
+            };
+            image_env = crate::build::build(&opts)?.env;
+            Some(out)
+        }
+        None => None,
+    };
+
+    // 1. fetch the rootfs (docker export or registry pull) as a tar, unless a Dockerfile
+    // build already produced the ext4 above.
+    let rootfs_tar = work.join("rootfs.tar");
+    if dockerfile_ext4.is_none() {
+        let source = resolve_source(args).await?;
+        // Inherit the image's configured environment (PATH etc.) for the guest command,
+        // as `docker run` does.
+        image_env = source.config_env().await?;
+        source.to_tar(&rootfs_tar).await?;
+    }
+
+    // 2. assemble the boot medium (virtkit-agent injected as PID 1).
+    let (mut boot_args, mut cmdline) = if let Some(ext4) = &dockerfile_ext4 {
+        // A Dockerfile build exports a *clean* ext4 (no agent baked in). Boot it the way
+        // the builder boots its own stages: a minimal initramfs holds the agent as `/init`,
+        // which pivots into the ext4 at /dev/vda — so the booted image stays byte-clean.
+        let cpio = work.join("initramfs.cpio");
+        crate::initramfs::build_agent_initramfs(&args.agent, &cpio)?;
+        // throwaway rw qcow2 overlay over the ro raw ext4 (rw raw errors on tmpfs)
+        let overlay = work.join("overlay.qcow2");
+        crate::qcow2::create_overlay(&overlay, ext4)?;
+        (
+            vec![
+                "--initramfs".into(),
+                cpio.into_os_string(),
+                "--disk".into(),
+                format!(
+                    "path={},readonly=off,backing_files=on,image_type=qcow2",
+                    overlay.display()
+                )
+                .into(),
+            ],
+            format!(
+                "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda \
+                 VIRTKIT_HOSTNAME=vm VIRTKIT_VSOCK_PORT={VSOCK_PORT}"
+            ),
+        )
+    } else if args.disk {
         println!("virtkit: building ext4 rootfs");
         let rootfs = work.join("root.ext4");
         crate::ext4::build_from_tar(&rootfs_tar, &args.agent, &rootfs)?;
@@ -126,14 +258,48 @@ async fn build_and_boot(args: &RunArgs, work: &Path) -> Result<()> {
         )
     };
 
-    // 3. boot
     let vsock = work.join("vsock.sock");
+
+    // Networking: a userspace `virtkit switch` over vsock gives the guest egress (the agent
+    // forks a tap bridged to it and takes the static address from the cmdline fragment).
+    let mut switch = if args.net {
+        let (child, frag) = spawn_vm_switch(&vsock, work, NET_VSOCK_PORT).await?;
+        cmdline.push_str(&frag);
+        Some(child)
+    } else {
+        None
+    };
+
+    // Working directory: share a host dir read-write over virtiofs at WORKDIR_MOUNT (no uid
+    // map, like the fleet dev VM — virtiofsd's `--sandbox=none` writes back as the host
+    // user), so the guest command reads/writes the live tree and its outputs land on the
+    // host. The command then runs with its cwd there (see `drive`). virtio-fs needs shared
+    // guest memory, so `mem` gains `shared=on`.
+    let mut virtiofsd: Option<Child> = None;
+    let mem = if let Some(host_dir) = &args.workdir {
+        let sock = work.join("workdir.fs.sock");
+        virtiofsd = Some(crate::fleet::spawn_virtiofsd(
+            &sock,
+            host_dir,
+            false,
+            &[],
+            &[],
+        )?);
+        boot_args.push("--fs".into());
+        boot_args.push(format!("tag=work,socket={}", sock.display()).into());
+        cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS=work:{WORKDIR_MOUNT}"));
+        format!("{},shared=on", args.mem)
+    } else {
+        args.mem.clone()
+    };
+
+    // 3. boot
     let console = work.join("console.log");
     println!(
         "virtkit: booting cloud-hypervisor (cpus={}, mem={})",
-        args.cpus, args.mem
+        args.cpus, mem
     );
-    let mut ch = spawn_ch(
+    let mut ch = match spawn_ch(
         &args.cloud_hypervisor,
         &boot_args,
         &cmdline,
@@ -141,21 +307,48 @@ async fn build_and_boot(args: &RunArgs, work: &Path) -> Result<()> {
         &vsock,
         &console,
         args.cpus,
-        &args.mem,
-    )?;
+        &mem,
+    ) {
+        Ok(ch) => ch,
+        // The --net switch and --workdir virtiofsd are already spawned; kill them so a
+        // failed boot does not leak host-side children (a leaked `virtkit virtiofsd` would,
+        // e.g., hold this binary's file busy for the next build).
+        Err(e) => {
+            for mut child in [switch.take(), virtiofsd.take()].into_iter().flatten() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            return Err(e);
+        }
+    };
 
     let addr = SocketAddr::VsockMux {
         path: vsock,
         port: VSOCK_PORT,
     };
-    let result = drive(&mut ch, &addr, &console, args).await;
+    let result = drive(&mut ch, &addr, &console, args, &image_env).await;
     let _ = ch.kill();
     let _ = ch.wait();
+    for mut child in [switch.take(), virtiofsd.take()].into_iter().flatten() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     result
 }
 
+/// Single-quote a value for a `/bin/sh` `export` (wrap in `'…'`, escaping embedded `'`).
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Wait for the in-guest virtkit-agent, run the command, relay its output.
-async fn drive(ch: &mut Child, addr: &SocketAddr, console: &Path, args: &RunArgs) -> Result<()> {
+async fn drive(
+    ch: &mut Child,
+    addr: &SocketAddr,
+    console: &Path,
+    args: &RunArgs,
+    image_env: &[(String, String)],
+) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(args.boot_timeout_secs);
     loop {
         if let Some(status) = ch.try_wait()? {
@@ -179,15 +372,38 @@ async fn drive(ch: &mut Child, addr: &SocketAddr, console: &Path, args: &RunArgs
     if args.shell {
         return run_shell(addr).await;
     }
-    let command = if args.command.is_empty() {
-        vec![
-            "sh".into(),
-            "-c".into(),
-            "echo PID1=$(cat /proc/1/comm); id; uname -a; cat /etc/os-release | head -1".into(),
-        ]
+    let user_script = if args.command.is_empty() {
+        "echo PID1=$(cat /proc/1/comm); id; uname -a; cat /etc/os-release | head -1".to_string()
     } else {
-        vec!["sh".into(), "-c".into(), args.command.join(" ")]
+        args.command.join(" ")
     };
+    // A `--workdir` share mounts the live tree at WORKDIR_MOUNT; run the command there so it
+    // sees the shared files and writes its outputs back to the host.
+    let body = match &args.workdir {
+        Some(_) => format!("cd {WORKDIR_MOUNT} && {user_script}"),
+        None => user_script,
+    };
+    // Apply the built image's environment first (PATH etc.), so the command runs like
+    // `docker run` — the base image's PATH puts toolchains in scope. The command's own
+    // exports (if any) come after and win.
+    let mut script = String::new();
+    for (k, v) in image_env {
+        // Only emit valid shell identifiers: a crafted image `Config.Env` key with shell
+        // metacharacters would otherwise inject into this `sh -c` body (the value is already
+        // quoted by sh_quote; the name is not).
+        if k.is_empty()
+            || !k
+                .bytes()
+                .enumerate()
+                .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()))
+        {
+            eprintln!("virtkit: skipping image env var with non-identifier name {k:?}");
+            continue;
+        }
+        script.push_str(&format!("export {k}={}; ", sh_quote(v)));
+    }
+    script.push_str(&body);
+    let command = vec!["sh".into(), "-c".into(), script];
     let result = crate::executor::exec_script(addr, &command, Vec::new(), None)
         .await
         .context("running the command in the guest")?;
@@ -267,6 +483,11 @@ fn tail(path: &Path, lines: usize) -> String {
     all[all.len().saturating_sub(lines)..].join("\n")
 }
 
+/// A long-lived guest for one build stage: the stage's rw qcow2 image is booted once
+/// directly (with egress via a `virtkit switch`), and every `RUN` of the stage execs
+/// into it — no per-`RUN` reboot. [`VmSession::capture`] copies the current state to a
+/// consistent qcow2 (for the instruction cache) and [`VmSession::finish`] shuts down
+/// cleanly; the guest's writes are already in the stage image, so there is no commit.
 pub(crate) struct VmSession {
     ch: Child,
     addr: SocketAddr,
@@ -567,5 +788,68 @@ impl Drop for VmSession {
             let _ = c.wait();
         }
         let _ = std::fs::remove_dir_all(&self.work);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Boot a session with a read-only source disk, mount it in the guest with the
+    /// agent's native `mount`, and read a file from it — the COPY --from primitive.
+    /// Heavy (boots a microVM); run with the runtime paths:
+    ///   VIRTKIT_T_CH=… VIRTKIT_T_KERNEL=… VIRTKIT_T_AGENT=… \
+    ///   VIRTKIT_T_ROOT=<bootable ext4> VIRTKIT_T_DATA=<ext4 with /payload.txt> \
+    ///   cargo test --target x86_64-unknown-linux-gnu -- --ignored mount_source_disk
+    #[test]
+    #[ignore]
+    fn mount_source_disk() {
+        let p = |k: &str| std::env::var_os(k).map(PathBuf::from).expect(k);
+        let (ch, kernel, agent, root, data) = (
+            p("VIRTKIT_T_CH"),
+            p("VIRTKIT_T_KERNEL"),
+            p("VIRTKIT_T_AGENT"),
+            p("VIRTKIT_T_ROOT"),
+            p("VIRTKIT_T_DATA"),
+        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let s = boot_session(
+                &ch,
+                &kernel,
+                &agent,
+                &root,
+                false,
+                1,
+                "1G",
+                120,
+                &[data],
+                None,
+            )
+            .await
+            .expect("boot_session");
+            let mount = [
+                "/usr/local/bin/virtkit-agent".to_string(),
+                "mount".into(),
+                "--ro".into(),
+                "/dev/vdb".into(),
+                "/mnt/src".into(),
+            ];
+            assert_eq!(s.exec(&mount, None).await.unwrap(), 0, "agent mount failed");
+            let read = [
+                "sh".to_string(),
+                "-c".into(),
+                "grep -q MARKER-FROM-VDB /mnt/src/payload.txt".into(),
+            ];
+            assert_eq!(
+                s.exec(&read, None).await.unwrap(),
+                0,
+                "reading source failed"
+            );
+            s.finish().await.unwrap();
+        });
     }
 }

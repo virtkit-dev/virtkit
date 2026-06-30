@@ -45,6 +45,14 @@
 # count = 32
 # subnet = "192.168.231.0/24"
 
+# [build]                # defaults for `virtkit build` (a CLI flag always overrides).
+# cloud_hypervisor = "/usr/local/bin/cloud-hypervisor"  # default: top-level cloud_hypervisor
+# kernel = "/usr/local/lib/virtkit/vmlinux"             # build guest kernel
+# agent = "/usr/local/lib/virtkit/virtkit-agent"        # injected as PID 1
+# cache_registry = "127.0.0.1:5000"                     # shared instruction cache
+# cache_insecure = true                                 # the cache registry is plain HTTP
+# journal = false                                       # add an ext4 journal to the export
+
 # MICROVM_IMAGE is prefix-based (the prefix names the source): unset = local/default;
 # `local/<name>` = a bundle dir under [local] dir; `registry/<name>[:tag|@digest]` =
 # a [registry] bundle; `docker/<name>[:tag|@digest]` = an on-demand [convert]

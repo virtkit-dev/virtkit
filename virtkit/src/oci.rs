@@ -38,6 +38,56 @@ pub async fn resolve_digest(reference: &str) -> Result<String> {
         .with_context(|| format!("resolving manifest digest for {reference}"))
 }
 
+/// Whether `reference` resolves in its registry: `Ok(true)` if the manifest is present,
+/// `Ok(false)` if the registry reports it unknown (name/manifest not found), and `Err`
+/// for auth/network/other failures. Lets an `auto` source fall back to docker *only* when
+/// the image truly is not in a registry, while surfacing auth errors instead of masking
+/// them behind a docker fallback.
+pub async fn manifest_exists(
+    reference: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+    ca_pem: Option<Vec<u8>>,
+    insecure: bool,
+) -> Result<bool> {
+    use oci_client::errors::{OciDistributionError, OciErrorCode};
+    let parsed: Reference = reference
+        .parse()
+        .with_context(|| format!("parsing OCI reference {reference:?}"))?;
+    let mut cfg = ClientConfig::default();
+    if insecure {
+        cfg.protocol = ClientProtocol::Http;
+    }
+    if let Some(data) = ca_pem {
+        cfg.extra_root_certificates.push(Certificate {
+            encoding: CertificateEncoding::Pem,
+            data,
+        });
+    }
+    let client = oci_client::Client::new(cfg);
+    let auth = match (username, password) {
+        (Some(u), Some(p)) => RegistryAuth::Basic(u.to_string(), p.to_string()),
+        _ => RegistryAuth::Anonymous,
+    };
+    let not_found = |c: &OciErrorCode| {
+        matches!(
+            c,
+            OciErrorCode::ManifestUnknown | OciErrorCode::NameUnknown | OciErrorCode::NotFound
+        )
+    };
+    match client.fetch_manifest_digest(&parsed, &auth).await {
+        Ok(_) => Ok(true),
+        Err(OciDistributionError::ImageManifestNotFoundError(_)) => Ok(false),
+        Err(OciDistributionError::RegistryError { envelope, .. })
+            if envelope.errors.iter().any(|e| not_found(&e.code)) =>
+        {
+            Ok(false)
+        }
+        Err(OciDistributionError::ServerError { code: 404, .. }) => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("resolving {reference} in its registry")),
+    }
+}
+
 /// Fetch `reference`'s image config (`Env`/`User`/`WorkingDir`), so a stage's `RUN`s
 /// inherit the base image's environment. Cached on disk keyed by the reference, so it
 /// is fetched at most once per ref (a warm build reads the cache, no network).
