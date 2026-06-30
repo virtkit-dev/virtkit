@@ -294,20 +294,21 @@ enum Cmd {
         #[arg(last = true)]
         command: Vec<String>,
     },
-    /// Compute the content hash of Dockerfile stages (so a stage resolves to the
-    /// image tag an external build pipeline produced). Prints `stage:hash` lines.
-    /// Multiple -f flags are merged; cross-file stage deps fold transitively.
+    /// Print each stage's build-cache key (its `stage_key`: the chained content key after
+    /// the stage's last instruction) — the exact identity virtkit's instruction cache
+    /// stores the stage's snapshot under. Prints `stage:key` lines. Resolves base
+    /// digests + base image config over the network so the key matches a real build.
     DockerHash {
-        /// Dockerfile(s) to analyze (repeatable; default: Dockerfile)
+        /// Dockerfile to analyze (default: Dockerfile)
         #[arg(short = 'f', long = "file", default_value = "Dockerfile")]
-        dockerfile: Vec<PathBuf>,
-        /// Build arg affecting the hash (KEY=VAL), repeatable
+        dockerfile: PathBuf,
+        /// Build arg affecting the key (KEY=VAL), repeatable
         #[arg(long = "build-arg")]
         build_arg: Vec<String>,
-        /// Regex of stages to exclude from analysis, repeatable
+        /// Build context for context `COPY` content hashing (default: the Dockerfile's dir)
         #[arg(long)]
-        blacklist: Vec<String>,
-        /// Stages to print (default: all, in definition order)
+        context: Option<PathBuf>,
+        /// Stages to print (default: all, in build order)
         stages: Vec<String>,
     },
     /// Check whether an ext4 image is fresh given a list of content-fingerprint parts
@@ -485,16 +486,18 @@ async fn main() -> ExitCode {
     if let Cmd::DockerHash {
         dockerfile,
         build_arg,
-        blacklist,
+        context,
         stages,
     } = &cli.cmd
     {
-        let mut args = std::collections::BTreeMap::new();
-        for a in build_arg {
-            let (k, v) = a.split_once('=').unwrap_or((a.as_str(), ""));
-            args.insert(k.to_string(), v.to_string());
-        }
-        return match dockerhash::run(dockerfile.as_slice(), &args, blacklist, stages) {
+        let args: Vec<(String, String)> = build_arg
+            .iter()
+            .map(|a| {
+                let (k, v) = a.split_once('=').unwrap_or((a.as_str(), ""));
+                (k.to_string(), v.to_string())
+            })
+            .collect();
+        return match dockerhash::run(dockerfile, context.as_deref(), &args, stages) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         };

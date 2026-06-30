@@ -199,6 +199,100 @@ fn render_cmd(cmd: &Cmdline) -> String {
     }
 }
 
+/// A non-building backend that answers only the read-only queries the key/scope resolution
+/// needs — the base manifest digest and base image config, resolved over the network as a
+/// real build would. It never materializes a rootfs, so it lets `docker-hash` compute each
+/// stage's cache key (via `resolve_stages`) without pulling/running/copying. Memoizes both
+/// lookups so a base shared by several stages is fetched once.
+#[derive(Default)]
+pub struct Planner {
+    digests: HashMap<String, Option<String>>,
+    configs: HashMap<String, crate::oci::ImageConfig>,
+}
+
+impl Planner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+// resolve_stages only calls resolve_base_digest + base_config; the materialization
+// primitives are unreachable on this backend (it never builds), so they error.
+impl Executor for Planner {
+    fn resolve_base_digest(&mut self, image: &str) -> Option<String> {
+        if let Some(d) = self.digests.get(image) {
+            return d.clone();
+        }
+        let d = match block_on(crate::oci::resolve_digest(image)) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!(
+                    "virtkit: docker-hash: digest resolve failed for {image} ({e:#}) — keying by ref"
+                );
+                None
+            }
+        };
+        self.digests.insert(image.to_string(), d.clone());
+        d
+    }
+    fn base_config(&mut self, image: &str) -> Result<crate::oci::ImageConfig> {
+        if let Some(c) = self.configs.get(image) {
+            return Ok(c.clone());
+        }
+        let c = block_on(crate::oci::pull_config(image, None, None, None, false))?;
+        self.configs.insert(image.to_string(), c.clone());
+        Ok(c)
+    }
+    fn from_image(&mut self, _stage: &str, _image: &str) -> Result<Rootfs> {
+        bail!("Planner backend does not materialize stages")
+    }
+    fn from_scratch(&mut self, _stage: &str) -> Result<Rootfs> {
+        bail!("Planner backend does not materialize stages")
+    }
+    fn from_stage(&mut self, _stage: &str, _parent: &Rootfs) -> Result<Rootfs> {
+        bail!("Planner backend does not materialize stages")
+    }
+    fn pull(&mut self, _image: &str) -> Result<Rootfs> {
+        bail!("Planner backend does not materialize stages")
+    }
+    fn run(
+        &mut self,
+        _fs: &Rootfs,
+        _cmd: &Cmdline,
+        _mounts: &[ResolvedMount<'_>],
+        _state: &ShellState,
+    ) -> Result<()> {
+        bail!("Planner backend does not run instructions")
+    }
+    fn copy(&mut self, _fs: &Rootfs, _op: &Copy, _from: Option<&Rootfs>) -> Result<()> {
+        bail!("Planner backend does not run instructions")
+    }
+    fn export_ext4(&mut self, _fs: &Rootfs, _out: &Path) -> Result<()> {
+        bail!("Planner backend does not export")
+    }
+}
+
+/// Drive an async future to completion from a sync context, even when already inside a
+/// tokio runtime (the CLI's async main): run it on a dedicated thread with its own runtime
+/// — a nested `block_on` on the calling thread would panic.
+fn block_on<F>(fut: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("building the planner tokio runtime")
+                .block_on(fut)
+        })
+        .join()
+        .expect("the planner runtime thread panicked")
+    })
+}
+
 /// Host backend for the no-`RUN` subset (`FROM scratch` + `COPY`): each stage is a real
 /// host directory, `COPY` is a host-side file copy, and the export is virtkit's own
 /// pure-Rust ext4 builder — no docker, no buildkit, no `mke2fs`, no VM. `RUN` and

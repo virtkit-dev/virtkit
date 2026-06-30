@@ -267,6 +267,43 @@ fn resolve_stages(
     Ok(out)
 }
 
+/// Resolve every stage's cache key (name or index → `stage_key`: the chain key after the
+/// stage's last instruction) without building — the exact identity virtkit's instruction
+/// cache stores a stage's snapshot under. Resolves base digests + base image config over
+/// the network (like a real build) so the keys match what a build would store. Backs the
+/// `docker-hash` subcommand.
+pub fn stage_keys(
+    dockerfile: &Path,
+    context: Option<&Path>,
+    build_args: &[(String, String)],
+) -> Result<Vec<(String, String)>> {
+    let src = std::fs::read_to_string(dockerfile)
+        .with_context(|| format!("reading {}", dockerfile.display()))?;
+    let df = parser::parse(&src)?;
+    let ba: Vars = build_args.iter().cloned().collect();
+    let plan = Plan::from_dockerfile(&df, &ba)?;
+    let order = plan.all_order()?;
+    let ctx = context.map(Path::to_path_buf).unwrap_or_else(|| {
+        dockerfile
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    });
+    let mut ex = exec::Planner::new();
+    // canonical keys: DOCKER_STAGE_HASH is excluded (its injected value never affects a
+    // stage's identity), so `docker-hash` prints exactly the key a build would store.
+    let resolved = resolve_stages(&plan, &order, &ba, &ctx, &mut ex, None)?;
+    let mut out = Vec::new();
+    for &idx in &order {
+        let name = plan.stages[idx]
+            .name
+            .clone()
+            .unwrap_or_else(|| idx.to_string());
+        out.push((name, resolved[&idx].final_key.clone()));
+    }
+    Ok(out)
+}
+
 /// The reserved build arg whose value virtkit synthesizes (the declaring stage's
 /// `stage_key`) instead of taking from the user — see [`drive`]/[`resolve_stages`].
 const DOCKER_STAGE_HASH: &str = "DOCKER_STAGE_HASH";

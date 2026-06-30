@@ -3834,7 +3834,6 @@ dependencies = [
  "jemallocator",
  "libc",
  "oci-client",
- "regex",
  "reqwest",
  "serde",
  "serde_json",

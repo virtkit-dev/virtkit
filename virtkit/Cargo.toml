@@ -17,7 +17,6 @@ tar.workspace = true
 oci-client.workspace = true
 flate2.workspace = true
 sha2.workspace = true
-regex.workspace = true
 fastcdc.workspace = true
 zstd.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }

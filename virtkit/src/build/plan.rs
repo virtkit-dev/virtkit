@@ -202,8 +202,6 @@ impl Plan {
     /// Topological order over *every* stage (not pruned to a single target), so a caller
     /// that needs all stages — e.g. `docker-hash` printing every stage's key — gets each
     /// one after its dependencies. Errors on a dependency cycle.
-    // Consumed by `stage_keys` (the docker-hash rewrite), added in a following commit.
-    #[allow(dead_code)]
     pub fn all_order(&self) -> Result<Vec<usize>> {
         let mut order = Vec::new();
         let mut state = vec![0u8; self.stages.len()];

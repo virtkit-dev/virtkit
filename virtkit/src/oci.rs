@@ -24,6 +24,110 @@ pub struct ImageConfig {
     pub workdir: Option<String>,
 }
 
+/// Resolve `reference` to its manifest digest (`sha256:…`), anonymously — for the build
+/// cache key, so a moved tag changes the key (and a stale cached base is not reused).
+/// Errors (offline, private registry) propagate; the caller falls back to keying by ref.
+pub async fn resolve_digest(reference: &str) -> Result<String> {
+    let reference: Reference = reference
+        .parse()
+        .with_context(|| format!("parsing OCI reference {reference:?}"))?;
+    let client = oci_client::Client::new(ClientConfig::default());
+    client
+        .fetch_manifest_digest(&reference, &RegistryAuth::Anonymous)
+        .await
+        .with_context(|| format!("resolving manifest digest for {reference}"))
+}
+
+/// Fetch `reference`'s image config (`Env`/`User`/`WorkingDir`), so a stage's `RUN`s
+/// inherit the base image's environment. Cached on disk keyed by the reference, so it
+/// is fetched at most once per ref (a warm build reads the cache, no network).
+pub async fn pull_config(
+    reference: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+    ca_pem: Option<Vec<u8>>,
+    insecure: bool,
+) -> Result<ImageConfig> {
+    if let Some(json) = read_cached_config(reference) {
+        return Ok(parse_config(&json));
+    }
+    let parsed: Reference = reference
+        .parse()
+        .with_context(|| format!("parsing OCI reference {reference:?}"))?;
+    let mut cfg = ClientConfig::default();
+    if insecure {
+        cfg.protocol = ClientProtocol::Http;
+    }
+    if let Some(data) = ca_pem {
+        cfg.extra_root_certificates.push(Certificate {
+            encoding: CertificateEncoding::Pem,
+            data,
+        });
+    }
+    let client = oci_client::Client::new(cfg);
+    let auth = match (username, password) {
+        (Some(u), Some(p)) => RegistryAuth::Basic(u.to_string(), p.to_string()),
+        _ => RegistryAuth::Anonymous,
+    };
+    let (_manifest, _digest, config_json) =
+        client
+            .pull_manifest_and_config(&parsed, &auth)
+            .await
+            .with_context(|| format!("pulling the config of {reference}"))?;
+    write_cached_config(reference, &config_json);
+    Ok(parse_config(&config_json))
+}
+
+/// Parse an OCI image config JSON's `.config` into the fields a build inherits.
+fn parse_config(json: &str) -> ImageConfig {
+    let v: serde_json::Value = serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
+    let c = &v["config"];
+    let env = c["Env"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e.as_str())
+                .filter_map(|kv| kv.split_once('='))
+                .map(|(k, val)| (k.to_string(), val.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let nonempty = |s: &serde_json::Value| s.as_str().filter(|x| !x.is_empty()).map(str::to_string);
+    ImageConfig {
+        env,
+        user: nonempty(&c["User"]),
+        workdir: nonempty(&c["WorkingDir"]),
+    }
+}
+
+fn config_cache_path(reference: &str) -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    let dir = base.join("virtkit/dfconfig");
+    let _ = std::fs::create_dir_all(&dir);
+    let mut h = Sha256::new();
+    h.update(reference.as_bytes());
+    let mut name = String::new();
+    for b in h.finalize() {
+        name.push_str(&format!("{b:02x}"));
+    }
+    name.push_str(".json");
+    Some(dir.join(name))
+}
+
+fn read_cached_config(reference: &str) -> Option<String> {
+    std::fs::read_to_string(config_cache_path(reference)?).ok()
+}
+
+fn write_cached_config(reference: &str, json: &str) {
+    if let Some(p) = config_cache_path(reference) {
+        let _ = std::fs::write(p, json);
+    }
+}
+
 /// Pull `reference` and flatten it into a rootfs tar at `out_tar`.
 pub async fn pull_flatten(
     reference: &str,
@@ -322,6 +426,27 @@ fn join(parent: &str, name: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn parse_image_config_fields() {
+        let json = r#"{"architecture":"amd64","config":{
+            "User":"app","WorkingDir":"/srv",
+            "Env":["PATH=/usr/local/bin:/bin","LANG=C.UTF-8","BARE"]}}"#;
+        let c = parse_config(json);
+        assert_eq!(c.user.as_deref(), Some("app"));
+        assert_eq!(c.workdir.as_deref(), Some("/srv"));
+        assert_eq!(
+            c.env,
+            vec![
+                ("PATH".to_string(), "/usr/local/bin:/bin".to_string()),
+                ("LANG".to_string(), "C.UTF-8".to_string()),
+            ]
+        );
+        // empty / missing fields -> None, malformed -> defaults
+        let empty = parse_config(r#"{"config":{"User":"","WorkingDir":""}}"#);
+        assert!(empty.user.is_none() && empty.workdir.is_none() && empty.env.is_empty());
+        assert!(parse_config("not json").env.is_empty());
+    }
 
     #[test]
     fn pax_record_length_counts_itself() {
