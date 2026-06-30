@@ -19,9 +19,9 @@ docker build -t "$IMAGE" -f .devcontainer/Dockerfile .devcontainer
 #
 # Reproducibility: SOURCE_DATE_EPOCH neutralises any build timestamp, and the
 # build dir and cargo home are remapped to stable virtual prefixes (/src, /cargo)
-# so the binary is independent of where it was built — this script, CI and a
-# teammate's checkout all produce identical bytes (the same prefixes are used in
-# .gitlab-ci.yml). Stripping is done by the release profile, not the host strip.
+# so the binary is independent of where it was built — this script and a
+# teammate's checkout produce identical bytes. Stripping is done by the release
+# profile, not the host strip.
 docker run --rm \
   --user "$(id -u):$(id -g)" \
   -e HOME=/tmp \

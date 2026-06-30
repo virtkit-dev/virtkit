@@ -14,8 +14,7 @@ license = "Apache-2.0"
 
 # Reproducible release builds: strip inside the toolchain (not the host strip).
 # Path-independence comes from --remap-path-prefix / -ffile-prefix-map applied at
-# build time (see build.sh and .gitlab-ci.yml), since trim-paths is not yet
-# stabilized in this toolchain.
+# build time (see build.sh), since trim-paths is not yet stabilized in this toolchain.
 [profile.release]
 strip = true
 
