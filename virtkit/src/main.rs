@@ -30,13 +30,13 @@ mod fleet;
 mod image;
 mod initramfs;
 mod jobctx;
-mod launch;
 mod local;
 mod mkoci;
 mod net;
 mod oci;
 mod registry;
 mod regserve;
+mod run;
 mod services;
 mod source;
 mod switch;
@@ -593,7 +593,7 @@ async fn main() -> ExitCode {
         command,
     } = &cli.cmd
     {
-        let args = launch::LaunchArgs {
+        let args = run::LaunchArgs {
             image: image.clone(),
             kernel: kernel.clone(),
             agent: agent.clone(),
@@ -610,7 +610,7 @@ async fn main() -> ExitCode {
             shell: *shell,
             command: command.clone(),
         };
-        return match launch::run(&args).await {
+        return match run::run(&args).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         };
