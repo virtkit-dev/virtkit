@@ -728,23 +728,13 @@ fn boot_vm(
     Ok((ch, aux))
 }
 
-/// Create a CoW qcow2 `overlay` over the ro raw `ext4` base. qemu-img stores the
-/// backing path RELATIVE to the overlay's directory, so a relative base path would be
-/// resolved twice (overlay dir + base path) and break; canonicalize it to an absolute
-/// path so the backing reference is unambiguous.
+/// Create a CoW qcow2 `overlay` over the ro raw `ext4` base. The backing reference is
+/// stored verbatim, so canonicalize the base to an absolute path — a relative one would
+/// be resolved against the overlay's directory and break.
 fn create_overlay(ext4: &Path, overlay: &Path) -> Result<()> {
     let base =
         std::fs::canonicalize(ext4).with_context(|| format!("locating {}", ext4.display()))?;
-    let st = Command::new("qemu-img")
-        .args(["create", "-q", "-f", "qcow2", "-F", "raw", "-b"])
-        .arg(&base)
-        .arg(overlay)
-        .status()
-        .context("running qemu-img")?;
-    if !st.success() {
-        bail!("qemu-img create failed ({st})");
-    }
-    Ok(())
+    crate::qcow2::create_overlay(overlay, &base)
 }
 
 /// Start the bundled virtiofsd (this executable's `virtkit virtiofsd` subcommand) on

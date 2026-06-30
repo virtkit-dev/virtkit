@@ -96,15 +96,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // have no disk at all (the rootfs is the cpio, in RAM).
     let overlay = ctx.overlay();
     if let Media::Disk { rootfs, .. } = &media {
-        let status = Command::new(cfg.qemu_img())
-            .args(["create", "-q", "-f", "qcow2", "-F", "raw", "-b"])
-            .arg(rootfs)
-            .arg(&overlay)
-            .status()
-            .with_context(|| format!("running {}", cfg.qemu_img().display()))?;
-        if !status.success() {
-            bail!("qemu-img create failed ({status})");
-        }
+        crate::qcow2::create_overlay(&overlay, rootfs)?;
     }
 
     let mut cmdline = match (generic, &media) {

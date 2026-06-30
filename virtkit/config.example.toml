@@ -3,7 +3,6 @@
 
 # state_dir = "/var/lib/virtkit"          # job state: <state_dir>/jobs/<job id>/
 # cloud_hypervisor = "/usr/local/bin/cloud-hypervisor"
-# qemu_img = "qemu-img"
 # virtiofsd = "/usr/local/bin/virtiofsd"      # external virtiofsd (default: bundled)
 
 [vm]

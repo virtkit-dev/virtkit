@@ -97,15 +97,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path) -> Result<()> {
         crate::ext4::build_from_tar(&rootfs_tar, &args.agent, &rootfs)?;
         // throwaway rw qcow2 overlay over the ro raw ext4 (rw raw errors on tmpfs)
         let overlay = work.join("overlay.qcow2");
-        let st = Command::new("qemu-img")
-            .args(["create", "-q", "-f", "qcow2", "-F", "raw", "-b"])
-            .arg(&rootfs)
-            .arg(&overlay)
-            .status()
-            .context("running qemu-img")?;
-        if !st.success() {
-            bail!("qemu-img create failed ({st})");
-        }
+        crate::qcow2::create_overlay(&overlay, &rootfs)?;
         (
             vec![
                 "--disk".into(),

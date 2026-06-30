@@ -4,10 +4,10 @@
 //! wrote a full image per instruction (the dominant disk IO of cache-on); reading the qcow2
 //! natively eliminates it.
 //!
-//! Scope: the qcow2 images this tool itself produces (cloud-hypervisor rw overlays and their
-//! `qemu-img create` copies) — version 2/3, 64 KiB clusters, no compression, no encryption,
+//! Scope: the qcow2 images this tool itself produces (the cloud-hypervisor rw overlays it
+//! creates natively) — version 2/3, 64 KiB clusters, no compression, no encryption,
 //! no extended L2, standard refcounts. Anything outside that is rejected rather than
-//! mis-read. Read-only: writing/creating overlays stays with `qemu-img`.
+//! mis-read. Overlay creation is native too (`create_overlay`) — no `qemu-img` at runtime.
 
 use std::collections::HashMap;
 use std::fs::File;

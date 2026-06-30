@@ -17,8 +17,6 @@ pub struct Config {
     pub state_dir: Option<PathBuf>,
     /// Path of the cloud-hypervisor binary (a bare name resolves through PATH)
     pub cloud_hypervisor: Option<PathBuf>,
-    /// qemu-img, used to create the per-job qcow2 overlay
-    pub qemu_img: Option<PathBuf>,
     /// virtiofsd binary, only needed when [share] is set
     pub virtiofsd: Option<PathBuf>,
     pub vm: Vm,
@@ -416,10 +414,6 @@ impl Config {
         self.cloud_hypervisor
             .as_deref()
             .unwrap_or(Path::new("cloud-hypervisor"))
-    }
-
-    pub fn qemu_img(&self) -> &Path {
-        self.qemu_img.as_deref().unwrap_or(Path::new("qemu-img"))
     }
 
     /// The command that runs virtiofsd. With no `[virtiofsd]` configured it is the
