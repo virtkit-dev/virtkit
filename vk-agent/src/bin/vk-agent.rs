@@ -141,8 +141,9 @@ enum Commands {
 }
 
 fn main() {
-    // Multi-call binary: invoked through the `virtctl` symlink, it is the fleet
-    // control client (talks to the manager over vsock) — no --socket, its own args.
+    // Multi-call binary: invoked through a `virtctl` symlink (user-provided, e.g. via
+    // `fleet --vm-symlink`), it is the fleet control client (talks to the manager over
+    // vsock) — no --socket, its own args.
     let argv0 = std::env::args().next().unwrap_or_default();
     if std::path::Path::new(&argv0)
         .file_name()

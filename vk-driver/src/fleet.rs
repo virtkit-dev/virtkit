@@ -298,7 +298,7 @@ pub async fn run(
 
     println!(
         "fleet: switch{} up on {gateway}/{prefix}; {declared} service(s) declared, \
-         {} autostarted — others start with virtctl",
+         {} autostarted — others start with the in-VM virtctl client (--vm-symlink)",
         if vm.is_some() { " + vm" } else { "" },
         autostart.len(),
     );

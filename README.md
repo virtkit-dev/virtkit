@@ -24,7 +24,8 @@ usable on their own.
   transparent TCP/UDP egress via [`ipstack`](https://crates.io/crates/ipstack))
   carries guest traffic over `vsock` — no tap devices, bridges, or root.
 - **microVM fleet.** Boot a dev VM + service VMs (redis, mysql, …) on one shared
-  `*.lan` network; start/stop them on demand with the in-VM `virtctl` client.
+  `*.lan` network; start/stop them on demand with the in-VM `virtctl` client
+  (expose it with `fleet --vm-symlink /usr/local/bin/vk-agent:/usr/local/bin/virtctl`).
 - **GitLab CI executor.** A custom executor that boots a fresh microVM per job, runs
   each stage over `vsock`, and tears it down — with a tap pool for concurrent jobs and
   on-demand OCI-image conversion.
@@ -64,12 +65,13 @@ base-image digest and the apk pins together.
 
 `vk-agent`:
 
-- `init` — PID 1 for a systemd-less guest (also runs the captured entrypoint /
-  hands off to systemd, depending on `VIRTKIT_MODE`).
-- `serve` — the exec server (`vsock`); `exec` / `connect` / `forward` are the host-
-  side clients (e.g. `connect` is an SSH `ProxyCommand` over `vsock`).
-- `net` — bridge a guest tap NIC to the host switch over `vsock`.
-- Invoked as `virtctl`, it is the fleet control client (`virtctl start <unit>`, …).
+- `init` — PID 1 for the guest (also runs the image's entrypoint or hands off
+  to systemd, depending on `VIRTKIT_MODE`).
+- `serve` — the in-VM command server; `exec` / `connect` / `forward` are the
+  host-side clients (e.g. `connect` works as an SSH `ProxyCommand`).
+- `net` — connect a guest NIC to the host's network switch.
+- Invoked as `virtctl` (a symlink exposed via `fleet --vm-symlink`), it is the
+  fleet control client (`virtctl start <unit>`, …).
 
 ## Layout
 

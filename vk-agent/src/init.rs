@@ -68,10 +68,9 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     // If booted from the agent-only initramfs (`VIRTKIT_PIVOT=<root dev>`), mount the
     // real image ext4 and switch into it — keeping this process as PID 1 — so the agent
     // never lives inside the image. A no-op on the legacy in-rootfs `init=` boot.
-    let pivoted = pivot_to_real_root().unwrap_or_else(|e| {
+    if let Err(e) = pivot_to_real_root() {
         warn!("vk-agent init: pivot to real root failed: {e:#} — continuing in place");
-        false
-    });
+    }
 
     mount_api_filesystems();
     apply_sysctls(); // honor /etc/sysctl.d/*.conf — there is no systemd-sysctl here
@@ -81,12 +80,6 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     write_self_hosts(&cmdline);
     load_image_env(); // so served/exec'd commands inherit the image PATH etc.
     export_default_run_user(); // so served stages drop to the image's USER
-    // /usr/local/bin/virtctl -> the agent (fleet control client). Skipped when pivoted
-    // into a built image (dfbuild): the agent isn't in the rootfs, so the symlink would
-    // dangle and pollute the artifact.
-    if !pivoted {
-        ensure_virtctl_symlink();
-    }
     mount_virtiofs(&cmdline);
     apply_symlinks(&cmdline);
     link_ci_tools(&cmdline); // host CI tools (git/git-lfs/…) onto PATH, if the image lacks them
@@ -442,16 +435,6 @@ fn write_self_hosts(cmdline: &HashMap<String, String>) {
     }
     if let Err(e) = std::fs::write("/etc/hosts", hosts) {
         warn!("vk-agent init: writing /etc/hosts failed: {e}");
-    }
-}
-
-/// Expose the agent under the `virtctl` name (the fleet control client): a symlink
-/// next to it, so `virtctl start mysql` works from the VM's PATH. Best effort;
-/// the rootfs is writable (CoW), and it's recreated each boot if missing.
-fn ensure_virtctl_symlink() {
-    let link = "/usr/local/bin/virtctl";
-    if !std::path::Path::new(link).exists() {
-        let _ = std::os::unix::fs::symlink("vk-agent", link);
     }
 }
 
