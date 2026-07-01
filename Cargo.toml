@@ -15,8 +15,14 @@ license = "Apache-2.0"
 # Reproducible release builds: strip inside the toolchain (not the host strip).
 # Path-independence comes from --remap-path-prefix / -ffile-prefix-map applied at
 # build time (see build.sh), since trim-paths is not yet stabilized in this toolchain.
+#
+# lto + a single codegen unit trade compile time for smaller, faster binaries
+# (cross-crate inlining + dead-code elimination); both also make the output more
+# deterministic, which the reproducible-build guarantee wants anyway.
 [profile.release]
 strip = true
+lto = "thin"
+codegen-units = 1
 
 # Single source of truth for dependency versions. Members reference these with
 # `<dep>.workspace = true` and only add the per-crate features they need.
@@ -31,7 +37,13 @@ serde_json = "1"
 tar = "0.4"
 # pull OCI images straight from a registry (no docker daemon); rustls so the
 # binary stays musl-static (no openssl). flate2 gunzips the layer tars.
-oci-client = { version = "0.17", default-features = false, features = ["rustls-tls"] }
+#
+# No tls feature: oci-client's `rustls-tls` would pin reqwest and jsonwebtoken to the
+# aws-lc-rs provider, pulling the aws-lc-sys C blob alongside the ring backend russh
+# already uses. We wire the backends directly instead — reqwest (rustls + ring) and
+# jsonwebtoken (rust_crypto) below — so a single crypto backend is linked. oci-client
+# builds its reqwest client from whatever TLS reqwest compiled, so HTTPS still works.
+oci-client = { version = "0.17", default-features = false }
 flate2 = "1"
 # docker-hash: content hashing of a (Dockerfile, stage) for image-tag resolution
 sha2 = "0.11"
@@ -55,7 +67,17 @@ bytes = "1"
 # direct HTTP client for the transparent-zstd blob push (oci-client can't set a
 # per-request Content-Encoding). rustls so the binary stays musl-static (matches
 # oci-client); already in the tree via oci-client.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "query"] }
+#
+# `rustls-no-provider` compiles rustls without a built-in crypto provider (the plain
+# `rustls` feature would force aws-lc-rs); main installs the ring provider as the
+# process default. json/stream are pulled in by oci-client too, kept here explicitly.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "query", "stream"] }
+# rustls with the ring provider only (default features would pull aws-lc-rs). Ties
+# the whole reqwest/oci-client TLS stack to ring; the provider is installed in main.
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
+# oci-client declares jsonwebtoken with no crypto backend; force the pure-Rust one
+# (its `rustls-tls` path would pick aws-lc-rs). Present for feature unification only.
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 # fleet switch (`switch`): a userspace L2 gateway for microVMs. etherparse parses
 # and builds ethernet/ARP/IPv4/UDP (checksums); ipstack terminates arbitrary guest
 # TCP/UDP for transparent egress through the host's sockets (the gvproxy replacement).

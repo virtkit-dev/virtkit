@@ -33,6 +33,10 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
+# feature-unification only (forces oci-client's jsonwebtoken onto rust_crypto, not
+# aws-lc-rs); not referenced in code.
+jsonwebtoken.workspace = true
 
 # Bundled vhost-user virtio-fs daemon (the `vk virtiofsd` subcommand) — a default
 # feature, disable with --no-default-features. Versions are pinned to match what

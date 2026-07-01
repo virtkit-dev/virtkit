@@ -516,6 +516,11 @@ async fn main() -> ExitCode {
         }
     }
 
+    // reqwest/rustls are compiled with no built-in crypto provider (rustls-no-provider,
+    // to keep aws-lc-rs out of the build); install ring — the backend russh already
+    // uses — as the process default before any TLS client is constructed.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
     let cfg = match Config::load() {
         Ok(cfg) => cfg,
