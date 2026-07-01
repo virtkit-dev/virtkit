@@ -43,7 +43,7 @@ All build scripts wrap Docker, so the host needs only Docker — no local Rust s
 
 ### Cargo commands (pinned toolchain)
 
-The toolchain is pinned in `rust-toolchain.toml` (1.96.0, musl target, clippy +
+The toolchain is pinned in `rust-toolchain.toml` (1.96.1, musl target, clippy +
 rustfmt). Run cargo directly if you have it, or inside the devcontainer image to
 match CI exactly (clippy needs the static-FFI env — see `.github/workflows/quality.yml`):
 

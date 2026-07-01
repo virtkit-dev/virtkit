@@ -2,7 +2,7 @@
 # builds. Tag and digest are kept in sync with rust-toolchain.toml by update.sh.
 # Alpine (not Debian) so the bundled virtiofsd can link the static libseccomp /
 # libcap-ng that Alpine ships as packages — Debian has no musl-static build of them.
-FROM rust:1.96.0-alpine3.21@sha256:7dba3db75b0d5861af2e5dcf5b87347411e84403b5c9835be00ef1e72e299d2a
+FROM rust:1.96.1-alpine3.21@sha256:bdd51fa1f2ff1b9accee5224246e39f4817228ee1c20e335635e8e55badec324
 
 # Build deps (one per line in apk-pins.txt, pinned to exact versions for byte-for-byte
 # reproducibility — Alpine has no snapshot service, so the pins + the image digest
