@@ -63,6 +63,7 @@ RUN export ARCH=x86_64 \
            grep -q "^${opt}=y" .config && { echo "removed option ${opt} resurrected by olddefconfig"; exit 1; } || true; \
        done \
     && make ARCH=x86_64 -j"$(nproc)" vmlinux \
+    && strip --strip-all vmlinux \
     && cp vmlinux /build/vmlinux
 # Keep the resolved config for provenance / auditing (separate layer, so it does not
 # invalidate the compile cache): `docker build --target config` extracts it.
