@@ -1,0 +1,1194 @@
+//! gitlab-runner custom executor running each CI job in a throwaway Cloud Hypervisor
+//! microVM.
+//!
+//! Wire-up in /etc/gitlab-runner/config.toml:
+//!   [runners.custom]
+//!     config_exec   = "/usr/local/bin/vk"
+//!     config_args   = ["gitlab", "config"]
+//!     prepare_exec  = "/usr/local/bin/vk"
+//!     prepare_args  = ["gitlab", "prepare"]
+//!     run_exec      = "/usr/local/bin/vk"
+//!     run_args      = ["gitlab", "run"]
+//!     cleanup_exec  = "/usr/local/bin/vk"
+//!     cleanup_args  = ["gitlab", "cleanup"]
+
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
+mod build;
+mod config;
+mod convert;
+mod cpio;
+mod dockerhash;
+mod ensure;
+mod executor;
+mod ext4;
+mod fleet;
+mod image;
+mod initramfs;
+mod jobctx;
+mod local;
+mod mkoci;
+mod net;
+mod oci;
+mod qcow2;
+mod registry;
+mod regserve;
+mod run;
+mod services;
+mod source;
+mod sshagent;
+mod sshconf;
+mod switch;
+#[cfg(feature = "virtiofsd")]
+mod virtiofsd;
+mod vm;
+
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use clap::{Parser, Subcommand};
+use vk_agent::addr::SocketAddr;
+
+use crate::config::Config;
+use crate::jobctx::JobCtx;
+
+#[derive(Parser)]
+#[command(version, about)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum GitlabCmd {
+    /// config_exec: describe the driver to gitlab-runner (JSON on stdout)
+    Config,
+    /// prepare_exec: boot the job's microVM, wait for the in-guest agent
+    Prepare,
+    /// run_exec: run one stage script inside the VM
+    Run {
+        script: PathBuf,
+        /// Stage name (prepare_script, get_sources, build_script, ...), unused
+        stage: Option<String>,
+    },
+    /// cleanup_exec: stop the VM and remove the job state (idempotent)
+    Cleanup,
+}
+
+#[derive(Subcommand)]
+enum RegistryCmd {
+    /// Push a local bundle dir (runner.ext4 + boot.kind [+ vmlinuz + initrd.img])
+    /// to the [registry] repo at <name>:<tag>, with CDC+zstd chunk dedup.
+    Push {
+        /// Local bundle directory
+        dir: PathBuf,
+        /// Target reference, <name>:<tag> (a :tag is required for a push)
+        reference: String,
+    },
+    /// Pull+cache a bundle from the [registry] repo and print its cache dir.
+    Pull {
+        /// Source reference, <name>[:tag|@sha256:…]
+        reference: String,
+    },
+    /// Check a bundle exists in the [registry] repo without pulling it: print its
+    /// manifest digest and exit 0, or exit non-zero if absent (the CI build's
+    /// already-built check, replacing `docker manifest inspect`).
+    Inspect {
+        /// Source reference, <name>[:tag|@sha256:…]
+        reference: String,
+    },
+    /// Run a local OCI registry server backed by a content-addressed store, so
+    /// every worktree pointing its [registry] here shares one bundle pool (a
+    /// chunk pushed from one is reused by the rest). Loopback, no auth/TLS — pair
+    /// with `[registry] insecure = true`.
+    Serve {
+        /// Listen address (use a loopback address — there is no auth).
+        #[arg(long, default_value = "127.0.0.1:5000")]
+        addr: std::net::SocketAddr,
+        /// Store directory [default: $XDG_DATA_HOME/virtkit/registry].
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Install + start a `systemd --user` unit running `registry serve`, so the
+    /// shared store is always available (survives logout/reboot).
+    InstallService {
+        #[arg(long, default_value = "127.0.0.1:5000")]
+        addr: std::net::SocketAddr,
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
+enum Cmd {
+    /// GitLab custom-executor lifecycle (config / prepare / run / cleanup)
+    Gitlab {
+        #[command(subcommand)]
+        cmd: GitlabCmd,
+    },
+    /// Native OCI bundle registry: push/pull guest bundles with content-defined chunk
+    /// deduplication (CDC + per-chunk zstd), no oras, no docker.
+    Registry {
+        #[command(subcommand)]
+        cmd: RegistryCmd,
+    },
+    /// Build a Dockerfile target and export it as a bootable ext4 image — a from-scratch
+    /// builder (no docker, no buildkit). With `--microvm`, each RUN executes in a Cloud
+    /// Hypervisor guest and instruction snapshots are cached (`--cache-registry`); the
+    /// default host backend handles the `FROM scratch` + COPY subset. `--print-plan` parses
+    /// + plans + prints the build without running it.
+    Build {
+        /// Dockerfile to build
+        #[arg(short = 'f', long = "file", default_value = "Dockerfile")]
+        file: PathBuf,
+        /// target stage (AS name or index; default: the last stage)
+        #[arg(long)]
+        target: Option<String>,
+        /// build context for COPY (default: the Dockerfile's directory)
+        #[arg(long)]
+        context: Option<PathBuf>,
+        /// ext4 output path
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// parse + plan + print the build order and primitives; build nothing
+        #[arg(long = "print-plan")]
+        print_plan: bool,
+        /// run the build in a microVM (RUN executes in a Cloud Hypervisor guest);
+        /// needs --cloud-hypervisor/--kernel/--agent. Default: host backend
+        /// (FROM scratch + COPY only).
+        #[arg(long)]
+        microvm: bool,
+        #[arg(long = "cloud-hypervisor")]
+        cloud_hypervisor: Option<PathBuf>,
+        #[arg(long)]
+        kernel: Option<PathBuf>,
+        #[arg(long)]
+        agent: Option<PathBuf>,
+        /// instruction-cache registry repo (e.g. 127.0.0.1:5000 of a `virtkit
+        /// registry serve`): each instruction's ext4 is pushed/pulled there
+        #[arg(long = "cache-registry")]
+        cache_registry: Option<String>,
+        /// the cache registry speaks plain HTTP (a loopback regserve)
+        #[arg(long = "cache-insecure")]
+        cache_insecure: bool,
+        /// add an ext4 journal to the exported image (the build stays journal-less)
+        #[arg(long)]
+        journal: bool,
+        /// override an ARG default: NAME=VALUE (repeatable)
+        #[arg(long = "build-arg", value_name = "NAME=VALUE")]
+        build_arg: Vec<String>,
+    },
+    /// Host side of a forward (companion of `virtkit-agent forward`): accept on
+    /// `--listen` and splice each connection to `--to`, opaque to the protocol.
+    /// Long-running, spawned detached per job — e.g. the VMM's per-port vsock
+    /// unix socket -> a host-local service the guest must not reach directly.
+    Forward {
+        /// Local address to listen on (a unix socket path, tcp://host:port, ...)
+        #[arg(long)]
+        listen: SocketAddr,
+        /// Target each accepted connection is spliced to
+        #[arg(long)]
+        to: SocketAddr,
+    },
+    /// Filtering ssh-agent proxy: serve the ssh-agent protocol on `--listen`, relaying to
+    /// the real agent at `--upstream` but exposing only the keys in the `--allow` .pub
+    /// files (refusing to sign with or list any other key). The host side of forwarding a
+    /// subset of the agent into a guest.
+    SshAgentProxy {
+        /// Unix socket to serve on (the VMM's per-port vsock socket)
+        #[arg(long)]
+        listen: PathBuf,
+        /// The real ssh-agent socket to relay to (e.g. $SSH_AUTH_SOCK)
+        #[arg(long)]
+        upstream: PathBuf,
+        /// OpenSSH public-key file whose key may be exposed (repeatable)
+        #[arg(long = "allow", value_name = "PUBKEY")]
+        allow: Vec<PathBuf>,
+    },
+    /// Userspace L2 network gateway for microVM(s) — the fleet switch. Accepts the
+    /// qemu vhost transport on each VM's hybrid-vsock guest-port socket, answers
+    /// ARP + serves DHCP, and proxies guest TCP/UDP out through the host's own
+    /// sockets — no host privileges, multi-VM on one LAN. Replaces gvproxy.
+    Switch {
+        /// VM qemu socket(s) to accept on (Cloud Hypervisor's <vsock.sock>_<port>);
+        /// repeatable — one per VM on the shared LAN.
+        #[arg(long = "listen", required = true)]
+        listen: Vec<PathBuf>,
+        /// Gateway IPv4 — also the DHCP server and DNS address.
+        #[arg(long, default_value = "192.168.127.1")]
+        gateway: std::net::Ipv4Addr,
+        /// Subnet prefix length.
+        #[arg(long, default_value_t = 24)]
+        prefix: u8,
+        /// fleet name the gateway resolver answers locally: name=ip (repeatable)
+        #[arg(long = "host")]
+        host: Vec<String>,
+        /// egress allowlist — destination IPv4 CIDR for direct (non-proxied) egress,
+        /// optionally port-scoped as CIDR:port (repeatable). With no
+        /// --allow-ip/--allow-name, egress is unrestricted.
+        #[arg(long = "allow-ip", value_name = "CIDR[:PORT]")]
+        allow_ip: Vec<String>,
+        /// egress allowlist — hostname suffix the http(s) proxy permits, e.g.
+        /// `corp.example.com` (repeatable).
+        #[arg(long = "allow-name", value_name = "SUFFIX")]
+        allow_name: Vec<String>,
+    },
+    /// Orchestrate a fleet of microVMs on one shared LAN: ensure each ext4 is current,
+    /// run the switch in-process, and boot the service VMs (init=service-vm-init,
+    /// static *.lan addresses) plus the interactive dev VM (--vm; DHCP,
+    /// virtiofs /workdir + git worktree). --listen adds any extra VM's vsock.
+    Fleet {
+        #[arg(long, default_value = "192.168.127.1")]
+        gateway: std::net::Ipv4Addr,
+        #[arg(long, default_value_t = 24)]
+        prefix: u8,
+        #[arg(long, default_value_t = 1024)]
+        net_port: u32,
+        /// fleet host map for /etc/hosts (name=ip,...), passed to the guests
+        #[arg(long)]
+        hosts: Option<String>,
+        #[arg(long, default_value = "/usr/local/lib/vk/vmlinux")]
+        kernel: PathBuf,
+        #[arg(long, default_value = "cloud-hypervisor")]
+        cloud_hypervisor: PathBuf,
+        /// extra vsock socket(s) the switch should also listen on (e.g. the VM's)
+        #[arg(long = "listen")]
+        listen: Vec<PathBuf>,
+        /// service VM to boot: name:ext4:ip/cidr:cid[:flags] where flags is a
+        /// comma-separated subset of workdir,autostart (repeatable)
+        #[arg(long = "service")]
+        service: Vec<String>,
+        /// build-service-image.sh to (re)build a stale/missing service ext4
+        #[arg(long)]
+        service_build: Option<PathBuf>,
+        /// docker image a service ext4 is built from: name=ref (repeatable)
+        #[arg(long = "service-image")]
+        service_image: Vec<String>,
+        /// ensure the ext4 images are current (build the stale ones) and exit, without
+        /// starting the switch or booting any VM
+        #[arg(long)]
+        ensure_only: bool,
+        /// interactive dev VM ext4 to boot in-process (omit to boot the VM separately)
+        #[arg(long)]
+        vm: Option<PathBuf>,
+        /// build script to (re)build a stale/missing VM ext4
+        #[arg(long)]
+        vm_build: Option<PathBuf>,
+        /// VM hostname [derived from ext4 filename when omitted]
+        #[arg(long)]
+        vm_name: Option<String>,
+        /// host dir shared rw as /workdir in the VM [current dir]
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+        /// VM's git dir to share at the same guest path (worktree); derived from
+        /// the workdir when omitted
+        #[arg(long)]
+        git_dir: Option<PathBuf>,
+        /// VM vsock CID
+        #[arg(long, default_value_t = 3)]
+        vm_cid: u32,
+        /// VM vCPUs
+        #[arg(long, default_value_t = 4)]
+        vm_cpus: u32,
+        /// VM RAM
+        #[arg(long, default_value = "8G")]
+        vm_mem: String,
+        /// extra host directory to share into the VM: host_path:guest_path[:ro] (repeatable)
+        #[arg(long = "vm-share", value_name = "HOST:GUEST[:ro]")]
+        vm_share: Vec<String>,
+        /// symlink to create inside the VM after virtiofs mounts: src:dest (repeatable)
+        #[arg(long = "vm-symlink", value_name = "SRC:DEST")]
+        vm_symlink: Vec<String>,
+        /// public key to authorise for ssh-serve (OpenSSH format, repeatable)
+        #[arg(long = "vm-ssh-key", value_name = "PUBKEY")]
+        vm_ssh_keys: Vec<String>,
+        /// UID translation for extra VM shares (repeatable; applies to all --vm-share);
+        /// format: `type:from:to[:count]` — types: map, guest, host, squash-guest, squash-host, forbid-guest
+        #[arg(long = "vm-uid-map", value_name = "MAP")]
+        vm_uid_map: Vec<String>,
+        /// GID translation for extra VM shares (repeatable; same format as --vm-uid-map)
+        #[arg(long = "vm-gid-map", value_name = "MAP")]
+        vm_gid_map: Vec<String>,
+    },
+    /// Dev: run a docker/OCI image as a microVM — boot it (cpio initramfs in RAM or an
+    /// ext4 disk), virtkit-agent as PID 1 over vsock, and run a command or interactive
+    /// shell. No gitlab-runner, no assembly tools; just an image source + cloud-hypervisor.
+    Run {
+        /// Image to boot (docker ref, or OCI reference with --source oci), e.g. alpine:3.20.
+        /// Omit when booting a Dockerfile target with --file.
+        image: Option<String>,
+        /// Boot a Dockerfile target instead of an image: build (or cache-restore, with
+        /// --cache-registry) the target into an ext4 and boot it — no explicit ext4 file
+        #[arg(short = 'f', long = "file")]
+        file: Option<PathBuf>,
+        /// target stage to boot (AS name or index; default: the last stage), with --file
+        #[arg(long)]
+        target: Option<String>,
+        /// build context for the Dockerfile's COPY (default: the Dockerfile's directory)
+        #[arg(long)]
+        context: Option<PathBuf>,
+        /// instruction-cache registry for the --file build (push/pull each stage's ext4
+        /// by content key, so a repeat boot restores the image instead of rebuilding)
+        #[arg(long = "cache-registry")]
+        cache_registry: Option<String>,
+        /// the cache registry speaks plain HTTP (a loopback regserve)
+        #[arg(long = "cache-insecure")]
+        cache_insecure: bool,
+        /// override an ARG default for the --file build: NAME=VALUE (repeatable)
+        #[arg(long = "build-arg", value_name = "NAME=VALUE")]
+        build_arg: Vec<String>,
+        /// share a host dir read-write into the guest (mounted at /work) and run the
+        /// command there, so its outputs land back on the host
+        #[arg(long, value_name = "DIR")]
+        workdir: Option<PathBuf>,
+        /// Pinned guest kernel (the pinned vmlinux: virtio + ext4 built in)
+        #[arg(long, default_value = "/usr/local/lib/vk/vmlinux")]
+        kernel: PathBuf,
+        /// Where the rootfs comes from: oci (registry pull, no docker daemon), docker
+        /// (docker export), or auto (registry, falling back to docker for an unpushed image)
+        #[arg(long, value_enum, default_value = "auto")]
+        source: run::SourceMode,
+        /// PEM CA bundle the registry TLS cert chains to (oci/auto)
+        #[arg(long)]
+        ca: Option<PathBuf>,
+        #[arg(long)]
+        username: Option<String>,
+        #[arg(long)]
+        password: Option<String>,
+        /// plain HTTP registry (oci/auto)
+        #[arg(long)]
+        insecure: bool,
+        /// Static (musl) virtkit-agent injected as PID 1
+        #[arg(long = "agent", default_value = "/usr/local/lib/vk/vk-agent")]
+        agent: PathBuf,
+        /// cloud-hypervisor binary
+        #[arg(long, default_value = "cloud-hypervisor")]
+        cloud_hypervisor: PathBuf,
+        #[arg(long, default_value_t = 2)]
+        cpus: u32,
+        #[arg(long, default_value = "1G")]
+        mem: String,
+        #[arg(long, default_value_t = 120)]
+        boot_timeout: u64,
+        /// Boot from a native ext4 disk instead of a cpio initramfs
+        #[arg(long)]
+        disk: bool,
+        /// Drop into an interactive shell in the guest (requires a terminal);
+        /// ignores any trailing command
+        #[arg(long)]
+        shell: bool,
+        /// Give the guest network egress via a userspace `vk switch`
+        /// (DHCP + DNS + transparent proxy over vsock)
+        #[arg(long)]
+        net: bool,
+        /// Forward the host SSH agent ($SSH_AUTH_SOCK) into the guest, so ssh/git in the
+        /// guest use the host's keys without the keys ever entering the guest
+        #[arg(long = "ssh-agent")]
+        ssh_agent: bool,
+        /// Expose only these ~/.ssh/config Host aliases to the guest: a filtered agent
+        /// offers just their keys and their config stanzas are injected (repeatable).
+        /// Implies --ssh-agent.
+        #[arg(long = "ssh-host", value_name = "ALIAS")]
+        ssh_host: Vec<String>,
+        /// Command to run in the guest (default: a boot-info probe)
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Print each stage's build-cache key (its `stage_key`: the chained content key after
+    /// the stage's last instruction) — the exact identity virtkit's instruction cache
+    /// stores the stage's snapshot under. Prints `stage:key` lines. Resolves base
+    /// digests + base image config over the network so the key matches a real build.
+    DockerHash {
+        /// Dockerfile to analyze (default: Dockerfile)
+        #[arg(short = 'f', long = "file", default_value = "Dockerfile")]
+        dockerfile: PathBuf,
+        /// Build arg affecting the key (KEY=VAL), repeatable
+        #[arg(long = "build-arg")]
+        build_arg: Vec<String>,
+        /// Build context for context `COPY` content hashing (default: the Dockerfile's dir)
+        #[arg(long)]
+        context: Option<PathBuf>,
+        /// Stages to print (default: all, in build order)
+        stages: Vec<String>,
+    },
+    /// Check whether an ext4 image is fresh given a list of content-fingerprint parts
+    /// (pre-hashed strings or raw values): computes sha256(parts joined by '\n')
+    /// formatted 8-4-4-4-12, reads the image's UUID, and exits 0 if they match (fresh)
+    /// or 1 if they differ or the image is missing (stale). Always prints the UUID on
+    /// stdout so the caller can pass it to `mkext-tar --uuid` on a stale build.
+    Fingerprint {
+        /// ext4 image to check for freshness
+        ext4: PathBuf,
+        /// Parts to hash (pre-computed hashes or raw strings), joined by '\n'
+        parts: Vec<String>,
+    },
+    /// Dev: build an ext4 image from a directory tree (native, no mke2fs).
+    Mkext { src: PathBuf, out: PathBuf },
+    /// Dev: verify the native qcow2 reader against `qemu-img convert` for an image.
+    Qcow2Verify { path: PathBuf },
+    /// Build an ext4 image from a rootfs tar (e.g. `docker export`), injecting
+    /// host files at guest paths. Native, no mke2fs, no root.
+    MkextTar {
+        /// rootfs tar (ownership/mode from its headers), or "-" to STREAM stdin
+        /// (e.g. `docker export | … -`) — single pass, no intermediate tar
+        tar: PathBuf,
+        /// output ext4 image
+        out: PathBuf,
+        /// inject a host file at a guest path, HOST:GUEST:OCTAL_MODE (repeatable)
+        #[arg(long = "inject", value_name = "HOST:GUEST:MODE")]
+        inject: Vec<String>,
+        /// spare free space (GiB) left in the filesystem for the guest to write
+        #[arg(long, default_value_t = 0)]
+        free_gib: u64,
+        /// streaming only (tar = "-"): upper-bound rootfs size in GiB (the image is
+        /// sparse, so over-estimating is free); required when streaming
+        #[arg(long, default_value_t = 0)]
+        size_gib: u64,
+        /// streaming only: inode budget override (default: ~1 per 16 KiB)
+        #[arg(long)]
+        inodes: Option<u64>,
+        /// filesystem UUID to stamp (32 hex digits, dashes optional) — set it to a
+        /// content fingerprint to make the image's identity == what it was built from
+        #[arg(long)]
+        uuid: Option<String>,
+        /// filesystem label to stamp (≤16 bytes; for blkid/lsblk)
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Build an ext4 image straight from a local OCI image archive (the tar
+    /// `buildctl --output type=oci` produces): flatten its layers AND extract the
+    /// image config (Env/User/Entrypoint/Cmd into /etc/virtkit/{env,user,cmd}),
+    /// no docker/podman. Replaces the podman load→create→export→mkext-tar chain.
+    MkextOci {
+        /// OCI image archive (tar), or "-" to STREAM stdin (spooled to a temp
+        /// file first: OCI archives need random access, index.json is last)
+        archive: PathBuf,
+        /// output ext4 image
+        out: PathBuf,
+        /// inject a host file at a guest path, HOST:GUEST:OCTAL_MODE (repeatable)
+        #[arg(long = "inject", value_name = "HOST:GUEST:MODE")]
+        inject: Vec<String>,
+        /// spare free space (GiB) left in the filesystem for the guest to write
+        #[arg(long, default_value_t = 0)]
+        free_gib: u64,
+        /// filesystem UUID to stamp (32 hex digits, dashes optional) — set it to a
+        /// content fingerprint to make the image's identity == what it was built from
+        #[arg(long)]
+        uuid: Option<String>,
+        /// filesystem label to stamp (≤16 bytes; for blkid/lsblk)
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Dev: pull an OCI image from a registry (no docker) and flatten it to a
+    /// rootfs tar.
+    OciPull {
+        reference: String,
+        out: PathBuf,
+        #[arg(long)]
+        username: Option<String>,
+        #[arg(long)]
+        password: Option<String>,
+        /// PEM CA bundle the registry's TLS cert chains to
+        #[arg(long)]
+        ca: Option<PathBuf>,
+        /// plain HTTP (a local/insecure registry)
+        #[arg(long)]
+        insecure: bool,
+    },
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    // `vk virtiofsd …` — the bundled vhost-user virtio-fs daemon. Dispatched
+    // before the clap CLI / config load (it takes virtiofsd's own flags and needs no
+    // executor config); the spawned daemon blocks until the VMM disconnects.
+    #[cfg(feature = "virtiofsd")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.get(1).map(String::as_str) == Some("virtiofsd") {
+            return match virtiofsd::run(args[1..].to_vec()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, 1),
+            };
+        }
+    }
+
+    let cli = Cli::parse();
+    let cfg = match Config::load() {
+        Ok(cfg) => cfg,
+        Err(e) => return fail(&e, 2),
+    };
+    // `run` is a standalone dev path: no JobCtx (no CUSTOM_ENV_* job context).
+    if let Cmd::Run {
+        image,
+        file,
+        target,
+        context,
+        cache_registry,
+        cache_insecure,
+        build_arg,
+        workdir,
+        kernel,
+        source,
+        ca,
+        username,
+        password,
+        insecure,
+        agent,
+        cloud_hypervisor,
+        cpus,
+        mem,
+        boot_timeout,
+        disk,
+        shell,
+        net,
+        ssh_agent,
+        ssh_host,
+        command,
+    } = &cli.cmd
+    {
+        if file.is_none() && image.is_none() {
+            return fail(
+                &anyhow::anyhow!("run needs an image or --file <Dockerfile>"),
+                2,
+            );
+        }
+        let build_args: Vec<(String, String)> = build_arg
+            .iter()
+            .map(|a| {
+                let (k, v) = a.split_once('=').unwrap_or((a.as_str(), ""));
+                (k.to_string(), v.to_string())
+            })
+            .collect();
+        let args = run::RunArgs {
+            image: image.clone().unwrap_or_default(),
+            dockerfile: file.clone(),
+            target: target.clone(),
+            context: context.clone(),
+            cache_registry: cache_registry.clone(),
+            cache_insecure: *cache_insecure,
+            build_args,
+            workdir: workdir.clone(),
+            kernel: kernel.clone(),
+            agent: agent.clone(),
+            cloud_hypervisor: cloud_hypervisor.clone(),
+            source: *source,
+            ca: ca.clone(),
+            username: username.clone(),
+            password: password.clone(),
+            insecure: *insecure,
+            cpus: *cpus,
+            mem: mem.clone(),
+            boot_timeout_secs: *boot_timeout,
+            disk: *disk,
+            shell: *shell,
+            net: *net,
+            ssh_agent: *ssh_agent,
+            ssh_hosts: ssh_host.clone(),
+            command: command.clone(),
+        };
+        return match run::run(&args).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        };
+    }
+    if let Cmd::DockerHash {
+        dockerfile,
+        build_arg,
+        context,
+        stages,
+    } = &cli.cmd
+    {
+        let args: Vec<(String, String)> = build_arg
+            .iter()
+            .map(|a| {
+                let (k, v) = a.split_once('=').unwrap_or((a.as_str(), ""));
+                (k.to_string(), v.to_string())
+            })
+            .collect();
+        return match dockerhash::run(dockerfile, context.as_deref(), &args, stages) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        };
+    }
+    if let Cmd::Mkext { src, out } = &cli.cmd {
+        return match ext4::build_from_dir(src, out) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        };
+    }
+    if let Cmd::Qcow2Verify { path } = &cli.cmd {
+        return match qcow2::verify_against_convert(path) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        };
+    }
+    if let Cmd::MkextTar {
+        tar,
+        out,
+        inject,
+        free_gib,
+        size_gib,
+        inodes,
+        uuid,
+        label,
+    } = &cli.cmd
+    {
+        let fsid = {
+            let uuid = match uuid {
+                Some(s) => match parse_uuid(s) {
+                    Some(u) => Some(u),
+                    None => {
+                        return fail(&anyhow::anyhow!("bad --uuid {s:?} (want 32 hex digits)"), 2);
+                    }
+                },
+                None => None,
+            };
+            ext4::FsId {
+                uuid,
+                label: label.clone(),
+                with_journal: true,
+            }
+        };
+        let parsed = match parse_injects(inject) {
+            Ok(p) => p,
+            Err(e) => return fail(&e, 2),
+        };
+        let injects: Vec<(&str, &Path, u16)> = parsed
+            .iter()
+            .map(|(g, h, m)| (g.as_str(), h.as_path(), *m))
+            .collect();
+        let extra_free = free_gib * (1024 * 1024 * 1024 / 4096); // GiB -> 4 KiB blocks
+        let r = if tar.as_os_str() == "-" {
+            if *size_gib == 0 {
+                return fail(
+                    &anyhow::anyhow!("--size-gib is required when streaming (tar = -)"),
+                    2,
+                );
+            }
+            let reader = ProgressReader::new(std::io::BufReader::with_capacity(
+                1 << 20,
+                std::io::stdin().lock(),
+            ));
+            let res = ext4::build_from_tar_stream(
+                reader,
+                &injects,
+                size_gib * (1 << 30),
+                extra_free,
+                *inodes,
+                &fsid,
+                out,
+            );
+            eprintln!(); // terminate the progress line
+            res
+        } else {
+            ext4::build_from_tar_injecting(tar, &injects, extra_free, &fsid, out)
+        };
+        return match r {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        };
+    }
+    if let Cmd::MkextOci {
+        archive,
+        out,
+        inject,
+        free_gib,
+        uuid,
+        label,
+    } = &cli.cmd
+    {
+        let fsid = {
+            let uuid = match uuid {
+                Some(s) => match parse_uuid(s) {
+                    Some(u) => Some(u),
+                    None => {
+                        return fail(&anyhow::anyhow!("bad --uuid {s:?} (want 32 hex digits)"), 2);
+                    }
+                },
+                None => None,
+            };
+            ext4::FsId {
+                uuid,
+                label: label.clone(),
+                with_journal: true,
+            }
+        };
+        let parsed = match parse_injects(inject) {
+            Ok(p) => p,
+            Err(e) => return fail(&e, 2),
+        };
+        let injects: Vec<(&str, &Path, u16)> = parsed
+            .iter()
+            .map(|(g, h, m)| (g.as_str(), h.as_path(), *m))
+            .collect();
+        let extra_free = free_gib * (1024 * 1024 * 1024 / 4096); // GiB -> 4 KiB blocks
+        return match mkoci::archive_to_ext4(archive, out, &injects, &[], extra_free, &fsid) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        };
+    }
+    if let Cmd::Build {
+        file,
+        target,
+        context,
+        out,
+        print_plan,
+        microvm,
+        cloud_hypervisor,
+        kernel,
+        agent,
+        cache_registry,
+        cache_insecure,
+        journal,
+        build_arg,
+    } = &cli.cmd
+    {
+        // each --build-arg is NAME=VALUE; a bare NAME means an empty value.
+        let build_args: Vec<(String, String)> = build_arg
+            .iter()
+            .map(|a| match a.split_once('=') {
+                Some((k, v)) => (k.to_string(), v.to_string()),
+                None => (a.clone(), String::new()),
+            })
+            .collect();
+        // CLI flag wins; otherwise fall back to [build] config (and the top-level
+        // cloud_hypervisor for the build guest's VMM). bool flags are opt-in, so a set
+        // flag or a config `true` enables them.
+        let b = &cfg.build;
+        let opts = build::Options {
+            dockerfile: file.clone(),
+            target: target.clone(),
+            context: context.clone(),
+            out: out.clone(),
+            print_plan: *print_plan,
+            microvm: *microvm,
+            cloud_hypervisor: cloud_hypervisor
+                .clone()
+                .or_else(|| b.cloud_hypervisor.clone())
+                .or_else(|| cfg.cloud_hypervisor.clone()),
+            kernel: kernel.clone().or_else(|| b.kernel.clone()),
+            agent: agent.clone().or_else(|| b.agent.clone()),
+            cache_registry: cache_registry.clone().or_else(|| b.cache_registry.clone()),
+            cache_insecure: *cache_insecure || b.cache_insecure,
+            journal: *journal || b.journal,
+            build_args,
+        };
+        return match build::build(&opts) {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        };
+    }
+    if let Cmd::Fingerprint { ext4, parts } = &cli.cmd {
+        let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+        let uuid = ensure::fingerprint(&refs);
+        println!("{uuid}");
+        if fleet::fs_uuid(ext4).as_deref() == Some(uuid.as_str()) {
+            return ExitCode::SUCCESS;
+        }
+        return exit_code(1);
+    }
+    if let Cmd::OciPull {
+        reference,
+        out,
+        username,
+        password,
+        ca,
+        insecure,
+    } = &cli.cmd
+    {
+        let ca_pem = match ca {
+            Some(p) => match std::fs::read(p) {
+                Ok(b) => Some(b),
+                Err(e) => return fail(&anyhow::anyhow!("reading {}: {e}", p.display()), 1),
+            },
+            None => None,
+        };
+        return match oci::pull_flatten(
+            reference,
+            username.as_deref(),
+            password.as_deref(),
+            ca_pem,
+            *insecure,
+            out,
+        )
+        .await
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        };
+    }
+    if let Cmd::Registry { cmd } = &cli.cmd {
+        return match cmd {
+            RegistryCmd::Push { dir, reference } => match registry::push(&cfg, dir, reference) {
+                Ok(_digest) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, 1),
+            },
+            RegistryCmd::Inspect { reference } => match registry::inspect(&cfg, reference) {
+                Ok(digest) => {
+                    println!("{digest}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(&e, 1),
+            },
+            // pull consumes cfg (it builds a throwaway JobCtx to share the cache layout)
+            RegistryCmd::Pull { reference } => match registry::pull(cfg, reference) {
+                Ok(dir) => {
+                    println!("{}", dir.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(&e, 1),
+            },
+            RegistryCmd::Serve { addr, root } => {
+                let root = match root.clone().map(Ok).unwrap_or_else(regserve::default_root) {
+                    Ok(r) => r,
+                    Err(e) => return fail(&e, 2),
+                };
+                match regserve::serve(*addr, root).await {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => fail(&e, 1),
+                }
+            }
+            RegistryCmd::InstallService { addr, root } => {
+                let root = match root.clone().map(Ok).unwrap_or_else(regserve::default_root) {
+                    Ok(r) => r,
+                    Err(e) => return fail(&e, 2),
+                };
+                match regserve::install_service(*addr, &root) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => fail(&e, 1),
+                }
+            }
+        };
+    }
+    if let Cmd::Switch {
+        listen,
+        gateway,
+        prefix,
+        host,
+        allow_ip,
+        allow_name,
+    } = &cli.cmd
+    {
+        let mut hosts = std::collections::HashMap::new();
+        for h in host {
+            match h.split_once('=').and_then(|(n, ip)| {
+                ip.parse::<std::net::Ipv4Addr>()
+                    .ok()
+                    .map(|ip| (n.to_ascii_lowercase(), ip))
+            }) {
+                Some((name, ip)) => {
+                    hosts.insert(name, ip);
+                }
+                None => return fail(&anyhow::anyhow!("bad --host {h:?} (want name=ip)"), 2),
+            }
+        }
+        let egress = match switch::Egress::new(allow_ip, allow_name) {
+            Ok(e) => e,
+            Err(e) => return fail(&e, 2),
+        };
+        return match switch::run(listen, *gateway, *prefix, hosts, egress).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        };
+    }
+    if let Cmd::Fleet {
+        gateway,
+        prefix,
+        net_port,
+        hosts,
+        kernel,
+        cloud_hypervisor,
+        listen,
+        service,
+        service_build,
+        service_image,
+        ensure_only,
+        vm,
+        vm_build,
+        vm_name,
+        workdir,
+        git_dir,
+        vm_cid,
+        vm_cpus,
+        vm_mem,
+        vm_share,
+        vm_symlink,
+        vm_uid_map,
+        vm_gid_map,
+        vm_ssh_keys,
+    } = &cli.cmd
+    {
+        // Parse --vm-share host:guest[:ro] entries.
+        let mut extra_shares = Vec::new();
+        for spec in vm_share {
+            let parts: Vec<&str> = spec.splitn(3, ':').collect();
+            let (host, guest, readonly) = match parts.as_slice() {
+                [host, guest] => (*host, *guest, false),
+                [host, guest, ro] if *ro == "ro" => (*host, *guest, true),
+                [_, _, flag] => {
+                    return fail(
+                        &anyhow::anyhow!("bad --vm-share flag {flag:?} (want `ro`)"),
+                        2,
+                    );
+                }
+                _ => {
+                    return fail(
+                        &anyhow::anyhow!("bad --vm-share {spec:?} (want host:guest[:ro])"),
+                        2,
+                    );
+                }
+            };
+            if guest.contains(' ') {
+                return fail(
+                    &anyhow::anyhow!("bad --vm-share {spec:?}: guest path may not contain spaces"),
+                    2,
+                );
+            }
+            extra_shares.push(fleet::ShareSpec {
+                host_dir: PathBuf::from(host),
+                guest_path: guest.to_string(),
+                readonly,
+                uid_maps: vm_uid_map.clone(),
+                gid_maps: vm_gid_map.clone(),
+            });
+        }
+        for spec in vm_symlink.iter() {
+            if spec.contains(' ') {
+                return fail(
+                    &anyhow::anyhow!("bad --vm-symlink {spec:?}: src:dest may not contain spaces"),
+                    2,
+                );
+            }
+        }
+        // Resolve the VM hostname (explicit --vm-name, else the ext4 file stem) and
+        // validate it: it lands unquoted in VIRTKIT_HOSTNAME on the kernel cmdline, so
+        // only RFC-1123 chars are allowed — no spaces or `=` to inject extra params.
+        let vm_name = vm.as_ref().map(|ext4| {
+            vm_name.clone().unwrap_or_else(|| {
+                ext4.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("vm")
+                    .to_string()
+            })
+        });
+        if let Some(name) = &vm_name
+            && (name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+        {
+            return fail(
+                &anyhow::anyhow!(
+                    "vm name {name:?} is not a valid hostname (allowed: [A-Za-z0-9-]); pass --vm-name"
+                ),
+                2,
+            );
+        }
+        let vm_opts = vm.as_ref().map(|ext4| fleet::VmOpts {
+            ext4: ext4.clone(),
+            name: vm_name.clone().unwrap(),
+            workdir: workdir.clone().unwrap_or_else(|| PathBuf::from(".")),
+            git_dir: git_dir.clone(),
+            cid: *vm_cid,
+            cpus: *vm_cpus,
+            mem: vm_mem.clone(),
+            build_script: vm_build.clone(),
+            extra_shares,
+            extra_symlinks: vm_symlink.clone(),
+            ssh_keys: vm_ssh_keys.to_vec(),
+        });
+        return match fleet::run(
+            *gateway,
+            *prefix,
+            *net_port,
+            hosts.clone(),
+            kernel.clone(),
+            cloud_hypervisor.clone(),
+            listen.clone(),
+            service.clone(),
+            vm_opts,
+            service_build.clone(),
+            service_image.clone(),
+            *ensure_only,
+        )
+        .await
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        };
+    }
+    let ctx = match JobCtx::new(cfg) {
+        Ok(ctx) => ctx,
+        Err(e) => return fail(&e, 2),
+    };
+
+    match cli.cmd {
+        Cmd::Gitlab { cmd } => match cmd {
+            GitlabCmd::Config => {
+                let info = serde_json::json!({
+                    "driver": {
+                        "name": "virtkit",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "builds_dir": ctx.cfg.guest.builds_dir,
+                    "cache_dir": ctx.cfg.guest.cache_dir,
+                    "builds_dir_is_shared": false,
+                });
+                println!("{info}");
+                ExitCode::SUCCESS
+            }
+            GitlabCmd::Prepare => match vm::prepare(&ctx).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, ctx.system_failure),
+            },
+            GitlabCmd::Run { script, stage: _ } => match executor::run_stage(&ctx, &script).await {
+                Ok(result) => match (result.code, result.signal) {
+                    (Some(0), _) => ExitCode::SUCCESS,
+                    // non-zero exit: the script already reported its error
+                    (Some(_), _) => exit_code(ctx.build_failure),
+                    (None, signal) => {
+                        eprintln!("virtkit: stage script killed by signal {signal:?}");
+                        exit_code(ctx.build_failure)
+                    }
+                },
+                // can't reach/drive the VM: environment problem, job is retryable
+                Err(e) => fail(&e, ctx.system_failure),
+            },
+            GitlabCmd::Cleanup => match vm::cleanup(&ctx) {
+                Ok(()) => ExitCode::SUCCESS,
+                // gitlab-runner only logs cleanup failures; report and don't mask
+                Err(e) => fail(&e, 1),
+            },
+        },
+        // run_forward only returns on a bind error; otherwise it serves until the
+        // process is killed (cleanup tears the detached child down).
+        Cmd::Forward { listen, to } => match vk_agent::forward::run_forward(&listen, &to).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        },
+        Cmd::SshAgentProxy {
+            listen,
+            upstream,
+            allow,
+        } => match sshagent::load_allow(&allow)
+            .and_then(|keys| sshagent::run_proxy(&listen, &upstream, &keys))
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        },
+        // handled above, before JobCtx
+        Cmd::Registry { .. }
+        | Cmd::Switch { .. }
+        | Cmd::Fleet { .. }
+        | Cmd::Run { .. }
+        | Cmd::Mkext { .. }
+        | Cmd::Qcow2Verify { .. }
+        | Cmd::MkextTar { .. }
+        | Cmd::MkextOci { .. }
+        | Cmd::Build { .. }
+        | Cmd::OciPull { .. }
+        | Cmd::DockerHash { .. }
+        | Cmd::Fingerprint { .. } => {
+            unreachable!()
+        }
+    }
+}
+
+fn fail(e: &anyhow::Error, code: i32) -> ExitCode {
+    eprintln!("virtkit: error: {e:#}");
+    exit_code(code)
+}
+
+/// Parse a UUID (32 hex digits, dashes optional) into 16 bytes.
+fn parse_uuid(s: &str) -> Option<[u8; 16]> {
+    let hex: String = s.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn exit_code(code: i32) -> ExitCode {
+    ExitCode::from(code.clamp(1, 255) as u8)
+}
+
+/// Parse `--inject HOST:GUEST:OCTAL_MODE` specs into `(guest, host, mode)`, with
+/// the guest path normalized to the image-relative form (no leading slash) the
+/// ext4 writer expects. Shared by `mkext-tar` and `mkext-oci`.
+fn parse_injects(specs: &[String]) -> anyhow::Result<Vec<(String, PathBuf, u16)>> {
+    let mut out = Vec::new();
+    for spec in specs {
+        let p: Vec<&str> = spec.splitn(3, ':').collect();
+        if p.len() != 3 {
+            anyhow::bail!("--inject must be HOST:GUEST:MODE, got {spec:?}");
+        }
+        let mode = u16::from_str_radix(p[2], 8)
+            .map_err(|_| anyhow::anyhow!("bad octal mode in {spec:?}"))?;
+        out.push((
+            p[1].trim_start_matches('/').to_string(),
+            PathBuf::from(p[0]),
+            mode,
+        ));
+    }
+    Ok(out)
+}
+
+/// Wraps a reader to print a bytes-streamed indicator to stderr (so streaming a
+/// `docker export` shows progress without depending on `pv`).
+struct ProgressReader<R> {
+    inner: R,
+    bytes: u64,
+    next_report: u64,
+}
+
+impl<R> ProgressReader<R> {
+    fn new(inner: R) -> Self {
+        ProgressReader {
+            inner,
+            bytes: 0,
+            next_report: 0,
+        }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for ProgressReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.bytes += n as u64;
+        if self.bytes >= self.next_report {
+            use std::io::Write;
+            eprint!(
+                "\r   streaming rootfs: {:.1} GiB",
+                self.bytes as f64 / (1u64 << 30) as f64
+            );
+            let _ = std::io::stderr().flush();
+            self.next_report = self.bytes + (512 << 20); // report every 512 MiB
+        }
+        Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A --inject value parses to a single (guest, host, mode) entry with the guest path
+    // normalized to image-relative form.
+    #[test]
+    fn inject_value_parses() {
+        let parsed = parse_injects(&["/host/x.sh:/etc/profile.d/x.sh:0644".to_string()]).unwrap();
+        assert_eq!(
+            parsed,
+            vec![(
+                "etc/profile.d/x.sh".to_string(),
+                PathBuf::from("/host/x.sh"),
+                0o644
+            )]
+        );
+    }
+}

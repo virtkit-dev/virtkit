@@ -9,7 +9,7 @@
 # Kept separate from build.sh (the Rust artifacts): the kernel changes rarely, so it is
 # rebuilt only on a pin bump. The docker layer cache makes an unchanged rerun a no-op;
 # --no-cache forces a clean rebuild. Output joins ./dist next to the binaries, so
-# consumers fetch dist/vmlinux the same way they fetch virtkit / virtkit-agent.
+# consumers fetch dist/vmlinux the same way they fetch vk-driver / vk-agent.
 set -euo pipefail
 cd "$(dirname "$0")"
 

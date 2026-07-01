@@ -3817,7 +3817,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "virtkit"
+name = "vk-agent"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures",
+ "jemallocator",
+ "libc",
+ "listenfd",
+ "log",
+ "rand 0.10.1",
+ "rmp-serde",
+ "russh",
+ "russh-sftp",
+ "serde",
+ "serde_json",
+ "simplelog",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-serde",
+ "tokio-util",
+ "tokio-vsock",
+]
+
+[[package]]
+name = "vk-driver"
 version = "0.3.0"
 dependencies = [
  "anyhow",
@@ -3844,34 +3869,9 @@ dependencies = [
  "vhost",
  "vhost-user-backend",
  "virtiofsd",
- "virtkit-agent",
+ "vk-agent",
  "vm-memory",
  "zstd",
-]
-
-[[package]]
-name = "virtkit-agent"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "clap",
- "futures",
- "jemallocator",
- "libc",
- "listenfd",
- "log",
- "rand 0.10.1",
- "rmp-serde",
- "russh",
- "russh-sftp",
- "serde",
- "serde_json",
- "simplelog",
- "thiserror 2.0.18",
- "tokio",
- "tokio-serde",
- "tokio-util",
- "tokio-vsock",
 ]
 
 [[package]]

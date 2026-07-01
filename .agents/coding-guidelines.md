@@ -22,5 +22,5 @@ Generated code **must** pass CI's formatting and lint checks (`.github/workflows
 
 Each language has its own file under [`coding-guidelines/`](coding-guidelines/):
 
-- [Rust (`virtkit/`, `virtkit-agent/`)](coding-guidelines/rust.md)
+- [Rust (`vk-driver/`, `vk-agent/`)](coding-guidelines/rust.md)
 - [Shell (`*.sh`, build & update scripts)](coding-guidelines/shell.md)

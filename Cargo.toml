@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["virtkit", "virtkit-agent"]
+members = ["vk-driver", "vk-agent"]
 
 [workspace.package]
 version = "0.3.0"

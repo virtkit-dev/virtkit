@@ -15,8 +15,8 @@ usable on their own.
 
 | Binary | Role |
 | --- | --- |
-| `virtkit` | **host driver** — image building/conversion, the fleet orchestrator + control plane, the GitLab executor, the userspace network switch, and a bundled virtio-fs daemon. |
-| `virtkit-agent` | **guest PID 1 / agent** — brings a systemd-less guest up (mounts, networking, hostname, virtio-fs, optional SSH), and serves an exec channel over `vsock` so the host can run commands inside the VM. |
+| `vk` | **host driver** — image building/conversion, the fleet orchestrator + control plane, the GitLab executor, the userspace network switch, and a bundled virtio-fs daemon. |
+| `vk-agent` | **guest PID 1 / agent** — brings a systemd-less guest up (mounts, networking, hostname, virtio-fs, optional SSH), and serves an exec channel over `vsock` so the host can run commands inside the VM. |
 
 ## Features
 
@@ -32,7 +32,7 @@ usable on their own.
   native ext4 image (no `mke2fs`, no root); the filesystem UUID is a fingerprint of
   the build inputs, so staleness is a UUID compare.
 - **Batteries included.** The guest kernel (`build-kernel.sh`) and a vhost-user
-  virtio-fs daemon (`virtkit virtiofsd`) are built/bundled by virtkit itself — no
+  virtio-fs daemon (`vk virtiofsd`) are built/bundled by virtkit itself — no
   separate binaries to track.
 - **Reproducible builds.** Static-musl binaries from a digest-pinned Alpine toolchain
   with pinned apk versions; `./update.sh` records the pins.
@@ -40,7 +40,7 @@ usable on their own.
 ## Build
 
 ```sh
-./build.sh         # -> dist/{virtkit, virtkit-agent, SHA256SUMS, build-info.txt}
+./build.sh         # -> dist/{vk, vk-agent, SHA256SUMS, build-info.txt}
 ./build-kernel.sh  # -> dist/vmlinux (the guest kernel; rebuilt only on a pin bump)
 ```
 
@@ -50,7 +50,7 @@ base-image digest and the apk pins together.
 
 ## Subcommands
 
-`virtkit`:
+`vk`:
 
 - `fleet` — orchestrate the dev fleet (dev VM + service VMs on one LAN).
 - `gitlab config` / `gitlab prepare` / `gitlab run` / `gitlab cleanup` — the GitLab custom-executor lifecycle.
@@ -62,7 +62,7 @@ base-image digest and the apk pins together.
 - `virtiofsd` — the bundled vhost-user virtio-fs daemon.
 - `forward` / `launch` — byte forwarder / standalone microVM launcher.
 
-`virtkit-agent`:
+`vk-agent`:
 
 - `init` — PID 1 for a systemd-less guest (also runs the captured entrypoint /
   hands off to systemd, depending on `VIRTKIT_MODE`).
@@ -74,8 +74,8 @@ base-image digest and the apk pins together.
 ## Layout
 
 ```
-virtkit/         host driver crate
-virtkit-agent/   guest agent crate (PID 1 + exec server)
+vk-driver/       host driver crate
+vk-agent/        guest agent crate (PID 1 + exec server)
 kernel/          guest kernel build (Dockerfile + config fragment)
 build.sh         build the binaries -> dist/
 build-kernel.sh  build the guest kernel -> dist/vmlinux

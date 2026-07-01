@@ -10,7 +10,7 @@ name: Release
 #
 # build and build_kernel run in parallel after quality; release downloads their
 # artifacts and publishes. Each binary ships with its own .sha256 sidecar
-# (virtkit.sha256, virtkit-agent.sha256, vmlinux.sha256) so users can verify
+# (vk.sha256, vk-agent.sha256, vmlinux.sha256) so users can verify
 # just the file they downloaded without fetching a combined manifest.
 
 on:
@@ -61,10 +61,10 @@ jobs:
         run: |
           tag="${GITHUB_REF#refs/tags/}"
           gh release create "$tag" \
-            dist/virtkit \
-            dist/virtkit.sha256 \
-            dist/virtkit-agent \
-            dist/virtkit-agent.sha256 \
+            dist/vk \
+            dist/vk.sha256 \
+            dist/vk-agent \
+            dist/vk-agent.sha256 \
             dist/vmlinux \
             dist/vmlinux.sha256 \
             dist/build-info.txt \

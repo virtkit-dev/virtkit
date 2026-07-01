@@ -1,0 +1,54 @@
+[package]
+name = "vk-agent"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["string"] }
+futures.workspace = true
+libc.workspace = true
+listenfd.workspace = true
+log.workspace = true
+# ssh-serve only (feature `ssh`): russh + russh-sftp pull a full SSH/crypto stack
+# (ring backend, C-compiled), so keep them out of the lean default agent that
+# ships in the microVM image; the `ssh` feature enables them for the VS Code
+# Remote-SSH build. russh's crypto backend (ring) is pinned in the workspace manifest.
+rand = { workspace = true, optional = true }
+russh = { workspace = true, optional = true }
+russh-sftp = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+simplelog.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+    "net",
+    "process",
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+    "io-util",
+    "io-std",
+    "fs",
+] }
+tokio-serde.workspace = true
+tokio-util.workspace = true
+tokio-vsock.workspace = true
+
+[target.'cfg(target_env = "musl")'.dependencies]
+jemallocator.workspace = true
+
+[features]
+# Embedded SSH server (`ssh-serve`), for the VS Code Remote-SSH path. ON by
+# default: the dev VM needs it and one dist binary then serves the VM and
+# services alike. russh's ring backend (C) is built by the devcontainer's musl
+# toolchain. Build --no-default-features for a leaner agent when ssh isn't needed.
+default = ["ssh"]
+ssh = ["dep:russh", "dep:rand", "dep:russh-sftp"]
+
+[dev-dependencies]
+rmp-serde.workspace = true

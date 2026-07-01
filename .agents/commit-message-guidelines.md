@@ -49,7 +49,7 @@ apply cargo fmt across the workspace
 
 Pick one lowercase scope matching the component touched. Common scopes here:
 
-- `virtkit`, `virtkit-agent` — the two crates (use a module subscope for precision, e.g. `virtkit/net:`).
+- `vk-driver`, `vk-agent` — the two crates (use a module subscope for precision, e.g. `vk-driver/net:`).
 - `kernel` — the guest kernel config / build.
 - `ci` — GitHub Actions or GitLab CI.
 - A script's basename when the change is to that script, e.g. `build.sh:`, `build-kernel.sh:`, `update-kernel.sh:`.

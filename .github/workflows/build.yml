@@ -30,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build binaries (virtkit, virtkit-agent)
+      - name: Build binaries (vk, vk-agent)
         run: ./build.sh
 
       - name: Upload binary artifacts
@@ -38,10 +38,10 @@ jobs:
         with:
           name: ${{ inputs.artifact-prefix }}-binaries-${{ github.sha }}
           path: |
-            dist/virtkit
-            dist/virtkit-agent
-            dist/virtkit.sha256
-            dist/virtkit-agent.sha256
+            dist/vk
+            dist/vk-agent
+            dist/vk.sha256
+            dist/vk-agent.sha256
             dist/build-info.txt
           retention-days: ${{ inputs.retention-days }}
 

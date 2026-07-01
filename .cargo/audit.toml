@@ -1,7 +1,7 @@
 # cargo-audit configuration (consumed by ./audit.sh).
 #
 # RUSTSEC-2023-0071 — Marvin attack on the `rsa` crate. `rsa` is pulled
-# transitively by russh, only under virtkit-agent's optional `ssh` feature, so
+# transitively by russh, only under vk-agent's optional `ssh` feature, so
 # the embedded SSH server can accept clients' RSA public keys. There is no fixed
 # release: the constant-time fixes are split across upstream issues #626
 # (padding) and PR #680 (the decrypt Ok/Err oracle) and currently exist only in
