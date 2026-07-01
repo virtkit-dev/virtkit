@@ -4,6 +4,33 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-02
+
+### Changed
+
+- **Breaking:** the binaries are renamed — the host driver ships as `vk` (crate
+  `vk-driver`) and the guest agent as `vk-agent`; the default install tree moves
+  from `/usr/local/lib/virtkit/` to `/usr/local/lib/vk/`. The `VIRTKIT_*`
+  host↔guest env-var protocol and the `/etc/virtkit`, `/var/lib/virtkit` and
+  `$XDG_DATA_HOME/virtkit` runtime/state paths are a wire contract and are
+  unchanged.
+- Shared host↔guest code (the wire protocol, the exec/pty/forward helpers and
+  the `.dockerignore` matcher) moved into a new `vk-core` crate; `vk` no longer
+  depends on the agent crate, so guest-only code (the SSH stack, …) can never
+  reach the host binary.
+- Single `ring` crypto backend (aws-lc-rs dropped) plus thin LTO and one codegen
+  unit on the release profile shrink the stripped binaries: `vk` 16.20 →
+  11.85 MiB (-26.9%), `vk-agent` 6.58 → 5.62 MiB (-14.7%).
+- The shipped guest `vmlinux` is stripped of its unloaded ELF symbol tables
+  (~4.5 MB smaller; kallsyms keeps panic/oops backtraces symbolized).
+- Rust toolchain upgraded to 1.96.1.
+
+### Removed
+
+- **Breaking:** the agent no longer creates the in-guest `/usr/local/bin/virtctl`
+  convenience symlink at boot; expose the fleet control client explicitly with
+  `fleet --vm-symlink /usr/local/bin/vk-agent:/usr/local/bin/virtctl`.
+
 ## [0.3.0] - 2026-06-30
 
 ### Added
@@ -309,7 +336,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/wallix/virtkit/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/wallix/virtkit/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/wallix/virtkit/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/wallix/virtkit/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/wallix/virtkit/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/wallix/virtkit/compare/v0.1.10...v0.2.0
