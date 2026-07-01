@@ -324,19 +324,18 @@ fn build_command(cmd: &CmdExec) -> Command {
     command
 }
 
-pub(crate) struct ResolvedUser {
+pub struct ResolvedUser {
     pub uid: libc::uid_t,
     pub gid: libc::gid_t,
     pub home: Option<std::ffi::OsString>,
-    // only the ssh server (feature `ssh`) needs the login shell
-    #[cfg_attr(not(feature = "ssh"), allow(dead_code))]
+    // only the ssh server (in vk-agent) reads the login shell
     pub shell: Option<std::ffi::OsString>,
     pub groups: Vec<libc::gid_t>,
 }
 
 /// Look up a user in the passwd/group databases. Done in the parent — getpwnam_r
 /// and getgrouplist are not async-signal-safe, so they must not run in pre_exec.
-pub(crate) fn resolve_user(name: &str) -> std::io::Result<ResolvedUser> {
+pub fn resolve_user(name: &str) -> std::io::Result<ResolvedUser> {
     use std::io::{Error, ErrorKind};
     let c_name = std::ffi::CString::new(name)
         .map_err(|_| Error::new(ErrorKind::InvalidInput, "user name contains NUL"))?;

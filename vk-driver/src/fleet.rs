@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use vk_agent::fleetctl::{Reply, Request, UnitStatus};
+use vk_core::fleetctl::{Reply, Request, UnitStatus};
 
 /// One fleet VM unit: `name:ext4:ip/cidr:cid[:flags]`, where `flags` is a
 /// comma-separated subset of `workdir`/`autostart`. The agent (PID 1) always
@@ -269,7 +269,7 @@ pub async fn run(
     if let Some(b) = &vm {
         let ctrl = b
             .dir()
-            .join(format!("vsock.sock_{}", vk_agent::fleetctl::CONTROL_PORT));
+            .join(format!("vsock.sock_{}", vk_core::fleetctl::CONTROL_PORT));
         let mgr = mgr.clone();
         tokio::spawn(async move {
             if let Err(e) = control_server(&ctrl, mgr).await {
@@ -493,9 +493,9 @@ async fn control_server(listen: &Path, mgr: Arc<Manager>) -> Result<()> {
 async fn handle_control(conn: tokio::net::UnixStream, mgr: Arc<Manager>) -> Result<()> {
     let (rd, mut wr) = conn.into_split();
     let mut rd = tokio::io::BufReader::new(rd);
-    let req: Request = vk_agent::fleetctl::read_msg(&mut rd).await?;
+    let req: Request = vk_core::fleetctl::read_msg(&mut rd).await?;
     let reply = mgr.handle(req); // sync; the unit lock is never held across an await
-    vk_agent::fleetctl::write_msg(&mut wr, &reply).await?;
+    vk_core::fleetctl::write_msg(&mut wr, &reply).await?;
     Ok(())
 }
 

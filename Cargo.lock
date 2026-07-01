@@ -4087,18 +4087,29 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
- "futures",
  "jemallocator",
+ "libc",
+ "log",
+ "rand 0.10.1",
+ "russh",
+ "russh-sftp",
+ "simplelog",
+ "tokio",
+ "vk-core",
+]
+
+[[package]]
+name = "vk-core"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "futures",
  "libc",
  "listenfd",
  "log",
- "rand 0.10.1",
  "rmp-serde",
- "russh",
- "russh-sftp",
  "serde",
  "serde_json",
- "simplelog",
  "thiserror 2.0.18",
  "tokio",
  "tokio-serde",
@@ -4136,7 +4147,7 @@ dependencies = [
  "vhost",
  "vhost-user-backend",
  "virtiofsd",
- "vk-agent",
+ "vk-core",
  "vm-memory",
  "zstd",
 ]

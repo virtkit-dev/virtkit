@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-vk-agent = { path = "../vk-agent" }
+vk-core = { path = "../vk-core" }
 futures.workspace = true
 libc.workspace = true
 serde.workspace = true

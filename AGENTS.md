@@ -13,15 +13,19 @@ The same codebase powers a local dev fleet and a GitLab custom executor. See
 
 ## Architecture
 
-A Cargo workspace (`Cargo.toml`, edition 2024) with two crates:
+A Cargo workspace (`Cargo.toml`, edition 2024) with three crates:
 
-- **`vk-driver/`** — the host driver: image building/conversion (OCI → ext4/initramfs),
-  the fleet orchestrator + control plane, the GitLab executor, the userspace L2
-  network switch (ARP/DHCP/DNS + transparent TCP/UDP egress via `ipstack`), and a
-  bundled virtio-fs daemon (`virtiofsd`).
-- **`vk-agent/`** — the guest PID 1 / agent: brings a systemd-less guest up
-  (mounts, networking, hostname, virtio-fs, optional SSH) and serves an exec channel
-  over `vsock` so the host can run commands inside the VM.
+- **`vk-core/`** — the shared host↔guest library: the wire protocol (`messages`,
+  `framing`, `addr`, `net`, `status`, `fleetctl`) plus the runtime helpers both sides
+  build on (`exec`, `forward`, `pty`, `dockerignore`). Deliberately free of guest-only
+  concerns and of russh, so the host links none of that.
+- **`vk-driver/`** — the host driver (depends on `vk-core`): image building/conversion
+  (OCI → ext4/initramfs), the fleet orchestrator + control plane, the GitLab executor,
+  the userspace L2 network switch (ARP/DHCP/DNS + transparent TCP/UDP egress via
+  `ipstack`), and a bundled virtio-fs daemon (`virtiofsd`).
+- **`vk-agent/`** — the guest PID 1 / agent (depends on `vk-core`): brings a systemd-less
+  guest up (mounts, networking, hostname, virtio-fs, optional SSH) and serves an exec
+  channel over `vsock` so the host can run commands inside the VM.
 
 The guest kernel is a vanilla Linux `vmlinux` built from a vendored config fragment
 (`kernel/`); it is pinned and built separately from the binaries.
@@ -49,7 +53,7 @@ match CI exactly (clippy needs the static-FFI env — see `.github/workflows/qua
 
 ```bash
 cargo build --release --workspace
-cargo test --workspace                              # tests, e.g. vk-agent/tests/exec.rs
+cargo test --workspace                              # tests, e.g. vk-core/tests/exec.rs
 cargo fmt --all                                     # format (check: --check)
 cargo clippy --workspace --all-targets -- -D warnings
 ```

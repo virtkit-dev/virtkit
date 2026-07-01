@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use vk_agent::addr::SocketAddr;
+use vk_core::addr::SocketAddr;
 
 use crate::config::Config;
 use crate::jobctx::JobCtx;
@@ -1068,7 +1068,7 @@ async fn main() -> ExitCode {
         },
         // run_forward only returns on a bind error; otherwise it serves until the
         // process is killed (cleanup tears the detached child down).
-        Cmd::Forward { listen, to } => match vk_agent::forward::run_forward(&listen, &to).await {
+        Cmd::Forward { listen, to } => match vk_core::forward::run_forward(&listen, &to).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         },

@@ -1,6 +1,6 @@
 # Rust Coding Guidelines
 
-Applies to: `vk-driver/**`, `vk-agent/**`.
+Applies to: `vk-core/**`, `vk-driver/**`, `vk-agent/**`.
 
 See [`../coding-guidelines.md`](../coding-guidelines.md) for general conventions and formatting requirements that apply to all code.
 
@@ -16,7 +16,7 @@ See [`../coding-guidelines.md`](../coding-guidelines.md) for general conventions
 - **Panics are DoS:** treat every `unwrap`, `expect`, indexing, and `as` cast on untrusted input as a potential denial-of-service. Use `?`, `.get()`, `checked_*`, `TryFrom`, and surface real errors. Enable clippy lints: `unwrap_used`, `expect_used`, `panic`, `indexing_slicing`, `arithmetic_side_effects` (allow in `#[cfg(test)]` modules).
 - **Propagate errors:** do not discard `Result` with `.ok()`, `.unwrap_or_default()`, or `let _ =` without a comment explaining why the failure is safe to ignore. Propagate the worst exit code, not just the last one.
 - **Resolve before crossing trust boundaries:** resolve all user-supplied inputs (usernames, paths, dynamic library lookups) before entering a restricted context (`chroot`, privilege drop, seccomp). After crossing, any library call may execute attacker-controlled code. This matters directly here — virtkit runs rootless and the agent is guest PID 1.
-- Deterministic seeds for property/fuzz tests. Co-locate fast unit tests; heavier integration tests under `tests/` (e.g. `vk-agent/tests/exec.rs`).
+- Deterministic seeds for property/fuzz tests. Co-locate fast unit tests; heavier integration tests under `tests/` (e.g. `vk-core/tests/exec.rs`).
 - Measure before optimizing; document benchmark context when micro-optimizing.
 
 ## Dependencies — favor the standard library

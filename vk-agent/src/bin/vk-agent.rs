@@ -9,13 +9,13 @@ use std::fs::File;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
-use vk_agent::addr::SocketAddr;
-use vk_agent::exec::client::{client_run_cmd, client_run_tty};
-use vk_agent::exec::server::run_server;
-use vk_agent::messages::RunMode;
-use vk_agent::messages::{CmdExec, CmdResult, Tty};
-use vk_agent::net::connect;
-use vk_agent::status::get_status;
+use vk_core::addr::SocketAddr;
+use vk_core::exec::client::{client_run_cmd, client_run_tty};
+use vk_core::exec::server::run_server;
+use vk_core::messages::RunMode;
+use vk_core::messages::{CmdExec, CmdResult, Tty};
+use vk_core::net::connect;
+use vk_core::status::get_status;
 
 #[derive(Debug, Parser)] // requires `derive` feature
 #[command(name = "vk-agent", version)]
@@ -155,7 +155,7 @@ fn main() {
             .enable_all()
             .build()
             .expect("building the tokio runtime");
-        if let Err(e) = rt.block_on(vk_agent::fleetctl::run_client(&args)) {
+        if let Err(e) = rt.block_on(vk_core::fleetctl::run_client(&args)) {
             eprintln!("virtctl: {e:#}");
             std::process::exit(1);
         }
@@ -261,7 +261,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
                     std::process::exit(2);
                 }
                 // (0, 0) = terminal that does not report a size: pick a sane default
-                let (rows, cols) = match vk_agent::pty::get_winsize(0) {
+                let (rows, cols) = match vk_core::pty::get_winsize(0) {
                     Ok((0, 0)) | Err(_) => (24, 80),
                     Ok(size) => size,
                 };
@@ -348,7 +348,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
                 },
             )
             .unwrap();
-            if let Err(e) = vk_agent::forward::run_forward(&listen, &socket).await {
+            if let Err(e) = vk_core::forward::run_forward(&listen, &socket).await {
                 error!("forward: {e:#}");
                 std::process::exit(1)
             }
@@ -357,7 +357,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
             // stdout carries the raw SSH byte stream — never init a logger on it.
             // Errors go to stderr, which ssh surfaces to the user as ProxyCommand
             // output.
-            if let Err(e) = vk_agent::forward::run_connect(&socket).await {
+            if let Err(e) = vk_core::forward::run_connect(&socket).await {
                 eprintln!("connect: {e:#}");
                 std::process::exit(1)
             }

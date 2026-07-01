@@ -4,15 +4,15 @@
 //! a shell started by the in-guest virtkit-agent (vsock), and relay stdout/stderr —
 //! gitlab-runner captures both for the job log. This is the virtkit-agent client
 //! protocol with a file (not the terminal) as the stdin source, hence a local
-//! pump instead of vk_agent::exec::client.
+//! pump instead of vk_core::exec::client.
 
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{SinkExt, StreamExt};
-use vk_agent::addr::SocketAddr;
-use vk_agent::messages::{CmdExec, CmdResult, Fd, Message, RunMode};
+use vk_core::addr::SocketAddr;
+use vk_core::messages::{CmdExec, CmdResult, Fd, Message, RunMode};
 
 use crate::jobctx::JobCtx;
 
@@ -65,7 +65,7 @@ pub async fn exec_script(
     script: Vec<u8>,
     user: Option<String>,
 ) -> Result<CmdResult> {
-    let (mut stream, mut sink) = vk_agent::net::connect(addr)
+    let (mut stream, mut sink) = vk_core::net::connect(addr)
         .await
         .context("connecting to the VM's vk-agent")?;
 

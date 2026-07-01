@@ -51,7 +51,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use log::{info, warn};
 
-use crate::addr::SocketAddr;
+use vk_core::addr::SocketAddr;
 
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const SSH_VSOCK_PORT: u32 = 2222;

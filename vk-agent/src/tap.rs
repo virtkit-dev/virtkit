@@ -19,8 +19,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::addr::SocketAddr;
-use crate::net::{RawConn, raw_connect};
+use vk_core::addr::SocketAddr;
+use vk_core::net::{RawConn, raw_connect};
 
 // tun/tap ioctl + flags (stable kernel ABI). Defined here rather than relying on
 // libc's optional constants so the musl-static build needs nothing extra.

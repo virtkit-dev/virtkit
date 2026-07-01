@@ -24,10 +24,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 
-use crate::addr::SocketAddr;
-use crate::exec::server::{ResolvedUser, resolve_user};
-use crate::net::raw_listen;
-use crate::pty::{self, PtyMaster};
+use vk_core::addr::SocketAddr;
+use vk_core::exec::server::{ResolvedUser, resolve_user};
+use vk_core::net::raw_listen;
+use vk_core::pty::{self, PtyMaster};
 
 /// Accept SSH connections on `socket` (a vsock listener in the VM; tcp/unix work
 /// too, for tests). Each connection is authenticated against `authorized_keys`

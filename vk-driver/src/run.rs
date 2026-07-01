@@ -12,7 +12,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use vk_agent::addr::SocketAddr;
+use vk_core::addr::SocketAddr;
 
 use crate::source::Source;
 
@@ -513,7 +513,7 @@ async fn drive(
                 tail(console, 20)
             );
         }
-        if vk_agent::status::get_status(addr).await.is_ok() {
+        if vk_core::status::get_status(addr).await.is_ok() {
             break;
         }
         if Instant::now() >= deadline {
@@ -593,9 +593,9 @@ async fn write_guest_ssh_config(addr: &SocketAddr, config: &str) -> Result<()> {
 /// terminal (raw mode), sized to it. Returns when the shell exits, whatever its
 /// status — a shell that quits non-zero is not a launch failure.
 async fn run_shell(addr: &SocketAddr) -> Result<()> {
-    use vk_agent::messages::{CmdExec, RunMode, Tty};
-    let (rows, cols) = vk_agent::pty::get_winsize(0).unwrap_or((24, 80));
-    let (stream, sink) = vk_agent::net::connect(addr)
+    use vk_core::messages::{CmdExec, RunMode, Tty};
+    let (rows, cols) = vk_core::pty::get_winsize(0).unwrap_or((24, 80));
+    let (stream, sink) = vk_core::net::connect(addr)
         .await
         .context("connecting to the VM's vk-agent")?;
     let exec = CmdExec {
@@ -612,7 +612,7 @@ async fn run_shell(addr: &SocketAddr) -> Result<()> {
         }),
         user: None,
     };
-    vk_agent::exec::client::client_run_tty(stream, sink, exec)
+    vk_core::exec::client::client_run_tty(stream, sink, exec)
         .await
         .context("interactive guest shell")?;
     Ok(())
@@ -851,7 +851,7 @@ pub(crate) async fn boot_session(
                 tail(&console, 20)
             );
         }
-        if vk_agent::status::get_status(&addr).await.is_ok() {
+        if vk_core::status::get_status(&addr).await.is_ok() {
             break;
         }
         if Instant::now() >= deadline {

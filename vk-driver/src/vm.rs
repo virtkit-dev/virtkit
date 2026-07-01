@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use vk_agent::addr::SocketAddr;
+use vk_core::addr::SocketAddr;
 
 use crate::image::ResolvedImage;
 use crate::jobctx::JobCtx;
@@ -335,7 +335,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
                 ctx.ch_log().display()
             );
         }
-        match vk_agent::status::get_status(&addr).await {
+        match vk_core::status::get_status(&addr).await {
             Ok(status) => {
                 // Fail fast on a wire-protocol skew (the guest bundle's virtkit-agent
                 // predates this virtkit, or vice versa): rmp_serde structs are
@@ -343,7 +343,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
                 // commands and would otherwise drop the connection mid-command with
                 // an opaque "connection to the VM lost". A pre-versioning virtkit-agent
                 // reports protocol 0.
-                let want = vk_agent::messages::PROTOCOL_VERSION;
+                let want = vk_core::messages::PROTOCOL_VERSION;
                 if status.protocol() != want {
                     bail!(
                         "guest vk-agent wire protocol v{} != vk v{want} — the guest \

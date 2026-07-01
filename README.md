@@ -76,6 +76,7 @@ base-image digest and the apk pins together.
 ## Layout
 
 ```
+vk-core/         shared host↔guest library (wire protocol + exec/pty/dockerignore)
 vk-driver/       host driver crate
 vk-agent/        guest agent crate (PID 1 + exec server)
 kernel/          guest kernel build (Dockerfile + config fragment)

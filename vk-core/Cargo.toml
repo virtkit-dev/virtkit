@@ -1,0 +1,33 @@
+[package]
+name = "vk-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+libc.workspace = true
+listenfd.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = [
+    "net",
+    "process",
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+    "io-util",
+    "io-std",
+] }
+tokio-serde.workspace = true
+tokio-util.workspace = true
+tokio-vsock.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rmp-serde.workspace = true

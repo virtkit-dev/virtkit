@@ -6,11 +6,11 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+# shared host↔guest protocol + runtime helpers (exec/pty/forward/dockerignore/…).
+vk-core = { path = "../vk-core" }
 anyhow.workspace = true
 clap = { workspace = true, features = ["string"] }
-futures.workspace = true
 libc.workspace = true
-listenfd.workspace = true
 log.workspace = true
 # ssh-serve only (feature `ssh`): russh + russh-sftp pull a full SSH/crypto stack
 # (ring backend, C-compiled), so keep them out of the lean default agent that
@@ -19,10 +19,7 @@ log.workspace = true
 rand = { workspace = true, optional = true }
 russh = { workspace = true, optional = true }
 russh-sftp = { workspace = true, optional = true }
-serde.workspace = true
-serde_json.workspace = true
 simplelog.workspace = true
-thiserror.workspace = true
 tokio = { workspace = true, features = [
     "net",
     "process",
@@ -35,9 +32,6 @@ tokio = { workspace = true, features = [
     "io-std",
     "fs",
 ] }
-tokio-serde.workspace = true
-tokio-util.workspace = true
-tokio-vsock.workspace = true
 
 [target.'cfg(target_env = "musl")'.dependencies]
 jemallocator.workspace = true
@@ -49,6 +43,3 @@ jemallocator.workspace = true
 # toolchain. Build --no-default-features for a leaner agent when ssh isn't needed.
 default = ["ssh"]
 ssh = ["dep:russh", "dep:rand", "dep:russh-sftp"]
-
-[dev-dependencies]
-rmp-serde.workspace = true
