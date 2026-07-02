@@ -57,7 +57,7 @@ zstd = "0.13"
 # tokio features are member-specific; only the version is pinned here.
 tokio = { version = "1" }
 toml = "1"
-# embedded local OCI registry server (`virtkit registry serve`): a minimal v2
+# embedded local OCI registry server (`vk registry serve`): a minimal v2
 # distribution API over hyper (already in the tree via oci-client). Pure Rust, so
 # the binary stays musl-static.
 hyper = { version = "1", features = ["server", "http1"] }
