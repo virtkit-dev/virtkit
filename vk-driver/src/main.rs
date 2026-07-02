@@ -191,15 +191,17 @@ enum Cmd {
     /// default host backend handles the `FROM scratch` + COPY subset. `--print-plan` parses
     /// + plans + prints the build without running it.
     Build {
-        /// Dockerfile to build
+        /// Dockerfile to build (repeatable: the files merge into one stage namespace,
+        /// so a FROM/COPY --from in one file can name a stage declared in another)
         #[arg(short = 'f', long = "file", default_value = "Dockerfile")]
-        file: PathBuf,
+        file: Vec<PathBuf>,
         /// target stage (AS name or index; default: the last stage)
         #[arg(long)]
         target: Option<String>,
-        /// build context for COPY (default: the Dockerfile's directory)
+        /// build context for COPY (repeatable, zipped positionally with -f;
+        /// default: each Dockerfile's own directory)
         #[arg(long)]
-        context: Option<PathBuf>,
+        context: Vec<PathBuf>,
         /// ext4 output path
         #[arg(long)]
         out: Option<PathBuf>,
@@ -373,15 +375,17 @@ enum Cmd {
         /// Omit when booting a Dockerfile target with --file.
         image: Option<String>,
         /// Boot a Dockerfile target instead of an image: build (or cache-restore, with
-        /// --cache-registry) the target into an ext4 and boot it — no explicit ext4 file
+        /// --cache-registry) the target into an ext4 and boot it — no explicit ext4
+        /// file (repeatable: the files merge into one stage namespace)
         #[arg(short = 'f', long = "file")]
-        file: Option<PathBuf>,
+        file: Vec<PathBuf>,
         /// target stage to boot (AS name or index; default: the last stage), with --file
         #[arg(long)]
         target: Option<String>,
-        /// build context for the Dockerfile's COPY (default: the Dockerfile's directory)
+        /// build context for the Dockerfile's COPY (repeatable, zipped positionally
+        /// with -f; default: each Dockerfile's own directory)
         #[arg(long)]
-        context: Option<PathBuf>,
+        context: Vec<PathBuf>,
         /// instruction cache for the --file build (push/pull each stage's ext4 by
         /// content key, so a repeat boot restores instead of rebuilding): a registry
         /// repo, an absolute store directory path, or `none` to disable. Default:
@@ -460,15 +464,17 @@ enum Cmd {
     /// stores the stage's snapshot under. Prints `stage:key` lines. Resolves base
     /// digests + base image config over the network so the key matches a real build.
     DockerHash {
-        /// Dockerfile to analyze (default: Dockerfile)
+        /// Dockerfile to analyze (default: Dockerfile; repeatable: the files merge
+        /// into one stage namespace, exactly as `vk build` sees them)
         #[arg(short = 'f', long = "file", default_value = "Dockerfile")]
-        dockerfile: PathBuf,
+        dockerfile: Vec<PathBuf>,
         /// Build arg affecting the key (KEY=VAL), repeatable
         #[arg(long = "build-arg")]
         build_arg: Vec<String>,
-        /// Build context for context `COPY` content hashing (default: the Dockerfile's dir)
+        /// Build context for context `COPY` content hashing (repeatable, zipped
+        /// positionally with -f; default: each Dockerfile's own directory)
         #[arg(long)]
-        context: Option<PathBuf>,
+        context: Vec<PathBuf>,
         /// Stages to print (default: all, in build order)
         stages: Vec<String>,
     },
@@ -654,7 +660,7 @@ async fn cli_main() -> ExitCode {
         command,
     } = &cli.cmd
     {
-        if file.is_none() && image.is_none() {
+        if file.is_empty() && image.is_none() {
             return fail(
                 &anyhow::anyhow!("run needs an image or --file <Dockerfile>"),
                 2,
@@ -669,9 +675,9 @@ async fn cli_main() -> ExitCode {
             .collect();
         let args = run::RunArgs {
             image: image.clone().unwrap_or_default(),
-            dockerfile: file.clone(),
+            dockerfiles: file.clone(),
             target: target.clone(),
-            context: context.clone(),
+            contexts: context.clone(),
             cache_registry: cache_registry.clone(),
             cache_insecure: *cache_insecure,
             build_args,
@@ -713,7 +719,7 @@ async fn cli_main() -> ExitCode {
                 (k.to_string(), v.to_string())
             })
             .collect();
-        return match dockerhash::run(dockerfile, context.as_deref(), &args, stages) {
+        return match dockerhash::run(dockerfile, context, &args, stages) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         };
@@ -864,9 +870,9 @@ async fn cli_main() -> ExitCode {
         // flag or a config `true` enables them.
         let b = &cfg.build;
         let opts = build::Options {
-            dockerfile: file.clone(),
+            dockerfiles: file.clone(),
             target: target.clone(),
-            context: context.clone(),
+            contexts: context.clone(),
             out: out.clone(),
             print_plan: *print_plan,
             microvm: *microvm,

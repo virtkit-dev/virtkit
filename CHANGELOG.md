@@ -20,6 +20,10 @@ All notable changes to virtkit will be documented in this file.
   interchangeable with a `vk registry serve` on the same root.
 - `vk registry gc` prunes idle tags and unreferenced blobs from a store.
 - `run --cpus host` matches the host CPU count.
+- `-f` is repeatable on `build`, `run` and `docker-hash`: the Dockerfiles merge
+  into one stage namespace, so a `FROM` or `COPY --from` in one file can name a
+  stage declared in another. `--context` is repeatable too, pairing with each
+  `-f` in order.
 
 ### Changed
 

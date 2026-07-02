@@ -49,12 +49,14 @@ pub struct RunArgs {
     /// — the rootfs is then built from the Dockerfile target.
     pub image: String,
     /// Boot a Dockerfile target instead of an image: build (or cache-restore, with
-    /// `cache_registry`) the target into an ext4 and boot it — no explicit `--out` ext4.
-    pub dockerfile: Option<PathBuf>,
-    /// Target stage to boot (AS name or index; default: the last stage), with `dockerfile`.
+    /// `cache_registry`) the target into an ext4 and boot it — no explicit `--out`
+    /// ext4. Several files merge into one stage namespace; empty = an image boot.
+    pub dockerfiles: Vec<PathBuf>,
+    /// Target stage to boot (AS name or index; default: the last stage), with `dockerfiles`.
     pub target: Option<String>,
-    /// Build context for the Dockerfile's `COPY` (default: the Dockerfile's directory).
-    pub context: Option<PathBuf>,
+    /// Build-context roots, zipped positionally with `dockerfiles` (default: each
+    /// Dockerfile's own directory).
+    pub contexts: Vec<PathBuf>,
     /// Instruction cache for a Dockerfile boot: each stage's ext4 is pushed/pulled by
     /// its content key, so a repeat boot restores instead of rebuilding. A registry
     /// repo, an absolute store directory path, or `none` to disable; `None` = the
@@ -201,28 +203,27 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     // Dockerfile boot it is the target stage's accumulated ENV; for an image boot it is the
     // image's configured `Config.Env`.
     let mut image_env: Vec<(String, String)> = Vec::new();
-    let dockerfile_ext4 = match &args.dockerfile {
-        Some(file) => {
-            let out = work.join("root.ext4");
-            let opts = crate::build::Options {
-                dockerfile: file.clone(),
-                target: args.target.clone(),
-                context: args.context.clone(),
-                out: Some(out.clone()),
-                print_plan: false,
-                microvm: true,
-                cloud_hypervisor: Some(args.cloud_hypervisor.clone()),
-                kernel: Some(kernel.to_path_buf()),
-                agent: Some(agent.to_path_buf()),
-                cache_registry: args.cache_registry.clone(),
-                cache_insecure: args.cache_insecure,
-                journal: false,
-                build_args: args.build_args.clone(),
-            };
-            image_env = crate::build::build(&opts)?.env;
-            Some(out)
-        }
-        None => None,
+    let dockerfile_ext4 = if args.dockerfiles.is_empty() {
+        None
+    } else {
+        let out = work.join("root.ext4");
+        let opts = crate::build::Options {
+            dockerfiles: args.dockerfiles.clone(),
+            target: args.target.clone(),
+            contexts: args.contexts.clone(),
+            out: Some(out.clone()),
+            print_plan: false,
+            microvm: true,
+            cloud_hypervisor: Some(args.cloud_hypervisor.clone()),
+            kernel: Some(kernel.to_path_buf()),
+            agent: Some(agent.to_path_buf()),
+            cache_registry: args.cache_registry.clone(),
+            cache_insecure: args.cache_insecure,
+            journal: false,
+            build_args: args.build_args.clone(),
+        };
+        image_env = crate::build::build(&opts)?.env;
+        Some(out)
     };
 
     // 1. the rootfs source (docker export or registry pull) for an image boot, unless a

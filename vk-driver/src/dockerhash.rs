@@ -9,19 +9,20 @@
 //! real build would store. A context `COPY` folds in the sha256 of the files it copies,
 //! so the key tracks the copied bytes too.
 
-use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
 /// CLI entry: print `stage:key` for the requested stages (or every stage, in build
-/// order, if none requested).
+/// order, if none requested). Several Dockerfiles merge into one stage namespace,
+/// exactly as `vk build` sees them.
 pub fn run(
-    dockerfile: &Path,
-    context: Option<&Path>,
+    dockerfiles: &[PathBuf],
+    contexts: &[PathBuf],
     build_args: &[(String, String)],
     requested: &[String],
 ) -> Result<()> {
-    let keys = crate::build::stage_keys(dockerfile, context, build_args)?;
+    let keys = crate::build::stage_keys(dockerfiles, contexts, build_args)?;
     if requested.is_empty() {
         for (name, key) in &keys {
             println!("{name}:{key}");
@@ -33,7 +34,16 @@ pub fn run(
             .iter()
             .find(|(n, _)| n == s)
             .map(|(_, k)| k)
-            .with_context(|| format!("stage '{s}' not found in {}", dockerfile.display()))?;
+            .with_context(|| {
+                format!(
+                    "stage '{s}' not found in {}",
+                    dockerfiles
+                        .iter()
+                        .map(|f| f.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" + ")
+                )
+            })?;
         println!("{s}:{key}");
     }
     Ok(())

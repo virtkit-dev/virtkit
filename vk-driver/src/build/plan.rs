@@ -45,6 +45,7 @@ pub struct Stage {
 }
 
 /// One Dockerfile going into a [`Plan`], with the paths its stages resolve against.
+#[derive(Debug)]
 pub struct PlanInput {
     pub dockerfile: Dockerfile,
     /// Where the Dockerfile came from (diagnostics only).

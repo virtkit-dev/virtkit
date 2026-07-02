@@ -47,11 +47,13 @@ use plan::{Base, Plan, PlanInput};
 
 /// What/how to build.
 pub struct Options {
-    pub dockerfile: PathBuf,
+    /// Dockerfile(s), merged into one stage namespace (see [`Plan::from_dockerfiles`]).
+    pub dockerfiles: Vec<PathBuf>,
     /// Stage selector: an `AS` name or index; `None` = the last stage.
     pub target: Option<String>,
-    /// Build context root for `COPY` (default: the Dockerfile's directory).
-    pub context: Option<PathBuf>,
+    /// Build-context roots, zipped positionally with `dockerfiles`; a file without one
+    /// defaults to its own directory.
+    pub contexts: Vec<PathBuf>,
     /// ext4 output path (unused in `--print-plan`).
     pub out: Option<PathBuf>,
     /// Parse + plan + print the build order and primitives, build nothing.
@@ -108,29 +110,47 @@ fn cache_repo(cache_registry: Option<&str>) -> Result<Option<String>> {
     })
 }
 
-/// Read + parse a Dockerfile into a [`PlanInput`], its context defaulting to the
-/// file's directory.
-fn load_input(dockerfile: &Path, context: Option<&Path>) -> Result<PlanInput> {
-    let src = std::fs::read_to_string(dockerfile)
-        .with_context(|| format!("reading {}", dockerfile.display()))?;
-    let context = context.map(Path::to_path_buf).unwrap_or_else(|| {
-        dockerfile
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf()
-    });
-    Ok(PlanInput {
-        dockerfile: parser::parse(&src)?,
-        origin: dockerfile.to_path_buf(),
-        context,
-    })
+/// Read + parse the Dockerfiles into [`PlanInput`]s, zipping each with its context
+/// (`--context` values pair positionally with `-f`; a file without one defaults to
+/// its own directory).
+fn load_inputs(dockerfiles: &[PathBuf], contexts: &[PathBuf]) -> Result<Vec<PlanInput>> {
+    if dockerfiles.is_empty() {
+        bail!("no Dockerfile given");
+    }
+    if contexts.len() > dockerfiles.len() {
+        bail!(
+            "{} --context values for {} -f file(s) — contexts zip positionally with -f",
+            contexts.len(),
+            dockerfiles.len()
+        );
+    }
+    dockerfiles
+        .iter()
+        .enumerate()
+        .map(|(i, dockerfile)| {
+            let src = std::fs::read_to_string(dockerfile)
+                .with_context(|| format!("reading {}", dockerfile.display()))?;
+            let context = contexts.get(i).cloned().unwrap_or_else(|| {
+                dockerfile
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf()
+            });
+            Ok(PlanInput {
+                dockerfile: parser::parse(&src)
+                    .with_context(|| format!("parsing {}", dockerfile.display()))?,
+                origin: dockerfile.clone(),
+                context,
+            })
+        })
+        .collect()
 }
 
 /// Entry point for the `build` subcommand.
 pub fn build(opts: &Options) -> Result<Built> {
-    let input = load_input(&opts.dockerfile, opts.context.as_deref())?;
+    let inputs = load_inputs(&opts.dockerfiles, &opts.contexts)?;
     let build_args: Vars = opts.build_args.iter().cloned().collect();
-    let plan = Plan::from_dockerfiles(&[input], &build_args)?;
+    let plan = Plan::from_dockerfiles(&inputs, &build_args)?;
     let target = plan.resolve_target(opts.target.as_deref())?;
     let order = plan.build_order(target)?;
 
@@ -221,7 +241,11 @@ pub fn build(opts: &Options) -> Result<Built> {
     let built = result?;
     println!(
         "virtkit: built {} -> {}",
-        opts.dockerfile.display(),
+        opts.dockerfiles
+            .iter()
+            .map(|f| f.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" + "),
         out.display()
     );
     Ok(built)
@@ -405,13 +429,13 @@ fn resolve_stages(
 /// the network (like a real build) so the keys match what a build would store. Backs the
 /// `docker-hash` subcommand.
 pub fn stage_keys(
-    dockerfile: &Path,
-    context: Option<&Path>,
+    dockerfiles: &[PathBuf],
+    contexts: &[PathBuf],
     build_args: &[(String, String)],
 ) -> Result<Vec<(String, String)>> {
-    let input = load_input(dockerfile, context)?;
+    let inputs = load_inputs(dockerfiles, contexts)?;
     let ba: Vars = build_args.iter().cloned().collect();
-    let plan = Plan::from_dockerfiles(&[input], &ba)?;
+    let plan = Plan::from_dockerfiles(&inputs, &ba)?;
     let order = plan.all_order()?;
     let mut ex = exec::Planner::new();
     // canonical keys: DOCKER_STAGE_HASH is excluded (its injected value never affects a
@@ -1260,6 +1284,90 @@ mod tests {
             t.contains(&"stage-context /nonexistent".to_string()),
             "{t:#?}"
         );
+    }
+
+    #[test]
+    fn load_inputs_zips_contexts_with_files() {
+        let tmp = std::env::temp_dir().join(format!("vk-loadinputs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("a")).unwrap();
+        std::fs::create_dir_all(tmp.join("b")).unwrap();
+        std::fs::write(tmp.join("a/Dockerfile"), "FROM scratch AS x\n").unwrap();
+        std::fs::write(tmp.join("b/Dockerfile"), "FROM scratch AS y\n").unwrap();
+        let files = [tmp.join("a/Dockerfile"), tmp.join("b/Dockerfile")];
+
+        // no --context: each file defaults to its own directory.
+        let inputs = load_inputs(&files, &[]).unwrap();
+        assert_eq!(inputs[0].context, tmp.join("a"));
+        assert_eq!(inputs[1].context, tmp.join("b"));
+        // one --context: pairs with the first file, the second keeps its default.
+        let inputs = load_inputs(&files, std::slice::from_ref(&tmp)).unwrap();
+        assert_eq!(inputs[0].context, tmp);
+        assert_eq!(inputs[1].context, tmp.join("b"));
+        // more contexts than files / no files: errors.
+        let err = load_inputs(&files[..1], &[tmp.clone(), tmp.clone()]).unwrap_err();
+        assert!(format!("{err:#}").contains("zip positionally"), "{err:#}");
+        assert!(load_inputs(&[], &[]).is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cross_file_build_uses_each_files_context() {
+        // Two files, two contexts: the merged build hashes each stage's COPY against
+        // its own file's context, and editing one context busts only that stage's key
+        // (and its dependents' — the chain), not the other file's.
+        let tmp = std::env::temp_dir().join(format!("vk-crossctx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        for d in ["a", "b"] {
+            std::fs::create_dir_all(tmp.join(d)).unwrap();
+        }
+        std::fs::write(tmp.join("a/Dockerfile"), "FROM scratch AS lib\nCOPY f /f\n").unwrap();
+        std::fs::write(tmp.join("a/f"), "lib-v1").unwrap();
+        std::fs::write(
+            tmp.join("b/Dockerfile"),
+            "FROM scratch AS app\nCOPY --from=lib /f /lib-f\nCOPY f /app-f\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.join("b/f"), "app-v1").unwrap();
+        let files = [tmp.join("a/Dockerfile"), tmp.join("b/Dockerfile")];
+
+        let keys = || {
+            let m: HashMap<String, String> =
+                stage_keys(&files, &[], &[]).unwrap().into_iter().collect();
+            (m["lib"].clone(), m["app"].clone())
+        };
+        let (lib1, app1) = keys();
+        // editing file a's context changes lib's key, and chains into app (which
+        // COPY --froms it) …
+        std::fs::write(tmp.join("a/f"), "lib-v2").unwrap();
+        let (lib2, app2) = keys();
+        assert_ne!(lib1, lib2);
+        assert_ne!(app1, app2);
+        // … while editing file b's context touches only app.
+        std::fs::write(tmp.join("b/f"), "app-v2").unwrap();
+        let (lib3, app3) = keys();
+        assert_eq!(lib2, lib3);
+        assert_ne!(app2, app3);
+
+        // the drive declares each stage's own context to the backend.
+        let ba = Vars::new();
+        let plan = Plan::from_dockerfiles(&load_inputs(&files, &[]).unwrap(), &ba).unwrap();
+        let order = plan
+            .build_order(plan.resolve_target(Some("app")).unwrap())
+            .unwrap();
+        let mut ex = DryRun::new();
+        drive(&plan, &order, &ba, &mut ex).unwrap();
+        let t = ex.transcript;
+        assert!(
+            t.contains(&format!("stage-context {}", tmp.join("a").display())),
+            "{t:#?}"
+        );
+        assert!(
+            t.contains(&format!("stage-context {}", tmp.join("b").display())),
+            "{t:#?}"
+        );
+        assert!(t.iter().any(|l| l.starts_with("copy from=lib ")), "{t:#?}");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
