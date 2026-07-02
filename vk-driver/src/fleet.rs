@@ -21,6 +21,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use vk_core::fleetctl::{Reply, Request, UnitStatus};
 
+use crate::vmm::Vmm;
+
 /// One fleet VM unit: `name:ext4:ip/cidr:cid[:flags]`, where `flags` is a
 /// comma-separated subset of `workdir`/`autostart`. The agent (PID 1) always
 /// execs the image's captured entrypoint (VIRTKIT_MODE=service). The `workdir`
@@ -529,25 +531,31 @@ fn boot_service(
     // symlinks into the repo, so RO makes those chmod no-ops and protects the host tree.
     // Plain services get no share and the default small VM.
     let mut aux: Vec<Child> = Vec::new();
-    let mut fs_args: Vec<String> = Vec::new();
+    let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
     let mut virtiofs = String::new();
-    let (mut cpus, mut mem) = ("boot=2".to_string(), "size=1G".to_string());
+    let (mut cpus, mut mem, mut shared_mem) = (2u32, "1G".to_string(), false);
     if svc.workdir {
         let workdir =
             workdir.context("a `workdir` unit needs the repo share, but the fleet has no VM")?;
         let workdir_sock = dir.join("vfsd-workdir.sock");
         aux.push(spawn_virtiofsd(&workdir_sock, workdir, true, &[], &[])?);
-        fs_args.push(format!("tag=workdir,socket={}", workdir_sock.display()));
+        shares.push(crate::vmm::FsShare {
+            tag: "workdir".into(),
+            socket: workdir_sock,
+        });
         virtiofs.push_str("workdir:/workdir");
         // git worktree: share the main repo's git dir at the SAME guest path so the
         // worktree's .git -> commondir chain resolves (the assembly reads git).
         if let Some(gs) = git_share {
             let git_sock = dir.join("vfsd-git.sock");
             aux.push(spawn_virtiofsd(&git_sock, gs, true, &[], &[])?);
-            fs_args.push(format!("tag=gitdir,socket={}", git_sock.display()));
+            shares.push(crate::vmm::FsShare {
+                tag: "gitdir".into(),
+                socket: git_sock,
+            });
             virtiofs.push_str(&format!(",gitdir:{}", gs.display()));
         }
-        (cpus, mem) = ("boot=4".to_string(), "size=4G,shared=on".to_string());
+        (cpus, mem, shared_mem) = (4, "4G".to_string(), true);
     }
 
     // Static address + the gateway as resolver (its DNS answers *.lan and forwards
@@ -562,33 +570,32 @@ fn boot_service(
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS={virtiofs}"));
     }
 
+    let spec = crate::vmm::VmSpec {
+        kernel: kernel.to_path_buf(),
+        cmdline,
+        disks: vec![crate::vmm::Disk::overlay(overlay)],
+        initramfs: None,
+        shares,
+        vsock_cid: svc.cid,
+        vsock_socket: vsock,
+        cpus,
+        mem,
+        shared_mem,
+        net: crate::vmm::Net::None,
+        balloon: false,
+        serial_log: console.clone(),
+        api_socket: None,
+    };
     let log = std::fs::File::create(&console)?;
-    let mut cmd = Command::new(cloud_hypervisor);
-    cmd.arg("--kernel").arg(kernel).arg("--disk").arg(format!(
-        "path={},readonly=off,backing_files=on,image_type=qcow2",
-        overlay.display()
-    ));
-    for fa in &fs_args {
-        cmd.arg("--fs").arg(fa);
+    let ch = crate::vmm::CloudHypervisor {
+        bin: cloud_hypervisor.to_path_buf(),
     }
-    let ch = cmd
-        .arg("--vsock")
-        .arg(format!("cid={},socket={}", svc.cid, vsock.display()))
-        .arg("--cpus")
-        .arg(&cpus)
-        .arg("--memory")
-        .arg(&mem)
-        .arg("--serial")
-        .arg(format!("file={}", console.display()))
-        .arg("--console")
-        .arg("off")
-        .arg("--cmdline")
-        .arg(&cmdline)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        .spawn()
-        .with_context(|| format!("spawning {}", cloud_hypervisor.display()))?;
+    .command(&spec)
+    .stdin(Stdio::null())
+    .stdout(log.try_clone()?)
+    .stderr(log)
+    .spawn()
+    .with_context(|| format!("spawning {}", cloud_hypervisor.display()))?;
     Ok((ch, aux))
 }
 
@@ -611,7 +618,10 @@ fn boot_vm(
     // virtiofsd on /workdir — READ-WRITE (no --readonly): live editing both ways.
     let workdir_sock = dir.join("vfsd-workdir.sock");
     aux.push(spawn_virtiofsd(&workdir_sock, &b.workdir, false, &[], &[])?);
-    let mut fs_args: Vec<String> = vec![format!("tag=workdir,socket={}", workdir_sock.display())];
+    let mut shares: Vec<crate::vmm::FsShare> = vec![crate::vmm::FsShare {
+        tag: "workdir".into(),
+        socket: workdir_sock,
+    }];
     let mut virtiofs = String::from("workdir:/workdir");
 
     // git worktree: share the main repo's git dir at the SAME guest path so the
@@ -620,7 +630,10 @@ fn boot_vm(
     if let Some(gs) = &git_share {
         let git_sock = dir.join("vfsd-git.sock");
         aux.push(spawn_virtiofsd(&git_sock, gs, false, &[], &[])?);
-        fs_args.push(format!("tag=gitdir,socket={}", git_sock.display()));
+        shares.push(crate::vmm::FsShare {
+            tag: "gitdir".into(),
+            socket: git_sock,
+        });
         virtiofs.push_str(&format!(",gitdir:{}", gs.display()));
     }
 
@@ -635,8 +648,8 @@ fn boot_vm(
             &share.uid_maps,
             &share.gid_maps,
         )?);
-        fs_args.push(format!("tag={tag},socket={}", sock.display()));
         virtiofs.push_str(&format!(",{tag}:{}", share.guest_path));
+        shares.push(crate::vmm::FsShare { tag, socket: sock });
     }
 
     // Symlinks to create inside the guest after virtiofs mounts (--vm-symlink).
@@ -697,34 +710,33 @@ fn boot_vm(
         b.name
     );
 
-    let log = std::fs::File::create(&console)?;
-    let mut cmd = Command::new(cloud_hypervisor);
-    cmd.arg("--kernel").arg(kernel).arg("--disk").arg(format!(
-        "path={},readonly=off,backing_files=on,image_type=qcow2",
-        overlay.display()
-    ));
-    for fa in &fs_args {
-        cmd.arg("--fs").arg(fa);
-    }
     // shared=on is REQUIRED for virtiofs (the workdir/gitdir shares).
-    let ch = cmd
-        .arg("--vsock")
-        .arg(format!("cid={},socket={}", b.cid, vsock.display()))
-        .arg("--cpus")
-        .arg(format!("boot={}", b.cpus))
-        .arg("--memory")
-        .arg(format!("size={},shared=on", b.mem))
-        .arg("--serial")
-        .arg(format!("file={}", console.display()))
-        .arg("--console")
-        .arg("off")
-        .arg("--cmdline")
-        .arg(&cmdline)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        .spawn()
-        .with_context(|| format!("spawning {}", cloud_hypervisor.display()))?;
+    let spec = crate::vmm::VmSpec {
+        kernel: kernel.to_path_buf(),
+        cmdline,
+        disks: vec![crate::vmm::Disk::overlay(overlay)],
+        initramfs: None,
+        shares,
+        vsock_cid: b.cid,
+        vsock_socket: vsock,
+        cpus: b.cpus,
+        mem: b.mem.clone(),
+        shared_mem: true,
+        net: crate::vmm::Net::None,
+        balloon: false,
+        serial_log: console.clone(),
+        api_socket: None,
+    };
+    let log = std::fs::File::create(&console)?;
+    let ch = crate::vmm::CloudHypervisor {
+        bin: cloud_hypervisor.to_path_buf(),
+    }
+    .command(&spec)
+    .stdin(Stdio::null())
+    .stdout(log.try_clone()?)
+    .stderr(log)
+    .spawn()
+    .with_context(|| format!("spawning {}", cloud_hypervisor.display()))?;
     Ok((ch, aux))
 }
 

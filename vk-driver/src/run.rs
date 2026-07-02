@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail};
 use vk_core::addr::SocketAddr;
 
 use crate::source::Source;
+use crate::vmm::Vmm;
 
 const VSOCK_PORT: u32 = 4444;
 /// vsock port the guest SSH-agent forwarder dials; the host splices it to `$SSH_AUTH_SOCK`.
@@ -206,65 +207,54 @@ async fn build_and_boot(args: &RunArgs, work: &Path) -> Result<()> {
     }
 
     // 2. assemble the boot medium (virtkit-agent injected as PID 1).
-    let (mut boot_args, mut cmdline) = if let Some(ext4) = &dockerfile_ext4 {
-        // A Dockerfile build exports a *clean* ext4 (no agent baked in). Boot it the way
-        // the builder boots its own stages: a minimal initramfs holds the agent as `/init`,
-        // which pivots into the ext4 at /dev/vda — so the booted image stays byte-clean.
-        let cpio = work.join("initramfs.cpio");
-        crate::initramfs::build_agent_initramfs(&args.agent, &cpio)?;
-        // throwaway rw qcow2 overlay over the ro raw ext4 (rw raw errors on tmpfs)
-        let overlay = work.join("overlay.qcow2");
-        crate::qcow2::create_overlay(&overlay, ext4)?;
-        (
-            vec![
-                "--initramfs".into(),
-                cpio.into_os_string(),
-                "--disk".into(),
+    let (disks, initramfs, mut cmdline): (Vec<crate::vmm::Disk>, Option<PathBuf>, String) =
+        if let Some(ext4) = &dockerfile_ext4 {
+            // A Dockerfile build exports a *clean* ext4 (no agent baked in). Boot it the way
+            // the builder boots its own stages: a minimal initramfs holds the agent as `/init`,
+            // which pivots into the ext4 at /dev/vda — so the booted image stays byte-clean.
+            let cpio = work.join("initramfs.cpio");
+            crate::initramfs::build_agent_initramfs(&args.agent, &cpio)?;
+            // throwaway rw qcow2 overlay over the ro raw ext4 (rw raw errors on tmpfs)
+            let overlay = work.join("overlay.qcow2");
+            crate::qcow2::create_overlay(&overlay, ext4)?;
+            (
+                vec![crate::vmm::Disk::overlay(overlay)],
+                Some(cpio),
                 format!(
-                    "path={},readonly=off,backing_files=on,image_type=qcow2",
-                    overlay.display()
-                )
-                .into(),
-            ],
-            format!(
-                "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda \
-                 VIRTKIT_HOSTNAME=vm VIRTKIT_VSOCK_PORT={VSOCK_PORT}"
-            ),
-        )
-    } else if args.disk {
-        println!("virtkit: building ext4 rootfs");
-        let rootfs = work.join("root.ext4");
-        crate::ext4::build_from_tar(&rootfs_tar, &args.agent, &rootfs)?;
-        // throwaway rw qcow2 overlay over the ro raw ext4 (rw raw errors on tmpfs)
-        let overlay = work.join("overlay.qcow2");
-        crate::qcow2::create_overlay(&overlay, &rootfs)?;
-        (
-            vec![
-                "--disk".into(),
+                    "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda \
+                     VIRTKIT_HOSTNAME=vm VIRTKIT_VSOCK_PORT={VSOCK_PORT}"
+                ),
+            )
+        } else if args.disk {
+            println!("virtkit: building ext4 rootfs");
+            let rootfs = work.join("root.ext4");
+            crate::ext4::build_from_tar(&rootfs_tar, &args.agent, &rootfs)?;
+            // throwaway rw qcow2 overlay over the ro raw ext4 (rw raw errors on tmpfs)
+            let overlay = work.join("overlay.qcow2");
+            crate::qcow2::create_overlay(&overlay, &rootfs)?;
+            (
+                vec![crate::vmm::Disk::overlay(overlay)],
+                // no initrd: the kernel mounts /dev/vda (ext4) directly
+                None,
                 format!(
-                    "path={},readonly=off,backing_files=on,image_type=qcow2",
-                    overlay.display()
-                )
-                .into(),
-            ],
-            // no initrd: the kernel mounts /dev/vda (ext4) directly
-            format!(
-                "console=ttyS0 root=/dev/vda rw rootfstype=ext4 init=/usr/local/bin/vk-agent \
-                 VIRTKIT_HOSTNAME=vm VIRTKIT_VSOCK_PORT={VSOCK_PORT}"
-            ),
-        )
-    } else {
-        println!("virtkit: building cpio initramfs");
-        let cpio = work.join("initramfs.cpio");
-        crate::initramfs::build_initramfs(&rootfs_tar, &args.agent, &cpio)?;
-        (
-            vec!["--initramfs".into(), cpio.into_os_string()],
-            format!(
-                "console=ttyS0 rdinit=/usr/local/bin/vk-agent VIRTKIT_HOSTNAME=vm \
-                 VIRTKIT_VSOCK_PORT={VSOCK_PORT}"
-            ),
-        )
-    };
+                    "console=ttyS0 root=/dev/vda rw rootfstype=ext4 \
+                     init=/usr/local/bin/vk-agent \
+                     VIRTKIT_HOSTNAME=vm VIRTKIT_VSOCK_PORT={VSOCK_PORT}"
+                ),
+            )
+        } else {
+            println!("virtkit: building cpio initramfs");
+            let cpio = work.join("initramfs.cpio");
+            crate::initramfs::build_initramfs(&rootfs_tar, &args.agent, &cpio)?;
+            (
+                Vec::new(),
+                Some(cpio),
+                format!(
+                    "console=ttyS0 rdinit=/usr/local/bin/vk-agent VIRTKIT_HOSTNAME=vm \
+                     VIRTKIT_VSOCK_PORT={VSOCK_PORT}"
+                ),
+            )
+        };
 
     // SSH-agent forwarding: tell the guest agent to present SSH_AUTH_SOCK and relay it over
     // a vsock port, which the host side (started below) bridges to the host's real agent —
@@ -290,8 +280,9 @@ async fn build_and_boot(args: &RunArgs, work: &Path) -> Result<()> {
     // user), so the guest command reads/writes the live tree and its outputs land on the
     // host. The command then runs with its cwd there (see `drive`). virtio-fs needs shared
     // guest memory, so `mem` gains `shared=on`.
+    let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
     let mut virtiofsd: Option<Child> = None;
-    let mem = if let Some(host_dir) = &args.workdir {
+    let shared_mem = if let Some(host_dir) = &args.workdir {
         let sock = work.join("workdir.fs.sock");
         virtiofsd = Some(crate::fleet::spawn_virtiofsd(
             &sock,
@@ -300,30 +291,39 @@ async fn build_and_boot(args: &RunArgs, work: &Path) -> Result<()> {
             &[],
             &[],
         )?);
-        boot_args.push("--fs".into());
-        boot_args.push(format!("tag=work,socket={}", sock.display()).into());
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS=work:{WORKDIR_MOUNT}"));
-        format!("{},shared=on", args.mem)
+        shares.push(crate::vmm::FsShare {
+            tag: "work".into(),
+            socket: sock,
+        });
+        true
     } else {
-        args.mem.clone()
+        false
     };
 
     // 3. boot
     let console = work.join("console.log");
     println!(
         "virtkit: booting cloud-hypervisor (cpus={}, mem={})",
-        args.cpus, mem
+        args.cpus, args.mem
     );
-    let mut ch = match spawn_ch(
-        &args.cloud_hypervisor,
-        &boot_args,
-        &cmdline,
-        &args.kernel,
-        &vsock,
-        &console,
-        args.cpus,
-        &mem,
-    ) {
+    let spec = crate::vmm::VmSpec {
+        kernel: args.kernel.clone(),
+        cmdline,
+        disks,
+        initramfs,
+        shares,
+        vsock_cid: 3,
+        vsock_socket: vsock.clone(),
+        cpus: args.cpus,
+        mem: args.mem.clone(),
+        shared_mem,
+        net: crate::vmm::Net::None,
+        balloon: false,
+        serial_log: console.clone(),
+        api_socket: None,
+    };
+    let mut ch = match spawn_ch(&args.cloud_hypervisor, &spec) {
         Ok(ch) => ch,
         // The --net switch and --workdir virtiofsd are already spawned; kill them so a
         // failed boot does not leak host-side children (a leaked `vk virtiofsd` would,
@@ -618,35 +618,13 @@ async fn run_shell(addr: &SocketAddr) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_ch(
-    cloud_hypervisor: &Path,
-    boot_args: &[std::ffi::OsString],
-    cmdline: &str,
-    kernel: &Path,
-    vsock: &Path,
-    console: &Path,
-    cpus: u32,
-    mem: &str,
-) -> Result<Child> {
-    let log = std::fs::File::create(console.with_extension("ch.log"))?;
-    let mut cmd = Command::new(cloud_hypervisor);
-    cmd.arg("--kernel")
-        .arg(kernel)
-        .args(boot_args)
-        .arg("--vsock")
-        .arg(format!("cid=3,socket={}", vsock.display()))
-        .arg("--cpus")
-        .arg(format!("boot={cpus}"))
-        .arg("--memory")
-        .arg(format!("size={mem}"))
-        .arg("--serial")
-        .arg(format!("file={}", console.display()))
-        .arg("--console")
-        .arg("off")
-        .arg("--cmdline")
-        .arg(cmdline)
-        .stdin(Stdio::null())
+fn spawn_ch(cloud_hypervisor: &Path, spec: &crate::vmm::VmSpec) -> Result<Child> {
+    let log = std::fs::File::create(spec.serial_log.with_extension("ch.log"))?;
+    let mut cmd = crate::vmm::CloudHypervisor {
+        bin: cloud_hypervisor.to_path_buf(),
+    }
+    .command(spec);
+    cmd.stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
     // Self-reap the VM if virtkit dies before teardown — a leaked cloud-hypervisor is a
@@ -771,30 +749,17 @@ pub(crate) async fn boot_session(
     // base ext4 or the parent stage), so the guest's writes accumulate into it and it
     // becomes the stage's result — no separate boot overlay, no commit. (A raw-rw disk
     // does not present as /dev/vda, which is why every stage image is a qcow2.)
-    let mut boot_args: Vec<std::ffi::OsString> = vec![
-        "--initramfs".into(),
-        cpio.into_os_string(),
-        "--disk".into(),
-        format!(
-            "path={},readonly=off,backing_files=on,image_type=qcow2",
-            image.display()
-        )
-        .into(),
-    ];
+    let mut disks: Vec<crate::vmm::Disk> = vec![crate::vmm::Disk::overlay(image.to_path_buf())];
     // Source stages for COPY --from / RUN --mount=from, attached read-only as the next
     // virtio-blk disks (vdb, vdc, … in order) for the guest to mount and read. A forked
-    // source is a qcow2 over its parent, so it must be attached as qcow2 with its backing
-    // chain enabled; a base source is a plain raw ext4.
+    // source is a qcow2 over its parent (its backing chain is resolved); a base source is
+    // a plain raw ext4.
     for src in sources {
-        boot_args.push("--disk".into());
-        let mut a = std::ffi::OsString::from("path=");
-        a.push(src);
-        if disk_format(src) == "qcow2" {
-            a.push(",readonly=on,image_type=qcow2,backing_files=on");
-        } else {
-            a.push(",readonly=on");
-        }
-        boot_args.push(a);
+        disks.push(crate::vmm::Disk {
+            path: src.clone(),
+            qcow2: disk_format(src) == "qcow2",
+            readonly: true,
+        });
     }
     // The kernel runs the initramfs `/init` (the agent); it then pivots into the ext4
     // named by VIRTKIT_PIVOT. No `init=`/`root=` for the kernel to mount — the agent does.
@@ -807,13 +772,16 @@ pub(crate) async fn boot_session(
 
     // Build context for COPY from the context: served read-only over virtiofs and
     // mounted by the agent at CONTEXT_MOUNT (it reads VIRTKIT_VIRTIOFS at boot).
+    let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
     let mut virtiofsd: Option<Child> = None;
     if let Some(ctx) = context {
         let sock = work.join("context.fs.sock");
         virtiofsd = Some(crate::fleet::spawn_virtiofsd(&sock, ctx, true, &[], &[])?);
-        boot_args.push("--fs".into());
-        boot_args.push(format!("tag=context,socket={}", sock.display()).into());
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS=context:{CONTEXT_MOUNT}"));
+        shares.push(crate::vmm::FsShare {
+            tag: "context".into(),
+            socket: sock,
+        });
     }
 
     let mut switch: Option<Child> = None;
@@ -823,22 +791,24 @@ pub(crate) async fn boot_session(
         cmdline.push_str(&frag);
     }
 
-    // virtio-fs (the context share) requires shared guest memory.
-    let mem = if context.is_some() {
-        format!("{mem},shared=on")
-    } else {
-        mem.to_string()
-    };
-    let mut ch = spawn_ch(
-        cloud_hypervisor,
-        &boot_args,
-        &cmdline,
-        kernel,
-        &vsock,
-        &console,
+    // virtio-fs (the context share) requires shared guest memory (shared_mem).
+    let spec = crate::vmm::VmSpec {
+        kernel: kernel.to_path_buf(),
+        cmdline,
+        disks,
+        initramfs: Some(cpio),
+        shares,
+        vsock_cid: 3,
+        vsock_socket: vsock.clone(),
         cpus,
-        &mem,
-    )?;
+        mem: mem.to_string(),
+        shared_mem: context.is_some(),
+        net: crate::vmm::Net::None,
+        balloon: false,
+        serial_log: console.clone(),
+        api_socket: None,
+    };
+    let mut ch = spawn_ch(cloud_hypervisor, &spec)?;
     let addr = SocketAddr::VsockMux {
         path: vsock,
         port: VSOCK_PORT,

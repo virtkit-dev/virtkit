@@ -14,6 +14,7 @@ use vk_core::addr::SocketAddr;
 
 use crate::image::ResolvedImage;
 use crate::jobctx::JobCtx;
+use crate::vmm::Vmm;
 
 /// A job VM's boot medium: a copy-on-write ext4 disk (with an optional initrd —
 /// a self-booting image ships one; a generic guest on the all-built-in pinned
@@ -125,7 +126,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         ),
     };
 
-    let mut fs_args: Vec<String> = Vec::new();
+    let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
     if let Some(share) = &cfg.share {
         let vfsd_sock = ctx.vfsd_sock();
         let mut vfsd = cfg.virtiofsd_command(); // bundled `vk virtiofsd` unless configured
@@ -139,8 +140,10 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         std::fs::write(ctx.vfsd_pidfile(), child.id().to_string())?;
         wait_for_socket(&vfsd_sock, Duration::from_secs(5))
             .context("virtiofsd did not create its socket")?;
-        fs_args.push("--fs".into());
-        fs_args.push(format!("tag=workdir,socket={}", vfsd_sock.display()));
+        shares.push(crate::vmm::FsShare {
+            tag: "workdir".into(),
+            socket: vfsd_sock,
+        });
     }
 
     // GitLab CI tools ([gitlab] dir): a second, read-only virtio-fs share. The
@@ -159,12 +162,14 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         std::fs::write(ctx.tools_vfsd_pidfile(), child.id().to_string())?;
         wait_for_socket(&sock, Duration::from_secs(5))
             .context("the tools virtiofsd did not create its socket")?;
-        fs_args.push("--fs".into());
-        fs_args.push(format!("tag=vktools,socket={}", sock.display()));
+        shares.push(crate::vmm::FsShare {
+            tag: "vktools".into(),
+            socket: sock,
+        });
         cmdline.push_str(" VIRTKIT_TOOLS=vktools:/run/virtkit-tools");
     }
 
-    let mut net_args: Vec<String> = Vec::new();
+    let mut net = crate::vmm::Net::None;
     // (ip, prefix, gw, dns) once a tap is wired, rendered onto the cmdline below
     // in the form the chosen init understands.
     let mut net_info: Option<(String, u32, String, String)> = None;
@@ -174,8 +179,10 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             if cfg.net.tap.is_empty() {
                 bail!("net.mode = \"tap\" requires net.tap");
             }
-            net_args.push("--net".into());
-            net_args.push(format!("tap={},mac={}", cfg.net.tap, cfg.net.mac));
+            net = crate::vmm::Net::Tap {
+                tap: cfg.net.tap.clone(),
+                mac: cfg.net.mac.clone(),
+            };
             if !cfg.net.ip.is_empty() {
                 let (ip, prefix) = split_cidr(&cfg.net.ip)?;
                 net_info = Some((ip, prefix, cfg.net.gw.clone(), cfg.net.dns.clone()));
@@ -183,8 +190,10 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         }
         "pool" => {
             let lease = crate::net::allocate(ctx)?;
-            net_args.push("--net".into());
-            net_args.push(format!("tap={},mac={}", lease.tap, lease.mac));
+            net = crate::vmm::Net::Tap {
+                tap: lease.tap.clone(),
+                mac: lease.mac.clone(),
+            };
             net_info = Some((lease.ip, lease.prefix.into(), lease.gw, lease.dns));
         }
         "switch" => {
@@ -253,60 +262,39 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         cmdline.push_str(&cfg.vm.cmdline_extra);
     }
 
-    // kernel is common; the boot medium is either a CoW disk overlay + its initrd
-    // or a single cpio initramfs (the rootfs in RAM).
-    let mut boot_args: Vec<std::ffi::OsString> =
-        vec!["--kernel".into(), kernel.clone().into_os_string()];
-    match &media {
-        Media::Disk { initrd, .. } => {
-            boot_args.push("--disk".into());
-            boot_args.push(
-                format!(
-                    "path={},readonly=off,backing_files=on,image_type=qcow2",
-                    overlay.display()
-                )
-                .into(),
-            );
-            // self-booting images ship an initrd; a generic guest on the pinned
-            // kernel mounts /dev/vda directly (virtio-blk + ext4 built in)
-            if let Some(initrd) = initrd {
-                boot_args.push("--initramfs".into());
-                boot_args.push(initrd.clone().into_os_string());
-            }
-        }
-        Media::Initramfs { cpio } => {
-            boot_args.push("--initramfs".into());
-            boot_args.push(cpio.clone().into_os_string());
-        }
-    }
+    // kernel is common; the boot medium is either a CoW disk overlay (+ a
+    // self-booting image's initrd) or a single cpio initramfs (the rootfs in RAM).
+    // A generic guest on the pinned kernel ships no initrd (virtio-blk + ext4 built in).
+    let (disks, initramfs) = match &media {
+        Media::Disk { initrd, .. } => (
+            vec![crate::vmm::Disk::overlay(overlay.clone())],
+            initrd.clone(),
+        ),
+        Media::Initramfs { cpio } => (Vec::new(), Some(cpio.clone())),
+    };
 
-    let mut ch = Command::new(cfg.cloud_hypervisor());
-    ch.arg("--api-socket")
-        .arg(ctx.api_sock())
-        .args(&boot_args)
-        .args(&fs_args)
-        .arg("--vsock")
-        .arg(format!("cid=3,socket={}", ctx.vsock_sock().display()))
-        .arg("--cpus")
-        .arg(format!("boot={cpus}"))
-        .arg("--memory")
-        // shared=on: required by virtio-fs, harmless without
-        .arg(format!("size={mem},shared=on"))
-        .arg("--serial")
-        .arg(format!("file={}", ctx.console_log().display()))
-        .arg("--console")
-        .arg("off")
-        .arg("--cmdline")
-        .arg(&cmdline)
-        .args(&net_args);
-    if cfg.vm.balloon {
-        // size=0: no static balloon, just give freed guest pages back to the
-        // host so concurrent jobs overcommit safely (CONFIG_PAGE_REPORTING
-        // guest side, Debian kernels have it)
-        ch.arg("--balloon")
-            .arg("size=0,deflate_on_oom=on,free_page_reporting=on");
+    // shared=on (set via shared_mem): required by virtio-fs, harmless without.
+    let spec = crate::vmm::VmSpec {
+        kernel,
+        cmdline,
+        disks,
+        initramfs,
+        shares,
+        vsock_cid: 3,
+        vsock_socket: ctx.vsock_sock(),
+        cpus,
+        mem: mem.clone(),
+        shared_mem: true,
+        net,
+        balloon: cfg.vm.balloon,
+        serial_log: ctx.console_log(),
+        api_socket: Some(ctx.api_sock()),
+    };
+    let ch_command = crate::vmm::CloudHypervisor {
+        bin: cfg.cloud_hypervisor().to_path_buf(),
     }
-    let mut ch_child = spawn_detached(ch, &ctx.ch_log())
+    .command(&spec);
+    let mut ch_child = spawn_detached(ch_command, &ctx.ch_log())
         .with_context(|| format!("spawning {}", cfg.cloud_hypervisor().display()))?;
     std::fs::write(ctx.ch_pidfile(), ch_child.id().to_string())?;
 

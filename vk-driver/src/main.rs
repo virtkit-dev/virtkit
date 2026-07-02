@@ -44,6 +44,7 @@ mod switch;
 #[cfg(feature = "virtiofsd")]
 mod virtiofsd;
 mod vm;
+mod vmm;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
