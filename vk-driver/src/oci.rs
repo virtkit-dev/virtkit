@@ -217,13 +217,17 @@ pub async fn pull_flatten(
         .await
         .with_context(|| format!("pulling {reference}"))?;
 
-    let blob_path = out_tar.with_extension("blob");
-    let mut merger = Merger::new(&blob_path)?;
+    // scratch next to the output tar, not $TMPDIR: a multi-GB image on a tmpfs
+    // /tmp would land in RAM.
+    let scratch_dir = match out_tar.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let mut merger = Merger::new(crate::scratch::scratch(scratch_dir, "oci-spill")?);
     for layer in &image.layers {
         merger.apply_layer(&layer.data[..], &layer.media_type)?;
     }
     let n = merger.finish(out_tar)?;
-    let _ = std::fs::remove_file(&blob_path);
     println!(
         "virtkit: flattened {} layers -> {n} entries",
         image.layers.len()
@@ -257,19 +261,15 @@ pub(crate) struct Merger {
 }
 
 impl Merger {
-    pub(crate) fn new(blob_path: &Path) -> Result<Self> {
-        // read+write: apply_layer appends file data, finish seeks back to read it
-        Ok(Merger {
+    /// `blob` is the spill file for regular-file data: it must be open read+write
+    /// (apply_layer appends, finish seeks back to read) — e.g. a `scratch()` file,
+    /// which no aborted run can leak.
+    pub(crate) fn new(blob: std::fs::File) -> Merger {
+        Merger {
             entries: BTreeMap::new(),
-            blob: std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(blob_path)
-                .with_context(|| format!("creating {}", blob_path.display()))?,
+            blob,
             off: 0,
-        })
+        }
     }
 
     /// Apply one layer: collect its entries + whiteouts, remove whited-out paths
@@ -533,9 +533,7 @@ mod tests {
         b.append(&h, &b"ping"[..]).unwrap();
         let layer = b.into_inner().unwrap();
 
-        let dir = std::env::temp_dir().join(format!("virtkit-oci-xattr-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut m = Merger::new(&dir.join("blob")).unwrap();
+        let mut m = Merger::new(crate::scratch::scratch(&std::env::temp_dir(), "test-spill").unwrap());
         m.apply_layer(
             Cursor::new(&layer),
             "application/vnd.oci.image.layer.v1.tar",
@@ -543,7 +541,6 @@ mod tests {
         .unwrap();
         let mut out = Vec::new();
         m.finish_to(&mut out).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
 
         // read the merged tar back; the xattr must be present on the file.
         let mut ar = tar::Archive::new(Cursor::new(&out));

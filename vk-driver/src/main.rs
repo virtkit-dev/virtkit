@@ -39,6 +39,7 @@ mod qcow2;
 mod registry;
 mod regserve;
 mod run;
+mod scratch;
 mod services;
 mod source;
 mod sshagent;

@@ -11,7 +11,6 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom};
-use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -191,8 +190,7 @@ fn build_inner(
     all.push(("etc/virtkit/cmd", cmd_file.as_path(), 0o644));
 
     // flatten layers in manifest order through the shared Merger.
-    let blob_spill = work.join("rootfs.blob");
-    let mut merger = Merger::new(&blob_spill)?;
+    let mut merger = Merger::new(crate::scratch::scratch(work, "rootfs-spill")?);
     for layer in &manifest.layers {
         let (off, size) = ar.blob_range(&blob_path(&layer.digest))?;
         ar.file.seek(SeekFrom::Start(off))?;
@@ -212,7 +210,7 @@ fn build_inner(
     // through an OS pipe — no intermediate rootfs tar on disk (saves a multi-GB
     // write+read pass on large images). A writer thread emits the tar; this thread
     // consumes it and writes the ext4.
-    let (rd, wr) = os_pipe()?;
+    let (rd, wr) = crate::scratch::os_pipe()?;
     let writer = std::thread::spawn(move || -> Result<usize> {
         merger.finish_to(BufWriter::with_capacity(1 << 20, wr))
     });
@@ -236,21 +234,6 @@ fn build_inner(
     let n = merged?;
     println!("virtkit: flattened {layers_n} layers -> {n} entries");
     Ok(())
-}
-
-/// A unidirectional OS pipe as a (read, write) pair of owned files, for streaming
-/// the flattened rootfs from the merger thread into the ext4 builder.
-fn os_pipe() -> Result<(std::fs::File, std::fs::File)> {
-    let mut fds = [0i32; 2];
-    // SAFETY: pipe2(2) writes two fresh fds into the array on success. O_CLOEXEC
-    // keeps them from leaking into any concurrent fork+exec.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("creating pipe");
-    }
-    // SAFETY: both fds are freshly created and owned; wrap them in Files.
-    let read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
-    let write = unsafe { std::fs::File::from_raw_fd(fds[1]) };
-    Ok((read, write))
 }
 
 const INDEX_PATH: &str = "index.json";
@@ -485,8 +468,7 @@ mod tests {
         let config: ConfigFile = ar.read_json(&blob_path(&manifest.config.digest)).unwrap();
 
         // flatten through the shared Merger.
-        let spill = dir.join("spill");
-        let mut merger = Merger::new(&spill).unwrap();
+        let mut merger = Merger::new(crate::scratch::scratch(&dir, "test-spill").unwrap());
         for layer in &manifest.layers {
             let (off, size) = ar.blob_range(&blob_path(&layer.digest)).unwrap();
             ar.file.seek(SeekFrom::Start(off)).unwrap();
