@@ -99,32 +99,47 @@ pub async fn run(args: &RunArgs) -> Result<()> {
     if args.shell && unsafe { libc::isatty(0) != 1 || libc::isatty(1) != 1 } {
         bail!("--shell requires stdin and stdout to be a terminal");
     }
-    let work = std::env::temp_dir().join(format!("virtkit-launch-{}", std::process::id()));
-    std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
+    let work = WorkDir::create(
+        std::env::temp_dir().join(format!("virtkit-launch-{}", std::process::id())),
+    )?;
     // Resolve the agent and kernel: an explicit flag wins, else the copy embedded
     // in `vk` (served from a memfd), else the on-disk default.
-    let result = async {
-        // Held for the VM's lifetime: an embedded asset lives in a memfd whose
-        // /proc/self/fd path is only valid while the fd is open.
-        let agent = crate::embed::resolve(crate::embed::Asset::Agent, args.agent.as_deref())?;
-        let kernel = crate::embed::resolve(crate::embed::Asset::Kernel, args.kernel.as_deref())?;
-        if !agent.is_embedded() && !agent.path.is_file() {
-            bail!(
-                "vk-agent not found at {} (pass --agent, or use a `vk` with it embedded)",
-                agent.path.display()
-            );
-        }
-        if !kernel.is_embedded() && !kernel.path.is_file() {
-            bail!(
-                "kernel not found at {} (pass --kernel, or use a `vk` with it embedded)",
-                kernel.path.display()
-            );
-        }
-        build_and_boot(args, &work, &agent.path, &kernel.path).await
+    // Held for the VM's lifetime: an embedded asset lives in a memfd whose
+    // /proc/self/fd path is only valid while the fd is open.
+    let agent = crate::embed::resolve(crate::embed::Asset::Agent, args.agent.as_deref())?;
+    let kernel = crate::embed::resolve(crate::embed::Asset::Kernel, args.kernel.as_deref())?;
+    if !agent.is_embedded() && !agent.path.is_file() {
+        bail!(
+            "vk-agent not found at {} (pass --agent, or use a `vk` with it embedded)",
+            agent.path.display()
+        );
     }
-    .await;
-    let _ = std::fs::remove_dir_all(&work);
-    result
+    if !kernel.is_embedded() && !kernel.path.is_file() {
+        bail!(
+            "kernel not found at {} (pass --kernel, or use a `vk` with it embedded)",
+            kernel.path.display()
+        );
+    }
+    build_and_boot(args, &work.path, &agent.path, &kernel.path).await
+}
+
+/// A launch's named scratch dir. Removed on drop, so error and panic unwinds clean
+/// it up too; only a signal kill can leak it.
+struct WorkDir {
+    path: PathBuf,
+}
+
+impl WorkDir {
+    fn create(path: PathBuf) -> Result<WorkDir> {
+        std::fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
+        Ok(WorkDir { path })
+    }
+}
+
+impl Drop for WorkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 /// Pick the rootfs source for an image boot per `--source`. `auto` prefers the registry
