@@ -27,11 +27,30 @@ pub fn build_initramfs(tar: impl Read, agent: &Path, out: &Path) -> Result<()> {
 /// by the boot medium, never written into the rootfs. The kernel auto-mounts devtmpfs,
 /// so no `/dev/console` node is needed in the archive.
 pub fn build_agent_initramfs(agent: &Path, out: &Path) -> Result<()> {
+    build_agent_initramfs_with_config(agent, None, out)
+}
+
+/// [`build_agent_initramfs`] plus an optional boot-time service config: the JSON
+/// rides the archive at [`vk_core::runcfg::INITRAMFS_PATH`], where the agent reads
+/// it before pivoting. This is how a service's runtime config reaches a byte-clean
+/// image — rendered per boot (the cpio is rebuilt per boot anyway), never baked in.
+pub fn build_agent_initramfs_with_config(
+    agent: &Path,
+    config: Option<&vk_core::runcfg::RunConfig>,
+    out: &Path,
+) -> Result<()> {
     let file = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
     let mut cpio = CpioWriter::new(std::io::BufWriter::new(file));
     let f = std::fs::File::open(agent).with_context(|| format!("opening {}", agent.display()))?;
     let size = f.metadata()?.len();
     cpio.file("init", 0o755, size as u32, f)?;
+    if let Some(cfg) = config {
+        cpio.file_bytes(
+            vk_core::runcfg::INITRAMFS_PATH,
+            0o600,
+            cfg.to_json().as_bytes(),
+        )?;
+    }
     cpio.finish()?;
     Ok(())
 }
@@ -84,4 +103,40 @@ pub fn build_initramfs_injecting(
     }
     cpio.finish()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_initramfs_carries_the_boot_config() {
+        let tmp = std::env::temp_dir().join(format!("vk-initramfs-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let agent = tmp.join("agent");
+        std::fs::write(&agent, b"#!agent").unwrap();
+
+        let cfg = vk_core::runcfg::RunConfig {
+            entrypoint: vec!["redis-server".into()],
+            ..Default::default()
+        };
+        let with = tmp.join("with.cpio");
+        build_agent_initramfs_with_config(&agent, Some(&cfg), &with).unwrap();
+        let bytes = std::fs::read(&with).unwrap();
+        let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        assert!(has(vk_core::runcfg::INITRAMFS_PATH.as_bytes()));
+        assert!(has(b"redis-server"));
+
+        // without a config the entry is absent (plain run/build boots stay as-is).
+        let without = tmp.join("without.cpio");
+        build_agent_initramfs(&agent, &without).unwrap();
+        let bytes = std::fs::read(&without).unwrap();
+        assert!(
+            !bytes
+                .windows(vk_core::runcfg::INITRAMFS_PATH.len())
+                .any(|w| w == vk_core::runcfg::INITRAMFS_PATH.as_bytes())
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

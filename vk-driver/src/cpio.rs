@@ -79,7 +79,7 @@ impl<W: Write> CpioWriter<W> {
         self.pad(size as usize)
     }
 
-    #[cfg(test)]
+    /// A regular file from an in-memory buffer (e.g. a rendered boot config).
     pub fn file_bytes(&mut self, name: &str, mode: u32, data: &[u8]) -> io::Result<()> {
         self.file(name, mode, data.len() as u32, data)
     }
