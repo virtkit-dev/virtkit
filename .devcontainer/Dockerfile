@@ -1,7 +1,7 @@
 # Official Rust Alpine image (musl-native), pinned by digest for reproducible
 # builds. Tag and digest are kept in sync with rust-toolchain.toml by update.sh.
-# Alpine (not Debian) so the bundled virtiofsd can link the static libseccomp /
-# libcap-ng that Alpine ships as packages — Debian has no musl-static build of them.
+# Alpine (not Debian) for a musl-native gcc: the C our deps vendor (ring, zstd,
+# jemalloc) then targets musl directly. No system C libraries are linked.
 FROM rust:1.96.1-alpine3.21@sha256:bdd51fa1f2ff1b9accee5224246e39f4817228ee1c20e335635e8e55badec324
 
 # Build deps (one per line in apk-pins.txt, pinned to exact versions for byte-for-byte
@@ -9,8 +9,6 @@ FROM rust:1.96.1-alpine3.21@sha256:bdd51fa1f2ff1b9accee5224246e39f4817228ee1c20e
 # above are what freeze the inputs; regenerate with ./update.sh):
 #   gcc + musl-dev          ring (rustls' crypto backend) compiles C; Alpine's gcc
 #                           is musl-native, so it is also the musl C compiler.
-#   libseccomp-static/-dev  the static FFI libs the bundled virtiofsd links
-#   libcap-ng-static/-dev   (LIB*_LINK_TYPE=static in build.sh).
 #   git, ca-certificates, file   dev/build basics.
 COPY apk-pins.txt /tmp/apk-pins.txt
 RUN apk add --no-cache $(grep -vE '^[[:space:]]*(#|$)' /tmp/apk-pins.txt)

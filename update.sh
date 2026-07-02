@@ -19,7 +19,7 @@ sed -i -E "s/^channel = \".*\"/channel = \"$LATEST\"/" rust-toolchain.toml
 
 # Resolve the matching Rust Alpine image digest so the FROM line stays pinned, not
 # just tagged. ALPINE_TAG fixes the Alpine minor; bump it deliberately (a new Alpine
-# minor can change the libseccomp/libcap-ng versions linked into the binary).
+# minor can change the toolchain the vendored C is built with).
 ALPINE_TAG="${ALPINE_TAG:-alpine3.21}"
 IMG="rust:${LATEST}-${ALPINE_TAG}"
 docker pull -q "$IMG" >/dev/null
@@ -38,8 +38,8 @@ pin_apk() {
     echo "resolving apk versions for $pins in $IMG ..."
     # Install the packages, then read each one's installed version from `apk list
     # --installed` (lines "<name>-<version> <arch> …"): grep the package's line
-    # (anchored, version starts with a digit so libcap-ng vs libcap-ng-dev don't
-    # collide), take the first field, strip the "<name>-" prefix.
+    # (anchored, version starts with a digit so a package and its -dev variant
+    # don't collide), take the first field, strip the "<name>-" prefix.
     resolved=$(docker run --rm "$IMG" sh -ec '
         apk add --no-cache -q '"$names"' >/dev/null 2>&1 || true
         for p in '"$names"'; do

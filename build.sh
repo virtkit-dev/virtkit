@@ -83,10 +83,6 @@ BUILD_ENV=(
   SOURCE_DATE_EPOCH=0
   "RUSTFLAGS=--remap-path-prefix=/work=/src --remap-path-prefix=/work/target/.cargo-home=/cargo"
   "CFLAGS_x86_64_unknown_linux_musl=-ffile-prefix-map=/work=/src -ffile-prefix-map=/work/target/.cargo-home=/cargo"
-  LIBSECCOMP_LINK_TYPE=static
-  LIBSECCOMP_LIB_PATH=/usr/lib
-  LIBCAPNG_LINK_TYPE=static
-  LIBCAPNG_LIB_PATH=/usr/lib
 )
 
 # `vk` embeds the guest kernel and vk-agent, so the compile is two phases: build

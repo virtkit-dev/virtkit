@@ -41,8 +41,9 @@ The guest kernel is a vanilla Linux `vmlinux` built from a vendored config fragm
 ## Development Environment
 
 The release artifacts are built reproducibly inside a pinned devcontainer image
-(`.devcontainer/Dockerfile`, `rust:<ver>-alpine`, digest- and apk-pinned). Alpine is
-required so the bundled `virtiofsd` can statically link `libseccomp` / `libcap-ng`.
+(`.devcontainer/Dockerfile`, `rust:<ver>-alpine`, digest- and apk-pinned). Alpine
+supplies a musl-native gcc for the C our deps vendor (ring, zstd, jemalloc); no
+system C libraries are linked.
 All build scripts wrap Docker, so the host needs only Docker — no local Rust setup.
 
 ```bash
