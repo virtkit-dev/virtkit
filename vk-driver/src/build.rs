@@ -36,7 +36,7 @@ mod plan;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use exec::{DryRun, Executor, Host, MicroVm, ResolvedMount, Rootfs, ShellState};
 use interp::Vars;
@@ -122,6 +122,28 @@ pub fn build(opts: &Options) -> Result<Built> {
     } else {
         std::env::temp_dir().join(format!("virtkit-build-{}", std::process::id()))
     };
+    // Resolve the microVM's kernel + agent up front and hold them for the whole build:
+    // an embedded asset lives in a memfd whose /proc/self/fd path is valid only while the
+    // fd is open, and every stage boot (and the initramfs packer) reopens it.
+    let (kernel, agent) = if opts.microvm {
+        let kernel = crate::embed::resolve(crate::embed::Asset::Kernel, opts.kernel.as_deref())?;
+        if !kernel.is_embedded() && !kernel.path.is_file() {
+            bail!(
+                "kernel not found at {} (pass --kernel, or use a `vk` with it embedded)",
+                kernel.path.display()
+            );
+        }
+        let agent = crate::embed::resolve(crate::embed::Asset::Agent, opts.agent.as_deref())?;
+        if !agent.is_embedded() && !agent.path.is_file() {
+            bail!(
+                "vk-agent not found at {} (pass --agent, or use a `vk` with it embedded)",
+                agent.path.display()
+            );
+        }
+        (Some(kernel), Some(agent))
+    } else {
+        (None, None)
+    };
     let mut ex: Box<dyn Executor> = if opts.microvm {
         let cache = opts.cache_registry.clone().map(|repo| {
             crate::config::Registry::for_share(
@@ -133,12 +155,14 @@ pub fn build(opts: &Options) -> Result<Built> {
                 None,
             )
         });
+        let kernel = kernel.as_ref().expect("resolved under opts.microvm");
+        let agent = agent.as_ref().expect("resolved under opts.microvm");
         Box::new(MicroVm::new(
             opts.cloud_hypervisor
                 .clone()
                 .context("--microvm needs --cloud-hypervisor")?,
-            opts.kernel.clone().context("--microvm needs --kernel")?,
-            opts.agent.clone().context("--microvm needs --agent")?,
+            kernel.path.clone(),
+            agent.path.clone(),
             scratch.clone(),
             cache,
             opts.journal,

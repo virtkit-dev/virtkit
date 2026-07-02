@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Self-contained `vk`**: the guest kernel and `vk-agent` are embedded into the
+  binary — a single file boots OCI images.
+
 ## [0.4.0] - 2026-07-02
 
 ### Changed

@@ -65,8 +65,10 @@ pub struct RunArgs {
     /// host dir shared read-write into the guest (at WORKDIR_MOUNT); the command runs
     /// there, so its outputs land back on the host. `None` = no share.
     pub workdir: Option<PathBuf>,
-    pub kernel: PathBuf,
-    pub agent: PathBuf,
+    /// `None` uses the kernel embedded in `vk` (or the on-disk default).
+    pub kernel: Option<PathBuf>,
+    /// `None` uses the vk-agent embedded in `vk` (or the on-disk default).
+    pub agent: Option<PathBuf>,
     pub cloud_hypervisor: PathBuf,
     /// where the rootfs comes from for an image boot (registry pull / docker export / auto)
     pub source: SourceMode,
@@ -92,25 +94,34 @@ pub struct RunArgs {
 }
 
 pub async fn run(args: &RunArgs) -> Result<()> {
-    if !args.agent.is_file() {
-        bail!(
-            "vk-agent not found at {} (build it: ./build.sh)",
-            args.agent.display()
-        );
-    }
-    if !args.kernel.is_file() {
-        bail!(
-            "kernel not found at {} (the pinned guest vmlinux)",
-            args.kernel.display()
-        );
-    }
     // SAFETY: isatty has no failure mode beyond returning 0
     if args.shell && unsafe { libc::isatty(0) != 1 || libc::isatty(1) != 1 } {
         bail!("--shell requires stdin and stdout to be a terminal");
     }
     let work = std::env::temp_dir().join(format!("virtkit-launch-{}", std::process::id()));
     std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
-    let result = build_and_boot(args, &work).await;
+    // Resolve the agent and kernel: an explicit flag wins, else the copy embedded
+    // in `vk` (served from a memfd), else the on-disk default.
+    let result = async {
+        // Held for the VM's lifetime: an embedded asset lives in a memfd whose
+        // /proc/self/fd path is only valid while the fd is open.
+        let agent = crate::embed::resolve(crate::embed::Asset::Agent, args.agent.as_deref())?;
+        let kernel = crate::embed::resolve(crate::embed::Asset::Kernel, args.kernel.as_deref())?;
+        if !agent.is_embedded() && !agent.path.is_file() {
+            bail!(
+                "vk-agent not found at {} (pass --agent, or use a `vk` with it embedded)",
+                agent.path.display()
+            );
+        }
+        if !kernel.is_embedded() && !kernel.path.is_file() {
+            bail!(
+                "kernel not found at {} (pass --kernel, or use a `vk` with it embedded)",
+                kernel.path.display()
+            );
+        }
+        build_and_boot(args, &work, &agent.path, &kernel.path).await
+    }
+    .await;
     let _ = std::fs::remove_dir_all(&work);
     result
 }
@@ -161,7 +172,7 @@ async fn resolve_source(args: &RunArgs) -> Result<Source> {
     }
 }
 
-async fn build_and_boot(args: &RunArgs, work: &Path) -> Result<()> {
+async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path) -> Result<()> {
     // A Dockerfile boot reuses the build pipeline: build (or cache-restore, with a
     // registry) the target into an ext4, then boot it through the disk path below — so
     // `run -f Dockerfile` needs no explicit `--out` ext4. Otherwise fetch the rootfs tar
@@ -182,8 +193,8 @@ async fn build_and_boot(args: &RunArgs, work: &Path) -> Result<()> {
                 print_plan: false,
                 microvm: true,
                 cloud_hypervisor: Some(args.cloud_hypervisor.clone()),
-                kernel: Some(args.kernel.clone()),
-                agent: Some(args.agent.clone()),
+                kernel: Some(kernel.to_path_buf()),
+                agent: Some(agent.to_path_buf()),
                 cache_registry: args.cache_registry.clone(),
                 cache_insecure: args.cache_insecure,
                 journal: false,
@@ -213,7 +224,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path) -> Result<()> {
             // the builder boots its own stages: a minimal initramfs holds the agent as `/init`,
             // which pivots into the ext4 at /dev/vda — so the booted image stays byte-clean.
             let cpio = work.join("initramfs.cpio");
-            crate::initramfs::build_agent_initramfs(&args.agent, &cpio)?;
+            crate::initramfs::build_agent_initramfs(agent, &cpio)?;
             // throwaway rw qcow2 overlay over the ro raw ext4 (rw raw errors on tmpfs)
             let overlay = work.join("overlay.qcow2");
             crate::qcow2::create_overlay(&overlay, ext4)?;
@@ -228,7 +239,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path) -> Result<()> {
         } else if args.disk {
             println!("virtkit: building ext4 rootfs");
             let rootfs = work.join("root.ext4");
-            crate::ext4::build_from_tar(&rootfs_tar, &args.agent, &rootfs)?;
+            crate::ext4::build_from_tar(&rootfs_tar, agent, &rootfs)?;
             // throwaway rw qcow2 overlay over the ro raw ext4 (rw raw errors on tmpfs)
             let overlay = work.join("overlay.qcow2");
             crate::qcow2::create_overlay(&overlay, &rootfs)?;
@@ -245,7 +256,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path) -> Result<()> {
         } else {
             println!("virtkit: building cpio initramfs");
             let cpio = work.join("initramfs.cpio");
-            crate::initramfs::build_initramfs(&rootfs_tar, &args.agent, &cpio)?;
+            crate::initramfs::build_initramfs(&rootfs_tar, agent, &cpio)?;
             (
                 Vec::new(),
                 Some(cpio),
@@ -308,7 +319,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path) -> Result<()> {
         args.cpus, args.mem
     );
     let spec = crate::vmm::VmSpec {
-        kernel: args.kernel.clone(),
+        kernel: kernel.to_path_buf(),
         cmdline,
         disks,
         initramfs,
@@ -627,6 +638,25 @@ fn spawn_ch(cloud_hypervisor: &Path, spec: &crate::vmm::VmSpec) -> Result<Child>
     cmd.stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
+    // An embedded kernel is a CLOEXEC memfd addressed as /proc/self/fd/<n> (so idle
+    // helpers never inherit it). Hand it to the VMM alone by clearing CLOEXEC on that fd
+    // in the forked child, so it survives exec and the VMM can open the path.
+    if let Some(fd) = spec
+        .kernel
+        .to_str()
+        .and_then(|s| s.strip_prefix("/proc/self/fd/"))
+        .and_then(|n| n.parse::<std::os::unix::io::RawFd>().ok())
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: pre_exec runs in the forked child before exec; fcntl(F_SETFD) is
+        // async-signal-safe. F_SETFD 0 clears FD_CLOEXEC (the only fd flag).
+        unsafe {
+            cmd.pre_exec(move || match libc::fcntl(fd, libc::F_SETFD, 0) {
+                -1 => Err(std::io::Error::last_os_error()),
+                _ => Ok(()),
+            });
+        }
+    }
     // Self-reap the VM if virtkit dies before teardown — a leaked cloud-hypervisor is a
     // whole running guest, not just an idle helper (spawn_tied).
     crate::fleet::spawn_tied(cmd)

@@ -5,7 +5,8 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
-# The crate is vk-driver, but the shipped host binary is `vk`.
+# The single shipped binary is `vk` — vk-driver with the guest kernel and vk-agent
+# embedded (see build.rs + src/embed.rs, the default `embed` feature).
 [[bin]]
 name = "vk"
 path = "src/main.rs"
@@ -53,6 +54,12 @@ vm-memory = { version = "0.16", features = ["backend-mmap", "backend-atomic"], o
 jemallocator.workspace = true
 
 [features]
-default = ["virtiofsd"]
-# compile the bundled virtio-fs daemon into virtkit
+default = ["virtiofsd", "embed"]
+# Embed the guest kernel (vmlinux) and vk-agent into the `vk` binary so it runs
+# self-contained (no --kernel/--agent, no files under /usr/local/lib/vk). build.rs
+# reads VK_EMBED_KERNEL / VK_EMBED_AGENT at compile time; when unset (a plain dev
+# `cargo build`) it embeds nothing and the runtime falls back to those flags. See
+# src/embed.rs. build.sh sets the two vars for a real, shippable self-contained `vk`.
+embed = []
+# compile the bundled virtio-fs daemon into vk
 virtiofsd = ["dep:virtiofsd", "dep:vhost", "dep:vhost-user-backend", "dep:vm-memory"]
