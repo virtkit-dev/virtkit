@@ -17,6 +17,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- the run-stage shell is picked by probing the booted guest for bash, so
+  bash-less images (alpine, distroless) run correctly.
 - a `--ram` boot refuses an initramfs that cannot unpack in `--mem`, naming the
   required size.
 

@@ -82,17 +82,6 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     }
     std::fs::create_dir_all(&ctx.job_dir)
         .with_context(|| format!("creating {}", ctx.job_dir.display()))?;
-    // record the boot flavour for the run stage (a separate process) to pick the
-    // guest shell: a cpio/OCI guest (alpine/distroless in RAM) has no bash.
-    let _ = std::fs::write(
-        ctx.job_dir.join("boot.kind"),
-        match (generic, &media) {
-            (true, Media::Disk { .. }) => "generic-disk",
-            (true, Media::Initramfs { .. }) => "generic-cpio",
-            (false, _) => "systemd",
-        },
-    );
-
     // Disk guests get a throwaway CoW overlay over the ro base; initramfs guests
     // have no disk at all (the rootfs is the cpio, in RAM).
     let overlay = ctx.overlay();
@@ -344,6 +333,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
                     "vk: VM ready in {:.1}s (vk-agent {status})",
                     start.elapsed().as_secs_f32()
                 );
+                probe_guest_shell(ctx, &addr).await;
                 start_ssh_agent_forward(ctx)?;
                 start_services(ctx).await?;
                 return Ok(());
@@ -396,6 +386,29 @@ fn start_ssh_agent_forward(ctx: &JobCtx) -> Result<()> {
     wait_for_socket(&listen, Duration::from_secs(5))
         .context("ssh-agent forward did not bind its socket")?;
     Ok(())
+}
+
+/// Probe the booted guest for bash and record the result for the run stage (a
+/// separate process): the configured run_command (bash) serves most images, but a
+/// bash-less OCI guest (alpine, distroless) needs the POSIX-sh fallback. Probing
+/// the actual guest replaces the old medium-based guess (cpio => sh), which broke
+/// bash-less images once generic bundles became ext4 disks. Best-effort: an
+/// unreadable marker falls back to the configured command.
+async fn probe_guest_shell(ctx: &JobCtx, addr: &vk_core::addr::SocketAddr) {
+    let has_bash = matches!(
+        crate::executor::exec_script(
+            addr,
+            &["sh".to_string()],
+            b"command -v bash >/dev/null 2>&1".to_vec(),
+            None,
+        )
+        .await,
+        Ok(res) if res.code == Some(0)
+    );
+    let _ = std::fs::write(
+        ctx.job_dir.join("guest.shell"),
+        if has_bash { "configured" } else { "sh" },
+    );
 }
 
 /// Bring up the job's CI `services:` once the VM is ready (no-op without any).
