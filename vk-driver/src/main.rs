@@ -207,8 +207,8 @@ enum Cmd {
         #[arg(long)]
         agent: Option<PathBuf>,
         /// instruction cache: a registry repo (e.g. 127.0.0.1:5000 of a `vk registry
-        /// serve`), a store directory path (accessed in-process), or `none` to disable.
-        /// Default: the builtin local store `vk registry serve` also uses.
+        /// serve`), an absolute store directory path (accessed in-process), or `none`
+        /// to disable. Default: the builtin local store `vk registry serve` also uses.
         #[arg(long = "cache-registry")]
         cache_registry: Option<String>,
         /// the cache registry speaks plain HTTP (a loopback regserve); registry
@@ -373,8 +373,8 @@ enum Cmd {
         context: Option<PathBuf>,
         /// instruction cache for the --file build (push/pull each stage's ext4 by
         /// content key, so a repeat boot restores instead of rebuilding): a registry
-        /// repo, a store directory path, or `none` to disable. Default: the builtin
-        /// local store `vk registry serve` also uses.
+        /// repo, an absolute store directory path, or `none` to disable. Default:
+        /// the builtin local store `vk registry serve` also uses.
         #[arg(long = "cache-registry")]
         cache_registry: Option<String>,
         /// the cache registry speaks plain HTTP (a loopback regserve); registry

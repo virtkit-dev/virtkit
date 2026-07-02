@@ -57,8 +57,8 @@ pub struct RunArgs {
     pub context: Option<PathBuf>,
     /// Instruction cache for a Dockerfile boot: each stage's ext4 is pushed/pulled by
     /// its content key, so a repeat boot restores instead of rebuilding. A registry
-    /// repo, a store directory path, or `none` to disable; `None` = the builtin local
-    /// store (`regserve::default_root`).
+    /// repo, an absolute store directory path, or `none` to disable; `None` = the
+    /// builtin local store (`regserve::default_root`).
     pub cache_registry: Option<String>,
     /// the cache registry speaks plain HTTP (a loopback regserve).
     pub cache_insecure: bool,

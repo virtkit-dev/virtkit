@@ -61,8 +61,9 @@ pub struct Options {
     pub kernel: Option<PathBuf>,
     pub agent: Option<PathBuf>,
     /// instruction-cache destination: a registry repo (e.g. a `vk registry serve` at
-    /// `127.0.0.1:5000`), a store directory path (accessed in-process), or `none` to
-    /// disable caching. `None` = the builtin local store (`regserve::default_root`).
+    /// `127.0.0.1:5000`), an absolute store directory path (accessed in-process), or
+    /// `none` to disable caching. `None` = the builtin local store
+    /// (`regserve::default_root`).
     pub cache_registry: Option<String>,
     /// the cache registry speaks plain HTTP (a loopback regserve).
     pub cache_insecure: bool,
@@ -79,6 +80,22 @@ pub struct Options {
 #[derive(Default)]
 pub struct Built {
     pub env: Vec<(String, String)>,
+}
+
+/// Resolve the instruction-cache destination: an explicit registry/store wins; `none`
+/// disables; the default is the builtin local store — the same content-addressed root
+/// a `vk registry serve` shares, accessed in-process (no server, no port).
+fn cache_repo(cache_registry: Option<&str>) -> Result<Option<String>> {
+    Ok(match cache_registry {
+        Some("none") => None,
+        Some(repo) => Some(repo.to_string()),
+        None => Some(
+            crate::regserve::default_root()
+                .context("resolving the builtin cache store dir")?
+                .display()
+                .to_string(),
+        ),
+    })
 }
 
 /// Entry point for the `build` subcommand.
@@ -146,20 +163,7 @@ pub fn build(opts: &Options) -> Result<Built> {
         (None, None)
     };
     let mut ex: Box<dyn Executor> = if opts.microvm {
-        // Instruction cache: an explicit registry/store wins; `none` disables; the
-        // default is the builtin local store — the same content-addressed root a
-        // `vk registry serve` shares, accessed in-process (no server, no port).
-        let cache_repo = match opts.cache_registry.as_deref() {
-            Some("none") => None,
-            Some(repo) => Some(repo.to_string()),
-            None => Some(
-                crate::regserve::default_root()
-                    .context("resolving the builtin cache store dir")?
-                    .display()
-                    .to_string(),
-            ),
-        };
-        let cache = cache_repo.map(|repo| {
+        let cache = cache_repo(opts.cache_registry.as_deref())?.map(|repo| {
             crate::config::Registry::for_share(
                 repo,
                 opts.cache_insecure,
@@ -913,6 +917,19 @@ mod tests {
         let mut ex = DryRun::new();
         drive(&plan, &order, &ba, &mut ex, Path::new("/nonexistent")).unwrap();
         ex.transcript
+    }
+
+    #[test]
+    fn cache_repo_resolution() {
+        assert_eq!(cache_repo(Some("none")).unwrap(), None);
+        assert_eq!(
+            cache_repo(Some("127.0.0.1:5000")).unwrap().as_deref(),
+            Some("127.0.0.1:5000")
+        );
+        // The default must be an absolute path so Registry::local_root treats it
+        // as an in-process store rather than a registry host.
+        let default = cache_repo(None).unwrap().unwrap();
+        assert!(default.starts_with('/'), "not absolute: {default}");
     }
 
     #[test]

@@ -69,7 +69,8 @@ pub struct Build {
     pub kernel: Option<PathBuf>,
     /// the virtkit-agent injected into the build guest as PID 1.
     pub agent: Option<PathBuf>,
-    /// instruction-cache registry repo (a `vk registry serve`); unset = no cache.
+    /// instruction cache: a registry repo (a `vk registry serve`), an absolute store
+    /// directory path, or `none` to disable; unset = the builtin local store.
     pub cache_registry: Option<String>,
     /// the cache registry speaks plain HTTP (a loopback regserve).
     pub cache_insecure: bool,
