@@ -1069,18 +1069,7 @@ fn fail(e: &anyhow::Error, code: i32) -> ExitCode {
     exit_code(code)
 }
 
-/// Parse a UUID (32 hex digits, dashes optional) into 16 bytes.
-fn parse_uuid(s: &str) -> Option<[u8; 16]> {
-    let hex: String = s.chars().filter(|c| *c != '-').collect();
-    if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(out)
-}
+use crate::ensure::parse_uuid;
 
 fn exit_code(code: i32) -> ExitCode {
     ExitCode::from(code.clamp(1, 255) as u8)

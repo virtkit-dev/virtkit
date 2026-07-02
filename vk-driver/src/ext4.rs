@@ -234,7 +234,6 @@ pub fn normalize_superblock(image: &Path) -> Result<()> {
 /// mirroring the build path. Refuses a journaled image: the JBD2 superblock embeds the
 /// fs UUID at journal creation, so a restamp would desynchronize them — stamp first,
 /// [`add_journal`] after.
-#[allow(dead_code)] // used by the upcoming fleet in-process unit builds
 pub fn set_uuid(image: &Path, uuid: &[u8; 16]) -> Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .read(true)
