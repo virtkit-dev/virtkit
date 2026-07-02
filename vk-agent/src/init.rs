@@ -4,12 +4,15 @@
 //! own entrypoint (`VIRTKIT_MODE=service`).
 //!
 //! Configuration comes from the kernel cmdline (the executor passes it; a guest
-//! booted `init=/usr/local/bin/vk-agent` gets no usable argv) and from capture
-//! files written at image-build time:
+//! booted `init=/usr/local/bin/vk-agent` gets no usable argv), from the boot
+//! initramfs, and from capture files written at image-conversion time:
+//!   /virtkit-service.json  (initramfs) the service's runtime config — env, user,
+//!                       workdir, entrypoint+cmd — merged by the host (image defaults
+//!                       + per-service overrides) and read *before* the pivot hides
+//!                       the initramfs. The image itself stays byte-clean.
 //!   /etc/virtkit/env    image ENV (KEY=VALUE per line; lost by `docker export`)
 //!   /etc/virtkit/user   image USER: exported as VIRTKIT_DEFAULT_RUN_USER so served
-//!                       stages drop to it (serve mode), and dropped to in service mode
-//!   /etc/virtkit/cmd    Entrypoint+Cmd, one argv element per line (service mode)
+//!                       stages drop to it (serve mode)
 //!
 //! Cmdline params (all VIRTKIT_*):
 //!   VIRTKIT_VSOCK_PORT   serve agent's vsock port (default 4444)
@@ -32,8 +35,8 @@
 //!                        presents SSH_AUTH_SOCK and relays it over this vsock port to the
 //!                        host (which splices to the host's real agent). Only agent
 //!                        protocol bytes cross — private keys never enter the guest.
-//!   VIRTKIT_MODE=service fork the captured entrypoint; the agent stays as PID 1 and
-//!                        reaps orphans. A systemd image hands off via its entrypoint.
+//!   VIRTKIT_MODE=service fork the boot config's entrypoint; the agent stays as PID 1
+//!                        and reaps orphans. A systemd image hands off via its entrypoint.
 //!   VIRTKIT_SERVE=1      (service) also start the vsock exec server (port 4444) for
 //!                        live debugging: `vk-agent -s vsock-mux://<vsock.sock>:4444 exec`
 //!   VIRTKIT_DEBUG=1      (service) fork+wait the entrypoint, then hold the VM on exit
@@ -52,6 +55,7 @@ use anyhow::{Context, Result, bail};
 use log::{info, warn};
 
 use vk_core::addr::SocketAddr;
+use vk_core::runcfg::RunConfig;
 
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const SSH_VSOCK_PORT: u32 = 2222;
@@ -64,6 +68,9 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     info!("vk-agent init: PID {} ({socket})", std::process::id());
     // SAFETY: single-threaded here (no tokio, no serve fork yet).
     unsafe { std::env::set_var("PATH", DEFAULT_PATH) };
+
+    // The boot config rides the initramfs, which the pivot below hides — read it first.
+    let boot_config = read_boot_config();
 
     // If booted from the agent-only initramfs (`VIRTKIT_PIVOT=<root dev>`), mount the
     // real image ext4 and switch into it — keeping this process as PID 1 — so the agent
@@ -80,6 +87,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     write_self_hosts(&cmdline);
     load_image_env(); // so served/exec'd commands inherit the image PATH etc.
     export_default_run_user(); // so served stages drop to the image's USER
+    apply_boot_config(boot_config.as_ref()); // the boot config wins over any capture
     mount_virtiofs(&cmdline);
     apply_symlinks(&cmdline);
     link_ci_tools(&cmdline); // host CI tools (git/git-lfs/…) onto PATH, if the image lacks them
@@ -89,11 +97,11 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     // orphans reparent to PID 1 (this process): reap them.
     set_child_subreaper();
 
-    // VIRTKIT_MODE=service: fork the image's captured entrypoint and supervise it as
+    // VIRTKIT_MODE=service: fork the boot config's entrypoint and supervise it as
     // PID 1 (reaps orphans). A systemd image uses this too — its entrypoint execs
     // /sbin/init, handing off to systemd which then takes over process supervision.
     if cmdline.get("VIRTKIT_MODE").map(String::as_str) == Some("service") {
-        return run_service(&cmdline);
+        return run_service(&cmdline, boot_config.as_ref());
     }
 
     maybe_ssh_serve(&cmdline);
@@ -467,6 +475,37 @@ fn export_default_run_user() {
     }
 }
 
+/// The boot-time service config carried in the agent initramfs — `None` when the
+/// initramfs carries none (a plain `vk run`/builder boot) or it fails to parse.
+/// Must run before the pivot: the initramfs is hidden underneath afterwards.
+fn read_boot_config() -> Option<RunConfig> {
+    let path = format!("/{}", vk_core::runcfg::INITRAMFS_PATH);
+    let text = std::fs::read_to_string(&path).ok()?;
+    match RunConfig::from_json(&text) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            warn!("vk-agent init: unparsable {path}: {e}");
+            None
+        }
+    }
+}
+
+/// Apply the boot config's environment and user the way the `/etc/virtkit` capture
+/// does for converted images — the config wins over any baked capture (a clean image
+/// has none). The entrypoint/workdir parts are consumed by `run_service`.
+fn apply_boot_config(cfg: Option<&RunConfig>) {
+    let Some(cfg) = cfg else { return };
+    for (k, v) in &cfg.env {
+        // SAFETY: still single-threaded init, before any serve/service fork.
+        unsafe { std::env::set_var(k, v) };
+    }
+    if !cfg.user.is_empty() && cfg.user != "root" {
+        // SAFETY: as above.
+        unsafe { std::env::set_var("VIRTKIT_DEFAULT_RUN_USER", &cfg.user) };
+        info!("vk-agent init: VIRTKIT_DEFAULT_RUN_USER={}", cfg.user);
+    }
+}
+
 /// Mount the virtiofs shares named on the cmdline (VIRTKIT_VIRTIOFS=tag:path,...).
 fn mount_virtiofs(cmdline: &HashMap<String, String>) {
     let Some(spec) = cmdline.get("VIRTKIT_VIRTIOFS") else {
@@ -753,29 +792,28 @@ fn maybe_ssh_agent(cmdline: &HashMap<String, String>) {
     }
 }
 
-/// `VIRTKIT_MODE=service`: run the image's captured entrypoint as its user. Normally
-/// `exec` (the service becomes PID 1, like the container); under VIRTKIT_DEBUG it is
-/// run then held so a crash doesn't panic PID 1 and the console keeps the error.
-fn run_service(cmdline: &HashMap<String, String>) -> Result<()> {
-    let mut argv = read_argv_file("/etc/virtkit/cmd");
-    if argv.is_empty() {
-        // No captured entrypoint: a self-booting image (systemd) has its init at
-        // /sbin/init — hand off to it; otherwise drop to a shell.
-        if Path::new("/sbin/init").exists() {
-            warn!("vk-agent init: no captured command — forking /sbin/init");
-            argv = vec!["/sbin/init".into()];
-        } else {
-            warn!("vk-agent init: no captured command (/etc/virtkit/cmd) — forking /bin/sh");
-            argv = vec!["/bin/sh".into()];
+/// `VIRTKIT_MODE=service`: run the boot config's entrypoint as its user, in its
+/// workdir. Normally forked (the agent stays PID 1 and reaps orphans); under
+/// VIRTKIT_DEBUG it is run then held so a crash doesn't panic PID 1 and the console
+/// keeps the error.
+fn run_service(cmdline: &HashMap<String, String>, config: Option<&RunConfig>) -> Result<()> {
+    let cfg = config.cloned().unwrap_or_default();
+    let argv = service_argv(&cfg, Path::new("/sbin/init").exists());
+    let argv = wrap_user(argv, &cfg.user);
+    if !cfg.workdir.is_empty() && cfg.workdir != "/" {
+        // children (the service, a VIRTKIT_SERVE exec server) inherit PID 1's cwd,
+        // so the service starts in its image WORKDIR like `docker run` would.
+        if let Err(e) = std::env::set_current_dir(&cfg.workdir) {
+            warn!("vk-agent init: chdir {} failed: {e}", cfg.workdir);
         }
     }
-    let user = std::fs::read_to_string("/etc/virtkit/user")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    let argv = wrap_user(argv, &user);
     info!(
         "vk-agent init: service as {}: {:?}",
-        if user.is_empty() { "root" } else { &user },
+        if cfg.user.is_empty() {
+            "root"
+        } else {
+            &cfg.user
+        },
         argv
     );
 
@@ -847,6 +885,22 @@ fn supervise_service(service_pid: libc::pid_t, serve_pid: Option<libc::pid_t>) -
         // an orphan was reaped — keep supervising
     }
     poweroff();
+}
+
+/// The argv a service boots: the config's entrypoint+cmd; with none, a self-booting
+/// image (systemd) hands off to /sbin/init, else a shell (debuggable, never a panic).
+fn service_argv(cfg: &RunConfig, have_sbin_init: bool) -> Vec<String> {
+    let argv = cfg.argv();
+    if !argv.is_empty() {
+        return argv;
+    }
+    if have_sbin_init {
+        warn!("vk-agent init: no service command in the boot config — forking /sbin/init");
+        vec!["/sbin/init".into()]
+    } else {
+        warn!("vk-agent init: no service command in the boot config — forking /bin/sh");
+        vec!["/bin/sh".into()]
+    }
 }
 
 /// Wrap argv to drop to `user` via setpriv (when non-root and setpriv is present).
@@ -1044,19 +1098,6 @@ fn which(cmd: &str) -> bool {
         .any(|d| !d.is_empty() && Path::new(d).join(cmd).is_file())
 }
 
-/// Read a file as an argv list (one element per line; blank lines skipped — docker
-/// inspect appends a trailing newline that would otherwise be a stray empty arg).
-fn read_argv_file(path: &str) -> Vec<String> {
-    std::fs::read_to_string(path)
-        .map(|t| {
-            t.lines()
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn cstr(s: &str) -> CString {
     CString::new(s).expect("cmdline/path contains an interior NUL")
 }
@@ -1143,16 +1184,33 @@ mod tests {
     }
 
     #[test]
-    fn argv_file_skips_blanks() {
-        // (read_argv_file reads a real path; just exercise the line filter shape)
-        let v: Vec<String> = "redis-server\n\n/etc/redis.conf\n"
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect();
+    fn service_argv_prefers_config_then_init_then_shell() {
+        let cfg = RunConfig {
+            entrypoint: vec!["redis-server".into()],
+            cmd: vec!["--appendonly".into(), "yes".into()],
+            ..Default::default()
+        };
         assert_eq!(
-            v,
-            vec!["redis-server".to_string(), "/etc/redis.conf".to_string()]
+            service_argv(&cfg, true),
+            vec!["redis-server", "--appendonly", "yes"]
         );
+        // no configured command: a systemd image hands off, else a shell.
+        assert_eq!(
+            service_argv(&RunConfig::default(), true),
+            vec!["/sbin/init"]
+        );
+        assert_eq!(service_argv(&RunConfig::default(), false), vec!["/bin/sh"]);
+    }
+
+    #[test]
+    fn boot_config_parses_the_runcfg_json() {
+        let cfg = RunConfig {
+            env: vec![("PORT".into(), "6379".into())],
+            user: "redis".into(),
+            workdir: "/data".into(),
+            entrypoint: vec!["redis-server".into()],
+            cmd: vec![],
+        };
+        assert_eq!(RunConfig::from_json(&cfg.to_json()).unwrap(), cfg);
     }
 }

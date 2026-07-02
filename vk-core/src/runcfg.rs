@@ -8,6 +8,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Name of the boot-time config entry in the agent initramfs — the agent (as
+/// initramfs `/init`) reads it at `/virtkit-service.json` *before* pivoting into the
+/// real root (the pivot hides the initramfs).
+pub const INITRAMFS_PATH: &str = "virtkit-service.json";
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RunConfig {
     /// Environment, in declaration order (later keys override earlier ones).
@@ -33,6 +38,14 @@ impl RunConfig {
     /// The effective argv a service runs: entrypoint then cmd (Docker semantics).
     pub fn argv(&self) -> Vec<String> {
         self.entrypoint.iter().chain(&self.cmd).cloned().collect()
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).expect("RunConfig always serializes")
+    }
+
+    pub fn from_json(json: &str) -> Result<RunConfig, serde_json::Error> {
+        serde_json::from_str(json)
     }
 }
 

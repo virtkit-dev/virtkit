@@ -65,16 +65,14 @@ struct ConfigFile {
 struct ImageConfig {
     env: Option<Vec<String>>,
     user: Option<String>,
-    entrypoint: Option<Vec<String>>,
-    cmd: Option<Vec<String>>,
 }
 
 /// Build an ext4 rootfs from a local OCI image archive.
 ///
 /// `archive` is the OCI tar (or "-" to read stdin, spooled to a temp file). The
 /// caller's `injects` (image-relative guest path, host path, octal mode) are
-/// applied alongside three auto-generated config files derived from the image:
-/// `/etc/virtkit/{env,user,cmd}`, so the caller never needs podman. Shared by the
+/// applied alongside the auto-generated capture files derived from the image:
+/// `/etc/virtkit/{env,user}`, so the caller never needs podman. Shared by the
 /// `mkext-oci` CLI dispatch and the `build` subcommand.
 pub(crate) fn archive_to_ext4(
     archive: &Path,
@@ -152,18 +150,15 @@ fn build_inner(
     let manifest: Manifest = ar.read_json(&blob_path(&manifest_digest))?;
     let config: ConfigFile = ar.read_json(&blob_path(&manifest.config.digest))?;
 
-    // Auto-generate the three config files (dropped by the layer flattening,
-    // restored at boot by the agent, VIRTKIT_MODE=service) up front, so they are
-    // ready as injects before we start streaming the rootfs.
+    // Auto-generate the env/user capture files (dropped by the layer flattening,
+    // restored at boot by the agent for serve boots) up front, so they are ready as
+    // injects before we start streaming the rootfs.
     let ic = config.config.unwrap_or(ImageConfig {
         env: None,
         user: None,
-        entrypoint: None,
-        cmd: None,
     });
     let env_file = work.join("env");
     let user_file = work.join("user");
-    let cmd_file = work.join("cmd");
     std::fs::write(
         &env_file,
         render_env_with_files(ic.env.as_deref().unwrap_or(&[]), env_files)?,
@@ -174,20 +169,11 @@ fn build_inner(
         format!("{}\n", ic.user.as_deref().unwrap_or("")),
     )
     .with_context(|| format!("writing {}", user_file.display()))?;
-    std::fs::write(
-        &cmd_file,
-        render_cmd_file(
-            ic.entrypoint.as_deref().unwrap_or(&[]),
-            ic.cmd.as_deref().unwrap_or(&[]),
-        ),
-    )
-    .with_context(|| format!("writing {}", cmd_file.display()))?;
 
     // caller injects first, then the generated config files (image-relative paths).
     let mut all: Vec<(&str, &Path, u16)> = injects.to_vec();
     all.push(("etc/virtkit/env", env_file.as_path(), 0o644));
     all.push(("etc/virtkit/user", user_file.as_path(), 0o644));
-    all.push(("etc/virtkit/cmd", cmd_file.as_path(), 0o644));
 
     // flatten layers in manifest order through the shared Merger.
     let mut merger = Merger::new(crate::scratch::scratch(work, "rootfs-spill")?.file);
@@ -275,16 +261,6 @@ fn render_env_with_files(env: &[String], env_files: &[PathBuf]) -> Result<String
         out.push_str(&render_env_file(&lines));
     }
     Ok(out)
-}
-
-/// Render `/etc/virtkit/cmd`: Entrypoint argv then Cmd argv, one element per line.
-fn render_cmd_file(entrypoint: &[String], cmd: &[String]) -> String {
-    let mut out = String::new();
-    for arg in entrypoint.iter().chain(cmd) {
-        out.push_str(arg);
-        out.push('\n');
-    }
-    out
 }
 
 /// Random-access reader over an OCI archive: a one-pass index of every blob's
@@ -449,7 +425,7 @@ mod tests {
 
     /// End-to-end of the parse + flatten + config-render path (no ext4 bytes):
     /// the flattened rootfs must show the whiteout applied and the override won,
-    /// and the rendered env/user/cmd must match the image config.
+    /// and the rendered env/user must match the image config.
     #[test]
     fn parse_flatten_and_render() {
         let dir = std::env::temp_dir().join(format!("virtkit-mkoci-test-{}", std::process::id()));
@@ -508,13 +484,6 @@ mod tests {
             "malformed env line should be dropped"
         );
         assert_eq!(format!("{}\n", ic.user.as_deref().unwrap()), "svc\n");
-        assert_eq!(
-            render_cmd_file(
-                ic.entrypoint.as_deref().unwrap(),
-                ic.cmd.as_deref().unwrap()
-            ),
-            "/app/main\n--serve\n--port\n8080\n"
-        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
