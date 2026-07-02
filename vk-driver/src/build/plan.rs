@@ -66,83 +66,152 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Build the plan from parsed Dockerfiles: split into stages and resolve each
-    /// `FROM` base + the name index. `FROM` images are interpolated against the global
-    /// `ARG`s (with `build_args` overriding declared defaults). References resolve in
-    /// source order, so a `FROM <name>` only sees stages declared before it.
+    /// Build the plan from parsed Dockerfiles, merged into one stage namespace: split
+    /// each file into stages (indices run across files, in input order) and resolve
+    /// every `FROM` base.
+    ///
+    /// Within a file, references keep the Docker rule — a `FROM <name>` only sees
+    /// stages declared before it in that file, and a `FROM <index>` only earlier
+    /// (global) indices. Across files, a name declared in a *different* file resolves
+    /// as a stage regardless of input order (the topological build order handles the
+    /// forward edges; cycles are rejected there). Precedence: same-file-earlier stage,
+    /// then other-file stage, then external image. A stage name declared in two files
+    /// is an error.
+    ///
+    /// Global `ARG`s (before a file's first `FROM`) interpolate that file's `FROM`
+    /// refs file-locally, and merge into one namespace for `stage_ref` lookups —
+    /// two files re-declaring one name must resolve it to the same value
+    /// (`build_args` overrides both sides, so `--build-arg` always unifies).
     pub fn from_dockerfiles(inputs: &[PlanInput], build_args: &Vars) -> Result<Plan> {
-        let mut stages: Vec<Stage> = Vec::new();
-        let mut by_name: BTreeMap<String, usize> = BTreeMap::new();
-        let mut global_args: Vars = Vars::new();
+        /// A `FROM` base after pass 1: resolved, or a name deferred to pass 2 (it may
+        /// be a stage of another file, else an external image).
+        enum Pending {
+            Done(Base),
+            Name(String),
+        }
 
-        for input in inputs {
-            // Per-file boundary: "before the first FROM" means *this* file's first FROM,
-            // so a later file's leading ARGs stay global and its stray instructions
-            // can't silently attach to the previous file's last stage.
-            let file_start = stages.len();
+        let mut stages: Vec<Stage> = Vec::new();
+        let mut pending: Vec<Pending> = Vec::new(); // parallel to `stages`
+        let mut file_of: Vec<usize> = Vec::new(); // stage index -> input index
+        // name -> (stage index, declaring input index)
+        let mut by_name: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        let mut global_args: Vars = Vars::new();
+        let mut arg_of: BTreeMap<String, usize> = BTreeMap::new(); // ARG -> input index
+
+        // Pass 1: split every file into stages. Same-file name references resolve
+        // exactly as before (source order, latest-earlier declaration); anything else
+        // non-numeric is deferred.
+        for (fi, input) in inputs.iter().enumerate() {
+            let mut file_names: BTreeMap<String, usize> = BTreeMap::new();
+            let mut file_args: Vars = Vars::new();
+            let mut file_has_stage = false;
             for instr in &input.dockerfile.instructions {
                 match instr {
                     Instruction::From(f) => {
-                        // expand ${ARG} in the image ref against the global args.
-                        let image = interp::interpolate(&f.image, &global_args);
+                        // expand ${ARG} in the image ref against this file's global args.
+                        let image = interp::interpolate(&f.image, &file_args);
                         let index = stages.len();
                         let base = if image.eq_ignore_ascii_case("scratch") {
-                            Base::Scratch
-                        } else if let Some(&i) = by_name.get(&image) {
-                            Base::Stage(i)
+                            Pending::Done(Base::Scratch)
+                        } else if let Some(&i) = file_names.get(&image) {
+                            Pending::Done(Base::Stage(i))
                         } else if let Ok(i) = image.parse::<usize>() {
-                            // `FROM 0` — a stage by numeric index (rare but valid)
+                            // `FROM 0` — a stage by (global) numeric index, backward only
                             if i < index {
-                                Base::Stage(i)
+                                Pending::Done(Base::Stage(i))
                             } else {
-                                Base::Image(image.clone())
+                                Pending::Done(Base::Image(image.clone()))
                             }
                         } else {
-                            Base::Image(image)
+                            Pending::Name(image)
                         };
                         if let Some(name) = &f.as_name {
-                            by_name.insert(name.clone(), index);
+                            file_names.insert(name.clone(), index);
                         }
                         stages.push(Stage {
                             index,
                             name: f.as_name.clone(),
-                            base,
+                            base: Base::Scratch, // placeholder until pass 2
                             instructions: Vec::new(),
                             context: input.context.clone(),
                         });
+                        pending.push(base);
+                        file_of.push(fi);
+                        file_has_stage = true;
                     }
-                    // Global ARG before the file's first stage: resolve it (build-arg
+                    // Global ARG before this file's first stage: resolve it (build-arg
                     // override, else its interpolated default, else empty) into the
-                    // global scope.
-                    Instruction::Arg { name, default } if stages.len() == file_start => {
+                    // file scope, and merge into the shared namespace equal-or-error.
+                    Instruction::Arg { name, default } if !file_has_stage => {
                         let value = build_args.get(name).cloned().unwrap_or_else(|| {
                             default
                                 .as_deref()
-                                .map(|d| interp::interpolate(d, &global_args))
+                                .map(|d| interp::interpolate(d, &file_args))
                                 .unwrap_or_default()
                         });
-                        global_args.insert(name.clone(), value);
+                        match global_args.get(name) {
+                            // conflict only across files: within one file, Docker's
+                            // last-declaration-wins rule applies.
+                            Some(prev) if *prev != value && arg_of[name] != fi => bail!(
+                                "global ARG {name} resolves to {prev:?} in {} but {value:?} in {} \
+                                 (pass --build-arg {name}=... to unify)",
+                                inputs[arg_of[name]].origin.display(),
+                                input.origin.display()
+                            ),
+                            _ => {
+                                global_args.insert(name.clone(), value.clone());
+                                arg_of.entry(name.clone()).or_insert(fi);
+                            }
+                        }
+                        file_args.insert(name.clone(), value);
                     }
                     other => {
-                        if stages.len() == file_start {
+                        // only this file's own stages may receive instructions.
+                        if !file_has_stage {
                             bail!(
                                 "instruction before the first FROM in {}: {other:?}",
                                 input.origin.display()
                             );
                         }
-                        let stage = stages.last_mut().expect("guarded above");
+                        let stage = stages.last_mut().expect("file_has_stage");
                         stage.instructions.push(other.clone());
                     }
                 }
+            }
+            // Fold this file's names into the merged namespace: a name declared in two
+            // files is ambiguous everywhere it is referenced, so it is always an error.
+            for (name, idx) in file_names {
+                if let Some((_, prev_fi)) = by_name.get(&name)
+                    && *prev_fi != fi
+                {
+                    bail!(
+                        "stage {name:?} is declared in both {} and {}",
+                        inputs[*prev_fi].origin.display(),
+                        input.origin.display()
+                    );
+                }
+                by_name.insert(name, (idx, fi));
             }
         }
         if stages.is_empty() {
             bail!("no FROM / no stages in the Dockerfile");
         }
+        // Pass 2: a deferred name declared in a *different* file is a stage (any input
+        // order); a same-file (necessarily later) declaration keeps Docker's rule — the
+        // ref is an external image. A name in two files never gets here (error above).
+        for (g, p) in pending.into_iter().enumerate() {
+            stages[g].base = match p {
+                Pending::Done(base) => base,
+                Pending::Name(n) => match by_name.get(&n) {
+                    Some(&(i, fi)) if fi != file_of[g] => Base::Stage(i),
+                    _ => Base::Image(n),
+                },
+            };
+        }
         Ok(Plan {
             stages,
             global_args,
-            by_name,
+            by_name: by_name.into_iter().map(|(k, (i, _))| (k, i)).collect(),
         })
     }
 
@@ -387,6 +456,170 @@ mod tests {
     fn default_target_is_last_stage() {
         let p = plan("FROM a\nFROM b\nFROM c\n");
         assert_eq!(p.resolve_target(None).unwrap(), 2);
+    }
+
+    /// Two files as one merged plan, each with its own origin/context.
+    fn plan2(a: &str, b: &str) -> Result<Plan> {
+        let file = |src: &str, name: &str, ctx: &str| PlanInput {
+            dockerfile: parse(src).unwrap(),
+            origin: format!("{name}/Dockerfile").into(),
+            context: ctx.into(),
+        };
+        Plan::from_dockerfiles(
+            &[file(a, "a", "/ctx-a"), file(b, "b", "/ctx-b")],
+            &Vars::new(),
+        )
+    }
+
+    #[test]
+    fn cross_file_from_resolves_in_both_orders() {
+        // b's stage builds on a's `tools` — with the files given in either order.
+        let a = "FROM debian AS tools\nRUN t\n";
+        let b = "FROM tools AS app\nRUN a\n";
+        let p = plan2(a, b).unwrap();
+        assert_eq!(p.stages[1].base, Base::Stage(0));
+        // reversed input order: the reference is now forward, and still resolves.
+        let p = plan2(b, a).unwrap();
+        assert_eq!(p.stages[0].base, Base::Stage(1));
+        // ... and the topological order builds `tools` first anyway.
+        let target = p.resolve_target(Some("app")).unwrap();
+        assert_eq!(p.build_order(target).unwrap(), vec![1, 0]);
+    }
+
+    #[test]
+    fn cross_file_copy_from_and_mount_from_create_edges() {
+        let a = "FROM app AS bundle\nCOPY --from=tools /t /t\n\
+                 RUN --mount=type=bind,from=app,target=/a use\n";
+        let b = "FROM debian AS tools\nFROM debian AS app\n";
+        let p = plan2(a, b).unwrap();
+        let mut deps = p.deps(0);
+        deps.sort_unstable();
+        assert_eq!(deps, vec![1, 2]); // tools + app (base `app` + the two refs, deduped)
+    }
+
+    #[test]
+    fn same_file_forward_ref_stays_an_image() {
+        // Docker compat pin: within one file a FROM only sees earlier stages, even
+        // when a later stage declares the name — and even in a multi-file plan.
+        let p = plan("FROM foo\nFROM scratch AS foo\n");
+        assert_eq!(p.stages[0].base, Base::Image("foo".into()));
+        let p = plan2("FROM foo\nFROM scratch AS foo\n", "FROM debian AS other\n").unwrap();
+        assert_eq!(p.stages[0].base, Base::Image("foo".into()));
+    }
+
+    #[test]
+    fn within_file_duplicate_name_last_wins() {
+        // compat pin: a re-declared name in one file resolves to the latest earlier one.
+        let p = plan("FROM a AS x\nFROM b AS x\nFROM x\n");
+        assert_eq!(p.stages[2].base, Base::Stage(1));
+    }
+
+    #[test]
+    fn cross_file_duplicate_name_is_an_error() {
+        let err = plan2("FROM debian AS web\n", "FROM alpine AS web\n").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("\"web\""), "{msg}");
+        assert!(
+            msg.contains("a/Dockerfile") && msg.contains("b/Dockerfile"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn numeric_refs_are_global_and_backward_only() {
+        // `FROM 0` in the second file reaches the first file's stage 0; a forward
+        // numeric ref stays an image (Docker's rule, globally applied).
+        let p = plan2("FROM debian AS base\n", "FROM 0\n").unwrap();
+        assert_eq!(p.stages[1].base, Base::Stage(0));
+        let p = plan2("FROM 1\n", "FROM debian AS base\n").unwrap();
+        assert_eq!(p.stages[0].base, Base::Image("1".into()));
+    }
+
+    #[test]
+    fn stages_carry_their_files_context() {
+        let p = plan2("FROM debian AS a\n", "FROM a AS b\n").unwrap();
+        assert_eq!(p.stages[0].context, PathBuf::from("/ctx-a"));
+        assert_eq!(p.stages[1].context, PathBuf::from("/ctx-b"));
+    }
+
+    #[test]
+    fn instructions_never_leak_into_another_files_stage() {
+        // b has content before its first FROM: error, not an append to a's last stage.
+        let err = plan2("FROM debian AS a\n", "RUN oops\nFROM debian AS b\n").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("before the first FROM in b/Dockerfile"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn global_args_interpolate_file_locally_and_merge_equal_or_error() {
+        // identical re-declarations are fine, and each file's FROM sees its own args.
+        let p = plan2(
+            "ARG ver=9\nFROM img:${ver} AS a\n",
+            "ARG ver=9\nFROM img:${ver} AS b\n",
+        )
+        .unwrap();
+        assert_eq!(p.stages[0].base, Base::Image("img:9".into()));
+        assert_eq!(p.stages[1].base, Base::Image("img:9".into()));
+        // a file does not see another file's ARGs.
+        let p = plan2("ARG ver=9\nFROM a-${ver} AS a\n", "FROM b-${ver} AS b\n").unwrap();
+        assert_eq!(p.stages[1].base, Base::Image("b-".into()));
+        // conflicting defaults are ambiguous for merged lookups -> error naming both.
+        let err = plan2("ARG ver=8\nFROM x AS a\n", "ARG ver=9\nFROM y AS b\n").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("ARG ver"), "{msg}");
+        assert!(
+            msg.contains("a/Dockerfile") && msg.contains("b/Dockerfile"),
+            "{msg}"
+        );
+        // ... and --build-arg overrides both sides, unifying them.
+        let mut ba = Vars::new();
+        ba.insert("ver".into(), "7".into());
+        let file = |src: &str, name: &str| PlanInput {
+            dockerfile: parse(src).unwrap(),
+            origin: format!("{name}/Dockerfile").into(),
+            context: "/nonexistent".into(),
+        };
+        let p = Plan::from_dockerfiles(
+            &[
+                file("ARG ver=8\nFROM x:${ver} AS a\n", "a"),
+                file("ARG ver=9\nFROM y:${ver} AS b\n", "b"),
+            ],
+            &ba,
+        )
+        .unwrap();
+        assert_eq!(p.stages[0].base, Base::Image("x:7".into()));
+        assert_eq!(p.stages[1].base, Base::Image("y:7".into()));
+    }
+
+    #[test]
+    fn within_file_arg_redeclaration_last_wins() {
+        // compat pin: re-declaring a global ARG in one file keeps Docker's rule.
+        let p = plan2(
+            "ARG ver=8\nARG ver=9\nFROM img:${ver} AS a\n",
+            "FROM debian AS b\n",
+        )
+        .unwrap();
+        assert_eq!(p.stages[0].base, Base::Image("img:9".into()));
+        // ... and a later file conflicting with the re-declared value still errors.
+        let err = plan2(
+            "ARG ver=8\nARG ver=9\nFROM x AS a\n",
+            "ARG ver=8\nFROM y AS b\n",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("ARG ver"), "{err:#}");
+    }
+
+    #[test]
+    fn stage_ref_resolves_merged_global_args_across_files() {
+        // COPY --from=builder-${ver}: the ARG comes from file a, the stage from file b.
+        let p = plan2(
+            "ARG ver=9\nFROM debian AS a\n",
+            "FROM alpine AS builder-9\n",
+        )
+        .unwrap();
+        assert_eq!(p.stage_ref("builder-${ver}"), Some(1));
     }
 
     #[test]
