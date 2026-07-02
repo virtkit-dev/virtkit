@@ -10,6 +10,8 @@ All notable changes to virtkit will be documented in this file.
   needed. Cloud Hypervisor remains available (`VIRTKIT_VMM=cloud-hypervisor`).
 - **Self-contained `vk`**: the guest kernel and `vk-agent` are embedded into the
   binary — a single file boots OCI images.
+- Registry destinations can be a local store directory, accessed in-process and
+  interchangeable with a `vk registry serve` on the same root.
 - `run --cpus host` matches the host CPU count.
 
 ### Changed

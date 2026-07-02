@@ -39,9 +39,9 @@ use tokio::net::TcpListener;
 /// Default content type for a manifest whose Content-Type sidecar is missing.
 const DEFAULT_MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
-/// The on-disk content-addressed store. Shared by the HTTP handlers below and,
-/// once the builtin build cache lands, its in-process backend — both writing
-/// identical on-disk state. Cheap to clone-share via `Arc`.
+/// The on-disk content-addressed store. Shared by the HTTP handlers below and the
+/// in-process build-cache backend (`registry::local`), so both write identical
+/// on-disk state. Cheap to clone-share via `Arc`.
 pub(crate) struct Store {
     root: PathBuf,
     /// monotonic upload-id source (unique within this server process)
@@ -108,7 +108,6 @@ impl Store {
     /// Store raw canonical bytes content-addressed, adaptively compressed (the zstd
     /// form only when it actually shrinks). Idempotent: a present blob is only
     /// touched, and the compression is skipped. Returns the `sha256:<hex>` digest.
-    #[allow(dead_code)] // used by the upcoming builtin build cache
     pub(crate) fn put_blob(&self, raw: &[u8]) -> Result<String> {
         let hex = sha256_hex_raw(raw);
         self.put_blob_at(&hex, raw)?;
@@ -130,7 +129,6 @@ impl Store {
     }
 
     /// The canonical bytes of a blob (decompressing the zstd form), `None` if absent.
-    #[allow(dead_code)] // used by the upcoming builtin build cache
     pub(crate) fn get_blob(&self, hex: &str) -> Result<Option<Vec<u8>>> {
         let Some((path, is_zstd)) = self.find_blob(hex) else {
             return Ok(None);

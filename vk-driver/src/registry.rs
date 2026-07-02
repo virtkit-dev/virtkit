@@ -156,6 +156,9 @@ async fn inspect_async(rg: &Registry, name: &str, reference: &Reference) -> Resu
 /// True if `<name>:<tag>` resolves in the registry — a cheap manifest HEAD, no pull.
 /// The build instruction-cache existence check; a registry error reads as "absent".
 pub fn exists(rg: &Registry, name: &str, tag: &str) -> bool {
+    if let Some(root) = rg.local_root() {
+        return local::exists(&root, name, tag);
+    }
     block_on(async {
         let Ok((client, auth)) = client(rg) else {
             return false;
@@ -174,6 +177,9 @@ pub fn exists(rg: &Registry, name: &str, tag: &str) -> bool {
 /// caller then builds. The sparse reassembly is byte-exact, so the placed ext4 keeps
 /// its fingerprint UUID and reads as fresh on the next run.
 pub fn try_pull_ext4(rg: &Registry, name: &str, tag: &str, dest: &Path) -> Result<bool> {
+    if let Some(root) = rg.local_root() {
+        return local::try_pull_ext4(&root, name, tag, dest);
+    }
     block_on(try_pull_ext4_async(rg, name, tag, dest))
 }
 
@@ -202,6 +208,9 @@ async fn try_pull_ext4_async(rg: &Registry, name: &str, tag: &str, dest: &Path) 
 /// fingerprint), so other worktrees can pull it instead of rebuilding. Best-effort:
 /// the caller treats a failure as non-fatal (the image was built locally regardless).
 pub fn push_ext4(rg: &Registry, name: &str, tag: &str, ext4: &Path, boot_kind: &str) -> Result<()> {
+    if let Some(root) = rg.local_root() {
+        return local::push_ext4(&root, name, tag, ext4, boot_kind);
+    }
     block_on(push_ext4_async(rg, name, tag, ext4, boot_kind))
 }
 
@@ -236,6 +245,9 @@ pub fn fetch_chunks(
     name: &str,
     tag: &str,
 ) -> Result<Option<(Vec<OciDescriptor>, u64)>> {
+    if let Some(root) = rg.local_root() {
+        return local::fetch_chunks(&root, name, tag);
+    }
     block_on(fetch_chunks_async(rg, name, tag))
 }
 
@@ -292,6 +304,18 @@ pub fn push_ext4_diff(
     dirty: &[(u64, u64)],
     parent_layers: &[OciDescriptor],
 ) -> Result<(Vec<OciDescriptor>, u64)> {
+    if let Some(root) = rg.local_root() {
+        return local::push_ext4_diff(
+            &root,
+            name,
+            tag,
+            ext4,
+            boot_kind,
+            total_size,
+            dirty,
+            parent_layers,
+        );
+    }
     block_on(push_ext4_diff_async(
         rg,
         name,
@@ -1325,6 +1349,285 @@ fn chunkmap_put(dir: &Path, raw_hex: &str, digest: &str, size: i64) {
     }
 }
 
+/// The builtin cache backend: the regserve content-addressed store accessed
+/// in-process — no server, no port, no auth. Selected by `Registry::local_root`
+/// (a path/`file://` repo).
+/// Writes the exact on-disk state the HTTP server writes (transparent-zstd-form
+/// manifests, adaptively compressed blobs), so a `vk registry serve` on the same
+/// root serves what local builds pushed and vice versa. Every operation holds the
+/// store lock shared for its whole check→reference window; a future
+/// `vk registry gc` takes it exclusive (see `regserve::Store::lock_shared`).
+mod local {
+    use super::*;
+    use crate::regserve::Store;
+
+    pub(super) fn exists(root: &Path, name: &str, tag: &str) -> bool {
+        let inner = || -> Result<bool> {
+            let store = Store::new(root.to_path_buf())?;
+            let _lock = store.lock_shared()?;
+            Ok(store.get_manifest(name, tag)?.is_some())
+        };
+        inner().unwrap_or(false)
+    }
+
+    pub(super) fn fetch_chunks(
+        root: &Path,
+        name: &str,
+        tag: &str,
+    ) -> Result<Option<(Vec<OciDescriptor>, u64)>> {
+        let store = Store::new(root.to_path_buf())?;
+        let _lock = store.lock_shared()?;
+        let Some((manifest, config)) = manifest_and_config(&store, name, tag)? else {
+            return Ok(None);
+        };
+        let chunks: Vec<OciDescriptor> = manifest
+            .layers
+            .into_iter()
+            .filter(|l| {
+                matches!(
+                    l.media_type.as_str(),
+                    CHUNK_MEDIA_TYPE | CHUNK_MEDIA_TYPE_RAW
+                )
+            })
+            .collect();
+        Ok(Some((chunks, config.total_size)))
+    }
+
+    pub(super) fn try_pull_ext4(root: &Path, name: &str, tag: &str, dest: &Path) -> Result<bool> {
+        let store = Store::new(root.to_path_buf())?;
+        let _lock = store.lock_shared()?;
+        let Some((manifest, config)) = manifest_and_config(&store, name, tag)? else {
+            return Ok(false);
+        };
+        // tmp sibling + rename: a failed reassembly never leaves a partial file at
+        // `dest` (which the caller would boot). On a fully-cached build nothing has
+        // created the destination dir yet.
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let tmp = dest.with_extension("pull.tmp");
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        out.set_len(config.total_size)
+            .with_context(|| format!("sizing {}", tmp.display()))?;
+        for layer in &manifest.layers {
+            // self-describing via media type: a raw-digest chunk's canonical bytes ARE
+            // the data; a compressed-digest chunk's canonical bytes are a zstd frame.
+            let compressed = match layer.media_type.as_str() {
+                CHUNK_MEDIA_TYPE => true,
+                CHUNK_MEDIA_TYPE_RAW => false,
+                _ => continue,
+            };
+            let (offset, _len) = chunk_placement(layer)?;
+            let hex = layer.digest.trim_start_matches("sha256:");
+            let bytes = store.get_blob(hex)?.with_context(|| {
+                format!(
+                    "cached chunk {} missing from {}",
+                    layer.digest,
+                    root.display()
+                )
+            })?;
+            let raw = if compressed {
+                zstd::decode_all(&bytes[..])
+                    .with_context(|| format!("zstd-decompressing chunk {}", layer.digest))?
+            } else {
+                bytes
+            };
+            write_chunk_sparse(&mut out, offset, &raw)
+                .with_context(|| format!("writing a chunk into {}", tmp.display()))?;
+        }
+        out.flush()?;
+        drop(out);
+        let _ = std::fs::remove_file(dest);
+        std::fs::rename(&tmp, dest)
+            .with_context(|| format!("placing pulled ext4 at {}", dest.display()))?;
+        Ok(true)
+    }
+
+    pub(super) fn push_ext4(
+        root: &Path,
+        name: &str,
+        tag: &str,
+        ext4: &Path,
+        boot_kind: &str,
+    ) -> Result<()> {
+        let store = Store::new(root.to_path_buf())?;
+        let _lock = store.lock_shared()?;
+        let total_size = std::fs::metadata(ext4)
+            .with_context(|| format!("stat {}", ext4.display()))?
+            .len();
+        let mut layers: Vec<OciDescriptor> = Vec::new();
+        // hole-aware like the HTTP push: only the data extents are read and chunked.
+        for (start, len) in file_data_extents(ext4, total_size)? {
+            let mut f =
+                std::fs::File::open(ext4).with_context(|| format!("opening {}", ext4.display()))?;
+            f.seek(SeekFrom::Start(start))?;
+            chunk_region_into(&store, f.take(len), start, ext4, &mut layers)?;
+        }
+        put_bundle_manifest(&store, name, tag, layers, total_size, boot_kind).map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn push_ext4_diff(
+        root: &Path,
+        name: &str,
+        tag: &str,
+        ext4: &Path,
+        boot_kind: &str,
+        total_size: u64,
+        dirty: &[(u64, u64)],
+        parent_layers: &[OciDescriptor],
+    ) -> Result<(Vec<OciDescriptor>, u64)> {
+        let store = Store::new(root.to_path_buf())?;
+        let _lock = store.lock_shared()?;
+        // same shape as push_ext4_diff_async: reuse clean parent chunks, re-chunk the
+        // dirty ones from the captured overlay, then chunk writes into former holes.
+        let mut q = crate::qcow2::Qcow2::open(ext4)?;
+        let mut layers: Vec<OciDescriptor> = Vec::with_capacity(parent_layers.len());
+        let mut covered: Vec<(u64, u64)> = Vec::with_capacity(parent_layers.len());
+        for layer in parent_layers {
+            let (offset, length) = chunk_placement(layer)?;
+            covered.push((offset, length));
+            let is_dirty = dirty
+                .iter()
+                .any(|&(ds, dl)| offset < ds + dl && ds < offset + length);
+            if !is_dirty {
+                layers.push(layer.clone());
+                continue;
+            }
+            let mut buf = vec![0u8; length as usize];
+            q.read_at(offset, &mut buf).with_context(|| {
+                format!("reading {length} bytes at {offset} from {}", ext4.display())
+            })?;
+            if buf.iter().all(|&b| b == 0) {
+                continue; // freed/zeroed since the parent — the pull leaves a hole
+            }
+            let digest = store.put_blob(&buf)?;
+            layers.push(chunk_descriptor(
+                CHUNK_MEDIA_TYPE_RAW,
+                &digest,
+                buf.len() as i64,
+                offset,
+                length,
+            ));
+        }
+        covered.sort_unstable();
+        let mut dirty_sorted = dirty.to_vec();
+        dirty_sorted.sort_unstable();
+        for (start, len) in subtract_extents(&dirty_sorted, &covered) {
+            let reader =
+                crate::qcow2::RegionReader::new(crate::qcow2::Qcow2::open(ext4)?, start, len);
+            chunk_region_into(&store, reader, start, ext4, &mut layers)?;
+        }
+        let ret = layers.clone();
+        put_bundle_manifest(&store, name, tag, layers, total_size, boot_kind)?;
+        Ok((ret, total_size))
+    }
+
+    /// FastCDC-chunk `reader` (a data region starting at `start`) into the store,
+    /// appending a raw-digest descriptor per non-zero chunk — the local counterpart
+    /// of `chunk_region` (the store handles compression and dedup).
+    fn chunk_region_into(
+        store: &Store,
+        reader: impl Read,
+        start: u64,
+        label: &Path,
+        layers: &mut Vec<OciDescriptor>,
+    ) -> Result<()> {
+        let chunker = fastcdc::v2020::StreamCDC::new(
+            std::io::BufReader::new(reader),
+            CDC_MIN,
+            CDC_AVG,
+            CDC_MAX,
+        );
+        for chunk in chunker {
+            let chunk = chunk.with_context(|| format!("chunking {}", label.display()))?;
+            if chunk.data.iter().all(|&b| b == 0) {
+                continue; // hole — leave a gap, the pull fills it with zeros
+            }
+            let digest = store.put_blob(&chunk.data)?;
+            layers.push(chunk_descriptor(
+                CHUNK_MEDIA_TYPE_RAW,
+                &digest,
+                chunk.data.len() as i64,
+                start + chunk.offset,
+                chunk.length as u64,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Store the config blob + the bundle manifest and tag it — the local counterpart
+    /// of the config/manifest tail of `push_async`/`push_ext4_diff_async`, producing
+    /// the identical manifest JSON. Returns the manifest digest.
+    fn put_bundle_manifest(
+        store: &Store,
+        name: &str,
+        tag: &str,
+        layers: Vec<OciDescriptor>,
+        total_size: u64,
+        boot_kind: &str,
+    ) -> Result<String> {
+        let config = BundleConfig {
+            total_size,
+            chunk_count: layers.len(),
+            boot_kind: boot_kind.to_string(),
+            compression: "zstd".to_string(),
+            has_kernel: false,
+            has_initrd: false,
+        };
+        let config_json = serde_json::to_vec(&config).context("serializing the bundle config")?;
+        let config_digest = store.put_blob(&config_json)?;
+        let config_desc = OciDescriptor {
+            media_type: CONFIG_MEDIA_TYPE.to_string(),
+            digest: config_digest,
+            size: config_json.len() as i64,
+            ..Default::default()
+        };
+        let manifest = OciImageManifest {
+            schema_version: 2,
+            media_type: Some(OCI_IMAGE_MEDIA_TYPE.to_string()),
+            artifact_type: Some(ARTIFACT_TYPE.to_string()),
+            config: config_desc,
+            layers,
+            subject: None,
+            annotations: None,
+        };
+        let body = serde_json::to_vec(&manifest).context("serializing the bundle manifest")?;
+        store.put_manifest(name, tag, OCI_IMAGE_MEDIA_TYPE, &body)
+    }
+
+    /// Resolve `<name>:<tag>` to its parsed manifest + bundle config, `None` when the
+    /// tag is absent. A hit bumps the tag's mtime (the gc retention record).
+    fn manifest_and_config(
+        store: &Store,
+        name: &str,
+        tag: &str,
+    ) -> Result<Option<(OciImageManifest, BundleConfig)>> {
+        let Some((_digest, bytes, _ctype)) = store.get_manifest(name, tag)? else {
+            return Ok(None);
+        };
+        let manifest: OciImageManifest =
+            serde_json::from_slice(&bytes).context("parsing the bundle manifest")?;
+        let hex = manifest
+            .config
+            .digest
+            .trim_start_matches("sha256:")
+            .to_string();
+        let config = store
+            .get_blob(&hex)?
+            .with_context(|| format!("bundle config blob {} missing", manifest.config.digest))?;
+        let config: BundleConfig =
+            serde_json::from_slice(&config).context("parsing the bundle config blob")?;
+        Ok(Some((manifest, config)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1386,6 +1689,176 @@ mod tests {
                 sha256_hex(&comp)
             })
             .collect()
+    }
+
+    /// A `Registry` whose repo is a path routes to the local store backend.
+    fn local_registry(root: &Path) -> Registry {
+        Registry::for_share(
+            root.display().to_string(),
+            false,
+            None,
+            String::new(),
+            None,
+            None,
+        )
+    }
+
+    /// Full local-backend round-trip through the PUBLIC dispatch: push a sparse
+    /// image into a store-dir `Registry`, then exists → fetch_chunks → pull. The
+    /// reassembly is byte-identical and the hole survives (never densified), all
+    /// in-process — no server.
+    #[test]
+    fn local_store_roundtrip_is_sparse_and_byte_exact() {
+        let root = std::env::temp_dir().join(format!("vk-localreg-rt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let rg = local_registry(&root);
+        assert!(rg.local_root().is_some(), "a path repo must route local");
+
+        // 8 MiB data | 32 MiB hole | 8 MiB data, written sparsely.
+        let head = pseudo_random(8 << 20, 0xc0ffee);
+        let tail = pseudo_random(8 << 20, 0xbeef);
+        let total = (48u64) << 20;
+        let dir = root.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.ext4");
+        {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::File::create(&src).unwrap();
+            f.set_len(total).unwrap();
+            f.write_all_at(&head, 0).unwrap();
+            f.write_all_at(&tail, 40 << 20).unwrap();
+        }
+
+        assert!(!exists(&rg, "dfcache", "k1"), "empty store has no tag");
+        push_ext4(&rg, "dfcache", "k1", &src, "generic-disk").unwrap();
+        assert!(exists(&rg, "dfcache", "k1"));
+        let (chunks, size) = fetch_chunks(&rg, "dfcache", "k1").unwrap().expect("tagged");
+        assert_eq!(size, total);
+        assert!(chunks.len() > 1, "should split into several chunks");
+
+        let dest = dir.join("dest.ext4");
+        assert!(try_pull_ext4(&rg, "dfcache", "k1", &dest).unwrap());
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            std::fs::read(&src).unwrap(),
+            "reassembly must match the source"
+        );
+        {
+            use std::os::unix::fs::MetadataExt;
+            let on_disk = std::fs::metadata(&dest).unwrap().blocks() * 512;
+            assert!(
+                on_disk + (8 << 20) < total,
+                "expected a preserved hole: {on_disk} bytes on disk vs {total} logical"
+            );
+        }
+        // an absent tag pulls nothing and reports false
+        assert!(!try_pull_ext4(&rg, "dfcache", "missing", &dir.join("no.ext4")).unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A local diff push over an untouched overlay reuses the clean parent chunk
+    /// descriptors verbatim and still reassembles byte-exactly under the new tag.
+    #[test]
+    fn local_diff_push_reuses_clean_chunks() {
+        let root = std::env::temp_dir().join(format!("vk-localreg-diff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let rg = local_registry(&root);
+        let dir = root.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // dense 16 MiB base, pushed as the parent.
+        let base = dir.join("base.ext4");
+        std::fs::write(&base, pseudo_random(16 << 20, 0x1234)).unwrap();
+        push_ext4(&rg, "dfcache", "parent", &base, "generic-disk").unwrap();
+        let (parent_layers, total) = fetch_chunks(&rg, "dfcache", "parent").unwrap().unwrap();
+        assert!(parent_layers.len() > 2, "need several chunks to test reuse");
+
+        // an empty qcow2 overlay (no writes) with a small dirty range: the dirty
+        // chunk re-reads identical bytes (dedup hit), the rest reuse verbatim.
+        let overlay = dir.join("ovl.qcow2");
+        crate::qcow2::create_overlay(&overlay, &base).unwrap();
+        let dirty = [(0u64, 1u64 << 20)];
+        let (layers, size) = push_ext4_diff(
+            &rg,
+            "dfcache",
+            "child",
+            &overlay,
+            "generic-disk",
+            total,
+            &dirty,
+            &parent_layers,
+        )
+        .unwrap();
+        assert_eq!(size, total);
+        let reused = layers
+            .iter()
+            .filter(|l| parent_layers.iter().any(|p| p.digest == l.digest))
+            .count();
+        assert!(
+            reused >= parent_layers.len() - 2,
+            "clean chunks must be reused ({reused}/{})",
+            parent_layers.len()
+        );
+        let dest = dir.join("child.ext4");
+        assert!(try_pull_ext4(&rg, "dfcache", "child", &dest).unwrap());
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            std::fs::read(&base).unwrap(),
+            "an untouched overlay's child must equal the base"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Concurrent local-backend pushes and pulls against one store: several threads
+    /// push the SAME image under distinct tags (every chunk blob collides), while
+    /// puller threads grab each tag as soon as `exists` reports it. The write
+    /// ordering (chunks → config → manifest → tag) means a visible tag is always
+    /// fully materialized: every pull must succeed byte-exactly, mid-push or not.
+    #[test]
+    fn local_concurrent_push_pull_is_consistent() {
+        let root = std::env::temp_dir().join(format!("vk-localreg-conc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let rg = local_registry(&root);
+        let dir = root.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.ext4");
+        std::fs::write(&src, pseudo_random(6 << 20, 0xfeed)).unwrap();
+        let want = std::fs::read(&src).unwrap();
+
+        const PUSHERS: usize = 4;
+        std::thread::scope(|s| {
+            for t in 0..PUSHERS {
+                let (rg, src) = (&rg, &src);
+                s.spawn(move || {
+                    push_ext4(rg, "dfcache", &format!("conc{t}"), src, "generic-disk").unwrap();
+                });
+            }
+            for t in 0..PUSHERS {
+                let (rg, dir, want) = (&rg, &dir, &want);
+                s.spawn(move || {
+                    let tag = format!("conc{t}");
+                    // poll until the pusher publishes the tag, then pull immediately
+                    // (racing the other pushers' blob/tag writes). Bounded so a dead
+                    // pusher fails the test instead of hanging it.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    while !exists(rg, "dfcache", &tag) {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "tag {tag} never appeared"
+                        );
+                        std::thread::yield_now();
+                    }
+                    let dest = dir.join(format!("pull{t}.ext4"));
+                    assert!(try_pull_ext4(rg, "dfcache", &tag, &dest).unwrap());
+                    assert_eq!(
+                        &std::fs::read(&dest).unwrap(),
+                        want,
+                        "a visible tag must pull back byte-exact"
+                    );
+                });
+            }
+        });
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The production streaming path round-trips through the REAL sparse reassembly:

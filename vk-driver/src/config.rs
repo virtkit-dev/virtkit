@@ -305,6 +305,20 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// The store directory when `repo` names a local store rather than a remote
+    /// registry: an absolute path (`/…`) or a `file://` URL. registry.rs then
+    /// reads/writes the regserve content-addressed store in-process — no server,
+    /// no port, no auth; `ca_file`/`username`/`insecure`/`transparent_zstd` are
+    /// all meaningless and ignored for such a repo.
+    pub fn local_root(&self) -> Option<PathBuf> {
+        if let Some(p) = self.repo.strip_prefix("file://") {
+            return Some(PathBuf::from(p));
+        }
+        self.repo
+            .starts_with('/')
+            .then(|| PathBuf::from(&self.repo))
+    }
+
     /// Build a `Registry` for the build-sharing path (`fleet --registry`), from the
     /// CLI flags rather than a config file. `generic_kernel`/`keep` are irrelevant to
     /// push/pull-by-fingerprint (only `resolve` boots), so they take their defaults.
