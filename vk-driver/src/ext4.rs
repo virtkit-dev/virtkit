@@ -116,22 +116,6 @@ pub struct FsId {
     pub with_journal: bool,
 }
 
-/// Build an ext4 image at `out` from the rootfs `tar_path`, injecting the static
-/// agent (PID 1). Convenience wrapper over [`build_from_tar_injecting`].
-pub fn build_from_tar(tar_path: &Path, agent: &Path, out: &Path) -> Result<()> {
-    let inj = [("usr/local/bin/vk-agent", agent, 0o755)];
-    build_from_tar_injecting(
-        tar_path,
-        &inj,
-        0,
-        &FsId {
-            with_journal: true,
-            ..Default::default()
-        },
-        out,
-    )
-}
-
 /// Build an ext4 image at `out` from the rootfs `tar_path`, injecting each host
 /// file in `injects` at its guest path with the given mode (e.g. the agent
 /// agent, an init shim, captured env). `extra_free_blocks` is spare space left

@@ -595,7 +595,7 @@ impl Executor for MicroVm {
         ))
         .with_context(|| format!("pulling {image}"))?;
         // Build the base ext4 with free space for the RUN steps to write into
-        // (build_from_tar leaves none, which would ENOSPC on the first write). The agent
+        // (a zero extra_free_blocks leaves none, which would ENOSPC on the first write). The agent
         // is NOT injected: it boots from the initramfs and pivots into this rootfs, so the
         // image stays clean (no agent binary baked in).
         crate::ext4::build_from_tar_injecting(

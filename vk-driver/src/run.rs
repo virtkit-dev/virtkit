@@ -207,16 +207,19 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         None => None,
     };
 
-    // 1. fetch the rootfs (docker export or registry pull) as a tar, unless a Dockerfile
-    // build already produced the ext4 above.
-    let rootfs_tar = work.join("rootfs.tar");
-    if dockerfile_ext4.is_none() {
-        let source = resolve_source(args).await?;
-        // Inherit the image's configured environment (PATH etc.) for the guest command,
-        // as `docker run` does.
-        image_env = source.config_env().await?;
-        source.to_tar(&rootfs_tar).await?;
-    }
+    // 1. the rootfs source (docker export or registry pull) for an image boot, unless a
+    // Dockerfile build already produced the ext4 above. The rootfs tar itself never
+    // exists as a file — step 2 streams it straight into the cpio/ext4 builder.
+    let source = match dockerfile_ext4 {
+        None => {
+            let source = resolve_source(args).await?;
+            // Inherit the image's configured environment (PATH etc.) for the guest
+            // command, as `docker run` does.
+            image_env = source.config_env().await?;
+            Some(source)
+        }
+        Some(_) => None,
+    };
 
     // 2. assemble the boot medium (virtkit-agent injected as PID 1).
     let (disks, initramfs, mut cmdline): (Vec<crate::vmm::Disk>, Option<PathBuf>, String) =
@@ -240,7 +243,37 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         } else if !args.ram {
             println!("virtkit: building ext4 rootfs");
             let rootfs = work.join("root.ext4");
-            crate::ext4::build_from_tar(&rootfs_tar, agent, &rootfs)?;
+            let source = source.as_ref().expect("an image boot resolved a source");
+            source
+                .stream_tar(work, |tar, hints| {
+                    // Sparse upper bound (over-sizing is free): file-data bytes plus
+                    // per-file block-rounding slack — 4 KiB per entry when the count is
+                    // known (an OCI pull), else 25% — plus a fixed margin. Inodes: exact
+                    // when known, else the builder's data-derived default.
+                    let image_bytes = match hints.entries {
+                        Some(n) => hints.data_bytes + n * 4096,
+                        None => hints.data_bytes + hints.data_bytes / 4,
+                    } + 256 * 1024 * 1024;
+                    crate::ext4::build_from_tar_stream(
+                        tar,
+                        &[(crate::initramfs::CMDRUNNER_PATH, agent, 0o755)],
+                        image_bytes,
+                        0,
+                        // entries unknown (docker export): budget one inode per 8 KiB
+                        // of data with a floor, so small-file-heavy images don't
+                        // exhaust the inode table.
+                        Some(match hints.entries {
+                            Some(n) => n + 4096,
+                            None => (hints.data_bytes / 8192).max(65_536),
+                        }),
+                        &crate::ext4::FsId {
+                            with_journal: true,
+                            ..Default::default()
+                        },
+                        &rootfs,
+                    )
+                })
+                .await?;
             // throwaway rw qcow2 overlay over the ro raw ext4 (rw raw errors on tmpfs)
             let overlay = work.join("overlay.qcow2");
             crate::qcow2::create_overlay(&overlay, &rootfs)?;
@@ -257,7 +290,12 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         } else {
             println!("virtkit: building cpio initramfs");
             let cpio = work.join("initramfs.cpio");
-            crate::initramfs::build_initramfs(&rootfs_tar, agent, &cpio)?;
+            let source = source.as_ref().expect("an image boot resolved a source");
+            source
+                .stream_tar(work, |tar, _| {
+                    crate::initramfs::build_initramfs(tar, agent, &cpio)
+                })
+                .await?;
             // The kernel unpacks the cpio into the rootfs tmpfs, which is capped at
             // half of MemTotal — and MemTotal itself excludes the RAM still holding
             // the archive. So a cpio boot needs roughly (2 * unpacked + archive) ≈

@@ -187,6 +187,31 @@ pub async fn pull_flatten(
     insecure: bool,
     out_tar: &Path,
 ) -> Result<()> {
+    // scratch next to the output tar, not $TMPDIR: a multi-GB image on a tmpfs
+    // /tmp would land in RAM.
+    let scratch_dir = match out_tar.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let (merger, layers) =
+        pull_merged(reference, username, password, ca_pem, insecure, scratch_dir).await?;
+    let n = merger.finish(out_tar)?;
+    println!("virtkit: flattened {layers} layers -> {n} entries");
+    Ok(())
+}
+
+/// Pull `reference` and flatten its layers into a [`Merger`] (spilled to an unlinked
+/// scratch file in `scratch_dir`), plus the layer count. The caller picks the output
+/// form: `finish` to a tar file, or `finish_to` a writer to stream with no
+/// intermediate tar.
+pub(crate) async fn pull_merged(
+    reference: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+    ca_pem: Option<Vec<u8>>,
+    insecure: bool,
+    scratch_dir: &Path,
+) -> Result<(Merger, usize)> {
     let reference: Reference = reference
         .parse()
         .with_context(|| format!("parsing OCI reference {reference:?}"))?;
@@ -217,22 +242,11 @@ pub async fn pull_flatten(
         .await
         .with_context(|| format!("pulling {reference}"))?;
 
-    // scratch next to the output tar, not $TMPDIR: a multi-GB image on a tmpfs
-    // /tmp would land in RAM.
-    let scratch_dir = match out_tar.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
     let mut merger = Merger::new(crate::scratch::scratch(scratch_dir, "oci-spill")?);
     for layer in &image.layers {
         merger.apply_layer(&layer.data[..], &layer.media_type)?;
     }
-    let n = merger.finish(out_tar)?;
-    println!(
-        "virtkit: flattened {} layers -> {n} entries",
-        image.layers.len()
-    );
-    Ok(())
+    Ok((merger, image.layers.len()))
 }
 
 struct Entry {
@@ -533,7 +547,8 @@ mod tests {
         b.append(&h, &b"ping"[..]).unwrap();
         let layer = b.into_inner().unwrap();
 
-        let mut m = Merger::new(crate::scratch::scratch(&std::env::temp_dir(), "test-spill").unwrap());
+        let mut m =
+            Merger::new(crate::scratch::scratch(&std::env::temp_dir(), "test-spill").unwrap());
         m.apply_layer(
             Cursor::new(&layer),
             "application/vnd.oci.image.layer.v1.tar",

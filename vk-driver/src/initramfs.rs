@@ -4,6 +4,7 @@
 //! modules are injected: generic guests boot the pinned guest kernel, which has
 //! virtio (blk/net/vsock) + ext4 built in.
 
+use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -13,10 +14,10 @@ use crate::cpio::CpioWriter;
 /// Where the injected agent lands in the rootfs (relative path).
 pub const CMDRUNNER_PATH: &str = "usr/local/bin/vk-agent";
 
-/// Build a cpio initramfs at `out` from the rootfs `tar_path`, injecting the
-/// static agent as PID 1. Convenience wrapper over [`build_initramfs_injecting`].
-pub fn build_initramfs(tar_path: &Path, agent: &Path, out: &Path) -> Result<()> {
-    build_initramfs_injecting(tar_path, &[(CMDRUNNER_PATH, agent, 0o755)], out)
+/// Build a cpio initramfs at `out` from the rootfs tar streamed by `tar`, injecting
+/// the static agent as PID 1. Convenience wrapper over [`build_initramfs_injecting`].
+pub fn build_initramfs(tar: impl Read, agent: &Path, out: &Path) -> Result<()> {
+    build_initramfs_injecting(tar, &[(CMDRUNNER_PATH, agent, 0o755)], out)
 }
 
 /// Build a *minimal* cpio initramfs at `out` containing only the agent as `/init`.
@@ -35,21 +36,20 @@ pub fn build_agent_initramfs(agent: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Build a cpio initramfs at `out` from the rootfs `tar_path`, injecting each host
-/// file in `injects` at its guest path with the given mode (the agent PID 1, plus
-/// e.g. the captured `/etc/virtkit/{env,user}`). Hardlinks/device nodes/fifos are
-/// skipped — a generic rootfs (alpine, distroless) has none that matter for booting.
+/// Build a cpio initramfs at `out` from the rootfs tar streamed by `tar` (a single
+/// pass — no tar file needed), injecting each host file in `injects` at its guest
+/// path with the given mode (the agent PID 1, plus e.g. the captured
+/// `/etc/virtkit/{env,user}`). Hardlinks/device nodes/fifos are skipped — a generic
+/// rootfs (alpine, distroless) has none that matter for booting.
 pub fn build_initramfs_injecting(
-    tar_path: &Path,
+    tar: impl Read,
     injects: &[(&str, &Path, u16)],
     out: &Path,
 ) -> Result<()> {
     let file = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
     let mut cpio = CpioWriter::new(std::io::BufWriter::new(file));
 
-    let src =
-        std::fs::File::open(tar_path).with_context(|| format!("opening {}", tar_path.display()))?;
-    let mut ar = tar::Archive::new(src);
+    let mut ar = tar::Archive::new(tar);
     for entry in ar.entries()? {
         let mut e = entry?;
         let header = e.header();
