@@ -257,6 +257,24 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             println!("virtkit: building cpio initramfs");
             let cpio = work.join("initramfs.cpio");
             crate::initramfs::build_initramfs(&rootfs_tar, agent, &cpio)?;
+            // The kernel unpacks the cpio into the rootfs tmpfs, which is capped at
+            // half of MemTotal — and MemTotal itself excludes the RAM still holding
+            // the archive. So a cpio boot needs roughly (2 * unpacked + archive) ≈
+            // three times the initramfs size, plus working room; with less, the
+            // unpack hits ENOSPC and the guest dies before its console comes up
+            // (an empty-log "exited during boot"). Refuse up front instead.
+            let initramfs_mib = std::fs::metadata(&cpio)?.len() >> 20;
+            let need_mib = initramfs_mib * 3 + 384;
+            if let Some(mem_mib) = parse_mem_mib(&args.mem)
+                && mem_mib < need_mib
+            {
+                bail!(
+                    "the image unpacks to a {initramfs_mib} MiB initramfs, which does not fit \
+                     in --mem {} — pass --mem {}G, or boot it from a disk with --disk",
+                    args.mem,
+                    need_mib.div_ceil(1024),
+                );
+            }
             (
                 Vec::new(),
                 Some(cpio),
@@ -521,7 +539,7 @@ async fn drive(
         if let Some(status) = ch.try_wait()? {
             bail!(
                 "cloud-hypervisor exited during boot ({status})\n{}",
-                tail(console, 20)
+                boot_failure(console)
             );
         }
         if vk_core::status::get_status(addr).await.is_ok() {
@@ -661,6 +679,32 @@ fn spawn_ch(cloud_hypervisor: &Path, spec: &crate::vmm::VmSpec) -> Result<Child>
     // whole running guest, not just an idle helper (spawn_tied).
     crate::fleet::spawn_tied(cmd)
         .with_context(|| format!("spawning {}", cloud_hypervisor.display()))
+}
+
+/// Parse a `--mem` value into MiB: `<n>G`, `<n>M`, or a plain MiB count. `None` for
+/// anything else (e.g. cloud-hypervisor's richer syntax) — callers skip their check.
+fn parse_mem_mib(mem: &str) -> Option<u64> {
+    if let Some(g) = mem.strip_suffix(['G', 'g']) {
+        return g.parse::<u64>().ok().map(|n| n * 1024);
+    }
+    if let Some(m) = mem.strip_suffix(['M', 'm']) {
+        return m.parse().ok();
+    }
+    mem.parse().ok()
+}
+
+/// Diagnostic tail for a VMM that exited during boot: the serial log's last lines. A
+/// silent death — both the serial and the VMM's own log (`<serial>.ch.log`) empty —
+/// means the guest never brought its console up, almost always a boot-medium/resource
+/// problem rather than a VMM one; say so instead of showing an empty tail.
+fn boot_failure(console: &Path) -> String {
+    let serial = tail(console, 20);
+    if serial.is_empty() && tail(&console.with_extension("ch.log"), 20).is_empty() {
+        return "(no output at all: the guest died before its console initialised — \
+                e.g. too little --mem for the kernel or boot medium)"
+            .into();
+    }
+    serial
 }
 
 fn tail(path: &Path, lines: usize) -> String {
@@ -848,7 +892,7 @@ pub(crate) async fn boot_session(
         if let Some(status) = ch.try_wait()? {
             bail!(
                 "cloud-hypervisor exited during boot ({status})\n{}",
-                tail(&console, 20)
+                boot_failure(&console)
             );
         }
         if vk_core::status::get_status(&addr).await.is_ok() {
