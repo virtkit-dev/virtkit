@@ -17,6 +17,14 @@ that a static `libkrun.a` link hits.
 
 ## Local patches
 
+`src/devices/src/virtio/descriptor_utils.rs` + `src/devices/src/virtio/fs/mod.rs` —
+expose the fs engine to external transports: `Reader/Writer::from_volatile_slices`
+constructors (build a FUSE request view from buffers collected by another virtio
+transport, e.g. vhost-user) and public `filesystem`/`read_only` modules plus `pub use`
+of `Server` and `InodeAllocator`. Additive only — nothing upstream changes behaviour.
+Used by virtkit's bundled `vk virtiofsd` daemon (vk-driver/src/virtiofsd), which serves
+cloud-hypervisor's vhost-user shares with this fs engine instead of the virtiofsd crate.
+
 `src/arch/src/x86_64/mod.rs` — place the initrd below 4 GiB. It was placed at the top
 of all guest RAM, but the boot protocol's `setup_header` here has no `ext_ramdisk_image`
 field, so the address is passed only through the 32-bit `ramdisk_image`. Once the guest

@@ -16,6 +16,8 @@ All notable changes to virtkit will be documented in this file.
 
 - Images boot from a native ext4 disk by default; the in-RAM cpio boot moves
   behind `--ram` (replacing `--disk`) and the cpio bundle format is retired.
+- `vk virtiofsd` is reimplemented on the vendored libkrun fs engine; nothing in
+  the tree links C libraries anymore.
 
 ### Fixed
 

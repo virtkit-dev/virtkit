@@ -1,13 +1,15 @@
 mod augment_fs;
 mod device;
+// filesystem + read_only are public (local patch, see VENDOR.md): an external
+// vhost-user daemon drives the fs engine through the FileSystem trait types.
 #[allow(dead_code)]
-mod filesystem;
+pub mod filesystem;
 pub mod fuse;
 mod inode_alloc;
 #[allow(dead_code)]
 mod multikey;
 mod null_fs;
-mod read_only;
+pub mod read_only;
 mod server;
 pub mod virtual_entry;
 mod worker;
@@ -31,6 +33,11 @@ use super::descriptor_utils;
 pub use self::defs::uapi::VIRTIO_ID_FS as TYPE_FS;
 pub use self::device::Fs;
 pub use self::filesystem::ExportTable;
+// Local patch (see VENDOR.md): expose the transport-agnostic FUSE server pieces so an
+// external vhost-user daemon can drive PassthroughFs without this crate's Fs device.
+pub use self::filesystem::FileSystem;
+pub use self::inode_alloc::InodeAllocator;
+pub use self::server::Server;
 
 mod defs {
     use super::super::QueueConfig;

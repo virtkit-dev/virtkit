@@ -188,6 +188,18 @@ pub struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
+    /// Construct a Reader over externally collected buffers — the readable descriptors
+    /// of a chain delivered by another virtio transport (e.g. vhost-user), mapped into
+    /// this process. Local patch — see VENDOR.md.
+    pub fn from_volatile_slices(buffers: VecDeque<VolatileSlice<'a>>) -> Reader<'a> {
+        Reader {
+            buffer: DescriptorChainConsumer {
+                buffers,
+                bytes_consumed: 0,
+            },
+        }
+    }
+
     /// Construct a new Reader wrapper over `desc_chain`.
     pub fn new(mem: &'a GuestMemoryMmap, chain: DescriptorChain<'a>) -> Result<Reader<'a>> {
         let mut total_len: usize = 0;
@@ -340,6 +352,18 @@ pub struct Writer<'a> {
 }
 
 impl<'a> Writer<'a> {
+    /// Construct a Writer over externally collected buffers — the writable descriptors
+    /// of a chain delivered by another virtio transport (e.g. vhost-user), mapped into
+    /// this process. Local patch — see VENDOR.md.
+    pub fn from_volatile_slices(buffers: VecDeque<VolatileSlice<'a>>) -> Writer<'a> {
+        Writer {
+            buffer: DescriptorChainConsumer {
+                buffers,
+                bytes_consumed: 0,
+            },
+        }
+    }
+
     /// Construct a new Writer wrapper over `desc_chain`.
     pub fn new(mem: &'a GuestMemoryMmap, chain: DescriptorChain<'a>) -> Result<Writer<'a>> {
         let mut total_len: usize = 0;
