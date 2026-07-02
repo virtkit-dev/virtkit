@@ -18,6 +18,8 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 mod build;
 mod check;
+#[allow(dead_code)] // wired up by the executor's service switchover
+mod compose;
 mod config;
 mod convert;
 mod cpio;

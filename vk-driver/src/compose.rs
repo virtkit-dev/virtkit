@@ -1,0 +1,725 @@
+//! The docker-compose subset `vk run --compose` consumes — the service
+//! declaration, kept isomorphic to compose so a compose file (or a GitLab CI
+//! `services:` block, which is a subset of it) migrates mechanically.
+//!
+//! Supported per service: `image` xor `build.{context, dockerfile (string or list —
+//! a vk extension merging the files into one stage namespace), target, args}`,
+//! `environment`, `command`, `entrypoint`, `user`, `hostname`, `depends_on`
+//! (start-ordering only), `volumes` (bind mounts) and `profiles` (a profiled
+//! service stays down at start-up unless activated or depended on). **Any other
+//! key is a hard error** — silently ignoring a compose key would silently change
+//! behavior.
+//!
+//! Runtime config follows the compose model: the image (its config sidecar / OCI
+//! config) carries the defaults, the service entries are start-time overrides —
+//! merged by [`merged_config`] and handed to the guest at boot. Changing an
+//! override never rebuilds an image.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+use vk_core::runcfg::RunConfig;
+
+/// One declared service, mapped from a compose `services.<name>` entry.
+#[derive(Debug)]
+pub struct Unit {
+    pub name: String,
+    /// guest hostname (compose `hostname`, default: the service name)
+    pub hostname: String,
+    pub source: Source,
+    /// start-time overrides, layered over the image's runtime config
+    pub environment: Vec<(String, String)>,
+    pub entrypoint: Option<Vec<String>>,
+    pub command: Option<Vec<String>>,
+    pub user: Option<String>,
+    /// services that must be started before this one (ordering only)
+    pub depends_on: Vec<String>,
+    pub volumes: Vec<Volume>,
+    /// compose profiles: a service with any profile assigned is declared but NOT
+    /// started at start-up unless one of its profiles is activated (`--profile`)
+    /// or an enabled service depends on it — `virtctl start` works regardless
+    pub profiles: Vec<String>,
+}
+
+/// Where a unit's image comes from.
+#[derive(Debug)]
+pub enum Source {
+    /// pulled from a registry (fingerprint: the manifest digest)
+    Image(String),
+    /// built in-process from Dockerfile stage(s) (fingerprint: the stage key)
+    Build {
+        /// the service's Dockerfile(s); several merge into one stage namespace
+        dockerfiles: Vec<PathBuf>,
+        /// the build context, shared by all the service's files (compose semantics)
+        context: PathBuf,
+        target: Option<String>,
+        args: Vec<(String, String)>,
+    },
+}
+
+/// A bind mount (`host:guest[:ro]`); named volumes are not supported.
+#[derive(Debug)]
+pub struct Volume {
+    pub host: PathBuf,
+    pub guest: String,
+    pub read_only: bool,
+}
+
+/// The service's start-time config layered over the image's defaults, compose
+/// semantics: environment upserts; `entrypoint:` replaces the entrypoint AND drops
+/// the image's cmd (`command:`, when also given, replaces it); `command:` alone
+/// replaces only the cmd; `user:` replaces the user. The image keeps its workdir.
+pub fn merged_config(image: &RunConfig, unit: &Unit) -> RunConfig {
+    let mut env = image.env.clone();
+    for (k, v) in &unit.environment {
+        match env.iter_mut().find(|(ek, _)| ek == k) {
+            Some(e) => e.1 = v.clone(),
+            None => env.push((k.clone(), v.clone())),
+        }
+    }
+    let (entrypoint, cmd) = match (&unit.entrypoint, &unit.command) {
+        (Some(e), Some(c)) => (e.clone(), c.clone()),
+        (Some(e), None) => (e.clone(), Vec::new()),
+        (None, Some(c)) => (image.entrypoint.clone(), c.clone()),
+        (None, None) => (image.entrypoint.clone(), image.cmd.clone()),
+    };
+    RunConfig {
+        env,
+        user: unit.user.clone().unwrap_or_else(|| image.user.clone()),
+        workdir: image.workdir.clone(),
+        entrypoint,
+        cmd,
+    }
+}
+
+/// Start order over the units: dependencies first (DFS), unknown names and cycles
+/// are errors. Returns indices into `units`.
+pub fn boot_order(units: &[Unit]) -> Result<Vec<usize>> {
+    let by_name: BTreeMap<&str, usize> = units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (u.name.as_str(), i))
+        .collect();
+    let mut order = Vec::new();
+    let mut state = vec![0u8; units.len()]; // 0 unvisited, 1 visiting, 2 done
+    fn visit(
+        i: usize,
+        units: &[Unit],
+        by_name: &BTreeMap<&str, usize>,
+        state: &mut [u8],
+        order: &mut Vec<usize>,
+    ) -> Result<()> {
+        match state[i] {
+            2 => return Ok(()),
+            1 => bail!("depends_on cycle through service {:?}", units[i].name),
+            _ => {}
+        }
+        state[i] = 1;
+        for dep in &units[i].depends_on {
+            let &d = by_name.get(dep.as_str()).with_context(|| {
+                format!("service {:?} depends_on unknown {dep:?}", units[i].name)
+            })?;
+            visit(d, units, by_name, state, order)?;
+        }
+        state[i] = 2;
+        order.push(i);
+        Ok(())
+    }
+    for i in 0..units.len() {
+        visit(i, units, &by_name, &mut state, &mut order)?;
+    }
+    Ok(order)
+}
+
+/// Which units start eagerly, given the activated profiles — compose semantics:
+/// a unit with no profiles always starts; a profiled unit starts when one of its
+/// profiles is active, or when an enabled unit (transitively) depends on it. The
+/// rest stay declared-but-down, for `virtctl start`.
+pub fn enabled(units: &[Unit], active_profiles: &[String]) -> Vec<bool> {
+    let by_name: BTreeMap<&str, usize> = units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (u.name.as_str(), i))
+        .collect();
+    let mut on = vec![false; units.len()];
+    let mut stack: Vec<usize> = units
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| {
+            u.profiles.is_empty() || u.profiles.iter().any(|p| active_profiles.contains(p))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    while let Some(i) = stack.pop() {
+        if std::mem::replace(&mut on[i], true) {
+            continue;
+        }
+        for dep in &units[i].depends_on {
+            // unknown deps are boot_order's error to report; skip here.
+            if let Some(&d) = by_name.get(dep.as_str()) {
+                stack.push(d);
+            }
+        }
+    }
+    on
+}
+
+/// Load + map a compose file. `base` (the file's directory) anchors every relative
+/// path: build contexts, Dockerfiles, and bind-mount sources.
+pub fn load(path: &Path) -> Result<Vec<Unit>> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    parse(&text, base).with_context(|| format!("in {}", path.display()))
+}
+
+/// Parse + validate the compose subset (see the module docs for what is accepted).
+pub fn parse(yaml: &str, base: &Path) -> Result<Vec<Unit>> {
+    let file: ComposeFile = serde_yaml_ng::from_str(yaml)?;
+    if file.services.is_empty() {
+        bail!("no services declared");
+    }
+    let mut units = Vec::new();
+    for (name, svc) in file.services {
+        units.push(map_service(&name, svc, base).with_context(|| format!("service {name:?}"))?);
+    }
+    Ok(units)
+}
+
+/// A service name becomes a LAN hostname, so it must be a valid RFC-1123 DNS
+/// label: 1–63 chars of `[a-z0-9-]` with no leading or trailing hyphen.
+fn is_dns_label(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 63
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
+    if !is_dns_label(name) {
+        bail!(
+            "service name {name:?} must be a DNS label \
+             ([a-z0-9-], no leading/trailing hyphen, ≤63 chars) — it becomes a LAN hostname"
+        );
+    }
+    let source = match (svc.image, svc.build) {
+        (Some(image), None) => Source::Image(image),
+        (None, Some(build)) => map_build(build, base)?,
+        (Some(_), Some(_)) => bail!("give either image: or build:, not both"),
+        (None, None) => bail!("needs image: or build:"),
+    };
+    let volumes = svc
+        .volumes
+        .iter()
+        .map(|v| parse_volume(v, base))
+        .collect::<Result<_>>()?;
+    let depends_on = match svc.depends_on {
+        Some(d) => {
+            d.validate()?;
+            d.into_names()
+        }
+        None => Vec::new(),
+    };
+    Ok(Unit {
+        name: name.to_string(),
+        hostname: svc.hostname.unwrap_or_else(|| name.to_string()),
+        source,
+        environment: svc.environment.map(Env::into_pairs).unwrap_or_default(),
+        entrypoint: svc.entrypoint.map(Cmd::into_argv).transpose()?,
+        command: svc.command.map(Cmd::into_argv).transpose()?,
+        user: svc.user,
+        depends_on,
+        volumes,
+        profiles: svc.profiles,
+    })
+}
+
+fn map_build(build: serde_yaml_ng::Value, base: &Path) -> Result<Source> {
+    let spec = match build {
+        // `build: <dir>` is the compose shorthand for a context dir. The mapping
+        // form is dispatched explicitly (not via an untagged enum) so an unknown
+        // build key errors naming that key, like every other unsupported key.
+        serde_yaml_ng::Value::String(dir) => BuildSpec {
+            context: Some(dir.into()),
+            ..Default::default()
+        },
+        other => serde_yaml_ng::from_value(other).context("build:")?,
+    };
+    let context = base.join(spec.context.as_deref().unwrap_or(Path::new(".")));
+    let dockerfiles: Vec<PathBuf> = match spec.dockerfile {
+        None => vec![context.join("Dockerfile")],
+        Some(OneOrMany::One(f)) => vec![context.join(f)],
+        Some(OneOrMany::Many(fs)) => {
+            if fs.is_empty() {
+                bail!("build.dockerfile: empty list");
+            }
+            fs.into_iter().map(|f| context.join(f)).collect()
+        }
+    };
+    Ok(Source::Build {
+        dockerfiles,
+        context,
+        target: spec.target,
+        args: spec.args.map(Env::into_pairs).unwrap_or_default(),
+    })
+}
+
+/// A bind-mount `host:guest[:ro|rw]`. A source that is not a path (a compose named
+/// volume) is rejected — there is no volume manager here.
+fn parse_volume(spec: &str, base: &Path) -> Result<Volume> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    let (host, guest, mode) = match parts.as_slice() {
+        [h, g] => (*h, *g, "rw"),
+        [h, g, m] => (*h, *g, *m),
+        _ => bail!("bad volume {spec:?} (want host:guest[:ro])"),
+    };
+    if !(host.starts_with('/') || host.starts_with('.') || host.starts_with('~')) {
+        bail!("volume {spec:?}: named volumes are not supported (bind-mount a path)");
+    }
+    if host.starts_with('~') {
+        bail!("volume {spec:?}: ~ expansion is not supported (use an absolute path)");
+    }
+    let read_only = match mode {
+        "ro" => true,
+        "rw" => false,
+        other => bail!("volume {spec:?}: unsupported mode {other:?} (want ro or rw)"),
+    };
+    if !guest.starts_with('/') {
+        bail!("volume {spec:?}: the guest path must be absolute");
+    }
+    Ok(Volume {
+        host: base.join(host),
+        guest: guest.to_string(),
+        read_only,
+    })
+}
+
+/// Split a compose string-form command into argv, shell-words style (like compose,
+/// without running a shell): single/double quotes group words, and a backslash
+/// escapes the next character — except inside single quotes, where it is literal.
+fn shell_words(s: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false;
+    let mut escaped = false;
+    for c in s.chars() {
+        if escaped {
+            cur.push(c);
+            started = true;
+            escaped = false;
+            continue;
+        }
+        match (quote, c) {
+            // backslash escapes the next char outside quotes and inside double
+            // quotes; single quotes keep it literal (handled by the arm below).
+            (None, '\\') | (Some('"'), '\\') => {
+                escaped = true;
+                started = true;
+            }
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => cur.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                started = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if started {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            (None, c) => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        bail!("unterminated quote in {s:?}");
+    }
+    if escaped {
+        bail!("dangling backslash in {s:?}");
+    }
+    if started {
+        out.push(cur);
+    }
+    Ok(out)
+}
+
+// ---- raw compose shapes (serde; unknown keys are hard errors) ----
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComposeFile {
+    /// accepted and ignored: the compose spec deprecates it
+    #[serde(default)]
+    #[allow(dead_code)]
+    version: Option<String>,
+    #[serde(default)]
+    services: BTreeMap<String, ComposeService>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComposeService {
+    image: Option<String>,
+    build: Option<serde_yaml_ng::Value>,
+    environment: Option<Env>,
+    command: Option<Cmd>,
+    entrypoint: Option<Cmd>,
+    user: Option<String>,
+    hostname: Option<String>,
+    depends_on: Option<DependsOn>,
+    #[serde(default)]
+    volumes: Vec<String>,
+    #[serde(default)]
+    profiles: Vec<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct BuildSpec {
+    context: Option<PathBuf>,
+    dockerfile: Option<OneOrMany>,
+    target: Option<String>,
+    args: Option<Env>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(PathBuf),
+    Many(Vec<PathBuf>),
+}
+
+/// compose environment/args: a `KEY: value` map or a `KEY=value` list; scalar
+/// values (numbers, bools) stringify like compose does.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Env {
+    Map(BTreeMap<String, Scalar>),
+    List(Vec<String>),
+}
+
+impl Env {
+    fn into_pairs(self) -> Vec<(String, String)> {
+        match self {
+            Env::Map(m) => m.into_iter().map(|(k, v)| (k, v.into_string())).collect(),
+            Env::List(l) => l
+                .into_iter()
+                .map(|e| match e.split_once('=') {
+                    Some((k, v)) => (k.to_string(), v.to_string()),
+                    None => (e, String::new()),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Scalar {
+    Str(String),
+    Num(serde_yaml_ng::Number),
+    Bool(bool),
+    Null,
+}
+
+impl Scalar {
+    fn into_string(self) -> String {
+        match self {
+            Scalar::Str(s) => s,
+            Scalar::Num(n) => n.to_string(),
+            Scalar::Bool(b) => b.to_string(),
+            // compose reads a null-valued key (`KEY:`) from the host environment;
+            // a hermetic guest has no host env to inherit, so it maps to empty.
+            Scalar::Null => String::new(),
+        }
+    }
+}
+
+/// compose command/entrypoint: an argv list, or a string split shell-words style.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Cmd {
+    List(Vec<String>),
+    Str(String),
+}
+
+impl Cmd {
+    fn into_argv(self) -> Result<Vec<String>> {
+        match self {
+            Cmd::List(v) => Ok(v),
+            Cmd::Str(s) => shell_words(&s),
+        }
+    }
+}
+
+/// compose depends_on: a name list, or a map with per-dependency conditions —
+/// only start-ordering is supported, so `service_started` (the default) passes
+/// and anything else (e.g. `service_healthy`) errors.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DependsOn {
+    List(Vec<String>),
+    Map(BTreeMap<String, DependsCondition>),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DependsCondition {
+    condition: Option<String>,
+}
+
+impl DependsOn {
+    fn into_names(self) -> Vec<String> {
+        match self {
+            DependsOn::List(l) => l,
+            DependsOn::Map(m) => m.into_keys().collect(),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if let DependsOn::Map(m) = self {
+            for (name, c) in m {
+                match c.condition.as_deref() {
+                    None | Some("service_started") => {}
+                    Some(other) => bail!(
+                        "depends_on {name:?}: condition {other:?} is not supported \
+                         (start ordering only)"
+                    ),
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one(yaml: &str) -> Unit {
+        parse(yaml, Path::new("/base")).unwrap().pop().unwrap()
+    }
+
+    #[test]
+    fn image_service_with_overrides() {
+        let u = one(
+            "services:\n  redis:\n    image: redis:7\n    environment:\n      PORT: 6380\n\
+             \x20     FLAG: true\n    command: redis-server --port 6380\n    user: redis\n",
+        );
+        assert!(matches!(&u.source, Source::Image(i) if i == "redis:7"));
+        assert_eq!(u.hostname, "redis");
+        assert_eq!(
+            u.environment,
+            [
+                ("FLAG".to_string(), "true".to_string()),
+                ("PORT".to_string(), "6380".to_string())
+            ]
+        );
+        assert_eq!(
+            u.command.as_deref().unwrap(),
+            ["redis-server", "--port", "6380"]
+        );
+        assert_eq!(u.user.as_deref(), Some("redis"));
+    }
+
+    #[test]
+    fn build_service_paths_anchor_on_the_compose_dir() {
+        // shorthand: build: <dir>
+        let u = one("services:\n  app:\n    build: ./app\n");
+        match &u.source {
+            Source::Build {
+                dockerfiles,
+                context,
+                target,
+                ..
+            } => {
+                assert_eq!(context, &PathBuf::from("/base/./app"));
+                assert_eq!(dockerfiles, &[PathBuf::from("/base/./app/Dockerfile")]);
+                assert!(target.is_none());
+            }
+            _ => panic!("expected a build source"),
+        }
+        // mapping form with the vk list extension + target + args
+        let u = one(
+            "services:\n  app:\n    build:\n      context: .\n      dockerfile:\n\
+             \x20       - base.Dockerfile\n        - app.Dockerfile\n      target: app\n\
+             \x20     args:\n        ver: 9\n",
+        );
+        match &u.source {
+            Source::Build {
+                dockerfiles,
+                target,
+                args,
+                ..
+            } => {
+                assert_eq!(dockerfiles.len(), 2);
+                assert_eq!(dockerfiles[1], PathBuf::from("/base/./app.Dockerfile"));
+                assert_eq!(target.as_deref(), Some("app"));
+                assert_eq!(args, &[("ver".to_string(), "9".to_string())]);
+            }
+            _ => panic!("expected a build source"),
+        }
+    }
+
+    #[test]
+    fn unsupported_keys_error_naming_the_key() {
+        let err = parse(
+            "services:\n  web:\n    image: x\n    restart: always\n",
+            Path::new("/b"),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("restart"), "{err:#}");
+        let err = parse(
+            "services:\n  web:\n    build:\n      context: .\n      cache_from: [a]\n",
+            Path::new("/b"),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("cache_from"), "{err:#}");
+    }
+
+    #[test]
+    fn source_is_image_xor_build() {
+        let both = "services:\n  x:\n    image: a\n    build: .\n";
+        assert!(parse(both, Path::new("/b")).is_err());
+        let neither = "services:\n  x:\n    user: root\n";
+        assert!(parse(neither, Path::new("/b")).is_err());
+    }
+
+    #[test]
+    fn volumes_are_bind_mounts_only() {
+        let u = one("services:\n  s:\n    image: x\n    volumes:\n      - ./data:/data:ro\n");
+        assert_eq!(u.volumes[0].host, PathBuf::from("/base/./data"));
+        assert_eq!(u.volumes[0].guest, "/data");
+        assert!(u.volumes[0].read_only);
+        let named = "services:\n  s:\n    image: x\n    volumes:\n      - dbdata:/var/lib\n";
+        let err = parse(named, Path::new("/b")).unwrap_err();
+        assert!(format!("{err:#}").contains("named volumes"), "{err:#}");
+    }
+
+    #[test]
+    fn depends_on_orders_and_rejects_health_conditions() {
+        let units = parse(
+            "services:\n  a:\n    image: x\n    depends_on: [b]\n  b:\n    image: y\n",
+            Path::new("/b"),
+        )
+        .unwrap();
+        let order = boot_order(&units).unwrap();
+        let pos = |n: &str| order.iter().position(|&i| units[i].name == n).unwrap();
+        assert!(pos("b") < pos("a"));
+        // unknown dep + cycle
+        let unknown = parse(
+            "services:\n  a:\n    image: x\n    depends_on: [nope]\n",
+            Path::new("/b"),
+        )
+        .unwrap();
+        assert!(boot_order(&unknown).is_err());
+        let cycle = parse(
+            "services:\n  a:\n    image: x\n    depends_on: [b]\n  b:\n    image: y\n    depends_on: [a]\n",
+            Path::new("/b"),
+        )
+        .unwrap();
+        assert!(boot_order(&cycle).is_err());
+        // condition map: started ok, healthy rejected
+        let healthy = "services:\n  a:\n    image: x\n    depends_on:\n      b:\n        condition: service_healthy\n  b:\n    image: y\n";
+        let err = parse(healthy, Path::new("/b")).unwrap_err();
+        assert!(format!("{err:#}").contains("service_healthy"), "{err:#}");
+    }
+
+    #[test]
+    fn profiles_gate_the_start_set() {
+        let units = parse(
+            "services:\n\
+             \x20 web:\n    image: w\n    depends_on: [db]\n\
+             \x20 db:\n    image: d\n    profiles: [full]\n\
+             \x20 debug:\n    image: g\n    profiles: [debug]\n",
+            Path::new("/b"),
+        )
+        .unwrap();
+        let by = |name: &str| units.iter().position(|u| u.name == name).unwrap();
+        // no profile active: web starts, and pulls in db (an enabled service depends
+        // on it — compose implicitly enables dependencies); debug stays down.
+        let on = enabled(&units, &[]);
+        assert!(on[by("web")] && on[by("db")]);
+        assert!(!on[by("debug")]);
+        // activating the profile brings debug up too.
+        let on = enabled(&units, &["debug".to_string()]);
+        assert!(on[by("debug")]);
+        // a profiled unit nothing depends on and no active profile: everything down.
+        let solo = parse(
+            "services:\n  x:\n    image: i\n    profiles: [a, b]\n",
+            Path::new("/b"),
+        )
+        .unwrap();
+        assert_eq!(enabled(&solo, &[]), [false]);
+        assert_eq!(enabled(&solo, &["b".to_string()]), [true]);
+    }
+
+    #[test]
+    fn merged_config_layers_compose_overrides() {
+        let image = RunConfig {
+            env: vec![("PATH".into(), "/bin".into()), ("PORT".into(), "1".into())],
+            user: "svc".into(),
+            workdir: "/srv".into(),
+            entrypoint: vec!["/bin/app".into()],
+            cmd: vec!["--serve".into()],
+        };
+        let mut unit = one("services:\n  s:\n    image: x\n    environment: [PORT=2]\n");
+        // env upserts; everything else keeps the image defaults
+        let m = merged_config(&image, &unit);
+        assert_eq!(
+            m.env,
+            [
+                ("PATH".to_string(), "/bin".to_string()),
+                ("PORT".to_string(), "2".to_string())
+            ]
+        );
+        assert_eq!(m.argv(), ["/bin/app", "--serve"]);
+        assert_eq!((m.user.as_str(), m.workdir.as_str()), ("svc", "/srv"));
+        // command alone replaces cmd, keeps entrypoint
+        unit.command = Some(vec!["--other".into()]);
+        assert_eq!(merged_config(&image, &unit).argv(), ["/bin/app", "--other"]);
+        // entrypoint alone replaces entrypoint AND drops the image cmd
+        unit.command = None;
+        unit.entrypoint = Some(vec!["/bin/sh".into()]);
+        assert_eq!(merged_config(&image, &unit).argv(), ["/bin/sh"]);
+        // user override
+        unit.user = Some("root".into());
+        assert_eq!(merged_config(&image, &unit).user, "root");
+    }
+
+    #[test]
+    fn shell_words_honors_quotes() {
+        assert_eq!(
+            shell_words("redis-server '/etc/my conf' --x \"a b\"").unwrap(),
+            ["redis-server", "/etc/my conf", "--x", "a b"]
+        );
+        assert!(shell_words("broken 'quote").is_err());
+        assert_eq!(shell_words("  ").unwrap(), Vec::<String>::new());
+        // backslash escapes a space outside quotes and a quote inside double quotes;
+        // it is literal inside single quotes; a dangling backslash errors.
+        assert_eq!(
+            shell_words(r#"a\ b "c\"d" 'e\f'"#).unwrap(),
+            ["a b", "c\"d", "e\\f"]
+        );
+        assert!(shell_words(r"trailing\").is_err());
+    }
+
+    #[test]
+    fn service_names_must_be_dns_safe() {
+        assert!(parse("services:\n  My_Svc:\n    image: x\n", Path::new("/b")).is_err());
+        // leading/trailing hyphens and over-long names are rejected
+        assert!(parse("services:\n  -svc:\n    image: x\n", Path::new("/b")).is_err());
+        assert!(parse("services:\n  svc-:\n    image: x\n", Path::new("/b")).is_err());
+        assert!(!is_dns_label(&"a".repeat(64)));
+        assert!(is_dns_label("web-1"));
+    }
+}
