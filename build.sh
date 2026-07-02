@@ -175,8 +175,14 @@ done
 ( cd "$OUT" && sha256sum vk > vk.sha256 && sha256sum vk-agent > vk-agent.sha256 )
 base_image=$(sed -nE 's/^FROM (rust:.*)$/\1/p' .devcontainer/Dockerfile)
 toolchain=$(sed -nE 's/^channel = "(.*)"$/\1/p' rust-toolchain.toml)
-commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)
-[ -n "$(git status --porcelain 2>/dev/null)" ] && commit="$commit (dirty)"
+# VK_GIT_COMMIT lets the caller supply the commit — the --bootstrap-check rebuild runs
+# in a tree copy with no .git, so it inherits the outer build's commit instead of "unknown".
+if [ -n "${VK_GIT_COMMIT:-}" ]; then
+  commit="$VK_GIT_COMMIT"
+else
+  commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+  [ -n "$(git status --porcelain 2>/dev/null)" ] && commit="$commit (dirty)"
+fi
 cat > "$OUT/build-info.txt" <<EOF
 # virtkit reproducible build manifest
 # Verify: git checkout <git_commit> && ./build.sh && sha256sum -c dist/vk.sha256 dist/vk-agent.sha256
@@ -214,8 +220,9 @@ if [ -n "$BOOTSTRAP_CHECK" ]; then
   mkdir -p "$boot_tmp/$OUT"
   cp "$boot_dist/vmlinux" "$boot_tmp/$OUT/vmlinux"
   rebuild_start=$SECONDS
-  # Same VMM choice as requested.
-  ( cd "$boot_tmp" && ./build.sh --use-virtkit="$boot_dist" --vmm="$VMM" )
+  # Same VMM choice as requested, and the commit threaded in (the copy has no .git).
+  ( cd "$boot_tmp" && VK_GIT_COMMIT="$commit" ./build.sh \
+      --use-virtkit="$boot_dist" --vmm="$VMM" )
   since "bootstrap rebuild" "$rebuild_start"
 
   echo
