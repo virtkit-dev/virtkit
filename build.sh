@@ -4,11 +4,11 @@
 # Two backends produce the same artifact with the same toolchain:
 #   - default: Docker — `docker build` the devcontainer image, then `docker run`
 #     the compile in it.
-#   - --use-virtkit=<DIST>: dogfood — use the virtkit binary in <DIST> to build the
-#     devcontainer Dockerfile into a microVM and compile a shared checkout inside it
-#     (DIST also supplies vmlinux + vk-agent; cloud-hypervisor comes from PATH,
-#     or DIST/cloud-hypervisor if present). Set VK_CACHE=host:port to push/pull the
-#     build image from a `vk registry serve` by its content key.
+#   - --use-virtkit=<DIST>: dogfood — use the vk binary in <DIST> to build the
+#     devcontainer Dockerfile into a microVM and compile a shared checkout inside it.
+#     vk embeds the kernel + agent, so DIST needs only the vk binary (cloud-hypervisor
+#     comes from PATH, or DIST/cloud-hypervisor if present). Set VK_CACHE=host:port to
+#     push/pull the build image from a `vk registry serve` by its content key.
 #
 # Output goes to ./dist as stripped, static-pie musl ELF binaries. Both backends
 # mount the repo at /work and pass identical flags, so the bytes match either way.
@@ -39,9 +39,9 @@ if [ -n "$USE_VIRTKIT" ] && [ -n "$BOOTSTRAP_CHECK" ]; then
 fi
 
 # Fail fast: check the dogfood-rebuild prerequisites up front, before the slow Docker build
-# and compile — not three minutes later when the rebuild starts. The fresh virtkit +
-# vk-agent come from the Docker build below; only the guest kernel and the VMM are
-# external to it.
+# and compile — not three minutes later when the rebuild starts. The fresh vk (guest
+# kernel and vk-agent embedded) comes from the Docker build below; only the kernel to
+# embed (dist/vmlinux) and the VMM are external to it.
 if [ -n "$BOOTSTRAP_CHECK" ]; then
   [ -e "$OUT/vmlinux" ] || {
     echo "--bootstrap-check needs $OUT/vmlinux (run ./build-kernel.sh first)" >&2
@@ -72,14 +72,24 @@ BUILD_ENV=(
   LIBCAPNG_LIB_PATH=/usr/lib
 )
 
+# `vk` embeds the guest kernel and vk-agent, so the compile is two phases: build
+# vk-agent first, then build vk with VK_EMBED_* pointing at that agent and the
+# pinned vmlinux (both under /work, where the repo is mounted in either backend).
+# The kernel is optional here — without dist/vmlinux, vk builds without an embedded
+# kernel (it then needs --kernel at runtime); the release always has it.
+EMBED_ENV="VK_EMBED_AGENT=/work/target/$TARGET/release/vk-agent"
+if [ -e "$OUT/vmlinux" ]; then
+  EMBED_ENV="$EMBED_ENV VK_EMBED_KERNEL=/work/$OUT/vmlinux"
+else
+  echo "warning: $OUT/vmlinux not found — building vk without an embedded kernel (run ./build-kernel.sh first)" >&2
+fi
+BUILD_CMD="cargo build --release -p vk-agent && env $EMBED_ENV cargo build --release -p vk-driver"
+
 if [ -n "$USE_VIRTKIT" ]; then
-  # ---- dogfood backend: virtkit builds the env image + compiles in a microVM ----
+  # ---- dogfood backend: vk builds the env image + compiles in a microVM ----
+  # vk embeds the kernel + agent, so DIST needs only the vk binary.
   VK="$USE_VIRTKIT/vk"
-  KERNEL="$USE_VIRTKIT/vmlinux"
-  AGENT="$USE_VIRTKIT/vk-agent"
-  for f in "$VK" "$KERNEL" "$AGENT"; do
-    [ -e "$f" ] || { echo "missing $f (need a populated --use-virtkit dir)" >&2; exit 1; }
-  done
+  [ -e "$VK" ] || { echo "missing $VK (need a populated --use-virtkit dir)" >&2; exit 1; }
   ch_args=()
   if [ -x "$USE_VIRTKIT/cloud-hypervisor" ]; then
     ch_args=(--cloud-hypervisor "$USE_VIRTKIT/cloud-hypervisor")
@@ -104,11 +114,9 @@ if [ -n "$USE_VIRTKIT" ]; then
     --context .devcontainer \
     --workdir "$PWD" \
     --net \
-    --kernel "$KERNEL" \
-    --agent "$AGENT" \
     "${ch_args[@]}" \
     "${cache_args[@]}" \
-    -- "${exports}cargo build --release --workspace"
+    -- "${exports}${BUILD_CMD}"
 else
   # ---- default backend: Docker ----
   docker build -t "$IMAGE" -f .devcontainer/Dockerfile .devcontainer
@@ -123,7 +131,7 @@ else
     "${docker_env[@]}" \
     -v "$PWD":/work -w /work \
     "$IMAGE" \
-    cargo build --release --workspace
+    sh -c "$BUILD_CMD"
 fi
 
 mkdir -p "$OUT"
@@ -161,12 +169,12 @@ echo
 cat "$OUT/build-info.txt"
 
 if [ -n "$BOOTSTRAP_CHECK" ]; then
-  # Rebuild with the virtkit we just produced (the dogfood backend) and confirm it
+  # Rebuild with the vk we just produced (the dogfood backend) and confirm it
   # reproduces the Docker build bit-for-bit. The just-built $OUT is itself a valid
-  # --use-virtkit toolchain (vk + vk-agent built above, vmlinux from
-  # build-kernel.sh). The second build runs on a clean copy of the tree in a tmp dir —
-  # a full independent compile, mounted at the same /work path so the container-side
-  # paths (and thus the reproducible bytes) match the Docker build.
+  # --use-virtkit toolchain (the self-contained vk built above). The second build runs
+  # on a clean copy of the tree in a tmp dir — a full independent compile, mounted at
+  # the same /work path so the container-side paths (and thus the reproducible bytes)
+  # match the Docker build.
   echo
   echo "bootstrap check: rebuilding with the freshly built virtkit in a microVM…"
   boot_dist="$PWD/$OUT"
@@ -175,6 +183,10 @@ if [ -n "$BOOTSTRAP_CHECK" ]; then
   # Clean working-tree copy (no target/.git/dist) so the rebuild can't reuse this build's
   # target/ and is a genuine from-scratch compile.
   tar -c --exclude=./.git --exclude=./target --exclude="./$OUT" . | tar -x -C "$boot_tmp"
+  # `vk` embeds the kernel, so the rebuild must see the same vmlinux at dist/vmlinux
+  # (the tree copy above excludes dist/); without it the two vk binaries would differ.
+  mkdir -p "$boot_tmp/$OUT"
+  cp "$boot_dist/vmlinux" "$boot_tmp/$OUT/vmlinux"
   ( cd "$boot_tmp" && ./build.sh --use-virtkit="$boot_dist" )
 
   echo
