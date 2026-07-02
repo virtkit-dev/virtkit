@@ -227,6 +227,50 @@ pub fn normalize_superblock(image: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Stamp `image`'s filesystem UUID in place — the content-fingerprint identity fleet
+/// keys image freshness on (compared against `fs_uuid` before a rebuild). Writes the
+/// primary superblock and every sparse_super backup, so the image stays internally
+/// consistent (a backup-superblock recovery restores this UUID, not a stale one),
+/// mirroring the build path. Refuses a journaled image: the JBD2 superblock embeds the
+/// fs UUID at journal creation, so a restamp would desynchronize them — stamp first,
+/// [`add_journal`] after.
+#[allow(dead_code)] // used by the upcoming fleet in-process unit builds
+pub fn set_uuid(image: &Path, uuid: &[u8; 16]) -> Result<()> {
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(image)
+        .with_context(|| format!("opening {}", image.display()))?;
+    let mut sb = [0u8; 1024];
+    f.seek(SeekFrom::Start(1024))?;
+    f.read_exact(&mut sb)?;
+    if rd16(&sb, 0x38) != 0xEF53 {
+        bail!("{}: not an ext4 image (bad magic)", image.display());
+    }
+    if rd32(&sb, 0x5c) & EXT4_FEATURE_COMPAT_HAS_JOURNAL != 0 {
+        bail!(
+            "{}: journaled image — the journal superblock embeds the fs UUID, \
+             so it must be stamped before add_journal",
+            image.display()
+        );
+    }
+    sb[0x68..0x78].copy_from_slice(uuid);
+    // Primary at byte 1024 (s_block_group_nr = 0), then the backups at the start of
+    // each sparse_super group, each tagged with its own group number — the same
+    // layout the build path writes.
+    f.seek(SeekFrom::Start(1024))?;
+    f.write_all(&sb)?;
+    let groups = (rd32(&sb, 0x04) as u64).div_ceil(BLOCKS_PER_GROUP);
+    for g in 1..groups {
+        if sparse_super(g) {
+            le16(&mut sb, 0x5a, g as u16); // s_block_group_nr
+            f.seek(SeekFrom::Start(g * BLOCKS_PER_GROUP * BLOCK))?;
+            f.write_all(&sb)?;
+        }
+    }
+    Ok(())
+}
+
 /// Add a JBD2 journal to an existing ext4 `image` in place — the pure-Rust equivalent
 /// of `tune2fs -j`, for images this module built journal-less (so the build stays
 /// journal-less but the exported artifact can carry a journal for a direct read-write
@@ -2008,6 +2052,83 @@ mod tests {
             content.contains("hello-ext4-multigroup"),
             "content readback: {content:?}"
         );
+    }
+
+    // set_uuid stamps the primary superblock and every sparse_super backup, then
+    // refuses a journaled image. A free-space headroom past one block group forces
+    // the fs to span >1 group, so a backup superblock (group 1) exists to check.
+    #[test]
+    fn set_uuid_stamps_primary_and_backups_and_refuses_journaled() {
+        let base = std::env::temp_dir().join(format!("ext4-setuuid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let tar_path = base.join("rootfs.tar");
+        let img = base.join("fs.img");
+
+        let tar_file = std::fs::File::create(&tar_path).unwrap();
+        let mut ar = tar::Builder::new(tar_file);
+        let content = b"hi\n";
+        let mut h = tar::Header::new_gnu();
+        h.set_path("hi.txt").unwrap();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o644);
+        h.set_size(content.len() as u64);
+        h.set_cksum();
+        ar.append(&h, std::io::Cursor::new(content)).unwrap();
+        ar.finish().unwrap();
+
+        // A headroom past one group makes the fs span 2 groups; the image is sparse
+        // (set_len), so this stays cheap despite the nominal size.
+        let fsid = FsId {
+            with_journal: false,
+            uuid: Some([0x11u8; 16]),
+            ..Default::default()
+        };
+        let inj: &[(&str, &Path, u16)] = &[];
+        build_from_tar_injecting(&tar_path, inj, BLOCKS_PER_GROUP + 4096, &fsid, &img)
+            .expect("build");
+
+        let read_sb_at = |off: u64| {
+            let mut f = std::fs::File::open(&img).unwrap();
+            let mut sb = [0u8; 1024];
+            f.seek(SeekFrom::Start(off)).unwrap();
+            f.read_exact(&mut sb).unwrap();
+            sb
+        };
+        let backup_off = BLOCKS_PER_GROUP * BLOCK; // start of group 1
+        assert_eq!(
+            rd16(&read_sb_at(backup_off), 0x38),
+            0xEF53,
+            "build did not produce a backup superblock at group 1"
+        );
+
+        set_uuid(&img, &[0x5A; 16]).unwrap();
+        let primary = read_sb_at(1024);
+        assert_eq!(primary[0x68..0x78], [0x5A; 16], "primary UUID not stamped");
+        // magic preserved, s_block_group_nr of the primary is still 0
+        assert_eq!(&primary[0x38..0x3a], &0xEF53u16.to_le_bytes());
+        assert_eq!(
+            rd16(&primary, 0x5a),
+            0,
+            "primary s_block_group_nr clobbered"
+        );
+        let backup = read_sb_at(backup_off);
+        assert_eq!(backup[0x68..0x78], [0x5A; 16], "backup UUID not stamped");
+        assert_eq!(rd16(&backup, 0x5a), 1, "backup s_block_group_nr mismatch");
+
+        // restamping is fine while journal-less …
+        set_uuid(&img, &[0x5B; 16]).unwrap();
+        // … but refused once a journal embeds the UUID, and the UUID is left intact.
+        add_journal(&img).unwrap();
+        let err = set_uuid(&img, &[0x5C; 16]).unwrap_err();
+        assert!(format!("{err:#}").contains("journal"), "{err:#}");
+        assert_eq!(
+            read_sb_at(1024)[0x68..0x78],
+            [0x5B; 16],
+            "UUID changed after a refused restamp"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // Build a journaled ext4 image from a tar and verify it is e2fsck-clean and
