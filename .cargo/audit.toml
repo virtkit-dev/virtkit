@@ -14,7 +14,23 @@
 # RSA signature *verification* (public-key side), not the private-key decryption that is
 # Marvin's sharpest edge; the token-parsing path performs no RSA at all. Revisit and drop
 # this entry when rsa 0.10 ships stable.
+#
+# RUSTSEC-2025-0141 — `bincode` is unmaintained (informational, no vulnerability). It
+# enters the tree via imago, the qcow2 image library used by the vendored libkrun's block
+# devices, which uses it for fixed-layout big-endian (de)serialization of qcow2 metadata
+# structs. imago 0.2.3 (latest) still depends on it, so there is no upstream fix to take.
+# bincode 2 is pure safe Rust and the usage is internal struct coding, not a network-facing
+# format. Revisit and drop this entry when imago releases a version off bincode.
+#
+# RUSTSEC-2026-0173 — `proc-macro-error2` is unmaintained (informational, no
+# vulnerability). It is never compiled: it reaches Cargo.lock only through jiff's optional
+# `defmt` feature (jiff ← env_logger ← libkrun), which nothing enables — Cargo locks the
+# union of all optional dependencies, and cargo-audit scans the lockfile.
+# `cargo tree -i proc-macro-error2 --target all` confirms it is absent from every build.
+# Revisit and drop this entry when jiff or defmt-macros move off proc-macro-error2.
 [advisories]
 ignore = [
     "RUSTSEC-2023-0071", # rsa: Marvin attack (see above)
+    "RUSTSEC-2025-0141", # bincode: unmaintained (see above)
+    "RUSTSEC-2026-0173", # proc-macro-error2: unmaintained, never compiled (see above)
 ]
