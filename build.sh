@@ -24,6 +24,12 @@ IMAGE=virtkit-build
 TARGET=x86_64-unknown-linux-musl
 OUT=dist
 
+# Wall-clock timings, printed to stderr (informational only — never written to
+# build-info.txt, which must stay reproducible). Bash `SECONDS` counts whole seconds
+# since the script started; `since` reports the delta from a captured value.
+fmt_dur() { printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); }
+since()   { echo "build.sh: $1 in $(fmt_dur $(($SECONDS - $2)))" >&2; }
+
 USE_VIRTKIT=""
 BOOTSTRAP_CHECK=""
 VMM=libkrun          # dogfood VMM backend: libkrun (default) or cloud-hypervisor
@@ -89,6 +95,7 @@ else
 fi
 BUILD_CMD="cargo build --release -p vk-agent && env $EMBED_ENV cargo build --release -p vk-driver"
 
+compile_start=$SECONDS
 if [ -n "$USE_VIRTKIT" ]; then
   # ---- dogfood backend: vk builds the env image + compiles in a microVM ----
   # vk is self-contained (embedded kernel + agent), so DIST needs only the vk binary.
@@ -151,6 +158,7 @@ else
     "$IMAGE" \
     sh -c "$BUILD_CMD"
 fi
+since "compile ($([ -n "$USE_VIRTKIT" ] && echo "$VMM microVM" || echo docker))" "$compile_start"
 
 mkdir -p "$OUT"
 # Replace atomically (write a temp, then rename): a plain cp truncates the destination and
@@ -205,8 +213,10 @@ if [ -n "$BOOTSTRAP_CHECK" ]; then
   # (the tree copy above excludes dist/); without it the two vk binaries would differ.
   mkdir -p "$boot_tmp/$OUT"
   cp "$boot_dist/vmlinux" "$boot_tmp/$OUT/vmlinux"
+  rebuild_start=$SECONDS
   # Same VMM choice as requested.
   ( cd "$boot_tmp" && ./build.sh --use-virtkit="$boot_dist" --vmm="$VMM" )
+  since "bootstrap rebuild" "$rebuild_start"
 
   echo
   echo "bootstrap check: comparing sha256…"
@@ -227,3 +237,5 @@ if [ -n "$BOOTSTRAP_CHECK" ]; then
   fi
   echo "bootstrap check passed: Docker and vk backends produce identical binaries"
 fi
+
+since "total" 0
