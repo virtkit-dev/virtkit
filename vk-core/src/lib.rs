@@ -12,4 +12,5 @@ pub mod framing;
 pub mod messages;
 pub mod net;
 pub mod pty;
+pub mod runcfg;
 pub mod status;

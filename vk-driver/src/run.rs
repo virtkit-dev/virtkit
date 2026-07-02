@@ -226,7 +226,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             build_args: args.build_args.clone(),
             net: args.build_net.clone(),
         };
-        image_env = crate::build::build(&opts)?.env;
+        image_env = crate::build::build(&opts)?.config.env;
         Some(out)
     };
 

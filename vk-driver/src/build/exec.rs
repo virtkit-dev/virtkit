@@ -32,13 +32,20 @@ pub struct Rootfs {
     pub label: String,
 }
 
-/// The mutable per-stage shell state that `ENV`/`WORKDIR`/`USER` accumulate and that
-/// each `RUN` (and the exported image config) sees.
+/// The mutable per-stage shell state that `ENV`/`WORKDIR`/`USER` (and, for the
+/// exported runtime config, `ENTRYPOINT`/`CMD`) accumulate and that each `RUN` — and
+/// the exported image's runtime-config sidecar — sees. Seeded from the base image's
+/// OCI config (or the parent stage's final state) so the values survive RUN-less
+/// stages exactly as they would in Docker.
 #[derive(Debug, Clone, Default)]
 pub struct ShellState {
     pub env: Vec<(String, String)>,
     pub workdir: String,
     pub user: String,
+    /// Entrypoint argv (shell form already wrapped as `/bin/sh -c`).
+    pub entrypoint: Vec<String>,
+    /// Default arguments appended to the entrypoint.
+    pub cmd: Vec<String>,
 }
 
 /// How a `RUN`'s `--mount=…,from=` resolves: the source stage's committed rootfs.
@@ -1304,7 +1311,7 @@ mod tests {
             &ShellState {
                 user: "root".into(),
                 workdir: "/".into(),
-                env: vec![],
+                ..Default::default()
             },
         )
         .unwrap();

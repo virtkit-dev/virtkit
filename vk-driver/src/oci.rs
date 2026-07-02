@@ -16,12 +16,15 @@ use oci_client::manifest;
 use oci_client::secrets::RegistryAuth;
 
 /// The parts of an OCI image's config a build inherits into a stage: environment
-/// (notably `PATH`), default user and working directory.
+/// (notably `PATH`), default user and working directory, and the runtime
+/// entrypoint/cmd (carried through to the exported runtime-config sidecar).
 #[derive(Default, Debug, Clone)]
 pub struct ImageConfig {
     pub env: Vec<(String, String)>,
     pub user: Option<String>,
     pub workdir: Option<String>,
+    pub entrypoint: Vec<String>,
+    pub cmd: Vec<String>,
 }
 
 /// Resolve `reference` to its manifest digest (`sha256:…`), anonymously — for the build
@@ -143,10 +146,22 @@ fn parse_config(json: &str) -> ImageConfig {
         })
         .unwrap_or_default();
     let nonempty = |s: &serde_json::Value| s.as_str().filter(|x| !x.is_empty()).map(str::to_string);
+    let argv = |v: &serde_json::Value| {
+        v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     ImageConfig {
         env,
         user: nonempty(&c["User"]),
         workdir: nonempty(&c["WorkingDir"]),
+        entrypoint: argv(&c["Entrypoint"]),
+        cmd: argv(&c["Cmd"]),
     }
 }
 

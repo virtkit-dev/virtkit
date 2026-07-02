@@ -121,13 +121,34 @@ impl BuildNet {
     }
 }
 
-/// What a completed build exposes to its caller: the target stage's accumulated
-/// environment, so a caller booting the exported image can run a command with the image's
-/// configured environment — e.g. `run -f` putting the base image's `PATH` in scope so
-/// `cargo` resolves.
+/// What a completed build exposes to its caller: the target stage's runtime config
+/// (env/user/workdir/entrypoint/cmd — what a container runtime would read from the
+/// image config), so a caller booting the exported image can run its command the way
+/// `docker run` would — e.g. `run -f` putting the base image's `PATH` in scope so
+/// `cargo` resolves. The same config is written as the `<out>.json` sidecar, so a
+/// later boot of the ext4 (fleet skipping a fresh rebuild) reads it without a build.
 #[derive(Default)]
 pub struct Built {
-    pub env: Vec<(String, String)>,
+    pub config: vk_core::runcfg::RunConfig,
+}
+
+/// The runtime-config sidecar path for a built ext4: `<out>.json` (appended, so
+/// `svc.ext4` maps to `svc.ext4.json`).
+pub fn config_sidecar(out: &Path) -> PathBuf {
+    let mut s = out.as_os_str().to_os_string();
+    s.push(".json");
+    PathBuf::from(s)
+}
+
+/// A stage's final [`ShellState`] as the exported [`RunConfig`].
+fn run_config(st: &ShellState) -> vk_core::runcfg::RunConfig {
+    vk_core::runcfg::RunConfig {
+        env: st.env.clone(),
+        user: st.user.clone(),
+        workdir: st.workdir.clone(),
+        entrypoint: st.entrypoint.clone(),
+        cmd: st.cmd.clone(),
+    }
 }
 
 /// Resolve the instruction-cache destination: an explicit registry/store wins; `none`
@@ -280,7 +301,13 @@ pub fn build(opts: &Options) -> Result<Built> {
             .context("internal: target stage not committed")?;
         ex.export_ext4(fs, out)?;
         let st = states.get(&target).cloned().unwrap_or_default();
-        Ok(Built { env: st.env })
+        let config = run_config(&st);
+        // The sidecar persists the config the image itself deliberately does not
+        // carry (clean-image model: config is supplied at boot, never baked in).
+        let sidecar = config_sidecar(out);
+        std::fs::write(&sidecar, serde_json::to_vec_pretty(&config)?)
+            .with_context(|| format!("writing {}", sidecar.display()))?;
+        Ok(Built { config })
     })();
     let _ = std::fs::remove_dir_all(&scratch); // best-effort scratch cleanup
     let built = result?;
@@ -351,27 +378,27 @@ fn resolve_stages(
                 .map(|r| r.final_key.clone())
                 .context("internal: parent stage resolved out of order")?,
         };
-        // Seed ENV/USER/WORKDIR: a stage inherits its base — a prior stage's final state,
-        // or (for FROM <image>) the image config's ENV/USER/WORKDIR, so RUNs get the
-        // base PATH etc. The config is fetched only when the stage actually runs commands.
-        let has_run = stage
-            .instructions
-            .iter()
-            .any(|i| matches!(i, Instruction::Run(_)));
+        // Seed the shell state: a stage inherits its base — a prior stage's final
+        // state, or (for FROM <image>) the image config's ENV/USER/WORKDIR/
+        // ENTRYPOINT/CMD — so RUNs get the base PATH etc. and the runtime config
+        // survives RUN-less stages (a service stage that only COPYs still exports
+        // its base's entrypoint). Fetched unconditionally (memoized per image).
         let mut state = match &stage.base {
             Base::Stage(parent) => out
                 .get(parent)
                 .map(|r| r.final_state.clone())
                 .unwrap_or_default(),
-            Base::Image(image) if has_run => {
+            Base::Image(image) => {
                 let cfg = ex.base_config(image)?;
                 ShellState {
                     env: cfg.env,
                     user: cfg.user.unwrap_or_else(|| "root".into()),
                     workdir: cfg.workdir.unwrap_or_else(|| "/".into()),
+                    entrypoint: cfg.entrypoint,
+                    cmd: cfg.cmd,
                 }
             }
-            _ => ShellState::default(),
+            Base::Scratch => ShellState::default(),
         };
         if state.user.is_empty() {
             state.user = "root".into();
@@ -972,8 +999,8 @@ fn restore_into(ex: &mut dyn Executor, name: &str, key: &str) -> Result<Rootfs> 
     Ok(fs)
 }
 
-/// Apply a non-filesystem instruction (ENV/WORKDIR/USER) — updates the shell state
-/// only, so it needs no materialized rootfs.
+/// Apply a non-filesystem instruction (ENV/WORKDIR/USER/ENTRYPOINT/CMD) — updates the
+/// shell state only, so it needs no materialized rootfs.
 fn apply_meta(state: &mut ShellState, instr: &Instruction) {
     match instr {
         Instruction::Env(kvs) => {
@@ -983,9 +1010,25 @@ fn apply_meta(state: &mut ShellState, instr: &Instruction) {
         }
         Instruction::Workdir(w) => state.workdir = w.clone(),
         Instruction::User(u) => state.user = u.clone(),
-        // ARG/LABEL/ENTRYPOINT/CMD/Other: no effect in the prototype (LABEL/ENTRYPOINT/
-        // CMD would land in the exported image config; ARG would feed interpolation).
+        Instruction::Entrypoint(c) => {
+            state.entrypoint = cmdline_argv(c);
+            // Docker: declaring ENTRYPOINT resets an inherited CMD (a CMD later in
+            // the same stage still applies).
+            state.cmd.clear();
+        }
+        Instruction::Cmd(c) => state.cmd = cmdline_argv(c),
+        // ARG/LABEL/Other: no effect here (ARG feeds interpolation upstream; LABEL
+        // would land in an exported image config).
         _ => {}
+    }
+}
+
+/// An ENTRYPOINT/CMD as argv: exec form verbatim, shell form wrapped `/bin/sh -c` —
+/// Docker's runtime equivalence.
+fn cmdline_argv(c: &parser::Cmdline) -> Vec<String> {
+    match c {
+        parser::Cmdline::Exec(v) => v.clone(),
+        parser::Cmdline::Shell(s) => vec!["/bin/sh".into(), "-c".into(), s.clone()],
     }
 }
 
@@ -1554,6 +1597,80 @@ RUN ship
         let (lib2, app2) = keys(&a.replace("RUN one", "RUN two"));
         assert_ne!(lib1, lib2);
         assert_eq!(app1, app2);
+    }
+
+    #[test]
+    fn runtime_config_accumulates_and_inherits_across_stages() {
+        // ENTRYPOINT/CMD/ENV/USER/WORKDIR fold into the stage state, inherit through
+        // FROM <stage>, and follow Docker's ENTRYPOINT-resets-CMD rule.
+        let ba = Vars::new();
+        let src = "\
+FROM scratch AS base
+ENV A=1
+ENTRYPOINT [\"/bin/app\"]
+CMD [\"--serve\"]
+FROM base AS child
+FROM base AS override
+ENTRYPOINT run me
+";
+        let plan = plan_one(src, &ba);
+        let order = plan.all_order().unwrap();
+        let mut ex = DryRun::new();
+        let r = resolve_stages(&plan, &order, &ba, &mut ex, None).unwrap();
+        let base = &r[&0].final_state;
+        assert_eq!(base.entrypoint, ["/bin/app"]);
+        assert_eq!(base.cmd, ["--serve"]);
+        // an instruction-less child inherits everything
+        let child = &r[&1].final_state;
+        assert_eq!(child.entrypoint, ["/bin/app"]);
+        assert_eq!(child.cmd, ["--serve"]);
+        assert_eq!(child.env, [("A".to_string(), "1".to_string())]);
+        // re-declaring ENTRYPOINT (shell form -> /bin/sh -c) resets the inherited CMD
+        let ov = &r[&2].final_state;
+        assert_eq!(ov.entrypoint, ["/bin/sh", "-c", "run me"]);
+        assert!(ov.cmd.is_empty());
+    }
+
+    #[test]
+    fn build_writes_the_runtime_config_sidecar() {
+        // a Host (FROM scratch + COPY) build exports the ext4 plus its config sidecar.
+        let tmp = std::env::temp_dir().join(format!("vk-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("f"), "x").unwrap();
+        std::fs::write(
+            tmp.join("Dockerfile"),
+            "FROM scratch\nCOPY f /f\nENV PORT=6379\nUSER svc\nWORKDIR /srv\n\
+             ENTRYPOINT [\"/bin/app\"]\nCMD [\"--port\", \"6379\"]\n",
+        )
+        .unwrap();
+        let out = tmp.join("img.ext4");
+        let built = build(&Options {
+            dockerfiles: vec![tmp.join("Dockerfile")],
+            target: None,
+            contexts: vec![],
+            out: Some(out.clone()),
+            print_plan: false,
+            microvm: false,
+            cloud_hypervisor: None,
+            kernel: None,
+            agent: None,
+            cache_registry: Some("none".into()),
+            cache_insecure: false,
+            journal: false,
+            build_args: vec![],
+            net: BuildNet::None, // host backend: no RUN guests, no network
+        })
+        .unwrap();
+        let sidecar = config_sidecar(&out);
+        let cfg: vk_core::runcfg::RunConfig =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        assert_eq!(cfg, built.config);
+        assert_eq!(cfg.env, [("PORT".to_string(), "6379".to_string())]);
+        assert_eq!(cfg.user, "svc");
+        assert_eq!(cfg.workdir, "/srv");
+        assert_eq!(cfg.argv(), ["/bin/app", "--port", "6379"]);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
