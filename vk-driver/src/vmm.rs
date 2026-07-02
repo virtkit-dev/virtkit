@@ -137,6 +137,12 @@ pub struct VmSpec {
     /// CH API socket for graceful shutdown (the detached CI VM). `None` = no API
     /// socket (the held-`Child` paths kill the process directly).
     pub api_socket: Option<PathBuf>,
+    /// Fds backing unlinked boot media (`scratch::ScratchFile`), whose
+    /// `/proc/self/fd/<n>` paths appear in `kernel`/`initramfs`/`disks` — or in a
+    /// qcow2 backing reference. `run::spawn_vmm` clears CLOEXEC on each for the VMM
+    /// spawn, so the child inherits them (same numbers) and the paths resolve there.
+    #[serde(default)]
+    pub pass_fds: Vec<i32>,
 }
 
 /// A virtual machine monitor that can boot a [`VmSpec`]. `Send` so a boxed `dyn Vmm`
@@ -319,6 +325,7 @@ mod tests {
             balloon: true,
             serial_log: "/job/console.log".into(),
             api_socket: Some("/job/api.sock".into()),
+            pass_fds: Vec::new(),
         };
         assert_eq!(
             args(&ch.command(&spec)),
@@ -381,6 +388,7 @@ mod tests {
             balloon: false,
             serial_log: "/w/console.log".into(),
             api_socket: None,
+            pass_fds: Vec::new(),
         };
         assert_eq!(
             args(&ch.command(&spec)),

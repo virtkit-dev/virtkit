@@ -597,6 +597,7 @@ fn boot_service(
         balloon: false,
         serial_log: console.clone(),
         api_socket: None,
+        pass_fds: Vec::new(),
     };
     let log = std::fs::File::create(&console)?;
     let ch = crate::vmm::CloudHypervisor {
@@ -766,6 +767,7 @@ fn boot_vm(
         balloon: false,
         serial_log: console.clone(),
         api_socket: None,
+        pass_fds: Vec::new(),
     };
     let log = std::fs::File::create(&console)?;
     let ch = crate::vmm::CloudHypervisor {

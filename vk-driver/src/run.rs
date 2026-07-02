@@ -123,8 +123,9 @@ pub async fn run(args: &RunArgs) -> Result<()> {
     build_and_boot(args, &work.path, &agent.path, &kernel.path).await
 }
 
-/// A launch's named scratch dir. Removed on drop, so error and panic unwinds clean
-/// it up too; only a signal kill can leak it.
+/// A launch's named scratch dir — sockets, logs, and a `-f` build's ext4 live here
+/// (an image boot's media are unlinked scratch fds). Removed on drop, so error and
+/// panic unwinds clean it up too; only a signal kill can leak it.
 struct WorkDir {
     path: PathBuf,
 }
@@ -236,16 +237,33 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         Some(_) => None,
     };
 
-    // 2. assemble the boot medium (virtkit-agent injected as PID 1).
+    // 2. assemble the boot medium (virtkit-agent injected as PID 1). With the libkrun
+    // backend the media are unlinked scratch fds — `media` keeps them open (their
+    // /proc/self/fd paths must resolve until the VMM child has spawned), `pass_fds`
+    // hands them across the exec — so a killed run cannot leak them. The external
+    // cloud-hypervisor keeps named files in `work`.
+    let mut media: Vec<crate::scratch::ScratchFile> = Vec::new();
+    let mut pass_fds: Vec<i32> = Vec::new();
+    let anon = crate::vmm::libkrun_selected();
+    let mut medium = |name: &str| -> Result<PathBuf> {
+        if !anon {
+            return Ok(work.join(name));
+        }
+        let s = crate::scratch::scratch(work, name)?;
+        let path = s.path.clone();
+        pass_fds.push(s.fd());
+        media.push(s);
+        Ok(path)
+    };
     let (disks, initramfs, mut cmdline): (Vec<crate::vmm::Disk>, Option<PathBuf>, String) =
         if let Some(ext4) = &dockerfile_ext4 {
             // A Dockerfile build exports a *clean* ext4 (no agent baked in). Boot it the way
             // the builder boots its own stages: a minimal initramfs holds the agent as `/init`,
             // which pivots into the ext4 at /dev/vda — so the booted image stays byte-clean.
-            let cpio = work.join("initramfs.cpio");
+            let cpio = medium("initramfs.cpio")?;
             crate::initramfs::build_agent_initramfs(agent, &cpio)?;
             // throwaway rw qcow2 overlay over the ro raw ext4 (rw raw errors on tmpfs)
-            let overlay = work.join("overlay.qcow2");
+            let overlay = medium("overlay.qcow2")?;
             crate::qcow2::create_overlay(&overlay, ext4)?;
             (
                 vec![crate::vmm::Disk::overlay(overlay)],
@@ -257,7 +275,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             )
         } else if !args.ram {
             println!("virtkit: building ext4 rootfs");
-            let rootfs = work.join("root.ext4");
+            let rootfs = medium("root.ext4")?;
             let source = source.as_ref().expect("an image boot resolved a source");
             source
                 .stream_tar(work, |tar, hints| {
@@ -290,7 +308,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
                 })
                 .await?;
             // throwaway rw qcow2 overlay over the ro raw ext4 (rw raw errors on tmpfs)
-            let overlay = work.join("overlay.qcow2");
+            let overlay = medium("overlay.qcow2")?;
             crate::qcow2::create_overlay(&overlay, &rootfs)?;
             (
                 vec![crate::vmm::Disk::overlay(overlay)],
@@ -304,7 +322,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             )
         } else {
             println!("virtkit: building cpio initramfs");
-            let cpio = work.join("initramfs.cpio");
+            let cpio = medium("initramfs.cpio")?;
             let source = source.as_ref().expect("an image boot resolved a source");
             source
                 .stream_tar(work, |tar, _| {
@@ -424,6 +442,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         balloon: false,
         serial_log: console.clone(),
         api_socket: None,
+        pass_fds,
     };
     let mut ch = match spawn_vmm(vmm.as_ref(), &spec) {
         Ok(ch) => ch,
@@ -719,22 +738,31 @@ fn spawn_vmm(vmm: &dyn Vmm, spec: &crate::vmm::VmSpec) -> Result<Child> {
     cmd.stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
-    // An embedded kernel is a CLOEXEC memfd addressed as /proc/self/fd/<n> (so idle
-    // helpers never inherit it). Hand it to the VMM alone by clearing CLOEXEC on that fd
-    // in the forked child, so it survives exec and the VMM can open the path.
+    // An embedded kernel and unlinked boot media (spec.pass_fds) are CLOEXEC fds
+    // addressed as /proc/self/fd/<n> (so idle helpers never inherit them). Hand them to
+    // the VMM alone by clearing CLOEXEC on those fds in the forked child, so they
+    // survive exec — same numbers — and the VMM can open the paths.
+    let mut fds = spec.pass_fds.clone();
     if let Some(fd) = spec
         .kernel
         .to_str()
         .and_then(|s| s.strip_prefix("/proc/self/fd/"))
         .and_then(|n| n.parse::<std::os::unix::io::RawFd>().ok())
     {
+        fds.push(fd);
+    }
+    if !fds.is_empty() {
         use std::os::unix::process::CommandExt;
         // SAFETY: pre_exec runs in the forked child before exec; fcntl(F_SETFD) is
         // async-signal-safe. F_SETFD 0 clears FD_CLOEXEC (the only fd flag).
         unsafe {
-            cmd.pre_exec(move || match libc::fcntl(fd, libc::F_SETFD, 0) {
-                -1 => Err(std::io::Error::last_os_error()),
-                _ => Ok(()),
+            cmd.pre_exec(move || {
+                for &fd in &fds {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
             });
         }
     }
@@ -895,8 +923,20 @@ pub(crate) async fn boot_session(
     let work = std::env::temp_dir().join(format!("virtkit-session-{}-{stem}", std::process::id()));
     std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
     // The agent boots as PID 1 from a minimal initramfs (just `/init`), then pivots into
-    // the ext4 root below — so the agent is never written into the built image.
-    let cpio = work.join("initramfs.cpio");
+    // the ext4 root below — so the agent is never written into the built image. With
+    // libkrun it is an unlinked scratch fd: `_cpio` keeps it open until the VMM child
+    // (which inherits the fd via pass_fds below) has spawned, i.e. past spawn_vmm.
+    let mut pass_fds: Vec<i32> = Vec::new();
+    let mut _cpio: Option<crate::scratch::ScratchFile> = None;
+    let cpio = if crate::vmm::libkrun_selected() {
+        let s = crate::scratch::scratch(&work, "initramfs.cpio")?;
+        let path = s.path.clone();
+        pass_fds.push(s.fd());
+        _cpio = Some(s);
+        path
+    } else {
+        work.join("initramfs.cpio")
+    };
     crate::initramfs::build_agent_initramfs(agent, &cpio)?;
     // Boot the stage's rw qcow2 image directly: it is a CoW overlay over its backing (the
     // base ext4 or the parent stage), so the guest's writes accumulate into it and it
@@ -969,6 +1009,7 @@ pub(crate) async fn boot_session(
         balloon: false,
         serial_log: console.clone(),
         api_socket: None,
+        pass_fds,
     };
     let vmm = crate::vmm::selected(cloud_hypervisor);
     let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
@@ -1157,5 +1198,56 @@ mod tests {
             );
             s.finish().await.unwrap();
         });
+    }
+
+    /// Stands in for a VMM: `cat`s the first disk — i.e. opens a boot medium by path.
+    struct CatVmm;
+    impl crate::vmm::Vmm for CatVmm {
+        fn command(&self, spec: &crate::vmm::VmSpec) -> Command {
+            let mut cmd = Command::new("cat");
+            cmd.arg(&spec.disks[0].path);
+            cmd
+        }
+        fn name(&self) -> &'static str {
+            "cat"
+        }
+    }
+
+    // A scratch fd listed in pass_fds must survive the exec at the same number, so the
+    // spawned VMM can open its /proc/self/fd/<n> path (the fd is CLOEXEC otherwise).
+    #[test]
+    fn pass_fds_survive_exec() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("vk-passfd-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut medium = crate::scratch::scratch(&dir, "medium").unwrap();
+        medium.file.write_all(b"boot medium").unwrap();
+        let spec = crate::vmm::VmSpec {
+            kernel: "/dev/null".into(),
+            cmdline: String::new(),
+            disks: vec![crate::vmm::Disk {
+                path: medium.path.clone(),
+                qcow2: false,
+                readonly: true,
+            }],
+            initramfs: None,
+            shares: Vec::new(),
+            vsock_cid: 3,
+            vsock_socket: dir.join("vsock.sock"),
+            vsock_ports: Vec::new(),
+            cpus: 1,
+            mem: "1G".into(),
+            shared_mem: false,
+            net: crate::vmm::Net::None,
+            balloon: false,
+            serial_log: dir.join("console.log"),
+            api_socket: None,
+            pass_fds: vec![medium.fd()],
+        };
+        let mut child = spawn_vmm(&CatVmm, &spec).unwrap();
+        assert!(child.wait().unwrap().success());
+        let out = std::fs::read(spec.serial_log.with_extension("vmm.log")).unwrap();
+        assert_eq!(out, b"boot medium");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

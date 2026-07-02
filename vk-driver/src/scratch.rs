@@ -5,10 +5,33 @@
 //! panic — cannot leak it the way a named temp file can.
 
 use std::fs::File;
-use std::os::unix::io::FromRawFd;
-use std::path::Path;
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+
+/// An unlinked scratch file and its `/proc/self/fd/<n>` address. The fd is CLOEXEC:
+/// in-process consumers (and this process's own reopens) resolve the path directly,
+/// and a spawned VMM gets it by clearing CLOEXEC for that one spawn via
+/// `VmSpec::pass_fds` (see `run::spawn_vmm`). Hold the value as long as the path
+/// must stay valid.
+pub struct ScratchFile {
+    pub file: File,
+    pub path: PathBuf,
+}
+
+impl ScratchFile {
+    pub fn fd(&self) -> i32 {
+        self.file.as_raw_fd()
+    }
+}
+
+impl From<File> for ScratchFile {
+    fn from(file: File) -> ScratchFile {
+        let path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        ScratchFile { file, path }
+    }
+}
 
 /// Create an unlinked scratch file: `O_TMPFILE` in `dir` (no `O_EXCL`, so it can be
 /// reopened through `/proc/self/fd`), falling back to a memfd where `dir`'s
@@ -16,7 +39,7 @@ use anyhow::{Context, Result};
 /// have lived in — not `$TMPDIR`, which is often tmpfs — so large scratch data stays
 /// on disk. `name` is a debug label only (visible in the memfd's `/proc/<pid>/fd`
 /// symlink target).
-pub fn scratch(dir: &Path, name: &str) -> Result<File> {
+pub fn scratch(dir: &Path, name: &str) -> Result<ScratchFile> {
     let cdir = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())
         .context("scratch dir path has an interior nul")?;
     // SAFETY: `cdir` is a valid C string; open returns an owned fd or -1/errno.
@@ -29,7 +52,7 @@ pub fn scratch(dir: &Path, name: &str) -> Result<File> {
     };
     if fd >= 0 {
         // SAFETY: `fd` was just created and is owned by us.
-        return Ok(unsafe { File::from_raw_fd(fd) });
+        return Ok(unsafe { File::from_raw_fd(fd) }.into());
     }
     // Fall back only when O_TMPFILE itself is unsupported: EOPNOTSUPP from the
     // filesystem, EISDIR from kernels that predate the flag. Any other failure
@@ -50,7 +73,7 @@ pub fn scratch(dir: &Path, name: &str) -> Result<File> {
             .with_context(|| format!("memfd_create for scratch {name}"));
     }
     // SAFETY: `fd` was just created and is owned by us.
-    Ok(unsafe { File::from_raw_fd(fd) })
+    Ok(unsafe { File::from_raw_fd(fd) }.into())
 }
 
 /// A unidirectional OS pipe as a (read, write) pair of owned files, for streaming
@@ -73,22 +96,20 @@ pub fn os_pipe() -> Result<(File, File)> {
 mod tests {
     use super::*;
     use std::io::{Read, Seek, Write};
-    use std::os::unix::io::AsRawFd;
 
     // The scratch file must be writable/seekable through the held fd and reopenable
-    // through its /proc/self/fd/<n> path.
+    // through its /proc/self/fd/<n> path (what builders and the VMM do).
     #[test]
     fn write_seek_and_reopen_by_path() {
         let mut s = scratch(&std::env::temp_dir(), "test-blob").unwrap();
-        s.write_all(b"hello").unwrap();
-        s.seek(std::io::SeekFrom::Start(0)).unwrap();
-        let path = format!("/proc/self/fd/{}", s.as_raw_fd());
-        let mut reopened = File::open(&path).unwrap();
+        s.file.write_all(b"hello").unwrap();
+        s.file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut reopened = File::open(&s.path).unwrap();
         let mut got = String::new();
         reopened.read_to_string(&mut got).unwrap();
         assert_eq!(got, "hello");
         // File::create-style reopen (what builders do with the out path) must work too.
-        let f = File::create(&path).unwrap();
+        let f = File::create(&s.path).unwrap();
         f.set_len(1 << 20).unwrap();
     }
 }

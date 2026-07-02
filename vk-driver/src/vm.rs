@@ -282,6 +282,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         // libkrun has no API socket (it is driven as a subprocess); cloud-hypervisor
         // uses one for graceful shutdown in stop_vm.
         api_socket: (!crate::vmm::libkrun_selected()).then(|| ctx.api_sock()),
+        pass_fds: Vec::new(),
     };
     let vmm = crate::vmm::selected(cfg.cloud_hypervisor());
     let ch_command = vmm.command(&spec);

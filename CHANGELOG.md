@@ -18,6 +18,8 @@ All notable changes to virtkit will be documented in this file.
   behind `--ram` (replacing `--disk`) and the cpio bundle format is retired.
 - `vk virtiofsd` is reimplemented on the vendored libkrun fs engine; nothing in
   the tree links C libraries anymore.
+- `run` streams its boot media instead of materialising launch temp files; an
+  aborted boot no longer leaves a rootfs behind.
 
 ### Fixed
 

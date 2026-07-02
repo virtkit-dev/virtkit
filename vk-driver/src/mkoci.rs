@@ -190,7 +190,7 @@ fn build_inner(
     all.push(("etc/virtkit/cmd", cmd_file.as_path(), 0o644));
 
     // flatten layers in manifest order through the shared Merger.
-    let mut merger = Merger::new(crate::scratch::scratch(work, "rootfs-spill")?);
+    let mut merger = Merger::new(crate::scratch::scratch(work, "rootfs-spill")?.file);
     for layer in &manifest.layers {
         let (off, size) = ar.blob_range(&blob_path(&layer.digest))?;
         ar.file.seek(SeekFrom::Start(off))?;
@@ -468,7 +468,7 @@ mod tests {
         let config: ConfigFile = ar.read_json(&blob_path(&manifest.config.digest)).unwrap();
 
         // flatten through the shared Merger.
-        let mut merger = Merger::new(crate::scratch::scratch(&dir, "test-spill").unwrap());
+        let mut merger = Merger::new(crate::scratch::scratch(&dir, "test-spill").unwrap().file);
         for layer in &manifest.layers {
             let (off, size) = ar.blob_range(&blob_path(&layer.digest)).unwrap();
             ar.file.seek(SeekFrom::Start(off)).unwrap();

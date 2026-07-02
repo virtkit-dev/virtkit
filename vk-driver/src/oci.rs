@@ -242,7 +242,7 @@ pub(crate) async fn pull_merged(
         .await
         .with_context(|| format!("pulling {reference}"))?;
 
-    let mut merger = Merger::new(crate::scratch::scratch(scratch_dir, "oci-spill")?);
+    let mut merger = Merger::new(crate::scratch::scratch(scratch_dir, "oci-spill")?.file);
     for layer in &image.layers {
         merger.apply_layer(&layer.data[..], &layer.media_type)?;
     }
@@ -547,8 +547,11 @@ mod tests {
         b.append(&h, &b"ping"[..]).unwrap();
         let layer = b.into_inner().unwrap();
 
-        let mut m =
-            Merger::new(crate::scratch::scratch(&std::env::temp_dir(), "test-spill").unwrap());
+        let mut m = Merger::new(
+            crate::scratch::scratch(&std::env::temp_dir(), "test-spill")
+                .unwrap()
+                .file,
+        );
         m.apply_layer(
             Cursor::new(&layer),
             "application/vnd.oci.image.layer.v1.tar",
