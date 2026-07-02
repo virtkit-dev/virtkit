@@ -43,7 +43,7 @@ use anyhow::{Context, Result, bail};
 use exec::{DryRun, Executor, Host, MicroVm, ResolvedMount, Rootfs, ShellState};
 use interp::Vars;
 use parser::Instruction;
-use plan::{Base, Plan};
+use plan::{Base, Plan, PlanInput};
 
 /// What/how to build.
 pub struct Options {
@@ -108,26 +108,36 @@ fn cache_repo(cache_registry: Option<&str>) -> Result<Option<String>> {
     })
 }
 
-/// Entry point for the `build` subcommand.
-pub fn build(opts: &Options) -> Result<Built> {
-    let src = std::fs::read_to_string(&opts.dockerfile)
-        .with_context(|| format!("reading {}", opts.dockerfile.display()))?;
-    let df = parser::parse(&src)?;
-    let build_args: Vars = opts.build_args.iter().cloned().collect();
-    let plan = Plan::from_dockerfile(&df, &build_args)?;
-    let target = plan.resolve_target(opts.target.as_deref())?;
-    let order = plan.build_order(target)?;
-    let context = opts.context.clone().unwrap_or_else(|| {
-        opts.dockerfile
+/// Read + parse a Dockerfile into a [`PlanInput`], its context defaulting to the
+/// file's directory.
+fn load_input(dockerfile: &Path, context: Option<&Path>) -> Result<PlanInput> {
+    let src = std::fs::read_to_string(dockerfile)
+        .with_context(|| format!("reading {}", dockerfile.display()))?;
+    let context = context.map(Path::to_path_buf).unwrap_or_else(|| {
+        dockerfile
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf()
     });
+    Ok(PlanInput {
+        dockerfile: parser::parse(&src)?,
+        origin: dockerfile.to_path_buf(),
+        context,
+    })
+}
+
+/// Entry point for the `build` subcommand.
+pub fn build(opts: &Options) -> Result<Built> {
+    let input = load_input(&opts.dockerfile, opts.context.as_deref())?;
+    let build_args: Vars = opts.build_args.iter().cloned().collect();
+    let plan = Plan::from_dockerfiles(&[input], &build_args)?;
+    let target = plan.resolve_target(opts.target.as_deref())?;
+    let order = plan.build_order(target)?;
 
     // --print-plan: dry-run the whole pipeline and print the primitives, build nothing.
     if opts.print_plan {
         let mut ex = DryRun::new();
-        drive(&plan, &order, &build_args, &mut ex, &context)?;
+        drive(&plan, &order, &build_args, &mut ex)?;
         println!("# build order: {order:?} (target stage {target})");
         for line in &ex.transcript {
             println!("{line}");
@@ -194,13 +204,12 @@ pub fn build(opts: &Options) -> Result<Built> {
             scratch.clone(),
             cache,
             opts.journal,
-            context.clone(),
         ))
     } else {
-        Box::new(Host::new(context.clone(), scratch.clone()))
+        Box::new(Host::new(scratch.clone()))
     };
     let result = (|| -> Result<Built> {
-        let (committed, states) = drive(&plan, &order, &build_args, ex.as_mut(), &context)?;
+        let (committed, states) = drive(&plan, &order, &build_args, ex.as_mut())?;
         let fs = committed
             .get(&target)
             .context("internal: target stage not committed")?;
@@ -253,7 +262,6 @@ fn resolve_stages(
     plan: &Plan,
     order: &[usize],
     build_args: &Vars,
-    context: &Path,
     ex: &mut dyn Executor,
     dsh: Option<&str>,
 ) -> Result<HashMap<usize, Resolved>> {
@@ -347,7 +355,7 @@ fn resolve_stages(
             //     content. `--from=<image>` sources stay keyed by their reference text.
             let content = match &instr {
                 Instruction::Copy(c) => match &c.from {
-                    None => Some(context_copy_hash(context, c)),
+                    None => Some(context_copy_hash(&stage.context, c)),
                     Some(r) => source_stage_key(plan, &out, r),
                 },
                 Instruction::Run(r) => {
@@ -401,22 +409,14 @@ pub fn stage_keys(
     context: Option<&Path>,
     build_args: &[(String, String)],
 ) -> Result<Vec<(String, String)>> {
-    let src = std::fs::read_to_string(dockerfile)
-        .with_context(|| format!("reading {}", dockerfile.display()))?;
-    let df = parser::parse(&src)?;
+    let input = load_input(dockerfile, context)?;
     let ba: Vars = build_args.iter().cloned().collect();
-    let plan = Plan::from_dockerfile(&df, &ba)?;
+    let plan = Plan::from_dockerfiles(&[input], &ba)?;
     let order = plan.all_order()?;
-    let ctx = context.map(Path::to_path_buf).unwrap_or_else(|| {
-        dockerfile
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf()
-    });
     let mut ex = exec::Planner::new();
     // canonical keys: DOCKER_STAGE_HASH is excluded (its injected value never affects a
     // stage's identity), so `docker-hash` prints exactly the key a build would store.
-    let resolved = resolve_stages(&plan, &order, &ba, &ctx, &mut ex, None)?;
+    let resolved = resolve_stages(&plan, &order, &ba, &mut ex, None)?;
     let mut out = Vec::new();
     for &idx in &order {
         let name = plan.stages[idx]
@@ -518,10 +518,9 @@ fn drive(
     order: &[usize],
     build_args: &Vars,
     ex: &mut dyn Executor,
-    context: &Path,
 ) -> Result<(HashMap<usize, Rootfs>, HashMap<usize, ShellState>)> {
     // Canonical, value-independent keys (DOCKER_STAGE_HASH forced empty while keying).
-    let keyed = resolve_stages(plan, order, build_args, context, ex, None)?;
+    let keyed = resolve_stages(plan, order, build_args, ex, None)?;
     // Auto-inject DOCKER_STAGE_HASH for execution: its value is the stage_key of the
     // declaring stage nearest the target (self included), mirroring the wabbuilder
     // docker-tool.sh `BUILDER_TAG` scheme. A second pass re-interpolates the instructions
@@ -535,7 +534,7 @@ fn drive(
                 .context("internal: DOCKER_STAGE_HASH declarer not resolved")?
                 .final_key
                 .clone();
-            let exec = resolve_stages(plan, order, build_args, context, ex, Some(&value))?;
+            let exec = resolve_stages(plan, order, build_args, ex, Some(&value))?;
             merge_exec(&keyed, exec)
         }
         None => keyed,
@@ -591,9 +590,12 @@ fn drive(
             committed.insert(idx, fs);
             continue;
         }
-        // Declare the source stages this stage copies/mounts from, so the backend can
-        // attach them before the guest boots.
-        ex.stage_sources(&stage_source_rootfs(plan, &stage.instructions, &committed))?;
+        // Declare the stage's inputs — the source stages it copies/mounts from, and its
+        // build context — so the backend can attach them before the guest boots.
+        ex.stage_sources(
+            &stage_source_rootfs(plan, &stage.instructions, &committed),
+            &stage.context,
+        )?;
         // Instruction-level cache + lazy base: every step carries the chained key; the
         // base rootfs is materialized only when something must actually run (the first
         // cache miss). A fully-cached stage never pulls/flattens the base — it just
@@ -999,14 +1001,27 @@ fn upsert(env: &mut Vec<(String, String)>, k: &str, v: &str) {
 mod tests {
     use super::*;
 
+    /// A single-file plan whose stages' context is `/nonexistent` (the tests' COPYs
+    /// hash an empty file set — deterministic without touching the host).
+    fn plan_one(src: &str, ba: &Vars) -> Plan {
+        Plan::from_dockerfiles(
+            &[PlanInput {
+                dockerfile: parser::parse(src).unwrap(),
+                origin: "Dockerfile".into(),
+                context: "/nonexistent".into(),
+            }],
+            ba,
+        )
+        .unwrap()
+    }
+
     fn transcript(src: &str, target: Option<&str>) -> Vec<String> {
         let ba = Vars::new();
-        let df = parser::parse(src).unwrap();
-        let plan = Plan::from_dockerfile(&df, &ba).unwrap();
+        let plan = plan_one(src, &ba);
         let t = plan.resolve_target(target).unwrap();
         let order = plan.build_order(t).unwrap();
         let mut ex = DryRun::new();
-        drive(&plan, &order, &ba, &mut ex, Path::new("/nonexistent")).unwrap();
+        drive(&plan, &order, &ba, &mut ex).unwrap();
         ex.transcript
     }
 
@@ -1074,13 +1089,12 @@ mod tests {
     fn fully_cached_build_restores_final_snapshot_only() {
         let src = "FROM alpine AS builder\nRUN one\n\nFROM alpine\nRUN two\nRUN three\n";
         let ba = Vars::new();
-        let df = parser::parse(src).unwrap();
-        let plan = Plan::from_dockerfile(&df, &ba).unwrap();
+        let plan = plan_one(src, &ba);
         let t = plan.resolve_target(None).unwrap();
         let order = plan.build_order(t).unwrap();
         // cold: everything runs and populates the cache
         let mut ex = CachedDry::default();
-        drive(&plan, &order, &ba, &mut ex, Path::new("/nonexistent")).unwrap();
+        drive(&plan, &order, &ba, &mut ex).unwrap();
         assert!(ex.inner.transcript.iter().any(|l| l.starts_with("run ")));
         // warm: one probe of the target's final key, one restore — no per-step
         // probes, nothing built, the builder stage never touched
@@ -1089,7 +1103,7 @@ mod tests {
             cache: ex.cache,
             last_saved: None,
         };
-        drive(&plan, &order, &ba, &mut ex, Path::new("/nonexistent")).unwrap();
+        drive(&plan, &order, &ba, &mut ex).unwrap();
         let t = &ex.inner.transcript;
         assert_eq!(t.len(), 2, "{t:?}");
         assert!(
@@ -1104,14 +1118,13 @@ mod tests {
         let src = "FROM alpine AS builder\nRUN one\nRUN two\n\n\
                    FROM alpine\nRUN three\nCOPY --from=builder /a /b\n";
         let ba = Vars::new();
-        let df = parser::parse(src).unwrap();
-        let plan = Plan::from_dockerfile(&df, &ba).unwrap();
+        let plan = plan_one(src, &ba);
         let t = plan.resolve_target(None).unwrap();
         let order = plan.build_order(t).unwrap();
         // cold run populates the cache; evict the target's final key so only the
         // target's last instruction must re-run
         let mut ex = CachedDry::default();
-        drive(&plan, &order, &ba, &mut ex, Path::new("/nonexistent")).unwrap();
+        drive(&plan, &order, &ba, &mut ex).unwrap();
         let mut cache = ex.cache;
         cache.remove(&ex.last_saved.unwrap());
         let mut ex = CachedDry {
@@ -1119,7 +1132,7 @@ mod tests {
             cache,
             last_saved: None,
         };
-        drive(&plan, &order, &ba, &mut ex, Path::new("/nonexistent")).unwrap();
+        drive(&plan, &order, &ba, &mut ex).unwrap();
         let t = &ex.inner.transcript;
         let count = |p: &str| t.iter().filter(|l| l.starts_with(p)).count();
         // probes: the target's last key (miss), the builder's last key (hit), then the
@@ -1205,6 +1218,51 @@ mod tests {
     }
 
     #[test]
+    fn copy_keys_hash_the_stage_context() {
+        // A context COPY's content hash reads the *stage's* recorded context — and the
+        // context path itself never enters the key (same content in two places, same key).
+        let tmp = std::env::temp_dir().join(format!("vk-stagectx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        for d in ["a", "b", "c"] {
+            std::fs::create_dir_all(tmp.join(d)).unwrap();
+        }
+        std::fs::write(tmp.join("a/f.txt"), "one").unwrap();
+        std::fs::write(tmp.join("b/f.txt"), "two").unwrap();
+        std::fs::write(tmp.join("c/f.txt"), "one").unwrap(); // same content as a/
+        let ba = Vars::new();
+        let key = |ctx: &Path| {
+            let plan = Plan::from_dockerfiles(
+                &[PlanInput {
+                    dockerfile: parser::parse("FROM scratch\nCOPY f.txt /f\n").unwrap(),
+                    origin: "Dockerfile".into(),
+                    context: ctx.to_path_buf(),
+                }],
+                &ba,
+            )
+            .unwrap();
+            assert_eq!(plan.stages[0].context, ctx);
+            let order = plan.all_order().unwrap();
+            let mut ex = DryRun::new();
+            resolve_stages(&plan, &order, &ba, &mut ex, None).unwrap()[&0]
+                .final_key
+                .clone()
+        };
+        let (a, b, c) = (tmp.join("a"), tmp.join("b"), tmp.join("c"));
+        assert_ne!(key(&a), key(&b)); // different content -> different key
+        assert_eq!(key(&a), key(&c)); // same content elsewhere -> same key
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn drive_declares_each_stage_context() {
+        let t = transcript("FROM scratch AS s\nCOPY f /f\n", None);
+        assert!(
+            t.contains(&"stage-context /nonexistent".to_string()),
+            "{t:#?}"
+        );
+    }
+
+    #[test]
     fn end_to_end_multistage_drive() {
         let src = "\
 FROM debian:bookworm AS build
@@ -1257,11 +1315,10 @@ RUN ship
 ";
         let ba = Vars::new();
         let resolve = |source: &str| {
-            let df = parser::parse(source).unwrap();
-            let plan = Plan::from_dockerfile(&df, &ba).unwrap();
+            let plan = plan_one(source, &ba);
             let order = plan.all_order().unwrap();
             let mut ex = DryRun::new();
-            resolve_stages(&plan, &order, &ba, Path::new("/nonexistent"), &mut ex, None).unwrap()
+            resolve_stages(&plan, &order, &ba, &mut ex, None).unwrap()
         };
         let r = resolve(src);
         // every stage key is a full sha256 hex, and the computation is deterministic.
@@ -1292,11 +1349,10 @@ RUN ship
         // copies/mounts from changed — else it would restore the old source content.
         let ba = Vars::new();
         let keys = |src: &str| {
-            let plan = Plan::from_dockerfile(&parser::parse(src).unwrap(), &ba).unwrap();
+            let plan = plan_one(src, &ba);
             let order = plan.all_order().unwrap();
             let mut ex = DryRun::new();
-            let r = resolve_stages(&plan, &order, &ba, Path::new("/nonexistent"), &mut ex, None)
-                .unwrap();
+            let r = resolve_stages(&plan, &order, &ba, &mut ex, None).unwrap();
             (r[&0].final_key.clone(), r[&1].final_key.clone())
         };
         // COPY --from=<stage>
@@ -1336,21 +1392,19 @@ FROM core AS app
 RUN ship
 ";
         let ba = Vars::new();
-        let df = parser::parse(src).unwrap();
-        let plan = Plan::from_dockerfile(&df, &ba).unwrap();
+        let plan = plan_one(src, &ba);
         let target = plan.resolve_target(Some("app")).unwrap();
         let order = plan.build_order(target).unwrap();
-        let nonexistent = Path::new("/nonexistent");
         // 'app' does not declare it; the nearest declarer in its closure is 'core' (0).
         assert_eq!(nearest_dsh_declarer(&plan, target), Some(0));
 
         // canonical (key-pass) keys, DOCKER_STAGE_HASH excluded.
         let mut ex = DryRun::new();
-        let keyed = resolve_stages(&plan, &order, &ba, nonexistent, &mut ex, None).unwrap();
+        let keyed = resolve_stages(&plan, &order, &ba, &mut ex, None).unwrap();
         let value = keyed[&0].final_key.clone();
         // exec pass injects core's stage_key, then merge keeps the canonical keys.
         let mut ex2 = DryRun::new();
-        let exec = resolve_stages(&plan, &order, &ba, nonexistent, &mut ex2, Some(&value)).unwrap();
+        let exec = resolve_stages(&plan, &order, &ba, &mut ex2, Some(&value)).unwrap();
         let merged = merge_exec(&keyed, exec);
 
         // the executed RUN in 'core' sees the injected value via BUILDER_TAG …
@@ -1364,8 +1418,7 @@ RUN ship
 
         // injecting a different value yields identical keys (no self-reference circularity).
         let mut ex3 = DryRun::new();
-        let exec_other =
-            resolve_stages(&plan, &order, &ba, nonexistent, &mut ex3, Some("deadbeef")).unwrap();
+        let exec_other = resolve_stages(&plan, &order, &ba, &mut ex3, Some("deadbeef")).unwrap();
         let merged_other = merge_exec(&keyed, exec_other);
         assert_eq!(merged_other[&0].steps[0].key, merged[&0].steps[0].key);
     }

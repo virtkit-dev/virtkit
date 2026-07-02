@@ -9,6 +9,7 @@
 //! frontend/dockerfile/dockerfile2llb: `toDispatchState` + stage resolution).
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 
@@ -36,6 +37,20 @@ pub struct Stage {
     pub base: Base,
     /// Instructions after the `FROM`, in order (the `FROM` itself excluded).
     pub instructions: Vec<Instruction>,
+    /// Build-context root the stage's `COPY` (no `--from`) resolves against — the
+    /// context of the [`PlanInput`] that declared the stage. The path itself never
+    /// enters cache keys (only context-relative names + file content do), so where a
+    /// context lives cannot bust the cache.
+    pub context: PathBuf,
+}
+
+/// One Dockerfile going into a [`Plan`], with the paths its stages resolve against.
+pub struct PlanInput {
+    pub dockerfile: Dockerfile,
+    /// Where the Dockerfile came from (diagnostics only).
+    pub origin: PathBuf,
+    /// Build-context root for the stages this file declares (default: the file's dir).
+    pub context: PathBuf,
 }
 
 /// A resolved Dockerfile: its stages, plus a name→index lookup.
@@ -51,61 +66,73 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Build the plan from a parsed Dockerfile: split into stages and resolve each
+    /// Build the plan from parsed Dockerfiles: split into stages and resolve each
     /// `FROM` base + the name index. `FROM` images are interpolated against the global
     /// `ARG`s (with `build_args` overriding declared defaults). References resolve in
     /// source order, so a `FROM <name>` only sees stages declared before it.
-    pub fn from_dockerfile(df: &Dockerfile, build_args: &Vars) -> Result<Plan> {
+    pub fn from_dockerfiles(inputs: &[PlanInput], build_args: &Vars) -> Result<Plan> {
         let mut stages: Vec<Stage> = Vec::new();
         let mut by_name: BTreeMap<String, usize> = BTreeMap::new();
         let mut global_args: Vars = Vars::new();
 
-        for instr in &df.instructions {
-            match instr {
-                Instruction::From(f) => {
-                    // expand ${ARG} in the image ref against the global args.
-                    let image = interp::interpolate(&f.image, &global_args);
-                    let index = stages.len();
-                    let base = if image.eq_ignore_ascii_case("scratch") {
-                        Base::Scratch
-                    } else if let Some(&i) = by_name.get(&image) {
-                        Base::Stage(i)
-                    } else if let Ok(i) = image.parse::<usize>() {
-                        // `FROM 0` — a stage by numeric index (rare but valid)
-                        if i < index {
+        for input in inputs {
+            // Per-file boundary: "before the first FROM" means *this* file's first FROM,
+            // so a later file's leading ARGs stay global and its stray instructions
+            // can't silently attach to the previous file's last stage.
+            let file_start = stages.len();
+            for instr in &input.dockerfile.instructions {
+                match instr {
+                    Instruction::From(f) => {
+                        // expand ${ARG} in the image ref against the global args.
+                        let image = interp::interpolate(&f.image, &global_args);
+                        let index = stages.len();
+                        let base = if image.eq_ignore_ascii_case("scratch") {
+                            Base::Scratch
+                        } else if let Some(&i) = by_name.get(&image) {
                             Base::Stage(i)
+                        } else if let Ok(i) = image.parse::<usize>() {
+                            // `FROM 0` — a stage by numeric index (rare but valid)
+                            if i < index {
+                                Base::Stage(i)
+                            } else {
+                                Base::Image(image.clone())
+                            }
                         } else {
-                            Base::Image(image.clone())
+                            Base::Image(image)
+                        };
+                        if let Some(name) = &f.as_name {
+                            by_name.insert(name.clone(), index);
                         }
-                    } else {
-                        Base::Image(image)
-                    };
-                    if let Some(name) = &f.as_name {
-                        by_name.insert(name.clone(), index);
+                        stages.push(Stage {
+                            index,
+                            name: f.as_name.clone(),
+                            base,
+                            instructions: Vec::new(),
+                            context: input.context.clone(),
+                        });
                     }
-                    stages.push(Stage {
-                        index,
-                        name: f.as_name.clone(),
-                        base,
-                        instructions: Vec::new(),
-                    });
-                }
-                // Global ARG before the first stage: resolve it (build-arg override, else
-                // its interpolated default, else empty) into the global scope.
-                Instruction::Arg { name, default } if stages.is_empty() => {
-                    let value = build_args.get(name).cloned().unwrap_or_else(|| {
-                        default
-                            .as_deref()
-                            .map(|d| interp::interpolate(d, &global_args))
-                            .unwrap_or_default()
-                    });
-                    global_args.insert(name.clone(), value);
-                }
-                other => {
-                    let Some(stage) = stages.last_mut() else {
-                        bail!("instruction before the first FROM: {other:?}");
-                    };
-                    stage.instructions.push(other.clone());
+                    // Global ARG before the file's first stage: resolve it (build-arg
+                    // override, else its interpolated default, else empty) into the
+                    // global scope.
+                    Instruction::Arg { name, default } if stages.len() == file_start => {
+                        let value = build_args.get(name).cloned().unwrap_or_else(|| {
+                            default
+                                .as_deref()
+                                .map(|d| interp::interpolate(d, &global_args))
+                                .unwrap_or_default()
+                        });
+                        global_args.insert(name.clone(), value);
+                    }
+                    other => {
+                        if stages.len() == file_start {
+                            bail!(
+                                "instruction before the first FROM in {}: {other:?}",
+                                input.origin.display()
+                            );
+                        }
+                        let stage = stages.last_mut().expect("guarded above");
+                        stage.instructions.push(other.clone());
+                    }
                 }
             }
         }
@@ -250,17 +277,43 @@ mod tests {
     use super::*;
     use crate::build::parser::parse;
 
+    /// A single-file [`PlanInput`] with a placeholder origin/context (tests that care
+    /// about contexts build their own inputs).
+    fn input(src: &str) -> PlanInput {
+        PlanInput {
+            dockerfile: parse(src).unwrap(),
+            origin: "Dockerfile".into(),
+            context: "/nonexistent".into(),
+        }
+    }
+
+    fn plan_args(src: &str, build_args: &Vars) -> Result<Plan> {
+        Plan::from_dockerfiles(&[input(src)], build_args)
+    }
+
     fn plan(src: &str) -> Plan {
-        Plan::from_dockerfile(&parse(src).unwrap(), &Vars::new()).unwrap()
+        plan_args(src, &Vars::new()).unwrap()
+    }
+
+    #[test]
+    fn later_file_leading_args_stay_global_and_stray_instructions_bail() {
+        // Per-file boundary: a second file's leading ARG is global — it must not
+        // attach to the previous file's last stage — and its instruction before the
+        // file's first FROM errors.
+        let two = |a: &str, b: &str| Plan::from_dockerfiles(&[input(a), input(b)], &Vars::new());
+        let p = two(
+            "FROM alpine AS one\nRUN x\n",
+            "ARG ver=9\nFROM debian:${ver} AS two\n",
+        )
+        .unwrap();
+        assert_eq!(p.stages[0].instructions.len(), 1); // RUN x only, no stray ARG
+        assert_eq!(p.stages[1].base, Base::Image("debian:9".into()));
+        assert!(two("FROM alpine\n", "RUN x\nFROM alpine\n").is_err());
     }
 
     #[test]
     fn global_arg_interpolates_into_from() {
-        let p = Plan::from_dockerfile(
-            &parse("ARG ver=bookworm\nFROM debian:${ver} AS base\nRUN x\n").unwrap(),
-            &Vars::new(),
-        )
-        .unwrap();
+        let p = plan("ARG ver=bookworm\nFROM debian:${ver} AS base\nRUN x\n");
         assert_eq!(p.stages[0].base, Base::Image("debian:bookworm".into()));
         assert_eq!(
             p.global_args.get("ver").map(String::as_str),
@@ -271,11 +324,7 @@ mod tests {
     #[test]
     fn stage_ref_resolves_global_arg_in_from() {
         // COPY --from=builder-${ver} resolves the global ARG to the right stage edge.
-        let p = Plan::from_dockerfile(
-            &parse("ARG ver=9\nFROM alpine AS builder-9\nFROM alpine AS final\n").unwrap(),
-            &Vars::new(),
-        )
-        .unwrap();
+        let p = plan("ARG ver=9\nFROM alpine AS builder-9\nFROM alpine AS final\n");
         assert_eq!(p.stage_ref("builder-${ver}"), Some(0));
         assert_eq!(p.stage_ref("builder-9"), Some(0));
         assert_eq!(p.stage_ref("nope-${ver}"), None);
@@ -285,11 +334,7 @@ mod tests {
     fn build_arg_overrides_global_default_in_from() {
         let mut ba = Vars::new();
         ba.insert("ver".into(), "trixie".into());
-        let p = Plan::from_dockerfile(
-            &parse("ARG ver=bookworm\nFROM debian:${ver}\n").unwrap(),
-            &ba,
-        )
-        .unwrap();
+        let p = plan_args("ARG ver=bookworm\nFROM debian:${ver}\n", &ba).unwrap();
         assert_eq!(p.stages[0].base, Base::Image("debian:trixie".into()));
     }
 

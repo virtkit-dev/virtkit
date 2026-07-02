@@ -77,10 +77,12 @@ pub trait Executor {
     /// Apply a `COPY` into `fs` (from the build context, or `from`'s committed rootfs).
     fn copy(&mut self, fs: &Rootfs, op: &Copy, from: Option<&Rootfs>) -> Result<()>;
 
-    /// Declare the stages this stage will `COPY --from` / `RUN --mount=from` (their
-    /// committed rootfs), before its instructions run, so a backend can attach them
-    /// (default: nothing).
-    fn stage_sources(&mut self, _sources: &[Rootfs]) -> Result<()> {
+    /// Declare a stage's inputs before its instructions run: the stages it will
+    /// `COPY --from` / `RUN --mount=from` (their committed rootfs), and its build
+    /// context (what `COPY` without `--from` resolves against — per stage, since each
+    /// stage copies from the context of the Dockerfile that declared it). A backend
+    /// attaches/mounts them here (default: nothing).
+    fn stage_sources(&mut self, _sources: &[Rootfs], _context: &Path) -> Result<()> {
         Ok(())
     }
 
@@ -183,6 +185,11 @@ impl Executor for DryRun {
             op.sources,
             op.dest
         ));
+        Ok(())
+    }
+    fn stage_sources(&mut self, _sources: &[Rootfs], context: &Path) -> Result<()> {
+        self.transcript
+            .push(format!("stage-context {}", context.display()));
         Ok(())
     }
     fn export_ext4(&mut self, fs: &Rootfs, out: &Path) -> Result<()> {
@@ -311,9 +318,12 @@ pub struct MicroVm {
     sources: Vec<PathBuf>,
     /// source stage label → its guest device (e.g. `/dev/vdb`), matching `sources`.
     source_dev: HashMap<String, String>,
-    /// build-context dir, shared into each stage's guest over virtiofs for `COPY` from
-    /// the context (no `--from`).
-    context: PathBuf,
+    /// The *current stage's* build-context dir, shared into its guest over virtiofs for
+    /// `COPY` from the context (no `--from`). Set by `stage_sources` before the stage's
+    /// first boot and consumed by the next `ensure_session`; `None` between stages.
+    /// This per-stage handoff relies on the session-per-stage invariant (`stage_end`
+    /// tears the guest down) — a session outliving its stage would keep a stale share.
+    context: Option<PathBuf>,
     /// the in-flight cache push (run on a background thread) and the snapshot raw it reads.
     /// At most one runs at a time: it is spawned at the end of an instruction's `cache_save`
     /// and joined at the start of the next one — so the push (chunk + manifest + upload, the
@@ -429,7 +439,6 @@ impl MicroVm {
         scratch: PathBuf,
         cache: Option<crate::config::Registry>,
         journal: bool,
-        context: PathBuf,
     ) -> Self {
         MicroVm {
             cloud_hypervisor,
@@ -450,7 +459,7 @@ impl MicroVm {
             journal,
             sources: Vec::new(),
             source_dev: HashMap::new(),
-            context,
+            context: None,
             inflight: None,
             push_seq: 0,
             stage_last_key: HashMap::new(),
@@ -464,6 +473,10 @@ impl MicroVm {
     fn ensure_session(&mut self, fs: &Rootfs) -> Result<()> {
         if self.session.is_none() {
             let ext4 = self.stage_image(fs)?;
+            let context = self
+                .context
+                .as_deref()
+                .context("internal: stage booted before stage_sources set its context")?;
             let s = block_on(crate::run::boot_session(
                 &self.cloud_hypervisor,
                 &self.kernel,
@@ -474,7 +487,7 @@ impl MicroVm {
                 &self.mem,
                 self.boot_timeout_secs,
                 &self.sources,
-                Some(self.context.as_path()),
+                Some(context),
             ))?;
             self.session = Some(s);
         }
@@ -1065,9 +1078,10 @@ impl Executor for MicroVm {
         d
     }
 
-    fn stage_sources(&mut self, sources: &[Rootfs]) -> Result<()> {
+    fn stage_sources(&mut self, sources: &[Rootfs], context: &Path) -> Result<()> {
         // Resolve each source stage to its ext4 and assign it the next guest device
-        // (vdb, vdc, …); the session for this stage boots with these attached read-only.
+        // (vdb, vdc, …); the session for this stage boots with these attached read-only,
+        // and with the stage's build context as its virtiofs share.
         self.sources.clear();
         self.source_dev.clear();
         for (i, s) in sources.iter().enumerate() {
@@ -1075,6 +1089,7 @@ impl Executor for MicroVm {
             self.source_dev
                 .insert(s.label.clone(), format!("/dev/{}", vd_name(i + 1)));
         }
+        self.context = Some(context.to_path_buf());
         Ok(())
     }
 
@@ -1087,12 +1102,13 @@ impl Executor for MicroVm {
         if let Some(session) = self.session.take() {
             block_on(session.finish())?;
         }
-        // the next stage starts a fresh cache lineage; clear its attached sources and the
-        // in-memory parent layers.
+        // the next stage starts a fresh cache lineage; clear its attached sources, its
+        // context, and the in-memory parent layers.
         self.parent_key = None;
         self.parent_layers = None;
         self.sources.clear();
         self.source_dev.clear();
+        self.context = None;
         Ok(())
     }
 }
@@ -1132,17 +1148,18 @@ where
 pub struct Host {
     /// Scratch root holding each stage's directory (`<scratch>/<stage>`).
     scratch: PathBuf,
-    /// Build context root that `COPY <src>` (no `--from`) resolves against.
-    context: PathBuf,
+    /// Build context root that `COPY <src>` (no `--from`) resolves against — set per
+    /// stage by `stage_sources` before any instruction runs; `None` until then.
+    context: Option<PathBuf>,
     /// stage label → its host directory.
     dirs: HashMap<String, PathBuf>,
 }
 
 impl Host {
-    pub fn new(context: PathBuf, scratch: PathBuf) -> Self {
+    pub fn new(scratch: PathBuf) -> Self {
         Host {
             scratch,
-            context,
+            context: None,
             dirs: HashMap::new(),
         }
     }
@@ -1194,10 +1211,17 @@ impl Executor for Host {
             render_cmd(cmd)
         )
     }
+    fn stage_sources(&mut self, _sources: &[Rootfs], context: &Path) -> Result<()> {
+        self.context = Some(context.to_path_buf());
+        Ok(())
+    }
     fn copy(&mut self, fs: &Rootfs, op: &Copy, from: Option<&Rootfs>) -> Result<()> {
         let src_root = match from {
             Some(r) => self.stage_dir(r)?,
-            None => self.context.clone(),
+            None => self
+                .context
+                .clone()
+                .context("internal: copy before stage_sources set the context")?,
         };
         let dest_root = self.stage_dir(fs)?;
         // dest is relative to the rootfs root; a trailing '/' or multiple sources mean
@@ -1292,7 +1316,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("vk-host-from-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        let mut h = Host::new(tmp.join("ctx"), tmp.join("scratch"));
+        let mut h = Host::new(tmp.join("scratch"));
         let lib = h.from_scratch("lib").unwrap();
         std::fs::write(h.stage_dir(&lib).unwrap().join("t"), "tool").unwrap();
         let app = h.from_scratch("app").unwrap();
@@ -1311,6 +1335,34 @@ mod tests {
     }
 
     #[test]
+    fn host_copy_requires_and_reads_the_stage_context() {
+        // A context COPY reads the context `stage_sources` declared for the stage —
+        // and errors if it runs before any stage declared one.
+        let tmp = std::env::temp_dir().join(format!("vk-host-ctx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let stage = tmp.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("f.txt"), "from-stage").unwrap();
+
+        let mut h = Host::new(tmp.join("scratch"));
+        let fs = h.from_scratch("s").unwrap();
+        let op = Copy {
+            sources: vec!["f.txt".into()],
+            dest: "/f.txt".into(),
+            from: None,
+            chown: None,
+            chmod: None,
+            link: false,
+        };
+        assert!(h.copy(&fs, &op, None).is_err());
+        h.stage_sources(&[], &stage).unwrap();
+        h.copy(&fs, &op, None).unwrap();
+        let copied = std::fs::read_to_string(h.stage_dir(&fs).unwrap().join("f.txt")).unwrap();
+        assert_eq!(copied, "from-stage");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn host_builds_a_real_ext4_from_scratch_and_copy() {
         // exercises the actual "Dockerfile → ext4 with only virtkit" path: a scratch
         // stage + a COPY, exported via crate::ext4. No docker/buildkit/mke2fs/VM.
@@ -1320,7 +1372,8 @@ mod tests {
         std::fs::create_dir_all(&ctx).unwrap();
         std::fs::write(ctx.join("hello.txt"), b"hi from virtkit").unwrap();
 
-        let mut h = Host::new(ctx, tmp.join("scratch"));
+        let mut h = Host::new(tmp.join("scratch"));
+        h.stage_sources(&[], &ctx).unwrap();
         let fs = h.from_scratch("s").unwrap();
         let op = Copy {
             sources: vec!["hello.txt".into()],
