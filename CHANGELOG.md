@@ -8,6 +8,7 @@ All notable changes to virtkit will be documented in this file.
 
 - **Self-contained `vk`**: the guest kernel and `vk-agent` are embedded into the
   binary — a single file boots OCI images.
+- `run --cpus host` matches the host CPU count.
 
 ## [0.4.0] - 2026-07-02
 

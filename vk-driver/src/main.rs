@@ -56,6 +56,21 @@ use vk_core::addr::SocketAddr;
 use crate::config::Config;
 use crate::jobctx::JobCtx;
 
+/// clap value parser for `--cpus`: a number, or `host` for the host's CPU count
+/// (`available_parallelism`, which honours cgroup/affinity limits). libkrun and
+/// cloud-hypervisor both take a flat vCPU count, so this matches the host's logical
+/// CPUs; it does not replicate SMT/socket topology (libkrun exposes no such knob).
+fn parse_cpus(s: &str) -> Result<u32, String> {
+    if s == "host" {
+        std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .map_err(|e| format!("detecting the host CPU count: {e}"))
+    } else {
+        s.parse()
+            .map_err(|_| format!("--cpus expects a number or \"host\", got {s:?}"))
+    }
+}
+
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -370,7 +385,8 @@ enum Cmd {
         /// cloud-hypervisor binary
         #[arg(long, default_value = "cloud-hypervisor")]
         cloud_hypervisor: PathBuf,
-        #[arg(long, default_value_t = 2)]
+        /// vCPUs: a number, or `host` for as many as the host has (its logical CPU count)
+        #[arg(long, default_value = "2", value_parser = parse_cpus)]
         cpus: u32,
         #[arg(long, default_value = "1G")]
         mem: String,
@@ -1198,5 +1214,16 @@ mod tests {
                 0o644
             )]
         );
+    }
+
+    // --cpus takes a plain number or `host` (the host's logical CPU count, >= 1);
+    // anything else is rejected.
+    #[test]
+    fn cpus_value_parses() {
+        assert_eq!(parse_cpus("2"), Ok(2));
+        assert!(parse_cpus("host").is_ok_and(|n| n >= 1));
+        assert!(parse_cpus("").is_err());
+        assert!(parse_cpus("Host").is_err());
+        assert!(parse_cpus("-1").is_err());
     }
 }
