@@ -41,14 +41,14 @@ impl Asset {
     }
 
     /// On-disk fallback when nothing is embedded and no flag is given.
-    fn default_path(self) -> &'static str {
+    pub fn default_path(self) -> &'static str {
         match self {
             Asset::Kernel => "/usr/local/lib/vk/vmlinux",
             Asset::Agent => "/usr/local/lib/vk/vk-agent",
         }
     }
 
-    fn embedded(self) -> Option<&'static [u8]> {
+    pub fn embedded(self) -> Option<&'static [u8]> {
         match self {
             Asset::Kernel => kernel(),
             Asset::Agent => agent(),

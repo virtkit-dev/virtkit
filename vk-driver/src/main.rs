@@ -17,6 +17,7 @@
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 mod build;
+mod check;
 mod config;
 mod convert;
 mod cpio;
@@ -163,6 +164,16 @@ enum RegistryCmd {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
+    /// Preflight: check this host is usable by the current user — /dev/kvm access,
+    /// the VMM backend, a guest kernel/agent, and the host side of each feature the
+    /// config enables (net.mode taps, [convert], [registry], ...). One line per
+    /// check; exits non-zero if any fails.
+    Check {
+        /// check only these features, failing (instead of skipping) any that
+        /// turn out unconfigured (repeatable)
+        #[arg(long = "feature", value_enum, value_name = "FEATURE")]
+        feature: Vec<check::Feature>,
+    },
     /// GitLab custom-executor lifecycle (config / prepare / run / cleanup)
     Gitlab {
         #[command(subcommand)]
@@ -607,6 +618,13 @@ async fn cli_main() -> ExitCode {
         Ok(cfg) => cfg,
         Err(e) => return fail(&e, 2),
     };
+    if let Cmd::Check { feature } = &cli.cmd {
+        return if check::run(&cfg, feature) {
+            ExitCode::SUCCESS
+        } else {
+            exit_code(1)
+        };
+    }
     // `run` is a standalone dev path: no JobCtx (no CUSTOM_ENV_* job context).
     if let Cmd::Run {
         image,
@@ -1180,7 +1198,8 @@ async fn cli_main() -> ExitCode {
             Err(e) => fail(&e, 1),
         },
         // handled above, before JobCtx
-        Cmd::Registry { .. }
+        Cmd::Check { .. }
+        | Cmd::Registry { .. }
         | Cmd::Switch { .. }
         | Cmd::Fleet { .. }
         | Cmd::Run { .. }

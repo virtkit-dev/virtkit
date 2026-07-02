@@ -6,6 +6,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- `vk check` verifies the host is usable by the current user — `/dev/kvm`
+  access, the VMM backend, the guest kernel/agent, and each configured
+  feature's host prerequisites; `--feature` checks specific features.
 - **Built-in libkrun VMM, on by default** — no external hypervisor binary is
   needed. Cloud Hypervisor remains available (`VIRTKIT_VMM=cloud-hypervisor`).
 - **Self-contained `vk`**: the guest kernel and `vk-agent` are embedded into the
