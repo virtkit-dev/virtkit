@@ -92,14 +92,22 @@ impl Store {
             .join(hex)
     }
 
-    /// Whether the blob (either form) is present.
+    /// Whether the blob (either form) is present. A hit bumps the blob's mtime: the
+    /// caller is about to *reference* it without rewriting it (the dedup fast path),
+    /// and that mtime is what a future `vk registry gc` sweep will honour.
     pub(crate) fn has_blob(&self, hex: &str) -> bool {
-        self.find_blob(hex).is_some()
+        match self.find_blob(hex) {
+            Some((path, _)) => {
+                touch(&path);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Store raw canonical bytes content-addressed, adaptively compressed (the zstd
-    /// form only when it actually shrinks). Idempotent: a present blob is left in
-    /// place and the compression is skipped. Returns the `sha256:<hex>` digest.
+    /// form only when it actually shrinks). Idempotent: a present blob is only
+    /// touched, and the compression is skipped. Returns the `sha256:<hex>` digest.
     #[allow(dead_code)] // used by the upcoming builtin build cache
     pub(crate) fn put_blob(&self, raw: &[u8]) -> Result<String> {
         let hex = sha256_hex_raw(raw);
@@ -163,7 +171,8 @@ impl Store {
     }
 
     /// Resolve a tag or digest reference to `(digest, manifest bytes, content type)`,
-    /// `None` if absent.
+    /// `None` if absent. A tag hit bumps the tag file's mtime — the "last used"
+    /// record a future `vk registry gc` keys its tag retention on.
     pub(crate) fn get_manifest(
         &self,
         name: &str,
@@ -175,8 +184,12 @@ impl Store {
         let digest = if reference.starts_with("sha256:") {
             reference.to_string()
         } else {
-            match std::fs::read_to_string(self.tag_path(name, reference)) {
-                Ok(d) => d.trim().to_string(),
+            let tag = self.tag_path(name, reference);
+            match std::fs::read_to_string(&tag) {
+                Ok(d) => {
+                    touch(&tag);
+                    d.trim().to_string()
+                }
                 Err(_) => return Ok(None),
             }
         };
@@ -189,6 +202,58 @@ impl Store {
             .unwrap_or_else(|_| DEFAULT_MANIFEST_TYPE.to_string());
         Ok(Some((digest, data, ctype)))
     }
+
+    /// Take the store lock shared — held by every writer/reader across its whole
+    /// check→reference window (a local push: first `has_blob` through
+    /// `put_manifest`), so a future `vk registry gc` holding it *exclusive* can
+    /// never delete a blob between a dedup check and the manifest that references
+    /// it. Shared holders never block each other. flock is advisory and
+    /// filesystem-local — fine for `$XDG_DATA_HOME`; a store root on NFS is
+    /// unsupported.
+    ///
+    /// The future gc, for the record: take `lock_exclusive`; drop tags whose mtime
+    /// is past the retention window; mark every blob reachable from a remaining
+    /// tag/digest-pinned manifest (config + chunk digests); sweep unmarked blobs
+    /// whose mtime is also past a grace window (covering multi-request HTTP pushes,
+    /// whose HEAD hits bump blob mtimes but which hold no lock across requests);
+    /// clear stale `uploads/`.
+    pub(crate) fn lock_shared(&self) -> Result<LockGuard> {
+        self.flock(libc::LOCK_SH)
+    }
+
+    /// Take the store lock exclusive (blocks until all shared holders drop) — for a
+    /// future `vk registry gc`; see [`Store::lock_shared`].
+    #[allow(dead_code)] // test-exercised until `vk registry gc` lands
+    pub(crate) fn lock_exclusive(&self) -> Result<LockGuard> {
+        self.flock(libc::LOCK_EX)
+    }
+
+    fn flock(&self, op: libc::c_int) -> Result<LockGuard> {
+        use std::os::unix::io::AsRawFd;
+        let path = self.root.join(".lock");
+        let f =
+            std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+        // SAFETY: the fd is owned by `f`, which the guard keeps alive; flock returns
+        // 0 or -1/errno and blocks until the lock is granted.
+        if unsafe { libc::flock(f.as_raw_fd(), op) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("locking {}", path.display()));
+        }
+        Ok(LockGuard { _file: f })
+    }
+}
+
+/// A held store lock (see [`Store::lock_shared`]); released when dropped (flock
+/// releases on the last close of the fd).
+pub(crate) struct LockGuard {
+    _file: std::fs::File,
+}
+
+/// Bump a file's mtime to now — the usage record `vk registry gc` will read (blob:
+/// last written or dedup-referenced; tag: last used). Best-effort: a failed touch
+/// only ages the entry early.
+fn touch(path: &Path) {
+    let _ = std::fs::File::open(path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
 }
 
 /// Run the registry until the process is stopped. `addr` is the listen address
@@ -438,6 +503,8 @@ fn finish_upload(
             &digest,
         ));
     }
+    // shared store lock for the promotion (vs. a future exclusive gc); see lock_shared.
+    let _lock = store.lock_shared()?;
     let hex = digest.trim_start_matches("sha256:").to_string();
     let upload = store.upload_path(id);
     if !body.is_empty() {
@@ -493,6 +560,11 @@ fn get_blob(
             digest,
         ));
     };
+    // A HEAD hit is a remote pusher's dedup probe — about to reference this blob
+    // without re-uploading it. Record the use for the future gc sweep.
+    if head {
+        touch(&path);
+    }
 
     let builder = Response::builder()
         .status(StatusCode::OK)
@@ -560,6 +632,8 @@ fn put_manifest(
     ctype: &str,
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>> {
+    // shared store lock for the write (vs. a future exclusive gc); see lock_shared.
+    let _lock = store.lock_shared()?;
     let digest = store.put_manifest(name, reference, ctype, body)?;
     Response::builder()
         .status(StatusCode::CREATED)
@@ -931,6 +1005,183 @@ mod tests {
         assert_eq!(std::fs::read(&rpath).unwrap(), rnd);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GC readiness: a dedup hit (has_blob / a second put_blob) bumps the blob's
+    /// mtime and a tag hit bumps the tag file's mtime — the usage records the future
+    /// `vk registry gc` retention keys on.
+    #[test]
+    fn usage_mtimes_bump() {
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gcprep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        let backdate = |p: &Path| {
+            std::fs::File::open(p).unwrap().set_modified(old).unwrap();
+            assert!(std::fs::metadata(p).unwrap().modified().unwrap() <= old);
+        };
+        let raw = vec![9u8; 10_000];
+        let digest = store.put_blob(&raw).unwrap();
+        let hex = digest.trim_start_matches("sha256:");
+        let (blob, _) = store.find_blob(hex).unwrap();
+        backdate(&blob);
+        assert!(store.has_blob(hex), "blob just stored");
+        assert!(
+            std::fs::metadata(&blob).unwrap().modified().unwrap() > old,
+            "a dedup hit must bump the blob mtime"
+        );
+
+        store
+            .put_manifest("repo", "tag1", DEFAULT_MANIFEST_TYPE, b"{}")
+            .unwrap();
+        let tag = store.tag_path("repo", "tag1");
+        backdate(&tag);
+        assert!(store.get_manifest("repo", "tag1").unwrap().is_some());
+        assert!(
+            std::fs::metadata(&tag).unwrap().modified().unwrap() > old,
+            "a tag hit must bump the tag mtime"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Real mutual exclusion, probed non-blockingly: each `lock_*` call opens the
+    /// lock file anew (its own open file description), so guards conflict like
+    /// separate processes even within this test. Shared coexists with shared;
+    /// exclusive is denied while any shared guard lives and granted once dropped;
+    /// shared is denied while exclusive is held (a gc blocks pushes).
+    #[test]
+    fn store_lock_excludes_writers_from_gc() {
+        use std::os::unix::io::AsRawFd;
+        let dir = std::env::temp_dir().join(format!("vk-regserve-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        // non-blocking probe with its own open file description; `f` drops on
+        // return, releasing any lock the probe took.
+        let try_lock = |op: libc::c_int| -> bool {
+            let f = std::fs::File::create(dir.join(".lock")).unwrap();
+            // SAFETY: fd valid for f's lifetime; LOCK_NB makes a denial return -1.
+            unsafe { libc::flock(f.as_raw_fd(), op | libc::LOCK_NB) == 0 }
+        };
+
+        let s1 = store.lock_shared().unwrap();
+        let s2 = store.lock_shared().unwrap();
+        assert!(try_lock(libc::LOCK_SH), "shared must coexist with shared");
+        assert!(
+            !try_lock(libc::LOCK_EX),
+            "exclusive (gc) must be denied while shared holders live"
+        );
+        drop(s1);
+        assert!(!try_lock(libc::LOCK_EX), "one shared holder still lives");
+        drop(s2);
+        assert!(try_lock(libc::LOCK_EX), "exclusive acquires once all drop");
+
+        let gc = store.lock_exclusive().unwrap();
+        assert!(
+            !try_lock(libc::LOCK_SH),
+            "a pusher must be denied while gc holds exclusive"
+        );
+        drop(gc);
+        assert!(try_lock(libc::LOCK_SH));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hammer one store from many threads: concurrent `put_blob` of the SAME chunks
+    /// (same-name atomic-rename races), interleaved `put_manifest` to one shared tag
+    /// plus per-thread tags, and readers resolving tags/blobs throughout. Everything
+    /// must succeed, and the final state must be fully consistent: every blob's
+    /// canonical bytes intact, every tag resolving to a readable manifest.
+    #[test]
+    fn concurrent_store_writers_and_readers_stay_consistent() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-conc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        // a small pool of shared payloads so every thread collides on the same blob
+        // names (rename races), plus the manifest body each tag points at.
+        let payloads: Vec<Vec<u8>> = (0..4u8)
+            .map(|i| {
+                let mut v = vec![i; 60_000];
+                v.extend_from_slice(&[i, 1, 2, 3]);
+                v
+            })
+            .collect();
+        let manifest_body = br#"{"schemaVersion":2}"#.to_vec();
+
+        const THREADS: usize = 8;
+        const ITERS: usize = 30;
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let store = &store;
+                let payloads = &payloads;
+                let manifest_body = &manifest_body;
+                s.spawn(move || {
+                    for i in 0..ITERS {
+                        let _lock = store.lock_shared().unwrap();
+                        let p = &payloads[(t + i) % payloads.len()];
+                        let digest = store.put_blob(p).unwrap();
+                        assert!(store.has_blob(digest.trim_start_matches("sha256:")));
+                        // everyone fights over "shared"; each thread also owns a tag.
+                        store
+                            .put_manifest("conc", "shared", DEFAULT_MANIFEST_TYPE, manifest_body)
+                            .unwrap();
+                        store
+                            .put_manifest(
+                                "conc",
+                                &format!("t{t}"),
+                                DEFAULT_MANIFEST_TYPE,
+                                manifest_body,
+                            )
+                            .unwrap();
+                        // reader side: whatever the tag resolves to must be readable.
+                        let (_d, bytes, _ct) =
+                            store.get_manifest("conc", "shared").unwrap().unwrap();
+                        assert_eq!(&bytes, manifest_body);
+                    }
+                });
+            }
+        });
+
+        // final state: every payload's blob present with intact canonical bytes,
+        // every tag resolving, and no leftover atomic-write temp files.
+        for p in &payloads {
+            let hex = sha256_hex_raw(p);
+            assert_eq!(store.get_blob(&hex).unwrap().as_deref(), Some(&p[..]));
+        }
+        for t in 0..THREADS {
+            assert!(
+                store
+                    .get_manifest("conc", &format!("t{t}"))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let stray_tmp = walkdir_count_tmp(&dir);
+        assert_eq!(stray_tmp, 0, "no .tmp.* files may survive the races");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Count `.tmp.*` files (atomic_write temporaries) left anywhere under `root`.
+    fn walkdir_count_tmp(root: &Path) -> usize {
+        let mut n = 0;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(".tmp."))
+                {
+                    n += 1;
+                }
+            }
+        }
+        n
     }
 
     #[test]
