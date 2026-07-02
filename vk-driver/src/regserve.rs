@@ -19,11 +19,13 @@
 //!   repos/<name>/manifests/<hex>  sidecar: that manifest's Content-Type
 //!   uploads/<id>                  in-progress blob uploads (this process only)
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -94,7 +96,7 @@ impl Store {
 
     /// Whether the blob (either form) is present. A hit bumps the blob's mtime: the
     /// caller is about to *reference* it without rewriting it (the dedup fast path),
-    /// and that mtime is what a future `vk registry gc` sweep will honour.
+    /// and that mtime is what the [`Store::gc`] sweep honours.
     pub(crate) fn has_blob(&self, hex: &str) -> bool {
         match self.find_blob(hex) {
             Some((path, _)) => {
@@ -158,7 +160,10 @@ impl Store {
         let digest = format!("sha256:{}", sha256_hex_raw(body));
         let hex = &digest[7..];
         let dest = self.blob_path(hex);
-        if !dest.exists() {
+        if dest.exists() {
+            // a re-push is a dedup reference — the usage record the gc grace keys on
+            touch(&dest);
+        } else {
             atomic_write(&dest, body)?;
         }
         atomic_write(&self.manifest_type_path(name, hex), ctype.as_bytes())?;
@@ -170,7 +175,7 @@ impl Store {
 
     /// Resolve a tag or digest reference to `(digest, manifest bytes, content type)`,
     /// `None` if absent. A tag hit bumps the tag file's mtime — the "last used"
-    /// record a future `vk registry gc` keys its tag retention on.
+    /// record [`Store::gc`] keys its tag retention on.
     pub(crate) fn get_manifest(
         &self,
         name: &str,
@@ -203,25 +208,17 @@ impl Store {
 
     /// Take the store lock shared — held by every writer/reader across its whole
     /// check→reference window (a local push: first `has_blob` through
-    /// `put_manifest`), so a future `vk registry gc` holding it *exclusive* can
-    /// never delete a blob between a dedup check and the manifest that references
-    /// it. Shared holders never block each other. flock is advisory and
+    /// `put_manifest`), so a `vk registry gc` holding it *exclusive* can never
+    /// delete a blob between a dedup check and the manifest that references it.
+    /// Shared holders never block each other. flock is advisory and
     /// filesystem-local — fine for `$XDG_DATA_HOME`; a store root on NFS is
     /// unsupported.
-    ///
-    /// The future gc, for the record: take `lock_exclusive`; drop tags whose mtime
-    /// is past the retention window; mark every blob reachable from a remaining
-    /// tag/digest-pinned manifest (config + chunk digests); sweep unmarked blobs
-    /// whose mtime is also past a grace window (covering multi-request HTTP pushes,
-    /// whose HEAD hits bump blob mtimes but which hold no lock across requests);
-    /// clear stale `uploads/`.
     pub(crate) fn lock_shared(&self) -> Result<LockGuard> {
         self.flock(libc::LOCK_SH)
     }
 
-    /// Take the store lock exclusive (blocks until all shared holders drop) — for a
-    /// future `vk registry gc`; see [`Store::lock_shared`].
-    #[allow(dead_code)] // test-exercised until `vk registry gc` lands
+    /// Take the store lock exclusive (blocks until all shared holders drop) — the
+    /// [`Store::gc`] lock; see [`Store::lock_shared`].
     pub(crate) fn lock_exclusive(&self) -> Result<LockGuard> {
         self.flock(libc::LOCK_EX)
     }
@@ -239,6 +236,181 @@ impl Store {
         }
         Ok(LockGuard { _file: f })
     }
+
+    /// Garbage-collect the store, holding the lock exclusive (pushers briefly
+    /// block; see [`Store::lock_shared`]). Tags idle past `retention` are dropped
+    /// (tag mtime = last use). The surviving tags' manifests — plus digest-pinned
+    /// manifests (a sidecar with no tag) whose blob is younger than `grace` —
+    /// root the mark: their manifest, config and layer blobs are live. Everything
+    /// else idle past `grace` is swept: unmarked blobs (the grace window protects
+    /// multi-request HTTP pushes, whose HEAD hits bump blob mtimes but which hold
+    /// no lock across requests), unrooted manifest sidecars, and stale `uploads/`
+    /// (an alive push keeps appending, so its session file stays fresh). Orphaned
+    /// `.tmp.*` files from a crashed `atomic_write` age out with the blob sweep.
+    /// `dry_run` reports without removing anything.
+    pub(crate) fn gc(
+        &self,
+        retention: Duration,
+        grace: Duration,
+        dry_run: bool,
+    ) -> Result<GcReport> {
+        let _lock = self.lock_exclusive()?;
+        let now = SystemTime::now();
+        // Idle = mtime older than the window. An unreadable mtime — or one in the
+        // future — reads as fresh: never delete on uncertain evidence.
+        let idle = |path: &Path, window: Duration| {
+            std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age > window)
+        };
+        let remove = |path: &Path| -> Result<()> {
+            if !dry_run {
+                std::fs::remove_file(path)
+                    .with_context(|| format!("removing {}", path.display()))?;
+            }
+            Ok(())
+        };
+        let mut report = GcReport::default();
+
+        // drop idle tags; the survivors' manifest hexes root the mark phase.
+        let mut roots: HashSet<String> = HashSet::new();
+        for tags_dir in self.repo_dirs("tags") {
+            for tag in dir_files(&tags_dir) {
+                if idle(&tag, retention) {
+                    remove(&tag)?;
+                    report.tags_dropped += 1;
+                } else if let Ok(d) = std::fs::read_to_string(&tag) {
+                    roots.insert(d.trim().trim_start_matches("sha256:").to_string());
+                }
+            }
+        }
+
+        // manifest sidecars: rooted by a surviving tag, or by their own freshness
+        // (digest-pinned); the rest drop, their manifest blob falling to the sweep.
+        for man_dir in self.repo_dirs("manifests") {
+            for sidecar in dir_files(&man_dir) {
+                let Some(hex) = sidecar.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if roots.contains(hex) {
+                    continue;
+                }
+                if let Some((blob, _)) = self.find_blob(hex)
+                    && !idle(&blob, grace)
+                {
+                    roots.insert(hex.to_string());
+                    continue;
+                }
+                remove(&sidecar)?;
+                report.manifests_dropped += 1;
+            }
+        }
+
+        // mark every blob a root manifest references. A parse failure aborts:
+        // sweeping with incomplete marks would delete live data.
+        let mut marked: HashSet<String> = HashSet::new();
+        for hex in &roots {
+            let Some(bytes) = self.get_blob(hex)? else {
+                continue; // dangling tag: nothing left to keep alive
+            };
+            for child in manifest_digest_hexes(&bytes)
+                .with_context(|| format!("parsing manifest {hex} for the gc mark"))?
+            {
+                marked.insert(child);
+            }
+            marked.insert(hex.clone());
+        }
+
+        // sweep unmarked blobs idle past the grace window, in both storage forms.
+        for sub in ["blobs/sha256", "blobs/zstd"] {
+            for blob in dir_files(&self.root.join(sub)) {
+                let is_marked = blob
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| marked.contains(n));
+                if is_marked || !idle(&blob, grace) {
+                    continue;
+                }
+                report.bytes_freed += std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
+                remove(&blob)?;
+                report.blobs_dropped += 1;
+            }
+        }
+
+        for upload in dir_files(&self.root.join("uploads")) {
+            if idle(&upload, grace) {
+                remove(&upload)?;
+                report.uploads_dropped += 1;
+            }
+        }
+        Ok(report)
+    }
+
+    /// Every `tags/` or `manifests/` directory under `repos/` — repo names may be
+    /// nested (`bundles/appbuilder`), so walk down to the layout dirs. A repo path
+    /// *component* itself named `tags`/`manifests` would be indistinguishable from
+    /// the layout and is not supported by the gc.
+    fn repo_dirs(&self, kind: &str) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![self.root.join("repos")];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                if p.file_name().is_some_and(|n| n == kind) {
+                    out.push(p);
+                } else {
+                    stack.push(p);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// What a [`Store::gc`] pass removed (or, on a dry run, would remove).
+#[derive(Default)]
+pub(crate) struct GcReport {
+    pub(crate) tags_dropped: usize,
+    pub(crate) manifests_dropped: usize,
+    pub(crate) blobs_dropped: usize,
+    /// stored (on-disk) bytes of the dropped blobs
+    pub(crate) bytes_freed: u64,
+    pub(crate) uploads_dropped: usize,
+}
+
+/// The digest hexes a manifest references: its config and every layer, read
+/// structurally (`config.digest`, `layers[].digest`) so the gc mark needs no OCI
+/// types and tolerates media types it doesn't know. An image index (`manifests[]`)
+/// is an error: its children live behind another level of manifests the mark
+/// doesn't walk, so the gc must refuse rather than sweep them.
+fn manifest_digest_hexes(manifest: &[u8]) -> Result<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_slice(manifest).context("not JSON")?;
+    if v.pointer("/manifests").is_some() {
+        bail!("image indexes are not supported");
+    }
+    let layers = v.pointer("/layers").and_then(|l| l.as_array());
+    Ok(std::iter::once(v.pointer("/config/digest"))
+        .chain(layers.into_iter().flatten().map(|l| l.pointer("/digest")))
+        .filter_map(|d| d?.as_str())
+        .map(|d| d.trim_start_matches("sha256:").to_string())
+        .collect())
+}
+
+/// The files directly inside `dir` (a missing dir reads as empty; subdirectories
+/// are skipped).
+fn dir_files(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect()
 }
 
 /// A held store lock (see [`Store::lock_shared`]); released when dropped (flock
@@ -247,9 +419,9 @@ pub(crate) struct LockGuard {
     _file: std::fs::File,
 }
 
-/// Bump a file's mtime to now — the usage record `vk registry gc` will read (blob:
-/// last written or dedup-referenced; tag: last used). Best-effort: a failed touch
-/// only ages the entry early.
+/// Bump a file's mtime to now — the usage record [`Store::gc`] reads (blob: last
+/// written or dedup-referenced; tag: last used). Best-effort: a failed touch only
+/// ages the entry early.
 fn touch(path: &Path) {
     let _ = std::fs::File::open(path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
 }
@@ -501,7 +673,7 @@ fn finish_upload(
             &digest,
         ));
     }
-    // shared store lock for the promotion (vs. a future exclusive gc); see lock_shared.
+    // shared store lock for the promotion (vs. an exclusive gc); see lock_shared.
     let _lock = store.lock_shared()?;
     let hex = digest.trim_start_matches("sha256:").to_string();
     let upload = store.upload_path(id);
@@ -559,7 +731,7 @@ fn get_blob(
         ));
     };
     // A HEAD hit is a remote pusher's dedup probe — about to reference this blob
-    // without re-uploading it. Record the use for the future gc sweep.
+    // without re-uploading it. Record the use for the gc sweep.
     if head {
         touch(&path);
     }
@@ -630,7 +802,7 @@ fn put_manifest(
     ctype: &str,
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>> {
-    // shared store lock for the write (vs. a future exclusive gc); see lock_shared.
+    // shared store lock for the write (vs. an exclusive gc); see lock_shared.
     let _lock = store.lock_shared()?;
     let digest = store.put_manifest(name, reference, ctype, body)?;
     Response::builder()
@@ -871,6 +1043,24 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// `vk registry gc` — collect `root` and print a one-line summary; see
+/// [`Store::gc`] for the retention model.
+pub fn gc(root: PathBuf, retention: Duration, grace: Duration, dry_run: bool) -> Result<()> {
+    let store = Store::new(root)?;
+    let r = store.gc(retention, grace, dry_run)?;
+    println!(
+        "vk registry: gc {}: {} {} tag(s), {} manifest(s), {} blob(s) ({:.1} MiB), {} upload(s)",
+        store.root.display(),
+        if dry_run { "would drop" } else { "dropped" },
+        r.tags_dropped,
+        r.manifests_dropped,
+        r.blobs_dropped,
+        r.bytes_freed as f64 / f64::from(1u32 << 20),
+        r.uploads_dropped,
+    );
+    Ok(())
+}
+
 /// Default store root: `$XDG_DATA_HOME/virtkit/registry`, else `~/.local/share/...`.
 pub fn default_root() -> Result<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
@@ -1006,8 +1196,8 @@ mod tests {
     }
 
     /// GC readiness: a dedup hit (has_blob / a second put_blob) bumps the blob's
-    /// mtime and a tag hit bumps the tag file's mtime — the usage records the future
-    /// `vk registry gc` retention keys on.
+    /// mtime and a tag hit bumps the tag file's mtime — the usage records the
+    /// `Store::gc` retention keys on.
     #[test]
     fn usage_mtimes_bump() {
         use std::time::{Duration, SystemTime};
@@ -1042,6 +1232,290 @@ mod tests {
             "a tag hit must bump the tag mtime"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `sha256:<hex>` → `<hex>`.
+    fn hex(digest: &str) -> String {
+        digest.trim_start_matches("sha256:").to_string()
+    }
+
+    /// A minimal OCI-shaped manifest body referencing `config` and `layers`
+    /// (`sha256:` digests) — the structure `manifest_digest_hexes` marks from.
+    fn manifest_body(config: &str, layers: &[&str]) -> Vec<u8> {
+        let layers: Vec<_> = layers
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "mediaType": "application/vnd.wallix.microvm.ext4.chunk",
+                    "digest": d,
+                    "size": 1,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "schemaVersion": 2,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config,
+                "size": 1,
+            },
+            "layers": layers,
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// Backdate every file under `root` to `t`.
+    fn backdate_all(root: &Path, t: SystemTime) {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    std::fs::File::open(&p).unwrap().set_modified(t).unwrap();
+                }
+            }
+        }
+    }
+
+    const DAY: Duration = Duration::from_secs(86_400);
+
+    /// gc drops an idle tag and sweeps everything only it referenced (sidecar,
+    /// manifest, config and chunk blobs), while a live tag's whole graph survives
+    /// even with blob mtimes far past the grace window — reachability, not age,
+    /// keeps referenced data. A blob shared by both manifests stays.
+    #[test]
+    fn gc_sweeps_expired_unreferenced_state_only() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let shared = store.put_blob(&[1u8; 4096]).unwrap();
+        let cfg_live = store.put_blob(b"cfg-live").unwrap();
+        let cfg_dead = store.put_blob(b"cfg-dead").unwrap();
+        let only_live = store.put_blob(&[2u8; 4096]).unwrap();
+        let only_dead = store.put_blob(&[3u8; 4096]).unwrap();
+        let live_manifest = store
+            .put_manifest(
+                "repo",
+                "live",
+                DEFAULT_MANIFEST_TYPE,
+                &manifest_body(&cfg_live, &[&shared, &only_live]),
+            )
+            .unwrap();
+        let dead_manifest = store
+            .put_manifest(
+                "repo",
+                "dead",
+                DEFAULT_MANIFEST_TYPE,
+                &manifest_body(&cfg_dead, &[&shared, &only_dead]),
+            )
+            .unwrap();
+
+        // age the whole store past retention, then refresh only the live tag.
+        backdate_all(&dir, SystemTime::now() - DAY * 100);
+        touch(&store.tag_path("repo", "live"));
+
+        let report = store.gc(DAY * 30, DAY, false).unwrap();
+        assert_eq!(report.tags_dropped, 1);
+        assert_eq!(report.manifests_dropped, 1);
+        // the dead manifest + its config + its exclusive chunk
+        assert_eq!(report.blobs_dropped, 3);
+        assert!(report.bytes_freed > 0);
+        assert_eq!(report.uploads_dropped, 0);
+
+        assert!(store.get_manifest("repo", "live").unwrap().is_some());
+        assert!(store.get_manifest("repo", "dead").unwrap().is_none());
+        for d in [&shared, &cfg_live, &only_live, &live_manifest] {
+            assert!(store.has_blob(&hex(d)), "live data must survive: {d}");
+        }
+        for d in [&cfg_dead, &only_dead, &dead_manifest] {
+            assert!(!store.has_blob(&hex(d)), "dead data must sweep: {d}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The grace window: an unreferenced-but-fresh blob (a multi-request HTTP push
+    /// in flight) survives the sweep, and a fresh digest-pinned manifest (sidecar,
+    /// no tag) roots the old chunks it references. Once everything ages past the
+    /// grace window, a second pass sweeps it all. Stale upload sessions age out;
+    /// a live one stays.
+    #[test]
+    fn gc_grace_protects_inflight_pushes_and_digest_pins() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gcgrace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let chunk = store.put_blob(&[5u8; 4096]).unwrap();
+        let inflight = store.put_blob(&[6u8; 4096]).unwrap();
+        let body = manifest_body(&format!("sha256:{}", hex(&chunk)), &[&chunk]);
+        let pin = format!("sha256:{}", sha256_hex_raw(&body));
+        let pinned = store
+            .put_manifest("repo", &pin, DEFAULT_MANIFEST_TYPE, &body)
+            .unwrap();
+        std::fs::write(store.upload_path("9-0"), b"stale").unwrap();
+        std::fs::write(store.upload_path("9-1"), b"live").unwrap();
+
+        // age everything, then refresh what should count as in-flight: the
+        // unreferenced blob, the digest-pinned manifest, one upload session.
+        backdate_all(&dir, SystemTime::now() - DAY * 100);
+        touch(&store.find_blob(&hex(&inflight)).unwrap().0);
+        touch(&store.find_blob(&hex(&pinned)).unwrap().0);
+        touch(&store.upload_path("9-1"));
+
+        let report = store.gc(DAY * 30, DAY, false).unwrap();
+        assert_eq!(report.tags_dropped, 0);
+        assert_eq!(report.manifests_dropped, 0, "a fresh pin must stay rooted");
+        assert_eq!(
+            report.blobs_dropped, 0,
+            "grace + pin must protect all blobs"
+        );
+        assert_eq!(report.uploads_dropped, 1);
+        assert!(store.has_blob(&hex(&inflight)));
+        assert!(
+            store.has_blob(&hex(&chunk)),
+            "the pin must root its old chunk"
+        );
+        assert!(!store.upload_path("9-0").exists());
+        assert!(store.upload_path("9-1").exists());
+
+        // has_blob above re-bumped the mtimes — age everything out again and the
+        // pin, its chunk, the in-flight blob and the last upload all sweep.
+        backdate_all(&dir, SystemTime::now() - DAY * 100);
+        let report = store.gc(DAY * 30, DAY, false).unwrap();
+        assert_eq!(report.manifests_dropped, 1);
+        assert_eq!(report.blobs_dropped, 3);
+        assert_eq!(report.uploads_dropped, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dry run reports exactly what the real pass then drops, and removes
+    /// nothing itself.
+    #[test]
+    fn gc_dry_run_removes_nothing() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gcdry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let cfg = store.put_blob(b"cfg").unwrap();
+        let chunk = store.put_blob(&[7u8; 4096]).unwrap();
+        store
+            .put_manifest(
+                "repo",
+                "dead",
+                DEFAULT_MANIFEST_TYPE,
+                &manifest_body(&cfg, &[&chunk]),
+            )
+            .unwrap();
+        std::fs::write(store.upload_path("3-0"), b"stale").unwrap();
+        backdate_all(&dir, SystemTime::now() - DAY * 100);
+
+        let dry = store.gc(DAY * 30, DAY, true).unwrap();
+        assert_eq!(dry.tags_dropped, 1);
+        assert_eq!(dry.manifests_dropped, 1);
+        assert_eq!(dry.blobs_dropped, 3);
+        assert_eq!(dry.uploads_dropped, 1);
+        // still all present — probe via paths only (has_blob/get_manifest would
+        // bump the mtimes the real pass below keys on).
+        assert!(store.tag_path("repo", "dead").exists());
+        assert!(store.find_blob(&hex(&chunk)).is_some());
+        assert!(store.upload_path("3-0").exists());
+
+        let real = store.gc(DAY * 30, DAY, false).unwrap();
+        assert_eq!(real.tags_dropped, dry.tags_dropped);
+        assert_eq!(real.manifests_dropped, dry.manifests_dropped);
+        assert_eq!(real.blobs_dropped, dry.blobs_dropped);
+        assert_eq!(real.bytes_freed, dry.bytes_freed);
+        assert_eq!(real.uploads_dropped, dry.uploads_dropped);
+        assert!(!store.tag_path("repo", "dead").exists());
+        assert!(store.find_blob(&hex(&chunk)).is_none());
+        assert!(!store.upload_path("3-0").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gc mark refuses image indexes (`manifests[]`): their blobs live behind
+    /// nested manifests the mark doesn't walk, so a rooted index aborts the pass
+    /// — nothing sweeps — instead of collecting data the index still references.
+    #[test]
+    fn gc_refuses_image_indexes() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gcidx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let child = store.put_blob(&[8u8; 4096]).unwrap();
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [{
+                "mediaType": DEFAULT_MANIFEST_TYPE,
+                "digest": child,
+                "size": 1,
+            }],
+        })
+        .to_string()
+        .into_bytes();
+        store
+            .put_manifest(
+                "repo",
+                "multi",
+                "application/vnd.oci.image.index.v1+json",
+                &index,
+            )
+            .unwrap();
+
+        // age everything past retention, then keep only the index's tag live: the
+        // rooted index must abort the mark before the sweep reaches the old blob.
+        backdate_all(&dir, SystemTime::now() - DAY * 100);
+        touch(&store.tag_path("repo", "multi"));
+
+        assert!(
+            store.gc(DAY * 30, DAY, false).is_err(),
+            "a rooted index must abort the gc"
+        );
+        assert!(
+            store.find_blob(&hex(&child)).is_some(),
+            "an aborted pass must sweep nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A byte-identical digest-pinned re-push refreshes the manifest blob's mtime
+    /// (`put_manifest` touches an existing blob), so the grace window keeps the pin
+    /// — and everything it references — rooted until the follow-up tag arrives.
+    #[test]
+    fn gc_repushed_digest_pin_stays_rooted() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gcrepush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let cfg = store.put_blob(b"cfg-pin").unwrap();
+        let chunk = store.put_blob(&[9u8; 4096]).unwrap();
+        let body = manifest_body(&cfg, &[&chunk]);
+        let pin = format!("sha256:{}", sha256_hex_raw(&body));
+        store
+            .put_manifest("repo", &pin, DEFAULT_MANIFEST_TYPE, &body)
+            .unwrap();
+
+        // age everything past retention, then re-push the identical pinned
+        // manifest — the push-manifests-then-tag flow re-hitting an old store.
+        backdate_all(&dir, SystemTime::now() - DAY * 100);
+        store
+            .put_manifest("repo", &pin, DEFAULT_MANIFEST_TYPE, &body)
+            .unwrap();
+
+        let report = store.gc(DAY * 30, DAY, false).unwrap();
+        assert_eq!(
+            report.manifests_dropped, 0,
+            "a fresh re-push must stay rooted"
+        );
+        assert_eq!(
+            report.blobs_dropped, 0,
+            "the pin must root its old config and chunk"
+        );
+        assert!(store.find_blob(&hex(&cfg)).is_some());
+        assert!(store.find_blob(&hex(&chunk)).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

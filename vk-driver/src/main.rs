@@ -139,6 +139,25 @@ enum RegistryCmd {
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Garbage-collect a registry store: drop tags idle past the retention window,
+    /// then sweep the blobs no surviving manifest references and stale uploads
+    /// (both after a grace window). Takes the store lock exclusive, briefly
+    /// blocking concurrent pushers.
+    Gc {
+        /// Store directory [default: $XDG_DATA_HOME/virtkit/registry].
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Drop tags unused for more than this many days.
+        #[arg(long, default_value_t = 30)]
+        retention_days: u64,
+        /// Keep unreferenced blobs and stale uploads this many days past their
+        /// last use (protects in-flight multi-request pushes).
+        #[arg(long, default_value_t = 1)]
+        grace_days: u64,
+        /// Report what would be removed without removing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -920,6 +939,22 @@ async fn cli_main() -> ExitCode {
                     Err(e) => return fail(&e, 2),
                 };
                 match regserve::install_service(*addr, &root) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => fail(&e, 1),
+                }
+            }
+            RegistryCmd::Gc {
+                root,
+                retention_days,
+                grace_days,
+                dry_run,
+            } => {
+                let root = match root.clone().map(Ok).unwrap_or_else(regserve::default_root) {
+                    Ok(r) => r,
+                    Err(e) => return fail(&e, 2),
+                };
+                let days = |d: u64| std::time::Duration::from_secs(d * 86_400);
+                match regserve::gc(root, days(*retention_days), days(*grace_days), *dry_run) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => fail(&e, 1),
                 }

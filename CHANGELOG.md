@@ -12,6 +12,7 @@ All notable changes to virtkit will be documented in this file.
   binary — a single file boots OCI images.
 - Registry destinations can be a local store directory, accessed in-process and
   interchangeable with a `vk registry serve` on the same root.
+- `vk registry gc` prunes idle tags and unreferenced blobs from a store.
 - `run --cpus host` matches the host CPU count.
 
 ### Changed

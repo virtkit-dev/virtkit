@@ -1355,8 +1355,8 @@ fn chunkmap_put(dir: &Path, raw_hex: &str, digest: &str, size: i64) {
 /// Writes the exact on-disk state the HTTP server writes (transparent-zstd-form
 /// manifests, adaptively compressed blobs), so a `vk registry serve` on the same
 /// root serves what local builds pushed and vice versa. Every operation holds the
-/// store lock shared for its whole check→reference window; a future
-/// `vk registry gc` takes it exclusive (see `regserve::Store::lock_shared`).
+/// store lock shared for its whole check→reference window; `vk registry gc` takes
+/// it exclusive (see `regserve::Store::lock_shared`).
 mod local {
     use super::*;
     use crate::regserve::Store;
@@ -1858,6 +1858,61 @@ mod tests {
                 });
             }
         });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `vk registry gc` over a local-backend store: after one image's tag expires,
+    /// gc sweeps its manifest/config/chunks but keeps the other image fully
+    /// pullable — the mark phase walking the REAL manifests the backend writes.
+    /// (The gc semantics themselves are covered in regserve tests; this guards the
+    /// registry↔store manifest contract.)
+    #[test]
+    fn local_store_gc_keeps_live_image_pullable() {
+        let day = std::time::Duration::from_secs(86_400);
+        let root = std::env::temp_dir().join(format!("vk-localreg-gc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let rg = local_registry(&root);
+        let dir = root.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let live_src = dir.join("live.ext4");
+        let dead_src = dir.join("dead.ext4");
+        std::fs::write(&live_src, pseudo_random(6 << 20, 0xaaaa)).unwrap();
+        std::fs::write(&dead_src, pseudo_random(6 << 20, 0xbbbb)).unwrap();
+        push_ext4(&rg, "dfcache", "live", &live_src, "generic-disk").unwrap();
+        push_ext4(&rg, "dfcache", "dead", &dead_src, "generic-disk").unwrap();
+
+        // age the whole store past retention, then refresh only the live tag
+        // (`exists` resolves it, which bumps its mtime — the retention record).
+        let old = std::time::SystemTime::now() - day * 100;
+        let mut stack = vec![root.join("blobs"), root.join("repos")];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    std::fs::File::open(&p).unwrap().set_modified(old).unwrap();
+                }
+            }
+        }
+        assert!(exists(&rg, "dfcache", "live"));
+
+        let store = crate::regserve::Store::new(root.clone()).unwrap();
+        let report = store.gc(day * 30, day, false).unwrap();
+        assert_eq!(report.tags_dropped, 1);
+        assert!(
+            report.blobs_dropped > 0,
+            "the dead image's chunks must free"
+        );
+
+        assert!(!exists(&rg, "dfcache", "dead"));
+        let dest = dir.join("live-after-gc.ext4");
+        assert!(try_pull_ext4(&rg, "dfcache", "live", &dest).unwrap());
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            std::fs::read(&live_src).unwrap(),
+            "a gc must never break a live image"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
