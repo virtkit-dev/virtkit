@@ -10,11 +10,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use vk_core::addr::SocketAddr;
 
 use crate::image::ResolvedImage;
 use crate::jobctx::JobCtx;
-use crate::vmm::Vmm;
 
 /// The boot medium: a read-only base rootfs (booted through a CoW overlay) plus a
 /// self-booting image's own initrd, if it shipped one.
@@ -95,20 +93,26 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
     if let Some(share) = &cfg.share {
         let vfsd_sock = ctx.vfsd_sock();
-        let mut vfsd = cfg.virtiofsd_command(); // bundled `vk virtiofsd` unless configured
-        vfsd.arg(format!("--socket-path={}", vfsd_sock.display()))
-            .arg(format!("--shared-dir={}", share.dir.display()))
-            .args(["--cache=auto", "--sandbox=none"]);
-        if share.readonly {
-            vfsd.arg("--readonly");
+        // libkrun mounts the host dir directly (built-in virtio-fs); only
+        // cloud-hypervisor needs an external virtiofsd on the socket.
+        if !crate::vmm::libkrun_selected() {
+            let mut vfsd = cfg.virtiofsd_command(); // bundled `vk virtiofsd` unless configured
+            vfsd.arg(format!("--socket-path={}", vfsd_sock.display()))
+                .arg(format!("--shared-dir={}", share.dir.display()))
+                .args(["--cache=auto", "--sandbox=none"]);
+            if share.readonly {
+                vfsd.arg("--readonly");
+            }
+            let child = spawn_detached(vfsd, &ctx.vfsd_log()).context("spawning virtiofsd")?;
+            std::fs::write(ctx.vfsd_pidfile(), child.id().to_string())?;
+            wait_for_socket(&vfsd_sock, Duration::from_secs(5))
+                .context("virtiofsd did not create its socket")?;
         }
-        let child = spawn_detached(vfsd, &ctx.vfsd_log()).context("spawning virtiofsd")?;
-        std::fs::write(ctx.vfsd_pidfile(), child.id().to_string())?;
-        wait_for_socket(&vfsd_sock, Duration::from_secs(5))
-            .context("virtiofsd did not create its socket")?;
         shares.push(crate::vmm::FsShare {
             tag: "workdir".into(),
             socket: vfsd_sock,
+            host_dir: share.dir.clone(),
+            read_only: share.readonly,
         });
     }
 
@@ -119,18 +123,22 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         && let Some(dir) = &gl.dir
     {
         let sock = ctx.tools_vfsd_sock();
-        let mut vfsd = cfg.virtiofsd_command();
-        vfsd.arg(format!("--socket-path={}", sock.display()))
-            .arg(format!("--shared-dir={}", dir.display()))
-            .args(["--cache=auto", "--sandbox=none", "--readonly"]);
-        let child =
-            spawn_detached(vfsd, &ctx.tools_vfsd_log()).context("spawning the tools virtiofsd")?;
-        std::fs::write(ctx.tools_vfsd_pidfile(), child.id().to_string())?;
-        wait_for_socket(&sock, Duration::from_secs(5))
-            .context("the tools virtiofsd did not create its socket")?;
+        if !crate::vmm::libkrun_selected() {
+            let mut vfsd = cfg.virtiofsd_command();
+            vfsd.arg(format!("--socket-path={}", sock.display()))
+                .arg(format!("--shared-dir={}", dir.display()))
+                .args(["--cache=auto", "--sandbox=none", "--readonly"]);
+            let child = spawn_detached(vfsd, &ctx.tools_vfsd_log())
+                .context("spawning the tools virtiofsd")?;
+            std::fs::write(ctx.tools_vfsd_pidfile(), child.id().to_string())?;
+            wait_for_socket(&sock, Duration::from_secs(5))
+                .context("the tools virtiofsd did not create its socket")?;
+        }
         shares.push(crate::vmm::FsShare {
             tag: "vktools".into(),
             socket: sock,
+            host_dir: dir.clone(),
+            read_only: true,
         });
         cmdline.push_str(" VIRTKIT_TOOLS=vktools:/run/virtkit-tools");
     }
@@ -235,6 +243,27 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     let initramfs = media.initrd;
 
     // shared=on (set via shared_mem): required by virtio-fs, harmless without.
+    // vsock ports the guest uses: the exec channel always, plus the switch bridge in
+    // `switch` net mode (guest egress over the userspace switch) and the ssh-agent
+    // bridge when agent forwarding is on. Tap/pool networking uses a virtio-net device,
+    // not vsock. Only the libkrun backend consumes this; cloud-hypervisor derives it.
+    let mut vsock_ports = vec![crate::vmm::VsockPort::exec(
+        &ctx.vsock_sock(),
+        cfg.vm.vsock_port,
+    )];
+    if cfg.net.mode == "switch" {
+        vsock_ports.push(crate::vmm::VsockPort::bridge(
+            &ctx.vsock_sock(),
+            cfg.net.net_port,
+        ));
+    }
+    if ssh_agent_forwarding(cfg) {
+        vsock_ports.push(crate::vmm::VsockPort::bridge(
+            &ctx.vsock_sock(),
+            crate::run::SSH_AGENT_VSOCK_PORT,
+        ));
+    }
+
     let spec = crate::vmm::VmSpec {
         kernel,
         cmdline,
@@ -243,30 +272,28 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         shares,
         vsock_cid: 3,
         vsock_socket: ctx.vsock_sock(),
+        vsock_ports,
         cpus,
         mem: mem.clone(),
         shared_mem: true,
         net,
         balloon: cfg.vm.balloon,
         serial_log: ctx.console_log(),
-        api_socket: Some(ctx.api_sock()),
+        // libkrun has no API socket (it is driven as a subprocess); cloud-hypervisor
+        // uses one for graceful shutdown in stop_vm.
+        api_socket: (!crate::vmm::libkrun_selected()).then(|| ctx.api_sock()),
     };
-    let ch_command = crate::vmm::CloudHypervisor {
-        bin: cfg.cloud_hypervisor().to_path_buf(),
-    }
-    .command(&spec);
+    let vmm = crate::vmm::selected(cfg.cloud_hypervisor());
+    let ch_command = vmm.command(&spec);
     let mut ch_child = spawn_detached(ch_command, &ctx.ch_log())
-        .with_context(|| format!("spawning {}", cfg.cloud_hypervisor().display()))?;
+        .with_context(|| format!("spawning the {} VMM", vmm.name()))?;
     std::fs::write(ctx.ch_pidfile(), ch_child.id().to_string())?;
 
     println!("virtkit: booting microVM (cpus={cpus}, mem={mem})");
 
     // Ready = the in-guest virtkit-agent answers on vsock (systemd is up, the agent
     // socket is active). Each status attempt has its own internal timeout.
-    let addr = SocketAddr::VsockMux {
-        path: ctx.vsock_sock(),
-        port: cfg.vm.vsock_port,
-    };
+    let addr = crate::vmm::exec_addr(&ctx.vsock_sock(), cfg.vm.vsock_port);
     let start = Instant::now();
     let deadline = start + Duration::from_secs(cfg.vm.boot_timeout_secs);
     loop {
@@ -274,7 +301,8 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         if let Some(status) = ch_child.try_wait()? {
             log_tail(&ctx.console_log(), 30);
             bail!(
-                "cloud-hypervisor exited during boot ({status}, see {})",
+                "{} exited during boot ({status}, see {})",
+                vmm.name(),
                 ctx.ch_log().display()
             );
         }
@@ -581,19 +609,35 @@ pub fn stop_vm(ctx: &JobCtx) {
     if let Some(pid) = read_pidfile(&ctx.ch_pidfile()) {
         let tag = ctx.job_dir.to_string_lossy().into_owned();
         if pid_running(pid, &tag) {
-            let api = ctx.api_sock();
-            let _ = ch_api_put(&api, "vm.power-button");
-            if !wait_gone(
-                pid,
-                &tag,
-                Duration::from_secs(ctx.cfg.vm.shutdown_timeout_secs),
-            ) {
-                let _ = ch_api_put(&api, "vm.shutdown");
-                if !wait_gone(pid, &tag, Duration::from_secs(5)) {
-                    unsafe { libc::kill(pid, libc::SIGTERM) };
-                    if !wait_gone(pid, &tag, Duration::from_secs(3)) {
-                        unsafe { libc::kill(pid, libc::SIGKILL) };
-                        wait_gone(pid, &tag, Duration::from_secs(3));
+            if crate::vmm::libkrun_selected() {
+                // libkrun is a subprocess with no API socket, and on x86_64 its
+                // shutdown eventfd is unwired — there is no host-side ACPI poweroff.
+                // Terminate the process; the guest and its throwaway overlay go with
+                // it. SIGTERM first, then SIGKILL.
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+                if !wait_gone(
+                    pid,
+                    &tag,
+                    Duration::from_secs(ctx.cfg.vm.shutdown_timeout_secs),
+                ) {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    wait_gone(pid, &tag, Duration::from_secs(3));
+                }
+            } else {
+                let api = ctx.api_sock();
+                let _ = ch_api_put(&api, "vm.power-button");
+                if !wait_gone(
+                    pid,
+                    &tag,
+                    Duration::from_secs(ctx.cfg.vm.shutdown_timeout_secs),
+                ) {
+                    let _ = ch_api_put(&api, "vm.shutdown");
+                    if !wait_gone(pid, &tag, Duration::from_secs(5)) {
+                        unsafe { libc::kill(pid, libc::SIGTERM) };
+                        if !wait_gone(pid, &tag, Duration::from_secs(3)) {
+                            unsafe { libc::kill(pid, libc::SIGKILL) };
+                            wait_gone(pid, &tag, Duration::from_secs(3));
+                        }
                     }
                 }
             }
@@ -610,7 +654,7 @@ pub fn stop_vm(ctx: &JobCtx) {
             unsafe { libc::kill(pid, libc::SIGTERM) };
         }
     }
-    // the detached vk forward children (services registry proxy, ssh-agent) if started
+    // the detached virtkit forward children (services registry proxy, ssh-agent) if started
     for pidfile in [ctx.svc_forward_pidfile(), ctx.ssh_agent_forward_pidfile()] {
         if let Some(pid) = read_pidfile(&pidfile)
             && pid_running(pid, &ctx.job_dir.to_string_lossy())

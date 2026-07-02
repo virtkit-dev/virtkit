@@ -32,12 +32,10 @@ pub async fn run_stage(ctx: &JobCtx, script_path: &Path) -> Result<CmdResult> {
     .await
 }
 
-/// The VMM's hybrid-vsock socket for this job, as a vk-agent connect address.
+/// The exec-channel connect address for this job's VM, matching the selected backend
+/// (hybrid vsock-mux for cloud-hypervisor, a plain unix socket for libkrun).
 pub fn vsock_addr(ctx: &JobCtx) -> SocketAddr {
-    SocketAddr::VsockMux {
-        path: ctx.vsock_sock(),
-        port: ctx.cfg.vm.vsock_port,
-    }
+    crate::vmm::exec_addr(&ctx.vsock_sock(), ctx.cfg.vm.vsock_port)
 }
 
 /// The shell stage scripts are piped into: the configured run_command (bash) when

@@ -538,20 +538,28 @@ fn boot_service(
         let workdir =
             workdir.context("a `workdir` unit needs the repo share, but the fleet has no VM")?;
         let workdir_sock = dir.join("vfsd-workdir.sock");
-        aux.push(spawn_virtiofsd(&workdir_sock, workdir, true, &[], &[])?);
+        if !crate::vmm::libkrun_selected() {
+            aux.push(spawn_virtiofsd(&workdir_sock, workdir, true, &[], &[])?);
+        }
         shares.push(crate::vmm::FsShare {
             tag: "workdir".into(),
             socket: workdir_sock,
+            host_dir: workdir.to_path_buf(),
+            read_only: true,
         });
         virtiofs.push_str("workdir:/workdir");
         // git worktree: share the main repo's git dir at the SAME guest path so the
         // worktree's .git -> commondir chain resolves (the assembly reads git).
         if let Some(gs) = git_share {
             let git_sock = dir.join("vfsd-git.sock");
-            aux.push(spawn_virtiofsd(&git_sock, gs, true, &[], &[])?);
+            if !crate::vmm::libkrun_selected() {
+                aux.push(spawn_virtiofsd(&git_sock, gs, true, &[], &[])?);
+            }
             shares.push(crate::vmm::FsShare {
                 tag: "gitdir".into(),
                 socket: git_sock,
+                host_dir: gs.to_path_buf(),
+                read_only: true,
             });
             virtiofs.push_str(&format!(",gitdir:{}", gs.display()));
         }
@@ -570,6 +578,9 @@ fn boot_service(
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS={virtiofs}"));
     }
 
+    // fleet units are reached over the switch network, not vsock exec; only the
+    // guest→host switch bridge needs mapping.
+    let vsock_ports = vec![crate::vmm::VsockPort::bridge(&vsock, net_port)];
     let spec = crate::vmm::VmSpec {
         kernel: kernel.to_path_buf(),
         cmdline,
@@ -578,6 +589,7 @@ fn boot_service(
         shares,
         vsock_cid: svc.cid,
         vsock_socket: vsock,
+        vsock_ports,
         cpus,
         mem,
         shared_mem,
@@ -616,11 +628,16 @@ fn boot_vm(
     let mut aux: Vec<Child> = Vec::new();
 
     // virtiofsd on /workdir — READ-WRITE (no --readonly): live editing both ways.
+    let libkrun = crate::vmm::libkrun_selected();
     let workdir_sock = dir.join("vfsd-workdir.sock");
-    aux.push(spawn_virtiofsd(&workdir_sock, &b.workdir, false, &[], &[])?);
+    if !libkrun {
+        aux.push(spawn_virtiofsd(&workdir_sock, &b.workdir, false, &[], &[])?);
+    }
     let mut shares: Vec<crate::vmm::FsShare> = vec![crate::vmm::FsShare {
         tag: "workdir".into(),
         socket: workdir_sock,
+        host_dir: b.workdir.clone(),
+        read_only: false,
     }];
     let mut virtiofs = String::from("workdir:/workdir");
 
@@ -629,10 +646,14 @@ fn boot_vm(
     let git_share = git_share_for(&b.workdir, b.git_dir.as_deref());
     if let Some(gs) = &git_share {
         let git_sock = dir.join("vfsd-git.sock");
-        aux.push(spawn_virtiofsd(&git_sock, gs, false, &[], &[])?);
+        if !libkrun {
+            aux.push(spawn_virtiofsd(&git_sock, gs, false, &[], &[])?);
+        }
         shares.push(crate::vmm::FsShare {
             tag: "gitdir".into(),
             socket: git_sock,
+            host_dir: gs.to_path_buf(),
+            read_only: false,
         });
         virtiofs.push_str(&format!(",gitdir:{}", gs.display()));
     }
@@ -641,15 +662,30 @@ fn boot_vm(
     for (i, share) in b.extra_shares.iter().enumerate() {
         let tag = format!("share{i}");
         let sock = dir.join(format!("vfsd-share{i}.sock"));
-        aux.push(spawn_virtiofsd(
-            &sock,
-            &share.host_dir,
-            share.readonly,
-            &share.uid_maps,
-            &share.gid_maps,
-        )?);
+        if libkrun {
+            // libkrun's built-in virtio-fs cannot apply virtiofsd uid/gid maps.
+            if !share.uid_maps.is_empty() || !share.gid_maps.is_empty() {
+                bail!(
+                    "--vm-share with uid/gid maps is not supported under libkrun; \
+                     set VIRTKIT_VMM=cloud-hypervisor for this fleet"
+                );
+            }
+        } else {
+            aux.push(spawn_virtiofsd(
+                &sock,
+                &share.host_dir,
+                share.readonly,
+                &share.uid_maps,
+                &share.gid_maps,
+            )?);
+        }
         virtiofs.push_str(&format!(",{tag}:{}", share.guest_path));
-        shares.push(crate::vmm::FsShare { tag, socket: sock });
+        shares.push(crate::vmm::FsShare {
+            tag,
+            socket: sock,
+            host_dir: share.host_dir.clone(),
+            read_only: share.readonly,
+        });
     }
 
     // Symlinks to create inside the guest after virtiofs mounts (--vm-symlink).
@@ -710,6 +746,9 @@ fn boot_vm(
         b.name
     );
 
+    // The builder VM is reached over the switch network, not vsock exec; only the
+    // guest→host switch bridge needs mapping.
+    let vsock_ports = vec![crate::vmm::VsockPort::bridge(&vsock, net_port)];
     // shared=on is REQUIRED for virtiofs (the workdir/gitdir shares).
     let spec = crate::vmm::VmSpec {
         kernel: kernel.to_path_buf(),
@@ -719,6 +758,7 @@ fn boot_vm(
         shares,
         vsock_cid: b.cid,
         vsock_socket: vsock,
+        vsock_ports,
         cpus: b.cpus,
         mem: b.mem.clone(),
         shared_mem: true,

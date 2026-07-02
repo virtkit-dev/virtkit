@@ -16,7 +16,7 @@
 //!
 //! An embedded asset is materialised into an anonymous (CLOEXEC) memfd rather than a
 //! temp file, so nothing touches disk. The kernel is handed to the spawned VMM by
-//! clearing CLOEXEC on its fd for that one spawn (`run::spawn_ch`), which then opens
+//! clearing CLOEXEC on its fd for that one spawn (`run::spawn_vmm`), which then opens
 //! `/proc/self/fd/<n>`; the agent is only ever reopened in this process by the packer.
 use std::fs::File;
 use std::io::Write;
@@ -179,7 +179,7 @@ pub fn resolve(asset: Asset, explicit: Option<&Path>) -> Result<Resolved> {
 /// Back `bytes` with an anonymous in-memory file and return it with its
 /// `/proc/self/fd/<n>` path. The fd is `CLOEXEC`, so idle helper children never inherit
 /// it; the kernel is handed to the VMM by clearing `CLOEXEC` on its fd only in that
-/// spawn (see `run::spawn_ch`), and the agent is only ever reopened in-process. The
+/// spawn (see `run::spawn_vmm`), and the agent is only ever reopened in-process. The
 /// caller holds the returned `File` to keep the fd open.
 fn memfd(name: &str, bytes: &[u8]) -> Result<(File, PathBuf)> {
     let cname = std::ffi::CString::new(name).expect("asset name has no interior nul");

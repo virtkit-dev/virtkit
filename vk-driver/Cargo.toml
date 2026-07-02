@@ -53,6 +53,20 @@ vm-memory = { version = "0.16", features = ["backend-mmap", "backend-atomic"], o
 [target.'cfg(target_env = "musl")'.dependencies]
 jemallocator.workspace = true
 
+# libkrun VMM backend (the `libkrun` feature), an rlib crate dep so it shares
+# vk's std — no double-std / broken-unwinding that a static libkrun.a link
+# hits. Vendored under third_party/libkrun (rev 9a8fedc, stable-1.19.x with PR #728)
+# and locally patched so the passthrough fs device no longer needs libc's musl statx
+# bindings (dropped after 0.2.183) — letting the whole tree build on a modern libc.
+# See third_party/libkrun/VENDOR.md. default-features off drops the init-blob (we use
+# disable_implicit_init); blk (krun_add_disk2) + net.
+[dependencies.krun]
+path = "../third_party/libkrun/src/libkrun"
+package = "libkrun"
+default-features = false
+features = ["blk", "net"]
+optional = true
+
 [features]
 default = ["virtiofsd", "embed"]
 # Embed the guest kernel (vmlinux) and vk-agent into the `vk` binary so it runs
@@ -63,3 +77,9 @@ default = ["virtiofsd", "embed"]
 embed = []
 # compile the bundled virtio-fs daemon into vk
 virtiofsd = ["dep:virtiofsd", "dep:vhost", "dep:vhost-user-backend", "dep:vm-memory"]
+# the libkrun VMM backend, driven by the `__libkrun-boot` subcommand. libkrun is
+# reached via its C ABI; we always pass our own kernel (krun_set_kernel) so it
+# never loads libkrunfw. Its rust-vmm deps (vm-memory 0.17, …) coexist with the
+# bundled virtiofsd's (0.16) — independent subsystems, so no version unification.
+# Not yet in defaults: flipped on once the `__libkrun-boot` subprocess lands.
+libkrun = ["dep:krun"]

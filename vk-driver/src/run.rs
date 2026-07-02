@@ -314,17 +314,23 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     let mut virtiofsd: Option<Child> = None;
     let shared_mem = if let Some(host_dir) = &args.workdir {
         let sock = work.join("workdir.fs.sock");
-        virtiofsd = Some(crate::fleet::spawn_virtiofsd(
-            &sock,
-            host_dir,
-            false,
-            &[],
-            &[],
-        )?);
+        // libkrun mounts host_dir directly (built-in virtio-fs); only cloud-hypervisor
+        // needs the external virtiofsd on `sock`.
+        if !crate::vmm::libkrun_selected() {
+            virtiofsd = Some(crate::fleet::spawn_virtiofsd(
+                &sock,
+                host_dir,
+                false,
+                &[],
+                &[],
+            )?);
+        }
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS=work:{WORKDIR_MOUNT}"));
         shares.push(crate::vmm::FsShare {
             tag: "work".into(),
             socket: sock,
+            host_dir: host_dir.clone(),
+            read_only: false,
         });
         true
     } else {
@@ -333,10 +339,22 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
 
     // 3. boot
     let console = work.join("console.log");
+    let vmm = crate::vmm::selected(&args.cloud_hypervisor);
+    let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
     println!(
-        "virtkit: booting cloud-hypervisor (cpus={}, mem={})",
-        args.cpus, args.mem
+        "virtkit: booting {} (cpus={}, mem={})",
+        vmm.name(),
+        args.cpus,
+        args.mem
     );
+    // exec channel always; the switch and ssh-agent bridges only when set up above.
+    let mut vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
+    if args.net {
+        vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, NET_VSOCK_PORT));
+    }
+    if ssh.is_some() {
+        vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, SSH_AGENT_VSOCK_PORT));
+    }
     let spec = crate::vmm::VmSpec {
         kernel: kernel.to_path_buf(),
         cmdline,
@@ -345,6 +363,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         shares,
         vsock_cid: 3,
         vsock_socket: vsock.clone(),
+        vsock_ports,
         cpus: args.cpus,
         mem: args.mem.clone(),
         shared_mem,
@@ -353,7 +372,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         serial_log: console.clone(),
         api_socket: None,
     };
-    let mut ch = match spawn_ch(&args.cloud_hypervisor, &spec) {
+    let mut ch = match spawn_vmm(vmm.as_ref(), &spec) {
         Ok(ch) => ch,
         // The --net switch and --workdir virtiofsd are already spawned; kill them so a
         // failed boot does not leak host-side children (a leaked `vk virtiofsd` would,
@@ -384,10 +403,6 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     };
     let ssh_config = ssh.and_then(|s| s.guest_config);
 
-    let addr = SocketAddr::VsockMux {
-        path: vsock,
-        port: VSOCK_PORT,
-    };
     let result = drive(
         &mut ch,
         &addr,
@@ -538,10 +553,7 @@ async fn drive(
     let deadline = Instant::now() + Duration::from_secs(args.boot_timeout_secs);
     loop {
         if let Some(status) = ch.try_wait()? {
-            bail!(
-                "cloud-hypervisor exited during boot ({status})\n{}",
-                boot_failure(console)
-            );
+            bail!("{}", boot_failure(console, status));
         }
         if vk_core::status::get_status(addr).await.is_ok() {
             break;
@@ -648,12 +660,9 @@ async fn run_shell(addr: &SocketAddr) -> Result<()> {
     Ok(())
 }
 
-fn spawn_ch(cloud_hypervisor: &Path, spec: &crate::vmm::VmSpec) -> Result<Child> {
-    let log = std::fs::File::create(spec.serial_log.with_extension("ch.log"))?;
-    let mut cmd = crate::vmm::CloudHypervisor {
-        bin: cloud_hypervisor.to_path_buf(),
-    }
-    .command(spec);
+fn spawn_vmm(vmm: &dyn Vmm, spec: &crate::vmm::VmSpec) -> Result<Child> {
+    let log = std::fs::File::create(spec.serial_log.with_extension("vmm.log"))?;
+    let mut cmd = vmm.command(spec);
     cmd.stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -676,15 +685,45 @@ fn spawn_ch(cloud_hypervisor: &Path, spec: &crate::vmm::VmSpec) -> Result<Child>
             });
         }
     }
-    // Self-reap the VM if virtkit dies before teardown — a leaked cloud-hypervisor is a
-    // whole running guest, not just an idle helper (spawn_tied).
-    crate::fleet::spawn_tied(cmd)
-        .with_context(|| format!("spawning {}", cloud_hypervisor.display()))
+    // Self-reap the VM if virtkit dies before teardown — a leaked VMM is a whole
+    // running guest, not just an idle helper (spawn_tied).
+    crate::fleet::spawn_tied(cmd).context("spawning the VMM")
+}
+
+/// Report a VMM that exited during boot: name the backend that actually ran (libkrun
+/// by default, else cloud-hypervisor) and show the tails of both the guest serial log
+/// and the VMM's own stdout/stderr (`<serial>.vmm.log`) — libkrun prints its abort
+/// reason there, so surfacing it is what makes a failed boot legible.
+fn boot_failure(console: &Path, status: std::process::ExitStatus) -> String {
+    let vmm = if crate::vmm::libkrun_selected() {
+        "libkrun"
+    } else {
+        "cloud-hypervisor"
+    };
+    let vmm_log = console.with_extension("vmm.log");
+    let serial = tail(console, 20);
+    let vmm_out = tail(&vmm_log, 20);
+    // A silent death means the guest never brought its console up — almost always a
+    // boot-medium/resource problem rather than a VMM one; say so instead of showing
+    // two empty tails.
+    let hint = if serial.is_empty() && vmm_out.is_empty() {
+        "\n(no output at all: the guest died before its console initialised — \
+         e.g. too little --mem for the kernel or boot medium)"
+    } else {
+        ""
+    };
+    format!(
+        "{vmm} exited during boot ({status})\n--- serial ({}) ---\n{}\n--- vmm ({}) ---\n{}{hint}",
+        console.display(),
+        serial,
+        vmm_log.display(),
+        vmm_out,
+    )
 }
 
 /// Parse a `--mem` value into MiB: `<n>G`, `<n>M`, or a plain MiB count. `None` for
 /// anything else (e.g. cloud-hypervisor's richer syntax) — callers skip their check.
-fn parse_mem_mib(mem: &str) -> Option<u64> {
+pub(crate) fn parse_mem_mib(mem: &str) -> Option<u64> {
     if let Some(g) = mem.strip_suffix(['G', 'g']) {
         return g.parse::<u64>().ok().map(|n| n * 1024);
     }
@@ -692,20 +731,6 @@ fn parse_mem_mib(mem: &str) -> Option<u64> {
         return m.parse().ok();
     }
     mem.parse().ok()
-}
-
-/// Diagnostic tail for a VMM that exited during boot: the serial log's last lines. A
-/// silent death — both the serial and the VMM's own log (`<serial>.ch.log`) empty —
-/// means the guest never brought its console up, almost always a boot-medium/resource
-/// problem rather than a VMM one; say so instead of showing an empty tail.
-fn boot_failure(console: &Path) -> String {
-    let serial = tail(console, 20);
-    if serial.is_empty() && tail(&console.with_extension("ch.log"), 20).is_empty() {
-        return "(no output at all: the guest died before its console initialised — \
-                e.g. too little --mem for the kernel or boot medium)"
-            .into();
-    }
-    serial
 }
 
 fn tail(path: &Path, lines: usize) -> String {
@@ -851,11 +876,15 @@ pub(crate) async fn boot_session(
     let mut virtiofsd: Option<Child> = None;
     if let Some(ctx) = context {
         let sock = work.join("context.fs.sock");
-        virtiofsd = Some(crate::fleet::spawn_virtiofsd(&sock, ctx, true, &[], &[])?);
+        if !crate::vmm::libkrun_selected() {
+            virtiofsd = Some(crate::fleet::spawn_virtiofsd(&sock, ctx, true, &[], &[])?);
+        }
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS=context:{CONTEXT_MOUNT}"));
         shares.push(crate::vmm::FsShare {
             tag: "context".into(),
             socket: sock,
+            host_dir: ctx.to_path_buf(),
+            read_only: true,
         });
     }
 
@@ -866,6 +895,10 @@ pub(crate) async fn boot_session(
         cmdline.push_str(&frag);
     }
 
+    let mut vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
+    if net {
+        vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, NET_VSOCK_PORT));
+    }
     // virtio-fs (the context share) requires shared guest memory (shared_mem).
     let spec = crate::vmm::VmSpec {
         kernel: kernel.to_path_buf(),
@@ -875,6 +908,7 @@ pub(crate) async fn boot_session(
         shares,
         vsock_cid: 3,
         vsock_socket: vsock.clone(),
+        vsock_ports,
         cpus,
         mem: mem.to_string(),
         shared_mem: context.is_some(),
@@ -883,18 +917,13 @@ pub(crate) async fn boot_session(
         serial_log: console.clone(),
         api_socket: None,
     };
-    let mut ch = spawn_ch(cloud_hypervisor, &spec)?;
-    let addr = SocketAddr::VsockMux {
-        path: vsock,
-        port: VSOCK_PORT,
-    };
+    let vmm = crate::vmm::selected(cloud_hypervisor);
+    let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
+    let mut ch = spawn_vmm(vmm.as_ref(), &spec)?;
     let deadline = Instant::now() + Duration::from_secs(boot_timeout_secs);
     loop {
         if let Some(status) = ch.try_wait()? {
-            bail!(
-                "cloud-hypervisor exited during boot ({status})\n{}",
-                boot_failure(&console)
-            );
+            bail!("{}", boot_failure(&console, status));
         }
         if vk_core::status::get_status(&addr).await.is_ok() {
             break;
