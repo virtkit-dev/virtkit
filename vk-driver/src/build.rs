@@ -86,10 +86,18 @@ pub struct Built {
 
 /// Resolve the instruction-cache destination: an explicit registry/store wins; `none`
 /// disables; the default is the builtin local store — the same content-addressed root
-/// a `vk registry serve` shares, accessed in-process (no server, no port).
+/// a `vk registry serve` shares, accessed in-process (no server, no port). A
+/// dot-relative path is rejected: only absolute paths and `file://` URLs select the
+/// in-process store, everything else is a registry host.
 fn cache_repo(cache_registry: Option<&str>) -> Result<Option<String>> {
     Ok(match cache_registry {
         Some("none") => None,
+        // A hostname can't start with a dot, so this is a relative path — which
+        // Registry::local_root would silently treat as a registry host.
+        Some(repo) if repo.starts_with('.') => bail!(
+            "cache destination {repo:?} is a relative path; \
+             an in-process store needs an absolute path (or a file:// URL)"
+        ),
         Some(repo) => Some(repo.to_string()),
         None => Some(
             crate::regserve::default_root()
@@ -1104,6 +1112,8 @@ mod tests {
         // as an in-process store rather than a registry host.
         let default = cache_repo(None).unwrap().unwrap();
         assert!(default.starts_with('/'), "not absolute: {default}");
+        // A relative path would be misread as a registry host; refuse it.
+        assert!(cache_repo(Some("./cache")).is_err());
     }
 
     #[test]
