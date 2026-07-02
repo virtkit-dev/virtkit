@@ -17,6 +17,9 @@
 # (the dogfood backend, on a clean copy of the tree in a tmp dir) and assert the binaries
 # are byte-for-byte identical — proof the microVM backend reproduces Docker, i.e. vk
 # can rebuild itself. Needs dist/vmlinux (run ./build-kernel.sh first).
+#
+# --vmm=libkrun|cloud-hypervisor: VMM for the dogfood/bootstrap microVM (default:
+# vk's built-in libkrun; cloud-hypervisor needs the external binary).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -43,6 +46,10 @@ for arg in "$@"; do
 done
 if [ -n "$USE_VIRTKIT" ] && [ -n "$BOOTSTRAP_CHECK" ]; then
   echo "--bootstrap-check runs the Docker build first; it cannot be combined with --use-virtkit" >&2
+  exit 2
+fi
+if [ "$VMM" != libkrun ] && [ -z "$USE_VIRTKIT" ] && [ -z "$BOOTSTRAP_CHECK" ]; then
+  echo "--vmm only applies with --use-virtkit or --bootstrap-check" >&2
   exit 2
 fi
 
