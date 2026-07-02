@@ -206,11 +206,13 @@ enum Cmd {
         kernel: Option<PathBuf>,
         #[arg(long)]
         agent: Option<PathBuf>,
-        /// instruction-cache registry repo (e.g. 127.0.0.1:5000 of a `virtkit
-        /// registry serve`): each instruction's ext4 is pushed/pulled there
+        /// instruction cache: a registry repo (e.g. 127.0.0.1:5000 of a `vk registry
+        /// serve`), a store directory path (accessed in-process), or `none` to disable.
+        /// Default: the builtin local store `vk registry serve` also uses.
         #[arg(long = "cache-registry")]
         cache_registry: Option<String>,
-        /// the cache registry speaks plain HTTP (a loopback regserve)
+        /// the cache registry speaks plain HTTP (a loopback regserve); registry
+        /// caches only — the builtin/path store has no transport
         #[arg(long = "cache-insecure")]
         cache_insecure: bool,
         /// add an ext4 journal to the exported image (the build stays journal-less)
@@ -369,11 +371,14 @@ enum Cmd {
         /// build context for the Dockerfile's COPY (default: the Dockerfile's directory)
         #[arg(long)]
         context: Option<PathBuf>,
-        /// instruction-cache registry for the --file build (push/pull each stage's ext4
-        /// by content key, so a repeat boot restores the image instead of rebuilding)
+        /// instruction cache for the --file build (push/pull each stage's ext4 by
+        /// content key, so a repeat boot restores instead of rebuilding): a registry
+        /// repo, a store directory path, or `none` to disable. Default: the builtin
+        /// local store `vk registry serve` also uses.
         #[arg(long = "cache-registry")]
         cache_registry: Option<String>,
-        /// the cache registry speaks plain HTTP (a loopback regserve)
+        /// the cache registry speaks plain HTTP (a loopback regserve); registry
+        /// caches only — the builtin/path store has no transport
         #[arg(long = "cache-insecure")]
         cache_insecure: bool,
         /// override an ARG default for the --file build: NAME=VALUE (repeatable)

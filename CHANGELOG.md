@@ -10,6 +10,9 @@ All notable changes to virtkit will be documented in this file.
   needed. Cloud Hypervisor remains available (`VIRTKIT_VMM=cloud-hypervisor`).
 - **Self-contained `vk`**: the guest kernel and `vk-agent` are embedded into the
   binary — a single file boots OCI images.
+- **Build caching works out of the box**: microVM builds cache to a builtin local
+  store by default, so a repeat build restores instead of rebuilding.
+  `--cache-registry` selects a registry, a store directory, or `none`.
 - Registry destinations can be a local store directory, accessed in-process and
   interchangeable with a `vk registry serve` on the same root.
 - `vk registry gc` prunes idle tags and unreferenced blobs from a store.

@@ -60,8 +60,9 @@ pub struct Options {
     pub cloud_hypervisor: Option<PathBuf>,
     pub kernel: Option<PathBuf>,
     pub agent: Option<PathBuf>,
-    /// instruction-cache registry repo (e.g. a `vk registry serve` at
-    /// `127.0.0.1:5000`); each instruction's ext4 is pushed/pulled here. None = off.
+    /// instruction-cache destination: a registry repo (e.g. a `vk registry serve` at
+    /// `127.0.0.1:5000`), a store directory path (accessed in-process), or `none` to
+    /// disable caching. `None` = the builtin local store (`regserve::default_root`).
     pub cache_registry: Option<String>,
     /// the cache registry speaks plain HTTP (a loopback regserve).
     pub cache_insecure: bool,
@@ -145,7 +146,20 @@ pub fn build(opts: &Options) -> Result<Built> {
         (None, None)
     };
     let mut ex: Box<dyn Executor> = if opts.microvm {
-        let cache = opts.cache_registry.clone().map(|repo| {
+        // Instruction cache: an explicit registry/store wins; `none` disables; the
+        // default is the builtin local store — the same content-addressed root a
+        // `vk registry serve` shares, accessed in-process (no server, no port).
+        let cache_repo = match opts.cache_registry.as_deref() {
+            Some("none") => None,
+            Some(repo) => Some(repo.to_string()),
+            None => Some(
+                crate::regserve::default_root()
+                    .context("resolving the builtin cache store dir")?
+                    .display()
+                    .to_string(),
+            ),
+        };
+        let cache = cache_repo.map(|repo| {
             crate::config::Registry::for_share(
                 repo,
                 opts.cache_insecure,
