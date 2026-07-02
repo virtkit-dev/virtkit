@@ -39,23 +39,25 @@ use tokio::net::TcpListener;
 /// Default content type for a manifest whose Content-Type sidecar is missing.
 const DEFAULT_MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
-/// The on-disk content-addressed store. Cheap to clone-share via `Arc`.
-struct Store {
+/// The on-disk content-addressed store. Shared by the HTTP handlers below and,
+/// once the builtin build cache lands, its in-process backend — both writing
+/// identical on-disk state. Cheap to clone-share via `Arc`.
+pub(crate) struct Store {
     root: PathBuf,
     /// monotonic upload-id source (unique within this server process)
     next_upload: AtomicU64,
 }
 
 impl Store {
-    fn new(root: PathBuf) -> Result<Arc<Self>> {
+    pub(crate) fn new(root: PathBuf) -> Result<Self> {
         for sub in ["blobs/sha256", "blobs/zstd", "uploads", "repos"] {
             let p = root.join(sub);
             std::fs::create_dir_all(&p).with_context(|| format!("creating {}", p.display()))?;
         }
-        Ok(Arc::new(Store {
+        Ok(Store {
             root,
             next_upload: AtomicU64::new(0),
-        }))
+        })
     }
     /// Identity blob: the stored bytes ARE the canonical (digested) bytes.
     fn blob_path(&self, hex: &str) -> PathBuf {
@@ -89,6 +91,104 @@ impl Store {
             .join("manifests")
             .join(hex)
     }
+
+    /// Whether the blob (either form) is present.
+    pub(crate) fn has_blob(&self, hex: &str) -> bool {
+        self.find_blob(hex).is_some()
+    }
+
+    /// Store raw canonical bytes content-addressed, adaptively compressed (the zstd
+    /// form only when it actually shrinks). Idempotent: a present blob is left in
+    /// place and the compression is skipped. Returns the `sha256:<hex>` digest.
+    #[allow(dead_code)] // used by the upcoming builtin build cache
+    pub(crate) fn put_blob(&self, raw: &[u8]) -> Result<String> {
+        let hex = sha256_hex_raw(raw);
+        self.put_blob_at(&hex, raw)?;
+        Ok(format!("sha256:{hex}"))
+    }
+
+    /// [`Store::put_blob`] under an already-known digest hex — the HTTP push path,
+    /// where the client's digest is trusted (see `finish_upload`).
+    fn put_blob_at(&self, hex: &str, raw: &[u8]) -> Result<()> {
+        if !self.has_blob(hex) {
+            let z = crate::registry::zstd_with_size(raw)?;
+            if z.len() < raw.len() {
+                atomic_write(&self.zstd_blob_path(hex), &z)?;
+            } else {
+                atomic_write(&self.blob_path(hex), raw)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The canonical bytes of a blob (decompressing the zstd form), `None` if absent.
+    #[allow(dead_code)] // used by the upcoming builtin build cache
+    pub(crate) fn get_blob(&self, hex: &str) -> Result<Option<Vec<u8>>> {
+        let Some((path, is_zstd)) = self.find_blob(hex) else {
+            return Ok(None);
+        };
+        let stored = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        if is_zstd {
+            return Ok(Some(
+                zstd::decode_all(&stored[..]).context("decompressing a stored blob")?,
+            ));
+        }
+        Ok(Some(stored))
+    }
+
+    /// Store manifest bytes (content-addressed) + the Content-Type sidecar, and point
+    /// the tag at it (a digest reference is already self-describing). Returns the
+    /// manifest digest.
+    pub(crate) fn put_manifest(
+        &self,
+        name: &str,
+        reference: &str,
+        ctype: &str,
+        body: &[u8],
+    ) -> Result<String> {
+        if !valid_name(name) || !valid_reference(reference) {
+            bail!("invalid manifest reference {name}:{reference}");
+        }
+        let digest = format!("sha256:{}", sha256_hex_raw(body));
+        let hex = &digest[7..];
+        let dest = self.blob_path(hex);
+        if !dest.exists() {
+            atomic_write(&dest, body)?;
+        }
+        atomic_write(&self.manifest_type_path(name, hex), ctype.as_bytes())?;
+        if !reference.starts_with("sha256:") {
+            atomic_write(&self.tag_path(name, reference), digest.as_bytes())?;
+        }
+        Ok(digest)
+    }
+
+    /// Resolve a tag or digest reference to `(digest, manifest bytes, content type)`,
+    /// `None` if absent.
+    pub(crate) fn get_manifest(
+        &self,
+        name: &str,
+        reference: &str,
+    ) -> Result<Option<(String, Vec<u8>, String)>> {
+        if !valid_name(name) || !valid_reference(reference) {
+            return Ok(None);
+        }
+        let digest = if reference.starts_with("sha256:") {
+            reference.to_string()
+        } else {
+            match std::fs::read_to_string(self.tag_path(name, reference)) {
+                Ok(d) => d.trim().to_string(),
+                Err(_) => return Ok(None),
+            }
+        };
+        let hex = digest.trim_start_matches("sha256:");
+        let Ok(data) = std::fs::read(self.blob_path(hex)) else {
+            return Ok(None);
+        };
+        let ctype = std::fs::read_to_string(self.manifest_type_path(name, hex))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| DEFAULT_MANIFEST_TYPE.to_string());
+        Ok(Some((digest, data, ctype)))
+    }
 }
 
 /// Run the registry until the process is stopped. `addr` is the listen address
@@ -104,7 +204,7 @@ pub async fn serve(addr: SocketAddr, root: PathBuf) -> Result<()> {
 /// learn it first). The store is content-addressed and written atomically, so several
 /// servers may serve the same `root` concurrently.
 pub async fn serve_on(listener: TcpListener, root: PathBuf) -> Result<()> {
-    let store = Store::new(root)?;
+    let store = Arc::new(Store::new(root)?);
     if let Ok(addr) = listener.local_addr() {
         eprintln!(
             "vk registry: serving {} on http://{addr}",
@@ -350,7 +450,7 @@ fn finish_upload(
     }
 
     // already stored (either form)? idempotent — drop the upload.
-    if store.find_blob(&hex).is_some() {
+    if store.has_blob(&hex) {
         let _ = std::fs::remove_file(&upload);
     } else if body_is_zstd {
         // the upload is a zstd frame whose decompression hashes to the digest: store
@@ -358,18 +458,12 @@ fn finish_upload(
         std::fs::rename(&upload, store.zstd_blob_path(&hex))
             .with_context(|| format!("promoting zstd upload {hex}"))?;
     } else {
-        // raw canonical bytes: compress; keep compressed only if it actually shrinks
-        // (a compressed-digest chunk won't, and stays identity — no double-compress).
+        // raw canonical bytes: put_blob_at compresses adaptively (compressed form
+        // only if it actually shrinks — a compressed-digest chunk stays identity).
         let raw =
             std::fs::read(&upload).with_context(|| format!("reading {}", upload.display()))?;
-        let z = crate::registry::zstd_with_size(&raw)?;
-        if z.len() < raw.len() {
-            atomic_write(&store.zstd_blob_path(&hex), &z)?;
-            let _ = std::fs::remove_file(&upload);
-        } else {
-            std::fs::rename(&upload, store.blob_path(&hex))
-                .with_context(|| format!("promoting blob {hex}"))?;
-        }
+        store.put_blob_at(&hex, &raw)?;
+        let _ = std::fs::remove_file(&upload);
     }
 
     Response::builder()
@@ -466,18 +560,7 @@ fn put_manifest(
     ctype: &str,
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>> {
-    let digest = format!("sha256:{}", sha256_hex_raw(body));
-    let hex = &digest[7..];
-    let dest = store.blob_path(hex);
-    if !dest.exists() {
-        atomic_write(&dest, body)?;
-    }
-    atomic_write(&store.manifest_type_path(name, hex), ctype.as_bytes())?;
-    // a tag reference also gets a tag -> digest pointer (a digest reference is
-    // already self-describing).
-    if !reference.starts_with("sha256:") {
-        atomic_write(&store.tag_path(name, reference), digest.as_bytes())?;
-    }
+    let digest = store.put_manifest(name, reference, ctype, body)?;
     Response::builder()
         .status(StatusCode::CREATED)
         .header("Location", format!("/v2/{name}/manifests/{digest}"))
@@ -493,36 +576,18 @@ fn get_manifest(
     reference: &str,
     head: bool,
 ) -> Result<Response<Full<Bytes>>> {
-    // resolve the reference to a digest (a tag is a pointer file; a digest is itself)
-    let digest = if reference.starts_with("sha256:") {
-        reference.to_string()
-    } else {
-        match std::fs::read_to_string(store.tag_path(name, reference)) {
-            Ok(d) => d.trim().to_string(),
-            Err(_) => {
-                return Ok(error_response(
-                    StatusCode::NOT_FOUND,
-                    "MANIFEST_UNKNOWN",
-                    reference,
-                ));
-            }
-        }
-    };
-    let hex = digest.trim_start_matches("sha256:");
-    let Ok(data) = std::fs::read(store.blob_path(hex)) else {
+    let Some((digest, data, ctype)) = store.get_manifest(name, reference)? else {
         return Ok(error_response(
             StatusCode::NOT_FOUND,
             "MANIFEST_UNKNOWN",
-            &digest,
+            reference,
         ));
     };
-    let ctype = std::fs::read_to_string(store.manifest_type_path(name, hex))
-        .unwrap_or_else(|_| DEFAULT_MANIFEST_TYPE.to_string());
     let len = data.len();
     Response::builder()
         .status(StatusCode::OK)
         .header("Docker-Content-Digest", &digest)
-        .header(hyper::header::CONTENT_TYPE, ctype.trim())
+        .header(hyper::header::CONTENT_TYPE, &ctype)
         .header(hyper::header::CONTENT_LENGTH, len.to_string())
         .body(Full::new(if head {
             Bytes::new()
