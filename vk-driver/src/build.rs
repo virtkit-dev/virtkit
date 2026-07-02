@@ -17,7 +17,9 @@
 //! filesystem-changing instruction (RUN/COPY) the resulting ext4 snapshot is pushed
 //! to / pulled from virtkit's own `[registry]` keyed by that key (the CDC chunk dedup
 //! makes successive snapshots share almost all blobs). On a rebuild the longest cached
-//! prefix is restored and only the changed tail re-runs.
+//! prefix is restored and only the changed tail re-runs; a stage whose last key is
+//! cached restores that one snapshot directly (no per-instruction probes), and a stage
+//! only such fully-cached consumers read is skipped entirely.
 //!
 //! A context `COPY` also keys on a sha256 of the (sorted, `.dockerignore`-filtered)
 //! content of the files it references, so editing a copied source busts the cache; a
@@ -33,7 +35,7 @@ mod interp;
 mod parser;
 mod plan;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -499,13 +501,56 @@ fn drive(
         None => keyed,
     };
     let mut committed: HashMap<usize, Rootfs> = HashMap::new();
+    // Fast-path plan, back-to-front: a stage whose last snapshot is cached is "fully
+    // cached" (keys chain, so that one key covers the stage's whole history including
+    // its base and COPY --from sources) — it restores that snapshot alone, with no
+    // per-instruction probes (a round trip each on a remote cache). A stage only ever
+    // read by fully-cached consumers is skipped outright: nothing that runs will look
+    // at it. `needed` propagates from the target; a stage that will run pulls in its
+    // parent stage and `--from` sources.
+    let mut needed: HashSet<usize> = HashSet::from([target]);
+    let mut cached_final: HashMap<usize, String> = HashMap::new();
+    for &idx in order.iter().rev() {
+        if !needed.contains(&idx) {
+            continue;
+        }
+        let steps = &resolved
+            .get(&idx)
+            .context("internal: stage not resolved")?
+            .steps;
+        if let Some(last) = steps.last()
+            && ex.cache_has(&last.key)
+        {
+            cached_final.insert(idx, last.key.clone());
+            continue;
+        }
+        let stage = &plan.stages[idx];
+        if let Base::Stage(parent) = &stage.base {
+            needed.insert(*parent);
+        }
+        needed.extend(stage_source_refs(plan, &stage.instructions));
+    }
     for &idx in order {
+        if !needed.contains(&idx) {
+            continue;
+        }
         let stage = &plan.stages[idx];
         let name = stage.name.clone().unwrap_or_else(|| format!("stage{idx}"));
         let steps = &resolved
             .get(&idx)
             .context("internal: stage not resolved")?
             .steps;
+        // Fully cached: restore the final snapshot directly, nothing to probe or run.
+        if let Some(key) = cached_final.get(&idx) {
+            println!(
+                "virtkit: build CACHED  {name} ({} instructions)",
+                steps.len()
+            );
+            let fs = restore_into(ex, &name, key)?;
+            ex.stage_end(&fs)?;
+            committed.insert(idx, fs);
+            continue;
+        }
         // Declare the source stages this stage copies/mounts from, so the backend can
         // attach them before the guest boots.
         ex.stage_sources(&stage_source_rootfs(plan, &stage.instructions, &committed))?;
@@ -558,14 +603,10 @@ fn drive(
     Ok((committed, states))
 }
 
-/// The committed rootfs of the stages an instruction list references via `COPY --from`
-/// / `RUN --mount=from` (distinct, in source order). Resolved on the raw `--from` text
-/// — literal stage names; a `--from=$VAR` would not be seen (a known limitation).
-fn stage_source_rootfs(
-    plan: &Plan,
-    instructions: &[Instruction],
-    committed: &HashMap<usize, Rootfs>,
-) -> Vec<Rootfs> {
+/// The stage indices an instruction list references via `COPY --from` / `RUN
+/// --mount=from` (distinct, in source order). Resolved on the raw `--from` text —
+/// literal stage names; a `--from=$VAR` would not be seen (a known limitation).
+fn stage_source_refs(plan: &Plan, instructions: &[Instruction]) -> Vec<usize> {
     let mut refs: Vec<&str> = Vec::new();
     for instr in instructions {
         match instr {
@@ -584,18 +625,28 @@ fn stage_source_rootfs(
             _ => {}
         }
     }
-    let mut srcs = Vec::new();
     let mut seen: Vec<usize> = Vec::new();
     for r in refs {
         if let Some(si) = plan.stage_ref(r)
             && !seen.contains(&si)
-            && let Some(rf) = committed.get(&si)
         {
             seen.push(si);
-            srcs.push(rf.clone());
         }
     }
-    srcs
+    seen
+}
+
+/// [`stage_source_refs`] resolved to committed rootfs (stages not committed are
+/// dropped — their consumers are fully cached, so no guest ever reads them).
+fn stage_source_rootfs(
+    plan: &Plan,
+    instructions: &[Instruction],
+    committed: &HashMap<usize, Rootfs>,
+) -> Vec<Rootfs> {
+    stage_source_refs(plan, instructions)
+        .into_iter()
+        .filter_map(|si| committed.get(&si).cloned())
+        .collect()
 }
 
 /// sha256 hex of `s` — the base cache key.
@@ -917,6 +968,129 @@ mod tests {
         let mut ex = DryRun::new();
         drive(&plan, &order, &ba, &mut ex, Path::new("/nonexistent")).unwrap();
         ex.transcript
+    }
+
+    /// A [`DryRun`] with an instruction cache: `cache_save` records keys, `cache_has`
+    /// answers from them, and every cache primitive lands in the transcript so tests
+    /// can assert what a warm rebuild touches.
+    #[derive(Default)]
+    struct CachedDry {
+        inner: DryRun,
+        cache: HashSet<String>,
+        /// key of the most recent `cache_save` — the target's final key after a cold
+        /// run, so tests can evict it to simulate a partially cached rebuild.
+        last_saved: Option<String>,
+    }
+
+    impl Executor for CachedDry {
+        fn from_image(&mut self, stage: &str, image: &str) -> Result<Rootfs> {
+            self.inner.from_image(stage, image)
+        }
+        fn from_scratch(&mut self, stage: &str) -> Result<Rootfs> {
+            self.inner.from_scratch(stage)
+        }
+        fn from_stage(&mut self, stage: &str, parent: &Rootfs) -> Result<Rootfs> {
+            self.inner.from_stage(stage, parent)
+        }
+        fn pull(&mut self, image: &str) -> Result<Rootfs> {
+            self.inner.pull(image)
+        }
+        fn run(
+            &mut self,
+            fs: &Rootfs,
+            cmd: &parser::Cmdline,
+            mounts: &[ResolvedMount<'_>],
+            state: &ShellState,
+        ) -> Result<()> {
+            self.inner.run(fs, cmd, mounts, state)
+        }
+        fn copy(&mut self, fs: &Rootfs, op: &parser::Copy, from: Option<&Rootfs>) -> Result<()> {
+            self.inner.copy(fs, op, from)
+        }
+        fn export_ext4(&mut self, fs: &Rootfs, out: &Path) -> Result<()> {
+            self.inner.export_ext4(fs, out)
+        }
+        fn cache_has(&mut self, key: &str) -> bool {
+            let hit = self.cache.contains(key);
+            self.inner
+                .transcript
+                .push(format!("cache-has {key} -> {hit}"));
+            hit
+        }
+        fn cache_restore(&mut self, fs: &Rootfs, key: &str) -> Result<()> {
+            self.inner
+                .transcript
+                .push(format!("cache-restore {} <- {key}", fs.label));
+            Ok(())
+        }
+        fn cache_save(&mut self, _fs: &Rootfs, key: &str) -> Result<()> {
+            self.cache.insert(key.to_string());
+            self.last_saved = Some(key.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fully_cached_build_restores_final_snapshot_only() {
+        let src = "FROM alpine AS builder\nRUN one\n\nFROM alpine\nRUN two\nRUN three\n";
+        let ba = Vars::new();
+        let df = parser::parse(src).unwrap();
+        let plan = Plan::from_dockerfile(&df, &ba).unwrap();
+        let t = plan.resolve_target(None).unwrap();
+        let order = plan.build_order(t).unwrap();
+        // cold: everything runs and populates the cache
+        let mut ex = CachedDry::default();
+        drive(&plan, &order, &ba, &mut ex, Path::new("/nonexistent")).unwrap();
+        assert!(ex.inner.transcript.iter().any(|l| l.starts_with("run ")));
+        // warm: one probe of the target's final key, one restore — no per-step
+        // probes, nothing built, the builder stage never touched
+        let mut ex = CachedDry {
+            inner: DryRun::new(),
+            cache: ex.cache,
+            last_saved: None,
+        };
+        drive(&plan, &order, &ba, &mut ex, Path::new("/nonexistent")).unwrap();
+        let t = &ex.inner.transcript;
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert!(
+            t[0].starts_with("cache-has ") && t[0].ends_with("-> true"),
+            "{t:?}"
+        );
+        assert!(t[1].starts_with("cache-restore "), "{t:?}");
+    }
+
+    #[test]
+    fn partially_cached_build_fast_paths_cached_stages() {
+        let src = "FROM alpine AS builder\nRUN one\nRUN two\n\n\
+                   FROM alpine\nRUN three\nCOPY --from=builder /a /b\n";
+        let ba = Vars::new();
+        let df = parser::parse(src).unwrap();
+        let plan = Plan::from_dockerfile(&df, &ba).unwrap();
+        let t = plan.resolve_target(None).unwrap();
+        let order = plan.build_order(t).unwrap();
+        // cold run populates the cache; evict the target's final key so only the
+        // target's last instruction must re-run
+        let mut ex = CachedDry::default();
+        drive(&plan, &order, &ba, &mut ex, Path::new("/nonexistent")).unwrap();
+        let mut cache = ex.cache;
+        cache.remove(&ex.last_saved.unwrap());
+        let mut ex = CachedDry {
+            inner: DryRun::new(),
+            cache,
+            last_saved: None,
+        };
+        drive(&plan, &order, &ba, &mut ex, Path::new("/nonexistent")).unwrap();
+        let t = &ex.inner.transcript;
+        let count = |p: &str| t.iter().filter(|l| l.starts_with(p)).count();
+        // probes: the target's last key (miss), the builder's last key (hit), then the
+        // target per-step (hit, miss) — the builder's per-step keys are never probed
+        assert_eq!(count("cache-has "), 4, "{t:?}");
+        // restores: the builder's final snapshot + the target's cached prefix
+        assert_eq!(count("cache-restore "), 2, "{t:?}");
+        // only the evicted COPY re-runs; no RUN and no base pull anywhere
+        assert_eq!(count("copy "), 1, "{t:?}");
+        assert_eq!(count("run "), 0, "{t:?}");
+        assert_eq!(count("from-image "), 0, "{t:?}");
     }
 
     #[test]
