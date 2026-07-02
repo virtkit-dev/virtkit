@@ -79,8 +79,9 @@ pub struct RunArgs {
     pub cpus: u32,
     pub mem: String,
     pub boot_timeout_secs: u64,
-    /// boot from a native ext4 disk instead of a cpio initramfs
-    pub disk: bool,
+    /// boot the rootfs as a cpio initramfs held in RAM instead of the default
+    /// native-ext4 disk (needs --mem of roughly three times the image size)
+    pub ram: bool,
     /// attach an interactive shell once the guest is up (needs a terminal)
     pub shell: bool,
     /// give the guest egress via a userspace `vk switch` (DHCP + DNS + proxy)
@@ -236,7 +237,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
                      VIRTKIT_HOSTNAME=vm VIRTKIT_VSOCK_PORT={VSOCK_PORT}"
                 ),
             )
-        } else if args.disk {
+        } else if !args.ram {
             println!("virtkit: building ext4 rootfs");
             let rootfs = work.join("root.ext4");
             crate::ext4::build_from_tar(&rootfs_tar, agent, &rootfs)?;
@@ -270,7 +271,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             {
                 bail!(
                     "the image unpacks to a {initramfs_mib} MiB initramfs, which does not fit \
-                     in --mem {} — pass --mem {}G, or boot it from a disk with --disk",
+                     in --mem {} — pass --mem {}G, or drop --ram to boot from a disk",
                     args.mem,
                     need_mib.div_ceil(1024),
                 );

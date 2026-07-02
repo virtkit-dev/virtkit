@@ -10,6 +10,16 @@ All notable changes to virtkit will be documented in this file.
   binary — a single file boots OCI images.
 - `run --cpus host` matches the host CPU count.
 
+### Changed
+
+- `run` boots images from a native ext4 disk by default; the in-RAM cpio boot
+  moves behind a new `--ram` flag, which replaces `--disk`.
+
+### Fixed
+
+- a `--ram` boot refuses an initramfs that cannot unpack in `--mem`, naming the
+  required size.
+
 ## [0.4.0] - 2026-07-02
 
 ### Changed

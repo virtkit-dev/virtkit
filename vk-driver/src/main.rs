@@ -330,9 +330,9 @@ enum Cmd {
         #[arg(long = "vm-gid-map", value_name = "MAP")]
         vm_gid_map: Vec<String>,
     },
-    /// Dev: run a docker/OCI image as a microVM — boot it (cpio initramfs in RAM or an
-    /// ext4 disk), virtkit-agent as PID 1 over vsock, and run a command or interactive
-    /// shell. No gitlab-runner, no assembly tools; just an image source + cloud-hypervisor.
+    /// Dev: run a docker/OCI image as a microVM — boot it from a native ext4 disk
+    /// (or a cpio initramfs in RAM with --ram), virtkit-agent as PID 1 over vsock, and
+    /// run a command or interactive shell.
     Run {
         /// Image to boot (docker ref, or OCI reference with --source oci), e.g. alpine:3.20.
         /// Omit when booting a Dockerfile target with --file.
@@ -392,9 +392,10 @@ enum Cmd {
         mem: String,
         #[arg(long, default_value_t = 120)]
         boot_timeout: u64,
-        /// Boot from a native ext4 disk instead of a cpio initramfs
+        /// Boot the rootfs as a cpio initramfs held entirely in RAM: zero host
+        /// scratch, but the guest needs --mem of roughly three times the image size
         #[arg(long)]
-        disk: bool,
+        ram: bool,
         /// Drop into an interactive shell in the guest (requires a terminal);
         /// ignores any trailing command
         #[arg(long)]
@@ -566,7 +567,7 @@ async fn main() -> ExitCode {
         cpus,
         mem,
         boot_timeout,
-        disk,
+        ram,
         shell,
         net,
         ssh_agent,
@@ -607,7 +608,7 @@ async fn main() -> ExitCode {
             cpus: *cpus,
             mem: mem.clone(),
             boot_timeout_secs: *boot_timeout,
-            disk: *disk,
+            ram: *ram,
             shell: *shell,
             net: *net,
             ssh_agent: *ssh_agent,
