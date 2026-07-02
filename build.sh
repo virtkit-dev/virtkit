@@ -6,16 +6,16 @@
 #     the compile in it.
 #   - --use-virtkit=<DIST>: dogfood — use the vk binary in <DIST> to build the
 #     devcontainer Dockerfile into a microVM and compile a shared checkout inside it.
-#     vk embeds the kernel + agent, so DIST needs only the vk binary (cloud-hypervisor
-#     comes from PATH, or DIST/cloud-hypervisor if present). Set VK_CACHE=host:port to
-#     push/pull the build image from a `vk registry serve` by its content key.
+#     vk embeds the kernel + agent and boots on its built-in libkrun, so DIST needs
+#     only the vk binary. Set VK_CACHE=host:port to push/pull the build image from a
+#     `vk registry serve` by its content key.
 #
 # Output goes to ./dist as stripped, static-pie musl ELF binaries. Both backends
 # mount the repo at /work and pass identical flags, so the bytes match either way.
 #
-# --bootstrap-check: after the default Docker build, rebuild with the just-built virtkit
+# --bootstrap-check: after the default Docker build, rebuild with the just-built vk
 # (the dogfood backend, on a clean copy of the tree in a tmp dir) and assert the binaries
-# are byte-for-byte identical — proof the microVM backend reproduces Docker, i.e. virtkit
+# are byte-for-byte identical — proof the microVM backend reproduces Docker, i.e. vk
 # can rebuild itself. Needs dist/vmlinux (run ./build-kernel.sh first).
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -26,10 +26,12 @@ OUT=dist
 
 USE_VIRTKIT=""
 BOOTSTRAP_CHECK=""
+VMM=libkrun          # dogfood VMM backend: libkrun (default) or cloud-hypervisor
 for arg in "$@"; do
   case "$arg" in
     --use-virtkit=*) USE_VIRTKIT="${arg#*=}" ;;
     --bootstrap-check) BOOTSTRAP_CHECK=1 ;;
+    --vmm=libkrun|--vmm=cloud-hypervisor) VMM="${arg#*=}" ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -38,19 +40,21 @@ if [ -n "$USE_VIRTKIT" ] && [ -n "$BOOTSTRAP_CHECK" ]; then
   exit 2
 fi
 
-# Fail fast: check the dogfood-rebuild prerequisites up front, before the slow Docker build
-# and compile — not three minutes later when the rebuild starts. The fresh vk (guest
-# kernel and vk-agent embedded) comes from the Docker build below; only the kernel to
-# embed (dist/vmlinux) and the VMM are external to it.
+# Fail fast: check the dogfood-rebuild prerequisite up front, before the slow Docker
+# build and compile. The fresh vk comes from the Docker build below with the guest
+# kernel embedded and boots on its built-in libkrun — so the rebuild needs only
+# dist/vmlinux (to embed into the vk it produces), no external VMM.
 if [ -n "$BOOTSTRAP_CHECK" ]; then
   [ -e "$OUT/vmlinux" ] || {
     echo "--bootstrap-check needs $OUT/vmlinux (run ./build-kernel.sh first)" >&2
     exit 1
   }
-  [ -x "$OUT/cloud-hypervisor" ] || command -v cloud-hypervisor >/dev/null || {
-    echo "--bootstrap-check needs cloud-hypervisor (in PATH or at $OUT/cloud-hypervisor)" >&2
-    exit 1
-  }
+  if [ "$VMM" = cloud-hypervisor ]; then
+    [ -x "$OUT/cloud-hypervisor" ] || command -v cloud-hypervisor >/dev/null || {
+      echo "--bootstrap-check --vmm=cloud-hypervisor needs cloud-hypervisor (in PATH or at $OUT/cloud-hypervisor)" >&2
+      exit 1
+    }
+  fi
 fi
 
 # Reproducibility: SOURCE_DATE_EPOCH neutralises any build timestamp, and the build
@@ -87,16 +91,25 @@ BUILD_CMD="cargo build --release -p vk-agent && env $EMBED_ENV cargo build --rel
 
 if [ -n "$USE_VIRTKIT" ]; then
   # ---- dogfood backend: vk builds the env image + compiles in a microVM ----
-  # vk embeds the kernel + agent, so DIST needs only the vk binary.
+  # vk is self-contained (embedded kernel + agent), so DIST needs only the vk binary.
   VK="$USE_VIRTKIT/vk"
   [ -e "$VK" ] || { echo "missing $VK (need a populated --use-virtkit dir)" >&2; exit 1; }
+
+  # VMM backend: built-in libkrun by default (no external binary); cloud-hypervisor for
+  # a comparison run needs the CH binary and VIRTKIT_VMM set.
+  vmm_env=()
   ch_args=()
-  if [ -x "$USE_VIRTKIT/cloud-hypervisor" ]; then
-    ch_args=(--cloud-hypervisor "$USE_VIRTKIT/cloud-hypervisor")
-  elif ! command -v cloud-hypervisor >/dev/null; then
-    echo "missing cloud-hypervisor (in PATH or at $USE_VIRTKIT/cloud-hypervisor)" >&2
-    exit 1
+  if [ "$VMM" = cloud-hypervisor ]; then
+    if [ -x "$USE_VIRTKIT/cloud-hypervisor" ]; then ch="$USE_VIRTKIT/cloud-hypervisor"
+    elif command -v cloud-hypervisor >/dev/null; then ch=$(command -v cloud-hypervisor)
+    else
+      echo "--vmm=cloud-hypervisor needs cloud-hypervisor (in PATH or at $USE_VIRTKIT/cloud-hypervisor)" >&2
+      exit 1
+    fi
+    vmm_env+=(VIRTKIT_VMM=cloud-hypervisor)
+    ch_args=(--cloud-hypervisor "$ch")
   fi
+
   cache_args=()
   [ -n "${VK_CACHE:-}" ] && cache_args=(--cache-registry "$VK_CACHE")
 
@@ -109,11 +122,16 @@ if [ -n "$USE_VIRTKIT" ]; then
     exports+="export ${e%%=*}='$v'; "
   done
 
-  "$VK" run \
+  # A release compile of the whole workspace is CPU- and memory-hungry, so size the
+  # build VM for it: all the host's CPUs (--cpus host) for parallelism, and enough
+  # RAM that rustc is not OOM-killed (the `run` defaults are 2 cpus / 1G).
+  env "${vmm_env[@]}" "$VK" run \
     --file .devcontainer/Dockerfile \
     --context .devcontainer \
     --workdir "$PWD" \
     --net \
+    --cpus host \
+    --mem 8G \
     "${ch_args[@]}" \
     "${cache_args[@]}" \
     -- "${exports}${BUILD_CMD}"
@@ -176,7 +194,7 @@ if [ -n "$BOOTSTRAP_CHECK" ]; then
   # the same /work path so the container-side paths (and thus the reproducible bytes)
   # match the Docker build.
   echo
-  echo "bootstrap check: rebuilding with the freshly built virtkit in a microVM…"
+  echo "bootstrap check: rebuilding with the freshly built vk in a microVM…"
   boot_dist="$PWD/$OUT"
   boot_tmp=$(mktemp -d)
   trap 'rm -rf "$boot_tmp"' EXIT
@@ -187,7 +205,8 @@ if [ -n "$BOOTSTRAP_CHECK" ]; then
   # (the tree copy above excludes dist/); without it the two vk binaries would differ.
   mkdir -p "$boot_tmp/$OUT"
   cp "$boot_dist/vmlinux" "$boot_tmp/$OUT/vmlinux"
-  ( cd "$boot_tmp" && ./build.sh --use-virtkit="$boot_dist" )
+  # Same VMM choice as requested.
+  ( cd "$boot_tmp" && ./build.sh --use-virtkit="$boot_dist" --vmm="$VMM" )
 
   echo
   echo "bootstrap check: comparing sha256…"
@@ -203,8 +222,8 @@ if [ -n "$BOOTSTRAP_CHECK" ]; then
     fi
   done
   if [ -n "$mismatch" ]; then
-    echo "bootstrap check FAILED: the virtkit backend did not reproduce the Docker build" >&2
+    echo "bootstrap check FAILED: the vk backend did not reproduce the Docker build" >&2
     exit 1
   fi
-  echo "bootstrap check passed: Docker and virtkit backends produce identical binaries"
+  echo "bootstrap check passed: Docker and vk backends produce identical binaries"
 fi
