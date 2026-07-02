@@ -4,10 +4,12 @@ This file provides guidance to AI coding assistants (Claude Code, Copilot, etc.)
 
 ## Project Overview
 
-virtkit — a rootless toolkit for [Cloud Hypervisor](https://www.cloudhypervisor.org/)
-microVMs, shipped as two small static-musl binaries. It boots OCI/Docker images as
-fast microVMs, gives them a shared LAN with egress over ordinary host sockets (no tap,
-no bridge, no `CAP_NET_ADMIN`, no root), and drives commands into them over `vsock`.
+virtkit — a rootless microVM toolkit shipped as two static-musl binaries, with the
+VMM built in. It boots OCI/Docker images as fast microVMs on its embedded
+[libkrun](https://github.com/containers/libkrun) VMM ([Cloud Hypervisor](https://www.cloudhypervisor.org/)
+stays available as an external backend via `VIRTKIT_VMM=cloud-hypervisor`), gives
+them a shared LAN with egress over ordinary host sockets (no tap, no bridge, no
+`CAP_NET_ADMIN`, no root), and drives commands into them over `vsock`.
 The same codebase powers a local dev fleet and a GitLab custom executor. See
 [`README.md`](README.md) for the full feature tour.
 
@@ -22,10 +24,16 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with three crates:
 - **`vk-driver/`** — the host driver (depends on `vk-core`): image building/conversion
   (OCI → ext4/initramfs), the fleet orchestrator + control plane, the GitLab executor,
   the userspace L2 network switch (ARP/DHCP/DNS + transparent TCP/UDP egress via
-  `ipstack`), and a bundled virtio-fs daemon (`virtiofsd`).
+  `ipstack`), the libkrun VMM backend (`vmm`/`libkrun_sys`, default; the pinned guest
+  kernel and vk-agent are embedded so `vk` runs self-contained), and a bundled
+  virtio-fs daemon (`virtiofsd`, serving cloud-hypervisor shares with the vendored
+  libkrun fs engine).
 - **`vk-agent/`** — the guest PID 1 / agent (depends on `vk-core`): brings a systemd-less
   guest up (mounts, networking, hostname, virtio-fs, optional SSH) and serves an exec
   channel over `vsock` so the host can run commands inside the VM.
+
+libkrun is vendored (its own cargo workspace, locally patched) under
+`third_party/libkrun` — see its `VENDOR.md` for the patch list.
 
 The guest kernel is a vanilla Linux `vmlinux` built from a vendored config fragment
 (`kernel/`); it is pinned and built separately from the binaries.

@@ -6,6 +6,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **Built-in libkrun VMM, on by default** — no external hypervisor binary is
+  needed. Cloud Hypervisor remains available (`VIRTKIT_VMM=cloud-hypervisor`).
 - **Self-contained `vk`**: the guest kernel and `vk-agent` are embedded into the
   binary — a single file boots OCI images.
 - `run --cpus host` matches the host CPU count.

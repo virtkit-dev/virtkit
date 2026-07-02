@@ -68,7 +68,7 @@ features = ["blk", "net"]
 optional = true
 
 [features]
-default = ["virtiofsd", "embed"]
+default = ["virtiofsd", "libkrun", "embed"]
 # Embed the guest kernel (vmlinux) and vk-agent into the `vk` binary so it runs
 # self-contained (no --kernel/--agent, no files under /usr/local/lib/vk). build.rs
 # reads VK_EMBED_KERNEL / VK_EMBED_AGENT at compile time; when unset (a plain dev
@@ -81,5 +81,7 @@ virtiofsd = ["dep:virtiofsd", "dep:vhost", "dep:vhost-user-backend", "dep:vm-mem
 # reached via its C ABI; we always pass our own kernel (krun_set_kernel) so it
 # never loads libkrunfw. Its rust-vmm deps (vm-memory 0.17, …) coexist with the
 # bundled virtiofsd's (0.16) — independent subsystems, so no version unification.
-# Not yet in defaults: flipped on once the `__libkrun-boot` subprocess lands.
+# On by default: libkrun is the default backend (selection is env-driven, see
+# vmm::libkrun_selected); VIRTKIT_VMM=cloud-hypervisor opts out, and jobs libkrun
+# cannot serve (e.g. uid/gid-mapped shares) refuse with a pointer to that switch.
 libkrun = ["dep:krun"]

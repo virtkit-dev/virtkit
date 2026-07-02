@@ -29,6 +29,8 @@ mod fleet;
 mod image;
 mod initramfs;
 mod jobctx;
+#[cfg(feature = "libkrun")]
+mod libkrun_sys;
 mod local;
 mod mkoci;
 mod net;
@@ -534,6 +536,25 @@ fn main() -> ExitCode {
         let args: Vec<String> = std::env::args().collect();
         if args.get(1).map(String::as_str) == Some("virtiofsd") {
             return match virtiofsd::run(args[1..].to_vec()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, 1),
+            };
+        }
+    }
+
+    // `vk __libkrun-boot <spec-json>` — internal: boot one microVM under libkrun (the
+    // Libkrun Vmm backend execs this per VM). Dispatched before the CLI; it links
+    // libkrun and blocks in krun_start_enter until the guest powers off.
+    #[cfg(feature = "libkrun")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.get(1).map(String::as_str) == Some("__libkrun-boot") {
+            let spec: vmm::VmSpec = match args.get(2).map(|j| serde_json::from_str(j)) {
+                Some(Ok(spec)) => spec,
+                Some(Err(e)) => return fail(&anyhow::anyhow!("__libkrun-boot: bad spec: {e}"), 2),
+                None => return fail(&anyhow::anyhow!("__libkrun-boot: missing spec JSON"), 2),
+            };
+            return match libkrun_sys::boot(&spec) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(&e, 1),
             };
