@@ -792,7 +792,12 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
         layers.push(push_file(&client, &image, &dir.join("initrd.img"), INITRD_MEDIA_TYPE).await?);
     }
 
-    let boot_kind = image::read_boot_kind(dir);
+    let boot_kind = image::read_boot_kind(dir).with_context(|| {
+        format!(
+            "bundle {}: unsupported boot.kind marker — reconvert it",
+            dir.display()
+        )
+    })?;
     let config = BundleConfig {
         total_size,
         chunk_count,
@@ -889,7 +894,9 @@ async fn resolve_async(
         image::gc(&images_dir, &dir, rg.keep);
     }
 
-    let boot_kind = image::read_boot_kind(&dir);
+    let boot_kind = image::read_boot_kind(&dir).with_context(|| {
+        format!("registry bundle {name}@{digest}: unsupported boot.kind marker — re-push it")
+    })?;
     println!("virtkit: image {name}@{digest} (registry bundle, {boot_kind:?})");
     Ok((
         image::resolved_from_dir(&rg.generic_kernel, &dir, boot_kind),

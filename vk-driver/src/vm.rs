@@ -16,29 +16,18 @@ use crate::image::ResolvedImage;
 use crate::jobctx::JobCtx;
 use crate::vmm::Vmm;
 
-/// A job VM's boot medium: a copy-on-write ext4 disk (with an optional initrd —
-/// a self-booting image ships one; a generic guest on the all-built-in pinned
-/// kernel needs none) or a cpio initramfs held in RAM.
-enum Media {
-    Disk {
-        rootfs: PathBuf,
-        initrd: Option<PathBuf>,
-    },
-    Initramfs {
-        cpio: PathBuf,
-    },
+/// The boot medium: a read-only base rootfs (booted through a CoW overlay) plus a
+/// self-booting image's own initrd, if it shipped one.
+struct Media {
+    rootfs: PathBuf,
+    initrd: Option<PathBuf>,
 }
 
 impl Media {
     fn files(&self) -> Vec<&Path> {
-        match self {
-            Media::Disk { rootfs, initrd } => {
-                let mut v = vec![rootfs.as_path()];
-                v.extend(initrd.as_deref());
-                v
-            }
-            Media::Initramfs { cpio } => vec![cpio.as_path()],
-        }
+        let mut v = vec![self.rootfs.as_path()];
+        v.extend(self.initrd.as_deref());
+        v
     }
 }
 
@@ -51,12 +40,9 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             kernel,
             initrd,
             generic,
-        } => (kernel, Media::Disk { rootfs, initrd }, generic),
-        ResolvedImage::Initramfs { kernel, initramfs } => {
-            (kernel, Media::Initramfs { cpio: initramfs }, true)
-        }
+        } => (kernel, Media { rootfs, initrd }, generic),
     };
-    // generic guests (cpio, or ext4 on the pinned guest kernel) boot virtkit-agent as PID 1;
+    // generic guests (ext4 on the pinned guest kernel) boot virtkit-agent as PID 1;
     // self-booting images boot their own init off a disk.
     for p in media
         .files()
@@ -82,37 +68,28 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     }
     std::fs::create_dir_all(&ctx.job_dir)
         .with_context(|| format!("creating {}", ctx.job_dir.display()))?;
-    // Disk guests get a throwaway CoW overlay over the ro base; initramfs guests
-    // have no disk at all (the rootfs is the cpio, in RAM).
+    // Every guest gets a throwaway CoW overlay over the ro base rootfs.
     let overlay = ctx.overlay();
-    if let Media::Disk { rootfs, .. } = &media {
-        crate::qcow2::create_overlay(&overlay, rootfs)?;
-    }
+    crate::qcow2::create_overlay(&overlay, &media.rootfs)?;
 
-    let mut cmdline = match (generic, &media) {
-        // generic disk guest (the default bundle): virtkit-agent is PID 1 on the ext4
+    let mut cmdline = if generic {
+        // generic guest (the default bundle): virtkit-agent is PID 1 on the ext4
         // root (virtio-blk + ext4 built into the pinned kernel) and serves the exec
         // channel directly — no systemd.
-        (true, Media::Disk { .. }) => format!(
+        format!(
             "console=ttyS0 root=/dev/vda rw rootfstype=ext4 init=/usr/local/bin/vk-agent \
              VIRTKIT_HOSTNAME={} VIRTKIT_VSOCK_PORT={}",
             cfg.vm.hostname, cfg.vm.vsock_port
-        ),
-        // generic cpio guest: virtkit-agent is PID 1 in the initramfs (no disk root)
-        // and serves directly.
-        (true, Media::Initramfs { .. }) => format!(
-            "console=ttyS0 rdinit=/usr/local/bin/vk-agent VIRTKIT_HOSTNAME={} \
-             VIRTKIT_VSOCK_PORT={}",
-            cfg.vm.hostname, cfg.vm.vsock_port
-        ),
+        )
+    } else {
         // self-booting image: virtkit-agent is PID 1, execs the image's captured
         // entrypoint (VIRTKIT_MODE=service) which brings up systemd; the in-guest
         // serve agent then runs as a systemd unit.
-        (false, _) => format!(
+        format!(
             "console=ttyS0 root=/dev/vda rw rootfstype=ext4 init=/usr/local/bin/vk-agent \
              VIRTKIT_MODE=service VIRTKIT_HOSTNAME={}",
             cfg.vm.hostname
-        ),
+        )
     };
 
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
@@ -251,16 +228,11 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         cmdline.push_str(&cfg.vm.cmdline_extra);
     }
 
-    // kernel is common; the boot medium is either a CoW disk overlay (+ a
-    // self-booting image's initrd) or a single cpio initramfs (the rootfs in RAM).
-    // A generic guest on the pinned kernel ships no initrd (virtio-blk + ext4 built in).
-    let (disks, initramfs) = match &media {
-        Media::Disk { initrd, .. } => (
-            vec![crate::vmm::Disk::overlay(overlay.clone())],
-            initrd.clone(),
-        ),
-        Media::Initramfs { cpio } => (Vec::new(), Some(cpio.clone())),
-    };
+    // kernel is common; the boot medium is the CoW disk overlay plus a
+    // self-booting image's initrd. A generic guest on the pinned kernel ships
+    // no initrd (virtio-blk + ext4 built in).
+    let disks = vec![crate::vmm::Disk::overlay(overlay.clone())];
+    let initramfs = media.initrd;
 
     // shared=on (set via shared_mem): required by virtio-fs, harmless without.
     let spec = crate::vmm::VmSpec {
@@ -287,13 +259,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         .with_context(|| format!("spawning {}", cfg.cloud_hypervisor().display()))?;
     std::fs::write(ctx.ch_pidfile(), ch_child.id().to_string())?;
 
-    println!(
-        "virtkit: booting microVM (cpus={cpus}, mem={mem}, {})",
-        match &media {
-            Media::Disk { .. } => "disk",
-            Media::Initramfs { .. } => "cpio initramfs",
-        }
-    );
+    println!("virtkit: booting microVM (cpus={cpus}, mem={mem})");
 
     // Ready = the in-guest virtkit-agent answers on vsock (systemd is up, the agent
     // socket is active). Each status attempt has its own internal timeout.

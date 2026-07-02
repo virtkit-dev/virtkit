@@ -224,10 +224,6 @@ pub struct Convert {
     /// or modules.
     #[serde(default = "default_generic_kernel")]
     pub generic_kernel: PathBuf,
-    /// Generic images boot from an ext4 disk (true) or a cpio initramfs in RAM
-    /// (false). Disk suits larger images; RAM is faster for small ones.
-    #[serde(default)]
-    pub generic_disk: bool,
     /// tag → digest resolution (same wiring as [registry])
     #[serde(default = "default_oras")]
     pub oras: PathBuf,

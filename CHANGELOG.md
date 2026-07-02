@@ -12,8 +12,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
-- `run` boots images from a native ext4 disk by default; the in-RAM cpio boot
-  moves behind a new `--ram` flag, which replaces `--disk`.
+- Images boot from a native ext4 disk by default; the in-RAM cpio boot moves
+  behind `--ram` (replacing `--disk`) and the cpio bundle format is retired.
 
 ### Fixed
 

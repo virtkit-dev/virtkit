@@ -6,10 +6,10 @@
 //! `boot.kind`, and OPTIONALLY a `vmlinuz` + `initrd.img` — produced by
 //! build-image.sh or pulled into place. Nothing is fetched: this is the
 //! on-disk counterpart of the registry/convert cached-dir path, resolved to a
-//! `ResolvedImage` exactly the same way (Disk vs Initramfs from `boot.kind`,
+//! `ResolvedImage` exactly the same way (the boot shape from `boot.kind`,
 //! the shared `[local] generic_kernel` for kernel-less bundles).
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::image::{self, ResolvedImage};
 use crate::jobctx::JobCtx;
@@ -31,7 +31,9 @@ pub fn resolve(ctx: &JobCtx, name: &str) -> Result<ResolvedImage> {
             dir.display()
         );
     }
-    let boot_kind = image::read_boot_kind(&dir);
+    let boot_kind = image::read_boot_kind(&dir).with_context(|| {
+        format!("local image {name:?}: unsupported boot.kind marker — rebuild the image")
+    })?;
     println!("virtkit: image local/{name} ({boot_kind:?})");
     Ok(image::resolved_from_dir(
         &ctx.cfg.local.generic_kernel,

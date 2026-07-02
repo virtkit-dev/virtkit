@@ -32,9 +32,6 @@ use crate::jobctx::JobCtx;
 pub enum BootKind {
     /// The image ships its own kernel + systemd (a self-booting ext4 bundle).
     Systemd,
-    /// Generic OCI image (no kernel, no init), booted from a cpio initramfs in
-    /// RAM on the pinned guest kernel, virtkit-agent as PID 1.
-    GenericCpio,
     /// Generic OCI image, booted from an ext4 disk on the pinned guest kernel,
     /// virtkit-agent as PID 1.
     GenericDisk,
@@ -52,9 +49,6 @@ pub enum ResolvedImage {
         initrd: Option<PathBuf>,
         generic: bool,
     },
-    /// Generic image: kernel + a cpio initramfs (the rootfs, in RAM), virtkit-agent
-    /// as PID 1 (no disk). Network via the kernel `ip=` autoconfig param.
-    Initramfs { kernel: PathBuf, initramfs: PathBuf },
 }
 
 /// Resolve the job's MICROVM_IMAGE to a concrete bootable image. The variable is
@@ -85,7 +79,7 @@ pub fn resolve(ctx: &JobCtx) -> Result<ResolvedImage> {
 }
 
 /// Return a `ResolvedImage` from a cached/baked bundle dir, shared by the
-/// registry and local paths: Disk vs Initramfs from the recorded `boot.kind`,
+/// registry and local paths: the boot shape from the recorded `boot.kind`,
 /// and which kernel/initrd files the bundle ships. `generic_kernel` is the
 /// shared pinned kernel a kernel-less bundle boots.
 pub(crate) fn resolved_from_dir(
@@ -112,7 +106,7 @@ pub(crate) fn resolved_from_dir(
             }
         }
         // generic: the pinned shared kernel (virtio + ext4 built in, no initrd).
-        BootKind::GenericDisk | BootKind::GenericCpio => ResolvedImage::Disk {
+        BootKind::GenericDisk => ResolvedImage::Disk {
             rootfs,
             kernel: generic_kernel.to_path_buf(),
             initrd: None,
@@ -121,10 +115,12 @@ pub(crate) fn resolved_from_dir(
     }
 }
 
-/// Read the boot flavour from a bundle dir; an unknown/absent marker reads as
-/// systemd. The marker is trimmed before matching, so a file written with a
-/// trailing newline (e.g. `echo generic-disk > boot.kind`) is read correctly.
-pub(crate) fn read_boot_kind(dir: &Path) -> BootKind {
+/// Read the boot flavour from a bundle dir. An absent marker reads as systemd
+/// (bundles predating the marker); an unrecognised marker — e.g. the retired
+/// `generic-cpio` — reads as `None`, which callers treat as a stale bundle.
+/// The marker is trimmed before matching, so a file written with a trailing
+/// newline (e.g. `echo generic-disk > boot.kind`) is read correctly.
+pub(crate) fn read_boot_kind(dir: &Path) -> Option<BootKind> {
     parse_boot_kind(
         std::fs::read_to_string(dir.join("boot.kind"))
             .ok()
@@ -132,11 +128,11 @@ pub(crate) fn read_boot_kind(dir: &Path) -> BootKind {
     )
 }
 
-fn parse_boot_kind(marker: Option<&str>) -> BootKind {
+fn parse_boot_kind(marker: Option<&str>) -> Option<BootKind> {
     match marker.map(str::trim) {
-        Some("generic-cpio") => BootKind::GenericCpio,
-        Some("generic-disk") => BootKind::GenericDisk,
-        _ => BootKind::Systemd,
+        None | Some("systemd") => Some(BootKind::Systemd),
+        Some("generic-disk") => Some(BootKind::GenericDisk),
+        Some(_) => None,
     }
 }
 
@@ -145,7 +141,6 @@ fn parse_boot_kind(marker: Option<&str>) -> BootKind {
 pub(crate) fn boot_kind_tag(kind: BootKind) -> &'static str {
     match kind {
         BootKind::Systemd => "systemd",
-        BootKind::GenericCpio => "generic-cpio",
         BootKind::GenericDisk => "generic-disk",
     }
 }
@@ -307,28 +302,22 @@ mod tests {
         // exact tags
         assert!(matches!(
             parse_boot_kind(Some("generic-disk")),
-            BootKind::GenericDisk
-        ));
-        assert!(matches!(
-            parse_boot_kind(Some("generic-cpio")),
-            BootKind::GenericCpio
+            Some(BootKind::GenericDisk)
         ));
         // trailing newline (echo) / surrounding whitespace must still match
         assert!(matches!(
             parse_boot_kind(Some("generic-disk\n")),
-            BootKind::GenericDisk
+            Some(BootKind::GenericDisk)
         ));
         assert!(matches!(
-            parse_boot_kind(Some("  generic-cpio \n")),
-            BootKind::GenericCpio
+            parse_boot_kind(Some("  systemd \n")),
+            Some(BootKind::Systemd)
         ));
-        // absent / unknown -> systemd default
-        assert!(matches!(parse_boot_kind(None), BootKind::Systemd));
-        assert!(matches!(
-            parse_boot_kind(Some("systemd")),
-            BootKind::Systemd
-        ));
-        assert!(matches!(parse_boot_kind(Some("bogus")), BootKind::Systemd));
+        // absent marker -> legacy systemd bundle
+        assert!(matches!(parse_boot_kind(None), Some(BootKind::Systemd)));
+        // unknown markers (including the retired generic-cpio) -> stale bundle
+        assert!(parse_boot_kind(Some("generic-cpio")).is_none());
+        assert!(parse_boot_kind(Some("bogus")).is_none());
     }
 
     #[test]

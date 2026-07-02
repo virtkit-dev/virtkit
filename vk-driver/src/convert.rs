@@ -18,7 +18,7 @@
 //!     `[convert] generic_kernel` with no initrd.
 //!   - **generic** — a plain OCI image with no kernel (alpine, distroless): its
 //!     flattened rootfs is `docker export`ed and turned, host-side, into a native
-//!     ext4 disk or a cpio initramfs (`[convert] generic_disk`) with the static agent
+//!     ext4 disk with the static agent
 //!     injected as PID 1 — no mkfs container, no e2fsprogs. It boots the shared pinned
 //!     `[convert] generic_kernel` (virtio + ext4 built in), so it carries no kernel,
 //!     initrd or modules of its own.
@@ -89,7 +89,8 @@ pub fn resolve(ctx: &JobCtx, docker_ref: &str) -> Result<ResolvedImage> {
         convert(&ctx.cfg, cv, &name, &digest, &dir)?;
         image::gc(&images_dir, &dir, cv.keep);
     }
-    let boot_kind = image::read_boot_kind(&dir);
+    let boot_kind = image::read_boot_kind(&dir)
+        .with_context(|| format!("bundle {} has an unsupported boot.kind", dir.display()))?;
     println!("virtkit: image docker/{name}@{digest} (converted bundle, {boot_kind:?})");
     Ok(match boot_kind {
         // self-booting (systemd) guest: the image's own kernel + initrd if it
@@ -115,10 +116,6 @@ pub fn resolve(ctx: &JobCtx, docker_ref: &str) -> Result<ResolvedImage> {
             initrd: None,
             generic: true,
         },
-        BootKind::GenericCpio => ResolvedImage::Initramfs {
-            kernel: cv.generic_kernel.clone(),
-            initramfs: dir.join("initramfs.cpio"),
-        },
     })
 }
 
@@ -129,9 +126,9 @@ fn bundle_complete(dir: &Path) -> bool {
     match image::read_boot_kind(dir) {
         // a systemd bundle always has the rootfs; vmlinuz/initrd only when the
         // image shipped its own kernel (else it boots the shared host kernel)
-        BootKind::Systemd => dir.join("runner.ext4").is_file(),
-        BootKind::GenericDisk => dir.join("runner.ext4").is_file(),
-        BootKind::GenericCpio => dir.join("initramfs.cpio").is_file(),
+        Some(BootKind::Systemd) | Some(BootKind::GenericDisk) => dir.join("runner.ext4").is_file(),
+        // unknown marker (e.g. a retired generic-cpio bundle): stale, reconvert
+        None => false,
     }
 }
 
@@ -155,7 +152,7 @@ fn convert(cfg: &Config, cv: &Convert, name: &str, digest: &str, dir: &Path) -> 
     std::fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
 
     // the boot marker means a self-booting (systemd) guest; otherwise it is a
-    // generic OCI image we boot from a cpio initramfs with virtkit-agent as PID 1.
+    // generic OCI image booted from an ext4 disk with virtkit-agent as PID 1.
     let boot_kind = if image_is_systemd(cv, &img, &tmp)? {
         println!(
             "virtkit: converting {img} (systemd, rootfs {}) ...",
@@ -163,14 +160,10 @@ fn convert(cfg: &Config, cv: &Convert, name: &str, digest: &str, dir: &Path) -> 
         );
         assemble_systemd(cv, &img, &tmp)?;
         BootKind::Systemd
-    } else if cv.generic_disk {
-        println!("virtkit: converting {img} (generic OCI, ext4 disk) ...");
-        assemble_generic(cv, &img, &tmp, true)?;
-        BootKind::GenericDisk
     } else {
-        println!("virtkit: converting {img} (generic OCI, cpio initramfs) ...");
-        assemble_generic(cv, &img, &tmp, false)?;
-        BootKind::GenericCpio
+        println!("virtkit: converting {img} (generic OCI, ext4 disk) ...");
+        assemble_generic(cv, &img, &tmp)?;
+        BootKind::GenericDisk
     };
     write_boot_kind(&tmp, boot_kind)?;
 
@@ -226,12 +219,11 @@ fn assemble_systemd(cv: &Convert, img: &str, tmp: &Path) -> Result<()> {
     Ok(())
 }
 
-/// generic image: export the image's flattened rootfs and turn it into a boot
-/// medium with the static virtkit-agent injected as PID 1 — a cpio initramfs in RAM
-/// (`disk=false`) or a native ext4 disk (`disk=true`), the same assembly the dev
-/// `launch` uses. No kernel, initrd or modules are bundled: a generic image
-/// boots the shared pinned guest kernel (virtio + ext4 built in).
-fn assemble_generic(cv: &Convert, img: &str, tmp: &Path, disk: bool) -> Result<()> {
+/// generic image: export the image's flattened rootfs and turn it into a native
+/// ext4 disk with the static virtkit-agent injected as PID 1. No kernel, initrd
+/// or modules are bundled: a generic image boots the shared pinned guest kernel
+/// (virtio + ext4 built in).
+fn assemble_generic(cv: &Convert, img: &str, tmp: &Path) -> Result<()> {
     let tar = tmp.join("rootfs.tar");
     // export the flattened rootfs without a host privilege: `create` materialises
     // the image's layers, `export` streams them as a tar (the container never runs)
@@ -255,20 +247,16 @@ fn assemble_generic(cv: &Convert, img: &str, tmp: &Path, disk: bool) -> Result<(
         ("etc/virtkit/user", user_file.as_path(), 0o644),
     ];
 
-    if disk {
-        crate::ext4::build_from_tar_injecting(
-            &tar,
-            &injects,
-            0,
-            &crate::ext4::FsId {
-                with_journal: true,
-                ..Default::default()
-            },
-            &tmp.join("runner.ext4"),
-        )?;
-    } else {
-        crate::initramfs::build_initramfs_injecting(&tar, &injects, &tmp.join("initramfs.cpio"))?;
-    }
+    crate::ext4::build_from_tar_injecting(
+        &tar,
+        &injects,
+        0,
+        &crate::ext4::FsId {
+            with_journal: true,
+            ..Default::default()
+        },
+        &tmp.join("runner.ext4"),
+    )?;
     // the captures are baked into the rootfs now; drop the loose copies
     let _ = std::fs::remove_file(&tar);
     let _ = std::fs::remove_file(&env_file);
@@ -320,16 +308,10 @@ fn assets_fingerprint(cv: &Convert) -> Result<u64> {
     })?);
     parts.push(cv.rootfs_size.as_bytes().to_vec());
     // generic bundles boot the shared pinned kernel rather than embedding one, so
-    // the kernel is not part of a bundle's content and stays out of the cache key;
-    // the disk-vs-cpio choice does change the artifact, so fold it in
-    parts.push(
-        if cv.generic_disk {
-            b"disk" as &[u8]
-        } else {
-            b"cpio"
-        }
-        .to_vec(),
-    );
+    // the kernel is not part of a bundle's content and stays out of the cache key.
+    // The literal "disk" is the retired disk-vs-cpio fold, kept so existing
+    // disk-bundle cache keys stay valid.
+    parts.push(b"disk".to_vec());
     let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
     Ok(image::fnv64(&refs))
 }

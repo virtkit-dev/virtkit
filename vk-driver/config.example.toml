@@ -97,7 +97,6 @@
 # rootfs_size = "32G"              # ext4 size of the converted rootfs (sparse)
 # generic_kernel = "/usr/local/lib/vk/vmlinux"  # shared kernel for
 #                                  # kernel-less OCI images (alpine/distroless)
-# generic_disk = false             # generic images: ext4 disk (true) vs cpio in RAM
 # oras = "/usr/local/bin/oras"     # tag → digest resolution
 # ca_file = "/etc/virtkit/registry-ca.crt"
 # username = "ci-push"             # also drives docker pull (--config); the
