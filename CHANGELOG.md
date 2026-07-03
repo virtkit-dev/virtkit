@@ -36,6 +36,8 @@ All notable changes to virtkit will be documented in this file.
   bash-less images (alpine, distroless) run correctly.
 - a `--ram` boot refuses an initramfs that cannot unpack in `--mem`, naming the
   required size.
+- a stage consuming another via `COPY --from` or `RUN --mount=from` rebuilds
+  when the source stage changes, instead of restoring a stale cached snapshot.
 
 ## [0.4.0] - 2026-07-02
 

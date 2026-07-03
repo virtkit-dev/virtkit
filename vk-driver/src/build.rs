@@ -336,11 +336,29 @@ fn resolve_stages(
             }
             // expand $VAR / ${VAR} against the current scope, then key the result.
             let instr = interp::expand_instruction(raw, &vars);
-            // A context COPY (no `--from`) also keys on the sha256 of the files it
-            // references, so editing a copied source busts the cache (Docker semantics);
-            // a `--from=<stage>` copy is already covered by that stage's key chain.
+            // Content the key must track beyond the instruction text (Docker semantics —
+            // the cache follows the bytes an instruction reads, not just its spelling):
+            //   - a context COPY keys on the sha256 of the files it references, so
+            //     editing a copied source busts the cache;
+            //   - a COPY --from=<stage> / RUN --mount=from=<stage> keys on the source
+            //     stage's final key, so a change anywhere in the source stage chains
+            //     into every consumer — without it, a consumer whose own instructions
+            //     did not change would restore a snapshot holding the *old* source
+            //     content. `--from=<image>` sources stay keyed by their reference text.
             let content = match &instr {
-                Instruction::Copy(c) if c.from.is_none() => Some(context_copy_hash(context, c)),
+                Instruction::Copy(c) => match &c.from {
+                    None => Some(context_copy_hash(context, c)),
+                    Some(r) => source_stage_key(plan, &out, r),
+                },
+                Instruction::Run(r) => {
+                    let keys: Vec<String> = r
+                        .mounts
+                        .iter()
+                        .filter_map(|m| m.from.as_deref())
+                        .filter_map(|f| source_stage_key(plan, &out, f))
+                        .collect();
+                    (!keys.is_empty()).then(|| keys.join("\n"))
+                }
                 _ => None,
             };
             key = chain_key(&key, &instr, content.as_deref());
@@ -408,6 +426,20 @@ pub fn stage_keys(
         out.push((name, resolved[&idx].final_key.clone()));
     }
     Ok(out)
+}
+
+/// The final key of the stage a `--from=<x>` names — its content identity, folded into
+/// the consuming instruction's key. `None` when `x` is an external image (keyed by its
+/// reference text alone) or an unresolvable `$VAR` ref (the same known limitation as
+/// [`stage_source_refs`]). The source is always resolved first: it is a dependency, so
+/// the topological order places it earlier.
+fn source_stage_key(
+    plan: &Plan,
+    resolved: &HashMap<usize, Resolved>,
+    reference: &str,
+) -> Option<String> {
+    let s = plan.stage_ref(reference)?;
+    resolved.get(&s).map(|r| r.final_key.clone())
 }
 
 /// The reserved build arg whose value virtkit synthesizes (the declaring stage's
@@ -1252,6 +1284,42 @@ RUN ship
         let r2 = resolve(&src.replace("ENV V=1", "ENV V=2"));
         assert_ne!(r[&0].final_key, r2[&0].final_key);
         assert_ne!(r[&1].final_key, r2[&1].final_key);
+    }
+
+    #[test]
+    fn source_stage_changes_chain_into_consumers() {
+        // A consumer restoring its cached snapshot must re-key whenever a stage it
+        // copies/mounts from changed — else it would restore the old source content.
+        let ba = Vars::new();
+        let keys = |src: &str| {
+            let plan = Plan::from_dockerfile(&parser::parse(src).unwrap(), &ba).unwrap();
+            let order = plan.all_order().unwrap();
+            let mut ex = DryRun::new();
+            let r = resolve_stages(&plan, &order, &ba, Path::new("/nonexistent"), &mut ex, None)
+                .unwrap();
+            (r[&0].final_key.clone(), r[&1].final_key.clone())
+        };
+        // COPY --from=<stage>
+        let a = "FROM alpine AS lib\nRUN one\nFROM alpine AS app\nCOPY --from=lib /f /f\n";
+        let (lib1, app1) = keys(a);
+        let (lib2, app2) = keys(&a.replace("RUN one", "RUN two"));
+        assert_ne!(lib1, lib2);
+        assert_ne!(app1, app2);
+        // RUN --mount=from=<stage>
+        let a = "FROM alpine AS lib\nRUN one\nFROM alpine AS app\n\
+                 RUN --mount=type=bind,from=lib,target=/l use\n";
+        let (lib1, app1) = keys(a);
+        let (lib2, app2) = keys(&a.replace("RUN one", "RUN two"));
+        assert_ne!(lib1, lib2);
+        assert_ne!(app1, app2);
+        // a COPY --from=<external image> folds no stage key (keyed by its text alone):
+        // the consumer's key is indifferent to unrelated stage edits.
+        let a = "FROM alpine AS lib\nRUN one\nFROM alpine AS app\n\
+                 COPY --from=busybox:latest /bin/sh /sh\n";
+        let (lib1, app1) = keys(a);
+        let (lib2, app2) = keys(&a.replace("RUN one", "RUN two"));
+        assert_ne!(lib1, lib2);
+        assert_eq!(app1, app2);
     }
 
     #[test]
