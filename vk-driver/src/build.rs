@@ -214,6 +214,14 @@ fn load_inputs(dockerfiles: &[PathBuf], contexts: &[PathBuf]) -> Result<Vec<Plan
 /// Entry point for the `build` subcommand.
 pub fn build(opts: &Options) -> Result<Built> {
     let inputs = load_inputs(&opts.dockerfiles, &opts.contexts)?;
+    build_inputs(inputs, opts)
+}
+
+/// [`build`] for a caller that already holds parsed [`PlanInput`]s — e.g. `vk run
+/// --compose` materializing an `image:` service as the synthetic single-`FROM`
+/// plan, with no Dockerfile on disk. `opts.dockerfiles`/`opts.contexts` are the
+/// file-loading path's inputs and are ignored here; everything else applies.
+pub fn build_inputs(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
     let build_args: Vars = opts.build_args.iter().cloned().collect();
     let plan = Plan::from_dockerfiles(&inputs, &build_args)?;
     let target = plan.resolve_target(opts.target.as_deref())?;
@@ -237,13 +245,18 @@ pub fn build(opts: &Options) -> Result<Built> {
         .as_deref()
         .context("build needs --out <file> (or --print-plan)")?;
     // microVM scratch holds each stage's raw ext4 (booted read-write — keep it off
-    // tmpfs), so place it next to the output; the host backend's scratch is just dirs.
+    // tmpfs), so place it next to the output; the host backend's scratch is just
+    // dirs. Keyed by pid + an in-process counter: two builds in one process (e.g.
+    // `run --compose` materializing several services, or parallel tests) must
+    // never share — the first one's cleanup would delete the second's scratch.
+    static BUILD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let scratch = if opts.microvm {
         out.parent()
             .unwrap_or_else(|| Path::new("."))
-            .join(format!(".build-{}", std::process::id()))
+            .join(format!(".build-{}-{seq}", std::process::id()))
     } else {
-        std::env::temp_dir().join(format!("virtkit-build-{}", std::process::id()))
+        std::env::temp_dir().join(format!("virtkit-build-{}-{seq}", std::process::id()))
     };
     // Resolve the microVM's kernel + agent up front and hold them for the whole build:
     // an embedded asset lives in a memfd whose /proc/self/fd path is valid only while the
@@ -313,9 +326,9 @@ pub fn build(opts: &Options) -> Result<Built> {
     let built = result?;
     println!(
         "virtkit: built {} -> {}",
-        opts.dockerfiles
+        inputs
             .iter()
-            .map(|f| f.display().to_string())
+            .map(|i| i.origin.display().to_string())
             .collect::<Vec<_>>()
             .join(" + "),
         out.display()
@@ -1649,6 +1662,55 @@ ENTRYPOINT run me
         let ov = &r[&2].final_state;
         assert_eq!(ov.entrypoint, ["/bin/sh", "-c", "run me"]);
         assert!(ov.cmd.is_empty());
+    }
+
+    #[test]
+    fn build_inputs_matches_the_file_path() {
+        // an in-memory plan (the synthetic FROM plan `run --compose` uses for
+        // image: services) builds the same artifact the file path would.
+        let tmp = std::env::temp_dir().join(format!("vk-buildinputs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("f"), "x").unwrap();
+        let src = "FROM scratch\nCOPY f /f\nENTRYPOINT [\"/f\"]\n";
+        std::fs::write(tmp.join("Dockerfile"), src).unwrap();
+        let opts = |out: PathBuf| Options {
+            dockerfiles: vec![tmp.join("Dockerfile")],
+            target: None,
+            contexts: vec![],
+            out: Some(out),
+            print_plan: false,
+            microvm: false,
+            cloud_hypervisor: None,
+            kernel: None,
+            agent: None,
+            cache_registry: Some("none".into()),
+            cache_insecure: false,
+            journal: false,
+            build_args: vec![],
+            net: BuildNet::None,
+        };
+        let via_file = build(&opts(tmp.join("a.ext4"))).unwrap();
+        let via_inputs = build_inputs(
+            vec![PlanInput {
+                dockerfile: parser::parse(src).unwrap(),
+                origin: "inline".into(),
+                context: tmp.clone(),
+            }],
+            &opts(tmp.join("b.ext4")),
+        )
+        .unwrap();
+        assert_eq!(via_file.config, via_inputs.config);
+        let (a, b) = (
+            std::fs::read(tmp.join("a.ext4")).unwrap(),
+            std::fs::read(tmp.join("b.ext4")).unwrap(),
+        );
+        // identical past the primary superblock, whose UUID is random per build.
+        // Relies on this fixture being a tiny single-group image: a larger one would
+        // carry UUID-bearing backup superblocks (one per sparse_super group, 128 MiB
+        // apart) past this offset — do not enlarge it without widening the compare.
+        assert_eq!(a[2048..], b[2048..]);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
