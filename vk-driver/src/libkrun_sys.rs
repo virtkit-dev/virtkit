@@ -14,7 +14,7 @@
 //! disks (qcow2 backing chains), built-in virtio-fs shares, per-port vsock, optional
 //! tap networking, and the console on the serial-log file. The shutdown eventfd stays
 //! unwired (as upstream leaves it on x86_64); teardown is process-kill — see
-//! `vm::stop_vm`.
+//! `vm::graceful_vmm_stop`.
 
 use std::ffi::CString;
 

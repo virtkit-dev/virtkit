@@ -12,10 +12,10 @@ use anyhow::{Context, Result, bail};
 
 /// Spawn a foreground-owned helper tied to this process: a pre-exec hook asks the kernel to
 /// SIGTERM the child when its parent dies, so a crashed or `kill -9`'d virtkit cannot leak it
-/// (a stuck virtiofsd would, e.g., keep this binary's file busy for the next build). For
-/// foreground owners only — the `run`/build VMs, where one virtkit process
-/// owns the helper for its whole lifetime. NOT for the gitlab job VM, whose helpers are
-/// deliberately detached (`spawn_detached`) to outlive the short `prepare`.
+/// (a stuck virtiofsd would, e.g., keep this binary's file busy for the next build). For any
+/// process that owns its helpers for its whole lifetime — the `run`/build VMs, and the CI job
+/// supervisor (itself the one detached process that outlives the short `prepare`, tying every
+/// helper to its own death).
 ///
 /// PR_SET_PDEATHSIG ties the death signal to the SPAWNING THREAD, not the process. These
 /// helpers are spawned from async code that tokio may run on a blocking-pool thread, which

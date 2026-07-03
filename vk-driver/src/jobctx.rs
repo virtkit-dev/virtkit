@@ -89,11 +89,15 @@ impl JobCtx {
     pub fn vfsd_sock(&self) -> PathBuf {
         self.job_dir.join("vfsd.sock")
     }
-    pub fn ch_pidfile(&self) -> PathBuf {
-        self.job_dir.join("ch.pid")
+    /// The job supervisor — the ONE detached process owning every helper (switch,
+    /// virtiofsds, forwards, the VMM) as tied children. It writes this pidfile
+    /// itself at startup; cleanup and the stale-state sweep signal it, and
+    /// everything else cascades (PDEATHSIG).
+    pub fn supervisor_pidfile(&self) -> PathBuf {
+        self.job_dir.join("supervisor.pid")
     }
-    pub fn vfsd_pidfile(&self) -> PathBuf {
-        self.job_dir.join("vfsd.pid")
+    pub fn supervisor_log(&self) -> PathBuf {
+        self.job_dir.join("supervisor.log")
     }
     pub fn console_log(&self) -> PathBuf {
         self.job_dir.join("console.log")
@@ -113,34 +117,20 @@ impl JobCtx {
     pub fn tools_vfsd_sock(&self) -> PathBuf {
         self.job_dir.join("tools-vfsd.sock")
     }
-    pub fn tools_vfsd_pidfile(&self) -> PathBuf {
-        self.job_dir.join("tools-vfsd.pid")
-    }
     pub fn tools_vfsd_log(&self) -> PathBuf {
         self.job_dir.join("tools-vfsd.log")
     }
-    /// Host side of the services registry forward (a detached `virtkit
-    /// forward` child, like the VMM): killed in cleanup, found via its pidfile.
-    pub fn svc_forward_pidfile(&self) -> PathBuf {
-        self.job_dir.join("svc-forward.pid")
-    }
+    /// Host side of the services registry forward (`vk forward`, a supervisor child).
     pub fn svc_forward_log(&self) -> PathBuf {
         self.job_dir.join("svc-forward.log")
     }
-    /// Host side of the SSH-agent forward (a detached `vk forward` child splicing
-    /// to the runner's `$SSH_AUTH_SOCK`): killed in cleanup, found via its pidfile.
-    pub fn ssh_agent_forward_pidfile(&self) -> PathBuf {
-        self.job_dir.join("ssh-agent-forward.pid")
-    }
+    /// Host side of the SSH-agent forward (`vk forward` splicing to the runner's
+    /// `$SSH_AUTH_SOCK`, a supervisor child).
     pub fn ssh_agent_forward_log(&self) -> PathBuf {
         self.job_dir.join("ssh-agent-forward.log")
     }
-    /// Per-job switch (net.mode = "switch"): a detached `vk switch` child
-    /// giving the VM a userspace LAN over vsock + the egress allowlist; killed
-    /// in cleanup, found via its pidfile.
-    pub fn switch_pidfile(&self) -> PathBuf {
-        self.job_dir.join("switch.pid")
-    }
+    /// Per-job switch (net.mode = "switch"): a `vk switch` child of the supervisor
+    /// giving the VM a userspace LAN over vsock + the egress allowlist.
     pub fn switch_log(&self) -> PathBuf {
         self.job_dir.join("switch.log")
     }

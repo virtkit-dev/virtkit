@@ -31,17 +31,9 @@ impl Media {
 
 pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     let cfg = &ctx.cfg;
-    // MICROVM_IMAGE selects the guest image (prefix-based); unset = local/default.
-    let (kernel, media, generic) = match crate::image::resolve(ctx)? {
-        ResolvedImage::Disk {
-            rootfs,
-            kernel,
-            initrd,
-            generic,
-        } => (kernel, Media { rootfs, initrd }, generic),
-    };
-    // generic guests (ext4 on the pinned guest kernel) boot virtkit-agent as PID 1;
-    // self-booting images boot their own init off a disk.
+    // Fail-fast preflight in the runner-visible process (crisp errors beat a
+    // supervisor log pointer); the supervisor re-resolves from the same env.
+    let (kernel, media, _generic) = resolve_media(ctx)?;
     for p in media
         .files()
         .into_iter()
@@ -56,9 +48,9 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     }
     let (cpus, mem) = vm_size(ctx)?;
 
-    // A leftover job dir (failed cleanup, retried job id) must not leak a VM
-    // or keep its tap leased.
-    stop_vm(ctx);
+    // A leftover job (failed cleanup, retried job id) must not leak: signal its
+    // supervisor — everything it owns cascades by PDEATHSIG — and drop the state.
+    stop_supervisor(ctx);
     crate::net::release(ctx);
     if ctx.job_dir.exists() {
         std::fs::remove_dir_all(&ctx.job_dir)
@@ -66,6 +58,108 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     }
     std::fs::create_dir_all(&ctx.job_dir)
         .with_context(|| format!("creating {}", ctx.job_dir.display()))?;
+
+    // ONE detached process owns the job from here (the runner protocol requires
+    // this stage to exit — ready is signaled by exiting 0): the supervisor spawns
+    // the switch/virtiofsds/forwards/VMM as tied children, supervises them, and
+    // tears everything down on SIGTERM (cleanup) or by dying. The job dir on its
+    // cmdline is the pid-reuse guard for the later signal.
+    let exe = std::env::current_exe().context("locating the virtkit binary")?;
+    let mut sup_cmd = Command::new(exe);
+    sup_cmd.args(["gitlab", "supervise"]).arg(&ctx.job_dir);
+    let mut sup =
+        spawn_detached(sup_cmd, &ctx.supervisor_log()).context("spawning the job supervisor")?;
+
+    println!("virtkit: booting microVM (cpus={cpus}, mem={mem})");
+
+    // Ready = the in-guest virtkit-agent answers on vsock. The supervisor exiting
+    // during boot (the VMM died, a helper failed to start) fails the poll fast.
+    let addr = crate::vmm::exec_addr(&ctx.vsock_sock(), cfg.vm.vsock_port);
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(cfg.vm.boot_timeout_secs);
+    loop {
+        if let Some(status) = sup.try_wait()? {
+            log_tail(&ctx.supervisor_log(), 15);
+            log_tail(&ctx.console_log(), 30);
+            bail!(
+                "the job supervisor exited during boot ({status}, see {})",
+                ctx.supervisor_log().display()
+            );
+        }
+        match vk_core::status::get_status(&addr).await {
+            Ok(status) => {
+                // Fail fast on a wire-protocol skew (the guest bundle's virtkit-agent
+                // predates this virtkit, or vice versa): rmp_serde structs are
+                // fixed-length arrays, so a mismatched virtkit-agent cannot decode our
+                // commands and would otherwise drop the connection mid-command with
+                // an opaque "connection to the VM lost". A pre-versioning virtkit-agent
+                // reports protocol 0.
+                let want = vk_core::messages::PROTOCOL_VERSION;
+                if status.protocol() != want {
+                    bail!(
+                        "guest vk-agent wire protocol v{} != vk v{want} — the guest \
+                         bundle and the host are out of sync; rebuild/republish the guest \
+                         bundle with a matching vk-agent",
+                        status.protocol(),
+                    );
+                }
+                println!(
+                    "vk: VM ready in {:.1}s (vk-agent {status})",
+                    start.elapsed().as_secs_f32()
+                );
+                probe_guest_shell(ctx, &addr).await;
+                run_services_setup(ctx).await?;
+                return Ok(());
+            }
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    log_tail(&ctx.console_log(), 30);
+                    bail!(
+                        "VM not ready after {}s ({e}) — console tail above, logs in {}",
+                        cfg.vm.boot_timeout_secs,
+                        ctx.job_dir.display()
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Resolve MICROVM_IMAGE to the boot files (kernel + rootfs + optional initrd).
+fn resolve_media(ctx: &JobCtx) -> Result<(PathBuf, Media, bool)> {
+    match crate::image::resolve(ctx)? {
+        ResolvedImage::Disk {
+            rootfs,
+            kernel,
+            initrd,
+            generic,
+        } => Ok((kernel, Media { rootfs, initrd }, generic)),
+    }
+}
+
+/// The detached job supervisor (`vk gitlab supervise <job_dir>`, spawned by
+/// prepare): assembles and boots everything the job needs — switch, virtiofsds,
+/// forwards, the VMM — as tied children (PDEATHSIG), then supervises. SIGTERM
+/// (cleanup, or the stale-state sweep) shuts the guest down gracefully and exits;
+/// the children cascade. Readiness is prepare's business (it polls the agent).
+pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
+    if job_dir_arg != ctx.job_dir {
+        bail!(
+            "supervise arg {} != the job dir the environment derives ({}) — refusing",
+            job_dir_arg.display(),
+            ctx.job_dir.display()
+        );
+    }
+    // The pidfile is written by this process (not prepare): it exists from the
+    // first moment there is something to signal, whatever happens to prepare.
+    std::fs::write(ctx.supervisor_pidfile(), std::process::id().to_string())
+        .with_context(|| format!("writing {}", ctx.supervisor_pidfile().display()))?;
+
+    let cfg = &ctx.cfg;
+    let (kernel, media, generic) = resolve_media(ctx)?;
+    let (cpus, mem) = vm_size(ctx)?;
+    let mut children: Vec<std::process::Child> = Vec::new();
     // Every guest gets a throwaway CoW overlay over the ro base rootfs.
     let overlay = ctx.overlay();
     crate::qcow2::create_overlay(&overlay, &media.rootfs)?;
@@ -103,8 +197,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             if share.readonly {
                 vfsd.arg("--readonly");
             }
-            let child = spawn_detached(vfsd, &ctx.vfsd_log()).context("spawning virtiofsd")?;
-            std::fs::write(ctx.vfsd_pidfile(), child.id().to_string())?;
+            children.push(spawn_tied_logged(vfsd, &ctx.vfsd_log()).context("spawning virtiofsd")?);
             wait_for_socket(&vfsd_sock, Duration::from_secs(5))
                 .context("virtiofsd did not create its socket")?;
         }
@@ -128,9 +221,10 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             vfsd.arg(format!("--socket-path={}", sock.display()))
                 .arg(format!("--shared-dir={}", dir.display()))
                 .args(["--cache=auto", "--sandbox=none", "--readonly"]);
-            let child = spawn_detached(vfsd, &ctx.tools_vfsd_log())
-                .context("spawning the tools virtiofsd")?;
-            std::fs::write(ctx.tools_vfsd_pidfile(), child.id().to_string())?;
+            children.push(
+                spawn_tied_logged(vfsd, &ctx.tools_vfsd_log())
+                    .context("spawning the tools virtiofsd")?,
+            );
             wait_for_socket(&sock, Duration::from_secs(5))
                 .context("the tools virtiofsd did not create its socket")?;
         }
@@ -178,7 +272,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             // before the guest dials it; then point the agent at it. The same
             // shared LAN/egress core the dev `fleet` uses.
             let (gateway, prefix, guest_ip) = crate::net::switch_addrs(&cfg.net.subnet)?;
-            spawn_switch(ctx, gateway, prefix)?;
+            children.push(spawn_switch(ctx, gateway, prefix)?);
             cmdline.push_str(&format!(
                 " VIRTKIT_NET_PORT={} VIRTKIT_VM_IP={guest_ip}/{prefix} \
                  VIRTKIT_VM_GW={gateway} VIRTKIT_VM_DNS={gateway}",
@@ -220,8 +314,9 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     }
 
     // SSH-agent forwarding ([auth] ssh_agent): tell the guest agent to present
-    // SSH_AUTH_SOCK and relay it over a vsock port to the host side (start_ssh_agent_forward
-    // below). A no-op if the runner has no agent — warn so a misconfig is visible.
+    // SSH_AUTH_SOCK and relay it over a vsock port to the host side (the forward from
+    // ssh_agent_forward_command, started by the supervisor). A no-op if the runner has
+    // no agent — warn so a misconfig is visible.
     if ssh_agent_forwarding(cfg) {
         cmdline.push_str(&format!(
             " VIRTKIT_SSH_AGENT_PORT={}",
@@ -280,71 +375,56 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         balloon: cfg.vm.balloon,
         serial_log: ctx.console_log(),
         // libkrun has no API socket (it is driven as a subprocess); cloud-hypervisor
-        // uses one for graceful shutdown in stop_vm.
+        // uses one for graceful shutdown in graceful_vmm_stop.
         api_socket: (!crate::vmm::libkrun_selected()).then(|| ctx.api_sock()),
         pass_fds: Vec::new(),
     };
+    // passive listeners the guest dials once up: safe (and simplest) to start before
+    // the VMM, and intentionally not bind-waited — they bind long before the guest
+    // boots far enough to dial them. Both are plain `vk forward` children.
+    if let Some(fwd) = ssh_agent_forward_command(ctx)? {
+        children.push(
+            spawn_tied_logged(fwd, &ctx.ssh_agent_forward_log())
+                .context("spawning the ssh-agent forward")?,
+        );
+    }
+    if let Some(fwd) = services_forward_command(ctx)? {
+        children.push(
+            spawn_tied_logged(fwd, &ctx.svc_forward_log())
+                .context("spawning the services forward")?,
+        );
+    }
+
     let vmm = crate::vmm::selected(cfg.cloud_hypervisor());
     let ch_command = vmm.command(&spec);
-    let mut ch_child = spawn_detached(ch_command, &ctx.ch_log())
+    let mut vmm_child = spawn_tied_logged(ch_command, &ctx.ch_log())
         .with_context(|| format!("spawning the {} VMM", vmm.name()))?;
-    std::fs::write(ctx.ch_pidfile(), ch_child.id().to_string())?;
 
-    println!("virtkit: booting microVM (cpus={cpus}, mem={mem})");
-
-    // Ready = the in-guest virtkit-agent answers on vsock (systemd is up, the agent
-    // socket is active). Each status attempt has its own internal timeout.
-    let addr = crate::vmm::exec_addr(&ctx.vsock_sock(), cfg.vm.vsock_port);
-    let start = Instant::now();
-    let deadline = start + Duration::from_secs(cfg.vm.boot_timeout_secs);
+    // Own the job until told to stop (SIGTERM: cleanup or a stale-state sweep) or
+    // the guest dies on its own. Tied children die with this process either way;
+    // the explicit kills below just make teardown prompt instead of lazy.
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing the SIGTERM handler")?;
     loop {
-        // try_wait on the held Child: exact (no /proc parsing, no pid-reuse race)
-        if let Some(status) = ch_child.try_wait()? {
-            log_tail(&ctx.console_log(), 30);
-            bail!(
-                "{} exited during boot ({status}, see {})",
-                vmm.name(),
-                ctx.ch_log().display()
-            );
-        }
-        match vk_core::status::get_status(&addr).await {
-            Ok(status) => {
-                // Fail fast on a wire-protocol skew (the guest bundle's virtkit-agent
-                // predates this virtkit, or vice versa): rmp_serde structs are
-                // fixed-length arrays, so a mismatched virtkit-agent cannot decode our
-                // commands and would otherwise drop the connection mid-command with
-                // an opaque "connection to the VM lost". A pre-versioning virtkit-agent
-                // reports protocol 0.
-                let want = vk_core::messages::PROTOCOL_VERSION;
-                if status.protocol() != want {
-                    bail!(
-                        "guest vk-agent wire protocol v{} != vk v{want} — the guest \
-                         bundle and the host are out of sync; rebuild/republish the guest \
-                         bundle with a matching vk-agent",
-                        status.protocol(),
-                    );
+        tokio::select! {
+            _ = term.recv() => {
+                graceful_vmm_stop(ctx, &mut vmm_child);
+                for mut c in children {
+                    let _ = c.kill();
+                    let _ = c.wait();
                 }
-                println!(
-                    "vk: VM ready in {:.1}s (vk-agent {status})",
-                    start.elapsed().as_secs_f32()
-                );
-                probe_guest_shell(ctx, &addr).await;
-                start_ssh_agent_forward(ctx)?;
-                start_services(ctx).await?;
                 return Ok(());
             }
-            Err(e) => {
-                if Instant::now() >= deadline {
-                    log_tail(&ctx.console_log(), 30);
-                    bail!(
-                        "VM not ready after {}s ({e}) — console tail above, logs in {}",
-                        cfg.vm.boot_timeout_secs,
-                        ctx.job_dir.display()
-                    );
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                if let Some(status) = vmm_child.try_wait()? {
+                    for mut c in children {
+                        let _ = c.kill();
+                        let _ = c.wait();
+                    }
+                    bail!("{} exited ({status})", vmm.name());
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -355,18 +435,18 @@ fn ssh_agent_forwarding(cfg: &crate::config::Config) -> bool {
     cfg.auth.ssh_agent && std::env::var_os("SSH_AUTH_SOCK").is_some()
 }
 
-/// Host side of the SSH-agent forward ([auth] ssh_agent): the guest dials vsock port
-/// SSH_AGENT_VSOCK_PORT, surfaced by cloud-hypervisor as `<vsock.sock>_<port>`; a detached
+/// Host side of the SSH-agent forward ([auth] ssh_agent): the guest dials vsock
+/// port SSH_AGENT_VSOCK_PORT, surfaced by the VMM as `<vsock.sock>_<port>`; a
 /// `vk forward` binds it and splices to the runner's `$SSH_AUTH_SOCK`. Only agent
-/// protocol bytes cross — the keys never enter the guest. Torn down in cleanup via its pidfile.
-fn start_ssh_agent_forward(ctx: &JobCtx) -> Result<()> {
+/// protocol bytes cross — the keys never enter the guest. `None` when forwarding
+/// is off. A passive listener: started before the guest, no readiness to wait for.
+fn ssh_agent_forward_command(ctx: &JobCtx) -> Result<Option<Command>> {
     if !ssh_agent_forwarding(&ctx.cfg) {
-        return Ok(());
+        return Ok(None);
     }
     let host_sock = std::env::var_os("SSH_AUTH_SOCK").expect("checked by ssh_agent_forwarding");
     let mut listen = ctx.vsock_sock().into_os_string();
     listen.push(format!("_{}", crate::run::SSH_AGENT_VSOCK_PORT));
-    let listen = std::path::PathBuf::from(listen);
 
     let exe = std::env::current_exe().context("locating the virtkit binary")?;
     let mut fwd = Command::new(exe);
@@ -375,12 +455,7 @@ fn start_ssh_agent_forward(ctx: &JobCtx) -> Result<()> {
         .arg(&listen)
         .arg("--to")
         .arg(&host_sock);
-    let child = spawn_detached(fwd, &ctx.ssh_agent_forward_log())
-        .context("spawning the ssh-agent forward")?;
-    std::fs::write(ctx.ssh_agent_forward_pidfile(), child.id().to_string())?;
-    wait_for_socket(&listen, Duration::from_secs(5))
-        .context("ssh-agent forward did not bind its socket")?;
-    Ok(())
+    Ok(Some(fwd))
 }
 
 /// Probe the booted guest for bash and record the result for the run stage (a
@@ -406,29 +481,18 @@ async fn probe_guest_shell(ctx: &JobCtx, addr: &vk_core::addr::SocketAddr) {
     );
 }
 
-/// Bring up the job's CI `services:` once the VM is ready (no-op without any).
-/// A host-side forward bridges the VMM's per-port vsock socket to the registry
-/// proxy; then a root script in the guest starts the guest-side forward and each
-/// service container (see services.rs). The registry credential lives only on
-/// the host proxy — it never reaches the guest or the job.
-async fn start_services(ctx: &JobCtx) -> Result<()> {
+/// Host side of the services registry forward: a guest connection to host vsock
+/// port <port> is surfaced as `<vsock.sock>_<port>`; a `vk forward` binds it and
+/// splices to the registry proxy. `None` when the job declares no services. The
+/// registry credential lives only on the host proxy — it never reaches the guest.
+fn services_forward_command(ctx: &JobCtx) -> Result<Option<Command>> {
     let services = crate::services::from_env()?;
     if services.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
-    let scfg = ctx.cfg.services.as_ref().ok_or_else(|| {
-        anyhow!(
-            "job declares services: but virtkit has no [services] config — \
-             cannot satisfy them (configure the registry proxy)"
-        )
-    })?;
-
-    // Host side of the registry forward. A guest connection to host vsock port
-    // <port> is surfaced by Cloud Hypervisor as the unix socket
-    // <vsock.sock>_<port>; our forward binds it and splices to the proxy.
+    let scfg = services_cfg(ctx)?;
     let mut listen = ctx.vsock_sock().into_os_string();
     listen.push(format!("_{}", scfg.port));
-    let listen = std::path::PathBuf::from(listen);
 
     let exe = std::env::current_exe().context("locating the virtkit binary")?;
     let mut fwd = Command::new(exe);
@@ -437,13 +501,28 @@ async fn start_services(ctx: &JobCtx) -> Result<()> {
         .arg(&listen)
         .arg("--to")
         .arg(format!("tcp://{}", scfg.registry_proxy));
-    let child =
-        spawn_detached(fwd, &ctx.svc_forward_log()).context("spawning the services forward")?;
-    std::fs::write(ctx.svc_forward_pidfile(), child.id().to_string())?;
-    // the guest's first pull must not race the host listener coming up
-    wait_for_socket(&listen, Duration::from_secs(5))
-        .context("services forward did not bind its socket")?;
+    Ok(Some(fwd))
+}
 
+fn services_cfg(ctx: &JobCtx) -> Result<&crate::config::Services> {
+    ctx.cfg.services.as_ref().ok_or_else(|| {
+        anyhow!(
+            "job declares services: but virtkit has no [services] config — \
+             cannot satisfy them (configure the registry proxy)"
+        )
+    })
+}
+
+/// Bring up the job's CI `services:` once the VM is ready (no-op without any): a
+/// root script in the guest starts the guest-side registry forward and each
+/// service container (see services.rs). The host-side forward it dials is already
+/// up — a supervisor child.
+async fn run_services_setup(ctx: &JobCtx) -> Result<()> {
+    let services = crate::services::from_env()?;
+    if services.is_empty() {
+        return Ok(());
+    }
+    let scfg = services_cfg(ctx)?;
     println!("virtkit: bringing up {} service(s)", services.len());
     let script = crate::services::setup_script(scfg, &services);
     // services are a systemd-guest feature (in-VM dockerd); use the configured shell
@@ -462,12 +541,11 @@ async fn start_services(ctx: &JobCtx) -> Result<()> {
     }
 }
 
-/// Spawn the per-job userspace switch (net.mode = "switch") as a detached child,
+/// The per-job userspace switch (net.mode = "switch"): a tied supervisor child
 /// listening on the guest's vsock-bridge socket (`<vsock.sock>_<net_port>`) with
-/// the `[egress]` allowlist, and wait for it to bind before the guest dials it.
-/// Long-lived (it serves the VM's whole life); torn down in cleanup via its
-/// pidfile. The switch is this same `virtkit` binary's `switch` subcommand.
-fn spawn_switch(ctx: &JobCtx, gateway: Ipv4Addr, prefix: u8) -> Result<()> {
+/// the `[egress]` allowlist, awaited until it binds before the guest dials it.
+/// The switch is this same `virtkit` binary's `switch` subcommand.
+fn spawn_switch(ctx: &JobCtx, gateway: Ipv4Addr, prefix: u8) -> Result<std::process::Child> {
     let cfg = &ctx.cfg;
     let listen = ctx.net_vsock_sock(cfg.net.net_port);
     let _ = std::fs::remove_file(&listen);
@@ -488,11 +566,10 @@ fn spawn_switch(ctx: &JobCtx, gateway: Ipv4Addr, prefix: u8) -> Result<()> {
     for name in effective_allow_names(cfg, ctx)? {
         cmd.arg("--allow-name").arg(name);
     }
-    let child = spawn_detached(cmd, &ctx.switch_log()).context("spawning the per-job switch")?;
-    std::fs::write(ctx.switch_pidfile(), child.id().to_string())?;
+    let child = spawn_tied_logged(cmd, &ctx.switch_log()).context("spawning the per-job switch")?;
     wait_for_socket(&listen, Duration::from_secs(5))
         .context("the per-job switch did not bind its socket")?;
-    Ok(())
+    Ok(child)
 }
 
 /// The switch `--allow-name` list for this job: the host `[egress]` cap by default,
@@ -603,70 +680,72 @@ fn prefix_to_netmask(prefix: u32) -> String {
     )
 }
 
-/// Stop the job's VM (and virtiofsd) if running: graceful ACPI power-button,
-/// then forced VMM shutdown, then SIGKILL. Idempotent — every step tolerates an
-/// already-gone process or a partial prepare.
-pub fn stop_vm(ctx: &JobCtx) {
-    if let Some(pid) = read_pidfile(&ctx.ch_pidfile()) {
-        let tag = ctx.job_dir.to_string_lossy().into_owned();
-        if pid_running(pid, &tag) {
-            if crate::vmm::libkrun_selected() {
-                // libkrun is a subprocess with no API socket, and on x86_64 its
-                // shutdown eventfd is unwired — there is no host-side ACPI poweroff.
-                // Terminate the process; the guest and its throwaway overlay go with
-                // it. SIGTERM first, then SIGKILL.
-                unsafe { libc::kill(pid, libc::SIGTERM) };
-                if !wait_gone(
-                    pid,
-                    &tag,
-                    Duration::from_secs(ctx.cfg.vm.shutdown_timeout_secs),
-                ) {
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
-                    wait_gone(pid, &tag, Duration::from_secs(3));
-                }
-            } else {
-                let api = ctx.api_sock();
-                let _ = ch_api_put(&api, "vm.power-button");
-                if !wait_gone(
-                    pid,
-                    &tag,
-                    Duration::from_secs(ctx.cfg.vm.shutdown_timeout_secs),
-                ) {
-                    let _ = ch_api_put(&api, "vm.shutdown");
-                    if !wait_gone(pid, &tag, Duration::from_secs(5)) {
-                        unsafe { libc::kill(pid, libc::SIGTERM) };
-                        if !wait_gone(pid, &tag, Duration::from_secs(3)) {
-                            unsafe { libc::kill(pid, libc::SIGKILL) };
-                            wait_gone(pid, &tag, Duration::from_secs(3));
-                        }
-                    }
-                }
+/// Signal the job's supervisor and wait for it to go — everything it owns (the
+/// switch, virtiofsds, forwards, the VMM after its graceful guest shutdown)
+/// follows, by its TERM handler or by PDEATHSIG. Idempotent: tolerates a missing
+/// or stale pidfile (the job-dir cmdline tag guards against pid reuse).
+pub fn stop_supervisor(ctx: &JobCtx) {
+    let Some(pid) = read_pidfile(&ctx.supervisor_pidfile()) else {
+        return;
+    };
+    let tag = ctx.job_dir.to_string_lossy().into_owned();
+    if !pid_running(pid, &tag) {
+        return;
+    }
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    // the supervisor's own teardown runs the graceful guest shutdown; give it
+    // that budget plus margin before the hammer.
+    let grace = Duration::from_secs(ctx.cfg.vm.shutdown_timeout_secs + 15);
+    if !wait_gone(pid, &tag, grace) {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        wait_gone(pid, &tag, Duration::from_secs(3));
+    }
+}
+
+/// Gracefully stop the supervisor's own VMM child: ACPI power-button over the API
+/// socket, then vm.shutdown, then SIGTERM/SIGKILL — each step only if the previous
+/// one did not end the process. libkrun has no API socket: TERM then KILL.
+fn graceful_vmm_stop(ctx: &JobCtx, child: &mut std::process::Child) {
+    let timeout = Duration::from_secs(ctx.cfg.vm.shutdown_timeout_secs);
+    if crate::vmm::libkrun_selected() {
+        unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+        if !wait_child_gone(child, timeout) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        return;
+    }
+    let api = ctx.api_sock();
+    let _ = ch_api_put(&api, "vm.power-button");
+    if !wait_child_gone(child, timeout) {
+        let _ = ch_api_put(&api, "vm.shutdown");
+        if !wait_child_gone(child, Duration::from_secs(5)) {
+            unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+            if !wait_child_gone(child, Duration::from_secs(3)) {
+                let _ = child.kill();
+                let _ = child.wait();
             }
-        }
-    }
-    for pidfile in [
-        ctx.vfsd_pidfile(),
-        ctx.tools_vfsd_pidfile(),
-        ctx.switch_pidfile(),
-    ] {
-        if let Some(pid) = read_pidfile(&pidfile)
-            && pid_running(pid, &ctx.job_dir.to_string_lossy())
-        {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-        }
-    }
-    // the detached virtkit forward children (services registry proxy, ssh-agent) if started
-    for pidfile in [ctx.svc_forward_pidfile(), ctx.ssh_agent_forward_pidfile()] {
-        if let Some(pid) = read_pidfile(&pidfile)
-            && pid_running(pid, &ctx.job_dir.to_string_lossy())
-        {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
         }
     }
 }
 
+/// Poll the held child (exact — no /proc parsing, no pid-reuse race) until it
+/// exits or `timeout` passes.
+fn wait_child_gone(child: &mut std::process::Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 pub fn cleanup(ctx: &JobCtx) -> Result<()> {
-    stop_vm(ctx);
+    stop_supervisor(ctx);
     crate::net::release(ctx);
     match std::fs::remove_dir_all(&ctx.job_dir) {
         Ok(()) => Ok(()),
@@ -675,10 +754,27 @@ pub fn cleanup(ctx: &JobCtx) -> Result<()> {
     }
 }
 
+/// Spawn a tied child (PDEATHSIG — it dies with this process, see
+/// `spawn::spawn_tied`) with stdout+stderr appended to a log file. The
+/// supervisor's spawn primitive: children need no pidfiles, killing the
+/// supervisor cascades.
+fn spawn_tied_logged(mut cmd: Command, log: &Path) -> Result<std::process::Child> {
+    let logfile = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .with_context(|| format!("opening {}", log.display()))?;
+    cmd.stdin(Stdio::null())
+        .stdout(logfile.try_clone()?)
+        .stderr(logfile);
+    crate::spawn::spawn_tied(cmd).map_err(Into::into)
+}
+
 /// Spawn a long-lived child in its own process group (it must survive this
 /// short-lived executor stage and never receive its signals), stdout+stderr
 /// appended to a log file. The returned Child is never killed on drop; later
-/// stages find the process again through its pidfile.
+/// stages find the process again through its pidfile. Only the job supervisor is
+/// spawned this way — everything else is its tied child.
 fn spawn_detached(mut cmd: Command, log: &Path) -> Result<std::process::Child> {
     let logfile = std::fs::OpenOptions::new()
         .create(true)

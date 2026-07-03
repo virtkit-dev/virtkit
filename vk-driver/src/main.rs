@@ -100,6 +100,13 @@ enum GitlabCmd {
     },
     /// cleanup_exec: stop the VM and remove the job state (idempotent)
     Cleanup,
+    /// internal: the detached per-job supervisor prepare spawns — owns the job's
+    /// switch/virtiofsds/forwards/VMM as tied children until SIGTERM'd by cleanup
+    #[command(hide = true)]
+    Supervise {
+        /// the job dir (pid-reuse guard on the cmdline; must match the environment)
+        job_dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1027,6 +1034,10 @@ async fn cli_main() -> ExitCode {
                 },
                 // can't reach/drive the VM: environment problem, job is retryable
                 Err(e) => fail(&e, ctx.system_failure),
+            },
+            GitlabCmd::Supervise { job_dir } => match vm::supervise(&ctx, &job_dir).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, 1),
             },
             GitlabCmd::Cleanup => match vm::cleanup(&ctx) {
                 Ok(()) => ExitCode::SUCCESS,
