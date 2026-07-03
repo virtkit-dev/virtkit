@@ -94,6 +94,90 @@ pub async fn ensure_unit(
     Ok(crate::compose::merged_config(&image_cfg, unit))
 }
 
+/// A unit's content fingerprint — the canonical-UUID identity `ensure` stamps as the
+/// image's ext4 UUID: `fingerprint(manifest digest)` for `image:` units,
+/// `fingerprint(stage key)` for `build:` ones. Resolved over the network, exactly as
+/// the ensure itself will.
+#[allow(dead_code)] // wired up by the executor services switchover
+pub async fn unit_fingerprint(unit: &crate::compose::Unit, build: &BuildOpts) -> Result<String> {
+    match &unit.source {
+        crate::compose::Source::Build {
+            dockerfiles,
+            context,
+            target,
+            args,
+        } => {
+            let mut build_args = build.build_args.clone();
+            build_args.extend(args.iter().cloned());
+            let contexts = vec![context.clone(); dockerfiles.len()];
+            let key = crate::build::target_stage_key(
+                dockerfiles,
+                &contexts,
+                &build_args,
+                target.as_deref(),
+            )?;
+            Ok(crate::ensure::fingerprint(&[&key]))
+        }
+        crate::compose::Source::Image(image) => {
+            let digest = crate::oci::resolve_digest(image)
+                .await
+                .with_context(|| format!("resolving {image}"))?;
+            Ok(crate::ensure::fingerprint(&[&digest]))
+        }
+    }
+}
+
+/// Ensure a unit's image in the shared content-addressed `store` and return its
+/// image path + merged runtime config. The store key is the unit's fingerprint, so
+/// every consumer wanting the same content shares one image: concurrent ensures
+/// serialize on a per-fingerprint `flock` — the first pays the pull/build, the rest
+/// find it fresh (the UUID check inside the lock). Each ensure bumps a per-entry
+/// `.used` marker so a later GC can sweep by idle age — a cache hit never rebuilds
+/// the image, so its ext4 mtime is not a usage signal on its own. Nothing here
+/// removes store entries; GC (which must also sweep the sibling `<fp>.lock` files) is
+/// a follow-up, like the instruction cache's.
+#[allow(dead_code)] // wired up by the executor services switchover
+pub async fn ensure_unit_store(
+    unit: &crate::compose::Unit,
+    store: &Path,
+    build: &BuildOpts,
+) -> Result<(PathBuf, RunConfig)> {
+    let fp = unit_fingerprint(unit, build).await?;
+    let dir = store.join(&fp);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let ext4 = dir.join("image.ext4");
+    // The flock blocks until granted — potentially for a whole concurrent pull/build —
+    // so acquire it on a blocking thread rather than parking an async worker, and hold
+    // the guard across the ensure below.
+    let lock_path = store.join(format!("{fp}.lock"));
+    let _lock = tokio::task::spawn_blocking(move || lock_exclusive(&lock_path))
+        .await
+        .context("unit store lock task")??;
+    let config = ensure_unit(unit, &ext4, build).await?;
+    // GC readiness: record last use on every ensure (hit or miss), best-effort.
+    let _ = std::fs::File::create(dir.join(".used"));
+    Ok((ext4, config))
+}
+
+/// A held image lock; released when dropped (flock releases on the last close).
+struct LockGuard {
+    _file: std::fs::File,
+}
+
+/// Blocking exclusive `flock` on `path` (created if absent). Advisory and
+/// filesystem-local — fine for a runner state dir; a store on NFS is unsupported.
+fn lock_exclusive(path: &Path) -> Result<LockGuard> {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    // SAFETY: the fd is owned by `f`, which the guard keeps alive; flock returns
+    // 0 or -1/errno and blocks until the lock is granted.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("locking {}", path.display()));
+    }
+    Ok(LockGuard { _file: f })
+}
+
 /// The `n`th static service address, counted from the TOP of the subnet down
 /// (`n = 0` → broadcast - 1). DHCP leases (a dev VM, a CI job VM) grow from the
 /// bottom (.2 up), so the two never collide in practice.
@@ -246,6 +330,77 @@ fn create_overlay(ext4: &Path, overlay: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+
+    #[test]
+    fn build_unit_fingerprints_key_the_store() {
+        // scratch-only builds resolve offline; the fingerprint follows the content.
+        let tmp = std::env::temp_dir().join(format!("vk-unitfp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let write = |name: &str, content: &str| -> crate::compose::Unit {
+            let dir = tmp.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("Dockerfile"), content).unwrap();
+            crate::compose::parse(
+                &format!("services:\n  {name}:\n    build: ./{name}\n"),
+                &tmp,
+            )
+            .unwrap()
+            .pop()
+            .unwrap()
+        };
+        let a = write("aa", "FROM scratch\nENV X=1\n");
+        let b = write("bb", "FROM scratch\nENV X=2\n");
+        let c = write("cc", "FROM scratch\nENV X=1\n"); // same content as aa
+        let opts = BuildOpts {
+            build_args: vec![],
+            kernel: "/nonexistent".into(),
+            cloud_hypervisor: "/nonexistent".into(),
+            agent: "/nonexistent".into(),
+            cache_registry: Some("none".into()),
+            cache_insecure: false,
+        };
+        let fp = |u: &crate::compose::Unit| block_on(unit_fingerprint(u, &opts)).unwrap();
+        assert_ne!(fp(&a), fp(&b)); // different content -> different store entries
+        assert_eq!(fp(&a), fp(&c)); // same content -> one shared entry
+        assert!(crate::ensure::parse_uuid(&fp(&a)).is_some()); // canonical UUID form
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn store_lock_serializes_holders() {
+        let tmp = std::env::temp_dir().join(format!("vk-unitlock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("x.lock");
+        let guard = lock_exclusive(&path).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = path.clone();
+        let t = std::thread::spawn(move || {
+            let _g = lock_exclusive(&p2).unwrap(); // blocks until the first drops
+            tx.send(()).unwrap();
+        });
+        // the second locker must still be waiting …
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "second flock holder did not block"
+        );
+        drop(guard);
+        // … and proceeds once released.
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("second flock holder never acquired");
+        t.join().unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn static_ips_grow_from_the_subnet_top() {
