@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-03
+
 ### Added
 
 - `vk check` verifies the host is usable by the current user — `/dev/kvm`
@@ -386,7 +388,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/wallix/virtkit/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/wallix/virtkit/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/wallix/virtkit/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/wallix/virtkit/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/wallix/virtkit/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/wallix/virtkit/compare/v0.2.0...v0.2.1
