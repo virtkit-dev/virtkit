@@ -21,8 +21,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use vk_core::fleetctl::{Reply, Request, UnitStatus};
 
-use crate::vmm::Vmm;
-
 /// One fleet VM unit: `name:ext4:ip/cidr:cid[:flags]`, where `flags` is a
 /// comma-separated subset of `workdir`/`autostart`. The agent (PID 1) always
 /// execs the image's captured entrypoint (VIRTKIT_MODE=service). The `workdir`
@@ -506,7 +504,7 @@ async fn handle_control(conn: tokio::net::UnixStream, mgr: Arc<Manager>) -> Resu
 /// address, attached to the shared switch over vsock. A `workdir` unit (the runner)
 /// additionally gets the live repo (workdir + git dir) over virtiofs, READ-ONLY: its
 /// entrypoint assembles the appliance from /workdir and execs systemd. Returns the
-/// cloud-hypervisor child plus any virtiofsd children (so the caller can stop them).
+/// VMM child plus any virtiofsd children (so the caller can stop them).
 #[allow(clippy::too_many_arguments)]
 fn boot_service(
     svc: &Service,
@@ -600,21 +598,20 @@ fn boot_service(
         pass_fds: Vec::new(),
     };
     let log = std::fs::File::create(&console)?;
-    let ch = crate::vmm::CloudHypervisor {
-        bin: cloud_hypervisor.to_path_buf(),
-    }
-    .command(&spec)
-    .stdin(Stdio::null())
-    .stdout(log.try_clone()?)
-    .stderr(log)
-    .spawn()
-    .with_context(|| format!("spawning {}", cloud_hypervisor.display()))?;
-    Ok((ch, aux))
+    let vmm = crate::vmm::selected(cloud_hypervisor);
+    let child = vmm
+        .command(&spec)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .spawn()
+        .with_context(|| format!("spawning {}", vmm.name()))?;
+    Ok((child, aux))
 }
 
 /// Boot the interactive dev VM (the former launch-builder.sh NET=lan, in Rust): two virtiofs shares
 /// (workdir + the git worktree), a CoW overlay keyed on the base fs UUID, and
-/// DHCP networking. Returns the cloud-hypervisor
+/// DHCP networking. Returns the VMM
 /// child plus the virtiofsd children (so the caller can stop them on shutdown).
 fn boot_vm(
     b: &VmOpts,
@@ -770,16 +767,15 @@ fn boot_vm(
         pass_fds: Vec::new(),
     };
     let log = std::fs::File::create(&console)?;
-    let ch = crate::vmm::CloudHypervisor {
-        bin: cloud_hypervisor.to_path_buf(),
-    }
-    .command(&spec)
-    .stdin(Stdio::null())
-    .stdout(log.try_clone()?)
-    .stderr(log)
-    .spawn()
-    .with_context(|| format!("spawning {}", cloud_hypervisor.display()))?;
-    Ok((ch, aux))
+    let vmm = crate::vmm::selected(cloud_hypervisor);
+    let child = vmm
+        .command(&spec)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .spawn()
+        .with_context(|| format!("spawning {}", vmm.name()))?;
+    Ok((child, aux))
 }
 
 /// Create a CoW qcow2 `overlay` over the ro raw `ext4` base. The backing reference is

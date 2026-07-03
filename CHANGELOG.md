@@ -40,6 +40,8 @@ All notable changes to virtkit will be documented in this file.
   when the source stage changes, instead of restoring a stale cached snapshot.
 - `COPY --from=<stage>` with an absolute source copies the stage's path, not
   the host's.
+- the fleet boots its units and the dev VM with the selected VMM backend
+  (libkrun by default) instead of always Cloud Hypervisor.
 
 ## [0.4.0] - 2026-07-02
 
