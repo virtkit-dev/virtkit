@@ -621,6 +621,25 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// The guest script for the trailing command. Empty: a boot-info probe. One
+/// argument: a shell one-liner, taken verbatim (`-- 'echo a | nc b 1234'`).
+/// Several: an argv — each word quoted so its boundaries survive the guest's
+/// script shell, like `docker run`: `-- sh -c 'complex | script'` reaches the
+/// guest exactly as typed.
+fn user_script(command: &[String]) -> String {
+    match command {
+        [] => {
+            "echo PID1=$(cat /proc/1/comm); id; uname -a; cat /etc/os-release | head -1".to_string()
+        }
+        [script] => script.clone(),
+        argv => argv
+            .iter()
+            .map(|a| sh_quote(a))
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
 async fn drive(
     ch: &mut Child,
     addr: &SocketAddr,
@@ -652,11 +671,7 @@ async fn drive(
     if args.shell {
         return run_shell(addr).await;
     }
-    let user_script = if args.command.is_empty() {
-        "echo PID1=$(cat /proc/1/comm); id; uname -a; cat /etc/os-release | head -1".to_string()
-    } else {
-        args.command.join(" ")
-    };
+    let user_script = user_script(&args.command);
     // A `--workdir` share mounts the live tree at WORKDIR_MOUNT; run the command there so it
     // sees the shared files and writes its outputs back to the host.
     let body = match &args.workdir {
@@ -1167,6 +1182,27 @@ impl Drop for VmSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_script_preserves_argv_boundaries() {
+        // several words: an argv — quoting keeps `sh -c '…'` intact end to end.
+        let argv = ["sh", "-c", "echo PING | nc redis 6390"].map(String::from);
+        assert_eq!(user_script(&argv), "'sh' '-c' 'echo PING | nc redis 6390'");
+        // one word with spaces: a shell one-liner, verbatim.
+        assert_eq!(user_script(&["cd /x && make".to_string()]), "cd /x && make");
+        // plain argv stays a plain command line.
+        assert_eq!(
+            user_script(&["cargo", "build", "--release"].map(String::from)),
+            "'cargo' 'build' '--release'"
+        );
+        // empty: the boot-info probe.
+        assert!(user_script(&[]).starts_with("echo PID1="));
+        // embedded single quotes survive the quoting.
+        assert_eq!(
+            user_script(&["echo", "it's"].map(String::from)),
+            "'echo' 'it'\\''s'"
+        );
+    }
 
     /// Boot a session with a read-only source disk, mount it in the guest with the
     /// agent's native `mount`, and read a file from it — the COPY --from primitive.

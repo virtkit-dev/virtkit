@@ -402,7 +402,10 @@ enum Cmd {
         /// Implies --ssh-agent.
         #[arg(long = "ssh-host", value_name = "ALIAS")]
         ssh_host: Vec<String>,
-        /// Command to run in the guest (default: a boot-info probe)
+        /// Command to run in the guest (default: a boot-info probe). Several
+        /// words are an argv, each passed as typed (like docker run — use
+        /// `sh -c '…'` for shell features); a single word is a shell one-liner
+        /// run verbatim
         #[arg(last = true)]
         command: Vec<String>,
     },

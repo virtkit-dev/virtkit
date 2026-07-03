@@ -11,6 +11,13 @@ All notable changes to virtkit will be documented in this file.
   through the instruction cache) instead of a named on-disk store, everything
   dies with the run, and the `/run/vk` control filesystem replaces virtctl.
 
+### Fixed
+
+- `vk run IMG -- cmd arg ...` preserves each argument as typed (docker-run
+  semantics) instead of joining them with spaces, so quoting and shell
+  metacharacters in an argument no longer leak; use `-- sh -c '...'` for shell
+  features.
+
 ## [0.5.0] - 2026-07-03
 
 ### Added
