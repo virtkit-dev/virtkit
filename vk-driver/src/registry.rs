@@ -171,7 +171,7 @@ pub fn exists(rg: &Registry, name: &str, tag: &str) -> bool {
 }
 
 /// Try to pull a bundle tagged `<name>:<tag>` (a content fingerprint) and place its
-/// `runner.ext4` at `dest`, for the build-sharing path (`fleet --registry`): a
+/// `runner.ext4` at `dest`, for the build-sharing path: a
 /// worktree reuses a bundle another already built+pushed instead of rebuilding.
 /// Returns `Ok(false)` when the tag is absent (or the registry is unreachable) — the
 /// caller then builds. The sparse reassembly is byte-exact, so the placed ext4 keeps

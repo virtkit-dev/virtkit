@@ -108,7 +108,7 @@ enum Commands {
     Connect,
     /// Bridge a guest tap NIC to a host network backend (gvproxy) over --socket,
     /// using the qemu vhost framing (BE32 length + ethernet frame). The guest
-    /// gets a real L2 interface on the shared fleet LAN with no host privileges:
+    /// gets a real L2 interface on the shared LAN with no host privileges:
     /// the backend runs unprivileged on the host and egresses via host sockets.
     /// Addressing (IP/route/DNS) is configured separately. E.g.:
     ///   vk-agent -s vsock://1024 net --iface eth0
@@ -141,26 +141,6 @@ enum Commands {
 }
 
 fn main() {
-    // Multi-call binary: invoked through a `virtctl` symlink (user-provided, e.g. via
-    // `fleet --vm-symlink`), it is the fleet control client (talks to the manager over
-    // vsock) — no --socket, its own args.
-    let argv0 = std::env::args().next().unwrap_or_default();
-    if std::path::Path::new(&argv0)
-        .file_name()
-        .and_then(|s| s.to_str())
-        == Some("virtctl")
-    {
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("building the tokio runtime");
-        if let Err(e) = rt.block_on(vk_core::fleetctl::run_client(&args)) {
-            eprintln!("virtctl: {e:#}");
-            std::process::exit(1);
-        }
-        return;
-    }
     // Local fs freeze/thaw, no socket: the host runs `vk-agent fsfreeze -f|-u
     // <mountpoint>` in the guest over the exec channel to quiesce the root fs for a
     // consistent snapshot. Built in (vs util-linux) so it works on any guest; handled

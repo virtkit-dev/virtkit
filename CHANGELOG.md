@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Removed
+
+- The `vk fleet` command and the in-guest `virtctl` client. `vk run --compose`
+  covers the workload with run's lifecycle: images materialize per run (warm
+  through the instruction cache) instead of a named on-disk store, everything
+  dies with the run, and the `/run/vk` control filesystem replaces virtctl.
+
 ## [0.5.0] - 2026-07-03
 
 ### Added

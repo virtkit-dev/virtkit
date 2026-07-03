@@ -29,7 +29,7 @@ pub struct Config {
     /// Egress allowlist for `net.mode = "switch"`: the per-job switch refuses DNS
     /// names outside `allow_name` and direct connections outside `allow_ip` (plus
     /// the IPs it resolved for an allowed name). Empty (the default) = unrestricted
-    /// — the dev fleet leaves it empty; CI sets it as the corp egress gate.
+    /// — dev use leaves it empty; CI sets it as the corp egress gate.
     pub egress: Egress,
     /// On-demand docker-image → bootable-bundle conversion, backing the
     /// `MICROVM_IMAGE: docker/<name>[:tag|@sha256:…]` form; absent = that
@@ -320,7 +320,7 @@ impl Registry {
             .then(|| PathBuf::from(&self.repo))
     }
 
-    /// Build a `Registry` for the build-sharing path (`fleet --registry`), from the
+    /// Build a `Registry` for the build-sharing path, from the
     /// CLI flags rather than a config file. `generic_kernel`/`keep` are irrelevant to
     /// push/pull-by-fingerprint (only `resolve` boots), so they take their defaults.
     pub fn for_share(

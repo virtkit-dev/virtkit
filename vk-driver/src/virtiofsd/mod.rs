@@ -1,6 +1,6 @@
 //! Bundled vhost-user virtio-fs daemon — the `vk virtiofsd …` subcommand, so
 //! virtkit ships its own virtio-fs backend instead of a separate virtiofsd binary
-//! (the fleet and the executor spawn `current_exe virtiofsd …`).
+//! (the run/units paths and the executor spawn `current_exe virtiofsd …`).
 //!
 //! FUSE requests are served by the vendored libkrun fs engine
 //! (`Server<PassthroughFs>` — the same code the libkrun backend uses in-process),

@@ -21,6 +21,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
@@ -1849,6 +1850,33 @@ fn le32(buf: &mut [u8], off: usize, v: u32) {
 
 fn be32(buf: &mut [u8], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
+}
+
+/// The base ext4's filesystem UUID (blkid, fallback dumpe2fs), used to name the
+/// overlay so a rebuilt base never reuses a stale overlay, and (via ensure) as the
+/// content fingerprint that decides a rebuild.
+pub(crate) fn fs_uuid(ext4: &Path) -> Option<String> {
+    if let Ok(out) = Command::new("blkid")
+        .args(["-o", "value", "-s", "UUID"])
+        .arg(ext4)
+        .output()
+        && out.status.success()
+    {
+        let u = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !u.is_empty() {
+            return Some(u);
+        }
+    }
+    let out = Command::new("dumpe2fs").arg("-h").arg(ext4).output().ok()?;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(rest) = line.strip_prefix("Filesystem UUID:") {
+            let u = rest.trim().to_string();
+            if !u.is_empty() {
+                return Some(u);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

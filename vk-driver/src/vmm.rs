@@ -4,7 +4,7 @@
 //!
 //! The command is returned un-spawned: each caller owns its own lifecycle (the CI
 //! path spawns it detached with a pidfile and shuts it down over the CH API
-//! socket; the dev `run`/`fleet`/build paths hold the `Child` and kill it). Running
+//! socket; the dev `run`/build paths hold the `Child` and kill it). Running
 //! every VMM as a subprocess keeps the per-VM crash/seccomp boundary and lets an
 //! in-process VMM (e.g. libkrun) plug in later as a self-subcommand without
 //! touching callers.

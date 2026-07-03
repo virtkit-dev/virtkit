@@ -1,6 +1,6 @@
 //! Guest-side tap NIC bridged to a host network backend over a raw stream.
 //!
-//! How a microVM joins the shared fleet LAN with no host privileges: a userspace
+//! How a microVM joins the shared LAN with no host privileges: a userspace
 //! network backend (gvproxy today) runs unprivileged on the host and egresses
 //! through ordinary host sockets; virtkit-agent — root in the guest, on a kernel we
 //! control, where AppArmor's unprivileged-userns restriction does not apply —
@@ -11,7 +11,7 @@
 //! big-endian length prefix followed by the ethernet frame. The backend is
 //! swappable behind this framing — a native Rust netstack could replace gvproxy
 //! with no change here or in the guest. Addressing (IP/route/DNS) is deliberately
-//! the caller's job, so the fleet's address policy lives outside the transport.
+//! the caller's job, so the LAN's address policy lives outside the transport.
 
 use anyhow::{Context, Result, bail};
 use log::{debug, info};

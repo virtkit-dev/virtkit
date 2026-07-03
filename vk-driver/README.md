@@ -1,7 +1,7 @@
 # virtkit — host driver
 
 The `virtkit` binary is the host side of the toolkit: image building and
-conversion, the userspace network switch, the fleet orchestrator, and the
+conversion, the userspace network switch, and the
 GitLab CI executor. See the [workspace README](../README.md) for an
 architecture overview and build instructions.
 
@@ -13,27 +13,11 @@ minimal working configs for each mode are shown below.
 
 ## Subcommands
 
-### Fleet orchestrator
-
-Boots a dev VM + named service VMs on one shared `*.lan` LAN (like
-docker-compose but as real VMs). Runs the network switch in-process.
-
-```sh
-vk fleet \
-  --vm vm.ext4 \
-  --workdir /path/to/repo \
-  --service redis:redis.ext4:192.168.127.10/24:3 \
-  --service mysql:mysql.ext4:192.168.127.11/24:4 \
-  --hosts redis=192.168.127.10,mysql=192.168.127.11
-```
-
----
-
 ### Network switch
 
-Userspace L2 gateway for microVMs: ARP, DHCP, a fleet DNS resolver, and
+Userspace L2 gateway for microVMs: ARP, DHCP, a service-name DNS resolver, and
 transparent TCP/UDP egress — no host privileges, multiple VMs on one LAN.
-Run in-process by `fleet`; can also run standalone:
+Spawned per run/job; can also run standalone:
 
 ```sh
 vk switch \

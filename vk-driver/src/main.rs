@@ -26,7 +26,6 @@ mod embed;
 mod ensure;
 mod executor;
 mod ext4;
-mod fleet;
 mod image;
 mod initramfs;
 mod jobctx;
@@ -43,6 +42,7 @@ mod run;
 mod scratch;
 mod services;
 mod source;
+mod spawn;
 mod sshagent;
 mod sshconf;
 mod switch;
@@ -273,7 +273,7 @@ enum Cmd {
         #[arg(long = "allow", value_name = "PUBKEY")]
         allow: Vec<PathBuf>,
     },
-    /// Userspace L2 network gateway for microVM(s) — the fleet switch. Accepts the
+    /// Userspace L2 network gateway for microVM(s). Accepts the
     /// qemu vhost transport on each VM's hybrid-vsock guest-port socket, answers
     /// ARP + serves DHCP, and proxies guest TCP/UDP out through the host's own
     /// sockets — no host privileges, multi-VM on one LAN. Replaces gvproxy.
@@ -288,7 +288,7 @@ enum Cmd {
         /// Subnet prefix length.
         #[arg(long, default_value_t = 24)]
         prefix: u8,
-        /// fleet name the gateway resolver answers locally: name=ip (repeatable)
+        /// service name the gateway resolver answers locally: name=ip (repeatable)
         #[arg(long = "host")]
         host: Vec<String>,
         /// egress allowlist — destination IPv4 CIDR for direct (non-proxied) egress,
@@ -300,83 +300,6 @@ enum Cmd {
         /// `corp.example.com` (repeatable).
         #[arg(long = "allow-name", value_name = "SUFFIX")]
         allow_name: Vec<String>,
-    },
-    /// Orchestrate a fleet of microVMs on one shared LAN: ensure each ext4 is current,
-    /// run the switch in-process, and boot the service VMs (init=service-vm-init,
-    /// static *.lan addresses) plus the interactive dev VM (--vm; DHCP,
-    /// virtiofs /workdir + git worktree). --listen adds any extra VM's vsock.
-    Fleet {
-        #[arg(long, default_value = "192.168.127.1")]
-        gateway: std::net::Ipv4Addr,
-        #[arg(long, default_value_t = 24)]
-        prefix: u8,
-        #[arg(long, default_value_t = 1024)]
-        net_port: u32,
-        /// fleet host map for /etc/hosts (name=ip,...), passed to the guests
-        #[arg(long)]
-        hosts: Option<String>,
-        #[arg(long, default_value = "/usr/local/lib/vk/vmlinux")]
-        kernel: PathBuf,
-        #[arg(long, default_value = "cloud-hypervisor")]
-        cloud_hypervisor: PathBuf,
-        /// extra vsock socket(s) the switch should also listen on (e.g. the VM's)
-        #[arg(long = "listen")]
-        listen: Vec<PathBuf>,
-        /// service VM to boot: name:ext4:ip/cidr:cid[:flags] where flags is a
-        /// comma-separated subset of workdir,autostart (repeatable)
-        #[arg(long = "service")]
-        service: Vec<String>,
-        /// build-service-image.sh to (re)build a stale/missing service ext4
-        #[arg(long)]
-        service_build: Option<PathBuf>,
-        /// docker image a service ext4 is built from: name=ref (repeatable)
-        #[arg(long = "service-image")]
-        service_image: Vec<String>,
-        /// ensure the ext4 images are current (build the stale ones) and exit, without
-        /// starting the switch or booting any VM
-        #[arg(long)]
-        ensure_only: bool,
-        /// interactive dev VM ext4 to boot in-process (omit to boot the VM separately)
-        #[arg(long)]
-        vm: Option<PathBuf>,
-        /// build script to (re)build a stale/missing VM ext4
-        #[arg(long)]
-        vm_build: Option<PathBuf>,
-        /// VM hostname [derived from ext4 filename when omitted]
-        #[arg(long)]
-        vm_name: Option<String>,
-        /// host dir shared rw as /workdir in the VM [current dir]
-        #[arg(long)]
-        workdir: Option<PathBuf>,
-        /// VM's git dir to share at the same guest path (worktree); derived from
-        /// the workdir when omitted
-        #[arg(long)]
-        git_dir: Option<PathBuf>,
-        /// VM vsock CID
-        #[arg(long, default_value_t = 3)]
-        vm_cid: u32,
-        /// VM vCPUs
-        #[arg(long, default_value_t = 4)]
-        vm_cpus: u32,
-        /// VM RAM
-        #[arg(long, default_value = "8G")]
-        vm_mem: String,
-        /// extra host directory to share into the VM: host_path:guest_path[:ro] (repeatable)
-        #[arg(long = "vm-share", value_name = "HOST:GUEST[:ro]")]
-        vm_share: Vec<String>,
-        /// symlink to create inside the VM after virtiofs mounts: src:dest (repeatable)
-        #[arg(long = "vm-symlink", value_name = "SRC:DEST")]
-        vm_symlink: Vec<String>,
-        /// public key to authorise for ssh-serve (OpenSSH format, repeatable)
-        #[arg(long = "vm-ssh-key", value_name = "PUBKEY")]
-        vm_ssh_keys: Vec<String>,
-        /// UID translation for extra VM shares (repeatable; applies to all --vm-share);
-        /// format: `type:from:to[:count]` — types: map, guest, host, squash-guest, squash-host, forbid-guest
-        #[arg(long = "vm-uid-map", value_name = "MAP")]
-        vm_uid_map: Vec<String>,
-        /// GID translation for extra VM shares (repeatable; same format as --vm-uid-map)
-        #[arg(long = "vm-gid-map", value_name = "MAP")]
-        vm_gid_map: Vec<String>,
     },
     /// Dev: run a docker/OCI image as a microVM — boot it from a native ext4 disk
     /// (or a cpio initramfs in RAM with --ram), virtkit-agent as PID 1 over vsock, and
@@ -936,7 +859,7 @@ async fn cli_main() -> ExitCode {
         let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
         let uuid = ensure::fingerprint(&refs);
         println!("{uuid}");
-        if fleet::fs_uuid(ext4).as_deref() == Some(uuid.as_str()) {
+        if ext4::fs_uuid(ext4).as_deref() == Some(uuid.as_str()) {
             return ExitCode::SUCCESS;
         }
         return exit_code(1);
@@ -1061,129 +984,6 @@ async fn cli_main() -> ExitCode {
             Err(e) => fail(&e, 1),
         };
     }
-    if let Cmd::Fleet {
-        gateway,
-        prefix,
-        net_port,
-        hosts,
-        kernel,
-        cloud_hypervisor,
-        listen,
-        service,
-        service_build,
-        service_image,
-        ensure_only,
-        vm,
-        vm_build,
-        vm_name,
-        workdir,
-        git_dir,
-        vm_cid,
-        vm_cpus,
-        vm_mem,
-        vm_share,
-        vm_symlink,
-        vm_uid_map,
-        vm_gid_map,
-        vm_ssh_keys,
-    } = &cli.cmd
-    {
-        // Parse --vm-share host:guest[:ro] entries.
-        let mut extra_shares = Vec::new();
-        for spec in vm_share {
-            let parts: Vec<&str> = spec.splitn(3, ':').collect();
-            let (host, guest, readonly) = match parts.as_slice() {
-                [host, guest] => (*host, *guest, false),
-                [host, guest, ro] if *ro == "ro" => (*host, *guest, true),
-                [_, _, flag] => {
-                    return fail(
-                        &anyhow::anyhow!("bad --vm-share flag {flag:?} (want `ro`)"),
-                        2,
-                    );
-                }
-                _ => {
-                    return fail(
-                        &anyhow::anyhow!("bad --vm-share {spec:?} (want host:guest[:ro])"),
-                        2,
-                    );
-                }
-            };
-            if guest.contains(' ') {
-                return fail(
-                    &anyhow::anyhow!("bad --vm-share {spec:?}: guest path may not contain spaces"),
-                    2,
-                );
-            }
-            extra_shares.push(fleet::ShareSpec {
-                host_dir: PathBuf::from(host),
-                guest_path: guest.to_string(),
-                readonly,
-                uid_maps: vm_uid_map.clone(),
-                gid_maps: vm_gid_map.clone(),
-            });
-        }
-        for spec in vm_symlink.iter() {
-            if spec.contains(' ') {
-                return fail(
-                    &anyhow::anyhow!("bad --vm-symlink {spec:?}: src:dest may not contain spaces"),
-                    2,
-                );
-            }
-        }
-        // Resolve the VM hostname (explicit --vm-name, else the ext4 file stem) and
-        // validate it: it lands unquoted in VIRTKIT_HOSTNAME on the kernel cmdline, so
-        // only RFC-1123 chars are allowed — no spaces or `=` to inject extra params.
-        let vm_name = vm.as_ref().map(|ext4| {
-            vm_name.clone().unwrap_or_else(|| {
-                ext4.file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("vm")
-                    .to_string()
-            })
-        });
-        if let Some(name) = &vm_name
-            && (name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
-        {
-            return fail(
-                &anyhow::anyhow!(
-                    "vm name {name:?} is not a valid hostname (allowed: [A-Za-z0-9-]); pass --vm-name"
-                ),
-                2,
-            );
-        }
-        let vm_opts = vm.as_ref().map(|ext4| fleet::VmOpts {
-            ext4: ext4.clone(),
-            name: vm_name.clone().unwrap(),
-            workdir: workdir.clone().unwrap_or_else(|| PathBuf::from(".")),
-            git_dir: git_dir.clone(),
-            cid: *vm_cid,
-            cpus: *vm_cpus,
-            mem: vm_mem.clone(),
-            build_script: vm_build.clone(),
-            extra_shares,
-            extra_symlinks: vm_symlink.clone(),
-            ssh_keys: vm_ssh_keys.to_vec(),
-        });
-        return match fleet::run(
-            *gateway,
-            *prefix,
-            *net_port,
-            hosts.clone(),
-            kernel.clone(),
-            cloud_hypervisor.clone(),
-            listen.clone(),
-            service.clone(),
-            vm_opts,
-            service_build.clone(),
-            service_image.clone(),
-            *ensure_only,
-        )
-        .await
-        {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => fail(&e, 1),
-        };
-    }
     let ctx = match JobCtx::new(cfg) {
         Ok(ctx) => ctx,
         Err(e) => return fail(&e, 2),
@@ -1247,7 +1047,6 @@ async fn cli_main() -> ExitCode {
         Cmd::Check { .. }
         | Cmd::Registry { .. }
         | Cmd::Switch { .. }
-        | Cmd::Fleet { .. }
         | Cmd::Run { .. }
         | Cmd::Mkext { .. }
         | Cmd::Qcow2Verify { .. }

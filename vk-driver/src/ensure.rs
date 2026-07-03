@@ -1,15 +1,7 @@
-//! `fleet` ensure — bring each VM's ext4 up to date before boot. Each image is
-//! content-addressed: its ext4 UUID is a fingerprint of what it was built from, so
-//! the staleness check is just a UUID compare. The staleness check and the fingerprint
-//! recipe both live in the build script (`build-{builder,service}-image.sh`), which
-//! calls `vk fingerprint` to compute the UUID and `blkid` to check the existing
-//! image. This module just invokes the build script; the script exits 0 immediately
-//! when the image is already fresh.
+//! Content fingerprints for image staleness: an ext4's UUID is a fingerprint of
+//! what it was built from, so a staleness check is just a UUID compare. `vk
+//! fingerprint` exposes the recipe so build scripts compute the same value.
 
-use std::path::Path;
-use std::process::Command;
-
-use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 fn sha256_hex(data: impl AsRef<[u8]>) -> String {
@@ -35,29 +27,6 @@ pub fn fingerprint(parts: &[&str]) -> String {
         &hex[16..20],
         &hex[20..32]
     )
-}
-
-/// Run the VM's build script. The script owns the staleness check (UUID compare)
-/// and exits 0 immediately when the image is already fresh.
-pub fn ensure_vm(build_script: &Path) -> Result<()> {
-    run_build(build_script, &[])
-}
-
-/// Run build-service-image.sh <image> <name>. The script owns the staleness check
-/// and exits 0 immediately when the image is already fresh.
-pub fn ensure_service(name: &str, image: &str, build_script: &Path) -> Result<()> {
-    run_build(build_script, &[image, name])
-}
-
-fn run_build(script: &Path, args: &[&str]) -> Result<()> {
-    let st = Command::new(script)
-        .args(args)
-        .status()
-        .with_context(|| format!("running {}", script.display()))?;
-    if !st.success() {
-        bail!("{} failed ({st})", script.display());
-    }
-    Ok(())
 }
 
 #[cfg(test)]

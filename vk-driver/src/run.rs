@@ -384,7 +384,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     };
 
     // Working directory: share a host dir read-write over virtiofs at WORKDIR_MOUNT (no uid
-    // map, like the fleet dev VM — virtiofsd's `--sandbox=none` writes back as the host
+    // map — virtiofsd's `--sandbox=none` writes back as the host
     // user), so the guest command reads/writes the live tree and its outputs land on the
     // host. The command then runs with its cwd there (see `drive`). virtio-fs needs shared
     // guest memory, so `mem` gains `shared=on`.
@@ -395,7 +395,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         // libkrun mounts host_dir directly (built-in virtio-fs); only cloud-hypervisor
         // needs the external virtiofsd on `sock`.
         if !crate::vmm::libkrun_selected() {
-            virtiofsd = Some(crate::fleet::spawn_virtiofsd(
+            virtiofsd = Some(crate::spawn::spawn_virtiofsd(
                 &sock,
                 host_dir,
                 false,
@@ -522,7 +522,7 @@ fn spawn_ssh_agent_forward(vsock: &Path, host_sock: &OsStr, work: &Path) -> Resu
         .stdout(log.try_clone()?)
         .stderr(log);
     // self-reap if virtkit dies before teardown (spawn_tied)
-    crate::fleet::spawn_tied(cmd).context("spawning the ssh-agent forward")
+    crate::spawn::spawn_tied(cmd).context("spawning the ssh-agent forward")
 }
 
 /// How `--ssh-agent`/`--ssh-host` resolve for a launch: the host agent socket to expose,
@@ -611,7 +611,7 @@ fn spawn_ssh_agent_proxy(
     }
     // self-reap if virtkit dies before teardown (spawn_tied)
     cmd.stdout(log.try_clone()?).stderr(log);
-    crate::fleet::spawn_tied(cmd).context("spawning the ssh-agent proxy")
+    crate::spawn::spawn_tied(cmd).context("spawning the ssh-agent proxy")
 }
 
 /// Wait for the in-guest virtkit-agent, run the command, relay its output. `ssh_config`, if
@@ -775,7 +775,7 @@ fn spawn_vmm(vmm: &dyn Vmm, spec: &crate::vmm::VmSpec) -> Result<Child> {
     }
     // Self-reap the VM if virtkit dies before teardown — a leaked VMM is a whole
     // running guest, not just an idle helper (spawn_tied).
-    crate::fleet::spawn_tied(cmd).context("spawning the VMM")
+    crate::spawn::spawn_tied(cmd).context("spawning the VMM")
 }
 
 /// Report a VMM that exited during boot: name the backend that actually ran (libkrun
@@ -882,7 +882,7 @@ async fn spawn_vm_switch(
         .stdout(swlog.try_clone()?)
         .stderr(swlog);
     // self-reap if virtkit dies before teardown (spawn_tied)
-    let mut child = crate::fleet::spawn_tied(cmd)
+    let mut child = crate::spawn::spawn_tied(cmd)
         .with_context(|| format!("spawning {} switch", exe.display()))?;
     let dl = Instant::now() + Duration::from_secs(5);
     while !listen.exists() {
@@ -990,7 +990,7 @@ pub(crate) async fn boot_session(
     if let Some(ctx) = context {
         let sock = work.join("context.fs.sock");
         if !crate::vmm::libkrun_selected() {
-            virtiofsd = Some(crate::fleet::spawn_virtiofsd(&sock, ctx, true, &[], &[])?);
+            virtiofsd = Some(crate::spawn::spawn_virtiofsd(&sock, ctx, true, &[], &[])?);
         }
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS=context:{CONTEXT_MOUNT}"));
         shares.push(crate::vmm::FsShare {

@@ -1,5 +1,5 @@
 //! `vk-agent init` — PID 1 for guest images that ship no systemd. It brings
-//! the rootfs and (optionally) the fleet LAN up, then either supervises a `serve`
+//! the rootfs and (optionally) the shared LAN up, then either supervises a `serve`
 //! agent you drive over vsock (the default — a managed VM), or `exec`s the image's
 //! own entrypoint (`VIRTKIT_MODE=service`).
 //!
@@ -585,7 +585,7 @@ fn link_ci_tools(cmdline: &HashMap<String, String>) {
     }
 }
 
-/// Bring eth0 up on the shared fleet LAN: fork the tap bridge (`net`) to the host
+/// Bring eth0 up on the shared LAN: fork the tap bridge (`net`) to the host
 /// switch over VIRTKIT_NET_PORT, then DHCP or a static address.
 fn configure_network(cmdline: &HashMap<String, String>) {
     let Some(port) = cmdline.get("VIRTKIT_NET_PORT") else {

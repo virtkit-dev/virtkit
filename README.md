@@ -7,8 +7,7 @@ and gets its own kernel, so whatever runs inside is fully isolated from the
 host. Everything ships in two static binaries and runs as an ordinary user
 process: the only thing it needs from the host is access to `/dev/kvm`.
 
-From one tool you get a local **dev fleet** (a dev VM plus service VMs, like
-docker-compose but with real VMs) and a **GitLab CI executor** (a fresh,
+From one tool you get isolated dev VMs and a **GitLab CI executor** (a fresh,
 throwaway VM for every job) — and each piece (image building, networking, the
 in-VM agent) is usable on its own.
 
@@ -35,11 +34,6 @@ vk run -f Dockerfile --net -- ./run-tests.sh
 - **Give VMs internet access with a flag.** Pass `--net` and the VM can reach
   the network — no bridges, tap devices, or firewall rules to configure on the
   host, and no privileges needed.
-- **Run a dev fleet.** `vk fleet` boots your dev VM alongside service VMs
-  (redis, mysql, …) on a shared network where every VM is reachable as
-  `<name>.lan`. From inside the dev VM, start and stop services on demand with
-  `virtctl` (expose it with
-  `fleet --vm-symlink /usr/local/bin/vk-agent:/usr/local/bin/virtctl`).
 - **Isolate GitLab CI jobs.** The custom executor gives every job a fresh
   microVM and destroys it when the job ends. Concurrent jobs are supported, and
   Docker images from your `.gitlab-ci.yml` are converted on demand.
@@ -55,7 +49,7 @@ vk run -f Dockerfile --net -- ./run-tests.sh
 
 | Binary | Role |
 | --- | --- |
-| `vk` | The host-side tool. Boots and manages VMs, builds and converts images, runs the fleet and the GitLab executor, and provides the guest network. Self-contained: the guest kernel and `vk-agent` are embedded. |
+| `vk` | The host-side tool. Boots and manages VMs, builds and converts images, runs the GitLab executor, and provides the guest network. Self-contained: the guest kernel and `vk-agent` are embedded. |
 | `vk-agent` | Runs inside the guest as PID 1. Brings the system up (mounts, networking, hostname, shared folders, optional SSH) and lets the host run commands inside the VM. |
 
 ## Under the hood
@@ -72,8 +66,8 @@ For the curious — none of this is needed to use the tool:
 - Images are converted to native ext4 disks entirely in userspace, and each
   disk is fingerprinted by its build inputs — checking whether a cached image
   is stale is instant.
-- The host talks to guests over `vsock`: the same channel carries shells, CI
-  job stages, and fleet control.
+- The host talks to guests over `vsock`: the same channel carries shells and CI
+  job stages.
 - The release binaries are static (musl) and built from a fully pinned Alpine
   toolchain, so builds are byte-for-byte reproducible; `./update.sh` records
   the pins.
@@ -95,10 +89,9 @@ toolchain, the base-image digest and the apk pins together.
 
 - `run` — boot an image (or a Dockerfile target) as a microVM and run a command
   or an interactive shell in it.
-- `fleet` — orchestrate the dev fleet (dev VM + service VMs on one LAN).
 - `gitlab config` / `gitlab prepare` / `gitlab run` / `gitlab cleanup` — the GitLab custom-executor lifecycle.
 - `build` — build a Dockerfile into a bootable image, each `RUN` in a microVM.
-- `switch` — the guest network gateway (run in-process by `fleet`).
+- `switch` — the guest network gateway (spawned per run/job).
 - `mkext-tar` / `mkext` — build a bootable ext4 image from a rootfs tar / directory.
 - `oci-pull` — pull and flatten an OCI image to a rootfs tar.
 - `registry push` / `registry pull` — push/pull guest bundles to/from an OCI
@@ -114,8 +107,6 @@ toolchain, the base-image digest and the apk pins together.
 - `serve` — the in-VM command server; `exec` / `connect` / `forward` are the
   host-side clients (e.g. `connect` works as an SSH `ProxyCommand`).
 - `net` — connect a guest NIC to the host's network switch.
-- Invoked as `virtctl` (a symlink exposed via `fleet --vm-symlink`), it is the
-  fleet control client (`virtctl start <unit>`, …).
 
 ## Layout
 

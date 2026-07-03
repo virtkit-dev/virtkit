@@ -82,7 +82,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "tls1
 # oci-client declares jsonwebtoken with no crypto backend; force the pure-Rust one
 # (its `rustls-tls` path would pick aws-lc-rs). Present for feature unification only.
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
-# fleet switch (`switch`): a userspace L2 gateway for microVMs. etherparse parses
+# the `switch` subcommand: a userspace L2 gateway for microVMs. etherparse parses
 # and builds ethernet/ARP/IPv4/UDP (checksums); ipstack terminates arbitrary guest
 # TCP/UDP for transparent egress through the host's sockets (the gvproxy replacement).
 etherparse = "0.20"

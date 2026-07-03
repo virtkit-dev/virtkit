@@ -1,4 +1,4 @@
-//! Userspace L2 network gateway + switch for a fleet of microVMs.
+//! Userspace L2 network gateway + switch for a LAN of microVMs.
 //!
 //! Each VM reaches us over Cloud Hypervisor's hybrid vsock: the guest dials host
 //! CID 2 on a port and CH connects to the host unix socket `<vsock.sock>_<port>`,
@@ -57,7 +57,7 @@ type Mac = [u8; 6];
 type PortId = u32;
 
 /// Egress policy — which off-subnet destinations the switch originates flows to.
-/// Default `AllowAll` (the dev fleet is unrestricted); CI passes an allowlist.
+/// Default `AllowAll` (dev use is unrestricted); CI passes an allowlist.
 /// Direct (non-proxied) TCP/UDP egress is gated by destination IP (`allows_ip`);
 /// the in-switch http(s) proxy gates web egress by hostname (`allows_host`).
 #[derive(Clone, Default)]
@@ -251,7 +251,7 @@ struct Switch {
     /// IPv4 packets from any VM destined off-subnet -> the shared ipstack
     egress_tx: UnboundedSender<Vec<u8>>,
     next_port: AtomicU32,
-    /// fleet name -> IP, answered by the gateway resolver (replaces /etc/hosts)
+    /// service name -> IP, answered by the gateway resolver (replaces /etc/hosts)
     hosts: Arc<HashMap<String, Ipv4Addr>>,
     /// upstream resolver (the host's own) for everything else
     upstream: SocketAddr,
@@ -313,7 +313,7 @@ pub async fn run(
 
     eprintln!(
         "switch: {} port(s), gateway {}/{} (ARP + DHCP + DNS + egress, shared LAN); \
-         resolver: {} fleet name(s), upstream {}; egress: {}",
+         resolver: {} service name(s), upstream {}; egress: {}",
         listen.len(),
         gateway,
         prefix,
@@ -427,7 +427,7 @@ impl Switch {
                         send(inner, port, &reply);
                     }
                 } else if let Some((src_port, query)) = dns_query(ip, self.cfg.gateway) {
-                    // DNS to the gateway: the resolver answers fleet names and forwards
+                    // DNS to the gateway: the resolver answers service names and forwards
                     // the rest to the host's resolver. Async (it may dial upstream), so
                     // hand it off with a clone of the port's sink and a copy of the query.
                     if let (Some(tx), Some(cip)) = (inner.ports.get(&port).cloned(), ipv4_src(ip)) {
@@ -579,7 +579,7 @@ fn host_upstream() -> SocketAddr {
     SocketAddr::new(FALLBACK_DNS.into(), DNS_PORT)
 }
 
-/// Resolve a guest DNS query and send the response back to it: fleet names are
+/// Resolve a guest DNS query and send the response back to it: service names are
 /// answered from the local map; everything else is forwarded to the host's resolver.
 #[allow(clippy::too_many_arguments)]
 async fn handle_dns(
@@ -594,7 +594,7 @@ async fn handle_dns(
     egress: Arc<EgressGuard>,
 ) {
     let response = if let Some(r) = local_answer(&query, &hosts) {
-        Some(r) // fleet name: on-subnet, not subject to egress pinning
+        Some(r) // service name: on-subnet, not subject to egress pinning
     } else if let Some((name, _qtype, qend)) = parse_question(&query) {
         if egress.name_allowed(&name) {
             // forward, then pin the A-records so the guest's connection is allowed
@@ -639,7 +639,7 @@ async fn forward_upstream(query: &[u8], upstream: SocketAddr) -> Option<Vec<u8>>
     Some(buf)
 }
 
-/// If the query's name is a known fleet name, build the answer locally (an A record
+/// If the query's name is a known service name, build the answer locally (an A record
 /// for A queries, NODATA otherwise so the name never leaks upstream); else None.
 fn local_answer(query: &[u8], hosts: &HashMap<String, Ipv4Addr>) -> Option<Vec<u8>> {
     let (name, qtype, qend) = parse_question(query)?;
@@ -1048,7 +1048,7 @@ mod tests {
         assert!(e.allows_host("api.github.com"));
         assert!(!e.allows_host("evil.com"));
         assert!(!e.allows_host("corp.example.com.evil.com")); // not a real suffix match
-        // no rules => allow all (the dev fleet default)
+        // no rules => allow all (the dev default)
         assert!(matches!(Egress::new(&[], &[]).unwrap(), Egress::AllowAll));
         let any = Egress::default();
         assert!(any.allows_ip("8.8.8.8".parse().unwrap(), 443) && any.allows_host("evil.com"));
@@ -1243,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_answers_fleet_a_records() {
+    fn resolver_answers_service_a_records() {
         let mut hosts = HashMap::new();
         hosts.insert("redis.lan".to_string(), Ipv4Addr::new(192, 168, 127, 3));
         // A query for a known name -> one A answer with the mapped IP.
