@@ -232,6 +232,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     let mut primary: Option<vk_core::runcfg::RunConfig> = None;
     let mut primary_idx: Option<usize> = None;
     let mut primary_hostname: Option<String> = None;
+    let mut primary_volumes: Vec<crate::compose::Volume> = Vec::new();
     let dockerfile_ext4 = if let Some(name) = &args.service {
         let idx = compose_units
             .iter()
@@ -253,6 +254,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         let cfg = crate::compose::merged_config(&built.config, unit);
         image_env = cfg.env.clone();
         primary_hostname = Some(unit.hostname.clone());
+        primary_volumes = unit.volumes.clone();
         primary = Some(cfg);
         primary_idx = Some(idx);
         Some(out)
@@ -519,13 +521,14 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     // host. The command then runs with its cwd there (see `drive`). virtio-fs needs shared
     // guest memory, so `mem` gains `shared=on`.
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
-    let mut virtiofsd: Option<Child> = None;
-    let shared_mem = if let Some(host_dir) = &args.workdir {
+    let mut virtiofsds: Vec<Child> = Vec::new();
+    let mut virtiofs = String::new();
+    if let Some(host_dir) = &args.workdir {
         let sock = work.join("workdir.fs.sock");
         // libkrun mounts host_dir directly (built-in virtio-fs); only cloud-hypervisor
         // needs the external virtiofsd on `sock`.
         if !crate::vmm::libkrun_selected() {
-            virtiofsd = Some(crate::spawn::spawn_virtiofsd(
+            virtiofsds.push(crate::spawn::spawn_virtiofsd(
                 &sock,
                 host_dir,
                 false,
@@ -533,17 +536,45 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
                 &[],
             )?);
         }
-        cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS=work:{WORKDIR_MOUNT}"));
+        virtiofs.push_str(&format!("work:{WORKDIR_MOUNT}"));
         shares.push(crate::vmm::FsShare {
             tag: "work".into(),
             socket: sock,
             host_dir: host_dir.clone(),
             read_only: false,
         });
-        true
-    } else {
-        false
-    };
+    }
+    // A --service primary gets its compose volumes, exactly like a sibling unit
+    // would: bind mounts over virtiofs. Persistent state (a dev VM's
+    // ~/.vscode-server, say) is whatever the compose file binds to a host dir —
+    // the VM itself stays throwaway.
+    for (i, vol) in primary_volumes.iter().enumerate() {
+        let tag = format!("vol{i}");
+        let sock = work.join(format!("vfsd-{tag}.sock"));
+        if !crate::vmm::libkrun_selected() {
+            virtiofsds.push(crate::spawn::spawn_virtiofsd(
+                &sock,
+                &vol.host,
+                vol.read_only,
+                &[],
+                &[],
+            )?);
+        }
+        if !virtiofs.is_empty() {
+            virtiofs.push(',');
+        }
+        virtiofs.push_str(&format!("{tag}:{}", vol.guest));
+        shares.push(crate::vmm::FsShare {
+            tag,
+            socket: sock,
+            host_dir: vol.host.clone(),
+            read_only: vol.read_only,
+        });
+    }
+    if !virtiofs.is_empty() {
+        cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS={virtiofs}"));
+    }
+    let shared_mem = !shares.is_empty();
 
     // 3. boot
     let console = work.join("console.log");
@@ -583,13 +614,15 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     };
     let mut ch = match spawn_vmm(vmm.as_ref(), &spec) {
         Ok(ch) => ch,
-        // The --net switch and --workdir virtiofsd are already spawned; kill them so a
-        // failed boot does not leak host-side children (a leaked `vk virtiofsd` would,
-        // e.g., hold this binary's file busy for the next build).
+        // The --net switch and the virtiofsds (--workdir plus any --service compose
+        // volumes) are already spawned; kill them so a failed boot does not leak
+        // host-side children (a leaked `vk virtiofsd` would, e.g., hold this binary's
+        // file busy for the next build).
         Err(e) => {
             for mut child in services
                 .drain(..)
-                .chain([switch.take(), virtiofsd.take()].into_iter().flatten())
+                .chain(virtiofsds.drain(..))
+                .chain(switch.take())
             {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -636,7 +669,8 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     let _ = ch.wait();
     for mut child in services
         .drain(..)
-        .chain([switch.take(), virtiofsd.take()].into_iter().flatten())
+        .chain(virtiofsds.drain(..))
+        .chain(switch.take())
     {
         let _ = child.kill();
         let _ = child.wait();

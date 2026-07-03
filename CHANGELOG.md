@@ -11,8 +11,8 @@ All notable changes to virtkit will be documented in this file.
   everything is torn down when the run exits.
 - `vk run --compose <file> --service NAME` boots that compose service as the
   primary VM (like `docker compose run`): its config becomes the command's
-  environment, with no trailing command its entrypoint+cmd runs, and only its
-  `depends_on` closure boots alongside.
+  environment, with no trailing command its entrypoint+cmd runs, only its
+  `depends_on` closure boots alongside — and its compose volumes are applied.
 
 ### Changed
 
