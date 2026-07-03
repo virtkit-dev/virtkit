@@ -3,6 +3,7 @@
 //! embedded SSH server (`ssh`/`sftp`, feature `ssh`). The shared host↔guest protocol
 //! and runtime helpers live in the `vk-core` crate.
 
+pub mod ctlfs;
 pub mod diskmount;
 pub mod fsfreeze;
 pub mod init;

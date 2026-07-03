@@ -1,7 +1,7 @@
 # virtkit — host driver
 
 The `virtkit` binary is the host side of the toolkit: image building and
-conversion, the userspace network switch, and the
+conversion, the userspace network switch, the compose service runner, and the
 GitLab CI executor. See the [workspace README](../README.md) for an
 architecture overview and build instructions.
 
@@ -12,6 +12,23 @@ See [`config.example.toml`](config.example.toml) for the full reference;
 minimal working configs for each mode are shown below.
 
 ## Subcommands
+
+### Compose services
+
+`vk run --compose` boots a docker-compose file's services as microVMs on one
+shared LAN (each resolves by name). Three shapes: alongside an image/`-f`
+primary, as the primary itself (`--service`, like `docker compose run`), or
+alone — compose up, held until ctrl-c. Inside the primary,
+`/run/vk/services/<name>/{state,ctl,log,error}` reads states and
+starts/stops services with plain shell writes.
+
+```sh
+vk run --compose compose.yml -f Dockerfile --net -- cargo test
+vk run --compose compose.yml --service app        # docker compose run app
+vk run --compose compose.yml                      # compose up (ctrl-c stops)
+```
+
+---
 
 ### Network switch
 

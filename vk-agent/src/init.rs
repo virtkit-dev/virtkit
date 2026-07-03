@@ -28,6 +28,8 @@
 //!                        and link the CI tools it carries (git/git-lfs/…) onto
 //!                        the PATH, skipping any the image already provides
 //!   VIRTKIT_TMPFS        /path:size[,/path:size] RAM scratch dirs (e.g. CI /builds)
+//!   VIRTKIT_CTL=1        mount the compose control fs at /run/vk (a FUSE bridge
+//!                        to the host service manager over vsock)
 //!   VIRTKIT_SSH=1        also run ssh-serve (vsock 2222); keys VIRTKIT_SSH_KEYS
 //!                        (comma-separated `type:base64` entries, no spaces),
 //!                        user VIRTKIT_SSH_USER (default dev)
@@ -105,6 +107,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     }
 
     maybe_ssh_serve(&cmdline);
+    maybe_ctlfs(&cmdline);
     maybe_ssh_agent(&cmdline);
     let serve = spawn_serve(socket, inactivity_timeout)?;
     install_term_handler();
@@ -720,6 +723,17 @@ fn wait_for_iface(name: &str, tries: u32) -> bool {
 }
 
 /// Optionally run the embedded SSH server (VS Code Remote-SSH) on vsock 2222.
+/// VIRTKIT_CTL=1: fork the agent's `ctlfs` — the compose control plane mounted
+/// at /run/vk (each operation bridges to the host manager over vsock).
+fn maybe_ctlfs(cmdline: &HashMap<String, String>) {
+    if cmdline.get("VIRTKIT_CTL").map(String::as_str) != Some("1") {
+        return;
+    }
+    if let Err(e) = fork_agent(&["ctlfs".into(), "/run/vk".into()]) {
+        warn!("vk-agent init: control fs failed to start: {e}");
+    }
+}
+
 fn maybe_ssh_serve(cmdline: &HashMap<String, String>) {
     if cmdline.get("VIRTKIT_SSH").map(String::as_str) != Some("1") {
         return;

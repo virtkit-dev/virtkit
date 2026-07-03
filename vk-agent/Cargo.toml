@@ -10,6 +10,7 @@ license.workspace = true
 vk-core = { path = "../vk-core" }
 anyhow.workspace = true
 clap = { workspace = true, features = ["string"] }
+fuser = { workspace = true }
 libc.workspace = true
 log.workspace = true
 # ssh-serve only (feature `ssh`): russh + russh-sftp pull a full SSH/crypto stack

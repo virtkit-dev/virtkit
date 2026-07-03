@@ -98,6 +98,9 @@ rand = "0.10"
 # fixed release); it is suppressed in .cargo/audit.toml (see that file).
 russh = { version = "0.61.2", default-features = false, features = ["flate2", "ring", "rsa"] }
 russh-sftp = "2"
+# /run/vk control filesystem (`ctlfs`, vk-agent): pure-Rust FUSE, mounted by
+# PID-1 root directly through the mount syscall (no fusermount, no libfuse).
+fuser = { version = "0.17", default-features = false }
 simplelog = "0"
 thiserror = "2"
 tokio-serde = { version = "0", features = ["messagepack"] }

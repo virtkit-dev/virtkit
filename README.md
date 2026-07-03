@@ -7,9 +7,10 @@ and gets its own kernel, so whatever runs inside is fully isolated from the
 host. Everything ships in two static binaries and runs as an ordinary user
 process: the only thing it needs from the host is access to `/dev/kvm`.
 
-From one tool you get isolated dev VMs and a **GitLab CI executor** (a fresh,
-throwaway VM for every job) — and each piece (image building, networking, the
-in-VM agent) is usable on its own.
+From one tool you get **compose services as real VMs** (docker-compose style,
+per run or long-lived) and a **GitLab CI executor** (a fresh, throwaway VM for
+every job) — and each piece (image building, networking, the in-VM agent) is
+usable on its own.
 
 ## A taste
 
@@ -34,6 +35,14 @@ vk run -f Dockerfile --net -- ./run-tests.sh
 - **Give VMs internet access with a flag.** Pass `--net` and the VM can reach
   the network — no bridges, tap devices, or firewall rules to configure on the
   host, and no privileges needed.
+- **Run compose services as VMs.** `vk run --compose compose.yml` boots the
+  services (redis, mysql, …) on a shared network where each resolves by name —
+  alongside your command, as the primary itself (`--service`, like
+  `docker compose run`), or on their own (compose up, until ctrl-c). From
+  inside the primary, `/run/vk/services/<name>/{state,ctl,log}` reads states
+  and starts/stops services with plain shell writes. For a dev VM,
+  `vk run --ssh` boots any image with SSH access (VS Code Remote-SSH works
+  out of the box).
 - **Isolate GitLab CI jobs.** The custom executor gives every job a fresh
   microVM and destroys it when the job ends. Concurrent jobs are supported, and
   Docker images from your `.gitlab-ci.yml` are converted on demand.
@@ -66,8 +75,8 @@ For the curious — none of this is needed to use the tool:
 - Images are converted to native ext4 disks entirely in userspace, and each
   disk is fingerprinted by its build inputs — checking whether a cached image
   is stale is instant.
-- The host talks to guests over `vsock`: the same channel carries shells and CI
-  job stages.
+- The host talks to guests over `vsock`: the same channel carries shells, CI
+  job stages, and service control.
 - The release binaries are static (musl) and built from a fully pinned Alpine
   toolchain, so builds are byte-for-byte reproducible; `./update.sh` records
   the pins.

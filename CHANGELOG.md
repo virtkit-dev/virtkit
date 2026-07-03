@@ -14,6 +14,9 @@ All notable changes to virtkit will be documented in this file.
   primary itself with `--service NAME` (like `docker compose run`, entrypoint
   and volumes applied); or alone — compose up, services only, held until
   ctrl-c.
+- The primary VM controls its compose services through `/run/vk`:
+  `services/<name>/{state,ctl,log,error}` — `echo restart > ctl` blocks until
+  done, plain reads report state and console tails. No client binary needed.
 - `vk run --ssh` serves SSH into the guest with no sshd in the image, and
   prints a ready-to-paste ssh command (keys from `--ssh-key` or your standard
   `~/.ssh` identities); VS Code Remote-SSH works out of the box.

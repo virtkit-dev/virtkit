@@ -141,6 +141,17 @@ enum Commands {
 }
 
 fn main() {
+    // The compose control filesystem (no --socket: it dials the manager over
+    // vsock itself); handled before clap since init forks it with plain args.
+    let mut argv = std::env::args();
+    if argv.nth(1).as_deref() == Some("ctlfs") {
+        let mountpoint = std::env::args().nth(2).unwrap_or_else(|| "/run/vk".into());
+        if let Err(e) = vk_agent::ctlfs::run(std::path::Path::new(&mountpoint)) {
+            eprintln!("vk-agent ctlfs: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // Local fs freeze/thaw, no socket: the host runs `vk-agent fsfreeze -f|-u
     // <mountpoint>` in the guest over the exec channel to quiesce the root fs for a
     // consistent snapshot. Built in (vs util-linux) so it works on any guest; handled
