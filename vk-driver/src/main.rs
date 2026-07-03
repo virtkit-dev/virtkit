@@ -33,6 +33,7 @@ mod jobctx;
 #[cfg(feature = "libkrun")]
 mod libkrun_sys;
 mod local;
+mod manager;
 mod mkoci;
 mod net;
 mod oci;

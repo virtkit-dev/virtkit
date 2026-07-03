@@ -99,14 +99,21 @@ impl VsockPort {
     /// forwards to the host listener at `<base>_<port>` — the same `_<port>` suffix
     /// the hybrid-vsock host sockets already use.
     pub fn bridge(base: &Path, port: u32) -> Self {
-        let mut socket = base.as_os_str().to_owned();
-        socket.push(format!("_{port}"));
         VsockPort {
             port,
-            socket: socket.into(),
+            socket: hybrid_socket(base, port),
             listen: false,
         }
     }
+}
+
+/// The host-side socket for guest `port` on the hybrid-vsock convention:
+/// `<base>_<port>`. The single spelling of that suffix, shared by the bridge
+/// forwards and anything that dials the same socket directly.
+pub fn hybrid_socket(base: &Path, port: u32) -> PathBuf {
+    let mut socket = base.as_os_str().to_owned();
+    socket.push(format!("_{port}"));
+    socket.into()
 }
 
 /// Everything needed to boot one microVM, independent of the VMM.

@@ -421,6 +421,12 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         cmdline.push_str(&format!(" VIRTKIT_SSH_AGENT_PORT={SSH_AGENT_VSOCK_PORT}"));
     }
 
+    // With compose services declared, the agent exposes their control plane at
+    // /run/vk (a FUSE bridge to the manager over vsock).
+    if args.compose.is_some() && !compose_units.is_empty() {
+        cmdline.push_str(" VIRTKIT_CTL=1");
+    }
+
     // --ssh: the guest agent serves SSH over vsock (no sshd in the image). The
     // authorized keys ride the kernel cmdline whitespace-free as `type:base64`;
     // sessions run as root — the only user every image is guaranteed to have.
@@ -437,10 +443,14 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     }
 
     // Compose services: sibling unit VMs on the run switch, resolvable by alias
-    // over its DNS, torn down with the run. Each image materializes into the work
-    // dir per run — like the `-f` build itself, warmth comes from the instruction
-    // cache. Built before the switch spawns (the switch binds their sockets).
-    let mut svc_boot: Vec<(crate::units::Provisioned, PathBuf)> = Vec::new();
+    // over its DNS, torn down with the run. EVERY declared unit materializes into
+    // the work dir — like the `-f` build itself, warmth comes from the instruction
+    // cache — and is handed to the service manager, so the primary can start a
+    // profiled-down unit on demand over the control plane; only the enabled set
+    // (or the --service dependency closure) boots eagerly. Built before the
+    // switch spawns (the switch binds every unit's socket, up or down).
+    let mut svc_units: Vec<(crate::units::Provisioned, PathBuf)> = Vec::new();
+    let mut svc_start: Vec<String> = Vec::new();
     let mut svc_listen: Vec<PathBuf> = Vec::new();
     let mut svc_hosts: Vec<(String, String)> = Vec::new();
     if args.compose.is_some() {
@@ -453,11 +463,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             None => crate::compose::enabled(units, &args.profiles),
         };
         let (gw, prefix, _) = crate::net::switch_addrs(RUN_SUBNET)?;
-        let mut slot = 0u32;
-        for &i in &order {
-            if !on[i] {
-                continue;
-            }
+        for (slot, &i) in order.iter().enumerate() {
             let unit = &units[i];
             let dir = work.join(format!("svc-{}", unit.name));
             std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -465,25 +471,27 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             let built = build_service_image(args, unit, &ext4, kernel, agent)
                 .with_context(|| format!("service {}", unit.name))?;
             let config = crate::compose::merged_config(&built.config, unit);
-            let ip = crate::units::nth_static_ip(gw, prefix, slot)?;
+            let ip = crate::units::nth_static_ip(gw, prefix, slot as u32)?;
             svc_listen.push(dir.join(format!("vsock.sock_{NET_VSOCK_PORT}")));
             svc_hosts.push((unit.name.to_ascii_lowercase(), ip.to_string()));
             if unit.hostname != unit.name {
                 svc_hosts.push((unit.hostname.to_ascii_lowercase(), ip.to_string()));
             }
-            svc_boot.push((
+            svc_units.push((
                 crate::units::Provisioned {
                     name: unit.name.clone(),
                     hostname: unit.hostname.clone(),
                     ext4,
                     ip: format!("{ip}/{prefix}"),
-                    cid: crate::units::FIRST_SERVICE_CID + slot,
+                    cid: crate::units::FIRST_SERVICE_CID + slot as u32,
                     config,
                     volumes: unit.volumes.clone(),
                 },
                 dir,
             ));
-            slot += 1;
+            if on[i] {
+                svc_start.push(unit.name.clone());
+            }
         }
     }
 
@@ -507,35 +515,35 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         None
     };
 
-    // Boot the services, dependencies first, once the switch listens; every child
-    // joins the teardown set. No readiness wait (the compose contract): the run
-    // command retries its first connect.
-    let mut services: Vec<Child> = Vec::new();
-    if !svc_boot.is_empty() {
+    // Hand every declared unit to the manager, then boot the eager set through
+    // it, dependencies first, once the switch listens. No readiness wait (the
+    // compose contract): the run command retries its first connect. The same
+    // manager later serves the primary's control plane (start/stop on demand).
+    let manager = if svc_units.is_empty() {
+        None
+    } else {
         let (gw, _, _) = crate::net::switch_addrs(RUN_SUBNET)?;
-        for (svc, dir) in &svc_boot {
-            match crate::units::boot_unit(
-                svc,
-                dir,
-                kernel,
-                &args.cloud_hypervisor,
-                agent,
-                NET_VSOCK_PORT,
-                gw,
-            ) {
-                Ok((child, aux)) => {
-                    println!("virtkit: service {} booting ({})", svc.name, svc.ip);
-                    services.push(child);
-                    services.extend(aux);
+        Some(std::sync::Arc::new(crate::manager::Manager::new(
+            kernel.to_path_buf(),
+            args.cloud_hypervisor.clone(),
+            NET_VSOCK_PORT,
+            gw,
+            agent.to_path_buf(),
+            svc_units,
+        )))
+    };
+    if let Some(mgr) = &manager {
+        for name in &svc_start {
+            let reply = mgr.start(name);
+            if !reply.ok {
+                mgr.stop_all();
+                if let Some(mut c) = switch.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
                 }
-                Err(e) => {
-                    for mut c in services.drain(..).chain(switch.take()) {
-                        let _ = c.kill();
-                        let _ = c.wait();
-                    }
-                    return Err(e.context(format!("booting service {}", svc.name)));
-                }
+                bail!("booting service {name}: {}", reply.message);
             }
+            println!("virtkit: service {name}: {}", reply.message);
         }
     }
 
@@ -625,6 +633,14 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     if args.ssh {
         vsock_ports.push(crate::vmm::VsockPort::exec(&ssh_sock, SSH_VSOCK_PORT));
     }
+    // Control plane (guest→host): the primary dials CONTROL_PORT to reach the
+    // service manager; only wired when compose services are declared.
+    if manager.is_some() {
+        vsock_ports.push(crate::vmm::VsockPort::bridge(
+            &vsock,
+            vk_core::fleetctl::CONTROL_PORT,
+        ));
+    }
     let spec = crate::vmm::VmSpec {
         kernel: kernel.to_path_buf(),
         cmdline,
@@ -643,6 +659,18 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         api_socket: None,
         pass_fds,
     };
+    // Control server on the primary's hybrid-vsock control socket — only the
+    // primary's guest can reach it, so the control plane is scoped to this run.
+    if let Some(mgr) = &manager {
+        let ctl = crate::vmm::hybrid_socket(&vsock, vk_core::fleetctl::CONTROL_PORT);
+        let mgr = mgr.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::manager::control_server(&ctl, mgr).await {
+                eprintln!("virtkit: control server exited: {e:#}");
+            }
+        });
+    }
+
     let mut ch = match spawn_vmm(vmm.as_ref(), &spec) {
         Ok(ch) => ch,
         // The --net switch and the virtiofsds (--workdir plus any --service compose
@@ -650,11 +678,10 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         // host-side children (a leaked `vk virtiofsd` would, e.g., hold this binary's
         // file busy for the next build).
         Err(e) => {
-            for mut child in services
-                .drain(..)
-                .chain(virtiofsds.drain(..))
-                .chain(switch.take())
-            {
+            if let Some(mgr) = &manager {
+                mgr.stop_all();
+            }
+            for mut child in virtiofsds.drain(..).chain(switch.take()) {
                 let _ = child.kill();
                 let _ = child.wait();
             }
@@ -716,11 +743,10 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     }
     let _ = ch.kill();
     let _ = ch.wait();
-    for mut child in services
-        .drain(..)
-        .chain(virtiofsds.drain(..))
-        .chain(switch.take())
-    {
+    if let Some(mgr) = &manager {
+        mgr.stop_all();
+    }
+    for mut child in virtiofsds.drain(..).chain(switch.take()) {
         let _ = child.kill();
         let _ = child.wait();
     }
