@@ -467,8 +467,15 @@ fn resolve_stages(
                 vars.insert(arg.clone(), value);
                 continue;
             }
-            // expand $VAR / ${VAR} against the current scope, then key the result.
-            let instr = interp::expand_instruction(raw, &vars);
+            // expand $VAR / ${VAR} against the current scope, then key the result —
+            // except ENTRYPOINT/CMD, which Docker stores verbatim in the image
+            // config: any $VAR in them belongs to the *runtime* shell (a service's
+            // env overrides must reach it), not to the build scope. Expanding here
+            // would bake build-time values into the exported runtime config.
+            let instr = match raw {
+                Instruction::Entrypoint(_) | Instruction::Cmd(_) => raw.clone(),
+                _ => interp::expand_instruction(raw, &vars),
+            };
             // Content the key must track beyond the instruction text (Docker semantics —
             // the cache follows the bytes an instruction reads, not just its spelling):
             //   - a context COPY keys on the sha256 of the files it references, so
@@ -1669,6 +1676,17 @@ ENTRYPOINT run me
         let base = &r[&0].final_state;
         assert_eq!(base.entrypoint, ["/bin/app"]);
         assert_eq!(base.cmd, ["--serve"]);
+        // ENTRYPOINT/CMD are stored verbatim (Docker image-config semantics): a
+        // $VAR in them is the runtime shell's to expand — a compose environment
+        // override must be able to reach it — never baked at build time.
+        let p2 = plan_one(
+            "FROM scratch AS s\nENV A=built\nENTRYPOINT [\"sh\", \"-c\", \"echo $A\"]\n",
+            &ba,
+        );
+        let order2 = p2.all_order().unwrap();
+        let mut ex2 = DryRun::new();
+        let r2 = resolve_stages(&p2, &order2, &ba, &mut ex2, None).unwrap();
+        assert_eq!(r2[&0].final_state.entrypoint, ["sh", "-c", "echo $A"]);
         // an instruction-less child inherits everything
         let child = &r[&1].final_state;
         assert_eq!(child.entrypoint, ["/bin/app"]);
