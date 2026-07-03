@@ -20,6 +20,9 @@ use crate::vmm::Vmm;
 const VSOCK_PORT: u32 = 4444;
 /// vsock port the guest SSH-agent forwarder dials; the host splices it to `$SSH_AUTH_SOCK`.
 pub(crate) const SSH_AGENT_VSOCK_PORT: u32 = 2223;
+/// Guest vsock port the agent's ssh-serve listens on (`--ssh`); mirrors the
+/// agent's `SSH_VSOCK_PORT`.
+const SSH_VSOCK_PORT: u32 = 2222;
 /// vsock port the guest's tap bridge dials to reach the userspace switch.
 const NET_VSOCK_PORT: u32 = 1024;
 /// The run LAN: gateway .1, the run VM .2, services from the top down.
@@ -113,6 +116,12 @@ pub struct RunArgs {
     /// expose only these ~/.ssh/config host aliases (filtered agent + injected config);
     /// implies SSH-agent forwarding
     pub ssh_hosts: Vec<String>,
+    /// serve SSH into the guest (the agent's ssh-serve over vsock; no sshd in the
+    /// image) and print the ready-to-paste ssh command; sessions run as root
+    pub ssh: bool,
+    /// public keys authorised for `ssh` (OpenSSH format); empty = the standard
+    /// ~/.ssh/id_*.pub identities
+    pub ssh_keys: Vec<String>,
     pub command: Vec<String>,
 }
 
@@ -412,6 +421,21 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         cmdline.push_str(&format!(" VIRTKIT_SSH_AGENT_PORT={SSH_AGENT_VSOCK_PORT}"));
     }
 
+    // --ssh: the guest agent serves SSH over vsock (no sshd in the image). The
+    // authorized keys ride the kernel cmdline whitespace-free as `type:base64`;
+    // sessions run as root — the only user every image is guaranteed to have.
+    if args.ssh {
+        let keys = if args.ssh_keys.is_empty() {
+            default_ssh_pubkeys()?
+        } else {
+            args.ssh_keys.clone()
+        };
+        cmdline.push_str(&format!(
+            " VIRTKIT_SSH=1 VIRTKIT_SSH_KEYS={} VIRTKIT_SSH_USER=root",
+            encode_ssh_keys(&keys)?
+        ));
+    }
+
     // Compose services: sibling unit VMs on the run switch, resolvable by alias
     // over its DNS, torn down with the run. Each image materializes into the work
     // dir per run — like the `-f` build itself, warmth comes from the instruction
@@ -594,6 +618,13 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     if ssh.is_some() {
         vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, SSH_AGENT_VSOCK_PORT));
     }
+    // --ssh, host→guest: libkrun needs an explicit per-port listener socket;
+    // cloud-hypervisor ignores the entry (its hybrid base socket multiplexes
+    // every guest port behind the CONNECT handshake).
+    let ssh_sock = work.join("ssh.sock");
+    if args.ssh {
+        vsock_ports.push(crate::vmm::VsockPort::exec(&ssh_sock, SSH_VSOCK_PORT));
+    }
     let spec = crate::vmm::VmSpec {
         kernel: kernel.to_path_buf(),
         cmdline,
@@ -630,6 +661,24 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             return Err(e);
         }
     };
+
+    // The ProxyCommand splices ssh's stdio onto the guest's vsock ssh port, so
+    // the hostname after `root@` is only a known_hosts label. The host key is
+    // ephemeral (fresh per boot, reached over a private channel), hence the
+    // relaxed checking options.
+    if args.ssh {
+        let target = if crate::vmm::libkrun_selected() {
+            ssh_sock.display().to_string()
+        } else {
+            format!("vsock-mux://{}:{SSH_VSOCK_PORT}", vsock.display())
+        };
+        let exe = std::env::current_exe().context("locating the virtkit binary")?;
+        println!(
+            "virtkit: ssh: ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+             -o ProxyCommand=\"'{}' connect --to '{target}'\" root@vk-run",
+            exe.display()
+        );
+    }
 
     // Host side of the SSH-agent forward: the guest dials vsock port SSH_AGENT_VSOCK_PORT,
     // surfaced by cloud-hypervisor as <vsock.sock>_<port>. With --ssh-host a filtering proxy
@@ -759,6 +808,51 @@ struct SshAgentSetup {
 /// restricts it to the named `~/.ssh/config` aliases (their keys + injected config); a bare
 /// `--ssh-agent` forwards the whole agent. Returns `None` if forwarding is off or the host
 /// has no `$SSH_AUTH_SOCK`.
+/// Encode OpenSSH public keys for the kernel cmdline: `type:base64` entries
+/// joined by commas (the cmdline is whitespace-split, so spaces and the key
+/// comment are dropped); the agent decodes each back to `type base64` and hands
+/// it to ssh-serve as an authorized key.
+fn encode_ssh_keys(keys: &[String]) -> Result<String> {
+    let mut encoded = Vec::new();
+    for key in keys {
+        let mut parts = key.split_whitespace();
+        match (parts.next(), parts.next()) {
+            (Some(key_type), Some(base64)) => encoded.push(format!("{key_type}:{base64}")),
+            _ => {
+                bail!("--ssh-key {key:?} is not an OpenSSH public key (expected `type base64 ...`)")
+            }
+        }
+    }
+    Ok(encoded.join(","))
+}
+
+/// The default `--ssh` identities: the standard public keys under `~/.ssh`.
+fn default_ssh_pubkeys() -> Result<Vec<String>> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("--ssh with no --ssh-key needs $HOME to find ~/.ssh")?;
+    let keys = ssh_pubkeys_in(&home.join(".ssh"));
+    if keys.is_empty() {
+        bail!(
+            "--ssh: no public key under {} (id_ed25519/id_ecdsa/id_rsa) — pass --ssh-key",
+            home.join(".ssh").display()
+        );
+    }
+    Ok(keys)
+}
+
+// Each standard identity file holds a single key; `encode_ssh_keys` keys off the
+// first `type base64` pair, so only the first key of a file (were it multi-line) is
+// authorized — a non-issue for the id_*.pub these read.
+fn ssh_pubkeys_in(ssh_dir: &Path) -> Vec<String> {
+    ["id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"]
+        .iter()
+        .filter_map(|name| std::fs::read_to_string(ssh_dir.join(name)).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn ssh_agent_setup(args: &RunArgs) -> Option<SshAgentSetup> {
     if !args.ssh_agent && args.ssh_hosts.is_empty() {
         return None;
@@ -1416,6 +1510,33 @@ mod tests {
             user_script(&["echo", "it's"].map(String::from)),
             "'echo' 'it'\\''s'"
         );
+    }
+
+    #[test]
+    fn encode_ssh_keys_cmdline_shape() {
+        // type + base64 survive; the comment is dropped; entries join on commas.
+        let keys = [
+            "ssh-ed25519 AAAAC3Nza me@host".to_string(),
+            "ssh-rsa AAAAB3Nza".to_string(),
+        ];
+        assert_eq!(
+            encode_ssh_keys(&keys).unwrap(),
+            "ssh-ed25519:AAAAC3Nza,ssh-rsa:AAAAB3Nza"
+        );
+        // a bare word is not an OpenSSH `type base64` line.
+        assert!(encode_ssh_keys(&["garbage".to_string()]).is_err());
+    }
+
+    #[test]
+    fn ssh_pubkeys_in_reads_standard_identities() {
+        let dir = std::env::temp_dir().join(format!("virtkit-sshkeys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("id_ed25519.pub"), "ssh-ed25519 AAA me@host\n").unwrap();
+        std::fs::write(dir.join("id_rsa.pub"), "").unwrap(); // empty file: skipped
+        let keys = ssh_pubkeys_in(&dir);
+        assert_eq!(keys, ["ssh-ed25519 AAA me@host".to_string()]);
+        assert!(ssh_pubkeys_in(&dir.join("missing")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Boot a session with a read-only source disk, mount it in the guest with the

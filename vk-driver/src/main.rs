@@ -267,6 +267,15 @@ enum Cmd {
         #[arg(long)]
         to: SocketAddr,
     },
+    /// plumbing: splice stdio to `--to` — the SSH `ProxyCommand` shape. ssh hands its
+    /// protocol stream on stdio; we relay it to the guest's ssh-serve (`run --ssh`
+    /// prints the full invocation). Addresses: a unix path, vsock-mux://<path>:<port>,
+    /// tcp://host:port.
+    Connect {
+        /// Target address to dial
+        #[arg(long)]
+        to: SocketAddr,
+    },
     /// Filtering ssh-agent proxy: serve the ssh-agent protocol on `--listen`, relaying to
     /// the real agent at `--upstream` but exposing only the keys in the `--allow` .pub
     /// files (refusing to sign with or list any other key). The host side of forwarding a
@@ -426,6 +435,15 @@ enum Cmd {
         /// Implies --ssh-agent.
         #[arg(long = "ssh-host", value_name = "ALIAS")]
         ssh_host: Vec<String>,
+        /// Serve SSH into the guest (the agent's in-VM ssh-serve over vsock — no sshd
+        /// in the image): prints a ready-to-paste ssh command once booted. Sessions
+        /// run as root; the VM lives for the duration of the run command.
+        #[arg(long)]
+        ssh: bool,
+        /// public key authorised for --ssh (OpenSSH format, repeatable; implies --ssh).
+        /// Default: your standard ~/.ssh/id_*.pub keys
+        #[arg(long = "ssh-key", value_name = "PUBKEY")]
+        ssh_key: Vec<String>,
         /// Command to run in the guest (default: a boot-info probe). Several
         /// words are an argv, each passed as typed (like docker run — use
         /// `sh -c '…'` for shell features); a single word is a shell one-liner
@@ -637,6 +655,8 @@ async fn cli_main() -> ExitCode {
         service,
         ssh_agent,
         ssh_host,
+        ssh,
+        ssh_key,
         command,
     } = &cli.cmd
     {
@@ -697,6 +717,8 @@ async fn cli_main() -> ExitCode {
             build_net: bnet,
             ssh_agent: *ssh_agent,
             ssh_hosts: ssh_host.clone(),
+            ssh: *ssh || !ssh_key.is_empty(),
+            ssh_keys: ssh_key.clone(),
             command: command.clone(),
         };
         return match run::run(&args).await {
@@ -1074,6 +1096,11 @@ async fn cli_main() -> ExitCode {
                 // gitlab-runner only logs cleanup failures; report and don't mask
                 Err(e) => fail(&e, 1),
             },
+        },
+        // stdio↔socket splice for an SSH ProxyCommand; returns when either side closes.
+        Cmd::Connect { to } => match vk_core::forward::run_connect(&to).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
         },
         // run_forward only returns on a bind error; otherwise it serves until the
         // process is killed (cleanup tears the detached child down).

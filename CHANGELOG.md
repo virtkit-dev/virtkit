@@ -13,6 +13,9 @@ All notable changes to virtkit will be documented in this file.
   primary VM (like `docker compose run`): its config becomes the command's
   environment, with no trailing command its entrypoint+cmd runs, only its
   `depends_on` closure boots alongside — and its compose volumes are applied.
+- `vk run --ssh` serves SSH into the guest with no sshd in the image, and
+  prints a ready-to-paste ssh command (keys from `--ssh-key` or your standard
+  `~/.ssh` identities); VS Code Remote-SSH works out of the box.
 
 ### Changed
 
