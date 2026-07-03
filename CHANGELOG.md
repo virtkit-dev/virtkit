@@ -29,6 +29,7 @@ All notable changes to virtkit will be documented in this file.
   the tree links C libraries anymore.
 - `run` streams its boot media instead of materialising launch temp files; an
   aborted boot no longer leaves a rootfs behind.
+- The pinned guest kernel is bumped to 6.18.37.
 
 ### Fixed
 
