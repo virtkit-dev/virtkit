@@ -10,8 +10,9 @@ name: CI
 # a full Linux kernel (tens of minutes) and changes infrequently; use release.yml
 # or build-kernel.sh locally when you need a new vmlinux.
 #
-# build_kernel is included when the workflow is triggered manually
-# (workflow_dispatch) for testing kernel config changes without cutting a release.
+# The kernel is built (and embedded into vk) when the workflow is triggered
+# manually (workflow_dispatch), for testing kernel config changes without cutting
+# a release.
 
 on:
   push:

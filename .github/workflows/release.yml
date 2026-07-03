@@ -8,8 +8,9 @@ name: Release
 # runs those two scripts and uploads everything they drop in dist/. The pinned
 # toolchain lives in the images, not here, so the runner needs no Rust setup.
 #
-# build and build_kernel run in parallel after quality; release downloads their
-# artifacts and publishes. Each binary ships with its own .sha256 sidecar
+# build runs in parallel with quality (lint + audit); the kernel is built in the
+# same job as the binaries so the published vk has it embedded. release publishes
+# once both quality and build pass. Each binary ships with its own .sha256 sidecar
 # (vk.sha256, vk-agent.sha256, vmlinux.sha256) so users can verify
 # just the file they downloaded without fetching a combined manifest.
 
@@ -23,12 +24,12 @@ permissions:
   contents: read
 
 jobs:
-  # Gate: run the same lint + audit checks as CI against the tagged commit.
+  # Gate: run the same lint + audit checks as CI against the tagged commit. Runs in
+  # parallel with build; the release job below waits on both.
   quality:
     uses: ./.github/workflows/quality.yml
 
   build:
-    needs: [quality]
     uses: ./.github/workflows/build.yml
     with:
       artifact-prefix: release
@@ -36,7 +37,7 @@ jobs:
       retention-days: 1
 
   release:
-    needs: [build]
+    needs: [quality, build]
     runs-on: ubuntu-latest
     # gh release create needs write access to the repo's releases.
     permissions:

@@ -1,12 +1,17 @@
 name: Build
 
-# Reusable workflow: build binaries and/or the guest kernel.
+# Reusable workflow: build the binaries, optionally with the guest kernel.
 # Called by ci.yml (on push/PR/dispatch) and release.yml (on tag).
+#
+# The kernel is built first, in the same job as the binaries: build.sh embeds
+# dist/vmlinux into vk when it is present, so building both on one runner is what
+# makes the released vk self-contained. A separate kernel job would leave build.sh
+# with no vmlinux to embed.
 #
 # Inputs
 #   artifact-prefix  — prefix for uploaded artifact names; callers set this to
 #                      avoid collisions between CI and release runs on the same SHA.
-#   build-kernel     — whether to run the kernel build job (default: false).
+#   build-kernel     — whether to build the guest kernel and embed it (default: false).
 
 on:
   workflow_call:
@@ -25,10 +30,17 @@ permissions:
   contents: read
 
 jobs:
-  build_virtkit:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+
+      # Build the kernel before the binaries so build.sh finds dist/vmlinux and
+      # embeds it into vk. Skipped in ordinary CI — a full kernel build takes tens
+      # of minutes and the kernel changes rarely.
+      - name: Build guest kernel (vmlinux)
+        if: inputs.build-kernel
+        run: ./build-kernel.sh
 
       - name: Build binaries (vk, vk-agent)
         run: ./build.sh
@@ -45,16 +57,8 @@ jobs:
             dist/build-info.txt
           retention-days: ${{ inputs.retention-days }}
 
-  build_kernel:
-    if: inputs.build-kernel
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Build guest kernel (vmlinux)
-        run: ./build-kernel.sh
-
       - name: Upload kernel artifact
+        if: inputs.build-kernel
         uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.artifact-prefix }}-kernel-${{ github.sha }}
