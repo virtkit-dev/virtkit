@@ -566,9 +566,9 @@ async fn plan_services(
 }
 
 /// The per-job userspace switch (net.mode = "switch"): a tied supervisor child
-/// listening on the guest's vsock-bridge socket (`<vsock.sock>_<net_port>`) with
-/// the `[egress]` allowlist, awaited until it binds before the guest dials it.
-/// The switch is this same `virtkit` binary's `switch` subcommand.
+/// on the guest's vsock-bridge socket (`<vsock.sock>_<net_port>`) plus each
+/// service's, with the `[egress]` allowlist and the service aliases in the
+/// gateway resolver. Returns once every socket is bound.
 fn spawn_switch(
     ctx: &JobCtx,
     gateway: Ipv4Addr,
@@ -576,40 +576,27 @@ fn spawn_switch(
     services: &[crate::units::Provisioned],
 ) -> Result<std::process::Child> {
     let cfg = &ctx.cfg;
-    let listen = ctx.net_vsock_sock(cfg.net.net_port);
-    let _ = std::fs::remove_file(&listen);
-    let exe = std::env::current_exe().context("locating the virtkit binary")?;
-    let mut cmd = Command::new(exe);
-    cmd.arg("switch")
-        .arg("--listen")
-        .arg(&listen)
-        .arg("--gateway")
-        .arg(gateway.to_string())
-        .arg("--prefix")
-        .arg(prefix.to_string());
-    // each service VM's vsock bridge socket, plus its alias in the gateway
-    // resolver — the job (and the services themselves) resolve plain aliases.
+    let mut listen = vec![ctx.net_vsock_sock(cfg.net.net_port)];
+    let mut hosts = Vec::new();
     for svc in services {
-        let sock = ctx
-            .job_dir
-            .join(format!("svc-{}", svc.name))
-            .join(format!("vsock.sock_{}", cfg.net.net_port));
-        cmd.arg("--listen").arg(sock);
+        listen.push(
+            ctx.job_dir
+                .join(format!("svc-{}", svc.name))
+                .join(format!("vsock.sock_{}", cfg.net.net_port)),
+        );
         let ip = svc.ip.split('/').next().unwrap_or_default();
-        cmd.arg("--host").arg(format!("{}={ip}", svc.hostname));
+        hosts.push((svc.hostname.clone(), ip.to_string()));
     }
-    // allow_ip stays host-controlled; allow_name is the host cap by default, or a
-    // job-narrowed subset of it (MICROVM_EGRESS_ALLOW_NAME).
-    for cidr in &cfg.egress.allow_ip {
-        cmd.arg("--allow-ip").arg(cidr);
-    }
-    for name in effective_allow_names(cfg, ctx)? {
-        cmd.arg("--allow-name").arg(name);
-    }
-    let child = spawn_tied_logged(cmd, &ctx.switch_log()).context("spawning the per-job switch")?;
-    wait_for_socket(&listen, Duration::from_secs(5))
-        .context("the per-job switch did not bind its socket")?;
-    Ok(child)
+    crate::switch::spawn(&crate::switch::Spawn {
+        listen,
+        gateway,
+        prefix,
+        hosts,
+        allow_ip: cfg.egress.allow_ip.clone(),
+        allow_name: effective_allow_names(cfg, ctx)?,
+        log: ctx.switch_log(),
+    })
+    .context("spawning the per-job switch")
 }
 
 /// The switch `--allow-name` list for this job: the host `[egress]` cap by default,

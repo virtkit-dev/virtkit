@@ -1069,47 +1069,17 @@ async fn spawn_vm_switch(
     let (gw, prefix, guest_ip) = crate::net::switch_addrs(RUN_SUBNET)?;
     let mut listen = vsock.to_path_buf().into_os_string();
     listen.push(format!("_{net_port}"));
-    let listen = PathBuf::from(listen);
-    let _ = std::fs::remove_file(&listen);
-    let exe = std::env::current_exe().context("locating the virtkit binary")?;
-    let swlog = std::fs::File::create(work.join("switch.log"))?;
-    let mut cmd = Command::new(&exe);
-    cmd.arg("switch")
-        .arg("--listen")
-        .arg(&listen)
-        .arg("--gateway")
-        .arg(gw.to_string())
-        .arg("--prefix")
-        .arg(prefix.to_string());
-    for a in allow_ip {
-        cmd.arg("--allow-ip").arg(a);
-    }
-    for n in allow_name {
-        cmd.arg("--allow-name").arg(n);
-    }
-    // service VMs' vsock bridge sockets + their aliases in the gateway resolver
-    for l in extra_listen {
-        let _ = std::fs::remove_file(l);
-        cmd.arg("--listen").arg(l);
-    }
-    for (name, ip) in hosts {
-        cmd.arg("--host").arg(format!("{name}={ip}"));
-    }
-    cmd.stdin(Stdio::null())
-        .stdout(swlog.try_clone()?)
-        .stderr(swlog);
-    // self-reap if virtkit dies before teardown (spawn_tied)
-    let mut child = crate::spawn::spawn_tied(cmd)
-        .with_context(|| format!("spawning {} switch", exe.display()))?;
-    let dl = Instant::now() + Duration::from_secs(5);
-    while !listen.exists() {
-        if Instant::now() >= dl {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("vk switch did not bind {}", listen.display());
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let mut all_listen = vec![PathBuf::from(listen)];
+    all_listen.extend(extra_listen.iter().cloned());
+    let child = crate::switch::spawn(&crate::switch::Spawn {
+        listen: all_listen,
+        gateway: gw,
+        prefix,
+        hosts: hosts.to_vec(),
+        allow_ip: allow_ip.to_vec(),
+        allow_name: allow_name.to_vec(),
+        log: work.join("switch.log"),
+    })?;
     let frag = format!(
         " VIRTKIT_NET_PORT={net_port} VIRTKIT_VM_IP={guest_ip}/{prefix} \
          VIRTKIT_VM_GW={gw} VIRTKIT_VM_DNS={gw}"

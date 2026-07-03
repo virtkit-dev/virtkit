@@ -259,6 +259,68 @@ struct Switch {
     egress: Arc<EgressGuard>,
 }
 
+/// How a consumer spawns its switch: the listen sockets (one per VM on the LAN),
+/// the gateway identity, the resolver's local names, the egress allowlists
+/// (empty = unrestricted), and where the log goes.
+pub struct Spawn {
+    pub listen: Vec<PathBuf>,
+    pub gateway: Ipv4Addr,
+    pub prefix: u8,
+    /// resolver entries served over the gateway DNS (`name=ip`)
+    pub hosts: Vec<(String, String)>,
+    pub allow_ip: Vec<String>,
+    pub allow_name: Vec<String>,
+    pub log: PathBuf,
+}
+
+/// Spawn the switch as a tied child of this process (this binary's `switch`
+/// subcommand). Every consumer — `run`, the gitlab job supervisor —
+/// owns its LAN the way it owns its VMMs and virtiofsds: a child that dies with
+/// it (PDEATHSIG), with its own pid and log to inspect when the LAN misbehaves.
+/// Returns once every listen socket is bound, so a guest never dials a
+/// not-yet-listening switch.
+pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe().context("locating the virtkit binary")?;
+    let log = std::fs::File::create(&opts.log)
+        .with_context(|| format!("creating {}", opts.log.display()))?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("switch")
+        .arg("--gateway")
+        .arg(opts.gateway.to_string())
+        .arg("--prefix")
+        .arg(opts.prefix.to_string());
+    for l in &opts.listen {
+        let _ = std::fs::remove_file(l);
+        cmd.arg("--listen").arg(l);
+    }
+    for (name, ip) in &opts.hosts {
+        cmd.arg("--host").arg(format!("{name}={ip}"));
+    }
+    for a in &opts.allow_ip {
+        cmd.arg("--allow-ip").arg(a);
+    }
+    for n in &opts.allow_name {
+        cmd.arg("--allow-name").arg(n);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    let mut child = crate::spawn::spawn_tied(cmd).context("spawning the switch subprocess")?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for l in &opts.listen {
+        while !l.exists() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("the switch did not bind {}", l.display());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    Ok(child)
+}
+
 pub async fn run(
     listen: &[PathBuf],
     gateway: Ipv4Addr,
