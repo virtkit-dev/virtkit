@@ -10,7 +10,7 @@ VMM built in. It boots OCI/Docker images as fast microVMs on its embedded
 stays available as an external backend via `VIRTKIT_VMM=cloud-hypervisor`), gives
 them a shared LAN with egress over ordinary host sockets (no tap, no bridge, no
 `CAP_NET_ADMIN`, no root), and drives commands into them over `vsock`.
-The same codebase powers local service VMs and a GitLab custom executor. See
+The same codebase powers local compose-service VMs and a GitLab custom executor. See
 [`README.md`](README.md) for the full feature tour.
 
 ## Architecture
@@ -22,7 +22,7 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with three crates:
   build on (`exec`, `forward`, `pty`, `dockerignore`). Deliberately free of guest-only
   concerns and of russh, so the host links none of that.
 - **`vk-driver/`** — the host driver (depends on `vk-core`): image building/conversion
-  (OCI → ext4/initramfs), the GitLab executor,
+  (OCI → ext4/initramfs), the compose service runner + control plane, the GitLab executor,
   the userspace L2 network switch (ARP/DHCP/DNS + transparent TCP/UDP egress via
   `ipstack`), the libkrun VMM backend (`vmm`/`libkrun_sys`, default; the pinned guest
   kernel and vk-agent are embedded so `vk` runs self-contained), and a bundled

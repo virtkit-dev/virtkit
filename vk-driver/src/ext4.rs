@@ -227,7 +227,7 @@ pub fn normalize_superblock(image: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Stamp `image`'s filesystem UUID in place — the content-fingerprint identity fleet
+/// Stamp `image`'s filesystem UUID in place — the content-fingerprint identity the unit
 /// keys image freshness on (compared against `fs_uuid` before a rebuild). Writes the
 /// primary superblock and every sparse_super backup, so the image stays internally
 /// consistent (a backup-superblock recovery restores this UUID, not a stale one),

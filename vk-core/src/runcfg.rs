@@ -3,7 +3,7 @@
 //!
 //! The builder exports it as a JSON sidecar next to a built ext4 (the image itself
 //! stays byte-clean — config is supplied at boot, compose-style, never baked in), and
-//! fleet hands the merged result (image defaults + per-service overrides) to the
+//! the host hands the merged result (image defaults + per-service overrides) to the
 //! guest agent through the boot initramfs.
 
 use serde::{Deserialize, Serialize};

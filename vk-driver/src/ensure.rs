@@ -135,7 +135,7 @@ pub async fn ensure_unit_pull(image: &str, out: &Path) -> Result<()> {
     source
         .stream_tar(scratch, |tar, hints| {
             // Same sizing as the `vk run` image path, plus writable headroom for the
-            // service's own writes: fleet boots through a CoW overlay, but the
+            // service's own writes: units boot through a CoW overlay, but the
             // *filesystem* still needs free blocks to allocate (mirrors the builder's
             // bases).
             crate::ext4::build_from_tar_stream(

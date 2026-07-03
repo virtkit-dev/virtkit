@@ -1,5 +1,5 @@
 //! CI `services:` support: each service is a sibling microVM on the per-job
-//! switch, exactly a fleet unit.
+//! switch, exactly a compose unit.
 //!
 //! GitLab passes a job's `services:` to any executor as the `CI_JOB_SERVICES`
 //! JSON (here `CUSTOM_ENV_CI_JOB_SERVICES`). This module is pure: it parses the
