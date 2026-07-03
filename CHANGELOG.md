@@ -6,13 +6,14 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
-- `vk run --compose <file>` boots the compose services alongside the run on a
-  shared LAN (implies `--net`), reachable by name; `--profile` gates them and
-  everything is torn down when the run exits.
-- `vk run --compose <file> --service NAME` boots that compose service as the
-  primary VM (like `docker compose run`): its config becomes the command's
-  environment, with no trailing command its entrypoint+cmd runs, only its
-  `depends_on` closure boots alongside — and its compose volumes are applied.
+- `vk run --compose <file>` boots the file's services (a docker-compose subset;
+  built from their `build:` stage or pulled from their `image:` ref into clean
+  images, config supplied at boot) as sibling microVMs on the run's LAN,
+  reachable by name — no readiness wait, retry the first connect. `--profile`
+  gates profiled services. Three shapes: alongside an image/`-f` run; as the
+  primary itself with `--service NAME` (like `docker compose run`, entrypoint
+  and volumes applied); or alone — compose up, services only, held until
+  ctrl-c.
 - `vk run --ssh` serves SSH into the guest with no sshd in the image, and
   prints a ready-to-paste ssh command (keys from `--ssh-key` or your standard
   `~/.ssh` identities); VS Code Remote-SSH works out of the box.

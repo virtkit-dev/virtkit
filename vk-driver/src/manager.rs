@@ -71,7 +71,6 @@ impl Manager {
     }
 
     /// Number of declared units.
-    #[allow(dead_code)] // wired up by run's compose-up mode
     pub fn declared(&self) -> usize {
         self.units.lock().unwrap().len()
     }

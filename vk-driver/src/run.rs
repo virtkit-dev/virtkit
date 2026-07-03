@@ -151,6 +151,11 @@ pub async fn run(args: &RunArgs) -> Result<()> {
             kernel.path.display()
         );
     }
+    // No primary (no image, no -f, no --service) + a compose file = compose up:
+    // services only, held until ctrl-c.
+    if args.image.is_empty() && args.dockerfiles.is_empty() && args.service.is_none() {
+        return compose_up(args, &work.path, &agent.path, &kernel.path).await;
+    }
     build_and_boot(args, &work.path, &agent.path, &kernel.path).await
 }
 
@@ -421,12 +426,6 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         cmdline.push_str(&format!(" VIRTKIT_SSH_AGENT_PORT={SSH_AGENT_VSOCK_PORT}"));
     }
 
-    // With compose services declared, the agent exposes their control plane at
-    // /run/vk (a FUSE bridge to the manager over vsock).
-    if args.compose.is_some() && !compose_units.is_empty() {
-        cmdline.push_str(" VIRTKIT_CTL=1");
-    }
-
     // --ssh: the guest agent serves SSH over vsock (no sshd in the image). The
     // authorized keys ride the kernel cmdline whitespace-free as `type:base64`;
     // sessions run as root — the only user every image is guaranteed to have.
@@ -443,56 +442,12 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     }
 
     // Compose services: sibling unit VMs on the run switch, resolvable by alias
-    // over its DNS, torn down with the run. EVERY declared unit materializes into
-    // the work dir — like the `-f` build itself, warmth comes from the instruction
-    // cache — and is handed to the service manager, so the primary can start a
-    // profiled-down unit on demand over the control plane; only the enabled set
-    // (or the --service dependency closure) boots eagerly. Built before the
-    // switch spawns (the switch binds every unit's socket, up or down).
-    let mut svc_units: Vec<(crate::units::Provisioned, PathBuf)> = Vec::new();
-    let mut svc_start: Vec<String> = Vec::new();
-    let mut svc_listen: Vec<PathBuf> = Vec::new();
-    let mut svc_hosts: Vec<(String, String)> = Vec::new();
-    if args.compose.is_some() {
-        let units = &compose_units;
-        let order = crate::compose::boot_order(units)?;
-        // A --service primary starts only its dependencies (compose-run
-        // semantics); otherwise the profile-enabled set boots.
-        let on = match primary_idx {
-            Some(idx) => crate::compose::dependency_closure(units, idx),
-            None => crate::compose::enabled(units, &args.profiles),
-        };
-        let (gw, prefix, _) = crate::net::switch_addrs(RUN_SUBNET)?;
-        for (slot, &i) in order.iter().enumerate() {
-            let unit = &units[i];
-            let dir = work.join(format!("svc-{}", unit.name));
-            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-            let ext4 = dir.join("image.ext4");
-            let built = build_service_image(args, unit, &ext4, kernel, agent)
-                .with_context(|| format!("service {}", unit.name))?;
-            let config = crate::compose::merged_config(&built.config, unit);
-            let ip = crate::units::nth_static_ip(gw, prefix, slot as u32)?;
-            svc_listen.push(dir.join(format!("vsock.sock_{NET_VSOCK_PORT}")));
-            svc_hosts.push((unit.name.to_ascii_lowercase(), ip.to_string()));
-            if unit.hostname != unit.name {
-                svc_hosts.push((unit.hostname.to_ascii_lowercase(), ip.to_string()));
-            }
-            svc_units.push((
-                crate::units::Provisioned {
-                    name: unit.name.clone(),
-                    hostname: unit.hostname.clone(),
-                    ext4,
-                    ip: format!("{ip}/{prefix}"),
-                    cid: crate::units::FIRST_SERVICE_CID + slot as u32,
-                    config,
-                    volumes: unit.volumes.clone(),
-                },
-                dir,
-            ));
-            if on[i] {
-                svc_start.push(unit.name.clone());
-            }
-        }
+    // over its DNS, torn down with the run.
+    let planned = plan_services(args, work, kernel, agent, &compose_units, primary_idx)?;
+    // With sibling services under management, the agent exposes their control
+    // plane at /run/vk (a FUSE bridge to the manager over vsock).
+    if !planned.units.is_empty() {
+        cmdline.push_str(" VIRTKIT_CTL=1");
     }
 
     // Networking: a userspace `vk switch` over vsock gives the guest egress (the agent
@@ -505,8 +460,8 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             NET_VSOCK_PORT,
             &[],
             &[],
-            &svc_listen,
-            &svc_hosts,
+            &planned.listen,
+            &planned.hosts,
         )
         .await?;
         cmdline.push_str(&frag);
@@ -519,7 +474,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     // it, dependencies first, once the switch listens. No readiness wait (the
     // compose contract): the run command retries its first connect. The same
     // manager later serves the primary's control plane (start/stop on demand).
-    let manager = if svc_units.is_empty() {
+    let manager = if planned.units.is_empty() {
         None
     } else {
         let (gw, _, _) = crate::net::switch_addrs(RUN_SUBNET)?;
@@ -529,11 +484,11 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             NET_VSOCK_PORT,
             gw,
             agent.to_path_buf(),
-            svc_units,
+            planned.units,
         )))
     };
     if let Some(mgr) = &manager {
-        for name in &svc_start {
+        for name in &planned.start {
             let reply = mgr.start(name);
             if !reply.ok {
                 mgr.stop_all();
@@ -751,6 +706,154 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         let _ = child.wait();
     }
     result
+}
+
+/// Every declared compose unit, materialized and addressed, plus which ones
+/// boot eagerly and what the switch must serve for them.
+struct PlannedServices {
+    /// (unit, runtime dir) for the manager — the `--service` primary excluded
+    /// (it boots as the run VM, not as a sibling)
+    units: Vec<(crate::units::Provisioned, PathBuf)>,
+    /// names to boot eagerly: the profile-enabled set, or the primary's
+    /// dependency closure
+    start: Vec<String>,
+    /// per-unit switch sockets (up or down — an on-demand start dials a
+    /// listening LAN)
+    listen: Vec<PathBuf>,
+    /// alias -> ip for the gateway resolver
+    hosts: Vec<(String, String)>,
+}
+
+/// Materialize EVERY declared unit into the work dir — like the `-f` build
+/// itself, warmth comes from the instruction cache — so the manager can start a
+/// profiled-down unit on demand later; only `start` boots eagerly.
+fn plan_services(
+    args: &RunArgs,
+    work: &Path,
+    kernel: &Path,
+    agent: &Path,
+    units: &[crate::compose::Unit],
+    primary_idx: Option<usize>,
+) -> Result<PlannedServices> {
+    let mut planned = PlannedServices {
+        units: Vec::new(),
+        start: Vec::new(),
+        listen: Vec::new(),
+        hosts: Vec::new(),
+    };
+    if args.compose.is_none() {
+        return Ok(planned);
+    }
+    let order = crate::compose::boot_order(units)?;
+    // A --service primary starts only its dependencies (compose-run semantics);
+    // otherwise the profile-enabled set boots.
+    let on = match primary_idx {
+        Some(idx) => crate::compose::dependency_closure(units, idx),
+        None => crate::compose::enabled(units, &args.profiles),
+    };
+    let (gw, prefix, _) = crate::net::switch_addrs(RUN_SUBNET)?;
+    let mut slot = 0u32;
+    for &i in &order {
+        // the primary is the run VM itself, not a sibling unit
+        if Some(i) == primary_idx {
+            continue;
+        }
+        let unit = &units[i];
+        let dir = work.join(format!("svc-{}", unit.name));
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let ext4 = dir.join("image.ext4");
+        let built = build_service_image(args, unit, &ext4, kernel, agent)
+            .with_context(|| format!("service {}", unit.name))?;
+        let config = crate::compose::merged_config(&built.config, unit);
+        let ip = crate::units::nth_static_ip(gw, prefix, slot)?;
+        planned
+            .listen
+            .push(dir.join(format!("vsock.sock_{NET_VSOCK_PORT}")));
+        planned
+            .hosts
+            .push((unit.name.to_ascii_lowercase(), ip.to_string()));
+        if unit.hostname != unit.name {
+            planned
+                .hosts
+                .push((unit.hostname.to_ascii_lowercase(), ip.to_string()));
+        }
+        planned.units.push((
+            crate::units::Provisioned {
+                name: unit.name.clone(),
+                hostname: unit.hostname.clone(),
+                ext4,
+                ip: format!("{ip}/{prefix}"),
+                cid: crate::units::FIRST_SERVICE_CID + slot,
+                config,
+                volumes: unit.volumes.clone(),
+            },
+            dir,
+        ));
+        if on[i] {
+            planned.start.push(unit.name.clone());
+        }
+        slot += 1;
+    }
+    Ok(planned)
+}
+
+/// `vk run --compose` with no primary — compose up: boot the enabled services
+/// on the run LAN and hold until ctrl-c; everything dies with this process.
+async fn compose_up(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path) -> Result<()> {
+    let compose = args
+        .compose
+        .as_ref()
+        .expect("compose_up requires --compose");
+    let units = crate::compose::load(compose)?;
+    if units.is_empty() {
+        bail!("{} declares no services", compose.display());
+    }
+    let planned = plan_services(args, work, kernel, agent, &units, None)?;
+
+    // The switch binds every unit's socket; no VM ever dials the base socket
+    // (there is no primary), it is just the switch's canonical listen path.
+    let vsock = work.join("vsock.sock");
+    let (mut switch, _frag) = spawn_vm_switch(
+        &vsock,
+        work,
+        NET_VSOCK_PORT,
+        &[],
+        &[],
+        &planned.listen,
+        &planned.hosts,
+    )
+    .await?;
+
+    let (gw, prefix, _) = crate::net::switch_addrs(RUN_SUBNET)?;
+    let mgr = std::sync::Arc::new(crate::manager::Manager::new(
+        kernel.to_path_buf(),
+        args.cloud_hypervisor.clone(),
+        NET_VSOCK_PORT,
+        gw,
+        agent.to_path_buf(),
+        planned.units,
+    ));
+    for name in &planned.start {
+        let reply = mgr.start(name);
+        if !reply.ok {
+            mgr.stop_all();
+            let _ = switch.kill();
+            let _ = switch.wait();
+            bail!("booting service {name}: {}", reply.message);
+        }
+        println!("virtkit: service {name}: {}", reply.message);
+    }
+    println!(
+        "virtkit: compose up on {gw}/{prefix}; {} of {} service(s) started — ctrl-c stops everything",
+        planned.start.len(),
+        mgr.declared(),
+    );
+    tokio::signal::ctrl_c().await.ok();
+    println!("virtkit: stopping ...");
+    mgr.stop_all();
+    let _ = switch.kill();
+    let _ = switch.wait();
+    Ok(())
 }
 
 /// Materialize one compose service's clean image into the work dir: a `build:`

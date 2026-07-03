@@ -415,6 +415,8 @@ enum Cmd {
         /// boot this compose file's services as sibling microVMs on the run's LAN
         /// (implies --net): the command reaches them by alias; everything is torn
         /// down when the run exits. No readiness wait — retry the first connect.
+        /// Alone (no image/-f/--service) this is compose up: services only, held
+        /// until ctrl-c.
         #[arg(long)]
         compose: Option<PathBuf>,
         /// activate a compose profile (repeatable): profiled services stay down
@@ -661,10 +663,27 @@ async fn cli_main() -> ExitCode {
         command,
     } = &cli.cmd
     {
-        if file.is_empty() && image.is_none() && service.is_none() {
+        let services_only = file.is_empty() && image.is_none() && service.is_none();
+        if services_only && compose.is_none() {
+            return fail(
+                &anyhow::anyhow!("run needs an image, --file <Dockerfile>, or a --compose file"),
+                2,
+            );
+        }
+        // Services-only (compose up): there is no primary VM to run anything in.
+        if services_only
+            && (!command.is_empty()
+                || *shell
+                || *ssh
+                || !ssh_key.is_empty()
+                || *ssh_agent
+                || !ssh_host.is_empty()
+                || workdir.is_some())
+        {
             return fail(
                 &anyhow::anyhow!(
-                    "run needs an image, --file <Dockerfile>, or --compose + --service"
+                    "--compose without an image/-f/--service is services-only (compose up) — \
+                     there is no primary VM for a command, --shell, --ssh, or --workdir"
                 ),
                 2,
             );
