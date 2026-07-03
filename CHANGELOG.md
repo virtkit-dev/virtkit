@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `vk run --compose <file>` boots the compose services alongside the run on a
+  shared LAN (implies `--net`), reachable by name; `--profile` gates them and
+  everything is torn down when the run exits.
+
 ### Changed
 
 - The GitLab executor boots a job's `services:` as sibling microVMs on the

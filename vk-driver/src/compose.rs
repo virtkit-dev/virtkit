@@ -225,9 +225,19 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
         }
         None => Vec::new(),
     };
+    // The hostname lands unquoted in the switch's `--host <name>=<ip>` and the guest
+    // cmdline, so it gets the same DNS-label gate as the service name.
+    let hostname = match svc.hostname {
+        Some(h) if !is_dns_label(&h) => bail!(
+            "service {name:?} hostname {h:?} must be a DNS label \
+             ([a-z0-9-], no leading/trailing hyphen, ≤63 chars)"
+        ),
+        Some(h) => h,
+        None => name.to_string(),
+    };
     Ok(Unit {
         name: name.to_string(),
-        hostname: svc.hostname.unwrap_or_else(|| name.to_string()),
+        hostname,
         source,
         environment: svc.environment.map(Env::into_pairs).unwrap_or_default(),
         entrypoint: svc.entrypoint.map(Cmd::into_argv).transpose()?,
@@ -721,5 +731,22 @@ mod tests {
         assert!(parse("services:\n  svc-:\n    image: x\n", Path::new("/b")).is_err());
         assert!(!is_dns_label(&"a".repeat(64)));
         assert!(is_dns_label("web-1"));
+    }
+
+    #[test]
+    fn hostname_override_must_be_dns_safe() {
+        // a valid override is taken verbatim
+        assert_eq!(
+            one("services:\n  db:\n    image: x\n    hostname: primary-db\n").hostname,
+            "primary-db"
+        );
+        // one that could break out of `--host <name>=<ip>` / the guest cmdline is rejected
+        assert!(
+            parse(
+                "services:\n  db:\n    image: x\n    hostname: bad=host\n",
+                Path::new("/b")
+            )
+            .is_err()
+        );
     }
 }

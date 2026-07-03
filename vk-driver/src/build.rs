@@ -175,6 +175,22 @@ fn cache_repo(cache_registry: Option<&str>) -> Result<Option<String>> {
     })
 }
 
+/// The synthetic single-`FROM` plan for a pulled image — how `run --compose`
+/// materializes an `image:` service through the builder (and its base cache)
+/// instead of a separate pull path. The ref must be a plain reference: anything
+/// with whitespace/control characters could smuggle extra instructions into the
+/// parsed plan.
+pub fn image_plan_input(image: &str) -> Result<PlanInput> {
+    if image.is_empty() || image.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("invalid image reference {image:?}");
+    }
+    Ok(PlanInput {
+        dockerfile: parser::parse(&format!("FROM {image}\n"))?,
+        origin: image.into(),
+        context: "/nonexistent".into(), // no COPY in a bare FROM plan
+    })
+}
+
 /// Read + parse the Dockerfiles into [`PlanInput`]s, zipping each with its context
 /// (`--context` values pair positionally with `-f`; a file without one defaults to
 /// its own directory).
@@ -1662,6 +1678,18 @@ ENTRYPOINT run me
         let ov = &r[&2].final_state;
         assert_eq!(ov.entrypoint, ["/bin/sh", "-c", "run me"]);
         assert!(ov.cmd.is_empty());
+    }
+
+    #[test]
+    fn image_plan_input_guards_against_instruction_smuggling() {
+        // a plain ref parses to a single-FROM plan
+        let pi = image_plan_input("redis:7-alpine").unwrap();
+        assert_eq!(pi.origin, std::path::Path::new("redis:7-alpine"));
+        // anything that could smuggle a second instruction is rejected
+        assert!(image_plan_input("").is_err());
+        assert!(image_plan_input("redis\nRUN evil").is_err());
+        assert!(image_plan_input("redis 7").is_err());
+        assert!(image_plan_input("redis\t7").is_err());
     }
 
     #[test]

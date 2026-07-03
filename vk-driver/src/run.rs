@@ -22,6 +22,8 @@ const VSOCK_PORT: u32 = 4444;
 pub(crate) const SSH_AGENT_VSOCK_PORT: u32 = 2223;
 /// vsock port the guest's tap bridge dials to reach the userspace switch.
 const NET_VSOCK_PORT: u32 = 1024;
+/// The run LAN: gateway .1, the run VM .2, services from the top down.
+const RUN_SUBNET: &str = "192.168.127.0/24";
 
 /// How the host re-invokes the agent's native subcommands (`fsfreeze`, `mount`,
 /// `copy`) inside the guest. `/proc/self/exe` resolves, in the forked child, to the
@@ -88,8 +90,16 @@ pub struct RunArgs {
     pub ram: bool,
     /// attach an interactive shell once the guest is up (needs a terminal)
     pub shell: bool,
-    /// give the guest egress via a userspace `vk switch` (DHCP + DNS + proxy)
+    /// give the guest egress via a userspace `vk switch` (DHCP + DNS + proxy);
+    /// forced on by `compose` (the services live on that switch's LAN)
     pub net: bool,
+    /// compose file whose services boot as sibling unit VMs on the run switch,
+    /// resolvable by alias, torn down with the run. Images materialize per run
+    /// into the work dir; the instruction cache provides repeat-run warmth.
+    pub compose: Option<PathBuf>,
+    /// activated compose profiles (profiled services stay down unless activated
+    /// or depended on)
+    pub profiles: Vec<String>,
     /// Egress for the `--file` build's `RUN` guests (`--build-net`,
     /// `--build-allow-ip`, `--build-allow-name`). Unused for an image boot.
     pub build_net: crate::build::BuildNet,
@@ -359,15 +369,103 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         cmdline.push_str(&format!(" VIRTKIT_SSH_AGENT_PORT={SSH_AGENT_VSOCK_PORT}"));
     }
 
+    // Compose services: sibling unit VMs on the run switch, resolvable by alias
+    // over its DNS, torn down with the run. Each image materializes into the work
+    // dir per run — like the `-f` build itself, warmth comes from the instruction
+    // cache. Built before the switch spawns (the switch binds their sockets).
+    let mut svc_boot: Vec<(crate::units::Provisioned, PathBuf)> = Vec::new();
+    let mut svc_listen: Vec<PathBuf> = Vec::new();
+    let mut svc_hosts: Vec<(String, String)> = Vec::new();
+    if let Some(compose) = &args.compose {
+        let units = crate::compose::load(compose)?;
+        let order = crate::compose::boot_order(&units)?;
+        let on = crate::compose::enabled(&units, &args.profiles);
+        let (gw, prefix, _) = crate::net::switch_addrs(RUN_SUBNET)?;
+        let mut slot = 0u32;
+        for &i in &order {
+            if !on[i] {
+                continue;
+            }
+            let unit = &units[i];
+            let dir = work.join(format!("svc-{}", unit.name));
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            let ext4 = dir.join("image.ext4");
+            let built = build_service_image(args, unit, &ext4, kernel, agent)
+                .with_context(|| format!("service {}", unit.name))?;
+            let config = crate::compose::merged_config(&built.config, unit);
+            let ip = crate::units::nth_static_ip(gw, prefix, slot)?;
+            svc_listen.push(dir.join(format!("vsock.sock_{NET_VSOCK_PORT}")));
+            svc_hosts.push((unit.name.to_ascii_lowercase(), ip.to_string()));
+            if unit.hostname != unit.name {
+                svc_hosts.push((unit.hostname.to_ascii_lowercase(), ip.to_string()));
+            }
+            svc_boot.push((
+                crate::units::Provisioned {
+                    name: unit.name.clone(),
+                    hostname: unit.hostname.clone(),
+                    ext4,
+                    ip: format!("{ip}/{prefix}"),
+                    cid: crate::units::FIRST_SERVICE_CID + slot,
+                    config,
+                    volumes: unit.volumes.clone(),
+                },
+                dir,
+            ));
+            slot += 1;
+        }
+    }
+
     // Networking: a userspace `vk switch` over vsock gives the guest egress (the agent
     // forks a tap bridged to it and takes the static address from the cmdline fragment).
+    // With services it also pre-listens on their sockets and answers their aliases.
     let mut switch = if args.net {
-        let (child, frag) = spawn_vm_switch(&vsock, work, NET_VSOCK_PORT, &[], &[]).await?;
+        let (child, frag) = spawn_vm_switch(
+            &vsock,
+            work,
+            NET_VSOCK_PORT,
+            &[],
+            &[],
+            &svc_listen,
+            &svc_hosts,
+        )
+        .await?;
         cmdline.push_str(&frag);
         Some(child)
     } else {
         None
     };
+
+    // Boot the services, dependencies first, once the switch listens; every child
+    // joins the teardown set. No readiness wait (the compose contract): the run
+    // command retries its first connect.
+    let mut services: Vec<Child> = Vec::new();
+    if !svc_boot.is_empty() {
+        let (gw, _, _) = crate::net::switch_addrs(RUN_SUBNET)?;
+        for (svc, dir) in &svc_boot {
+            match crate::units::boot_unit(
+                svc,
+                dir,
+                kernel,
+                &args.cloud_hypervisor,
+                agent,
+                NET_VSOCK_PORT,
+                gw,
+            ) {
+                Ok((child, aux)) => {
+                    println!("virtkit: service {} booting ({})", svc.name, svc.ip);
+                    services.push(child);
+                    services.extend(aux);
+                }
+                Err(e) => {
+                    for mut c in services.drain(..).chain(switch.take()) {
+                        let _ = c.kill();
+                        let _ = c.wait();
+                    }
+                    return Err(e.context(format!("booting service {}", svc.name)));
+                }
+            }
+        }
+    }
 
     // Working directory: share a host dir read-write over virtiofs at WORKDIR_MOUNT (no uid
     // map — virtiofsd's `--sandbox=none` writes back as the host
@@ -443,7 +541,10 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         // failed boot does not leak host-side children (a leaked `vk virtiofsd` would,
         // e.g., hold this binary's file busy for the next build).
         Err(e) => {
-            for mut child in [switch.take(), virtiofsd.take()].into_iter().flatten() {
+            for mut child in services
+                .drain(..)
+                .chain([switch.take(), virtiofsd.take()].into_iter().flatten())
+            {
                 let _ = child.kill();
                 let _ = child.wait();
             }
@@ -483,11 +584,61 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     }
     let _ = ch.kill();
     let _ = ch.wait();
-    for mut child in [switch.take(), virtiofsd.take()].into_iter().flatten() {
+    for mut child in services
+        .drain(..)
+        .chain([switch.take(), virtiofsd.take()].into_iter().flatten())
+    {
         let _ = child.kill();
         let _ = child.wait();
     }
     result
+}
+
+/// Materialize one compose service's clean image into the work dir: a `build:`
+/// unit through the builder directly, an `image:` unit as the synthetic
+/// single-`FROM` plan — both warmed by the instruction cache (a pulled base is
+/// digest-keyed, so a repeat run restores instead of re-pulling).
+fn build_service_image(
+    args: &RunArgs,
+    unit: &crate::compose::Unit,
+    out: &Path,
+    kernel: &Path,
+    agent: &Path,
+) -> Result<crate::build::Built> {
+    let mut opts = crate::build::Options {
+        dockerfiles: Vec::new(),
+        target: None,
+        contexts: Vec::new(),
+        out: Some(out.to_path_buf()),
+        print_plan: false,
+        microvm: true,
+        cloud_hypervisor: Some(args.cloud_hypervisor.clone()),
+        kernel: Some(kernel.to_path_buf()),
+        agent: Some(agent.to_path_buf()),
+        cache_registry: args.cache_registry.clone(),
+        cache_insecure: args.cache_insecure,
+        journal: false,
+        build_args: args.build_args.clone(),
+        net: args.build_net.clone(),
+    };
+    match &unit.source {
+        crate::compose::Source::Build {
+            dockerfiles,
+            context,
+            target,
+            args: unit_args,
+        } => {
+            opts.dockerfiles = dockerfiles.clone();
+            // compose semantics: one context for all the service's files.
+            opts.contexts = vec![context.clone(); dockerfiles.len()];
+            opts.target = target.clone();
+            opts.build_args.extend(unit_args.iter().cloned());
+            crate::build::build(&opts)
+        }
+        crate::compose::Source::Image(image) => {
+            crate::build::build_inputs(vec![crate::build::image_plan_input(image)?], &opts)
+        }
+    }
 }
 
 /// Spawn the host side of the SSH-agent forward: `vk forward` binds the VMM's per-port
@@ -857,8 +1008,10 @@ async fn spawn_vm_switch(
     net_port: u32,
     allow_ip: &[String],
     allow_name: &[String],
+    extra_listen: &[PathBuf],
+    hosts: &[(String, String)],
 ) -> Result<(Child, String)> {
-    let (gw, prefix, guest_ip) = crate::net::switch_addrs("192.168.127.0/24")?;
+    let (gw, prefix, guest_ip) = crate::net::switch_addrs(RUN_SUBNET)?;
     let mut listen = vsock.to_path_buf().into_os_string();
     listen.push(format!("_{net_port}"));
     let listen = PathBuf::from(listen);
@@ -878,6 +1031,14 @@ async fn spawn_vm_switch(
     }
     for n in allow_name {
         cmd.arg("--allow-name").arg(n);
+    }
+    // service VMs' vsock bridge sockets + their aliases in the gateway resolver
+    for l in extra_listen {
+        let _ = std::fs::remove_file(l);
+        cmd.arg("--listen").arg(l);
+    }
+    for (name, ip) in hosts {
+        cmd.arg("--host").arg(format!("{name}={ip}"));
     }
     cmd.stdin(Stdio::null())
         .stdout(swlog.try_clone()?)
@@ -1009,8 +1170,16 @@ pub(crate) async fn boot_session(
             crate::build::BuildNet::Allow { ips, names } => (ips, names),
             _ => (&[], &[]),
         };
-        let (child, frag) =
-            spawn_vm_switch(&vsock, &work, NET_VSOCK_PORT, allow_ip, allow_name).await?;
+        let (child, frag) = spawn_vm_switch(
+            &vsock,
+            &work,
+            NET_VSOCK_PORT,
+            allow_ip,
+            allow_name,
+            &[],
+            &[],
+        )
+        .await?;
         switch = Some(child);
         cmdline.push_str(&frag);
     }

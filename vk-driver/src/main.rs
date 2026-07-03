@@ -18,7 +18,6 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 mod build;
 mod check;
-#[allow(dead_code)] // fully wired up by the run compose switchover
 mod compose;
 mod config;
 mod convert;
@@ -403,6 +402,15 @@ enum Cmd {
         /// (DHCP + DNS + transparent proxy over vsock)
         #[arg(long)]
         net: bool,
+        /// boot this compose file's services as sibling microVMs on the run's LAN
+        /// (implies --net): the command reaches them by alias; everything is torn
+        /// down when the run exits. No readiness wait — retry the first connect.
+        #[arg(long)]
+        compose: Option<PathBuf>,
+        /// activate a compose profile (repeatable): profiled services stay down
+        /// unless activated or depended on
+        #[arg(long = "profile", value_name = "NAME")]
+        profile: Vec<String>,
         /// Forward the host SSH agent ($SSH_AUTH_SOCK) into the guest, so ssh/git in the
         /// guest use the host's keys without the keys ever entering the guest
         #[arg(long = "ssh-agent")]
@@ -618,6 +626,8 @@ async fn cli_main() -> ExitCode {
         ram,
         shell,
         net,
+        compose,
+        profile,
         ssh_agent,
         ssh_host,
         command,
@@ -662,7 +672,10 @@ async fn cli_main() -> ExitCode {
             boot_timeout_secs: *boot_timeout,
             ram: *ram,
             shell: *shell,
-            net: *net,
+            // services live on the run switch's LAN: --compose implies it.
+            net: *net || compose.is_some(),
+            compose: compose.clone(),
+            profiles: profile.clone(),
             build_net: bnet,
             ssh_agent: *ssh_agent,
             ssh_hosts: ssh_host.clone(),
