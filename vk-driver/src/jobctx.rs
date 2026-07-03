@@ -120,10 +120,6 @@ impl JobCtx {
     pub fn tools_vfsd_log(&self) -> PathBuf {
         self.job_dir.join("tools-vfsd.log")
     }
-    /// Host side of the services registry forward (`vk forward`, a supervisor child).
-    pub fn svc_forward_log(&self) -> PathBuf {
-        self.job_dir.join("svc-forward.log")
-    }
     /// Host side of the SSH-agent forward (`vk forward` splicing to the runner's
     /// `$SSH_AUTH_SOCK`, a supervisor child).
     pub fn ssh_agent_forward_log(&self) -> PathBuf {

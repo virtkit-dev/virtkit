@@ -1,20 +1,18 @@
-//! CI `services:` support (host-mediated, Path B).
+//! CI `services:` support: each service is a sibling microVM on the per-job
+//! switch, exactly a fleet unit.
 //!
 //! GitLab passes a job's `services:` to any executor as the `CI_JOB_SERVICES`
-//! JSON (here `CUSTOM_ENV_CI_JOB_SERVICES`). We run each service as a container
-//! *inside* the job VM, reachable by its alias — but the image is pulled through
-//! the host registry pull-through proxy over a vsock forward, so the registry
-//! credential never enters the guest. This module is pure: it parses the
-//! services, rewrites each image onto the guest-local proxy endpoint, and emits
-//! the root shell script vm::prepare runs in the guest. Everything job-derived
-//! is validated or shell-quoted — the script is assembled from untrusted input.
+//! JSON (here `CUSTOM_ENV_CI_JOB_SERVICES`). This module is pure: it parses the
+//! entries and maps them onto compose units, which the job supervisor
+//! provisions (shared content-addressed store) and boots via the shared `units`
+//! machinery — clean images, config at boot, resolvable by alias over the
+//! switch's DNS. No docker in the job image, no registry proxy: the host pulls
+//! service images itself, so registry credentials never enter any guest.
 
 use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
 use serde::Deserialize;
-
-use crate::config::Services as ServicesCfg;
 
 /// One `CI_JOB_SERVICES` entry — the subset of the runner's serialization we
 /// consume (any other key the runner emits is ignored).
@@ -30,11 +28,9 @@ pub struct Service {
     pub variables: BTreeMap<String, String>,
     /// Entrypoint override (argv array); empty = the image's own.
     #[serde(default)]
-    #[allow(dead_code)] // read by to_units, wired up by the executor switchover
     pub entrypoint: Vec<String>,
     /// Command override (argv array); empty = the image's own.
     #[serde(default)]
-    #[allow(dead_code)] // read by to_units, wired up by the executor switchover
     pub command: Vec<String>,
 }
 
@@ -43,7 +39,6 @@ pub struct Service {
 /// bespoke path. Image-only (a GitLab service has no build context); the alias
 /// becomes both the unit name and the guest hostname (it is what the job resolves);
 /// `variables:` become environment overrides with compose semantics.
-#[allow(dead_code)] // wired up by the executor services switchover
 pub fn to_units(services: Vec<Service>) -> Vec<crate::compose::Unit> {
     services
         .into_iter()
@@ -88,8 +83,9 @@ fn default_alias(image: &str) -> String {
     path.replace('/', "__")
 }
 
-/// The alias lands in `docker --name` and an `/etc/hosts` line in a generated
-/// script: keep it to characters that cannot break out of either.
+/// The alias becomes the unit hostname and lands unquoted in VIRTKIT_HOSTNAME on
+/// a kernel cmdline and in the switch's --host flag: keep it to characters that
+/// cannot break out of either.
 fn validate_alias(alias: &str) -> Result<()> {
     if alias.is_empty()
         || !alias
@@ -101,119 +97,9 @@ fn validate_alias(alias: &str) -> Result<()> {
     Ok(())
 }
 
-/// Swap the image's registry for the guest-local proxy endpoint, keeping the
-/// repository path: `registry.example.com/team/db:tag` with endpoint
-/// `127.0.0.1:5000` -> `127.0.0.1:5000/team/db:tag`. A bare name (docker.io image,
-/// no registry component) is prefixed as-is.
-fn rewrite_ref(image: &str, endpoint: &str) -> String {
-    let path = match image.split_once('/') {
-        Some((host, rest)) if host.contains('.') || host.contains(':') || host == "localhost" => {
-            rest
-        }
-        _ => image,
-    };
-    format!("{endpoint}/{path}")
-}
-
-/// Wrap a string in single quotes for safe inclusion in the generated script.
-fn sh_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
-
-const SERVICE_BLOCK: &str = r#"
-echo 'ci-services: starting __ALIAS__'
-docker rm -f __ALIAS_Q__ >/dev/null 2>&1 || true
-docker run -d --name __ALIAS_Q____ENV__ __REF_Q__
-svc_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' __ALIAS_Q__)
-[ -n "$svc_ip" ] || { echo 'ci-services: __ALIAS__ has no IP' >&2; exit 1; }
-svc_port=$(docker inspect -f '{{range $p, $_ := .Config.ExposedPorts}}{{$p}}{{"\n"}}{{end}}' __ALIAS_Q__ | head -1 | cut -d/ -f1)
-printf '%s %s\n' "$svc_ip" __ALIAS_Q__ >>/etc/hosts
-if [ -n "$svc_port" ]; then
-  for _i in $(seq 1 __TRIES__); do (echo >"/dev/tcp/$svc_ip/$svc_port") 2>/dev/null && break; sleep 0.1; done
-fi
-echo "ci-services: __ALIAS__ ready at $svc_ip:${svc_port:-?}"
-"#;
-
-/// The root script vm::prepare pipes into the guest: start the guest-side
-/// registry forward (survives the script — torn down with the VM), then bring up
-/// each service container, alias it in /etc/hosts, and wait for its port.
-pub fn setup_script(cfg: &ServicesCfg, services: &[Service]) -> String {
-    let tries = cfg.ready_timeout_secs * 10; // sleep 0.1 per try
-    let mut s = String::new();
-    s.push_str("set -euo pipefail\n");
-    s.push_str("echo 'ci-services: starting the registry forward'\n");
-    // guest -> host registry forward; setsid so it outlives this script (the VM
-    // teardown reaps it). 127.0.0.1 is auto-insecure in docker, so no daemon
-    // config is needed for the rewritten refs.
-    s.push_str(&format!(
-        "setsid /usr/local/bin/vk-agent --socket vsock://{port} forward \
-         --listen tcp://127.0.0.1:{port} </dev/null >/var/log/ci-services-forward.log 2>&1 &\n",
-        port = cfg.port,
-    ));
-    // wait for the forward's listener before the first pull races it
-    s.push_str(&format!(
-        "for _i in $(seq 1 50); do (echo >/dev/tcp/127.0.0.1/{port}) 2>/dev/null && break; sleep 0.1; done\n",
-        port = cfg.port,
-    ));
-
-    let endpoint = format!("127.0.0.1:{}", cfg.port);
-    for svc in services {
-        let alias_q = sh_quote(&svc.alias);
-        let ref_q = sh_quote(&rewrite_ref(&svc.name, &endpoint));
-        let env: String = svc
-            .variables
-            .iter()
-            .map(|(k, v)| format!(" -e {}", sh_quote(&format!("{k}={v}"))))
-            .collect();
-        s.push_str(
-            &SERVICE_BLOCK
-                .replace("__ALIAS_Q__", &alias_q)
-                .replace("__ENV__", &env)
-                .replace("__REF_Q__", &ref_q)
-                .replace("__ALIAS__", &svc.alias)
-                .replace("__TRIES__", &tries.to_string()),
-        );
-    }
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rewrite_swaps_registry_keeps_path() {
-        assert_eq!(
-            rewrite_ref("registry.example.com/team/db:abc", "127.0.0.1:5000"),
-            "127.0.0.1:5000/team/db:abc"
-        );
-        // registry with a port
-        assert_eq!(
-            rewrite_ref("192.0.2.10:5000/team/cache:1", "127.0.0.1:5000"),
-            "127.0.0.1:5000/team/cache:1"
-        );
-        // bare name (no registry component) is prefixed as-is
-        assert_eq!(
-            rewrite_ref("redis:7", "127.0.0.1:5000"),
-            "127.0.0.1:5000/redis:7"
-        );
-    }
-
-    #[test]
-    fn sh_quote_escapes() {
-        assert_eq!(sh_quote("a b"), "'a b'");
-        assert_eq!(sh_quote("a'b"), "'a'\\''b'");
-    }
 
     #[test]
     fn alias_validation_rejects_injection() {
@@ -274,21 +160,5 @@ mod tests {
         assert!(redis.entrypoint.is_none() && redis.command.is_none());
         assert!(redis.environment.is_empty() && redis.volumes.is_empty());
         assert!(redis.depends_on.is_empty() && redis.profiles.is_empty());
-    }
-
-    #[test]
-    fn setup_script_runs_and_aliases_each_service() {
-        let cfg = ServicesCfg::default();
-        let svcs = vec![Service {
-            name: "registry.example.com/team/db:abc".into(),
-            alias: "srv_mysql".into(),
-            variables: BTreeMap::new(),
-            entrypoint: vec![],
-            command: vec![],
-        }];
-        let script = setup_script(&cfg, &svcs);
-        assert!(script.contains("forward --listen tcp://127.0.0.1:5000"));
-        assert!(script.contains("docker run -d --name 'srv_mysql' '127.0.0.1:5000/team/db:abc'"));
-        assert!(script.contains("\"$svc_ip\" 'srv_mysql' >>/etc/hosts"));
     }
 }

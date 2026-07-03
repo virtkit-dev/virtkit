@@ -18,7 +18,7 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 mod build;
 mod check;
-#[allow(dead_code)] // wired up by the executor's service switchover
+#[allow(dead_code)] // fully wired up by the run compose switchover
 mod compose;
 mod config;
 mod convert;
@@ -48,7 +48,6 @@ mod spawn;
 mod sshagent;
 mod sshconf;
 mod switch;
-#[allow(dead_code)] // wired up by the executor's service switchover
 mod units;
 #[cfg(feature = "virtiofsd")]
 mod virtiofsd;

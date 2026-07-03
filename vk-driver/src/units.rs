@@ -98,7 +98,6 @@ pub async fn ensure_unit(
 /// image's ext4 UUID: `fingerprint(manifest digest)` for `image:` units,
 /// `fingerprint(stage key)` for `build:` ones. Resolved over the network, exactly as
 /// the ensure itself will.
-#[allow(dead_code)] // wired up by the executor services switchover
 pub async fn unit_fingerprint(unit: &crate::compose::Unit, build: &BuildOpts) -> Result<String> {
     match &unit.source {
         crate::compose::Source::Build {
@@ -136,7 +135,6 @@ pub async fn unit_fingerprint(unit: &crate::compose::Unit, build: &BuildOpts) ->
 /// the image, so its ext4 mtime is not a usage signal on its own. Nothing here
 /// removes store entries; GC (which must also sweep the sibling `<fp>.lock` files) is
 /// a follow-up, like the instruction cache's.
-#[allow(dead_code)] // wired up by the executor services switchover
 pub async fn ensure_unit_store(
     unit: &crate::compose::Unit,
     store: &Path,

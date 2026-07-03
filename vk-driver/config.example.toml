@@ -104,12 +104,11 @@
 #                                  # registry cert (/etc/docker/certs.d)
 # keep = 3                         # cached conversions per image (GC)
 
-# [services]            # CI `services:` support. Each declared service runs as a
-#                       # container inside the job VM, its image pulled through a
-#                       # host registry pull-through proxy over a per-job vsock
-#                       # forward — the registry credential stays on the proxy and
-#                       # never enters the guest. Present at all = enabled (a job
-#                       # declaring services without this section fails in prepare).
-# registry_proxy = "127.0.0.1:5000"   # host proxy the per-job forward targets
-# port = 5000                         # guest tcp listen + vsock port for the forward
-# ready_timeout_secs = 60             # wait per service for its first port to open
+# [services]            # CI `services:` support. Each declared service boots as a
+#                       # sibling microVM on the per-job switch, resolvable by its
+#                       # alias over the switch DNS — job images no longer need
+#                       # docker. Requires the job's [net] mode = "switch". This
+#                       # section is optional; services work with its defaults.
+# store_dir = "/var/lib/virtkit/services"  # shared content-addressed image store,
+#                       # one entry per image digest, shared by every job on the
+#                       # runner. Default: <state_dir>/services.

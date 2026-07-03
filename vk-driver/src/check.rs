@@ -29,7 +29,7 @@ pub enum Feature {
     Gitlab,
     /// [share]: shared dir readable, a virtiofsd available when needed
     Share,
-    /// [services]: the registry pull-through proxy accepts connections
+    /// [services]: the shared service-image store is writable
     Services,
 }
 
@@ -355,29 +355,24 @@ fn share(cfg: &Config) -> Outcome {
 }
 
 fn services(cfg: &Config) -> Outcome {
-    use std::net::ToSocketAddrs;
-    let Some(s) = &cfg.services else {
-        return skip("[services] not configured");
-    };
-    let Some(addr) = s
-        .registry_proxy
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut a| a.next())
-    else {
+    // CI services boot as sibling microVMs from the shared image store; the
+    // check is that the store is (creatable and) writable by this user.
+    let store = cfg.services_store();
+    if let Err(e) = std::fs::create_dir_all(&store) {
         return fail(format!(
-            "registry_proxy {:?} does not resolve",
-            s.registry_proxy
+            "service store {} not creatable: {e}",
+            store.display()
         ));
-    };
-    match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)) {
-        Ok(_) => ok(format!(
-            "registry proxy {} accepting connections",
-            s.registry_proxy
-        )),
+    }
+    let probe = store.join(".check");
+    match std::fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            ok(format!("service image store {} writable", store.display()))
+        }
         Err(e) => fail(format!(
-            "registry proxy {} unreachable: {e}",
-            s.registry_proxy
+            "service image store {} not writable: {e}",
+            store.display()
         )),
     }
 }
@@ -423,11 +418,12 @@ mod tests {
 
     // A feature the default config leaves unconfigured is a skip, so the default
     // sweep passes on hosts that don't use it; run() escalates it to a failure
-    // only when named explicitly.
+    // only when named explicitly. (Services need no configuration — their image
+    // store defaults under state_dir — so they are always checked, never skipped.)
     #[test]
     fn unconfigured_feature_skips() {
         let cfg = Config::default();
-        for f in [Feature::Convert, Feature::Registry, Feature::Services] {
+        for f in [Feature::Convert, Feature::Registry] {
             assert_eq!(evaluate(&cfg, f).status, Status::Skip);
         }
     }

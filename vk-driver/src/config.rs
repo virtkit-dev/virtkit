@@ -344,29 +344,13 @@ impl Registry {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Services {
-    /// Host-local registry pull-through proxy (gitlab-ci/runners 42-microvm-registry.sh)
-    /// the per-job host forward targets; the guest pulls service images through
-    /// it so the registry credential stays host-side.
-    pub registry_proxy: String,
-    /// vsock port linking the guest forward (listens on 127.0.0.1:<port>) to the
-    /// host forward (listens on <vsock.sock>_<port>); also the guest-local port
-    /// the rewritten service refs point at. 127.0.0.0/8 is auto-insecure in docker.
-    pub port: u32,
-    /// Seconds to wait for each service's first exposed port to accept TCP.
-    pub ready_timeout_secs: u64,
-}
-
-impl Default for Services {
-    fn default() -> Self {
-        Services {
-            registry_proxy: "127.0.0.1:5000".into(),
-            port: 5000,
-            ready_timeout_secs: 60,
-        }
-    }
+    /// Shared content-addressed store for CI service images: ensured once per
+    /// content fingerprint (manifest digest), shared by every job on the runner.
+    /// Default: `<state_dir>/services`.
+    pub store_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -448,6 +432,15 @@ impl Config {
         self.state_dir
             .as_deref()
             .unwrap_or(Path::new("/var/lib/virtkit"))
+    }
+
+    /// The CI service-image store: `[services] store_dir` if set, else
+    /// `<state_dir>/services`.
+    pub fn services_store(&self) -> PathBuf {
+        self.services
+            .as_ref()
+            .and_then(|s| s.store_dir.clone())
+            .unwrap_or_else(|| self.state_dir().join("services"))
     }
 
     /// The local-bundles directory: `[local] dir` if set, else `<state_dir>/images`.

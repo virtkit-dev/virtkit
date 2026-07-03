@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- The GitLab executor boots a job's `services:` as sibling microVMs on the
+  per-job network instead of docker containers inside the job VM: job images no
+  longer need docker, and registry credentials never enter a guest. The
+  `[services]` config replaces `registry_proxy`/`port`/`ready_timeout_secs` with
+  an optional `store_dir`.
+
 ### Removed
 
 - The `vk fleet` command and the in-guest `virtctl` client. `vk run --compose`

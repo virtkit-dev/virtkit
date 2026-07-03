@@ -40,7 +40,6 @@ pub fn fingerprint(parts: &[&str]) -> String {
 }
 
 /// Parse a UUID (32 hex digits, dashes optional) into 16 bytes.
-#[allow(dead_code)] // wired up by the executor's service switchover
 pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
     let hex: String = s.chars().filter(|c| *c != '-').collect();
     if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -55,7 +54,6 @@ pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
 
 /// How unit images build in-process: the merged Dockerfiles and the builder
 /// wiring, shared by every `build:` unit (each unit picks its target stage).
-#[allow(dead_code)] // wired up by the executor's service switchover
 pub struct BuildRecipe {
     pub dockerfiles: Vec<PathBuf>,
     /// Build contexts, zipped positionally with `dockerfiles` (missing = the file's dir).
@@ -80,7 +78,6 @@ fn unit_fresh(out: &Path, expected_uuid: &str) -> bool {
 /// everything the stage is built from (base digest, instructions, copied files,
 /// source stages), so a UUID match means byte-equivalent content. Otherwise build
 /// the stage (the instruction cache makes that incremental) and stamp the UUID.
-#[allow(dead_code)] // wired up by the executor's service switchover
 pub fn ensure_unit_build(
     recipe: &BuildRecipe,
     target: Option<&str>,
@@ -117,7 +114,6 @@ pub fn ensure_unit_build(
 /// Ensure an `image:` unit's image: a byte-clean ext4 of the pulled rootfs (no agent
 /// — it rides the boot initramfs), UUID = `fingerprint(manifest digest)`, runtime
 /// config sidecar from the image's OCI config. Anonymous registry access.
-#[allow(dead_code)] // wired up by the executor's service switchover
 pub async fn ensure_unit_pull(image: &str, out: &Path) -> Result<()> {
     let digest = crate::oci::resolve_digest(image)
         .await

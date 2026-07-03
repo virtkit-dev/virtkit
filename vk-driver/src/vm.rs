@@ -108,7 +108,6 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
                     start.elapsed().as_secs_f32()
                 );
                 probe_guest_shell(ctx, &addr).await;
-                run_services_setup(ctx).await?;
                 return Ok(());
             }
             Err(e) => {
@@ -159,6 +158,11 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     let cfg = &ctx.cfg;
     let (kernel, media, generic) = resolve_media(ctx)?;
     let (cpus, mem) = vm_size(ctx)?;
+    // The agent backs each service boot (it rides the boot initramfs) and any
+    // service build; an embedded copy lives in a memfd whose path is valid only
+    // while this handle is open — supervise runs for the job's whole life.
+    // `[build] agent` overrides, as everywhere else.
+    let agent = crate::embed::resolve(crate::embed::Asset::Agent, cfg.build.agent.as_deref())?;
     let mut children: Vec<std::process::Child> = Vec::new();
     // Every guest gets a throwaway CoW overlay over the ro base rootfs.
     let overlay = ctx.overlay();
@@ -238,6 +242,14 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     }
 
     let mut net = crate::vmm::Net::None;
+    // services: need the per-job LAN — they are sibling VMs on the switch.
+    if cfg.net.mode != "switch" && !crate::services::from_env()?.is_empty() {
+        bail!(
+            "the job declares services:, which boot as sibling VMs on the per-job \
+             switch — set [net] mode = \"switch\" (got {:?})",
+            cfg.net.mode
+        );
+    }
     // (ip, prefix, gw, dns) once a tap is wired, rendered onto the cmdline below
     // in the form the chosen init understands.
     let mut net_info: Option<(String, u32, String, String)> = None;
@@ -270,9 +282,32 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             // tap bridged to the switch over vsock, then sets a static address.
             // Spawn the switch (with the egress allowlist) so it is listening
             // before the guest dials it; then point the agent at it. The same
-            // shared LAN/egress core the dev `fleet` uses.
+            // shared LAN/egress core `run --compose` uses.
             let (gateway, prefix, guest_ip) = crate::net::switch_addrs(&cfg.net.subnet)?;
-            children.push(spawn_switch(ctx, gateway, prefix)?);
+            let services = plan_services(ctx, gateway, prefix, &agent.path).await?;
+            // the switch binds each service's vsock socket at startup: the
+            // runtime dirs must exist before it spawns.
+            for svc in &services {
+                std::fs::create_dir_all(ctx.job_dir.join(format!("svc-{}", svc.name)))
+                    .with_context(|| format!("creating service dir for {}", svc.name))?;
+            }
+            children.push(spawn_switch(ctx, gateway, prefix, &services)?);
+            for svc in &services {
+                let dir = ctx.job_dir.join(format!("svc-{}", svc.name));
+                let (child, aux) = crate::units::boot_unit(
+                    svc,
+                    &dir,
+                    &cfg.local.generic_kernel,
+                    cfg.cloud_hypervisor(),
+                    &agent.path,
+                    cfg.net.net_port,
+                    gateway,
+                )
+                .with_context(|| format!("booting service {}", svc.name))?;
+                println!("virtkit: service {} booting ({})", svc.name, svc.ip);
+                children.push(child);
+                children.extend(aux);
+            }
             cmdline.push_str(&format!(
                 " VIRTKIT_NET_PORT={} VIRTKIT_VM_IP={guest_ip}/{prefix} \
                  VIRTKIT_VM_GW={gateway} VIRTKIT_VM_DNS={gateway}",
@@ -388,13 +423,6 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                 .context("spawning the ssh-agent forward")?,
         );
     }
-    if let Some(fwd) = services_forward_command(ctx)? {
-        children.push(
-            spawn_tied_logged(fwd, &ctx.svc_forward_log())
-                .context("spawning the services forward")?,
-        );
-    }
-
     let vmm = crate::vmm::selected(cfg.cloud_hypervisor());
     let ch_command = vmm.command(&spec);
     let mut vmm_child = spawn_tied_logged(ch_command, &ctx.ch_log())
@@ -422,6 +450,18 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                         let _ = c.wait();
                     }
                     bail!("{} exited ({status})", vmm.name());
+                }
+                // any owned helper dying (the switch, a service VM, a virtiofsd,
+                // a forward) leaves a broken job: fail loudly rather than limp.
+                for c in &mut children {
+                    if let Some(status) = c.try_wait()? {
+                        graceful_vmm_stop(ctx, &mut vmm_child);
+                        for mut c in children {
+                            let _ = c.kill();
+                            let _ = c.wait();
+                        }
+                        bail!("a supervised helper exited ({status}) — job torn down");
+                    }
                 }
             }
         }
@@ -481,71 +521,60 @@ async fn probe_guest_shell(ctx: &JobCtx, addr: &vk_core::addr::SocketAddr) {
     );
 }
 
-/// Host side of the services registry forward: a guest connection to host vsock
-/// port <port> is surfaced as `<vsock.sock>_<port>`; a `vk forward` binds it and
-/// splices to the registry proxy. `None` when the job declares no services. The
-/// registry credential lives only on the host proxy — it never reaches the guest.
-fn services_forward_command(ctx: &JobCtx) -> Result<Option<Command>> {
-    let services = crate::services::from_env()?;
-    if services.is_empty() {
-        return Ok(None);
+/// Map the job's `services:` onto provisioned units: parse + alias-map, ensure
+/// each clean image in the shared content-addressed store (first job pays the
+/// pull, concurrent jobs flock and share), assign static addresses from the top
+/// of the job subnet and CIDs from the service range, and merge each unit's boot
+/// config (image defaults + service `variables:`/entrypoint/command overrides).
+async fn plan_services(
+    ctx: &JobCtx,
+    gateway: Ipv4Addr,
+    prefix: u8,
+    agent: &Path,
+) -> Result<Vec<crate::units::Provisioned>> {
+    let units = crate::services::to_units(crate::services::from_env()?);
+    if units.is_empty() {
+        return Ok(Vec::new());
     }
-    let scfg = services_cfg(ctx)?;
-    let mut listen = ctx.vsock_sock().into_os_string();
-    listen.push(format!("_{}", scfg.port));
-
-    let exe = std::env::current_exe().context("locating the virtkit binary")?;
-    let mut fwd = Command::new(exe);
-    fwd.arg("forward")
-        .arg("--listen")
-        .arg(&listen)
-        .arg("--to")
-        .arg(format!("tcp://{}", scfg.registry_proxy));
-    Ok(Some(fwd))
-}
-
-fn services_cfg(ctx: &JobCtx) -> Result<&crate::config::Services> {
-    ctx.cfg.services.as_ref().ok_or_else(|| {
-        anyhow!(
-            "job declares services: but virtkit has no [services] config — \
-             cannot satisfy them (configure the registry proxy)"
-        )
-    })
-}
-
-/// Bring up the job's CI `services:` once the VM is ready (no-op without any): a
-/// root script in the guest starts the guest-side registry forward and each
-/// service container (see services.rs). The host-side forward it dials is already
-/// up — a supervisor child.
-async fn run_services_setup(ctx: &JobCtx) -> Result<()> {
-    let services = crate::services::from_env()?;
-    if services.is_empty() {
-        return Ok(());
+    let build = crate::units::BuildOpts {
+        build_args: Vec::new(),
+        kernel: ctx.cfg.local.generic_kernel.clone(),
+        cloud_hypervisor: ctx.cfg.cloud_hypervisor().to_path_buf(),
+        agent: agent.to_path_buf(),
+        cache_registry: None,
+        cache_insecure: false,
+    };
+    let store = ctx.cfg.services_store();
+    std::fs::create_dir_all(&store).with_context(|| format!("creating {}", store.display()))?;
+    let mut out = Vec::new();
+    for (slot, unit) in units.into_iter().enumerate() {
+        let (ext4, config) = crate::units::ensure_unit_store(&unit, &store, &build)
+            .await
+            .with_context(|| format!("service {}", unit.name))?;
+        let ip = crate::units::nth_static_ip(gateway, prefix, slot as u32)?;
+        out.push(crate::units::Provisioned {
+            name: unit.name,
+            hostname: unit.hostname,
+            ext4,
+            ip: format!("{ip}/{prefix}"),
+            cid: crate::units::FIRST_SERVICE_CID + slot as u32,
+            config,
+            volumes: Vec::new(),
+        });
     }
-    let scfg = services_cfg(ctx)?;
-    println!("virtkit: bringing up {} service(s)", services.len());
-    let script = crate::services::setup_script(scfg, &services);
-    // services are a systemd-guest feature (in-VM dockerd); use the configured shell
-    let result = crate::executor::exec_script(
-        &crate::executor::vsock_addr(ctx),
-        &ctx.cfg.guest.run_command,
-        script.into_bytes(),
-        Some("root".into()),
-    )
-    .await
-    .context("running the services setup in the guest")?;
-    match (result.code, result.signal) {
-        (Some(0), _) => Ok(()),
-        (Some(c), _) => bail!("services setup failed in the guest (exit {c})"),
-        (None, sig) => bail!("services setup killed in the guest (signal {sig:?})"),
-    }
+    Ok(out)
 }
 
 /// The per-job userspace switch (net.mode = "switch"): a tied supervisor child
 /// listening on the guest's vsock-bridge socket (`<vsock.sock>_<net_port>`) with
 /// the `[egress]` allowlist, awaited until it binds before the guest dials it.
 /// The switch is this same `virtkit` binary's `switch` subcommand.
-fn spawn_switch(ctx: &JobCtx, gateway: Ipv4Addr, prefix: u8) -> Result<std::process::Child> {
+fn spawn_switch(
+    ctx: &JobCtx,
+    gateway: Ipv4Addr,
+    prefix: u8,
+    services: &[crate::units::Provisioned],
+) -> Result<std::process::Child> {
     let cfg = &ctx.cfg;
     let listen = ctx.net_vsock_sock(cfg.net.net_port);
     let _ = std::fs::remove_file(&listen);
@@ -558,6 +587,17 @@ fn spawn_switch(ctx: &JobCtx, gateway: Ipv4Addr, prefix: u8) -> Result<std::proc
         .arg(gateway.to_string())
         .arg("--prefix")
         .arg(prefix.to_string());
+    // each service VM's vsock bridge socket, plus its alias in the gateway
+    // resolver — the job (and the services themselves) resolve plain aliases.
+    for svc in services {
+        let sock = ctx
+            .job_dir
+            .join(format!("svc-{}", svc.name))
+            .join(format!("vsock.sock_{}", cfg.net.net_port));
+        cmd.arg("--listen").arg(sock);
+        let ip = svc.ip.split('/').next().unwrap_or_default();
+        cmd.arg("--host").arg(format!("{}={ip}", svc.hostname));
+    }
     // allow_ip stays host-controlled; allow_name is the host cap by default, or a
     // job-narrowed subset of it (MICROVM_EGRESS_ALLOW_NAME).
     for cidr in &cfg.egress.allow_ip {
