@@ -415,8 +415,10 @@ enum Cmd {
         /// boot this compose file's services as sibling microVMs on the run's LAN
         /// (implies --net): the command reaches them by alias; everything is torn
         /// down when the run exits. No readiness wait — retry the first connect.
-        /// Alone (no image/-f/--service) this is compose up: services only, held
-        /// until ctrl-c.
+        /// Services declare `image:` or `build:` (`build.dockerfile` may be a
+        /// list: the files merge into one stage namespace, `target` picks any
+        /// stage across them). Alone (no image/-f/--service) this is compose up:
+        /// services only, held until ctrl-c.
         #[arg(long)]
         compose: Option<PathBuf>,
         /// activate a compose profile (repeatable): profiled services stay down

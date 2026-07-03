@@ -10,6 +10,20 @@
 //! key is a hard error** — silently ignoring a compose key would silently change
 //! behavior.
 //!
+//! ```yaml
+//! services:
+//!   redis:
+//!     image: redis:7-alpine       # pulled; fingerprint = manifest digest
+//!   db:
+//!     build: ./db                 # shorthand: context ./db, ./db/Dockerfile
+//!   app:
+//!     build:
+//!       context: .                # shared by all the service's dockerfiles
+//!       dockerfile: [base.Dockerfile, app.Dockerfile]  # merged stage namespace
+//!       target: app               # any stage across the merged files
+//!     depends_on: [db, redis]
+//! ```
+//!
 //! Runtime config follows the compose model: the image (its config sidecar / OCI
 //! config) carries the defaults, the service entries are start-time overrides —
 //! merged by [`merged_config`] and handed to the guest at boot. Changing an

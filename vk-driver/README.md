@@ -28,6 +28,38 @@ vk run --compose compose.yml --service app        # docker compose run app
 vk run --compose compose.yml                      # compose up (ctrl-c stops)
 ```
 
+Service images come from a registry (`image:`) or are built in-process
+(`build:`, each `RUN` in a microVM, instruction-cached — repeat runs restore
+instead of rebuilding). `build.dockerfile` also accepts a **list** — a vk
+extension merging the files into one stage namespace, so a `FROM` or
+`COPY --from` in one file can name a stage declared in another; all files
+share the service's single `context`:
+
+```yaml
+services:
+  redis:
+    image: redis:7-alpine             # pulled, fingerprinted by manifest digest
+  db:
+    build: ./db                       # shorthand: context ./db, ./db/Dockerfile
+  api:
+    build:
+      context: ./api                  # default "." (relative to the compose file)
+      dockerfile: api.Dockerfile      # default "Dockerfile"
+      target: runtime                 # stage to build (default: the last)
+      args:
+        VERSION: "1.2"
+  app:
+    build:
+      context: .
+      dockerfile: [base.Dockerfile, app.Dockerfile]  # one merged stage namespace
+      target: app                     # may build on stages from base.Dockerfile
+    depends_on: [db, redis]
+```
+
+Also supported per service: `environment`, `command`, `entrypoint`, `user`,
+`hostname`, `volumes` (bind mounts), `depends_on` and `profiles`; any other
+compose key is a hard error rather than a silent behavior change.
+
 ---
 
 ### Network switch
