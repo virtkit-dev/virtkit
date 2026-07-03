@@ -16,8 +16,8 @@ use serde::Deserialize;
 
 use crate::config::Services as ServicesCfg;
 
-/// One `CI_JOB_SERVICES` entry. GitLab also sets `entrypoint`/`command`; we only
-/// model what backing stores need, and serde ignores the rest.
+/// One `CI_JOB_SERVICES` entry — the subset of the runner's serialization we
+/// consume (any other key the runner emits is ignored).
 #[derive(Debug, Deserialize)]
 pub struct Service {
     /// Image reference, with the registry already variable-expanded by GitLab.
@@ -28,6 +28,38 @@ pub struct Service {
     /// Per-service environment (the service-level `variables:`).
     #[serde(default)]
     pub variables: BTreeMap<String, String>,
+    /// Entrypoint override (argv array); empty = the image's own.
+    #[serde(default)]
+    #[allow(dead_code)] // read by to_units, wired up by the executor switchover
+    pub entrypoint: Vec<String>,
+    /// Command override (argv array); empty = the image's own.
+    #[serde(default)]
+    #[allow(dead_code)] // read by to_units, wired up by the executor switchover
+    pub command: Vec<String>,
+}
+
+/// Map the job's services onto compose units — the run/CI service shape — so a
+/// CI service is provisioned and booted by the shared `units` machinery instead of a
+/// bespoke path. Image-only (a GitLab service has no build context); the alias
+/// becomes both the unit name and the guest hostname (it is what the job resolves);
+/// `variables:` become environment overrides with compose semantics.
+#[allow(dead_code)] // wired up by the executor services switchover
+pub fn to_units(services: Vec<Service>) -> Vec<crate::compose::Unit> {
+    services
+        .into_iter()
+        .map(|s| crate::compose::Unit {
+            name: s.alias.clone(),
+            hostname: s.alias,
+            source: crate::compose::Source::Image(s.name),
+            environment: s.variables.into_iter().collect(),
+            entrypoint: (!s.entrypoint.is_empty()).then_some(s.entrypoint),
+            command: (!s.command.is_empty()).then_some(s.command),
+            user: None,
+            depends_on: Vec::new(),
+            volumes: Vec::new(),
+            profiles: Vec::new(),
+        })
+        .collect()
 }
 
 /// Parse the job's services from the environment. Empty/unset = no services.
@@ -195,7 +227,8 @@ mod tests {
     #[test]
     fn parses_services_json_and_defaults_alias() {
         let json = r#"[
-            {"name":"reg.example.com/team/db:1","alias":"srv_mysql"},
+            {"name":"reg.example.com/team/db:1","alias":"srv_mysql",
+             "entrypoint":["/bin/db","--init"],"command":["--port","3307"]},
             {"name":"reg.io/team/cache:2","variables":{"X":"y"}}
         ]"#;
         // SAFETY: tests are single-threaded per process here; set + parse + clear
@@ -204,9 +237,43 @@ mod tests {
         unsafe { std::env::remove_var("CUSTOM_ENV_CI_JOB_SERVICES") };
         assert_eq!(svcs.len(), 2);
         assert_eq!(svcs[0].alias, "srv_mysql");
+        assert_eq!(svcs[0].entrypoint, ["/bin/db", "--init"]);
+        assert_eq!(svcs[0].command, ["--port", "3307"]);
         // second has no alias -> derived (registry stripped, path flattened)
         assert_eq!(svcs[1].alias, "team__cache");
         assert_eq!(svcs[1].variables.get("X").unwrap(), "y");
+        assert!(svcs[1].entrypoint.is_empty() && svcs[1].command.is_empty());
+    }
+
+    #[test]
+    fn services_map_onto_compose_units() {
+        let units = to_units(vec![
+            Service {
+                name: "reg.io/team/db:1".into(),
+                alias: "db".into(),
+                variables: [("PORT".to_string(), "3307".to_string())].into(),
+                entrypoint: vec!["/bin/db".into()],
+                command: vec!["--fast".into()],
+            },
+            Service {
+                name: "redis:7".into(),
+                alias: "redis".into(),
+                variables: BTreeMap::new(),
+                entrypoint: vec![],
+                command: vec![],
+            },
+        ]);
+        let db = &units[0];
+        assert_eq!((db.name.as_str(), db.hostname.as_str()), ("db", "db"));
+        assert!(matches!(&db.source, crate::compose::Source::Image(i) if i == "reg.io/team/db:1"));
+        assert_eq!(db.environment, [("PORT".to_string(), "3307".to_string())]);
+        assert_eq!(db.entrypoint.as_deref().unwrap(), ["/bin/db"]);
+        assert_eq!(db.command.as_deref().unwrap(), ["--fast"]);
+        // empty overrides map to None: the image's own entrypoint/cmd apply.
+        let redis = &units[1];
+        assert!(redis.entrypoint.is_none() && redis.command.is_none());
+        assert!(redis.environment.is_empty() && redis.volumes.is_empty());
+        assert!(redis.depends_on.is_empty() && redis.profiles.is_empty());
     }
 
     #[test]
@@ -216,6 +283,8 @@ mod tests {
             name: "registry.example.com/team/db:abc".into(),
             alias: "srv_mysql".into(),
             variables: BTreeMap::new(),
+            entrypoint: vec![],
+            command: vec![],
         }];
         let script = setup_script(&cfg, &svcs);
         assert!(script.contains("forward --listen tcp://127.0.0.1:5000"));
