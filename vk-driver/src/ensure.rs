@@ -138,24 +138,16 @@ pub async fn ensure_unit_pull(image: &str, out: &Path) -> Result<()> {
     let scratch = out.parent().unwrap_or_else(|| Path::new("."));
     source
         .stream_tar(scratch, |tar, hints| {
-            // Size/inode estimates as the `vk run` image path (over-estimating is
-            // free — the image is sparse), plus writable headroom for the service's
-            // own writes: fleet boots through a CoW overlay, but the *filesystem*
-            // still needs free blocks to allocate (mirrors the builder's bases).
-            let image_bytes = match hints.entries {
-                Some(n) => hints.data_bytes + n * 4096,
-                None => hints.data_bytes + hints.data_bytes / 4,
-            } + 256 * 1024 * 1024;
-            let inodes = match hints.entries {
-                Some(n) => n + 4096,
-                None => (hints.data_bytes / 8192).max(65_536),
-            };
+            // Same sizing as the `vk run` image path, plus writable headroom for the
+            // service's own writes: fleet boots through a CoW overlay, but the
+            // *filesystem* still needs free blocks to allocate (mirrors the builder's
+            // bases).
             crate::ext4::build_from_tar_stream(
                 tar,
                 &[], // clean image: nothing injected
-                image_bytes,
+                hints.image_bytes(),
                 32u64 * 1024 * 1024 * 1024 / 4096,
-                Some(inodes),
+                Some(hints.inode_count()),
                 &crate::ext4::FsId {
                     uuid: Some(uuid),
                     label: None,

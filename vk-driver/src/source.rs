@@ -31,6 +31,28 @@ pub struct TarHints {
     pub entries: Option<u64>,
 }
 
+impl TarHints {
+    /// Sparse upper bound on the ext4 data size (over-sizing is free — the image is
+    /// sparse): file-data bytes plus per-file block-rounding slack — 4 KiB per entry
+    /// when the count is known (an OCI pull), else 25% — plus a fixed margin.
+    pub fn image_bytes(&self) -> u64 {
+        let slack = match self.entries {
+            Some(n) => self.data_bytes + n * 4096,
+            None => self.data_bytes + self.data_bytes / 4,
+        };
+        slack + 256 * 1024 * 1024
+    }
+
+    /// Inode budget: exact when the entry count is known, else one inode per 8 KiB of
+    /// data with a floor, so small-file-heavy images don't exhaust the inode table.
+    pub fn inode_count(&self) -> u64 {
+        match self.entries {
+            Some(n) => n + 4096,
+            None => (self.data_bytes / 8192).max(65_536),
+        }
+    }
+}
+
 impl Source {
     /// Stream the image's flattened rootfs tar into `consume` — no intermediate tar
     /// file. The producer (a `docker export` child or a merger writer thread) runs
@@ -221,6 +243,36 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    // Pin the shared sizing heuristic for both the known-count (OCI pull) and the
+    // unknown-count (docker export) branch, so the two call sites can't drift.
+    #[test]
+    fn tar_hints_sizing_is_stable() {
+        const MARGIN: u64 = 256 * 1024 * 1024;
+        let known = TarHints {
+            data_bytes: 10_000_000,
+            entries: Some(1000),
+        };
+        assert_eq!(known.image_bytes(), 10_000_000 + 1000 * 4096 + MARGIN);
+        assert_eq!(known.inode_count(), 1000 + 4096);
+
+        // Large unknown-count image: the one-inode-per-8-KiB rate wins over the floor.
+        let unknown = TarHints {
+            data_bytes: 1_000_000_000,
+            entries: None,
+        };
+        assert_eq!(
+            unknown.image_bytes(),
+            1_000_000_000 + 1_000_000_000 / 4 + MARGIN
+        );
+        assert_eq!(unknown.inode_count(), 1_000_000_000 / 8192);
+        // Tiny unknown-count image: the inode floor wins.
+        let tiny = TarHints {
+            data_bytes: 1024,
+            entries: None,
+        };
+        assert_eq!(tiny.inode_count(), 65_536);
+    }
 
     // Well past the pipe capacity, so a producer blocked mid-write only finishes
     // if the consumer side drains or closes the pipe.

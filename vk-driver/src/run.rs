@@ -286,26 +286,12 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             let source = source.as_ref().expect("an image boot resolved a source");
             source
                 .stream_tar(work, |tar, hints| {
-                    // Sparse upper bound (over-sizing is free): file-data bytes plus
-                    // per-file block-rounding slack — 4 KiB per entry when the count is
-                    // known (an OCI pull), else 25% — plus a fixed margin. Inodes: exact
-                    // when known, else the builder's data-derived default.
-                    let image_bytes = match hints.entries {
-                        Some(n) => hints.data_bytes + n * 4096,
-                        None => hints.data_bytes + hints.data_bytes / 4,
-                    } + 256 * 1024 * 1024;
                     crate::ext4::build_from_tar_stream(
                         tar,
                         &[(crate::initramfs::CMDRUNNER_PATH, agent, 0o755)],
-                        image_bytes,
+                        hints.image_bytes(),
                         0,
-                        // entries unknown (docker export): budget one inode per 8 KiB
-                        // of data with a floor, so small-file-heavy images don't
-                        // exhaust the inode table.
-                        Some(match hints.entries {
-                            Some(n) => n + 4096,
-                            None => (hints.data_bytes / 8192).max(65_536),
-                        }),
+                        Some(hints.inode_count()),
                         &crate::ext4::FsId {
                             with_journal: true,
                             ..Default::default()
