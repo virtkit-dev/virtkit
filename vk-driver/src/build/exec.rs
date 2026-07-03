@@ -1205,7 +1205,11 @@ impl Executor for Host {
         let dest = dest_root.join(op.dest.trim_start_matches('/'));
         let dest_is_dir = op.dest.ends_with('/') || op.sources.len() > 1;
         for s in &op.sources {
-            let src = src_root.join(s.trim_start_matches("./"));
+            // sources resolve under the source root like dest does under the rootfs
+            // root — an absolute source (the COPY --from=<stage> idiom) must not
+            // escape to the host (`join` would replace the root with it).
+            let rel = s.trim_start_matches('/');
+            let src = src_root.join(rel.strip_prefix("./").unwrap_or(rel));
             if src.is_dir() {
                 // Docker copies the *contents* of a directory source into dest.
                 std::fs::create_dir_all(&dest)
@@ -1279,6 +1283,31 @@ mod tests {
         assert_eq!(ex.transcript[0], "from-image build (debian:bookworm)");
         assert!(ex.transcript[1].contains("apt-get update"));
         assert!(ex.transcript[2].starts_with("export-ext4"));
+    }
+
+    #[test]
+    fn host_copy_from_stage_resolves_absolute_sources_in_the_stage() {
+        // `COPY --from=<stage> /t /t2`: the absolute source is a path *in the source
+        // stage*, never a host path.
+        let tmp = std::env::temp_dir().join(format!("vk-host-from-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut h = Host::new(tmp.join("ctx"), tmp.join("scratch"));
+        let lib = h.from_scratch("lib").unwrap();
+        std::fs::write(h.stage_dir(&lib).unwrap().join("t"), "tool").unwrap();
+        let app = h.from_scratch("app").unwrap();
+        let op = Copy {
+            sources: vec!["/t".into()],
+            dest: "/t2".into(),
+            from: Some("lib".into()),
+            chown: None,
+            chmod: None,
+            link: false,
+        };
+        h.copy(&app, &op, Some(&lib)).unwrap();
+        let copied = std::fs::read_to_string(h.stage_dir(&app).unwrap().join("t2")).unwrap();
+        assert_eq!(copied, "tool");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
