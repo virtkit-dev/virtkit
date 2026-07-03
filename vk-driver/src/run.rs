@@ -90,6 +90,9 @@ pub struct RunArgs {
     pub shell: bool,
     /// give the guest egress via a userspace `vk switch` (DHCP + DNS + proxy)
     pub net: bool,
+    /// Egress for the `--file` build's `RUN` guests (`--build-net`,
+    /// `--build-allow-ip`, `--build-allow-name`). Unused for an image boot.
+    pub build_net: crate::build::BuildNet,
     /// forward the host SSH agent into the guest (keys never enter the guest)
     pub ssh_agent: bool,
     /// expose only these ~/.ssh/config host aliases (filtered agent + injected config);
@@ -221,6 +224,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             cache_insecure: args.cache_insecure,
             journal: false,
             build_args: args.build_args.clone(),
+            net: args.build_net.clone(),
         };
         image_env = crate::build::build(&opts)?.env;
         Some(out)
@@ -372,7 +376,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     // Networking: a userspace `vk switch` over vsock gives the guest egress (the agent
     // forks a tap bridged to it and takes the static address from the cmdline fragment).
     let mut switch = if args.net {
-        let (child, frag) = spawn_vm_switch(&vsock, work, NET_VSOCK_PORT).await?;
+        let (child, frag) = spawn_vm_switch(&vsock, work, NET_VSOCK_PORT, &[], &[]).await?;
         cmdline.push_str(&frag);
         Some(child)
     } else {
@@ -846,7 +850,13 @@ pub(crate) const CONTEXT_MOUNT: &str = "/run/virtkit-context";
 /// Spawn a `vk switch` giving one VM a userspace LAN + egress over `vsock` (DHCP +
 /// DNS + transparent proxy, unrestricted). Returns the switch child and the cmdline
 /// fragment the guest agent needs to bring up its tap. Waits for the switch to bind.
-async fn spawn_vm_switch(vsock: &Path, work: &Path, net_port: u32) -> Result<(Child, String)> {
+async fn spawn_vm_switch(
+    vsock: &Path,
+    work: &Path,
+    net_port: u32,
+    allow_ip: &[String],
+    allow_name: &[String],
+) -> Result<(Child, String)> {
     let (gw, prefix, guest_ip) = crate::net::switch_addrs("192.168.127.0/24")?;
     let mut listen = vsock.to_path_buf().into_os_string();
     listen.push(format!("_{net_port}"));
@@ -861,8 +871,14 @@ async fn spawn_vm_switch(vsock: &Path, work: &Path, net_port: u32) -> Result<(Ch
         .arg("--gateway")
         .arg(gw.to_string())
         .arg("--prefix")
-        .arg(prefix.to_string())
-        .stdin(Stdio::null())
+        .arg(prefix.to_string());
+    for a in allow_ip {
+        cmd.arg("--allow-ip").arg(a);
+    }
+    for n in allow_name {
+        cmd.arg("--allow-name").arg(n);
+    }
+    cmd.stdin(Stdio::null())
         .stdout(swlog.try_clone()?)
         .stderr(swlog);
     // self-reap if virtkit dies before teardown (spawn_tied)
@@ -885,7 +901,8 @@ async fn spawn_vm_switch(vsock: &Path, work: &Path, net_port: u32) -> Result<(Ch
 }
 
 /// Boot a stage guest on `image` (a rw qcow2, written in place) and wait for the in-guest
-/// agent. With `net`, a `vk switch` gives egress (DHCP + DNS + transparent proxy).
+/// agent. Unless `net` is `None`, a `vk switch` gives egress (DHCP + DNS + transparent
+/// proxy), restricted to `net`'s allowlist if it has one.
 #[allow(clippy::too_many_arguments)]
 /// Lightweight phase timing for the cache-push path, enabled with `VIRTKIT_TIMING=1`.
 /// Emits one line per phase; summing them across a build sizes how much of cold-cache-on
@@ -915,7 +932,7 @@ pub(crate) async fn boot_session(
     kernel: &Path,
     agent: &Path,
     image: &Path,
-    net: bool,
+    net: &crate::build::BuildNet,
     cpus: u32,
     mem: &str,
     boot_timeout_secs: u64,
@@ -985,14 +1002,20 @@ pub(crate) async fn boot_session(
     }
 
     let mut switch: Option<Child> = None;
-    if net {
-        let (child, frag) = spawn_vm_switch(&vsock, &work, NET_VSOCK_PORT).await?;
+    let net_on = !matches!(net, crate::build::BuildNet::None);
+    if net_on {
+        let (allow_ip, allow_name): (&[String], &[String]) = match net {
+            crate::build::BuildNet::Allow { ips, names } => (ips, names),
+            _ => (&[], &[]),
+        };
+        let (child, frag) =
+            spawn_vm_switch(&vsock, &work, NET_VSOCK_PORT, allow_ip, allow_name).await?;
         switch = Some(child);
         cmdline.push_str(&frag);
     }
 
     let mut vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
-    if net {
+    if net_on {
         vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, NET_VSOCK_PORT));
     }
     // virtio-fs (the context share) requires shared guest memory (shared_mem).
@@ -1172,7 +1195,7 @@ mod tests {
                 &kernel,
                 &agent,
                 &root,
-                false,
+                &crate::build::BuildNet::None,
                 1,
                 "1G",
                 120,

@@ -234,6 +234,17 @@ enum Cmd {
         /// override an ARG default: NAME=VALUE (repeatable)
         #[arg(long = "build-arg", value_name = "NAME=VALUE")]
         build_arg: Vec<String>,
+        /// network for the microVM build's RUN steps: `all` (unrestricted) or `none`
+        #[arg(long = "build-net", default_value = "all", value_name = "all|none")]
+        build_net: String,
+        /// restrict RUN egress to this destination IPv4 CIDR, optionally port-scoped
+        /// as CIDR:port (repeatable; any --build-allow-* flag turns filtering on)
+        #[arg(long = "build-allow-ip", value_name = "CIDR[:PORT]")]
+        build_allow_ip: Vec<String>,
+        /// restrict RUN egress to hosts at/under this DNS suffix, e.g. `crates.io`
+        /// (repeatable; any --build-allow-* flag turns filtering on)
+        #[arg(long = "build-allow-name", value_name = "SUFFIX")]
+        build_allow_name: Vec<String>,
     },
     /// Host side of a forward (companion of `virtkit-agent forward`): accept on
     /// `--listen` and splice each connection to `--to`, opaque to the protocol.
@@ -399,6 +410,19 @@ enum Cmd {
         /// override an ARG default for the --file build: NAME=VALUE (repeatable)
         #[arg(long = "build-arg", value_name = "NAME=VALUE")]
         build_arg: Vec<String>,
+        /// network for the --file build's RUN steps: `all` (unrestricted) or `none`.
+        /// Independent of --net, which governs the booted guest.
+        #[arg(long = "build-net", default_value = "all", value_name = "all|none")]
+        build_net: String,
+        /// restrict the --file build's RUN egress to this destination IPv4 CIDR,
+        /// optionally port-scoped as CIDR:port (repeatable; any --build-allow-* flag
+        /// turns filtering on)
+        #[arg(long = "build-allow-ip", value_name = "CIDR[:PORT]")]
+        build_allow_ip: Vec<String>,
+        /// restrict the --file build's RUN egress to hosts at/under this DNS suffix,
+        /// e.g. `crates.io` (repeatable; any --build-allow-* flag turns filtering on)
+        #[arg(long = "build-allow-name", value_name = "SUFFIX")]
+        build_allow_name: Vec<String>,
         /// share a host dir read-write into the guest (mounted at /work) and run the
         /// command there, so its outputs land back on the host
         #[arg(long, value_name = "DIR")]
@@ -640,6 +664,9 @@ async fn cli_main() -> ExitCode {
         cache_registry,
         cache_insecure,
         build_arg,
+        build_net,
+        build_allow_ip,
+        build_allow_name,
         workdir,
         kernel,
         source,
@@ -673,6 +700,10 @@ async fn cli_main() -> ExitCode {
                 (k.to_string(), v.to_string())
             })
             .collect();
+        let bnet = match build::BuildNet::from_flags(build_net, build_allow_ip, build_allow_name) {
+            Ok(n) => n,
+            Err(e) => return fail(&e, 2),
+        };
         let args = run::RunArgs {
             image: image.clone().unwrap_or_default(),
             dockerfiles: file.clone(),
@@ -696,6 +727,7 @@ async fn cli_main() -> ExitCode {
             ram: *ram,
             shell: *shell,
             net: *net,
+            build_net: bnet,
             ssh_agent: *ssh_agent,
             ssh_hosts: ssh_host.clone(),
             command: command.clone(),
@@ -855,6 +887,9 @@ async fn cli_main() -> ExitCode {
         cache_insecure,
         journal,
         build_arg,
+        build_net,
+        build_allow_ip,
+        build_allow_name,
     } = &cli.cmd
     {
         // each --build-arg is NAME=VALUE; a bare NAME means an empty value.
@@ -865,6 +900,10 @@ async fn cli_main() -> ExitCode {
                 None => (a.clone(), String::new()),
             })
             .collect();
+        let net = match build::BuildNet::from_flags(build_net, build_allow_ip, build_allow_name) {
+            Ok(n) => n,
+            Err(e) => return fail(&e, 2),
+        };
         // CLI flag wins; otherwise fall back to [build] config (and the top-level
         // cloud_hypervisor for the build guest's VMM). bool flags are opt-in, so a set
         // flag or a config `true` enables them.
@@ -886,6 +925,7 @@ async fn cli_main() -> ExitCode {
             cache_insecure: *cache_insecure || b.cache_insecure,
             journal: *journal || b.journal,
             build_args,
+            net,
         };
         return match build::build(&opts) {
             Ok(_) => ExitCode::SUCCESS,

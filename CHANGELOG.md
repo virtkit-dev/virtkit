@@ -20,6 +20,10 @@ All notable changes to virtkit will be documented in this file.
   interchangeable with a `vk registry serve` on the same root.
 - `vk registry gc` prunes idle tags and unreferenced blobs from a store.
 - `run --cpus host` matches the host CPU count.
+- Build-time network policy on `build` and `run -f`: `--build-net none` cuts the
+  `RUN` steps off the network, and `--build-allow-ip CIDR[:PORT]` /
+  `--build-allow-name SUFFIX` restrict their egress to an allowlist. The booted
+  guest's `--net` is unaffected.
 - `-f` is repeatable on `build`, `run` and `docker-hash`: the Dockerfiles merge
   into one stage namespace, so a `FROM` or `COPY --from` in one file can name a
   stage declared in another. `--context` is repeatable too, pairing with each

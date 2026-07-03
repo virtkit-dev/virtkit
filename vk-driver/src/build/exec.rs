@@ -282,7 +282,8 @@ impl Executor for Planner {
 
 /// The microVM backend: a stage is a bootable ext4 (the OCI base pulled + flattened
 /// with the agent injected), `RUN` boots it in a Cloud Hypervisor guest with egress
-/// (a `vk switch`) and execs the command — changes persist and the exported ext4
+/// per the build's [`BuildNet`](crate::build::BuildNet) policy (a `vk switch`,
+/// unrestricted by default) and execs the command — changes persist and the exported ext4
 /// is left clean. `COPY` / `RUN --mount=from` are not wired yet, so it builds the
 /// `FROM <image>` + `RUN` (+ multi-stage fork) shape. Each stage's ext4 lives under
 /// `scratch`.
@@ -313,6 +314,8 @@ pub struct MicroVm {
     parent_key: Option<String>,
     /// add a journal to the exported image (the build itself stays journal-less).
     journal: bool,
+    /// egress policy for the stage guests (no network / unrestricted / allowlist).
+    net: crate::build::BuildNet,
     /// source-stage ext4s to attach read-only (as vdb, vdc, …) to this stage's guest,
     /// for `COPY --from` / `RUN --mount=from`. Set per stage by the driver.
     sources: Vec<PathBuf>,
@@ -439,6 +442,7 @@ impl MicroVm {
         scratch: PathBuf,
         cache: Option<crate::config::Registry>,
         journal: bool,
+        net: crate::build::BuildNet,
     ) -> Self {
         MicroVm {
             cloud_hypervisor,
@@ -457,6 +461,7 @@ impl MicroVm {
             session: None,
             parent_key: None,
             journal,
+            net,
             sources: Vec::new(),
             source_dev: HashMap::new(),
             context: None,
@@ -482,7 +487,7 @@ impl MicroVm {
                 &self.kernel,
                 &self.agent,
                 &ext4,
-                true,
+                &self.net,
                 self.cpus,
                 &self.mem,
                 self.boot_timeout_secs,

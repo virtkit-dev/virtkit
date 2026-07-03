@@ -75,6 +75,50 @@ pub struct Options {
     pub journal: bool,
     /// `--build-arg NAME=VALUE` overrides for ARG defaults.
     pub build_args: Vec<(String, String)>,
+    /// Egress for the microVM build's `RUN` guests (see [`BuildNet`]).
+    pub net: BuildNet,
+}
+
+/// Egress policy for the microVM build's `RUN` guests.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BuildNet {
+    /// No switch: `RUN` steps get no network.
+    None,
+    /// Unrestricted egress via the guest's `vk switch` (the default, as `docker build`).
+    All,
+    /// Egress restricted to destination CIDRs (optionally port-scoped) and DNS-name
+    /// suffixes, enforced by the guest's `vk switch`: it refuses lookups of other
+    /// names, and a connection may only reach a listed CIDR or an IP a permitted
+    /// lookup just resolved.
+    Allow {
+        ips: Vec<String>,
+        names: Vec<String>,
+    },
+}
+
+impl BuildNet {
+    /// Map the `--build-net` / `--build-allow-*` flags to a policy: allow flags
+    /// restrict egress (and contradict `--build-net none`); with none of them,
+    /// `--build-net` picks unrestricted (`all`, the default) or no network (`none`).
+    /// Allowlist syntax is validated here so a bad flag fails before any build work.
+    pub fn from_flags(net: &str, ips: &[String], names: &[String]) -> Result<BuildNet> {
+        let restricted = !ips.is_empty() || !names.is_empty();
+        match net {
+            "none" if restricted => {
+                bail!("--build-net none contradicts --build-allow-ip/--build-allow-name")
+            }
+            "none" => Ok(BuildNet::None),
+            "all" if restricted => {
+                crate::switch::Egress::new(ips, names)?;
+                Ok(BuildNet::Allow {
+                    ips: ips.to_vec(),
+                    names: names.to_vec(),
+                })
+            }
+            "all" => Ok(BuildNet::All),
+            other => bail!("--build-net {other:?} (want all or none)"),
+        }
+    }
 }
 
 /// What a completed build exposes to its caller: the target stage's accumulated
@@ -224,6 +268,7 @@ pub fn build(opts: &Options) -> Result<Built> {
             scratch.clone(),
             cache,
             opts.journal,
+            opts.net.clone(),
         ))
     } else {
         Box::new(Host::new(scratch.clone()))
@@ -1309,6 +1354,31 @@ mod tests {
         assert!(format!("{err:#}").contains("zip positionally"), "{err:#}");
         assert!(load_inputs(&[], &[]).is_err());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn build_net_from_flags() {
+        assert_eq!(
+            BuildNet::from_flags("all", &[], &[]).unwrap(),
+            BuildNet::All
+        );
+        assert_eq!(
+            BuildNet::from_flags("none", &[], &[]).unwrap(),
+            BuildNet::None
+        );
+        let ips = vec!["10.0.0.0/8:443".to_string()];
+        let names = vec!["crates.io".to_string()];
+        assert_eq!(
+            BuildNet::from_flags("all", &ips, &names).unwrap(),
+            BuildNet::Allow {
+                ips: ips.clone(),
+                names: names.clone()
+            }
+        );
+        // `none` + an allowlist is contradictory; bad values fail before any build work.
+        assert!(BuildNet::from_flags("none", &ips, &[]).is_err());
+        assert!(BuildNet::from_flags("all", &["not-a-cidr".into()], &[]).is_err());
+        assert!(BuildNet::from_flags("half", &[], &[]).is_err());
     }
 
     #[test]
