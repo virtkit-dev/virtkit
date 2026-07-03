@@ -100,6 +100,11 @@ pub struct RunArgs {
     /// activated compose profiles (profiled services stay down unless activated
     /// or depended on)
     pub profiles: Vec<String>,
+    /// boot this compose service as the PRIMARY run VM (`docker compose run`):
+    /// its image is the rootfs, its merged config the command's env (and, with no
+    /// trailing command, its entrypoint+cmd the command); only its depends_on
+    /// closure boots as siblings. Requires `compose`; excludes image/`-f`.
+    pub service: Option<String>,
     /// Egress for the `--file` build's `RUN` guests (`--build-net`,
     /// `--build-allow-ip`, `--build-allow-name`). Unused for an image boot.
     pub build_net: crate::build::BuildNet,
@@ -215,8 +220,43 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     // `docker run` does — e.g. the base image's PATH puts `cargo` in scope. For a `-f`
     // Dockerfile boot it is the target stage's accumulated ENV; for an image boot it is the
     // image's configured `Config.Env`.
+    // Compose is loaded up front: a --service primary replaces the image/-f
+    // rootfs below, and the (remaining) services boot as siblings further down.
+    let compose_units: Vec<crate::compose::Unit> = match &args.compose {
+        Some(p) => crate::compose::load(p)?,
+        None => Vec::new(),
+    };
     let mut image_env: Vec<(String, String)> = Vec::new();
-    let dockerfile_ext4 = if args.dockerfiles.is_empty() {
+    // The --service primary's merged config: env for the command, argv as the
+    // default command, hostname for the guest.
+    let mut primary: Option<vk_core::runcfg::RunConfig> = None;
+    let mut primary_idx: Option<usize> = None;
+    let mut primary_hostname: Option<String> = None;
+    let dockerfile_ext4 = if let Some(name) = &args.service {
+        let idx = compose_units
+            .iter()
+            .position(|u| &u.name == name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--service {name:?}: no such compose service (declared: {})",
+                    compose_units
+                        .iter()
+                        .map(|u| u.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+        let unit = &compose_units[idx];
+        let out = work.join("root.ext4");
+        let built = build_service_image(args, unit, &out, kernel, agent)
+            .with_context(|| format!("service {name}"))?;
+        let cfg = crate::compose::merged_config(&built.config, unit);
+        image_env = cfg.env.clone();
+        primary_hostname = Some(unit.hostname.clone());
+        primary = Some(cfg);
+        primary_idx = Some(idx);
+        Some(out)
+    } else if args.dockerfiles.is_empty() {
         None
     } else {
         let out = work.join("root.ext4");
@@ -287,7 +327,8 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
                 Some(cpio),
                 format!(
                     "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda \
-                     VIRTKIT_HOSTNAME=vm VIRTKIT_VSOCK_PORT={VSOCK_PORT}"
+                     VIRTKIT_HOSTNAME={} VIRTKIT_VSOCK_PORT={VSOCK_PORT}",
+                    primary_hostname.as_deref().unwrap_or("vm")
                 ),
             )
         } else if !args.ram {
@@ -376,10 +417,15 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     let mut svc_boot: Vec<(crate::units::Provisioned, PathBuf)> = Vec::new();
     let mut svc_listen: Vec<PathBuf> = Vec::new();
     let mut svc_hosts: Vec<(String, String)> = Vec::new();
-    if let Some(compose) = &args.compose {
-        let units = crate::compose::load(compose)?;
-        let order = crate::compose::boot_order(&units)?;
-        let on = crate::compose::enabled(&units, &args.profiles);
+    if args.compose.is_some() {
+        let units = &compose_units;
+        let order = crate::compose::boot_order(units)?;
+        // A --service primary starts only its dependencies (compose-run
+        // semantics); otherwise the profile-enabled set boots.
+        let on = match primary_idx {
+            Some(idx) => crate::compose::dependency_closure(units, idx),
+            None => crate::compose::enabled(units, &args.profiles),
+        };
         let (gw, prefix, _) = crate::net::switch_addrs(RUN_SUBNET)?;
         let mut slot = 0u32;
         for &i in &order {
@@ -569,6 +615,9 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     };
     let ssh_config = ssh.and_then(|s| s.guest_config);
 
+    // With a --service primary and no trailing command, the service's own
+    // entrypoint+cmd runs — `docker compose run <svc>` semantics.
+    let fallback_argv = primary.map(|c| c.argv()).unwrap_or_default();
     let result = drive(
         &mut ch,
         &addr,
@@ -576,6 +625,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         args,
         ssh_config.as_deref(),
         &image_env,
+        &fallback_argv,
     )
     .await;
     if let Some(mut f) = ssh_forward.take() {
@@ -784,6 +834,7 @@ async fn drive(
     args: &RunArgs,
     ssh_config: Option<&str>,
     image_env: &[(String, String)],
+    fallback_argv: &[String],
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(args.boot_timeout_secs);
     loop {
@@ -808,7 +859,11 @@ async fn drive(
     if args.shell {
         return run_shell(addr).await;
     }
-    let user_script = user_script(&args.command);
+    let user_script = user_script(if args.command.is_empty() {
+        fallback_argv
+    } else {
+        &args.command
+    });
     // A `--workdir` share mounts the live tree at WORKDIR_MOUNT; run the command there so it
     // sees the shared files and writes its outputs back to the host.
     let body = match &args.workdir {

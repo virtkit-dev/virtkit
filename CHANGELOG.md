@@ -9,6 +9,10 @@ All notable changes to virtkit will be documented in this file.
 - `vk run --compose <file>` boots the compose services alongside the run on a
   shared LAN (implies `--net`), reachable by name; `--profile` gates them and
   everything is torn down when the run exits.
+- `vk run --compose <file> --service NAME` boots that compose service as the
+  primary VM (like `docker compose run`): its config becomes the command's
+  environment, with no trailing command its entrypoint+cmd runs, and only its
+  `depends_on` closure boots alongside.
 
 ### Changed
 

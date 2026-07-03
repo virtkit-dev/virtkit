@@ -166,6 +166,31 @@ pub fn enabled(units: &[Unit], active_profiles: &[String]) -> Vec<bool> {
     on
 }
 
+/// The transitive `depends_on` closure of one unit, excluding the unit itself —
+/// `docker compose run` semantics: running a service starts its dependencies
+/// (profiled or not) and nothing else. Unknown names are `boot_order`'s error to
+/// report; they are skipped here.
+pub fn dependency_closure(units: &[Unit], root: usize) -> Vec<bool> {
+    let by_name: BTreeMap<&str, usize> = units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (u.name.as_str(), i))
+        .collect();
+    let mut on = vec![false; units.len()];
+    let mut stack = vec![root];
+    while let Some(i) = stack.pop() {
+        for dep in &units[i].depends_on {
+            if let Some(&d) = by_name.get(dep.as_str())
+                && !std::mem::replace(&mut on[d], true)
+            {
+                stack.push(d);
+            }
+        }
+    }
+    on[root] = false;
+    on
+}
+
 /// Load + map a compose file. `base` (the file's directory) anchors every relative
 /// path: build contexts, Dockerfiles, and bind-mount sources.
 pub fn load(path: &Path) -> Result<Vec<Unit>> {
@@ -671,6 +696,26 @@ mod tests {
         .unwrap();
         assert_eq!(enabled(&solo, &[]), [false]);
         assert_eq!(enabled(&solo, &["b".to_string()]), [true]);
+    }
+
+    #[test]
+    fn dependency_closure_is_transitive_and_excludes_the_root() {
+        let units = parse(
+            "services:\n\
+             \x20 a:\n    image: i\n    depends_on: [b]\n\
+             \x20 b:\n    image: i\n    depends_on: [c]\n\
+             \x20 c:\n    image: i\n    profiles: [x]\n\
+             \x20 d:\n    image: i\n",
+            Path::new("/b"),
+        )
+        .unwrap();
+        let by = |n: &str| units.iter().position(|u| u.name == n).unwrap();
+        let on = dependency_closure(&units, by("a"));
+        // b and c (transitively, despite c's profile) — never a itself, never d.
+        assert!(on[by("b")] && on[by("c")]);
+        assert!(!on[by("a")] && !on[by("d")]);
+        // a leaf has an empty closure.
+        assert!(dependency_closure(&units, by("d")).iter().all(|x| !x));
     }
 
     #[test]

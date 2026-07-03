@@ -411,6 +411,12 @@ enum Cmd {
         /// unless activated or depended on
         #[arg(long = "profile", value_name = "NAME")]
         profile: Vec<String>,
+        /// boot this compose service as the primary VM (like docker compose run):
+        /// its image is the rootfs, its config the command's env — with no trailing
+        /// command its entrypoint+cmd runs — and only its depends_on chain boots
+        /// alongside. Requires --compose; replaces the image/-f
+        #[arg(long, value_name = "NAME", requires = "compose")]
+        service: Option<String>,
         /// Forward the host SSH agent ($SSH_AUTH_SOCK) into the guest, so ssh/git in the
         /// guest use the host's keys without the keys ever entering the guest
         #[arg(long = "ssh-agent")]
@@ -628,14 +634,25 @@ async fn cli_main() -> ExitCode {
         net,
         compose,
         profile,
+        service,
         ssh_agent,
         ssh_host,
         command,
     } = &cli.cmd
     {
-        if file.is_empty() && image.is_none() {
+        if file.is_empty() && image.is_none() && service.is_none() {
             return fail(
-                &anyhow::anyhow!("run needs an image or --file <Dockerfile>"),
+                &anyhow::anyhow!(
+                    "run needs an image, --file <Dockerfile>, or --compose + --service"
+                ),
+                2,
+            );
+        }
+        if service.is_some() && (image.is_some() || !file.is_empty()) {
+            return fail(
+                &anyhow::anyhow!(
+                    "--service picks the primary from the compose file — drop the image/-f"
+                ),
                 2,
             );
         }
@@ -676,6 +693,7 @@ async fn cli_main() -> ExitCode {
             net: *net || compose.is_some(),
             compose: compose.clone(),
             profiles: profile.clone(),
+            service: service.clone(),
             build_net: bnet,
             ssh_agent: *ssh_agent,
             ssh_hosts: ssh_host.clone(),
