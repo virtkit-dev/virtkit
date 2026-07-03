@@ -48,6 +48,8 @@ mod spawn;
 mod sshagent;
 mod sshconf;
 mod switch;
+#[allow(dead_code)] // wired up by the executor's service switchover
+mod units;
 #[cfg(feature = "virtiofsd")]
 mod virtiofsd;
 mod vm;

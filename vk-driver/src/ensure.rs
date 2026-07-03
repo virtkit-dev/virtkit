@@ -83,18 +83,18 @@ fn unit_fresh(out: &Path, expected_uuid: &str) -> bool {
 #[allow(dead_code)] // wired up by the executor's service switchover
 pub fn ensure_unit_build(
     recipe: &BuildRecipe,
-    stage: &str,
+    target: Option<&str>,
     stage_key: &str,
     out: &Path,
 ) -> Result<()> {
     let expected = fingerprint(&[stage_key]);
     if unit_fresh(out, &expected) {
-        println!("virtkit: {} fresh (stage {stage})", out.display());
+        println!("virtkit: {} fresh", out.display());
         return Ok(());
     }
     crate::build::build(&crate::build::Options {
         dockerfiles: recipe.dockerfiles.clone(),
-        target: Some(stage.to_string()),
+        target: target.map(String::from),
         contexts: recipe.contexts.clone(),
         out: Some(out.to_path_buf()),
         print_plan: false,
@@ -211,12 +211,12 @@ mod tests {
         crate::ext4::set_uuid(&out, &parse_uuid(&expected).unwrap()).unwrap();
 
         // UUID matches but the sidecar is missing -> stale (a boot needs the config).
-        assert!(ensure_unit_build(&recipe, "svc", key, &out).is_err());
+        assert!(ensure_unit_build(&recipe, Some("svc"), key, &out).is_err());
         std::fs::write(crate::build::config_sidecar(&out), "{}").unwrap();
         // UUID + sidecar -> fresh, no build attempted.
-        ensure_unit_build(&recipe, "svc", key, &out).unwrap();
+        ensure_unit_build(&recipe, Some("svc"), key, &out).unwrap();
         // a different stage key -> stale again.
-        assert!(ensure_unit_build(&recipe, "svc", "other", &out).is_err());
+        assert!(ensure_unit_build(&recipe, Some("svc"), "other", &out).is_err());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

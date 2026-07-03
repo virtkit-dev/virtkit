@@ -60,7 +60,7 @@ pub enum Source {
 }
 
 /// A bind mount (`host:guest[:ro]`); named volumes are not supported.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Volume {
     pub host: PathBuf,
     pub guest: String,

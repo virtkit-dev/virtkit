@@ -126,7 +126,7 @@ impl BuildNet {
 /// image config), so a caller booting the exported image can run its command the way
 /// `docker run` would — e.g. `run -f` putting the base image's `PATH` in scope so
 /// `cargo` resolves. The same config is written as the `<out>.json` sidecar, so a
-/// later boot of the ext4 (fleet skipping a fresh rebuild) reads it without a build.
+/// later boot of the ext4 (a fresh unit skipping a rebuild) reads it without a build.
 #[derive(Default)]
 pub struct Built {
     pub config: vk_core::runcfg::RunConfig,
@@ -536,6 +536,26 @@ fn source_stage_key(
 ) -> Option<String> {
     let s = plan.stage_ref(reference)?;
     resolved.get(&s).map(|r| r.final_key.clone())
+}
+
+/// The cache key (`stage_key`) of one target stage in the merged Dockerfiles — the
+/// content identity a unit image is fingerprinted with. `None` targets the last
+/// stage, like a build. Resolves base digests/config over the network like a real
+/// build, pruned to the target's dependency subgraph.
+pub fn target_stage_key(
+    dockerfiles: &[PathBuf],
+    contexts: &[PathBuf],
+    build_args: &[(String, String)],
+    target: Option<&str>,
+) -> Result<String> {
+    let inputs = load_inputs(dockerfiles, contexts)?;
+    let ba: Vars = build_args.iter().cloned().collect();
+    let plan = Plan::from_dockerfiles(&inputs, &ba)?;
+    let t = plan.resolve_target(target)?;
+    let order = plan.build_order(t)?;
+    let mut ex = exec::Planner::new();
+    let resolved = resolve_stages(&plan, &order, &ba, &mut ex, None)?;
+    Ok(resolved[&t].final_key.clone())
 }
 
 /// The reserved build arg whose value virtkit synthesizes (the declaring stage's
