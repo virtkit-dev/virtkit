@@ -38,6 +38,8 @@ All notable changes to virtkit will be documented in this file.
 - `run` streams its boot media instead of materialising launch temp files; an
   aborted boot no longer leaves a rootfs behind.
 - The pinned guest kernel is bumped to 6.18.37.
+- The guest kernel source falls back to the PGP-signed upstream git tag, verified
+  against a vendored signing key, when the kernel.org CDN is unavailable.
 
 ### Fixed
 
