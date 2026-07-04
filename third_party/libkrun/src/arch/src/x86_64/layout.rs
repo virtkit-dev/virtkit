@@ -22,11 +22,19 @@ pub const INITRD_SEV_START: u64 = 0xa00000;
 /// Start of the high memory.
 pub const HIMEM_START: u64 = 0x0010_0000; //1 MB.
 
-// Typically, on x86 systems 16 IRQs are used (0-15).
-/// First usable IRQ ID for virtio device interrupts on x86_64.
+/// Number of interrupt pins on the guest's single IOAPIC. Must match the
+/// emulated IOAPIC (devices/legacy/ioapic.rs) and the pins the MPTABLE routes
+/// (mptable.rs): the guest can only use an IRQ that all three agree exists.
+pub const IOAPIC_NUM_PINS: u32 = 24;
+
+/// First usable IRQ ID for virtio device interrupts on x86_64. Pins 0-4 are
+/// reserved for legacy devices (timer, keyboard, PIC cascade, the serial ports),
+/// so virtio devices start at pin 5.
 pub const IRQ_BASE: u32 = 5;
-/// Last usable IRQ ID for virtio device interrupts on x86_64.
-pub const IRQ_MAX: u32 = 15;
+/// Last usable IRQ ID for virtio device interrupts on x86_64. Legacy virtio-mmio
+/// has one interrupt line per device (no MSI multiplexing), so each device claims
+/// one IOAPIC pin and the ceiling is the single IOAPIC's last pin (pin 23).
+pub const IRQ_MAX: u32 = IOAPIC_NUM_PINS - 1;
 
 /// Address for the TSS setup.
 pub const KVM_TSS_ADDRESS: u64 = 0xfffb_d000;

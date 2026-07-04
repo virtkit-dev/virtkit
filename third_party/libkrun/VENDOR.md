@@ -40,6 +40,15 @@ the static-PIE musl target, so cargo emitted a "dropping unsupported crate type
 `libkrun.so`/`.dylib` soname via `cargo:rustc-cdylib-link-arg` (itself warned about
 with no cdylib target), so it is now a no-op.
 
+`src/arch/src/x86_64/layout.rs` + `src/arch/src/x86_64/mptable.rs` — raise the
+virtio-mmio IRQ ceiling to the full single IOAPIC. Upstream caps `IRQ_MAX` at 15 and
+the MPTABLE routes only the 16 legacy ISA INTSRC pins, while the emulated IOAPIC
+(`devices/legacy/ioapic.rs`) already exposes 24 pins. `IRQ_MAX` is now
+`IOAPIC_NUM_PINS - 1` (23) and the MPTABLE routes and sizes all 24 pins, so a guest can
+wire virtio-mmio devices landing on the high pins (19 usable IRQs instead of 11). A
+`mptable::tests::intsrc_entry_count` test locks the routed-pin count to `IOAPIC_NUM_PINS`.
+Search for `IOAPIC_NUM_PINS`.
+
 `src/devices/src/virtio/fs/linux/passthrough.rs` — the passthrough fs device called
 `libc::statx` with `libc::STATX_BASIC_STATS | libc::STATX_MNT_ID`. libc dropped its
 musl `statx` struct/fn/constants after 0.2.183, but virtkit needs a newer libc (its

@@ -14,6 +14,8 @@ use libc::c_char;
 use arch_gen::x86::mpspec;
 use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
+use crate::x86_64::layout::IOAPIC_NUM_PINS;
+
 // This is a workaround to the Rust enforcement specifying that any implementation of a foreign
 // trait (in this case `ByteValued`) where:
 // *    the type that is implementing the trait is foreign or
@@ -119,7 +121,7 @@ fn compute_mp_size(num_cpus: u8) -> usize {
         + mem::size_of::<MpcCpuWrapper>() * (num_cpus as usize)
         + mem::size_of::<MpcIoapicWrapper>()
         + mem::size_of::<MpcBusWrapper>()
-        + mem::size_of::<MpcIntsrcWrapper>() * 16
+        + mem::size_of::<MpcIntsrcWrapper>() * (IOAPIC_NUM_PINS as usize)
         + mem::size_of::<MpcLintsrcWrapper>() * 2
 }
 
@@ -214,8 +216,11 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
         base_mp = base_mp.unchecked_add(size);
         checksum = checksum.wrapping_add(compute_checksum(&mpc_ioapic.0));
     }
-    // Per kvm_setup_default_irq_routing() in kernel
-    for i in 0..16 {
+    // Route every IOAPIC pin, not just the legacy ISA range: the IRQ allocator
+    // hands out pins up to IRQ_MAX (IOAPIC_NUM_PINS - 1), and without an INTSRC
+    // entry the guest cannot wire a virtio-mmio device landing on a high pin.
+    // Per kvm_setup_default_irq_routing() in kernel.
+    for i in 0..IOAPIC_NUM_PINS as u8 {
         let size = mem::size_of::<MpcIntsrcWrapper>() as u64;
         let mut mpc_intsrc = MpcIntsrcWrapper(mpspec::mpc_intsrc::default());
         mpc_intsrc.0.type_ = mpspec::MP_INTSRC as u8;
@@ -414,6 +419,43 @@ mod tests {
             }
             assert_eq!(cpu_count, i);
         }
+    }
+
+    #[test]
+    fn intsrc_entry_count() {
+        // The INTSRC loop bound and compute_mp_size must stay in lockstep: the
+        // table routes one MP_INTSRC per IOAPIC pin, so the count the guest sees
+        // must equal IOAPIC_NUM_PINS (drift would leave high pins unroutable).
+        let mem = GuestMemoryMmap::from_ranges(&[(
+            GuestAddress(MPTABLE_START),
+            compute_mp_size(MAX_SUPPORTED_CPUS as u8),
+        )])
+        .unwrap();
+
+        setup_mptable(&mem, 1).unwrap();
+
+        let mpf_intel: MpfIntelWrapper = mem.read_obj(GuestAddress(MPTABLE_START)).unwrap();
+        let mpc_offset = GuestAddress(u64::from(mpf_intel.0.physptr));
+        let mpc_table: MpcTableWrapper = mem.read_obj(mpc_offset).unwrap();
+        let mpc_end = mpc_offset
+            .checked_add(u64::from(mpc_table.0.length))
+            .unwrap();
+
+        let mut entry_offset = mpc_offset
+            .checked_add(mem::size_of::<MpcTableWrapper>() as u64)
+            .unwrap();
+        let mut intsrc_count: u32 = 0;
+        while entry_offset < mpc_end {
+            let entry_type: u8 = mem.read_obj(entry_offset).unwrap();
+            entry_offset = entry_offset
+                .checked_add(table_entry_size(entry_type) as u64)
+                .unwrap();
+            assert!(entry_offset <= mpc_end);
+            if u32::from(entry_type) == mpspec::MP_INTSRC {
+                intsrc_count += 1;
+            }
+        }
+        assert_eq!(intsrc_count, IOAPIC_NUM_PINS);
     }
 
     #[test]
