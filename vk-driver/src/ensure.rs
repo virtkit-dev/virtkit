@@ -106,6 +106,7 @@ pub fn ensure_unit_build(
         // unrestricted RUN egress, like `docker build` (and `vk build`'s default) —
         // service stages install packages.
         net: crate::build::BuildNet::All,
+        require_cached: false,
     })?;
     let uuid = parse_uuid(&expected).expect("fingerprint is a canonical UUID");
     crate::ext4::set_uuid(out, &uuid)

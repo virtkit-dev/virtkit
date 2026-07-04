@@ -31,6 +31,10 @@ All notable changes to virtkit will be documented in this file.
   guest can run any host command as the host user; `--host-exec-wrapper` forces
   every command through an allowlist program (`--host-exec-env` passes chosen
   client env globs through to it).
+- `--require-cached` on `vk build` and `vk run`: the build may restore stages
+  from the instruction cache but must not execute anything — a cache miss
+  aborts with exit code 3, so scripts can branch cached-vs-cold without paying
+  for a build.
 
 ### Changed
 

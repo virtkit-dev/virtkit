@@ -255,6 +255,11 @@ enum Cmd {
         /// (repeatable; any --build-allow-* flag turns filtering on)
         #[arg(long = "build-allow-name", value_name = "SUFFIX")]
         build_allow_name: Vec<String>,
+        /// restores from the instruction cache are allowed, but nothing may build:
+        /// a cache miss aborts with exit code 3, so scripts can branch
+        /// cached-vs-cold without paying for a build
+        #[arg(long = "require-cached")]
+        require_cached: bool,
     },
     /// Host side of a forward (companion of `virtkit-agent forward`): accept on
     /// `--listen` and splice each connection to `--to`, opaque to the protocol.
@@ -496,6 +501,11 @@ enum Cmd {
             requires = "host_exec_wrapper"
         )]
         host_exec_env: Vec<String>,
+        /// the -f/--service/compose builds may restore from the instruction cache but
+        /// must not build: a cache miss aborts with exit code 3, so scripts can branch
+        /// cached-vs-cold without paying for a build
+        #[arg(long = "require-cached")]
+        require_cached: bool,
         /// Command to run in the guest (default: a boot-info probe). Several
         /// words are an argv, each passed as typed (like docker run — use
         /// `sh -c '…'` for shell features); a single word is a shell one-liner
@@ -717,6 +727,7 @@ async fn cli_main() -> ExitCode {
         host_exec,
         host_exec_wrapper,
         host_exec_env,
+        require_cached,
         command,
     } = &cli.cmd
     {
@@ -839,10 +850,12 @@ async fn cli_main() -> ExitCode {
             host_exec: *host_exec,
             host_exec_wrapper: host_exec_wrapper.clone(),
             host_exec_env: host_exec_env.clone(),
+            require_cached: *require_cached,
             command: command.clone(),
         };
         return match run::run(&args).await {
             Ok(()) => ExitCode::SUCCESS,
+            Err(e) if is_not_cached(&e) => fail(&e, 3),
             Err(e) => fail(&e, 1),
         };
     }
@@ -999,6 +1012,7 @@ async fn cli_main() -> ExitCode {
         build_net,
         build_allow_ip,
         build_allow_name,
+        require_cached,
     } = &cli.cmd
     {
         // each --build-arg is NAME=VALUE; a bare NAME means an empty value.
@@ -1035,9 +1049,11 @@ async fn cli_main() -> ExitCode {
             journal: *journal || b.journal,
             build_args,
             net,
+            require_cached: *require_cached,
         };
         return match build::build(&opts) {
             Ok(_) => ExitCode::SUCCESS,
+            Err(e) if is_not_cached(&e) => fail(&e, 3),
             Err(e) => fail(&e, 1),
         };
     }
@@ -1259,6 +1275,12 @@ async fn cli_main() -> ExitCode {
 fn fail(e: &anyhow::Error, code: i32) -> ExitCode {
     eprintln!("virtkit: error: {e:#}");
     exit_code(code)
+}
+
+/// `--require-cached` refusals get their own exit code (3), so scripts can branch
+/// on cached-vs-cold. Checked at the chain root — contexts may wrap the error.
+fn is_not_cached(e: &anyhow::Error) -> bool {
+    e.root_cause().downcast_ref::<build::NotCached>().is_some()
 }
 
 use crate::ensure::parse_uuid;

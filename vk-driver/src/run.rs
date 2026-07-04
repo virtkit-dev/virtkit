@@ -149,6 +149,9 @@ pub struct RunArgs {
     pub host_exec_wrapper: Option<PathBuf>,
     /// client env vars passed through to the wrapper (`serve --exec-wrapper-env` globs)
     pub host_exec_env: Vec<String>,
+    /// a `-f`/`--service`/compose build may restore stages from the instruction
+    /// cache but must not execute anything; a cache miss aborts (exit 3 at the CLI)
+    pub require_cached: bool,
     pub command: Vec<String>,
 }
 
@@ -410,6 +413,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             journal: false,
             build_args: args.build_args.clone(),
             net: args.build_net.clone(),
+            require_cached: args.require_cached,
         };
         image_env = crate::build::build(&opts)?.config.env;
         Some(out)
@@ -1082,6 +1086,7 @@ fn build_service_image(
         journal: false,
         build_args: args.build_args.clone(),
         net: args.build_net.clone(),
+        require_cached: args.require_cached,
     };
     match &unit.source {
         crate::compose::Source::Build {

@@ -77,7 +77,33 @@ pub struct Options {
     pub build_args: Vec<(String, String)>,
     /// Egress for the microVM build's `RUN` guests (see [`BuildNet`]).
     pub net: BuildNet,
+    /// Restores from the instruction cache are allowed, but nothing may actually
+    /// build: any stage whose final snapshot is not cached aborts the build with a
+    /// [`NotCached`] error (exit 3 at the CLI), so a caller can branch on
+    /// cached-vs-cold without paying for the build.
+    pub require_cached: bool,
 }
+
+/// `--require-cached` refusal: the target needs stages whose final snapshots are
+/// not in the instruction cache. A typed error so the CLI can map it to a distinct
+/// exit code (3) — "not cached" is an expected branch for callers, not a failure.
+#[derive(Debug)]
+pub struct NotCached {
+    /// names of the stages that would have to build
+    pub stages: Vec<String>,
+}
+
+impl std::fmt::Display for NotCached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "--require-cached: stage(s) not in the instruction cache: {}",
+            self.stages.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for NotCached {}
 
 /// Egress policy for the microVM build's `RUN` guests.
 #[derive(Clone, Debug, PartialEq)]
@@ -246,7 +272,7 @@ pub fn build_inputs(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
     // --print-plan: dry-run the whole pipeline and print the primitives, build nothing.
     if opts.print_plan {
         let mut ex = DryRun::new();
-        drive(&plan, &order, &build_args, &mut ex)?;
+        drive(&plan, &order, &build_args, &mut ex, false)?;
         println!("# build order: {order:?} (target stage {target})");
         for line in &ex.transcript {
             println!("{line}");
@@ -324,7 +350,8 @@ pub fn build_inputs(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
         Box::new(Host::new(scratch.clone()))
     };
     let result = (|| -> Result<Built> {
-        let (committed, states) = drive(&plan, &order, &build_args, ex.as_mut())?;
+        let (committed, states) =
+            drive(&plan, &order, &build_args, ex.as_mut(), opts.require_cached)?;
         let fs = committed
             .get(&target)
             .context("internal: target stage not committed")?;
@@ -670,6 +697,7 @@ fn drive(
     order: &[usize],
     build_args: &Vars,
     ex: &mut dyn Executor,
+    require_cached: bool,
 ) -> Result<(HashMap<usize, Rootfs>, HashMap<usize, ShellState>)> {
     // Canonical, value-independent keys (DOCKER_STAGE_HASH forced empty while keying).
     let keyed = resolve_stages(plan, order, build_args, ex, None)?;
@@ -720,6 +748,24 @@ fn drive(
             needed.insert(*parent);
         }
         needed.extend(stage_source_refs(plan, &stage.instructions));
+    }
+    // --require-cached: `needed \ cached_final` is exactly the set of stages the
+    // loop below would build (materialize a base, run instructions) rather than
+    // restore. Refuse with the typed error before any work starts.
+    if require_cached {
+        let missing: Vec<String> = order
+            .iter()
+            .filter(|i| needed.contains(i) && !cached_final.contains_key(i))
+            .map(|&i| {
+                plan.stages[i]
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("stage{i}"))
+            })
+            .collect();
+        if !missing.is_empty() {
+            return Err(NotCached { stages: missing }.into());
+        }
     }
     for &idx in order {
         if !needed.contains(&idx) {
@@ -1189,7 +1235,7 @@ mod tests {
         let t = plan.resolve_target(target).unwrap();
         let order = plan.build_order(t).unwrap();
         let mut ex = DryRun::new();
-        drive(&plan, &order, &ba, &mut ex).unwrap();
+        drive(&plan, &order, &ba, &mut ex, false).unwrap();
         ex.transcript
     }
 
@@ -1262,7 +1308,7 @@ mod tests {
         let order = plan.build_order(t).unwrap();
         // cold: everything runs and populates the cache
         let mut ex = CachedDry::default();
-        drive(&plan, &order, &ba, &mut ex).unwrap();
+        drive(&plan, &order, &ba, &mut ex, false).unwrap();
         assert!(ex.inner.transcript.iter().any(|l| l.starts_with("run ")));
         // warm: one probe of the target's final key, one restore — no per-step
         // probes, nothing built, the builder stage never touched
@@ -1271,7 +1317,7 @@ mod tests {
             cache: ex.cache,
             last_saved: None,
         };
-        drive(&plan, &order, &ba, &mut ex).unwrap();
+        drive(&plan, &order, &ba, &mut ex, false).unwrap();
         let t = &ex.inner.transcript;
         assert_eq!(t.len(), 2, "{t:?}");
         assert!(
@@ -1279,6 +1325,50 @@ mod tests {
             "{t:?}"
         );
         assert!(t[1].starts_with("cache-restore "), "{t:?}");
+    }
+
+    #[test]
+    fn require_cached_refuses_cold_and_allows_warm() {
+        let src = "FROM alpine AS builder\nRUN one\n\nFROM alpine\nRUN two\n";
+        let ba = Vars::new();
+        let plan = plan_one(src, &ba);
+        let t = plan.resolve_target(None).unwrap();
+        let order = plan.build_order(t).unwrap();
+        // cold cache: refused with the typed error, before anything runs; the
+        // unnamed final stage reports its `stage{i}` fallback name
+        let mut ex = CachedDry::default();
+        let err = drive(&plan, &order, &ba, &mut ex, true).unwrap_err();
+        let nc = err.downcast_ref::<NotCached>().expect("typed NotCached");
+        assert_eq!(nc.stages, vec!["stage1".to_string()]);
+        assert!(
+            !ex.inner.transcript.iter().any(|l| l.starts_with("run ")),
+            "{:?}",
+            ex.inner.transcript
+        );
+        // a named uncached stage reports its real `AS` name, not the fallback
+        let named = plan_one("FROM alpine AS app\nRUN build\n", &ba);
+        let norder = named
+            .build_order(named.resolve_target(None).unwrap())
+            .unwrap();
+        let err = drive(&named, &norder, &ba, &mut CachedDry::default(), true).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<NotCached>()
+                .expect("typed NotCached")
+                .stages,
+            vec!["app".to_string()]
+        );
+        // populated cache: the same require-cached drive restores, builds nothing
+        let mut ex = CachedDry::default();
+        drive(&plan, &order, &ba, &mut ex, false).unwrap();
+        let mut ex = CachedDry {
+            inner: DryRun::new(),
+            cache: ex.cache,
+            last_saved: None,
+        };
+        drive(&plan, &order, &ba, &mut ex, true).unwrap();
+        let t = &ex.inner.transcript;
+        assert!(t.iter().any(|l| l.starts_with("cache-restore ")), "{t:?}");
+        assert!(!t.iter().any(|l| l.starts_with("run ")), "{t:?}");
     }
 
     #[test]
@@ -1292,7 +1382,7 @@ mod tests {
         // cold run populates the cache; evict the target's final key so only the
         // target's last instruction must re-run
         let mut ex = CachedDry::default();
-        drive(&plan, &order, &ba, &mut ex).unwrap();
+        drive(&plan, &order, &ba, &mut ex, false).unwrap();
         let mut cache = ex.cache;
         cache.remove(&ex.last_saved.unwrap());
         let mut ex = CachedDry {
@@ -1300,7 +1390,7 @@ mod tests {
             cache,
             last_saved: None,
         };
-        drive(&plan, &order, &ba, &mut ex).unwrap();
+        drive(&plan, &order, &ba, &mut ex, false).unwrap();
         let t = &ex.inner.transcript;
         let count = |p: &str| t.iter().filter(|l| l.starts_with(p)).count();
         // probes: the target's last key (miss), the builder's last key (hit), then the
@@ -1525,7 +1615,7 @@ mod tests {
             .build_order(plan.resolve_target(Some("app")).unwrap())
             .unwrap();
         let mut ex = DryRun::new();
-        drive(&plan, &order, &ba, &mut ex).unwrap();
+        drive(&plan, &order, &ba, &mut ex, false).unwrap();
         let t = ex.transcript;
         assert!(
             t.contains(&format!("stage-context {}", tmp.join("a").display())),
@@ -1735,6 +1825,7 @@ ENTRYPOINT run me
             journal: false,
             build_args: vec![],
             net: BuildNet::None,
+            require_cached: false,
         };
         let via_file = build(&opts(tmp.join("a.ext4"))).unwrap();
         let via_inputs = build_inputs(
@@ -1788,6 +1879,7 @@ ENTRYPOINT run me
             journal: false,
             build_args: vec![],
             net: BuildNet::None, // host backend: no RUN guests, no network
+            require_cached: false,
         })
         .unwrap();
         let sidecar = config_sidecar(&out);
