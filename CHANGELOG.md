@@ -18,6 +18,9 @@ All notable changes to virtkit will be documented in this file.
   primary (beyond `--workdir`), with the same semantics as a `--service`
   primary's compose volumes — persistent state (a dev VM's `~/.vscode-server`,
   credentials dirs) lives on the host while the VM stays throwaway.
+- `vk run --symlink SRC:DST` creates in-guest symlinks after the mounts — the
+  single-file share escape hatch (virtiofs shares directories only); a dangling
+  `SRC` is skipped.
 
 ### Changed
 

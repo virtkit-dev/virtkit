@@ -350,6 +350,27 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Volume> {
     })
 }
 
+/// Parse a `--symlink SRC:DST` spec: two absolute guest paths, split at the first
+/// colon (matching the agent's VIRTKIT_SYMLINKS parser, so a `:` in DST is fine).
+/// The spec rides the kernel cmdline, where ',' and whitespace are separators —
+/// paths containing them are rejected rather than silently corrupting the format.
+pub fn parse_symlink(spec: &str) -> Result<(String, String)> {
+    match spec.split_once(':') {
+        Some((src, dst))
+            if src.starts_with('/')
+                && dst.starts_with('/')
+                && !spec.contains(',')
+                && !spec.chars().any(char::is_whitespace) =>
+        {
+            Ok((src.to_string(), dst.to_string()))
+        }
+        _ => bail!(
+            "bad --symlink {spec:?} (want absolute SRC:DST guest paths; \
+             ',' and whitespace are cmdline separators)"
+        ),
+    }
+}
+
 /// Split a compose string-form command into argv, shell-words style (like compose,
 /// without running a shell): single/double quotes group words, and a backslash
 /// escapes the next character — except inside single quotes, where it is literal.
@@ -654,6 +675,25 @@ mod tests {
         let named = "services:\n  s:\n    image: x\n    volumes:\n      - dbdata:/var/lib\n";
         let err = parse(named, Path::new("/b")).unwrap_err();
         assert!(format!("{err:#}").contains("named volumes"), "{err:#}");
+    }
+
+    #[test]
+    fn symlink_specs_are_absolute_and_cmdline_safe() {
+        // happy path
+        assert_eq!(
+            parse_symlink("/host/file:/etc/creds").unwrap(),
+            ("/host/file".to_string(), "/etc/creds".to_string())
+        );
+        // a DST containing ':' round-trips via the first-colon split
+        assert_eq!(
+            parse_symlink("/a:/weird:name").unwrap(),
+            ("/a".to_string(), "/weird:name".to_string())
+        );
+        // relative SRC, missing colon, and cmdline separators are rejected
+        assert!(parse_symlink("rel:/dst").is_err());
+        assert!(parse_symlink("/no-colon").is_err());
+        assert!(parse_symlink("/a,b:/c").is_err());
+        assert!(parse_symlink("/a b:/c").is_err());
     }
 
     #[test]

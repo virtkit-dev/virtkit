@@ -460,6 +460,11 @@ enum Cmd {
         /// — e.g. persistent state a throwaway VM should keep on the host
         #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
         volume: Vec<String>,
+        /// create an in-guest symlink after the mounts (repeatable) — the single-file
+        /// share escape hatch (virtiofs shares directories only); a dangling SRC is
+        /// skipped
+        #[arg(long = "symlink", value_name = "SRC:DST")]
+        symlink: Vec<String>,
         /// Command to run in the guest (default: a boot-info probe). Several
         /// words are an argv, each passed as typed (like docker run — use
         /// `sh -c '…'` for shell features); a single word is a shell one-liner
@@ -675,6 +680,7 @@ async fn cli_main() -> ExitCode {
         ssh_key,
         state_dir,
         volume,
+        symlink,
         command,
     } = &cli.cmd
     {
@@ -694,13 +700,14 @@ async fn cli_main() -> ExitCode {
                 || *ssh_agent
                 || !ssh_host.is_empty()
                 || workdir.is_some()
-                || !volume.is_empty())
+                || !volume.is_empty()
+                || !symlink.is_empty())
         {
             return fail(
                 &anyhow::anyhow!(
                     "--compose without an image/-f/--service is services-only (compose up) — \
-                     there is no primary VM for a command, --shell, --ssh, --workdir, or \
-                     --volume"
+                     there is no primary VM for a command, --shell, --ssh, --workdir, \
+                     --volume, or --symlink"
                 ),
                 2,
             );
@@ -742,6 +749,14 @@ async fn cli_main() -> ExitCode {
                 Err(e) => return fail(&e, 2),
             }
         };
+        let symlinks = match symlink
+            .iter()
+            .map(|s| compose::parse_symlink(s))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(v) => v,
+            Err(e) => return fail(&e, 2),
+        };
         let args = run::RunArgs {
             image: image.clone().unwrap_or_default(),
             dockerfiles: file.clone(),
@@ -776,6 +791,7 @@ async fn cli_main() -> ExitCode {
             ssh_keys: ssh_key.clone(),
             state_dir: state_dir.clone(),
             volumes,
+            symlinks,
             command: command.clone(),
         };
         return match run::run(&args).await {

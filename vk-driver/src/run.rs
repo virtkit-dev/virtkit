@@ -130,6 +130,10 @@ pub struct RunArgs {
     /// extra host-dir bind mounts into the primary (beyond `workdir`), same
     /// semantics as a `--service` primary's compose volumes
     pub volumes: Vec<crate::compose::Volume>,
+    /// in-guest symlinks (`src:dest`) created after the mounts — the single-file
+    /// share escape hatch (virtiofs shares directories only); dangling sources
+    /// are skipped by the agent
+    pub symlinks: Vec<(String, String)>,
     pub command: Vec<String>,
 }
 
@@ -660,6 +664,17 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     }
     if !virtiofs.is_empty() {
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS={virtiofs}"));
+    }
+    // In-guest symlinks, created by the agent after the mounts — the single-file
+    // share escape hatch (virtiofs shares directories only); a dangling source is
+    // skipped guest-side.
+    if !args.symlinks.is_empty() {
+        let spec: Vec<String> = args
+            .symlinks
+            .iter()
+            .map(|(src, dest)| format!("{src}:{dest}"))
+            .collect();
+        cmdline.push_str(&format!(" VIRTKIT_SYMLINKS={}", spec.join(",")));
     }
     let shared_mem = !shares.is_empty();
 
