@@ -85,12 +85,15 @@ pub struct VsockPort {
 }
 
 impl VsockPort {
-    /// Exec-style channel: the VMM listens on `base` and forwards host connections to
-    /// guest `port`. Mirrors cloud-hypervisor's hybrid base socket (host→guest).
+    /// Exec-style channel (host→guest): libkrun listens on `<base>_<port>` and
+    /// forwards host connections to guest `port` — the raw, relay-free path a
+    /// `vsock-auto://<base>:<port>` client prefers. Cloud-hypervisor ignores the
+    /// entry (its hybrid socket at `base` serves every port behind the CONNECT
+    /// handshake, which is the same client's fallback).
     pub fn exec(base: &Path, port: u32) -> Self {
         VsockPort {
             port,
-            socket: base.to_path_buf(),
+            socket: hybrid_socket(base, port),
             listen: true,
         }
     }
@@ -108,13 +111,9 @@ impl VsockPort {
 }
 
 /// The host-side socket for guest `port` on the hybrid-vsock convention:
-/// `<base>_<port>`. The single spelling of that suffix, shared by the bridge
-/// forwards and anything that dials the same socket directly.
-pub fn hybrid_socket(base: &Path, port: u32) -> PathBuf {
-    let mut socket = base.as_os_str().to_owned();
-    socket.push(format!("_{port}"));
-    socket.into()
-}
+/// `<base>_<port>`. Re-exported from vk-core, where `vsock-auto://` resolution
+/// shares the single spelling of that suffix.
+pub use vk_core::net::hybrid_socket;
 
 /// Everything needed to boot one microVM, independent of the VMM.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -276,18 +275,15 @@ pub fn selected(cloud_hypervisor: &Path) -> Box<dyn Vmm> {
     })
 }
 
-/// The exec-channel connect address for the selected backend: libkrun listens on the
-/// base socket and forwards raw to the guest (a plain unix connect), while
-/// cloud-hypervisor multiplexes guest ports behind the hybrid-vsock `CONNECT`
-/// handshake.
+/// The exec-channel connect address: `vsock-auto://<base>:<port>` on every
+/// backend. The client resolves the best path at connect time — libkrun's
+/// dedicated per-port listener (raw, no relay) when it answers, else the CONNECT
+/// handshake on Cloud Hypervisor's hybrid base socket. One address form, no
+/// backend knowledge anywhere.
 pub fn exec_addr(vsock_socket: &Path, port: u32) -> SocketAddr {
-    if libkrun_selected() {
-        SocketAddr::Unix(vsock_socket.to_path_buf())
-    } else {
-        SocketAddr::VsockMux {
-            path: vsock_socket.to_path_buf(),
-            port,
-        }
+    SocketAddr::VsockAuto {
+        path: vsock_socket.to_path_buf(),
+        port,
     }
 }
 

@@ -5,7 +5,7 @@ use listenfd::ListenFd;
 use log::{debug, info};
 use std::os::fd::RawFd;
 use std::os::unix::prelude::{FromRawFd, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio_vsock::{VMADDR_CID_ANY, VMADDR_CID_HOST, VsockAddr, VsockListener, VsockStream};
@@ -38,8 +38,41 @@ async fn connect_inner(socket: &SocketAddr) -> Result<(SerStream, DeSink), anyho
             Ok(wrap_stream(stream))
         }
         SocketAddr::VsockMux { path, port } => Ok(wrap_stream(connect_mux(path, *port).await?)),
+        SocketAddr::VsockAuto { path, port } => Ok(wrap_stream(connect_auto(path, *port).await?)),
         SocketAddr::Tcp(_) => bail!("tcp:// is for `forward` only, not the virtkit-agent protocol"),
     }
+}
+
+/// The host-side socket of guest `port` on the hybrid-vsock suffix convention:
+/// `<base>_<port>` — the single spelling of that suffix, shared by the VMM
+/// backends, the bridge forwards, and `vsock-auto://` resolution.
+pub fn hybrid_socket(base: &Path, port: u32) -> PathBuf {
+    let mut socket = base.as_os_str().to_owned();
+    socket.push(format!("_{port}"));
+    socket.into()
+}
+
+/// `vsock-auto://`: resolve the best host→guest path for a guest port at connect
+/// time. A dedicated per-port listener at `<base>_<port>` (libkrun) is raw and
+/// relay-free, so it is preferred; anything short of a connected socket falls
+/// back to the `CONNECT` handshake on `<base>` (Cloud Hypervisor's hybrid
+/// socket). One address form for every backend.
+///
+/// Only meaningful for host→guest ports: a guest→host bridge port puts a *host*
+/// listener on the same `<base>_<port>` path, which this resolution would
+/// connect to instead of the guest.
+async fn connect_auto(path: &Path, port: u32) -> Result<UnixStream, anyhow::Error> {
+    let per_port = hybrid_socket(path, port);
+    let direct_err = match UnixStream::connect(&per_port).await {
+        Ok(stream) => return Ok(stream),
+        Err(e) => e,
+    };
+    connect_mux(path, port).await.with_context(|| {
+        format!(
+            "vsock-auto: per-port socket {} unusable ({direct_err}), and the mux handshake failed",
+            per_port.display()
+        )
+    })
 }
 
 /// "Hybrid vsock" (Cloud Hypervisor, Firecracker): connect to the unix socket the VMM
@@ -148,8 +181,10 @@ pub fn listen(socket: &SocketAddr) -> Result<Listeners, anyhow::Error> {
             );
             Ok(Listeners(vec![Listener::Vsock(listener)]))
         }
-        SocketAddr::VsockMux { .. } => {
-            bail!("cannot listen on vsock-mux:// (host side of the VMM, connect only)")
+        SocketAddr::VsockMux { .. } | SocketAddr::VsockAuto { .. } => {
+            bail!(
+                "cannot listen on vsock-mux:// / vsock-auto:// (host side of the VMM, connect only)"
+            )
         }
         SocketAddr::Tcp(_) => bail!("tcp:// is for `forward` only, not the virtkit-agent protocol"),
     }
@@ -283,6 +318,7 @@ pub async fn raw_connect(target: &SocketAddr) -> Result<RawConn, anyhow::Error> 
             )
         }
         SocketAddr::VsockMux { path, port } => RawConn::Unix(connect_mux(path, *port).await?),
+        SocketAddr::VsockAuto { path, port } => RawConn::Unix(connect_auto(path, *port).await?),
         SocketAddr::Systemd => bail!("cannot connect to systemd:// (serve only)"),
     })
 }
@@ -315,7 +351,9 @@ pub async fn raw_listen(local: &SocketAddr) -> Result<RawListener, anyhow::Error
                 VsockListener::bind(addr).with_context(|| format!("binding vsock {addr:?}"))?,
             )
         }
-        SocketAddr::VsockMux { .. } => bail!("cannot listen on vsock-mux:// (connect only)"),
+        SocketAddr::VsockMux { .. } | SocketAddr::VsockAuto { .. } => {
+            bail!("cannot listen on vsock-mux:// / vsock-auto:// (connect only)")
+        }
         SocketAddr::Systemd => bail!("raw_listen does not support systemd://"),
     })
 }
@@ -327,5 +365,67 @@ impl RawListener {
             RawListener::Unix(l) => RawConn::Unix(l.accept().await?.0),
             RawListener::Vsock(l) => RawConn::Vsock(l.accept().await?.0),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("vk-net-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// vsock-auto prefers the dedicated per-port socket: the stream is raw (the
+    /// listener sees the payload bytes, no CONNECT line) even though a mux-style
+    /// listener also sits on the base path.
+    #[tokio::test]
+    async fn vsock_auto_prefers_the_per_port_socket() {
+        let dir = scratch("auto-direct");
+        let base = dir.join("vsock.sock");
+        // decoy on the base path: if the client wrongly dials it, direct.accept()
+        // below never returns and the test times out instead of passing
+        let decoy = UnixListener::bind(&base).unwrap();
+        let direct = UnixListener::bind(hybrid_socket(&base, 4444)).unwrap();
+        let mut conn = connect_auto(&base, 4444).await.unwrap();
+        conn.write_all(b"raw-bytes").await.unwrap();
+        let (mut served, _) = direct.accept().await.unwrap();
+        let mut buf = [0u8; 9];
+        served.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"raw-bytes");
+        drop(decoy);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without a per-port socket, vsock-auto falls back to the CONNECT handshake
+    /// on the base path — the Cloud Hypervisor form.
+    #[tokio::test]
+    async fn vsock_auto_falls_back_to_the_mux_handshake() {
+        let dir = scratch("auto-mux");
+        let base = dir.join("vsock.sock");
+        let mux = UnixListener::bind(&base).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = mux.accept().await.unwrap();
+            let mut line = Vec::new();
+            loop {
+                let b = s.read_u8().await.unwrap();
+                if b == b'\n' {
+                    break;
+                }
+                line.push(b);
+            }
+            assert_eq!(line, b"CONNECT 4444");
+            s.write_all(b"OK 4444\n").await.unwrap();
+            let mut buf = [0u8; 9];
+            s.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"raw-bytes");
+        });
+        let mut conn = connect_auto(&base, 4444).await.unwrap();
+        conn.write_all(b"raw-bytes").await.unwrap();
+        server.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

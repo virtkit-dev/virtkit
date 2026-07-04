@@ -581,12 +581,12 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     if ssh.is_some() {
         vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, SSH_AGENT_VSOCK_PORT));
     }
-    // --ssh, host→guest: libkrun needs an explicit per-port listener socket;
-    // cloud-hypervisor ignores the entry (its hybrid base socket multiplexes
-    // every guest port behind the CONNECT handshake).
-    let ssh_sock = work.join("ssh.sock");
+    // --ssh, host→guest: registered on the base socket like the exec channel, so
+    // the connect address is `vsock-auto://<vsock.sock>:2222` on either backend
+    // (libkrun gets a per-port listener; cloud-hypervisor ignores the entry —
+    // its hybrid socket serves every port).
     if args.ssh {
-        vsock_ports.push(crate::vmm::VsockPort::exec(&ssh_sock, SSH_VSOCK_PORT));
+        vsock_ports.push(crate::vmm::VsockPort::exec(&vsock, SSH_VSOCK_PORT));
     }
     // Control plane (guest→host): the primary dials CONTROL_PORT to reach the
     // service manager; only wired when compose services are declared.
@@ -649,11 +649,9 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     // ephemeral (fresh per boot, reached over a private channel), hence the
     // relaxed checking options.
     if args.ssh {
-        let target = if crate::vmm::libkrun_selected() {
-            ssh_sock.display().to_string()
-        } else {
-            format!("vsock-mux://{}:{SSH_VSOCK_PORT}", vsock.display())
-        };
+        // vsock-auto: the ProxyCommand picks the best path itself — the per-port
+        // listener when the backend has one, else the CONNECT handshake.
+        let target = format!("vsock-auto://{}:{SSH_VSOCK_PORT}", vsock.display());
         let exe = std::env::current_exe().context("locating the virtkit binary")?;
         println!(
             "virtkit: ssh: ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \

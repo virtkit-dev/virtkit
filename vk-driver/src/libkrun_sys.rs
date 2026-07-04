@@ -159,10 +159,12 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
             }
         }
 
-        // vsock ports. listen=true: libkrun listens on the host unix socket and
-        // forwards host connections to the guest port (the exec channel). listen=false:
-        // the guest dials the port and libkrun forwards to the host socket, where the
-        // host already listens (the switch and ssh-agent bridges). cloud-hypervisor
+        // vsock ports, each on its own `<base>_<port>` host socket. listen=true:
+        // libkrun listens there and forwards host connections to the guest port
+        // (the exec channel; `vsock-auto://` clients dial it directly — nothing
+        // listens on the base path itself under libkrun). listen=false: the guest
+        // dials the port and libkrun forwards to the host socket, where the host
+        // already listens (the switch and ssh-agent bridges). cloud-hypervisor
         // gets the equivalent wiring from its single hybrid socket.
         for vp in &spec.vsock_ports {
             let path = cstr(&vp.socket.to_string_lossy());

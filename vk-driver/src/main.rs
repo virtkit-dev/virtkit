@@ -271,6 +271,7 @@ enum Cmd {
     /// plumbing: splice stdio to `--to` — the SSH `ProxyCommand` shape. ssh hands its
     /// protocol stream on stdio; we relay it to the guest's ssh-serve (`run --ssh`
     /// prints the full invocation). Addresses: a unix path, vsock-mux://<path>:<port>,
+    /// vsock-auto://<path>:<port> (best path per backend),
     /// tcp://host:port.
     Connect {
         /// Target address to dial

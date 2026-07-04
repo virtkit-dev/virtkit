@@ -10,6 +10,10 @@ use anyhow::anyhow;
 /// - `vsock-mux://path:port`: "hybrid vsock" of Cloud Hypervisor / Firecracker —
 ///   the unix socket the VMM exposes on the host, multiplexing guest vsock ports
 ///   behind a `CONNECT <port>` handshake (connect only)
+/// - `vsock-auto://path:port`: resolve the best host→guest path for a guest port
+///   at connect time — the dedicated per-port socket `<path>_<port>` (raw, no
+///   relay) when one answers, else the `CONNECT` handshake on `<path>` — so one
+///   address works on every VMM backend (connect only)
 /// - `tcp://host:port`: AF_INET(6); the only kind a stock TCP client (e.g. a
 ///   guest dockerd talking to a forwarded registry) can use as an endpoint
 /// - anything else: path of a unix socket
@@ -19,6 +23,7 @@ pub enum SocketAddr {
     Unix(PathBuf),
     Vsock { cid: Option<u32>, port: u32 },
     VsockMux { path: PathBuf, port: u32 },
+    VsockAuto { path: PathBuf, port: u32 },
     Tcp(std::net::SocketAddr),
 }
 
@@ -42,6 +47,14 @@ impl std::str::FromStr for SocketAddr {
                 .rsplit_once(':')
                 .ok_or_else(|| anyhow!("vsock-mux:// expects <path>:<port>"))?;
             Ok(SocketAddr::VsockMux {
+                path: path.into(),
+                port: parse_num(port, "port")?,
+            })
+        } else if let Some(rest) = s.strip_prefix("vsock-auto://") {
+            let (path, port) = rest
+                .rsplit_once(':')
+                .ok_or_else(|| anyhow!("vsock-auto:// expects <path>:<port>"))?;
+            Ok(SocketAddr::VsockAuto {
                 path: path.into(),
                 port: parse_num(port, "port")?,
             })
@@ -72,6 +85,9 @@ impl fmt::Display for SocketAddr {
             } => write!(f, "vsock://{cid}:{port}"),
             SocketAddr::VsockMux { path, port } => {
                 write!(f, "vsock-mux://{}:{port}", path.display())
+            }
+            SocketAddr::VsockAuto { path, port } => {
+                write!(f, "vsock-auto://{}:{port}", path.display())
             }
             SocketAddr::Tcp(addr) => write!(f, "tcp://{addr}"),
         }
@@ -132,6 +148,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_vsock_auto() {
+        assert_eq!(
+            parse("vsock-auto:///tmp/vsock.sock:4444"),
+            SocketAddr::VsockAuto {
+                path: "/tmp/vsock.sock".into(),
+                port: 4444
+            }
+        );
+        assert!(
+            "vsock-auto:///tmp/vsock.sock"
+                .parse::<SocketAddr>()
+                .is_err()
+        );
+    }
+
+    #[test]
     fn parse_tcp() {
         assert_eq!(
             parse("tcp://127.0.0.1:5000"),
@@ -149,6 +181,7 @@ mod tests {
             "vsock://4444",
             "vsock://3:4444",
             "vsock-mux:///tmp/vsock.sock:4444",
+            "vsock-auto:///tmp/vsock.sock:4444",
             "tcp://127.0.0.1:5000",
         ] {
             assert_eq!(parse(s).to_string(), s);

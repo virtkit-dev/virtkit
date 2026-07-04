@@ -4,6 +4,19 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `vsock-auto://<vsock.sock>:<port>` addresses: one host→guest connect address
+  that works on both VMM backends — the client picks the best path at connect
+  time. `run --ssh` prints its ProxyCommand in this form, so attaching to a VM
+  no longer depends on which backend booted it.
+
+### Changed
+
+- Under libkrun, the host→guest sockets (the exec channel, `--ssh`) now live at
+  `<vsock.sock>_<port>` instead of the base `vsock.sock` path; tooling that
+  dialed the base path directly should switch to a `vsock-auto://` address.
+
 ## [0.6.0] - 2026-07-04
 
 ### Added
