@@ -603,7 +603,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     // over its DNS, torn down with the run.
     let planned = plan_services(args, work, kernel, agent, &compose_units, primary_idx)?;
     // With sibling services under management, the agent exposes their control
-    // plane at /run/vk (a FUSE bridge to the manager over vsock).
+    // plane at /run/vk/services (a FUSE bridge to the manager over vsock).
     if !planned.units.is_empty() {
         cmdline.push_str(" VIRTKIT_CTL=1");
     }

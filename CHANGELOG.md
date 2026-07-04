@@ -31,6 +31,10 @@ All notable changes to virtkit will be documented in this file.
 - Under libkrun, the host→guest sockets (the exec channel, `--ssh`) now live at
   `<vsock.sock>_<port>` instead of the base `vsock.sock` path; tooling that
   dialed the base path directly should switch to a `vsock-auto://` address.
+- The in-guest compose control filesystem moved its mountpoint one level down,
+  from `/run/vk` to `/run/vk/services` — every visible path
+  (`/run/vk/services/<name>/{state,ctl,log,error}`) is unchanged, and `/run/vk`
+  is now a plain directory with room for the run's other endpoints.
 
 ## [0.6.0] - 2026-07-04
 

@@ -216,7 +216,7 @@ fn state_of(st: &mut UnitState) -> &'static str {
 
 /// Accept control connections on a VM's hybrid-vsock control socket and serve
 /// the control protocol (a session of request/reply pairs per connection —
-/// the guest's /run/vk bridge keeps one connection open across operations).
+/// the guest's /run/vk/services bridge keeps one connection open across operations).
 pub async fn control_server(listen: &Path, mgr: Arc<Manager>) -> Result<()> {
     let _ = std::fs::remove_file(listen);
     let listener = tokio::net::UnixListener::bind(listen)

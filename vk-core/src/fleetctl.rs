@@ -1,6 +1,6 @@
-//! Service control protocol — the guest control client (the agent's /run/vk
-//! filesystem bridge) and the host service manager speak this over vsock. The
-//! guest dials host:CONTROL_PORT; the manager (listening on the VM's
+//! Service control protocol — the guest control client (the agent's
+//! /run/vk/services filesystem bridge) and the host service manager speak this
+//! over vsock. The guest dials host:CONTROL_PORT; the manager (listening on the VM's
 //! hybrid-vsock socket for that port) starts/stops/queries the declared
 //! service VMs. One newline-delimited JSON request, one reply. Scoped to the
 //! VM by construction — only the VM's vsock reaches the control socket.

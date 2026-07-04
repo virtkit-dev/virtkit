@@ -28,8 +28,8 @@
 //!                        and link the CI tools it carries (git/git-lfs/…) onto
 //!                        the PATH, skipping any the image already provides
 //!   VIRTKIT_TMPFS        /path:size[,/path:size] RAM scratch dirs (e.g. CI /builds)
-//!   VIRTKIT_CTL=1        mount the compose control fs at /run/vk (a FUSE bridge
-//!                        to the host service manager over vsock)
+//!   VIRTKIT_CTL=1        mount the compose control fs at /run/vk/services (a FUSE
+//!                        bridge to the host service manager over vsock)
 //!   VIRTKIT_SSH=1        also run ssh-serve (vsock 2222); keys VIRTKIT_SSH_KEYS
 //!                        (comma-separated `type:base64` entries, no spaces),
 //!                        user VIRTKIT_SSH_USER (default dev)
@@ -757,14 +757,15 @@ fn wait_for_iface(name: &str, tries: u32) -> bool {
     false
 }
 
-/// Optionally run the embedded SSH server (VS Code Remote-SSH) on vsock 2222.
 /// VIRTKIT_CTL=1: fork the agent's `ctlfs` — the compose control plane mounted
-/// at /run/vk (each operation bridges to the host manager over vsock).
+/// at /run/vk/services (each operation bridges to the host manager over vsock).
+/// Mounted one level down so /run/vk stays a plain directory with room for the
+/// run's other endpoints.
 fn maybe_ctlfs(cmdline: &HashMap<String, String>) {
     if cmdline.get("VIRTKIT_CTL").map(String::as_str) != Some("1") {
         return;
     }
-    if let Err(e) = fork_agent(&["ctlfs".into(), "/run/vk".into()]) {
+    if let Err(e) = fork_agent(&["ctlfs".into(), "/run/vk/services".into()]) {
         warn!("vk-agent init: control fs failed to start: {e}");
     }
 }

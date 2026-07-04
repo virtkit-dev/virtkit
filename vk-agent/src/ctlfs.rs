@@ -1,4 +1,5 @@
-//! `/run/vk` — the run's compose services as a control filesystem, /proc-style:
+//! `/run/vk/services` — the run's compose services as a control filesystem,
+//! /proc-style:
 //!
 //! ```text
 //! /run/vk/services/<name>/state   read:  "running" | "stopped"
@@ -12,6 +13,11 @@
 //! (`vk_core::fleetctl`) — so any shell or language talks to the orchestrator
 //! with no client binary. Files are served with direct I/O: content is
 //! generated per read, never cached against a stale size.
+//!
+//! The fs root *is* the services directory (each unit a top-level dir): PID 1
+//! mounts it at `/run/vk/services`, keeping `/run/vk` itself a plain directory
+//! with room for the run's other endpoints (e.g. the `host.sock` host-exec
+//! socket).
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -33,7 +39,6 @@ use vk_core::fleetctl::{Client, Reply, Request};
 const DIR_TTL: Duration = Duration::from_secs(1);
 const FILE_TTL: Duration = Duration::ZERO;
 const ROOT: u64 = 1;
-const SERVICES: u64 = 2;
 /// Unit inodes: unit `i` owns the range `FIRST + i*STRIDE ..`, dir first.
 const FIRST: u64 = 100;
 const STRIDE: u64 = 8;
@@ -136,7 +141,7 @@ impl CtlFs {
 
     fn attr(&self, ino: u64) -> Option<FileAttr> {
         let (kind, perm, size) = match ino {
-            ROOT | SERVICES => (FileType::Directory, 0o555, 0),
+            ROOT => (FileType::Directory, 0o555, 0),
             _ => match self.decode(ino)? {
                 (_, None) => (FileType::Directory, 0o555, 0),
                 (_, Some(Node::Ctl)) => (FileType::RegularFile, 0o200, 0),
@@ -211,8 +216,7 @@ impl Filesystem for CtlFs {
     fn lookup(&self, _req: &fuser::Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = name.to_string_lossy();
         let ino = match parent.0 {
-            ROOT if name == "services" => Some(SERVICES),
-            SERVICES => self
+            ROOT => self
                 .units
                 .iter()
                 .position(|u| *u == name)
@@ -365,8 +369,7 @@ impl Filesystem for CtlFs {
         mut reply: ReplyDirectory,
     ) {
         let entries: Vec<(u64, FileType, String)> = match ino.0 {
-            ROOT => vec![(SERVICES, FileType::Directory, "services".into())],
-            SERVICES => self
+            ROOT => self
                 .units
                 .iter()
                 .enumerate()

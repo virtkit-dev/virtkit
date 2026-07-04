@@ -145,7 +145,9 @@ fn main() {
     // vsock itself); handled before clap since init forks it with plain args.
     let mut argv = std::env::args();
     if argv.nth(1).as_deref() == Some("ctlfs") {
-        let mountpoint = std::env::args().nth(2).unwrap_or_else(|| "/run/vk".into());
+        let mountpoint = std::env::args()
+            .nth(2)
+            .unwrap_or_else(|| "/run/vk/services".into());
         if let Err(e) = vk_agent::ctlfs::run(std::path::Path::new(&mountpoint)) {
             eprintln!("vk-agent ctlfs: {e:#}");
             std::process::exit(1);
