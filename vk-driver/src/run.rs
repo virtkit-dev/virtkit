@@ -7,7 +7,7 @@
 //! aside (docker only with `--source docker`/`auto`), nothing else is needed.
 
 use std::ffi::OsStr;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -134,6 +134,9 @@ pub struct RunArgs {
     /// share escape hatch (virtiofs shares directories only); dangling sources
     /// are skipped by the agent
     pub symlinks: Vec<(String, String)>,
+    /// extra environment for the guest (`--env`/`--env-file`, flags last so they
+    /// win), appended to the image env and persisted in-guest for login shells
+    pub env: Vec<(String, String)>,
     pub command: Vec<String>,
 }
 
@@ -413,6 +416,26 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         }
         Some(_) => None,
     };
+    // --env/--env-file extras, upserted so they win over the image env — both in
+    // `drive`'s exports and in the guest's own env (the media below carry the
+    // merged list: the boot config for a clean -f/--service image, an injected
+    // /etc/virtkit/env capture for a converted one).
+    for (k, v) in &args.env {
+        match image_env.iter_mut().find(|(ek, _)| ek == k) {
+            Some(e) => e.1 = v.clone(),
+            None => image_env.push((k.clone(), v.clone())),
+        }
+    }
+    // Every carrier of this list (drive's exports, the boot config, the
+    // /etc/virtkit/env capture) is line-oriented in the guest: drop entries an
+    // embedded newline would split into bogus extra lines — loudly.
+    image_env.retain(|(k, v)| {
+        let ok = !k.contains('\n') && !v.contains('\n');
+        if !ok {
+            eprintln!("virtkit: skipping env var {k:?} (embedded newline)");
+        }
+        ok
+    });
 
     // 2. assemble the boot medium (virtkit-agent injected as PID 1). With the libkrun
     // backend the media are unlinked scratch fds — `media` keeps them open (their
@@ -432,13 +455,44 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         media.push(s);
         Ok(path)
     };
+    // The effective env as capture-file lines, injected into a converted image's
+    // rootfs at /etc/virtkit/env (a clean `-f` image carries it in the boot config
+    // instead). Same format as the conversion capture: raw KEY=VALUE per line.
+    let env_capture = work.join("env.capture");
+    let mut injects: Vec<(&str, &Path, u16)> =
+        vec![(crate::initramfs::CMDRUNNER_PATH, agent, 0o755)];
+    if !image_env.is_empty() {
+        let text: String = image_env
+            .iter()
+            .map(|(k, v)| format!("{k}={v}\n"))
+            .collect();
+        // env values may be secrets (the reason they stay off the cmdline):
+        // keep the host-side capture private too.
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&env_capture)
+            .and_then(|mut f| f.write_all(text.as_bytes()))
+            .with_context(|| format!("writing {}", env_capture.display()))?;
+        injects.push(("etc/virtkit/env", &env_capture, 0o644));
+    }
     let (disks, initramfs, mut cmdline): (Vec<crate::vmm::Disk>, Option<PathBuf>, String) =
         if let Some(ext4) = &dockerfile_ext4 {
             // A Dockerfile build exports a *clean* ext4 (no agent baked in). Boot it the way
             // the builder boots its own stages: a minimal initramfs holds the agent as `/init`,
             // which pivots into the ext4 at /dev/vda — so the booted image stays byte-clean.
+            // The boot config carries the effective env (stage/service ENV + --env
+            // extras): the agent applies it and materializes /etc/virtkit/env for login
+            // shells, keeping the image itself byte-clean.
             let cpio = medium("initramfs.cpio")?;
-            crate::initramfs::build_agent_initramfs(agent, &cpio)?;
+            let boot_cfg = vk_core::runcfg::RunConfig {
+                env: image_env.clone(),
+                ..Default::default()
+            };
+            crate::initramfs::build_agent_initramfs_with_config(agent, Some(&boot_cfg), &cpio)?;
             // throwaway rw qcow2 overlay over the ro raw ext4 (rw raw errors on tmpfs)
             let overlay = medium("overlay.qcow2")?;
             crate::qcow2::create_overlay(&overlay, ext4)?;
@@ -459,7 +513,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
                 .stream_tar(work, |tar, hints| {
                     crate::ext4::build_from_tar_stream(
                         tar,
-                        &[(crate::initramfs::CMDRUNNER_PATH, agent, 0o755)],
+                        &injects,
                         hints.image_bytes(),
                         0,
                         Some(hints.inode_count()),
@@ -490,7 +544,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             let source = source.as_ref().expect("an image boot resolved a source");
             source
                 .stream_tar(work, |tar, _| {
-                    crate::initramfs::build_initramfs(tar, agent, &cpio)
+                    crate::initramfs::build_initramfs_injecting(tar, &injects, &cpio)
                 })
                 .await?;
             // The kernel unpacks the cpio into the rootfs tmpfs, which is capped at

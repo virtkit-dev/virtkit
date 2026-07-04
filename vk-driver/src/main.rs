@@ -465,6 +465,14 @@ enum Cmd {
         /// skipped
         #[arg(long = "symlink", value_name = "SRC:DST")]
         symlink: Vec<String>,
+        /// extra environment for the guest command and its login shells (repeatable);
+        /// wins over the image env and any --env-file
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// KEY=VALUE lines of extra guest environment (`#` and blank lines skipped;
+        /// repeatable, later files win; --env flags win over every file)
+        #[arg(long = "env-file", value_name = "FILE")]
+        env_file: Vec<PathBuf>,
         /// Command to run in the guest (default: a boot-info probe). Several
         /// words are an argv, each passed as typed (like docker run — use
         /// `sh -c '…'` for shell features); a single word is a shell one-liner
@@ -681,6 +689,8 @@ async fn cli_main() -> ExitCode {
         state_dir,
         volume,
         symlink,
+        env,
+        env_file,
         command,
     } = &cli.cmd
     {
@@ -701,13 +711,15 @@ async fn cli_main() -> ExitCode {
                 || !ssh_host.is_empty()
                 || workdir.is_some()
                 || !volume.is_empty()
-                || !symlink.is_empty())
+                || !symlink.is_empty()
+                || !env.is_empty()
+                || !env_file.is_empty())
         {
             return fail(
                 &anyhow::anyhow!(
                     "--compose without an image/-f/--service is services-only (compose up) — \
                      there is no primary VM for a command, --shell, --ssh, --workdir, \
-                     --volume, or --symlink"
+                     --volume, --symlink, --env, or --env-file"
                 ),
                 2,
             );
@@ -757,6 +769,10 @@ async fn cli_main() -> ExitCode {
             Ok(v) => v,
             Err(e) => return fail(&e, 2),
         };
+        let extra_env = match collect_extra_env(env_file, env) {
+            Ok(v) => v,
+            Err(e) => return fail(&e, 2),
+        };
         let args = run::RunArgs {
             image: image.clone().unwrap_or_default(),
             dockerfiles: file.clone(),
@@ -792,6 +808,7 @@ async fn cli_main() -> ExitCode {
             state_dir: state_dir.clone(),
             volumes,
             symlinks,
+            env: extra_env,
             command: command.clone(),
         };
         return match run::run(&args).await {
@@ -1241,6 +1258,38 @@ fn parse_injects(specs: &[String]) -> anyhow::Result<Vec<(String, PathBuf, u16)>
     Ok(out)
 }
 
+/// Collect the extra guest env from `--env-file`s (in order, later files win)
+/// then `--env` flags (they win over every file), upserted into one list — the
+/// same upsert the guest applies. `#` and blank lines in a file are skipped.
+fn collect_extra_env(files: &[PathBuf], flags: &[String]) -> anyhow::Result<Vec<(String, String)>> {
+    let mut extra_env: Vec<(String, String)> = Vec::new();
+    let mut env_upsert = |k: &str, v: &str| match extra_env.iter_mut().find(|(ek, _)| ek == k) {
+        Some(e) => e.1 = v.to_string(),
+        None => extra_env.push((k.to_string(), v.to_string())),
+    };
+    for path in files {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!(e).context(format!("reading {}", path.display())))?;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            match line.split_once('=') {
+                Some((k, v)) => env_upsert(k, v),
+                None => anyhow::bail!("bad line {line:?} in {} (want KEY=VALUE)", path.display()),
+            }
+        }
+    }
+    for e in flags {
+        match e.split_once('=') {
+            Some((k, v)) => env_upsert(k, v),
+            None => anyhow::bail!("bad --env {e:?} (want KEY=VALUE)"),
+        }
+    }
+    Ok(extra_env)
+}
+
 /// Wraps a reader to print a bytes-streamed indicator to stderr (so streaming a
 /// `docker export` shows progress without depending on `pv`).
 struct ProgressReader<R> {
@@ -1293,6 +1342,42 @@ mod tests {
                 0o644
             )]
         );
+    }
+
+    // --env-file entries load in order (later files win) and --env flags win over
+    // every file; `#` and blank lines are skipped; malformed input errors out.
+    #[test]
+    fn extra_env_upserts_files_then_flags() {
+        let dir = std::env::temp_dir().join(format!("virtkit-envfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("one.env");
+        let f2 = dir.join("two.env");
+        std::fs::write(&f1, "# comment\n\nA=1\nB=from-one\nEMPTY=\n").unwrap();
+        std::fs::write(&f2, "B=from-two\nC=3\n").unwrap();
+        let env = collect_extra_env(
+            &[f1.clone(), f2],
+            &["C=flag".to_string(), "D=4".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            env,
+            [
+                ("A", "1"),
+                ("B", "from-two"),
+                ("EMPTY", ""),
+                ("C", "flag"),
+                ("D", "4")
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+        // malformed file line and malformed flag both error
+        std::fs::write(&f1, "NOEQUALS\n").unwrap();
+        assert!(collect_extra_env(&[f1], &[]).is_err());
+        assert!(collect_extra_env(&[], &["NOEQUALS".to_string()]).is_err());
+        // an unreadable file errors with its path
+        let err = collect_extra_env(&[dir.join("missing.env")], &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("missing.env"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --cpus takes a plain number or `host` (the host's logical CPU count, >= 1);

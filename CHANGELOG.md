@@ -21,6 +21,10 @@ All notable changes to virtkit will be documented in this file.
 - `vk run --symlink SRC:DST` creates in-guest symlinks after the mounts — the
   single-file share escape hatch (virtiofs shares directories only); a dangling
   `SRC` is skipped.
+- `vk run --env KEY=VALUE` / `--env-file FILE` add environment to the guest:
+  applied to the run command and to everything spawned in the VM. The effective
+  env is also materialized to `/etc/virtkit/env` in the guest on every boot, so
+  an image's profile.d snippet can restore it in login shells.
 
 ### Changed
 

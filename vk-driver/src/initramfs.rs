@@ -14,12 +14,6 @@ use crate::cpio::CpioWriter;
 /// Where the injected agent lands in the rootfs (relative path).
 pub const CMDRUNNER_PATH: &str = "usr/local/bin/vk-agent";
 
-/// Build a cpio initramfs at `out` from the rootfs tar streamed by `tar`, injecting
-/// the static agent as PID 1. Convenience wrapper over [`build_initramfs_injecting`].
-pub fn build_initramfs(tar: impl Read, agent: &Path, out: &Path) -> Result<()> {
-    build_initramfs_injecting(tar, &[(CMDRUNNER_PATH, agent, 0o755)], out)
-}
-
 /// Build a *minimal* cpio initramfs at `out` containing only the agent as `/init`.
 /// Used by the disk-boot path (e.g. build): the kernel runs this agent as PID 1
 /// from RAM, which then mounts the real image ext4 and `pivot_root`s into it (see

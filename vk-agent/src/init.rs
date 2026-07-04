@@ -90,6 +90,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     load_image_env(); // so served/exec'd commands inherit the image PATH etc.
     export_default_run_user(); // so served stages drop to the image's USER
     apply_boot_config(boot_config.as_ref()); // the boot config wins over any capture
+    materialize_env(boot_config.as_ref()); // persist the merged env for login shells
     mount_virtiofs(&cmdline);
     apply_symlinks(&cmdline);
     link_ci_tools(&cmdline); // host CI tools (git/git-lfs/…) onto PATH, if the image lacks them
@@ -506,6 +507,40 @@ fn apply_boot_config(cfg: Option<&RunConfig>) {
         // SAFETY: as above.
         unsafe { std::env::set_var("VIRTKIT_DEFAULT_RUN_USER", &cfg.user) };
         info!("vk-agent init: VIRTKIT_DEFAULT_RUN_USER={}", cfg.user);
+    }
+}
+
+/// Persist the boot config's environment to /etc/virtkit/env, upserted over any
+/// baked capture (config wins, order preserved). The runtime env is already
+/// applied by `apply_boot_config`; this write is for *login* shells, whose
+/// /etc/profile resets PATH — a profile.d snippet can re-apply the effective env
+/// from the file, and on a clean-image boot (`run -f`) the file would otherwise
+/// not exist at all. Best effort: a read-only rootfs just keeps the in-process env.
+fn materialize_env(cfg: Option<&RunConfig>) {
+    let Some(cfg) = cfg else { return };
+    if cfg.env.is_empty() {
+        return;
+    }
+    let mut merged: Vec<(String, String)> = std::fs::read_to_string("/etc/virtkit/env")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(k, v)| (k.into(), v.into())))
+        .collect();
+    for (k, v) in &cfg.env {
+        match merged.iter_mut().find(|(ek, _)| ek == k) {
+            Some(e) => e.1 = v.clone(),
+            None => merged.push((k.clone(), v.clone())),
+        }
+    }
+    // one entry per line — a key/value with an embedded newline can't fit the format
+    let text: String = merged
+        .iter()
+        .filter(|(k, v)| !k.contains('\n') && !v.contains('\n'))
+        .map(|(k, v)| format!("{k}={v}\n"))
+        .collect();
+    let _ = std::fs::create_dir_all("/etc/virtkit");
+    if let Err(e) = std::fs::write("/etc/virtkit/env", text) {
+        warn!("vk-agent init: writing /etc/virtkit/env failed: {e}");
     }
 }
 
