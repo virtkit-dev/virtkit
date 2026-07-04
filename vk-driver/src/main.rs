@@ -258,6 +258,11 @@ enum Cmd {
         /// cached-vs-cold without paying for a build
         #[arg(long = "require-cached")]
         require_cached: bool,
+        /// max stages built concurrently on the microVM backend (independent stages
+        /// build in parallel over the dependency graph). Default: auto, bounded by host
+        /// RAM; also settable via VIRTKIT_BUILD_JOBS. 1 forces a sequential build
+        #[arg(long = "build-jobs", value_name = "N")]
+        build_jobs: Option<usize>,
     },
     /// Host side of a forward (companion of `virtkit-agent forward`): accept on
     /// `--listen` and splice each connection to `--to`, opaque to the protocol.
@@ -1018,6 +1023,7 @@ async fn cli_main() -> ExitCode {
         build_allow_ip,
         build_allow_name,
         require_cached,
+        build_jobs,
     } = &cli.cmd
     {
         // each --build-arg is NAME=VALUE; a bare NAME means an empty value.
@@ -1057,6 +1063,7 @@ async fn cli_main() -> ExitCode {
             build_args,
             net,
             require_cached: *require_cached,
+            build_jobs: *build_jobs,
         };
         return match build::build(&opts) {
             Ok(_) => ExitCode::SUCCESS,

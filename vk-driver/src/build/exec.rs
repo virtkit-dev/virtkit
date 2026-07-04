@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 
@@ -311,8 +312,10 @@ pub struct MicroVm {
     /// keyed by its chained content hash, and pulled back on a rebuild hit. The CDC
     /// chunk dedup makes successive snapshots share almost all blobs. `None` = no cache.
     cache: Option<crate::config::Registry>,
-    /// stage label → its ext4 image path.
-    images: HashMap<String, PathBuf>,
+    /// stage label → its ext4 image path. Shared across concurrent stage workers
+    /// (a fork / `COPY --from` reads a dep's committed image): the driver commits a
+    /// stage before unblocking its dependents, so the write happens-before the read.
+    images: Arc<Mutex<HashMap<String, PathBuf>>>,
     /// the current stage's long-lived guest (booted on its first RUN, reused for the
     /// rest, committed + torn down by `stage_end`). `None` between stages.
     session: Option<crate::run::VmSession>,
@@ -347,8 +350,9 @@ pub struct MicroVm {
     push_seq: u64,
     /// stage label → the cache key of its last pushed snapshot (its committed image). A
     /// `FROM <stage>` fork starts from exactly that image, so its first instruction can
-    /// diff against this key instead of a full re-chunk of the whole image.
-    stage_last_key: HashMap<String, String>,
+    /// diff against this key instead of a full re-chunk of the whole image. Shared
+    /// across workers (same happens-before as `images`).
+    stage_last_key: Arc<Mutex<HashMap<String, String>>>,
     /// the previous diff push's layer list (+ total size), kept in memory so the next
     /// instruction diffs against it without re-fetching+parsing the parent manifest from
     /// the registry every push. `None` at a stage's first instruction (it fetches once) and
@@ -356,7 +360,8 @@ pub struct MicroVm {
     parent_layers: Option<(Vec<oci_client::manifest::OciDescriptor>, u64)>,
     /// resolved manifest digest per base image ref, memoized so the cache-key seed and the
     /// base ext4 cache key share one lookup. `Some(None)` = a resolve that failed (key by ref).
-    base_digests: HashMap<String, Option<String>>,
+    /// Shared across workers: a pure memoization cache, safe to populate from any stage.
+    base_digests: Arc<Mutex<HashMap<String, Option<String>>>>,
 }
 
 /// What `cache_save` chunks + uploads in the background. The thread returns the pushed
@@ -465,7 +470,7 @@ impl MicroVm {
             // overlay/push are hole-aware, so the unused capacity costs nothing on disk.
             free_blocks: 32u64 * 1024 * 1024 * 1024 / 4096,
             cache,
-            images: HashMap::new(),
+            images: Arc::new(Mutex::new(HashMap::new())),
             session: None,
             parent_key: None,
             journal,
@@ -475,9 +480,49 @@ impl MicroVm {
             context: None,
             inflight: None,
             push_seq: 0,
-            stage_last_key: HashMap::new(),
+            stage_last_key: Arc::new(Mutex::new(HashMap::new())),
             parent_layers: None,
-            base_digests: HashMap::new(),
+            base_digests: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Memory each stage guest reserves, in MiB — the parallel driver divides available
+    /// host RAM by this to pick a default job count.
+    pub fn mem_mib(&self) -> u64 {
+        crate::run::parse_mem_mib(&self.mem).unwrap_or(2048)
+    }
+
+    /// A fresh per-stage worker that shares this executor's cross-stage state (the
+    /// `images` / `stage_last_key` / `base_digests` maps and the cache registry) but
+    /// starts with an empty per-stage working set (no session, sources, or in-flight
+    /// push). The parallel driver builds each concurrent stage on its own worker, so the
+    /// per-stage guest and cache-push bookkeeping never alias across threads; the shared
+    /// maps are the only synchronization point. Config (kernel/agent/net/…) is cheap to
+    /// clone per worker.
+    pub fn worker(&self) -> MicroVm {
+        MicroVm {
+            cloud_hypervisor: self.cloud_hypervisor.clone(),
+            kernel: self.kernel.clone(),
+            agent: self.agent.clone(),
+            scratch: self.scratch.clone(),
+            cpus: self.cpus,
+            mem: self.mem.clone(),
+            boot_timeout_secs: self.boot_timeout_secs,
+            free_blocks: self.free_blocks,
+            cache: self.cache.clone(),
+            images: Arc::clone(&self.images),
+            stage_last_key: Arc::clone(&self.stage_last_key),
+            base_digests: Arc::clone(&self.base_digests),
+            journal: self.journal,
+            net: self.net.clone(),
+            session: None,
+            parent_key: None,
+            sources: Vec::new(),
+            source_dev: HashMap::new(),
+            context: None,
+            inflight: None,
+            push_seq: 0,
+            parent_layers: None,
         }
     }
 
@@ -512,6 +557,8 @@ impl MicroVm {
     }
     fn stage_image(&self, fs: &Rootfs) -> Result<PathBuf> {
         self.images
+            .lock()
+            .unwrap()
             .get(&fs.label)
             .cloned()
             .with_context(|| format!("no ext4 for stage {:?}", fs.label))
@@ -527,7 +574,10 @@ impl MicroVm {
     fn wrap_base(&mut self, stage: &str, base: &Path) -> Result<()> {
         let overlay = self.stage_overlay_path(stage);
         crate::qcow2::create_overlay(&overlay, base)?;
-        self.images.insert(stage.to_string(), overlay);
+        self.images
+            .lock()
+            .unwrap()
+            .insert(stage.to_string(), overlay);
         Ok(())
     }
     /// Parent layers + total size for the next diff push: the previous push's layers held in
@@ -559,7 +609,10 @@ impl MicroVm {
             match inf.handle.join().expect("cache push thread panicked") {
                 Ok(layers) => {
                     self.parent_layers = layers;
-                    self.stage_last_key.insert(label.to_string(), inf.key);
+                    self.stage_last_key
+                        .lock()
+                        .unwrap()
+                        .insert(label.to_string(), inf.key);
                 }
                 Err(e) => eprintln!("virtkit: build async push failed ({e:#}) — not cached"),
             }
@@ -701,12 +754,20 @@ impl Executor for MicroVm {
         let overlay = self.stage_overlay_path(stage);
         crate::qcow2::create_overlay(&overlay, &src)
             .with_context(|| format!("forking {} -> {}", src.display(), overlay.display()))?;
-        self.images.insert(stage.to_string(), overlay);
+        self.images
+            .lock()
+            .unwrap()
+            .insert(stage.to_string(), overlay);
         // This fork starts from the parent stage's final image, which was cached under
         // the parent's last key — so the first instruction here can diff against it instead
         // of fully re-chunking the whole image. (None if the parent wasn't cached, e.g.
         // caching off → full push.)
-        self.parent_key = self.stage_last_key.get(&parent.label).cloned();
+        self.parent_key = self
+            .stage_last_key
+            .lock()
+            .unwrap()
+            .get(&parent.label)
+            .cloned();
         self.parent_layers = None;
         Ok(Rootfs {
             label: stage.to_string(),
@@ -920,7 +981,7 @@ impl Executor for MicroVm {
             crate::qcow2::flatten_to_raw(&image, out)
                 .with_context(|| format!("exporting {} -> {}", image.display(), out.display()))?;
         }
-        self.images.remove(&fs.label);
+        self.images.lock().unwrap().remove(&fs.label);
         // Zero the superblock's volatile bookkeeping (write/mount/check times + the
         // kbytes-written/mount counters) so the artifact is deterministic: a cache-restored
         // (warm) build and a cold build are byte-identical, and rebuilds are reproducible.
@@ -986,6 +1047,8 @@ impl Executor for MicroVm {
                 Ok(layers) => {
                     self.parent_layers = Some(layers);
                     self.stage_last_key
+                        .lock()
+                        .unwrap()
                         .insert(fs.label.clone(), key.to_string());
                 }
                 Err(e) => {
@@ -1029,7 +1092,10 @@ impl Executor for MicroVm {
             match inf.handle.join().expect("cache push thread panicked") {
                 Ok(layers) => {
                     self.parent_layers = layers;
-                    self.stage_last_key.insert(fs.label.clone(), inf.key);
+                    self.stage_last_key
+                        .lock()
+                        .unwrap()
+                        .insert(fs.label.clone(), inf.key);
                 }
                 Err(e) => {
                     eprintln!("virtkit: build async push failed ({e:#}) — not cached");
@@ -1041,9 +1107,12 @@ impl Executor for MicroVm {
 
         let (parent_layers, parent_total) = self.parent_for_push(&rg, total_size);
 
-        // Spawn the push on a background thread; it overlaps the next instruction's RUN. Only
-        // one runs at a time (joined above before the next is spawned), so the parent-layer
-        // chain stays ordered and the registry sees one writer.
+        // Spawn the push on a background thread; it overlaps the next instruction's RUN.
+        // Within a stage only one push runs at a time (joined above before the next is
+        // spawned), so this stage's parent-layer chain stays ordered. Across concurrent
+        // stages (the parallel driver) several pushes may hit the store at once; that is
+        // safe — the store is content-addressed and writes atomically (temp + rename), and
+        // a stage is fully pushed before any dependent that reads its chunks starts.
         let snap_push = snap.clone();
         let key_s = key.to_string();
         let handle = std::thread::spawn(move || -> PushOutput {
@@ -1075,7 +1144,7 @@ impl Executor for MicroVm {
     }
 
     fn resolve_base_digest(&mut self, image: &str) -> Option<String> {
-        if let Some(d) = self.base_digests.get(image) {
+        if let Some(d) = self.base_digests.lock().unwrap().get(image) {
             return d.clone();
         }
         let d = match block_on(crate::oci::resolve_digest(image)) {
@@ -1087,7 +1156,10 @@ impl Executor for MicroVm {
                 None
             }
         };
-        self.base_digests.insert(image.to_string(), d.clone());
+        self.base_digests
+            .lock()
+            .unwrap()
+            .insert(image.to_string(), d.clone());
         d
     }
 

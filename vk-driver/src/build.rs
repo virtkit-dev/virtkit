@@ -37,6 +37,7 @@ mod plan;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex};
 
 use anyhow::{Context, Result, bail};
 
@@ -85,6 +86,11 @@ pub struct Options {
     /// [`NotCached`] error (exit 3 at the CLI), so a caller can branch on
     /// cached-vs-cold without paying for the build.
     pub require_cached: bool,
+    /// Max stages built concurrently (microVM backend). `Some` (the `--build-jobs`
+    /// flag) takes precedence over `VIRTKIT_BUILD_JOBS`, which takes precedence over
+    /// the `None` = auto default (bounded by host RAM, each stage guest reserving a
+    /// fixed slice). `1` forces the sequential build. Ignored by the host backend.
+    pub build_jobs: Option<usize>,
 }
 
 /// `--require-cached` refusal: the target needs stages whose final snapshots are
@@ -325,44 +331,54 @@ pub fn build_inputs(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
     } else {
         (None, None)
     };
-    let mut ex: Box<dyn Executor> = if opts.microvm {
-        let cache = cache_repo(opts.cache_registry.as_deref())?.map(|repo| {
-            crate::config::Registry::for_share(
-                repo,
-                opts.cache_insecure,
-                None,
-                String::new(),
-                None,
-                None,
-            )
-        });
-        let kernel = kernel.as_ref().expect("resolved under opts.microvm");
-        let agent = agent.as_ref().expect("resolved under opts.microvm");
-        // cloud-hypervisor is only needed when VIRTKIT_VMM selects it; the default
-        // libkrun backend is embedded in `vk` and drives no external VMM binary.
-        let ch = if crate::vmm::libkrun_selected() {
-            opts.cloud_hypervisor.clone().unwrap_or_default()
-        } else {
-            opts.cloud_hypervisor.clone().context(
-                "the cloud-hypervisor backend (VIRTKIT_VMM=cloud-hypervisor) needs \
-                 --cloud-hypervisor",
-            )?
-        };
-        Box::new(MicroVm::new(
-            ch,
-            kernel.path.clone(),
-            agent.path.clone(),
-            scratch.clone(),
-            cache,
-            opts.journal,
-            opts.net.clone(),
-        ))
-    } else {
-        Box::new(Host::new(scratch.clone()))
-    };
     let result = (|| -> Result<Built> {
-        let (committed, states) =
-            drive(&plan, &order, &build_args, ex.as_mut(), opts.require_cached)?;
+        // The microVM backend drives stages in parallel over the dependency DAG (each
+        // stage on its own guest); the host backend (FROM scratch + COPY) stays
+        // sequential. Both produce the same committed map, then share the export tail.
+        let (committed, states, mut ex): (_, _, Box<dyn Executor>) = if opts.microvm {
+            let cache = cache_repo(opts.cache_registry.as_deref())?.map(|repo| {
+                crate::config::Registry::for_share(
+                    repo,
+                    opts.cache_insecure,
+                    None,
+                    String::new(),
+                    None,
+                    None,
+                )
+            });
+            let kernel = kernel.as_ref().expect("resolved under opts.microvm");
+            let agent = agent.as_ref().expect("resolved under opts.microvm");
+            // cloud-hypervisor is only needed when VIRTKIT_VMM selects it; the default
+            // libkrun backend is embedded in `vk` and drives no external VMM binary.
+            let ch = if crate::vmm::libkrun_selected() {
+                opts.cloud_hypervisor.clone().unwrap_or_default()
+            } else {
+                opts.cloud_hypervisor.clone().context(
+                    "the cloud-hypervisor backend (VIRTKIT_VMM=cloud-hypervisor) needs \
+                     --cloud-hypervisor",
+                )?
+            };
+            let mv = MicroVm::new(
+                ch,
+                kernel.path.clone(),
+                agent.path.clone(),
+                scratch.clone(),
+                cache,
+                opts.journal,
+                opts.net.clone(),
+            );
+            let jobs = resolve_build_jobs(opts, mv.mem_mib());
+            let (committed, states) =
+                drive_microvm(&plan, &order, &build_args, &mv, jobs, opts.require_cached)?;
+            // `mv` shares the workers' `images` map (same Arc), so it can export the
+            // target and is reused as the exporter.
+            (committed, states, Box::new(mv))
+        } else {
+            let mut ex = Host::new(scratch.clone());
+            let (committed, states) =
+                drive(&plan, &order, &build_args, &mut ex, opts.require_cached)?;
+            (committed, states, Box::new(ex))
+        };
         let fs = committed
             .get(&target)
             .context("internal: target stage not committed")?;
@@ -703,22 +719,20 @@ fn merge_exec(
 /// it / COPY --from it). Backend-agnostic. Keys + interpolation come from
 /// [`resolve_stages`] (the shared identity computation), so the build and `docker-hash`
 /// agree on every stage's cache key.
-fn drive(
+/// Resolve every stage to its keyed instruction stream, with `DOCKER_STAGE_HASH`
+/// auto-injected for execution (its value is the stage_key of the declaring stage
+/// nearest the target). The canonical cache keys stay value-independent, so the
+/// injected hash never alters what is cached and `docker-hash` agrees with the build.
+fn resolve_all(
     plan: &Plan,
     order: &[usize],
     build_args: &Vars,
     ex: &mut dyn Executor,
-    require_cached: bool,
-) -> Result<(HashMap<usize, Rootfs>, HashMap<usize, ShellState>)> {
+) -> Result<HashMap<usize, Resolved>> {
     // Canonical, value-independent keys (DOCKER_STAGE_HASH forced empty while keying).
     let keyed = resolve_stages(plan, order, build_args, ex, None)?;
-    // Auto-inject DOCKER_STAGE_HASH for execution: its value is the stage_key of the
-    // declaring stage nearest the target (self included), mirroring the wabbuilder
-    // docker-tool.sh `BUILDER_TAG` scheme. A second pass re-interpolates the instructions
-    // with that value; the cache keys stay the canonical ones above, so the injected hash
-    // never alters what is cached (and `docker-hash` agrees with the build).
     let target = *order.last().context("internal: empty build order")?;
-    let resolved = match nearest_dsh_declarer(plan, target) {
+    Ok(match nearest_dsh_declarer(plan, target) {
         Some(d) => {
             let value = keyed
                 .get(&d)
@@ -729,15 +743,25 @@ fn drive(
             merge_exec(&keyed, exec)
         }
         None => keyed,
-    };
-    let mut committed: HashMap<usize, Rootfs> = HashMap::new();
-    // Fast-path plan, back-to-front: a stage whose last snapshot is cached is "fully
-    // cached" (keys chain, so that one key covers the stage's whole history including
-    // its base and COPY --from sources) — it restores that snapshot alone, with no
-    // per-instruction probes (a round trip each on a remote cache). A stage only ever
-    // read by fully-cached consumers is skipped outright: nothing that runs will look
-    // at it. `needed` propagates from the target; a stage that will run pulls in its
-    // parent stage and `--from` sources.
+    })
+}
+
+/// The set of stages the build must touch, and which of them are fully cached.
+///
+/// Back-to-front: a stage whose last snapshot is cached is "fully cached" (keys chain,
+/// so that one key covers its whole history including its base and `COPY --from`
+/// sources) — it restores that snapshot alone, with no per-instruction probes, and does
+/// NOT pull its dependencies into `needed`. A stage only ever read by fully-cached
+/// consumers is skipped outright. `needed` propagates from the target; a stage that
+/// will run pulls in its parent stage and `--from` sources.
+fn compute_needed(
+    plan: &Plan,
+    order: &[usize],
+    resolved: &HashMap<usize, Resolved>,
+    ex: &mut dyn Executor,
+    require_cached: bool,
+) -> Result<(HashSet<usize>, HashMap<usize, String>)> {
+    let target = *order.last().context("internal: empty build order")?;
     let mut needed: HashSet<usize> = HashSet::from([target]);
     let mut cached_final: HashMap<usize, String> = HashMap::new();
     for &idx in order.iter().rev() {
@@ -760,9 +784,9 @@ fn drive(
         }
         needed.extend(stage_source_refs(plan, &stage.instructions));
     }
-    // --require-cached: `needed \ cached_final` is exactly the set of stages the
-    // loop below would build (materialize a base, run instructions) rather than
-    // restore. Refuse with the typed error before any work starts.
+    // --require-cached: `needed \ cached_final` is exactly the set of stages the driver
+    // would build (materialize a base, run instructions) rather than restore. Refuse
+    // with the typed error before any work starts.
     if require_cached {
         let missing: Vec<String> = order
             .iter()
@@ -778,80 +802,308 @@ fn drive(
             return Err(NotCached { stages: missing }.into());
         }
     }
+    Ok((needed, cached_final))
+}
+
+/// Build one stage to its committed rootfs. `committed` must already hold every stage
+/// this one depends on (its base `FROM` and `COPY --from` / `RUN --mount=from` sources);
+/// the driver guarantees that by ordering. A fully-cached stage restores its snapshot
+/// directly and reads nothing from `committed`. Reused by both the sequential [`drive`]
+/// and the parallel [`drive_microvm`], so the two cannot diverge.
+fn build_stage(
+    plan: &Plan,
+    resolved: &HashMap<usize, Resolved>,
+    cached_final: &HashMap<usize, String>,
+    committed: &HashMap<usize, Rootfs>,
+    ex: &mut dyn Executor,
+    idx: usize,
+) -> Result<Rootfs> {
+    let stage = &plan.stages[idx];
+    let name = stage.name.clone().unwrap_or_else(|| format!("stage{idx}"));
+    let steps = &resolved
+        .get(&idx)
+        .context("internal: stage not resolved")?
+        .steps;
+    // Fully cached: restore the final snapshot directly, nothing to probe or run.
+    if let Some(key) = cached_final.get(&idx) {
+        println!(
+            "virtkit: [{name}] build CACHED ({} instructions)",
+            steps.len()
+        );
+        let fs = restore_into(ex, &name, key)?;
+        ex.stage_end(&fs)?;
+        return Ok(fs);
+    }
+    // Declare the stage's inputs — the source stages it copies/mounts from, and its
+    // build context — so the backend can attach them before the guest boots.
+    ex.stage_sources(
+        &stage_source_rootfs(plan, &stage.instructions, committed),
+        &stage.context,
+    )?;
+    // Instruction-level cache + lazy base: every step carries the chained key; the base
+    // rootfs is materialized only when something must actually run (the first cache
+    // miss). A fully-cached prefix never pulls/flattens the base. `fs` is None until
+    // materialized.
+    let mut fs: Option<Rootfs> = None;
+    let mut building = false;
+    let mut last_hit: Option<String> = None;
+    for step in steps {
+        if !building && ex.cache_has(&step.key) {
+            println!("virtkit: [{name}] CACHED {}", instr_label(&step.instr));
+            last_hit = Some(step.key.clone());
+            continue;
+        }
+        // first miss: materialize the rootfs — restore the last cached snapshot if there
+        // was a cached prefix, else build the base from scratch/image/stage.
+        if !building {
+            fs = Some(match &last_hit {
+                Some(k) => restore_into(ex, &name, k)?,
+                None => materialize_base(ex, &stage.base, &name, committed)?,
+            });
+            building = true;
+        }
+        let f = fs.as_mut().expect("materialized on first miss");
+        apply_fs(plan, committed, ex, f, &step.state, &step.instr)?;
+        ex.cache_save(f, &step.key)?;
+    }
+    // Nothing ran: the whole instruction run was cached → restore the final snapshot; or
+    // there were no fs-changing instructions → the stage is the base.
+    let final_fs = match fs {
+        Some(f) => f,
+        None => match &last_hit {
+            Some(k) => restore_into(ex, &name, k)?,
+            None => materialize_base(ex, &stage.base, &name, committed)?,
+        },
+    };
+    // Finalize the stage: tear down its long-lived guest (if any) and commit its overlay
+    // back into the stage ext4 so forks / COPY --from / export see the writes.
+    ex.stage_end(&final_fs)?;
+    Ok(final_fs)
+}
+
+/// Each stage's final ENV/USER/WORKDIR, so a caller booting the exported image can run a
+/// command with the image's environment (e.g. `run -f` applying PATH).
+fn final_states(resolved: &HashMap<usize, Resolved>) -> HashMap<usize, ShellState> {
+    resolved
+        .iter()
+        .map(|(idx, r)| (*idx, r.final_state.clone()))
+        .collect()
+}
+
+/// Sequential driver: walk the stages in topological order, building each through the
+/// executor. Backend-agnostic — used by the host/dry-run backends (and as the reference
+/// the parallel microVM driver must match).
+fn drive(
+    plan: &Plan,
+    order: &[usize],
+    build_args: &Vars,
+    ex: &mut dyn Executor,
+    require_cached: bool,
+) -> Result<(HashMap<usize, Rootfs>, HashMap<usize, ShellState>)> {
+    let resolved = resolve_all(plan, order, build_args, ex)?;
+    let (needed, cached_final) = compute_needed(plan, order, &resolved, ex, require_cached)?;
+    let mut committed: HashMap<usize, Rootfs> = HashMap::new();
     for &idx in order {
         if !needed.contains(&idx) {
             continue;
         }
-        let stage = &plan.stages[idx];
-        let name = stage.name.clone().unwrap_or_else(|| format!("stage{idx}"));
-        let steps = &resolved
-            .get(&idx)
-            .context("internal: stage not resolved")?
-            .steps;
-        // Fully cached: restore the final snapshot directly, nothing to probe or run.
-        if let Some(key) = cached_final.get(&idx) {
-            println!(
-                "virtkit: build CACHED  {name} ({} instructions)",
-                steps.len()
-            );
-            let fs = restore_into(ex, &name, key)?;
-            ex.stage_end(&fs)?;
-            committed.insert(idx, fs);
-            continue;
-        }
-        // Declare the stage's inputs — the source stages it copies/mounts from, and its
-        // build context — so the backend can attach them before the guest boots.
-        ex.stage_sources(
-            &stage_source_rootfs(plan, &stage.instructions, &committed),
-            &stage.context,
-        )?;
-        // Instruction-level cache + lazy base: every step carries the chained key; the
-        // base rootfs is materialized only when something must actually run (the first
-        // cache miss). A fully-cached stage never pulls/flattens the base — it just
-        // restores the final snapshot. `fs` is None until materialized.
-        let mut fs: Option<Rootfs> = None;
-        let mut building = false;
-        let mut last_hit: Option<String> = None;
-        for step in steps {
-            if !building && ex.cache_has(&step.key) {
-                println!("virtkit: build CACHED  {}", instr_label(&step.instr));
-                last_hit = Some(step.key.clone());
-                continue;
-            }
-            // first miss: materialize the rootfs — restore the last cached snapshot if
-            // there was a cached prefix, else build the base from scratch/image/stage.
-            if !building {
-                fs = Some(match &last_hit {
-                    Some(k) => restore_into(ex, &name, k)?,
-                    None => materialize_base(ex, &stage.base, &name, &committed)?,
-                });
-                building = true;
-            }
-            let f = fs.as_mut().expect("materialized on first miss");
-            apply_fs(plan, &committed, ex, f, &step.state, &step.instr)?;
-            ex.cache_save(f, &step.key)?;
-        }
-        // Nothing ran: the whole instruction run was cached → restore the final
-        // snapshot; or there were no fs-changing instructions → the stage is the base.
-        let final_fs = match fs {
-            Some(f) => f,
-            None => match &last_hit {
-                Some(k) => restore_into(ex, &name, k)?,
-                None => materialize_base(ex, &stage.base, &name, &committed)?,
-            },
-        };
-        // Finalize the stage: tear down its long-lived guest (if any) and commit its
-        // overlay back into the stage ext4 so forks / COPY --from / export see the writes.
-        ex.stage_end(&final_fs)?;
-        committed.insert(idx, final_fs);
+        let fs = build_stage(plan, &resolved, &cached_final, &committed, ex, idx)?;
+        committed.insert(idx, fs);
     }
-    // Each stage's final ENV/USER/WORKDIR, so a caller booting the exported image can run
-    // a command with the image's environment (e.g. `run -f` applying PATH).
-    let states = resolved
-        .into_iter()
-        .map(|(idx, r)| (idx, r.final_state))
+    Ok((committed, final_states(&resolved)))
+}
+
+/// Mutable state shared by [`run_dag`]'s workers, behind one mutex.
+struct Dag<R> {
+    /// nodes whose deps are all done and that no worker has claimed yet.
+    ready: Vec<usize>,
+    /// node → number of its deps not yet done. Reaches 0 → the node becomes ready.
+    indeg: HashMap<usize, usize>,
+    /// finished node results so far (a worker snapshots this before building a node).
+    done: HashMap<usize, R>,
+    /// nodes not yet finished; the run is complete when this hits 0.
+    remaining: usize,
+    /// first worker error; set once, then every worker drains and returns.
+    error: Option<anyhow::Error>,
+}
+
+/// Run a DAG of tasks with bounded concurrency. `nodes` is the set to run; `deps[n]`
+/// lists the nodes that must finish before `n` (each must itself be in `nodes`).
+/// `build(n, done)` produces `n`'s result given a snapshot of finished results that is
+/// guaranteed to contain all of `n`'s deps. Returns every node's result, or the first
+/// error (with remaining work abandoned).
+///
+/// The ordering matches a sequential topological walk — a node runs only once its deps
+/// are in `done` — so `build` must be deterministic with respect to concurrency (its
+/// result may not depend on which siblings ran alongside it). The microVM stage builder
+/// satisfies this: stage cache keys are content-addressed, independent of build order.
+fn run_dag<R, F>(
+    nodes: &[usize],
+    deps: &HashMap<usize, Vec<usize>>,
+    jobs: usize,
+    build: F,
+) -> Result<HashMap<usize, R>>
+where
+    R: Send + Clone,
+    F: Fn(usize, &HashMap<usize, R>) -> Result<R> + Sync,
+{
+    let mut indeg: HashMap<usize, usize> = HashMap::new();
+    let mut dependents: HashMap<usize, Vec<usize>> = HashMap::new();
+    for &n in nodes {
+        let ds = deps.get(&n).map(Vec::as_slice).unwrap_or(&[]);
+        indeg.insert(n, ds.len());
+        for &d in ds {
+            dependents.entry(d).or_default().push(n);
+        }
+    }
+    let ready: Vec<usize> = nodes.iter().copied().filter(|n| indeg[n] == 0).collect();
+    let jobs = jobs.max(1).min(nodes.len().max(1));
+    let dag = Mutex::new(Dag {
+        ready,
+        indeg,
+        done: HashMap::<usize, R>::new(),
+        remaining: nodes.len(),
+        error: None,
+    });
+    let cv = Condvar::new();
+    // Borrow the owned state under distinct names so the workers share it by reference
+    // while `dag` stays owned for the `into_inner` below.
+    let (dagref, cv, build, dependents) = (&dag, &cv, &build, &dependents);
+    std::thread::scope(|s| {
+        for _ in 0..jobs {
+            s.spawn(move || {
+                loop {
+                    // Claim the next ready node (or exit when the run is done / has failed),
+                    // snapshotting the done map so the build reads its deps lock-free.
+                    let (n, snapshot) = {
+                        let mut g = dagref.lock().unwrap();
+                        let n = loop {
+                            if g.error.is_some() || g.remaining == 0 {
+                                return;
+                            }
+                            if let Some(n) = g.ready.pop() {
+                                break n;
+                            }
+                            g = cv.wait(g).unwrap();
+                        };
+                        (n, g.done.clone())
+                    };
+                    let res = build(n, &snapshot);
+                    let mut g = dagref.lock().unwrap();
+                    match res {
+                        Ok(r) => {
+                            g.done.insert(n, r);
+                            g.remaining -= 1;
+                            if let Some(ds) = dependents.get(&n) {
+                                for &dep in ds {
+                                    if let Some(c) = g.indeg.get_mut(&dep) {
+                                        *c -= 1;
+                                        if *c == 0 {
+                                            g.ready.push(dep);
+                                        }
+                                    }
+                                }
+                            }
+                            cv.notify_all();
+                        }
+                        Err(e) => {
+                            if g.error.is_none() {
+                                g.error = Some(e);
+                            }
+                            cv.notify_all();
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let dag = dag.into_inner().unwrap();
+    if let Some(e) = dag.error {
+        return Err(e);
+    }
+    Ok(dag.done)
+}
+
+/// Parallel driver for the microVM backend: build independent stages concurrently over
+/// the dependency DAG. Each concurrent stage runs on its own [`MicroVm::worker`] (its own
+/// guest and cache-push bookkeeping); the workers share only the committed-image maps,
+/// and a stage is committed before any dependent starts — the same ordering the
+/// sequential [`drive`] guarantees, so the exported image and cache are identical.
+fn drive_microvm(
+    plan: &Plan,
+    order: &[usize],
+    build_args: &Vars,
+    base: &MicroVm,
+    jobs: usize,
+    require_cached: bool,
+) -> Result<(HashMap<usize, Rootfs>, HashMap<usize, ShellState>)> {
+    // Read-only passes on a throwaway worker (shares `base`'s memoization + cache maps).
+    let mut probe = base.worker();
+    let resolved = resolve_all(plan, order, build_args, &mut probe)?;
+    let (needed, cached_final) =
+        compute_needed(plan, order, &resolved, &mut probe, require_cached)?;
+    drop(probe);
+
+    // Dependency edges over the needed subset. A fully-cached stage restores standalone,
+    // so it gets no deps (it can start immediately); a stage that consumes it still waits
+    // for it, because the consumer keeps the edge in its own dep list.
+    let needed_order: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|i| needed.contains(i))
         .collect();
-    Ok((committed, states))
+    let mut deps: HashMap<usize, Vec<usize>> = HashMap::new();
+    for &idx in &needed_order {
+        let d = if cached_final.contains_key(&idx) {
+            Vec::new()
+        } else {
+            plan.deps(idx)
+                .into_iter()
+                .filter(|x| needed.contains(x))
+                .collect()
+        };
+        deps.insert(idx, d);
+    }
+
+    let committed = run_dag(&needed_order, &deps, jobs, |idx, done| {
+        // A fresh per-stage worker: its own guest + cache-push state, sharing only the
+        // committed-image maps with `base`.
+        let mut ex = base.worker();
+        build_stage(plan, &resolved, &cached_final, done, &mut ex, idx)
+    })?;
+    Ok((committed, final_states(&resolved)))
+}
+
+/// Resolve the parallel build's job count: explicit `--build-jobs`, else the
+/// `VIRTKIT_BUILD_JOBS` env override, else RAM-auto — each stage guest reserves
+/// `mem_mib`, so cap concurrency at ~80% of available RAM divided by that, clamped to a
+/// sane ceiling. CPU is intentionally allowed to oversubscribe (the host scheduler
+/// time-slices); RAM overcommit would OOM.
+fn resolve_build_jobs(opts: &Options, mem_mib: u64) -> usize {
+    if let Some(j) = opts.build_jobs {
+        return j.max(1);
+    }
+    if let Ok(v) = std::env::var("VIRTKIT_BUILD_JOBS")
+        && let Ok(j) = v.trim().parse::<usize>()
+    {
+        return j.max(1);
+    }
+    let avail = mem_available_mib().unwrap_or(8 * 1024);
+    let usable = avail * 8 / 10;
+    ((usable / mem_mib.max(1)) as usize).clamp(1, 16)
+}
+
+/// Available host RAM in MiB, from `/proc/meminfo` `MemAvailable`. `None` if unreadable.
+fn mem_available_mib() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb / 1024);
+        }
+    }
+    None
 }
 
 /// The stage indices an instruction list references via `COPY --from` / `RUN
@@ -1837,6 +2089,7 @@ ENTRYPOINT run me
             build_args: vec![],
             net: BuildNet::None,
             require_cached: false,
+            build_jobs: None,
         };
         let via_file = build(&opts(tmp.join("a.ext4"))).unwrap();
         let via_inputs = build_inputs(
@@ -1891,6 +2144,7 @@ ENTRYPOINT run me
             build_args: vec![],
             net: BuildNet::None, // host backend: no RUN guests, no network
             require_cached: false,
+            build_jobs: None,
         })
         .unwrap();
         let sidecar = config_sidecar(&out);
@@ -1959,5 +2213,106 @@ RUN ship
             !t.iter().any(|l| l.contains("two")),
             "stage y must be pruned"
         );
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    // A diamond DAG: 0 → {1, 2} → 3. Every node must see its deps already done, run
+    // exactly once, and the results must be identical whether serial or concurrent.
+    fn diamond() -> (Vec<usize>, HashMap<usize, Vec<usize>>) {
+        let nodes = vec![0, 1, 2, 3];
+        let deps = HashMap::from([(0, vec![]), (1, vec![0]), (2, vec![0]), (3, vec![1, 2])]);
+        (nodes, deps)
+    }
+
+    #[test]
+    fn run_dag_respects_deps_and_runs_each_node_once() {
+        let (nodes, deps) = diamond();
+        for jobs in [1usize, 4] {
+            let built = Mutex::new(Vec::<usize>::new());
+            let out = run_dag(&nodes, &deps, jobs, |n, done| {
+                for d in &deps[&n] {
+                    assert!(
+                        done.contains_key(d),
+                        "node {n} ran before dep {d} (jobs={jobs})"
+                    );
+                }
+                built.lock().unwrap().push(n);
+                Ok::<usize, anyhow::Error>(n * 10)
+            })
+            .unwrap();
+            assert_eq!(out, HashMap::from([(0, 0), (1, 10), (2, 20), (3, 30)]));
+            let mut b = built.into_inner().unwrap();
+            b.sort_unstable();
+            assert_eq!(
+                b,
+                vec![0, 1, 2, 3],
+                "each node built exactly once (jobs={jobs})"
+            );
+        }
+    }
+
+    #[test]
+    fn run_dag_surfaces_the_first_error() {
+        let (nodes, deps) = diamond();
+        let r = run_dag(&nodes, &deps, 4, |n, _done| {
+            if n == 1 {
+                anyhow::bail!("boom on {n}");
+            }
+            Ok::<usize, anyhow::Error>(n)
+        });
+        assert!(r.unwrap_err().to_string().contains("boom"));
+    }
+
+    #[test]
+    fn run_dag_runs_independent_nodes_concurrently() {
+        // Four nodes with no edges + four workers: they must actually overlap.
+        let nodes: Vec<usize> = (0..4).collect();
+        let deps: HashMap<usize, Vec<usize>> = nodes.iter().map(|&n| (n, vec![])).collect();
+        let cur = AtomicUsize::new(0);
+        let max = AtomicUsize::new(0);
+        run_dag(&nodes, &deps, 4, |_n, _done| {
+            let now = cur.fetch_add(1, SeqCst) + 1;
+            max.fetch_max(now, SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            cur.fetch_sub(1, SeqCst);
+            Ok::<usize, anyhow::Error>(0)
+        })
+        .unwrap();
+        assert!(
+            max.load(SeqCst) >= 2,
+            "independent nodes should run concurrently (peak {})",
+            max.load(SeqCst)
+        );
+    }
+
+    #[test]
+    fn build_jobs_override_beats_auto() {
+        let opts = |j: Option<usize>| Options {
+            dockerfiles: vec![],
+            target: None,
+            contexts: vec![],
+            out: None,
+            print_plan: false,
+            microvm: true,
+            cloud_hypervisor: None,
+            kernel: None,
+            agent: None,
+            cache_registry: None,
+            cache_insecure: false,
+            journal: false,
+            build_args: vec![],
+            net: BuildNet::All,
+            require_cached: false,
+            build_jobs: j,
+        };
+        // Explicit --build-jobs wins and is floored to 1.
+        assert_eq!(resolve_build_jobs(&opts(Some(3)), 2048), 3);
+        assert_eq!(resolve_build_jobs(&opts(Some(0)), 2048), 1);
+        // Auto is RAM-bounded and clamped to [1, 16]. (Skip when the env override is set.)
+        if std::env::var("VIRTKIT_BUILD_JOBS").is_err() {
+            assert_eq!(resolve_build_jobs(&opts(None), u64::MAX / 2), 1);
+            assert!((1..=16).contains(&resolve_build_jobs(&opts(None), 1)));
+        }
     }
 }

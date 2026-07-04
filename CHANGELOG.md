@@ -9,6 +9,11 @@ All notable changes to virtkit will be documented in this file.
 - `vk build` now always builds in a microVM (the embedded libkrun by default):
   the `--microvm` flag is gone, and `--cloud-hypervisor` is required only when
   `VIRTKIT_VMM=cloud-hypervisor` selects that backend.
+- `vk build` on the microVM backend now builds independent stages in parallel
+  over the Dockerfile's dependency graph, so multi-stage builds finish faster.
+  Concurrency defaults to a job count bounded by available host RAM;
+  `--build-jobs N` (or `VIRTKIT_BUILD_JOBS`) overrides it, and `--build-jobs 1`
+  forces a sequential build.
 
 ## [0.7.0] - 2026-07-04
 
