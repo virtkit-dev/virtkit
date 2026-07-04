@@ -30,6 +30,9 @@
 //!   VIRTKIT_TMPFS        /path:size[,/path:size] RAM scratch dirs (e.g. CI /builds)
 //!   VIRTKIT_CTL=1        mount the compose control fs at /run/vk/services (a FUSE
 //!                        bridge to the host service manager over vsock)
+//!   VIRTKIT_HOST_EXEC_PORT  host command channel: present /run/vk/host.sock and
+//!                        relay it over this vsock port to the host's `vk-agent
+//!                        serve` (whose --exec-wrapper enforces the allowlist)
 //!   VIRTKIT_SSH=1        also run ssh-serve (vsock 2222); keys VIRTKIT_SSH_KEYS
 //!                        (comma-separated `type:base64` entries, no spaces),
 //!                        user VIRTKIT_SSH_USER (default dev)
@@ -109,6 +112,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
 
     maybe_ssh_serve(&cmdline);
     maybe_ctlfs(&cmdline);
+    maybe_host_exec(&cmdline);
     maybe_ssh_agent(&cmdline);
     let serve = spawn_serve(socket, inactivity_timeout)?;
     install_term_handler();
@@ -770,6 +774,41 @@ fn maybe_ctlfs(cmdline: &HashMap<String, String>) {
     }
 }
 
+/// Guest vsock port + socket of the host-exec channel (`VIRTKIT_HOST_EXEC_PORT`):
+/// the guest-side forwarder presents `/run/vk/host.sock`, relaying each connection
+/// to the host's `vk-agent serve` (which enforces its own command allowlist).
+const HOST_EXEC_SOCK: &str = "/run/vk/host.sock";
+
+/// Argv for the guest-side host-exec forwarder: listen on [`HOST_EXEC_SOCK`] and
+/// relay to the host over `port` — the exact shape of the SSH-agent forward.
+fn host_exec_forward_args(port: &str) -> Vec<String> {
+    vec![
+        "--socket".into(),
+        format!("vsock://{port}"),
+        "forward".into(),
+        "--listen".into(),
+        HOST_EXEC_SOCK.into(),
+    ]
+}
+
+/// Optionally expose the host command channel (`VIRTKIT_HOST_EXEC_PORT`): a
+/// guest-side forwarder presents [`HOST_EXEC_SOCK`], so guest tooling reaches the
+/// host's `vk-agent serve` at a discoverable path with no transport knowledge
+/// (`vk-agent -s /run/vk/host.sock exec …`). Only protocol bytes cross the vsock;
+/// what may actually run is decided host-side (`serve --exec-wrapper`).
+fn maybe_host_exec(cmdline: &HashMap<String, String>) {
+    let Some(port) = cmdline.get("VIRTKIT_HOST_EXEC_PORT") else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all("/run/vk") {
+        warn!("vk-agent init: creating /run/vk failed: {e}");
+        return;
+    }
+    if let Err(e) = fork_agent(&host_exec_forward_args(port)) {
+        warn!("vk-agent init: host-exec forward failed to start: {e}");
+    }
+}
+
 fn maybe_ssh_serve(cmdline: &HashMap<String, String>) {
     if cmdline.get("VIRTKIT_SSH").map(String::as_str) != Some("1") {
         return;
@@ -1179,6 +1218,20 @@ mod tests {
                 "forward",
                 "--listen",
                 SSH_AGENT_SOCK,
+            ]
+        );
+    }
+
+    #[test]
+    fn host_exec_forward_args_relay_to_host_port() {
+        assert_eq!(
+            host_exec_forward_args("1100"),
+            vec![
+                "--socket",
+                "vsock://1100",
+                "forward",
+                "--listen",
+                HOST_EXEC_SOCK,
             ]
         );
     }

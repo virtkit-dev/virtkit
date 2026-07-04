@@ -6,7 +6,7 @@
 //! for the disk path (virtio-blk + ext4 are built in). docker/cloud-hypervisor
 //! aside (docker only with `--source docker`/`auto`), nothing else is needed.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -26,6 +26,10 @@ pub(crate) const SSH_AGENT_VSOCK_PORT: u32 = 2223;
 const SSH_VSOCK_PORT: u32 = 2222;
 /// vsock port the guest's tap bridge dials to reach the userspace switch.
 const NET_VSOCK_PORT: u32 = 1024;
+/// vsock port the guest's host-exec forwarder dials (`--host-exec`); the host side
+/// is a `vk-agent serve` on the bridged per-port socket, so guest tooling can run
+/// host commands through its allowlist wrapper. Sits next to the control port (1099).
+const HOST_EXEC_PORT: u32 = 1100;
 /// The run LAN: gateway .1, the run VM .2, services from the top down.
 const RUN_SUBNET: &str = "192.168.127.0/24";
 
@@ -137,6 +141,14 @@ pub struct RunArgs {
     /// extra environment for the guest (`--env`/`--env-file`, flags last so they
     /// win), appended to the image env and persisted in-guest for login shells
     pub env: Vec<(String, String)>,
+    /// serve host commands to the guest: a host-side `vk-agent serve` on a bridged
+    /// vsock port, surfaced in-guest at /run/vk/host.sock
+    pub host_exec: bool,
+    /// force every host-exec command through this program (`serve --exec-wrapper`),
+    /// e.g. an allowlist dispatcher
+    pub host_exec_wrapper: Option<PathBuf>,
+    /// client env vars passed through to the wrapper (`serve --exec-wrapper-env` globs)
+    pub host_exec_env: Vec<String>,
     pub command: Vec<String>,
 }
 
@@ -608,6 +620,12 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         cmdline.push_str(" VIRTKIT_CTL=1");
     }
 
+    // --host-exec: the guest agent presents /run/vk/host.sock, relayed over vsock
+    // to a host-side `vk-agent serve` (spawned after boot, below).
+    if args.host_exec {
+        cmdline.push_str(&format!(" VIRTKIT_HOST_EXEC_PORT={HOST_EXEC_PORT}"));
+    }
+
     // Networking: a userspace `vk switch` over vsock gives the guest egress (the agent
     // forks a tap bridged to it and takes the static address from the cmdline fragment).
     // With services it also pre-listens on their sockets and answers their aliases.
@@ -765,6 +783,11 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             vk_core::fleetctl::CONTROL_PORT,
         ));
     }
+    // Host-exec (guest->host): the guest's /run/vk/host.sock forwarder dials
+    // HOST_EXEC_PORT, bridged to the `vk-agent serve` spawned below.
+    if args.host_exec {
+        vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, HOST_EXEC_PORT));
+    }
     let spec = crate::vmm::VmSpec {
         kernel: kernel.to_path_buf(),
         cmdline,
@@ -846,6 +869,16 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     };
     let ssh_config = ssh.and_then(|s| s.guest_config);
 
+    // Host side of the host-exec channel: a `vk-agent serve` on the bridged
+    // per-port socket the guest's /run/vk/host.sock forwarder dials. cwd is the
+    // --workdir (else our own), so a relative `exec --dir` resolves against the
+    // shared tree; the wrapper (if any) enforces what may run.
+    let mut host_exec_serve = if args.host_exec {
+        Some(spawn_host_exec_serve(&vsock, agent, args, work)?)
+    } else {
+        None
+    };
+
     // With a --service primary and no trailing command, the service's own
     // entrypoint+cmd runs — `docker compose run <svc>` semantics.
     let fallback_argv = primary.map(|c| c.argv()).unwrap_or_default();
@@ -859,7 +892,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         &fallback_argv,
     )
     .await;
-    if let Some(mut f) = ssh_forward.take() {
+    for mut f in ssh_forward.take().into_iter().chain(host_exec_serve.take()) {
         let _ = f.kill();
         let _ = f.wait();
     }
@@ -1089,6 +1122,55 @@ fn spawn_ssh_agent_forward(vsock: &Path, host_sock: &OsStr, work: &Path) -> Resu
         .stderr(log);
     // self-reap if virtkit dies before teardown (spawn_tied)
     crate::spawn::spawn_tied(cmd).context("spawning the ssh-agent forward")
+}
+
+/// Spawn the host side of the `--host-exec` channel: a `vk-agent serve` listening on
+/// the VMM's bridged per-port socket (`<vsock.sock>_<HOST_EXEC_PORT>`), which the
+/// guest's `/run/vk/host.sock` forwarder dials. The serve runs with the `--workdir`
+/// (else our own cwd) as its working directory, so a guest `exec --dir .` resolves
+/// against the shared tree; `--host-exec-wrapper` forces every command through an
+/// allowlist program. Without a wrapper the guest can run any host command as the
+/// host user — the opt-in contract of `--host-exec`. The serve inherits virtkit's
+/// host environment so the commands it runs (docker, a browser, …) have a working
+/// host PATH/HOME; the wrapper's own allowlist gates the *client* env on top.
+/// Long-lived for the VM's lifetime; the caller kills it on teardown, and
+/// `spawn_tied` reaps it if virtkit dies first.
+fn spawn_host_exec_serve(vsock: &Path, agent: &Path, args: &RunArgs, work: &Path) -> Result<Child> {
+    let listen = crate::vmm::hybrid_socket(vsock, HOST_EXEC_PORT);
+    let log = std::fs::File::create(work.join("host-exec-serve.log"))
+        .context("creating the host-exec serve log")?;
+    let mut cmd = Command::new(agent);
+    cmd.args(host_exec_serve_args(
+        &listen,
+        args.host_exec_wrapper.as_deref(),
+        &args.host_exec_env,
+    ));
+    if let Some(dir) = &args.workdir {
+        cmd.current_dir(dir);
+    }
+    cmd.stdout(log.try_clone()?).stderr(log);
+    crate::spawn::spawn_tied(cmd).context("spawning the host-exec serve")
+}
+
+/// Argv for the host-side `--host-exec` serve: `-s <listen> serve`, plus the
+/// allowlist wrapper (`--exec-wrapper`) and its client-env globs
+/// (`--exec-wrapper-env`) when a wrapper was given. Without a wrapper the serve
+/// runs commands unrestricted — the opt-in contract of `--host-exec`.
+fn host_exec_serve_args(
+    listen: &Path,
+    wrapper: Option<&Path>,
+    env_globs: &[String],
+) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = vec!["-s".into(), listen.into(), "serve".into()];
+    if let Some(wrapper) = wrapper {
+        argv.push("--exec-wrapper".into());
+        argv.push(wrapper.into());
+        for glob in env_globs {
+            argv.push("--exec-wrapper-env".into());
+            argv.push(glob.into());
+        }
+    }
+    argv
 }
 
 /// How `--ssh-agent`/`--ssh-host` resolve for a launch: the host agent socket to expose,
@@ -1786,6 +1868,36 @@ impl Drop for VmSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_exec_serve_args_gate_the_wrapper() {
+        let listen = Path::new("/run/vsock.sock_1100");
+        // no wrapper: a bare unrestricted serve, no --exec-wrapper* flags
+        assert_eq!(
+            host_exec_serve_args(listen, None, &["LC_*".into()]),
+            ["-s", "/run/vsock.sock_1100", "serve"].map(OsString::from)
+        );
+        // a wrapper carries its client-env globs through; none without it
+        assert_eq!(
+            host_exec_serve_args(
+                listen,
+                Some(Path::new("/opt/allow")),
+                &["LC_*".into(), "TERM".into()]
+            ),
+            [
+                "-s",
+                "/run/vsock.sock_1100",
+                "serve",
+                "--exec-wrapper",
+                "/opt/allow",
+                "--exec-wrapper-env",
+                "LC_*",
+                "--exec-wrapper-env",
+                "TERM",
+            ]
+            .map(OsString::from)
+        );
+    }
 
     #[test]
     fn user_script_preserves_argv_boundaries() {

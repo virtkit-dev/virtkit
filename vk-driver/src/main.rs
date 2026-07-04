@@ -473,6 +473,29 @@ enum Cmd {
         /// repeatable, later files win; --env flags win over every file)
         #[arg(long = "env-file", value_name = "FILE")]
         env_file: Vec<PathBuf>,
+        /// serve host commands to the guest at /run/vk/host.sock (over vsock): guest
+        /// tooling runs `vk-agent -s /run/vk/host.sock exec -- CMD` on the host.
+        /// WITHOUT --host-exec-wrapper the guest can run ANY host command as the host
+        /// user (unrestricted); add --host-exec-wrapper to force every command through
+        /// an allowlist program
+        #[arg(long = "host-exec")]
+        host_exec: bool,
+        /// force every --host-exec command through this program (it receives the
+        /// requested command line as its arguments and decides what to run)
+        #[arg(
+            long = "host-exec-wrapper",
+            value_name = "PROGRAM",
+            requires = "host_exec"
+        )]
+        host_exec_wrapper: Option<PathBuf>,
+        /// client env vars passed through to the --host-exec-wrapper (repeatable;
+        /// shell-style globs, e.g. `LC_*`)
+        #[arg(
+            long = "host-exec-env",
+            value_name = "GLOB",
+            requires = "host_exec_wrapper"
+        )]
+        host_exec_env: Vec<String>,
         /// Command to run in the guest (default: a boot-info probe). Several
         /// words are an argv, each passed as typed (like docker run — use
         /// `sh -c '…'` for shell features); a single word is a shell one-liner
@@ -691,6 +714,9 @@ async fn cli_main() -> ExitCode {
         symlink,
         env,
         env_file,
+        host_exec,
+        host_exec_wrapper,
+        host_exec_env,
         command,
     } = &cli.cmd
     {
@@ -713,13 +739,14 @@ async fn cli_main() -> ExitCode {
                 || !volume.is_empty()
                 || !symlink.is_empty()
                 || !env.is_empty()
-                || !env_file.is_empty())
+                || !env_file.is_empty()
+                || *host_exec)
         {
             return fail(
                 &anyhow::anyhow!(
                     "--compose without an image/-f/--service is services-only (compose up) — \
                      there is no primary VM for a command, --shell, --ssh, --workdir, \
-                     --volume, --symlink, --env, or --env-file"
+                     --volume, --symlink, --env, --env-file, or --host-exec"
                 ),
                 2,
             );
@@ -809,6 +836,9 @@ async fn cli_main() -> ExitCode {
             volumes,
             symlinks,
             env: extra_env,
+            host_exec: *host_exec,
+            host_exec_wrapper: host_exec_wrapper.clone(),
+            host_exec_env: host_exec_env.clone(),
             command: command.clone(),
         };
         return match run::run(&args).await {

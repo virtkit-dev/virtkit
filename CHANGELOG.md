@@ -25,6 +25,12 @@ All notable changes to virtkit will be documented in this file.
   applied to the run command and to everything spawned in the VM. The effective
   env is also materialized to `/etc/virtkit/env` in the guest on every boot, so
   an image's profile.d snippet can restore it in login shells.
+- `vk run --host-exec` serves host commands to the guest at `/run/vk/host.sock`
+  (over vsock): guest tooling runs `vk-agent -s /run/vk/host.sock exec -- CMD`
+  on the host with no transport knowledge. Without `--host-exec-wrapper` the
+  guest can run any host command as the host user; `--host-exec-wrapper` forces
+  every command through an allowlist program (`--host-exec-env` passes chosen
+  client env globs through to it).
 
 ### Changed
 
