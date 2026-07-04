@@ -448,13 +448,19 @@ enum Cmd {
         ssh_host: Vec<String>,
         /// Serve SSH into the guest (the agent's in-VM ssh-serve over vsock — no sshd
         /// in the image): prints a ready-to-paste ssh command once booted. Sessions
-        /// run as root; the VM lives for the duration of the run command.
+        /// run as --ssh-user (default root); the VM lives for the duration of the run command.
         #[arg(long)]
         ssh: bool,
         /// public key authorised for --ssh (OpenSSH format, repeatable; implies --ssh).
         /// Default: your standard ~/.ssh/id_*.pub keys
         #[arg(long = "ssh-key", value_name = "PUBKEY")]
         ssh_key: Vec<String>,
+        /// user --ssh sessions log in as — root is the only user every image is
+        /// guaranteed to have, but a dev image's unprivileged user keeps
+        /// shared-tree ownership coherent
+        #[arg(long = "ssh-user", value_name = "NAME", default_value = "root",
+              value_parser = run::parse_ssh_user)]
+        ssh_user: String,
         /// pin the run's sockets, console log and build media to this directory
         /// (created/reused, mode 0700, never removed) instead of a fresh temp dir,
         /// so external tooling can attach to the running VM:
@@ -719,6 +725,7 @@ async fn cli_main() -> ExitCode {
         ssh_host,
         ssh,
         ssh_key,
+        ssh_user,
         state_dir,
         volume,
         symlink,
@@ -843,6 +850,7 @@ async fn cli_main() -> ExitCode {
             ssh_hosts: ssh_host.clone(),
             ssh: *ssh || !ssh_key.is_empty(),
             ssh_keys: ssh_key.clone(),
+            ssh_user: ssh_user.clone(),
             state_dir: state_dir.clone(),
             volumes,
             symlinks,

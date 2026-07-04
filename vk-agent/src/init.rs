@@ -35,7 +35,7 @@
 //!                        serve` (whose --exec-wrapper enforces the allowlist)
 //!   VIRTKIT_SSH=1        also run ssh-serve (vsock 2222); keys VIRTKIT_SSH_KEYS
 //!                        (comma-separated `type:base64` entries, no spaces),
-//!                        user VIRTKIT_SSH_USER (default dev)
+//!                        user VIRTKIT_SSH_USER (default root)
 //!   VIRTKIT_SSH_AGENT_PORT  forward the host SSH agent: run a guest-side forwarder that
 //!                        presents SSH_AUTH_SOCK and relays it over this vsock port to the
 //!                        host (which splices to the host's real agent). Only agent
@@ -837,7 +837,7 @@ fn maybe_ssh_serve(cmdline: &HashMap<String, String>) {
     let user = cmdline
         .get("VIRTKIT_SSH_USER")
         .cloned()
-        .unwrap_or_else(|| "dev".into());
+        .unwrap_or_else(|| "root".into());
     let mut args = vec![
         "--socket".into(),
         format!("vsock://{SSH_VSOCK_PORT}"),

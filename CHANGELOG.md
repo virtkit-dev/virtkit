@@ -35,6 +35,9 @@ All notable changes to virtkit will be documented in this file.
   from the instruction cache but must not execute anything — a cache miss
   aborts with exit code 3, so scripts can branch cached-vs-cold without paying
   for a build.
+- `vk run --ssh-user NAME` picks the `--ssh` login user (default stays root —
+  the only user every image is guaranteed to have); a dev image's unprivileged
+  user keeps shared-tree ownership coherent.
 
 ### Changed
 

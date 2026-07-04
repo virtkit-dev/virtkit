@@ -122,11 +122,14 @@ pub struct RunArgs {
     /// implies SSH-agent forwarding
     pub ssh_hosts: Vec<String>,
     /// serve SSH into the guest (the agent's ssh-serve over vsock; no sshd in the
-    /// image) and print the ready-to-paste ssh command; sessions run as root
+    /// image) and print the ready-to-paste ssh command; sessions run as `ssh_user`
     pub ssh: bool,
     /// public keys authorised for `ssh` (OpenSSH format); empty = the standard
     /// ~/.ssh/id_*.pub identities
     pub ssh_keys: Vec<String>,
+    /// user `ssh` sessions log in as (root unless the image has better — a dev
+    /// image's unprivileged user keeps shared-tree ownership coherent)
+    pub ssh_user: String,
     /// pin the run's scratch dir (sockets, console log) to a stable path instead
     /// of a fresh temp dir, so external tooling can attach to the running VM; the
     /// directory is reused across runs and never removed
@@ -602,7 +605,8 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
 
     // --ssh: the guest agent serves SSH over vsock (no sshd in the image). The
     // authorized keys ride the kernel cmdline whitespace-free as `type:base64`;
-    // sessions run as root — the only user every image is guaranteed to have.
+    // sessions run as --ssh-user (default root — the only user every image is
+    // guaranteed to have).
     if args.ssh {
         let keys = if args.ssh_keys.is_empty() {
             default_ssh_pubkeys()?
@@ -610,8 +614,9 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             args.ssh_keys.clone()
         };
         cmdline.push_str(&format!(
-            " VIRTKIT_SSH=1 VIRTKIT_SSH_KEYS={} VIRTKIT_SSH_USER=root",
-            encode_ssh_keys(&keys)?
+            " VIRTKIT_SSH=1 VIRTKIT_SSH_KEYS={} VIRTKIT_SSH_USER={}",
+            encode_ssh_keys(&keys)?,
+            args.ssh_user
         ));
     }
 
@@ -841,7 +846,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     };
 
     // The ProxyCommand splices ssh's stdio onto the guest's vsock ssh port, so
-    // the hostname after `root@` is only a known_hosts label. The host key is
+    // the hostname after `user@` is only a known_hosts label. The host key is
     // ephemeral (fresh per boot, reached over a private channel), hence the
     // relaxed checking options.
     if args.ssh {
@@ -851,8 +856,9 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         let exe = std::env::current_exe().context("locating the virtkit binary")?;
         println!(
             "virtkit: ssh: ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-             -o ProxyCommand=\"'{}' connect --to '{target}'\" root@vk-run",
-            exe.display()
+             -o ProxyCommand=\"'{}' connect --to '{target}'\" {}@vk-run",
+            exe.display(),
+            args.ssh_user
         );
     }
 
@@ -1207,6 +1213,25 @@ fn encode_ssh_keys(keys: &[String]) -> Result<String> {
         }
     }
     Ok(encoded.join(","))
+}
+
+/// A login name safe to splice into the whitespace-split kernel cmdline (see
+/// `read_cmdline` in vk-agent): non-empty and restricted to the portable POSIX
+/// username charset, so whitespace or `=` can't corrupt `VIRTKIT_SSH_USER=` or
+/// the tokens around it.
+pub fn parse_ssh_user(s: &str) -> Result<String, String> {
+    if s.is_empty() {
+        return Err("must not be empty".into());
+    }
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return Err(format!(
+            "{s:?} is not a valid login name (allowed: letters, digits, `_`, `-`, `.`)"
+        ));
+    }
+    Ok(s.to_string())
 }
 
 /// The default `--ssh` identities: the standard public keys under `~/.ssh`.
@@ -1938,6 +1963,17 @@ mod tests {
         );
         // a bare word is not an OpenSSH `type base64` line.
         assert!(encode_ssh_keys(&["garbage".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parse_ssh_user_rejects_cmdline_breakers() {
+        // portable login names pass through unchanged.
+        assert_eq!(parse_ssh_user("dev").unwrap(), "dev");
+        assert_eq!(parse_ssh_user("build-bot_1.0").unwrap(), "build-bot_1.0");
+        // whitespace or `=` would corrupt the whitespace-split kernel cmdline.
+        assert!(parse_ssh_user("").is_err());
+        assert!(parse_ssh_user("foo bar").is_err());
+        assert!(parse_ssh_user("a=b").is_err());
     }
 
     #[test]
