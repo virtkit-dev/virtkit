@@ -450,6 +450,12 @@ enum Cmd {
         /// Default: your standard ~/.ssh/id_*.pub keys
         #[arg(long = "ssh-key", value_name = "PUBKEY")]
         ssh_key: Vec<String>,
+        /// pin the run's sockets, console log and build media to this directory
+        /// (created/reused, mode 0700, never removed) instead of a fresh temp dir,
+        /// so external tooling can attach to the running VM:
+        /// `vk-agent -s vsock-auto://DIR/vsock.sock:4444 exec …`
+        #[arg(long = "state-dir", value_name = "DIR")]
+        state_dir: Option<PathBuf>,
         /// Command to run in the guest (default: a boot-info probe). Several
         /// words are an argv, each passed as typed (like docker run — use
         /// `sh -c '…'` for shell features); a single word is a shell one-liner
@@ -663,6 +669,7 @@ async fn cli_main() -> ExitCode {
         ssh_host,
         ssh,
         ssh_key,
+        state_dir,
         command,
     } = &cli.cmd
     {
@@ -742,6 +749,7 @@ async fn cli_main() -> ExitCode {
             ssh_hosts: ssh_host.clone(),
             ssh: *ssh || !ssh_key.is_empty(),
             ssh_keys: ssh_key.clone(),
+            state_dir: state_dir.clone(),
             command: command.clone(),
         };
         return match run::run(&args).await {

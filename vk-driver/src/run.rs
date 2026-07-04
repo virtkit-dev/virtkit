@@ -7,6 +7,7 @@
 //! aside (docker only with `--source docker`/`auto`), nothing else is needed.
 
 use std::ffi::OsStr;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -122,6 +123,10 @@ pub struct RunArgs {
     /// public keys authorised for `ssh` (OpenSSH format); empty = the standard
     /// ~/.ssh/id_*.pub identities
     pub ssh_keys: Vec<String>,
+    /// pin the run's scratch dir (sockets, console log) to a stable path instead
+    /// of a fresh temp dir, so external tooling can attach to the running VM; the
+    /// directory is reused across runs and never removed
+    pub state_dir: Option<PathBuf>,
     pub command: Vec<String>,
 }
 
@@ -130,9 +135,12 @@ pub async fn run(args: &RunArgs) -> Result<()> {
     if args.shell && unsafe { libc::isatty(0) != 1 || libc::isatty(1) != 1 } {
         bail!("--shell requires stdin and stdout to be a terminal");
     }
-    let work = WorkDir::create(
-        std::env::temp_dir().join(format!("virtkit-launch-{}", std::process::id())),
-    )?;
+    let work = match &args.state_dir {
+        Some(dir) => WorkDir::pinned(dir.clone())?,
+        None => WorkDir::create(
+            std::env::temp_dir().join(format!("virtkit-launch-{}", std::process::id())),
+        )?,
+    };
     // Resolve the agent and kernel: an explicit flag wins, else the copy embedded
     // in `vk` (served from a memfd), else the on-disk default.
     // Held for the VM's lifetime: an embedded asset lives in a memfd whose
@@ -162,21 +170,110 @@ pub async fn run(args: &RunArgs) -> Result<()> {
 /// A launch's named scratch dir — sockets, logs, and a `-f` build's ext4 live here
 /// (an image boot's media are unlinked scratch fds). Removed on drop, so error and
 /// panic unwinds clean it up too; only a signal kill can leak it.
+///
+/// A `--state-dir` run pins it to a caller-chosen path instead: the directory is
+/// reused (stale sockets from a previous run are unlinked up front) and NEVER
+/// removed — the stable socket paths are the whole point (external tooling
+/// attaches to `vsock-auto://<dir>/vsock.sock:<port>` while the VM runs), and the
+/// caller may keep its own files (SSH keys, bind-mount sources) alongside.
 struct WorkDir {
     path: PathBuf,
+    pinned: bool,
+    /// Advisory exclusive `flock` on the pinned dir itself, held for the run's
+    /// lifetime so a second `--state-dir` run on the same path fails fast
+    /// instead of unlinking the live run's sockets.
+    _lock: Option<std::fs::File>,
 }
 
 impl WorkDir {
     fn create(path: PathBuf) -> Result<WorkDir> {
         std::fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
-        Ok(WorkDir { path })
+        Ok(WorkDir {
+            path,
+            pinned: false,
+            _lock: None,
+        })
     }
+
+    /// Create-or-reuse a caller-pinned scratch dir (`--state-dir`).
+    fn pinned(path: PathBuf) -> Result<WorkDir> {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        // 0700 on create AND reuse: the dir holds the VM's control sockets (the
+        // exec channel is a root shell in the guest), and unlike the temp-dir
+        // default this path is caller-chosen — often inside a repo tree — so
+        // deny other users traversal regardless of umask or a pre-existing mode.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restricting {} to 0700", path.display()))?;
+        let lock = lock_state_dir(&path)?;
+        remove_stale_sockets(&path)?;
+        Ok(WorkDir {
+            path,
+            pinned: true,
+            _lock: Some(lock),
+        })
+    }
+}
+
+/// Non-blocking exclusive `flock` on the state dir itself: a second run on the
+/// same `--state-dir` would unlink the live run's sockets and fight over the
+/// binds, so refuse it up front. Advisory and filesystem-local, like the other
+/// locks in the tree.
+fn lock_state_dir(dir: &Path) -> Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::open(dir).with_context(|| format!("opening {}", dir.display()))?;
+    // SAFETY: the fd is owned by `f`, which the caller keeps alive; flock
+    // returns 0 or -1/errno and does not block under LOCK_NB.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            bail!("state-dir {} is in use by a live run", dir.display());
+        }
+        return Err(err).with_context(|| format!("locking {}", dir.display()));
+    }
+    Ok(f)
 }
 
 impl Drop for WorkDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        if !self.pinned {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
+}
+
+/// Unlink a previous run's socket files (`vsock.sock`, `vsock.sock_<port>`,
+/// virtiofsd sockets, …) from a reused `--state-dir`, one level deep (the
+/// per-service `svc-*` dirs hold their own). A stale unix socket file makes the
+/// next bind fail, so this must run before anything listens; everything else in
+/// the directory is left alone — it may be the caller's.
+fn remove_stale_sockets(dir: &Path) -> Result<()> {
+    let mut walk = vec![dir.to_path_buf()];
+    while let Some(d) = walk.pop() {
+        let entries = match std::fs::read_dir(&d) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ft.is_dir() && d == *dir && name.starts_with("svc-") {
+                walk.push(path);
+            } else if ft.is_socket() {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("removing stale {}", path.display()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Pick the rootfs source for an image boot per `--source`. `auto` prefers the registry
@@ -1652,6 +1749,26 @@ mod tests {
         );
         // a bare word is not an OpenSSH `type base64` line.
         assert!(encode_ssh_keys(&["garbage".to_string()]).is_err());
+    }
+
+    #[test]
+    fn remove_stale_sockets_spares_caller_files() {
+        let dir = std::env::temp_dir().join(format!("virtkit-stale-{}", std::process::id()));
+        let svc = dir.join("svc-db");
+        let deep = dir.join("data"); // non-svc subdir: not descended into
+        std::fs::create_dir_all(&svc).unwrap();
+        std::fs::create_dir_all(&deep).unwrap();
+        use std::os::unix::net::UnixListener;
+        let _a = UnixListener::bind(dir.join("vsock.sock")).unwrap();
+        let _b = UnixListener::bind(svc.join("vsock.sock_4444")).unwrap();
+        let _c = UnixListener::bind(deep.join("kept.sock")).unwrap();
+        std::fs::write(dir.join("vsock.sock.notes"), "caller's").unwrap();
+        remove_stale_sockets(&dir).unwrap();
+        assert!(!dir.join("vsock.sock").exists());
+        assert!(!svc.join("vsock.sock_4444").exists());
+        assert!(deep.join("kept.sock").exists()); // non-svc dirs are not descended
+        assert!(dir.join("vsock.sock.notes").exists()); // caller's file untouched
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -10,6 +10,10 @@ All notable changes to virtkit will be documented in this file.
   that works on both VMM backends — the client picks the best path at connect
   time. `run --ssh` prints its ProxyCommand in this form, so attaching to a VM
   no longer depends on which backend booted it.
+- `vk run --state-dir DIR` pins the run's sockets and console log to a stable
+  directory (created/reused, never removed, forced to mode 0700 — it exposes the
+  VM's control sockets) instead of a fresh temp dir, so external tooling can
+  attach to the running VM: `vk-agent -s vsock-auto://DIR/vsock.sock:4444 exec`.
 
 ### Changed
 
