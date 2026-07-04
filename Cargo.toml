@@ -7,7 +7,7 @@ members = ["vk-core", "vk-driver", "vk-agent"]
 exclude = ["third_party/libkrun"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 authors = [
     "Vincent Vanackere <vincent.vanackere@gmail.com>",
