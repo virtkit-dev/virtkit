@@ -319,8 +319,10 @@ fn map_build(build: serde_yaml_ng::Value, base: &Path) -> Result<Source> {
 }
 
 /// A bind-mount `host:guest[:ro|rw]`. A source that is not a path (a compose named
-/// volume) is rejected — there is no volume manager here.
-fn parse_volume(spec: &str, base: &Path) -> Result<Volume> {
+/// volume) is rejected — there is no volume manager here. Public: `run -v/--volume`
+/// parses the same syntax, anchored at the caller's cwd instead of the compose
+/// file's directory.
+pub fn parse_volume(spec: &str, base: &Path) -> Result<Volume> {
     let parts: Vec<&str> = spec.split(':').collect();
     let (host, guest, mode) = match parts.as_slice() {
         [h, g] => (*h, *g, "rw"),

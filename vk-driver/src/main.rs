@@ -456,6 +456,10 @@ enum Cmd {
         /// `vk-agent -s vsock-auto://DIR/vsock.sock:4444 exec …`
         #[arg(long = "state-dir", value_name = "DIR")]
         state_dir: Option<PathBuf>,
+        /// bind-mount an extra host dir into the guest (repeatable), beyond --workdir
+        /// — e.g. persistent state a throwaway VM should keep on the host
+        #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+        volume: Vec<String>,
         /// Command to run in the guest (default: a boot-info probe). Several
         /// words are an argv, each passed as typed (like docker run — use
         /// `sh -c '…'` for shell features); a single word is a shell one-liner
@@ -670,6 +674,7 @@ async fn cli_main() -> ExitCode {
         ssh,
         ssh_key,
         state_dir,
+        volume,
         command,
     } = &cli.cmd
     {
@@ -688,12 +693,14 @@ async fn cli_main() -> ExitCode {
                 || !ssh_key.is_empty()
                 || *ssh_agent
                 || !ssh_host.is_empty()
-                || workdir.is_some())
+                || workdir.is_some()
+                || !volume.is_empty())
         {
             return fail(
                 &anyhow::anyhow!(
                     "--compose without an image/-f/--service is services-only (compose up) — \
-                     there is no primary VM for a command, --shell, --ssh, or --workdir"
+                     there is no primary VM for a command, --shell, --ssh, --workdir, or \
+                     --volume"
                 ),
                 2,
             );
@@ -716,6 +723,24 @@ async fn cli_main() -> ExitCode {
         let bnet = match build::BuildNet::from_flags(build_net, build_allow_ip, build_allow_name) {
             Ok(n) => n,
             Err(e) => return fail(&e, 2),
+        };
+        // --volume: compose bind-mount syntax, relative host paths anchored at the
+        // caller's cwd (the compose loader anchors at the file's directory).
+        let volumes = if volume.is_empty() {
+            Vec::new()
+        } else {
+            let cwd = match std::env::current_dir() {
+                Ok(d) => d,
+                Err(e) => return fail(&anyhow::anyhow!(e).context("getting the current dir"), 1),
+            };
+            match volume
+                .iter()
+                .map(|v| compose::parse_volume(v, &cwd))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(v) => v,
+                Err(e) => return fail(&e, 2),
+            }
         };
         let args = run::RunArgs {
             image: image.clone().unwrap_or_default(),
@@ -750,6 +775,7 @@ async fn cli_main() -> ExitCode {
             ssh: *ssh || !ssh_key.is_empty(),
             ssh_keys: ssh_key.clone(),
             state_dir: state_dir.clone(),
+            volumes,
             command: command.clone(),
         };
         return match run::run(&args).await {

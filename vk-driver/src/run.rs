@@ -127,6 +127,9 @@ pub struct RunArgs {
     /// of a fresh temp dir, so external tooling can attach to the running VM; the
     /// directory is reused across runs and never removed
     pub state_dir: Option<PathBuf>,
+    /// extra host-dir bind mounts into the primary (beyond `workdir`), same
+    /// semantics as a `--service` primary's compose volumes
+    pub volumes: Vec<crate::compose::Volume>,
     pub command: Vec<String>,
 }
 
@@ -628,11 +631,11 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             read_only: false,
         });
     }
-    // A --service primary gets its compose volumes, exactly like a sibling unit
-    // would: bind mounts over virtiofs. Persistent state (a dev VM's
-    // ~/.vscode-server, say) is whatever the compose file binds to a host dir —
-    // the VM itself stays throwaway.
-    for (i, vol) in primary_volumes.iter().enumerate() {
+    // A --service primary gets its compose volumes, and any primary its `--volume`
+    // flags, exactly like a sibling unit would: bind mounts over virtiofs.
+    // Persistent state (a dev VM's ~/.vscode-server, say) is whatever binds to a
+    // host dir — the VM itself stays throwaway.
+    for (i, vol) in primary_volumes.iter().chain(&args.volumes).enumerate() {
         let tag = format!("vol{i}");
         let sock = work.join(format!("vfsd-{tag}.sock"));
         if !crate::vmm::libkrun_selected() {

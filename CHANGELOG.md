@@ -14,6 +14,10 @@ All notable changes to virtkit will be documented in this file.
   directory (created/reused, never removed, forced to mode 0700 — it exposes the
   VM's control sockets) instead of a fresh temp dir, so external tooling can
   attach to the running VM: `vk-agent -s vsock-auto://DIR/vsock.sock:4444 exec`.
+- `vk run -v/--volume HOST:GUEST[:ro]` bind-mounts extra host dirs into the
+  primary (beyond `--workdir`), with the same semantics as a `--service`
+  primary's compose volumes — persistent state (a dev VM's `~/.vscode-server`,
+  credentials dirs) lives on the host while the VM stays throwaway.
 
 ### Changed
 
