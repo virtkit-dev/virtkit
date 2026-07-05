@@ -34,6 +34,12 @@ All notable changes to virtkit will be documented in this file.
   longer risk running out of memory-backed space; `--state-dir` still picks a
   caller-chosen location.
 
+### Fixed
+
+- `vk build` steps that write large amounts of transient data to `/tmp` (for
+  example unpacking a big toolchain) no longer fail with "no space left on
+  device" when the guest has ample disk free.
+
 ## [0.7.0] - 2026-07-04
 
 ### Added

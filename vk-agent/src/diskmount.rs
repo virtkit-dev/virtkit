@@ -106,6 +106,33 @@ pub fn mount_ro(device: &str, target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Mount `device` (an ext4) read-write at an existing `target` — the ephemeral, disk-backed
+/// scratch fs a build guest uses for `/tmp` (VIRTKIT_TMP_DEV). `flags` carries the same
+/// hardening the tmpfs path applies (`MS_NOSUID | MS_NODEV`). Returns an `io::Result` so the
+/// caller can treat it uniformly with the tmpfs fallback. Assumes `target` exists.
+pub fn mount_rw(device: &str, target: &Path, flags: libc::c_ulong) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let bad = |what| Error::new(ErrorKind::InvalidInput, what);
+    let dev = CString::new(device).map_err(|_| bad("device path has a NUL"))?;
+    let tgt =
+        CString::new(target.as_os_str().as_bytes()).map_err(|_| bad("mountpoint has a NUL"))?;
+    let fstype = CString::new("ext4").unwrap();
+    // SAFETY: valid C strings; data arg is null (no fs-specific options).
+    let rc = unsafe {
+        libc::mount(
+            dev.as_ptr(),
+            tgt.as_ptr(),
+            fstype.as_ptr(),
+            flags,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Bind-mount `src` at `target` read-only, creating `target` to match `src`'s type.
 /// Used for `RUN --mount=type=bind,from=<stage>,source=…,target=…`: the source stage's
 /// ext4 is mounted read-only elsewhere, and its `source` subtree is bound at `target`.

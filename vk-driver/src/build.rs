@@ -36,6 +36,10 @@
 mod exec;
 mod interp;
 mod parser;
+
+// Disk-device naming (0 = vda, 1 = vdb, …) — also used by `run::boot_session` to name the
+// build guest's ephemeral /tmp scratch disk.
+pub(crate) use exec::vd_name;
 mod plan;
 mod progress;
 

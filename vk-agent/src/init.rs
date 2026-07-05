@@ -199,15 +199,43 @@ fn mount_api_filesystems() {
     // a service's runtime dir survives — e.g. /run/redis (owned by redis) that redis
     // binds its unix socket into. systemd-tmpfiles would recreate these; we have no
     // systemd, and a bare tmpfs mount would hide them.
+    //
+    // /tmp is the exception when a build hands us a disk-backed scratch device
+    // (VIRTKIT_TMP_DEV): a build's RUN steps write bulk transient data (tar extractions,
+    // ./configure) to /tmp, and a RAM tmpfs caps that at ½·guest-RAM. The device is a
+    // separate, sparse ext4 disk — not RAM-bound, and never part of the stage snapshot — so
+    // it stays a fresh mount that leaks nothing into the image.
+    let tmp_dev = tmp_dev_from_cmdline();
     for target in ["/run", "/tmp"] {
         if !std::path::Path::new(target).exists() {
             created.push(target);
         }
         let _ = std::fs::create_dir_all(target);
-        if let Err(e) = mount_tmpfs_keep_dirs(target, libc::MS_NOSUID | libc::MS_NODEV)
+        let res = if target == "/tmp"
+            && let Some(dev) = &tmp_dev
+        {
+            crate::diskmount::mount_rw(
+                dev,
+                std::path::Path::new(target),
+                libc::MS_NOSUID | libc::MS_NODEV,
+            )
+            .and_then(|()| {
+                // A freshly-made ext4's root is mode 0755 owned by root, but a kernel tmpfs
+                // /tmp is 1777 (world-writable + sticky). Restore that so unprivileged RUN
+                // steps (apt dropping to _apt, ./configure) can create temp files there.
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    std::path::Path::new(target),
+                    std::fs::Permissions::from_mode(0o1777),
+                )
+            })
+        } else {
+            mount_tmpfs_keep_dirs(target, libc::MS_NOSUID | libc::MS_NODEV)
+        };
+        if let Err(e) = res
             && e.raw_os_error() != Some(libc::EBUSY)
         {
-            warn!("vk-agent init: tmpfs on {target} failed: {e}");
+            warn!("vk-agent init: mounting {target} failed: {e}");
         }
     }
     // Now that /run (the registry's tmpfs) is mounted, record the mountpoints we created
@@ -215,6 +243,16 @@ fn mount_api_filesystems() {
     for target in created {
         crate::diskmount::note_created(std::path::Path::new(target));
     }
+}
+
+/// The disk-backed `/tmp` scratch device a build's `boot_session` passes as
+/// `VIRTKIT_TMP_DEV=/dev/vdN`, or `None` for a plain run (tmpfs `/tmp`). Read straight from
+/// `/proc/cmdline` because `/tmp` is mounted before the general cmdline parse.
+fn tmp_dev_from_cmdline() -> Option<String> {
+    std::fs::read_to_string("/proc/cmdline")
+        .ok()?
+        .split_whitespace()
+        .find_map(|t| t.strip_prefix("VIRTKIT_TMP_DEV=").map(str::to_string))
 }
 
 /// Mount a fresh tmpfs on `target`, first snapshotting its underlying top-level

@@ -439,7 +439,7 @@ fn content_diff(prev: &Path, cur: &Path, within: &[(u64, u64)]) -> Result<Vec<(u
 
 /// The Linux disk name for the `n`th virtio-blk device (0 = `vda`, 25 = `vdz`,
 /// 26 = `vdaa`, …) — matches the kernel's `disk_name` enumeration order.
-fn vd_name(n: usize) -> String {
+pub(crate) fn vd_name(n: usize) -> String {
     let mut n = n + 1;
     let mut s = String::new();
     while n > 0 {

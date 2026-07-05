@@ -199,6 +199,28 @@ pub fn build_from_tar_injecting(
     t.write(out, extra_free_blocks)
 }
 
+/// Build an empty ext4 at `out` with `extra_free_blocks` of spare capacity — a contentless
+/// scratch filesystem, e.g. an ephemeral guest `/tmp` disk. The free space is sparse
+/// (holes), so a large capacity is nearly free to create and store. No journal: the fs is
+/// throwaway.
+pub fn build_empty(out: &Path, extra_free_blocks: u64) -> Result<()> {
+    // A valid empty tar is two 512-byte end-of-archive zero records.
+    let tar = out.with_extension("empty.tar");
+    std::fs::write(&tar, [0u8; 1024]).with_context(|| format!("writing {}", tar.display()))?;
+    let r = build_from_tar_injecting(
+        &tar,
+        &[],
+        extra_free_blocks,
+        &FsId {
+            with_journal: false,
+            ..Default::default()
+        },
+        out,
+    );
+    let _ = std::fs::remove_file(&tar);
+    r
+}
+
 /// Zero the ext4 superblock's volatile bookkeeping — the write/mount/check timestamps and
 /// the lifetime "kbytes written" / mount counters — so an exported image is deterministic:
 /// a warm (cache-restored) build and a cold build produce byte-identical artifacts, and a

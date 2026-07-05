@@ -1631,6 +1631,9 @@ pub(crate) struct VmSession {
     /// virtiofsd serving the build context (for `COPY` from the context), if any.
     virtiofsd: Option<Child>,
     work: PathBuf,
+    /// the ephemeral /tmp scratch disk (backing ext4 + rw overlay), removed on drop — a
+    /// separate device from `image`, so it is never part of the stage snapshot.
+    scratch_disks: Vec<PathBuf>,
 }
 
 /// Guest mountpoint of the build-context virtiofs share (for `COPY` from the context).
@@ -1695,6 +1698,11 @@ pub(crate) fn disk_format(path: &Path) -> &'static str {
     }
 }
 
+/// Spare capacity of a build guest's ephemeral /tmp scratch disk (blocks of 4 KiB). Sparse,
+/// so the generous ceiling costs nothing until written; it just has to comfortably hold a
+/// toolchain unpack (rust is ~2.5 GiB) or a big `./configure` tree.
+const TMP_DISK_FREE_BLOCKS: u64 = 32 * 1024 * 1024 * 1024 / 4096;
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn boot_session(
     cloud_hypervisor: &Path,
@@ -1743,11 +1751,28 @@ pub(crate) async fn boot_session(
             readonly: true,
         });
     }
+    // Ephemeral, disk-backed /tmp for the build guest: a sparse, empty ext4 on its own
+    // virtio-blk device, so a stage's RUN steps can extract gigabytes to /tmp without the
+    // ½·RAM cap of a tmpfs — yet, being a separate device, it never enters the stage
+    // snapshot (no cache churn). The guest writes into it directly (no overlay: it is
+    // throwaway, discarded with the session), so it needs no CoW backing. Created next to
+    // the stage image (the build scratch's real filesystem, not this session's workdir which
+    // may be a tmpfs). The agent mounts it at /tmp (VIRTKIT_TMP_DEV).
+    let tmp_backing = image.with_file_name(format!("{stem}.tmpdisk.ext4"));
+    crate::ext4::build_empty(&tmp_backing, TMP_DISK_FREE_BLOCKS)
+        .with_context(|| format!("creating the /tmp scratch disk {}", tmp_backing.display()))?;
+    let tmp_dev = crate::build::vd_name(disks.len());
+    disks.push(crate::vmm::Disk {
+        path: tmp_backing.clone(),
+        qcow2: false,
+        readonly: false,
+    });
+    let scratch_disks = vec![tmp_backing];
     // The kernel runs the initramfs `/init` (the agent); it then pivots into the ext4
     // named by VIRTKIT_PIVOT. No `init=`/`root=` for the kernel to mount — the agent does.
     let mut cmdline = format!(
         "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda \
-         VIRTKIT_HOSTNAME=vm VIRTKIT_VSOCK_PORT={VSOCK_PORT}"
+         VIRTKIT_HOSTNAME=vm VIRTKIT_VSOCK_PORT={VSOCK_PORT} VIRTKIT_TMP_DEV=/dev/{tmp_dev}"
     );
     let vsock = work.join("vsock.sock");
     let console = work.join("console.log");
@@ -1846,6 +1871,7 @@ pub(crate) async fn boot_session(
         switch,
         virtiofsd,
         work,
+        scratch_disks,
     })
 }
 
@@ -1961,6 +1987,10 @@ impl Drop for VmSession {
             let _ = c.wait();
         }
         let _ = std::fs::remove_dir_all(&self.work);
+        // the ephemeral /tmp scratch disk (never committed — a separate device from `image`).
+        for d in &self.scratch_disks {
+            let _ = std::fs::remove_file(d);
+        }
     }
 }
 
