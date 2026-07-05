@@ -170,9 +170,9 @@ pub async fn run(args: &RunArgs) -> Result<()> {
     }
     let work = match &args.state_dir {
         Some(dir) => WorkDir::pinned(dir.clone())?,
-        None => WorkDir::create(
-            std::env::temp_dir().join(format!("virtkit-launch-{}", std::process::id())),
-        )?,
+        None => {
+            WorkDir::create(default_scratch_base()?.join(format!("launch-{}", std::process::id())))?
+        }
     };
     // Resolve the agent and kernel: an explicit flag wins, else the copy embedded
     // in `vk` (served from a memfd), else the on-disk default.
@@ -198,6 +198,22 @@ pub async fn run(args: &RunArgs) -> Result<()> {
         return compose_up(args, &work.path, &agent.path, &kernel.path).await;
     }
     build_and_boot(args, &work.path, &agent.path, &kernel.path).await
+}
+
+/// Default base for a run's launch scratch: `$XDG_CACHE_HOME/virtkit`, else
+/// `~/.cache/virtkit`. Deliberately NOT `std::env::temp_dir()`: that is often a small
+/// RAM-backed tmpfs (e.g. a 16 GiB `/tmp`), and a `-f` build writes its stage ext4s and the
+/// assembled `root.ext4` here — a large build would exhaust the tmpfs (ENOSPC) while the
+/// real disk sits idle. Cache semantics fit (transient, regenerable, removed on drop); the
+/// durable instruction store lives under `$XDG_DATA_HOME` instead. `--state-dir` overrides
+/// this with a caller-chosen path. The short `launch-<pid>` leaf keeps the AF_UNIX socket
+/// paths created under here well within the 108-byte limit.
+fn default_scratch_base() -> Result<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(xdg).join("virtkit"));
+    }
+    let home = std::env::var_os("HOME").context("neither XDG_CACHE_HOME nor HOME is set")?;
+    Ok(PathBuf::from(home).join(".cache/virtkit"))
 }
 
 /// A launch's named scratch dir — sockets, logs, and a `-f` build's ext4 live here

@@ -29,6 +29,10 @@ All notable changes to virtkit will be documented in this file.
   of a RAM-backed temp dir, so large builds no longer risk running out of
   memory-backed space; scratch left behind by a crashed or killed build is
   cleaned up automatically on the next build.
+- `vk run -f` writes its temporary launch scratch under the cache directory
+  (`~/.cache/virtkit`) instead of a RAM-backed temp dir, so large builds no
+  longer risk running out of memory-backed space; `--state-dir` still picks a
+  caller-chosen location.
 
 ## [0.7.0] - 2026-07-04
 
