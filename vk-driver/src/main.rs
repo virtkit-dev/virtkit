@@ -196,10 +196,10 @@ enum Cmd {
         cmd: RegistryCmd,
     },
     /// Build a Dockerfile target and export it as a bootable ext4 image — a from-scratch
-    /// builder (no docker, no buildkit). With `--microvm`, each RUN executes in a Cloud
-    /// Hypervisor guest and instruction snapshots are cached (`--cache-registry`); the
-    /// default host backend handles the `FROM scratch` + COPY subset. `--print-plan` parses
-    /// + plans + prints the build without running it.
+    /// builder (no docker, no buildkit). Each RUN executes in a microVM guest (the
+    /// embedded libkrun by default) and instruction snapshots are cached
+    /// (`--cache-registry`). `--print-plan` parses + plans + prints the build without
+    /// running it.
     Build {
         /// Dockerfile to build (repeatable: the files merge into one stage namespace,
         /// so a FROM/COPY --from in one file can name a stage declared in another)
@@ -218,11 +218,9 @@ enum Cmd {
         /// parse + plan + print the build order and primitives; build nothing
         #[arg(long = "print-plan")]
         print_plan: bool,
-        /// run the build in a microVM (RUN executes in a Cloud Hypervisor guest);
-        /// needs --cloud-hypervisor (kernel/agent default to the copies embedded in
-        /// `vk`). Default: host backend (FROM scratch + COPY only).
-        #[arg(long)]
-        microvm: bool,
+        /// cloud-hypervisor binary — only used when VIRTKIT_VMM=cloud-hypervisor selects
+        /// that backend; the default libkrun backend is embedded in `vk` and needs none
+        /// (kernel/agent likewise default to the copies embedded in `vk`)
         #[arg(long = "cloud-hypervisor")]
         cloud_hypervisor: Option<PathBuf>,
         #[arg(long)]
@@ -1009,7 +1007,6 @@ async fn cli_main() -> ExitCode {
         context,
         out,
         print_plan,
-        microvm,
         cloud_hypervisor,
         kernel,
         agent,
@@ -1045,7 +1042,9 @@ async fn cli_main() -> ExitCode {
             contexts: context.clone(),
             out: out.clone(),
             print_plan: *print_plan,
-            microvm: *microvm,
+            // `vk build` always builds in a microVM (libkrun by default). The host
+            // backend remains for the FROM-scratch+COPY tests / programmatic callers.
+            microvm: true,
             cloud_hypervisor: cloud_hypervisor
                 .clone()
                 .or_else(|| b.cloud_hypervisor.clone())

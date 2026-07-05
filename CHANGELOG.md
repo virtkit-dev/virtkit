@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- `vk build` now always builds in a microVM (the embedded libkrun by default):
+  the `--microvm` flag is gone, and `--cloud-hypervisor` is required only when
+  `VIRTKIT_VMM=cloud-hypervisor` selects that backend.
+
 ## [0.7.0] - 2026-07-04
 
 ### Added

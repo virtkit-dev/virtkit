@@ -2,10 +2,10 @@
 //!
 //! A from-scratch builder for the narrow job we actually need: build a Dockerfile
 //! target and export it as a filesystem (ext4) image, with `RUN` steps run in a
-//! Cloud Hypervisor microVM rather than rootless containers. It is intentionally the
-//! *classic* (pre-buildkit) builder shape — stages in topological order, a linear
-//! per-instruction cache — not a buildkit reimplementation: no concurrent solver, no
-//! content-addressed per-op cache graph.
+//! microVM (the embedded libkrun by default) rather than rootless containers. It is
+//! intentionally the *classic* (pre-buildkit) builder shape — stages in topological
+//! order, a linear per-instruction cache — not a buildkit reimplementation: no
+//! concurrent solver, no content-addressed per-op cache graph.
 //!
 //! Pipeline: [`parser`] (Dockerfile → instructions, lexing mirrors buildkit's
 //! parser) → [`plan`] (stages + cross-stage deps + toposort) → [`exec`] (a backend
@@ -58,9 +58,12 @@ pub struct Options {
     pub out: Option<PathBuf>,
     /// Parse + plan + print the build order and primitives, build nothing.
     pub print_plan: bool,
-    /// Use the microVM backend (RUN executes in a Cloud Hypervisor guest) instead of
-    /// the host backend (FROM scratch + COPY only). Needs the three tool paths.
+    /// Use the microVM backend (each RUN executes in a guest — libkrun by default)
+    /// instead of the host backend (FROM scratch + COPY only). `vk build` always sets
+    /// this; the host backend is only used by tests / programmatic no-RUN callers.
     pub microvm: bool,
+    /// cloud-hypervisor binary, only used when `VIRTKIT_VMM=cloud-hypervisor` selects
+    /// that backend (the default libkrun backend is embedded and needs none).
     pub cloud_hypervisor: Option<PathBuf>,
     pub kernel: Option<PathBuf>,
     pub agent: Option<PathBuf>,
@@ -335,10 +338,18 @@ pub fn build_inputs(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
         });
         let kernel = kernel.as_ref().expect("resolved under opts.microvm");
         let agent = agent.as_ref().expect("resolved under opts.microvm");
+        // cloud-hypervisor is only needed when VIRTKIT_VMM selects it; the default
+        // libkrun backend is embedded in `vk` and drives no external VMM binary.
+        let ch = if crate::vmm::libkrun_selected() {
+            opts.cloud_hypervisor.clone().unwrap_or_default()
+        } else {
+            opts.cloud_hypervisor.clone().context(
+                "the cloud-hypervisor backend (VIRTKIT_VMM=cloud-hypervisor) needs \
+                 --cloud-hypervisor",
+            )?
+        };
         Box::new(MicroVm::new(
-            opts.cloud_hypervisor
-                .clone()
-                .context("--microvm needs --cloud-hypervisor")?,
+            ch,
             kernel.path.clone(),
             agent.path.clone(),
             scratch.clone(),

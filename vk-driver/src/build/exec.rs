@@ -9,10 +9,11 @@
 //!     host: stage dirs + file copies, exported via virtkit's pure-Rust ext4 builder.
 //!   - [`MicroVm`] builds the `FROM <image>` + `RUN` shape: pull/flatten the base with
 //!     the OCI client into a bootable ext4 (agent injected, free space for writes),
-//!     and run each `RUN` inside a Cloud Hypervisor guest (a rw qcow2 overlay over the
+//!     and run each `RUN` inside a microVM guest (a rw qcow2 overlay over the
 //!     ext4, committed back so writes persist; egress via a `vk switch` so
 //!     `apt`/`apk` work; root remounted read-only before teardown so the exported ext4
-//!     is clean). Needs KVM + the runtime tools (cloud-hypervisor + the guest kernel).
+//!     is clean). Needs KVM; the VMM is the embedded libkrun by default (or an external
+//!     cloud-hypervisor when `VIRTKIT_VMM=cloud-hypervisor`), plus the guest kernel.
 //!     `COPY --from=<stage>` and `RUN --mount=type=bind,from=<stage>` work by attaching
 //!     the source stage's ext4 read-only and copying / bind-mounting inside the guest;
 //!     `COPY` from the build context copies from the context shared over virtiofs,
@@ -288,7 +289,7 @@ impl Executor for Planner {
 }
 
 /// The microVM backend: a stage is a bootable ext4 (the OCI base pulled + flattened
-/// with the agent injected), `RUN` boots it in a Cloud Hypervisor guest with egress
+/// with the agent injected), `RUN` boots it in a microVM guest with egress
 /// per the build's [`BuildNet`](crate::build::BuildNet) policy (a `vk switch`,
 /// unrestricted by default) and execs the command — changes persist and the exported ext4
 /// is left clean. `COPY` / `RUN --mount=from` are not wired yet, so it builds the
