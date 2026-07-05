@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `vk run --detach` runs the build and boot in the foreground — so Ctrl-C aborts
+  them cleanly instead of orphaning a half-started VM — then detaches once the
+  guest is ready, freeing the terminal while the microVM keeps running.
+  `--detach-log PATH` captures the backgrounded VM's output (default: discard).
+
 ### Changed
 
 - `vk build` now always builds in a microVM (the embedded libkrun by default):

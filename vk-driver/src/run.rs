@@ -155,6 +155,11 @@ pub struct RunArgs {
     /// a `-f`/`--service`/compose build may restore stages from the instruction
     /// cache but must not execute anything; a cache miss aborts (exit 3 at the CLI)
     pub require_cached: bool,
+    /// daemonize once the guest is ready (foreground build/boot, background after); see
+    /// [`crate::detach`]. Set only via the CLI `--detach` fork path.
+    pub detach: bool,
+    /// where a `--detach` run redirects its output after detaching (default: discard)
+    pub detach_log: Option<PathBuf>,
     pub command: Vec<String>,
 }
 
@@ -1059,6 +1064,11 @@ async fn compose_up(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path) ->
         planned.start.len(),
         mgr.declared(),
     );
+    // Every service booted; for a `--detach` run, daemonize now so the terminal is freed
+    // while the services keep running (a no-op unless this is the forked child).
+    if args.detach {
+        crate::detach::signal_ready(args.detach_log.as_deref());
+    }
     tokio::signal::ctrl_c().await.ok();
     println!("virtkit: stopping ...");
     mgr.stop_all();
@@ -1393,6 +1403,14 @@ async fn drive(
     }
     if let Some(cfg) = ssh_config {
         write_guest_ssh_config(addr, cfg).await?;
+    }
+    // The guest has answered its status probe (booted, agent serving) and its ssh config is
+    // in place. For a `--detach` run this is the moment to daemonize: redirect output to the
+    // log and wake the foreground parent, which returns to the shell while this process holds
+    // the VM below. A boot failure above bails before here, so it surfaces in the foreground.
+    // A no-op unless this process is the forked `--detach` child.
+    if args.detach {
+        crate::detach::signal_ready(args.detach_log.as_deref());
     }
     if args.shell {
         return run_shell(addr).await;

@@ -22,6 +22,7 @@ mod compose;
 mod config;
 mod convert;
 mod cpio;
+mod detach;
 mod dockerhash;
 mod embed;
 mod ensure;
@@ -515,6 +516,15 @@ enum Cmd {
         /// cached-vs-cold without paying for a build
         #[arg(long = "require-cached")]
         require_cached: bool,
+        /// Daemonize once the guest is ready: run the build + boot in the foreground
+        /// (Ctrl-C aborts them), then detach so the terminal is freed while the VM keeps
+        /// running. Intended for a long-lived run (`--ssh`, or `-- sleep infinity`)
+        #[arg(long = "detach")]
+        detach: bool,
+        /// With --detach, redirect the backgrounded VM's output here after detaching
+        /// (default: discard). The foreground build/boot still prints to the terminal
+        #[arg(long = "detach-log", value_name = "PATH", requires = "detach")]
+        detach_log: Option<PathBuf>,
         /// Command to run in the guest (default: a boot-info probe). Several
         /// words are an argv, each passed as typed (like docker run — use
         /// `sh -c '…'` for shell features); a single word is a shell one-liner
@@ -666,6 +676,18 @@ fn main() -> ExitCode {
         }
     }
 
+    // `vk run … --detach` — daemonize once the guest is ready. The fork must precede the
+    // Tokio runtime (forking a live multi-threaded runtime is undefined behavior): the child
+    // continues as the background daemon, the parent supervises the foreground build/boot.
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if detach::wants_detach(&args)
+            && let detach::Forked::Parent(code) = detach::fork()
+        {
+            return code;
+        }
+    }
+
     // The CLI proper runs on a Tokio runtime (formerly `#[tokio::main]`).
     match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -738,6 +760,8 @@ async fn cli_main() -> ExitCode {
         host_exec_wrapper,
         host_exec_env,
         require_cached,
+        detach,
+        detach_log,
         command,
     } = &cli.cmd
     {
@@ -862,6 +886,8 @@ async fn cli_main() -> ExitCode {
             host_exec_wrapper: host_exec_wrapper.clone(),
             host_exec_env: host_exec_env.clone(),
             require_cached: *require_cached,
+            detach: *detach,
+            detach_log: detach_log.clone(),
             command: command.clone(),
         };
         return match run::run(&args).await {
