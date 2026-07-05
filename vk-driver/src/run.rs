@@ -1429,9 +1429,15 @@ async fn drive(
     }
     script.push_str(&body);
     let command = vec!["sh".into(), "-c".into(), script];
-    let result = crate::executor::exec_script(addr, &command, Vec::new(), None)
-        .await
-        .context("running the command in the guest")?;
+    let result = crate::executor::exec_script(
+        addr,
+        &command,
+        Vec::new(),
+        None,
+        &crate::executor::OutputSink::Inherit,
+    )
+    .await
+    .context("running the command in the guest")?;
     match result.code {
         Some(0) | None => Ok(()),
         Some(c) => bail!("guest command exited {c}"),
@@ -1446,9 +1452,15 @@ async fn write_guest_ssh_config(addr: &SocketAddr, config: &str) -> Result<()> {
         "-c".into(),
         "umask 077 && mkdir -p ~/.ssh && cat > ~/.ssh/config".into(),
     ];
-    let r = crate::executor::exec_script(addr, &cmd, config.as_bytes().to_vec(), None)
-        .await
-        .context("writing ~/.ssh/config in the guest")?;
+    let r = crate::executor::exec_script(
+        addr,
+        &cmd,
+        config.as_bytes().to_vec(),
+        None,
+        &crate::executor::OutputSink::Inherit,
+    )
+    .await
+    .context("writing ~/.ssh/config in the guest")?;
     match r.code {
         Some(0) | None => Ok(()),
         Some(c) => bail!("writing ~/.ssh/config in the guest failed (exit {c})"),
@@ -1806,9 +1818,15 @@ pub(crate) async fn boot_session(
 }
 
 impl VmSession {
-    /// Run `command` (optionally as `user`) in the live guest; returns its exit code.
-    pub(crate) async fn exec(&self, command: &[String], user: Option<String>) -> Result<i32> {
-        let r = crate::executor::exec_script(&self.addr, command, Vec::new(), user)
+    /// Run `command` (optionally as `user`) in the live guest, relaying its output through
+    /// `sink`; returns its exit code.
+    pub(crate) async fn exec(
+        &self,
+        command: &[String],
+        user: Option<String>,
+        sink: &crate::executor::OutputSink,
+    ) -> Result<i32> {
+        let r = crate::executor::exec_script(&self.addr, command, Vec::new(), user, sink)
             .await
             .context("running the command in the guest")?;
         Ok(r.code.unwrap_or(0))
@@ -1819,7 +1837,14 @@ impl VmSession {
     async fn guest_ok(&self, argv: &[&str]) -> bool {
         let cmd: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
         matches!(
-            crate::executor::exec_script(&self.addr, &cmd, Vec::new(), None).await,
+            crate::executor::exec_script(
+                &self.addr,
+                &cmd,
+                Vec::new(),
+                None,
+                &crate::executor::OutputSink::Inherit,
+            )
+            .await,
             Ok(r) if r.code == Some(0)
         )
     }
@@ -1839,9 +1864,14 @@ impl VmSession {
         let t = Instant::now();
         let frozen = self.guest_ok(&[GUEST_AGENT, "fsfreeze", "-f", "/"]).await;
         if !frozen {
-            let _ =
-                crate::executor::exec_script(&self.addr, &["sync".to_string()], Vec::new(), None)
-                    .await;
+            let _ = crate::executor::exec_script(
+                &self.addr,
+                &["sync".to_string()],
+                Vec::new(),
+                None,
+                &crate::executor::OutputSink::Inherit,
+            )
+            .await;
         }
         let copied = std::fs::copy(&self.image, out);
         if frozen {
@@ -1863,9 +1893,14 @@ impl VmSession {
         let quiesced = self.guest_ok(&[GUEST_AGENT, "cleanup"]).await
             || self.guest_ok(&[GUEST_AGENT, "fsfreeze", "-f", "/"]).await;
         if !quiesced {
-            let _ =
-                crate::executor::exec_script(&self.addr, &["sync".to_string()], Vec::new(), None)
-                    .await;
+            let _ = crate::executor::exec_script(
+                &self.addr,
+                &["sync".to_string()],
+                Vec::new(),
+                None,
+                &crate::executor::OutputSink::Inherit,
+            )
+            .await;
         }
         let _ = self.ch.kill();
         let _ = self.ch.wait();
@@ -2053,14 +2088,19 @@ mod tests {
                 "/dev/vdb".into(),
                 "/mnt/src".into(),
             ];
-            assert_eq!(s.exec(&mount, None).await.unwrap(), 0, "agent mount failed");
+            let sink = crate::executor::OutputSink::Inherit;
+            assert_eq!(
+                s.exec(&mount, None, &sink).await.unwrap(),
+                0,
+                "agent mount failed"
+            );
             let read = [
                 "sh".to_string(),
                 "-c".into(),
                 "grep -q MARKER-FROM-VDB /mnt/src/payload.txt".into(),
             ];
             assert_eq!(
-                s.exec(&read, None).await.unwrap(),
+                s.exec(&read, None, &sink).await.unwrap(),
                 0,
                 "reading source failed"
             );

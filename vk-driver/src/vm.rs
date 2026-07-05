@@ -511,6 +511,7 @@ async fn probe_guest_shell(ctx: &JobCtx, addr: &vk_core::addr::SocketAddr) {
             &["sh".to_string()],
             b"command -v bash >/dev/null 2>&1".to_vec(),
             None,
+            &crate::executor::OutputSink::Inherit,
         )
         .await,
         Ok(res) if res.code == Some(0)

@@ -3,9 +3,12 @@
 //! A from-scratch builder for the narrow job we actually need: build a Dockerfile
 //! target and export it as a filesystem (ext4) image, with `RUN` steps run in a
 //! microVM (the embedded libkrun by default) rather than rootless containers. It is
-//! intentionally the *classic* (pre-buildkit) builder shape — stages in topological
-//! order, a linear per-instruction cache — not a buildkit reimplementation: no
-//! concurrent solver, no content-addressed per-op cache graph.
+//! intentionally the *classic* (pre-buildkit) builder shape — a strict linear
+//! per-instruction cache chain per stage — not a buildkit reimplementation with a
+//! content-addressed per-op cache graph. Independent stages *do* build concurrently
+//! over the dependency DAG (the microVM backend's parallel driver, `drive_microvm`);
+//! the concurrency is coarse-grained, one guest per stage, not buildkit's fine-grained
+//! per-op solver.
 //!
 //! Pipeline: [`parser`] (Dockerfile → instructions, lexing mirrors buildkit's
 //! parser) → [`plan`] (stages + cross-stage deps + toposort) → [`exec`] (a backend
@@ -34,10 +37,11 @@ mod exec;
 mod interp;
 mod parser;
 mod plan;
+mod progress;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result, bail};
 
@@ -45,6 +49,7 @@ use exec::{DryRun, Executor, Host, MicroVm, ResolvedMount, Rootfs, ShellState};
 use interp::Vars;
 use parser::Instruction;
 use plan::{Base, Plan, PlanInput};
+use progress::{Outcome, Progress, StageInit};
 
 /// What/how to build.
 pub struct Options {
@@ -281,7 +286,14 @@ pub fn build_inputs(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
     // --print-plan: dry-run the whole pipeline and print the primitives, build nothing.
     if opts.print_plan {
         let mut ex = DryRun::new();
-        drive(&plan, &order, &build_args, &mut ex, false)?;
+        drive(
+            &plan,
+            &order,
+            &build_args,
+            &mut ex,
+            false,
+            &Progress::disabled(),
+        )?;
         println!("# build order: {order:?} (target stage {target})");
         for line in &ex.transcript {
             println!("{line}");
@@ -331,6 +343,10 @@ pub fn build_inputs(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
     } else {
         (None, None)
     };
+    // Live build overview (Docker/buildkit-style): a dashboard in a terminal, plain `#N`
+    // lines otherwise. The drivers populate it (which stages/steps run) once they know the
+    // needed set, and route each stage's guest output through it.
+    let progress = Progress::new();
     let result = (|| -> Result<Built> {
         // The microVM backend drives stages in parallel over the dependency DAG (each
         // stage on its own guest); the host backend (FROM scratch + COPY) stays
@@ -368,21 +384,36 @@ pub fn build_inputs(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
                 opts.net.clone(),
             );
             let jobs = resolve_build_jobs(opts, mv.mem_mib());
-            let (committed, states) =
-                drive_microvm(&plan, &order, &build_args, &mv, jobs, opts.require_cached)?;
+            let (committed, states) = drive_microvm(
+                &plan,
+                &order,
+                &build_args,
+                &mv,
+                jobs,
+                opts.require_cached,
+                &progress,
+            )?;
             // `mv` shares the workers' `images` map (same Arc), so it can export the
             // target and is reused as the exporter.
             (committed, states, Box::new(mv))
         } else {
             let mut ex = Host::new(scratch.clone());
-            let (committed, states) =
-                drive(&plan, &order, &build_args, &mut ex, opts.require_cached)?;
+            let (committed, states) = drive(
+                &plan,
+                &order,
+                &build_args,
+                &mut ex,
+                opts.require_cached,
+                &progress,
+            )?;
             (committed, states, Box::new(ex))
         };
         let fs = committed
             .get(&target)
             .context("internal: target stage not committed")?;
+        progress.export_start();
         ex.export_ext4(fs, out)?;
+        progress.export_done();
         let st = states.get(&target).cloned().unwrap_or_default();
         let config = run_config(&st);
         // The sidecar persists the config the image itself deliberately does not
@@ -392,6 +423,8 @@ pub fn build_inputs(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
             .with_context(|| format!("writing {}", sidecar.display()))?;
         Ok(Built { config })
     })();
+    // Leave the final dashboard frame on screen (FINISHED/FAILED) before any teardown log.
+    progress.finish(result.is_ok());
     let _ = std::fs::remove_dir_all(&scratch); // best-effort scratch cleanup
     let built = result?;
     println!(
@@ -805,6 +838,48 @@ fn compute_needed(
     Ok((needed, cached_final))
 }
 
+/// The needed stages (in build order) as the progress reporter's display list: a `FROM`
+/// line plus one line per `RUN`/`COPY` per stage.
+fn stage_inits(
+    plan: &Plan,
+    order: &[usize],
+    resolved: &HashMap<usize, Resolved>,
+    needed: &HashSet<usize>,
+) -> Vec<StageInit> {
+    order
+        .iter()
+        .filter(|i| needed.contains(i))
+        .map(|&idx| {
+            let stage = &plan.stages[idx];
+            StageInit {
+                id: idx,
+                name: stage.name.clone().unwrap_or_else(|| format!("stage{idx}")),
+                base_label: base_label(plan, &stage.base),
+                steps: resolved[&idx]
+                    .steps
+                    .iter()
+                    .map(|s| instr_label(&s.instr))
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+/// The `FROM …` line label for a stage's base.
+fn base_label(plan: &Plan, base: &Base) -> String {
+    match base {
+        Base::Image(image) => format!("FROM {image}"),
+        Base::Scratch => "FROM scratch".into(),
+        Base::Stage(parent) => {
+            let name = plan.stages[*parent]
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("stage{parent}"));
+            format!("FROM {name}")
+        }
+    }
+}
+
 /// Build one stage to its committed rootfs. `committed` must already hold every stage
 /// this one depends on (its base `FROM` and `COPY --from` / `RUN --mount=from` sources);
 /// the driver guarantees that by ordering. A fully-cached stage restores its snapshot
@@ -817,6 +892,7 @@ fn build_stage(
     committed: &HashMap<usize, Rootfs>,
     ex: &mut dyn Executor,
     idx: usize,
+    progress: &Arc<Progress>,
 ) -> Result<Rootfs> {
     let stage = &plan.stages[idx];
     let name = stage.name.clone().unwrap_or_else(|| format!("stage{idx}"));
@@ -824,12 +900,12 @@ fn build_stage(
         .get(&idx)
         .context("internal: stage not resolved")?
         .steps;
+    // Route this stage's guest output through the progress reporter (line-buffered +
+    // stage-prefixed) so concurrent stages stay legible.
+    ex.set_output_sink(progress.stage_sink(idx));
     // Fully cached: restore the final snapshot directly, nothing to probe or run.
     if let Some(key) = cached_final.get(&idx) {
-        println!(
-            "virtkit: [{name}] build CACHED ({} instructions)",
-            steps.len()
-        );
+        progress.stage_fully_cached(idx);
         let fs = restore_into(ex, &name, key)?;
         ex.stage_end(&fs)?;
         return Ok(fs);
@@ -847,32 +923,53 @@ fn build_stage(
     let mut fs: Option<Rootfs> = None;
     let mut building = false;
     let mut last_hit: Option<String> = None;
-    for step in steps {
+    for (i, step) in steps.iter().enumerate() {
         if !building && ex.cache_has(&step.key) {
-            println!("virtkit: [{name}] CACHED {}", instr_label(&step.instr));
+            progress.step_done(idx, i, Outcome::Cached);
             last_hit = Some(step.key.clone());
             continue;
         }
         // first miss: materialize the rootfs — restore the last cached snapshot if there
-        // was a cached prefix, else build the base from scratch/image/stage.
+        // was a cached prefix (the base folds into that restore), else build the base from
+        // scratch/image/stage.
         if !building {
             fs = Some(match &last_hit {
-                Some(k) => restore_into(ex, &name, k)?,
-                None => materialize_base(ex, &stage.base, &name, committed)?,
+                Some(k) => {
+                    let f = restore_into(ex, &name, k)?;
+                    progress.base_done(idx, Outcome::Cached);
+                    f
+                }
+                None => {
+                    progress.base_start(idx);
+                    let f = materialize_base(ex, &stage.base, &name, committed)?;
+                    progress.base_done(idx, Outcome::Ran);
+                    f
+                }
             });
             building = true;
         }
         let f = fs.as_mut().expect("materialized on first miss");
+        progress.step_start(idx, i);
         apply_fs(plan, committed, ex, f, &step.state, &step.instr)?;
         ex.cache_save(f, &step.key)?;
+        progress.step_done(idx, i, Outcome::Ran);
     }
     // Nothing ran: the whole instruction run was cached → restore the final snapshot; or
     // there were no fs-changing instructions → the stage is the base.
     let final_fs = match fs {
         Some(f) => f,
         None => match &last_hit {
-            Some(k) => restore_into(ex, &name, k)?,
-            None => materialize_base(ex, &stage.base, &name, committed)?,
+            Some(k) => {
+                let f = restore_into(ex, &name, k)?;
+                progress.base_done(idx, Outcome::Cached);
+                f
+            }
+            None => {
+                progress.base_start(idx);
+                let f = materialize_base(ex, &stage.base, &name, committed)?;
+                progress.base_done(idx, Outcome::Ran);
+                f
+            }
         },
     };
     // Finalize the stage: tear down its long-lived guest (if any) and commit its overlay
@@ -899,15 +996,25 @@ fn drive(
     build_args: &Vars,
     ex: &mut dyn Executor,
     require_cached: bool,
+    progress: &Arc<Progress>,
 ) -> Result<(HashMap<usize, Rootfs>, HashMap<usize, ShellState>)> {
     let resolved = resolve_all(plan, order, build_args, ex)?;
     let (needed, cached_final) = compute_needed(plan, order, &resolved, ex, require_cached)?;
+    progress.init(stage_inits(plan, order, &resolved, &needed));
     let mut committed: HashMap<usize, Rootfs> = HashMap::new();
     for &idx in order {
         if !needed.contains(&idx) {
             continue;
         }
-        let fs = build_stage(plan, &resolved, &cached_final, &committed, ex, idx)?;
+        let fs = build_stage(
+            plan,
+            &resolved,
+            &cached_final,
+            &committed,
+            ex,
+            idx,
+            progress,
+        )?;
         committed.insert(idx, fs);
     }
     Ok((committed, final_states(&resolved)))
@@ -1037,6 +1144,7 @@ fn drive_microvm(
     base: &MicroVm,
     jobs: usize,
     require_cached: bool,
+    progress: &Arc<Progress>,
 ) -> Result<(HashMap<usize, Rootfs>, HashMap<usize, ShellState>)> {
     // Read-only passes on a throwaway worker (shares `base`'s memoization + cache maps).
     let mut probe = base.worker();
@@ -1044,6 +1152,7 @@ fn drive_microvm(
     let (needed, cached_final) =
         compute_needed(plan, order, &resolved, &mut probe, require_cached)?;
     drop(probe);
+    progress.init(stage_inits(plan, order, &resolved, &needed));
 
     // Dependency edges over the needed subset. A fully-cached stage restores standalone,
     // so it gets no deps (it can start immediately); a stage that consumes it still waits
@@ -1070,7 +1179,7 @@ fn drive_microvm(
         // A fresh per-stage worker: its own guest + cache-push state, sharing only the
         // committed-image maps with `base`.
         let mut ex = base.worker();
-        build_stage(plan, &resolved, &cached_final, done, &mut ex, idx)
+        build_stage(plan, &resolved, &cached_final, done, &mut ex, idx, progress)
     })?;
     Ok((committed, final_states(&resolved)))
 }
@@ -1330,7 +1439,14 @@ fn instr_label(instr: &Instruction) -> String {
                 parser::Cmdline::Exec(v) => v.join(" "),
             }
         ),
-        Instruction::Copy(c) => format!("COPY {:?} -> {}", c.sources, c.dest),
+        Instruction::Copy(c) => {
+            let from = c
+                .from
+                .as_deref()
+                .map(|f| format!("--from={f} "))
+                .unwrap_or_default();
+            format!("COPY {from}{} -> {}", c.sources.join(" "), c.dest)
+        }
         other => format!("{other:?}"),
     }
 }
@@ -1498,7 +1614,7 @@ mod tests {
         let t = plan.resolve_target(target).unwrap();
         let order = plan.build_order(t).unwrap();
         let mut ex = DryRun::new();
-        drive(&plan, &order, &ba, &mut ex, false).unwrap();
+        drive(&plan, &order, &ba, &mut ex, false, &Progress::disabled()).unwrap();
         ex.transcript
     }
 
@@ -1571,7 +1687,7 @@ mod tests {
         let order = plan.build_order(t).unwrap();
         // cold: everything runs and populates the cache
         let mut ex = CachedDry::default();
-        drive(&plan, &order, &ba, &mut ex, false).unwrap();
+        drive(&plan, &order, &ba, &mut ex, false, &Progress::disabled()).unwrap();
         assert!(ex.inner.transcript.iter().any(|l| l.starts_with("run ")));
         // warm: one probe of the target's final key, one restore — no per-step
         // probes, nothing built, the builder stage never touched
@@ -1580,7 +1696,7 @@ mod tests {
             cache: ex.cache,
             last_saved: None,
         };
-        drive(&plan, &order, &ba, &mut ex, false).unwrap();
+        drive(&plan, &order, &ba, &mut ex, false, &Progress::disabled()).unwrap();
         let t = &ex.inner.transcript;
         assert_eq!(t.len(), 2, "{t:?}");
         assert!(
@@ -1600,7 +1716,7 @@ mod tests {
         // cold cache: refused with the typed error, before anything runs; the
         // unnamed final stage reports its `stage{i}` fallback name
         let mut ex = CachedDry::default();
-        let err = drive(&plan, &order, &ba, &mut ex, true).unwrap_err();
+        let err = drive(&plan, &order, &ba, &mut ex, true, &Progress::disabled()).unwrap_err();
         let nc = err.downcast_ref::<NotCached>().expect("typed NotCached");
         assert_eq!(nc.stages, vec!["stage1".to_string()]);
         assert!(
@@ -1613,7 +1729,15 @@ mod tests {
         let norder = named
             .build_order(named.resolve_target(None).unwrap())
             .unwrap();
-        let err = drive(&named, &norder, &ba, &mut CachedDry::default(), true).unwrap_err();
+        let err = drive(
+            &named,
+            &norder,
+            &ba,
+            &mut CachedDry::default(),
+            true,
+            &Progress::disabled(),
+        )
+        .unwrap_err();
         assert_eq!(
             err.downcast_ref::<NotCached>()
                 .expect("typed NotCached")
@@ -1622,13 +1746,13 @@ mod tests {
         );
         // populated cache: the same require-cached drive restores, builds nothing
         let mut ex = CachedDry::default();
-        drive(&plan, &order, &ba, &mut ex, false).unwrap();
+        drive(&plan, &order, &ba, &mut ex, false, &Progress::disabled()).unwrap();
         let mut ex = CachedDry {
             inner: DryRun::new(),
             cache: ex.cache,
             last_saved: None,
         };
-        drive(&plan, &order, &ba, &mut ex, true).unwrap();
+        drive(&plan, &order, &ba, &mut ex, true, &Progress::disabled()).unwrap();
         let t = &ex.inner.transcript;
         assert!(t.iter().any(|l| l.starts_with("cache-restore ")), "{t:?}");
         assert!(!t.iter().any(|l| l.starts_with("run ")), "{t:?}");
@@ -1645,7 +1769,7 @@ mod tests {
         // cold run populates the cache; evict the target's final key so only the
         // target's last instruction must re-run
         let mut ex = CachedDry::default();
-        drive(&plan, &order, &ba, &mut ex, false).unwrap();
+        drive(&plan, &order, &ba, &mut ex, false, &Progress::disabled()).unwrap();
         let mut cache = ex.cache;
         cache.remove(&ex.last_saved.unwrap());
         let mut ex = CachedDry {
@@ -1653,7 +1777,7 @@ mod tests {
             cache,
             last_saved: None,
         };
-        drive(&plan, &order, &ba, &mut ex, false).unwrap();
+        drive(&plan, &order, &ba, &mut ex, false, &Progress::disabled()).unwrap();
         let t = &ex.inner.transcript;
         let count = |p: &str| t.iter().filter(|l| l.starts_with(p)).count();
         // probes: the target's last key (miss), the builder's last key (hit), then the
@@ -1878,7 +2002,7 @@ mod tests {
             .build_order(plan.resolve_target(Some("app")).unwrap())
             .unwrap();
         let mut ex = DryRun::new();
-        drive(&plan, &order, &ba, &mut ex, false).unwrap();
+        drive(&plan, &order, &ba, &mut ex, false, &Progress::disabled()).unwrap();
         let t = ex.transcript;
         assert!(
             t.contains(&format!("stage-context {}", tmp.join("a").display())),

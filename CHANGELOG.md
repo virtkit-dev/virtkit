@@ -14,6 +14,10 @@ All notable changes to virtkit will be documented in this file.
   Concurrency defaults to a job count bounded by available host RAM;
   `--build-jobs N` (or `VIRTKIT_BUILD_JOBS`) overrides it, and `--build-jobs 1`
   forces a sequential build.
+- `vk build` now shows a live progress overview in a terminal — a pinned
+  dashboard with a line per build step and each command's output attributed to
+  its stage — falling back to plain log lines off a terminal or with
+  `VIRTKIT_PROGRESS=plain`.
 
 ## [0.7.0] - 2026-07-04
 

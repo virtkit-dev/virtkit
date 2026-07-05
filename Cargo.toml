@@ -110,3 +110,7 @@ tokio-vsock = "0.7"
 rmp-serde = "1"
 # musl builds use jemalloc instead of the default musl allocator (same approach as ripgrep)
 jemallocator = "0.5"
+# `vk build` live progress dashboard: a multi-line, in-place-updating overview that is
+# robust across terminals and multiplexers (tmux/zellij). Pure Rust (console uses libc
+# termios, no C lib), so the musl-static build is unaffected.
+indicatif = "0.18"

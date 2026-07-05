@@ -131,6 +131,11 @@ pub trait Executor {
     fn stage_end(&mut self, _fs: &Rootfs) -> Result<()> {
         Ok(())
     }
+
+    /// Route this stage's guest command output through `sink` (the build progress
+    /// reporter, which line-buffers + stage-prefixes it). Default: ignored — only the
+    /// microVM backend runs guests that produce output.
+    fn set_output_sink(&mut self, _sink: crate::executor::OutputSink) {}
 }
 
 /// Records every primitive without doing anything — drives the whole pipeline on any
@@ -374,6 +379,9 @@ pub struct MicroVm {
     /// base ext4 cache key share one lookup. `Some(None)` = a resolve that failed (key by ref).
     /// Shared across workers: a pure memoization cache, safe to populate from any stage.
     base_digests: Arc<Mutex<HashMap<String, Option<String>>>>,
+    /// where this stage's guest command output goes — set per stage by the driver to the
+    /// progress reporter's stage sink. `Inherit` (the default) writes straight to stdout.
+    output_sink: crate::executor::OutputSink,
 }
 
 /// What `cache_save` chunks + uploads in the background. The thread returns the pushed
@@ -498,6 +506,7 @@ impl MicroVm {
             stage_last_digest: Arc::new(Mutex::new(HashMap::new())),
             parent_layers: None,
             base_digests: Arc::new(Mutex::new(HashMap::new())),
+            output_sink: crate::executor::OutputSink::Inherit,
         }
     }
 
@@ -540,6 +549,9 @@ impl MicroVm {
             inflight: None,
             push_seq: 0,
             parent_layers: None,
+            // A fresh worker inherits nothing; the driver sets the stage's sink before
+            // its instructions run.
+            output_sink: crate::executor::OutputSink::Inherit,
         }
     }
 
@@ -692,7 +704,6 @@ impl Executor for MicroVm {
             && crate::registry::exists(&rg, CACHE_REPO, &base_key)
             && let Some(digest) = crate::registry::try_pull_ext4(&rg, CACHE_REPO, &base_key, &ext4)?
         {
-            println!("virtkit: build base CACHED {image}");
             self.wrap_base(stage, &ext4)?;
             self.parent_key = Some(base_key);
             self.parent_digest = Some(digest);
@@ -901,6 +912,7 @@ impl Executor for MicroVm {
         // Boot the stage's guest once (on the first RUN/COPY) and reuse it for the rest
         // — one VM per stage, not per RUN.
         self.ensure_session(fs)?;
+        let sink = self.output_sink.clone();
         let session = self.session.as_ref().expect("session booted");
         // Set up the bind mounts: mount each source device read-only, then bind its
         // subtree at the target.
@@ -913,7 +925,7 @@ impl Executor for MicroVm {
                     dev.clone(),
                     mp.clone(),
                 ];
-                if block_on(session.exec(&m1, None))? != 0 {
+                if block_on(session.exec(&m1, None, &sink))? != 0 {
                     bail!("RUN --mount: mounting source device {dev} failed");
                 }
             }
@@ -924,21 +936,23 @@ impl Executor for MicroVm {
                 bindsrc.clone(),
                 target.clone(),
             ];
-            if block_on(session.exec(&m2, None))? != 0 {
+            if block_on(session.exec(&m2, None, &sink))? != 0 {
                 bail!("RUN --mount: bind-mounting {bindsrc} at {target} failed");
             }
         }
-        let code = block_on(session.exec(&argv, user))?;
+        let code = block_on(session.exec(&argv, user, &sink))?;
         // Tear the mounts down (target before its device mountpoint), best-effort.
         for (device, _, target) in binds.iter().rev() {
             let _ = block_on(session.exec(
                 &[GUEST_AGENT.to_string(), "umount".into(), target.clone()],
                 None,
+                &sink,
             ));
             if let Some((_, mp)) = device {
                 let _ = block_on(session.exec(
                     &[GUEST_AGENT.to_string(), "umount".into(), mp.clone()],
                     None,
+                    &sink,
                 ));
             }
         }
@@ -973,7 +987,7 @@ impl Executor for MicroVm {
                     dev,
                     mp.clone(),
                 ];
-                if block_on(session.exec(&m, None))? != 0 {
+                if block_on(session.exec(&m, None, &self.output_sink))? != 0 {
                     bail!("mounting source {} for COPY failed", src.label);
                 }
                 (mp.clone(), Some(mp))
@@ -1008,9 +1022,13 @@ impl Executor for MicroVm {
             }
         }
         argv.push(op.dest.clone());
-        let code = block_on(session.exec(&argv, None))?;
+        let code = block_on(session.exec(&argv, None, &self.output_sink))?;
         if let Some(mp) = mount {
-            let _ = block_on(session.exec(&[GUEST_AGENT.to_string(), "umount".into(), mp], None));
+            let _ = block_on(session.exec(
+                &[GUEST_AGENT.to_string(), "umount".into(), mp],
+                None,
+                &self.output_sink,
+            ));
         }
         if code != 0 {
             let src = from.map_or("context", |f| f.label.as_str());
@@ -1272,6 +1290,10 @@ impl Executor for MicroVm {
         self.source_dev.clear();
         self.context = None;
         Ok(())
+    }
+
+    fn set_output_sink(&mut self, sink: crate::executor::OutputSink) {
+        self.output_sink = sink;
     }
 }
 

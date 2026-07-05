@@ -8,6 +8,7 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{SinkExt, StreamExt};
@@ -17,6 +18,42 @@ use vk_core::messages::{CmdExec, CmdResult, Fd, Message, RunMode};
 use crate::jobctx::JobCtx;
 
 const STDIN_CHUNK: usize = 4096;
+
+/// Where a guest command's stdout/stderr go. `Inherit` relays them straight to the
+/// process stdout/stderr (the default — `vk run`, the gitlab-runner stages, internal
+/// quiesce commands). `Routed` hands each chunk to a callback tagged by fd — the `vk
+/// build` progress reporter uses this to line-buffer and stage-prefix RUN output so
+/// concurrent stages stay legible instead of interleaving unattributed.
+/// The callback a [`OutputSink::Routed`] hands each output chunk to, tagged by fd.
+pub type OutputFn = Arc<dyn Fn(Fd, &[u8]) + Send + Sync>;
+
+#[derive(Clone)]
+pub enum OutputSink {
+    Inherit,
+    Routed(OutputFn),
+}
+
+impl OutputSink {
+    fn relay(&self, fd: Fd, msg: &[u8]) -> std::io::Result<()> {
+        match self {
+            OutputSink::Inherit => {
+                if matches!(fd, Fd::Stderr) {
+                    let mut err = std::io::stderr();
+                    err.write_all(msg)?;
+                    err.flush()
+                } else {
+                    let mut out = std::io::stdout();
+                    out.write_all(msg)?;
+                    out.flush()
+                }
+            }
+            OutputSink::Routed(f) => {
+                f(fd, msg);
+                Ok(())
+            }
+        }
+    }
+}
 
 pub async fn run_stage(ctx: &JobCtx, script_path: &Path) -> Result<CmdResult> {
     let script = std::fs::read(script_path)
@@ -28,6 +65,7 @@ pub async fn run_stage(ctx: &JobCtx, script_path: &Path) -> Result<CmdResult> {
         &guest_shell(ctx),
         script,
         ctx.user_req.clone(),
+        &OutputSink::Inherit,
     )
     .await
 }
@@ -60,6 +98,7 @@ pub async fn exec_script(
     command: &[String],
     script: Vec<u8>,
     user: Option<String>,
+    output: &OutputSink,
 ) -> Result<CmdResult> {
     let (mut stream, mut sink) = vk_core::net::connect(addr)
         .await
@@ -110,19 +149,11 @@ pub async fn exec_script(
             Message::Data {
                 fd: Fd::Stdout,
                 msg,
-            } => {
-                let mut out = std::io::stdout();
-                out.write_all(&msg)?;
-                out.flush()?;
-            }
+            } => output.relay(Fd::Stdout, &msg)?,
             Message::Data {
                 fd: Fd::Stderr,
                 msg,
-            } => {
-                let mut err = std::io::stderr();
-                err.write_all(&msg)?;
-                err.flush()?;
-            }
+            } => output.relay(Fd::Stderr, &msg)?,
             // the shell exited without draining the script: stop feeding it
             Message::Close { fd: Fd::Stdin, .. } => feed_stdin.abort(),
             Message::Close { .. } => {}
