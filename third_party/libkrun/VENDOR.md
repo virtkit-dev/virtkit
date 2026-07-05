@@ -67,3 +67,13 @@ corruption whose trigger depends on the guest's per-request descriptor layout. T
 slice is now `subslice`d to the remaining count, matching the byte-copy `write()` path
 that already clamps. Covered by the `write_from_at_must_not_overread_past_count` test.
 Search for `subslice` in `consume`.
+
+`src/devices/src/virtio/block/device.rs` + `src/devices/src/virtio/file_traits.rs` —
+serve reads from read-only raw disks out of an `mmap` of the backing file instead of a
+`pread` per request. Upstream reads every block through imago's positioned-I/O file
+storage; a read-only raw image (a build stage's `COPY --from` source, a read-only root)
+is immutable and its guest block offset is its file offset, so it is mapped once
+(`PROT_READ`, `MAP_SHARED`) and each guest read becomes a copy straight from the host
+page cache. qcow2 (needs format translation) and `direct_io` (asks to bypass the cache)
+keep the imago path, and a failed `mmap` falls back to it rather than aborting the boot.
+Covered by the `block::device::tests` mmap tests. Search for `DiskMmap`.
