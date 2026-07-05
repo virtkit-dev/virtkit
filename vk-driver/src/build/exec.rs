@@ -323,6 +323,13 @@ pub struct MicroVm {
     /// push re-chunks against (only its dirty clusters). Seeded from the base image on
     /// `from_image`; `None` means a full push (no known parent chunks).
     parent_key: Option<String>,
+    /// immutable manifest digest of the current parent's cached snapshot — the reference a
+    /// diff push fetches its reusable parent chunks by. Distinct from `parent_key` (the tag):
+    /// concurrent builds of the same instruction clobber the tag with byte-different but
+    /// equivalent content, so re-fetching parent chunks by tag can splice another build's
+    /// bytes onto this stage's actual backing and corrupt the reused (unchanged) regions.
+    /// Pinning the digest makes the fetch resolve exactly the parent this stage forked from.
+    parent_digest: Option<String>,
     /// add a journal to the exported image (the build itself stays journal-less).
     journal: bool,
     /// egress policy for the stage guests (no network / unrestricted / allowlist).
@@ -353,6 +360,11 @@ pub struct MicroVm {
     /// diff against this key instead of a full re-chunk of the whole image. Shared
     /// across workers (same happens-before as `images`).
     stage_last_key: Arc<Mutex<HashMap<String, String>>>,
+    /// stage label → the immutable manifest digest of its last pushed snapshot (its committed
+    /// image), the digest counterpart of `stage_last_key`. A `FROM <stage>` fork pins this so
+    /// its first diff push reuses that stage's exact chunks regardless of concurrent tag
+    /// clobbering. Shared across workers (same happens-before as `stage_last_key`).
+    stage_last_digest: Arc<Mutex<HashMap<String, String>>>,
     /// the previous diff push's layer list (+ total size), kept in memory so the next
     /// instruction diffs against it without re-fetching+parsing the parent manifest from
     /// the registry every push. `None` at a stage's first instruction (it fetches once) and
@@ -365,9 +377,10 @@ pub struct MicroVm {
 }
 
 /// What `cache_save` chunks + uploads in the background. The thread returns the pushed
-/// layer list (so the next instruction diffs against it in memory) — `None` for a full
-/// push, which has no chainable layers.
-type PushOutput = Result<Option<(Vec<oci_client::manifest::OciDescriptor>, u64)>>;
+/// layer list + total size (so the next instruction diffs against it in memory) paired with
+/// the snapshot's manifest digest (recorded so a `FROM <stage>` child pins it) — `None` for
+/// a full push, which has no chainable layers.
+type PushOutput = Result<Option<((Vec<oci_client::manifest::OciDescriptor>, u64), String)>>;
 
 struct PushInflight {
     handle: std::thread::JoinHandle<PushOutput>,
@@ -473,6 +486,7 @@ impl MicroVm {
             images: Arc::new(Mutex::new(HashMap::new())),
             session: None,
             parent_key: None,
+            parent_digest: None,
             journal,
             net,
             sources: Vec::new(),
@@ -481,6 +495,7 @@ impl MicroVm {
             inflight: None,
             push_seq: 0,
             stage_last_key: Arc::new(Mutex::new(HashMap::new())),
+            stage_last_digest: Arc::new(Mutex::new(HashMap::new())),
             parent_layers: None,
             base_digests: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -512,11 +527,13 @@ impl MicroVm {
             cache: self.cache.clone(),
             images: Arc::clone(&self.images),
             stage_last_key: Arc::clone(&self.stage_last_key),
+            stage_last_digest: Arc::clone(&self.stage_last_digest),
             base_digests: Arc::clone(&self.base_digests),
             journal: self.journal,
             net: self.net.clone(),
             session: None,
             parent_key: None,
+            parent_digest: None,
             sources: Vec::new(),
             source_dev: HashMap::new(),
             context: None,
@@ -591,11 +608,20 @@ impl MicroVm {
     ) -> (Vec<oci_client::manifest::OciDescriptor>, u64) {
         match self.parent_layers.take() {
             Some((l, t)) => (l, t),
-            None => match self.parent_key.clone().and_then(|pk| {
-                crate::registry::fetch_chunks(rg, CACHE_REPO, &pk)
-                    .ok()
-                    .flatten()
-            }) {
+            // Resolve the parent by its pinned immutable digest, not the mutable tag
+            // (`parent_key`): under concurrent builds the tag may have been clobbered with a
+            // byte-different snapshot of the same instruction, and reusing those chunks over
+            // this stage's actual backing corrupts the unchanged regions. Fall back to the
+            // tag only when no digest was pinned (e.g. an earlier push failed).
+            None => match self
+                .parent_digest
+                .clone()
+                .or_else(|| self.parent_key.clone())
+                .and_then(|r| {
+                    crate::registry::fetch_chunks(rg, CACHE_REPO, &r)
+                        .ok()
+                        .flatten()
+                }) {
                 Some((l, t)) => (l, t),
                 None => (Vec::new(), total_size),
             },
@@ -607,12 +633,22 @@ impl MicroVm {
     fn drain_push(&mut self, label: &str) {
         if let Some(inf) = self.inflight.take() {
             match inf.handle.join().expect("cache push thread panicked") {
-                Ok(layers) => {
-                    self.parent_layers = layers;
+                Ok(out) => {
                     self.stage_last_key
                         .lock()
                         .unwrap()
                         .insert(label.to_string(), inf.key);
+                    match out {
+                        Some((layers, digest)) => {
+                            self.parent_layers = Some(layers);
+                            self.stage_last_digest
+                                .lock()
+                                .unwrap()
+                                .insert(label.to_string(), digest.clone());
+                            self.parent_digest = Some(digest);
+                        }
+                        None => self.parent_layers = None,
+                    }
                 }
                 Err(e) => eprintln!("virtkit: build async push failed ({e:#}) — not cached"),
             }
@@ -654,11 +690,12 @@ impl Executor for MicroVm {
         let base_key = base_cache_key(&base_id);
         if let Some(rg) = self.cache.clone()
             && crate::registry::exists(&rg, CACHE_REPO, &base_key)
-            && crate::registry::try_pull_ext4(&rg, CACHE_REPO, &base_key, &ext4)?
+            && let Some(digest) = crate::registry::try_pull_ext4(&rg, CACHE_REPO, &base_key, &ext4)?
         {
             println!("virtkit: build base CACHED {image}");
             self.wrap_base(stage, &ext4)?;
             self.parent_key = Some(base_key);
+            self.parent_digest = Some(digest);
             self.parent_layers = None;
             return Ok(Rootfs {
                 label: stage.to_string(),
@@ -693,11 +730,18 @@ impl Executor for MicroVm {
         )?;
         let _ = std::fs::remove_file(&tar);
         // Populate the base cache (best-effort: a push failure must not fail the build).
+        self.parent_digest = None;
         if let Some(rg) = self.cache.clone() {
             let boot_kind = crate::image::boot_kind_tag(crate::image::BootKind::GenericDisk);
-            if let Err(e) = crate::registry::push_ext4(&rg, CACHE_REPO, &base_key, &ext4, boot_kind)
-            {
-                eprintln!("virtkit: build base cache push of {image} failed ({e:#}) — not cached");
+            match crate::registry::push_ext4(&rg, CACHE_REPO, &base_key, &ext4, boot_kind) {
+                // pin the digest we just wrote, not the tag: another process may clobber
+                // base_key with its own (byte-different) base before our first diff push.
+                Ok(digest) => self.parent_digest = Some(digest),
+                Err(e) => {
+                    eprintln!(
+                        "virtkit: build base cache push of {image} failed ({e:#}) — not cached"
+                    )
+                }
             }
         }
         self.wrap_base(stage, &ext4)?;
@@ -764,6 +808,14 @@ impl Executor for MicroVm {
         // caching off → full push.)
         self.parent_key = self
             .stage_last_key
+            .lock()
+            .unwrap()
+            .get(&parent.label)
+            .cloned();
+        // pin the parent stage's immutable snapshot digest so the first diff push reuses its
+        // exact chunks even if a concurrent build clobbers the parent's tag.
+        self.parent_digest = self
+            .stage_last_digest
             .lock()
             .unwrap()
             .get(&parent.label)
@@ -1008,12 +1060,13 @@ impl Executor for MicroVm {
         // pull the snapshot's ext4 (chunk-cached, byte-exact), then wrap it in a rw qcow2 so
         // any remaining instructions can boot it directly and write into the overlay.
         let ext4 = self.image_path(&fs.label);
-        if !crate::registry::try_pull_ext4(&rg, CACHE_REPO, key, &ext4)? {
+        let Some(digest) = crate::registry::try_pull_ext4(&rg, CACHE_REPO, key, &ext4)? else {
             bail!("cached instruction {key} vanished from the registry");
-        }
+        };
         self.wrap_base(&fs.label, &ext4)?;
-        // the restored snapshot is the parent the next save diffs against.
+        // the restored snapshot is the parent the next save diffs against — pin its digest.
         self.parent_key = Some(key.to_string());
+        self.parent_digest = Some(digest);
         Ok(())
     }
     fn cache_save(&mut self, fs: &Rootfs, key: &str) -> Result<()> {
@@ -1044,16 +1097,26 @@ impl Executor for MicroVm {
                 &cumulative,
                 &parent_layers,
             ) {
-                Ok(layers) => {
-                    self.parent_layers = Some(layers);
+                Ok((layers, total, digest)) => {
+                    self.parent_layers = Some((layers, total));
                     self.stage_last_key
                         .lock()
                         .unwrap()
                         .insert(fs.label.clone(), key.to_string());
+                    self.stage_last_digest
+                        .lock()
+                        .unwrap()
+                        .insert(fs.label.clone(), digest.clone());
+                    self.parent_digest = Some(digest);
                 }
                 Err(e) => {
                     eprintln!("virtkit: build cache push of {key} failed ({e:#}) — not cached");
+                    // Drop the pinned parent too: this push never wrote its tag, so the next
+                    // diff must not reuse the *previous* stage's digest as its parent (that
+                    // would splice stale bytes over what this instruction changed). Falling
+                    // back to `parent_key` — this push's absent tag — forces a full re-chunk.
                     self.parent_layers = None;
+                    self.parent_digest = None;
                 }
             }
             self.parent_key = Some(key.to_string());
@@ -1090,16 +1153,30 @@ impl Executor for MicroVm {
         // capture — content_diff above was its last reader.
         if let Some(inf) = self.inflight.take() {
             match inf.handle.join().expect("cache push thread panicked") {
-                Ok(layers) => {
-                    self.parent_layers = layers;
+                Ok(out) => {
                     self.stage_last_key
                         .lock()
                         .unwrap()
                         .insert(fs.label.clone(), inf.key);
+                    match out {
+                        Some((layers, digest)) => {
+                            self.parent_layers = Some(layers);
+                            self.stage_last_digest
+                                .lock()
+                                .unwrap()
+                                .insert(fs.label.clone(), digest.clone());
+                            self.parent_digest = Some(digest);
+                        }
+                        None => self.parent_layers = None,
+                    }
                 }
                 Err(e) => {
                     eprintln!("virtkit: build async push failed ({e:#}) — not cached");
+                    // Drop the pinned parent too (see the sync push path): this push never
+                    // wrote its tag, so the next diff must fall back to `parent_key` and
+                    // full-re-chunk rather than reuse the previous stage's digest.
                     self.parent_layers = None;
+                    self.parent_digest = None;
                 }
             }
             let _ = std::fs::remove_file(&inf.snap);
@@ -1117,7 +1194,7 @@ impl Executor for MicroVm {
         let key_s = key.to_string();
         let handle = std::thread::spawn(move || -> PushOutput {
             let t = std::time::Instant::now();
-            let layers = crate::registry::push_ext4_diff(
+            let (layers, total, digest) = crate::registry::push_ext4_diff(
                 &rg,
                 CACHE_REPO,
                 &key_s,
@@ -1128,7 +1205,7 @@ impl Executor for MicroVm {
                 &parent_layers,
             )?;
             crate::run::tlog("cache.push", t);
-            Ok(Some(layers))
+            Ok(Some(((layers, total), digest)))
         });
         self.inflight = Some(PushInflight {
             handle,

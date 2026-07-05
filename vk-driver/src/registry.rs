@@ -176,20 +176,29 @@ pub fn exists(rg: &Registry, name: &str, tag: &str) -> bool {
 /// Returns `Ok(false)` when the tag is absent (or the registry is unreachable) — the
 /// caller then builds. The sparse reassembly is byte-exact, so the placed ext4 keeps
 /// its fingerprint UUID and reads as fresh on the next run.
-pub fn try_pull_ext4(rg: &Registry, name: &str, tag: &str, dest: &Path) -> Result<bool> {
+/// Reassemble a cached bundle's ext4 at `dest`, returning the manifest digest it resolved
+/// the tag to (`None` if the tag is absent). The caller pins that digest so a later diff
+/// push re-chunks against *exactly* this content, even if a concurrent build clobbers the
+/// tag with byte-different (equivalent) bytes in between.
+pub fn try_pull_ext4(rg: &Registry, name: &str, tag: &str, dest: &Path) -> Result<Option<String>> {
     if let Some(root) = rg.local_root() {
         return local::try_pull_ext4(&root, name, tag, dest);
     }
     block_on(try_pull_ext4_async(rg, name, tag, dest))
 }
 
-async fn try_pull_ext4_async(rg: &Registry, name: &str, tag: &str, dest: &Path) -> Result<bool> {
+async fn try_pull_ext4_async(
+    rg: &Registry,
+    name: &str,
+    tag: &str,
+    dest: &Path,
+) -> Result<Option<String>> {
     let (client, auth) = client(rg)?;
     let image = make_ref(rg, name, tag)?;
     // Absent tag (or an unreachable registry) -> build locally; only a *found* bundle
     // that then fails to pull is a hard error.
     let Ok(digest) = client.fetch_manifest_digest(&image, &auth).await else {
-        return Ok(false);
+        return Ok(None);
     };
     let parent = dest.parent().unwrap_or_else(|| Path::new("."));
     let bundle = parent.join(format!(".vkpull-{}", sanitize_component(name)));
@@ -201,13 +210,19 @@ async fn try_pull_ext4_async(rg: &Registry, name: &str, tag: &str, dest: &Path) 
     std::fs::rename(&runner, dest)
         .with_context(|| format!("placing pulled ext4 at {}", dest.display()))?;
     let _ = std::fs::remove_dir_all(&bundle);
-    Ok(true)
+    Ok(Some(digest))
 }
 
 /// Push a built `ext4` to the registry as a bundle tagged `<name>:<tag>` (its content
 /// fingerprint), so other worktrees can pull it instead of rebuilding. Best-effort:
 /// the caller treats a failure as non-fatal (the image was built locally regardless).
-pub fn push_ext4(rg: &Registry, name: &str, tag: &str, ext4: &Path, boot_kind: &str) -> Result<()> {
+pub fn push_ext4(
+    rg: &Registry,
+    name: &str,
+    tag: &str,
+    ext4: &Path,
+    boot_kind: &str,
+) -> Result<String> {
     if let Some(root) = rg.local_root() {
         return local::push_ext4(&root, name, tag, ext4, boot_kind);
     }
@@ -220,7 +235,7 @@ async fn push_ext4_async(
     tag: &str,
     ext4: &Path,
     boot_kind: &str,
-) -> Result<()> {
+) -> Result<String> {
     let parent = ext4.parent().unwrap_or_else(|| Path::new("."));
     let bundle = parent.join(format!(".vkpush-{}", sanitize_component(name)));
     let _ = std::fs::remove_dir_all(&bundle);
@@ -234,7 +249,7 @@ async fn push_ext4_async(
     std::fs::write(bundle.join("boot.kind"), boot_kind).context("writing boot.kind")?;
     let r = push_async(rg, &bundle, name, tag).await;
     let _ = std::fs::remove_dir_all(&bundle);
-    r.map(|_digest| ())
+    r
 }
 
 /// Fetch a cached bundle's chunk layer descriptors (with their offset/length
@@ -257,7 +272,14 @@ async fn fetch_chunks_async(
     tag: &str,
 ) -> Result<Option<(Vec<OciDescriptor>, u64)>> {
     let (client, auth) = client(rg)?;
-    let image = make_ref(rg, name, tag)?;
+    // A pinned parent is passed by immutable digest (`sha256:…`), which must be resolved
+    // as a digest reference — `make_ref` would build an unparseable `:sha256:…` tag. A
+    // plain tag is resolved to its current digest first.
+    let image = if tag.starts_with("sha256:") {
+        make_digest_ref(rg, name, tag)?
+    } else {
+        make_ref(rg, name, tag)?
+    };
     let Ok(digest) = client.fetch_manifest_digest(&image, &auth).await else {
         return Ok(None);
     };
@@ -303,7 +325,7 @@ pub fn push_ext4_diff(
     total_size: u64,
     dirty: &[(u64, u64)],
     parent_layers: &[OciDescriptor],
-) -> Result<(Vec<OciDescriptor>, u64)> {
+) -> Result<(Vec<OciDescriptor>, u64, String)> {
     if let Some(root) = rg.local_root() {
         return local::push_ext4_diff(
             &root,
@@ -338,7 +360,7 @@ async fn push_ext4_diff_async(
     total_size: u64,
     dirty: &[(u64, u64)],
     parent_layers: &[OciDescriptor],
-) -> Result<(Vec<OciDescriptor>, u64)> {
+) -> Result<(Vec<OciDescriptor>, u64, String)> {
     let (client, auth) = client(rg)?;
     let image = make_ref(rg, name, tag)?;
     client
@@ -483,7 +505,7 @@ async fn push_ext4_diff_async(
         "virtkit: registry: pushed {}/{name}:{tag} -> {digest}",
         rg.repo
     );
-    Ok((ret_layers, total_size))
+    Ok((ret_layers, total_size, digest))
 }
 
 /// Process one raw chunk for a push: dedup on its content (raw digest in transparent
@@ -1377,7 +1399,7 @@ mod local {
     ) -> Result<Option<(Vec<OciDescriptor>, u64)>> {
         let store = Store::new(root.to_path_buf())?;
         let _lock = store.lock_shared()?;
-        let Some((manifest, config)) = manifest_and_config(&store, name, tag)? else {
+        let Some((_digest, manifest, config)) = manifest_and_config(&store, name, tag)? else {
             return Ok(None);
         };
         let chunks: Vec<OciDescriptor> = manifest
@@ -1393,11 +1415,16 @@ mod local {
         Ok(Some((chunks, config.total_size)))
     }
 
-    pub(super) fn try_pull_ext4(root: &Path, name: &str, tag: &str, dest: &Path) -> Result<bool> {
+    pub(super) fn try_pull_ext4(
+        root: &Path,
+        name: &str,
+        tag: &str,
+        dest: &Path,
+    ) -> Result<Option<String>> {
         let store = Store::new(root.to_path_buf())?;
         let _lock = store.lock_shared()?;
-        let Some((manifest, config)) = manifest_and_config(&store, name, tag)? else {
-            return Ok(false);
+        let Some((digest, manifest, config)) = manifest_and_config(&store, name, tag)? else {
+            return Ok(None);
         };
         // tmp sibling + rename: a failed reassembly never leaves a partial file at
         // `dest` (which the caller would boot). On a fully-cached build nothing has
@@ -1446,7 +1473,7 @@ mod local {
         let _ = std::fs::remove_file(dest);
         std::fs::rename(&tmp, dest)
             .with_context(|| format!("placing pulled ext4 at {}", dest.display()))?;
-        Ok(true)
+        Ok(Some(digest))
     }
 
     pub(super) fn push_ext4(
@@ -1455,7 +1482,7 @@ mod local {
         tag: &str,
         ext4: &Path,
         boot_kind: &str,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let store = Store::new(root.to_path_buf())?;
         let _lock = store.lock_shared()?;
         let total_size = std::fs::metadata(ext4)
@@ -1469,7 +1496,7 @@ mod local {
             f.seek(SeekFrom::Start(start))?;
             chunk_region_into(&store, f.take(len), start, ext4, &mut layers)?;
         }
-        put_bundle_manifest(&store, name, tag, layers, total_size, boot_kind).map(|_| ())
+        put_bundle_manifest(&store, name, tag, layers, total_size, boot_kind)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1482,7 +1509,7 @@ mod local {
         total_size: u64,
         dirty: &[(u64, u64)],
         parent_layers: &[OciDescriptor],
-    ) -> Result<(Vec<OciDescriptor>, u64)> {
+    ) -> Result<(Vec<OciDescriptor>, u64, String)> {
         let store = Store::new(root.to_path_buf())?;
         let _lock = store.lock_shared()?;
         // same shape as push_ext4_diff_async: reuse clean parent chunks, re-chunk the
@@ -1525,8 +1552,8 @@ mod local {
             chunk_region_into(&store, reader, start, ext4, &mut layers)?;
         }
         let ret = layers.clone();
-        put_bundle_manifest(&store, name, tag, layers, total_size, boot_kind)?;
-        Ok((ret, total_size))
+        let digest = put_bundle_manifest(&store, name, tag, layers, total_size, boot_kind)?;
+        Ok((ret, total_size, digest))
     }
 
     /// FastCDC-chunk `reader` (a data region starting at `start`) into the store,
@@ -1608,8 +1635,8 @@ mod local {
         store: &Store,
         name: &str,
         tag: &str,
-    ) -> Result<Option<(OciImageManifest, BundleConfig)>> {
-        let Some((_digest, bytes, _ctype)) = store.get_manifest(name, tag)? else {
+    ) -> Result<Option<(String, OciImageManifest, BundleConfig)>> {
+        let Some((digest, bytes, _ctype)) = store.get_manifest(name, tag)? else {
             return Ok(None);
         };
         let manifest: OciImageManifest =
@@ -1624,7 +1651,7 @@ mod local {
             .with_context(|| format!("bundle config blob {} missing", manifest.config.digest))?;
         let config: BundleConfig =
             serde_json::from_slice(&config).context("parsing the bundle config blob")?;
-        Ok(Some((manifest, config)))
+        Ok(Some((digest, manifest, config)))
     }
 }
 
@@ -1737,7 +1764,11 @@ mod tests {
         assert!(chunks.len() > 1, "should split into several chunks");
 
         let dest = dir.join("dest.ext4");
-        assert!(try_pull_ext4(&rg, "dfcache", "k1", &dest).unwrap());
+        assert!(
+            try_pull_ext4(&rg, "dfcache", "k1", &dest)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             std::fs::read(&dest).unwrap(),
             std::fs::read(&src).unwrap(),
@@ -1752,7 +1783,11 @@ mod tests {
             );
         }
         // an absent tag pulls nothing and reports false
-        assert!(!try_pull_ext4(&rg, "dfcache", "missing", &dir.join("no.ext4")).unwrap());
+        assert!(
+            try_pull_ext4(&rg, "dfcache", "missing", &dir.join("no.ext4"))
+                .unwrap()
+                .is_none()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1778,7 +1813,7 @@ mod tests {
         let overlay = dir.join("ovl.qcow2");
         crate::qcow2::create_overlay(&overlay, &base).unwrap();
         let dirty = [(0u64, 1u64 << 20)];
-        let (layers, size) = push_ext4_diff(
+        let (layers, size, _digest) = push_ext4_diff(
             &rg,
             "dfcache",
             "child",
@@ -1800,7 +1835,11 @@ mod tests {
             parent_layers.len()
         );
         let dest = dir.join("child.ext4");
-        assert!(try_pull_ext4(&rg, "dfcache", "child", &dest).unwrap());
+        assert!(
+            try_pull_ext4(&rg, "dfcache", "child", &dest)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             std::fs::read(&dest).unwrap(),
             std::fs::read(&base).unwrap(),
@@ -1849,7 +1888,7 @@ mod tests {
                         std::thread::yield_now();
                     }
                     let dest = dir.join(format!("pull{t}.ext4"));
-                    assert!(try_pull_ext4(rg, "dfcache", &tag, &dest).unwrap());
+                    assert!(try_pull_ext4(rg, "dfcache", &tag, &dest).unwrap().is_some());
                     assert_eq!(
                         &std::fs::read(&dest).unwrap(),
                         want,
@@ -1907,7 +1946,11 @@ mod tests {
 
         assert!(!exists(&rg, "dfcache", "dead"));
         let dest = dir.join("live-after-gc.ext4");
-        assert!(try_pull_ext4(&rg, "dfcache", "live", &dest).unwrap());
+        assert!(
+            try_pull_ext4(&rg, "dfcache", "live", &dest)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             std::fs::read(&dest).unwrap(),
             std::fs::read(&live_src).unwrap(),
