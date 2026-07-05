@@ -93,14 +93,20 @@ impl<'a> DescriptorChainConsumer<'a> {
                 break;
             }
 
-            bufs.push(vs);
-
             let rem = count - buflen;
-            if rem < vs.len() {
-                buflen += rem;
+            // Clamp the final descriptor to the bytes still wanted. `consume`'s contract
+            // is that the combined length handed to `f` is <= `count`; pushing the whole
+            // descriptor let a vectored disk read (`write_from_at`) over-read past `count`
+            // into guest memory the guest never asked to be filled.
+            let vs = if rem < vs.len() {
+                vs.subslice(0, rem)
+                    .expect("rem < vs.len(), so the subslice is in bounds")
             } else {
-                buflen += vs.len();
-            }
+                vs
+            };
+
+            buflen += vs.len();
+            bufs.push(vs);
         }
 
         if bufs.is_empty() {
@@ -563,6 +569,57 @@ pub fn create_descriptor_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A vectored read into a descriptor chain whose length ends *inside* a writable
+    /// descriptor must fill exactly `count` bytes and leave the rest of that descriptor
+    /// untouched.
+    ///
+    /// `Writer::write_from_at` reads `count` bytes from a file into the chain via
+    /// `DescriptorChainConsumer::consume`, whose contract is that the combined length of
+    /// the slices it passes the callback is `<= count`. When `count` fell inside a
+    /// descriptor, `consume` still handed that descriptor whole to the callback, so the
+    /// vectored read filled it completely and wrote `descriptor_len - remaining` extra
+    /// bytes past `count` into guest memory the driver never requested.
+    #[test]
+    fn write_from_at_must_not_overread_past_count() {
+        use DescriptorType::*;
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let buf_addr = GuestAddress(0x1000);
+        // One 100-byte writable descriptor, pre-filled with 0xAA (the "leave me alone"
+        // marker for the region past the requested count).
+        let chain =
+            create_descriptor_chain(&mem, GuestAddress(0), buf_addr, vec![(Writable, 100)], 0)
+                .expect("create_descriptor_chain failed");
+        mem.write_slice(&[0xAAu8; 100], buf_addr).unwrap();
+
+        // Fake disk: 0xBB everywhere, larger than the descriptor so an over-read succeeds.
+        let dir = std::env::temp_dir().join(format!("overread-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let disk_path = dir.join("disk");
+        std::fs::write(&disk_path, vec![0xBBu8; 512]).unwrap();
+        let disk = std::fs::File::open(&disk_path).unwrap();
+
+        let mut writer = Writer::new(&mem, chain).expect("failed to create Writer");
+        let n = writer
+            .write_from_at(&disk, 50, 0)
+            .expect("write_from_at failed");
+
+        let mut got = [0u8; 100];
+        mem.read_slice(&mut got, buf_addr).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(n, 50, "must report exactly count=50 bytes read");
+        assert!(
+            got[..50].iter().all(|&b| b == 0xBB),
+            "first 50 bytes must come from the disk"
+        );
+        assert!(
+            got[50..].iter().all(|&b| b == 0xAA),
+            "bytes past count=50 must be untouched, but were over-read from disk: {:?}",
+            &got[50..]
+        );
+    }
 
     #[test]
     fn reader_test_simple_chain() {

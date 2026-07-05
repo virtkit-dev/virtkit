@@ -56,3 +56,14 @@ dependency tree pulls libc >= 0.2.186). `struct statx` is defined by the kernel 
 to be architecture-independent, so the patch reproduces exactly the fields the device
 reads and issues the raw `SYS_statx` syscall. Behaviour is identical, including the
 returned `stx_mnt_id`. Search for `mod statx_compat` in that file.
+
+`src/devices/src/virtio/descriptor_utils.rs` — clamp the final descriptor in
+`DescriptorChainConsumer::consume`. It documents that the combined length of the slices
+handed to the callback is `<= count`, but pushed the last descriptor whole and only
+clamped the byte counter, so a vectored disk read (`Writer::write_from_at` ->
+`DiskProperties::read_vectored_at_volatile`) filled the entire final descriptor and
+over-read past `count` into guest memory the guest never requested — a read-path
+corruption whose trigger depends on the guest's per-request descriptor layout. The final
+slice is now `subslice`d to the remaining count, matching the byte-copy `write()` path
+that already clamps. Covered by the `write_from_at_must_not_overread_past_count` test.
+Search for `subslice` in `consume`.
