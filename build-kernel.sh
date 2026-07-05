@@ -15,19 +15,45 @@ cd "$(dirname "$0")"
 
 OUT=dist
 NOCACHE=""
-[ "${1:-}" = "--no-cache" ] && NOCACHE="--no-cache"
-export DOCKER_BUILDKIT=1
+FORCE_DOCKER=""
+for arg in "$@"; do
+  case "$arg" in
+    --no-cache) NOCACHE="--no-cache" ;;
+    --docker) FORCE_DOCKER=1 ;;
+    *) echo "unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
 mkdir -p "$OUT"
 
-# The kernel builds in the same image as the binaries (kernel/Dockerfile is
-# `FROM virtkit-build`, the pinned rust:alpine devcontainer) — build it first so the
-# base + rust toolchain + frozen apt/apk inputs are shared and reproducible.
-echo "-- building the build image (virtkit-build) ..."
-docker build -t virtkit-build -f .devcontainer/Dockerfile .devcontainer
+# Backend: dogfood a `vk` on PATH (the same microVM builder build.sh uses) unless --docker
+# forces Docker. Either way the kernel builds in the pinned rust:alpine devcontainer, so
+# the base + toolchain + frozen apk inputs are shared and reproducible.
+if [ -z "$FORCE_DOCKER" ] && command -v vk >/dev/null 2>&1; then
+  VK_BIN=$(command -v vk)
+  echo "-- building the guest kernel (vmlinux) with vk from PATH ($VK_BIN) ..."
+  # Merge the devcontainer + kernel Dockerfiles so kernel's `FROM virtkit-build` resolves
+  # to the devcontainer stage (vk has no docker image tags; each -f keeps its own dir as
+  # its COPY context). Build up to `build` (which compiles vmlinux), boot it with the repo
+  # mounted at /work, and copy vmlinux into dist/ — the workspace model, no artifact-stage
+  # extraction. (--no-cache is docker-only; vk's content-addressed cache rebuilds whenever
+  # the pinned inputs change.)
+  "$VK_BIN" run \
+    -f .devcontainer/Dockerfile -f kernel/Dockerfile \
+    --target build \
+    --workdir "$PWD" --cpus host --mem 8G \
+    -- cp /build/vmlinux "$OUT/vmlinux"
+else
+  export DOCKER_BUILDKIT=1
+  # The kernel builds in the same image as the binaries (kernel/Dockerfile is
+  # `FROM virtkit-build`, the pinned rust:alpine devcontainer) — build it first so the
+  # base + rust toolchain + frozen apt/apk inputs are shared and reproducible.
+  echo "-- building the build image (virtkit-build) ..."
+  docker build -t virtkit-build -f .devcontainer/Dockerfile .devcontainer
 
-echo "-- building the guest kernel (vmlinux) ..."
-# the Dockerfile's `artifact` stage is just the vmlinux file; -o extracts it directly.
-docker build ${NOCACHE:+$NOCACHE} --target artifact -o "type=local,dest=$OUT" kernel
+  echo "-- building the guest kernel (vmlinux) ..."
+  # the Dockerfile's `artifact` stage is just the vmlinux file; -o extracts it directly.
+  docker build ${NOCACHE:+$NOCACHE} --target artifact -o "type=local,dest=$OUT" kernel
+fi
 
 echo
 echo "built $OUT/vmlinux"
@@ -37,7 +63,7 @@ file "$OUT/vmlinux" 2>/dev/null || true
 # Kept in its own file (build.sh owns build-info.txt and rewrites it whole), so the two
 # scripts stay run-order independent. Verify a fetched vmlinux against the same commit:
 #   git checkout <git_commit> && ./build-kernel.sh && sha256sum -c dist/vmlinux.sha256
-base_image=$(sed -nE 's/^FROM (rust:.*)$/\1/p' .devcontainer/Dockerfile)
+base_image=$(sed -nE 's/^FROM (rust:[^ ]*).*$/\1/p' .devcontainer/Dockerfile)
 kernel_version=$(sed -nE 's/^ARG KERNEL_VERSION=(.*)$/\1/p' kernel/Dockerfile)
 kernel_sha256=$(sed -nE 's/^ARG KERNEL_SHA256=(.*)$/\1/p' kernel/Dockerfile)
 commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)

@@ -35,11 +35,13 @@ since()   { echo "build.sh: $1 in $(fmt_dur $(($SECONDS - $2)))" >&2; }
 
 USE_VIRTKIT=""
 BOOTSTRAP_CHECK=""
+FORCE_DOCKER=""
 VMM=libkrun          # dogfood VMM backend: libkrun (default) or cloud-hypervisor
 for arg in "$@"; do
   case "$arg" in
     --use-virtkit=*) USE_VIRTKIT="${arg#*=}" ;;
     --bootstrap-check) BOOTSTRAP_CHECK=1 ;;
+    --docker) FORCE_DOCKER=1 ;;
     --vmm=libkrun|--vmm=cloud-hypervisor) VMM="${arg#*=}" ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
@@ -48,8 +50,24 @@ if [ -n "$USE_VIRTKIT" ] && [ -n "$BOOTSTRAP_CHECK" ]; then
   echo "--bootstrap-check runs the Docker build first; it cannot be combined with --use-virtkit" >&2
   exit 2
 fi
-if [ "$VMM" != libkrun ] && [ -z "$USE_VIRTKIT" ] && [ -z "$BOOTSTRAP_CHECK" ]; then
-  echo "--vmm only applies with --use-virtkit or --bootstrap-check" >&2
+if [ -n "$FORCE_DOCKER" ] && [ -n "$USE_VIRTKIT" ]; then
+  echo "--docker cannot be combined with --use-virtkit" >&2
+  exit 2
+fi
+
+# Backend: an explicit --use-virtkit dir wins; otherwise dogfood a `vk` on PATH when there
+# is one — unless --docker forces Docker, or this is the --bootstrap-check baseline (which
+# must be the Docker build the vk rebuild compares against). Else Docker.
+VK_BIN=""
+if [ -n "$USE_VIRTKIT" ]; then
+  VK_BIN="$USE_VIRTKIT/vk"
+elif [ -z "$FORCE_DOCKER" ] && [ -z "$BOOTSTRAP_CHECK" ] && command -v vk >/dev/null 2>&1; then
+  VK_BIN=$(command -v vk)
+  echo "build.sh: building with vk from PATH ($VK_BIN); pass --docker to force the Docker backend" >&2
+fi
+
+if [ "$VMM" != libkrun ] && [ -z "$VK_BIN" ] && [ -z "$BOOTSTRAP_CHECK" ]; then
+  echo "--vmm applies only to the vk backend (--use-virtkit, a vk on PATH, or --bootstrap-check)" >&2
   exit 2
 fi
 
@@ -99,21 +117,21 @@ fi
 BUILD_CMD="cargo build --release -p vk-agent && env $EMBED_ENV cargo build --release -p vk-driver"
 
 compile_start=$SECONDS
-if [ -n "$USE_VIRTKIT" ]; then
+if [ -n "$VK_BIN" ]; then
   # ---- dogfood backend: vk builds the env image + compiles in a microVM ----
-  # vk is self-contained (embedded kernel + agent), so DIST needs only the vk binary.
-  VK="$USE_VIRTKIT/vk"
-  [ -e "$VK" ] || { echo "missing $VK (need a populated --use-virtkit dir)" >&2; exit 1; }
+  # vk is self-contained (embedded kernel + agent), so it needs no external base.
+  VK="$VK_BIN"
+  [ -e "$VK" ] || { echo "missing vk at $VK" >&2; exit 1; }
 
   # VMM backend: built-in libkrun by default (no external binary); cloud-hypervisor for
   # a comparison run needs the CH binary and VIRTKIT_VMM set.
   vmm_env=()
   ch_args=()
   if [ "$VMM" = cloud-hypervisor ]; then
-    if [ -x "$USE_VIRTKIT/cloud-hypervisor" ]; then ch="$USE_VIRTKIT/cloud-hypervisor"
+    if [ -n "$USE_VIRTKIT" ] && [ -x "$USE_VIRTKIT/cloud-hypervisor" ]; then ch="$USE_VIRTKIT/cloud-hypervisor"
     elif command -v cloud-hypervisor >/dev/null; then ch=$(command -v cloud-hypervisor)
     else
-      echo "--vmm=cloud-hypervisor needs cloud-hypervisor (in PATH or at $USE_VIRTKIT/cloud-hypervisor)" >&2
+      echo "--vmm=cloud-hypervisor needs cloud-hypervisor (in PATH${USE_VIRTKIT:+ or at $USE_VIRTKIT/cloud-hypervisor})" >&2
       exit 1
     fi
     vmm_env+=(VIRTKIT_VMM=cloud-hypervisor)
@@ -161,7 +179,7 @@ else
     "$IMAGE" \
     sh -c "$BUILD_CMD"
 fi
-since "compile ($([ -n "$USE_VIRTKIT" ] && echo "$VMM microVM" || echo docker))" "$compile_start"
+since "compile ($([ -n "$VK_BIN" ] && echo "$VMM microVM" || echo docker))" "$compile_start"
 
 mkdir -p "$OUT"
 # Replace atomically (write a temp, then rename): a plain cp truncates the destination and
@@ -176,7 +194,7 @@ done
 # rebuild from the same commit + inputs and confirm byte-for-byte:
 #   git checkout <git_commit> && ./build.sh && sha256sum -c dist/vk.sha256 dist/vk-agent.sha256
 ( cd "$OUT" && sha256sum vk > vk.sha256 && sha256sum vk-agent > vk-agent.sha256 )
-base_image=$(sed -nE 's/^FROM (rust:.*)$/\1/p' .devcontainer/Dockerfile)
+base_image=$(sed -nE 's/^FROM (rust:[^ ]*).*$/\1/p' .devcontainer/Dockerfile)
 toolchain=$(sed -nE 's/^channel = "(.*)"$/\1/p' rust-toolchain.toml)
 # VK_GIT_COMMIT lets the caller supply the commit — the --bootstrap-check rebuild runs
 # in a tree copy with no .git, so it inherits the outer build's commit instead of "unknown".
