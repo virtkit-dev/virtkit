@@ -643,6 +643,14 @@ enum Cmd {
 /// "Cannot start a runtime from within a runtime". The CLI proper runs on the runtime
 /// entered in `cli_main`.
 fn main() -> ExitCode {
+    // Raise this process's soft open-file limit toward its hard cap (≤1M) before anything
+    // else: vk serves each guest's virtio-fs shares in-process (libkrun's built-in fs opens
+    // a host fd per accessed shared file — and this same binary re-execs as `__libkrun-boot`
+    // to run the VMM), so a heavy build (`cargo`/`make -j` on a shared workdir) needs far
+    // more than a login shell's default soft limit, else the guest sees EMFILE. The separate
+    // virtiofsd path already does this (see the virtiofsd module); the built-in path did not.
+    raise_nofile();
+
     // `vk virtiofsd …` — the bundled vhost-user virtio-fs daemon. Dispatched
     // before the clap CLI / config load (it takes virtiofsd's own flags and needs no
     // executor config); the spawned daemon blocks until the VMM disconnects.
@@ -695,6 +703,27 @@ fn main() -> ExitCode {
     {
         Ok(rt) => rt.block_on(cli_main()),
         Err(e) => fail(&anyhow::anyhow!("building the async runtime: {e}"), 1),
+    }
+}
+
+/// Best-effort raise of the soft `RLIMIT_NOFILE` to the hard cap (capped at 1M). A user
+/// process may lift its soft limit up to the hard limit without privilege; see the caller
+/// in `main` for why vk needs it.
+fn raise_nofile() {
+    // SAFETY: getrlimit/setrlimit read/write only the `rlimit` we pass.
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        let want = lim.rlim_max.min(1024 * 1024);
+        if lim.rlim_cur < want {
+            lim.rlim_cur = want;
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &lim); // best-effort; never lowers
+        }
     }
 }
 
