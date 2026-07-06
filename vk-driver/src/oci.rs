@@ -34,6 +34,14 @@ pub async fn resolve_digest(reference: &str) -> Result<String> {
     let reference: Reference = reference
         .parse()
         .with_context(|| format!("parsing OCI reference {reference:?}"))?;
+    // A digest-pinned ref (`name[:tag]@sha256:…`) already carries its manifest digest — it
+    // is authoritative and cannot move, so return it without a registry round-trip. This is
+    // what lets a fully-cached build of a digest-pinned base (the reproducible-build norm)
+    // skip the network entirely: the digest feeds the cache key directly, identical to what
+    // the fetch below would return.
+    if let Some(digest) = reference.digest() {
+        return Ok(digest.to_string());
+    }
     let client = oci_client::Client::new(ClientConfig::default());
     client
         .fetch_manifest_digest(&reference, &RegistryAuth::Anonymous)
@@ -505,6 +513,26 @@ fn join(parent: &str, name: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn resolve_digest_shortcircuits_a_pinned_ref() {
+        // A digest-pinned ref resolves to its embedded digest with no registry round-trip —
+        // this test runs offline, which is the whole point (it would otherwise need network).
+        let digest = "sha256:865b95f46d98cf867a156fe4a135ad3fe50d2056aa3f25ed31662dff6da4eb62";
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        // Both the tag+digest and the tag-less digest-only forms short-circuit to the digest.
+        for reference in [
+            format!("alpine:3.23.2@{digest}"),
+            format!("alpine@{digest}"),
+        ] {
+            let got = rt
+                .block_on(resolve_digest(&reference))
+                .expect("pinned ref must resolve offline");
+            assert_eq!(got, digest);
+        }
+    }
 
     #[test]
     fn parse_image_config_fields() {
