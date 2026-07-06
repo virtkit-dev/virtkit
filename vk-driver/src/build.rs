@@ -252,12 +252,17 @@ fn load_inputs(dockerfiles: &[PathBuf], contexts: &[PathBuf]) -> Result<Vec<Plan
         .map(|(i, dockerfile)| {
             let src = std::fs::read_to_string(dockerfile)
                 .with_context(|| format!("reading {}", dockerfile.display()))?;
-            let context = contexts.get(i).cloned().unwrap_or_else(|| {
-                dockerfile
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .to_path_buf()
-            });
+            let context = contexts
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| default_context(dockerfile));
+            // Resolve to an absolute path: the microVM backend shares the context into the
+            // guest over virtio-fs, and libkrun's in-process server mounts the host dir
+            // directly — an empty or cwd-relative path serves nothing, so a context `COPY`
+            // fails inside the guest with `Connection refused` (os error 111). (cloud-hypervisor
+            // masked this: its virtiofsd resolves a relative/empty dir against its own cwd.)
+            let context = std::path::absolute(&context)
+                .with_context(|| format!("resolving build context {}", context.display()))?;
             Ok(PlanInput {
                 dockerfile: parser::parse(&src)
                     .with_context(|| format!("parsing {}", dockerfile.display()))?,
@@ -266,6 +271,17 @@ fn load_inputs(dockerfiles: &[PathBuf], contexts: &[PathBuf]) -> Result<Vec<Plan
             })
         })
         .collect()
+}
+
+/// The default build context for a `-f <dockerfile>` given no explicit `--context`: the
+/// Dockerfile's directory. `Path::parent()` of a bare filename (`-f Dockerfile`) is
+/// `Some("")`, not `None`, so an empty parent must fall back to `.` too — otherwise the
+/// context becomes the empty path, which serves no files into the guest.
+fn default_context(dockerfile: &Path) -> PathBuf {
+    match dockerfile.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
 }
 
 /// Entry point for the `build` subcommand.
@@ -2071,6 +2087,23 @@ mod tests {
         assert!(
             t.contains(&"stage-context /nonexistent".to_string()),
             "{t:#?}"
+        );
+    }
+
+    #[test]
+    fn default_context_defaults_bare_dockerfile_to_dot() {
+        // `-f Dockerfile`: `parent()` is `Some("")`, which must fall back to `.` — not the
+        // empty path, which resolves to nothing and serves no files into the guest.
+        assert_eq!(default_context(Path::new("Dockerfile")), PathBuf::from("."));
+        // A nested relative path keeps its directory as the context.
+        assert_eq!(
+            default_context(Path::new("sub/dir/Dockerfile")),
+            PathBuf::from("sub/dir")
+        );
+        // An absolute path keeps its parent directory.
+        assert_eq!(
+            default_context(Path::new("/abs/dir/Dockerfile")),
+            PathBuf::from("/abs/dir")
         );
     }
 
