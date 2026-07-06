@@ -286,6 +286,46 @@ impl Plan {
             .filter(|&i| i < self.stages.len())
     }
 
+    /// Reject a `COPY --from=<stage>` / `RUN --mount=…,from=<stage>` whose source lives
+    /// under `/tmp`. A build guest's `/tmp` is an ephemeral scratch disk that never enters
+    /// the stage's committed image (see the microVM executor), so such a source is always
+    /// empty when another stage reads it — this fails here, before any build work, with a
+    /// fix instead of a late, cryptic "No such file" from inside the guest. External-image
+    /// `--from`s are exempt (their `/tmp` is a real, committed part of the image). Only the
+    /// stages in `order` (the ones actually built) are checked.
+    pub fn check_tmp_sources(&self, order: &[usize]) -> Result<()> {
+        for &idx in order {
+            for instr in &self.stages[idx].instructions {
+                match instr {
+                    Instruction::Copy(c) => {
+                        if let Some(from) = &c.from
+                            && self.stage_ref(from).is_some()
+                        {
+                            for src in &c.sources {
+                                if is_ephemeral_tmp(src) {
+                                    bail!("{}", tmp_source_error("COPY --from", from, src));
+                                }
+                            }
+                        }
+                    }
+                    Instruction::Run(r) => {
+                        for m in &r.mounts {
+                            if let Some(from) = &m.from
+                                && self.stage_ref(from).is_some()
+                                && let Some(src) = &m.source
+                                && is_ephemeral_tmp(src)
+                            {
+                                bail!("{}", tmp_source_error("RUN --mount=…,from", from, src));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Topological build order for `target` and its transitive dependencies only.
     /// Errors on a dependency cycle.
     pub fn build_order(&self, target: usize) -> Result<Vec<usize>> {
@@ -342,6 +382,22 @@ impl Plan {
     }
 }
 
+/// Whether `path` (a `--from` source, so relative to the source stage's root) lands under
+/// the ephemeral `/tmp` disk — after stripping a leading `/` or `./`.
+fn is_ephemeral_tmp(path: &str) -> bool {
+    let p = path.trim_start_matches('/');
+    let p = p.strip_prefix("./").unwrap_or(p);
+    p == "tmp" || p.starts_with("tmp/")
+}
+
+fn tmp_source_error(kind: &str, from: &str, src: &str) -> String {
+    format!(
+        "{kind}={from} {src:?}: /tmp is an ephemeral build scratch disk that is never part \
+         of a stage's committed image, so it cannot be a cross-stage source. Have the \
+         {from:?} stage write the artifact to a persistent path (e.g. /out) instead of /tmp."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +445,57 @@ mod tests {
             p.global_args.get("ver").map(String::as_str),
             Some("bookworm")
         );
+    }
+
+    #[test]
+    fn tmp_cross_stage_source_is_rejected() {
+        let order = |p: &Plan| p.build_order(p.resolve_target(None).unwrap()).unwrap();
+
+        // COPY --from=<stage> of a /tmp path fails up front — /tmp is never committed.
+        let bad = plan(
+            "FROM alpine AS builder\nRUN x\n\
+             FROM alpine\nCOPY --from=builder /tmp/artifact /usr/bin/artifact\n",
+        );
+        assert!(bad.check_tmp_sources(&order(&bad)).is_err());
+
+        // A persistent source path is fine.
+        let good = plan(
+            "FROM alpine AS builder\nRUN x\n\
+             FROM alpine\nCOPY --from=builder /out/artifact /usr/bin/artifact\n",
+        );
+        assert!(good.check_tmp_sources(&order(&good)).is_ok());
+
+        // --from an external image: its /tmp is real (committed), so it is not rejected.
+        let img = plan("FROM alpine\nCOPY --from=busybox:latest /tmp/x /x\n");
+        assert!(img.check_tmp_sources(&order(&img)).is_ok());
+
+        // RUN --mount=type=bind,from=<stage>,source=/tmp/... is rejected the same way.
+        let mnt = plan(
+            "FROM alpine AS builder\nRUN x\n\
+             FROM alpine\nRUN --mount=type=bind,from=builder,source=/tmp/a,target=/a use\n",
+        );
+        assert!(mnt.check_tmp_sources(&order(&mnt)).is_err());
+
+        // A relative and a `./`-prefixed /tmp source are rejected too — the source is
+        // relative to the stage root, so these still land on the ephemeral scratch.
+        for src in ["tmp/artifact", "./tmp/artifact"] {
+            let rel = plan(&format!(
+                "FROM alpine AS builder\nRUN x\n\
+                 FROM alpine\nCOPY --from=builder {src} /usr/bin/artifact\n"
+            ));
+            assert!(rel.check_tmp_sources(&order(&rel)).is_err(), "{src}");
+        }
+    }
+
+    #[test]
+    fn is_ephemeral_tmp_matches_tmp_only_at_a_path_boundary() {
+        for good in ["/tmp", "/tmp/x", "tmp", "tmp/x", "./tmp", "./tmp/x"] {
+            assert!(is_ephemeral_tmp(good), "{good} should be ephemeral /tmp");
+        }
+        // A sibling whose name merely starts with "tmp" is a persistent path, not /tmp.
+        for bad in ["/tmpfoo", "/tmpfoo/x", "tmpish", "/out/tmp", "/var/tmp"] {
+            assert!(!is_ephemeral_tmp(bad), "{bad} is not the ephemeral /tmp");
+        }
     }
 
     #[test]

@@ -39,6 +39,10 @@ All notable changes to virtkit will be documented in this file.
 - `vk build` steps that write large amounts of transient data to `/tmp` (for
   example unpacking a big toolchain) no longer fail with "no space left on
   device" when the guest has ample disk free.
+- `vk build` now rejects a multi-stage `COPY --from` (or `RUN --mount=…,from`)
+  that reads from a `/tmp` path up front, with a message pointing at a
+  persistent source path, instead of failing deep in the build with a cryptic
+  "No such file".
 
 ## [0.7.0] - 2026-07-04
 

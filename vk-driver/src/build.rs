@@ -334,6 +334,9 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     let plan = Plan::from_dockerfiles(&inputs, &build_args)?;
     let target = plan.resolve_target(opts.target.as_deref())?;
     let order = plan.build_order(target)?;
+    // Reject a cross-stage source under /tmp up front: /tmp is ephemeral and never
+    // committed, so it would fail late with a cryptic "No such file" from the guest.
+    plan.check_tmp_sources(&order)?;
 
     // --print-plan: dry-run the whole pipeline and print the primitives, build nothing.
     if opts.print_plan {
