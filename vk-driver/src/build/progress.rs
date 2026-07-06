@@ -218,15 +218,22 @@ impl Progress {
         self.done_cell(stage, step + 2, outcome);
     }
 
-    /// The whole stage restores from cache — announce its `FROM` and every step as CACHED.
+    /// The whole stage restores from its final snapshot in one shot, so collapse it to a
+    /// single `[stage] CACHED` line rather than itemizing every instruction. Every step
+    /// still counts toward the header's done/total — the work is accounted, just not listed.
     pub fn stage_fully_cached(&self, stage: StageId) {
         let Some(meta) = self.meta.get() else { return };
         let Some(sm) = meta.stages.get(&stage) else {
             return;
         };
         self.done.fetch_add(sm.total, Ordering::Relaxed);
-        for num in 1..=sm.total {
-            self.emit_cell_line(sm, num, Outcome::Cached, None);
+        match &self.backend {
+            Backend::Tty(tty) => {
+                let line = self.dim(&right_align(&format!(" => [{}]", sm.name), "CACHED"));
+                let _ = tty.mp.println(line);
+            }
+            Backend::Plain => println!("#{} CACHED [{}]", sm.seq(1), sm.name),
+            Backend::Disabled => {}
         }
         self.refresh_header();
     }
