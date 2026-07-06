@@ -310,11 +310,12 @@ async fn fetch_chunks_async(
 
 /// Push `ext4` as a new bundle tagged `<name>:<tag>`, reusing `parent_layers` for every
 /// chunk whose byte range is untouched by `dirty` and re-chunking only the dirty ranges.
-/// `parent_layers` tile the image (CDC covers it contiguously), so a parent chunk that
-/// overlaps a dirty extent is regenerated whole (one chunk, same offset/length) and the
-/// rest are reused verbatim — only the dirty bytes are read, hashed and (if new)
-/// compressed/uploaded. `dirty` is the set of cluster ranges the guest wrote (from
-/// `qemu-img map`); `total_size` is the parent's (the ext4 size is fixed across RUNs).
+/// A parent chunk that overlaps a dirty extent is regenerated whole (one chunk, same
+/// offset/length) and the rest are reused verbatim — only the dirty bytes are read,
+/// hashed and (if new) compressed/uploaded. When `parent_layers` is empty there is no
+/// safe parent to reuse, so the whole qcow2 backing chain is re-chunked. `dirty` is the
+/// set of cluster ranges the guest wrote (from `qemu-img map`); `total_size` is the
+/// parent's (the ext4 size is fixed across RUNs).
 #[allow(clippy::too_many_arguments)]
 pub fn push_ext4_diff(
     rg: &Registry,
@@ -423,14 +424,18 @@ async fn push_ext4_diff_async(
         layers.push(desc);
     }
     // Writes into regions that were holes in the parent (e.g. new files in former free
-    // space): dirty and covered by no parent chunk. The dirty extents are already a subset
-    // of the overlay's own data, so no separate data scan is needed (chunk_region drops the
-    // all-zero chunks). Without this such writes would be lost — the parent has no chunk
-    // there to regenerate.
-    covered.sort_unstable();
-    let mut dirty_sorted = dirty.to_vec();
-    dirty_sorted.sort_unstable();
-    let new_regions = subtract_extents(&dirty_sorted, &covered);
+    // space): dirty and covered by no parent chunk. With no parent at all, this must become
+    // a full chain re-chunk; otherwise a FROM-scratch stage (or a push after a missed
+    // parent) would cache only the dirty overlay clusters and omit untouched ext4 metadata
+    // inherited from its backing image.
+    let new_regions = if parent_layers.is_empty() {
+        q.chain_data_extents()?
+    } else {
+        covered.sort_unstable();
+        let mut dirty_sorted = dirty.to_vec();
+        dirty_sorted.sort_unstable();
+        subtract_extents(&dirty_sorted, &covered)
+    };
     for (start, len) in new_regions {
         // stream this region from the captured overlay (qcow2) via the native reader.
         let reader: Box<dyn std::io::Read + Send> = Box::new(crate::qcow2::RegionReader::new(
@@ -1543,10 +1548,15 @@ mod local {
                 length,
             ));
         }
-        covered.sort_unstable();
-        let mut dirty_sorted = dirty.to_vec();
-        dirty_sorted.sort_unstable();
-        for (start, len) in subtract_extents(&dirty_sorted, &covered) {
+        let new_regions = if parent_layers.is_empty() {
+            q.chain_data_extents()?
+        } else {
+            covered.sort_unstable();
+            let mut dirty_sorted = dirty.to_vec();
+            dirty_sorted.sort_unstable();
+            subtract_extents(&dirty_sorted, &covered)
+        };
+        for (start, len) in new_regions {
             let reader =
                 crate::qcow2::RegionReader::new(crate::qcow2::Qcow2::open(ext4)?, start, len);
             chunk_region_into(&store, reader, start, ext4, &mut layers)?;
@@ -1844,6 +1854,67 @@ mod tests {
             std::fs::read(&dest).unwrap(),
             std::fs::read(&base).unwrap(),
             "an untouched overlay's child must equal the base"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With no reusable parent manifest, a diff push must become a full qcow2-chain
+    /// re-chunk. A dirty-only fallback would publish a partial image: the first
+    /// FROM-scratch COPY/RUN would omit untouched ext4 metadata from its backing image.
+    #[test]
+    fn local_diff_push_without_parent_rechunks_full_chain() {
+        let root =
+            std::env::temp_dir().join(format!("vk-localreg-noparent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let rg = local_registry(&root);
+        let dir = root.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let total = 8u64 << 20;
+        let base = dir.join("base.ext4");
+        {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::File::create(&base).unwrap();
+            f.set_len(total).unwrap();
+            f.write_all_at(&pseudo_random(128 << 10, 0x1111), 0)
+                .unwrap();
+            f.write_all_at(&pseudo_random(128 << 10, 0x2222), 4 << 20)
+                .unwrap();
+        }
+
+        let overlay = dir.join("ovl.qcow2");
+        crate::qcow2::create_overlay(&overlay, &base).unwrap();
+        let (layers, size, _digest) = push_ext4_diff(
+            &rg,
+            "dfcache",
+            "child",
+            &overlay,
+            "generic-disk",
+            total,
+            &[(0, 64 << 10)], // must not limit the no-parent fallback
+            &[],
+        )
+        .unwrap();
+        assert_eq!(size, total);
+        assert!(
+            layers.iter().any(|l| {
+                chunk_placement(l)
+                    .map(|(off, _)| off >= 4 << 20)
+                    .unwrap_or(false)
+            }),
+            "the no-parent fallback must include backing data outside dirty ranges"
+        );
+
+        let dest = dir.join("child.ext4");
+        assert!(
+            try_pull_ext4(&rg, "dfcache", "child", &dest)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            std::fs::read(&base).unwrap(),
+            "a no-parent diff push must publish the full chain, not only dirty clusters"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
