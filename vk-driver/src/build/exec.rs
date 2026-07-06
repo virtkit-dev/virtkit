@@ -348,11 +348,14 @@ pub struct MicroVm {
     journal: bool,
     /// egress policy for the stage guests (no network / unrestricted / allowlist).
     net: crate::build::BuildNet,
-    /// source-stage ext4s to attach read-only (as vdb, vdc, …) to this stage's guest,
-    /// for `COPY --from` / `RUN --mount=from`. Set per stage by the driver.
-    sources: Vec<PathBuf>,
-    /// source stage label → its guest device (e.g. `/dev/vdb`), matching `sources`.
+    /// source-stage ext4s available to attach read-only to this stage's guest, in the
+    /// first-use order computed by the driver. A boot attaches only a budget-sized subset.
+    sources: Vec<(String, PathBuf)>,
+    /// source stage label → its guest device (e.g. `/dev/vdb`) for the current boot.
     source_dev: HashMap<String, String>,
+    /// The stage's disk-backed `/tmp`, reused across source-batch reboots and removed at
+    /// `stage_end`. It is outside the stage image, so it never enters snapshots/cache.
+    tmp_disk: Option<PathBuf>,
     /// The *current stage's* build-context dir, shared into its guest over virtiofs for
     /// `COPY` from the context (no `--from`). Set by `stage_sources` before the stage's
     /// first boot and consumed by the next `ensure_session`; `None` between stages.
@@ -466,6 +469,83 @@ pub(crate) fn vd_name(n: usize) -> String {
 /// Cache repo (under the registry's repo prefix) holding the instruction snapshots.
 const CACHE_REPO: &str = "dfcache";
 
+/// Conservative libkrun/mmio source-disk budget for a build guest:
+/// 19 usable IRQs minus balloon/rng/console, context-fs, rootfs, `/tmp`, and vsock.
+const MAX_SOURCE_DISKS: usize = 12;
+
+/// Pick the source disks for one guest boot. The common case is a forward scan through
+/// source stages: boot sources 0..11, then 12..23, and so on. If one instruction needs
+/// scattered sources, keep all of them and fill whatever space remains nearby.
+fn select_source_batch(
+    sources: &[(String, PathBuf)],
+    needed: &[&str],
+    stage: &str,
+) -> Result<Vec<(String, PathBuf)>> {
+    let mut needed_unique: Vec<&str> = Vec::new();
+    for label in needed {
+        if !needed_unique.contains(label) {
+            needed_unique.push(*label);
+        }
+    }
+    if needed_unique.len() > MAX_SOURCE_DISKS {
+        bail!(
+            "stage {stage} needs {} source stages in a single instruction, but this VMM can attach at most {MAX_SOURCE_DISKS} source stages per boot: {}",
+            needed_unique.len(),
+            needed_unique.join(", ")
+        );
+    }
+
+    let mut needed_positions = Vec::new();
+    for label in &needed_unique {
+        let pos = sources
+            .iter()
+            .position(|(source_label, _)| source_label.as_str() == *label)
+            .with_context(|| {
+                format!("internal: source {label:?} needed by stage {stage:?} was not declared")
+            })?;
+        needed_positions.push(pos);
+    }
+
+    let mut subset: Vec<(String, PathBuf)> = Vec::new();
+    let add = |subset: &mut Vec<(String, PathBuf)>, source: &(String, PathBuf)| {
+        if subset.iter().all(|(label, _)| label != &source.0) {
+            subset.push((source.0.clone(), source.1.clone()));
+        }
+    };
+
+    if needed_positions.is_empty() {
+        for source in sources.iter().take(MAX_SOURCE_DISKS) {
+            add(&mut subset, source);
+        }
+        return Ok(subset);
+    }
+
+    let start = *needed_positions.iter().min().expect("not empty");
+    for source in sources.iter().skip(start).take(MAX_SOURCE_DISKS) {
+        add(&mut subset, source);
+    }
+    if needed_unique
+        .iter()
+        .all(|needed| subset.iter().any(|(label, _)| label.as_str() == *needed))
+    {
+        return Ok(subset);
+    }
+
+    subset.clear();
+    for source in sources {
+        if needed_unique.contains(&source.0.as_str()) {
+            add(&mut subset, source);
+        }
+    }
+    for source in sources.iter().skip(start).chain(sources.iter().take(start)) {
+        if subset.len() >= MAX_SOURCE_DISKS {
+            break;
+        }
+        add(&mut subset, source);
+    }
+    Ok(subset)
+}
+
 /// Cache tag for a base image's materialized ext4 — `base-<sha256(image ref)>`, in the
 /// same `CACHE_REPO` as the instruction snapshots (the `base-` prefix can't collide
 /// with the 64-hex chained instruction keys).
@@ -515,6 +595,7 @@ impl MicroVm {
             net,
             sources: Vec::new(),
             source_dev: HashMap::new(),
+            tmp_disk: None,
             context: None,
             inflight: None,
             push_seq: 0,
@@ -563,6 +644,7 @@ impl MicroVm {
             parent_digest: None,
             sources: Vec::new(),
             source_dev: HashMap::new(),
+            tmp_disk: None,
             context: None,
             inflight: None,
             push_seq: 0,
@@ -575,30 +657,60 @@ impl MicroVm {
         }
     }
 
-    /// Boot this stage's guest (over `fs`'s ext4, with the stage's source disks attached
-    /// read-only) if it isn't running yet.
-    fn ensure_session(&mut self, fs: &Rootfs) -> Result<()> {
-        if self.session.is_none() {
-            let ext4 = self.stage_image(fs)?;
-            let context = self
-                .context
-                .as_deref()
-                .context("internal: stage booted before stage_sources set its context")?;
-            let s = block_on(crate::run::boot_session(
-                &self.cloud_hypervisor,
-                &self.kernel,
-                &self.agent,
-                &ext4,
-                &self.net,
-                self.cpus,
-                &self.mem,
-                self.boot_timeout_secs,
-                &self.sources,
-                Some(context),
-                self.cancel.clone(),
-            ))?;
-            self.session = Some(s);
+    /// Boot this stage's guest with every `needed` source label attached. When the live
+    /// guest has the right source batch, reuse it; otherwise quiesce it and reboot the
+    /// same stage image with a new read-only source subset. Reuse is scoped to the current
+    /// instruction's sources only — it does not anticipate the next one, so a stage that
+    /// alternates sources across the batch boundary reboots on each instruction.
+    fn ensure_session_with(&mut self, fs: &Rootfs, needed: &[&str]) -> Result<()> {
+        if self.session.is_some()
+            && needed
+                .iter()
+                .all(|label| self.source_dev.contains_key(*label))
+        {
+            return Ok(());
         }
+
+        let subset = select_source_batch(&self.sources, needed, &fs.label)?;
+        if let Some(session) = self.session.take() {
+            block_on(session.finish())?;
+            self.source_dev.clear();
+        }
+
+        let ext4 = self.stage_image(fs)?;
+        let context = self
+            .context
+            .clone()
+            .context("internal: stage booted before stage_sources set its context")?;
+        let tmp_disk = match &self.tmp_disk {
+            Some(path) => path.clone(),
+            None => {
+                let path = crate::run::build_tmp_disk(&ext4)?;
+                self.tmp_disk = Some(path.clone());
+                path
+            }
+        };
+        let source_paths: Vec<PathBuf> = subset.iter().map(|(_, path)| path.clone()).collect();
+        let s = block_on(crate::run::boot_session(
+            &self.cloud_hypervisor,
+            &self.kernel,
+            &self.agent,
+            &ext4,
+            &self.net,
+            self.cpus,
+            &self.mem,
+            self.boot_timeout_secs,
+            &source_paths,
+            Some(&context),
+            Some(&tmp_disk),
+            self.cancel.clone(),
+        ))?;
+        self.source_dev = subset
+            .iter()
+            .enumerate()
+            .map(|(i, (label, _))| (label.clone(), format!("/dev/{}", vd_name(i + 1))))
+            .collect();
+        self.session = Some(s);
         Ok(())
     }
     /// `--debug`: run `e2fsck` on a raw ext4 as it crosses the cache boundary. A clean fs
@@ -740,6 +852,9 @@ impl Drop for MicroVm {
         // while the push join below runs); the push reads an already-captured snapshot, not
         // the live VM, so this is independent of it. `VmSession`'s own `Drop` does the kill.
         self.session.take();
+        if let Some(tmp) = self.tmp_disk.take() {
+            let _ = std::fs::remove_file(tmp);
+        }
         if let Some(inf) = self.inflight.take() {
             let _ = inf.handle.join();
             let _ = std::fs::remove_file(&inf.snap);
@@ -912,6 +1027,18 @@ impl Executor for MicroVm {
         mounts: &[ResolvedMount<'_>],
         state: &ShellState,
     ) -> Result<()> {
+        let mut needed: Vec<&str> = Vec::new();
+        for m in mounts {
+            if let Some(src) = m.from
+                && !needed.contains(&src.label.as_str())
+            {
+                needed.push(src.label.as_str());
+            }
+        }
+        // Boot the stage's guest once (on the first RUN/COPY) and reuse it while its
+        // attached source batch satisfies the next instruction.
+        self.ensure_session_with(fs, &needed)?;
+
         // Resolve `--mount=type=bind,from=<stage>`: each binds the source stage's
         // `source` subtree at `target` (read-only) for the command's duration.
         // For each mount: an optional (device, scratch mountpoint) to mount first (a
@@ -975,9 +1102,6 @@ impl Executor for MicroVm {
             "" | "root" => None,
             u => Some(u.to_string()),
         };
-        // Boot the stage's guest once (on the first RUN/COPY) and reuse it for the rest
-        // — one VM per stage, not per RUN.
-        self.ensure_session(fs)?;
         let sink = self.output_sink.clone();
         let session = self.session.as_ref().expect("session booted");
         // Set up the bind mounts: mount each source device read-only, then bind its
@@ -1028,7 +1152,8 @@ impl Executor for MicroVm {
         Ok(())
     }
     fn copy(&mut self, fs: &Rootfs, op: &Copy, from: Option<&Rootfs>) -> Result<()> {
-        self.ensure_session(fs)?;
+        let needed: Vec<&str> = from.map(|src| vec![src.label.as_str()]).unwrap_or_default();
+        self.ensure_session_with(fs, &needed)?;
         // The source tree lives at `root` in the guest: a `--from` stage is mounted
         // read-only from its attached device; the build context is already mounted (over
         // virtiofs) at CONTEXT_MOUNT by the agent at boot.
@@ -1331,15 +1456,12 @@ impl Executor for MicroVm {
     }
 
     fn stage_sources(&mut self, sources: &[Rootfs], context: &Path) -> Result<()> {
-        // Resolve each source stage to its ext4 and assign it the next guest device
-        // (vdb, vdc, …); the session for this stage boots with these attached read-only,
-        // and with the stage's build context as its virtiofs share.
+        // Resolve source stages to their ext4s in first-use order. Guest devices are
+        // assigned per boot, because large stages attach only a budget-sized subset.
         self.sources.clear();
         self.source_dev.clear();
-        for (i, s) in sources.iter().enumerate() {
-            self.sources.push(self.stage_image(s)?);
-            self.source_dev
-                .insert(s.label.clone(), format!("/dev/{}", vd_name(i + 1)));
+        for s in sources {
+            self.sources.push((s.label.clone(), self.stage_image(s)?));
         }
         self.context = Some(context.to_path_buf());
         Ok(())
@@ -1353,6 +1475,9 @@ impl Executor for MicroVm {
         // (the booted disk), so later stages / the export see them with no commit step.
         if let Some(session) = self.session.take() {
             block_on(session.finish())?;
+        }
+        if let Some(tmp) = self.tmp_disk.take() {
+            let _ = std::fs::remove_file(tmp);
         }
         // the next stage starts a fresh cache lineage; clear its attached sources, its
         // context, and the in-memory parent layers.
@@ -1546,6 +1671,16 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn source_labels(batch: &[(String, PathBuf)]) -> Vec<String> {
+        batch.iter().map(|(label, _)| label.clone()).collect()
+    }
+
+    fn test_sources(n: usize) -> Vec<(String, PathBuf)> {
+        (0..n)
+            .map(|i| (format!("s{i}"), PathBuf::from(format!("/tmp/s{i}.ext4"))))
+            .collect()
+    }
+
     #[test]
     fn dryrun_records_primitives() {
         let mut ex = DryRun::new();
@@ -1566,6 +1701,56 @@ mod tests {
         assert_eq!(ex.transcript[0], "from-image build (debian:bookworm)");
         assert!(ex.transcript[1].contains("apt-get update"));
         assert!(ex.transcript[2].starts_with("export-ext4"));
+    }
+
+    #[test]
+    fn source_batch_slides_forward_in_first_use_order() {
+        let sources = test_sources(19);
+
+        let first = select_source_batch(&sources, &["s0"], "app").unwrap();
+        assert_eq!(
+            source_labels(&first),
+            (0..12).map(|i| format!("s{i}")).collect::<Vec<_>>()
+        );
+
+        let second = select_source_batch(&sources, &["s12"], "app").unwrap();
+        assert_eq!(
+            source_labels(&second),
+            (12..19).map(|i| format!("s{i}")).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn source_batch_keeps_scattered_needed_sources() {
+        let sources = test_sources(20);
+        let batch = select_source_batch(&sources, &["s0", "s18"], "app").unwrap();
+        let labels = source_labels(&batch);
+
+        assert!(labels.iter().any(|label| label == "s0"));
+        assert!(labels.iter().any(|label| label == "s18"));
+        assert!(labels.len() <= MAX_SOURCE_DISKS);
+    }
+
+    #[test]
+    fn source_batch_with_no_needed_sources_takes_the_first_window() {
+        // A context-only instruction needs no source stage; the batch still fills the boot
+        // with the leading window so a later source-using instruction can likely reuse it.
+        let sources = test_sources(20);
+        let batch = select_source_batch(&sources, &[], "app").unwrap();
+        assert_eq!(
+            source_labels(&batch),
+            (0..12).map(|i| format!("s{i}")).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn source_batch_rejects_single_instruction_over_budget() {
+        let sources = test_sources(20);
+        let needed: Vec<String> = (0..=MAX_SOURCE_DISKS).map(|i| format!("s{i}")).collect();
+        let needed_refs: Vec<&str> = needed.iter().map(String::as_str).collect();
+        let err = select_source_batch(&sources, &needed_refs, "app").unwrap_err();
+
+        assert!(err.to_string().contains("at most 12 source stages"));
     }
 
     #[test]

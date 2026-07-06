@@ -1712,6 +1712,18 @@ pub(crate) fn disk_format(path: &Path) -> &'static str {
 /// toolchain unpack (rust is ~2.5 GiB) or a big `./configure` tree.
 const TMP_DISK_FREE_BLOCKS: u64 = 32 * 1024 * 1024 * 1024 / 4096;
 
+fn tmp_disk_path(image: &Path) -> PathBuf {
+    let stem = image.file_stem().and_then(|s| s.to_str()).unwrap_or("disk");
+    image.with_file_name(format!("{stem}.tmpdisk.ext4"))
+}
+
+pub(crate) fn build_tmp_disk(image: &Path) -> Result<PathBuf> {
+    let tmp_backing = tmp_disk_path(image);
+    crate::ext4::build_empty(&tmp_backing, TMP_DISK_FREE_BLOCKS)
+        .with_context(|| format!("creating the /tmp scratch disk {}", tmp_backing.display()))?;
+    Ok(tmp_backing)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn boot_session(
     cloud_hypervisor: &Path,
@@ -1724,6 +1736,7 @@ pub(crate) async fn boot_session(
     boot_timeout_secs: u64,
     sources: &[PathBuf],
     context: Option<&Path>,
+    tmp_disk: Option<&Path>,
     cancel: Option<CancellationToken>,
 ) -> Result<VmSession> {
     let stem = image.file_stem().and_then(|s| s.to_str()).unwrap_or("disk");
@@ -1761,23 +1774,24 @@ pub(crate) async fn boot_session(
             readonly: true,
         });
     }
-    // Ephemeral, disk-backed /tmp for the build guest: a sparse, empty ext4 on its own
-    // virtio-blk device, so a stage's RUN steps can extract gigabytes to /tmp without the
-    // ½·RAM cap of a tmpfs — yet, being a separate device, it never enters the stage
-    // snapshot (no cache churn). The guest writes into it directly (no overlay: it is
-    // throwaway, discarded with the session), so it needs no CoW backing. Created next to
-    // the stage image (the build scratch's real filesystem, not this session's workdir which
-    // may be a tmpfs). The agent mounts it at /tmp (VIRTKIT_TMP_DEV).
-    let tmp_backing = image.with_file_name(format!("{stem}.tmpdisk.ext4"));
-    crate::ext4::build_empty(&tmp_backing, TMP_DISK_FREE_BLOCKS)
-        .with_context(|| format!("creating the /tmp scratch disk {}", tmp_backing.display()))?;
+    // Disk-backed /tmp for the build guest: a sparse ext4 on its own virtio-blk device, so
+    // a stage's RUN steps can extract gigabytes to /tmp without the ½·RAM cap of a tmpfs —
+    // yet, being a separate device, it never enters the stage snapshot (no cache churn).
+    // A normal one-shot session creates and owns a throwaway disk. A batched build stage
+    // passes a caller-owned disk so /tmp survives the source-subset reboots.
+    let (tmp_backing, scratch_disks) = match tmp_disk {
+        Some(path) => (path.to_path_buf(), Vec::new()),
+        None => {
+            let path = build_tmp_disk(image)?;
+            (path.clone(), vec![path])
+        }
+    };
     let tmp_dev = crate::build::vd_name(disks.len());
     disks.push(crate::vmm::Disk {
         path: tmp_backing.clone(),
         qcow2: false,
         readonly: false,
     });
-    let scratch_disks = vec![tmp_backing];
     // The kernel runs the initramfs `/init` (the agent); it then pivots into the ext4
     // named by VIRTKIT_PIVOT. No `init=`/`root=` for the kernel to mount — the agent does.
     let mut cmdline = format!(
@@ -2160,6 +2174,7 @@ mod tests {
                 "1G",
                 120,
                 &[data],
+                None,
                 None,
                 None,
             )
