@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
+use tokio_util::sync::CancellationToken;
 
 use super::parser::{Cmdline, Copy, Mount};
 
@@ -136,6 +137,11 @@ pub trait Executor {
     /// reporter, which line-buffers + stage-prefixes it). Default: ignored — only the
     /// microVM backend runs guests that produce output.
     fn set_output_sink(&mut self, _sink: crate::executor::OutputSink) {}
+
+    /// Give this stage the build-wide cancellation token so a RUN executing in its guest
+    /// is interrupted when another stage fails. Default: ignored — only the microVM
+    /// backend boots guests that a cancellation can interrupt.
+    fn set_cancel(&mut self, _cancel: CancellationToken) {}
 }
 
 /// Records every primitive without doing anything — drives the whole pipeline on any
@@ -382,6 +388,10 @@ pub struct MicroVm {
     /// where this stage's guest command output goes — set per stage by the driver to the
     /// progress reporter's stage sink. `Inherit` (the default) writes straight to stdout.
     output_sink: crate::executor::OutputSink,
+    /// build-wide cancellation, set per stage by the driver: the first stage failure
+    /// cancels it, interrupting the RUN steps still executing in every other stage's guest
+    /// so the build stops promptly instead of running the in-flight steps to completion.
+    cancel: Option<CancellationToken>,
 }
 
 /// What `cache_save` chunks + uploads in the background. The thread returns the pushed
@@ -507,6 +517,7 @@ impl MicroVm {
             parent_layers: None,
             base_digests: Arc::new(Mutex::new(HashMap::new())),
             output_sink: crate::executor::OutputSink::Inherit,
+            cancel: None,
         }
     }
 
@@ -552,6 +563,8 @@ impl MicroVm {
             // A fresh worker inherits nothing; the driver sets the stage's sink before
             // its instructions run.
             output_sink: crate::executor::OutputSink::Inherit,
+            // Set per stage by the driver (`build_stage`), before its instructions run.
+            cancel: None,
         }
     }
 
@@ -575,6 +588,7 @@ impl MicroVm {
                 self.boot_timeout_secs,
                 &self.sources,
                 Some(context),
+                self.cancel.clone(),
             ))?;
             self.session = Some(s);
         }
@@ -672,9 +686,12 @@ impl MicroVm {
 impl Drop for MicroVm {
     /// On an error mid-stage the backend can be dropped with a cache push still in flight:
     /// join it so its thread finishes and its snapshot raw is removed, rather than detaching
-    /// the thread and leaking the multi-MB capture. (The live `session` cleans its own VM
-    /// via `VmSession`'s own `Drop`.)
+    /// the thread and leaking the multi-MB capture.
     fn drop(&mut self) {
+        // Kill the guest first (a build-cancel teardown otherwise leaves it holding its RAM
+        // while the push join below runs); the push reads an already-captured snapshot, not
+        // the live VM, so this is independent of it. `VmSession`'s own `Drop` does the kill.
+        self.session.take();
         if let Some(inf) = self.inflight.take() {
             let _ = inf.handle.join();
             let _ = std::fs::remove_file(&inf.snap);
@@ -1294,6 +1311,9 @@ impl Executor for MicroVm {
 
     fn set_output_sink(&mut self, sink: crate::executor::OutputSink) {
         self.output_sink = sink;
+    }
+    fn set_cancel(&mut self, cancel: CancellationToken) {
+        self.cancel = Some(cancel);
     }
 }
 

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{SinkExt, StreamExt};
+use tokio_util::sync::CancellationToken;
 use vk_core::addr::SocketAddr;
 use vk_core::messages::{CmdExec, CmdResult, Fd, Message, RunMode};
 
@@ -66,6 +67,7 @@ pub async fn run_stage(ctx: &JobCtx, script_path: &Path) -> Result<CmdResult> {
         script,
         ctx.user_req.clone(),
         &OutputSink::Inherit,
+        None,
     )
     .await
 }
@@ -93,12 +95,17 @@ pub fn guest_shell(ctx: &JobCtx) -> Vec<String> {
 /// Run `script` (piped to `command`, e.g. bash) as `user` and relay its output,
 /// returning the command result. Shared by the gitlab-runner stages (run_stage)
 /// and the in-prepare services bring-up (which runs as root).
+///
+/// `cancel`, when set, aborts the running command promptly (the caller tears the guest
+/// down afterwards): the parallel build passes the shared build-cancellation token so a
+/// stage failure stops the RUN steps still executing in sibling stages' guests.
 pub async fn exec_script(
     addr: &SocketAddr,
     command: &[String],
     script: Vec<u8>,
     user: Option<String>,
     output: &OutputSink,
+    cancel: Option<&CancellationToken>,
 ) -> Result<CmdResult> {
     let (mut stream, mut sink) = vk_core::net::connect(addr)
         .await
@@ -145,7 +152,20 @@ pub async fn exec_script(
     });
 
     let result = loop {
-        match next(&mut stream).await? {
+        let msg = match cancel {
+            // Race the next guest message against cancellation so a build-wide abort
+            // interrupts a long RUN mid-flight instead of waiting for it to finish.
+            Some(c) => tokio::select! {
+                biased;
+                () = c.cancelled() => {
+                    feed_stdin.abort();
+                    bail!("guest command aborted: build stopped after an earlier stage failed");
+                }
+                m = next(&mut stream) => m?,
+            },
+            None => next(&mut stream).await?,
+        };
+        match msg {
             Message::Data {
                 fd: Fd::Stdout,
                 msg,

@@ -13,6 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use tokio_util::sync::CancellationToken;
 use vk_core::addr::SocketAddr;
 
 use crate::source::Source;
@@ -1467,6 +1468,7 @@ async fn drive(
         Vec::new(),
         None,
         &crate::executor::OutputSink::Inherit,
+        None,
     )
     .await
     .context("running the command in the guest")?;
@@ -1490,6 +1492,7 @@ async fn write_guest_ssh_config(addr: &SocketAddr, config: &str) -> Result<()> {
         config.as_bytes().to_vec(),
         None,
         &crate::executor::OutputSink::Inherit,
+        None,
     )
     .await
     .context("writing ~/.ssh/config in the guest")?;
@@ -1634,6 +1637,10 @@ pub(crate) struct VmSession {
     /// the ephemeral /tmp scratch disk (backing ext4 + rw overlay), removed on drop — a
     /// separate device from `image`, so it is never part of the stage snapshot.
     scratch_disks: Vec<PathBuf>,
+    /// build-wide cancellation: when the parallel driver aborts a build (a stage failed),
+    /// a RUN still executing in this guest is interrupted rather than run to completion.
+    /// `None` outside the parallel build (a plain `vk run`).
+    cancel: Option<CancellationToken>,
 }
 
 /// Guest mountpoint of the build-context virtiofs share (for `COPY` from the context).
@@ -1715,6 +1722,7 @@ pub(crate) async fn boot_session(
     boot_timeout_secs: u64,
     sources: &[PathBuf],
     context: Option<&Path>,
+    cancel: Option<CancellationToken>,
 ) -> Result<VmSession> {
     let stem = image.file_stem().and_then(|s| s.to_str()).unwrap_or("disk");
     let work = std::env::temp_dir().join(format!("virtkit-session-{}-{stem}", std::process::id()));
@@ -1872,6 +1880,7 @@ pub(crate) async fn boot_session(
         virtiofsd,
         work,
         scratch_disks,
+        cancel,
     })
 }
 
@@ -1884,9 +1893,16 @@ impl VmSession {
         user: Option<String>,
         sink: &crate::executor::OutputSink,
     ) -> Result<i32> {
-        let r = crate::executor::exec_script(&self.addr, command, Vec::new(), user, sink)
-            .await
-            .context("running the command in the guest")?;
+        let r = crate::executor::exec_script(
+            &self.addr,
+            command,
+            Vec::new(),
+            user,
+            sink,
+            self.cancel.as_ref(),
+        )
+        .await
+        .context("running the command in the guest")?;
         Ok(r.code.unwrap_or(0))
     }
 
@@ -1901,6 +1917,7 @@ impl VmSession {
                 Vec::new(),
                 None,
                 &crate::executor::OutputSink::Inherit,
+                None,
             )
             .await,
             Ok(r) if r.code == Some(0)
@@ -1928,6 +1945,7 @@ impl VmSession {
                 Vec::new(),
                 None,
                 &crate::executor::OutputSink::Inherit,
+                None,
             )
             .await;
         }
@@ -1957,6 +1975,7 @@ impl VmSession {
                 Vec::new(),
                 None,
                 &crate::executor::OutputSink::Inherit,
+                None,
             )
             .await;
         }
@@ -2139,6 +2158,7 @@ mod tests {
                 "1G",
                 120,
                 &[data],
+                None,
                 None,
             )
             .await

@@ -4530,6 +4530,7 @@ dependencies = [
  "sha2 0.11.0",
  "tar",
  "tokio",
+ "tokio-util",
  "toml",
  "vhost",
  "vhost-user-backend",

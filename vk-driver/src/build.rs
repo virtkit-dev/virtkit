@@ -48,6 +48,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result, bail};
+use tokio_util::sync::CancellationToken;
 
 use exec::{DryRun, Executor, Host, MicroVm, ResolvedMount, Rootfs, ShellState};
 use interp::Vars;
@@ -916,6 +917,7 @@ fn base_label(plan: &Plan, base: &Base) -> String {
 /// the driver guarantees that by ordering. A fully-cached stage restores its snapshot
 /// directly and reads nothing from `committed`. Reused by both the sequential [`drive`]
 /// and the parallel [`drive_microvm`], so the two cannot diverge.
+#[allow(clippy::too_many_arguments)]
 fn build_stage(
     plan: &Plan,
     resolved: &HashMap<usize, Resolved>,
@@ -924,7 +926,16 @@ fn build_stage(
     ex: &mut dyn Executor,
     idx: usize,
     progress: &Arc<Progress>,
+    cancel: Option<&CancellationToken>,
 ) -> Result<Rootfs> {
+    // Abort before doing any work if an earlier stage already failed, and hand the token
+    // to the backend so a RUN launched below is interrupted the moment a sibling fails.
+    if let Some(c) = cancel {
+        if c.is_cancelled() {
+            bail!("build stopped after an earlier stage failed");
+        }
+        ex.set_cancel(c.clone());
+    }
     let stage = &plan.stages[idx];
     let name = stage.name.clone().unwrap_or_else(|| format!("stage{idx}"));
     let steps = &resolved
@@ -955,6 +966,13 @@ fn build_stage(
     let mut building = false;
     let mut last_hit: Option<String> = None;
     for (i, step) in steps.iter().enumerate() {
+        // Stop between steps if another stage has failed (covers the gap between a fast
+        // step finishing and the next boot; a long in-flight RUN is cut short in-guest).
+        if let Some(c) = cancel
+            && c.is_cancelled()
+        {
+            bail!("build stopped after an earlier stage failed");
+        }
         if !building && ex.cache_has(&step.key) {
             progress.step_done(idx, i, Outcome::Cached);
             last_hit = Some(step.key.clone());
@@ -1045,6 +1063,7 @@ fn drive(
             ex,
             idx,
             progress,
+            None,
         )?;
         committed.insert(idx, fs);
     }
@@ -1069,7 +1088,8 @@ struct Dag<R> {
 /// lists the nodes that must finish before `n` (each must itself be in `nodes`).
 /// `build(n, done)` produces `n`'s result given a snapshot of finished results that is
 /// guaranteed to contain all of `n`'s deps. Returns every node's result, or the first
-/// error (with remaining work abandoned).
+/// error (with remaining work abandoned). On the first error `cancel` (if given) is
+/// triggered, so a `build` that honors the token can abort work already in flight.
 ///
 /// The ordering matches a sequential topological walk — a node runs only once its deps
 /// are in `done` — so `build` must be deterministic with respect to concurrency (its
@@ -1079,6 +1099,7 @@ fn run_dag<R, F>(
     nodes: &[usize],
     deps: &HashMap<usize, Vec<usize>>,
     jobs: usize,
+    cancel: Option<&CancellationToken>,
     build: F,
 ) -> Result<HashMap<usize, R>>
 where
@@ -1147,6 +1168,12 @@ where
                         Err(e) => {
                             if g.error.is_none() {
                                 g.error = Some(e);
+                                // Record the real first error under the lock, THEN cancel —
+                                // so a cancellation-induced error from an interrupted sibling
+                                // can never win the `is_none()` race and mask the true cause.
+                                if let Some(c) = cancel {
+                                    c.cancel();
+                                }
                             }
                             cv.notify_all();
                             return;
@@ -1206,11 +1233,24 @@ fn drive_microvm(
         deps.insert(idx, d);
     }
 
-    let committed = run_dag(&needed_order, &deps, jobs, |idx, done| {
+    // Build-wide cancellation: `run_dag` fires it on the first stage failure, and each
+    // stage honors it, so a failure interrupts the RUN steps in flight on sibling guests
+    // instead of letting them run to completion before the build bails.
+    let cancel = CancellationToken::new();
+    let committed = run_dag(&needed_order, &deps, jobs, Some(&cancel), |idx, done| {
         // A fresh per-stage worker: its own guest + cache-push state, sharing only the
         // committed-image maps with `base`.
         let mut ex = base.worker();
-        build_stage(plan, &resolved, &cached_final, done, &mut ex, idx, progress)
+        build_stage(
+            plan,
+            &resolved,
+            &cached_final,
+            done,
+            &mut ex,
+            idx,
+            progress,
+            Some(&cancel),
+        )
     })?;
     Ok((committed, final_states(&resolved)))
 }
@@ -2479,7 +2519,7 @@ RUN ship
         let (nodes, deps) = diamond();
         for jobs in [1usize, 4] {
             let built = Mutex::new(Vec::<usize>::new());
-            let out = run_dag(&nodes, &deps, jobs, |n, done| {
+            let out = run_dag(&nodes, &deps, jobs, None, |n, done| {
                 for d in &deps[&n] {
                     assert!(
                         done.contains_key(d),
@@ -2504,7 +2544,7 @@ RUN ship
     #[test]
     fn run_dag_surfaces_the_first_error() {
         let (nodes, deps) = diamond();
-        let r = run_dag(&nodes, &deps, 4, |n, _done| {
+        let r = run_dag(&nodes, &deps, 4, None, |n, _done| {
             if n == 1 {
                 anyhow::bail!("boom on {n}");
             }
@@ -2514,13 +2554,44 @@ RUN ship
     }
 
     #[test]
+    fn run_dag_cancels_in_flight_work_on_first_error() {
+        // Independent nodes: node 0 fails fast; the others block until cancelled. run_dag
+        // must fire the token on the first error so in-flight siblings abort promptly
+        // instead of running their (here: deliberately long) body to completion.
+        let nodes: Vec<usize> = (0..4).collect();
+        let deps: HashMap<usize, Vec<usize>> = nodes.iter().map(|&n| (n, vec![])).collect();
+        let cancel = CancellationToken::new();
+        let cancelled = AtomicUsize::new(0);
+        let r = run_dag(&nodes, &deps, 4, Some(&cancel), |n, _done| {
+            if n == 0 {
+                anyhow::bail!("boom");
+            }
+            // Poll for cancellation; a working token trips within a tick, a broken one
+            // runs out the (generous) ceiling and the assertion below fails.
+            for _ in 0..500 {
+                if cancel.is_cancelled() {
+                    cancelled.fetch_add(1, SeqCst);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok::<usize, anyhow::Error>(n)
+        });
+        assert!(r.unwrap_err().to_string().contains("boom"));
+        assert!(
+            cancelled.load(SeqCst) >= 1,
+            "the first failure should cancel the siblings still in flight"
+        );
+    }
+
+    #[test]
     fn run_dag_runs_independent_nodes_concurrently() {
         // Four nodes with no edges + four workers: they must actually overlap.
         let nodes: Vec<usize> = (0..4).collect();
         let deps: HashMap<usize, Vec<usize>> = nodes.iter().map(|&n| (n, vec![])).collect();
         let cur = AtomicUsize::new(0);
         let max = AtomicUsize::new(0);
-        run_dag(&nodes, &deps, 4, |_n, _done| {
+        run_dag(&nodes, &deps, 4, None, |_n, _done| {
             let now = cur.fetch_add(1, SeqCst) + 1;
             max.fetch_max(now, SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(40));
