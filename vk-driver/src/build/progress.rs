@@ -94,6 +94,9 @@ struct Tty {
 /// bars-map key for the export tail (no real stage has this id).
 const EXPORT_KEY: (StageId, usize) = (usize::MAX, 0);
 
+/// bars-map cell num for a stage's transient "restoring" spinner (real cells are 1..=total).
+const RESTORE_NUM: usize = 0;
+
 enum Backend {
     Tty(Tty),
     Plain,
@@ -278,6 +281,27 @@ impl Progress {
             Backend::Disabled => {}
         }
         self.refresh_header();
+    }
+
+    /// Show a transient spinner while a stage's cached snapshot is pulled from the registry
+    /// and reassembled — an otherwise silent, sometimes long gap that runs after the stage's
+    /// cells are already marked CACHED (so the header advances with nothing visibly running).
+    /// Cleared by [`Progress::restore_done`], or drained by [`Progress::finish`] on error.
+    pub fn restore_start(&self, stage: StageId, name: &str) {
+        if let Backend::Tty(tty) = &self.backend {
+            let pb = tty.mp.add(ProgressBar::new_spinner());
+            pb.set_style(self.step_style());
+            pb.set_message(format!("[{name}] restoring cached image"));
+            pb.enable_steady_tick(Duration::from_millis(120));
+            tty.bars.lock().unwrap().insert((stage, RESTORE_NUM), pb);
+        }
+    }
+    pub fn restore_done(&self, stage: StageId) {
+        if let Backend::Tty(tty) = &self.backend
+            && let Some(pb) = tty.bars.lock().unwrap().remove(&(stage, RESTORE_NUM))
+        {
+            pb.finish_and_clear();
+        }
     }
 
     pub fn export_start(&self) {
@@ -685,6 +709,8 @@ mod tests {
     fn drive(p: &Arc<Progress>) {
         p.init(two_stages());
         p.stage_fully_cached(0); // base: FROM (1 cell)
+        p.restore_start(0, "base");
+        p.restore_done(0);
         p.base_start(1);
         p.base_done(1, Outcome::Ran);
         p.step_start(1, 0);
@@ -746,6 +772,27 @@ mod tests {
             p.step_start(1, 0);
             p.step_failed(1, 0);
             p.finish(false);
+        }
+    }
+
+    /// A restore that errors mid-way leaves its spinner without a matching `restore_done`;
+    /// `finish(false)` must drain it so no steady-tick bar lingers, in each live mode.
+    #[test]
+    fn failed_restore_spinner_is_drained_by_finish() {
+        for p in [
+            Arc::new(Progress::new_backend(Backend::Plain, false)),
+            Arc::new(Progress::new_backend(Backend::Tty(Tty::new()), false)),
+        ] {
+            p.init(two_stages());
+            p.stage_fully_cached(0);
+            p.restore_start(0, "base"); // no restore_done: the restore failed
+            p.finish(false);
+            if let Backend::Tty(tty) = &p.backend {
+                assert!(
+                    tty.bars.lock().unwrap().is_empty(),
+                    "finish must drain the leftover restore spinner"
+                );
+            }
         }
     }
 

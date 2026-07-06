@@ -973,7 +973,9 @@ fn build_stage(
     // Fully cached: restore the final snapshot directly, nothing to probe or run.
     if let Some(key) = cached_final.get(&idx) {
         progress.stage_fully_cached(idx);
+        progress.restore_start(idx, &name);
         let fs = restore_into(ex, &name, key)?;
+        progress.restore_done(idx);
         ex.stage_end(&fs)?;
         return Ok(fs);
     }
@@ -1018,7 +1020,12 @@ fn build_stage(
         // build the base from scratch/image/stage (shown here, in order, before this step).
         if !building {
             fs = Some(match &last_hit {
-                Some(k) => restore_into(ex, &name, k)?,
+                Some(k) => {
+                    progress.restore_start(idx, &name);
+                    let f = restore_into(ex, &name, k)?;
+                    progress.restore_done(idx);
+                    f
+                }
                 None => {
                     progress.base_start(idx);
                     let f = materialize_base(ex, &stage.base, &name, committed)?;
@@ -1048,7 +1055,12 @@ fn build_stage(
         None => match &last_hit {
             // Every step was a cache hit: the FROM line was already shown (CACHED) at the
             // first hit in the loop, so just restore the final snapshot.
-            Some(k) => restore_into(ex, &name, k)?,
+            Some(k) => {
+                progress.restore_start(idx, &name);
+                let f = restore_into(ex, &name, k)?;
+                progress.restore_done(idx);
+                f
+            }
             None => {
                 progress.base_start(idx);
                 let f = materialize_base(ex, &stage.base, &name, committed)?;
