@@ -898,8 +898,17 @@ impl Executor for MicroVm {
         let tar = self
             .scratch
             .join(format!("{}.tar", stage.replace(['/', '\\', ':'], "_")));
+        // Swallow the pull's status lines: the live build dashboard owns the terminal
+        // (a raw write would corrupt its cursor accounting) and already shows this
+        // stage's FROM step, so the "pulling …"/"flattened …" notes are redundant here.
         block_on(crate::oci::pull_flatten(
-            image, None, None, None, false, &tar,
+            image,
+            None,
+            None,
+            None,
+            false,
+            &tar,
+            &|_| {},
         ))
         .with_context(|| format!("pulling {image}"))?;
         // Build the base ext4 with free space for the RUN steps to write into

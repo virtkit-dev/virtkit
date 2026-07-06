@@ -1162,6 +1162,7 @@ async fn cli_main() -> ExitCode {
             ca_pem,
             *insecure,
             out,
+            &|m| println!("{m}"),
         )
         .await
         {

@@ -15,6 +15,13 @@ use oci_client::client::{Certificate, CertificateEncoding, ClientConfig, ClientP
 use oci_client::manifest;
 use oci_client::secrets::RegistryAuth;
 
+/// A sink for the human-readable status lines a pull emits (`pulling …`, `flattened …`).
+/// The caller supplies where they go: straight to stdout for a standalone pull, or a
+/// no-op under the `vk build` dashboard — which owns the terminal, so a raw `println!`
+/// there would corrupt indicatif's cursor accounting and re-print the whole live block.
+/// `Sync` keeps the returned futures `Send`.
+pub type Note<'a> = &'a (dyn Fn(&str) + Sync);
+
 /// The parts of an OCI image's config a build inherits into a stage: environment
 /// (notably `PATH`), default user and working directory, and the runtime
 /// entrypoint/cmd (carried through to the exported runtime-config sidecar).
@@ -209,6 +216,7 @@ pub async fn pull_flatten(
     ca_pem: Option<Vec<u8>>,
     insecure: bool,
     out_tar: &Path,
+    note: Note<'_>,
 ) -> Result<()> {
     // scratch next to the output tar, not $TMPDIR: a multi-GB image on a tmpfs
     // /tmp would land in RAM.
@@ -216,10 +224,20 @@ pub async fn pull_flatten(
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let (merger, layers) =
-        pull_merged(reference, username, password, ca_pem, insecure, scratch_dir).await?;
+    let (merger, layers) = pull_merged(
+        reference,
+        username,
+        password,
+        ca_pem,
+        insecure,
+        scratch_dir,
+        note,
+    )
+    .await?;
     let n = merger.finish(out_tar)?;
-    println!("virtkit: flattened {layers} layers -> {n} entries");
+    note(&format!(
+        "virtkit: flattened {layers} layers -> {n} entries"
+    ));
     Ok(())
 }
 
@@ -234,6 +252,7 @@ pub(crate) async fn pull_merged(
     ca_pem: Option<Vec<u8>>,
     insecure: bool,
     scratch_dir: &Path,
+    note: Note<'_>,
 ) -> Result<(Merger, usize)> {
     let reference: Reference = reference
         .parse()
@@ -259,7 +278,7 @@ pub(crate) async fn pull_merged(
         manifest::IMAGE_LAYER_MEDIA_TYPE,
         manifest::IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
     ];
-    println!("virtkit: pulling OCI image {reference} ...");
+    note(&format!("virtkit: pulling OCI image {reference} ..."));
     let image = client
         .pull(&reference, &auth, accepted)
         .await

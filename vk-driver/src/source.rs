@@ -81,6 +81,7 @@ impl Source {
                     ca_pem.clone(),
                     *insecure,
                     scratch_dir,
+                    &|m| println!("{m}"),
                 )
                 .await?;
                 let hints = TarHints {
