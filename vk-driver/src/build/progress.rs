@@ -114,6 +114,11 @@ pub struct Progress {
     line_buf: Mutex<HashMap<(StageId, u8), Vec<u8>>>,
     /// the cell num currently running per stage, for prefixing that stage's output.
     cur: Mutex<HashMap<StageId, usize>>,
+    /// cached cells counted per stage but not yet materialized — a cache hit resolves an
+    /// instruction instantly, but its filesystem is in hand only once the stage's snapshot
+    /// is restored. Held here until [`Progress::restore_done`] moves it into `done`, so the
+    /// header tracks real materialization instead of racing ahead of a running restore pull.
+    pending: Mutex<HashMap<StageId, usize>>,
 }
 
 /// braille spinner frames + a trailing space (the finished frame, never shown — bars are
@@ -151,6 +156,7 @@ impl Progress {
             total: AtomicUsize::new(0),
             line_buf: Mutex::new(HashMap::new()),
             cur: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
         }
     }
 
@@ -271,7 +277,8 @@ impl Progress {
         let Some(sm) = meta.stages.get(&stage) else {
             return;
         };
-        self.done.fetch_add(sm.total, Ordering::Relaxed);
+        // Counted into `done` only once the stage's snapshot is restored (restore_done).
+        *self.pending.lock().unwrap().entry(stage).or_default() += sm.total;
         match &self.backend {
             Backend::Tty(tty) => {
                 let line = self.dim(&right_align(&format!(" => [{}]", sm.name), "CACHED"));
@@ -297,11 +304,17 @@ impl Progress {
         }
     }
     pub fn restore_done(&self, stage: StageId) {
+        // The snapshot is now materialized: the stage's cached cells become done.
+        let n = self.pending.lock().unwrap().remove(&stage).unwrap_or(0);
+        if n > 0 {
+            self.done.fetch_add(n, Ordering::Relaxed);
+        }
         if let Backend::Tty(tty) = &self.backend
             && let Some(pb) = tty.bars.lock().unwrap().remove(&(stage, RESTORE_NUM))
         {
             pb.finish_and_clear();
         }
+        self.refresh_header();
     }
 
     pub fn export_start(&self) {
@@ -350,6 +363,13 @@ impl Progress {
     /// failed when `!ok`.
     pub fn finish(&self, ok: bool) {
         let tag = if ok { "FINISHED" } else { "FAILED" };
+        // A successful build restores every cached prefix, so all pending is already in
+        // `done`; fold in any remainder (a build that stopped before a restore) so the final
+        // count is never stuck below total.
+        let leftover: usize = self.pending.lock().unwrap().drain().map(|(_, n)| n).sum();
+        if leftover > 0 {
+            self.done.fetch_add(leftover, Ordering::Relaxed);
+        }
         match &self.backend {
             Backend::Tty(tty) => {
                 for (_, pb) in tty.bars.lock().unwrap().drain() {
@@ -412,7 +432,16 @@ impl Progress {
     }
 
     fn done_cell(&self, stage: StageId, num: usize, outcome: Outcome) {
-        self.done.fetch_add(1, Ordering::Relaxed);
+        match outcome {
+            // A ran cell is materialized now; a cached cell counts only once its stage's
+            // snapshot is restored (restore_done), so the header does not race a restore.
+            Outcome::Ran => {
+                self.done.fetch_add(1, Ordering::Relaxed);
+            }
+            Outcome::Cached => {
+                *self.pending.lock().unwrap().entry(stage).or_default() += 1;
+            }
+        }
         // reclaim the running bar's elapsed (if this cell had one — cache hits never start).
         // A step reports its frozen command time (see `step_committing`); the base has none
         // frozen, so it falls back to the bar's full lifetime (its materialize time).
@@ -756,6 +785,47 @@ mod tests {
         assert!(
             long.contains('…'),
             "an over-long label is clipped: {long:?}"
+        );
+    }
+
+    /// A cached cell resolves instantly but counts toward the header only once its stage's
+    /// snapshot is restored — so the count does not race ahead of a running restore pull.
+    #[test]
+    fn cached_cells_count_only_after_restore() {
+        let p = Arc::new(Progress::new_backend(Backend::Tty(Tty::new()), false));
+        p.init(two_stages());
+        p.stage_fully_cached(0); // stage 0's single cell is now cached...
+        assert_eq!(
+            p.done.load(Ordering::Relaxed),
+            0,
+            "a cached cell is pending until its snapshot is restored"
+        );
+        p.restore_start(0, "base");
+        p.restore_done(0);
+        assert_eq!(
+            p.done.load(Ordering::Relaxed),
+            1,
+            "the restore materializes the cached cell into the header count"
+        );
+    }
+
+    /// A build that stops before a cached stage's restore leaves that cell pending; `finish`
+    /// folds the remainder into `done` so the final count is never stuck below what resolved.
+    #[test]
+    fn finish_flushes_pending_cached_cells() {
+        let p = Arc::new(Progress::new_backend(Backend::Tty(Tty::new()), false));
+        p.init(two_stages());
+        p.stage_fully_cached(0); // stage 0's cell resolves as a cache hit...
+        assert_eq!(
+            p.done.load(Ordering::Relaxed),
+            0,
+            "still pending — no restore ran"
+        );
+        p.finish(false); // build stopped before restore_done
+        assert_eq!(
+            p.done.load(Ordering::Relaxed),
+            1,
+            "finish flushes the un-restored pending cell into done"
         );
     }
 
