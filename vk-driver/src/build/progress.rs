@@ -235,6 +235,31 @@ impl Progress {
         self.done_cell(stage, step + 2, outcome);
     }
 
+    /// The step's command failed. Emit its line marked `FAILED` and drop its live bar, so
+    /// the dashboard shows which instruction stopped the build instead of clearing the
+    /// in-flight line (which would leave only the error text below the CACHED lines).
+    pub fn step_failed(&self, stage: StageId, step: usize) {
+        self.flush_partial(stage);
+        let num = step + 2;
+        let Some(meta) = self.meta.get() else { return };
+        let Some(sm) = meta.stages.get(&stage) else {
+            return;
+        };
+        match &self.backend {
+            Backend::Tty(tty) => {
+                if let Some(pb) = tty.bars.lock().unwrap().remove(&(stage, num)) {
+                    pb.finish_and_clear();
+                }
+                tty.ran.lock().unwrap().remove(&(stage, num));
+                let head = format!(" => [{} {}/{}] {}", sm.name, num, sm.total, sm.label(num));
+                let line = self.paint(&right_align(&head, "FAILED"), "\x1b[31m");
+                let _ = tty.mp.println(line);
+            }
+            Backend::Plain => println!("#{} ERROR", sm.seq(num)),
+            Backend::Disabled => {}
+        }
+    }
+
     /// The whole stage restores from its final snapshot in one shot, so collapse it to a
     /// single `[stage] CACHED` line rather than itemizing every instruction. Every step
     /// still counts toward the header's done/total — the work is accounted, just not listed.
@@ -706,6 +731,22 @@ mod tests {
             long.contains('…'),
             "an over-long label is clipped: {long:?}"
         );
+    }
+
+    /// A failed step emits its line and finishes without panicking, in each live mode.
+    #[test]
+    fn step_failure_drives_without_panicking() {
+        for p in [
+            Arc::new(Progress::new_backend(Backend::Plain, false)),
+            Arc::new(Progress::new_backend(Backend::Tty(Tty::new()), false)),
+        ] {
+            p.init(two_stages());
+            p.base_start(1);
+            p.base_done(1, Outcome::Ran);
+            p.step_start(1, 0);
+            p.step_failed(1, 0);
+            p.finish(false);
+        }
     }
 
     #[test]

@@ -989,6 +989,10 @@ fn build_stage(
     // materialized.
     let mut fs: Option<Rootfs> = None;
     let mut building = false;
+    // Whether the FROM (cell 1) line has been emitted. It is shown in order — before the
+    // step lines — so a cached prefix does not leave the FROM line trailing at the first
+    // miss; materialization of the base itself stays lazy (deferred to that first miss).
+    let mut base_shown = false;
     let mut last_hit: Option<String> = None;
     for (i, step) in steps.iter().enumerate() {
         // Stop between steps if another stage has failed (covers the gap between a fast
@@ -999,24 +1003,27 @@ fn build_stage(
             bail!("build stopped after an earlier stage failed");
         }
         if !building && ex.cache_has(&step.key) {
+            // A cached prefix restores the base as part of it, so the FROM line is CACHED;
+            // emit it before this step's line so it prints in order.
+            if !base_shown {
+                progress.base_done(idx, Outcome::Cached);
+                base_shown = true;
+            }
             progress.step_done(idx, i, Outcome::Cached);
             last_hit = Some(step.key.clone());
             continue;
         }
         // first miss: materialize the rootfs — restore the last cached snapshot if there
-        // was a cached prefix (the base folds into that restore), else build the base from
-        // scratch/image/stage.
+        // was a cached prefix (the base folds into that restore, already shown above), else
+        // build the base from scratch/image/stage (shown here, in order, before this step).
         if !building {
             fs = Some(match &last_hit {
-                Some(k) => {
-                    let f = restore_into(ex, &name, k)?;
-                    progress.base_done(idx, Outcome::Cached);
-                    f
-                }
+                Some(k) => restore_into(ex, &name, k)?,
                 None => {
                     progress.base_start(idx);
                     let f = materialize_base(ex, &stage.base, &name, committed)?;
                     progress.base_done(idx, Outcome::Ran);
+                    base_shown = true;
                     f
                 }
             });
@@ -1024,12 +1031,14 @@ fn build_stage(
         }
         let f = fs.as_mut().expect("materialized on first miss");
         progress.step_start(idx, i);
-        apply_fs(plan, committed, ex, f, &step.state, &step.instr)?;
+        apply_fs(plan, committed, ex, f, &step.state, &step.instr)
+            .inspect_err(|_| progress.step_failed(idx, i))?;
         // The command is done; the snapshot + cache push that follow are commit overhead,
         // not the step's runtime — freeze the reported time here so a trivial step isn't
         // charged for the previous push's upload that `cache_save` joins.
         progress.step_committing(idx, i);
-        ex.cache_save(f, &step.key)?;
+        ex.cache_save(f, &step.key)
+            .inspect_err(|_| progress.step_failed(idx, i))?;
         progress.step_done(idx, i, Outcome::Ran);
     }
     // Nothing ran: the whole instruction run was cached → restore the final snapshot; or
@@ -1037,11 +1046,9 @@ fn build_stage(
     let final_fs = match fs {
         Some(f) => f,
         None => match &last_hit {
-            Some(k) => {
-                let f = restore_into(ex, &name, k)?;
-                progress.base_done(idx, Outcome::Cached);
-                f
-            }
+            // Every step was a cache hit: the FROM line was already shown (CACHED) at the
+            // first hit in the loop, so just restore the final snapshot.
+            Some(k) => restore_into(ex, &name, k)?,
             None => {
                 progress.base_start(idx);
                 let f = materialize_base(ex, &stage.base, &name, committed)?;
