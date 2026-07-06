@@ -25,6 +25,10 @@ All notable changes to virtkit will be documented in this file.
   dashboard with a line per build step and each command's output attributed to
   its stage — falling back to plain log lines off a terminal or with
   `VIRTKIT_PROGRESS=plain`.
+- `vk build` writes its temporary build scratch next to the output file instead
+  of a RAM-backed temp dir, so large builds no longer risk running out of
+  memory-backed space; scratch left behind by a crashed or killed build is
+  cleaned up automatically on the next build.
 
 ## [0.7.0] - 2026-07-04
 

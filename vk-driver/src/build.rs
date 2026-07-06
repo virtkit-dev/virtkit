@@ -269,6 +269,27 @@ pub fn build(opts: &Options) -> Result<Built> {
     build_inputs(inputs, opts)
 }
 
+/// Filename prefix for a build's scratch dir, named `<prefix><pid>-<seq>`. The embedded
+/// pid lets a later run reclaim scratch orphaned by a hard-killed build (see
+/// [`sweep_stale_scratch`]).
+const SCRATCH_PREFIX: &str = ".build-";
+
+/// The scratch dir for a build writing to `out`, unique per run (`<prefix><pid>-<seq>`).
+/// Placed next to `out` so stage ext4s land on the real filesystem the caller chose, not
+/// a small/RAM-backed tmpfs — but always made absolute: stage qcow2 overlays record their
+/// backing image by path, and qcow2 resolves a *relative* backing against the overlay's
+/// own directory, so a cwd-relative scratch (from a relative `--out`) would apply the
+/// prefix twice and fail to open the backing.
+fn build_scratch(out: &Path, seq: u64) -> Result<PathBuf> {
+    let rel = out
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("{SCRATCH_PREFIX}{}-{seq}", std::process::id()));
+    // Must be absolute (see above); the relative fallback would reintroduce the exact
+    // backing-path bug, so surface the error instead of silently using it.
+    std::path::absolute(&rel).context("resolving the build scratch dir to an absolute path")
+}
+
 /// [`build`] for a caller that already holds parsed [`PlanInput`]s — e.g. `vk run
 /// --compose` materializing an `image:` service as the synthetic single-`FROM`
 /// plan, with no Dockerfile on disk. `opts.dockerfiles`/`opts.contexts` are the
@@ -314,20 +335,19 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
         .out
         .as_deref()
         .context("build needs --out <file> (or --print-plan)")?;
-    // microVM scratch holds each stage's raw ext4 (booted read-write — keep it off
-    // tmpfs), so place it next to the output; the host backend's scratch is just
-    // dirs. Keyed by pid + an in-process counter: two builds in one process (e.g.
-    // `run --compose` materializing several services, or parallel tests) must
-    // never share — the first one's cleanup would delete the second's scratch.
+    // Scratch placement + naming: see [`build_scratch`]. Keyed by pid + an in-process
+    // counter, so two builds in one process (e.g. `run --compose` materializing several
+    // services, or parallel tests) never share — the first one's cleanup would otherwise
+    // delete the second's scratch.
     static BUILD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let scratch = if microvm {
-        out.parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(format!(".build-{}-{seq}", std::process::id()))
-    } else {
-        std::env::temp_dir().join(format!("virtkit-build-{}-{seq}", std::process::id()))
-    };
+    let scratch = build_scratch(out, seq)?;
+    // Self-heal: a build normally removes its scratch on exit (even on error), but a hard
+    // kill (SIGKILL/OOM/Ctrl-C/panic) orphans it. Before starting, drop any sibling
+    // scratch whose owning process is gone, so crashed runs don't accumulate.
+    if let Some(parent) = scratch.parent() {
+        sweep_stale_scratch(parent, SCRATCH_PREFIX);
+    }
     // Resolve the microVM's kernel + agent up front and hold them for the whole build:
     // an embedded asset lives in a memfd whose /proc/self/fd path is valid only while the
     // fd is open, and every stage boot (and the initramfs packer) reopens it.
@@ -1210,6 +1230,44 @@ fn resolve_build_jobs(opts: &Options, mem_mib: u64) -> usize {
     ((usable / mem_mib.max(1)) as usize).clamp(1, 16)
 }
 
+/// Remove build scratch orphaned by earlier runs that were hard-killed (SIGKILL, OOM,
+/// Ctrl-C, panic) before their normal on-exit cleanup could run. Scratch dirs in `dir`
+/// are named `<prefix><pid>-<seq>`; one whose owning `pid` is no longer a live process is
+/// stale and removed. A dir owned by this process (a concurrent in-process build) or by a
+/// live pid is left untouched — worst case an orphan survives, never a live build's
+/// scratch deleted. Best-effort: any error (unreadable dir, racing removal) is ignored.
+fn sweep_stale_scratch(dir: &Path, prefix: &str) {
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(prefix))
+            .and_then(|rest| rest.split_once('-'))
+            .and_then(|(pid, _seq)| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid != me && !pid_alive(pid) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Whether `pid` is a live process. `kill(pid, 0)` sends no signal — it only reports
+/// whether the target exists (`ESRCH` = gone; `EPERM` = alive but not ours, so live).
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 performs only the existence/permission check, delivering nothing.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    // Read errno only on the failure branch: EPERM = alive but not ours; ESRCH = gone.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// Available host RAM in MiB, from `/proc/meminfo` `MemAvailable`. `None` if unreadable.
 fn mem_available_mib() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -1609,6 +1667,54 @@ mod tests {
     }
     fn build_inputs_host(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
         build_backend(inputs, opts, false)
+    }
+
+    /// Scratch is absolute even for a relative `--out`, so a stage qcow2's recorded backing
+    /// path resolves against the overlay's own dir without doubling the scratch prefix.
+    #[test]
+    fn build_scratch_is_absolute_for_relative_out() {
+        let s = build_scratch(Path::new("./test.ext4"), 0).unwrap();
+        assert!(
+            s.is_absolute(),
+            "scratch must be absolute, got {}",
+            s.display()
+        );
+        assert!(
+            s.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(SCRATCH_PREFIX)),
+            "scratch dir must carry the prefix, got {}",
+            s.display()
+        );
+    }
+
+    /// The startup sweep removes scratch owned by a dead process but never a live pid's
+    /// (nor this process's own, nor an unrelated dir).
+    #[test]
+    fn sweep_removes_only_dead_pid_scratch() {
+        let root = std::env::temp_dir().join(format!("vk-sweep-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // A guaranteed-dead pid: spawn a child and reap it.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+
+        let dead_dir = root.join(format!("{SCRATCH_PREFIX}{dead}-0"));
+        let own_dir = root.join(format!("{SCRATCH_PREFIX}{}-3", std::process::id()));
+        let live_dir = root.join(format!("{SCRATCH_PREFIX}1-0")); // pid 1 (init) always alive
+        let unrelated = root.join("not-scratch");
+        for d in [&dead_dir, &own_dir, &live_dir, &unrelated] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        sweep_stale_scratch(&root, SCRATCH_PREFIX);
+
+        assert!(!dead_dir.exists(), "dead-pid scratch should be swept");
+        assert!(own_dir.exists(), "this process's own scratch must be kept");
+        assert!(live_dir.exists(), "a live pid's scratch must be kept");
+        assert!(unrelated.exists(), "a non-scratch dir must be untouched");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A single-file plan whose stages' context is `/nonexistent` (the tests' COPYs
