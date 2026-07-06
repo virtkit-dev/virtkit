@@ -84,7 +84,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
         warn!("vk-agent init: pivot to real root failed: {e:#} — continuing in place");
     }
 
-    mount_api_filesystems();
+    mount_api_filesystems()?;
     apply_sysctls(); // honor /etc/sysctl.d/*.conf — there is no systemd-sysctl here
     let cmdline = read_cmdline();
     bring_up_loopback();
@@ -154,7 +154,7 @@ fn pivot_to_real_root() -> Result<bool> {
 
 /// Mount the kernel API filesystems a from-scratch rootfs lacks. Best effort:
 /// each may already be mounted (the initrd/kernel set some up) — tolerate it.
-fn mount_api_filesystems() {
+fn mount_api_filesystems() -> Result<()> {
     // Mountpoint dirs we create here (that the base lacked, e.g. a FROM scratch image) are
     // recorded so `cleanup` can drop them before commit — otherwise an empty /proc, /sys,
     // /dev, /run, /tmp would litter the built image. Recorded after /run is mounted (the
@@ -235,6 +235,20 @@ fn mount_api_filesystems() {
         if let Err(e) = res
             && e.raw_os_error() != Some(libc::EBUSY)
         {
+            // A build explicitly provisioned the disk-backed /tmp scratch (VIRTKIT_TMP_DEV):
+            // if it will not mount, /tmp would silently stay on the (small, lineage-shared)
+            // rootfs overlay and a bulk RUN write would later ENOSPC with no hint why. Fail
+            // the boot instead — the build surfaces this as a boot failure with the console
+            // tail, so the cause is visible rather than a mystery out-of-space mid-RUN.
+            if target == "/tmp"
+                && let Some(dev) = &tmp_dev
+            {
+                bail!(
+                    "mounting the disk-backed /tmp scratch device {dev} failed: {e} — \
+                     refusing to fall back to an on-rootfs /tmp (a bulk write would then \
+                     exhaust the rootfs). Check that {dev} is a valid ext4 scratch disk."
+                );
+            }
             warn!("vk-agent init: mounting {target} failed: {e}");
         }
     }
@@ -243,6 +257,7 @@ fn mount_api_filesystems() {
     for target in created {
         crate::diskmount::note_created(std::path::Path::new(target));
     }
+    Ok(())
 }
 
 /// The disk-backed `/tmp` scratch device a build's `boot_session` passes as
