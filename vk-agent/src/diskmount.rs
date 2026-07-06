@@ -398,9 +398,34 @@ pub fn main(args: &[String]) -> i32 {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("vk-agent: {e:#}");
+            // ECONNREFUSED/ENOTCONN from a filesystem op means the host-side virtio-fs server
+            // backing a share stopped responding — most often the build context at
+            // CONTEXT_MOUNT. That server is a HOST component (a virtiofsd process for
+            // cloud-hypervisor, or in-process inside the libkrun VMM), never a guest process.
+            // The bare errno ("Connection refused") is opaque; name the real cause. It stops
+            // responding when the host kills/starves it or it hits a resource limit (open
+            // files, memory) — all aggravated by running many build-stage microVMs at once.
+            if virtiofs_backend_gone(&e) {
+                eprintln!(
+                    "vk-agent: ^ the host-side virtio-fs server backing this path stopped \
+                     responding (it serves the build context / shares). Check host memory and \
+                     open-file limits, or lower the build concurrency (--build-jobs)."
+                );
+            }
             1
         }
     }
+}
+
+/// Whether an error chain carries a virtio-fs transport failure: `ECONNREFUSED`/`ENOTCONN`
+/// from a filesystem op, which the guest sees once the host-side share server (libkrun's
+/// in-process virtio-fs, or a `virtiofsd` for cloud-hypervisor) dies.
+fn virtiofs_backend_gone(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            .is_some_and(|n| n == libc::ECONNREFUSED || n == libc::ENOTCONN)
+    })
 }
 
 /// `copy [--chown u:g] [--chmod OCTAL] [--ignore-root DIR] <src>... <dst>`. With
@@ -512,5 +537,27 @@ mod tests {
             "**/*_test.go not excluded"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn virtiofs_backend_gone_matches_transport_errnos() {
+        use anyhow::Context;
+
+        // ECONNREFUSED/ENOTCONN buried in the chain are detected, regardless of context depth.
+        for errno in [libc::ECONNREFUSED, libc::ENOTCONN] {
+            let e = Err::<(), _>(std::io::Error::from_raw_os_error(errno))
+                .context("copying ctx -> dst")
+                .unwrap_err();
+            assert!(
+                super::virtiofs_backend_gone(&e),
+                "errno {errno} should match"
+            );
+        }
+
+        // An unrelated filesystem errno must not trigger the hint.
+        let other = Err::<(), _>(std::io::Error::from_raw_os_error(libc::ENOENT))
+            .context("stat missing")
+            .unwrap_err();
+        assert!(!super::virtiofs_backend_gone(&other));
     }
 }
