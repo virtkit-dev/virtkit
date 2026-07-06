@@ -64,10 +64,6 @@ pub struct Options {
     pub out: Option<PathBuf>,
     /// Parse + plan + print the build order and primitives, build nothing.
     pub print_plan: bool,
-    /// Use the microVM backend (each RUN executes in a guest — libkrun by default)
-    /// instead of the host backend (FROM scratch + COPY only). `vk build` always sets
-    /// this; the host backend is only used by tests / programmatic no-RUN callers.
-    pub microvm: bool,
     /// cloud-hypervisor binary, only used when `VIRTKIT_VMM=cloud-hypervisor` selects
     /// that backend (the default libkrun backend is embedded and needs none).
     pub cloud_hypervisor: Option<PathBuf>,
@@ -278,6 +274,15 @@ pub fn build(opts: &Options) -> Result<Built> {
 /// plan, with no Dockerfile on disk. `opts.dockerfiles`/`opts.contexts` are the
 /// file-loading path's inputs and are ignored here; everything else applies.
 pub fn build_inputs(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
+    build_backend(inputs, opts, true)
+}
+
+/// Backend-parameterized [`build_inputs`]. `microvm` selects the real microVM backend
+/// (every production build) or the host backend — `FROM scratch` + `COPY`, no VM — which
+/// exists only so tests can exercise the whole pipeline (plan → drive → export → sidecar)
+/// without KVM. There is no user-facing switch: production is always the microVM backend,
+/// so `microvm == false` is reachable from `#[cfg(test)]` alone.
+fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Result<Built> {
     let build_args: Vars = opts.build_args.iter().cloned().collect();
     let plan = Plan::from_dockerfiles(&inputs, &build_args)?;
     let target = plan.resolve_target(opts.target.as_deref())?;
@@ -301,8 +306,10 @@ pub fn build_inputs(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
         return Ok(Built::default());
     }
 
-    // Real build: the Host backend (FROM scratch + COPY, exported via virtkit's own
-    // ext4 builder — no docker/buildkit/mke2fs/VM). RUN / FROM <image> error here.
+    // Real build: materialize each stage through the selected backend and export the
+    // target as an ext4 (via virtkit's own builder — no docker/buildkit/mke2fs). The host
+    // backend (tests only) handles just FROM scratch + COPY and errors on RUN / FROM
+    // <image>; the microVM backend handles the full shape.
     let out = opts
         .out
         .as_deref()
@@ -314,7 +321,7 @@ pub fn build_inputs(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
     // never share — the first one's cleanup would delete the second's scratch.
     static BUILD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let scratch = if opts.microvm {
+    let scratch = if microvm {
         out.parent()
             .unwrap_or_else(|| Path::new("."))
             .join(format!(".build-{}-{seq}", std::process::id()))
@@ -324,7 +331,7 @@ pub fn build_inputs(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
     // Resolve the microVM's kernel + agent up front and hold them for the whole build:
     // an embedded asset lives in a memfd whose /proc/self/fd path is valid only while the
     // fd is open, and every stage boot (and the initramfs packer) reopens it.
-    let (kernel, agent) = if opts.microvm {
+    let (kernel, agent) = if microvm {
         let kernel = crate::embed::resolve(crate::embed::Asset::Kernel, opts.kernel.as_deref())?;
         if !kernel.is_embedded() && !kernel.path.is_file() {
             bail!(
@@ -351,7 +358,7 @@ pub fn build_inputs(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
         // The microVM backend drives stages in parallel over the dependency DAG (each
         // stage on its own guest); the host backend (FROM scratch + COPY) stays
         // sequential. Both produce the same committed map, then share the export tail.
-        let (committed, states, mut ex): (_, _, Box<dyn Executor>) = if opts.microvm {
+        let (committed, states, mut ex): (_, _, Box<dyn Executor>) = if microvm {
             let cache = cache_repo(opts.cache_registry.as_deref())?.map(|repo| {
                 crate::config::Registry::for_share(
                     repo,
@@ -362,8 +369,8 @@ pub fn build_inputs(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
                     None,
                 )
             });
-            let kernel = kernel.as_ref().expect("resolved under opts.microvm");
-            let agent = agent.as_ref().expect("resolved under opts.microvm");
+            let kernel = kernel.as_ref().expect("resolved under microvm");
+            let agent = agent.as_ref().expect("resolved under microvm");
             // cloud-hypervisor is only needed when VIRTKIT_VMM selects it; the default
             // libkrun backend is embedded in `vk` and drives no external VMM binary.
             let ch = if crate::vmm::libkrun_selected() {
@@ -1594,6 +1601,16 @@ fn upsert(env: &mut Vec<(String, String)>, k: &str, v: &str) {
 mod tests {
     use super::*;
 
+    /// Host-backend `build` / `build_inputs` (FROM scratch + COPY, no VM) — the path tests
+    /// use to drive the whole pipeline without KVM. Production always builds in microVMs.
+    fn build_host(opts: &Options) -> Result<Built> {
+        let inputs = load_inputs(&opts.dockerfiles, &opts.contexts)?;
+        build_backend(inputs, opts, false)
+    }
+    fn build_inputs_host(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
+        build_backend(inputs, opts, false)
+    }
+
     /// A single-file plan whose stages' context is `/nonexistent` (the tests' COPYs
     /// hash an empty file set — deterministic without touching the host).
     fn plan_one(src: &str, ba: &Vars) -> Plan {
@@ -2203,7 +2220,6 @@ ENTRYPOINT run me
             contexts: vec![],
             out: Some(out),
             print_plan: false,
-            microvm: false,
             cloud_hypervisor: None,
             kernel: None,
             agent: None,
@@ -2215,8 +2231,8 @@ ENTRYPOINT run me
             require_cached: false,
             build_jobs: None,
         };
-        let via_file = build(&opts(tmp.join("a.ext4"))).unwrap();
-        let via_inputs = build_inputs(
+        let via_file = build_host(&opts(tmp.join("a.ext4"))).unwrap();
+        let via_inputs = build_inputs_host(
             vec![PlanInput {
                 dockerfile: parser::parse(src).unwrap(),
                 origin: "inline".into(),
@@ -2252,13 +2268,12 @@ ENTRYPOINT run me
         )
         .unwrap();
         let out = tmp.join("img.ext4");
-        let built = build(&Options {
+        let built = build_host(&Options {
             dockerfiles: vec![tmp.join("Dockerfile")],
             target: None,
             contexts: vec![],
             out: Some(out.clone()),
             print_plan: false,
-            microvm: false,
             cloud_hypervisor: None,
             kernel: None,
             agent: None,
@@ -2418,7 +2433,6 @@ RUN ship
             contexts: vec![],
             out: None,
             print_plan: false,
-            microvm: true,
             cloud_hypervisor: None,
             kernel: None,
             agent: None,

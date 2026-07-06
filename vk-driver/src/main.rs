@@ -1074,9 +1074,6 @@ async fn cli_main() -> ExitCode {
             contexts: context.clone(),
             out: out.clone(),
             print_plan: *print_plan,
-            // `vk build` always builds in a microVM (libkrun by default). The host
-            // backend remains for the FROM-scratch+COPY tests / programmatic callers.
-            microvm: true,
             cloud_hypervisor: cloud_hypervisor
                 .clone()
                 .or_else(|| b.cloud_hypervisor.clone())

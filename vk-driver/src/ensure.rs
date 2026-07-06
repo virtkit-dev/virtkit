@@ -95,7 +95,6 @@ pub fn ensure_unit_build(
         contexts: recipe.contexts.clone(),
         out: Some(out.to_path_buf()),
         print_plan: false,
-        microvm: true,
         cloud_hypervisor: recipe.cloud_hypervisor.clone(),
         kernel: recipe.kernel.clone(),
         agent: recipe.agent.clone(),
