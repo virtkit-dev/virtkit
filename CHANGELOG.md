@@ -43,6 +43,9 @@ All notable changes to virtkit will be documented in this file.
   that reads from a `/tmp` path up front, with a message pointing at a
   persistent source path, instead of failing deep in the build with a cryptic
   "No such file".
+- `vk build` now busts the layer cache when a file bind-mounted into a step
+  (`RUN --mount=type=bind`) from the build context changes; previously editing
+  such a file left the cached layer in place and the step was not rerun.
 
 ## [0.7.0] - 2026-07-04
 

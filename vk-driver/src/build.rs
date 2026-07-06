@@ -624,6 +624,8 @@ fn resolve_stages(
             // the cache follows the bytes an instruction reads, not just its spelling):
             //   - a context COPY keys on the sha256 of the files it references, so
             //     editing a copied source busts the cache;
+            //   - a RUN --mount=type=bind from the context keys on the sha256 of the
+            //     mounted files, so editing a bind-mounted script busts the cache;
             //   - a COPY --from=<stage> / RUN --mount=from=<stage> keys on the source
             //     stage's final key, so a change anywhere in the source stage chains
             //     into every consumer — without it, a consumer whose own instructions
@@ -631,17 +633,28 @@ fn resolve_stages(
             //     content. `--from=<image>` sources stay keyed by their reference text.
             let content = match &instr {
                 Instruction::Copy(c) => match &c.from {
-                    None => Some(context_copy_hash(&stage.context, c)),
+                    None => Some(context_files_hash(&stage.context, &c.sources)),
                     Some(r) => source_stage_key(plan, &out, r),
                 },
                 Instruction::Run(r) => {
-                    let keys: Vec<String> = r
+                    // A --mount=from=<stage> keys on the source stage; a bind mount
+                    // from the context keys on its files (source defaults to the whole
+                    // context). --from=<image> and non-bind mounts contribute nothing.
+                    let parts: Vec<String> = r
                         .mounts
                         .iter()
-                        .filter_map(|m| m.from.as_deref())
-                        .filter_map(|f| source_stage_key(plan, &out, f))
+                        .filter_map(|m| match &m.from {
+                            Some(f) => source_stage_key(plan, &out, f),
+                            None if m.typ == "bind" => {
+                                // Default source matches the executor's bind default (build/exec.rs);
+                                // copy_src_files resolves both "/" and "." to the context root.
+                                let src = m.source.clone().unwrap_or_else(|| "/".into());
+                                Some(context_files_hash(&stage.context, &[src]))
+                            }
+                            None => None,
+                        })
                         .collect();
-                    (!keys.is_empty()).then(|| keys.join("\n"))
+                    (!parts.is_empty()).then(|| parts.join("\n"))
                 }
                 _ => None,
             };
@@ -1427,8 +1440,8 @@ fn hash_key(s: &str) -> String {
 }
 
 /// Chain the cache key with one instruction (an explicit canonical form, [`canonical`])
-/// plus, for a context `COPY`, a content hash of the files it references. A change anywhere
-/// in the prefix — or in the copied bytes — changes the key.
+/// plus, for a context `COPY` or a `RUN --mount=type=bind`, a content hash of the files it
+/// references. A change anywhere in the prefix — or in the referenced bytes — changes the key.
 fn chain_key(prev: &str, instr: &Instruction, content: Option<&str>) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -1505,15 +1518,16 @@ fn kv(kvs: &[(String, String)], sep: char) -> String {
         .join(&sep.to_string())
 }
 
-/// sha256 over the (sorted, `.dockerignore`-filtered) content of the context files a
-/// `COPY` (without `--from`) references — so the cache key tracks the copied bytes, not
-/// just the instruction text. Each source may be a file, a directory (recursed), or a
-/// trailing-segment glob (`dir/*.json`). Unreadable/absent sources contribute a marker.
-fn context_copy_hash(context: &Path, copy: &parser::Copy) -> String {
+/// sha256 over the (sorted, `.dockerignore`-filtered) content of the context files a set
+/// of sources references — so the cache key tracks the referenced bytes, not just the
+/// instruction text. Drives both a context `COPY` (without `--from`) and a `RUN
+/// --mount=type=bind` from the context. Each source may be a file, a directory (recursed),
+/// or a trailing-segment glob (`dir/*.json`). Unreadable/absent sources contribute a marker.
+fn context_files_hash(context: &Path, sources: &[String]) -> String {
     use sha2::{Digest, Sha256};
     let ign = vk_core::dockerignore::Ignore::load(context);
     let mut files: Vec<PathBuf> = Vec::new();
-    for src in &copy.sources {
+    for src in sources {
         files.extend(copy_src_files(context, &ign, src));
     }
     files.sort();
@@ -2046,33 +2060,26 @@ mod tests {
     }
 
     #[test]
-    fn context_copy_hash_tracks_content_and_dockerignore() {
+    fn context_files_hash_tracks_content_and_dockerignore() {
         let dir = std::env::temp_dir().join(format!("vk-copyhash-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/a.rs"), "fn main() {}").unwrap();
         std::fs::write(dir.join("README.md"), "hi").unwrap();
         std::fs::write(dir.join(".dockerignore"), "*.md\n").unwrap();
-        let cp = |srcs: &[&str]| parser::Copy {
-            sources: srcs.iter().map(|s| s.to_string()).collect(),
-            dest: "/app".into(),
-            from: None,
-            chown: None,
-            chmod: None,
-            link: false,
-        };
-        let h1 = context_copy_hash(&dir, &cp(&["."]));
+        let srcs = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let h1 = context_files_hash(&dir, &srcs(&["."]));
         // editing a copied source changes the hash
         std::fs::write(dir.join("src/a.rs"), "fn main() { /* x */ }").unwrap();
-        assert_ne!(h1, context_copy_hash(&dir, &cp(&["."])));
+        assert_ne!(h1, context_files_hash(&dir, &srcs(&["."])));
         // editing a .dockerignore'd file does NOT change the hash
-        let before = context_copy_hash(&dir, &cp(&["."]));
+        let before = context_files_hash(&dir, &srcs(&["."]));
         std::fs::write(dir.join("README.md"), "changed").unwrap();
-        assert_eq!(before, context_copy_hash(&dir, &cp(&["."])));
+        assert_eq!(before, context_files_hash(&dir, &srcs(&["."])));
         // a glob source matches by segment (src/*.rs covers a.rs)
         assert_eq!(
-            context_copy_hash(&dir, &cp(&["src/*.rs"])),
-            context_copy_hash(&dir, &cp(&["src/a.rs"]))
+            context_files_hash(&dir, &srcs(&["src/*.rs"])),
+            context_files_hash(&dir, &srcs(&["src/a.rs"]))
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2110,6 +2117,63 @@ mod tests {
         let (a, b, c) = (tmp.join("a"), tmp.join("b"), tmp.join("c"));
         assert_ne!(key(&a), key(&b)); // different content -> different key
         assert_eq!(key(&a), key(&c)); // same content elsewhere -> same key
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn run_bind_mount_keys_the_mounted_context_file() {
+        // A `RUN --mount=type=bind` reads a file from the context but never copies it, so
+        // its content must still enter the key — editing the mounted script busts the cache.
+        // A `--mount=type=cache`, by contrast, reads no context bytes and must not.
+        let tmp = std::env::temp_dir().join(format!("vk-runbind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("setup.sh"), "echo one\n").unwrap();
+        let ba = Vars::new();
+        let key = |dockerfile: &str| {
+            let plan = Plan::from_dockerfiles(
+                &[PlanInput {
+                    dockerfile: parser::parse(dockerfile).unwrap(),
+                    origin: "Dockerfile".into(),
+                    context: tmp.clone(),
+                }],
+                &ba,
+            )
+            .unwrap();
+            let order = plan.all_order().unwrap();
+            let mut ex = DryRun::new();
+            resolve_stages(&plan, &order, &ba, &mut ex, None).unwrap()[&0]
+                .final_key
+                .clone()
+        };
+
+        // explicit source: editing the mounted script busts the key
+        let explicit =
+            "FROM scratch\nRUN --mount=type=bind,source=/setup.sh,target=/setup.sh /setup.sh\n";
+        let before = key(explicit);
+        // default source (whole context): editing a context file also busts the key
+        let defaulted = "FROM scratch\nRUN --mount=type=bind,target=/ctx /ctx/setup.sh\n";
+        let before_default = key(defaulted);
+        // cache mount reads no context bytes, so its key must not track context content
+        let cached = "FROM scratch\nRUN --mount=type=cache,target=/c echo hi\n";
+        let before_cache = key(cached);
+
+        std::fs::write(tmp.join("setup.sh"), "echo two\n").unwrap();
+        assert_ne!(
+            before,
+            key(explicit),
+            "editing a bind-mounted script must bust the cache"
+        );
+        assert_ne!(
+            before_default,
+            key(defaulted),
+            "editing a context file must bust a default-source bind mount's key"
+        );
+        assert_eq!(
+            before_cache,
+            key(cached),
+            "a cache mount reads no context bytes, so its key must not change"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
