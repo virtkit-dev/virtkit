@@ -20,7 +20,7 @@
 //! a `ResolvedImage` returned from the cached dir keyed on `boot.kind`.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -990,7 +990,7 @@ async fn pull_into(
     // runner.ext4: create at total_size (a sparse hole), then write each chunk at
     // its offset so the zero gaps between chunks stay holes.
     let ext4 = tmp.join("runner.ext4");
-    let mut out = std::fs::OpenOptions::new()
+    let out = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
@@ -999,38 +999,68 @@ async fn pull_into(
     out.set_len(config.total_size)
         .with_context(|| format!("sizing {}", ext4.display()))?;
 
+    // Reassemble the chunks concurrently: each in-flight chunk fetches (network or the
+    // local cache), then decompresses + writes into its own disjoint slot on a blocking
+    // thread. The per-chunk zstd decode is CPU-bound, so overlapping it with the other
+    // fetches and decodes is the win. Writes use `pwrite`, so a shared `File` is safe.
+    // A chunk is either compressed-digest (blob = zstd, decode here) or raw
+    // (`transparent_zstd`: blob is the canonical raw bytes — the registry already
+    // served them decompressed, so write as-is). Self-describing via media type; other
+    // layers (kernel/initrd) are handled below.
+    use futures::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const RESTORE_CONCURRENCY: usize = 16;
+    let chunk_layers: Vec<OciDescriptor> = manifest
+        .layers
+        .iter()
+        .filter(|l| {
+            matches!(
+                l.media_type.as_str(),
+                CHUNK_MEDIA_TYPE | CHUNK_MEDIA_TYPE_RAW
+            )
+        })
+        .cloned()
+        .collect();
     let chunks_cache = chunks_cache_dir(dir);
-    let (mut fetched, mut reused) = (0usize, 0usize);
-    for layer in &manifest.layers {
-        // A chunk is either compressed-digest (blob = zstd, decode here) or raw
-        // (`transparent_zstd`: blob is the canonical raw bytes — the registry already
-        // served them decompressed, so write as-is). Self-describing via media type.
-        let compressed = match layer.media_type.as_str() {
-            CHUNK_MEDIA_TYPE => true,
-            CHUNK_MEDIA_TYPE_RAW => false,
-            _ => continue,
-        };
-        let (offset, _len) = chunk_placement(layer)?;
-        let bytes = pull_chunk(
-            client,
-            image,
-            layer,
-            &chunks_cache,
-            &mut fetched,
-            &mut reused,
-        )
-        .await?;
-        let raw = if compressed {
-            zstd::decode_all(&bytes[..])
-                .with_context(|| format!("zstd-decompressing chunk {}", layer.digest))?
-        } else {
-            bytes
-        };
-        write_chunk_sparse(&mut out, offset, &raw)
-            .with_context(|| format!("writing a chunk into {}", ext4.display()))?;
+    let out = std::sync::Arc::new(out);
+    let fetched = AtomicUsize::new(0);
+    let reused = AtomicUsize::new(0);
+    let results: Vec<Result<()>> = futures::stream::iter(chunk_layers)
+        .map(|layer| {
+            let compressed = layer.media_type == CHUNK_MEDIA_TYPE;
+            let out = std::sync::Arc::clone(&out);
+            let ext4 = ext4.clone();
+            let (fetched, reused, chunks_cache) = (&fetched, &reused, &chunks_cache);
+            async move {
+                let (offset, _len) = chunk_placement(&layer)?;
+                let bytes =
+                    pull_chunk(client, image, &layer, chunks_cache, fetched, reused).await?;
+                let digest = layer.digest;
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let raw = if compressed {
+                        zstd::decode_all(&bytes[..])
+                            .with_context(|| format!("zstd-decompressing chunk {digest}"))?
+                    } else {
+                        bytes
+                    };
+                    write_chunk_sparse(&out, offset, &raw)
+                        .with_context(|| format!("writing a chunk into {}", ext4.display()))
+                })
+                .await
+                .context("a chunk-reassembly worker panicked")?
+            }
+        })
+        .buffer_unordered(RESTORE_CONCURRENCY)
+        .collect()
+        .await;
+    for r in results {
+        r?;
     }
-    out.flush()?;
     drop(out);
+    let (fetched, reused) = (
+        fetched.load(Ordering::Relaxed),
+        reused.load(Ordering::Relaxed),
+    );
     println!(
         "virtkit: registry: {} ext4 chunks ({fetched} fetched, {reused} cached)",
         fetched + reused
@@ -1081,13 +1111,14 @@ async fn pull_chunk(
     image: &OciReference,
     layer: &OciDescriptor,
     cache: &Path,
-    fetched: &mut usize,
-    reused: &mut usize,
+    fetched: &std::sync::atomic::AtomicUsize,
+    reused: &std::sync::atomic::AtomicUsize,
 ) -> Result<Vec<u8>> {
+    use std::sync::atomic::Ordering;
     let hex = layer.digest.trim_start_matches("sha256:");
     let cached = cache.join(hex);
     if let Ok(bytes) = std::fs::read(&cached) {
-        *reused += 1;
+        reused.fetch_add(1, Ordering::Relaxed);
         return Ok(bytes);
     }
     let bytes = pull_blob_bytes(client, image, layer).await?;
@@ -1097,7 +1128,7 @@ async fn pull_chunk(
     let tmp = cache.join(format!("{hex}.tmp"));
     std::fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
     let _ = std::fs::rename(&tmp, &cached);
-    *fetched += 1;
+    fetched.fetch_add(1, Ordering::Relaxed);
     Ok(bytes)
 }
 
@@ -1121,12 +1152,57 @@ async fn pull_blob_bytes(
 /// tiles the whole file (chunks are contiguous, no gaps), so a zero region surfaces
 /// as all-zero chunks — without this skip they'd be written back as real zeros and
 /// densify the cached ext4 (a 16 GiB sparse image would land as 16 GiB on disk).
-fn write_chunk_sparse(out: &mut std::fs::File, offset: u64, raw: &[u8]) -> std::io::Result<()> {
+///
+/// A positioned write (`pwrite`, no shared file cursor), so parallel reassembly
+/// workers can each fill their own chunk's disjoint slot concurrently.
+fn write_chunk_sparse(out: &std::fs::File, offset: u64, raw: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
     if raw.iter().all(|&b| b == 0) {
         return Ok(());
     }
-    out.seek(SeekFrom::Start(offset))?;
-    out.write_all(raw)
+    out.write_all_at(raw, offset)
+}
+
+/// Reassemble a bundle's chunks into their (disjoint) slots in parallel: each worker
+/// claims the next layer and runs `place` on it, which decompresses the chunk and
+/// writes it at its offset. The per-chunk zstd decode is the bottleneck, so this
+/// scales with cores. Returns the first worker error, if any.
+fn reassemble_parallel<F>(layers: &[OciDescriptor], place: F) -> Result<()>
+where
+    F: Fn(&OciDescriptor) -> Result<()> + Sync,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(layers.len().max(1));
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= layers.len() {
+                        break;
+                    }
+                    if let Err(e) = place(&layers[i]) {
+                        let mut slot = err.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        // stop the other workers from starting new chunks.
+                        next.store(layers.len(), Ordering::Relaxed);
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    match err.into_inner().unwrap() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// A chunk descriptor's (offset, length) inside runner.ext4, from its annotations.
@@ -1439,7 +1515,7 @@ mod local {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let tmp = dest.with_extension("pull.tmp");
-        let mut out = std::fs::OpenOptions::new()
+        let out = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
@@ -1447,13 +1523,13 @@ mod local {
             .with_context(|| format!("creating {}", tmp.display()))?;
         out.set_len(config.total_size)
             .with_context(|| format!("sizing {}", tmp.display()))?;
-        for layer in &manifest.layers {
+        reassemble_parallel(&manifest.layers, |layer| {
             // self-describing via media type: a raw-digest chunk's canonical bytes ARE
             // the data; a compressed-digest chunk's canonical bytes are a zstd frame.
             let compressed = match layer.media_type.as_str() {
                 CHUNK_MEDIA_TYPE => true,
                 CHUNK_MEDIA_TYPE_RAW => false,
-                _ => continue,
+                _ => return Ok(()),
             };
             let (offset, _len) = chunk_placement(layer)?;
             let hex = layer.digest.trim_start_matches("sha256:");
@@ -1470,10 +1546,9 @@ mod local {
             } else {
                 bytes
             };
-            write_chunk_sparse(&mut out, offset, &raw)
-                .with_context(|| format!("writing a chunk into {}", tmp.display()))?;
-        }
-        out.flush()?;
+            write_chunk_sparse(&out, offset, &raw)
+                .with_context(|| format!("writing a chunk into {}", tmp.display()))
+        })?;
         drop(out);
         let _ = std::fs::remove_file(dest);
         std::fs::rename(&tmp, dest)
@@ -2138,7 +2213,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
-        let mut out = std::fs::OpenOptions::new()
+        let out = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
@@ -2153,9 +2228,8 @@ mod tests {
             count += 1;
             let comp = zstd::encode_all(&chunk.data[..], ZSTD_LEVEL).unwrap();
             let back = zstd::decode_all(&comp[..]).unwrap();
-            write_chunk_sparse(&mut out, chunk.offset, &back).unwrap();
+            write_chunk_sparse(&out, chunk.offset, &back).unwrap();
         }
-        out.flush().unwrap();
         drop(out);
         assert!(count > 1, "should split into several chunks");
 
@@ -2195,6 +2269,70 @@ mod tests {
             unchanged * 2 > before.len(),
             "expected most of {} chunks unchanged, only {unchanged} were",
             before.len()
+        );
+    }
+
+    /// `reassemble_parallel` fills disjoint chunk slots concurrently and comes back
+    /// byte-for-byte identical to the source; a failing placer surfaces as the Err.
+    #[test]
+    fn reassemble_parallel_is_byte_exact_and_propagates_errors() {
+        use std::collections::HashMap;
+
+        // Tile a buffer into fixed 64 KiB chunks at contiguous, disjoint offsets.
+        let data = pseudo_random(4 << 20, 0xfeed);
+        let chunk = 64 << 10;
+        let mut layers = Vec::new();
+        let mut raw_by_digest: HashMap<String, Vec<u8>> = HashMap::new();
+        for (i, slice) in data.chunks(chunk).enumerate() {
+            let digest = format!("sha256:{i:064x}");
+            raw_by_digest.insert(digest.clone(), slice.to_vec());
+            layers.push(chunk_descriptor(
+                "application/octet-stream",
+                &digest,
+                slice.len() as i64,
+                (i * chunk) as u64,
+                slice.len() as u64,
+            ));
+        }
+        assert!(
+            layers.len() > 4,
+            "need several chunks to exercise the workers"
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "virtkit-reassemble-parallel-{}.ext4",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let out = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        out.set_len(data.len() as u64).unwrap();
+
+        reassemble_parallel(&layers, |layer| {
+            let (offset, _len) = chunk_placement(layer)?;
+            write_chunk_sparse(&out, offset, &raw_by_digest[&layer.digest])?;
+            Ok(())
+        })
+        .unwrap();
+        drop(out);
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            data,
+            "parallel reassembly must match the input byte-for-byte"
+        );
+        let _ = std::fs::remove_file(&path);
+
+        // A failing placer surfaces as the returned Err (the first error wins).
+        let err = reassemble_parallel(&layers, |layer| anyhow::bail!("boom at {}", layer.digest))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("boom at"),
+            "expected the worker error to propagate, got: {err}"
         );
     }
 }
