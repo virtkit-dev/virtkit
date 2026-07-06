@@ -1022,6 +1022,10 @@ fn build_stage(
         let f = fs.as_mut().expect("materialized on first miss");
         progress.step_start(idx, i);
         apply_fs(plan, committed, ex, f, &step.state, &step.instr)?;
+        // The command is done; the snapshot + cache push that follow are commit overhead,
+        // not the step's runtime — freeze the reported time here so a trivial step isn't
+        // charged for the previous push's upload that `cache_save` joins.
+        progress.step_committing(idx, i);
         ex.cache_save(f, &step.key)?;
         progress.step_done(idx, i, Outcome::Ran);
     }

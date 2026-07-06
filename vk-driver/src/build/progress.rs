@@ -85,6 +85,10 @@ struct Tty {
     header: ProgressBar,
     /// running bars keyed by (stage, cell num); export uses [`EXPORT_KEY`].
     bars: Mutex<HashMap<(StageId, usize), ProgressBar>>,
+    /// a step's command run-time, frozen at [`Progress::step_committing`] so the emitted line
+    /// reports how long the RUN/COPY took — not that plus the snapshot + cache push that
+    /// `cache_save` folds in after it (which would inflate a trivial step to minutes).
+    ran: Mutex<HashMap<(StageId, usize), Duration>>,
 }
 
 /// bars-map key for the export tail (no real stage has this id).
@@ -212,6 +216,19 @@ impl Progress {
     }
     pub fn step_start(&self, stage: StageId, step: usize) {
         self.start_cell(stage, step + 2);
+    }
+    /// The step's command has finished; its snapshot + cache push are about to run. Freeze
+    /// the command's elapsed for the final line and switch the live bar to a dim "caching"
+    /// state, so the dashboard keeps moving through the commit instead of appearing to stall
+    /// on a step whose command is already done.
+    pub fn step_committing(&self, stage: StageId, step: usize) {
+        if let Backend::Tty(tty) = &self.backend {
+            let num = step + 2;
+            if let Some(pb) = tty.bars.lock().unwrap().get(&(stage, num)) {
+                tty.ran.lock().unwrap().insert((stage, num), pb.elapsed());
+                pb.set_style(self.commit_style());
+            }
+        }
     }
     pub fn step_done(&self, stage: StageId, step: usize, outcome: Outcome) {
         self.flush_partial(stage);
@@ -348,9 +365,16 @@ impl Progress {
     fn done_cell(&self, stage: StageId, num: usize, outcome: Outcome) {
         self.done.fetch_add(1, Ordering::Relaxed);
         // reclaim the running bar's elapsed (if this cell had one — cache hits never start).
+        // A step reports its frozen command time (see `step_committing`); the base has none
+        // frozen, so it falls back to the bar's full lifetime (its materialize time).
         let elapsed = if let Backend::Tty(tty) = &self.backend {
             tty.bars.lock().unwrap().remove(&(stage, num)).map(|pb| {
-                let e = pb.elapsed();
+                let e = tty
+                    .ran
+                    .lock()
+                    .unwrap()
+                    .remove(&(stage, num))
+                    .unwrap_or_else(|| pb.elapsed());
                 pb.finish_and_clear();
                 e
             })
@@ -425,6 +449,15 @@ impl Progress {
         // wrapped bar line would break indicatif's line accounting); the trailing {elapsed}
         // is thereby pushed to the right margin, matching the completed lines' status column.
         ProgressStyle::with_template(" => {spinner:.green} {wide_msg} {elapsed:.dim}")
+            .unwrap()
+            .tick_chars(SPINNER_TICKS)
+    }
+
+    /// The style for a step whose command has finished and is committing to the cache: a
+    /// dimmed label with a `caching` marker, distinguishing the snapshot/push phase from the
+    /// still-running command above it.
+    fn commit_style(&self) -> ProgressStyle {
+        ProgressStyle::with_template(" => {spinner:.yellow} {wide_msg:.dim} caching {elapsed:.dim}")
             .unwrap()
             .tick_chars(SPINNER_TICKS)
     }
@@ -537,6 +570,7 @@ impl Tty {
             sep,
             header,
             bars: Mutex::new(HashMap::new()),
+            ran: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -630,6 +664,7 @@ mod tests {
         p.base_done(1, Outcome::Ran);
         p.step_start(1, 0);
         p.emit(1, 1, b"Compiling foo\npartial-no-newline");
+        p.step_committing(1, 0);
         p.step_done(1, 0, Outcome::Ran);
         p.step_done(1, 1, Outcome::Cached); // a cache hit: no start
         p.export_start();
