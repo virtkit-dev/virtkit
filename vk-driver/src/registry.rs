@@ -1900,6 +1900,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Concurrent DIFF-pushes and pulls against one store, with heterogeneous content that
+    /// forces chunk sharing — the pattern a parallel multi-stage build hits: many stages
+    /// forked from a common base, each diff-pushed and pulled while siblings race the same
+    /// content-addressed blobs. Each image shares a prefix (chunks that dedup to the same
+    /// blobs, so pushers collide on those same blob writes) and carries a distinct suffix
+    /// (distinct blobs). A child is a diff over its base that reuses every parent chunk, so
+    /// it must reconstruct the base exactly. Asserts the store stays consistent under the
+    /// colliding writes — no torn or lost blob, every visible tag fully materialized — and
+    /// that every pull comes back byte-exact.
+    #[test]
+    fn local_concurrent_diff_push_pull_is_byte_exact() {
+        let root =
+            std::env::temp_dir().join(format!("vk-localreg-diffconc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let rg = local_registry(&root);
+        let dir = root.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        const N: usize = 8;
+        // shared 4 MiB prefix (identical chunks across all images) + a distinct 2 MiB suffix.
+        let prefix = pseudo_random(4 << 20, 0x5eed);
+        let bases: Vec<(std::path::PathBuf, Vec<u8>)> = (0..N)
+            .map(|t| {
+                let mut bytes = prefix.clone();
+                bytes.extend_from_slice(&pseudo_random(2 << 20, 0x100 + t as u64));
+                let p = dir.join(format!("base{t}.ext4"));
+                std::fs::write(&p, &bytes).unwrap();
+                (p, bytes)
+            })
+            .collect();
+
+        std::thread::scope(|s| {
+            // Pushers: publish each base, then diff-push an (empty) overlay child that reuses
+            // all of its parent's chunks — so the child reconstructs the base verbatim.
+            for (t, (base, _)) in bases.iter().enumerate() {
+                let (rg, dir) = (&rg, &dir);
+                s.spawn(move || {
+                    push_ext4(rg, "dc", &format!("base{t}"), base, "generic-disk").unwrap();
+                    let (parent, total) = fetch_chunks(rg, "dc", &format!("base{t}"))
+                        .unwrap()
+                        .unwrap();
+                    let ovl = dir.join(format!("child{t}.qcow2"));
+                    crate::qcow2::create_overlay(&ovl, base).unwrap();
+                    let (layers, size, _d) = push_ext4_diff(
+                        rg,
+                        "dc",
+                        &format!("child{t}"),
+                        &ovl,
+                        "generic-disk",
+                        total,
+                        &[], // untouched overlay: no dirty chunks, reuse the whole parent
+                        &parent,
+                    )
+                    .unwrap();
+                    assert_eq!(size, total);
+                    assert!(
+                        layers
+                            .iter()
+                            .all(|l| parent.iter().any(|p| p.digest == l.digest)),
+                        "child{t}: a clean diff must reuse only parent chunks"
+                    );
+                });
+            }
+            // Pullers: grab each base and its child as they appear, asserting byte-exactness.
+            for (t, (_, want)) in bases.iter().enumerate() {
+                let (rg, dir) = (&rg, &dir);
+                s.spawn(move || {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                    for tag in [format!("base{t}"), format!("child{t}")] {
+                        while !exists(rg, "dc", &tag) {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "tag {tag} never appeared"
+                            );
+                            std::thread::yield_now();
+                        }
+                        let dest = dir.join(format!("pull-{tag}.ext4"));
+                        assert!(try_pull_ext4(rg, "dc", &tag, &dest).unwrap().is_some());
+                        assert_eq!(
+                            &std::fs::read(&dest).unwrap(),
+                            want,
+                            "{tag} must pull back byte-exact under concurrent diff-pushes"
+                        );
+                    }
+                });
+            }
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// `vk registry gc` over a local-backend store: after one image's tag expires,
     /// gc sweeps its manifest/config/chunks but keeps the other image fully
     /// pullable — the mark phase walking the REAL manifests the backend writes.
