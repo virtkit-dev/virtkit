@@ -97,6 +97,11 @@ pub struct Options {
     /// the `None` = auto default (bounded by host RAM, each stage guest reserving a
     /// fixed slice). `1` forces the sequential build. Ignored by the host backend.
     pub build_jobs: Option<usize>,
+    /// Verify every stage snapshot with `e2fsck` (best-effort) as it crosses the cache
+    /// boundary — after a cache load, and before an upload — to catch a corrupt ext4
+    /// early instead of letting it poison the cache or ship in the image. Off by default
+    /// (an `e2fsck` per instruction is not free).
+    pub debug: bool,
 }
 
 /// `--require-cached` refusal: the target needs stages whose final snapshots are
@@ -430,6 +435,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
                 cache,
                 opts.journal,
                 opts.net.clone(),
+                opts.debug,
             );
             let jobs = resolve_build_jobs(opts, mv.mem_mib());
             let (committed, states) = drive_microvm(
@@ -2413,6 +2419,7 @@ ENTRYPOINT run me
             net: BuildNet::None,
             require_cached: false,
             build_jobs: None,
+            debug: false,
         };
         let via_file = build_host(&opts(tmp.join("a.ext4"))).unwrap();
         let via_inputs = build_inputs_host(
@@ -2467,6 +2474,7 @@ ENTRYPOINT run me
             net: BuildNet::None, // host backend: no RUN guests, no network
             require_cached: false,
             build_jobs: None,
+            debug: false,
         })
         .unwrap();
         let sidecar = config_sidecar(&out);
@@ -2657,6 +2665,7 @@ RUN ship
             net: BuildNet::All,
             require_cached: false,
             build_jobs: j,
+            debug: false,
         };
         // Explicit --build-jobs wins and is floored to 1.
         assert_eq!(resolve_build_jobs(&opts(Some(3)), 2048), 3);

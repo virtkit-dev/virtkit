@@ -264,6 +264,11 @@ enum Cmd {
         /// RAM; also settable via VIRTKIT_BUILD_JOBS. 1 forces a sequential build
         #[arg(long = "build-jobs", value_name = "N")]
         build_jobs: Option<usize>,
+        /// verify each stage snapshot with e2fsck as it crosses the instruction cache
+        /// (after a load, before an upload) to catch a corrupt ext4 early. Best-effort
+        /// (skipped if e2fsck is absent); adds an fsck per instruction
+        #[arg(long)]
+        debug: bool,
     },
     /// Host side of a forward (companion of `virtkit-agent forward`): accept on
     /// `--listen` and splice each connection to `--to`, opaque to the protocol.
@@ -1079,6 +1084,7 @@ async fn cli_main() -> ExitCode {
         build_allow_name,
         require_cached,
         build_jobs,
+        debug,
     } = &cli.cmd
     {
         // each --build-arg is NAME=VALUE; a bare NAME means an empty value.
@@ -1116,6 +1122,7 @@ async fn cli_main() -> ExitCode {
             net,
             require_cached: *require_cached,
             build_jobs: *build_jobs,
+            debug: *debug,
         };
         return match build::build(&opts) {
             Ok(_) => ExitCode::SUCCESS,

@@ -107,6 +107,7 @@ pub fn ensure_unit_build(
         net: crate::build::BuildNet::All,
         require_cached: false,
         build_jobs: None,
+        debug: false,
     })?;
     let uuid = parse_uuid(&expected).expect("fingerprint is a canonical UUID");
     crate::ext4::set_uuid(out, &uuid)

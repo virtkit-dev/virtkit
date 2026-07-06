@@ -221,6 +221,44 @@ pub fn build_empty(out: &Path, extra_free_blocks: u64) -> Result<()> {
     r
 }
 
+/// Result of a best-effort ext4 consistency check ([`fsck`]).
+pub enum FsckResult {
+    /// The filesystem passed `e2fsck -fn` cleanly.
+    Clean,
+    /// `e2fsck` reported on-disk corruption. Carries its combined output for the log.
+    Corrupt(String),
+    /// The check could not run (`e2fsck` missing, or an operational error) — inconclusive.
+    /// Carries a short reason; callers treat this as "not verified", never as corruption.
+    Skipped(String),
+}
+
+/// Run a read-only consistency check (`e2fsck -fn`) on a raw ext4 `image`. Diagnostic only:
+/// it never modifies the image and never hard-depends on `e2fsck` being installed —
+/// `--debug` build paths use it to catch a corrupt snapshot before it poisons the cache
+/// (or after it is loaded). A missing/unrunnable `e2fsck` yields [`FsckResult::Skipped`].
+pub fn fsck(image: &Path) -> FsckResult {
+    // -f: force a full check even if the superblock looks clean; -n: answer "no" to every
+    // fix prompt (read-only, never touches the image).
+    let out = match Command::new("e2fsck").arg("-fn").arg(image).output() {
+        Ok(o) => o,
+        Err(e) => return FsckResult::Skipped(format!("e2fsck could not run: {e}")),
+    };
+    match out.status.code() {
+        // e2fsck exit is a bitmask. 0 = no errors. Bits 1/2 = errors (would be) corrected,
+        // 4 = errors left uncorrected — any of these means on-disk corruption was found
+        // (and it may abort with bit 8 also set, e.g. exit 12, so check corruption bits
+        // first). Bits 8/16/32 *alone* (operational/usage/cancelled — e.g. the file is not
+        // an ext4) mean the check couldn't conclude, not that the fs is corrupt.
+        Some(0) => FsckResult::Clean,
+        Some(c) if c & 0b111 != 0 => {
+            let mut msg = String::from_utf8_lossy(&out.stdout).into_owned();
+            msg.push_str(&String::from_utf8_lossy(&out.stderr));
+            FsckResult::Corrupt(msg.trim().to_string())
+        }
+        other => FsckResult::Skipped(format!("e2fsck exited {other:?} (operational error)")),
+    }
+}
+
 /// Zero the ext4 superblock's volatile bookkeeping — the write/mount/check timestamps and
 /// the lifetime "kbytes written" / mount counters — so an exported image is deterministic:
 /// a warm (cache-restored) build and a cold build produce byte-identical artifacts, and a
@@ -1953,6 +1991,63 @@ mod tests {
     }
     fn rd32(b: &[u8], o: usize) -> u32 {
         u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
+    }
+
+    /// `fsck` passes a freshly built ext4 and flags a trashed one. Skipped when `e2fsck`
+    /// is not installed (the check is best-effort), so CI without e2fsprogs still passes.
+    #[test]
+    fn fsck_passes_clean_and_flags_corrupt() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = std::env::temp_dir().join(format!("vk-fsck-{}", std::process::id()));
+        let src = dir.join("src");
+        // A tree with several dirs + files, so the fs has real inode table + directory
+        // blocks to corrupt (an empty fs is too forgiving for e2fsck to flag).
+        for d in ["a", "b", "a/c"] {
+            std::fs::create_dir_all(src.join(d)).unwrap();
+        }
+        for (p, n) in [("a/f1", 4096), ("b/f2", 200_000), ("a/c/f3", 50_000)] {
+            std::fs::write(src.join(p), vec![0x5au8; n]).unwrap();
+        }
+        let img = dir.join("fs.ext4");
+        build_from_dir(&src, &img).unwrap();
+
+        match fsck(&img) {
+            FsckResult::Clean => {}
+            // e2fsck absent/unrunnable: nothing more to assert.
+            FsckResult::Skipped(_) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            FsckResult::Corrupt(r) => panic!("a freshly built ext4 must be clean, got: {r}"),
+        }
+
+        // Zero the root inode (inode 2), leaving the superblock, group descriptors and
+        // bitmaps intact — so e2fsck opens the fs cleanly but finds the root inode invalid
+        // (mode 0 / not a directory): a structural error, not an "operational" open failure.
+        {
+            let raw = std::fs::read(&img).unwrap();
+            let sb = &raw[1024..]; // primary superblock
+            let block_size = 1024u64 << rd32(sb, 24); // s_log_block_size
+            let inode_size = rd16(sb, 88).max(128) as u64; // s_inode_size
+            // GDT follows the superblock's block: block 1 for >1 KiB blocks, block 2 for 1 KiB.
+            let gdt_off = if block_size == 1024 {
+                2 * block_size
+            } else {
+                block_size
+            } as usize;
+            let inode_table_block = rd32(&raw[gdt_off..], 8) as u64; // bg_inode_table_lo
+            // inodes are 1-indexed, so inode 2 (the root) sits one inode into the table.
+            let root = inode_table_block * block_size + inode_size;
+            let mut f = std::fs::OpenOptions::new().write(true).open(&img).unwrap();
+            f.seek(SeekFrom::Start(root)).unwrap();
+            f.write_all(&vec![0u8; inode_size as usize]).unwrap();
+        }
+        match fsck(&img) {
+            FsckResult::Corrupt(_) => {}
+            FsckResult::Skipped(why) => panic!("e2fsck should have run: {why}"),
+            FsckResult::Clean => panic!("a trashed ext4 must not pass fsck"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

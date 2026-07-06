@@ -317,6 +317,9 @@ pub struct MicroVm {
     cpus: u32,
     mem: String,
     boot_timeout_secs: u64,
+    /// `--debug`: e2fsck each stage snapshot as it crosses the cache (after a load, before
+    /// an upload) to catch a corrupt ext4 early. Best-effort; adds an fsck per instruction.
+    debug: bool,
     /// spare free blocks left in each stage's ext4 so RUN steps can write.
     free_blocks: u64,
     /// instruction-cache registry: each instruction's resulting ext4 is pushed here
@@ -479,6 +482,7 @@ fn base_cache_key(image: &str) -> String {
 }
 
 impl MicroVm {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cloud_hypervisor: PathBuf,
         kernel: PathBuf,
@@ -487,6 +491,7 @@ impl MicroVm {
         cache: Option<crate::config::Registry>,
         journal: bool,
         net: crate::build::BuildNet,
+        debug: bool,
     ) -> Self {
         MicroVm {
             cloud_hypervisor,
@@ -496,6 +501,7 @@ impl MicroVm {
             cpus: 2,
             mem: "2G".into(),
             boot_timeout_secs: 120,
+            debug,
             // 32 GiB of writable headroom: a real image (full toolchains + large apt
             // installs) writes many GiB into a single stage. The ext4 is sparse and the
             // overlay/push are hole-aware, so the unused capacity costs nothing on disk.
@@ -543,6 +549,7 @@ impl MicroVm {
             cpus: self.cpus,
             mem: self.mem.clone(),
             boot_timeout_secs: self.boot_timeout_secs,
+            debug: self.debug,
             free_blocks: self.free_blocks,
             cache: self.cache.clone(),
             images: Arc::clone(&self.images),
@@ -593,6 +600,47 @@ impl MicroVm {
             self.session = Some(s);
         }
         Ok(())
+    }
+    /// `--debug`: run `e2fsck` on a raw ext4 as it crosses the cache boundary. A clean fs
+    /// (or an inconclusive skip — e2fsck absent) passes; genuine corruption fails the build
+    /// with `context` naming where it was caught, so a bad snapshot never silently becomes a
+    /// corrupt image or an EUCLEAN mid-build. No-op unless `--debug` is set.
+    fn verify_ext4(&self, image: &Path, context: &str) -> Result<()> {
+        if !self.debug {
+            return Ok(());
+        }
+        match crate::ext4::fsck(image) {
+            crate::ext4::FsckResult::Clean => Ok(()),
+            crate::ext4::FsckResult::Skipped(why) => {
+                eprintln!("virtkit: --debug: ext4 check of {context} skipped ({why})");
+                Ok(())
+            }
+            crate::ext4::FsckResult::Corrupt(report) => bail!(
+                "--debug: {context} is a corrupt ext4 (e2fsck):\n{report}\n\
+                 this snapshot must not be used; evict it from the cache and rebuild"
+            ),
+        }
+    }
+    /// `--debug`: verify a snapshot qcow2 that is about to be uploaded to the cache. The
+    /// capture is synchronous (only the upload is async), so a corrupt snapshot fails the
+    /// build here and now — it must not ship in the image or poison the cache for a later
+    /// build. Flattens to a throwaway raw for `e2fsck`, then discards it. No-op unless
+    /// `--debug` is set.
+    fn verify_snapshot(&self, snap: &Path, context: &str) -> Result<()> {
+        if !self.debug {
+            return Ok(());
+        }
+        let raw = snap.with_extension("fsck.raw");
+        let flattened = crate::qcow2::flatten_to_raw(snap, &raw)
+            .with_context(|| format!("flattening {} for the --debug ext4 check", snap.display()));
+        if flattened.is_err() {
+            // A partially-written raw may linger even on failure; do not leak it.
+            let _ = std::fs::remove_file(&raw);
+        }
+        flattened?;
+        let r = self.verify_ext4(&raw, context);
+        let _ = std::fs::remove_file(&raw);
+        r
     }
     fn image_path(&self, stage: &str) -> PathBuf {
         self.scratch
@@ -721,6 +769,7 @@ impl Executor for MicroVm {
             && crate::registry::exists(&rg, CACHE_REPO, &base_key)
             && let Some(digest) = crate::registry::try_pull_ext4(&rg, CACHE_REPO, &base_key, &ext4)?
         {
+            self.verify_ext4(&ext4, &format!("cached base image {image} (after load)"))?;
             self.wrap_base(stage, &ext4)?;
             self.parent_key = Some(base_key);
             self.parent_digest = Some(digest);
@@ -1098,6 +1147,10 @@ impl Executor for MicroVm {
         let Some(digest) = crate::registry::try_pull_ext4(&rg, CACHE_REPO, key, &ext4)? else {
             bail!("cached instruction {key} vanished from the registry");
         };
+        // `--debug`: a reassembled snapshot must be a clean ext4 before the build boots or
+        // forks it — else a corrupt cache entry (bad chunks / a poisoned push) silently
+        // becomes a corrupt image or an EUCLEAN mid-build.
+        self.verify_ext4(&ext4, &format!("cached instruction {key} (after load)"))?;
         self.wrap_base(&fs.label, &ext4)?;
         // the restored snapshot is the parent the next save diffs against — pin its digest.
         self.parent_key = Some(key.to_string());
@@ -1117,6 +1170,7 @@ impl Executor for MicroVm {
         // capture (no freeze/copy needed).
         if self.session.is_none() {
             let img = self.stage_image(fs)?;
+            self.verify_snapshot(&img, &format!("snapshot of {key} (before upload)"))?;
             let (cumulative, total_size) = {
                 let mut q = crate::qcow2::Qcow2::open(&img)?;
                 (q.data_extents()?, q.virtual_size())
@@ -1170,6 +1224,7 @@ impl Executor for MicroVm {
                 .expect("session present")
                 .capture(&snap),
         )?;
+        self.verify_snapshot(&snap, &format!("snapshot of {key} (before upload)"))?;
         // Native qcow2 read: the overlay's own clusters (cumulative dirty) + its size.
         let (cumulative, total_size) = {
             let mut q = crate::qcow2::Qcow2::open(&snap)?;

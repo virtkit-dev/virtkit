@@ -439,6 +439,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             net: args.build_net.clone(),
             require_cached: args.require_cached,
             build_jobs: None,
+            debug: false,
         };
         image_env = crate::build::build(&opts)?.config.env;
         Some(out)
@@ -1120,6 +1121,7 @@ fn build_service_image(
         net: args.build_net.clone(),
         require_cached: args.require_cached,
         build_jobs: None,
+        debug: false,
     };
     match &unit.source {
         crate::compose::Source::Build {
