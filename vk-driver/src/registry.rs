@@ -43,7 +43,7 @@ const CDC_MAX: u32 = 16 << 20;
 // Fixed zstd level: identical raw chunks must compress to identical bytes for the
 // blob digest (sha256 of the compressed bytes) to dedup. Shared with regserve's
 // transparent storage compression.
-pub(crate) const ZSTD_LEVEL: i32 = 3;
+pub(crate) const ZSTD_LEVEL: i32 = 1;
 
 // Media types for the bundle artifact.
 const ARTIFACT_TYPE: &str = "application/vnd.wallix.microvm.bundle";

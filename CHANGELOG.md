@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- `vk push` now compresses image chunks at a faster zstd level, speeding up
+  pushes at the cost of slightly larger uploads and registry storage.
+
 ## [0.8.0] - 2026-07-07
 
 ### Added
