@@ -74,6 +74,9 @@ pub struct Build {
     pub cache_registry: Option<String>,
     /// the cache registry speaks plain HTTP (a loopback regserve).
     pub cache_insecure: bool,
+    /// how aggressively the instruction cache is populated: `auto` (default), `layers`
+    /// (one snapshot per stage), or `instructions` (one per RUN/COPY).
+    pub build_cache: crate::build::BuildCache,
     /// add an ext4 journal to the exported image (the build itself stays journal-less).
     pub journal: bool,
 }
@@ -537,13 +540,19 @@ mod tests {
             agent = "/k/virtkit-agent"
             cache_registry = "127.0.0.1:5000"
             cache_insecure = true
+            build_cache = "layers"
             "#,
         )
         .unwrap();
         assert_eq!(cfg.build.kernel.as_deref(), Some(Path::new("/k/vmlinux")));
         assert_eq!(cfg.build.cache_registry.as_deref(), Some("127.0.0.1:5000"));
         assert!(cfg.build.cache_insecure && !cfg.build.journal);
-        // absent [build] = all unset
+        assert_eq!(cfg.build.build_cache, crate::build::BuildCache::Layers);
+        // absent [build] = all unset, cache mode defaults to auto
         assert!(Config::default().build.cache_registry.is_none());
+        assert_eq!(
+            Config::default().build.build_cache,
+            crate::build::BuildCache::Auto
+        );
     }
 }

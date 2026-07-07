@@ -22,7 +22,10 @@
 //! makes successive snapshots share almost all blobs). On a rebuild the longest cached
 //! prefix is restored and only the changed tail re-runs; a stage whose last key is
 //! cached restores that one snapshot directly (no per-instruction probes), and a stage
-//! only such fully-cached consumers read is skipped entirely.
+//! only such fully-cached consumers read is skipped entirely. How many intermediate
+//! snapshots a cold build actually pushes is set by [`BuildCache`] (`--build-cache`):
+//! stage-level reuse works in every mode, so the mode only trades per-instruction commit
+//! overhead against how much of a stage a later edit re-runs.
 //!
 //! A context `COPY` also keys on a sha256 of the (sorted, `.dockerignore`-filtered)
 //! content of the files it references, so editing a copied source busts the cache; a
@@ -46,6 +49,7 @@ mod progress;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use tokio_util::sync::CancellationToken;
@@ -55,6 +59,75 @@ use interp::Vars;
 use parser::Instruction;
 use plan::{Base, Plan, PlanInput};
 use progress::{Outcome, Progress, StageInit};
+
+/// How aggressively a build populates the instruction cache.
+///
+/// Restoring a cached prefix and the fully-cached-stage fast path both work at stage
+/// granularity in every mode, so a build whose target is unchanged costs the same
+/// regardless. The mode only changes *which* intermediate `RUN`/`COPY` snapshots are
+/// pushed on a cold or partial build — trading the per-instruction commit overhead (a
+/// guest freeze + diff + push per step) against how much of a stage a later edit re-runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildCache {
+    /// Checkpoint past a work threshold: a stage's final step is always cached (so
+    /// stage-level reuse and `COPY --from` still hit), plus any intermediate step once
+    /// the uncommitted run time since the last checkpoint crosses [`CHECKPOINT_SECS`]
+    /// (override `VIRTKIT_BUILD_CACHE_CHECKPOINT_SECS`). Trivial steps fold into the
+    /// next checkpoint's delta, so a long stage pays a handful of commits instead of one
+    /// per instruction, while a late-instruction edit still resumes from a recent
+    /// checkpoint.
+    #[default]
+    Auto,
+    /// One commit per stage: cache only each stage's final snapshot, with no intermediate
+    /// snapshots and no partial-prefix restore. Fastest cold build; any mid-stage change
+    /// re-runs the whole stage.
+    Layers,
+    /// Cache every `RUN`/`COPY` snapshot, so a rebuild restores the longest cached prefix
+    /// and re-runs only the changed tail — at the cost of a commit per instruction.
+    Instructions,
+}
+
+impl std::str::FromStr for BuildCache {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "layers" => Ok(Self::Layers),
+            "instructions" => Ok(Self::Instructions),
+            other => Err(format!(
+                "invalid build cache mode {other:?} (expected auto, layers, or instructions)"
+            )),
+        }
+    }
+}
+
+/// `auto` mode's checkpoint threshold (seconds): an intermediate snapshot is pushed once
+/// this much uncommitted run time has accrued since the last checkpoint. Bounds the work
+/// a late-instruction edit re-runs while sparing trivial steps a commit each.
+const CHECKPOINT_SECS: u64 = 20;
+
+// Test-only override for `checkpoint_secs`: forces the `auto` threshold on the current
+// thread so a test can exercise it without mutating the process environment (which would
+// race other tests' concurrent reads under the multithreaded runner). Thread-local, so it
+// is invisible to other tests — `build_stage` reads it on the caller's thread.
+#[cfg(test)]
+thread_local! {
+    static CHECKPOINT_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// The effective `auto` checkpoint threshold, `VIRTKIT_BUILD_CACHE_CHECKPOINT_SECS`
+/// overriding the [`CHECKPOINT_SECS`] default.
+fn checkpoint_secs() -> u64 {
+    #[cfg(test)]
+    if let Some(secs) = CHECKPOINT_OVERRIDE.with(std::cell::Cell::get) {
+        return secs;
+    }
+    std::env::var("VIRTKIT_BUILD_CACHE_CHECKPOINT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(CHECKPOINT_SECS)
+}
 
 /// What/how to build.
 pub struct Options {
@@ -81,6 +154,8 @@ pub struct Options {
     pub cache_registry: Option<String>,
     /// the cache registry speaks plain HTTP (a loopback regserve).
     pub cache_insecure: bool,
+    /// how aggressively the instruction cache is populated (see [`BuildCache`]).
+    pub build_cache: BuildCache,
     /// add an ext4 journal to the exported image (the build stays journal-less).
     pub journal: bool,
     /// `--build-arg NAME=VALUE` overrides for ARG defaults.
@@ -347,6 +422,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
             &build_args,
             &mut ex,
             false,
+            opts.build_cache,
             &Progress::disabled(),
         )?;
         println!("# build order: {order:?} (target stage {target})");
@@ -448,6 +524,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
                 &mv,
                 jobs,
                 opts.require_cached,
+                opts.build_cache,
                 &progress,
             )?;
             // `mv` shares the workers' `images` map (same Arc), so it can export the
@@ -461,6 +538,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
                 &build_args,
                 &mut ex,
                 opts.require_cached,
+                opts.build_cache,
                 &progress,
             )?;
             (committed, states, Box::new(ex))
@@ -963,6 +1041,7 @@ fn build_stage(
     committed: &HashMap<usize, Rootfs>,
     ex: &mut dyn Executor,
     idx: usize,
+    cache: BuildCache,
     progress: &Arc<Progress>,
     cancel: Option<&CancellationToken>,
 ) -> Result<Rootfs> {
@@ -1009,6 +1088,14 @@ fn build_stage(
     // miss; materialization of the base itself stays lazy (deferred to that first miss).
     let mut base_shown = false;
     let mut last_hit: Option<String> = None;
+    // `layers` never writes intermediate snapshots, so their keys can't hit — skip the
+    // per-step probe (a registry round-trip each) and build the whole stage from base.
+    // The fully-cached stage was already short-circuited above via `cached_final`.
+    let probe = !matches!(cache, BuildCache::Layers);
+    // `auto`: uncommitted run time accrued since the last checkpoint, and the threshold
+    // it must cross to force one. Reset on every commit.
+    let checkpoint = Duration::from_secs(checkpoint_secs());
+    let mut uncommitted = Duration::ZERO;
     for (i, step) in steps.iter().enumerate() {
         // Stop between steps if another stage has failed (covers the gap between a fast
         // step finishing and the next boot; a long in-flight RUN is cut short in-guest).
@@ -1017,7 +1104,7 @@ fn build_stage(
         {
             bail!("build stopped after an earlier stage failed");
         }
-        if !building && ex.cache_has(&step.key) {
+        if probe && !building && ex.cache_has(&step.key) {
             // A cached prefix restores the base as part of it, so the FROM line is CACHED;
             // emit it before this step's line so it prints in order.
             if !base_shown {
@@ -1051,14 +1138,30 @@ fn build_stage(
         }
         let f = fs.as_mut().expect("materialized on first miss");
         progress.step_start(idx, i);
+        let t0 = Instant::now();
         apply_fs(plan, committed, ex, f, &step.state, &step.instr)
             .inspect_err(|_| progress.step_failed(idx, i))?;
-        // The command is done; the snapshot + cache push that follow are commit overhead,
-        // not the step's runtime — freeze the reported time here so a trivial step isn't
-        // charged for the previous push's upload that `cache_save` joins.
-        progress.step_committing(idx, i);
-        ex.cache_save(f, &step.key)
-            .inspect_err(|_| progress.step_failed(idx, i))?;
+        uncommitted += t0.elapsed();
+        // The stage's final step is always committed (so stage-level reuse and
+        // `COPY --from` hit); which intermediate steps are, depends on the mode:
+        // `instructions` commits every step, `layers` none, `auto` one once enough
+        // uncommitted run time has accrued (deferring is safe — the overlay is
+        // cumulative, so a later capture recovers the merged multi-step delta).
+        let last = i + 1 == steps.len();
+        let commit = match cache {
+            BuildCache::Instructions => true,
+            BuildCache::Layers => last,
+            BuildCache::Auto => last || uncommitted >= checkpoint,
+        };
+        if commit {
+            // The command is done; the snapshot + cache push that follow are commit
+            // overhead, not the step's runtime — freeze the reported time here so a
+            // trivial step isn't charged for the previous push's upload `cache_save` joins.
+            progress.step_committing(idx, i);
+            ex.cache_save(f, &step.key)
+                .inspect_err(|_| progress.step_failed(idx, i))?;
+            uncommitted = Duration::ZERO;
+        }
         progress.step_done(idx, i, Outcome::Ran);
     }
     // Nothing ran: the whole instruction run was cached → restore the final snapshot; or
@@ -1106,6 +1209,7 @@ fn drive(
     build_args: &Vars,
     ex: &mut dyn Executor,
     require_cached: bool,
+    cache: BuildCache,
     progress: &Arc<Progress>,
 ) -> Result<(HashMap<usize, Rootfs>, HashMap<usize, ShellState>)> {
     let resolved = resolve_all(plan, order, build_args, ex)?;
@@ -1123,6 +1227,7 @@ fn drive(
             &committed,
             ex,
             idx,
+            cache,
             progress,
             None,
         )?;
@@ -1256,6 +1361,7 @@ where
 /// guest and cache-push bookkeeping); the workers share only the committed-image maps,
 /// and a stage is committed before any dependent starts — the same ordering the
 /// sequential [`drive`] guarantees, so the exported image and cache are identical.
+#[allow(clippy::too_many_arguments)]
 fn drive_microvm(
     plan: &Plan,
     order: &[usize],
@@ -1263,6 +1369,7 @@ fn drive_microvm(
     base: &MicroVm,
     jobs: usize,
     require_cached: bool,
+    cache: BuildCache,
     progress: &Arc<Progress>,
 ) -> Result<(HashMap<usize, Rootfs>, HashMap<usize, ShellState>)> {
     // Read-only passes on a throwaway worker (shares `base`'s memoization + cache maps).
@@ -1309,6 +1416,7 @@ fn drive_microvm(
             done,
             &mut ex,
             idx,
+            cache,
             progress,
             Some(&cancel),
         )
@@ -1843,7 +1951,16 @@ mod tests {
         let t = plan.resolve_target(target).unwrap();
         let order = plan.build_order(t).unwrap();
         let mut ex = DryRun::new();
-        drive(&plan, &order, &ba, &mut ex, false, &Progress::disabled()).unwrap();
+        drive(
+            &plan,
+            &order,
+            &ba,
+            &mut ex,
+            false,
+            BuildCache::Instructions,
+            &Progress::disabled(),
+        )
+        .unwrap();
         ex.transcript
     }
 
@@ -1901,6 +2018,7 @@ mod tests {
             Ok(())
         }
         fn cache_save(&mut self, _fs: &Rootfs, key: &str) -> Result<()> {
+            self.inner.transcript.push(format!("cache-save {key}"));
             self.cache.insert(key.to_string());
             self.last_saved = Some(key.to_string());
             Ok(())
@@ -1916,7 +2034,16 @@ mod tests {
         let order = plan.build_order(t).unwrap();
         // cold: everything runs and populates the cache
         let mut ex = CachedDry::default();
-        drive(&plan, &order, &ba, &mut ex, false, &Progress::disabled()).unwrap();
+        drive(
+            &plan,
+            &order,
+            &ba,
+            &mut ex,
+            false,
+            BuildCache::Instructions,
+            &Progress::disabled(),
+        )
+        .unwrap();
         assert!(ex.inner.transcript.iter().any(|l| l.starts_with("run ")));
         // warm: one probe of the target's final key, one restore — no per-step
         // probes, nothing built, the builder stage never touched
@@ -1925,7 +2052,16 @@ mod tests {
             cache: ex.cache,
             last_saved: None,
         };
-        drive(&plan, &order, &ba, &mut ex, false, &Progress::disabled()).unwrap();
+        drive(
+            &plan,
+            &order,
+            &ba,
+            &mut ex,
+            false,
+            BuildCache::Instructions,
+            &Progress::disabled(),
+        )
+        .unwrap();
         let t = &ex.inner.transcript;
         assert_eq!(t.len(), 2, "{t:?}");
         assert!(
@@ -1945,7 +2081,16 @@ mod tests {
         // cold cache: refused with the typed error, before anything runs; the
         // unnamed final stage reports its `stage{i}` fallback name
         let mut ex = CachedDry::default();
-        let err = drive(&plan, &order, &ba, &mut ex, true, &Progress::disabled()).unwrap_err();
+        let err = drive(
+            &plan,
+            &order,
+            &ba,
+            &mut ex,
+            true,
+            BuildCache::Instructions,
+            &Progress::disabled(),
+        )
+        .unwrap_err();
         let nc = err.downcast_ref::<NotCached>().expect("typed NotCached");
         assert_eq!(nc.stages, vec!["stage1".to_string()]);
         assert!(
@@ -1964,6 +2109,7 @@ mod tests {
             &ba,
             &mut CachedDry::default(),
             true,
+            BuildCache::Instructions,
             &Progress::disabled(),
         )
         .unwrap_err();
@@ -1975,13 +2121,31 @@ mod tests {
         );
         // populated cache: the same require-cached drive restores, builds nothing
         let mut ex = CachedDry::default();
-        drive(&plan, &order, &ba, &mut ex, false, &Progress::disabled()).unwrap();
+        drive(
+            &plan,
+            &order,
+            &ba,
+            &mut ex,
+            false,
+            BuildCache::Instructions,
+            &Progress::disabled(),
+        )
+        .unwrap();
         let mut ex = CachedDry {
             inner: DryRun::new(),
             cache: ex.cache,
             last_saved: None,
         };
-        drive(&plan, &order, &ba, &mut ex, true, &Progress::disabled()).unwrap();
+        drive(
+            &plan,
+            &order,
+            &ba,
+            &mut ex,
+            true,
+            BuildCache::Instructions,
+            &Progress::disabled(),
+        )
+        .unwrap();
         let t = &ex.inner.transcript;
         assert!(t.iter().any(|l| l.starts_with("cache-restore ")), "{t:?}");
         assert!(!t.iter().any(|l| l.starts_with("run ")), "{t:?}");
@@ -1998,7 +2162,16 @@ mod tests {
         // cold run populates the cache; evict the target's final key so only the
         // target's last instruction must re-run
         let mut ex = CachedDry::default();
-        drive(&plan, &order, &ba, &mut ex, false, &Progress::disabled()).unwrap();
+        drive(
+            &plan,
+            &order,
+            &ba,
+            &mut ex,
+            false,
+            BuildCache::Instructions,
+            &Progress::disabled(),
+        )
+        .unwrap();
         let mut cache = ex.cache;
         cache.remove(&ex.last_saved.unwrap());
         let mut ex = CachedDry {
@@ -2006,7 +2179,16 @@ mod tests {
             cache,
             last_saved: None,
         };
-        drive(&plan, &order, &ba, &mut ex, false, &Progress::disabled()).unwrap();
+        drive(
+            &plan,
+            &order,
+            &ba,
+            &mut ex,
+            false,
+            BuildCache::Instructions,
+            &Progress::disabled(),
+        )
+        .unwrap();
         let t = &ex.inner.transcript;
         let count = |p: &str| t.iter().filter(|l| l.starts_with(p)).count();
         // probes: the target's last key (miss), the builder's last key (hit), then the
@@ -2018,6 +2200,108 @@ mod tests {
         assert_eq!(count("copy "), 1, "{t:?}");
         assert_eq!(count("run "), 0, "{t:?}");
         assert_eq!(count("from-image "), 0, "{t:?}");
+    }
+
+    /// The `--build-cache` modes differ only in which snapshots a cold build pushes:
+    /// `layers` and (with instant DryRun steps, below the checkpoint) `auto` commit one
+    /// snapshot per stage — its final step — while `instructions` commits every step.
+    /// `layers` additionally skips the per-step prefix probe. Two stages of two steps
+    /// each (the target `COPY --from` pulls the builder in), so a full-instruction build
+    /// commits 4 snapshots and a stage-level build 2.
+    #[test]
+    fn build_cache_modes_control_which_snapshots_are_pushed() {
+        let src = "FROM alpine AS builder\nRUN one\nRUN two\n\n\
+                   FROM alpine\nRUN three\nCOPY --from=builder /a /b\n";
+        let ba = Vars::new();
+        let plan = plan_one(src, &ba);
+        let order = plan
+            .build_order(plan.resolve_target(None).unwrap())
+            .unwrap();
+        let cold = |mode| {
+            let mut ex = CachedDry::default();
+            drive(
+                &plan,
+                &order,
+                &ba,
+                &mut ex,
+                false,
+                mode,
+                &Progress::disabled(),
+            )
+            .unwrap();
+            let t = &ex.inner.transcript;
+            let count = |p: &str| t.iter().filter(|l| l.starts_with(p)).count();
+            (
+                count("cache-save "),
+                count("cache-has "),
+                count("run ") + count("copy "),
+            )
+        };
+        // every mode runs all four steps; they diverge only in commits (and, for
+        // `layers`, in probes: no per-step `cache_has`, just the two stage-final probes).
+        assert_eq!(cold(BuildCache::Instructions), (4, 4, 4));
+        assert_eq!(cold(BuildCache::Auto), (2, 4, 4));
+        assert_eq!(cold(BuildCache::Layers), (2, 2, 4));
+
+        // Forcing the checkpoint to 0 makes `auto` cross the threshold on every step, so it
+        // commits all four like `instructions` — exercising the upper `uncommitted >=
+        // checkpoint` branch. The override is thread-local, so `cold` (which drives the build
+        // synchronously on this thread) sees it while other tests are unaffected.
+        CHECKPOINT_OVERRIDE.with(|c| c.set(Some(0)));
+        let auto_zero = cold(BuildCache::Auto);
+        CHECKPOINT_OVERRIDE.with(|c| c.set(None));
+        assert_eq!(auto_zero, (4, 4, 4));
+    }
+
+    /// A build whose target is fully cached restores its final snapshot in every mode —
+    /// each mode's cold run commits the target's last step, so the warm rebuild takes the
+    /// fully-cached fast path (one probe, one restore, nothing runs) regardless.
+    #[test]
+    fn every_mode_restores_a_fully_cached_target() {
+        let src = "FROM alpine\nRUN one\nRUN two\n";
+        let ba = Vars::new();
+        let plan = plan_one(src, &ba);
+        let order = plan
+            .build_order(plan.resolve_target(None).unwrap())
+            .unwrap();
+        for mode in [
+            BuildCache::Auto,
+            BuildCache::Layers,
+            BuildCache::Instructions,
+        ] {
+            let mut cold = CachedDry::default();
+            drive(
+                &plan,
+                &order,
+                &ba,
+                &mut cold,
+                false,
+                mode,
+                &Progress::disabled(),
+            )
+            .unwrap();
+            let mut warm = CachedDry {
+                inner: DryRun::new(),
+                cache: cold.cache,
+                last_saved: None,
+            };
+            drive(
+                &plan,
+                &order,
+                &ba,
+                &mut warm,
+                false,
+                mode,
+                &Progress::disabled(),
+            )
+            .unwrap();
+            let t = &warm.inner.transcript;
+            assert!(!t.iter().any(|l| l.starts_with("run ")), "{mode:?}: {t:?}");
+            assert!(
+                t.iter().any(|l| l.starts_with("cache-restore ")),
+                "{mode:?}: {t:?}"
+            );
+        }
     }
 
     #[test]
@@ -2298,7 +2582,16 @@ mod tests {
             .build_order(plan.resolve_target(Some("app")).unwrap())
             .unwrap();
         let mut ex = DryRun::new();
-        drive(&plan, &order, &ba, &mut ex, false, &Progress::disabled()).unwrap();
+        drive(
+            &plan,
+            &order,
+            &ba,
+            &mut ex,
+            false,
+            BuildCache::Instructions,
+            &Progress::disabled(),
+        )
+        .unwrap();
         let t = ex.transcript;
         assert!(
             t.contains(&format!("stage-context {}", tmp.join("a").display())),
@@ -2504,6 +2797,7 @@ ENTRYPOINT run me
             agent: None,
             cache_registry: Some("none".into()),
             cache_insecure: false,
+            build_cache: BuildCache::default(),
             journal: false,
             build_args: vec![],
             net: BuildNet::None,
@@ -2559,6 +2853,7 @@ ENTRYPOINT run me
             agent: None,
             cache_registry: Some("none".into()),
             cache_insecure: false,
+            build_cache: BuildCache::default(),
             journal: false,
             build_args: vec![],
             net: BuildNet::None, // host backend: no RUN guests, no network
@@ -2750,6 +3045,7 @@ RUN ship
             agent: None,
             cache_registry: None,
             cache_insecure: false,
+            build_cache: BuildCache::default(),
             journal: false,
             build_args: vec![],
             net: BuildNet::All,

@@ -237,6 +237,11 @@ enum Cmd {
         /// caches only — the builtin/path store has no transport
         #[arg(long = "cache-insecure")]
         cache_insecure: bool,
+        /// how aggressively to populate the instruction cache: `auto` (default;
+        /// checkpoints only past a work threshold), `layers` (one snapshot per stage,
+        /// no partial-prefix reuse), or `instructions` (one snapshot per RUN/COPY)
+        #[arg(long = "build-cache", value_name = "auto|layers|instructions")]
+        build_cache: Option<String>,
         /// add an ext4 journal to the exported image (the build stays journal-less)
         #[arg(long)]
         journal: bool,
@@ -1077,6 +1082,7 @@ async fn cli_main() -> ExitCode {
         agent,
         cache_registry,
         cache_insecure,
+        build_cache,
         journal,
         build_arg,
         build_net,
@@ -1099,6 +1105,14 @@ async fn cli_main() -> ExitCode {
             Ok(n) => n,
             Err(e) => return fail(&e, 2),
         };
+        // CLI flag wins, else the [build] config default.
+        let build_cache = match build_cache {
+            Some(m) => match m.parse::<build::BuildCache>() {
+                Ok(m) => m,
+                Err(e) => return fail(&anyhow::anyhow!(e), 2),
+            },
+            None => cfg.build.build_cache,
+        };
         // CLI flag wins; otherwise fall back to [build] config (and the top-level
         // cloud_hypervisor for the build guest's VMM). bool flags are opt-in, so a set
         // flag or a config `true` enables them.
@@ -1117,6 +1131,7 @@ async fn cli_main() -> ExitCode {
             agent: agent.clone().or_else(|| b.agent.clone()),
             cache_registry: cache_registry.clone().or_else(|| b.cache_registry.clone()),
             cache_insecure: *cache_insecure || b.cache_insecure,
+            build_cache,
             journal: *journal || b.journal,
             build_args,
             net,

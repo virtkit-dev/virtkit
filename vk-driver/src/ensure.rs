@@ -100,6 +100,7 @@ pub fn ensure_unit_build(
         agent: recipe.agent.clone(),
         cache_registry: recipe.cache_registry.clone(),
         cache_insecure: recipe.cache_insecure,
+        build_cache: crate::build::BuildCache::default(),
         journal: false,
         build_args: recipe.build_args.clone(),
         // unrestricted RUN egress, like `docker build` (and `vk build`'s default) —

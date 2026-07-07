@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `vk build --build-cache <mode>` selects how aggressively the instruction cache
+  is populated: `layers` caches only each stage's final snapshot, `instructions`
+  caches every RUN/COPY, and `auto` (the default) caches stage boundaries plus
+  intermediate snapshots only past a work threshold. `layers`/`auto` speed up
+  builds of long stages by committing far fewer snapshots. Also settable as
+  `build_cache` in the `[build]` config table.
+
 ### Changed
 
 - `vk push` now compresses image chunks at a faster zstd level, speeding up
