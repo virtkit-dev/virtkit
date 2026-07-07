@@ -17,6 +17,9 @@ All notable changes to virtkit will be documented in this file.
 
 - `vk push` now compresses image chunks at a faster zstd level, speeding up
   pushes at the cost of slightly larger uploads and registry storage.
+- `vk build` now sizes each parallel build guest to the host CPU count (capped
+  at 16) and 4G of RAM by default, giving heavy stages more compile/link
+  parallelism; override per guest with `VIRTKIT_BUILD_CPUS` / `VIRTKIT_BUILD_MEM`.
 
 ## [0.8.0] - 2026-07-07
 

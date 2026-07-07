@@ -561,6 +561,43 @@ fn base_cache_key(image: &str) -> String {
     s
 }
 
+/// Per-stage build guest vCPUs: `VIRTKIT_BUILD_CPUS` if set, else the host's logical
+/// CPU count, clamped to 16 to bound oversubscription. CPU oversubscribes across
+/// concurrent stages by design (see `resolve_build_jobs`), so each heavy stage — the
+/// build's critical path — gets real parallelism instead of a 2-vCPU throttle.
+fn build_cpus() -> u32 {
+    let host = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(4);
+    resolve_build_cpus(std::env::var("VIRTKIT_BUILD_CPUS").ok().as_deref(), host)
+}
+
+/// A positive `VIRTKIT_BUILD_CPUS` overriding `host` verbatim (an explicit request is
+/// honoured uncapped); anything absent, blank, zero, or unparseable falls back to `host`
+/// clamped to 16, bounding per-stage oversubscription.
+fn resolve_build_cpus(env: Option<&str>, host: u32) -> u32 {
+    env.and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(host.min(16))
+}
+
+/// Per-stage build guest RAM: `VIRTKIT_BUILD_MEM` if set, else 4G — headroom for the
+/// parallel compile/link processes a high-vCPU stage now spawns. Raising this lowers the
+/// RAM-derived job count (`resolve_build_jobs`), trading stage concurrency for per-stage
+/// throughput — which suits builds whose critical path is a few heavy stages.
+fn build_mem() -> String {
+    resolve_build_mem(std::env::var("VIRTKIT_BUILD_MEM").ok().as_deref())
+}
+
+/// A non-blank `VIRTKIT_BUILD_MEM` (trimmed) overriding the 4G default. Passed through to
+/// the VMM as-is, like `--mem`, so richer cloud-hypervisor syntax stays usable.
+fn resolve_build_mem(env: Option<&str>) -> String {
+    env.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| "4G".into())
+}
+
 impl MicroVm {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -578,8 +615,8 @@ impl MicroVm {
             kernel,
             agent,
             scratch,
-            cpus: 2,
-            mem: "2G".into(),
+            cpus: build_cpus(),
+            mem: build_mem(),
             boot_timeout_secs: 120,
             debug,
             // 32 GiB of writable headroom: a real image (full toolchains + large apt
@@ -1679,6 +1716,35 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_build_cpus_prefers_valid_env_over_host() {
+        // A valid positive override wins and is honoured uncapped.
+        assert_eq!(resolve_build_cpus(Some("8"), 4), 8);
+        assert_eq!(resolve_build_cpus(Some(" 32 "), 4), 32);
+        assert_eq!(resolve_build_cpus(Some("64"), 8), 64);
+        // Absent, blank, zero, or non-numeric falls back to the host count.
+        assert_eq!(resolve_build_cpus(None, 8), 8);
+        assert_eq!(resolve_build_cpus(Some(""), 8), 8);
+        assert_eq!(resolve_build_cpus(Some("0"), 8), 8);
+        assert_eq!(resolve_build_cpus(Some("abc"), 8), 8);
+        // The host-derived default is clamped to 16; an explicit override is not.
+        assert_eq!(resolve_build_cpus(None, 64), 16);
+    }
+
+    #[test]
+    fn resolve_build_mem_defaults_to_4g_and_round_trips() {
+        // Unset or blank yields the 4G default, which parses back to 4096 MiB.
+        assert_eq!(resolve_build_mem(None), "4G");
+        assert_eq!(resolve_build_mem(Some("   ")), "4G");
+        assert_eq!(
+            crate::run::parse_mem_mib(&resolve_build_mem(None)),
+            Some(4096)
+        );
+        // A set value is trimmed and passed through verbatim.
+        assert_eq!(resolve_build_mem(Some(" 8G ")), "8G");
+        assert_eq!(resolve_build_mem(Some("2048")), "2048");
+    }
 
     fn source_labels(batch: &[(String, PathBuf)]) -> Vec<String> {
         batch.iter().map(|(label, _)| label.clone()).collect()
