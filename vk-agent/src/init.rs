@@ -66,6 +66,8 @@ const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/s
 const SSH_VSOCK_PORT: u32 = 2222;
 /// Guest-side SSH_AUTH_SOCK the forwarder binds (on the /run tmpfs, never in the image).
 const SSH_AGENT_SOCK: &str = "/run/virtkit-ssh-agent.sock";
+const HOST_EXEC_AGENT_SOURCE: &str = "/proc/1/exe";
+const HOST_EXEC_AGENT_BIN: &str = "/run/vk/bin/vk-agent";
 
 /// Entry point for `… init`. Sets the guest up, then serves (default) or execs the
 /// image entrypoint (VIRTKIT_MODE=service).
@@ -857,9 +859,30 @@ fn maybe_host_exec(cmdline: &HashMap<String, String>) {
         warn!("vk-agent init: creating /run/vk failed: {e}");
         return;
     }
+    if let Err(e) = install_host_exec_agent(HOST_EXEC_AGENT_SOURCE, HOST_EXEC_AGENT_BIN) {
+        warn!("vk-agent init: mounting {HOST_EXEC_AGENT_BIN} failed: {e:#}");
+    }
     if let Err(e) = fork_agent(&host_exec_forward_args(port)) {
         warn!("vk-agent init: host-exec forward failed to start: {e}");
     }
+}
+
+fn install_host_exec_agent(src: &str, dest: &str) -> Result<()> {
+    let dest_path = Path::new(dest);
+    let parent = dest_path
+        .parent()
+        .with_context(|| format!("{dest} has no parent directory"))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let _ = std::fs::remove_file(dest_path);
+    // Bind-mount the running agent rather than copying it: the client always matches the
+    // live binary and the image needn't ship it. The bind needs an existing dest inode,
+    // hence the empty placeholder file created just above.
+    std::fs::File::create(dest_path).with_context(|| format!("creating {dest}"))?;
+    if let Err(e) = mount(src, dest, "", libc::MS_BIND) {
+        let _ = std::fs::remove_file(dest_path);
+        return Err(e).with_context(|| format!("mounting {src} on {dest}"));
+    }
+    Ok(())
 }
 
 fn maybe_ssh_serve(cmdline: &HashMap<String, String>) {

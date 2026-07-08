@@ -6,6 +6,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- `vk run --host-exec` now makes the in-guest `vk-agent` client available at
+  `/run/vk/bin/vk-agent`, so guest tooling can invoke the host-exec channel
+  without relying on the image to ship the binary.
 - `vk build` now supports `RUN --mount=type=bind,from=scratch,rw,target=…`, giving a
   step an empty, writable, disk-backed scratch directory at the target — handy for a
   step that writes more transient data than the RAM-backed `/tmp` holds. The scratch
