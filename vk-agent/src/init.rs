@@ -52,7 +52,7 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -614,9 +614,80 @@ fn mount_virtiofs(cmdline: &HashMap<String, String>) {
             warn!("vk-agent init: bad VIRTKIT_VIRTIOFS entry {entry:?} (want tag:path)");
             continue;
         };
-        let _ = std::fs::create_dir_all(path);
+        let mountpoint = Path::new(path);
+        let created_parents = match create_mountpoint(mountpoint) {
+            Ok(created) => created,
+            Err(e) => {
+                warn!(
+                    "vk-agent init: creating virtiofs mountpoint {} failed: {e}",
+                    mountpoint.display()
+                );
+                continue;
+            }
+        };
         if let Err(e) = mount(tag, path, "virtiofs", 0) {
-            warn!("vk-agent init: mount virtiofs {tag} at {path} failed: {e}");
+            warn!(
+                "vk-agent init: mount virtiofs {tag} at {} failed: {e}",
+                mountpoint.display()
+            );
+        } else {
+            chown_created_mount_parents(mountpoint, &created_parents);
+        }
+    }
+}
+
+/// Create a mountpoint without losing which parent directories were synthesized.
+///
+/// The mountpoint itself is excluded from the returned list: after the mount it is the
+/// shared host directory, so chowning it would alter host ownership.
+fn create_mountpoint(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut created = Vec::new();
+    if let Some(parent) = path.parent() {
+        let mut parents: Vec<&Path> = parent.ancestors().collect();
+        parents.reverse();
+        for dir in parents {
+            if dir.as_os_str().is_empty() || dir.exists() {
+                continue;
+            }
+            match std::fs::create_dir(dir) {
+                Ok(()) => created.push(dir.to_path_buf()),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    Ok(created)
+}
+
+fn chown_created_mount_parents(mountpoint: &Path, created_parents: &[PathBuf]) {
+    if created_parents.is_empty() {
+        return;
+    }
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = match std::fs::metadata(mountpoint) {
+        Ok(meta) => meta,
+        Err(e) => {
+            warn!(
+                "vk-agent init: stat mount {} to chown its synthesized parents failed: {e}",
+                mountpoint.display()
+            );
+            return;
+        }
+    };
+    for dir in created_parents {
+        if let Err(e) = std::os::unix::fs::chown(dir, Some(meta.uid()), Some(meta.gid())) {
+            warn!(
+                "vk-agent init: chown synthesized mount parent {} to {}:{} failed: {e}",
+                dir.display(),
+                meta.uid(),
+                meta.gid()
+            );
         }
     }
 }
@@ -1309,6 +1380,56 @@ mod tests {
                 "--listen",
                 HOST_EXEC_SOCK,
             ]
+        );
+    }
+
+    /// Removes its directory on drop so a panicking assertion never leaks the temp tree.
+    struct TempTree(PathBuf);
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn create_mountpoint_tracks_only_created_parents() {
+        let root = std::env::temp_dir().join(format!(
+            "virtkit-init-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = TempTree(root);
+        let root = &root.0;
+        let target = root.join("home/vince/bastion/wab/.git");
+
+        let created = create_mountpoint(&target).unwrap();
+
+        assert_eq!(
+            created,
+            vec![
+                root.join("home"),
+                root.join("home/vince"),
+                root.join("home/vince/bastion"),
+                root.join("home/vince/bastion/wab"),
+            ]
+        );
+        assert!(target.is_dir());
+        assert!(!created.contains(&target));
+
+        // Re-run: nothing new to create, including no re-report of existing parents.
+        let created_again = create_mountpoint(&target).unwrap();
+        assert!(created_again.is_empty());
+
+        // Partial prefix already present: only the missing tail is reported.
+        let other = root.join("home/vince/bastion/other/.git");
+        let created_partial = create_mountpoint(&other).unwrap();
+        assert_eq!(
+            created_partial,
+            vec![root.join("home/vince/bastion/other"),]
         );
     }
 

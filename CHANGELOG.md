@@ -38,6 +38,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- When a host directory is shared into the guest, parent directories created for
+  the mount point are now owned by the same user as the shared directory (not
+  root), so git and similar tools no longer reject the path.
 - `vk build` no longer leaves stale separator lines in the TTY dashboard when
   build commands print long, wrapped output.
 
