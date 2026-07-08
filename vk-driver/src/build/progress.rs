@@ -8,7 +8,8 @@
 //! hand-rolled ANSI renderer gets wrong across emulators and multiplexers (tmux/zellij):
 //! a header bar plus one live spinner line per in-flight step stay pinned at the bottom,
 //! while completed/cached steps and each guest command's (stage-prefixed) output scroll
-//! into history above them via [`MultiProgress::println`]. Three modes, picked once:
+//! into history above them while the live block is temporarily suspended. Three modes,
+//! picked once:
 //! - **Tty**: the live indicatif dashboard (stdout is a terminal).
 //! - **Plain**: no cursor control — each event and output line prints as a `#N …` line
 //!   (buildkit `--progress=plain`). Used off-terminal (CI logs) or `VIRTKIT_PROGRESS=plain`.
@@ -19,7 +20,7 @@
 //! line-buffered and stage-prefixed instead of interleaving unattributed.
 
 use std::collections::HashMap;
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -262,7 +263,7 @@ impl Progress {
                 tty.ran.lock().unwrap().remove(&(stage, num));
                 let head = format!(" => [{} {}/{}] {}", sm.name, num, sm.total, sm.label(num));
                 let line = self.paint(&right_align(&head, "FAILED"), "\x1b[31m");
-                let _ = tty.mp.println(line);
+                let _ = tty.println(line);
             }
             Backend::Plain => println!("#{} ERROR", sm.seq(num)),
             Backend::Disabled => {}
@@ -282,7 +283,7 @@ impl Progress {
         match &self.backend {
             Backend::Tty(tty) => {
                 let line = self.dim(&right_align(&format!(" => [{}]", sm.name), "CACHED"));
-                let _ = tty.mp.println(line);
+                let _ = tty.println(line);
             }
             Backend::Plain => println!("#{} CACHED [{}]", sm.seq(1), sm.name),
             Backend::Disabled => {}
@@ -351,7 +352,7 @@ impl Progress {
                     })
                     .unwrap_or_default();
                 let line = self.green(&right_align(" => exporting to image", &fmt_dur(elapsed)));
-                let _ = tty.mp.println(line);
+                let _ = tty.println(line);
                 self.refresh_header();
             }
             Backend::Plain => println!("#{seq} DONE"),
@@ -388,7 +389,7 @@ impl Progress {
                 } else {
                     self.paint(&line, "\x1b[1;31m")
                 };
-                let _ = tty.mp.println(styled);
+                let _ = tty.println(styled);
             }
             Backend::Plain => println!("#0 {tag}"),
             Backend::Disabled => {}
@@ -485,7 +486,7 @@ impl Progress {
                         self.green(&right_align(&head, &fmt_dur(elapsed.unwrap_or_default())))
                     }
                 };
-                let _ = tty.mp.println(line);
+                let _ = tty.println(line);
             }
             Backend::Plain => match outcome {
                 // a ran cell already printed its `#N [stage …]` start line, so just close it;
@@ -586,11 +587,8 @@ impl Progress {
         let seq = self.output_seq(stage);
         match &self.backend {
             Backend::Tty(tty) => {
-                for l in lines {
-                    let _ = tty
-                        .mp
-                        .println(format!("{} {l}", self.dim(&format!("#{seq}"))));
-                }
+                let prefix = self.dim(&format!("#{seq}"));
+                let _ = tty.print_lines(lines.iter().map(|l| format!("{prefix} {l}")));
             }
             Backend::Plain => {
                 for l in lines {
@@ -650,6 +648,30 @@ impl Tty {
             bars: Mutex::new(HashMap::new()),
             ran: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn println(&self, line: impl AsRef<str>) -> io::Result<()> {
+        self.print_lines(std::iter::once(line))
+    }
+
+    fn print_lines<I, S>(&self, lines: I) -> io::Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        if self.mp.is_hidden() {
+            return Ok(());
+        }
+        // `MultiProgress::println` misaccounts wrapped text rows in indicatif 0.18, which
+        // can leave stale pinned separator rows behind. Suspending lets stdout perform a
+        // normal line write while indicatif only clears/redraws the live block.
+        self.mp.suspend(|| {
+            let mut out = io::stdout().lock();
+            for line in lines {
+                writeln!(out, "{}", line.as_ref())?;
+            }
+            out.flush()
+        })
     }
 }
 

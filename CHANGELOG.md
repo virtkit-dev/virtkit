@@ -21,6 +21,11 @@ All notable changes to virtkit will be documented in this file.
   at 16) and 4G of RAM by default, giving heavy stages more compile/link
   parallelism; override per guest with `VIRTKIT_BUILD_CPUS` / `VIRTKIT_BUILD_MEM`.
 
+### Fixed
+
+- `vk build` no longer leaves stale separator lines in the TTY dashboard when
+  build commands print long, wrapped output.
+
 ## [0.8.0] - 2026-07-07
 
 ### Added
