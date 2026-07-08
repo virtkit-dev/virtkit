@@ -102,6 +102,7 @@ pub fn ensure_unit_build(
         cache_insecure: recipe.cache_insecure,
         build_cache: crate::build::BuildCache::default(),
         journal: false,
+        tmp_tmpfs: false,
         build_args: recipe.build_args.clone(),
         // unrestricted RUN egress, like `docker build` (and `vk build`'s default) —
         // service stages install packages.

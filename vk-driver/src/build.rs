@@ -158,6 +158,11 @@ pub struct Options {
     pub build_cache: BuildCache,
     /// add an ext4 journal to the exported image (the build stays journal-less).
     pub journal: bool,
+    /// `--build-tmp-tmpfs`: use a RAM tmpfs for each stage guest's `/tmp` instead of the
+    /// default disk-backed scratch. Disk-backed `/tmp` (the default) lifts the ½·guest-RAM cap
+    /// on bulk `/tmp` writes (e.g. a large toolchain unpack) via a separate device that never
+    /// enters the stage snapshot; this opts back to the smaller, RAM-bound tmpfs.
+    pub tmp_tmpfs: bool,
     /// `--build-arg NAME=VALUE` overrides for ARG defaults.
     pub build_args: Vec<(String, String)>,
     /// Egress for the microVM build's `RUN` guests (see [`BuildNet`]).
@@ -515,6 +520,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
                 opts.journal,
                 opts.net.clone(),
                 opts.debug,
+                !opts.tmp_tmpfs,
             );
             let jobs = resolve_build_jobs(opts, mv.mem_mib());
             let (committed, states) = drive_microvm(
@@ -2799,6 +2805,7 @@ ENTRYPOINT run me
             cache_insecure: false,
             build_cache: BuildCache::default(),
             journal: false,
+            tmp_tmpfs: false,
             build_args: vec![],
             net: BuildNet::None,
             require_cached: false,
@@ -2855,6 +2862,7 @@ ENTRYPOINT run me
             cache_insecure: false,
             build_cache: BuildCache::default(),
             journal: false,
+            tmp_tmpfs: false,
             build_args: vec![],
             net: BuildNet::None, // host backend: no RUN guests, no network
             require_cached: false,
@@ -3047,6 +3055,7 @@ RUN ship
             cache_insecure: false,
             build_cache: BuildCache::default(),
             journal: false,
+            tmp_tmpfs: false,
             build_args: vec![],
             net: BuildNet::All,
             require_cached: false,

@@ -245,6 +245,11 @@ enum Cmd {
         /// add an ext4 journal to the exported image (the build stays journal-less)
         #[arg(long)]
         journal: bool,
+        /// use a RAM tmpfs for each stage guest's `/tmp` instead of the default
+        /// disk-backed scratch (which bounds a bulk `/tmp` write, e.g. a large toolchain
+        /// unpack, by disk rather than ½·guest-RAM). Also settable as `tmp_tmpfs` in `[build]`
+        #[arg(long = "build-tmp-tmpfs")]
+        build_tmp_tmpfs: bool,
         /// override an ARG default: NAME=VALUE (repeatable)
         #[arg(long = "build-arg", value_name = "NAME=VALUE")]
         build_arg: Vec<String>,
@@ -1084,6 +1089,7 @@ async fn cli_main() -> ExitCode {
         cache_insecure,
         build_cache,
         journal,
+        build_tmp_tmpfs,
         build_arg,
         build_net,
         build_allow_ip,
@@ -1133,6 +1139,7 @@ async fn cli_main() -> ExitCode {
             cache_insecure: *cache_insecure || b.cache_insecure,
             build_cache,
             journal: *journal || b.journal,
+            tmp_tmpfs: *build_tmp_tmpfs || b.tmp_tmpfs,
             build_args,
             net,
             require_cached: *require_cached,

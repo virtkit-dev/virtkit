@@ -6,6 +6,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- `vk build --build-tmp-tmpfs` uses a RAM tmpfs for each stage guest's `/tmp`
+  instead of the default disk-backed scratch. `/tmp` is disk-backed by default so a
+  step that writes a lot of transient data there (e.g. unpacking a big toolchain) is
+  bounded by disk rather than half the guest's RAM; this flag reverts to the smaller,
+  RAM-bound tmpfs. Also settable as `tmp_tmpfs` in the `[build]` config table.
 - `vk build --build-cache <mode>` selects how aggressively the instruction cache
   is populated: `layers` caches only each stage's final snapshot, `instructions`
   caches every RUN/COPY, and `auto` (the default) caches stage boundaries plus

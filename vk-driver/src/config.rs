@@ -79,6 +79,10 @@ pub struct Build {
     pub build_cache: crate::build::BuildCache,
     /// add an ext4 journal to the exported image (the build itself stays journal-less).
     pub journal: bool,
+    /// use a RAM tmpfs for each stage guest's `/tmp` instead of the default disk-backed
+    /// scratch. Disk-backed `/tmp` (the default) bounds bulk `/tmp` writes by disk rather
+    /// than ½·guest-RAM; set this to trade that for a RAM tmpfs. Default off (disk-backed).
+    pub tmp_tmpfs: bool,
 }
 
 /// Host credentials forwarded into job VMs. The SSH agent is relayed over a vsock

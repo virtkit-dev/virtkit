@@ -436,6 +436,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             cache_insecure: args.cache_insecure,
             build_cache: crate::build::BuildCache::default(),
             journal: false,
+            tmp_tmpfs: false,
             build_args: args.build_args.clone(),
             net: args.build_net.clone(),
             require_cached: args.require_cached,
@@ -1119,6 +1120,7 @@ fn build_service_image(
         cache_insecure: args.cache_insecure,
         build_cache: crate::build::BuildCache::default(),
         journal: false,
+        tmp_tmpfs: false,
         build_args: args.build_args.clone(),
         net: args.build_net.clone(),
         require_cached: args.require_cached,
@@ -1638,9 +1640,6 @@ pub(crate) struct VmSession {
     /// virtiofsd serving the build context (for `COPY` from the context), if any.
     virtiofsd: Option<Child>,
     work: PathBuf,
-    /// the ephemeral /tmp scratch disk (backing ext4 + rw overlay), removed on drop — a
-    /// separate device from `image`, so it is never part of the stage snapshot.
-    scratch_disks: Vec<PathBuf>,
     /// Unix socket the stage overlay's dirty-drain control listener serves on (libkrun build
     /// stages only). `checkpoint_dirty` connects here; `None` = full-capture fallback.
     dirty_socket: Option<PathBuf>,
@@ -1722,6 +1721,7 @@ fn tmp_disk_path(image: &Path) -> PathBuf {
     image.with_file_name(format!("{stem}.tmpdisk.ext4"))
 }
 
+/// The ephemeral disk backing a build guest's `/tmp` (the default; off under `--build-tmp-tmpfs`).
 pub(crate) fn build_tmp_disk(image: &Path) -> Result<PathBuf> {
     let tmp_backing = tmp_disk_path(image);
     crate::ext4::build_empty(&tmp_backing, TMP_DISK_FREE_BLOCKS)
@@ -1741,6 +1741,10 @@ pub(crate) async fn boot_session(
     boot_timeout_secs: u64,
     sources: &[PathBuf],
     context: Option<&Path>,
+    // `Some` → attach this caller-owned ext4 as a disk-backed /tmp scratch (the default; off
+    // under --build-tmp-tmpfs); `None` → a RAM tmpfs /tmp (no device attached, no
+    // VIRTKIT_TMP_DEV). The caller owns the disk's lifecycle: it is reused across a stage's
+    // source-batch reboots and removed at stage_end, so it never enters the stage snapshot.
     tmp_disk: Option<&Path>,
     cancel: Option<CancellationToken>,
 ) -> Result<VmSession> {
@@ -1791,31 +1795,32 @@ pub(crate) async fn boot_session(
             dirty_control_socket: None,
         });
     }
-    // Disk-backed /tmp for the build guest: a sparse ext4 on its own virtio-blk device, so
-    // a stage's RUN steps can extract gigabytes to /tmp without the ½·RAM cap of a tmpfs —
-    // yet, being a separate device, it never enters the stage snapshot (no cache churn).
-    // A normal one-shot session creates and owns a throwaway disk. A batched build stage
-    // passes a caller-owned disk so /tmp survives the source-subset reboots.
-    let (tmp_backing, scratch_disks) = match tmp_disk {
-        Some(path) => (path.to_path_buf(), Vec::new()),
-        None => {
-            let path = build_tmp_disk(image)?;
-            (path.clone(), vec![path])
-        }
-    };
-    let tmp_dev = crate::build::vd_name(disks.len());
-    disks.push(crate::vmm::Disk {
-        path: tmp_backing.clone(),
-        qcow2: false,
-        readonly: false,
-        dirty_control_socket: None,
+    // Disk-backed /tmp for the build guest (the default; off under --build-tmp-tmpfs): a sparse
+    // ext4 on its own virtio-blk device, so a stage's RUN steps can extract gigabytes to /tmp
+    // without the ½·RAM cap of a tmpfs — yet, being a separate device, it never enters the stage
+    // snapshot (no cache churn). The caller owns the disk's lifecycle (a batched build reuses
+    // one disk so /tmp survives the source-subset reboots, and removes it at stage_end).
+    // `None` = a RAM tmpfs /tmp: the agent falls back to tmpfs when VIRTKIT_TMP_DEV is absent,
+    // so we simply attach no device and set no cmdline var.
+    let tmp_dev = tmp_disk.map(|path| {
+        let dev = crate::build::vd_name(disks.len());
+        disks.push(crate::vmm::Disk {
+            path: path.to_path_buf(),
+            qcow2: false,
+            readonly: false,
+            dirty_control_socket: None,
+        });
+        dev
     });
     // The kernel runs the initramfs `/init` (the agent); it then pivots into the ext4
     // named by VIRTKIT_PIVOT. No `init=`/`root=` for the kernel to mount — the agent does.
     let mut cmdline = format!(
         "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda \
-         VIRTKIT_HOSTNAME=vm VIRTKIT_VSOCK_PORT={VSOCK_PORT} VIRTKIT_TMP_DEV=/dev/{tmp_dev}"
+         VIRTKIT_HOSTNAME=vm VIRTKIT_VSOCK_PORT={VSOCK_PORT}"
     );
+    if let Some(dev) = &tmp_dev {
+        cmdline.push_str(&format!(" VIRTKIT_TMP_DEV=/dev/{dev}"));
+    }
     let vsock = work.join("vsock.sock");
     let console = work.join("console.log");
 
@@ -1913,7 +1918,6 @@ pub(crate) async fn boot_session(
         switch,
         virtiofsd,
         work,
-        scratch_disks,
         dirty_socket,
         cancel,
     })
@@ -2106,10 +2110,6 @@ impl Drop for VmSession {
             let _ = c.wait();
         }
         let _ = std::fs::remove_dir_all(&self.work);
-        // the ephemeral /tmp scratch disk (never committed — a separate device from `image`).
-        for d in &self.scratch_disks {
-            let _ = std::fs::remove_file(d);
-        }
     }
 }
 

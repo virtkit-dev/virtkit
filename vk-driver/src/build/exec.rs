@@ -353,8 +353,13 @@ pub struct MicroVm {
     sources: Vec<(String, PathBuf)>,
     /// source stage label → its guest device (e.g. `/dev/vdb`) for the current boot.
     source_dev: HashMap<String, String>,
-    /// The stage's disk-backed `/tmp`, reused across source-batch reboots and removed at
-    /// `stage_end`. It is outside the stage image, so it never enters snapshots/cache.
+    /// Give each stage guest a disk-backed `/tmp` scratch (the default) so a bulk RUN write
+    /// (e.g. a large toolchain unpack) is bounded by disk rather than ½·guest-RAM. Cleared by
+    /// `--build-tmp-tmpfs`, which reverts `/tmp` to a RAM tmpfs.
+    tmp_disk_enabled: bool,
+    /// The stage's disk-backed `/tmp` (only when `tmp_disk_enabled`), reused across source-batch
+    /// reboots and removed at `stage_end`. It is outside the stage image, so it never enters
+    /// snapshots/cache.
     tmp_disk: Option<PathBuf>,
     /// The *current stage's* build-context dir, shared into its guest over virtiofs for
     /// `COPY` from the context (no `--from`). Set by `stage_sources` before the stage's
@@ -609,6 +614,7 @@ impl MicroVm {
         journal: bool,
         net: crate::build::BuildNet,
         debug: bool,
+        tmp_disk_enabled: bool,
     ) -> Self {
         MicroVm {
             cloud_hypervisor,
@@ -632,6 +638,7 @@ impl MicroVm {
             net,
             sources: Vec::new(),
             source_dev: HashMap::new(),
+            tmp_disk_enabled,
             tmp_disk: None,
             context: None,
             inflight: None,
@@ -681,6 +688,7 @@ impl MicroVm {
             parent_digest: None,
             sources: Vec::new(),
             source_dev: HashMap::new(),
+            tmp_disk_enabled: self.tmp_disk_enabled,
             tmp_disk: None,
             context: None,
             inflight: None,
@@ -719,13 +727,21 @@ impl MicroVm {
             .context
             .clone()
             .context("internal: stage booted before stage_sources set its context")?;
-        let tmp_disk = match &self.tmp_disk {
-            Some(path) => path.clone(),
-            None => {
-                let path = crate::run::build_tmp_disk(&ext4)?;
-                self.tmp_disk = Some(path.clone());
-                path
-            }
+        // Disk-backed /tmp unless the build opted out (--build-tmp-tmpfs), in which case the
+        // guest uses a RAM tmpfs /tmp. The disk is provisioned once per stage and reused across
+        // its source-batch reboots (removed at stage_end), so it survives the reboots yet never
+        // enters the stage snapshot.
+        let tmp_disk = if self.tmp_disk_enabled {
+            Some(match &self.tmp_disk {
+                Some(path) => path.clone(),
+                None => {
+                    let path = crate::run::build_tmp_disk(&ext4)?;
+                    self.tmp_disk = Some(path.clone());
+                    path
+                }
+            })
+        } else {
+            None
         };
         let source_paths: Vec<PathBuf> = subset.iter().map(|(_, path)| path.clone()).collect();
         let s = block_on(crate::run::boot_session(
@@ -739,7 +755,7 @@ impl MicroVm {
             self.boot_timeout_secs,
             &source_paths,
             Some(&context),
-            Some(&tmp_disk),
+            tmp_disk.as_deref(),
             self.cancel.clone(),
         ))?;
         self.source_dev = subset
