@@ -1640,6 +1640,10 @@ pub(crate) struct VmSession {
     /// virtiofsd serving the build context (for `COPY` from the context), if any.
     virtiofsd: Option<Child>,
     work: PathBuf,
+    /// Guest device of the ephemeral `--mount=from=scratch` disk (e.g. `/dev/vde`), when one
+    /// was attached; `None` = this guest has no writable scratch disk. The executor mounts it
+    /// on demand for a `RUN --mount=type=bind,from=scratch,rw` step.
+    scratch_dev: Option<String>,
     /// Unix socket the stage overlay's dirty-drain control listener serves on (libkrun build
     /// stages only). `checkpoint_dirty` connects here; `None` = full-capture fallback.
     dirty_socket: Option<PathBuf>,
@@ -1711,22 +1715,30 @@ pub(crate) fn disk_format(path: &Path) -> &'static str {
     }
 }
 
-/// Spare capacity of a build guest's ephemeral /tmp scratch disk (blocks of 4 KiB). Sparse,
-/// so the generous ceiling costs nothing until written; it just has to comfortably hold a
+/// Spare capacity of a build guest's ephemeral scratch disks (blocks of 4 KiB). Sparse, so
+/// the generous ceiling costs nothing until written; it just has to comfortably hold a
 /// toolchain unpack (rust is ~2.5 GiB) or a big `./configure` tree.
-const TMP_DISK_FREE_BLOCKS: u64 = 32 * 1024 * 1024 * 1024 / 4096;
+const SCRATCH_DISK_FREE_BLOCKS: u64 = 32 * 1024 * 1024 * 1024 / 4096;
 
-fn tmp_disk_path(image: &Path) -> PathBuf {
+/// A fresh, empty, sparse ext4 next to `image`, tagged by `role` (`tmpdisk`/`scratchdisk`)
+/// so a guest's `/tmp` disk and its `--mount=from=scratch` disk don't collide. Both are
+/// ephemeral devices, never part of a stage snapshot; the caller removes them.
+fn build_empty_disk(image: &Path, role: &str) -> Result<PathBuf> {
     let stem = image.file_stem().and_then(|s| s.to_str()).unwrap_or("disk");
-    image.with_file_name(format!("{stem}.tmpdisk.ext4"))
+    let backing = image.with_file_name(format!("{stem}.{role}.ext4"));
+    crate::ext4::build_empty(&backing, SCRATCH_DISK_FREE_BLOCKS)
+        .with_context(|| format!("creating the {role} disk {}", backing.display()))?;
+    Ok(backing)
 }
 
 /// The ephemeral disk backing a build guest's `/tmp` (the default; off under `--build-tmp-tmpfs`).
 pub(crate) fn build_tmp_disk(image: &Path) -> Result<PathBuf> {
-    let tmp_backing = tmp_disk_path(image);
-    crate::ext4::build_empty(&tmp_backing, TMP_DISK_FREE_BLOCKS)
-        .with_context(|| format!("creating the /tmp scratch disk {}", tmp_backing.display()))?;
-    Ok(tmp_backing)
+    build_empty_disk(image, "tmpdisk")
+}
+
+/// The ephemeral disk backing a stage's `RUN --mount=type=bind,from=scratch,rw` targets.
+pub(crate) fn build_scratch_disk(image: &Path) -> Result<PathBuf> {
+    build_empty_disk(image, "scratchdisk")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1746,6 +1758,10 @@ pub(crate) async fn boot_session(
     // VIRTKIT_TMP_DEV). The caller owns the disk's lifecycle: it is reused across a stage's
     // source-batch reboots and removed at stage_end, so it never enters the stage snapshot.
     tmp_disk: Option<&Path>,
+    // `Some` → attach this caller-owned empty ext4 as the writable scratch disk backing
+    // `RUN --mount=type=bind,from=scratch,rw` targets; its guest device is recorded on the
+    // returned `VmSession`. Same ephemeral, caller-owned lifecycle as `tmp_disk`.
+    scratch_disk: Option<&Path>,
     cancel: Option<CancellationToken>,
 ) -> Result<VmSession> {
     let stem = image.file_stem().and_then(|s| s.to_str()).unwrap_or("disk");
@@ -1811,6 +1827,20 @@ pub(crate) async fn boot_session(
             dirty_control_socket: None,
         });
         dev
+    });
+    // Writable scratch disk for `RUN --mount=type=bind,from=scratch,rw`: an empty rw ext4 on
+    // its own device, mounted on demand by the executor at the mount target. Ephemeral and
+    // never snapshotted, exactly like the /tmp disk. The device name is recorded on the
+    // session so the executor knows where to mount it.
+    let scratch_dev = scratch_disk.map(|path| {
+        let dev = crate::build::vd_name(disks.len());
+        disks.push(crate::vmm::Disk {
+            path: path.to_path_buf(),
+            qcow2: false,
+            readonly: false,
+            dirty_control_socket: None,
+        });
+        format!("/dev/{dev}")
     });
     // The kernel runs the initramfs `/init` (the agent); it then pivots into the ext4
     // named by VIRTKIT_PIVOT. No `init=`/`root=` for the kernel to mount — the agent does.
@@ -1918,12 +1948,18 @@ pub(crate) async fn boot_session(
         switch,
         virtiofsd,
         work,
+        scratch_dev,
         dirty_socket,
         cancel,
     })
 }
 
 impl VmSession {
+    /// Guest device of this session's writable scratch disk, if one was attached at boot.
+    pub(crate) fn scratch_dev(&self) -> Option<&str> {
+        self.scratch_dev.as_deref()
+    }
+
     /// Run `command` (optionally as `user`) in the live guest, relaying its output through
     /// `sink`; returns its exit code.
     pub(crate) async fn exec(
@@ -2258,6 +2294,7 @@ mod tests {
                 "1G",
                 120,
                 &[data],
+                None,
                 None,
                 None,
                 None,

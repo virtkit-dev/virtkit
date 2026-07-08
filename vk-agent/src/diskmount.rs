@@ -133,6 +133,67 @@ pub fn mount_rw(device: &str, target: &Path, flags: libc::c_ulong) -> std::io::R
     Ok(())
 }
 
+/// Mount `device` (an empty ext4) read-write at `target`, creating `target`, as an
+/// ephemeral writable scratch for `RUN --mount=type=bind,from=scratch,rw`. Hardened
+/// (`MS_NOSUID | MS_NODEV`). Its contents are discarded when the guest tears down — the
+/// backing device is separate and never part of the stage snapshot.
+///
+/// By default the root inode keeps the ext4 default `root:root 0755`, matching BuildKit (which
+/// leaves a `from=scratch` mount root-owned). `uid`/`gid`/`mode` override that — a virtkit
+/// extension (BuildKit rejects them on bind mounts) so a non-root `RUN` can write to the scratch.
+pub fn mount_scratch(
+    device: &str,
+    target: &Path,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    mode: Option<u32>,
+) -> Result<()> {
+    create_dir_all_noting(target)
+        .with_context(|| format!("creating scratch mountpoint {}", target.display()))?;
+    mount_rw(device, target, libc::MS_NOSUID | libc::MS_NODEV)
+        .with_context(|| format!("mounting scratch {device} at {}", target.display()))?;
+    // The scratch device is reused across a stage's steps, so start every mount fresh:
+    // empty any prior step's contents (BuildKit hands each from=scratch mount an empty dir,
+    // with no lost+found), and reset ownership+mode so a prior step's uid/gid/mode doesn't
+    // carry over. Defaults are the ext4/BuildKit root:root 0755, overridden by uid/gid/mode.
+    empty_dir(target).with_context(|| format!("emptying scratch {}", target.display()))?;
+    std::os::unix::fs::chown(target, Some(uid.unwrap_or(0)), Some(gid.unwrap_or(0)))
+        .with_context(|| format!("chown scratch {}", target.display()))?;
+    fs::set_permissions(target, fs::Permissions::from_mode(mode.unwrap_or(0o755)))
+        .with_context(|| format!("chmod scratch {}", target.display()))?;
+    Ok(())
+}
+
+/// Remove every entry under `dir` (files, dirs, symlinks) without following symlinks — used
+/// to hand a reused scratch device a fresh, empty root each mount.
+fn empty_dir(dir: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Parse a `mount --scratch` uid/gid/mode CLI token: `-` = unset, else a number in `radix`.
+/// A leading `0o` is accepted only for the octal `mode`; a decimal uid/gid must be bare digits.
+fn scratch_num(tok: &str, radix: u32, what: &str) -> Result<Option<u32>> {
+    if tok == "-" {
+        return Ok(None);
+    }
+    let digits = if radix == 8 {
+        tok.trim_start_matches("0o")
+    } else {
+        tok
+    };
+    u32::from_str_radix(digits, radix)
+        .map(Some)
+        .with_context(|| format!("invalid scratch {what} {tok:?}"))
+}
+
 /// Bind-mount `src` at `target` read-only, creating `target` to match `src`'s type.
 /// Used for `RUN --mount=type=bind,from=<stage>,source=…,target=…`: the source stage's
 /// ext4 is mounted read-only elsewhere, and its `source` subtree is bound at `target`.
@@ -381,10 +442,24 @@ pub fn main(args: &[String]) -> i32 {
     let result = match args.first().map(String::as_str) {
         Some("mount") => match &args[1..] {
             [flag, device, target] if flag == "--ro" => mount_ro(device, Path::new(target)),
+            [flag, device, target, uid, gid, mode] if flag == "--scratch" => {
+                match (
+                    scratch_num(uid, 10, "uid"),
+                    scratch_num(gid, 10, "gid"),
+                    scratch_num(mode, 8, "mode"),
+                ) {
+                    (Ok(u), Ok(g), Ok(m)) => mount_scratch(device, Path::new(target), u, g, m),
+                    (Err(e), ..) | (_, Err(e), _) | (.., Err(e)) => Err(e),
+                }
+            }
             [flag, src, target] if flag == "--bind" => {
                 mount_bind_ro(Path::new(src), Path::new(target))
             }
-            _ => return usage("mount --ro <device> <mp> | mount --bind <src> <target>"),
+            _ => {
+                return usage(
+                    "mount --ro <device> <mp> | mount --scratch <device> <mp> <uid|-> <gid|-> <mode|-> | mount --bind <src> <target>",
+                );
+            }
         },
         Some("umount") => match &args[1..] {
             [target] => umount(Path::new(target)),
@@ -559,5 +634,51 @@ mod tests {
             .context("stat missing")
             .unwrap_err();
         assert!(!super::virtiofs_backend_gone(&other));
+    }
+
+    #[test]
+    fn scratch_num_parses_sentinel_radix_and_errors() {
+        use super::scratch_num;
+        // `-` is the unset sentinel for every field.
+        assert_eq!(scratch_num("-", 10, "uid").unwrap(), None);
+        assert_eq!(scratch_num("-", 8, "mode").unwrap(), None);
+        // uid/gid parse as decimal.
+        assert_eq!(scratch_num("1000", 10, "uid").unwrap(), Some(1000));
+        // mode parses as octal, with or without the `0o` prefix.
+        assert_eq!(scratch_num("755", 8, "mode").unwrap(), Some(0o755));
+        assert_eq!(scratch_num("0o700", 8, "mode").unwrap(), Some(0o700));
+        // a non-numeric token is an error, not a silent default.
+        assert!(scratch_num("root", 10, "uid").is_err());
+        assert!(scratch_num("8", 8, "mode").is_err());
+        // the `0o` prefix is octal-only: a decimal uid/gid must be bare digits.
+        assert!(scratch_num("0o5", 10, "uid").is_err());
+    }
+
+    #[test]
+    fn empty_dir_clears_all_entries_without_following_symlinks() {
+        use super::empty_dir;
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("dm-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let scratch = base.join("scratch");
+        let outside = base.join("outside");
+        fs::create_dir_all(&scratch).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        // A regular file, a populated subdirectory, and a symlink pointing outside the scratch.
+        fs::write(scratch.join("file"), "data").unwrap();
+        fs::create_dir_all(scratch.join("sub/nested")).unwrap();
+        fs::write(scratch.join("sub/nested/f"), "x").unwrap();
+        fs::write(outside.join("keep"), "keep").unwrap();
+        symlink(&outside, scratch.join("link")).unwrap();
+
+        empty_dir(&scratch).unwrap();
+
+        // The scratch root is now empty…
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+        // …and the symlink was removed as the link itself, not followed: its target survives.
+        assert!(outside.join("keep").exists());
+        let _ = fs::remove_dir_all(&base);
     }
 }

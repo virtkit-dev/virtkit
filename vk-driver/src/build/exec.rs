@@ -361,6 +361,11 @@ pub struct MicroVm {
     /// reboots and removed at `stage_end`. It is outside the stage image, so it never enters
     /// snapshots/cache.
     tmp_disk: Option<PathBuf>,
+    /// The stage's writable scratch disk backing `RUN --mount=type=bind,from=scratch,rw`,
+    /// lazily provisioned on the first such RUN and then reused across source-batch reboots
+    /// (removed at `stage_end`). Like `tmp_disk`, a separate device that never enters the
+    /// stage snapshot.
+    scratch_disk: Option<PathBuf>,
     /// The *current stage's* build-context dir, shared into its guest over virtiofs for
     /// `COPY` from the context (no `--from`). Set by `stage_sources` before the stage's
     /// first boot and consumed by the next `ensure_session`; `None` between stages.
@@ -474,17 +479,20 @@ pub(crate) fn vd_name(n: usize) -> String {
 /// Cache repo (under the registry's repo prefix) holding the instruction snapshots.
 const CACHE_REPO: &str = "dfcache";
 
-/// Conservative libkrun/mmio source-disk budget for a build guest:
-/// 19 usable IRQs minus balloon/rng/console, context-fs, rootfs, `/tmp`, and vsock.
+/// Conservative libkrun/mmio source-disk budget for a build guest: 19 usable IRQs minus
+/// balloon/rng/console, context-fs, rootfs, vsock, and one reserved ephemeral scratch slot
+/// (`/tmp` and/or `--mount=from=scratch`). When a boot attaches *both* a `/tmp` disk and a
+/// scratch disk, the caller drops the effective budget by one (see `ensure_session_with`).
 const MAX_SOURCE_DISKS: usize = 12;
 
-/// Pick the source disks for one guest boot. The common case is a forward scan through
-/// source stages: boot sources 0..11, then 12..23, and so on. If one instruction needs
-/// scattered sources, keep all of them and fill whatever space remains nearby.
+/// Pick the source disks for one guest boot (at most `max`). The common case is a forward
+/// scan through source stages: boot sources 0..max, then the next window, and so on. If one
+/// instruction needs scattered sources, keep all of them and fill whatever space remains.
 fn select_source_batch(
     sources: &[(String, PathBuf)],
     needed: &[&str],
     stage: &str,
+    max: usize,
 ) -> Result<Vec<(String, PathBuf)>> {
     let mut needed_unique: Vec<&str> = Vec::new();
     for label in needed {
@@ -492,9 +500,9 @@ fn select_source_batch(
             needed_unique.push(*label);
         }
     }
-    if needed_unique.len() > MAX_SOURCE_DISKS {
+    if needed_unique.len() > max {
         bail!(
-            "stage {stage} needs {} source stages in a single instruction, but this VMM can attach at most {MAX_SOURCE_DISKS} source stages per boot: {}",
+            "stage {stage} needs {} source stages in a single instruction, but this VMM can attach at most {max} source stages per boot: {}",
             needed_unique.len(),
             needed_unique.join(", ")
         );
@@ -519,14 +527,14 @@ fn select_source_batch(
     };
 
     if needed_positions.is_empty() {
-        for source in sources.iter().take(MAX_SOURCE_DISKS) {
+        for source in sources.iter().take(max) {
             add(&mut subset, source);
         }
         return Ok(subset);
     }
 
     let start = *needed_positions.iter().min().expect("not empty");
-    for source in sources.iter().skip(start).take(MAX_SOURCE_DISKS) {
+    for source in sources.iter().skip(start).take(max) {
         add(&mut subset, source);
     }
     if needed_unique
@@ -543,7 +551,7 @@ fn select_source_batch(
         }
     }
     for source in sources.iter().skip(start).chain(sources.iter().take(start)) {
-        if subset.len() >= MAX_SOURCE_DISKS {
+        if subset.len() >= max {
             break;
         }
         add(&mut subset, source);
@@ -640,6 +648,7 @@ impl MicroVm {
             source_dev: HashMap::new(),
             tmp_disk_enabled,
             tmp_disk: None,
+            scratch_disk: None,
             context: None,
             inflight: None,
             push_seq: 0,
@@ -690,6 +699,7 @@ impl MicroVm {
             source_dev: HashMap::new(),
             tmp_disk_enabled: self.tmp_disk_enabled,
             tmp_disk: None,
+            scratch_disk: None,
             context: None,
             inflight: None,
             push_seq: 0,
@@ -707,16 +717,36 @@ impl MicroVm {
     /// same stage image with a new read-only source subset. Reuse is scoped to the current
     /// instruction's sources only — it does not anticipate the next one, so a stage that
     /// alternates sources across the batch boundary reboots on each instruction.
-    fn ensure_session_with(&mut self, fs: &Rootfs, needed: &[&str]) -> Result<()> {
+    fn ensure_session_with(
+        &mut self,
+        fs: &Rootfs,
+        needed: &[&str],
+        needs_scratch: bool,
+    ) -> Result<()> {
+        let have_scratch = self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.scratch_dev().is_some());
         if self.session.is_some()
             && needed
                 .iter()
                 .all(|label| self.source_dev.contains_key(*label))
+            && (!needs_scratch || have_scratch)
         {
             return Ok(());
         }
 
-        let subset = select_source_batch(&self.sources, needed, &fs.label)?;
+        // Ephemeral scratch devices this boot attaches: the `/tmp` disk (default; off under
+        // --build-tmp-tmpfs) and
+        // the `--mount=from=scratch` disk (once provisioned, kept attached for the rest of the
+        // stage so it survives source-batch reboots). One scratch slot is already in the source
+        // budget; a boot carrying *both* disks costs one extra, so drop the source budget then.
+        let want_tmp = self.tmp_disk_enabled;
+        let want_scratch = needs_scratch || self.scratch_disk.is_some();
+        let extra = (want_tmp as usize + want_scratch as usize).saturating_sub(1);
+        let max_sources = MAX_SOURCE_DISKS - extra;
+
+        let subset = select_source_batch(&self.sources, needed, &fs.label, max_sources)?;
         if let Some(session) = self.session.take() {
             block_on(session.finish())?;
             self.source_dev.clear();
@@ -731,12 +761,26 @@ impl MicroVm {
         // guest uses a RAM tmpfs /tmp. The disk is provisioned once per stage and reused across
         // its source-batch reboots (removed at stage_end), so it survives the reboots yet never
         // enters the stage snapshot.
-        let tmp_disk = if self.tmp_disk_enabled {
+        let tmp_disk = if want_tmp {
             Some(match &self.tmp_disk {
                 Some(path) => path.clone(),
                 None => {
                     let path = crate::run::build_tmp_disk(&ext4)?;
                     self.tmp_disk = Some(path.clone());
+                    path
+                }
+            })
+        } else {
+            None
+        };
+        // Writable scratch disk for `RUN --mount=from=scratch,rw`: same lazy, once-per-stage
+        // provisioning as the /tmp disk. Once created it stays attached across reboots.
+        let scratch_disk = if want_scratch {
+            Some(match &self.scratch_disk {
+                Some(path) => path.clone(),
+                None => {
+                    let path = crate::run::build_scratch_disk(&ext4)?;
+                    self.scratch_disk = Some(path.clone());
                     path
                 }
             })
@@ -756,6 +800,7 @@ impl MicroVm {
             &source_paths,
             Some(&context),
             tmp_disk.as_deref(),
+            scratch_disk.as_deref(),
             self.cancel.clone(),
         ))?;
         self.source_dev = subset
@@ -961,10 +1006,56 @@ impl Drop for MicroVm {
         if let Some(tmp) = self.tmp_disk.take() {
             let _ = std::fs::remove_file(tmp);
         }
+        if let Some(scratch) = self.scratch_disk.take() {
+            let _ = std::fs::remove_file(scratch);
+        }
         if let Some(inf) = self.inflight.take() {
             let _ = inf.handle.join();
             let _ = std::fs::remove_file(&inf.snap);
         }
+    }
+}
+
+/// Validate a RUN step's `--mount` specs and return the `from=scratch` mount's target, if any.
+/// Enforces the from=scratch contract without touching the guest, so it is unit-testable: at
+/// most one `from=scratch` per step (they would share the single scratch device), and `rw` /
+/// `uid` / `gid` / `mode` only on a `from=scratch` mount — a stage or build-context bind is a
+/// read-only view of committed bytes, always root-owned.
+fn scratch_mount_target(specs: &[&Mount]) -> Result<Option<String>> {
+    let mut scratch: Option<&Mount> = None;
+    for m in specs {
+        if m.from.as_deref() == Some("scratch") {
+            if scratch.is_some() {
+                bail!(
+                    "RUN --mount: at most one type=bind,from=scratch mount per step is supported \
+                     (they would share one scratch device); split the extra scratch across steps"
+                );
+            }
+            scratch = Some(m);
+            continue;
+        }
+        if m.rw {
+            bail!(
+                "RUN --mount ...,rw at {:?}: a writable mount is only supported with from=scratch \
+                 (an ephemeral disk-backed scratch); a stage or build-context mount is always \
+                 read-only",
+                m.target
+            );
+        }
+        if m.uid.is_some() || m.gid.is_some() || m.mode.is_some() {
+            bail!(
+                "RUN --mount ...,uid/gid/mode at {:?}: only supported with from=scratch",
+                m.target
+            );
+        }
+    }
+    match scratch {
+        Some(m) => {
+            Ok(Some(m.target.clone().context(
+                "RUN --mount=type=bind,from=scratch requires target=",
+            )?))
+        }
+        None => Ok(None),
     }
 }
 
@@ -1150,9 +1241,21 @@ impl Executor for MicroVm {
                 needed.push(src.label.as_str());
             }
         }
+        // `from=scratch` asks for an empty, writable, disk-backed scratch fs at the target
+        // (BuildKit's writable-bind idiom, disk-backed so it dodges the ½·RAM tmpfs cap). It
+        // is served by an ephemeral scratch disk attached to the guest — provisioned on demand
+        // and mounted directly at the target. One per step (a second would need to share the
+        // single device); split extra scratch needs across steps.
+        let specs: Vec<&Mount> = mounts.iter().map(|m| m.spec).collect();
+        let scratch_target = scratch_mount_target(&specs)?;
+        let scratch = specs
+            .iter()
+            .copied()
+            .find(|m| m.from.as_deref() == Some("scratch"));
+        let needs_scratch = scratch_target.is_some();
         // Boot the stage's guest once (on the first RUN/COPY) and reuse it while its
         // attached source batch satisfies the next instruction.
-        self.ensure_session_with(fs, &needed)?;
+        self.ensure_session_with(fs, &needed, needs_scratch)?;
 
         // Resolve `--mount=type=bind,from=<stage>`: each binds the source stage's
         // `source` subtree at `target` (read-only) for the command's duration.
@@ -1165,6 +1268,10 @@ impl Executor for MicroVm {
         type Bind = (Option<(String, String)>, String, String);
         let mut binds: Vec<Bind> = Vec::new();
         for (i, m) in mounts.iter().enumerate() {
+            // Scratch mounts are wired separately (mounted rw at the target, not bind-mounted).
+            if m.spec.from.as_deref() == Some("scratch") {
+                continue;
+            }
             let source = m.spec.source.clone().unwrap_or_else(|| "/".into());
             let target = m
                 .spec
@@ -1219,6 +1326,29 @@ impl Executor for MicroVm {
         };
         let sink = self.output_sink.clone();
         let session = self.session.as_ref().expect("session booted");
+        // Mount the ephemeral writable scratch at its target (rw). Defaults to the ext4
+        // root:root 0755 (like BuildKit); optional uid/gid/mode override it so a non-root RUN
+        // can write. The agent validates and applies them (`-` = keep the default).
+        if let Some(target) = &scratch_target {
+            let dev = session
+                .scratch_dev()
+                .context("internal: from=scratch mount but no scratch disk attached")?;
+            let spec = scratch.expect("scratch_target implies a scratch mount");
+            let opt = |o: &Option<String>| o.clone().unwrap_or_else(|| "-".into());
+            let ms = [
+                GUEST_AGENT.to_string(),
+                "mount".into(),
+                "--scratch".into(),
+                dev.to_string(),
+                target.clone(),
+                opt(&spec.uid),
+                opt(&spec.gid),
+                opt(&spec.mode),
+            ];
+            if block_on(session.exec(&ms, None, &sink))? != 0 {
+                bail!("RUN --mount from=scratch: mounting the scratch device at {target} failed");
+            }
+        }
         // Set up the bind mounts: mount each source device read-only, then bind its
         // subtree at the target.
         for (device, bindsrc, target) in &binds {
@@ -1261,6 +1391,15 @@ impl Executor for MicroVm {
                 ));
             }
         }
+        // Unmount the scratch target too, so its (discarded) contents don't shadow the target
+        // path for the next step; the scratch device itself stays attached for the stage.
+        if let Some(target) = &scratch_target {
+            let _ = block_on(session.exec(
+                &[GUEST_AGENT.to_string(), "umount".into(), target.clone()],
+                None,
+                &sink,
+            ));
+        }
         if code != 0 {
             bail!("RUN exited {code}: {shell}");
         }
@@ -1268,7 +1407,7 @@ impl Executor for MicroVm {
     }
     fn copy(&mut self, fs: &Rootfs, op: &Copy, from: Option<&Rootfs>) -> Result<()> {
         let needed: Vec<&str> = from.map(|src| vec![src.label.as_str()]).unwrap_or_default();
-        self.ensure_session_with(fs, &needed)?;
+        self.ensure_session_with(fs, &needed, false)?;
         // The source tree lives at `root` in the guest: a `--from` stage is mounted
         // read-only from its attached device; the build context is already mounted (over
         // virtiofs) at CONTEXT_MOUNT by the agent at boot.
@@ -1597,6 +1736,9 @@ impl Executor for MicroVm {
         if let Some(tmp) = self.tmp_disk.take() {
             let _ = std::fs::remove_file(tmp);
         }
+        if let Some(scratch) = self.scratch_disk.take() {
+            let _ = std::fs::remove_file(scratch);
+        }
         // the next stage starts a fresh cache lineage; clear its attached sources, its
         // context, and the in-memory parent layers.
         self.parent_key = None;
@@ -1818,6 +1960,74 @@ mod tests {
         assert_eq!(resolve_build_mem(Some("2048")), "2048");
     }
 
+    #[test]
+    fn scratch_mount_target_enforces_the_from_scratch_contract() {
+        let mount = |from: Option<&str>, target: Option<&str>| Mount {
+            typ: "bind".into(),
+            from: from.map(str::to_string),
+            target: target.map(str::to_string),
+            ..Mount::default()
+        };
+
+        // No mounts, or only stage/context binds → no scratch target, no error.
+        assert_eq!(scratch_mount_target(&[]).unwrap(), None);
+        let stage = mount(Some("builder"), Some("/in"));
+        assert_eq!(scratch_mount_target(&[&stage]).unwrap(), None);
+
+        // A single from=scratch mount returns its target.
+        let scratch = mount(Some("scratch"), Some("/s"));
+        assert_eq!(
+            scratch_mount_target(&[&scratch]).unwrap(),
+            Some("/s".into())
+        );
+
+        // from=scratch without a target is rejected.
+        let no_target = mount(Some("scratch"), None);
+        assert!(scratch_mount_target(&[&no_target]).is_err());
+
+        // Two from=scratch mounts in one step are rejected (they share one device).
+        let scratch2 = mount(Some("scratch"), Some("/s2"));
+        assert!(scratch_mount_target(&[&scratch, &scratch2]).is_err());
+
+        // rw on a non-scratch mount is rejected.
+        let rw_stage = Mount {
+            rw: true,
+            ..mount(Some("builder"), Some("/in"))
+        };
+        assert!(scratch_mount_target(&[&rw_stage]).is_err());
+
+        // uid/gid/mode on a non-scratch mount is rejected.
+        for spec in [
+            Mount {
+                uid: Some("1000".into()),
+                ..mount(Some("builder"), Some("/in"))
+            },
+            Mount {
+                gid: Some("1000".into()),
+                ..mount(None, Some("/in"))
+            },
+            Mount {
+                mode: Some("0700".into()),
+                ..mount(None, Some("/in"))
+            },
+        ] {
+            assert!(scratch_mount_target(&[&spec]).is_err());
+        }
+
+        // The same options on the from=scratch mount are accepted.
+        let scratch_opts = Mount {
+            rw: true,
+            uid: Some("1000".into()),
+            gid: Some("1000".into()),
+            mode: Some("0700".into()),
+            ..mount(Some("scratch"), Some("/s"))
+        };
+        assert_eq!(
+            scratch_mount_target(&[&scratch_opts]).unwrap(),
+            Some("/s".into())
+        );
+    }
+
     fn source_labels(batch: &[(String, PathBuf)]) -> Vec<String> {
         batch.iter().map(|(label, _)| label.clone()).collect()
     }
@@ -1854,13 +2064,13 @@ mod tests {
     fn source_batch_slides_forward_in_first_use_order() {
         let sources = test_sources(19);
 
-        let first = select_source_batch(&sources, &["s0"], "app").unwrap();
+        let first = select_source_batch(&sources, &["s0"], "app", MAX_SOURCE_DISKS).unwrap();
         assert_eq!(
             source_labels(&first),
             (0..12).map(|i| format!("s{i}")).collect::<Vec<_>>()
         );
 
-        let second = select_source_batch(&sources, &["s12"], "app").unwrap();
+        let second = select_source_batch(&sources, &["s12"], "app", MAX_SOURCE_DISKS).unwrap();
         assert_eq!(
             source_labels(&second),
             (12..19).map(|i| format!("s{i}")).collect::<Vec<_>>()
@@ -1870,7 +2080,7 @@ mod tests {
     #[test]
     fn source_batch_keeps_scattered_needed_sources() {
         let sources = test_sources(20);
-        let batch = select_source_batch(&sources, &["s0", "s18"], "app").unwrap();
+        let batch = select_source_batch(&sources, &["s0", "s18"], "app", MAX_SOURCE_DISKS).unwrap();
         let labels = source_labels(&batch);
 
         assert!(labels.iter().any(|label| label == "s0"));
@@ -1883,7 +2093,7 @@ mod tests {
         // A context-only instruction needs no source stage; the batch still fills the boot
         // with the leading window so a later source-using instruction can likely reuse it.
         let sources = test_sources(20);
-        let batch = select_source_batch(&sources, &[], "app").unwrap();
+        let batch = select_source_batch(&sources, &[], "app", MAX_SOURCE_DISKS).unwrap();
         assert_eq!(
             source_labels(&batch),
             (0..12).map(|i| format!("s{i}")).collect::<Vec<_>>()
@@ -1895,7 +2105,7 @@ mod tests {
         let sources = test_sources(20);
         let needed: Vec<String> = (0..=MAX_SOURCE_DISKS).map(|i| format!("s{i}")).collect();
         let needed_refs: Vec<&str> = needed.iter().map(String::as_str).collect();
-        let err = select_source_batch(&sources, &needed_refs, "app").unwrap_err();
+        let err = select_source_batch(&sources, &needed_refs, "app", MAX_SOURCE_DISKS).unwrap_err();
 
         assert!(err.to_string().contains("at most 12 source stages"));
     }

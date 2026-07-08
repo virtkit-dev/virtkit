@@ -1595,12 +1595,16 @@ fn canonical(instr: &Instruction) -> String {
             r.mounts
                 .iter()
                 .map(|m| format!(
-                    "{}:from={}:src={}:tgt={}:ro={}",
+                    "{}:from={}:src={}:tgt={}:ro={}:rw={}:uid={}:gid={}:mode={}",
                     m.typ,
                     o(&m.from),
                     o(&m.source),
                     o(&m.target),
-                    m.readonly
+                    m.readonly,
+                    m.rw,
+                    o(&m.uid),
+                    o(&m.gid),
+                    o(&m.mode),
                 ))
                 .collect::<Vec<_>>()
                 .join(",")
@@ -1815,6 +1819,11 @@ fn apply_fs(
             let mut resolved: Vec<(usize, Option<usize>)> = Vec::new(); // (mount idx, committed key)
             for (mi, m) in r.mounts.iter().enumerate() {
                 if let Some(from) = &m.from {
+                    // `scratch` is the reserved empty base (Docker semantics), not a stage or
+                    // image: an ephemeral writable scratch the backend serves without a source.
+                    if from == "scratch" {
+                        continue;
+                    }
                     match plan.stage_ref(from) {
                         Some(s) => resolved.push((mi, Some(s))),
                         None => {
@@ -1830,7 +1839,9 @@ fn apply_fs(
                 .iter()
                 .enumerate()
                 .map(|(mi, m)| {
-                    let from = if m.from.is_none() {
+                    // `from=scratch` (reserved empty base) resolves to no source rootfs — the
+                    // backend serves it as an ephemeral writable scratch, keyed off `spec.from`.
+                    let from = if m.from.is_none() || m.from.as_deref() == Some("scratch") {
                         None
                     } else {
                         match resolved
@@ -2327,7 +2338,7 @@ mod tests {
 
     #[test]
     fn canonical_is_explicit_and_stable() {
-        use parser::{Cmdline, Run};
+        use parser::{Cmdline, Mount, Run};
         let run = |s: &str| {
             Instruction::Run(Run {
                 cmd: Cmdline::Shell(s.into()),
@@ -2346,6 +2357,51 @@ mod tests {
         assert_ne!(
             canonical(&Instruction::Workdir("/a".into())),
             canonical(&Instruction::User("/a".into()))
+        );
+        // every scratch-mount option participates in the key, so two RUNs differing only in
+        // rw/uid/gid/mode do not collide (and thus never reuse each other's cached snapshot).
+        let run_mount = |m: Mount| {
+            Instruction::Run(Run {
+                cmd: Cmdline::Shell("build".into()),
+                mounts: vec![m],
+                network: None,
+                security: None,
+            })
+        };
+        let scratch = || Mount {
+            typ: "bind".into(),
+            from: Some("scratch".into()),
+            target: Some("/s".into()),
+            ..Mount::default()
+        };
+        let base = run_mount(scratch());
+        assert_ne!(
+            canonical(&base),
+            canonical(&run_mount(Mount {
+                rw: true,
+                ..scratch()
+            }))
+        );
+        assert_ne!(
+            canonical(&base),
+            canonical(&run_mount(Mount {
+                uid: Some("1000".into()),
+                ..scratch()
+            }))
+        );
+        assert_ne!(
+            canonical(&base),
+            canonical(&run_mount(Mount {
+                gid: Some("1000".into()),
+                ..scratch()
+            }))
+        );
+        assert_ne!(
+            canonical(&base),
+            canonical(&run_mount(Mount {
+                mode: Some("0700".into()),
+                ..scratch()
+            }))
         );
     }
 

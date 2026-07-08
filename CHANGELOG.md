@@ -6,6 +6,13 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- `vk build` now supports `RUN --mount=type=bind,from=scratch,rw,target=…`, giving a
+  step an empty, writable, disk-backed scratch directory at the target — handy for a
+  step that writes more transient data than the RAM-backed `/tmp` holds. The scratch
+  is discarded after the step and never enters the image, matching BuildKit, so the
+  same Dockerfile builds under both. One such mount per step. As a virtkit extension
+  (BuildKit rejects these on bind mounts), `uid=`/`gid=`/`mode=` set the scratch root's
+  owner and mode so a non-root `RUN` can write to it.
 - `vk build --build-tmp-tmpfs` uses a RAM tmpfs for each stage guest's `/tmp`
   instead of the default disk-backed scratch. `/tmp` is disk-backed by default so a
   step that writes a lot of transient data there (e.g. unpacking a big toolchain) is

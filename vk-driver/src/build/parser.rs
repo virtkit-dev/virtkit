@@ -74,6 +74,18 @@ pub struct Mount {
     pub source: Option<String>,
     pub target: Option<String>,
     pub readonly: bool,
+    /// `rw`/`readwrite`: the BuildKit spelling that requests a writable mount. A `from=scratch`
+    /// mount is an ephemeral disk-backed scratch and is always writable (that is its purpose), so
+    /// `rw` is accepted there but not required; on a stage/context mount — a read-only view of
+    /// committed bytes — `rw` is rejected rather than silently ignored.
+    pub rw: bool,
+    /// `uid=`/`gid=`/`mode=` for a `from=scratch` scratch's root dir (owner, group, octal
+    /// mode). A virtkit extension — BuildKit rejects these on `type=bind` mounts — that lets a
+    /// non-root `RUN` write to the scratch. Unset = the ext4 default `root:root 0755`. Kept as
+    /// raw strings (interpolated like the other fields); parsed by the executor.
+    pub uid: Option<String>,
+    pub gid: Option<String>,
+    pub mode: Option<String>,
 }
 
 /// Shell form (`RUN foo`) vs exec form (`RUN ["foo","bar"]`, a JSON array).
@@ -305,6 +317,10 @@ fn parse_mount(spec: &str) -> Mount {
             "source" | "src" => m.source = Some(v.trim().to_string()),
             "target" | "dst" | "destination" => m.target = Some(v.trim().to_string()),
             "ro" | "readonly" => m.readonly = true,
+            "rw" | "readwrite" => m.rw = true,
+            "uid" => m.uid = Some(v.trim().to_string()),
+            "gid" => m.gid = Some(v.trim().to_string()),
+            "mode" => m.mode = Some(v.trim().to_string()),
             _ => {}
         }
     }
@@ -502,9 +518,44 @@ mod tests {
                 source: Some("/o".into()),
                 target: Some("/i".into()),
                 readonly: false,
+                rw: false,
+                uid: None,
+                gid: None,
+                mode: None,
             }
         );
         assert_eq!(r.cmd, Cmdline::Shell("make".into()));
+    }
+
+    #[test]
+    fn run_mount_scratch_rw_uid_gid_mode() {
+        let df = parse(
+            "RUN --mount=type=bind,from=scratch,target=/s,rw,uid=1000,gid=1001,mode=0700 build\n",
+        )
+        .unwrap();
+        let Instruction::Run(r) = &df.instructions[0] else {
+            panic!()
+        };
+        assert_eq!(
+            r.mounts[0],
+            Mount {
+                typ: "bind".into(),
+                from: Some("scratch".into()),
+                source: None,
+                target: Some("/s".into()),
+                readonly: false,
+                rw: true,
+                uid: Some("1000".into()),
+                gid: Some("1001".into()),
+                mode: Some("0700".into()),
+            }
+        );
+        // `readwrite` is an accepted spelling of `rw`.
+        let df = parse("RUN --mount=type=bind,from=scratch,target=/s,readwrite build\n").unwrap();
+        let Instruction::Run(r) = &df.instructions[0] else {
+            panic!()
+        };
+        assert!(r.mounts[0].rw);
     }
 
     #[test]

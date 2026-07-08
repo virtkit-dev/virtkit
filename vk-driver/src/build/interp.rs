@@ -180,6 +180,10 @@ fn expand_mount(m: &parser::Mount, vars: &Vars) -> parser::Mount {
         source: m.source.as_deref().map(|s| interpolate(s, vars)),
         target: m.target.as_deref().map(|s| interpolate(s, vars)),
         readonly: m.readonly,
+        rw: m.rw,
+        uid: m.uid.as_deref().map(|s| interpolate(s, vars)),
+        gid: m.gid.as_deref().map(|s| interpolate(s, vars)),
+        mode: m.mode.as_deref().map(|s| interpolate(s, vars)),
     }
 }
 
