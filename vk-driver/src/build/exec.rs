@@ -850,6 +850,59 @@ impl MicroVm {
             },
         }
     }
+
+    /// Push `snap`'s `dirty` extents as this instruction's cache layer, chained onto the
+    /// stage's parent layers, and record the result as the new parent (or clear the pinned
+    /// parent on failure so the next push full-re-chunks rather than splicing stale bytes).
+    /// The synchronous commit shared by the no-guest and dirty-tracked (libkrun) paths.
+    #[allow(clippy::too_many_arguments)]
+    fn push_snapshot_sync(
+        &mut self,
+        rg: &crate::config::Registry,
+        fs: &Rootfs,
+        key: &str,
+        boot_kind: &str,
+        snap: &Path,
+        dirty: &[(u64, u64)],
+        total_size: u64,
+    ) -> Result<()> {
+        let (parent_layers, parent_total) = self.parent_for_push(rg, total_size);
+        match crate::registry::push_ext4_diff(
+            rg,
+            CACHE_REPO,
+            key,
+            snap,
+            boot_kind,
+            parent_total,
+            dirty,
+            &parent_layers,
+        ) {
+            Ok((layers, total, digest)) => {
+                self.parent_layers = Some((layers, total));
+                self.stage_last_key
+                    .lock()
+                    .unwrap()
+                    .insert(fs.label.clone(), key.to_string());
+                self.stage_last_digest
+                    .lock()
+                    .unwrap()
+                    .insert(fs.label.clone(), digest.clone());
+                self.parent_digest = Some(digest);
+            }
+            Err(e) => {
+                eprintln!("virtkit: build cache push of {key} failed ({e:#}) — not cached");
+                // Drop the pinned parent too: this push never wrote its tag, so the next diff
+                // must not reuse the *previous* stage's digest as its parent (that would splice
+                // stale bytes over what this instruction changed). Falling back to `parent_key`
+                // — this push's absent tag — forces a full re-chunk.
+                self.parent_layers = None;
+                self.parent_digest = None;
+            }
+        }
+        self.parent_key = Some(key.to_string());
+        Ok(())
+    }
+
     /// Join the in-flight cache push (if any), recording the stage's last key and freeing
     /// the snapshot raw. A barrier the build must cross before a stage's image is reused (a
     /// fork or export) and before exit, so the cache is fully populated.
@@ -1336,9 +1389,8 @@ impl Executor for MicroVm {
             crate::image::boot_kind_tag(crate::image::BootKind::GenericDisk).to_string();
 
         // No live guest (rare: a metadata-only instruction never booted a VM). The static
-        // stage image is a stable qcow2, so push it synchronously — read natively and deduped
-        // against the parent chain, like the live path below but with the image as its own
-        // capture (no freeze/copy needed).
+        // stage image is a stable qcow2, so push it synchronously — its whole data set is the
+        // "delta" (deduped against the parent chain), no freeze/copy needed.
         if self.session.is_none() {
             let img = self.stage_image(fs)?;
             self.verify_snapshot(&img, &format!("snapshot of {key} (before upload)"))?;
@@ -1346,47 +1398,51 @@ impl Executor for MicroVm {
                 let mut q = crate::qcow2::Qcow2::open(&img)?;
                 (q.data_extents()?, q.virtual_size())
             };
-            let (parent_layers, parent_total) = self.parent_for_push(&rg, total_size);
-            match crate::registry::push_ext4_diff(
+            return self.push_snapshot_sync(
                 &rg,
-                CACHE_REPO,
+                fs,
                 key,
-                &img,
                 &boot_kind,
-                parent_total,
+                &img,
                 &cumulative,
-                &parent_layers,
-            ) {
-                Ok((layers, total, digest)) => {
-                    self.parent_layers = Some((layers, total));
-                    self.stage_last_key
-                        .lock()
-                        .unwrap()
-                        .insert(fs.label.clone(), key.to_string());
-                    self.stage_last_digest
-                        .lock()
-                        .unwrap()
-                        .insert(fs.label.clone(), digest.clone());
-                    self.parent_digest = Some(digest);
-                }
-                Err(e) => {
-                    eprintln!("virtkit: build cache push of {key} failed ({e:#}) — not cached");
-                    // Drop the pinned parent too: this push never wrote its tag, so the next
-                    // diff must not reuse the *previous* stage's digest as its parent (that
-                    // would splice stale bytes over what this instruction changed). Falling
-                    // back to `parent_key` — this push's absent tag — forces a full re-chunk.
-                    self.parent_layers = None;
-                    self.parent_digest = None;
-                }
-            }
-            self.parent_key = Some(key.to_string());
-            return Ok(());
+                total_size,
+            );
         }
 
-        // Capture a consistent point-in-time copy of the live overlay (freeze + copy, to a
-        // qcow2). This is the only synchronous part — the live overlay keeps moving as the
-        // next RUN starts, so the copy must happen now; flatten/diff/push read the qcow2
-        // natively, off this thread. (Session borrow scoped so the `&mut self` below is free.)
+        // Live guest with block-level dirty tracking (libkrun): freeze the fs, drain just the
+        // clusters written since the last checkpoint, and push synchronously from a zero-copy
+        // qcow2 overlay over the frozen live image — O(delta) capture, no whole-overlay copy
+        // and no cumulative content diff (the old quadratic). The guest stays frozen across the
+        // push so the live image is a stable source; the push reads unchanged straddling
+        // regions through the overlay's backing chain.
+        if self.session.as_ref().is_some_and(|s| s.supports_dirty()) {
+            let frozen = block_on(self.session.as_ref().unwrap().freeze());
+            let pushed = (|| -> Result<()> {
+                let (image, dirty, total_size) = {
+                    let session = self.session.as_ref().unwrap();
+                    let dirty = session.drain_dirty()?;
+                    let image = session.image().to_path_buf();
+                    let total_size = crate::qcow2::Qcow2::open(&image)?.virtual_size();
+                    (image, dirty, total_size)
+                };
+                self.push_seq += 1;
+                let snap = self.image_path(&format!("{}.{}.cap.qcow2", fs.label, self.push_seq));
+                crate::qcow2::create_overlay(&snap, &image)?;
+                self.verify_snapshot(&snap, &format!("snapshot of {key} (before upload)"))?;
+                let r =
+                    self.push_snapshot_sync(&rg, fs, key, &boot_kind, &snap, &dirty, total_size);
+                let _ = std::fs::remove_file(&snap);
+                r
+            })();
+            block_on(self.session.as_ref().unwrap().thaw(frozen));
+            return pushed;
+        }
+
+        // Cloud-hypervisor (no dirty tracking): fall back to a full point-in-time copy of the
+        // live overlay (freeze + copy, to a qcow2). This is the only synchronous part — the
+        // live overlay keeps moving as the next RUN starts, so the copy must happen now;
+        // flatten/diff/push read the qcow2 natively, off this thread. (Session borrow scoped
+        // so the `&mut self` below is free.)
         self.push_seq += 1;
         let snap = self.image_path(&format!("{}.{}.cap.qcow2", fs.label, self.push_seq));
         block_on(

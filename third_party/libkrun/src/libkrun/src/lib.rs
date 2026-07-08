@@ -283,6 +283,18 @@ impl ContextConfig {
     }
 
     #[cfg(feature = "blk")]
+    /// Enable dirty-drain control on the previously-added block device `block_id`, serving the
+    /// protocol on `socket`. Returns whether a matching block was found.
+    fn set_block_dirty_socket(&mut self, block_id: &str, socket: String) -> bool {
+        if let Some(cfg) = self.block_cfgs.iter_mut().find(|c| c.block_id == block_id) {
+            cfg.dirty_control_socket = Some(socket);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(feature = "blk")]
     fn set_root_block_cfg(&mut self, block_cfg: BlockDeviceConfig) {
         self.root_block_cfg = Some(block_cfg);
     }
@@ -766,6 +778,7 @@ pub unsafe extern "C" fn krun_add_disk(
                 sync_mode: SyncMode::Full,
                 #[cfg(target_os = "macos")]
                 sync_mode: SyncMode::Relaxed,
+                dirty_control_socket: None,
             };
             cfg.add_block_cfg(block_device_config);
         }
@@ -814,6 +827,7 @@ pub unsafe extern "C" fn krun_add_disk2(
                 sync_mode: SyncMode::Full,
                 #[cfg(target_os = "macos")]
                 sync_mode: SyncMode::Relaxed,
+                dirty_control_socket: None,
             };
             cfg.add_block_cfg(block_device_config);
         }
@@ -866,8 +880,45 @@ pub unsafe extern "C" fn krun_add_disk3(
                 is_disk_read_only: read_only,
                 direct_io,
                 sync_mode,
+                dirty_control_socket: None,
             };
             cfg.add_block_cfg(block_device_config);
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+/// Enable dirty-block tracking on a previously-added disk (see `krun_add_disk2`/`3`), serving
+/// a drain protocol on the Unix socket at `c_socket_path`. The virtkit build backend uses this
+/// to capture only a checkpoint's delta instead of the whole cumulative overlay. Must be called
+/// after the matching `krun_add_disk*`. Returns `-ENOENT` if `ctx_id`/`block_id` is unknown.
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(feature = "blk")]
+pub unsafe extern "C" fn krun_set_block_dirty_socket(
+    ctx_id: u32,
+    c_block_id: *const c_char,
+    c_socket_path: *const c_char,
+) -> i32 {
+    let block_id = match CStr::from_ptr(c_block_id).to_str() {
+        Ok(id) => id,
+        Err(_) => return -libc::EINVAL,
+    };
+    let socket_path = match CStr::from_ptr(c_socket_path).to_str() {
+        Ok(p) => p,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            if !ctx_cfg
+                .get_mut()
+                .set_block_dirty_socket(block_id, socket_path.to_string())
+            {
+                return -libc::ENOENT;
+            }
         }
         Entry::Vacant(_) => return -libc::ENOENT,
     }
@@ -898,6 +949,7 @@ pub unsafe extern "C" fn krun_set_root_disk(ctx_id: u32, c_disk_path: *const c_c
                 sync_mode: SyncMode::Full,
                 #[cfg(target_os = "macos")]
                 sync_mode: SyncMode::Relaxed,
+                dirty_control_socket: None,
             };
             cfg.set_root_block_cfg(block_device_config);
         }
@@ -930,6 +982,7 @@ pub unsafe extern "C" fn krun_set_data_disk(ctx_id: u32, c_disk_path: *const c_c
                 sync_mode: SyncMode::Full,
                 #[cfg(target_os = "macos")]
                 sync_mode: SyncMode::Relaxed,
+                dirty_control_socket: None,
             };
             cfg.set_data_block_cfg(block_device_config);
         }
