@@ -98,6 +98,11 @@ enum Commands {
         /// vsock://[cid:]port
         #[arg(long)]
         listen: SocketAddr,
+        /// For a unix `--listen`, give the bound socket to this `user[:group]`
+        /// (numeric id or a guest passwd/group name) so a non-root client can
+        /// open it. Ignored for tcp/vsock listeners.
+        #[arg(long)]
+        chown: Option<String>,
     },
     /// Splice stdin/stdout to the --socket target, raw bytes (no virtkit-agent
     /// protocol) — the stdio sibling of `forward`, meant to be an SSH
@@ -329,7 +334,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
                 std::process::exit(1)
             };
         }
-        Commands::Forward { listen } => {
+        Commands::Forward { listen, chown } => {
             TermLogger::init(
                 LevelFilter::Info,
                 Config::default(),
@@ -341,7 +346,15 @@ async fn async_main(socket: SocketAddr, command: Commands) {
                 },
             )
             .unwrap();
-            if let Err(e) = vk_core::forward::run_forward(&listen, &socket).await {
+            let chown = match chown.as_deref().map(vk_agent::diskmount::parse_chown) {
+                Some(Ok(ids)) => Some(ids),
+                Some(Err(e)) => {
+                    error!("forward: --chown: {e:#}");
+                    std::process::exit(1)
+                }
+                None => None,
+            };
+            if let Err(e) = vk_core::forward::run_forward(&listen, &socket, chown).await {
                 error!("forward: {e:#}");
                 std::process::exit(1)
             }

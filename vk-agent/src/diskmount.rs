@@ -386,7 +386,7 @@ fn lchown(path: &Path, uid: u32, gid: u32) -> Result<()> {
 
 /// Parse a `--chown` value `user[:group]`: each part is a numeric id or a name resolved
 /// against the guest's passwd/group databases. A bare `user` uses that user's gid.
-fn parse_chown(spec: &str) -> Result<(u32, u32)> {
+pub fn parse_chown(spec: &str) -> Result<(u32, u32)> {
     let (u, g) = spec
         .split_once(':')
         .map_or((spec, None), |(u, g)| (u, Some(g)));

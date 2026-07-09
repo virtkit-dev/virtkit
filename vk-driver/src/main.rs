@@ -1336,10 +1336,12 @@ async fn cli_main() -> ExitCode {
         },
         // run_forward only returns on a bind error; otherwise it serves until the
         // process is killed (cleanup tears the detached child down).
-        Cmd::Forward { listen, to } => match vk_core::forward::run_forward(&listen, &to).await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => fail(&e, 1),
-        },
+        Cmd::Forward { listen, to } => {
+            match vk_core::forward::run_forward(&listen, &to, None).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, 1),
+            }
+        }
         Cmd::SshAgentProxy {
             listen,
             upstream,

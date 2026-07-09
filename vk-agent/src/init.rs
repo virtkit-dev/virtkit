@@ -906,15 +906,22 @@ fn maybe_ctlfs(cmdline: &HashMap<String, String>) {
 const HOST_EXEC_SOCK: &str = "/run/vk/host.sock";
 
 /// Argv for the guest-side host-exec forwarder: listen on [`HOST_EXEC_SOCK`] and
-/// relay to the host over `port` — the exact shape of the SSH-agent forward.
-fn host_exec_forward_args(port: &str) -> Vec<String> {
-    vec![
+/// relay to the host over `port` — the exact shape of the SSH-agent forward. When
+/// a non-root run user is given, the socket is chowned to it so a job stage running
+/// as that user can reach the host channel (`vk-agent -s /run/vk/host.sock exec …`).
+fn host_exec_forward_args(port: &str, run_user: Option<&str>) -> Vec<String> {
+    let mut args = vec![
         "--socket".into(),
         format!("vsock://{port}"),
         "forward".into(),
         "--listen".into(),
         HOST_EXEC_SOCK.into(),
-    ]
+    ];
+    if let Some(user) = run_user {
+        args.push("--chown".into());
+        args.push(user.into());
+    }
+    args
 }
 
 /// Optionally expose the host command channel (`VIRTKIT_HOST_EXEC_PORT`): a
@@ -933,7 +940,11 @@ fn maybe_host_exec(cmdline: &HashMap<String, String>) {
     if let Err(e) = install_host_exec_agent(HOST_EXEC_AGENT_SOURCE, HOST_EXEC_AGENT_BIN) {
         warn!("vk-agent init: mounting {HOST_EXEC_AGENT_BIN} failed: {e:#}");
     }
-    if let Err(e) = fork_agent(&host_exec_forward_args(port)) {
+    // Give the socket to the run user (VIRTKIT_DEFAULT_RUN_USER, set above by
+    // export_default_run_user/apply_boot_config; unset when the stage runs as root)
+    // so a non-root job stage can reach the host channel.
+    let run_user = std::env::var("VIRTKIT_DEFAULT_RUN_USER").ok();
+    if let Err(e) = fork_agent(&host_exec_forward_args(port, run_user.as_deref())) {
         warn!("vk-agent init: host-exec forward failed to start: {e}");
     }
 }
@@ -1372,7 +1383,7 @@ mod tests {
     #[test]
     fn host_exec_forward_args_relay_to_host_port() {
         assert_eq!(
-            host_exec_forward_args("1100"),
+            host_exec_forward_args("1100", None),
             vec![
                 "--socket",
                 "vsock://1100",
@@ -1389,6 +1400,22 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn host_exec_forward_args_chowns_socket_to_run_user() {
+        assert_eq!(
+            host_exec_forward_args("1100", Some("build")),
+            vec![
+                "--socket",
+                "vsock://1100",
+                "forward",
+                "--listen",
+                HOST_EXEC_SOCK,
+                "--chown",
+                "build",
+            ]
+        );
     }
 
     #[test]

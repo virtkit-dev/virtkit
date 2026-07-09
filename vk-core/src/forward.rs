@@ -38,10 +38,22 @@ pub async fn run_connect(target: &SocketAddr) -> Result<()> {
 
 /// Accept on `local` and splice every connection to `target` until cancelled.
 /// Per-connection errors are logged and do not stop the listener.
-pub async fn run_forward(local: &SocketAddr, target: &SocketAddr) -> Result<()> {
+///
+/// `chown` (a resolved `uid:gid`) is applied to the bound unix socket before the
+/// accept loop, so a non-root client can open it — the forwarder runs as root but
+/// its socket may need to belong to the guest's run user. Ignored for tcp/vsock.
+pub async fn run_forward(
+    local: &SocketAddr,
+    target: &SocketAddr,
+    chown: Option<(u32, u32)>,
+) -> Result<()> {
     let listener = raw_listen(local)
         .await
         .with_context(|| format!("forward: binding {local}"))?;
+    if let (SocketAddr::Unix(path), Some((uid, gid))) = (local, chown) {
+        std::os::unix::fs::chown(path, Some(uid), Some(gid))
+            .with_context(|| format!("forward: chown {} to {uid}:{gid}", path.display()))?;
+    }
     info!("forward: {local} -> {target}");
     loop {
         let mut inbound = match listener.accept().await {
@@ -99,7 +111,7 @@ mod tests {
         let listen: SocketAddr = format!("tcp://{front_addr}").parse().unwrap();
         let target: SocketAddr = format!("tcp://{backend_addr}").parse().unwrap();
         tokio::spawn(async move {
-            let _ = run_forward(&listen, &target).await;
+            let _ = run_forward(&listen, &target, None).await;
         });
 
         // give the forward a moment to bind, then round-trip a payload
