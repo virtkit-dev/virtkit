@@ -1014,14 +1014,21 @@ fn maybe_ssh_serve(cmdline: &HashMap<String, String>) {
 
 /// Argv for the guest-side SSH-agent forwarder: listen on the guest SSH_AUTH_SOCK and
 /// relay to the host over `port` (the host splices it to its real `$SSH_AUTH_SOCK`).
-fn ssh_agent_forward_args(port: &str) -> Vec<String> {
-    vec![
+/// When a non-root run user is given, the socket is chowned to it so that user's
+/// ssh/git (a served/exec'd stage) can open it.
+fn ssh_agent_forward_args(port: &str, run_user: Option<&str>) -> Vec<String> {
+    let mut args = vec![
         "--socket".into(),
         format!("vsock://{port}"),
         "forward".into(),
         "--listen".into(),
         SSH_AGENT_SOCK.into(),
-    ]
+    ];
+    if let Some(user) = run_user {
+        args.push("--chown".into());
+        args.push(user.into());
+    }
+    args
 }
 
 /// Optionally forward the host's SSH agent (`VIRTKIT_SSH_AGENT_PORT`): start the guest-side
@@ -1031,7 +1038,10 @@ fn maybe_ssh_agent(cmdline: &HashMap<String, String>) {
     let Some(port) = cmdline.get("VIRTKIT_SSH_AGENT_PORT") else {
         return;
     };
-    match fork_agent(&ssh_agent_forward_args(port)) {
+    // Give the socket to the run user (VIRTKIT_DEFAULT_RUN_USER, set earlier in init;
+    // unset when stages run as root) so that user's ssh/git can open it.
+    let run_user = std::env::var("VIRTKIT_DEFAULT_RUN_USER").ok();
+    match fork_agent(&ssh_agent_forward_args(port, run_user.as_deref())) {
         // Set it before spawn_serve so the served stages inherit it (single-threaded here).
         // SAFETY: PID 1, no other threads yet (serve/net not forked).
         Ok(_) => unsafe { std::env::set_var("SSH_AUTH_SOCK", SSH_AGENT_SOCK) },
@@ -1369,13 +1379,29 @@ mod tests {
     #[test]
     fn ssh_agent_forward_args_relay_to_host_port() {
         assert_eq!(
-            ssh_agent_forward_args("2223"),
+            ssh_agent_forward_args("2223", None),
             vec![
                 "--socket",
                 "vsock://2223",
                 "forward",
                 "--listen",
                 SSH_AGENT_SOCK,
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_agent_forward_args_chowns_socket_to_run_user() {
+        assert_eq!(
+            ssh_agent_forward_args("2223", Some("build")),
+            vec![
+                "--socket",
+                "vsock://2223",
+                "forward",
+                "--listen",
+                SSH_AGENT_SOCK,
+                "--chown",
+                "build",
             ]
         );
     }
