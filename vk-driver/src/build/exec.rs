@@ -413,6 +413,13 @@ pub struct MicroVm {
     /// cancels it, interrupting the RUN steps still executing in every other stage's guest
     /// so the build stops promptly instead of running the in-flight steps to completion.
     cancel: Option<CancellationToken>,
+    /// stage label → the qcow2 overlay's cumulative allocated extents at the previous
+    /// checkpoint. The next checkpoint diffs the current allocation against this to fold
+    /// newly-allocated clusters into the delta — a ground-truth backstop for libkrun's dirty
+    /// side-channel (a cluster cannot be written without the overlay allocating it, so this
+    /// recovers writes the dirty set drops). Local + sequential (a stage's checkpoints run in
+    /// order on one worker); cleared implicitly by rebuilding a stage from a fresh key.
+    stage_prev_extents: HashMap<String, Vec<(u64, u64)>>,
 }
 
 /// What `cache_save` chunks + uploads in the background. The thread returns the pushed
@@ -466,6 +473,65 @@ fn content_diff(prev: &Path, cur: &Path, within: &[(u64, u64)]) -> Result<Vec<(u
         }
     }
     Ok(out)
+}
+
+/// Whether `[off, off+len)` intersects any of `ranges` (used to test a differing extent
+/// against the drained dirty set — a difference disjoint from every dirty range is a
+/// cluster the capture failed to mark).
+fn any_overlap(ranges: &[(u64, u64)], off: u64, len: u64) -> bool {
+    let end = off + len;
+    ranges.iter().any(|&(o, l)| o < end && off < o + l)
+}
+
+/// Sort `(offset, len)` extents by offset and coalesce touching/overlapping ones into a
+/// canonical minimal list. Empty extents are dropped.
+fn coalesce_ranges(mut r: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    r.retain(|&(_, l)| l > 0);
+    r.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(r.len());
+    for (o, l) in r {
+        match out.last_mut() {
+            Some(last) if o <= last.0 + last.1 => last.1 = (last.0 + last.1).max(o + l) - last.0,
+            _ => out.push((o, l)),
+        }
+    }
+    out
+}
+
+/// Union of two extent lists, coalesced.
+fn union_ranges(a: &[(u64, u64)], b: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut all = a.to_vec();
+    all.extend_from_slice(b);
+    coalesce_ranges(all)
+}
+
+/// The parts of `a` not covered by `b` (both coalesced first). Used to isolate the clusters
+/// the dirty set missed (`a` = newly-allocated, `b` = drained dirty).
+fn subtract_ranges(a: &[(u64, u64)], b: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let a = coalesce_ranges(a.to_vec());
+    let b = coalesce_ranges(b.to_vec());
+    let mut out = Vec::new();
+    let mut bi = 0;
+    for (mut pos, len) in a {
+        let end = pos + len;
+        // advance past b-ranges entirely left of `pos`
+        while bi < b.len() && b[bi].0 + b[bi].1 <= pos {
+            bi += 1;
+        }
+        let mut j = bi;
+        while pos < end {
+            if j >= b.len() || b[j].0 >= end {
+                out.push((pos, end - pos));
+                break;
+            }
+            if b[j].0 > pos {
+                out.push((pos, b[j].0 - pos));
+            }
+            pos = pos.max(b[j].0 + b[j].1);
+            j += 1;
+        }
+    }
+    out
 }
 
 /// The Linux disk name for the `n`th virtio-blk device (0 = `vda`, 25 = `vdz`,
@@ -663,6 +729,7 @@ impl MicroVm {
             base_digests: Arc::new(Mutex::new(HashMap::new())),
             output_sink: crate::executor::OutputSink::Inherit,
             cancel: None,
+            stage_prev_extents: HashMap::new(),
         }
     }
 
@@ -714,6 +781,7 @@ impl MicroVm {
             output_sink: crate::executor::OutputSink::Inherit,
             // Set per stage by the driver (`build_stage`), before its instructions run.
             cancel: None,
+            stage_prev_extents: HashMap::new(),
         }
     }
 
@@ -857,6 +925,72 @@ impl MicroVm {
         let _ = std::fs::remove_file(&raw);
         r
     }
+    /// `--debug`: verify the *reassembled* cache entry — parent layers spliced with this
+    /// instruction's delta — which is what a later build restores, unlike [`Self::verify_snapshot`]
+    /// (the frozen source overlay is always the full, consistent fs, so it can never expose an
+    /// incomplete delta). Pull `key` back and e2fsck it. On corruption, `content_diff` the
+    /// reassembly against the frozen source `snap` and report how many differing extents the
+    /// drained `dirty` set failed to mark — pinpointing the capture gap that poisoned the layer.
+    /// No-op unless `--debug`.
+    fn verify_reassembly(
+        &self,
+        rg: &crate::config::Registry,
+        key: &str,
+        snap: &Path,
+        dirty: &[(u64, u64)],
+        total_size: u64,
+        context: &str,
+    ) -> Result<()> {
+        if !self.debug {
+            return Ok(());
+        }
+        let pulled = self.image_path(&format!("verify-{}", key.replace([':', '/'], "_")));
+        let digest = crate::registry::try_pull_ext4(rg, CACHE_REPO, key, &pulled)
+            .with_context(|| format!("--debug: pulling {context} back to verify the reassembly"))?;
+        if digest.is_none() {
+            bail!(
+                "--debug: {context} vanished from the cache before its reassembly could be verified"
+            );
+        }
+        let fsck = crate::ext4::fsck(&pulled);
+        if let crate::ext4::FsckResult::Corrupt(report) = &fsck {
+            // Localize the poisoning: the frozen `snap` is the full, correct fs, so every extent
+            // where the reassembly differs is a cluster the delta got wrong; those disjoint from
+            // `dirty` are exactly what the capture failed to record.
+            let overlay = pulled.with_extension("cmp.qcow2");
+            let localize = (|| -> Result<String> {
+                crate::qcow2::create_overlay(&overlay, &pulled)?;
+                let diffs = content_diff(snap, &overlay, &[(0, total_size)])?;
+                let missed: Vec<(u64, u64)> = diffs
+                    .iter()
+                    .copied()
+                    .filter(|&(o, l)| !any_overlap(dirty, o, l))
+                    .collect();
+                Ok(format!(
+                    "{} extent(s) differ from the frozen image; {} are outside the drained \
+                     dirty set (missed by capture) — first: {:?}",
+                    diffs.len(),
+                    missed.len(),
+                    missed.iter().take(8).collect::<Vec<_>>()
+                ))
+            })();
+            let _ = std::fs::remove_file(&overlay);
+            let _ = std::fs::remove_file(&pulled);
+            let detail =
+                localize.unwrap_or_else(|e| format!("(diff against source failed: {e:#})"));
+            bail!(
+                "--debug: reassembled {context} is a corrupt ext4 (e2fsck):\n{report}\n\
+                 dirty-delta audit: {detail}\n\
+                 the O(delta) capture produced an incomplete delta; rebuild with \
+                 --cache-registry none to bypass it"
+            );
+        }
+        let _ = std::fs::remove_file(&pulled);
+        if let crate::ext4::FsckResult::Skipped(why) = fsck {
+            eprintln!("virtkit: --debug: reassembly check of {context} skipped ({why})");
+        }
+        Ok(())
+    }
     fn image_path(&self, stage: &str) -> PathBuf {
         self.scratch
             .join(format!("{}.ext4", stage.replace(['/', '\\', ':'], "_")))
@@ -954,6 +1088,17 @@ impl MicroVm {
                     .unwrap()
                     .insert(fs.label.clone(), digest.clone());
                 self.parent_digest = Some(digest);
+                // Verify what actually got cached (parent + this delta), not just the frozen
+                // source — an incomplete delta reassembles to a corrupt ext4 that the source
+                // check can never catch. `--debug` only.
+                self.verify_reassembly(
+                    rg,
+                    key,
+                    snap,
+                    dirty,
+                    total_size,
+                    &format!("cached instruction {key}"),
+                )?;
             }
             Err(e) => {
                 eprintln!("virtkit: build cache push of {key} failed ({e:#}) — not cached");
@@ -1580,19 +1725,52 @@ impl Executor for MicroVm {
         if self.session.as_ref().is_some_and(|s| s.supports_dirty()) {
             let frozen = block_on(self.session.as_ref().unwrap().freeze());
             let pushed = (|| -> Result<()> {
-                let (image, dirty, total_size) = {
+                let (image, dirty, cumulative, total_size) = {
                     let session = self.session.as_ref().unwrap();
                     let dirty = session.drain_dirty()?;
                     let image = session.image().to_path_buf();
-                    let total_size = crate::qcow2::Qcow2::open(&image)?.virtual_size();
-                    (image, dirty, total_size)
+                    let mut q = crate::qcow2::Qcow2::open(&image)?;
+                    // The overlay's allocated clusters — ground truth for what the guest wrote,
+                    // since a write cannot reach the disk without allocating its cluster.
+                    let cumulative = q.data_extents()?;
+                    (image, dirty, cumulative, q.virtual_size())
                 };
+                // libkrun's dirty side-channel is unreliable — it has been observed to drop
+                // gigabytes of writes, both freshly-allocated clusters AND in-place rewrites of
+                // clusters allocated in an earlier checkpoint. A delta missing any of them splices
+                // stale parent chunks (a corrupt ext4 restored later). So take the delta from the
+                // qcow2 allocation map instead: every allocated cluster is regenerated from the
+                // frozen image, which covers new writes and rewrites alike (dedup keeps unchanged
+                // chunks from re-uploading — only re-reading). `dirty` is folded in for the one
+                // thing the map can't show: clusters discarded back to holes.
+                let delta = union_ranges(&dirty, &cumulative);
+                // Diagnostic breadcrumb: how much of *this checkpoint's* new allocation the dirty
+                // set failed to report — a running, always-on record of the underlying libkrun gap
+                // (the delta above is already correct regardless).
+                let prev = self
+                    .stage_prev_extents
+                    .get(&fs.label)
+                    .cloned()
+                    .unwrap_or_default();
+                let missed = subtract_ranges(&subtract_ranges(&cumulative, &prev), &dirty);
+                if !missed.is_empty() {
+                    let bytes: u64 = missed.iter().map(|&(_, l)| l).sum();
+                    eprintln!(
+                        "virtkit: dirty-tracking gap at {key}: {} newly-allocated extent(s) \
+                         ({bytes} bytes) were written but absent from the block device's dirty \
+                         set — recovered from the qcow2 allocation map (delta stays correct). \
+                         First: {:?}",
+                        missed.len(),
+                        missed.iter().take(6).collect::<Vec<_>>()
+                    );
+                }
+                self.stage_prev_extents.insert(fs.label.clone(), cumulative);
                 self.push_seq += 1;
                 let snap = self.image_path(&format!("{}.{}.cap.qcow2", fs.label, self.push_seq));
                 crate::qcow2::create_overlay(&snap, &image)?;
                 self.verify_snapshot(&snap, &format!("snapshot of {key} (before upload)"))?;
                 let r =
-                    self.push_snapshot_sync(&rg, fs, key, &boot_kind, &snap, &dirty, total_size);
+                    self.push_snapshot_sync(&rg, fs, key, &boot_kind, &snap, &delta, total_size);
                 let _ = std::fs::remove_file(&snap);
                 r
             })();
@@ -1937,6 +2115,45 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coalesce_merges_touching_and_overlapping() {
+        assert_eq!(
+            coalesce_ranges(vec![(10, 5), (0, 4), (4, 6), (100, 0), (15, 5)]),
+            vec![(0, 20)] // 0-4, 4-10, 10-15, 15-20 all touch; empty dropped
+        );
+        assert_eq!(
+            coalesce_ranges(vec![(0, 4), (10, 4), (6, 2)]),
+            vec![(0, 4), (6, 2), (10, 4)] // gaps preserved
+        );
+    }
+
+    #[test]
+    fn union_covers_both() {
+        assert_eq!(
+            union_ranges(&[(0, 10)], &[(20, 10)]),
+            vec![(0, 10), (20, 10)]
+        );
+        assert_eq!(union_ranges(&[(0, 10)], &[(5, 10)]), vec![(0, 15)]);
+    }
+
+    #[test]
+    fn subtract_isolates_the_uncovered_parts() {
+        // a fully covered by b → nothing missed
+        assert!(subtract_ranges(&[(0, 10)], &[(0, 20)]).is_empty());
+        // a disjoint from b → all of a missed
+        assert_eq!(subtract_ranges(&[(0, 10)], &[(20, 5)]), vec![(0, 10)]);
+        // b carves a hole in the middle and clips an edge
+        assert_eq!(
+            subtract_ranges(&[(0, 100)], &[(10, 10), (50, 10)]),
+            vec![(0, 10), (20, 30), (60, 40)]
+        );
+        // the newly-allocated-minus-dirty case: dirty covered the first cluster only
+        assert_eq!(
+            subtract_ranges(&[(0, 65536), (65536, 65536)], &[(0, 65536)]),
+            vec![(65536, 65536)]
+        );
+    }
 
     #[test]
     fn resolve_build_cpus_prefers_valid_env_over_host() {

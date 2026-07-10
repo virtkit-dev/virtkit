@@ -31,6 +31,16 @@ All notable changes to virtkit will be documented in this file.
   `ARG` and `ENV` supplied through its environment — so a shell variable such as a
   `${opt}` loop index is no longer silently blanked. A `RUN`'s `--mount` fields still
   interpolate. This unblocks Dockerfiles whose `RUN` steps use shell variables.
+- `vk build` no longer caches a corrupt ext4 for stages with large writes. The
+  O(delta) checkpoint trusted libkrun's block dirty-tracking to list the changed
+  clusters, but that side-channel drops writes (gigabytes, in `COPY`-heavy stages),
+  so a checkpoint reused stale parent chunks for the dropped clusters and cached an
+  image that failed with EUCLEAN on a later boot. The delta now comes from the qcow2
+  overlay's allocation map (authoritative — a cluster can't be written without being
+  allocated), which captures dropped writes and in-place rewrites alike; chunk dedup
+  still avoids re-uploading unchanged data. A `--debug` check verifies the pulled-back
+  reassembly (not just the frozen source), and a one-line log reports how much each
+  build's dirty set dropped.
 
 ## [0.9.0] - 2026-07-09
 
