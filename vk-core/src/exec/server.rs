@@ -469,7 +469,7 @@ async fn srv_run_cmd_tty(
     mut sink: impl Sink<Message, Error = std::io::Error> + Unpin + Send + 'static,
     cmd: CmdExec,
 ) -> Result<(), anyhow::Error> {
-    info!("command [{}] {} (tty)", req_id, &cmd);
+    info!("command [{}] {} (tty)", req_id, cmd);
     let Some(tty) = &cmd.tty else { unreachable!() };
     if cmd.mode == RunMode::Background {
         let msg = "--tty is incompatible with --background".to_string();
@@ -606,7 +606,7 @@ async fn srv_run_cmd(
     mut sink: impl Sink<Message, Error = std::io::Error> + Unpin + Send + 'static,
     cmd: CmdExec,
 ) -> Result<(), anyhow::Error> {
-    info!("command [{}] {}", req_id, &cmd);
+    info!("command [{}] {}", req_id, cmd);
     let mut command = build_command(&cmd);
 
     match cmd.mode {
@@ -674,9 +674,9 @@ async fn srv_run_cmd(
 
     let write_stdin = tokio::spawn(async move {
         while let Some(data) = stdin_rx.recv().await {
-            debug!("copy_stdin_task, writing {} bytes", &data.len());
+            debug!("copy_stdin_task, writing {} bytes", data.len());
             if stdin.write_all(&data).await.is_ok() {
-                debug!("copy_stdin_task, wrote {} bytes", &data.len());
+                debug!("copy_stdin_task, wrote {} bytes", data.len());
             } else {
                 break;
             }
@@ -700,7 +700,7 @@ async fn srv_run_cmd(
                     fd: messages::Fd::Stdin,
                     msg,
                 } => {
-                    debug!("writing to stdin {} bytes", &msg.len());
+                    debug!("writing to stdin {} bytes", msg.len());
                     if let Some(ref tx) = stdin_tx {
                         let _ = tx.send(msg).await;
                     } else {

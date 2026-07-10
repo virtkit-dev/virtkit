@@ -76,14 +76,14 @@ pub async fn client_run_cmd(
     let th_copy_stdout = thread::spawn(move || {
         let mut stdout = std::io::stdout();
         while let Some(data) = stdout_rx.blocking_recv() {
-            debug!("copy_stdout_thread, writing {} bytes", &data.len());
+            debug!("copy_stdout_thread, writing {} bytes", data.len());
             if std::io::Write::write_all(&mut stdout, &data).is_err() {
                 // downstream is gone (e.g. `... | head`): draining forever would let
                 // the remote command run unattended; disconnect instead — the server
                 // kills the remote process group on EOF. 141 = 128 + SIGPIPE.
                 process::exit(141);
             }
-            debug!("copy_stdout_thread, wrote {} bytes", &data.len());
+            debug!("copy_stdout_thread, wrote {} bytes", data.len());
         }
         info!("copy_stdout_thread done");
         stdout.flush()
@@ -97,12 +97,12 @@ pub async fn client_run_cmd(
     let th_copy_stderr = thread::spawn(move || {
         let mut stderr = std::io::stderr();
         while let Some(data) = stderr_rx.blocking_recv() {
-            debug!("copy_stderr_thread, writing {} bytes", &data.len());
+            debug!("copy_stderr_thread, writing {} bytes", data.len());
             if std::io::Write::write_all(&mut stderr, &data).is_err() {
                 // see the stdout thread: a closed stderr must disconnect too
                 process::exit(141);
             }
-            debug!("copy_stderr_thread, wrote {} bytes", &data.len());
+            debug!("copy_stderr_thread, wrote {} bytes", data.len());
         }
         info!("copy_stderr_thread done");
         stderr.flush()
@@ -156,7 +156,7 @@ pub async fn client_run_cmd(
             Message::ExecDone(cr) => {
                 info!(
                     "Process exit status: code={:?} signal={:?} (stdout: {}, stderr: {})",
-                    &cr.code, &cr.signal, stdout_recv, stderr_recv
+                    cr.code, cr.signal, stdout_recv, stderr_recv
                 );
                 drop(stdout_tx);
                 drop(stderr_tx);
