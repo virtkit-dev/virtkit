@@ -32,6 +32,7 @@ use devices::virtio::descriptor_utils::{Reader as KrunReader, Writer as KrunWrit
 use devices::virtio::fs::filesystem::FileSystem;
 use devices::virtio::fs::passthrough::{CachePolicy, Config as FsConfig, PassthroughFs};
 use devices::virtio::fs::read_only::PassthroughFsRo;
+use devices::virtio::fs::single_file::SingleFileFs;
 use devices::virtio::fs::{InodeAllocator, Server};
 use futures::executor::{ThreadPool, ThreadPoolBuilder};
 use vhost::vhost_user::Listener;
@@ -117,6 +118,31 @@ pub fn run(argv: Vec<String>) -> Result<()> {
     // CH connects as the client.
     let listener = Listener::new(&opt.socket_path, true)
         .with_context(|| format!("binding the vhost-user socket {}", opt.socket_path))?;
+
+    // A single-file share: serve just that file, no chroot (a file can't be chroot'd into —
+    // SingleFileFs opens it by absolute path). Matches the libkrun in-process backend, which
+    // auto-selects the single-file server the same way. SingleFileFs honors the ro flag but does
+    // not apply id maps, so refuse a share that asks for one rather than silently serving the file
+    // with its host ownership.
+    if std::fs::metadata(&opt.shared_dir)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        if !opt.uid_map.is_empty() || !opt.gid_map.is_empty() {
+            return Err(anyhow!(
+                "single-file share {}: uid/gid remapping is not supported",
+                opt.shared_dir
+            ));
+        }
+        let fs = SingleFileFs::new(opt.shared_dir.clone().into(), opt.readonly)?;
+        let opts = DaemonOpts {
+            listener,
+            tag: opt.tag.clone(),
+            thread_pool_size: opt.thread_pool_size,
+            seccomp: opt.seccomp,
+        };
+        return serve(fs, opts);
+    }
 
     // Sandbox, then resolve the served root. chroot confines path resolution to the
     // share even if the daemon is subverted; `none` matches how virtkit spawns its
