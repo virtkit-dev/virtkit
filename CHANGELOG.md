@@ -24,6 +24,14 @@ All notable changes to virtkit will be documented in this file.
   `--service` to `--primary`, naming the role it fills: the foreground VM whose
   lifecycle the run follows, as opposed to the background sibling services.
 
+### Fixed
+
+- `vk build` / `vk run -f` no longer expands `$VAR`/`${VAR}` inside a `RUN`'s command
+  itself. As Docker does, the command is left to the guest shell, with the in-scope
+  `ARG` and `ENV` supplied through its environment — so a shell variable such as a
+  `${opt}` loop index is no longer silently blanked. A `RUN`'s `--mount` fields still
+  interpolate. This unblocks Dockerfiles whose `RUN` steps use shell variables.
+
 ## [0.9.0] - 2026-07-09
 
 ### Added

@@ -49,6 +49,11 @@ pub struct ShellState {
     pub entrypoint: Vec<String>,
     /// Default arguments appended to the entrypoint.
     pub cmd: Vec<String>,
+    /// In-scope `ARG` values, exported into a `RUN`'s shell environment so `$VAR` resolves
+    /// there (Docker leaves a RUN command to the shell). Build-time only — `ENV` already
+    /// lives in `env`, and this is not part of the exported runtime config. Set per RUN
+    /// step by the resolver; empty otherwise.
+    pub build_args: Vec<(String, String)>,
 }
 
 /// How a `RUN`'s `--mount=…,from=` resolves: the source stage's committed rootfs.
@@ -1306,8 +1311,10 @@ impl Executor for MicroVm {
             Cmdline::Exec(v) => v.join(" "),
         };
         // assemble a /bin/sh script: env exports, cd into WORKDIR, then the command.
+        // A RUN command is executed raw (Docker leaves it to the shell), so the in-scope
+        // ENV and ARG are exported here for the shell to expand `$VAR` against.
         let mut script = String::new();
-        for (k, v) in &state.env {
+        for (k, v) in state.env.iter().chain(&state.build_args) {
             script.push_str(&format!("export {k}={}; ", shell_single_quote(v)));
         }
         let wd = if state.workdir.is_empty() {

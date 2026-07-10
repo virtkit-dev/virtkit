@@ -653,6 +653,7 @@ fn resolve_stages(
                     workdir: cfg.workdir.unwrap_or_else(|| "/".into()),
                     entrypoint: cfg.entrypoint,
                     cmd: cfg.cmd,
+                    build_args: Vec::new(),
                 }
             }
             Base::Scratch => ShellState::default(),
@@ -724,7 +725,7 @@ fn resolve_stages(
                     // A --mount=from=<stage> keys on the source stage; a bind mount
                     // from the context keys on its files (source defaults to the whole
                     // context). --from=<image> and non-bind mounts contribute nothing.
-                    let parts: Vec<String> = r
+                    let mut parts: Vec<String> = r
                         .mounts
                         .iter()
                         .filter_map(|m| match &m.from {
@@ -738,6 +739,16 @@ fn resolve_stages(
                             None => None,
                         })
                         .collect();
+                    // The command is keyed raw via `canonical` (it executes verbatim). Fold
+                    // in its interpolated form only when the in-scope vars actually change it
+                    // — i.e. it references an ARG/ENV — so a change to a referenced value
+                    // busts the cache, while a RUN using only shell-local variables keeps the
+                    // key it would have with no scope at all.
+                    let scoped = interp::interpolate_cmdline(&r.cmd, &vars);
+                    let unscoped = interp::interpolate_cmdline(&r.cmd, &interp::Vars::new());
+                    if scoped != unscoped {
+                        parts.push(format!("cmd={scoped}"));
+                    }
                     (!parts.is_empty()).then(|| parts.join("\n"))
                 }
                 _ => None,
@@ -745,10 +756,24 @@ fn resolve_stages(
             key = chain_key(&key, &instr, content.as_deref());
             if matches!(instr, Instruction::Run(_) | Instruction::Copy(_)) {
                 // a step runs under the state accumulated by the prior ENV/WORKDIR/USER.
+                let mut st = state.clone();
+                if matches!(instr, Instruction::Run(_)) {
+                    // Export the in-scope ARG values into the RUN's shell so its raw `$VAR`
+                    // references resolve there (ENV is already in `st.env`; drop names it
+                    // shadows). Kept out of the running `state` so it never leaks into a
+                    // child stage or the exported runtime config.
+                    let env_keys: std::collections::BTreeSet<&str> =
+                        st.env.iter().map(|(k, _)| k.as_str()).collect();
+                    st.build_args = vars
+                        .iter()
+                        .filter(|(k, _)| !env_keys.contains(k.as_str()))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                }
                 steps.push(Step {
                     instr,
                     key: key.clone(),
-                    state: state.clone(),
+                    state: st,
                 });
             } else {
                 // ENV/WORKDIR/USER: fold into the running state (+ scope) for later steps.
@@ -2736,10 +2761,11 @@ RUN ship
         assert_ne!(r[&0].final_key, r[&1].final_key);
         // the build stage ends on a RUN, so its identity is that last step's key.
         assert_eq!(r[&0].final_key, r[&0].steps.last().unwrap().key);
-        // ENV is in the interpolation scope: `$V` expanded into the RUN's command.
+        // a RUN command is left raw for the guest shell (`$V` resolves there against the
+        // exported ENV), not textually substituted at plan time.
         assert!(matches!(
             &r[&0].steps.last().unwrap().instr,
-            Instruction::Run(run) if matches!(&run.cmd, parser::Cmdline::Shell(s) if s == "make 1")
+            Instruction::Run(run) if matches!(&run.cmd, parser::Cmdline::Shell(s) if s == "make $V")
         ));
         // editing an upstream ENV busts the upstream key and chains through to the
         // dependent stage's key.
@@ -2966,14 +2992,23 @@ RUN ship
         let exec = resolve_stages(&plan, &order, &ba, &mut ex2, Some(&value)).unwrap();
         let merged = merge_exec(&keyed, exec);
 
-        // the executed RUN in 'core' sees the injected value via BUILDER_TAG …
-        let run = match &merged[&0].steps[0].instr {
-            Instruction::Run(r) => r.cmd.clone(),
+        // the executed RUN in 'core' sees the injected value via BUILDER_TAG — the command
+        // stays raw (the shell expands it), with the value exported into its environment …
+        let step = &merged[&0].steps[0];
+        match &step.instr {
+            Instruction::Run(r) => {
+                assert_eq!(r.cmd, parser::Cmdline::Shell("echo $BUILDER_TAG".into()))
+            }
             other => panic!("expected RUN, got {other:?}"),
         };
-        assert_eq!(run, parser::Cmdline::Shell(format!("echo {value}")));
+        assert!(
+            step.state
+                .env
+                .iter()
+                .any(|(k, v)| k == "BUILDER_TAG" && v == &value)
+        );
         // … but its cache key is the canonical, value-independent one.
-        assert_eq!(merged[&0].steps[0].key, keyed[&0].steps[0].key);
+        assert_eq!(step.key, keyed[&0].steps[0].key);
 
         // injecting a different value yields identical keys (no self-reference circularity).
         let mut ex3 = DryRun::new();

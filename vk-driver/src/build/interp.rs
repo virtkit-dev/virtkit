@@ -4,6 +4,13 @@
 //! expands to empty. Mirrors buildkit's `frontend/dockerfile/shell` expansion for the
 //! forms our Dockerfiles use (no nested `${...}` inside a modifier word, no `${#x}` /
 //! pattern ops — none appear in the survey).
+//!
+//! A `RUN`'s shell/exec *command* is the one exception: like Docker (`RUN` is not in the
+//! set of instructions that take environment replacement), it is left verbatim for the
+//! guest shell to expand — the in-scope ARG+ENV are exported into the RUN environment
+//! instead (see the executor). Otherwise a shell loop variable like `${opt}` would be
+//! substituted away to empty. Its `--mount` fields are still interpolated (those are
+//! Dockerfile-level flags, not shell text).
 
 use std::collections::BTreeMap;
 
@@ -131,7 +138,7 @@ pub fn expand_instruction(instr: &Instruction, vars: &Vars) -> Instruction {
     let e = |s: &str| interpolate(s, vars);
     match instr {
         Instruction::Run(r) => Instruction::Run(parser::Run {
-            cmd: expand_cmd(&r.cmd, vars),
+            cmd: r.cmd.clone(), // left raw — the guest shell expands it (see module docs)
             mounts: r.mounts.iter().map(|m| expand_mount(m, vars)).collect(),
             network: r.network.clone(),
             security: r.security.clone(),
@@ -170,6 +177,17 @@ fn expand_cmd(cmd: &Cmdline, vars: &Vars) -> Cmdline {
     match cmd {
         Cmdline::Shell(s) => Cmdline::Shell(interpolate(s, vars)),
         Cmdline::Exec(v) => Cmdline::Exec(v.iter().map(|a| interpolate(a, vars)).collect()),
+    }
+}
+
+/// The interpolated form of a command line, flattened to a single string. A `RUN`'s
+/// command is executed raw (the shell expands it), so this is used only to fold the
+/// *values* of the ARG/ENV it references into the cache key — a change to a referenced
+/// variable's value must still bust the cache even though the executed text is unchanged.
+pub fn interpolate_cmdline(cmd: &Cmdline, vars: &Vars) -> String {
+    match expand_cmd(cmd, vars) {
+        Cmdline::Shell(s) => s,
+        Cmdline::Exec(v) => v.join("\u{1f}"),
     }
 }
 
@@ -260,14 +278,30 @@ mod tests {
     #[test]
     fn expand_run_and_copy() {
         let v = vars(&[("UID", "1000"), ("D", "bookworm")]);
+        // A RUN command is left raw for the guest shell (its --mount fields do expand);
+        // interpolate_cmdline gives the interpolated form used only for keying.
         let run = Instruction::Run(parser::Run {
             cmd: Cmdline::Shell("useradd -u ${UID} dev".into()),
-            mounts: vec![],
+            mounts: vec![parser::Mount {
+                typ: "bind".into(),
+                from: None,
+                source: Some("/src-$D".into()),
+                target: Some("/t".into()),
+                readonly: true,
+                rw: false,
+                uid: None,
+                gid: None,
+                mode: None,
+            }],
             network: None,
             security: None,
         });
         match expand_instruction(&run, &v) {
-            Instruction::Run(r) => assert_eq!(r.cmd, Cmdline::Shell("useradd -u 1000 dev".into())),
+            Instruction::Run(r) => {
+                assert_eq!(r.cmd, Cmdline::Shell("useradd -u ${UID} dev".into())); // raw
+                assert_eq!(r.mounts[0].source.as_deref(), Some("/src-bookworm")); // mount expands
+                assert_eq!(interpolate_cmdline(&r.cmd, &v), "useradd -u 1000 dev"); // keying form
+            }
             _ => panic!(),
         }
         let copy = Instruction::Copy(parser::Copy {
