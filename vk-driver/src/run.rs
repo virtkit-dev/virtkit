@@ -2050,6 +2050,15 @@ impl VmSession {
         frozen
     }
 
+    /// Discard the guest fs's free blocks (`vk-agent fstrim /`) so a following checkpoint's
+    /// allocation map lists only live data — blocks freed by files written and deleted since
+    /// the last checkpoint are released and never enter the delta. Best-effort: a fs/backend
+    /// without discard support just keeps them (a larger, still-correct delta). Run before the
+    /// freeze — a frozen fs rejects the discard.
+    pub(crate) async fn trim(&self) {
+        let _ = self.guest_ok(&[GUEST_AGENT, "fstrim", "/"]).await;
+    }
+
     /// Undo a [`Self::freeze`]; `frozen` is that call's return.
     pub(crate) async fn thaw(&self, frozen: bool) {
         if frozen {

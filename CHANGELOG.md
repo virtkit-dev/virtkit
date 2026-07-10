@@ -24,6 +24,12 @@ All notable changes to virtkit will be documented in this file.
   `--service` to `--primary`, naming the role it fills: the foreground VM whose
   lifecycle the run follows, as opposed to the background sibling services.
 
+- `vk build` now discards a stage's freed blocks (`fstrim`) just before each cache
+  checkpoint, so a file created *and* deleted within one instruction interval is
+  released back to holes and never enters the cached delta or the exported image —
+  only live data is chunked and pushed. Built into the agent (FITRIM), so it works
+  on any guest image.
+
 ### Fixed
 
 - `vk build` / `vk run -f` no longer expands `$VAR`/`${VAR}` inside a `RUN`'s command

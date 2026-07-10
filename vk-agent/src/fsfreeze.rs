@@ -15,6 +15,37 @@ use anyhow::{Context, Result};
 // reinterpret: zero-extends on glibc, same low 32 bits on musl.
 const FIFREEZE: libc::Ioctl = 0xc004_5877_u32 as libc::Ioctl;
 const FITHAW: libc::Ioctl = 0xc004_5878_u32 as libc::Ioctl;
+// _IOWR('X', 121, struct fstrim_range) — sizeof(fstrim_range) == 24 (three u64).
+const FITRIM: libc::Ioctl = 0xc018_5879_u32 as libc::Ioctl;
+
+/// `struct fstrim_range` — the whole-fs discard request FITRIM takes. `len = u64::MAX`
+/// means "to the end"; the kernel writes back the trimmed byte count in `len`.
+#[repr(C)]
+struct FstrimRange {
+    start: u64,
+    len: u64,
+    minlen: u64,
+}
+
+/// Discard the free blocks of the filesystem mounted at `path` (`FITRIM`, like util-linux
+/// `fstrim`), so a subsequent snapshot's allocation map lists only live data — blocks freed
+/// by files created and deleted since the last snapshot are released back to holes and never
+/// enter the delta. Best-effort at the call site: a fs/backend without discard just keeps them.
+pub fn trim(path: &Path) -> Result<()> {
+    let f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut range = FstrimRange {
+        start: 0,
+        len: u64::MAX,
+        minlen: 0,
+    };
+    // SAFETY: `f` is a valid fd; FITRIM reads/writes a fstrim_range through the pointer.
+    let rc = unsafe { libc::ioctl(f.as_raw_fd(), FITRIM, &raw mut range) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("FITRIM on {}", path.display()));
+    }
+    Ok(())
+}
 
 /// Freeze the filesystem mounted at `path` (writes block until [`thaw`]).
 pub fn freeze(path: &Path) -> Result<()> {
@@ -55,6 +86,21 @@ pub fn main(args: &[String]) -> i32 {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("fsfreeze: {e:#}");
+            1
+        }
+    }
+}
+
+/// CLI entry for `vk-agent fstrim <mountpoint>` — mirrors util-linux `fstrim`.
+pub fn trim_main(args: &[String]) -> i32 {
+    let [path] = args else {
+        eprintln!("usage: vk-agent fstrim <mountpoint>");
+        return 2;
+    };
+    match trim(Path::new(path)) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("fstrim: {e:#}");
             1
         }
     }

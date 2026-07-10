@@ -498,13 +498,6 @@ fn coalesce_ranges(mut r: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     out
 }
 
-/// Union of two extent lists, coalesced.
-fn union_ranges(a: &[(u64, u64)], b: &[(u64, u64)]) -> Vec<(u64, u64)> {
-    let mut all = a.to_vec();
-    all.extend_from_slice(b);
-    coalesce_ranges(all)
-}
-
 /// The parts of `a` not covered by `b` (both coalesced first). Used to isolate the clusters
 /// the dirty set missed (`a` = newly-allocated, `b` = drained dirty).
 fn subtract_ranges(a: &[(u64, u64)], b: &[(u64, u64)]) -> Vec<(u64, u64)> {
@@ -1723,6 +1716,10 @@ impl Executor for MicroVm {
         // push so the live image is a stable source; the push reads unchanged straddling
         // regions through the overlay's backing chain.
         if self.session.as_ref().is_some_and(|s| s.supports_dirty()) {
+            // Discard blocks freed since the last checkpoint *before* quiescing (a frozen fs
+            // rejects the discard), so the allocation map below lists only live data — a file
+            // created and deleted within this interval never enters the delta.
+            block_on(self.session.as_ref().unwrap().trim());
             let frozen = block_on(self.session.as_ref().unwrap().freeze());
             let pushed = (|| -> Result<()> {
                 let (image, dirty, cumulative, total_size) = {
@@ -1735,18 +1732,12 @@ impl Executor for MicroVm {
                     let cumulative = q.data_extents()?;
                     (image, dirty, cumulative, q.virtual_size())
                 };
-                // libkrun's dirty side-channel is unreliable — it has been observed to drop
-                // gigabytes of writes, both freshly-allocated clusters AND in-place rewrites of
-                // clusters allocated in an earlier checkpoint. A delta missing any of them splices
-                // stale parent chunks (a corrupt ext4 restored later). So take the delta from the
-                // qcow2 allocation map instead: every allocated cluster is regenerated from the
-                // frozen image, which covers new writes and rewrites alike (dedup keeps unchanged
-                // chunks from re-uploading — only re-reading). `dirty` is folded in for the one
-                // thing the map can't show: clusters discarded back to holes.
-                let delta = union_ranges(&dirty, &cumulative);
-                // Diagnostic breadcrumb: how much of *this checkpoint's* new allocation the dirty
-                // set failed to report — a running, always-on record of the underlying libkrun gap
-                // (the delta above is already correct regardless).
+                // The delta IS the overlay's allocation map. libkrun's dirty side-channel is
+                // unreliable (it drops gigabytes — new writes and in-place rewrites alike), so
+                // trusting `cumulative` — every currently-allocated cluster, regenerated from the
+                // frozen image — is correct by construction; the pre-freeze trim keeps transient
+                // (created-then-deleted) blocks out of it. Chunk dedup keeps unchanged data from
+                // re-uploading. `dirty` now feeds only the diagnostic below.
                 let prev = self
                     .stage_prev_extents
                     .get(&fs.label)
@@ -1764,7 +1755,9 @@ impl Executor for MicroVm {
                         missed.iter().take(6).collect::<Vec<_>>()
                     );
                 }
-                self.stage_prev_extents.insert(fs.label.clone(), cumulative);
+                self.stage_prev_extents
+                    .insert(fs.label.clone(), cumulative.clone());
+                let delta = cumulative;
                 self.push_seq += 1;
                 let snap = self.image_path(&format!("{}.{}.cap.qcow2", fs.label, self.push_seq));
                 crate::qcow2::create_overlay(&snap, &image)?;
@@ -2126,15 +2119,6 @@ mod tests {
             coalesce_ranges(vec![(0, 4), (10, 4), (6, 2)]),
             vec![(0, 4), (6, 2), (10, 4)] // gaps preserved
         );
-    }
-
-    #[test]
-    fn union_covers_both() {
-        assert_eq!(
-            union_ranges(&[(0, 10)], &[(20, 10)]),
-            vec![(0, 10), (20, 10)]
-        );
-        assert_eq!(union_ranges(&[(0, 10)], &[(5, 10)]), vec![(0, 15)]);
     }
 
     #[test]
