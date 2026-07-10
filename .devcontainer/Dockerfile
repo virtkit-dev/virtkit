@@ -6,7 +6,7 @@
 # `FROM virtkit-build`) — the `vk` backend of build.sh/build-kernel.sh has no docker image
 # tags, so it resolves the base by stage name across merged -f files. Docker builds still
 # tag the image `virtkit-build` via -t; the two namespaces are independent.
-FROM rust:1.96.1-alpine3.21@sha256:bdd51fa1f2ff1b9accee5224246e39f4817228ee1c20e335635e8e55badec324 AS virtkit-build
+FROM rust:1.97.0-alpine3.21@sha256:8a34d94926e597c8755508a468ece234b6dbbe21d80c28ed77630f21e4b8e987 AS virtkit-build
 
 # Build deps (one per line in apk-pins.txt, pinned to exact versions for byte-for-byte
 # reproducibility — Alpine has no snapshot service, so the pins + the image digest
