@@ -350,6 +350,7 @@ mod tests {
             crate::compose::parse(
                 &format!("services:\n  {name}:\n    build: ./{name}\n"),
                 &tmp,
+                &|_| None,
             )
             .unwrap()
             .pop()

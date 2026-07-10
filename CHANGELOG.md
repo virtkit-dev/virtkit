@@ -4,6 +4,20 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `vk run --compose` now interpolates `$VAR`, `${VAR}` and `${VAR:-default}` in the
+  compose file, docker-compose style, from the process environment layered over a
+  sibling `.env` (process env wins; `$$` is a literal `$`). Interpolation runs on the
+  parsed YAML values (never keys), so it covers every field uniformly. An unset
+  variable with no default is a hard error rather than a silent empty value, so a
+  mistyped path or image tag fails the boot loudly. This keeps machine-specific values
+  (a repo path, a uid) out of the committed compose file.
+- A `volumes:` entry is split on newlines into multiple bind specs, so a single
+  `${VAR}` entry can inject a variable-length list of mounts — including conditional
+  ones — from one host-built variable; an empty value (e.g. `${VAR:-}` unset)
+  contributes no mounts.
+
 ### Changed
 
 - `vk run`'s flag selecting a compose service as the primary VM is renamed from

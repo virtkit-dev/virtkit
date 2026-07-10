@@ -206,17 +206,162 @@ pub fn dependency_closure(units: &[Unit], root: usize) -> Vec<bool> {
 }
 
 /// Load + map a compose file. `base` (the file's directory) anchors every relative
-/// path: build contexts, Dockerfiles, and bind-mount sources.
+/// path: build contexts, Dockerfiles, and bind-mount sources. Variable references
+/// (`$VAR`, `${VAR}`, `${VAR:-default}`) are interpolated first, docker-compose
+/// style — from the process environment layered over a sibling `.env` (the process
+/// env wins) — so machine-specific values (a repo path, a uid) stay out of the
+/// committed file.
 pub fn load(path: &Path) -> Result<Vec<Unit>> {
-    let text =
+    let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
-    parse(&text, base).with_context(|| format!("in {}", path.display()))
+    let dotenv = load_dotenv(base)?;
+    let resolve = |name: &str| {
+        // process environment first (docker precedence), then the sibling .env. A
+        // set-but-empty process value wins over a .env value — and, being empty, is
+        // then treated as unset by `interpolate` (so it takes a default or errors).
+        std::env::var(name).ok().or_else(|| {
+            dotenv
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        })
+    };
+    parse(&raw, base, &resolve).with_context(|| format!("in {}", path.display()))
+}
+
+/// Load `KEY=VALUE` pairs from a `.env` beside the compose file — docker-compose's
+/// interpolation source. A missing file is not an error (no vars). Blank lines and
+/// `#` comments are skipped; the value is taken raw (same convention as `--env-file`),
+/// so no quoting or escaping is interpreted.
+fn load_dotenv(dir: &Path) -> Result<Vec<(String, String)>> {
+    let path = dir.join(".env");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut vars = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        match line.split_once('=') {
+            Some((k, v)) => vars.push((k.trim().to_string(), v.to_string())),
+            None => bail!(
+                "{}:{}: expected KEY=VALUE, got {line:?}",
+                path.display(),
+                n + 1
+            ),
+        }
+    }
+    Ok(vars)
+}
+
+/// Interpolate `$VAR`, `${VAR}` and `${VAR:-default}` in `text`, docker-compose
+/// style; `$$` is a literal `$`. An unset (or empty) variable uses its `:-default`
+/// when given, otherwise it is a **hard error** — unlike docker's silent empty
+/// substitution, since an empty image tag or bind-mount path is always a bug that
+/// should fail the boot loudly rather than mount/pull the wrong thing.
+///
+/// `:-default` is the only supported modifier: docker's `:?`, `:+` and the
+/// colon-less `${VAR-default}` forms are rejected as a bad reference. A default is
+/// taken literally (no nested references), so `${A:-${B}}` yields `${B}` verbatim.
+fn interpolate(text: &str, resolve: &dyn Fn(&str) -> Option<String>) -> Result<String> {
+    // set-and-non-empty; treated as unset otherwise so `:-default` and the
+    // unset-error path both fire on an empty value.
+    let value = |name: &str| resolve(name).filter(|v| !v.is_empty());
+    let is_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
+
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('$') => {
+                chars.next();
+                out.push('$');
+            }
+            Some('{') => {
+                chars.next(); // consume '{'
+                let mut name = String::new();
+                let mut default: Option<String> = None;
+                loop {
+                    match chars.next() {
+                        Some('}') => break,
+                        Some(':') if chars.peek() == Some(&'-') => {
+                            chars.next(); // consume '-'
+                            let mut d = String::new();
+                            loop {
+                                match chars.next() {
+                                    Some('}') => break,
+                                    Some(dc) => d.push(dc),
+                                    None => bail!("unterminated ${{{name}...}} (missing '}}')"),
+                                }
+                            }
+                            default = Some(d);
+                            break;
+                        }
+                        Some(nc) if is_name(nc) => name.push(nc),
+                        Some(other) => {
+                            bail!("bad character {other:?} in ${{{name}...}} variable reference")
+                        }
+                        None => bail!("unterminated ${{{name}...}} (missing '}}')"),
+                    }
+                }
+                if name.is_empty() {
+                    bail!("empty variable reference ${{}}");
+                }
+                match value(&name).or(default) {
+                    Some(v) => out.push_str(&v),
+                    None => bail!(
+                        "compose references ${{{name}}} but it is unset — define it in the \
+                         environment or a sibling .env, or give it a ${{{name}:-default}}"
+                    ),
+                }
+            }
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                let mut name = String::new();
+                while let Some(&nc) = chars.peek() {
+                    if is_name(nc) {
+                        name.push(nc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                match value(&name) {
+                    Some(v) => out.push_str(&v),
+                    None => bail!(
+                        "compose references ${name} but it is unset — define it in the \
+                         environment or a sibling .env"
+                    ),
+                }
+            }
+            // a lone '$' not starting a reference (e.g. trailing, or before a space)
+            _ => out.push('$'),
+        }
+    }
+    Ok(out)
 }
 
 /// Parse + validate the compose subset (see the module docs for what is accepted).
-pub fn parse(yaml: &str, base: &Path) -> Result<Vec<Unit>> {
-    let file: ComposeFile = serde_yaml_ng::from_str(yaml)?;
+pub fn parse(
+    yaml: &str,
+    base: &Path,
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> Result<Vec<Unit>> {
+    // Interpolate on the parsed YAML *values* (never keys), then deserialize: a
+    // value may expand to embedded newlines (a volume-list variable) without
+    // disturbing the document structure, and `deny_unknown_fields` still runs.
+    let mut doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml)?;
+    interpolate_values(&mut doc, resolve)?;
+    let file: ComposeFile = serde_yaml_ng::from_value(doc)?;
     if file.services.is_empty() {
         bail!("no services declared");
     }
@@ -225,6 +370,31 @@ pub fn parse(yaml: &str, base: &Path) -> Result<Vec<Unit>> {
         units.push(map_service(&name, svc, base).with_context(|| format!("service {name:?}"))?);
     }
     Ok(units)
+}
+
+/// Interpolate every string *value* in a parsed YAML document (mapping keys are
+/// left untouched, matching docker-compose — only values carry `${VAR}`). Applied
+/// before deserializing so it covers every field uniformly.
+fn interpolate_values(
+    v: &mut serde_yaml_ng::Value,
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> Result<()> {
+    use serde_yaml_ng::Value;
+    match v {
+        Value::String(s) => *s = interpolate(s, resolve)?,
+        Value::Sequence(seq) => {
+            for e in seq {
+                interpolate_values(e, resolve)?;
+            }
+        }
+        Value::Mapping(m) => {
+            for (_k, val) in m.iter_mut() {
+                interpolate_values(val, resolve)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// A service name becomes a LAN hostname, so it must be a valid RFC-1123 DNS
@@ -252,10 +422,17 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
         (Some(_), Some(_)) => bail!("give either image: or build:, not both"),
         (None, None) => bail!("needs image: or build:"),
     };
+    // Each entry may hold several specs separated by newlines: interpolation can
+    // expand one `${LIST}` entry into N binds (an empty/whitespace value → none),
+    // so a host-built volume list — including conditional mounts — is injected
+    // through a single variable.
     let volumes = svc
         .volumes
         .iter()
-        .map(|v| parse_volume(v, base))
+        .flat_map(|entry| entry.lines())
+        .map(str::trim)
+        .filter(|spec| !spec.is_empty())
+        .map(|spec| parse_volume(spec, base))
         .collect::<Result<_>>()?;
     let depends_on = match svc.depends_on {
         Some(d) => {
@@ -577,6 +754,13 @@ impl DependsOn {
 mod tests {
     use super::*;
 
+    // Most tests need no interpolation: shadow `parse` with a no-vars variant so
+    // the call sites stay two-arg. Tests exercising `${VAR}` call `super::parse`
+    // with a real resolver.
+    fn parse(yaml: &str, base: &Path) -> Result<Vec<Unit>> {
+        super::parse(yaml, base, &|_| None)
+    }
+
     fn one(yaml: &str) -> Unit {
         parse(yaml, Path::new("/base")).unwrap().pop().unwrap()
     }
@@ -849,5 +1033,128 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    // A resolver over a fixed set of vars, for the interpolation tests.
+    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name: &str| map.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn interpolation_forms() {
+        let r = vars(&[("HOST", "/home/x"), ("EMPTY", "")]);
+        // braced, bare, and default (used when unset OR empty), plus $$ escape.
+        assert_eq!(interpolate("${HOST}/repo", &r).unwrap(), "/home/x/repo");
+        assert_eq!(interpolate("$HOST:/g", &r).unwrap(), "/home/x:/g");
+        assert_eq!(interpolate("${MISSING:-def}", &r).unwrap(), "def");
+        assert_eq!(interpolate("${EMPTY:-def}", &r).unwrap(), "def");
+        assert_eq!(interpolate("${HOST:-def}", &r).unwrap(), "/home/x");
+        assert_eq!(interpolate("price is $$5", &r).unwrap(), "price is $5");
+        // a lone '$' not starting a reference is kept verbatim.
+        assert_eq!(interpolate("a $ b", &r).unwrap(), "a $ b");
+    }
+
+    #[test]
+    fn interpolation_unset_is_hard_error() {
+        let r = vars(&[("SET", "1"), ("EMPTY", "")]);
+        assert!(interpolate("${MISSING}", &r).is_err());
+        assert!(interpolate("$MISSING", &r).is_err());
+        // set-but-empty is treated as unset (no default => error)
+        assert!(interpolate("${EMPTY}", &r).is_err());
+        assert!(interpolate("${UNTERMINATED", &r).is_err());
+        // a set var still resolves
+        assert_eq!(interpolate("${SET}", &r).unwrap(), "1");
+        // unsupported docker modifiers are a bad reference, not silently accepted
+        assert!(interpolate("${SET:?err}", &r).is_err());
+        assert!(interpolate("${SET:+alt}", &r).is_err());
+        assert!(interpolate("${SET-def}", &r).is_err());
+    }
+
+    #[test]
+    fn interpolation_default_is_literal_not_nested() {
+        // a `:-default` is taken verbatim: the inner `${B}` is not re-interpolated,
+        // so it ends at the first `}` and the trailing `}` is kept literally.
+        let r = vars(&[]);
+        assert_eq!(interpolate("${A:-${B}}", &r).unwrap(), "${B}");
+    }
+
+    // Removes its directory on drop, so a panicking assertion cannot leak it.
+    struct TmpDir(PathBuf);
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    #[test]
+    fn dotenv_parsing() {
+        let dir = std::env::temp_dir().join(format!("vk-dotenv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = TmpDir(dir.clone());
+        std::fs::write(
+            dir.join(".env"),
+            "# a comment\n\nexport A=1\nB = two words\nC=\n",
+        )
+        .unwrap();
+        let v = load_dotenv(&dir).unwrap();
+        assert_eq!(v.iter().find(|(k, _)| k == "A").unwrap().1, "1");
+        // value is taken raw after the first '='; key is trimmed, `export ` stripped
+        assert_eq!(v.iter().find(|(k, _)| k == "B").unwrap().1, " two words");
+        assert_eq!(v.iter().find(|(k, _)| k == "C").unwrap().1, "");
+        // a missing .env is empty, not an error
+        assert!(load_dotenv(Path::new("/no/such/dir")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn interpolation_covers_all_fields() {
+        let r = vars(&[
+            ("IMG", "redis:7"),
+            ("H", "srv"),
+            ("WHO", "redis"),
+            ("PORT", "6390"),
+        ]);
+        let u = super::parse(
+            "services:\n  redis:\n    image: ${IMG}\n    hostname: ${H}\n    user: ${WHO}\n\
+             \x20   environment:\n      PORT: ${PORT}\n    command: redis-server --port ${PORT}\n",
+            Path::new("/base"),
+            &r,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        assert!(matches!(&u.source, Source::Image(i) if i == "redis:7"));
+        assert_eq!(u.hostname, "srv");
+        assert_eq!(u.user.as_deref(), Some("redis"));
+        assert_eq!(u.environment, [("PORT".to_string(), "6390".to_string())]);
+        assert_eq!(u.command.unwrap(), ["redis-server", "--port", "6390"]);
+    }
+
+    #[test]
+    fn volume_list_injected_from_one_variable() {
+        let yaml = "services:\n  dev:\n    image: x\n    volumes:\n\
+                    \x20     - ${WABDIR}:/workdir\n      - ${EXTRA:-}\n";
+        // EXTRA expands to two newline-separated specs → one entry becomes two binds.
+        let r = vars(&[("WABDIR", "/repo"), ("EXTRA", "/a:/x\n/b:/y:ro")]);
+        let u = super::parse(yaml, Path::new("/base"), &r)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(u.volumes.len(), 3);
+        assert_eq!(u.volumes[0].guest, "/workdir");
+        assert_eq!(u.volumes[1].host, Path::new("/a"));
+        assert_eq!(u.volumes[2].guest, "/y");
+        assert!(u.volumes[2].read_only);
+
+        // an unset list variable (via :-) contributes zero binds, not an error.
+        let r2 = vars(&[("WABDIR", "/repo")]);
+        let u2 = super::parse(yaml, Path::new("/base"), &r2)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(u2.volumes.len(), 1);
     }
 }
