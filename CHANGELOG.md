@@ -46,6 +46,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- `vk run` now boots the primary as its built image's `USER` (or a `--primary`
+  service's compose `user:`); both primary paths were dropping it, so the guest
+  agent gets a default run user again — without it the host-exec socket was left
+  root-owned and unreachable by a non-root login.
 - When a host directory is shared into the guest, parent directories created for
   the mount point are now owned by the same user as the shared directory (not
   root), so git and similar tools no longer reject the path.

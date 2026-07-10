@@ -394,6 +394,12 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     let mut primary_idx: Option<usize> = None;
     let mut primary_hostname: Option<String> = None;
     let mut primary_volumes: Vec<crate::compose::Volume> = Vec::new();
+    // The primary's run user (a `-f` build's final image USER, or a --primary
+    // service's merged user): a clean image is byte-clean (no injected
+    // /etc/virtkit/user), so the boot config is the only carrier — dropping it
+    // leaves the guest agent without a run user and the host-exec socket unchowned
+    // (root-only). Set on both primary paths below; empty means root.
+    let mut primary_user = String::new();
     let dockerfile_ext4 = if let Some(name) = &args.primary {
         let idx = compose_units
             .iter()
@@ -414,6 +420,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             .with_context(|| format!("service {name}"))?;
         let cfg = crate::compose::merged_config(&built.config, unit);
         image_env = cfg.env.clone();
+        primary_user = cfg.user.clone();
         primary_hostname = Some(unit.hostname.clone());
         primary_volumes = unit.volumes.clone();
         primary = Some(cfg);
@@ -443,7 +450,9 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             build_jobs: None,
             debug: false,
         };
-        image_env = crate::build::build(&opts)?.config.env;
+        let built = crate::build::build(&opts)?;
+        primary_user = built.config.user;
+        image_env = built.config.env;
         Some(out)
     };
 
@@ -534,6 +543,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             let cpio = medium("initramfs.cpio")?;
             let boot_cfg = vk_core::runcfg::RunConfig {
                 env: image_env.clone(),
+                user: primary_user.clone(),
                 ..Default::default()
             };
             crate::initramfs::build_agent_initramfs_with_config(agent, Some(&boot_cfg), &cpio)?;
