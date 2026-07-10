@@ -45,8 +45,10 @@ All notable changes to virtkit will be documented in this file.
   overlay's allocation map (authoritative — a cluster can't be written without being
   allocated), which captures dropped writes and in-place rewrites alike; chunk dedup
   still avoids re-uploading unchanged data. A `--debug` check verifies the pulled-back
-  reassembly (not just the frozen source), and a one-line log reports how much each
-  build's dirty set dropped.
+  reassembly (not just the frozen source, which is always consistent and so could
+  never expose an incomplete delta). The unreliable block dirty-tracking this replaced
+  — a large patch to vendored libkrun — has been removed; the guest freeze already
+  flushes the overlay to its backing file, which is all the allocation-map read needs.
 
 ## [0.9.0] - 2026-07-09
 

@@ -25,8 +25,8 @@ use anyhow::{Result, bail};
 // >= 0 on success, a negative errno on failure.
 use krun::{
     krun_add_disk2, krun_add_net_tap, krun_add_virtiofs3, krun_add_vsock_port2, krun_create_ctx,
-    krun_disable_implicit_init, krun_init_log, krun_set_block_dirty_socket,
-    krun_set_console_output, krun_set_kernel, krun_set_vm_config, krun_start_enter,
+    krun_disable_implicit_init, krun_init_log, krun_set_console_output, krun_set_kernel,
+    krun_set_vm_config, krun_start_enter,
 };
 
 use crate::vmm::{Disk, Net, VmSpec};
@@ -196,16 +196,7 @@ unsafe fn add_disk(ctx: u32, index: usize, disk: &Disk) -> Result<()> {
     };
     ck("krun_add_disk2", unsafe {
         krun_add_disk2(ctx, block_id.as_ptr(), path.as_ptr(), format, disk.readonly)
-    })?;
-    // Dirty-block tracking (build stages): serve the drain protocol on the given socket so a
-    // checkpoint captures only the delta. Set only on the writable stage overlay.
-    if let Some(sock) = &disk.dirty_control_socket {
-        let sock = cstr(&sock.to_string_lossy());
-        ck("krun_set_block_dirty_socket", unsafe {
-            krun_set_block_dirty_socket(ctx, block_id.as_ptr(), sock.as_ptr())
-        })?;
-    }
-    Ok(())
+    })
 }
 
 #[cfg(test)]

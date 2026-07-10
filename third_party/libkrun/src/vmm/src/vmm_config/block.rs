@@ -33,10 +33,6 @@ pub struct BlockDeviceConfig {
     pub is_disk_read_only: bool,
     pub direct_io: bool,
     pub sync_mode: SyncMode,
-    /// If set, the block device serves a dirty-drain control protocol on this Unix socket
-    /// (see `Block::spawn_dirty_control`), letting the virtkit build backend capture only a
-    /// checkpoint's delta. `None` for every disk except a build stage's writable overlay.
-    pub dirty_control_socket: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,7 +70,6 @@ impl BlockBuilder {
             config.is_disk_read_only,
             config.direct_io,
             config.sync_mode,
-            config.dirty_control_socket,
         )
         .map_err(BlockConfigError::CreateBlockDevice)
     }

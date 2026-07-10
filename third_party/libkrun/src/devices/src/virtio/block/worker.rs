@@ -233,12 +233,9 @@ impl BlockWorker {
                 if !data_len.is_multiple_of(512) {
                     Err(RequestError::InvalidDataLength)
                 } else {
-                    let written = reader
+                    reader
                         .read_to_at(&self.disk, data_len, request_header.sector * 512)
-                        .map_err(RequestError::ReadingFromDescriptor)?;
-                    self.disk
-                        .record_write(request_header.sector * 512, data_len as u64);
-                    Ok(written)
+                        .map_err(RequestError::ReadingFromDescriptor)
                 }
             }
             VIRTIO_BLK_T_FLUSH => match self.disk.cache_type() {
@@ -275,10 +272,6 @@ impl BlockWorker {
                         discard_write_data.num_sectors as u64 * 512,
                     )
                     .map_err(RequestError::Discarding)?;
-                self.disk.record_write(
-                    discard_write_data.sector * 512,
-                    discard_write_data.num_sectors as u64 * 512,
-                );
                 Ok(0)
             }
             VIRTIO_BLK_T_WRITE_ZEROES => {
@@ -307,10 +300,6 @@ impl BlockWorker {
                         )
                         .map_err(RequestError::WritingZeroes)?;
                 }
-                self.disk.record_write(
-                    discard_write_data.sector * 512,
-                    discard_write_data.num_sectors as u64 * 512,
-                );
                 Ok(0)
             }
             _ => Err(RequestError::UnknownRequest),

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use tokio_util::sync::CancellationToken;
 use vk_core::addr::SocketAddr;
 
@@ -1654,9 +1654,6 @@ pub(crate) struct VmSession {
     /// was attached; `None` = this guest has no writable scratch disk. The executor mounts it
     /// on demand for a `RUN --mount=type=bind,from=scratch,rw` step.
     scratch_dev: Option<String>,
-    /// Unix socket the stage overlay's dirty-drain control listener serves on (libkrun build
-    /// stages only). `checkpoint_dirty` connects here; `None` = full-capture fallback.
-    dirty_socket: Option<PathBuf>,
     /// build-wide cancellation: when the parallel driver aborts a build (a stage failed),
     /// a RUN still executing in this guest is interrupted rather than run to completion.
     /// `None` outside the parallel build (a plain `vk run`).
@@ -1797,18 +1794,7 @@ pub(crate) async fn boot_session(
     // base ext4 or the parent stage), so the guest's writes accumulate into it and it
     // becomes the stage's result — no separate boot overlay, no commit. (A raw-rw disk
     // does not present as /dev/vda, which is why every stage image is a qcow2.)
-    // Dirty-block tracking for the O(delta) checkpoint capture: the writable stage overlay
-    // serves a drain protocol on this socket (libkrun only; cloud-hypervisor lacks the hook and
-    // falls back to a full capture + content_diff). `checkpoint_dirty` connects here at each
-    // commit. The socket lives in the per-session work dir, out of the guest's reach.
-    let dirty_socket = crate::vmm::libkrun_selected().then(|| work.join("dirty.sock"));
-    let overlay = match &dirty_socket {
-        Some(sock) => {
-            crate::vmm::Disk::overlay(image.to_path_buf()).with_dirty_control(sock.clone())
-        }
-        None => crate::vmm::Disk::overlay(image.to_path_buf()),
-    };
-    let mut disks: Vec<crate::vmm::Disk> = vec![overlay];
+    let mut disks: Vec<crate::vmm::Disk> = vec![crate::vmm::Disk::overlay(image.to_path_buf())];
     // Source stages for COPY --from / RUN --mount=from, attached read-only as the next
     // virtio-blk disks (vdb, vdc, … in order) for the guest to mount and read. A forked
     // source is a qcow2 over its parent (its backing chain is resolved); a base source is
@@ -1818,7 +1804,6 @@ pub(crate) async fn boot_session(
             path: src.clone(),
             qcow2: disk_format(src) == "qcow2",
             readonly: true,
-            dirty_control_socket: None,
         });
     }
     // Disk-backed /tmp for the build guest (the default; off under --build-tmp-tmpfs): a sparse
@@ -1834,7 +1819,6 @@ pub(crate) async fn boot_session(
             path: path.to_path_buf(),
             qcow2: false,
             readonly: false,
-            dirty_control_socket: None,
         });
         dev
     });
@@ -1848,7 +1832,6 @@ pub(crate) async fn boot_session(
             path: path.to_path_buf(),
             qcow2: false,
             readonly: false,
-            dirty_control_socket: None,
         });
         format!("/dev/{dev}")
     });
@@ -1959,7 +1942,6 @@ pub(crate) async fn boot_session(
         virtiofsd,
         work,
         scratch_dev,
-        dirty_socket,
         cancel,
     })
 }
@@ -2066,55 +2048,10 @@ impl VmSession {
         }
     }
 
-    /// The live stage overlay (the booted rw qcow2). During a freeze it is a stable snapshot
-    /// source; the dirty-tracked build path reads its delta extents directly from it.
+    /// The live stage overlay (the booted rw qcow2). During a freeze it is a stable point-in-time
+    /// source; the build checkpoint reads its allocated extents directly from it.
     pub(crate) fn image(&self) -> &Path {
         &self.image
-    }
-
-    /// Whether this guest's block device tracks dirty clusters (libkrun build stages). When
-    /// true, [`Self::drain_dirty`] yields the O(delta) changed extents instead of a whole-image
-    /// diff.
-    pub(crate) fn supports_dirty(&self) -> bool {
-        self.dirty_socket.is_some()
-    }
-
-    /// Drain the block device's dirty-cluster set over the control socket: the guest-logical
-    /// byte ranges written since the previous drain. Also flushes the device's writes to the
-    /// image file, so a subsequent host-side read of `image()` sees them. Freeze the guest
-    /// first (so no write races the drain). Errs if dirty tracking is disabled.
-    pub(crate) fn drain_dirty(&self) -> Result<Vec<(u64, u64)>> {
-        use std::io::{Read, Write};
-        let sock = self
-            .dirty_socket
-            .as_ref()
-            .context("drain_dirty: dirty tracking not enabled for this guest")?;
-        let mut conn = std::os::unix::net::UnixStream::connect(sock)
-            .with_context(|| format!("connecting dirty-control socket {}", sock.display()))?;
-        conn.write_all(b"D").context("dirty-control: send DRAIN")?;
-        let mut count = [0u8; 4];
-        conn.read_exact(&mut count)
-            .context("dirty-control: read range count")?;
-        let count = u32::from_le_bytes(count) as usize;
-        // The peer is the trusted in-process VMM child, but a stray count would size the read
-        // buffer directly — reject an implausible one rather than pre-allocate up to ~64 GiB.
-        // Ranges are coalesced whole clusters, so even a fully fragmented multi-TiB image stays
-        // far below this cap.
-        const MAX_DIRTY_RANGES: usize = 16 * 1024 * 1024;
-        ensure!(
-            count <= MAX_DIRTY_RANGES,
-            "dirty-control: implausible range count {count} (> {MAX_DIRTY_RANGES})",
-        );
-        let mut buf = vec![0u8; count * 16];
-        conn.read_exact(&mut buf)
-            .context("dirty-control: read ranges")?;
-        let mut ranges = Vec::with_capacity(count);
-        for c in buf.chunks_exact(16) {
-            let off = u64::from_le_bytes(c[..8].try_into().unwrap());
-            let len = u64::from_le_bytes(c[8..16].try_into().unwrap());
-            ranges.push((off, len));
-        }
-        Ok(ranges)
     }
 
     /// Shut the guest down cleanly: drop ephemeral mountpoints and flush the root fs to its
@@ -2376,7 +2313,6 @@ mod tests {
                 path: medium.path.clone(),
                 qcow2: false,
                 readonly: true,
-                dirty_control_socket: None,
             }],
             initramfs: None,
             shares: Vec::new(),
