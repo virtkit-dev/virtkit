@@ -186,7 +186,7 @@ fn stat(f: &File) -> io::Result<libc::stat64> {
 // kernel UAPI to be architecture-independent, so we reproduce exactly the subset this
 // device reads and invoke the raw SYS_statx syscall. Behaviour matches the previous
 // `libc::statx` path, including the returned stx_mnt_id.
-mod statx_compat {
+pub(crate) mod statx_compat {
     pub const STATX_BASIC_STATS: libc::c_uint = 0x0000_07ff;
     pub const STATX_MNT_ID: libc::c_uint = 0x0000_1000;
 

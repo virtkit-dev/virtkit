@@ -11,6 +11,9 @@ mod multikey;
 mod null_fs;
 pub mod read_only;
 mod server;
+// public (local patch): the single-file bind primitive, usable by both the in-process
+// virtio-fs device and the external `vk virtiofsd`.
+pub mod single_file;
 pub mod virtual_entry;
 mod worker;
 
