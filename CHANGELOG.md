@@ -19,6 +19,10 @@ All notable changes to virtkit will be documented in this file.
   `${VAR}` entry can inject a variable-length list of mounts — including conditional
   ones — from one host-built variable; an empty value (e.g. `${VAR:-}` unset)
   contributes no mounts.
+- `vk run -v HOST:GUEST` now supports **single-file bind mounts**: when `HOST` is a
+  regular file, that file is bound live read-write at `GUEST` instead of requiring a
+  wrapper directory. The share exposes only that one file — a guest cannot reach its
+  host siblings — and works on both the libkrun and cloud-hypervisor backends.
 
 ### Changed
 

@@ -755,9 +755,16 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     // flags, exactly like a sibling unit would: bind mounts over virtiofs.
     // Persistent state (a dev VM's ~/.vscode-server, say) is whatever binds to a
     // host dir — the VM itself stays throwaway.
+    // A single-file bind can't be mounted onto the guest file path (virtio-fs shares a
+    // directory); its share is served by the single-file fs, mounted at a hidden dir, and
+    // symlinked into place — collected here and merged into VIRTKIT_SYMLINKS below.
+    let mut file_bind_links: Vec<(String, String)> = Vec::new();
     for (i, vol) in primary_volumes.iter().chain(&args.volumes).enumerate() {
         let tag = format!("vol{i}");
         let sock = work.join(format!("vfsd-{tag}.sock"));
+        // cloud-hypervisor serves each share through an external virtiofsd (libkrun serves in
+        // process). Single-file binds work on both: the single-file fs runs in-process under
+        // libkrun and inside `vk virtiofsd` over vhost-user under cloud-hypervisor.
         if !crate::vmm::libkrun_selected() {
             virtiofsds.push(crate::spawn::spawn_virtiofsd(
                 &sock,
@@ -767,10 +774,26 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
                 &[],
             )?);
         }
+        let mount_at = if vol.is_file {
+            // virtio-fs shares a directory, so mount the single-file share at a hidden dir and
+            // symlink the guest target to the file inside it.
+            let base = vol
+                .host
+                .file_name()
+                .and_then(|n| n.to_str())
+                .with_context(|| {
+                    format!("single-file bind {}: bad file name", vol.host.display())
+                })?;
+            let mp = format!("/run/vk/filebind-{i}");
+            file_bind_links.push((format!("{mp}/{base}"), vol.guest.clone()));
+            mp
+        } else {
+            vol.guest.clone()
+        };
         if !virtiofs.is_empty() {
             virtiofs.push(',');
         }
-        virtiofs.push_str(&format!("{tag}:{}", vol.guest));
+        virtiofs.push_str(&format!("{tag}:{mount_at}"));
         shares.push(crate::vmm::FsShare {
             tag,
             socket: sock,
@@ -781,16 +804,17 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     if !virtiofs.is_empty() {
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS={virtiofs}"));
     }
-    // In-guest symlinks, created by the agent after the mounts — the single-file
-    // share escape hatch (virtiofs shares directories only); a dangling source is
-    // skipped guest-side.
-    if !args.symlinks.is_empty() {
-        let spec: Vec<String> = args
-            .symlinks
-            .iter()
-            .map(|(src, dest)| format!("{src}:{dest}"))
-            .collect();
-        cmdline.push_str(&format!(" VIRTKIT_SYMLINKS={}", spec.join(",")));
+    // In-guest symlinks, created by the agent after the mounts: explicit `--symlink`s plus one
+    // per single-file bind (target -> the file inside its hidden single-file share mount). A
+    // dangling source is skipped guest-side.
+    let symlink_specs: Vec<String> = args
+        .symlinks
+        .iter()
+        .chain(file_bind_links.iter())
+        .map(|(src, dest)| format!("{src}:{dest}"))
+        .collect();
+    if !symlink_specs.is_empty() {
+        cmdline.push_str(&format!(" VIRTKIT_SYMLINKS={}", symlink_specs.join(",")));
     }
     let shared_mem = !shares.is_empty();
 

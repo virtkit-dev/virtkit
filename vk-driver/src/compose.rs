@@ -79,6 +79,10 @@ pub struct Volume {
     pub host: PathBuf,
     pub guest: String,
     pub read_only: bool,
+    /// The host path is a regular file (not a directory): a single-file bind. Virtio-fs shares
+    /// a directory, so this is served by a single-file fs (root = just this file) and linked
+    /// into place in the guest, rather than mounted at `guest` directly.
+    pub is_file: bool,
 }
 
 /// The service's start-time config layered over the image's defaults, compose
@@ -520,10 +524,17 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Volume> {
     if !guest.starts_with('/') {
         bail!("volume {spec:?}: the guest path must be absolute");
     }
+    let host = base.join(host);
+    // A single-file bind when the source resolves to a regular file (a missing/dir source
+    // stays a directory share, the prior behavior).
+    let is_file = std::fs::metadata(&host)
+        .map(|m| m.is_file())
+        .unwrap_or(false);
     Ok(Volume {
-        host: base.join(host),
+        host,
         guest: guest.to_string(),
         read_only,
+        is_file,
     })
 }
 
