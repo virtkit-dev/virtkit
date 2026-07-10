@@ -113,7 +113,7 @@ pub struct RunArgs {
     /// its image is the rootfs, its merged config the command's env (and, with no
     /// trailing command, its entrypoint+cmd the command); only its depends_on
     /// closure boots as siblings. Requires `compose`; excludes image/`-f`.
-    pub service: Option<String>,
+    pub primary: Option<String>,
     /// Egress for the `--file` build's `RUN` guests (`--build-net`,
     /// `--build-allow-ip`, `--build-allow-name`). Unused for an image boot.
     pub build_net: crate::build::BuildNet,
@@ -136,7 +136,7 @@ pub struct RunArgs {
     /// directory is reused across runs and never removed
     pub state_dir: Option<PathBuf>,
     /// extra host-dir bind mounts into the primary (beyond `workdir`), same
-    /// semantics as a `--service` primary's compose volumes
+    /// semantics as a `--primary` primary's compose volumes
     pub volumes: Vec<crate::compose::Volume>,
     /// in-guest symlinks (`src:dest`) created after the mounts — the single-file
     /// share escape hatch (virtiofs shares directories only); dangling sources
@@ -153,7 +153,7 @@ pub struct RunArgs {
     pub host_exec_wrapper: Option<PathBuf>,
     /// client env vars passed through to the wrapper (`serve --exec-wrapper-env` globs)
     pub host_exec_env: Vec<String>,
-    /// a `-f`/`--service`/compose build may restore stages from the instruction
+    /// a `-f`/`--primary`/compose build may restore stages from the instruction
     /// cache but must not execute anything; a cache miss aborts (exit 3 at the CLI)
     pub require_cached: bool,
     /// daemonize once the guest is ready (foreground build/boot, background after); see
@@ -193,9 +193,9 @@ pub async fn run(args: &RunArgs) -> Result<()> {
             kernel.path.display()
         );
     }
-    // No primary (no image, no -f, no --service) + a compose file = compose up:
+    // No primary (no image, no -f, no --primary) + a compose file = compose up:
     // services only, held until ctrl-c.
-    if args.image.is_empty() && args.dockerfiles.is_empty() && args.service.is_none() {
+    if args.image.is_empty() && args.dockerfiles.is_empty() && args.primary.is_none() {
         return compose_up(args, &work.path, &agent.path, &kernel.path).await;
     }
     build_and_boot(args, &work.path, &agent.path, &kernel.path).await
@@ -381,26 +381,26 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     // `docker run` does — e.g. the base image's PATH puts `cargo` in scope. For a `-f`
     // Dockerfile boot it is the target stage's accumulated ENV; for an image boot it is the
     // image's configured `Config.Env`.
-    // Compose is loaded up front: a --service primary replaces the image/-f
+    // Compose is loaded up front: a --primary primary replaces the image/-f
     // rootfs below, and the (remaining) services boot as siblings further down.
     let compose_units: Vec<crate::compose::Unit> = match &args.compose {
         Some(p) => crate::compose::load(p)?,
         None => Vec::new(),
     };
     let mut image_env: Vec<(String, String)> = Vec::new();
-    // The --service primary's merged config: env for the command, argv as the
+    // The --primary primary's merged config: env for the command, argv as the
     // default command, hostname for the guest.
     let mut primary: Option<vk_core::runcfg::RunConfig> = None;
     let mut primary_idx: Option<usize> = None;
     let mut primary_hostname: Option<String> = None;
     let mut primary_volumes: Vec<crate::compose::Volume> = Vec::new();
-    let dockerfile_ext4 = if let Some(name) = &args.service {
+    let dockerfile_ext4 = if let Some(name) = &args.primary {
         let idx = compose_units
             .iter()
             .position(|u| &u.name == name)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "--service {name:?}: no such compose service (declared: {})",
+                    "--primary {name:?}: no such compose service (declared: {})",
                     compose_units
                         .iter()
                         .map(|u| u.name.as_str())
@@ -462,7 +462,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     };
     // --env/--env-file extras, upserted so they win over the image env — both in
     // `drive`'s exports and in the guest's own env (the media below carry the
-    // merged list: the boot config for a clean -f/--service image, an injected
+    // merged list: the boot config for a clean -f/--primary image, an injected
     // /etc/virtkit/env capture for a converted one).
     for (k, v) in &args.env {
         match image_env.iter_mut().find(|(ek, _)| ek == k) {
@@ -741,7 +741,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             read_only: false,
         });
     }
-    // A --service primary gets its compose volumes, and any primary its `--volume`
+    // A --primary primary gets its compose volumes, and any primary its `--volume`
     // flags, exactly like a sibling unit would: bind mounts over virtiofs.
     // Persistent state (a dev VM's ~/.vscode-server, say) is whatever binds to a
     // host dir — the VM itself stays throwaway.
@@ -854,7 +854,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
 
     let mut ch = match spawn_vmm(vmm.as_ref(), &spec) {
         Ok(ch) => ch,
-        // The --net switch and the virtiofsds (--workdir plus any --service compose
+        // The --net switch and the virtiofsds (--workdir plus any --primary compose
         // volumes) are already spawned; kill them so a failed boot does not leak
         // host-side children (a leaked `vk virtiofsd` would, e.g., hold this binary's
         // file busy for the next build).
@@ -914,7 +914,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         None
     };
 
-    // With a --service primary and no trailing command, the service's own
+    // With a --primary primary and no trailing command, the service's own
     // entrypoint+cmd runs — `docker compose run <svc>` semantics.
     let fallback_argv = primary.map(|c| c.argv()).unwrap_or_default();
     let result = drive(
@@ -946,7 +946,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
 /// Every declared compose unit, materialized and addressed, plus which ones
 /// boot eagerly and what the switch must serve for them.
 struct PlannedServices {
-    /// (unit, runtime dir) for the manager — the `--service` primary excluded
+    /// (unit, runtime dir) for the manager — the `--primary` primary excluded
     /// (it boots as the run VM, not as a sibling)
     units: Vec<(crate::units::Provisioned, PathBuf)>,
     /// names to boot eagerly: the profile-enabled set, or the primary's
@@ -980,7 +980,7 @@ fn plan_services(
         return Ok(planned);
     }
     let order = crate::compose::boot_order(units)?;
-    // A --service primary starts only its dependencies (compose-run semantics);
+    // A --primary primary starts only its dependencies (compose-run semantics);
     // otherwise the profile-enabled set boots.
     let on = match primary_idx {
         Some(idx) => crate::compose::dependency_closure(units, idx),

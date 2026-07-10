@@ -17,14 +17,14 @@ minimal working configs for each mode are shown below.
 
 `vk run --compose` boots a docker-compose file's services as microVMs on one
 shared LAN (each resolves by name). Three shapes: alongside an image/`-f`
-primary, as the primary itself (`--service`, like `docker compose run`), or
+primary, as the primary itself (`--primary`, like `docker compose run`), or
 alone — compose up, held until ctrl-c. Inside the primary,
 `/run/vk/services/<name>/{state,ctl,log,error}` reads states and
 starts/stops services with plain shell writes.
 
 ```sh
 vk run --compose compose.yml -f Dockerfile --net -- cargo test
-vk run --compose compose.yml --service app        # docker compose run app
+vk run --compose compose.yml --primary app        # docker compose run app
 vk run --compose compose.yml                      # compose up (ctrl-c stops)
 ```
 

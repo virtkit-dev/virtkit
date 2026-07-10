@@ -37,7 +37,7 @@ vk run -f Dockerfile --net -- ./run-tests.sh
   host, and no privileges needed.
 - **Run compose services as VMs.** `vk run --compose compose.yml` boots the
   services (redis, mysql, …) on a shared network where each resolves by name —
-  alongside your command, as the primary itself (`--service`, like
+  alongside your command, as the primary itself (`--primary`, like
   `docker compose run`), or on their own (compose up, until ctrl-c). From
   inside the primary, `/run/vk/services/<name>/{state,ctl,log}` reads states
   and starts/stops services with plain shell writes. For a dev VM,

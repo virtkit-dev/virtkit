@@ -442,7 +442,7 @@ enum Cmd {
         /// down when the run exits. No readiness wait — retry the first connect.
         /// Services declare `image:` or `build:` (`build.dockerfile` may be a
         /// list: the files merge into one stage namespace, `target` picks any
-        /// stage across them). Alone (no image/-f/--service) this is compose up:
+        /// stage across them). Alone (no image/-f/--primary) this is compose up:
         /// services only, held until ctrl-c.
         #[arg(long)]
         compose: Option<PathBuf>,
@@ -455,7 +455,7 @@ enum Cmd {
         /// command its entrypoint+cmd runs — and only its depends_on chain boots
         /// alongside. Requires --compose; replaces the image/-f
         #[arg(long, value_name = "NAME", requires = "compose")]
-        service: Option<String>,
+        primary: Option<String>,
         /// Forward the host SSH agent ($SSH_AUTH_SOCK) into the guest, so ssh/git in the
         /// guest use the host's keys without the keys ever entering the guest
         #[arg(long = "ssh-agent")]
@@ -526,7 +526,7 @@ enum Cmd {
             requires = "host_exec_wrapper"
         )]
         host_exec_env: Vec<String>,
-        /// the -f/--service/compose builds may restore from the instruction cache but
+        /// the -f/--primary/compose builds may restore from the instruction cache but
         /// must not build: a cache miss aborts with exit code 3, so scripts can branch
         /// cached-vs-cold without paying for a build
         #[arg(long = "require-cached")]
@@ -789,7 +789,7 @@ async fn cli_main() -> ExitCode {
         net,
         compose,
         profile,
-        service,
+        primary,
         ssh_agent,
         ssh_host,
         ssh,
@@ -809,7 +809,7 @@ async fn cli_main() -> ExitCode {
         command,
     } = &cli.cmd
     {
-        let services_only = file.is_empty() && image.is_none() && service.is_none();
+        let services_only = file.is_empty() && image.is_none() && primary.is_none();
         if services_only && compose.is_none() {
             return fail(
                 &anyhow::anyhow!("run needs an image, --file <Dockerfile>, or a --compose file"),
@@ -833,17 +833,17 @@ async fn cli_main() -> ExitCode {
         {
             return fail(
                 &anyhow::anyhow!(
-                    "--compose without an image/-f/--service is services-only (compose up) — \
+                    "--compose without an image/-f/--primary is services-only (compose up) — \
                      there is no primary VM for a command, --shell, --ssh, --workdir, \
                      --volume, --symlink, --env, --env-file, or --host-exec"
                 ),
                 2,
             );
         }
-        if service.is_some() && (image.is_some() || !file.is_empty()) {
+        if primary.is_some() && (image.is_some() || !file.is_empty()) {
             return fail(
                 &anyhow::anyhow!(
-                    "--service picks the primary from the compose file — drop the image/-f"
+                    "--primary selects the primary VM from the compose file — drop the image/-f"
                 ),
                 2,
             );
@@ -915,7 +915,7 @@ async fn cli_main() -> ExitCode {
             net: *net || compose.is_some(),
             compose: compose.clone(),
             profiles: profile.clone(),
-            service: service.clone(),
+            primary: primary.clone(),
             build_net: bnet,
             ssh_agent: *ssh_agent,
             ssh_hosts: ssh_host.clone(),

@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- `vk run`'s flag selecting a compose service as the primary VM is renamed from
+  `--service` to `--primary`, naming the role it fills: the foreground VM whose
+  lifecycle the run follows, as opposed to the background sibling services.
+
 ## [0.9.0] - 2026-07-09
 
 ### Added
