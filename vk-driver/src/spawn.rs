@@ -86,10 +86,20 @@ pub(crate) fn spawn_virtiofsd(
     for m in gid_maps {
         cmd.arg(format!("--gid-map={m}"));
     }
-    // self-reap if virtkit dies before the normal teardown runs (spawn_tied)
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    // self-reap if virtkit dies before the normal teardown runs (spawn_tied). stderr → a log
+    // next to the socket so a daemon crash leaves a trace instead of vanishing (a silent
+    // /dev/null made a worker panic look like an unexplained guest hang).
+    let errlog = sock.with_extension("stderr.log");
+    let (out, err) = match std::fs::File::create(&errlog) {
+        Ok(f) => (
+            f.try_clone()
+                .map(Stdio::from)
+                .unwrap_or_else(|_| Stdio::null()),
+            Stdio::from(f),
+        ),
+        Err(_) => (Stdio::null(), Stdio::null()),
+    };
+    cmd.stdin(Stdio::null()).stdout(out).stderr(err);
     let child = spawn_tied(cmd).context("spawning the bundled virtiofsd (vk virtiofsd)")?;
     for _ in 0..50 {
         if sock.exists() {
