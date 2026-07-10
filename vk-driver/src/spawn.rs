@@ -4,11 +4,25 @@
 //! (`run` and the build path) and the CI job supervisor.
 
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+
+/// Path to this executable for re-execing its own subcommands (switch, virtiofsd,
+/// VMM, forwards). Unlike `std::env::current_exe()`, which returns the *pathname*
+/// (and hands back a `…/vk (deleted)` string that fails to exec once the on-disk
+/// binary is replaced), `/proc/self/exe` is a magic link the kernel resolves to
+/// the inode the process is actually running. So it survives `build.sh` swapping
+/// the `vk` binary out from under a live `vk run` (an atomic `mv` over the old
+/// path), and it always yields the running driver's own image — never a
+/// version-mismatched `vk` newly landed on disk. Do NOT use for a persistent
+/// systemd `ExecStart` or a path shown to the user — those need the real on-disk
+/// path (`current_exe`).
+pub(crate) fn self_exe() -> PathBuf {
+    PathBuf::from("/proc/self/exe")
+}
 
 /// Spawn a foreground-owned helper tied to this process: a pre-exec hook asks the kernel to
 /// SIGTERM the child when its parent dies, so a crashed or `kill -9`'d virtkit cannot leak it
@@ -70,8 +84,7 @@ pub(crate) fn spawn_virtiofsd(
     gid_maps: &[String],
 ) -> Result<Child> {
     let _ = std::fs::remove_file(sock);
-    let exe = std::env::current_exe().context("locating the virtkit binary for virtiofsd")?;
-    let mut cmd = Command::new(exe);
+    let mut cmd = Command::new(self_exe());
     cmd.arg("virtiofsd")
         .arg(format!("--socket-path={}", sock.display()))
         .arg(format!("--shared-dir={}", shared_dir.display()))

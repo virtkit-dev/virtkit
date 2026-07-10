@@ -64,8 +64,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // the switch/virtiofsds/forwards/VMM as tied children, supervises them, and
     // tears everything down on SIGTERM (cleanup) or by dying. The job dir on its
     // cmdline is the pid-reuse guard for the later signal.
-    let exe = std::env::current_exe().context("locating the virtkit binary")?;
-    let mut sup_cmd = Command::new(exe);
+    let mut sup_cmd = Command::new(crate::spawn::self_exe());
     sup_cmd.args(["gitlab", "supervise"]).arg(&ctx.job_dir);
     let mut sup =
         spawn_detached(sup_cmd, &ctx.supervisor_log()).context("spawning the job supervisor")?;
@@ -488,8 +487,7 @@ fn ssh_agent_forward_command(ctx: &JobCtx) -> Result<Option<Command>> {
     let mut listen = ctx.vsock_sock().into_os_string();
     listen.push(format!("_{}", crate::run::SSH_AGENT_VSOCK_PORT));
 
-    let exe = std::env::current_exe().context("locating the virtkit binary")?;
-    let mut fwd = Command::new(exe);
+    let mut fwd = Command::new(crate::spawn::self_exe());
     fwd.arg("forward")
         .arg("--listen")
         .arg(&listen)

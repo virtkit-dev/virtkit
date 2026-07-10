@@ -281,7 +281,7 @@ pub struct Spawn {
 /// not-yet-listening switch.
 pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
     use std::process::{Command, Stdio};
-    let exe = std::env::current_exe().context("locating the virtkit binary")?;
+    let exe = crate::spawn::self_exe();
     let log = std::fs::File::create(&opts.log)
         .with_context(|| format!("creating {}", opts.log.display()))?;
     let mut cmd = Command::new(exe);

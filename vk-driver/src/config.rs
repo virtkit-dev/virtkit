@@ -471,8 +471,7 @@ impl Config {
         match &self.virtiofsd {
             Some(path) => std::process::Command::new(path),
             None => {
-                let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("vk"));
-                let mut c = std::process::Command::new(exe);
+                let mut c = std::process::Command::new(crate::spawn::self_exe());
                 c.arg("virtiofsd");
                 c
             }

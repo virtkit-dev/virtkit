@@ -1187,10 +1187,9 @@ fn build_service_image(
 fn spawn_ssh_agent_forward(vsock: &Path, host_sock: &OsStr, work: &Path) -> Result<Child> {
     let mut listen = vsock.to_path_buf().into_os_string();
     listen.push(format!("_{SSH_AGENT_VSOCK_PORT}"));
-    let exe = std::env::current_exe().context("locating the virtkit binary")?;
     let log = std::fs::File::create(work.join("ssh-agent-forward.log"))
         .context("creating the ssh-agent forward log")?;
-    let mut cmd = Command::new(exe);
+    let mut cmd = Command::new(crate::spawn::self_exe());
     cmd.arg("forward")
         .arg("--listen")
         .arg(&listen)
@@ -1387,10 +1386,9 @@ fn spawn_ssh_agent_proxy(
 ) -> Result<Child> {
     let mut listen = vsock.to_path_buf().into_os_string();
     listen.push(format!("_{SSH_AGENT_VSOCK_PORT}"));
-    let exe = std::env::current_exe().context("locating the virtkit binary")?;
     let log = std::fs::File::create(work.join("ssh-agent-forward.log"))
         .context("creating the ssh-agent forward log")?;
-    let mut cmd = Command::new(exe);
+    let mut cmd = Command::new(crate::spawn::self_exe());
     cmd.arg("ssh-agent-proxy")
         .arg("--listen")
         .arg(&listen)

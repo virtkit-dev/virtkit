@@ -236,10 +236,9 @@ pub struct Libkrun;
 impl Vmm for Libkrun {
     fn command(&self, spec: &VmSpec) -> Command {
         let json = serde_json::to_string(spec).expect("serializing VmSpec to JSON");
-        // /proc/self/exe is always the running binary — never a different `vk`
-        // resolved from $PATH — should current_exe() ever fail.
-        let exe = std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into());
-        let mut cmd = Command::new(exe);
+        // self_exe() is always the running binary — never a different `vk` resolved
+        // from $PATH — and survives the on-disk binary being replaced mid-run.
+        let mut cmd = Command::new(crate::spawn::self_exe());
         cmd.arg("__libkrun-boot").arg(json);
         cmd
     }
