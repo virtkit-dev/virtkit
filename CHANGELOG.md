@@ -6,6 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- Each `vk run` VM now shows a readable process name in `ps`/`top` — `vk:<stage>` for
+  a Dockerfile boot, `vk:<image>` for an image, and `vk:<service>` for each compose
+  service — instead of the generic `libkrun VM`. `--vm-name` overrides it with a template
+  where `{name}` expands to the stage, image, or service name.
 - `vk build` and `vk run` now print a timing breakdown when they finish, showing where
   the time went — planning, base pulls, cache pull/push, running instructions, image
   export, and (for `run`) source pull, boot-media assembly, boot, and command exec.

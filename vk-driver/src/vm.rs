@@ -412,6 +412,9 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         // uses one for graceful shutdown in graceful_vmm_stop.
         api_socket: (!crate::vmm::libkrun_selected()).then(|| ctx.api_sock()),
         pass_fds: Vec::new(),
+        // The CI job runs in its own process (no `--vm-name`), so the default template
+        // applies: `vk:<hostname>`.
+        proc_name: crate::vmm::resolve_proc_name(&cfg.vm.hostname),
     };
     // passive listeners the guest dials once up: safe (and simplest) to start before
     // the VMM, and intentionally not bind-waited — they bind long before the guest

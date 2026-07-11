@@ -293,6 +293,7 @@ pub fn boot_unit(
             serial_log: console.clone(),
             api_socket: None,
             pass_fds: Vec::new(),
+            proc_name: crate::vmm::resolve_proc_name(&svc.name),
         };
         let log = std::fs::File::create(&console)?;
         let vmm = crate::vmm::selected(cloud_hypervisor);

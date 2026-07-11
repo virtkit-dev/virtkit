@@ -429,6 +429,10 @@ enum Cmd {
         mem: String,
         #[arg(long, default_value_t = 120)]
         boot_timeout: u64,
+        /// Name for the VM's process (shown in `ps`/`top`): a template where `{name}`
+        /// expands to the Dockerfile stage, image, or compose service name
+        #[arg(long = "vm-name", default_value = "vk:{name}", value_name = "TEMPLATE")]
+        vm_name: String,
         /// Boot the rootfs as a cpio initramfs held entirely in RAM: zero host
         /// scratch, but the guest needs --mem of roughly three times the image size
         #[arg(long)]
@@ -664,8 +668,8 @@ enum Cmd {
 fn main() -> ExitCode {
     // Raise this process's soft open-file limit toward its hard cap (≤1M) before anything
     // else: vk serves each guest's virtio-fs shares in-process (libkrun's built-in fs opens
-    // a host fd per accessed shared file — and this same binary re-execs as `__libkrun-boot`
-    // to run the VMM), so a heavy build (`cargo`/`make -j` on a shared workdir) needs far
+    // a host fd per accessed shared file — and this same binary re-execs as the libkrun
+    // boot child to run the VMM), so a heavy build (`cargo`/`make -j` on a shared workdir) needs far
     // more than a login shell's default soft limit, else the guest sees EMFILE. The separate
     // virtiofsd path already does this (see the virtiofsd module); the built-in path did not.
     raise_nofile();
@@ -684,23 +688,20 @@ fn main() -> ExitCode {
         }
     }
 
-    // `vk __libkrun-boot <spec-json>` — internal: boot one microVM under libkrun (the
-    // Libkrun Vmm backend execs this per VM). Dispatched before the CLI; it links
+    // libkrun boot child — internal: boot one microVM under libkrun (the Libkrun Vmm
+    // backend re-execs this binary per VM, passing the spec in BOOT_SPEC_ENV so argv is
+    // free for the VM's process name). Dispatched before the CLI on that env var; it links
     // libkrun and blocks in krun_start_enter until the guest powers off.
     #[cfg(feature = "libkrun")]
-    {
-        let args: Vec<String> = std::env::args().collect();
-        if args.get(1).map(String::as_str) == Some("__libkrun-boot") {
-            let spec: vmm::VmSpec = match args.get(2).map(|j| serde_json::from_str(j)) {
-                Some(Ok(spec)) => spec,
-                Some(Err(e)) => return fail(&anyhow::anyhow!("__libkrun-boot: bad spec: {e}"), 2),
-                None => return fail(&anyhow::anyhow!("__libkrun-boot: missing spec JSON"), 2),
-            };
-            return match libkrun_sys::boot(&spec) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => fail(&e, 1),
-            };
-        }
+    if let Ok(json) = std::env::var(vmm::BOOT_SPEC_ENV) {
+        let spec: vmm::VmSpec = match serde_json::from_str(&json) {
+            Ok(spec) => spec,
+            Err(e) => return fail(&anyhow::anyhow!("libkrun boot: bad spec: {e}"), 2),
+        };
+        return match libkrun_sys::boot(&spec) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        };
     }
 
     // `vk run … --detach` — daemonize once the guest is ready. The fork must precede the
@@ -788,6 +789,7 @@ async fn cli_main() -> ExitCode {
         cpus,
         mem,
         boot_timeout,
+        vm_name,
         ram,
         shell,
         net,
@@ -913,6 +915,7 @@ async fn cli_main() -> ExitCode {
             cpus: *cpus,
             mem: mem.clone(),
             boot_timeout_secs: *boot_timeout,
+            vm_name: vm_name.clone(),
             ram: *ram,
             shell: *shell,
             // services live on the run switch's LAN: --compose implies it.

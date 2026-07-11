@@ -11,8 +11,54 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use vk_core::addr::SocketAddr;
+
+/// Env var carrying the JSON `VmSpec` to a libkrun boot child. It rides the environment
+/// (not argv) so `ps aux` shows just the VM's process name; its presence also selects the
+/// boot-child path in `main` (no positional subcommand needed).
+pub const BOOT_SPEC_ENV: &str = "VIRTKIT_BOOT_SPEC";
+
+/// Env var carrying the VM process name to the libkrun boot child; the vendored libkrun
+/// reads it for the 15-char `comm` (see `krun_start_enter` in third_party/libkrun).
+pub const VM_NAME_ENV: &str = "VIRTKIT_VM_NAME";
+
+/// Default `--vm-name` template. `{name}` expands to the per-VM unit name (a Dockerfile
+/// stage, an image, or a compose service).
+pub const DEFAULT_VM_NAME_TEMPLATE: &str = "vk:{name}";
+
+/// The `--vm-name` template, set once per process from the CLI. Booting happens across
+/// several call sites (run, compose siblings, stage builds) that all share this process,
+/// so a process-global spares threading the template through every signature. Separate
+/// processes (the boot child, a CI job) leave it unset and fall back to the default.
+static VM_NAME_TEMPLATE: OnceLock<String> = OnceLock::new();
+
+/// Record the `--vm-name` template for this process. First call wins; later calls (e.g. a
+/// test) are ignored.
+pub fn set_vm_name_template(template: String) {
+    let _ = VM_NAME_TEMPLATE.set(template);
+}
+
+/// Resolve a VM process name for `unit` (the stage/image/service name) by expanding `{name}`
+/// in the active template (default [`DEFAULT_VM_NAME_TEMPLATE`]).
+pub fn resolve_proc_name(unit: &str) -> String {
+    let template = VM_NAME_TEMPLATE
+        .get()
+        .map(String::as_str)
+        .unwrap_or(DEFAULT_VM_NAME_TEMPLATE);
+    expand_vm_name(template, unit)
+}
+
+/// Substitute `{name}` in a `--vm-name` template with the unit name.
+fn expand_vm_name(template: &str, unit: &str) -> String {
+    template.replace("{name}", unit)
+}
+
+/// Serde fallback for [`VmSpec::proc_name`] when a spec predates the field.
+fn default_proc_name() -> String {
+    resolve_proc_name("vm")
+}
 
 /// A virtio-blk disk, attached in order (first = `/dev/vda`, then `vdb`, …).
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -149,6 +195,12 @@ pub struct VmSpec {
     /// spawn, so the child inherits them (same numbers) and the paths resolve there.
     #[serde(default)]
     pub pass_fds: Vec<i32>,
+    /// Process name for the VMM subprocess: sets `comm` (top/htop, 15-char capped) and
+    /// argv[0] (`ps aux`). Derived from `--vm-name` (default `vk:{name}`) via
+    /// [`resolve_proc_name`]. Only the libkrun backend applies it — cloud-hypervisor keeps
+    /// its own binary name.
+    #[serde(default = "default_proc_name")]
+    pub proc_name: String,
 }
 
 /// A virtual machine monitor that can boot a [`VmSpec`]. `Send` so a boxed `dyn Vmm`
@@ -225,21 +277,29 @@ impl Vmm for CloudHypervisor {
     }
 }
 
-/// libkrun: boots `spec` by re-execing `vk __libkrun-boot <spec-json>` — a per-VM
-/// subprocess that links libkrun and drives its C API (see [`crate::libkrun_sys`]).
-/// Running it as a subprocess keeps the same lifecycle as [`CloudHypervisor`]
-/// (held `Child` / `spawn_tied`), with no in-process VMM in the orchestrator.
+/// libkrun: boots `spec` by re-execing this binary as a per-VM subprocess that links
+/// libkrun and drives its C API (see [`crate::libkrun_sys`]). Running it as a subprocess
+/// keeps the same lifecycle as [`CloudHypervisor`] (held `Child` / `spawn_tied`), with no
+/// in-process VMM in the orchestrator.
 #[cfg(feature = "libkrun")]
 pub struct Libkrun;
 
 #[cfg(feature = "libkrun")]
 impl Vmm for Libkrun {
     fn command(&self, spec: &VmSpec) -> Command {
+        use std::os::unix::process::CommandExt;
+
         let json = serde_json::to_string(spec).expect("serializing VmSpec to JSON");
         // self_exe() is always the running binary — never a different `vk` resolved
         // from $PATH — and survives the on-disk binary being replaced mid-run.
         let mut cmd = Command::new(crate::spawn::self_exe());
-        cmd.arg("__libkrun-boot").arg(json);
+        // Present as the VM's process name (e.g. `vk:myapp`) rather than
+        // `vk __libkrun-boot <json>`: argv[0] carries the name (`ps aux`), the spec rides
+        // BOOT_SPEC_ENV off argv (so `ps` stays clean), and VM_NAME_ENV feeds libkrun's
+        // 15-char `comm`. `main` dispatches on BOOT_SPEC_ENV's presence.
+        cmd.arg0(&spec.proc_name)
+            .env(BOOT_SPEC_ENV, json)
+            .env(VM_NAME_ENV, &spec.proc_name);
         cmd
     }
 
@@ -296,6 +356,17 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn vm_name_template_expands_name() {
+        assert_eq!(
+            expand_vm_name(DEFAULT_VM_NAME_TEMPLATE, "builder"),
+            "vk:builder"
+        );
+        assert_eq!(expand_vm_name("alpine {name} run", "web"), "alpine web run");
+        // no placeholder → the template is the literal name
+        assert_eq!(expand_vm_name("my-vm", "web"), "my-vm");
+    }
+
     /// The CI path: API socket (graceful shutdown), a rw qcow2 overlay root,
     /// a virtio-fs share, a leased tap, balloon, shared memory.
     #[test]
@@ -328,6 +399,7 @@ mod tests {
             serial_log: "/job/console.log".into(),
             api_socket: Some("/job/api.sock".into()),
             pass_fds: Vec::new(),
+            proc_name: "vk:ci".into(),
         };
         assert_eq!(
             args(&ch.command(&spec)),
@@ -391,6 +463,7 @@ mod tests {
             serial_log: "/w/console.log".into(),
             api_socket: None,
             pass_fds: Vec::new(),
+            proc_name: "vk:build".into(),
         };
         assert_eq!(
             args(&ch.command(&spec)),

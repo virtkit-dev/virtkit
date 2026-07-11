@@ -1,10 +1,9 @@
-//! libkrun backend: the `__libkrun-boot` subcommand drives libkrun's C API to
-//! boot a [`VmSpec`] in this process. libkrun is the vendored `krun` rlib crate
-//! (third_party/libkrun), so it shares virtkit's std — no static-`libkrun.a`
-//! double-std to reconcile.
+//! libkrun backend: the boot child drives libkrun's C API to boot a [`VmSpec`] in
+//! this process. libkrun is the vendored `krun` rlib crate (third_party/libkrun), so
+//! it shares virtkit's std — no static-`libkrun.a` double-std to reconcile.
 //!
-//! libkrun runs as a per-VM subprocess (the [`crate::vmm::Libkrun`] impl execs
-//! `vk __libkrun-boot <spec-json>`), so it slots into the same lifecycle as the
+//! libkrun runs as a per-VM subprocess (the [`crate::vmm::Libkrun`] impl re-execs this
+//! binary with the spec in `VIRTKIT_BOOT_SPEC`), so it slots into the same lifecycle as the
 //! cloud-hypervisor backend — held `Child` / `spawn_tied`, no in-process VMM in
 //! the orchestrator. We always supply our own kernel via `krun_set_kernel`, so
 //! libkrun never loads libkrunfw (see lib.rs:2848 upstream): the bundled-kernel
@@ -74,7 +73,7 @@ fn mem_mib(mem: &str) -> Result<u32> {
 }
 
 /// Boot `spec` under libkrun in this process. Returns only when the guest powers
-/// off (or never, until then) — the caller is the `__libkrun-boot` subprocess.
+/// off (or never, until then) — the caller is the libkrun boot subprocess.
 pub fn boot(spec: &VmSpec) -> Result<()> {
     unsafe {
         // libkrun logs to stderr (captured to the VMM log). Its debug level fires on the

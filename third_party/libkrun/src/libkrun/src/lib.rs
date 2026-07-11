@@ -2814,9 +2814,14 @@ pub unsafe extern "C" fn krun_set_kernel_console(ctx_id: u32, console_id: *const
 pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     #[cfg(target_os = "linux")]
     {
-        let prname = match env::var("HOSTNAME") {
-            Ok(val) => CString::new(format!("VM:{val}")).unwrap(),
-            Err(_) => CString::new("libkrun VM").unwrap(),
+        // VIRTKIT_VM_NAME (set by the vk driver) names the process; PR_SET_NAME caps it
+        // at 15 chars. Falls back to the upstream HOSTNAME / "libkrun VM" defaults.
+        let prname = match env::var("VIRTKIT_VM_NAME") {
+            Ok(val) => CString::new(val).unwrap_or_else(|_| CString::new("vk").unwrap()),
+            Err(_) => match env::var("HOSTNAME") {
+                Ok(val) => CString::new(format!("VM:{val}")).unwrap(),
+                Err(_) => CString::new("libkrun VM").unwrap(),
+            },
         };
         unsafe { libc::prctl(libc::PR_SET_NAME, prname.as_ptr()) };
     }

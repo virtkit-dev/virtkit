@@ -95,6 +95,9 @@ pub struct RunArgs {
     pub cpus: u32,
     pub mem: String,
     pub boot_timeout_secs: u64,
+    /// `--vm-name` template for the VMM process name, `{name}` expanding to the stage /
+    /// image / service name (see [`crate::vmm::resolve_proc_name`]). Default `vk:{name}`.
+    pub vm_name: String,
     /// boot the rootfs as a cpio initramfs held in RAM instead of the default
     /// native-ext4 disk (needs --mem of roughly three times the image size)
     pub ram: bool,
@@ -170,6 +173,9 @@ pub async fn run(args: &RunArgs) -> Result<()> {
     if args.shell && unsafe { libc::isatty(0) != 1 || libc::isatty(1) != 1 } {
         bail!("--shell requires stdin and stdout to be a terminal");
     }
+    // The VMM process-name template for every VM this run boots (the primary, plus any
+    // compose siblings and Dockerfile stage builds, which reach it via the process-global).
+    crate::vmm::set_vm_name_template(args.vm_name.clone());
     let work = match &args.state_dir {
         Some(dir) => WorkDir::pinned(dir.clone())?,
         None => {
@@ -865,6 +871,19 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     if args.host_exec {
         vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, HOST_EXEC_PORT));
     }
+    // The VM's process name follows the boot target: a --primary compose service, a -f
+    // Dockerfile stage (the target, or "build" for the default last stage), or the image ref.
+    let unit_name = if let Some(name) = &args.primary {
+        name.clone()
+    } else if !args.dockerfiles.is_empty() {
+        args.target.clone().unwrap_or_else(|| "build".to_string())
+    } else {
+        args.image
+            .rsplit('/')
+            .next()
+            .unwrap_or(&args.image)
+            .to_string()
+    };
     let spec = crate::vmm::VmSpec {
         kernel: kernel.to_path_buf(),
         cmdline,
@@ -882,6 +901,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         serial_log: console.clone(),
         api_socket: None,
         pass_fds,
+        proc_name: crate::vmm::resolve_proc_name(&unit_name),
     };
     // Control server on the primary's hybrid-vsock control socket — only the
     // primary's guest can reach it, so the control plane is scoped to this run.
@@ -1938,6 +1958,8 @@ pub(crate) async fn boot_session(
         serial_log: console.clone(),
         api_socket: None,
         pass_fds,
+        // `stem` is the stage ext4's name — the closest identity this build VM has.
+        proc_name: crate::vmm::resolve_proc_name(stem),
     };
     let vmm = crate::vmm::selected(cloud_hypervisor);
     let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
@@ -2363,6 +2385,7 @@ mod tests {
             serial_log: dir.join("console.log"),
             api_socket: None,
             pass_fds: vec![medium.fd()],
+            proc_name: "vk:test".into(),
         };
         let mut child = spawn_vmm(&CatVmm, &spec).unwrap();
         assert!(child.wait().unwrap().success());
