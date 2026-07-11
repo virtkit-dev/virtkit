@@ -1061,7 +1061,7 @@ fn plan_services(
         ext4: PathBuf,
         slot: u32,
     }
-    let mut specs = Vec::new();
+    let mut selected = Vec::new();
     let mut sited = Vec::new();
     let mut slot = 0u32;
     for &i in &order {
@@ -1072,7 +1072,7 @@ fn plan_services(
         let dir = work.join(format!("svc-{}", unit.name));
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let ext4 = dir.join("image.ext4");
-        specs.push(service_spec(args, unit, &ext4));
+        selected.push(i);
         sited.push(Sited {
             unit: i,
             dir,
@@ -1083,14 +1083,23 @@ fn plan_services(
     }
 
     // Build every sibling image in ONE unified build, so independent services build
-    // concurrently over a single job pool (warmth still comes from the instruction cache).
+    // concurrently over a single job pool and services sharing a Dockerfile build their
+    // common stages once (warmth still comes from the instruction cache). Each service's
+    // image exports to its own dir; the returned map is keyed by service name.
+    let out_of = |unit: &crate::compose::Unit| {
+        Some(work.join(format!("svc-{}", unit.name)).join("image.ext4"))
+    };
+    let units_to_build = compose_build_units(&args.build_args, units, &selected, out_of);
     let opts = service_build_options(args, kernel, agent);
-    let built = crate::build::build_many(specs, &opts)?;
+    let built = crate::build::build_units(units_to_build, &opts)?;
 
     // Address + provision each built image, layering its compose overrides over the image.
-    for (s, b) in sited.into_iter().zip(built) {
+    for s in sited {
         let unit = &units[s.unit];
-        let config = crate::compose::merged_config(&b.config, unit);
+        let config = built
+            .get(&unit.name)
+            .map(|b| crate::compose::merged_config(&b.config, unit))
+            .with_context(|| format!("internal: service {} not built", unit.name))?;
         let ip = crate::units::nth_static_ip(gw, prefix, s.slot)?;
         planned
             .listen
@@ -1221,9 +1230,13 @@ fn build_service_image(
 
 /// The build options common to every compose service build (the embedded kernel/agent, the
 /// instruction cache, egress policy). Per-service inputs/target/args/out are filled in by
-/// the caller; [`build_many`](crate::build::build_many) reads them from each `ServiceSpec`
+/// the caller; [`build_units`](crate::build::build_units) reads them from each `BuildUnit`
 /// instead, so the `out`/`dockerfiles`/`build_args` left here are unused on that path.
-fn service_build_options(args: &RunArgs, kernel: &Path, agent: &Path) -> crate::build::Options {
+pub(crate) fn service_build_options(
+    args: &RunArgs,
+    kernel: &Path,
+    agent: &Path,
+) -> crate::build::Options {
     crate::build::Options {
         dockerfiles: Vec::new(),
         target: None,
@@ -1246,45 +1259,70 @@ fn service_build_options(args: &RunArgs, kernel: &Path, agent: &Path) -> crate::
     }
 }
 
-/// Map one compose service to a [`ServiceSpec`](crate::build::ServiceSpec) for the unified
-/// build: its source (build files+contexts, or a pulled `image:`), stage target, output
-/// path, and build args — the global `--build-arg`s with the service's own `build.args`
-/// layered on top (a service arg wins on a duplicate key).
-fn service_spec(
-    args: &RunArgs,
-    unit: &crate::compose::Unit,
-    out: &Path,
-) -> crate::build::ServiceSpec {
-    let (input, target, unit_args) = match &unit.source {
-        crate::compose::Source::Build {
-            dockerfiles,
-            context,
-            target,
-            args: unit_args,
-        } => (
-            crate::build::ServiceInput::Build {
-                dockerfiles: dockerfiles.clone(),
+/// Map the selected compose services to [`BuildUnit`](crate::build::BuildUnit)s for a
+/// unified build. `build:` services with identical inputs (Dockerfile(s), contexts, and
+/// resolved build args) merge into one unit — one plan, one target per service — so their
+/// common stages build once; services with differing inputs, and each `image:` service,
+/// become their own unit. `out_of` gives each service its export path (`None` = warm the
+/// cache only). Build args are the global `--build-arg`s with the service's own `build.args`
+/// layered on top (a service arg wins on a duplicate key). Each target is labelled with its
+/// service name, so the returned [`Built`] map is keyed by service name.
+pub(crate) fn compose_build_units(
+    global_build_args: &[(String, String)],
+    units: &[crate::compose::Unit],
+    selected: &[usize],
+    out_of: impl Fn(&crate::compose::Unit) -> Option<PathBuf>,
+) -> Vec<crate::build::BuildUnit> {
+    // A build group's identity: (dockerfiles, contexts, resolved build args). Services with
+    // an equal signature share one plan, so they merge into one multi-target unit.
+    type BuildSig = (Vec<PathBuf>, Vec<PathBuf>, Vec<(String, String)>);
+    let mut result: Vec<crate::build::BuildUnit> = Vec::new();
+    let mut groups: Vec<(BuildSig, usize)> = Vec::new(); // signature -> index into `result`
+    for &i in selected {
+        let unit = &units[i];
+        let target = |selector: Option<String>| crate::build::TargetSpec {
+            label: unit.name.clone(),
+            selector,
+            out: out_of(unit),
+        };
+        match &unit.source {
+            crate::compose::Source::Build {
+                dockerfiles,
+                context,
+                target: stage,
+                args: unit_args,
+            } => {
                 // compose semantics: one context for all the service's files.
-                contexts: vec![context.clone(); dockerfiles.len()],
-            },
-            target.clone(),
-            unit_args.clone(),
-        ),
-        crate::compose::Source::Image(image) => (
-            crate::build::ServiceInput::Image(image.clone()),
-            None,
-            Vec::new(),
-        ),
-    };
-    let mut build_args = args.build_args.clone();
-    build_args.extend(unit_args);
-    crate::build::ServiceSpec {
-        name: unit.name.clone(),
-        input,
-        target,
-        build_args,
-        out: out.to_path_buf(),
+                let contexts = vec![context.clone(); dockerfiles.len()];
+                let mut build_args = global_build_args.to_vec();
+                build_args.extend(unit_args.iter().cloned());
+                let sig = (dockerfiles.clone(), contexts.clone(), build_args.clone());
+                // Order-sensitive on build_args: two services with the same args in a
+                // different order won't merge (a missed optimization, not a bug).
+                if let Some((_, ri)) = groups.iter().find(|(s, _)| *s == sig) {
+                    result[*ri].targets.push(target(stage.clone()));
+                } else {
+                    groups.push((sig, result.len()));
+                    result.push(crate::build::BuildUnit {
+                        label: unit.name.clone(),
+                        input: crate::build::UnitInput::Build {
+                            dockerfiles: dockerfiles.clone(),
+                            contexts,
+                        },
+                        build_args,
+                        targets: vec![target(stage.clone())],
+                    });
+                }
+            }
+            crate::compose::Source::Image(image) => result.push(crate::build::BuildUnit {
+                label: unit.name.clone(),
+                input: crate::build::UnitInput::Image(image.clone()),
+                build_args: global_build_args.to_vec(),
+                targets: vec![target(None)],
+            }),
+        }
     }
+    result
 }
 
 /// Spawn the host side of the SSH-agent forward: `vk forward` binds the VMM's per-port
@@ -2353,6 +2391,37 @@ impl Drop for VmSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_build_units_merge_services_sharing_a_dockerfile() {
+        // a + b share one context/Dockerfile (differ only by target) → one multi-target
+        // unit (their common stages build once); c's context differs, d is a pulled image →
+        // each its own unit.
+        let yaml = "services:\n\
+             \x20 a:\n    build:\n      context: ./ctx\n      target: sa\n\
+             \x20 b:\n    build:\n      context: ./ctx\n      target: sb\n\
+             \x20 c:\n    build:\n      context: ./other\n      target: sc\n\
+             \x20 d:\n    image: redis:7\n";
+        let units = crate::compose::parse(yaml, Path::new("/base"), &|_| None).unwrap();
+        let selected: Vec<usize> = (0..units.len()).collect();
+        let built = compose_build_units(&[], &units, &selected, |_| None);
+        assert_eq!(built.len(), 3, "a+b merge; c and d stand alone");
+        // the merged unit carries both a and b as targets, by their stage selectors.
+        let merged = built.iter().find(|u| u.targets.len() == 2).unwrap();
+        let mut targets: Vec<(&str, &str)> = merged
+            .targets
+            .iter()
+            .map(|t| (t.label.as_str(), t.selector.as_deref().unwrap()))
+            .collect();
+        targets.sort();
+        assert_eq!(targets, [("a", "sa"), ("b", "sb")]);
+        // exactly one unit is a pulled image (d).
+        let images = built
+            .iter()
+            .filter(|u| matches!(u.input, crate::build::UnitInput::Image(_)))
+            .count();
+        assert_eq!(images, 1);
+    }
 
     #[test]
     fn host_exec_serve_args_gate_the_wrapper() {

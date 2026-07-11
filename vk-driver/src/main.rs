@@ -210,9 +210,18 @@ enum Cmd {
         /// so a FROM/COPY --from in one file can name a stage declared in another)
         #[arg(short = 'f', long = "file", default_value = "Dockerfile")]
         file: Vec<PathBuf>,
-        /// target stage (AS name or index; default: the last stage)
+        /// target stage (AS name or index; default: the last stage). Repeatable: several
+        /// targets build together in one pass, sharing their common stages (built once) and
+        /// running the rest concurrently. With one --out they export to <out>/<target>.ext4;
+        /// with none they only warm the instruction cache
         #[arg(long)]
-        target: Option<String>,
+        target: Vec<String>,
+        /// build every service declared in this compose file (like the targets `vk run
+        /// --compose` would build) in one pass — services sharing a Dockerfile build their
+        /// common stages once. Warms the cache; with --out each exports to <out>/<name>.ext4.
+        /// Excludes -f/--target
+        #[arg(long)]
+        compose: Option<PathBuf>,
         /// build context for COPY (repeatable, zipped positionally with -f;
         /// default: each Dockerfile's own directory)
         #[arg(long)]
@@ -1086,6 +1095,7 @@ async fn cli_main() -> ExitCode {
     if let Cmd::Build {
         file,
         target,
+        compose,
         context,
         out,
         print_plan,
@@ -1132,7 +1142,9 @@ async fn cli_main() -> ExitCode {
         let b = &cfg.build;
         let opts = build::Options {
             dockerfiles: file.clone(),
-            target: target.clone(),
+            // build_units (the multi-target / --compose path) reads targets from its units;
+            // the single-image path uses this one (default: the last stage).
+            target: target.first().cloned(),
             contexts: context.clone(),
             out: out.clone(),
             print_plan: *print_plan,
@@ -1153,6 +1165,89 @@ async fn cli_main() -> ExitCode {
             build_jobs: *build_jobs,
             debug: *debug,
         };
+        // A compose file, or more than one --target, builds several images together in one
+        // pass: their common stages build once and the rest run concurrently. Each image
+        // exports to <out>/<name>.ext4 when --out is given, else only the cache is warmed.
+        // A single/absent target keeps the plain single-image build (and --print-plan).
+        if compose.is_some() || target.len() > 1 {
+            if *print_plan {
+                return fail(
+                    &anyhow::anyhow!(
+                        "--print-plan builds one target; drop --compose / extra --target"
+                    ),
+                    2,
+                );
+            }
+            if let Some(dir) = out
+                && let Err(e) = std::fs::create_dir_all(dir)
+            {
+                return fail(
+                    &anyhow::anyhow!("creating --out dir {}: {e}", dir.display()),
+                    1,
+                );
+            }
+            let out_file = |name: &str| out.as_ref().map(|d| d.join(format!("{name}.ext4")));
+            let units = if let Some(path) = compose {
+                if !target.is_empty() {
+                    return fail(
+                        &anyhow::anyhow!("--compose builds every service; --target does not apply"),
+                        2,
+                    );
+                }
+                // --compose uses each service's own Dockerfile, so a user-supplied -f has
+                // no effect; reject it rather than silently ignore it (default: "Dockerfile").
+                if file.len() != 1 || file[0] != Path::new("Dockerfile") {
+                    return fail(
+                        &anyhow::anyhow!(
+                            "--compose builds each service's own Dockerfile; -f does not apply"
+                        ),
+                        2,
+                    );
+                }
+                let cunits = match compose::load(path) {
+                    Ok(u) => u,
+                    Err(e) => return fail(&e, 1),
+                };
+                if cunits.is_empty() {
+                    return fail(
+                        &anyhow::anyhow!("{} declares no services", path.display()),
+                        1,
+                    );
+                }
+                let selected: Vec<usize> = (0..cunits.len()).collect();
+                run::compose_build_units(&opts.build_args, &cunits, &selected, |u| {
+                    out_file(&u.name)
+                })
+            } else {
+                // several --target of one Dockerfile: one unit, one target per selector.
+                // De-duplicate the selectors (first-seen order) so `--target app --target
+                // app` — which the DAG builds once — does not export or report it twice.
+                let mut seen = std::collections::HashSet::new();
+                let targets = target
+                    .iter()
+                    .filter(|t| seen.insert((*t).clone()))
+                    .map(|t| build::TargetSpec {
+                        label: t.clone(),
+                        selector: Some(t.clone()),
+                        out: out_file(t),
+                    })
+                    .collect();
+                vec![build::BuildUnit {
+                    label: String::new(),
+                    input: build::UnitInput::Build {
+                        dockerfiles: file.clone(),
+                        contexts: context.clone(),
+                    },
+                    build_args: opts.build_args.clone(),
+                    targets,
+                }]
+            };
+            return match build::build_units(units, &opts) {
+                Ok(_) => ExitCode::SUCCESS,
+                Err(e) if is_not_cached(&e) => fail(&e, 3),
+                Err(e) => fail(&e, 1),
+            };
+        }
         return match build::build(&opts) {
             Ok(_) => ExitCode::SUCCESS,
             Err(e) if is_not_cached(&e) => fail(&e, 3),

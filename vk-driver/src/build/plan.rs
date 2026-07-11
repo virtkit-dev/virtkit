@@ -336,6 +336,19 @@ impl Plan {
         Ok(order)
     }
 
+    /// Topological build order for a *set* of targets and their transitive dependencies —
+    /// the union pruned to what those targets need, each stage after its deps (a stage
+    /// shared by several targets appears once). Backs a unified multi-target build. Errors
+    /// on a dependency cycle.
+    pub fn build_order_multi(&self, targets: &[usize]) -> Result<Vec<usize>> {
+        let mut order = Vec::new();
+        let mut state = vec![0u8; self.stages.len()];
+        for &t in targets {
+            self.visit(t, &mut state, &mut order)?;
+        }
+        Ok(order)
+    }
+
     /// Topological order over *every* stage (not pruned to a single target), so a caller
     /// that needs all stages — e.g. `docker-hash` printing every stage's key — gets each
     /// one after its dependencies. Errors on a dependency cycle.
@@ -558,6 +571,54 @@ mod tests {
         assert!(pos(0) < pos(1) && pos(1) < pos(3));
         assert!(!order.contains(&2)); // extra pruned
         assert_eq!(*order.last().unwrap(), 3); // target last
+    }
+
+    #[test]
+    fn build_order_multi_unions_targets_and_shares_deps() {
+        // A diamond of one shared base plus two independent tails:
+        //   base -> {left, right}. Two targets 'left' and 'right' share 'base'.
+        let p = plan(
+            "FROM debian AS base\n\
+             FROM base AS left\nCOPY --from=base /x /x\n\
+             FROM base AS right\nCOPY --from=base /y /y\n",
+        );
+        let left = p.resolve_target(Some("left")).unwrap();
+        let right = p.resolve_target(Some("right")).unwrap();
+        let order = p.build_order_multi(&[left, right]).unwrap();
+        // both targets present, deps before dependents, and 'base' appears exactly once.
+        let pos = |i| order.iter().position(|&x| x == i).unwrap();
+        assert!(order.contains(&left) && order.contains(&right));
+        assert!(pos(0) < pos(left) && pos(0) < pos(right)); // base before both tails
+        assert_eq!(order.iter().filter(|&&x| x == 0).count(), 1); // shared dep once
+        assert_eq!(order.len(), 3); // base + left + right, no duplication
+    }
+
+    #[test]
+    fn build_order_multi_target_is_a_dep_of_another_target() {
+        // 'a' is itself a dependency of 'b'. Requesting both must not duplicate 'a', and
+        // must still order it before 'b'.
+        let p = plan("FROM debian AS a\nFROM a AS b\n");
+        let a = p.resolve_target(Some("a")).unwrap();
+        let b = p.resolve_target(Some("b")).unwrap();
+        let order = p.build_order_multi(&[a, b]).unwrap();
+        assert_eq!(order, vec![a, b]); // a before b, each once
+    }
+
+    #[test]
+    fn build_order_multi_rejects_a_cycle() {
+        // Force a cycle (not expressible via forward-only FROM): make x depend back on y.
+        let mut p = plan("FROM debian AS x\nFROM x AS y\n");
+        p.stages[0]
+            .instructions
+            .push(Instruction::Copy(crate::build::parser::Copy {
+                sources: vec!["/a".into()],
+                dest: "/a".into(),
+                from: Some("y".into()),
+                chown: None,
+                chmod: None,
+                link: false,
+            }));
+        assert!(p.build_order_multi(&[0, 1]).is_err());
     }
 
     #[test]

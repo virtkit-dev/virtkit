@@ -6,11 +6,15 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
-- `vk run --compose` now builds its services concurrently instead of one after another:
-  independent service images build in parallel over a single job pool (bounded by host
-  RAM, like a multi-stage build), and identical bases are built or restored once. The
-  live dashboard shows every service's stages together, each row prefixed with its
-  service name.
+- `vk build` now builds several targets in one pass: repeat `--target`, or pass
+  `--compose <file>` to build every service a compose file declares. Targets that share a
+  Dockerfile build their common stages once and run the rest concurrently over a single
+  job pool (bounded by host RAM). With `--out` each image exports to `<out>/<name>.ext4`;
+  with none, the build only warms the instruction cache — handy for pre-warming before a
+  `vk run`.
+- `vk run --compose` now builds its services concurrently instead of one after another,
+  in a single build over one job pool. Services sharing a Dockerfile build their common
+  stages once; the live dashboard shows every service's stages together.
 - Each `vk run` VM now shows a readable process name in `ps`/`top` — `vk:<stage>` for
   a Dockerfile boot, `vk:<image>` for an image, and `vk:<service>` for each compose
   service — instead of the generic `libkrun VM`. `--vm-name` overrides it with a template

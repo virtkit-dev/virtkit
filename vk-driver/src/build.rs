@@ -425,7 +425,7 @@ fn resolve_kernel_agent(
 /// Build the microVM backend for a build: its instruction-cache registry (if any), the
 /// cloud-hypervisor binary (only needed when `VIRTKIT_VMM` selects that backend), and the
 /// `MicroVm` itself over `scratch`. Shared by the single-target [`build_backend`] and the
-/// unified multi-service [`build_many`], so the two construct the backend identically.
+/// unified multi-unit [`build_units`], so the two construct the backend identically.
 fn make_microvm(
     opts: &Options,
     scratch: &Path,
@@ -618,10 +618,10 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     Ok(built)
 }
 
-/// Where one service's image comes from, in a unified multi-service build (see
-/// [`build_many`]): built from Dockerfile(s) + context(s), or pulled as the synthetic
-/// single-`FROM` plan of an `image:` reference.
-pub enum ServiceInput {
+/// Where one build unit's stages come from (see [`build_units`]): built from
+/// Dockerfile(s) + context(s), or pulled as the synthetic single-`FROM` plan of an
+/// `image:` reference.
+pub enum UnitInput {
     Build {
         dockerfiles: Vec<PathBuf>,
         /// zipped positionally with `dockerfiles` (a file without one defaults to its dir)
@@ -630,161 +630,207 @@ pub enum ServiceInput {
     Image(String),
 }
 
-/// One service to materialize in a unified multi-service build. `build_args` are already
-/// merged (global `--build-arg` plus the service's own `build.args`); `target` selects the
-/// stage (default: last); `out` is the service's ext4 output (its config sidecar is written
-/// beside it).
-pub struct ServiceSpec {
-    /// service name — prefixes stage identities + dashboard rows so same-named stages
-    /// across services stay distinct.
-    pub name: String,
-    pub input: ServiceInput,
-    pub target: Option<String>,
-    pub build_args: Vec<(String, String)>,
-    pub out: PathBuf,
+/// One target of a build unit: a stage of the unit's plan to materialize. `out` is where
+/// its ext4 is exported (its config sidecar written beside it); `None` warms the
+/// instruction cache without exporting anything — e.g. a prebuild that only wants the
+/// cached snapshots. `label` names it in the dashboard and keys the returned [`Built`].
+pub struct TargetSpec {
+    pub label: String,
+    /// stage selector (an `AS` name or index); `None` = the plan's last stage
+    pub selector: Option<String>,
+    pub out: Option<PathBuf>,
 }
 
-/// Build several compose services as ONE build: all their stages run in a single
-/// dependency DAG over one job pool (so independent services build concurrently under a
-/// single RAM budget), share one microVM backend (identical bases build/restore once) and
-/// one live dashboard, and each service's target is exported to its own `out`. Returns each
-/// service's [`Built`] in the input order. Microvm backend only (every compose build).
+/// One build unit: a single plan (shared by all its `targets`) plus the build args it is
+/// resolved under. Several targets of one unit share every common stage — it is built once
+/// — so a multi-target unit is strictly cheaper than repeating a single-target build. Units
+/// with different inputs stay separate (their stages can't be shared).
+pub struct BuildUnit {
+    /// disambiguates this unit's stage rows on the dashboard when a build spans several
+    /// units (a lone unit needs no prefix). Also namespaces the executor's per-stage
+    /// identity so two units with a same-named stage don't collide.
+    pub label: String,
+    pub input: UnitInput,
+    pub build_args: Vec<(String, String)>,
+    pub targets: Vec<TargetSpec>,
+}
+
+/// Build a set of units as ONE build: every unit's needed stages run in a single dependency
+/// DAG over one job pool (so independent work runs concurrently under a single host-RAM
+/// budget), sharing one microVM backend (identical bases build/restore once) and one live
+/// dashboard. Within a unit, stages common to several targets build once; each target with
+/// an `out` is exported there (with its config sidecar), and every target's runtime config
+/// is returned keyed by its label. Microvm backend only (every compose / multi-target build).
 ///
-/// Stage identities are namespaced per service — the executor keys its `images` map and
-/// scratch files by stage name, so without a per-service prefix two services with a
-/// same-named (or both unnamed) stage would collide. Services are otherwise independent:
-/// there are no cross-service `FROM`/`COPY --from` edges, so each keeps its own [`Plan`].
-pub fn build_many(specs: Vec<ServiceSpec>, opts: &Options) -> Result<Vec<Built>> {
-    if specs.is_empty() {
-        return Ok(Vec::new());
+/// A unit's stage identities are namespaced by its label — the executor keys its `images`
+/// map and scratch files by stage name, so without the prefix two units with a same-named
+/// (or both unnamed) stage would collide. There are no cross-unit build edges, so each unit
+/// keeps its own [`Plan`].
+pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<String, Built>> {
+    if units.is_empty() {
+        return Ok(HashMap::new());
     }
-    let build_args_of = |spec: &ServiceSpec| -> Vars { spec.build_args.iter().cloned().collect() };
     let timings = Arc::new(Timings::new());
     let (kernel, agent) = resolve_kernel_agent(opts)?;
 
-    // One scratch dir for the whole build (placed next to the first service's output; see
-    // [`build_scratch`]), swept of any orphaned siblings first.
+    // One scratch dir for the whole build, placed next to some target's output (any target
+    // that exports), else a temp dir for a cache-only build. Swept of orphaned siblings first.
+    let anchor = units
+        .iter()
+        .flat_map(|u| &u.targets)
+        .find_map(|t| t.out.clone())
+        .unwrap_or_else(|| std::env::temp_dir().join("vk-build"));
     static BUILD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let scratch = build_scratch(&specs[0].out, seq)?;
+    let scratch = build_scratch(&anchor, seq)?;
     if let Some(parent) = scratch.parent() {
         sweep_stale_scratch(parent, SCRATCH_PREFIX);
     }
     let mut mv = make_microvm(opts, &scratch, &kernel.path, &agent.path, &timings)?;
-    // One job budget for every service's stages combined (not per service), so N concurrent
-    // service builds stay within host RAM instead of multiplying live guests.
+    // One job budget for every unit's stages combined (not per unit), so concurrent work
+    // stays within host RAM instead of multiplying live guests.
     let jobs = resolve_build_jobs(opts, mv.mem_mib());
+    timings.note_jobs(jobs); // so the timing header reports "busy across N jobs"
+
+    // A lone unit's stage names are already unique, so it needs no prefix (the dashboard
+    // reads exactly like a single build); several units prefix by label to disambiguate.
+    let multi_unit = units.len() > 1;
+    let prefix_of = |u: &BuildUnit| -> String {
+        if multi_unit {
+            format!("{}:", u.label)
+        } else {
+            String::new()
+        }
+    };
 
     let progress = Progress::new();
-    let result = (|| -> Result<Vec<Built>> {
-        // One resolved service: its own plan/keys, the needed subset, and the base offset
-        // that maps its local stage indices into the build-wide id space.
-        struct Svc {
-            name: String,
-            out: PathBuf,
+    let result = (|| -> Result<HashMap<String, Built>> {
+        /// One resolved target of a unit: its stage index and where it exports.
+        struct Tgt {
+            idx: usize,
+            label: String,
+            out: Option<PathBuf>,
+        }
+        /// One resolved unit: its plan/keys, the needed subset, and the base offset that
+        /// maps its local stage indices into the build-wide id space.
+        struct Unit {
+            prefix: String,
             plan: Plan,
             order: Vec<usize>,
             resolved: HashMap<usize, Resolved>,
             needed: HashSet<usize>,
             cached_final: HashMap<usize, String>,
-            target: usize,
-            /// this service occupies global ids `[base, base + plan.stages.len())`.
+            targets: Vec<Tgt>,
+            /// this unit occupies global ids `[base, base + plan.stages.len())`.
             base: usize,
         }
 
-        // Read-only resolve for every service on one shared probe worker (so identical
-        // base digests/configs are fetched once across services).
+        // Read-only resolve for every unit on one shared probe worker (so identical base
+        // digests/configs are fetched once across units).
         let mut probe = mv.worker();
-        let mut svcs: Vec<Svc> = Vec::with_capacity(specs.len());
+        let mut resolved_units: Vec<Unit> = Vec::with_capacity(units.len());
         let mut base = 0usize;
-        for spec in &specs {
-            let build_args = build_args_of(spec);
-            let inputs = match &spec.input {
-                ServiceInput::Build {
+        for unit in &units {
+            let build_args: Vars = unit.build_args.iter().cloned().collect();
+            let inputs = match &unit.input {
+                UnitInput::Build {
                     dockerfiles,
                     contexts,
                 } => load_inputs(dockerfiles, contexts),
-                ServiceInput::Image(image) => Ok(vec![image_plan_input(image)?]),
+                UnitInput::Image(image) => Ok(vec![image_plan_input(image)?]),
             }
-            .with_context(|| format!("service {:?}", spec.name))?;
+            .with_context(|| format!("build unit {:?}", unit.label))?;
             let plan = Plan::from_dockerfiles(&inputs, &build_args)
-                .with_context(|| format!("service {:?}", spec.name))?;
-            let target = plan.resolve_target(spec.target.as_deref())?;
-            let order = plan.build_order(target)?;
+                .with_context(|| format!("build unit {:?}", unit.label))?;
+            let targets: Vec<Tgt> = unit
+                .targets
+                .iter()
+                .map(|t| {
+                    Ok(Tgt {
+                        idx: plan.resolve_target(t.selector.as_deref())?,
+                        label: t.label.clone(),
+                        out: t.out.clone(),
+                    })
+                })
+                .collect::<Result<_>>()
+                .with_context(|| format!("build unit {:?}", unit.label))?;
+            let target_idxs: Vec<usize> = targets.iter().map(|t| t.idx).collect();
+            let order = plan.build_order_multi(&target_idxs)?;
             plan.check_tmp_sources(&order)?;
-            let resolved = resolve_all(&plan, &order, &build_args, &mut probe)?;
-            let (needed, cached_final) =
-                compute_needed(&plan, &order, &resolved, &mut probe, opts.require_cached)
-                    .with_context(|| format!("service {:?}", spec.name))?;
+            let resolved = resolve_all(&plan, &order, &build_args, &mut probe, &target_idxs)?;
+            let (needed, cached_final) = compute_needed(
+                &plan,
+                &order,
+                &resolved,
+                &mut probe,
+                opts.require_cached,
+                &target_idxs,
+            )
+            .with_context(|| format!("build unit {:?}", unit.label))?;
             let stages = plan.stages.len();
-            svcs.push(Svc {
-                name: spec.name.clone(),
-                out: spec.out.clone(),
+            resolved_units.push(Unit {
+                prefix: prefix_of(unit),
                 plan,
                 order,
                 resolved,
                 needed,
                 cached_final,
-                target,
+                targets,
                 base,
             });
             base += stages;
         }
         drop(probe);
 
-        // The dashboard: every service's needed stages under one flat id space, its rows
-        // prefixed with the service name; one export tail per service.
-        let inits: Vec<StageInit> = svcs
+        // The dashboard: every unit's needed stages under one flat id space (prefixed per
+        // unit); one export tail per target that actually exports.
+        let inits: Vec<StageInit> = resolved_units
             .iter()
-            .flat_map(|s| {
-                stage_inits(
-                    &s.plan,
-                    &s.order,
-                    &s.resolved,
-                    &s.needed,
-                    s.base,
-                    &format!("{}:", s.name),
-                )
-            })
+            .flat_map(|u| stage_inits(&u.plan, &u.order, &u.resolved, &u.needed, u.base, &u.prefix))
             .collect();
-        progress.init(inits, svcs.len());
+        let exports = resolved_units
+            .iter()
+            .flat_map(|u| &u.targets)
+            .filter(|t| t.out.is_some())
+            .count();
+        progress.init(inits, exports);
 
-        // The build-wide DAG: each service's needed stages as global-id nodes, with edges
-        // only among that service's own stages (no cross-service dependencies). A
-        // fully-cached stage restores standalone, so it gets no deps.
+        // The build-wide DAG: each unit's needed stages as global-id nodes, with edges only
+        // among that unit's own stages (no cross-unit dependencies). A fully-cached stage
+        // restores standalone, so it gets no deps.
         let mut nodes: Vec<usize> = Vec::new();
         let mut deps: HashMap<usize, Vec<usize>> = HashMap::new();
-        for s in &svcs {
-            for &idx in &s.order {
-                if !s.needed.contains(&idx) {
+        for u in &resolved_units {
+            for &idx in &u.order {
+                if !u.needed.contains(&idx) {
                     continue;
                 }
-                let d = if s.cached_final.contains_key(&idx) {
+                let d = if u.cached_final.contains_key(&idx) {
                     Vec::new()
                 } else {
-                    s.plan
+                    u.plan
                         .deps(idx)
                         .into_iter()
-                        .filter(|x| s.needed.contains(x))
-                        .map(|x| s.base + x)
+                        .filter(|x| u.needed.contains(x))
+                        .map(|x| u.base + x)
                         .collect()
                 };
-                nodes.push(s.base + idx);
-                deps.insert(s.base + idx, d);
+                nodes.push(u.base + idx);
+                deps.insert(u.base + idx, d);
             }
         }
 
-        // Decode a global id back to its service (ids are contiguous per service, in `svcs`
-        // order), so the worker can pick the right plan/keys and localize the done map.
-        let bounds: Vec<(usize, usize)> = svcs
+        // Decode a global id back to its unit (ids are contiguous per unit, in order), so the
+        // worker can pick the right plan/keys and localize the done map.
+        let bounds: Vec<(usize, usize)> = resolved_units
             .iter()
-            .map(|s| (s.base, s.base + s.plan.stages.len()))
+            .map(|u| (u.base, u.base + u.plan.stages.len()))
             .collect();
-        let service_of = |gid: usize| -> usize {
+        let unit_of = |gid: usize| -> usize {
             bounds
                 .iter()
                 .position(|&(lo, hi)| lo <= gid && gid < hi)
-                .expect("global stage id maps to a service")
+                .expect("global stage id maps to a unit")
         };
 
         let cancel = CancellationToken::new();
@@ -794,20 +840,20 @@ pub fn build_many(specs: Vec<ServiceSpec>, opts: &Options) -> Result<Vec<Built>>
             jobs,
             Some(&cancel),
             |gid, done_global: &HashMap<usize, Rootfs>| {
-                let s = &svcs[service_of(gid)];
-                let local = gid - s.base;
-                // The done map is build-wide; hand this stage only its own service's committed
-                // rootfs, re-keyed to local indices (its deps are all same-service).
+                let u = &resolved_units[unit_of(gid)];
+                let local = gid - u.base;
+                // The done map is build-wide; hand this stage only its own unit's committed
+                // rootfs, re-keyed to local indices (its deps are all same-unit).
                 let committed: HashMap<usize, Rootfs> = done_global
                     .iter()
-                    .filter(|&(&g, _)| g >= s.base && g < s.base + s.plan.stages.len())
-                    .map(|(&g, fs)| (g - s.base, fs.clone()))
+                    .filter(|&(&g, _)| g >= u.base && g < u.base + u.plan.stages.len())
+                    .map(|(&g, fs)| (g - u.base, fs.clone()))
                     .collect();
                 let mut ex = mv.worker();
                 build_stage(
-                    &s.plan,
-                    &s.resolved,
-                    &s.cached_final,
+                    &u.plan,
+                    &u.resolved,
+                    &u.cached_final,
                     &committed,
                     &mut ex,
                     local,
@@ -815,35 +861,51 @@ pub fn build_many(specs: Vec<ServiceSpec>, opts: &Options) -> Result<Vec<Built>>
                     &progress,
                     &timings,
                     Some(&cancel),
-                    &format!("{}:", s.name),
+                    &u.prefix,
                     gid,
                 )
             },
         )?;
 
-        // Export each service's target to its own ext4 + config sidecar. `mv` shares the
-        // workers' images map, so it can export every target it just built.
-        let mut built = Vec::with_capacity(svcs.len());
-        for (i, s) in svcs.iter().enumerate() {
-            let fs = done
-                .get(&(s.base + s.target))
-                .context("internal: target stage not committed")?;
-            progress.export_start(i);
-            let t_export = Instant::now();
-            mv.export_ext4(fs, &s.out)
-                .with_context(|| format!("service {:?}", s.name))?;
-            timings.record(Phase::Export, &s.name, t_export.elapsed());
-            progress.export_done(i);
-            let st = s
-                .resolved
-                .get(&s.target)
-                .map(|r| r.final_state.clone())
-                .unwrap_or_default();
-            let config = run_config(&st);
-            let sidecar = config_sidecar(&s.out);
-            std::fs::write(&sidecar, serde_json::to_vec_pretty(&config)?)
-                .with_context(|| format!("writing {}", sidecar.display()))?;
-            built.push(Built { config });
+        // Export each exporting target to its ext4 + config sidecar (a cache-only target
+        // just reports its config); `mv` shares the workers' images map, so it can export
+        // every target it just built. Returned keyed by target label.
+        let mut built: HashMap<String, Built> = HashMap::new();
+        let mut export_i = 0usize;
+        for u in &resolved_units {
+            for t in &u.targets {
+                let fs = done
+                    .get(&(u.base + t.idx))
+                    .context("internal: target stage not committed")?;
+                if let Some(out) = &t.out {
+                    progress.export_start(export_i);
+                    let t_export = Instant::now();
+                    mv.export_ext4(fs, out)
+                        .with_context(|| format!("target {:?}", t.label))?;
+                    timings.record(Phase::Export, &t.label, t_export.elapsed());
+                    progress.export_done(export_i);
+                    export_i += 1;
+                    let sidecar = config_sidecar(out);
+                    let st = u
+                        .resolved
+                        .get(&t.idx)
+                        .map(|r| r.final_state.clone())
+                        .unwrap_or_default();
+                    std::fs::write(&sidecar, serde_json::to_vec_pretty(&run_config(&st))?)
+                        .with_context(|| format!("writing {}", sidecar.display()))?;
+                }
+                let st = u
+                    .resolved
+                    .get(&t.idx)
+                    .map(|r| r.final_state.clone())
+                    .unwrap_or_default();
+                built.insert(
+                    t.label.clone(),
+                    Built {
+                        config: run_config(&st),
+                    },
+                );
+            }
         }
         Ok(built)
     })();
@@ -852,12 +914,13 @@ pub fn build_many(specs: Vec<ServiceSpec>, opts: &Options) -> Result<Vec<Built>>
     timings.render();
     let _ = std::fs::remove_dir_all(&scratch); // best-effort scratch cleanup
     let built = result?;
-    for (spec, _) in specs.iter().zip(&built) {
-        println!(
-            "virtkit: built service {} -> {}",
-            spec.name,
-            spec.out.display()
-        );
+    for u in &units {
+        for t in &u.targets {
+            match &t.out {
+                Some(out) => println!("virtkit: built {} -> {}", t.label, out.display()),
+                None => println!("virtkit: cached {}", t.label),
+            }
+        }
     }
     Ok(built)
 }
@@ -1146,11 +1209,14 @@ pub fn target_stage_key(
 /// `stage_key`) instead of taking from the user — see [`drive`]/[`resolve_stages`].
 const DOCKER_STAGE_HASH: &str = "DOCKER_STAGE_HASH";
 
-/// The stage nearest `target` (BFS over the dependency DAG, `target` first) that declares
-/// `ARG DOCKER_STAGE_HASH`, or `None` if no stage in the target's closure does. Mirrors
-/// wabbuilder docker-tool.sh `_closure_args`: the closest declarer to the target wins
-/// (self included), and its `stage_key` is the value injected for the whole build.
-fn nearest_dsh_declarer(plan: &Plan, target: usize) -> Option<usize> {
+/// The stage nearest the `targets` (multi-source BFS over the dependency DAG, the targets
+/// first) that declares `ARG DOCKER_STAGE_HASH`, or `None` if no stage in their combined
+/// closure does. Mirrors wabbuilder docker-tool.sh `_closure_args`: the closest declarer
+/// wins (a target itself included), and its `stage_key` is the value injected for the whole
+/// build. A unified multi-target build passes all its targets: since a plan declares the arg
+/// in one place (and the cache key is DSH-independent by construction), the nearest declarer
+/// to any target is the single value to inject.
+fn nearest_dsh_declarer(plan: &Plan, targets: &[usize]) -> Option<usize> {
     use std::collections::VecDeque;
     let declares = |i: usize| {
         plan.stages[i]
@@ -1159,8 +1225,13 @@ fn nearest_dsh_declarer(plan: &Plan, target: usize) -> Option<usize> {
             .any(|ins| matches!(ins, Instruction::Arg { name, .. } if name == DOCKER_STAGE_HASH))
     };
     let mut seen = vec![false; plan.stages.len()];
-    let mut queue = VecDeque::from([target]);
-    seen[target] = true;
+    let mut queue = VecDeque::new();
+    for &t in targets {
+        if !seen[t] {
+            seen[t] = true;
+            queue.push_back(t);
+        }
+    }
     while let Some(cur) = queue.pop_front() {
         if declares(cur) {
             return Some(cur);
@@ -1222,11 +1293,11 @@ fn resolve_all(
     order: &[usize],
     build_args: &Vars,
     ex: &mut dyn Executor,
+    targets: &[usize],
 ) -> Result<HashMap<usize, Resolved>> {
     // Canonical, value-independent keys (DOCKER_STAGE_HASH forced empty while keying).
     let keyed = resolve_stages(plan, order, build_args, ex, None)?;
-    let target = *order.last().context("internal: empty build order")?;
-    Ok(match nearest_dsh_declarer(plan, target) {
+    Ok(match nearest_dsh_declarer(plan, targets) {
         Some(d) => {
             let value = keyed
                 .get(&d)
@@ -1254,9 +1325,9 @@ fn compute_needed(
     resolved: &HashMap<usize, Resolved>,
     ex: &mut dyn Executor,
     require_cached: bool,
+    targets: &[usize],
 ) -> Result<(HashSet<usize>, HashMap<usize, String>)> {
-    let target = *order.last().context("internal: empty build order")?;
-    let mut needed: HashSet<usize> = HashSet::from([target]);
+    let mut needed: HashSet<usize> = targets.iter().copied().collect();
     let mut cached_final: HashMap<usize, String> = HashMap::new();
     for &idx in order.iter().rev() {
         if !needed.contains(&idx) {
@@ -1560,8 +1631,11 @@ fn drive(
     progress: &Arc<Progress>,
     timings: &Arc<Timings>,
 ) -> Result<(HashMap<usize, Rootfs>, HashMap<usize, ShellState>)> {
-    let resolved = resolve_all(plan, order, build_args, ex)?;
-    let (needed, cached_final) = compute_needed(plan, order, &resolved, ex, require_cached)?;
+    // Single-target driver: the target is the order's last stage.
+    let targets = [*order.last().context("internal: empty build order")?];
+    let resolved = resolve_all(plan, order, build_args, ex, &targets)?;
+    let (needed, cached_final) =
+        compute_needed(plan, order, &resolved, ex, require_cached, &targets)?;
     progress.init(stage_inits(plan, order, &resolved, &needed, 0, ""), 1);
     let mut committed: HashMap<usize, Rootfs> = HashMap::new();
     for &idx in order {
@@ -1727,9 +1801,11 @@ fn drive_microvm(
     timings.note_jobs(jobs);
     // Read-only passes on a throwaway worker (shares `base`'s memoization + cache maps).
     let mut probe = base.worker();
-    let resolved = resolve_all(plan, order, build_args, &mut probe)?;
+    // Single-target driver: the target is the order's last stage.
+    let targets = [*order.last().context("internal: empty build order")?];
+    let resolved = resolve_all(plan, order, build_args, &mut probe, &targets)?;
     let (needed, cached_final) =
-        compute_needed(plan, order, &resolved, &mut probe, require_cached)?;
+        compute_needed(plan, order, &resolved, &mut probe, require_cached, &targets)?;
     drop(probe);
     progress.init(stage_inits(plan, order, &resolved, &needed, 0, ""), 1);
 
@@ -2311,7 +2387,7 @@ mod tests {
             let order = plan.build_order(target).unwrap();
             let needed: HashSet<usize> = order.iter().copied().collect();
             let mut ex = DryRun::new();
-            let resolved = resolve_all(&plan, &order, &ba, &mut ex).unwrap();
+            let resolved = resolve_all(&plan, &order, &ba, &mut ex, &[target]).unwrap();
             stage_inits(&plan, &order, &resolved, &needed, base, prefix)
         };
         let web = inits(0, "web:");
@@ -2326,6 +2402,193 @@ mod tests {
         assert_eq!(name(&db, 0), "db:build");
         assert_eq!(name(&web, 1), "web:stage1");
         assert_eq!(name(&db, 1), "db:stage1");
+    }
+
+    /// One [`build_units_dry`] target: `(label, stage selector, export out)`.
+    type TestTarget<'a> = (&'a str, Option<&'a str>, Option<PathBuf>);
+
+    /// Drive several build units through the [`DryRun`] backend, mirroring the
+    /// backend-agnostic core of [`build_units`] (per-unit plan/order/resolve, one flat
+    /// id space with per-unit `base` offset + label prefix, then `build_stage` per needed
+    /// stage in dependency order) — without the microVM-only bits it cannot exercise
+    /// (`make_microvm`/`run_dag`'s worker pool). Returns the shared transcript plus the
+    /// per-target-label result map, so a test can assert what got built, the stage-name
+    /// namespacing, the cache-only (`out: None`) path, and the returned keying.
+    ///
+    /// Each unit is `(label, dockerfile, targets)` where a target is [`TestTarget`]
+    /// `(label, selector, out)`. Stages run sequentially over the combined order (jobs=1
+    /// semantics), which is deterministic — content-addressed keys make order irrelevant.
+    fn build_units_dry(
+        units: &[(&str, &str, Vec<TestTarget<'_>>)],
+    ) -> (Vec<String>, HashMap<String, PathBuf>) {
+        let ba = Vars::new();
+        let mut ex = DryRun::new();
+        let progress = Progress::disabled();
+        let timings = Arc::new(Timings::new());
+        let multi_unit = units.len() > 1;
+        // Committed rootfs per global id, and the label -> export-out map the caller keys by.
+        let mut committed_global: HashMap<usize, Rootfs> = HashMap::new();
+        let mut result: HashMap<String, PathBuf> = HashMap::new();
+        let mut base = 0usize;
+        for (label, src, targets) in units {
+            let prefix = if multi_unit {
+                format!("{label}:")
+            } else {
+                String::new()
+            };
+            let plan = plan_one(src, &ba);
+            let tidx: Vec<usize> = targets
+                .iter()
+                .map(|(_, sel, _)| plan.resolve_target(*sel).unwrap())
+                .collect();
+            let order = plan.build_order_multi(&tidx).unwrap();
+            let resolved = resolve_all(&plan, &order, &ba, &mut ex, &tidx).unwrap();
+            let (needed, cached_final) =
+                compute_needed(&plan, &order, &resolved, &mut ex, false, &tidx).unwrap();
+            // Build every needed stage in dependency order; hand each one only its own
+            // unit's committed rootfs, re-keyed to local indices (as build_units does).
+            let mut committed_local: HashMap<usize, Rootfs> = HashMap::new();
+            for &idx in &order {
+                if !needed.contains(&idx) {
+                    continue;
+                }
+                let fs = build_stage(
+                    &plan,
+                    &resolved,
+                    &cached_final,
+                    &committed_local,
+                    &mut ex,
+                    idx,
+                    BuildCache::Instructions,
+                    &progress,
+                    &timings,
+                    None,
+                    &prefix,
+                    base + idx,
+                )
+                .unwrap();
+                committed_local.insert(idx, fs.clone());
+                committed_global.insert(base + idx, fs);
+            }
+            // Export each target that has an out, and record every target's label.
+            for ((tlabel, _, out), &idx) in targets.iter().zip(&tidx) {
+                if let Some(out) = out {
+                    let fs = committed_global.get(&(base + idx)).unwrap();
+                    ex.export_ext4(fs, out).unwrap();
+                    result.insert(tlabel.to_string(), out.clone());
+                }
+            }
+            base += plan.stages.len();
+        }
+        (ex.transcript, result)
+    }
+
+    #[test]
+    fn build_units_shares_a_stage_and_builds_both_tails() {
+        // One unit, two targets over a diamond: base -> {left, right}. The shared 'base'
+        // must build once; both divergent tails must build.
+        let out = |n: &str| Some(PathBuf::from(format!("/out/{n}.ext4")));
+        let (t, _) = build_units_dry(&[(
+            "",
+            "FROM scratch AS base\nRUN common\n\
+             FROM base AS left\nRUN l\n\
+             FROM base AS right\nRUN r\n",
+            vec![
+                ("left", Some("left"), out("left")),
+                ("right", Some("right"), out("right")),
+            ],
+        )]);
+        // 'base' (from scratch) is materialized exactly once …
+        assert_eq!(
+            t.iter()
+                .filter(|l| l.as_str() == "from-scratch base")
+                .count(),
+            1,
+            "shared base built once:\n{t:#?}"
+        );
+        // … and each divergent tail runs its own step.
+        assert!(
+            t.iter().any(|l| l.contains("run [") && l.contains(" l")),
+            "{t:#?}"
+        );
+        assert!(
+            t.iter().any(|l| l.contains("run [") && l.contains(" r")),
+            "{t:#?}"
+        );
+    }
+
+    #[test]
+    fn build_units_namespaces_stage_names_across_units() {
+        // Two units, each with a same-named stage `build` and an unnamed final stage. Their
+        // stage identities (the executor's images-map key / scratch names) must be prefixed
+        // by the unit label so they never collide.
+        let out = |n: &str| Some(PathBuf::from(format!("/out/{n}.ext4")));
+        let (t, _) = build_units_dry(&[
+            (
+                "web",
+                "FROM scratch AS build\nRUN wb\nFROM build\nRUN w\n",
+                vec![("web", None, out("web"))],
+            ),
+            (
+                "db",
+                "FROM scratch AS build\nRUN db\nFROM build\nRUN d\n",
+                vec![("db", None, out("db"))],
+            ),
+        ]);
+        // Each unit's `build` stage is scratch-materialized under its own prefix — distinct,
+        // no collision on a shared `build` name.
+        assert!(t.iter().any(|l| l == "from-scratch web:build"), "{t:#?}");
+        assert!(t.iter().any(|l| l == "from-scratch db:build"), "{t:#?}");
+        // The unnamed final stages likewise get a prefixed `stageN` fallback, so two
+        // otherwise-identical unnamed stages stay distinct.
+        assert!(
+            t.iter().any(|l| l.starts_with("from-stage web:stage")),
+            "{t:#?}"
+        );
+        assert!(
+            t.iter().any(|l| l.starts_with("from-stage db:stage")),
+            "{t:#?}"
+        );
+    }
+
+    #[test]
+    fn build_units_cache_only_target_exports_nothing() {
+        // A target with `out: None` warms the cache without exporting: the stage still
+        // builds, but no export-ext4 line is emitted and the label is not in the result map.
+        let (t, result) = build_units_dry(&[(
+            "",
+            "FROM scratch AS app\nRUN build-it\n",
+            vec![("app", Some("app"), None)],
+        )]);
+        assert!(
+            t.iter().any(|l| l.contains("build-it")),
+            "stage still builds:\n{t:#?}"
+        );
+        assert!(
+            !t.iter().any(|l| l.starts_with("export-ext4")),
+            "cache-only target must not export:\n{t:#?}"
+        );
+        assert!(
+            result.is_empty(),
+            "cache-only target is not keyed with an out"
+        );
+    }
+
+    #[test]
+    fn build_units_result_is_keyed_by_target_label() {
+        // The returned map is keyed by each exporting target's label, pointing at its out.
+        let out = |n: &str| Some(PathBuf::from(format!("/out/{n}.ext4")));
+        let (_, result) = build_units_dry(&[(
+            "",
+            "FROM scratch AS base\nRUN c\nFROM base AS left\nFROM base AS right\n",
+            vec![
+                ("left", Some("left"), out("left")),
+                ("right", Some("right"), out("right")),
+            ],
+        )]);
+        assert_eq!(result.get("left"), Some(&PathBuf::from("/out/left.ext4")));
+        assert_eq!(result.get("right"), Some(&PathBuf::from("/out/right.ext4")));
+        assert_eq!(result.len(), 2);
     }
 
     /// A single-file plan whose stages' context is `/nonexistent` (the tests' COPYs
@@ -3349,7 +3612,11 @@ RUN ship
         let target = plan.resolve_target(Some("app")).unwrap();
         let order = plan.build_order(target).unwrap();
         // 'app' does not declare it; the nearest declarer in its closure is 'core' (0).
-        assert_eq!(nearest_dsh_declarer(&plan, target), Some(0));
+        assert_eq!(nearest_dsh_declarer(&plan, &[target]), Some(0));
+        // With a multi-target search set the closest declarer is still 'core' (0): a
+        // target that itself declares it wins over the shared dependency's declarer.
+        let core = plan.resolve_target(Some("core")).unwrap();
+        assert_eq!(nearest_dsh_declarer(&plan, &[core, target]), Some(0));
 
         // canonical (key-pass) keys, DOCKER_STAGE_HASH excluded.
         let mut ex = DryRun::new();
