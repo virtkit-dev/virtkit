@@ -398,6 +398,75 @@ fn build_scratch(out: &Path, seq: u64) -> Result<PathBuf> {
     std::path::absolute(&rel).context("resolving the build scratch dir to an absolute path")
 }
 
+/// Resolve the microVM's kernel + agent and hold them for the whole build: an embedded
+/// asset lives in a memfd whose `/proc/self/fd` path is valid only while the fd is open,
+/// and every stage boot (and the initramfs packer) reopens it — so the caller keeps the
+/// returned handles alive until the build finishes.
+fn resolve_kernel_agent(
+    opts: &Options,
+) -> Result<(crate::embed::Resolved, crate::embed::Resolved)> {
+    let kernel = crate::embed::resolve(crate::embed::Asset::Kernel, opts.kernel.as_deref())?;
+    if !kernel.is_embedded() && !kernel.path.is_file() {
+        bail!(
+            "kernel not found at {} (pass --kernel, or use a `vk` with it embedded)",
+            kernel.path.display()
+        );
+    }
+    let agent = crate::embed::resolve(crate::embed::Asset::Agent, opts.agent.as_deref())?;
+    if !agent.is_embedded() && !agent.path.is_file() {
+        bail!(
+            "vk-agent not found at {} (pass --agent, or use a `vk` with it embedded)",
+            agent.path.display()
+        );
+    }
+    Ok((kernel, agent))
+}
+
+/// Build the microVM backend for a build: its instruction-cache registry (if any), the
+/// cloud-hypervisor binary (only needed when `VIRTKIT_VMM` selects that backend), and the
+/// `MicroVm` itself over `scratch`. Shared by the single-target [`build_backend`] and the
+/// unified multi-service [`build_many`], so the two construct the backend identically.
+fn make_microvm(
+    opts: &Options,
+    scratch: &Path,
+    kernel: &Path,
+    agent: &Path,
+    timings: &Arc<Timings>,
+) -> Result<MicroVm> {
+    let cache = cache_repo(opts.cache_registry.as_deref())?.map(|repo| {
+        crate::config::Registry::for_share(
+            repo,
+            opts.cache_insecure,
+            None,
+            String::new(),
+            None,
+            None,
+        )
+    });
+    // cloud-hypervisor is only needed when VIRTKIT_VMM selects it; the default libkrun
+    // backend is embedded in `vk` and drives no external VMM binary.
+    let ch = if crate::vmm::libkrun_selected() {
+        opts.cloud_hypervisor.clone().unwrap_or_default()
+    } else {
+        opts.cloud_hypervisor.clone().context(
+            "the cloud-hypervisor backend (VIRTKIT_VMM=cloud-hypervisor) needs \
+             --cloud-hypervisor",
+        )?
+    };
+    Ok(MicroVm::new(
+        ch,
+        kernel.to_path_buf(),
+        agent.to_path_buf(),
+        scratch.to_path_buf(),
+        cache,
+        opts.journal,
+        opts.net.clone(),
+        opts.debug,
+        !opts.tmp_tmpfs,
+        Arc::clone(timings),
+    ))
+}
+
 /// [`build`] for a caller that already holds parsed [`PlanInput`]s — e.g. `vk run
 /// --compose` materializing an `image:` service as the synthetic single-`FROM`
 /// plan, with no Dockerfile on disk. `opts.dockerfiles`/`opts.contexts` are the
@@ -466,25 +535,11 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     if let Some(parent) = scratch.parent() {
         sweep_stale_scratch(parent, SCRATCH_PREFIX);
     }
-    // Resolve the microVM's kernel + agent up front and hold them for the whole build:
-    // an embedded asset lives in a memfd whose /proc/self/fd path is valid only while the
-    // fd is open, and every stage boot (and the initramfs packer) reopens it.
+    // Resolve the microVM's kernel + agent up front and hold them for the whole build (see
+    // [`resolve_kernel_agent`]).
     let (kernel, agent) = if microvm {
-        let kernel = crate::embed::resolve(crate::embed::Asset::Kernel, opts.kernel.as_deref())?;
-        if !kernel.is_embedded() && !kernel.path.is_file() {
-            bail!(
-                "kernel not found at {} (pass --kernel, or use a `vk` with it embedded)",
-                kernel.path.display()
-            );
-        }
-        let agent = crate::embed::resolve(crate::embed::Asset::Agent, opts.agent.as_deref())?;
-        if !agent.is_embedded() && !agent.path.is_file() {
-            bail!(
-                "vk-agent not found at {} (pass --agent, or use a `vk` with it embedded)",
-                agent.path.display()
-            );
-        }
-        (Some(kernel), Some(agent))
+        let (k, a) = resolve_kernel_agent(opts)?;
+        (Some(k), Some(a))
     } else {
         (None, None)
     };
@@ -497,40 +552,9 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
         // stage on its own guest); the host backend (FROM scratch + COPY) stays
         // sequential. Both produce the same committed map, then share the export tail.
         let (committed, states, mut ex): (_, _, Box<dyn Executor>) = if microvm {
-            let cache = cache_repo(opts.cache_registry.as_deref())?.map(|repo| {
-                crate::config::Registry::for_share(
-                    repo,
-                    opts.cache_insecure,
-                    None,
-                    String::new(),
-                    None,
-                    None,
-                )
-            });
             let kernel = kernel.as_ref().expect("resolved under microvm");
             let agent = agent.as_ref().expect("resolved under microvm");
-            // cloud-hypervisor is only needed when VIRTKIT_VMM selects it; the default
-            // libkrun backend is embedded in `vk` and drives no external VMM binary.
-            let ch = if crate::vmm::libkrun_selected() {
-                opts.cloud_hypervisor.clone().unwrap_or_default()
-            } else {
-                opts.cloud_hypervisor.clone().context(
-                    "the cloud-hypervisor backend (VIRTKIT_VMM=cloud-hypervisor) needs \
-                     --cloud-hypervisor",
-                )?
-            };
-            let mv = MicroVm::new(
-                ch,
-                kernel.path.clone(),
-                agent.path.clone(),
-                scratch.clone(),
-                cache,
-                opts.journal,
-                opts.net.clone(),
-                opts.debug,
-                !opts.tmp_tmpfs,
-                Arc::clone(&timings),
-            );
+            let mv = make_microvm(opts, &scratch, &kernel.path, &agent.path, &timings)?;
             let jobs = resolve_build_jobs(opts, mv.mem_mib());
             let (committed, states) = drive_microvm(
                 &plan,
@@ -563,11 +587,11 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
         let fs = committed
             .get(&target)
             .context("internal: target stage not committed")?;
-        progress.export_start();
+        progress.export_start(0);
         let t_export = Instant::now();
         ex.export_ext4(fs, out)?;
         timings.record(Phase::Export, "", t_export.elapsed());
-        progress.export_done();
+        progress.export_done(0);
         let st = states.get(&target).cloned().unwrap_or_default();
         let config = run_config(&st);
         // The sidecar persists the config the image itself deliberately does not
@@ -591,6 +615,250 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
             .join(" + "),
         out.display()
     );
+    Ok(built)
+}
+
+/// Where one service's image comes from, in a unified multi-service build (see
+/// [`build_many`]): built from Dockerfile(s) + context(s), or pulled as the synthetic
+/// single-`FROM` plan of an `image:` reference.
+pub enum ServiceInput {
+    Build {
+        dockerfiles: Vec<PathBuf>,
+        /// zipped positionally with `dockerfiles` (a file without one defaults to its dir)
+        contexts: Vec<PathBuf>,
+    },
+    Image(String),
+}
+
+/// One service to materialize in a unified multi-service build. `build_args` are already
+/// merged (global `--build-arg` plus the service's own `build.args`); `target` selects the
+/// stage (default: last); `out` is the service's ext4 output (its config sidecar is written
+/// beside it).
+pub struct ServiceSpec {
+    /// service name — prefixes stage identities + dashboard rows so same-named stages
+    /// across services stay distinct.
+    pub name: String,
+    pub input: ServiceInput,
+    pub target: Option<String>,
+    pub build_args: Vec<(String, String)>,
+    pub out: PathBuf,
+}
+
+/// Build several compose services as ONE build: all their stages run in a single
+/// dependency DAG over one job pool (so independent services build concurrently under a
+/// single RAM budget), share one microVM backend (identical bases build/restore once) and
+/// one live dashboard, and each service's target is exported to its own `out`. Returns each
+/// service's [`Built`] in the input order. Microvm backend only (every compose build).
+///
+/// Stage identities are namespaced per service — the executor keys its `images` map and
+/// scratch files by stage name, so without a per-service prefix two services with a
+/// same-named (or both unnamed) stage would collide. Services are otherwise independent:
+/// there are no cross-service `FROM`/`COPY --from` edges, so each keeps its own [`Plan`].
+pub fn build_many(specs: Vec<ServiceSpec>, opts: &Options) -> Result<Vec<Built>> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let build_args_of = |spec: &ServiceSpec| -> Vars { spec.build_args.iter().cloned().collect() };
+    let timings = Arc::new(Timings::new());
+    let (kernel, agent) = resolve_kernel_agent(opts)?;
+
+    // One scratch dir for the whole build (placed next to the first service's output; see
+    // [`build_scratch`]), swept of any orphaned siblings first.
+    static BUILD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let scratch = build_scratch(&specs[0].out, seq)?;
+    if let Some(parent) = scratch.parent() {
+        sweep_stale_scratch(parent, SCRATCH_PREFIX);
+    }
+    let mut mv = make_microvm(opts, &scratch, &kernel.path, &agent.path, &timings)?;
+    // One job budget for every service's stages combined (not per service), so N concurrent
+    // service builds stay within host RAM instead of multiplying live guests.
+    let jobs = resolve_build_jobs(opts, mv.mem_mib());
+
+    let progress = Progress::new();
+    let result = (|| -> Result<Vec<Built>> {
+        // One resolved service: its own plan/keys, the needed subset, and the base offset
+        // that maps its local stage indices into the build-wide id space.
+        struct Svc {
+            name: String,
+            out: PathBuf,
+            plan: Plan,
+            order: Vec<usize>,
+            resolved: HashMap<usize, Resolved>,
+            needed: HashSet<usize>,
+            cached_final: HashMap<usize, String>,
+            target: usize,
+            /// this service occupies global ids `[base, base + plan.stages.len())`.
+            base: usize,
+        }
+
+        // Read-only resolve for every service on one shared probe worker (so identical
+        // base digests/configs are fetched once across services).
+        let mut probe = mv.worker();
+        let mut svcs: Vec<Svc> = Vec::with_capacity(specs.len());
+        let mut base = 0usize;
+        for spec in &specs {
+            let build_args = build_args_of(spec);
+            let inputs = match &spec.input {
+                ServiceInput::Build {
+                    dockerfiles,
+                    contexts,
+                } => load_inputs(dockerfiles, contexts),
+                ServiceInput::Image(image) => Ok(vec![image_plan_input(image)?]),
+            }
+            .with_context(|| format!("service {:?}", spec.name))?;
+            let plan = Plan::from_dockerfiles(&inputs, &build_args)
+                .with_context(|| format!("service {:?}", spec.name))?;
+            let target = plan.resolve_target(spec.target.as_deref())?;
+            let order = plan.build_order(target)?;
+            plan.check_tmp_sources(&order)?;
+            let resolved = resolve_all(&plan, &order, &build_args, &mut probe)?;
+            let (needed, cached_final) =
+                compute_needed(&plan, &order, &resolved, &mut probe, opts.require_cached)
+                    .with_context(|| format!("service {:?}", spec.name))?;
+            let stages = plan.stages.len();
+            svcs.push(Svc {
+                name: spec.name.clone(),
+                out: spec.out.clone(),
+                plan,
+                order,
+                resolved,
+                needed,
+                cached_final,
+                target,
+                base,
+            });
+            base += stages;
+        }
+        drop(probe);
+
+        // The dashboard: every service's needed stages under one flat id space, its rows
+        // prefixed with the service name; one export tail per service.
+        let inits: Vec<StageInit> = svcs
+            .iter()
+            .flat_map(|s| {
+                stage_inits(
+                    &s.plan,
+                    &s.order,
+                    &s.resolved,
+                    &s.needed,
+                    s.base,
+                    &format!("{}:", s.name),
+                )
+            })
+            .collect();
+        progress.init(inits, svcs.len());
+
+        // The build-wide DAG: each service's needed stages as global-id nodes, with edges
+        // only among that service's own stages (no cross-service dependencies). A
+        // fully-cached stage restores standalone, so it gets no deps.
+        let mut nodes: Vec<usize> = Vec::new();
+        let mut deps: HashMap<usize, Vec<usize>> = HashMap::new();
+        for s in &svcs {
+            for &idx in &s.order {
+                if !s.needed.contains(&idx) {
+                    continue;
+                }
+                let d = if s.cached_final.contains_key(&idx) {
+                    Vec::new()
+                } else {
+                    s.plan
+                        .deps(idx)
+                        .into_iter()
+                        .filter(|x| s.needed.contains(x))
+                        .map(|x| s.base + x)
+                        .collect()
+                };
+                nodes.push(s.base + idx);
+                deps.insert(s.base + idx, d);
+            }
+        }
+
+        // Decode a global id back to its service (ids are contiguous per service, in `svcs`
+        // order), so the worker can pick the right plan/keys and localize the done map.
+        let bounds: Vec<(usize, usize)> = svcs
+            .iter()
+            .map(|s| (s.base, s.base + s.plan.stages.len()))
+            .collect();
+        let service_of = |gid: usize| -> usize {
+            bounds
+                .iter()
+                .position(|&(lo, hi)| lo <= gid && gid < hi)
+                .expect("global stage id maps to a service")
+        };
+
+        let cancel = CancellationToken::new();
+        let done = run_dag(
+            &nodes,
+            &deps,
+            jobs,
+            Some(&cancel),
+            |gid, done_global: &HashMap<usize, Rootfs>| {
+                let s = &svcs[service_of(gid)];
+                let local = gid - s.base;
+                // The done map is build-wide; hand this stage only its own service's committed
+                // rootfs, re-keyed to local indices (its deps are all same-service).
+                let committed: HashMap<usize, Rootfs> = done_global
+                    .iter()
+                    .filter(|&(&g, _)| g >= s.base && g < s.base + s.plan.stages.len())
+                    .map(|(&g, fs)| (g - s.base, fs.clone()))
+                    .collect();
+                let mut ex = mv.worker();
+                build_stage(
+                    &s.plan,
+                    &s.resolved,
+                    &s.cached_final,
+                    &committed,
+                    &mut ex,
+                    local,
+                    opts.build_cache,
+                    &progress,
+                    &timings,
+                    Some(&cancel),
+                    &format!("{}:", s.name),
+                    gid,
+                )
+            },
+        )?;
+
+        // Export each service's target to its own ext4 + config sidecar. `mv` shares the
+        // workers' images map, so it can export every target it just built.
+        let mut built = Vec::with_capacity(svcs.len());
+        for (i, s) in svcs.iter().enumerate() {
+            let fs = done
+                .get(&(s.base + s.target))
+                .context("internal: target stage not committed")?;
+            progress.export_start(i);
+            let t_export = Instant::now();
+            mv.export_ext4(fs, &s.out)
+                .with_context(|| format!("service {:?}", s.name))?;
+            timings.record(Phase::Export, &s.name, t_export.elapsed());
+            progress.export_done(i);
+            let st = s
+                .resolved
+                .get(&s.target)
+                .map(|r| r.final_state.clone())
+                .unwrap_or_default();
+            let config = run_config(&st);
+            let sidecar = config_sidecar(&s.out);
+            std::fs::write(&sidecar, serde_json::to_vec_pretty(&config)?)
+                .with_context(|| format!("writing {}", sidecar.display()))?;
+            built.push(Built { config });
+        }
+        Ok(built)
+    })();
+    // Leave the final dashboard frame on screen before any teardown log.
+    progress.finish(result.is_ok());
+    timings.render();
+    let _ = std::fs::remove_dir_all(&scratch); // best-effort scratch cleanup
+    let built = result?;
+    for (spec, _) in specs.iter().zip(&built) {
+        println!(
+            "virtkit: built service {} -> {}",
+            spec.name,
+            spec.out.display()
+        );
+    }
     Ok(built)
 }
 
@@ -1038,15 +1306,21 @@ fn stage_inits(
     order: &[usize],
     resolved: &HashMap<usize, Resolved>,
     needed: &HashSet<usize>,
+    id_offset: progress::StageId,
+    name_prefix: &str,
 ) -> Vec<StageInit> {
     order
         .iter()
         .filter(|i| needed.contains(i))
         .map(|&idx| {
             let stage = &plan.stages[idx];
+            let base_name = stage.name.clone().unwrap_or_else(|| format!("stage{idx}"));
             StageInit {
-                id: idx,
-                name: stage.name.clone().unwrap_or_else(|| format!("stage{idx}")),
+                // `id_offset`/`name_prefix` namespace a unified multi-service build so its
+                // stages get globally-unique progress ids and per-service row labels; a
+                // single build passes `0`/`""`, leaving ids = plan indices, names unchanged.
+                id: id_offset + idx,
+                name: format!("{name_prefix}{base_name}"),
                 base_label: base_label(plan, &stage.base),
                 steps: resolved[&idx]
                     .steps
@@ -1090,6 +1364,8 @@ fn build_stage(
     progress: &Arc<Progress>,
     timings: &Arc<Timings>,
     cancel: Option<&CancellationToken>,
+    name_prefix: &str,
+    display: progress::StageId,
 ) -> Result<Rootfs> {
     // Abort before doing any work if an earlier stage already failed, and hand the token
     // to the backend so a RUN launched below is interrupted the moment a sibling fails.
@@ -1100,22 +1376,27 @@ fn build_stage(
         ex.set_cancel(c.clone());
     }
     let stage = &plan.stages[idx];
-    let name = stage.name.clone().unwrap_or_else(|| format!("stage{idx}"));
+    // The executor identity (its `images` map key + scratch file names) and every label
+    // is this `name`. A unified multi-service build prefixes it per service so same-named
+    // stages across services (two `AS build`s, or two unnamed `stage0`s) stay distinct;
+    // `display` is likewise a globally-unique progress id (a single build passes "" + idx).
+    let base_name = stage.name.clone().unwrap_or_else(|| format!("stage{idx}"));
+    let name = format!("{name_prefix}{base_name}");
     let steps = &resolved
         .get(&idx)
         .context("internal: stage not resolved")?
         .steps;
     // Route this stage's guest output through the progress reporter (line-buffered +
     // stage-prefixed) so concurrent stages stay legible.
-    ex.set_output_sink(progress.stage_sink(idx));
+    ex.set_output_sink(progress.stage_sink(display));
     // Fully cached: restore the final snapshot directly, nothing to probe or run.
     if let Some(key) = cached_final.get(&idx) {
-        progress.stage_fully_cached(idx);
-        progress.restore_start(idx, &name);
+        progress.stage_fully_cached(display);
+        progress.restore_start(display, &name);
         let t_restore = Instant::now();
         let fs = restore_into(ex, &name, key)?;
         timings.record(Phase::CachePull, &name, t_restore.elapsed());
-        progress.restore_done(idx);
+        progress.restore_done(display);
         ex.stage_end(&fs)?;
         return Ok(fs);
     }
@@ -1156,10 +1437,10 @@ fn build_stage(
             // A cached prefix restores the base as part of it, so the FROM line is CACHED;
             // emit it before this step's line so it prints in order.
             if !base_shown {
-                progress.base_done(idx, Outcome::Cached);
+                progress.base_done(display, Outcome::Cached);
                 base_shown = true;
             }
-            progress.step_done(idx, i, Outcome::Cached);
+            progress.step_done(display, i, Outcome::Cached);
             last_hit = Some(step.key.clone());
             continue;
         }
@@ -1169,19 +1450,19 @@ fn build_stage(
         if !building {
             fs = Some(match &last_hit {
                 Some(k) => {
-                    progress.restore_start(idx, &name);
+                    progress.restore_start(display, &name);
                     let t_restore = Instant::now();
                     let f = restore_into(ex, &name, k)?;
                     timings.record(Phase::CachePull, &name, t_restore.elapsed());
-                    progress.restore_done(idx);
+                    progress.restore_done(display);
                     f
                 }
                 None => {
-                    progress.base_start(idx);
+                    progress.base_start(display);
                     let t_base = Instant::now();
                     let f = materialize_base(ex, &stage.base, &name, committed)?;
                     timings.record(Phase::BasePull, &name, t_base.elapsed());
-                    progress.base_done(idx, Outcome::Ran);
+                    progress.base_done(display, Outcome::Ran);
                     base_shown = true;
                     f
                 }
@@ -1189,10 +1470,10 @@ fn build_stage(
             building = true;
         }
         let f = fs.as_mut().expect("materialized on first miss");
-        progress.step_start(idx, i);
+        progress.step_start(display, i);
         let t0 = Instant::now();
         apply_fs(plan, committed, ex, f, &step.state, &step.instr)
-            .inspect_err(|_| progress.step_failed(idx, i))?;
+            .inspect_err(|_| progress.step_failed(display, i))?;
         let ran = t0.elapsed();
         uncommitted += ran;
         timings.record(Phase::Instructions, &name, ran);
@@ -1211,14 +1492,14 @@ fn build_stage(
             // The command is done; the snapshot + cache push that follow are commit
             // overhead, not the step's runtime — freeze the reported time here so a
             // trivial step isn't charged for the previous push's upload `cache_save` joins.
-            progress.step_committing(idx, i);
+            progress.step_committing(display, i);
             let t_push = Instant::now();
             ex.cache_save(f, &step.key)
-                .inspect_err(|_| progress.step_failed(idx, i))?;
+                .inspect_err(|_| progress.step_failed(display, i))?;
             timings.record(Phase::CachePush, &name, t_push.elapsed());
             uncommitted = Duration::ZERO;
         }
-        progress.step_done(idx, i, Outcome::Ran);
+        progress.step_done(display, i, Outcome::Ran);
     }
     // Nothing ran: the whole instruction run was cached → restore the final snapshot; or
     // there were no fs-changing instructions → the stage is the base.
@@ -1228,19 +1509,19 @@ fn build_stage(
             // Every step was a cache hit: the FROM line was already shown (CACHED) at the
             // first hit in the loop, so just restore the final snapshot.
             Some(k) => {
-                progress.restore_start(idx, &name);
+                progress.restore_start(display, &name);
                 let t_restore = Instant::now();
                 let f = restore_into(ex, &name, k)?;
                 timings.record(Phase::CachePull, &name, t_restore.elapsed());
-                progress.restore_done(idx);
+                progress.restore_done(display);
                 f
             }
             None => {
-                progress.base_start(idx);
+                progress.base_start(display);
                 let t_base = Instant::now();
                 let f = materialize_base(ex, &stage.base, &name, committed)?;
                 timings.record(Phase::BasePull, &name, t_base.elapsed());
-                progress.base_done(idx, Outcome::Ran);
+                progress.base_done(display, Outcome::Ran);
                 f
             }
         },
@@ -1249,9 +1530,9 @@ fn build_stage(
     // back into the stage ext4 so forks / COPY --from / export see the writes. This joins the
     // last step's still-uploading cache push (no next RUN overlapped it), so show a spinner —
     // otherwise the dashboard sits frozen on the header through that upload.
-    progress.stage_finishing_start(idx, &name);
+    progress.stage_finishing_start(display, &name);
     let r = ex.stage_end(&final_fs);
-    progress.stage_finishing_done(idx);
+    progress.stage_finishing_done(display);
     r?;
     Ok(final_fs)
 }
@@ -1281,7 +1562,7 @@ fn drive(
 ) -> Result<(HashMap<usize, Rootfs>, HashMap<usize, ShellState>)> {
     let resolved = resolve_all(plan, order, build_args, ex)?;
     let (needed, cached_final) = compute_needed(plan, order, &resolved, ex, require_cached)?;
-    progress.init(stage_inits(plan, order, &resolved, &needed));
+    progress.init(stage_inits(plan, order, &resolved, &needed, 0, ""), 1);
     let mut committed: HashMap<usize, Rootfs> = HashMap::new();
     for &idx in order {
         if !needed.contains(&idx) {
@@ -1298,6 +1579,8 @@ fn drive(
             progress,
             timings,
             None,
+            "",
+            idx,
         )?;
         committed.insert(idx, fs);
     }
@@ -1448,7 +1731,7 @@ fn drive_microvm(
     let (needed, cached_final) =
         compute_needed(plan, order, &resolved, &mut probe, require_cached)?;
     drop(probe);
-    progress.init(stage_inits(plan, order, &resolved, &needed));
+    progress.init(stage_inits(plan, order, &resolved, &needed, 0, ""), 1);
 
     // Dependency edges over the needed subset. A fully-cached stage restores standalone,
     // so it gets no deps (it can start immediately); a stage that consumes it still waits
@@ -1490,6 +1773,8 @@ fn drive_microvm(
             progress,
             timings,
             Some(&cancel),
+            "",
+            idx,
         )
     })?;
     Ok((committed, final_states(&resolved)))
@@ -2011,6 +2296,36 @@ mod tests {
         assert!(live_dir.exists(), "a live pid's scratch must be kept");
         assert!(unrelated.exists(), "a non-scratch dir must be untouched");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The unified multi-service build namespaces each service's stages: `stage_inits`
+    /// offsets ids into a build-wide space and prefixes names, so two services with a
+    /// same-named stage (both `AS build`) and an unnamed final stage never collide on the
+    /// dashboard (the same namespacing keys the executor's images map + scratch files).
+    #[test]
+    fn stage_inits_namespace_services_by_offset_and_prefix() {
+        let ba = Vars::new();
+        let inits = |base: usize, prefix: &str| {
+            let plan = plan_one("FROM scratch AS build\nRUN a\nFROM build\nRUN b\n", &ba);
+            let target = plan.resolve_target(None).unwrap();
+            let order = plan.build_order(target).unwrap();
+            let needed: HashSet<usize> = order.iter().copied().collect();
+            let mut ex = DryRun::new();
+            let resolved = resolve_all(&plan, &order, &ba, &mut ex).unwrap();
+            stage_inits(&plan, &order, &resolved, &needed, base, prefix)
+        };
+        let web = inits(0, "web:");
+        let db = inits(2, "db:");
+        // ids are globally unique (each service offset by its base)
+        let ids: Vec<usize> = web.iter().chain(&db).map(|s| s.id).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3]);
+        // names carry the service prefix, so the shared `build` name stays distinct, and
+        // the unnamed final stage keeps its `stageN` fallback (also prefixed)
+        let name = |s: &[StageInit], i: usize| s[i].name.clone();
+        assert_eq!(name(&web, 0), "web:build");
+        assert_eq!(name(&db, 0), "db:build");
+        assert_eq!(name(&web, 1), "web:stage1");
+        assert_eq!(name(&db, 1), "db:stage1");
     }
 
     /// A single-file plan whose stages' context is `/nonexistent` (the tests' COPYs

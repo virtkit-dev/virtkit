@@ -72,8 +72,9 @@ impl StageMeta {
 
 struct Meta {
     stages: HashMap<StageId, StageMeta>,
-    /// the `#N` id of the `exporting to image` tail.
-    export_seq: usize,
+    /// the `#N` id of each `exporting to image` tail — one per output image (a unified
+    /// multi-service build exports several).
+    export_seqs: Vec<usize>,
 }
 
 /// The indicatif dashboard: a rule + header bar pinned at the bottom, plus one live bar
@@ -84,7 +85,7 @@ struct Tty {
     /// a dim horizontal rule at the top of the pinned block (the visual separator).
     sep: ProgressBar,
     header: ProgressBar,
-    /// running bars keyed by (stage, cell num); export uses [`EXPORT_KEY`].
+    /// running bars keyed by (stage, cell num); export uses [`export_key`].
     bars: Mutex<HashMap<(StageId, usize), ProgressBar>>,
     /// a step's command run-time, frozen at [`Progress::step_committing`] so the emitted line
     /// reports how long the RUN/COPY took — not that plus the snapshot + cache push that
@@ -92,8 +93,11 @@ struct Tty {
     ran: Mutex<HashMap<(StageId, usize), Duration>>,
 }
 
-/// bars-map key for the export tail (no real stage has this id).
-const EXPORT_KEY: (StageId, usize) = (usize::MAX, 0);
+/// bars-map key for the `index`-th export tail (no real stage has this id, so the
+/// `usize::MAX` stage never collides with a real stage's cells).
+fn export_key(index: usize) -> (StageId, usize) {
+    (usize::MAX, index)
+}
 
 /// bars-map cell num for a stage's transient "restoring" spinner (real cells are 1..=total).
 const RESTORE_NUM: usize = 0;
@@ -165,8 +169,9 @@ impl Progress {
     }
 
     /// Populate the step metadata (in build order, assigning each cell its `#N` id) and
-    /// prime the header. No-op when disabled.
-    pub fn init(self: &Arc<Self>, stages: Vec<StageInit>) {
+    /// prime the header. `exports` is the number of `exporting to image` tails (one per
+    /// output image — a unified multi-service build produces several). No-op when disabled.
+    pub fn init(self: &Arc<Self>, stages: Vec<StageInit>, exports: usize) {
         if matches!(self.backend, Backend::Disabled) {
             return;
         }
@@ -197,11 +202,12 @@ impl Progress {
                 },
             );
         }
-        total += 1; // the exporting tail
+        let export_seqs: Vec<usize> = (0..exports).map(|i| seq + 1 + i).collect();
+        total += exports; // one exporting tail per output image
         self.total.store(total, Ordering::Relaxed);
         let _ = self.meta.set(Meta {
             stages: map,
-            export_seq: seq + 1,
+            export_seqs,
         });
         if let Backend::Tty(tty) = &self.backend {
             tty.header.set_message(self.header_msg());
@@ -343,33 +349,33 @@ impl Progress {
         }
     }
 
-    pub fn export_start(&self) {
+    pub fn export_start(&self, index: usize) {
         match &self.backend {
             Backend::Tty(tty) => {
                 let pb = tty.mp.add(ProgressBar::new_spinner());
                 pb.set_style(self.step_style());
                 pb.set_message("exporting to image".to_string());
                 pb.enable_steady_tick(Duration::from_millis(120));
-                tty.bars.lock().unwrap().insert(EXPORT_KEY, pb);
+                tty.bars.lock().unwrap().insert(export_key(index), pb);
             }
             Backend::Plain => {
-                let seq = self.meta.get().map(|m| m.export_seq).unwrap_or(0);
+                let seq = self.export_seq(index);
                 println!("#{seq} exporting to image");
             }
             Backend::Disabled => {}
         }
     }
 
-    pub fn export_done(&self) {
+    pub fn export_done(&self, index: usize) {
         self.done.fetch_add(1, Ordering::Relaxed);
-        let seq = self.meta.get().map(|m| m.export_seq).unwrap_or(0);
+        let seq = self.export_seq(index);
         match &self.backend {
             Backend::Tty(tty) => {
                 let elapsed = tty
                     .bars
                     .lock()
                     .unwrap()
-                    .remove(&EXPORT_KEY)
+                    .remove(&export_key(index))
                     .map(|pb| {
                         let e = pb.elapsed();
                         pb.finish_and_clear();
@@ -383,6 +389,15 @@ impl Progress {
             Backend::Plain => println!("#{seq} DONE"),
             Backend::Disabled => {}
         }
+    }
+
+    /// The `#N` id of the `index`-th export tail (0 if init has not run / index is out
+    /// of range — plain-mode cosmetics only).
+    fn export_seq(&self, index: usize) -> usize {
+        self.meta
+            .get()
+            .and_then(|m| m.export_seqs.get(index).copied())
+            .unwrap_or(0)
     }
 
     /// Stop the renderer and leave a final summary line. Any still-running step is marked
@@ -783,7 +798,7 @@ mod tests {
     /// the Tty backend's draw target is hidden under `cargo test` (stdout not a terminal),
     /// so it exercises the state machine without emitting escape codes.
     fn drive(p: &Arc<Progress>) {
-        p.init(two_stages());
+        p.init(two_stages(), 1);
         p.stage_fully_cached(0); // base: FROM (1 cell)
         p.restore_start(0, "base");
         p.restore_done(0);
@@ -794,8 +809,8 @@ mod tests {
         p.step_committing(1, 0);
         p.step_done(1, 0, Outcome::Ran);
         p.step_done(1, 1, Outcome::Cached); // a cache hit: no start
-        p.export_start();
-        p.export_done();
+        p.export_start(0);
+        p.export_done(0);
         p.finish(true);
         assert_eq!(
             p.done.load(Ordering::Relaxed),
@@ -840,7 +855,7 @@ mod tests {
     #[test]
     fn cached_cells_count_only_after_restore() {
         let p = Arc::new(Progress::new_backend(Backend::Tty(Tty::new()), false));
-        p.init(two_stages());
+        p.init(two_stages(), 1);
         p.stage_fully_cached(0); // stage 0's single cell is now cached...
         assert_eq!(
             p.done.load(Ordering::Relaxed),
@@ -861,7 +876,7 @@ mod tests {
     #[test]
     fn finish_flushes_pending_cached_cells() {
         let p = Arc::new(Progress::new_backend(Backend::Tty(Tty::new()), false));
-        p.init(two_stages());
+        p.init(two_stages(), 1);
         p.stage_fully_cached(0); // stage 0's cell resolves as a cache hit...
         assert_eq!(
             p.done.load(Ordering::Relaxed),
@@ -883,7 +898,7 @@ mod tests {
             Arc::new(Progress::new_backend(Backend::Plain, false)),
             Arc::new(Progress::new_backend(Backend::Tty(Tty::new()), false)),
         ] {
-            p.init(two_stages());
+            p.init(two_stages(), 1);
             p.base_start(1);
             p.base_done(1, Outcome::Ran);
             p.step_start(1, 0);
@@ -900,7 +915,7 @@ mod tests {
             Arc::new(Progress::new_backend(Backend::Plain, false)),
             Arc::new(Progress::new_backend(Backend::Tty(Tty::new()), false)),
         ] {
-            p.init(two_stages());
+            p.init(two_stages(), 1);
             p.stage_fully_cached(0);
             p.restore_start(0, "base"); // no restore_done: the restore failed
             p.finish(false);
@@ -916,7 +931,7 @@ mod tests {
     #[test]
     fn disabled_is_inert() {
         let p = Arc::new(Progress::new_backend(Backend::Disabled, false));
-        p.init(two_stages());
+        p.init(two_stages(), 1);
         p.base_start(1);
         p.base_done(1, Outcome::Ran);
         p.finish(true);

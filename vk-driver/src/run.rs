@@ -1052,9 +1052,19 @@ fn plan_services(
         None => crate::compose::enabled(units, &args.profiles),
     };
     let (gw, prefix, _) = crate::net::switch_addrs(RUN_SUBNET)?;
+    // Site each sibling (its runtime dir + build spec + address slot), excluding the
+    // primary (it boots as the run VM, not a sibling). Kept in boot order so the eager
+    // `start` list and slot/IP assignment stay stable.
+    struct Sited {
+        unit: usize,
+        dir: PathBuf,
+        ext4: PathBuf,
+        slot: u32,
+    }
+    let mut specs = Vec::new();
+    let mut sited = Vec::new();
     let mut slot = 0u32;
     for &i in &order {
-        // the primary is the run VM itself, not a sibling unit
         if Some(i) == primary_idx {
             continue;
         }
@@ -1062,13 +1072,29 @@ fn plan_services(
         let dir = work.join(format!("svc-{}", unit.name));
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let ext4 = dir.join("image.ext4");
-        let built = build_service_image(args, unit, &ext4, kernel, agent)
-            .with_context(|| format!("service {}", unit.name))?;
-        let config = crate::compose::merged_config(&built.config, unit);
-        let ip = crate::units::nth_static_ip(gw, prefix, slot)?;
+        specs.push(service_spec(args, unit, &ext4));
+        sited.push(Sited {
+            unit: i,
+            dir,
+            ext4,
+            slot,
+        });
+        slot += 1;
+    }
+
+    // Build every sibling image in ONE unified build, so independent services build
+    // concurrently over a single job pool (warmth still comes from the instruction cache).
+    let opts = service_build_options(args, kernel, agent);
+    let built = crate::build::build_many(specs, &opts)?;
+
+    // Address + provision each built image, layering its compose overrides over the image.
+    for (s, b) in sited.into_iter().zip(built) {
+        let unit = &units[s.unit];
+        let config = crate::compose::merged_config(&b.config, unit);
+        let ip = crate::units::nth_static_ip(gw, prefix, s.slot)?;
         planned
             .listen
-            .push(dir.join(format!("vsock.sock_{NET_VSOCK_PORT}")));
+            .push(s.dir.join(format!("vsock.sock_{NET_VSOCK_PORT}")));
         planned
             .hosts
             .push((unit.name.to_ascii_lowercase(), ip.to_string()));
@@ -1081,18 +1107,17 @@ fn plan_services(
             crate::units::Provisioned {
                 name: unit.name.clone(),
                 hostname: unit.hostname.clone(),
-                ext4,
+                ext4: s.ext4,
                 ip: format!("{ip}/{prefix}"),
-                cid: crate::units::FIRST_SERVICE_CID + slot,
+                cid: crate::units::FIRST_SERVICE_CID + s.slot,
                 config,
                 volumes: unit.volumes.clone(),
             },
-            dir,
+            s.dir,
         ));
-        if on[i] {
+        if on[s.unit] {
             planned.start.push(unit.name.clone());
         }
-        slot += 1;
     }
     Ok(planned)
 }
@@ -1172,26 +1197,8 @@ fn build_service_image(
     kernel: &Path,
     agent: &Path,
 ) -> Result<crate::build::Built> {
-    let mut opts = crate::build::Options {
-        dockerfiles: Vec::new(),
-        target: None,
-        contexts: Vec::new(),
-        out: Some(out.to_path_buf()),
-        print_plan: false,
-        cloud_hypervisor: Some(args.cloud_hypervisor.clone()),
-        kernel: Some(kernel.to_path_buf()),
-        agent: Some(agent.to_path_buf()),
-        cache_registry: args.cache_registry.clone(),
-        cache_insecure: args.cache_insecure,
-        build_cache: crate::build::BuildCache::default(),
-        journal: false,
-        tmp_tmpfs: false,
-        build_args: args.build_args.clone(),
-        net: args.build_net.clone(),
-        require_cached: args.require_cached,
-        build_jobs: None,
-        debug: false,
-    };
+    let mut opts = service_build_options(args, kernel, agent);
+    opts.out = Some(out.to_path_buf());
     match &unit.source {
         crate::compose::Source::Build {
             dockerfiles,
@@ -1209,6 +1216,74 @@ fn build_service_image(
         crate::compose::Source::Image(image) => {
             crate::build::build_inputs(vec![crate::build::image_plan_input(image)?], &opts)
         }
+    }
+}
+
+/// The build options common to every compose service build (the embedded kernel/agent, the
+/// instruction cache, egress policy). Per-service inputs/target/args/out are filled in by
+/// the caller; [`build_many`](crate::build::build_many) reads them from each `ServiceSpec`
+/// instead, so the `out`/`dockerfiles`/`build_args` left here are unused on that path.
+fn service_build_options(args: &RunArgs, kernel: &Path, agent: &Path) -> crate::build::Options {
+    crate::build::Options {
+        dockerfiles: Vec::new(),
+        target: None,
+        contexts: Vec::new(),
+        out: None,
+        print_plan: false,
+        cloud_hypervisor: Some(args.cloud_hypervisor.clone()),
+        kernel: Some(kernel.to_path_buf()),
+        agent: Some(agent.to_path_buf()),
+        cache_registry: args.cache_registry.clone(),
+        cache_insecure: args.cache_insecure,
+        build_cache: crate::build::BuildCache::default(),
+        journal: false,
+        tmp_tmpfs: false,
+        build_args: args.build_args.clone(),
+        net: args.build_net.clone(),
+        require_cached: args.require_cached,
+        build_jobs: None,
+        debug: false,
+    }
+}
+
+/// Map one compose service to a [`ServiceSpec`](crate::build::ServiceSpec) for the unified
+/// build: its source (build files+contexts, or a pulled `image:`), stage target, output
+/// path, and build args — the global `--build-arg`s with the service's own `build.args`
+/// layered on top (a service arg wins on a duplicate key).
+fn service_spec(
+    args: &RunArgs,
+    unit: &crate::compose::Unit,
+    out: &Path,
+) -> crate::build::ServiceSpec {
+    let (input, target, unit_args) = match &unit.source {
+        crate::compose::Source::Build {
+            dockerfiles,
+            context,
+            target,
+            args: unit_args,
+        } => (
+            crate::build::ServiceInput::Build {
+                dockerfiles: dockerfiles.clone(),
+                // compose semantics: one context for all the service's files.
+                contexts: vec![context.clone(); dockerfiles.len()],
+            },
+            target.clone(),
+            unit_args.clone(),
+        ),
+        crate::compose::Source::Image(image) => (
+            crate::build::ServiceInput::Image(image.clone()),
+            None,
+            Vec::new(),
+        ),
+    };
+    let mut build_args = args.build_args.clone();
+    build_args.extend(unit_args);
+    crate::build::ServiceSpec {
+        name: unit.name.clone(),
+        input,
+        target,
+        build_args,
+        out: out.to_path_buf(),
     }
 }
 
