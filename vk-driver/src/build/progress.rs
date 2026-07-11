@@ -98,6 +98,9 @@ const EXPORT_KEY: (StageId, usize) = (usize::MAX, 0);
 /// bars-map cell num for a stage's transient "restoring" spinner (real cells are 1..=total).
 const RESTORE_NUM: usize = 0;
 
+/// bars-map cell num for a stage's transient "finishing" spinner (real cells are 1..=total).
+const FINISH_NUM: usize = usize::MAX;
+
 enum Backend {
     Tty(Tty),
     Plain,
@@ -316,6 +319,28 @@ impl Progress {
             pb.finish_and_clear();
         }
         self.refresh_header();
+    }
+
+    /// Show a transient spinner while a stage's guest shuts down at `stage_end` — after the last
+    /// step's bar is cleared but before the stage counts as done, an otherwise silent gap with
+    /// the header frozen and nothing visibly running. The final cache upload no longer blocks
+    /// here (it drains in the background), so this covers only the guest flush + shutdown.
+    /// Cleared by [`Progress::stage_finishing_done`], or drained by [`Progress::finish`] on error.
+    pub fn stage_finishing_start(&self, stage: StageId, name: &str) {
+        if let Backend::Tty(tty) = &self.backend {
+            let pb = tty.mp.add(ProgressBar::new_spinner());
+            pb.set_style(self.step_style());
+            pb.set_message(format!("[{name}] flushing cache"));
+            pb.enable_steady_tick(Duration::from_millis(120));
+            tty.bars.lock().unwrap().insert((stage, FINISH_NUM), pb);
+        }
+    }
+    pub fn stage_finishing_done(&self, stage: StageId) {
+        if let Backend::Tty(tty) = &self.backend
+            && let Some(pb) = tty.bars.lock().unwrap().remove(&(stage, FINISH_NUM))
+        {
+            pb.finish_and_clear();
+        }
     }
 
     pub fn export_start(&self) {

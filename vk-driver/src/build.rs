@@ -1246,8 +1246,13 @@ fn build_stage(
         },
     };
     // Finalize the stage: tear down its long-lived guest (if any) and commit its overlay
-    // back into the stage ext4 so forks / COPY --from / export see the writes.
-    ex.stage_end(&final_fs)?;
+    // back into the stage ext4 so forks / COPY --from / export see the writes. This joins the
+    // last step's still-uploading cache push (no next RUN overlapped it), so show a spinner —
+    // otherwise the dashboard sits frozen on the header through that upload.
+    progress.stage_finishing_start(idx, &name);
+    let r = ex.stage_end(&final_fs);
+    progress.stage_finishing_done(idx);
+    r?;
     Ok(final_fs)
 }
 

@@ -19,6 +19,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- `vk build` no longer appears frozen after a stage's last step. A stage's final cache
+  snapshot now uploads to the registry in the background like every other layer, so the
+  build moves straight on to the next stage instead of stalling on that upload, and a
+  spinner covers the brief guest shutdown that remains.
 - `vk build` on the libkrun backend no longer re-chunks the whole stage image at every
   instruction, which made a long stage's cache checkpoints slow down quadratically. Each
   checkpoint again pushes only the instruction's delta, as the cloud-hypervisor backend
