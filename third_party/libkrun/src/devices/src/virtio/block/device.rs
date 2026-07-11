@@ -219,6 +219,13 @@ fn encode_dirty_reply(ranges: &[(u64, u64)]) -> Vec<u8> {
     buf
 }
 
+/// Make the write-back cache durable on the host image file (flush, then sync). The one place
+/// that persists libkrun's cached writes to disk — shared by the DRAIN and FLUSH control commands
+/// and the on-VMM-exit observer, so the exact flush semantics can't drift between them.
+fn flush_sync(df: &SyncFormatAccess<Box<dyn DynStorage>>) -> io::Result<()> {
+    df.flush().and_then(|()| df.sync())
+}
+
 #[cfg(test)]
 mod dirty_tests {
     use super::{encode_dirty_reply, DirtyRanges, DIRTY_CLUSTER};
@@ -687,7 +694,7 @@ impl Block {
                             let (written, discarded) = {
                                 let df = disk_image.lock().unwrap();
                                 let size = df.size();
-                                if let Err(e) = df.flush().and_then(|()| df.sync()) {
+                                if let Err(e) = flush_sync(&df) {
                                     error!("virtio-blk: dirty-control flush failed: {e}");
                                     continue;
                                 }
@@ -705,10 +712,7 @@ impl Block {
                         // later host read sees a complete image (replaces a graceful power-off).
                         // Reply one byte: 0 ok, 1 error.
                         b'F' => {
-                            let reply = match {
-                                let df = disk_image.lock().unwrap();
-                                df.flush().and_then(|()| df.sync())
-                            } {
+                            let reply = match flush_sync(&disk_image.lock().unwrap()) {
                                 Ok(()) => 0u8,
                                 Err(e) => {
                                     error!("virtio-blk: dirty-control flush failed: {e}");
@@ -752,7 +756,7 @@ impl VmmExitObserver for Block {
             return;
         }
         let disk = self.disk_image.lock().unwrap();
-        if let Err(e) = disk.flush().and_then(|()| disk.sync()) {
+        if let Err(e) = flush_sync(&disk) {
             error!("block: failed to flush image on VMM exit: {e}");
         }
     }
