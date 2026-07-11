@@ -389,6 +389,14 @@ pub struct MicroVm {
     /// serializing after it. Its snapshot also serves as the previous baseline the next
     /// instruction's `content_diff` reads, so it is freed only after that join.
     inflight: Option<PushInflight>,
+    /// terminal pushes handed off at `stage_end`, awaiting a fork's adoption or the build-wide
+    /// drain. Shared across workers (the base executor holds the last reference). See
+    /// [`PushPool`].
+    pending: Arc<PushPool>,
+    /// for a `FROM <stage>` fork, the parent stage whose terminal push this fork must join before
+    /// its first diff push chains onto the parent's chunks. Consumed (once) by `parent_for_push`,
+    /// so the join overlaps this fork's first RUN instead of blocking its start. `None` otherwise.
+    fork_parent: Option<String>,
     /// monotonic counter for unique per-instruction snapshot filenames (several may exist
     /// at once: the live one plus the in-flight push's).
     push_seq: u64,
@@ -452,6 +460,46 @@ struct PushInflight {
     snap: PathBuf,
     /// the instruction key this push caches (recorded as the stage's last key on success).
     key: String,
+}
+
+/// Terminal cache pushes handed off at `stage_end` and awaiting their join, keyed by stage
+/// label. A stage's last push has no next instruction to overlap it, so rather than block the
+/// worker on the upload the push lands here and the worker moves on to the next DAG stage. It
+/// is joined either by a `FROM <stage>` fork that must diff against its chunks
+/// ([`MicroVm::join_pending`]) or, for everything else, by this pool's `Drop` — the build-wide
+/// barrier the process crosses before it exits so the cache is fully populated. Shared across
+/// the parallel driver's per-stage workers; the base executor holds the last reference, so the
+/// drain runs once, when it drops at build end (before the scratch dir is removed).
+#[derive(Default)]
+struct PushPool {
+    inflight: Mutex<HashMap<String, PushInflight>>,
+}
+
+impl PushPool {
+    fn insert(&self, label: String, inf: PushInflight) {
+        self.inflight.lock().unwrap().insert(label, inf);
+    }
+    fn take(&self, label: &str) -> Option<PushInflight> {
+        self.inflight.lock().unwrap().remove(label)
+    }
+}
+
+impl Drop for PushPool {
+    /// Join every terminal push no fork already adopted, so the cache is fully populated before
+    /// exit and every snapshot raw is freed before the scratch dir is removed. A failed push is
+    /// non-fatal (its instruction is simply left uncached), matching the intra-stage push path.
+    fn drop(&mut self) {
+        for (_, inf) in self.inflight.get_mut().unwrap().drain() {
+            match inf.handle.join() {
+                Ok(Err(e)) => {
+                    eprintln!("virtkit: build async push failed ({e:#}) — not cached")
+                }
+                Err(_) => eprintln!("virtkit: cache push thread panicked — not cached"),
+                Ok(Ok(_)) => {}
+            }
+            let _ = std::fs::remove_file(&inf.snap);
+        }
+    }
 }
 
 /// How the agent re-invokes its own native mount/umount/copy helpers over the exec
@@ -804,6 +852,8 @@ impl MicroVm {
             scratch_disk: None,
             context: None,
             inflight: None,
+            pending: Arc::new(PushPool::default()),
+            fork_parent: None,
             push_seq: 0,
             stage_last_key: Arc::new(Mutex::new(HashMap::new())),
             stage_last_digest: Arc::new(Mutex::new(HashMap::new())),
@@ -858,6 +908,8 @@ impl MicroVm {
             scratch_disk: None,
             context: None,
             inflight: None,
+            pending: Arc::clone(&self.pending),
+            fork_parent: None,
             push_seq: 0,
             parent_layers: None,
             // A fresh worker inherits nothing; the driver sets the stage's sink before
@@ -1137,6 +1189,15 @@ impl MicroVm {
         rg: &crate::config::Registry,
         total_size: u64,
     ) -> (Vec<oci_client::manifest::OciDescriptor>, u64) {
+        // A `FROM <stage>` fork's first push chains onto the parent's chunks: join the parent's
+        // (possibly still-uploading) terminal push now, so its blobs are in the registry before
+        // the fetch below references them, and seed the parent key + pinned digest it forked
+        // from. Runs once — later pushes chain onto this stage's own in-memory `parent_layers`.
+        if let Some(parent) = self.fork_parent.take() {
+            self.join_pending(&parent);
+            self.parent_key = self.stage_last_key.lock().unwrap().get(&parent).cloned();
+            self.parent_digest = self.stage_last_digest.lock().unwrap().get(&parent).cloned();
+        }
         match self.parent_layers.take() {
             Some((l, t)) => (l, t),
             // Resolve the parent by its pinned immutable digest, not the mutable tag
@@ -1226,33 +1287,69 @@ impl MicroVm {
         Ok(())
     }
 
-    /// Join the in-flight cache push (if any), recording the stage's last key and freeing
-    /// the snapshot raw. A barrier the build must cross before a stage's image is reused (a
-    /// fork or export) and before exit, so the cache is fully populated.
-    fn drain_push(&mut self, label: &str) {
-        if let Some(inf) = self.inflight.take() {
-            match inf.handle.join().expect("cache push thread panicked") {
-                Ok(out) => {
-                    self.stage_last_key
+    /// Join the previous in-flight push (if any) and adopt its result as the parent for the
+    /// next diff push: record the stage's last key, and on success pin its layers + digest as
+    /// the parent — on failure clear the pinned parent so the next diff falls back to
+    /// `parent_key` and re-chunks rather than splicing a stale digest's bytes over this
+    /// stage's backing. Frees the pushed snapshot. Called before spawning the next push.
+    fn harvest_prev_push(&mut self, label: &str) {
+        let Some(inf) = self.inflight.take() else {
+            return;
+        };
+        match inf.handle.join().expect("cache push thread panicked") {
+            Ok(out) => {
+                self.stage_last_key
+                    .lock()
+                    .unwrap()
+                    .insert(label.to_string(), inf.key);
+                match out {
+                    Some((layers, digest)) => {
+                        self.parent_layers = Some(layers);
+                        self.stage_last_digest
+                            .lock()
+                            .unwrap()
+                            .insert(label.to_string(), digest.clone());
+                        self.parent_digest = Some(digest);
+                    }
+                    None => self.parent_layers = None,
+                }
+            }
+            Err(e) => {
+                eprintln!("virtkit: build async push failed ({e:#}) — not cached");
+                self.parent_layers = None;
+                self.parent_digest = None;
+            }
+        }
+        let _ = std::fs::remove_file(&inf.snap);
+    }
+
+    /// Adopt a stage's parked terminal push (parked at its `stage_end`) before a `FROM <stage>`
+    /// fork's first diff push chains onto it: join the upload and record the stage's last key +
+    /// immutable digest so `parent_for_push` can pin the parent's chunks. The fork must cross this
+    /// barrier — its first diff push fetches those chunks from the registry, so they must be
+    /// uploaded first. Idempotent: a stage forked by several children joins once (later calls find
+    /// it gone but the recorded key/digest already in place). A failed push leaves no key, so the
+    /// fork full-pushes.
+    fn join_pending(&self, label: &str) {
+        let Some(inf) = self.pending.take(label) else {
+            return;
+        };
+        match inf.handle.join().expect("cache push thread panicked") {
+            Ok(out) => {
+                self.stage_last_key
+                    .lock()
+                    .unwrap()
+                    .insert(label.to_string(), inf.key);
+                if let Some((_, digest)) = out {
+                    self.stage_last_digest
                         .lock()
                         .unwrap()
-                        .insert(label.to_string(), inf.key);
-                    match out {
-                        Some((layers, digest)) => {
-                            self.parent_layers = Some(layers);
-                            self.stage_last_digest
-                                .lock()
-                                .unwrap()
-                                .insert(label.to_string(), digest.clone());
-                            self.parent_digest = Some(digest);
-                        }
-                        None => self.parent_layers = None,
-                    }
+                        .insert(label.to_string(), digest);
                 }
-                Err(e) => eprintln!("virtkit: build async push failed ({e:#}) — not cached"),
             }
-            let _ = std::fs::remove_file(&inf.snap);
+            Err(e) => eprintln!("virtkit: build async push failed ({e:#}) — not cached"),
         }
+        let _ = std::fs::remove_file(&inf.snap);
     }
 }
 
@@ -1462,24 +1559,14 @@ impl Executor for MicroVm {
             .lock()
             .unwrap()
             .insert(stage.to_string(), overlay);
-        // This fork starts from the parent stage's final image, which was cached under
-        // the parent's last key — so the first instruction here can diff against it instead
-        // of fully re-chunking the whole image. (None if the parent wasn't cached, e.g.
-        // caching off → full push.)
-        self.parent_key = self
-            .stage_last_key
-            .lock()
-            .unwrap()
-            .get(&parent.label)
-            .cloned();
-        // pin the parent stage's immutable snapshot digest so the first diff push reuses its
-        // exact chunks even if a concurrent build clobbers the parent's tag.
-        self.parent_digest = self
-            .stage_last_digest
-            .lock()
-            .unwrap()
-            .get(&parent.label)
-            .cloned();
+        // The fork boots from the parent's local image above; only its *first cache push* needs
+        // the parent's chunks in the registry (to diff against instead of re-chunking the whole
+        // image). The parent's terminal push may still be uploading, so defer joining it — record
+        // the parent label and let the first `parent_for_push` join it, overlapping that upload
+        // with this fork's first RUN rather than stalling the fork's start.
+        self.fork_parent = Some(parent.label.clone());
+        self.parent_key = None;
+        self.parent_digest = None;
         self.parent_layers = None;
         Ok(Rootfs {
             label: stage.to_string(),
@@ -1902,7 +1989,7 @@ impl Executor for MicroVm {
 
             // Push on a background thread; it overlaps the next instruction's RUN. Ordering +
             // parent chaining as in the cloud-hypervisor path below.
-            self.drain_push(&fs.label);
+            self.harvest_prev_push(&fs.label);
             let (parent_layers, parent_total) = self.parent_for_push(&rg, total_size);
             let snap_push = snap.clone();
             let key_s = key.to_string();
@@ -1934,13 +2021,17 @@ impl Executor for MicroVm {
             return Ok(());
         }
 
-        // Cloud-hypervisor (no dirty tracking): fall back to a full point-in-time copy of the
-        // live overlay (freeze + copy, to a qcow2). This is the only synchronous part — the
-        // live overlay keeps moving as the next RUN starts, so the copy must happen now;
-        // flatten/diff/push read the qcow2 natively, off this thread. (Session borrow scoped
-        // so the `&mut self` below is free.)
+        // Cloud-hypervisor (no dirty hook): capture a stable point-in-time copy of the live
+        // overlay (freeze + copy, to a qcow2), then diff + push it on a background thread that
+        // overlaps the next instruction's RUN. The copy is the only synchronous part — the live
+        // overlay keeps moving once the next RUN starts, so it must happen now; the diff/push read
+        // the copy natively, off this thread. (Session borrow scoped so the `&mut self` is free.)
         self.push_seq += 1;
         let snap = self.image_path(&format!("{}.{}.cap.qcow2", fs.label, self.push_seq));
+        // Discard blocks freed since the last checkpoint before capturing (a frozen fs rejects
+        // the discard, so this runs ahead of `capture`'s freeze), so a file created and deleted
+        // within this interval is released to holes and never enters the delta.
+        block_on(self.session.as_ref().expect("session present").trim());
         block_on(
             self.session
                 .as_ref()
@@ -1966,36 +2057,7 @@ impl Executor for MicroVm {
         // Reap the previous push (it ran during this instruction's RUN + capture, so it is
         // usually already done): harvest its layers as the in-memory parent and free its
         // capture — content_diff above was its last reader.
-        if let Some(inf) = self.inflight.take() {
-            match inf.handle.join().expect("cache push thread panicked") {
-                Ok(out) => {
-                    self.stage_last_key
-                        .lock()
-                        .unwrap()
-                        .insert(fs.label.clone(), inf.key);
-                    match out {
-                        Some((layers, digest)) => {
-                            self.parent_layers = Some(layers);
-                            self.stage_last_digest
-                                .lock()
-                                .unwrap()
-                                .insert(fs.label.clone(), digest.clone());
-                            self.parent_digest = Some(digest);
-                        }
-                        None => self.parent_layers = None,
-                    }
-                }
-                Err(e) => {
-                    eprintln!("virtkit: build async push failed ({e:#}) — not cached");
-                    // Drop the pinned parent too (see the sync push path): this push never
-                    // wrote its tag, so the next diff must fall back to `parent_key` and
-                    // full-re-chunk rather than reuse the previous stage's digest.
-                    self.parent_layers = None;
-                    self.parent_digest = None;
-                }
-            }
-            let _ = std::fs::remove_file(&inf.snap);
-        }
+        self.harvest_prev_push(&fs.label);
 
         let (parent_layers, parent_total) = self.parent_for_push(&rg, total_size);
 
@@ -2003,8 +2065,9 @@ impl Executor for MicroVm {
         // Within a stage only one push runs at a time (joined above before the next is
         // spawned), so this stage's parent-layer chain stays ordered. Across concurrent
         // stages (the parallel driver) several pushes may hit the store at once; that is
-        // safe — the store is content-addressed and writes atomically (temp + rename), and
-        // a stage is fully pushed before any dependent that reads its chunks starts.
+        // safe — the store is content-addressed and writes atomically (temp + rename), and a
+        // dependent that reads a stage's chunks (a `FROM <stage>` fork) joins that stage's
+        // push (join_pending) before it fetches them.
         let snap_push = snap.clone();
         let key_s = key.to_string();
         let timings = Arc::clone(&self.timings);
@@ -2070,9 +2133,18 @@ impl Executor for MicroVm {
     }
 
     fn stage_end(&mut self, fs: &Rootfs) -> Result<()> {
-        // Barrier: finish the stage's last cache push before its image is reused (a fork or
-        // export) or the build exits — so the cache is fully populated.
-        self.drain_push(&fs.label);
+        // The stage's last step always checkpoints (consuming its carry), but drop any remainder
+        // so a fresh stage on this worker never inherits a stale carry.
+        self.dirty_carry.remove(&fs.label);
+        // Hand the stage's last cache push to the shared pool instead of blocking on its upload
+        // here. The last step has no next instruction to overlap it, so joining it now would
+        // stall this worker on the whole last-layer upload; parking it lets the worker move on
+        // to the next DAG stage. A `FROM <stage>` fork joins it before diffing against its chunks
+        // (join_pending); everything else drains at build end (PushPool's Drop). A COPY --from
+        // consumer reads this stage's local image, not the registry, so it needs no join.
+        if let Some(inf) = self.inflight.take() {
+            self.pending.insert(fs.label.clone(), inf);
+        }
         // Shut the stage's guest down cleanly; its writes are already in the stage image
         // (the booted disk), so later stages / the export see them with no commit step.
         if let Some(session) = self.session.take() {
