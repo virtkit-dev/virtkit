@@ -165,14 +165,19 @@ impl Qcow2 {
             let n = ((self.cluster_size - in_cluster) as usize).min(buf.len() - done);
             let dst = &mut buf[done..done + n];
             match self.locate(l_off >> self.cluster_bits)? {
-                Cluster::Data(host) => self
-                    .file
-                    .read_exact_at(dst, host + in_cluster)
+                // imago materializes only the bytes the guest actually wrote; the unwritten
+                // remainder of an allocated cluster is simply absent from the file. imago's own
+                // storage reader fills the region past EOF with zeros (its `readv` contract), so
+                // match that here — read what the file holds and zero-fill the rest — rather than
+                // failing a strict read on a partially-written tail cluster.
+                Cluster::Data(host) => read_at_or_zero(&self.file, host + in_cluster, dst)
                     .context("reading qcow2 data cluster")?,
                 Cluster::Zero => dst.fill(0),
                 Cluster::Unallocated => match &self.backing {
                     Backing::None => dst.fill(0),
-                    Backing::Raw(f) => read_raw_or_zero(f, l_off, dst)?,
+                    Backing::Raw(f) => {
+                        read_at_or_zero(f, l_off, dst).context("reading raw backing")?
+                    }
                     // SAFETY of borrow: take the backing out to read it (no aliasing of self).
                     Backing::Qcow2(_) => self.read_backing_qcow2(l_off, dst)?,
                 },
@@ -506,15 +511,17 @@ fn resolve_backing(image: &Path, name: &str) -> std::path::PathBuf {
 }
 
 /// Read from a raw backing at `off`, zero-filling any part past EOF.
-fn read_raw_or_zero(f: &File, off: u64, dst: &mut [u8]) -> Result<()> {
-    let len = f.metadata().context("stat raw backing")?.len();
+/// Read `dst.len()` bytes at `off` from `f`, zero-filling anything past the file's end. Matches
+/// imago's storage reader, which materializes only written bytes and returns zeros beyond EOF —
+/// so a raw backing's holes and a qcow2 data cluster's unwritten tail both read as zeros.
+fn read_at_or_zero(f: &File, off: u64, dst: &mut [u8]) -> Result<()> {
+    let len = f.metadata().context("stat qcow2 image file")?.len();
     if off >= len {
         dst.fill(0);
         return Ok(());
     }
     let avail = ((len - off) as usize).min(dst.len());
-    f.read_exact_at(&mut dst[..avail], off)
-        .context("reading raw backing")?;
+    f.read_exact_at(&mut dst[..avail], off)?;
     dst[avail..].fill(0);
     Ok(())
 }
@@ -595,6 +602,61 @@ mod tests {
         assert_eq!(got, want, "native read must match qemu-img convert");
         // the overlay owns exactly the overwritten cluster.
         assert_eq!(q.data_extents().unwrap(), vec![(65536, 65536)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // imago writes only the bytes the guest sent, so an allocated tail cluster can be physically
+    // short in the file (its unwritten remainder never materialized). A read of that cluster must
+    // return the written prefix then zeros — matching imago's own reader — not fail a strict read.
+    #[test]
+    fn short_tail_data_cluster_reads_as_prefix_then_zeros() {
+        if !have("qemu-img") || !have("qemu-io") {
+            eprintln!("skipping: qemu-img/qemu-io not available");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("vk-qcow2-short-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let overlay = dir.join("ovl.qcow2");
+        // A 256 KiB qcow2 with no backing; write one full 64 KiB data cluster at offset 0.
+        assert!(
+            Command::new("qemu-img")
+                .args(["create", "-q", "-f", "qcow2"])
+                .arg(&overlay)
+                .arg("256K")
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("qemu-io")
+                .args(["-c", "write -P 0xBB 0 65536"])
+                .arg(&overlay)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Truncate the tail (the data cluster sits at the end of the file) so only 32 KiB of the
+        // cluster remains materialized — the state imago leaves after a partial write.
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&overlay)
+            .unwrap();
+        let len = f.metadata().unwrap().len();
+        f.set_len(len - 32 * 1024).unwrap();
+        drop(f);
+
+        let mut q = Qcow2::open(&overlay).unwrap();
+        let mut got = vec![0x11u8; 65536];
+        // Must not error on the short cluster.
+        q.read_at(0, &mut got).unwrap();
+        assert!(
+            got[..32 * 1024].iter().all(|&b| b == 0xBB),
+            "the materialized prefix must read back as written"
+        );
+        assert!(
+            got[32 * 1024..].iter().all(|&b| b == 0),
+            "the unwritten remainder past EOF must read back as zeros"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
