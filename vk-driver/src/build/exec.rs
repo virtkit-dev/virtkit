@@ -440,34 +440,79 @@ struct PushInflight {
 /// works even though the agent is no longer present anywhere in the image's rootfs.
 const GUEST_AGENT: &str = "/proc/self/exe";
 
-/// The byte ranges where `cur` differs from `prev`, examined only within `within` (the
-/// regions that could possibly have changed — the stage overlay's cumulative dirty set;
-/// outside it both snapshots equal the base). Both are captured overlay qcow2s, read
-/// natively (resolving unchanged clusters through their backing). This recovers a single
-/// instruction's delta from two consecutive cumulative snapshots, so a diff push re-chunks
-/// only what changed (not everything written so far).
-fn content_diff(prev: &Path, cur: &Path, within: &[(u64, u64)]) -> Result<Vec<(u64, u64)>> {
+/// The byte ranges where `cur` differs from `prev`, examined only within `within`. Both are
+/// captured overlay qcow2s, read natively (resolving unchanged clusters through their backing).
+/// This recovers a single instruction's delta from two consecutive cumulative snapshots, so a
+/// diff push re-chunks only what changed (not everything written so far).
+///
+/// With `skip_new_is_dirty`, reads are avoided where `prev`'s allocation map already decides the
+/// outcome: a block that `cur` allocates but `prev` does not is new to this interval and dirty by
+/// construction — no read needed (over `prev`'s backing it could only match by coincidence, which
+/// chunk dedup collapses on upload anyway). Only blocks allocated in *both* need the byte compare:
+/// an in-place rewrite reuses the same qcow2 cluster, invisible to the allocation map, so only the
+/// data reveals it. This is sound only when `within` is confined to `cur`'s own allocation (the
+/// diff-push path); a caller that passes a `within` spanning regions `cur` does not allocate (the
+/// full-image reassembly localizer) must clear the flag to force a true logical byte-compare over
+/// every block.
+fn content_diff(
+    prev: &Path,
+    cur: &Path,
+    within: &[(u64, u64)],
+    skip_new_is_dirty: bool,
+) -> Result<Vec<(u64, u64)>> {
     let mut a = crate::qcow2::Qcow2::open(prev)?;
     let mut b = crate::qcow2::Qcow2::open(cur)?;
+    // `prev`'s own allocated clusters (sorted, non-overlapping) — the blocks whose bytes must
+    // actually be compared; anything in `within` outside this set is new in `cur`. Only needed
+    // for the read-skip; a full byte-compare leaves it empty and compares every block.
+    let prev_alloc = if skip_new_is_dirty {
+        a.data_extents()?
+    } else {
+        Vec::new()
+    };
     const BLK: usize = 256 * 1024; // comparison + dirty-extent granularity
     let mut ba = vec![0u8; BLK];
     let mut bb = vec![0u8; BLK];
     let mut out: Vec<(u64, u64)> = Vec::new();
+    // Cursor into `prev_alloc`, advanced monotonically: `within` and `prev_alloc` are both
+    // sorted, and `pos` only increases, so each extent is visited at most once.
+    let mut pi = 0usize;
     for &(off, len) in within {
         let mut pos = off;
         let end = off + len;
         while pos < end {
             let n = ((end - pos) as usize).min(BLK);
-            a.read_at(pos, &mut ba[..n])?;
-            b.read_at(pos, &mut bb[..n])?;
-            if ba[..n] != bb[..n] {
+            let block_end = pos + n as u64;
+            // Compare the block unless the read-skip decides it dirty from allocation alone: with
+            // the skip off, `prev_alloc` is empty so `in_prev` is always true — a full logical
+            // diff over every block, holes included.
+            let in_prev = if skip_new_is_dirty {
+                // Drop `prev_alloc` extents that end at/before this block — they can't cover it or
+                // any later block.
+                while pi < prev_alloc.len() && prev_alloc[pi].0 + prev_alloc[pi].1 <= pos {
+                    pi += 1;
+                }
+                // Allocated in `prev` iff the next surviving extent starts before the block ends
+                // (it already ends after `pos` by the loop above).
+                pi < prev_alloc.len() && prev_alloc[pi].0 < block_end
+            } else {
+                true
+            };
+            let changed = if in_prev {
+                a.read_at(pos, &mut ba[..n])?;
+                b.read_at(pos, &mut bb[..n])?;
+                ba[..n] != bb[..n]
+            } else {
+                true // new in `cur` this interval — dirty without reading.
+            };
+            if changed {
                 // coalesce with the previous extent when contiguous.
                 match out.last_mut() {
                     Some(last) if last.0 + last.1 == pos => last.1 += n as u64,
                     _ => out.push((pos, n as u64)),
                 }
             }
-            pos += n as u64;
+            pos = block_end;
         }
     }
     Ok(out)
@@ -911,7 +956,9 @@ impl MicroVm {
             let overlay = pulled.with_extension("cmp.qcow2");
             let localize = (|| -> Result<String> {
                 crate::qcow2::create_overlay(&overlay, &pulled)?;
-                let diffs = content_diff(snap, &overlay, &[(0, total_size)])?;
+                // Full logical byte-compare: `within` spans the whole image (holes included),
+                // not `overlay`'s own allocation, so the read-skip would misreport — disable it.
+                let diffs = content_diff(snap, &overlay, &[(0, total_size)], false)?;
                 let missed: Vec<(u64, u64)> = diffs
                     .iter()
                     .copied()
@@ -1723,7 +1770,9 @@ impl Executor for MicroVm {
         // push's qcow2) within the cumulative bound — the overlay is cumulative, so this
         // recovers just what this instruction changed.
         let dirty = match &self.inflight {
-            Some(inf) => content_diff(&inf.snap, &snap, &cumulative)?,
+            // `within` is `snap`'s own allocation, so a block new to `snap` is dirty by
+            // construction — the read-skip is sound here.
+            Some(inf) => content_diff(&inf.snap, &snap, &cumulative, true)?,
             None => cumulative,
         };
 
@@ -2303,5 +2352,152 @@ mod tests {
         // ext4 superblock magic 0xEF53 (LE) at byte offset 0x438.
         assert_eq!(&bytes[0x438..0x43a], &[0x53, 0xEF], "ext4 superblock magic");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `content_diff` reports exactly this interval's changed extents between two overlay
+    /// captures: an unchanged shared cluster is skipped, an in-place-rewritten shared cluster
+    /// is dirty (caught by the byte compare), and a cluster new to `cur` is dirty by its
+    /// allocation alone — the read-skipping path must not miss or misreport any of them.
+    #[test]
+    fn content_diff_reports_rewritten_and_new_clusters() {
+        fn have(tool: &str) -> bool {
+            std::process::Command::new(tool)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+        if !have("qemu-img") || !have("qemu-io") {
+            eprintln!("skipping: qemu-img/qemu-io not available");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("vk-content-diff-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let base = dir.join("base.raw");
+        let prev = dir.join("prev.qcow2");
+        let cur = dir.join("cur.qcow2");
+        // 512 KiB base (eight 64 KiB clusters) of 0xAA.
+        std::fs::write(&base, vec![0xAAu8; 512 * 1024]).unwrap();
+        let overlay = |img: &std::path::Path| {
+            assert!(
+                std::process::Command::new("qemu-img")
+                    .args(["create", "-q", "-f", "qcow2", "-F", "raw", "-b"])
+                    .arg(&base)
+                    .arg(img)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        let write = |img: &std::path::Path, spec: &str| {
+            assert!(
+                std::process::Command::new("qemu-io")
+                    .args(["-c", spec])
+                    .arg(img)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        // prev: cluster 1 = 0xBB, cluster 3 = 0xDD.
+        overlay(&prev);
+        write(&prev, "write -P 0xBB 65536 65536");
+        write(&prev, "write -P 0xDD 196608 65536");
+        // cur: cluster 1 = 0xBB (unchanged), cluster 3 = 0xEE (rewritten), cluster 5 = 0xCC (new).
+        overlay(&cur);
+        write(&cur, "write -P 0xBB 65536 65536");
+        write(&cur, "write -P 0xEE 196608 65536");
+        write(&cur, "write -P 0xCC 327680 65536");
+
+        let within = crate::qcow2::Qcow2::open(&cur)
+            .unwrap()
+            .data_extents()
+            .unwrap();
+        let dirty = content_diff(&prev, &cur, &within, true).unwrap();
+        assert_eq!(
+            dirty,
+            vec![(196608, 65536), (327680, 65536)],
+            "only the rewritten (cluster 3) and new (cluster 5) clusters are dirty; the \
+             unchanged shared cluster 1 is skipped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With the read-skip off, `content_diff` is a true logical byte-compare over the whole
+    /// `within` — base-identical regions that neither overlay wrote (holes) come back clean.
+    /// This is the reassembly-localizer contract; the read-skip (valid only when `within` is
+    /// `cur`'s own allocation) would instead flag every hole outside `prev`'s allocation, so
+    /// the two flag values are asserted to diverge on exactly this shape.
+    #[test]
+    fn content_diff_full_compare_leaves_holes_clean() {
+        fn have(tool: &str) -> bool {
+            std::process::Command::new(tool)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+        if !have("qemu-img") || !have("qemu-io") {
+            eprintln!("skipping: qemu-img/qemu-io not available");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("vk-content-diff-full-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let base = dir.join("base.raw");
+        let prev = dir.join("prev.qcow2");
+        let cur = dir.join("cur.qcow2");
+        // 1 MiB base (sixteen 64 KiB clusters) of 0xAA — four 256 KiB comparison blocks.
+        std::fs::write(&base, vec![0xAAu8; 1024 * 1024]).unwrap();
+        let overlay = |img: &std::path::Path| {
+            assert!(
+                std::process::Command::new("qemu-img")
+                    .args(["create", "-q", "-f", "qcow2", "-F", "raw", "-b"])
+                    .arg(&base)
+                    .arg(img)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        let write = |img: &std::path::Path, spec: &str| {
+            assert!(
+                std::process::Command::new("qemu-io")
+                    .args(["-c", spec])
+                    .arg(img)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        // prev writes cluster 2 (in block 0); cur writes cluster 10 (in block 2). Each overlay
+        // leaves the other's cluster — and every other cluster — resolving to the base, so the
+        // only logical differences are those two clusters, one per non-adjacent 256 KiB block.
+        overlay(&prev);
+        write(&prev, "write -P 0xBB 131072 65536");
+        overlay(&cur);
+        write(&cur, "write -P 0xCC 655360 65536");
+
+        let whole = [(0u64, 1024 * 1024u64)];
+        // Full compare: only the two blocks that actually differ, at 256 KiB granularity.
+        let full = content_diff(&prev, &cur, &whole, false).unwrap();
+        assert_eq!(
+            full,
+            vec![(0, 262144), (524288, 262144)],
+            "full compare flags only the blocks whose bytes differ; base-identical holes are clean"
+        );
+        // Read-skip on this shape over-reports: blocks 1 and 3 are holes `prev` never allocated,
+        // so they are flagged dirty without a compare — strictly more bytes than the true diff.
+        let skipped: u64 = content_diff(&prev, &cur, &whole, true)
+            .unwrap()
+            .iter()
+            .map(|&(_, l)| l)
+            .sum();
+        let truth: u64 = full.iter().map(|&(_, l)| l).sum();
+        assert!(
+            skipped > truth,
+            "read-skip must over-report when within spans holes cur does not allocate \
+             (skipped {skipped} > truth {truth})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
