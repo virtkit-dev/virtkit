@@ -80,7 +80,10 @@ fn parse_cpus(s: &str) -> Result<u32, String> {
 }
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("VK_GIT_HASH"), ")"),
+    about
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
