@@ -38,7 +38,7 @@ use super::{
 
 use crate::virtio::{
     block::{ImageType, SyncMode},
-    ActivateError, InterruptTransport,
+    ActivateError, InterruptTransport, VmmExitObserver,
 };
 
 /// Configuration options for disk caching.
@@ -644,6 +644,9 @@ impl Block {
     ///   discarded ones — each encoded as `u32 count` then `count × (u64 offset, u64 len)`
     ///   little-endian. The caller freezes the guest fs first, so the flush + take is a
     ///   consistent point-in-time delta.
+    /// - `b'F'` (FLUSH) makes the write-back cache durable on the host image (flush + sync)
+    ///   without draining, and replies one byte (0 ok / 1 error). The caller flushes before it
+    ///   kills the VMM, so a later host read sees a complete image without a graceful power-off.
     ///
     /// Errors are logged and the listener keeps serving; a dead socket just means no checkpoints
     /// (the build falls back correctly on the virtkit side).
@@ -697,6 +700,23 @@ impl Block {
                                 error!("virtio-blk: dirty-control reply failed: {e}");
                             }
                         }
+                        // FLUSH: make the write-back cache durable on the host image without
+                        // draining the dirty set — the caller flushes before killing the VMM, so a
+                        // later host read sees a complete image (replaces a graceful power-off).
+                        // Reply one byte: 0 ok, 1 error.
+                        b'F' => {
+                            let reply = match {
+                                let df = disk_image.lock().unwrap();
+                                df.flush().and_then(|()| df.sync())
+                            } {
+                                Ok(()) => 0u8,
+                                Err(e) => {
+                                    error!("virtio-blk: dirty-control flush failed: {e}");
+                                    1u8
+                                }
+                            };
+                            let _ = conn.write_all(&[reply]);
+                        }
                         _ => continue,
                     }
                 }
@@ -717,6 +737,24 @@ impl Block {
     /// Specifies if this block device is read only.
     pub fn is_read_only(&self) -> bool {
         self.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0
+    }
+}
+
+impl VmmExitObserver for Block {
+    /// Flush the write-back cache to the host image before the VMM terminates on a clean
+    /// guest power-off. The VMM stops with `libc::_exit`, which skips `DiskProperties`'
+    /// `Drop`, and the block device has no other clean-shutdown flush — so without this a
+    /// power-off can leave imago's cached metadata/data unwritten and truncate the image (an
+    /// L2 entry left pointing past EOF, which a later native read then rejects). A no-op for
+    /// `Unsafe` caching, where guest flushes are advisory.
+    fn on_vmm_exit(&mut self) {
+        if self.cache_type != CacheType::Writeback {
+            return;
+        }
+        let disk = self.disk_image.lock().unwrap();
+        if let Err(e) = disk.flush().and_then(|()| disk.sync()) {
+            error!("block: failed to flush image on VMM exit: {e}");
+        }
     }
 }
 

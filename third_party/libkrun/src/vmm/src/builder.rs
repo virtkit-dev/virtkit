@@ -2229,6 +2229,11 @@ fn attach_block_devices(
     for block in block_devs.list.iter() {
         let id = String::from(block.lock().unwrap().id());
 
+        // Flush the device's write-back cache to the host image on a clean VMM exit
+        // (power-off): the VMM `_exit`s without running Drop, so this observer is the only
+        // clean-shutdown flush.
+        vmm.exit_observers.push(block.clone());
+
         // The device mutex mustn't be locked here otherwise it will deadlock.
         attach_mmio_device(vmm, id, intc.clone(), block.clone()).map_err(RegisterBlockDevice)?;
     }

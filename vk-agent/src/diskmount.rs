@@ -58,6 +58,16 @@ fn create_dir_all_noting(dir: &Path) -> Result<()> {
 /// are still mounted (the API filesystems) and drop the now-empty dir/stub; a directory
 /// that still holds real content survives (`remove_dir` fails on non-empty). Best-effort.
 pub fn cleanup() -> Result<()> {
+    remove_created();
+    quiesce_root();
+    Ok(())
+}
+
+/// Detach and drop the agent-created ephemeral mountpoints/stubs recorded in the registry, so
+/// the API-filesystem mountpoints and COPY/RUN scratch dirs Docker would not persist do not
+/// litter the committed image. A directory that still holds real content survives
+/// (`remove_dir` fails on non-empty). Best-effort.
+fn remove_created() {
     let list = fs::read_to_string(CREATED_REGISTRY).unwrap_or_default();
     for line in list.lines().rev() {
         let p = Path::new(line);
@@ -70,16 +80,18 @@ pub fn cleanup() -> Result<()> {
         }
     }
     let _ = fs::remove_file(CREATED_REGISTRY);
-    // Freeze the root fs (FIFREEZE) rather than a plain sync: freeze flushes *and*
-    // quiesces, so the host's SIGKILL right after cannot interrupt a background ext4
-    // writeback mid-update — which would leave the committed overlay (later read as a
-    // COPY --from source) intermittently missing directory entries. No thaw: the guest is
-    // killed. Fall back to sync if the freeze is unavailable.
+}
+
+/// Quiesce the root fs so the on-disk image is consistent. Freeze the root fs (FIFREEZE)
+/// rather than a plain sync: freeze flushes *and* quiesces, so a host SIGKILL right after
+/// cannot interrupt a background ext4 writeback mid-update — which would leave the committed
+/// overlay (later read as a COPY --from source) intermittently missing directory entries. No
+/// thaw: the guest is killed or powered off. Fall back to sync if the freeze is unavailable.
+fn quiesce_root() {
     if crate::fsfreeze::freeze(Path::new("/")).is_err() {
         // SAFETY: sync takes no arguments and cannot fail.
         unsafe { libc::sync() };
     }
-    Ok(())
 }
 
 /// Mount `device` (an ext4 block device) read-only at `target`, creating `target`.

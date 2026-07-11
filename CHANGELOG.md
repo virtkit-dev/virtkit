@@ -23,6 +23,10 @@ All notable changes to virtkit will be documented in this file.
   instruction, which made a long stage's cache checkpoints slow down quadratically. Each
   checkpoint again pushes only the instruction's delta, as the cloud-hypervisor backend
   already did.
+- `vk build` on the libkrun backend no longer risks a corrupt stage image. The guest's
+  disk cache is now flushed to the host image before the image is read back, so a stage
+  is no longer left with unflushed writes that failed a later export or cache reuse with
+  "failed to fill whole buffer".
 
 ## [0.10.0] - 2026-07-10
 

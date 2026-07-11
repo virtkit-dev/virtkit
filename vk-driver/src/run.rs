@@ -2188,14 +2188,49 @@ impl VmSession {
         Ok((written, discarded))
     }
 
-    /// Shut the guest down cleanly: drop ephemeral mountpoints and flush the root fs to its
-    /// block device, then kill the VM. The stage image is the booted disk, so its writes are
-    /// already persisted in place — there is nothing to commit.
+    /// Flush the stage disk's write-back cache to the host image over the block-control socket,
+    /// so a later host read (export / cache) sees a complete image once the VMM is killed. A
+    /// no-op when the guest has no control socket — a plain run (whose image is discarded) or
+    /// cloud-hypervisor (which writes through). Best-effort: an error is logged and the caller
+    /// kills the VMM regardless.
+    fn flush_disk(&self) {
+        use std::io::{Read, Write};
+        let Some(sock) = self.dirty_socket.as_ref() else {
+            return;
+        };
+        let flush = || -> Result<()> {
+            let mut conn = std::os::unix::net::UnixStream::connect(sock)
+                .with_context(|| format!("connecting block-control socket {}", sock.display()))?;
+            conn.write_all(b"F").context("block-control: send FLUSH")?;
+            let mut ack = [0u8; 1];
+            conn.read_exact(&mut ack)
+                .context("block-control: read FLUSH ack")?;
+            ensure!(ack[0] == 0, "block-control: FLUSH reported an error");
+            Ok(())
+        };
+        if let Err(e) = flush() {
+            eprintln!(
+                "virtkit: flushing the stage disk before shutdown failed ({e:#}) — the image \
+                 may be incomplete"
+            );
+        }
+    }
+
+    /// Shut the guest down and reclaim the VM. The stage image is the booted disk, so its writes
+    /// are already persisted in place — there is nothing to commit, only to make durable before
+    /// the kill.
+    ///
+    /// One path for every backend: quiesce the guest fs (so the image is a consistent
+    /// point-in-time), flush the block device's write-back cache to the host image, then kill.
+    /// libkrun keeps guest writes in that cache until an explicit flush, so a bare SIGKILL would
+    /// truncate the stage qcow2 (an L2 entry past EOF a later native read rejects) — [`flush_disk`]
+    /// makes it durable first. cloud-hypervisor writes through and a plain run discards its image,
+    /// so both have no control socket and the flush is a no-op.
     pub(crate) async fn finish(mut self) -> Result<()> {
-        // `cleanup` removes the agent-created ephemeral mountpoints/stubs (so they do not
-        // litter the image) and then syncs — all native, so it works on a shell-less
-        // `FROM scratch` stage. Fall back to a native fsfreeze, then a shell `sync`, if an
-        // older agent lacks cleanup. The guest is killed right after, so no thaw is needed.
+        // `cleanup` removes the agent-created ephemeral mountpoints/stubs (so they do not litter
+        // the image) and then quiesces — all native, so it works on a shell-less `FROM scratch`
+        // stage. Fall back to a native fsfreeze, then a shell `sync`, if an older agent lacks
+        // cleanup. The guest is killed right after, so no thaw is needed.
         let quiesced = self.guest_ok(&[GUEST_AGENT, "cleanup"]).await
             || self.guest_ok(&[GUEST_AGENT, "fsfreeze", "-f", "/"]).await;
         if !quiesced {
@@ -2209,6 +2244,7 @@ impl VmSession {
             )
             .await;
         }
+        self.flush_disk();
         let _ = self.ch.kill();
         let _ = self.ch.wait();
         for c in [self.switch.as_mut(), self.virtiofsd.as_mut()]
