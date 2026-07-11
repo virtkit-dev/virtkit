@@ -27,6 +27,7 @@ use anyhow::{Context, Result, bail};
 use tokio_util::sync::CancellationToken;
 
 use super::parser::{Cmdline, Copy, Mount};
+use crate::timing::Timings;
 
 /// An opaque handle to a stage's working filesystem (a host dir, an overlay, a VM
 /// disk — the backend's choice). The label is for diagnostics/transcripts.
@@ -351,6 +352,10 @@ pub struct MicroVm {
     parent_digest: Option<String>,
     /// add a journal to the exported image (the build itself stays journal-less).
     journal: bool,
+    /// shared timing collector: fine-grained phase probes (`VIRTKIT_TIMING`) from the
+    /// guest lifecycle and cache-push path record here, surfacing in the end-of-run
+    /// breakdown instead of printing mid-build over the live dashboard.
+    timings: Arc<Timings>,
     /// egress policy for the stage guests (no network / unrestricted / allowlist).
     net: crate::build::BuildNet,
     /// source-stage ext4s available to attach read-only to this stage's guest, in the
@@ -636,6 +641,7 @@ impl MicroVm {
         net: crate::build::BuildNet,
         debug: bool,
         tmp_disk_enabled: bool,
+        timings: Arc<Timings>,
     ) -> Self {
         MicroVm {
             cloud_hypervisor,
@@ -656,6 +662,7 @@ impl MicroVm {
             parent_key: None,
             parent_digest: None,
             journal,
+            timings,
             net,
             sources: Vec::new(),
             source_dev: HashMap::new(),
@@ -704,6 +711,7 @@ impl MicroVm {
             stage_last_digest: Arc::clone(&self.stage_last_digest),
             base_digests: Arc::clone(&self.base_digests),
             journal: self.journal,
+            timings: Arc::clone(&self.timings),
             net: self.net.clone(),
             session: None,
             parent_key: None,
@@ -761,7 +769,9 @@ impl MicroVm {
 
         let subset = select_source_batch(&self.sources, needed, &fs.label, max_sources)?;
         if let Some(session) = self.session.take() {
+            let t_fin = std::time::Instant::now();
             block_on(session.finish())?;
+            self.timings.probe("reboot.finish", t_fin.elapsed());
             self.source_dev.clear();
         }
 
@@ -815,6 +825,7 @@ impl MicroVm {
             tmp_disk.as_deref(),
             scratch_disk.as_deref(),
             self.cancel.clone(),
+            &self.timings,
         ))?;
         self.source_dev = subset
             .iter()
@@ -1700,7 +1711,7 @@ impl Executor for MicroVm {
             self.session
                 .as_ref()
                 .expect("session present")
-                .capture(&snap),
+                .capture(&snap, &self.timings),
         )?;
         self.verify_snapshot(&snap, &format!("snapshot of {key} (before upload)"))?;
         // Native qcow2 read: the overlay's own clusters (cumulative dirty) + its size.
@@ -1760,6 +1771,7 @@ impl Executor for MicroVm {
         // a stage is fully pushed before any dependent that reads its chunks starts.
         let snap_push = snap.clone();
         let key_s = key.to_string();
+        let timings = Arc::clone(&self.timings);
         let handle = std::thread::spawn(move || -> PushOutput {
             let t = std::time::Instant::now();
             let (layers, total, digest) = crate::registry::push_ext4_diff(
@@ -1772,7 +1784,7 @@ impl Executor for MicroVm {
                 &dirty,
                 &parent_layers,
             )?;
-            crate::run::tlog("cache.push", t);
+            timings.probe("cache.push", t.elapsed());
             Ok(Some(((layers, total), digest)))
         });
         self.inflight = Some(PushInflight {
@@ -1827,7 +1839,9 @@ impl Executor for MicroVm {
         // Shut the stage's guest down cleanly; its writes are already in the stage image
         // (the booted disk), so later stages / the export see them with no commit step.
         if let Some(session) = self.session.take() {
+            let t_fin = std::time::Instant::now();
             block_on(session.finish())?;
+            self.timings.probe("stage.finish", t_fin.elapsed());
         }
         if let Some(tmp) = self.tmp_disk.take() {
             let _ = std::fs::remove_file(tmp);

@@ -60,6 +60,8 @@ use parser::Instruction;
 use plan::{Base, Plan, PlanInput};
 use progress::{Outcome, Progress, StageInit};
 
+use crate::timing::{Phase, Timings};
+
 /// How aggressively a build populates the instruction cache.
 ///
 /// Restoring a cached prefix and the fully-cached-stage fast path both work at stage
@@ -411,12 +413,17 @@ pub fn build_inputs(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
 /// so `microvm == false` is reachable from `#[cfg(test)]` alone.
 fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Result<Built> {
     let build_args: Vars = opts.build_args.iter().cloned().collect();
+    // Timing breakdown, shared across the parallel stage workers and rendered once the
+    // build finishes (see [`Timings::render`]). Started here so the plan phase is timed.
+    let timings = Arc::new(Timings::new());
+    let t_plan = Instant::now();
     let plan = Plan::from_dockerfiles(&inputs, &build_args)?;
     let target = plan.resolve_target(opts.target.as_deref())?;
     let order = plan.build_order(target)?;
     // Reject a cross-stage source under /tmp up front: /tmp is ephemeral and never
     // committed, so it would fail late with a cryptic "No such file" from the guest.
     plan.check_tmp_sources(&order)?;
+    timings.record(Phase::Plan, "", t_plan.elapsed());
 
     // --print-plan: dry-run the whole pipeline and print the primitives, build nothing.
     if opts.print_plan {
@@ -429,6 +436,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
             false,
             opts.build_cache,
             &Progress::disabled(),
+            &timings,
         )?;
         println!("# build order: {order:?} (target stage {target})");
         for line in &ex.transcript {
@@ -521,6 +529,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
                 opts.net.clone(),
                 opts.debug,
                 !opts.tmp_tmpfs,
+                Arc::clone(&timings),
             );
             let jobs = resolve_build_jobs(opts, mv.mem_mib());
             let (committed, states) = drive_microvm(
@@ -532,6 +541,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
                 opts.require_cached,
                 opts.build_cache,
                 &progress,
+                &timings,
             )?;
             // `mv` shares the workers' `images` map (same Arc), so it can export the
             // target and is reused as the exporter.
@@ -546,6 +556,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
                 opts.require_cached,
                 opts.build_cache,
                 &progress,
+                &timings,
             )?;
             (committed, states, Box::new(ex))
         };
@@ -553,7 +564,9 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
             .get(&target)
             .context("internal: target stage not committed")?;
         progress.export_start();
+        let t_export = Instant::now();
         ex.export_ext4(fs, out)?;
+        timings.record(Phase::Export, "", t_export.elapsed());
         progress.export_done();
         let st = states.get(&target).cloned().unwrap_or_default();
         let config = run_config(&st);
@@ -566,6 +579,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     })();
     // Leave the final dashboard frame on screen (FINISHED/FAILED) before any teardown log.
     progress.finish(result.is_ok());
+    timings.render();
     let _ = std::fs::remove_dir_all(&scratch); // best-effort scratch cleanup
     let built = result?;
     println!(
@@ -1074,6 +1088,7 @@ fn build_stage(
     idx: usize,
     cache: BuildCache,
     progress: &Arc<Progress>,
+    timings: &Arc<Timings>,
     cancel: Option<&CancellationToken>,
 ) -> Result<Rootfs> {
     // Abort before doing any work if an earlier stage already failed, and hand the token
@@ -1097,7 +1112,9 @@ fn build_stage(
     if let Some(key) = cached_final.get(&idx) {
         progress.stage_fully_cached(idx);
         progress.restore_start(idx, &name);
+        let t_restore = Instant::now();
         let fs = restore_into(ex, &name, key)?;
+        timings.record(Phase::CachePull, &name, t_restore.elapsed());
         progress.restore_done(idx);
         ex.stage_end(&fs)?;
         return Ok(fs);
@@ -1153,13 +1170,17 @@ fn build_stage(
             fs = Some(match &last_hit {
                 Some(k) => {
                     progress.restore_start(idx, &name);
+                    let t_restore = Instant::now();
                     let f = restore_into(ex, &name, k)?;
+                    timings.record(Phase::CachePull, &name, t_restore.elapsed());
                     progress.restore_done(idx);
                     f
                 }
                 None => {
                     progress.base_start(idx);
+                    let t_base = Instant::now();
                     let f = materialize_base(ex, &stage.base, &name, committed)?;
+                    timings.record(Phase::BasePull, &name, t_base.elapsed());
                     progress.base_done(idx, Outcome::Ran);
                     base_shown = true;
                     f
@@ -1172,7 +1193,9 @@ fn build_stage(
         let t0 = Instant::now();
         apply_fs(plan, committed, ex, f, &step.state, &step.instr)
             .inspect_err(|_| progress.step_failed(idx, i))?;
-        uncommitted += t0.elapsed();
+        let ran = t0.elapsed();
+        uncommitted += ran;
+        timings.record(Phase::Instructions, &name, ran);
         // The stage's final step is always committed (so stage-level reuse and
         // `COPY --from` hit); which intermediate steps are, depends on the mode:
         // `instructions` commits every step, `layers` none, `auto` one once enough
@@ -1189,8 +1212,10 @@ fn build_stage(
             // overhead, not the step's runtime — freeze the reported time here so a
             // trivial step isn't charged for the previous push's upload `cache_save` joins.
             progress.step_committing(idx, i);
+            let t_push = Instant::now();
             ex.cache_save(f, &step.key)
                 .inspect_err(|_| progress.step_failed(idx, i))?;
+            timings.record(Phase::CachePush, &name, t_push.elapsed());
             uncommitted = Duration::ZERO;
         }
         progress.step_done(idx, i, Outcome::Ran);
@@ -1204,13 +1229,17 @@ fn build_stage(
             // first hit in the loop, so just restore the final snapshot.
             Some(k) => {
                 progress.restore_start(idx, &name);
+                let t_restore = Instant::now();
                 let f = restore_into(ex, &name, k)?;
+                timings.record(Phase::CachePull, &name, t_restore.elapsed());
                 progress.restore_done(idx);
                 f
             }
             None => {
                 progress.base_start(idx);
+                let t_base = Instant::now();
                 let f = materialize_base(ex, &stage.base, &name, committed)?;
+                timings.record(Phase::BasePull, &name, t_base.elapsed());
                 progress.base_done(idx, Outcome::Ran);
                 f
             }
@@ -1234,6 +1263,7 @@ fn final_states(resolved: &HashMap<usize, Resolved>) -> HashMap<usize, ShellStat
 /// Sequential driver: walk the stages in topological order, building each through the
 /// executor. Backend-agnostic — used by the host/dry-run backends (and as the reference
 /// the parallel microVM driver must match).
+#[allow(clippy::too_many_arguments)]
 fn drive(
     plan: &Plan,
     order: &[usize],
@@ -1242,6 +1272,7 @@ fn drive(
     require_cached: bool,
     cache: BuildCache,
     progress: &Arc<Progress>,
+    timings: &Arc<Timings>,
 ) -> Result<(HashMap<usize, Rootfs>, HashMap<usize, ShellState>)> {
     let resolved = resolve_all(plan, order, build_args, ex)?;
     let (needed, cached_final) = compute_needed(plan, order, &resolved, ex, require_cached)?;
@@ -1260,6 +1291,7 @@ fn drive(
             idx,
             cache,
             progress,
+            timings,
             None,
         )?;
         committed.insert(idx, fs);
@@ -1402,7 +1434,9 @@ fn drive_microvm(
     require_cached: bool,
     cache: BuildCache,
     progress: &Arc<Progress>,
+    timings: &Arc<Timings>,
 ) -> Result<(HashMap<usize, Rootfs>, HashMap<usize, ShellState>)> {
+    timings.note_jobs(jobs);
     // Read-only passes on a throwaway worker (shares `base`'s memoization + cache maps).
     let mut probe = base.worker();
     let resolved = resolve_all(plan, order, build_args, &mut probe)?;
@@ -1449,6 +1483,7 @@ fn drive_microvm(
             idx,
             cache,
             progress,
+            timings,
             Some(&cancel),
         )
     })?;
@@ -2001,6 +2036,7 @@ mod tests {
             false,
             BuildCache::Instructions,
             &Progress::disabled(),
+            &Arc::new(Timings::new()),
         )
         .unwrap();
         ex.transcript
@@ -2084,6 +2120,7 @@ mod tests {
             false,
             BuildCache::Instructions,
             &Progress::disabled(),
+            &Arc::new(Timings::new()),
         )
         .unwrap();
         assert!(ex.inner.transcript.iter().any(|l| l.starts_with("run ")));
@@ -2102,6 +2139,7 @@ mod tests {
             false,
             BuildCache::Instructions,
             &Progress::disabled(),
+            &Arc::new(Timings::new()),
         )
         .unwrap();
         let t = &ex.inner.transcript;
@@ -2131,6 +2169,7 @@ mod tests {
             true,
             BuildCache::Instructions,
             &Progress::disabled(),
+            &Arc::new(Timings::new()),
         )
         .unwrap_err();
         let nc = err.downcast_ref::<NotCached>().expect("typed NotCached");
@@ -2153,6 +2192,7 @@ mod tests {
             true,
             BuildCache::Instructions,
             &Progress::disabled(),
+            &Arc::new(Timings::new()),
         )
         .unwrap_err();
         assert_eq!(
@@ -2171,6 +2211,7 @@ mod tests {
             false,
             BuildCache::Instructions,
             &Progress::disabled(),
+            &Arc::new(Timings::new()),
         )
         .unwrap();
         let mut ex = CachedDry {
@@ -2186,6 +2227,7 @@ mod tests {
             true,
             BuildCache::Instructions,
             &Progress::disabled(),
+            &Arc::new(Timings::new()),
         )
         .unwrap();
         let t = &ex.inner.transcript;
@@ -2212,6 +2254,7 @@ mod tests {
             false,
             BuildCache::Instructions,
             &Progress::disabled(),
+            &Arc::new(Timings::new()),
         )
         .unwrap();
         let mut cache = ex.cache;
@@ -2229,6 +2272,7 @@ mod tests {
             false,
             BuildCache::Instructions,
             &Progress::disabled(),
+            &Arc::new(Timings::new()),
         )
         .unwrap();
         let t = &ex.inner.transcript;
@@ -2269,6 +2313,7 @@ mod tests {
                 false,
                 mode,
                 &Progress::disabled(),
+                &Arc::new(Timings::new()),
             )
             .unwrap();
             let t = &ex.inner.transcript;
@@ -2320,6 +2365,7 @@ mod tests {
                 false,
                 mode,
                 &Progress::disabled(),
+                &Arc::new(Timings::new()),
             )
             .unwrap();
             let mut warm = CachedDry {
@@ -2335,6 +2381,7 @@ mod tests {
                 false,
                 mode,
                 &Progress::disabled(),
+                &Arc::new(Timings::new()),
             )
             .unwrap();
             let t = &warm.inner.transcript;
@@ -2677,6 +2724,7 @@ mod tests {
             false,
             BuildCache::Instructions,
             &Progress::disabled(),
+            &Arc::new(Timings::new()),
         )
         .unwrap();
         let t = ex.transcript;

@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `vk build` and `vk run` now print a timing breakdown when they finish, showing where
+  the time went — planning, base pulls, cache pull/push, running instructions, image
+  export, and (for `run`) source pull, boot-media assembly, boot, and command exec.
+  Build phases are broken down per stage, and the header reports both wall-clock and
+  summed busy time so a parallel build reads differently from one bottlenecked on a
+  single stage.
+
 ## [0.10.0] - 2026-07-10
 
 ### Added

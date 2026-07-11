@@ -49,6 +49,7 @@ mod spawn;
 mod sshagent;
 mod sshconf;
 mod switch;
+mod timing;
 mod units;
 #[cfg(feature = "virtiofsd")]
 mod virtiofsd;

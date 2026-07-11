@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use vk_core::addr::SocketAddr;
 
 use crate::source::Source;
+use crate::timing::{Phase, Timings};
 use crate::vmm::Vmm;
 
 const VSOCK_PORT: u32 = 4444;
@@ -383,6 +384,10 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     // image's configured `Config.Env`.
     // Compose is loaded up front: a --primary primary replaces the image/-f
     // rootfs below, and the (remaining) services boot as siblings further down.
+    // Timing breakdown for the run's own phases (source pull, boot media, boot, exec),
+    // rendered when the run finishes. A `-f` Dockerfile build reports its own breakdown
+    // separately (via the build pipeline).
+    let timings = Timings::new();
     let compose_units: Vec<crate::compose::Unit> = match &args.compose {
         Some(p) => crate::compose::load(p)?,
         None => Vec::new(),
@@ -461,7 +466,9 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     // exists as a file — step 2 streams it straight into the cpio/ext4 builder.
     let source = match dockerfile_ext4 {
         None => {
+            let t_source = Instant::now();
             let source = resolve_source(args).await?;
+            timings.record(Phase::SourcePull, "", t_source.elapsed());
             // Inherit the image's configured environment (PATH etc.) for the guest
             // command, as `docker run` does.
             image_env = source.config_env().await?;
@@ -532,6 +539,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             .with_context(|| format!("writing {}", env_capture.display()))?;
         injects.push(("etc/virtkit/env", &env_capture, 0o644));
     }
+    let t_media = Instant::now();
     let (disks, initramfs, mut cmdline): (Vec<crate::vmm::Disk>, Option<PathBuf>, String) =
         if let Some(ext4) = &dockerfile_ext4 {
             // A Dockerfile build exports a *clean* ext4 (no agent baked in). Boot it the way
@@ -628,6 +636,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
                 ),
             )
         };
+    timings.record(Phase::BootMedia, "", t_media.elapsed());
 
     // SSH-agent forwarding: tell the guest agent to present SSH_AUTH_SOCK and relay it over
     // a vsock port, which the host side (started below) bridges to the host's real agent —
@@ -959,6 +968,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         ssh_config.as_deref(),
         &image_env,
         &fallback_argv,
+        &timings,
     )
     .await;
     for mut f in ssh_forward.take().into_iter().chain(host_exec_serve.take()) {
@@ -974,6 +984,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         let _ = child.kill();
         let _ = child.wait();
     }
+    timings.render();
     result
 }
 
@@ -1428,6 +1439,7 @@ fn user_script(command: &[String]) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drive(
     ch: &mut Child,
     addr: &SocketAddr,
@@ -1436,8 +1448,10 @@ async fn drive(
     ssh_config: Option<&str>,
     image_env: &[(String, String)],
     fallback_argv: &[String],
+    timings: &Timings,
 ) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(args.boot_timeout_secs);
+    let t_boot = Instant::now();
+    let deadline = t_boot + Duration::from_secs(args.boot_timeout_secs);
     loop {
         if let Some(status) = ch.try_wait()? {
             bail!("{}", boot_failure(console, status));
@@ -1454,6 +1468,7 @@ async fn drive(
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    timings.record(Phase::Boot, "", t_boot.elapsed());
     if let Some(cfg) = ssh_config {
         write_guest_ssh_config(addr, cfg).await?;
     }
@@ -1500,6 +1515,7 @@ async fn drive(
     }
     script.push_str(&body);
     let command = vec!["sh".into(), "-c".into(), script];
+    let t_exec = Instant::now();
     let result = crate::executor::exec_script(
         addr,
         &command,
@@ -1510,6 +1526,7 @@ async fn drive(
     )
     .await
     .context("running the command in the guest")?;
+    timings.record(Phase::Exec, "", t_exec.elapsed());
     match result.code {
         Some(0) | None => Ok(()),
         Some(c) => bail!("guest command exited {c}"),
@@ -1718,22 +1735,6 @@ async fn spawn_vm_switch(
     Ok((child, frag))
 }
 
-/// Boot a stage guest on `image` (a rw qcow2, written in place) and wait for the in-guest
-/// agent. Unless `net` is `None`, a `vk switch` gives egress (DHCP + DNS + transparent
-/// proxy), restricted to `net`'s allowlist if it has one.
-#[allow(clippy::too_many_arguments)]
-/// Lightweight phase timing for the cache-push path, enabled with `VIRTKIT_TIMING=1`.
-/// Emits one line per phase; summing them across a build sizes how much of cold-cache-on
-/// is reclaimable by moving work off the critical path (the async-push plan).
-pub(crate) fn tlog(phase: &str, started: Instant) {
-    if std::env::var_os("VIRTKIT_TIMING").is_some() {
-        eprintln!(
-            "virtkit-timing: {phase} {} ms",
-            started.elapsed().as_millis()
-        );
-    }
-}
-
 /// The qemu/cloud-hypervisor disk format of a stage image, by extension: forked stages
 /// are `.qcow2` (a copy-on-write overlay over their parent), bases are raw `.ext4`.
 pub(crate) fn disk_format(path: &Path) -> &'static str {
@@ -1770,6 +1771,9 @@ pub(crate) fn build_scratch_disk(image: &Path) -> Result<PathBuf> {
     build_empty_disk(image, "scratchdisk")
 }
 
+/// Boot a stage guest on `image` (a rw qcow2, written in place) and wait for the in-guest
+/// agent. Unless `net` is `None`, a `vk switch` gives egress (DHCP + DNS + transparent
+/// proxy), restricted to `net`'s allowlist if it has one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn boot_session(
     cloud_hypervisor: &Path,
@@ -1792,7 +1796,9 @@ pub(crate) async fn boot_session(
     // returned `VmSession`. Same ephemeral, caller-owned lifecycle as `tmp_disk`.
     scratch_disk: Option<&Path>,
     cancel: Option<CancellationToken>,
+    timings: &Timings,
 ) -> Result<VmSession> {
+    let t_boot = Instant::now();
     let stem = image.file_stem().and_then(|s| s.to_str()).unwrap_or("disk");
     let work = std::env::temp_dir().join(format!("virtkit-session-{}-{stem}", std::process::id()));
     std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
@@ -1811,7 +1817,9 @@ pub(crate) async fn boot_session(
     } else {
         work.join("initramfs.cpio")
     };
+    let t_ir = Instant::now();
     crate::initramfs::build_agent_initramfs(agent, &cpio)?;
+    timings.probe("boot.initramfs", t_ir.elapsed());
     // Boot the stage's rw qcow2 image directly: it is a CoW overlay over its backing (the
     // base ext4 or the parent stage), so the guest's writes accumulate into it and it
     // becomes the stage's result — no separate boot overlay, no commit. (A raw-rw disk
@@ -1933,7 +1941,10 @@ pub(crate) async fn boot_session(
     };
     let vmm = crate::vmm::selected(cloud_hypervisor);
     let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
+    let t_spawn = Instant::now();
     let mut ch = spawn_vmm(vmm.as_ref(), &spec)?;
+    timings.probe("boot.spawn", t_spawn.elapsed());
+    let t_wait = Instant::now();
     let deadline = Instant::now() + Duration::from_secs(boot_timeout_secs);
     loop {
         if let Some(status) = ch.try_wait()? {
@@ -1956,6 +1967,8 @@ pub(crate) async fn boot_session(
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    timings.probe("boot.wait", t_wait.elapsed());
+    timings.probe("boot.session", t_boot.elapsed());
     Ok(VmSession {
         ch,
         addr,
@@ -2024,13 +2037,13 @@ impl VmSession {
     /// hangs. cloud-hypervisor holds an advisory write lock on the live image that a plain
     /// `std::fs::copy` ignores; the copy keeps the same backing reference (opened
     /// read-only), so the reader resolves unchanged clusters through it.
-    pub(crate) async fn capture(&self, out: &Path) -> Result<()> {
+    pub(crate) async fn capture(&self, out: &Path, timings: &Timings) -> Result<()> {
         let t = Instant::now();
         let frozen = self.freeze().await;
         let copied = std::fs::copy(&self.image, out);
         self.thaw(frozen).await;
         copied.with_context(|| format!("copying {} -> {}", self.image.display(), out.display()))?;
-        tlog("snap.capture", t);
+        timings.probe("snap.capture", t.elapsed());
         Ok(())
     }
 
@@ -2276,6 +2289,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &Timings::new(),
             )
             .await
             .expect("boot_session");
