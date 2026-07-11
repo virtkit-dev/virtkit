@@ -68,6 +68,10 @@ pub struct Disk {
     /// raw base ext4. Drives `image_type=` and whether a backing chain is resolved.
     pub qcow2: bool,
     pub readonly: bool,
+    /// If set (libkrun build stages only), the VMM serves a dirty-drain control protocol
+    /// on this Unix socket so a checkpoint captures only the delta. `None` = untracked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty_control_socket: Option<PathBuf>,
 }
 
 impl Disk {
@@ -77,7 +81,14 @@ impl Disk {
             path,
             qcow2: true,
             readonly: false,
+            dirty_control_socket: None,
         }
+    }
+
+    /// Enable dirty-block tracking, serving the drain protocol on `socket` (libkrun only).
+    pub fn with_dirty_control(mut self, socket: PathBuf) -> Self {
+        self.dirty_control_socket = Some(socket);
+        self
     }
 
     /// cloud-hypervisor `--disk` value. qcow2 disks resolve their backing chain
@@ -448,6 +459,7 @@ mod tests {
                     path: "/w/source.ext4".into(),
                     qcow2: false,
                     readonly: true,
+                    dirty_control_socket: None,
                 },
             ],
             initramfs: Some("/w/initramfs.cpio".into()),

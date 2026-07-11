@@ -77,3 +77,15 @@ is immutable and its guest block offset is its file offset, so it is mapped once
 page cache. qcow2 (needs format translation) and `direct_io` (asks to bypass the cache)
 keep the imago path, and a failed `mmap` falls back to it rather than aborting the boot.
 Covered by the `block::device::tests` mmap tests. Search for `DiskMmap`.
+
+`src/devices/src/virtio/block/{device.rs,worker.rs}` + `src/libkrun/src/lib.rs` +
+`src/vmm/src/vmm_config/block.rs` — track guest-written clusters and drain them on demand,
+so virtkit's build backend can capture only a stage checkpoint's delta instead of the whole
+cumulative overlay. The block worker records every write/discard/write-zeroes into a
+per-disk `DirtyRanges` (64 KiB cluster granularity); when `dirty_control_socket` is set on a
+block device, `Block::spawn_dirty_control` serves a Unix-socket protocol (`b'D'` DRAIN →
+flush + reply the coalesced ranges since the last drain, encoded `u32 count` then
+`count × (u64 offset, u64 len)` little-endian). Exposed to C consumers via
+`krun_set_block_dirty_socket`. Additive only — no upstream behaviour changes when the socket
+is unset. Consumed by virtkit's `VmSession::drain_dirty` (vk-driver/src/run.rs). Covered by
+the `block::device::dirty_tests`. Search for `DirtyRanges`.

@@ -313,9 +313,11 @@ async fn fetch_chunks_async(
 /// A parent chunk that overlaps a dirty extent is regenerated whole (one chunk, same
 /// offset/length) and the rest are reused verbatim — only the dirty bytes are read,
 /// hashed and (if new) compressed/uploaded. When `parent_layers` is empty there is no
-/// safe parent to reuse, so the whole qcow2 backing chain is re-chunked. `dirty` is the
-/// set of cluster ranges the guest wrote (from `qemu-img map`); `total_size` is the
-/// parent's (the ext4 size is fixed across RUNs).
+/// safe parent to reuse, so the whole qcow2 backing chain is re-chunked. `dirty` is the set
+/// of cluster ranges the guest wrote (read from the overlay and pushed as data); `holes` is
+/// the set it freed (discard/trim) since the parent — represented as gaps that clear the
+/// parent's bytes there, never read. `total_size` is the parent's (the ext4 size is fixed
+/// across RUNs).
 #[allow(clippy::too_many_arguments)]
 pub fn push_ext4_diff(
     rg: &Registry,
@@ -325,6 +327,7 @@ pub fn push_ext4_diff(
     boot_kind: &str,
     total_size: u64,
     dirty: &[(u64, u64)],
+    holes: &[(u64, u64)],
     parent_layers: &[OciDescriptor],
 ) -> Result<(Vec<OciDescriptor>, u64, String)> {
     if let Some(root) = rg.local_root() {
@@ -336,6 +339,7 @@ pub fn push_ext4_diff(
             boot_kind,
             total_size,
             dirty,
+            holes,
             parent_layers,
         );
     }
@@ -347,6 +351,7 @@ pub fn push_ext4_diff(
         boot_kind,
         total_size,
         dirty,
+        holes,
         parent_layers,
     ))
 }
@@ -360,6 +365,7 @@ async fn push_ext4_diff_async(
     boot_kind: &str,
     total_size: u64,
     dirty: &[(u64, u64)],
+    holes: &[(u64, u64)],
     parent_layers: &[OciDescriptor],
 ) -> Result<(Vec<OciDescriptor>, u64, String)> {
     let (client, auth) = client(rg)?;
@@ -389,22 +395,31 @@ async fn push_ext4_diff_async(
     for layer in parent_layers {
         let (offset, length) = chunk_placement(layer)?;
         covered.push((offset, length));
-        // overlap test against the dirty cluster ranges (half-open intervals).
-        let is_dirty = dirty
-            .iter()
-            .any(|&(ds, dl)| offset < ds + dl && ds < offset + length);
-        if !is_dirty {
+        // overlap test against a cluster-range set (half-open intervals).
+        let overlaps = |ranges: &[(u64, u64)]| {
+            ranges
+                .iter()
+                .any(|&(ds, dl)| offset < ds + dl && ds < offset + length)
+        };
+        let is_dirty = overlaps(dirty);
+        let is_hole = overlaps(holes);
+        if !is_dirty && !is_hole {
             layers.push(layer.clone());
             reused += 1;
             continue;
         }
+        // Written and/or partly freed (a content-defined chunk can straddle both): regenerate
+        // from the overlay — the read resolves written bytes as data and untouched bytes through
+        // the backing chain — then force the fully-freed sub-ranges to zero so a hole never
+        // keeps the parent's stale bytes. Freed clusters read safely: imago maps them to zero.
         let mut buf = vec![0u8; length as usize];
         q.read_at(offset, &mut buf).with_context(|| {
             format!("reading {length} bytes at {offset} from {}", ext4.display())
         })?;
+        zero_ranges(&mut buf, offset, holes);
         regened += 1;
         if buf.iter().all(|&b| b == 0) {
-            continue; // freed/zeroed since the parent — drop it, the pull leaves a hole
+            continue; // fully freed/zeroed since the parent — drop it, the pull leaves a hole
         }
         let (desc, was_uploaded) = put_raw_chunk(
             &client,
@@ -630,6 +645,19 @@ fn subtract_extents(a: &[(u64, u64)], b: &[(u64, u64)]) -> Vec<(u64, u64)> {
         }
     }
     out
+}
+
+/// Zero the parts of `buf` (logical bytes starting at `base`) that fall inside any `hole`
+/// range. Used when regenerating a parent chunk that straddles freed and live regions: the
+/// live bytes stay as read from the overlay, the freed ones become an explicit zero hole.
+fn zero_ranges(buf: &mut [u8], base: u64, holes: &[(u64, u64)]) {
+    let end = base + buf.len() as u64;
+    for &(hs, hl) in holes {
+        let (s, e) = (hs.max(base), (hs + hl).min(end));
+        if s < e {
+            buf[(s - base) as usize..(e - base) as usize].fill(0);
+        }
+    }
 }
 
 /// Content-defined-chunk a `[start, start+len)` region streamed from `reader` (a raw file
@@ -1588,31 +1616,41 @@ mod local {
         boot_kind: &str,
         total_size: u64,
         dirty: &[(u64, u64)],
+        holes: &[(u64, u64)],
         parent_layers: &[OciDescriptor],
     ) -> Result<(Vec<OciDescriptor>, u64, String)> {
         let store = Store::new(root.to_path_buf())?;
         let _lock = store.lock_shared()?;
-        // same shape as push_ext4_diff_async: reuse clean parent chunks, re-chunk the
-        // dirty ones from the captured overlay, then chunk writes into former holes.
+        // same shape as push_ext4_diff_async: reuse clean parent chunks, drop freed ones as
+        // holes, re-chunk the dirty ones from the captured overlay, then chunk writes into
+        // former holes.
         let mut q = crate::qcow2::Qcow2::open(ext4)?;
         let mut layers: Vec<OciDescriptor> = Vec::with_capacity(parent_layers.len());
         let mut covered: Vec<(u64, u64)> = Vec::with_capacity(parent_layers.len());
         for layer in parent_layers {
             let (offset, length) = chunk_placement(layer)?;
             covered.push((offset, length));
-            let is_dirty = dirty
-                .iter()
-                .any(|&(ds, dl)| offset < ds + dl && ds < offset + length);
-            if !is_dirty {
+            let overlaps = |ranges: &[(u64, u64)]| {
+                ranges
+                    .iter()
+                    .any(|&(ds, dl)| offset < ds + dl && ds < offset + length)
+            };
+            let is_dirty = overlaps(dirty);
+            let is_hole = overlaps(holes);
+            if !is_dirty && !is_hole {
                 layers.push(layer.clone());
                 continue;
             }
+            // Written and/or partly freed: regenerate from the overlay, then force the
+            // fully-freed sub-ranges to zero so a straddling chunk keeps its live bytes while a
+            // hole never reassembles as the parent's stale data.
             let mut buf = vec![0u8; length as usize];
             q.read_at(offset, &mut buf).with_context(|| {
                 format!("reading {length} bytes at {offset} from {}", ext4.display())
             })?;
+            zero_ranges(&mut buf, offset, holes);
             if buf.iter().all(|&b| b == 0) {
-                continue; // freed/zeroed since the parent — the pull leaves a hole
+                continue; // fully freed/zeroed since the parent — the pull leaves a hole
             }
             let digest = store.put_blob(&buf)?;
             layers.push(chunk_descriptor(
@@ -1906,6 +1944,7 @@ mod tests {
             "generic-disk",
             total,
             &dirty,
+            &[],
             &parent_layers,
         )
         .unwrap();
@@ -1929,6 +1968,61 @@ mod tests {
             std::fs::read(&dest).unwrap(),
             std::fs::read(&base).unwrap(),
             "an untouched overlay's child must equal the base"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A hole (a discarded/trimmed region) must clear the parent's bytes there, not reuse
+    /// them: even though the overlay still reads the base's data through its backing and the
+    /// region is not dirty, passing it as a hole drops the covering parent chunks so the
+    /// region reassembles as zeros.
+    #[test]
+    fn local_diff_push_holes_clear_parent_bytes() {
+        let root = std::env::temp_dir().join(format!("vk-localreg-holes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let rg = local_registry(&root);
+        let dir = root.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // dense 16 MiB base, pushed as the parent.
+        let base = dir.join("base.ext4");
+        std::fs::write(&base, pseudo_random(16 << 20, 0x51de)).unwrap();
+        push_ext4(&rg, "hc", "parent", &base, "generic-disk").unwrap();
+        let (parent_layers, total) = fetch_chunks(&rg, "hc", "parent").unwrap().unwrap();
+
+        // an untouched overlay (reads base's bytes through its backing) with no dirty writes,
+        // but one 64 KiB cluster freed at 4 MiB. That cluster lands inside a content-defined
+        // parent chunk that also holds live bytes, so the chunk must be regenerated (not
+        // dropped) with only the freed cluster zeroed — the whole rest of the image is unchanged.
+        let overlay = dir.join("ovl.qcow2");
+        crate::qcow2::create_overlay(&overlay, &base).unwrap();
+        let hole = (4u64 << 20, 64u64 << 10);
+        push_ext4_diff(
+            &rg,
+            "hc",
+            "child",
+            &overlay,
+            "generic-disk",
+            total,
+            &[],     // nothing written
+            &[hole], // freed since the parent
+            &parent_layers,
+        )
+        .unwrap();
+
+        let dest = dir.join("child.ext4");
+        try_pull_ext4(&rg, "hc", "child", &dest).unwrap().unwrap();
+        let child = std::fs::read(&dest).unwrap();
+        let mut expected = std::fs::read(&base).unwrap();
+        let (hs, hl) = (hole.0 as usize, hole.1 as usize);
+        // The base was non-zero there, so zeroing the hole genuinely changes it...
+        assert!(expected[hs..hs + hl].iter().any(|&b| b != 0));
+        expected[hs..hs + hl].fill(0);
+        // ...and the child equals the base with exactly the freed cluster zeroed: a straddling
+        // chunk kept its live bytes (dropping it would have zeroed data around the hole too).
+        assert_eq!(
+            child, expected,
+            "a hole must clear only the freed cluster, leaving every live byte intact"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1967,7 +2061,8 @@ mod tests {
             "generic-disk",
             total,
             &[(0, 64 << 10)], // must not limit the no-parent fallback
-            &[],
+            &[],              // no holes
+            &[],              // no parent
         )
         .unwrap();
         assert_eq!(size, total);
@@ -2097,6 +2192,7 @@ mod tests {
                         "generic-disk",
                         total,
                         &[], // untouched overlay: no dirty chunks, reuse the whole parent
+                        &[], // no holes
                         &parent,
                     )
                     .unwrap();

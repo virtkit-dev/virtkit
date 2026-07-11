@@ -8,7 +8,7 @@
 use std::cmp;
 use std::convert::From;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::linux::fs::MetadataExt;
@@ -125,6 +125,195 @@ impl Drop for DiskMmap {
     }
 }
 
+/// Cluster granularity (bytes) at which guest writes are recorded for the dirty tracker.
+/// Matches the qcow2 cluster size the host-side reader/pusher works in, so a drained range
+/// aligns to whole clusters.
+const DIRTY_CLUSTER: u64 = 64 * 1024;
+
+/// Guest-logical clusters mutated since the last drain, split so the virtkit build backend can
+/// capture only a checkpoint's delta instead of the whole cumulative overlay. `written` holds
+/// clusters any write touched (to read and push as data); `discarded` holds clusters any discard
+/// or write-zeroes touched. A write wins over a discard at the 64 KiB cluster granularity: a
+/// cluster present in both was only partly freed, so it must be read whole (the overlay reflects
+/// the true content, zeroed sub-parts included) rather than holed — [`Self::take`] subtracts the
+/// written set out of the discarded one. A host-side control connection (see
+/// [`Block::spawn_dirty_control`]) drains both at each checkpoint.
+#[derive(Default)]
+pub(crate) struct DirtyRanges {
+    written: std::collections::BTreeSet<u64>,
+    discarded: std::collections::BTreeSet<u64>,
+}
+
+impl DirtyRanges {
+    /// Record that `[offset, offset+len)` was written, at cluster granularity.
+    fn record_write(&mut self, offset: u64, len: u64) {
+        for c in cluster_range(offset, len) {
+            self.written.insert(c);
+        }
+    }
+
+    /// Record that `[offset, offset+len)` was freed or zeroed (discard / write-zeroes). Only
+    /// whole clusters *fully* inside the range become holes — a partial cluster at either end
+    /// may still hold live data (an ext4 block freed next to live ones in the same 64 KiB
+    /// cluster), so rounding a hole outward would zero that data. Writes round outward instead
+    /// (see [`cluster_range`]): touching any part of a cluster keeps it read whole.
+    fn record_discard(&mut self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let first = offset.div_ceil(DIRTY_CLUSTER); // first cluster fully at/after offset
+        let end_cluster = (offset + len) / DIRTY_CLUSTER; // one past the last fully-covered one
+        for c in first..end_cluster {
+            self.discarded.insert(c);
+        }
+    }
+
+    /// Take the written clusters and the purely-discarded ones (discarded minus written) as
+    /// coalesced byte ranges (clamped to `size`), clearing both sets.
+    fn take(&mut self, size: u64) -> (Vec<(u64, u64)>, Vec<(u64, u64)>) {
+        let written = std::mem::take(&mut self.written);
+        let discarded = &std::mem::take(&mut self.discarded) - &written;
+        (
+            clusters_to_ranges(written, size),
+            clusters_to_ranges(discarded, size),
+        )
+    }
+}
+
+/// The whole clusters `[offset, offset+len)` spans (empty for a zero-length request).
+fn cluster_range(offset: u64, len: u64) -> std::ops::RangeInclusive<u64> {
+    if len == 0 {
+        return 1..=0; // empty
+    }
+    (offset / DIRTY_CLUSTER)..=((offset + len - 1) / DIRTY_CLUSTER)
+}
+
+/// Coalesce a cluster set into byte ranges clamped to `size`; adjacent clusters merge so the
+/// caller reads/pushes contiguously.
+fn clusters_to_ranges(clusters: std::collections::BTreeSet<u64>, size: u64) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for c in clusters {
+        let off = c * DIRTY_CLUSTER;
+        if off >= size {
+            continue;
+        }
+        let len = DIRTY_CLUSTER.min(size - off);
+        match out.last_mut() {
+            Some(last) if last.0 + last.1 == off => last.1 += len,
+            _ => out.push((off, len)),
+        }
+    }
+    out
+}
+
+/// Encode a drain reply on the dirty-control wire: `u32 count` then `count × (u64 offset,
+/// u64 len)`, all little-endian. The host side (virtkit's `VmSession::drain_dirty`) decodes
+/// this exact layout; keep the two in lockstep — `encode_decode_round_trips` pins the format.
+fn encode_dirty_reply(ranges: &[(u64, u64)]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + ranges.len() * 16);
+    buf.extend_from_slice(&(ranges.len() as u32).to_le_bytes());
+    for (off, len) in ranges {
+        buf.extend_from_slice(&off.to_le_bytes());
+        buf.extend_from_slice(&len.to_le_bytes());
+    }
+    buf
+}
+
+#[cfg(test)]
+mod dirty_tests {
+    use super::{encode_dirty_reply, DirtyRanges, DIRTY_CLUSTER};
+
+    #[test]
+    fn coalesces_adjacent_and_gaps() {
+        let mut d = DirtyRanges::default();
+        d.record_write(0, 100); // cluster 0 (sub-cluster write rounds up)
+        d.record_write(DIRTY_CLUSTER, 10); // cluster 1 — adjacent to 0, coalesces
+        d.record_write(3 * DIRTY_CLUSTER, 1); // cluster 3 — gap, separate range
+        let big = 100 * DIRTY_CLUSTER;
+        let (written, discarded) = d.take(big);
+        assert_eq!(
+            written,
+            vec![(0, 2 * DIRTY_CLUSTER), (3 * DIRTY_CLUSTER, DIRTY_CLUSTER)]
+        );
+        assert!(discarded.is_empty());
+        // take drains: a second drain sees nothing new.
+        assert_eq!(d.take(big), (vec![], vec![]));
+    }
+
+    #[test]
+    fn rewriting_a_cluster_stays_one_range() {
+        // An in-place rewrite of an already-dirtied cluster must still appear exactly once —
+        // this is the property that makes the tracker correct where allocation-diff was not.
+        let mut d = DirtyRanges::default();
+        d.record_write(1000, 8);
+        d.record_write(2000, 8); // same cluster 0, different bytes
+        assert_eq!(d.take(10 * DIRTY_CLUSTER).0, vec![(0, DIRTY_CLUSTER)]);
+    }
+
+    #[test]
+    fn a_written_cluster_is_never_holed() {
+        // A write wins over a discard on the same cluster, either order: the cluster was only
+        // partly freed and must be read whole, not holed. Only purely-discarded clusters hole.
+        let mut d = DirtyRanges::default();
+        d.record_write(0, 8); // cluster 0 written...
+        d.record_discard(0, DIRTY_CLUSTER); // ...then a full-cluster discard — stays written
+        d.record_discard(DIRTY_CLUSTER, DIRTY_CLUSTER); // cluster 1 discarded...
+        d.record_write(DIRTY_CLUSTER, 8); // ...then written — stays written
+        d.record_discard(2 * DIRTY_CLUSTER, DIRTY_CLUSTER); // cluster 2 purely discarded
+        let (written, discarded) = d.take(10 * DIRTY_CLUSTER);
+        assert_eq!(written, vec![(0, 2 * DIRTY_CLUSTER)]);
+        assert_eq!(discarded, vec![(2 * DIRTY_CLUSTER, DIRTY_CLUSTER)]);
+    }
+
+    #[test]
+    fn a_partial_cluster_discard_is_not_a_hole() {
+        // A discard that frees only part of a cluster (an ext4 block freed next to live ones)
+        // must not hole the whole cluster. Only the fully-covered middle cluster is a hole.
+        let mut d = DirtyRanges::default();
+        // Free [half of cluster 0 .. half of cluster 3): clusters 1 and 2 are fully inside.
+        d.record_discard(DIRTY_CLUSTER / 2, 3 * DIRTY_CLUSTER);
+        let (written, discarded) = d.take(10 * DIRTY_CLUSTER);
+        assert!(written.is_empty());
+        assert_eq!(discarded, vec![(DIRTY_CLUSTER, 2 * DIRTY_CLUSTER)]);
+    }
+
+    #[test]
+    fn clamps_tail_to_image_size() {
+        let mut d = DirtyRanges::default();
+        d.record_write(0, 1);
+        let size = DIRTY_CLUSTER / 2;
+        assert_eq!(d.take(size).0, vec![(0, size)]);
+        // A cluster wholly past the image size is dropped.
+        let mut d = DirtyRanges::default();
+        d.record_discard(5 * DIRTY_CLUSTER, 1);
+        assert_eq!(d.take(DIRTY_CLUSTER), (vec![], vec![]));
+    }
+
+    #[test]
+    fn encode_decode_round_trips() {
+        // Decode exactly the way virtkit's `VmSession::drain_dirty` does. If either side's
+        // byte layout drifts, this fails — the guard the two crates otherwise lack.
+        let ranges = vec![
+            (0u64, DIRTY_CLUSTER),
+            (7 * DIRTY_CLUSTER, 2 * DIRTY_CLUSTER),
+        ];
+        let buf = encode_dirty_reply(&ranges);
+
+        let count = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+        assert_eq!(count, ranges.len());
+        let mut decoded = Vec::with_capacity(count);
+        for c in buf[4..].chunks_exact(16) {
+            let off = u64::from_le_bytes(c[..8].try_into().unwrap());
+            let len = u64::from_le_bytes(c[8..16].try_into().unwrap());
+            decoded.push((off, len));
+        }
+        assert_eq!(decoded, ranges);
+
+        // An empty delta encodes to just the count header.
+        assert_eq!(encode_dirty_reply(&[]), 0u32.to_le_bytes());
+    }
+}
+
 /// Helper object for setting up all `Block` fields derived from its backing file.
 pub(crate) struct DiskProperties {
     cache_type: CacheType,
@@ -133,6 +322,9 @@ pub(crate) struct DiskProperties {
     pub(crate) mmap: Option<Arc<DiskMmap>>,
     nsectors: u64,
     image_id: Vec<u8>,
+    /// Clusters written since the last drain; shared with the dirty-control listener. Only
+    /// populated for a writable disk that opted into tracking (`spawn_dirty_control`).
+    dirty: Arc<Mutex<DirtyRanges>>,
 }
 
 impl DiskProperties {
@@ -141,6 +333,7 @@ impl DiskProperties {
         disk_image_id: Vec<u8>,
         cache_type: CacheType,
         mmap: Option<Arc<DiskMmap>>,
+        dirty: Arc<Mutex<DirtyRanges>>,
     ) -> io::Result<Self> {
         let disk_size = disk_image.lock().unwrap().size();
 
@@ -159,11 +352,25 @@ impl DiskProperties {
             image_id: disk_image_id,
             file: disk_image,
             mmap,
+            dirty,
         })
     }
 
     pub fn nsectors(&self) -> u64 {
         self.nsectors
+    }
+
+    /// Record a guest write for the dirty tracker (no-op unless tracking was enabled).
+    /// Called by the block worker after each data-writing request.
+    pub(crate) fn record_write(&self, offset: u64, len: u64) {
+        self.dirty.lock().unwrap().record_write(offset, len);
+    }
+
+    /// Record a guest discard / write-zeroes for the dirty tracker (no-op unless tracking was
+    /// enabled). Called by the block worker after each request that frees or zeroes clusters,
+    /// so the checkpoint represents them as holes rather than reading or reusing stale data.
+    pub(crate) fn record_discard(&self, offset: u64, len: u64) {
+        self.dirty.lock().unwrap().record_discard(offset, len);
     }
 
     pub fn image_id(&self) -> &[u8] {
@@ -274,6 +481,9 @@ pub struct Block {
     mmap: Option<Arc<DiskMmap>>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
+    /// Dirty-cluster tracker, shared with the block worker and (if tracking was enabled) the
+    /// host-side control listener. Empty and unused unless a control socket was configured.
+    dirty: Arc<Mutex<DirtyRanges>>,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
@@ -302,6 +512,7 @@ impl Block {
         is_disk_read_only: bool,
         direct_io: bool,
         sync_mode: SyncMode,
+        dirty_control_socket: Option<String>,
     ) -> io::Result<Block> {
         let disk_image = OpenOptions::new()
             .read(true)
@@ -363,12 +574,22 @@ impl Block {
 
         let disk_image = Arc::new(Mutex::new(disk_image));
 
+        let dirty = Arc::new(Mutex::new(DirtyRanges::default()));
+
         let disk_properties = DiskProperties::new(
             disk_image.clone(),
             disk_image_id.clone(),
             cache_type,
             mmap.clone(),
+            dirty.clone(),
         )?;
+
+        // Host-side dirty-drain control (virtkit build backend): serve a DRAIN protocol on the
+        // configured socket so a checkpoint captures only the delta. Spawned once here — the
+        // worker (re)constructs its own `DiskProperties` from the shared `dirty` Arc on activate.
+        if let Some(socket) = dirty_control_socket {
+            Self::spawn_dirty_control(socket, disk_image.clone(), dirty.clone());
+        }
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)
@@ -412,7 +633,75 @@ impl Block {
             device_state: DeviceState::Inactive,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
+            dirty,
         })
+    }
+
+    /// Spawn the host-side dirty-drain control listener on `socket_path`. On each connection it
+    /// reads a one-byte command:
+    /// - `b'D'` (DRAIN) flushes the disk image to its backing file and replies with the clusters
+    ///   mutated since the previous drain as two back-to-back blocks — written clusters, then
+    ///   discarded ones — each encoded as `u32 count` then `count × (u64 offset, u64 len)`
+    ///   little-endian. The caller freezes the guest fs first, so the flush + take is a
+    ///   consistent point-in-time delta.
+    ///
+    /// Errors are logged and the listener keeps serving; a dead socket just means no checkpoints
+    /// (the build falls back correctly on the virtkit side).
+    fn spawn_dirty_control(
+        socket_path: String,
+        disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+        dirty: Arc<Mutex<DirtyRanges>>,
+    ) {
+        use std::os::unix::net::UnixListener;
+
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(l) => l,
+            Err(e) => {
+                error!("virtio-blk: dirty-control bind {socket_path} failed: {e}");
+                return;
+            }
+        };
+        std::thread::Builder::new()
+            .name("blk dirty-control".into())
+            .spawn(move || {
+                for conn in listener.incoming() {
+                    let mut conn = match conn {
+                        Ok(c) => c,
+                        Err(e) => {
+                            error!("virtio-blk: dirty-control accept failed: {e}");
+                            continue;
+                        }
+                    };
+                    let mut cmd = [0u8; 1];
+                    if conn.read_exact(&mut cmd).is_err() {
+                        continue;
+                    }
+                    match cmd[0] {
+                        // DRAIN: persist all writes to the backing file, then take the delta. The
+                        // guest is frozen by the caller, so nothing races these two steps.
+                        b'D' => {
+                            let (written, discarded) = {
+                                let df = disk_image.lock().unwrap();
+                                let size = df.size();
+                                if let Err(e) = df.flush().and_then(|()| df.sync()) {
+                                    error!("virtio-blk: dirty-control flush failed: {e}");
+                                    continue;
+                                }
+                                dirty.lock().unwrap().take(size)
+                            };
+                            // Two range blocks back to back: written first, then discarded.
+                            let mut buf = encode_dirty_reply(&written);
+                            buf.extend_from_slice(&encode_dirty_reply(&discarded));
+                            if let Err(e) = conn.write_all(&buf) {
+                                error!("virtio-blk: dirty-control reply failed: {e}");
+                            }
+                        }
+                        _ => continue,
+                    }
+                }
+            })
+            .expect("spawn blk dirty-control thread");
     }
 
     /// Provides the ID of this block device.
@@ -500,6 +789,7 @@ impl VirtioDevice for Block {
                 self.disk_image_id.clone(),
                 self.cache_type,
                 self.mmap.clone(),
+                Arc::clone(&self.dirty),
             )
             .map_err(|_| ActivateError::BadActivate)?,
         };
@@ -554,6 +844,7 @@ mod tests {
             vec![0u8; VIRTIO_BLK_ID_BYTES as usize],
             CacheType::Unsafe,
             Some(Arc::new(DiskMmap::open(&p).unwrap())),
+            Arc::new(Mutex::new(DirtyRanges::default())),
         )
         .unwrap()
     }

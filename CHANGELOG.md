@@ -17,6 +17,13 @@ All notable changes to virtkit will be documented in this file.
   summed busy time so a parallel build reads differently from one bottlenecked on a
   single stage.
 
+### Fixed
+
+- `vk build` on the libkrun backend no longer re-chunks the whole stage image at every
+  instruction, which made a long stage's cache checkpoints slow down quadratically. Each
+  checkpoint again pushes only the instruction's delta, as the cloud-hypervisor backend
+  already did.
+
 ## [0.10.0] - 2026-07-10
 
 ### Added
