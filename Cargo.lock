@@ -4463,7 +4463,7 @@ checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 
 [[package]]
 name = "vk-agent"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4481,7 +4481,7 @@ dependencies = [
 
 [[package]]
 name = "vk-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -4500,7 +4500,7 @@ dependencies = [
 
 [[package]]
 name = "vk-driver"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "bytes",
