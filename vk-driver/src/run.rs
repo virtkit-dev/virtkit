@@ -934,6 +934,11 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         }
     };
 
+    // Pre-declared so every post-VMM error site can route through teardown_run,
+    // which needs these even when the ssh / host-exec steps have not run.
+    let mut ssh_forward: Option<Child> = None;
+    let mut host_exec_serve: Option<Child> = None;
+
     // The ProxyCommand splices ssh's stdio onto the guest's vsock ssh port, so
     // the hostname after `user@` is only a known_hosts label. The host key is
     // ephemeral (fresh per boot, reached over a private channel), hence the
@@ -942,7 +947,20 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         // vsock-auto: the ProxyCommand picks the best path itself — the per-port
         // listener when the backend has one, else the CONNECT handshake.
         let target = format!("vsock-auto://{}:{SSH_VSOCK_PORT}", vsock.display());
-        let exe = std::env::current_exe().context("locating the virtkit binary")?;
+        let exe = match std::env::current_exe().context("locating the virtkit binary") {
+            Ok(exe) => exe,
+            Err(e) => {
+                teardown_run(
+                    &mut ch,
+                    &manager,
+                    &mut virtiofsds,
+                    &mut switch,
+                    &mut ssh_forward,
+                    &mut host_exec_serve,
+                );
+                return Err(e);
+            }
+        };
         println!(
             "virtkit: ssh: ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
              -o ProxyCommand=\"'{}' connect --to '{target}'\" {}@vk-run",
@@ -954,29 +972,49 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     // Host side of the SSH-agent forward: the guest dials vsock port SSH_AGENT_VSOCK_PORT,
     // surfaced by cloud-hypervisor as <vsock.sock>_<port>. With --ssh-host a filtering proxy
     // exposes only the chosen keys; a bare --ssh-agent splices the whole agent through.
-    let mut ssh_forward = match &ssh {
+    let ssh_forward_result = match &ssh {
         Some(s) if s.allow_pub.is_empty() && s.guest_config.is_none() => {
-            Some(spawn_ssh_agent_forward(&vsock, &s.upstream, work)?)
+            spawn_ssh_agent_forward(&vsock, &s.upstream, work).map(Some)
         }
-        Some(s) => Some(spawn_ssh_agent_proxy(
-            &vsock,
-            &s.upstream,
-            &s.allow_pub,
-            work,
-        )?),
-        None => None,
+        Some(s) => spawn_ssh_agent_proxy(&vsock, &s.upstream, &s.allow_pub, work).map(Some),
+        None => Ok(None),
     };
+    match ssh_forward_result {
+        Ok(fwd) => ssh_forward = fwd,
+        Err(e) => {
+            teardown_run(
+                &mut ch,
+                &manager,
+                &mut virtiofsds,
+                &mut switch,
+                &mut ssh_forward,
+                &mut host_exec_serve,
+            );
+            return Err(e);
+        }
+    }
     let ssh_config = ssh.and_then(|s| s.guest_config);
 
     // Host side of the host-exec channel: a `vk-agent serve` on the bridged
     // per-port socket the guest's /run/vk/host.sock forwarder dials. cwd is the
     // --workdir (else our own), so a relative `exec --dir` resolves against the
     // shared tree; the wrapper (if any) enforces what may run.
-    let mut host_exec_serve = if args.host_exec {
-        Some(spawn_host_exec_serve(&vsock, agent, args, work)?)
-    } else {
-        None
-    };
+    if args.host_exec {
+        match spawn_host_exec_serve(&vsock, agent, args, work) {
+            Ok(fwd) => host_exec_serve = Some(fwd),
+            Err(e) => {
+                teardown_run(
+                    &mut ch,
+                    &manager,
+                    &mut virtiofsds,
+                    &mut switch,
+                    &mut ssh_forward,
+                    &mut host_exec_serve,
+                );
+                return Err(e);
+            }
+        }
+    }
 
     // With a --primary primary and no trailing command, the service's own
     // entrypoint+cmd runs — `docker compose run <svc>` semantics.
@@ -992,21 +1030,43 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         &timings,
     )
     .await;
+    teardown_run(
+        &mut ch,
+        &manager,
+        &mut virtiofsds,
+        &mut switch,
+        &mut ssh_forward,
+        &mut host_exec_serve,
+    );
+    timings.render();
+    result
+}
+
+/// Tear down every host-side child a run spawned — the VMM, the service manager, the
+/// --net switch and virtiofsds, and the ssh-agent / host-exec forwards.
+/// Used on both a clean exit and any error after the VMM is live, so a failed run leaks no
+/// children (a leaked `vk virtiofsd` would hold this binary's file busy for the next build).
+fn teardown_run(
+    ch: &mut Child,
+    manager: &Option<std::sync::Arc<crate::manager::Manager>>,
+    virtiofsds: &mut Vec<Child>,
+    switch: &mut Option<Child>,
+    ssh_forward: &mut Option<Child>,
+    host_exec_serve: &mut Option<Child>,
+) {
     for mut f in ssh_forward.take().into_iter().chain(host_exec_serve.take()) {
         let _ = f.kill();
         let _ = f.wait();
     }
     let _ = ch.kill();
     let _ = ch.wait();
-    if let Some(mgr) = &manager {
+    if let Some(mgr) = manager {
         mgr.stop_all();
     }
     for mut child in virtiofsds.drain(..).chain(switch.take()) {
         let _ = child.kill();
         let _ = child.wait();
     }
-    timings.render();
-    result
 }
 
 /// Every declared compose unit, materialized and addressed, plus which ones
