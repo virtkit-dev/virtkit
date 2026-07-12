@@ -272,6 +272,36 @@ pub fn umount(target: &Path) -> Result<()> {
 /// *contents* are copied into `dst`; a file source goes to `dst` (or `dst/<name>` when
 /// `dst` is a directory — trailing `/`, multiple sources, or an existing dir). Mode and
 /// owner are preserved from the source unless overridden by `chmod`/`chown`.
+/// Create `dir` and any missing parent levels the way BuildKit materializes a COPY
+/// target: every level this call creates is owned by `chown` (else root — the agent runs
+/// as root) at mode `chmod`, else 0755. A level that already exists is left untouched, so
+/// a target or parent an earlier stage set up is preserved — deliberately unlike Docker's
+/// `--link`, which re-materializes and resets pre-existing directories.
+fn ensure_copy_dir(dir: &Path, chown: Option<(u32, u32)>, chmod: Option<u32>) -> Result<()> {
+    // Walk upward recording the levels that do not exist yet; stop at the first that does
+    // (it and everything above it stay as-is).
+    let mut missing = Vec::new();
+    let mut cur = Some(dir);
+    while let Some(p) = cur {
+        if p.symlink_metadata().is_ok() {
+            break;
+        }
+        missing.push(p);
+        cur = p.parent();
+    }
+    let mode = chmod.unwrap_or(0o755);
+    // Create top-down, stamping each level this call brings into being.
+    for p in missing.iter().rev() {
+        fs::create_dir(p).with_context(|| format!("creating {}", p.display()))?;
+        if let Some((uid, gid)) = chown {
+            lchown(p, uid, gid)?;
+        }
+        fs::set_permissions(p, fs::Permissions::from_mode(mode))
+            .with_context(|| format!("chmod {}", p.display()))?;
+    }
+    Ok(())
+}
+
 pub fn copy_spec(
     srcs: &[String],
     dst: &str,
@@ -290,19 +320,22 @@ pub fn copy_spec(
             if ex && !ignore.is_some_and(|ig| ig.could_reinclude_under(src)) {
                 continue; // excluded dir with no possible re-include: prune
             }
-            fs::create_dir_all(dst_path)
-                .with_context(|| format!("creating {}", dst_path.display()))?;
+            // The COPY *target* directory is not copied content, so it is never stamped
+            // with the source dir's own owner/mode (that is what copy_tree does to the
+            // contents). ensure_copy_dir applies the target rules: a pre-existing target
+            // is left untouched, a created one (and any created parents) gets --chown
+            // else root at --chmod else 0755.
+            ensure_copy_dir(dst_path, chown, chmod)?;
             copy_tree(src, dst_path, chown, chmod, ignore, ex)?;
         } else if ex {
             continue;
         } else {
             let target = if into_dir {
-                fs::create_dir_all(dst_path)
-                    .with_context(|| format!("creating {}", dst_path.display()))?;
+                ensure_copy_dir(dst_path, chown, chmod)?;
                 dst_path.join(src.file_name().context("source has no file name")?)
             } else {
                 if let Some(p) = dst_path.parent() {
-                    fs::create_dir_all(p).with_context(|| format!("creating {}", p.display()))?;
+                    ensure_copy_dir(p, chown, chmod)?;
                 }
                 dst_path.to_path_buf()
             };
@@ -315,6 +348,11 @@ pub fn copy_spec(
 /// Copy the contents of `src_dir` into `dst_dir` (already created), recursively,
 /// applying `.dockerignore`. `parent_excluded` is whether `src_dir` itself is excluded;
 /// each entry inherits it and patterns matching the entry override it (last wins).
+///
+/// `dst_dir`'s own owner/mode is the caller's concern, not this function's. A *nested*
+/// directory is copied content, so it is stamped with the source's metadata here as it
+/// is created — overwriting a pre-existing nested dir, as Docker does. The top-level
+/// COPY target is handled by `copy_spec`, which (like Docker) never restamps it.
 fn copy_tree(
     src_dir: &Path,
     dst_dir: &Path,
@@ -323,8 +361,6 @@ fn copy_tree(
     ignore: Option<&Ignore>,
     parent_excluded: bool,
 ) -> Result<()> {
-    let dir_meta = fs::symlink_metadata(src_dir)?;
-    apply_meta(dst_dir, &dir_meta, chown, chmod)?;
     for entry in fs::read_dir(src_dir).with_context(|| format!("reading {}", src_dir.display()))? {
         let entry = entry?;
         let from = entry.path();
@@ -338,6 +374,7 @@ fn copy_tree(
                 continue;
             }
             fs::create_dir_all(&to)?;
+            apply_meta(&to, &m, chown, chmod)?;
             copy_tree(&from, &to, chown, chmod, ignore, ex)?;
         } else if !ex {
             copy_entry(&from, &to, &m, chown, chmod)?;
@@ -624,6 +661,204 @@ mod tests {
             "**/*_test.go not excluded"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn copy_spec_target_dir_mode_matches_docker() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |p: &std::path::Path| fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let base = std::env::temp_dir().join(format!("dm-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("file"), "f").unwrap();
+        // Non-default source modes, so "preserved source mode" is distinguishable from
+        // the 0755 default and from an untouched pre-existing target.
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(src.join("sub"), fs::Permissions::from_mode(0o750)).unwrap();
+        let cp = |dst: &std::path::Path| {
+            copy_spec(
+                &[src.to_string_lossy().into_owned()],
+                &dst.to_string_lossy(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        };
+
+        // Pre-existing target: its own mode is left untouched (Docker never restamps it),
+        // while a pre-existing nested dir IS overwritten with the source's mode.
+        let existing = base.join("existing");
+        fs::create_dir_all(existing.join("sub")).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o751)).unwrap();
+        fs::set_permissions(existing.join("sub"), fs::Permissions::from_mode(0o711)).unwrap();
+        cp(&existing);
+        assert_eq!(mode(&existing), 0o751, "pre-existing target mode preserved");
+        assert_eq!(
+            mode(&existing.join("sub")),
+            0o750,
+            "nested dir stamped from source"
+        );
+
+        // Created target: 0755 default, NOT the source dir's 0700.
+        let created = base.join("created");
+        cp(&created);
+        assert_eq!(
+            mode(&created),
+            0o755,
+            "created target is 0755, not the source mode"
+        );
+        assert_eq!(
+            mode(&created.join("sub")),
+            0o750,
+            "nested dir stamped from source"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn copy_spec_created_target_levels_are_stamped_deterministically() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |p: &std::path::Path| fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let base = std::env::temp_dir().join(format!("dm-parents-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("file"), "f").unwrap();
+
+        // A deep, entirely-missing target with --chmod: every level this COPY creates —
+        // leaf AND intermediate parents — gets 0o700 (matching BuildKit), not the umask
+        // default. This is the fix for the parents that create_dir_all left umask-moded.
+        let deep = base.join("d1/d2/d3");
+        copy_spec(
+            &[src.to_string_lossy().into_owned()],
+            &format!("{}/", deep.to_string_lossy()),
+            None,
+            Some(0o700),
+            None,
+        )
+        .unwrap();
+        for lvl in [base.join("d1"), base.join("d1/d2"), deep.clone()] {
+            assert_eq!(
+                mode(&lvl),
+                0o700,
+                "created level {} gets --chmod",
+                lvl.display()
+            );
+        }
+
+        // A single file copied into a missing directory: the container dir is created at
+        // the default 0o755 (BuildKit stamps it too, rather than leaving it unset).
+        let fdir = base.join("fdir");
+        copy_spec(
+            &[src.join("file").to_string_lossy().into_owned()],
+            &format!("{}/", fdir.to_string_lossy()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            mode(&fdir),
+            0o755,
+            "file-copy container dir created at 0755"
+        );
+        assert!(fdir.join("file").exists());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn copy_spec_created_levels_get_chown() {
+        use std::fs;
+        use std::os::unix::fs::MetadataExt;
+        let owner = |p: &std::path::Path| {
+            let m = fs::symlink_metadata(p).unwrap();
+            (m.uid(), m.gid())
+        };
+
+        let base = std::env::temp_dir().join(format!("dm-chown-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("file"), "f").unwrap();
+
+        // Under root the test can chown created levels to an arbitrary id and observe the
+        // change; without CAP_CHOWN it can only chown to its own id (still exercises the
+        // stamping path and proves every created level carries the requested owner).
+        // SAFETY: geteuid/getegid are always safe.
+        let (want_uid, want_gid) = if unsafe { libc::geteuid() } == 0 {
+            (1u32, 1u32)
+        } else {
+            (unsafe { libc::geteuid() }, unsafe { libc::getegid() })
+        };
+
+        let deep = base.join("d1/d2/d3");
+        copy_spec(
+            &[src.to_string_lossy().into_owned()],
+            &format!("{}/", deep.to_string_lossy()),
+            Some((want_uid, want_gid)),
+            None,
+            None,
+        )
+        .unwrap();
+        for lvl in [base.join("d1"), base.join("d1/d2"), deep.clone()] {
+            assert_eq!(
+                owner(&lvl),
+                (want_uid, want_gid),
+                "created level {} gets --chown",
+                lvl.display()
+            );
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn copy_spec_preexisting_intermediate_parent_untouched() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |p: &std::path::Path| fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let base = std::env::temp_dir().join(format!("dm-parent-keep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("file"), "f").unwrap();
+
+        // A pre-existing *intermediate* parent (not the leaf) with a distinctive mode: the
+        // COPY creates the missing leaf below it but must leave the parent's mode alone,
+        // since the walk stops at the first existing level.
+        let keep = base.join("keep");
+        fs::create_dir(&keep).unwrap();
+        fs::set_permissions(&keep, fs::Permissions::from_mode(0o701)).unwrap();
+
+        let leaf = keep.join("leaf");
+        copy_spec(
+            &[src.to_string_lossy().into_owned()],
+            &format!("{}/", leaf.to_string_lossy()),
+            None,
+            Some(0o700),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            mode(&keep),
+            0o701,
+            "pre-existing intermediate parent untouched"
+        );
+        assert_eq!(mode(&leaf), 0o700, "created leaf gets --chmod");
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
