@@ -76,15 +76,16 @@ RUN export ARCH=x86_64 \
                   CONFIG_VIRTIO_NET CONFIG_VIRTIO_PCI CONFIG_VIRTIO_VSOCKETS \
                   CONFIG_VIRTIO_FS CONFIG_FUSE_FS CONFIG_IP_PNP CONFIG_OVERLAY_FS \
                   CONFIG_BLK_DEV_INITRD CONFIG_DEVTMPFS_MOUNT \
-                  CONFIG_KVM CONFIG_KVM_INTEL CONFIG_KVM_AMD CONFIG_DUMMY; do \
+                  CONFIG_KVM CONFIG_KVM_INTEL CONFIG_KVM_AMD CONFIG_DUMMY \
+                  CONFIG_IPV6 CONFIG_WIREGUARD; do \
            grep -q "^${opt}=y" .config || { echo "missing ${opt}=y in .config"; exit 1; }; \
        done \
     && for opt in CONFIG_MLX5_CORE CONFIG_VFIO CONFIG_X86_SGX CONFIG_VIRTIO_PMEM \
                   CONFIG_CIFS CONFIG_NET_9P CONFIG_XFS_FS CONFIG_CRYPTO_FIPS \
                   CONFIG_SCSI CONFIG_DEBUG_FS CONFIG_IP_VS CONFIG_IP_SET \
                   CONFIG_NETFILTER_XT_MATCH_RECENT CONFIG_CPU_FREQ \
-                  CONFIG_NUMA CONFIG_VIRTIO_MEM CONFIG_XFRM CONFIG_WIREGUARD \
-                  CONFIG_VXLAN CONFIG_NET_UDP_TUNNEL; do \
+                  CONFIG_NUMA CONFIG_VIRTIO_MEM CONFIG_XFRM \
+                  CONFIG_VXLAN; do \
            grep -q "^${opt}=y" .config && { echo "removed option ${opt} resurrected by olddefconfig"; exit 1; } || true; \
        done \
     && make ARCH=x86_64 -j"$(nproc)" vmlinux \

@@ -25,6 +25,8 @@ All notable changes to virtkit will be documented in this file.
   Build phases are broken down per stage, and the header reports both wall-clock and
   summed busy time so a parallel build reads differently from one bottlenecked on a
   single stage.
+- Guests can now bring up WireGuard tunnels in-guest — the pinned kernel every guest
+  boots ships with `CONFIG_WIREGUARD` enabled.
 
 ### Fixed
 
