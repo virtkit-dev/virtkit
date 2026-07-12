@@ -20,6 +20,13 @@
 #
 # --vmm=libkrun|cloud-hypervisor: VMM for the dogfood/bootstrap microVM (default:
 # vk's built-in libkrun; cloud-hypervisor needs the external binary).
+#
+# --fast (alias --debug): build the debug cargo profile instead of release — a much
+# faster compile for iteration, still static-musl and still embedding the kernel/agent,
+# but unoptimized + unstripped and NOT reproducible, so not a release artifact (cannot
+# combine with --bootstrap-check). Also links with mold and trims debuginfo to line
+# tables to cut the edit-rebuild loop further; both are --fast-only and never touch the
+# release build.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -36,16 +43,29 @@ since()   { echo "build.sh: $1 in $(fmt_dur $(($SECONDS - $2)))" >&2; }
 USE_VIRTKIT=""
 BOOTSTRAP_CHECK=""
 FORCE_DOCKER=""
+FAST=""              # --fast/--debug: build the debug profile (much faster to compile,
+                     # unoptimized + unstripped) for iteration — NOT a release artifact
 VMM=libkrun          # dogfood VMM backend: libkrun (default) or cloud-hypervisor
 for arg in "$@"; do
   case "$arg" in
     --use-virtkit=*) USE_VIRTKIT="${arg#*=}" ;;
     --bootstrap-check) BOOTSTRAP_CHECK=1 ;;
     --docker) FORCE_DOCKER=1 ;;
+    --fast|--debug) FAST=1 ;;
     --vmm=libkrun|--vmm=cloud-hypervisor) VMM="${arg#*=}" ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
+# The debug profile is unoptimized and unstripped, so its bytes are neither the release
+# artifact nor reproducible — it cannot back the reproducibility check.
+if [ -n "$FAST" ] && [ -n "$BOOTSTRAP_CHECK" ]; then
+  echo "--fast builds the debug profile; it cannot be combined with --bootstrap-check" >&2
+  exit 2
+fi
+# Cargo profile flag + its target/ subdir, threaded through the embed env, build command,
+# and artifact copy below so --fast changes all three consistently.
+CARGO_PROFILE_FLAG="--release"; PROFILE_DIR=release
+[ -n "$FAST" ] && { CARGO_PROFILE_FLAG=""; PROFILE_DIR=debug; }
 if [ -n "$USE_VIRTKIT" ] && [ -n "$BOOTSTRAP_CHECK" ]; then
   echo "--bootstrap-check runs the Docker build first; it cannot be combined with --use-virtkit" >&2
   exit 2
@@ -94,27 +114,39 @@ fi
 # produce identical bytes. The repo is always mounted at /work, so these /work-relative
 # values hold for both backends. Stripping is done by the release profile, not the host
 # strip.
+RUSTFLAGS_VAL="--remap-path-prefix=/work=/src --remap-path-prefix=/work/target/.cargo-home=/cargo"
+# --fast: link with mold (in the build image via apk-pins.txt) instead of the default
+# linker — the link step dominates an incremental rebuild, so this is the biggest win.
+# Gated to --fast, so the reproducible release link is untouched.
+[ -n "$FAST" ] && RUSTFLAGS_VAL="$RUSTFLAGS_VAL -C link-arg=-fuse-ld=mold"
 BUILD_ENV=(
   HOME=/tmp
   CARGO_HOME=/work/target/.cargo-home
   CARGO_TARGET_DIR=/work/target
   SOURCE_DATE_EPOCH=0
-  "RUSTFLAGS=--remap-path-prefix=/work=/src --remap-path-prefix=/work/target/.cargo-home=/cargo"
+  "RUSTFLAGS=$RUSTFLAGS_VAL"
   "CFLAGS_x86_64_unknown_linux_musl=-ffile-prefix-map=/work=/src -ffile-prefix-map=/work/target/.cargo-home=/cargo"
 )
+# --fast: trim the dev profile's debuginfo to line tables — keeps file:line in panics/
+# backtraces but drops the bulky per-variable/type DWARF, so codegen and every relink are
+# faster. Overridden via the env so it stays --fast-only and needs no [profile.dev] in
+# Cargo.toml (which would slow a plain `cargo build` too).
+if [ -n "$FAST" ]; then
+  BUILD_ENV+=(CARGO_PROFILE_DEV_DEBUG=line-tables-only)
+fi
 
 # `vk` embeds the guest kernel and vk-agent, so the compile is two phases: build
 # vk-agent first, then build vk with VK_EMBED_* pointing at that agent and the
 # pinned vmlinux (both under /work, where the repo is mounted in either backend).
 # The kernel is optional here — without dist/vmlinux, vk builds without an embedded
 # kernel (it then needs --kernel at runtime); the release always has it.
-EMBED_ENV="VK_EMBED_AGENT=/work/target/$TARGET/release/vk-agent"
+EMBED_ENV="VK_EMBED_AGENT=/work/target/$TARGET/$PROFILE_DIR/vk-agent"
 if [ -e "$OUT/vmlinux" ]; then
   EMBED_ENV="$EMBED_ENV VK_EMBED_KERNEL=/work/$OUT/vmlinux"
 else
   echo "warning: $OUT/vmlinux not found — building vk without an embedded kernel (run ./build-kernel.sh first)" >&2
 fi
-BUILD_CMD="cargo build --release -p vk-agent && env $EMBED_ENV cargo build --release -p vk-driver"
+BUILD_CMD="cargo build $CARGO_PROFILE_FLAG -p vk-agent && env $EMBED_ENV cargo build $CARGO_PROFILE_FLAG -p vk-driver"
 
 compile_start=$SECONDS
 if [ -n "$VK_BIN" ]; then
@@ -186,7 +218,7 @@ mkdir -p "$OUT"
 # would fail "Text file busy" if the old $OUT/vk is still being executed (e.g. by a
 # previous --use-virtkit / --bootstrap-check run); rename never does.
 for b in vk vk-agent; do
-  cp "target/$TARGET/release/$b" "$OUT/.$b.tmp"
+  cp "target/$TARGET/$PROFILE_DIR/$b" "$OUT/.$b.tmp"
   mv -f "$OUT/.$b.tmp" "$OUT/$b"
 done
 
@@ -204,9 +236,19 @@ else
   commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)
   [ -n "$(git status --porcelain 2>/dev/null)" ] && commit="$commit (dirty)"
 fi
-cat > "$OUT/build-info.txt" <<EOF
-# virtkit reproducible build manifest
+# --fast produces the debug profile: unoptimized, unstripped, not reproducible. Stamp the
+# manifest so its hashes are never mistaken for a release artifact — the release "Verify"
+# recipe would rebuild the release profile and fail sha256sum -c against these debug bytes.
+if [ -n "$FAST" ]; then
+  manifest_header="# virtkit DEBUG build manifest (--fast) — NOT reproducible, not a release artifact
+profile:         debug"
+else
+  manifest_header="# virtkit reproducible build manifest
 # Verify: git checkout <git_commit> && ./build.sh && sha256sum -c dist/vk.sha256 dist/vk-agent.sha256
+profile:         release"
+fi
+cat > "$OUT/build-info.txt" <<EOF
+${manifest_header}
 git_commit:      ${commit}
 rust_toolchain:  ${toolchain}
 base_image:      ${base_image}

@@ -48,11 +48,19 @@ All build scripts wrap Docker, so the host needs only Docker — no local Rust s
 
 ```bash
 ./build.sh                          # static-musl binaries -> dist/ (Docker)
+./build.sh --fast                   # same, but the debug profile -> much faster iteration
 ./build-kernel.sh [--no-cache]      # guest kernel vmlinux -> dist/ (Docker; slow)
 ./audit.sh [--deny warnings]        # cargo-audit against the committed Cargo.lock
 ./update.sh                         # bump the pinned Rust toolchain + re-pin apk deps
 ./update-kernel.sh [--lts|--stable] # bump the pinned guest kernel (defaults to LTS)
 ```
+
+**For dev iteration, prefer `./build.sh --fast`** (alias `--debug`). It builds the unoptimized debug
+profile, links with mold, and trims debuginfo to line tables — a much faster compile
+that still produces the same static-musl `vk` with the kernel + agent embedded. The
+output is not stripped and not reproducible, so it is for iterating only, never a
+release artifact (it cannot combine with `--bootstrap-check`). Use a plain `./build.sh`
+for anything you ship or compare bytes against.
 
 ### Cargo commands (pinned toolchain)
 
