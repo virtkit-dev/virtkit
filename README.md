@@ -1,18 +1,17 @@
 # virtkit
 
-Run Docker images as lightweight virtual machines — no root, no daemon, no setup.
+virtkit runs Docker images as lightweight virtual machines. It boots an OCI
+image as a microVM in about a second, each with its own kernel, so whatever
+runs inside is isolated from the host. There's no daemon and nothing to install
+as root: it's two static binaries running as an ordinary user process, and the
+only thing it needs from the host is access to `/dev/kvm`.
 
-virtkit boots any OCI/Docker image as a microVM that starts in about a second
-and gets its own kernel, so whatever runs inside is fully isolated from the
-host. Everything ships in two static binaries and runs as an ordinary user
-process: the only thing it needs from the host is access to `/dev/kvm`.
+On top of that base you get docker-compose-style services running as real VMs
+(per run or long-lived) and a GitLab CI executor that hands every job a fresh,
+throwaway VM. The pieces underneath — image building, networking, the in-VM
+agent — also work on their own.
 
-From one tool you get **compose services as real VMs** (docker-compose style,
-per run or long-lived) and a **GitLab CI executor** (a fresh, throwaway VM for
-every job) — and each piece (image building, networking, the in-VM agent) is
-usable on its own.
-
-## A taste
+## A few examples
 
 ```sh
 # boot an image and step inside
@@ -27,32 +26,37 @@ vk run rust:1-alpine --workdir . --net --cpus host --mem 4G -- cargo build --rel
 vk run -f Dockerfile --net -- ./run-tests.sh
 ```
 
-## What you can do with it
+## What it does
 
-- **Boot Docker images directly.** `vk run alpine:latest --shell` pulls the
-  image, converts it to a bootable disk, and drops you into a shell.
-  Conversions are cached and only redone when the image actually changes.
-- **Give VMs internet access with a flag.** Pass `--net` and the VM can reach
-  the network — no bridges, tap devices, or firewall rules to configure on the
-  host, and no privileges needed.
-- **Run compose services as VMs.** `vk run --compose compose.yml` boots the
-  services (redis, mysql, …) on a shared network where each resolves by name —
-  alongside your command, as the primary itself (`--primary`, like
-  `docker compose run`), or on their own (compose up, until ctrl-c). From
-  inside the primary, `/run/vk/services/<name>/{state,ctl,log}` reads states
-  and starts/stops services with plain shell writes. For a dev VM,
-  `vk run --ssh` boots any image with SSH access (VS Code Remote-SSH works
-  out of the box).
-- **Isolate GitLab CI jobs.** The custom executor gives every job a fresh
-  microVM and destroys it when the job ends. Concurrent jobs are supported, and
-  Docker images from your `.gitlab-ci.yml` are converted on demand.
-- **Build Dockerfiles without Docker.** `vk build` runs each `RUN` instruction
-  in its own microVM, with per-instruction caching, and produces an image you
-  can boot straight away.
-- **Carry one file around.** The hypervisor, the guest kernel, and the guest
-  agent are all embedded in `vk` — copy it to a Linux machine with `/dev/kvm`
-  and it boots images. virtkit can even rebuild itself inside one of its own
-  microVMs (`./build.sh --bootstrap-check`).
+Boot Docker images directly. `vk run alpine:latest --shell` pulls the image,
+converts it to a bootable disk, and drops you into a shell. Conversions are
+cached and only redone when the image actually changes.
+
+Give a VM internet access with a flag. Pass `--net` and the VM can reach the
+network. There are no bridges, tap devices, or firewall rules to set up on the
+host, and it doesn't need privileges.
+
+Run compose services as VMs. `vk run --compose compose.yml` boots the services
+(redis, mysql, and so on) on a shared network where each one resolves by name.
+You can run them alongside your command, as the primary itself (`--primary`,
+like `docker compose run`), or on their own (compose up, until ctrl-c). From
+inside the primary, `/run/vk/services/<name>/{state,ctl,log}` lets you read
+service state and start or stop services with plain shell writes. For a dev VM,
+`vk run --ssh` boots any image with SSH access, and VS Code Remote-SSH works
+against it out of the box.
+
+Isolate GitLab CI jobs. The custom executor gives every job a fresh microVM and
+destroys it when the job ends. Concurrent jobs work, and Docker images from your
+`.gitlab-ci.yml` are converted on demand.
+
+Build Dockerfiles without Docker. `vk build` runs each `RUN` instruction in its
+own microVM, caches per instruction, and produces an image you can boot straight
+away.
+
+Carry one file around. The hypervisor, the guest kernel, and the guest agent are
+all embedded in `vk`, so you can copy it to any Linux machine with `/dev/kvm`
+and boot images. virtkit can even rebuild itself inside one of its own microVMs
+(`./build.sh --bootstrap-check`).
 
 ## The two binaries
 
@@ -61,25 +65,29 @@ vk run -f Dockerfile --net -- ./run-tests.sh
 | `vk` | The host-side tool. Boots and manages VMs, builds and converts images, runs the GitLab executor, and provides the guest network. Self-contained: the guest kernel and `vk-agent` are embedded. |
 | `vk-agent` | Runs inside the guest as PID 1. Brings the system up (mounts, networking, hostname, shared folders, optional SSH) and lets the host run commands inside the VM. |
 
-## Under the hood
+## How it works
 
-For the curious — none of this is needed to use the tool:
+You don't need any of this to use the tool, but if you're curious:
 
-- Guests boot on an embedded [libkrun](https://github.com/containers/libkrun)
-  VMM, so there is no external hypervisor to install; a stock kernel and stock
-  KVM are enough. [Cloud Hypervisor](https://www.cloudhypervisor.org/) is also
-  supported as an external backend (`VIRTKIT_VMM=cloud-hypervisor`).
-- Guest networking is a userspace switch living inside the `vk` process:
-  traffic leaves through the host's regular sockets, which is why no privileged
-  network setup is ever required.
-- Images are converted to native ext4 disks entirely in userspace, and each
-  disk is fingerprinted by its build inputs — checking whether a cached image
-  is stale is instant.
-- The host talks to guests over `vsock`: the same channel carries shells, CI
-  job stages, and service control.
-- The release binaries are static (musl) and built from a fully pinned Alpine
-  toolchain, so builds are byte-for-byte reproducible; `./update.sh` records
-  the pins.
+Guests boot on an embedded [libkrun](https://github.com/containers/libkrun)
+VMM, so there's no external hypervisor to install; a stock kernel and stock KVM
+are enough. [Cloud Hypervisor](https://www.cloudhypervisor.org/) also works as
+an external backend (`VIRTKIT_VMM=cloud-hypervisor`).
+
+Guest networking is a userspace switch living inside the `vk` process. Traffic
+leaves through the host's regular sockets, which is why no privileged network
+setup is ever required.
+
+Images are converted to native ext4 disks entirely in userspace. Each disk is
+fingerprinted by its build inputs, so checking whether a cached image has gone
+stale is instant.
+
+The host talks to guests over `vsock`, and the same channel carries shells, CI
+job stages, and service control.
+
+The release binaries are static (musl), built from a fully pinned Alpine
+toolchain, so builds are byte-for-byte reproducible. `./update.sh` records the
+pins.
 
 ## Build
 
@@ -89,8 +97,8 @@ For the curious — none of this is needed to use the tool:
 ```
 
 Both run inside a pinned `rust:*-alpine` container (Docker required), so the
-artifacts are byte-reproducible regardless of host. `./update.sh` bumps the Rust
-toolchain, the base-image digest and the apk pins together.
+artifacts come out byte-reproducible regardless of the host. `./update.sh` bumps
+the Rust toolchain, the base-image digest, and the apk pins together.
 
 ## Subcommands
 
