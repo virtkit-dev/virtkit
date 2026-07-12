@@ -215,8 +215,9 @@ pub async fn run(args: &RunArgs) -> Result<()> {
 /// real disk sits idle. Cache semantics fit (transient, regenerable, removed on drop); the
 /// durable instruction store lives under `$XDG_DATA_HOME` instead. `--state-dir` overrides
 /// this with a caller-chosen path. The short `launch-<pid>` leaf keeps the AF_UNIX socket
-/// paths created under here well within the 108-byte limit.
-fn default_scratch_base() -> Result<PathBuf> {
+/// paths created under here well within the 108-byte limit. Shared with the build path
+/// (`build_units`), which anchors a cache-only build's scratch here for the same reason.
+pub(crate) fn default_scratch_base() -> Result<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(xdg).join("virtkit"));
     }

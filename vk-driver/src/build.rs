@@ -674,12 +674,21 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
     let (kernel, agent) = resolve_kernel_agent(opts)?;
 
     // One scratch dir for the whole build, placed next to some target's output (any target
-    // that exports), else a temp dir for a cache-only build. Swept of orphaned siblings first.
-    let anchor = units
+    // that exports), else the disk-backed scratch base for a cache-only build. NOT
+    // std::env::temp_dir(): that is often a small RAM-backed tmpfs (e.g. a 16 GiB /tmp,
+    // possibly quota-capped), and the stage qcow2/ext4 files a heavy build writes here would
+    // exhaust it — surfacing as EDQUOT/ENOSPC on the host copy and, once a stage's qcow2 can
+    // no longer grow, EIO inside the guest (a failed dpkg fsync). The run path already anchors
+    // its cache-only scratch on default_scratch_base() for exactly this reason. Swept of
+    // orphaned siblings first.
+    let anchor = match units
         .iter()
         .flat_map(|u| &u.targets)
         .find_map(|t| t.out.clone())
-        .unwrap_or_else(|| std::env::temp_dir().join("vk-build"));
+    {
+        Some(out) => out,
+        None => crate::run::default_scratch_base()?.join("vk-build"),
+    };
     static BUILD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let scratch = build_scratch(&anchor, seq)?;
