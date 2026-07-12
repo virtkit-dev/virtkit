@@ -766,6 +766,35 @@ pub fn build_microvm(
         serial_devices.push(setup_serial_device(event_manager, input, output)?);
     }
 
+    // virtkit: give the guest an early 16550 COM1 console when nothing else has
+    // claimed the legacy serial. A stock modular Debian kernel has virtio_console
+    // (hvc0) as a module, so its early boot messages are only observable on ttyS0.
+    //
+    // The implicit virtio-console path (autoconfigure_console_ports, below) opens this
+    // same `console_output` file truncating (File::create). We deliberately open in
+    // append mode so the two fds coexist without our early serial bytes being clobbered
+    // by that truncating open; on the default hvc0 path the serial carries ~no traffic.
+    #[cfg(target_arch = "x86_64")]
+    if serial_devices.is_empty() && !vm_resources.disable_implicit_console {
+        if let Some(path) = vm_resources.console_output.clone() {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                Ok(out) => serial_devices.push(setup_serial_device(
+                    event_manager,
+                    None,
+                    Some(Box::new(out)),
+                )?),
+                Err(e) => warn!(
+                    "virtkit: could not open console_output {} for the legacy serial: {e}",
+                    path.display()
+                ),
+            }
+        }
+    }
+
     let exit_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK)
         .map_err(Error::EventFd)
         .map_err(StartMicrovmError::Internal)?;

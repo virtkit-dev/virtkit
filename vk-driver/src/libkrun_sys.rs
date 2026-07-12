@@ -66,6 +66,19 @@ fn detect_kernel_format(data: &[u8]) -> Option<u32> {
     .map(|(_, fmt)| fmt)
 }
 
+/// Normalise the guest cmdline's console token. The embedded kernel has virtio_console built
+/// in (hvc0) from early boot, so by default CH's `console=ttyS0` is rewritten to `console=hvc0`
+/// (the safe, pre-patch behaviour). A BYO/stock distro kernel has virtio_console as a module and
+/// only emits early output on the legacy serial, so `keep_serial` (VIRTKIT_CONSOLE_SERIAL=1)
+/// leaves `console=ttyS0` in place, served by the COM1 patch in the vendored builder.rs.
+fn console_cmdline(cmdline: &str, keep_serial: bool) -> String {
+    if keep_serial {
+        cmdline.to_string()
+    } else {
+        cmdline.replace("console=ttyS0", "console=hvc0")
+    }
+}
+
 /// The `krun_set_kernel` format tag for the kernel at `path`, or a clear error if libkrun cannot
 /// load it. Reads the file to sniff its magic (the same bytes libkrun itself scans).
 fn kernel_format(path: &std::path::Path) -> Result<u32> {
@@ -147,9 +160,17 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         )?;
 
         // Guest console -> the serial-log file, matching CH's `--serial file=`; the
-        // orchestrator reads that file for diagnostics. libkrun routes its implicit
-        // console (a virtio-console, hvc0) here, so we leave the implicit console on
-        // and normalise the cmdline's console token from CH's ttyS0 to hvc0 below.
+        // orchestrator reads that file for diagnostics. libkrun routes both its
+        // implicit virtio-console (hvc0) and (with the virtkit early-console patch in
+        // builder.rs) the legacy 16550 COM1 (ttyS0) to this file.
+        //
+        // Console plan:
+        //   - Embedded kernel (default): virtio_console is built in, so hvc0 works from
+        //     early boot -> rewrite console=ttyS0 -> console=hvc0 (the safe default;
+        //     preserves the pre-patch behaviour).
+        //   - BYO/stock distro kernel (e.g. modular Debian): virtio_console is a module,
+        //     so early output only appears on the legacy serial -> set
+        //     VIRTKIT_CONSOLE_SERIAL=1 to keep console=ttyS0 (served by the COM1 patch).
         let serial_log = cstr(&spec.serial_log.to_string_lossy());
         ck(
             "krun_set_console_output",
@@ -160,7 +181,11 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         // sniffed from the image so a custom (e.g. stock distro) kernel boots, not just our ELF.
         let kformat = kernel_format(&spec.kernel)?;
         let kernel = cstr(&spec.kernel.to_string_lossy());
-        let cmdline = cstr(&spec.cmdline.replace("console=ttyS0", "console=hvc0"));
+        let cmdline_str = console_cmdline(
+            &spec.cmdline,
+            std::env::var_os("VIRTKIT_CONSOLE_SERIAL").is_some(),
+        );
+        let cmdline = cstr(&cmdline_str);
         let initramfs = spec.initramfs.as_ref().map(|p| cstr(&p.to_string_lossy()));
         ck(
             "krun_set_kernel",
@@ -259,7 +284,7 @@ unsafe fn add_disk(ctx: u32, index: usize, disk: &Disk) -> Result<()> {
 mod tests {
     use super::{
         KRUN_KERNEL_FORMAT_ELF, KRUN_KERNEL_FORMAT_IMAGE_BZ2, KRUN_KERNEL_FORMAT_IMAGE_GZ,
-        KRUN_KERNEL_FORMAT_IMAGE_ZSTD, detect_kernel_format, mem_mib, parse_mac,
+        KRUN_KERNEL_FORMAT_IMAGE_ZSTD, console_cmdline, detect_kernel_format, mem_mib, parse_mac,
     };
 
     #[test]
@@ -318,6 +343,20 @@ mod tests {
             None
         );
         assert_eq!(detect_kernel_format(b"not a kernel"), None);
+    }
+
+    #[test]
+    fn console_cmdline_toggle() {
+        let cmdline = "init=/vk-agent console=ttyS0 root=/dev/vda";
+        // Default (embedded kernel): rewrite ttyS0 -> hvc0.
+        assert_eq!(
+            console_cmdline(cmdline, false),
+            "init=/vk-agent console=hvc0 root=/dev/vda"
+        );
+        // VIRTKIT_CONSOLE_SERIAL=1 (BYO kernel): keep ttyS0 untouched.
+        assert_eq!(console_cmdline(cmdline, true), cmdline);
+        // No console token present: unchanged either way.
+        assert_eq!(console_cmdline("init=/vk-agent", false), "init=/vk-agent");
     }
 
     #[test]

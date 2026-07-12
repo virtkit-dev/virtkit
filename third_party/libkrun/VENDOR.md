@@ -89,3 +89,11 @@ flush + reply the coalesced ranges since the last drain, encoded `u32 count` the
 `krun_set_block_dirty_socket`. Additive only — no upstream behaviour changes when the socket
 is unset. Consumed by virtkit's `VmSession::drain_dirty` (vk-driver/src/run.rs). Covered by
 the `block::device::dirty_tests`. Search for `DirtyRanges`.
+
+`src/vmm/src/builder.rs` — feed an early 16550 COM1 serial from `console_output` on non-EFI
+x86_64 boots. Upstream builds the legacy serial only for EFI/firmware boots, so a stock modular
+distro kernel (virtio_console as a module, hvc0) emits no early boot output — a BYO-kernel boot is
+impossible to observe. When `serial_devices` is empty, the implicit console is enabled, and
+`console_output` is set, a serial is added writing (append) to that file so COM1 (0x3f8, IRQ 4)
+carries early boot. Additive only; the embedded kernel keeps `console=hvc0` and never triggers it.
+Search for `virtkit: give the guest an early 16550 COM1 console`.
