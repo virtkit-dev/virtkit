@@ -28,6 +28,7 @@ mod embed;
 mod ensure;
 mod executor;
 mod ext4;
+mod ext4_read;
 mod image;
 mod initramfs;
 mod jobctx;
