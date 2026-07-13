@@ -678,11 +678,16 @@ pub(crate) fn vd_name(n: usize) -> String {
 /// Cache repo (under the registry's repo prefix) holding the instruction snapshots.
 const CACHE_REPO: &str = "dfcache";
 
-/// Conservative libkrun/mmio source-disk budget for a build guest: 19 usable IRQs minus
-/// balloon/rng/console, context-fs, rootfs, vsock, and one reserved ephemeral scratch slot
-/// (`/tmp` and/or `--mount=from=scratch`). When a boot attaches *both* a `/tmp` disk and a
-/// scratch disk, the caller drops the effective budget by one (see `ensure_session_with`).
-const MAX_SOURCE_DISKS: usize = 12;
+/// Conservative virtio-pci source-disk budget for a build guest. libkrun puts every virtio
+/// device on PCI bus 0, whose 31 usable slots (slot 0 is the host bridge) — not the scarce
+/// IOAPIC pins of the old MMIO/INTx transport — are now the limit. A build guest always
+/// spends slots on rootfs, context-fs, vsock, console, rng, and balloon (6), plus one reserved
+/// ephemeral scratch slot (`/tmp` and/or `--mount=from=scratch`); that leaves 24, held back to
+/// 22 for headroom. (Build-guest egress rides an extra vsock port, not a virtio-net device, so
+/// `--net` costs no PCI slot.) When a boot attaches *both* a `/tmp` disk and a scratch disk, the caller
+/// drops the effective budget by one (see `ensure_session_with`). The batching/reboot path is
+/// kept as the backstop for the rare instruction that still needs more sources than fit.
+const MAX_SOURCE_DISKS: usize = 22;
 
 /// Pick the source disks for one guest boot (at most `max`). The common case is a forward
 /// scan through source stages: boot sources 0..max, then the next window, and so on. If one
@@ -2528,29 +2533,40 @@ mod tests {
 
     #[test]
     fn source_batch_slides_forward_in_first_use_order() {
-        let sources = test_sources(19);
+        let n = MAX_SOURCE_DISKS + 7;
+        let sources = test_sources(n);
 
         let first = select_source_batch(&sources, &["s0"], "app", MAX_SOURCE_DISKS).unwrap();
         assert_eq!(
             source_labels(&first),
-            (0..12).map(|i| format!("s{i}")).collect::<Vec<_>>()
+            (0..MAX_SOURCE_DISKS)
+                .map(|i| format!("s{i}"))
+                .collect::<Vec<_>>()
         );
 
-        let second = select_source_batch(&sources, &["s12"], "app", MAX_SOURCE_DISKS).unwrap();
+        let next_label = format!("s{MAX_SOURCE_DISKS}");
+        let second =
+            select_source_batch(&sources, &[next_label.as_str()], "app", MAX_SOURCE_DISKS).unwrap();
         assert_eq!(
             source_labels(&second),
-            (12..19).map(|i| format!("s{i}")).collect::<Vec<_>>()
+            (MAX_SOURCE_DISKS..n)
+                .map(|i| format!("s{i}"))
+                .collect::<Vec<_>>()
         );
     }
 
     #[test]
     fn source_batch_keeps_scattered_needed_sources() {
-        let sources = test_sources(20);
-        let batch = select_source_batch(&sources, &["s0", "s18"], "app", MAX_SOURCE_DISKS).unwrap();
+        // Two needed sources farther apart than one forward window forces the scatter path.
+        let n = MAX_SOURCE_DISKS + 8;
+        let sources = test_sources(n);
+        let far = format!("s{}", n - 1);
+        let batch =
+            select_source_batch(&sources, &["s0", far.as_str()], "app", MAX_SOURCE_DISKS).unwrap();
         let labels = source_labels(&batch);
 
         assert!(labels.iter().any(|label| label == "s0"));
-        assert!(labels.iter().any(|label| label == "s18"));
+        assert!(labels.contains(&far));
         assert!(labels.len() <= MAX_SOURCE_DISKS);
     }
 
@@ -2558,22 +2574,27 @@ mod tests {
     fn source_batch_with_no_needed_sources_takes_the_first_window() {
         // A context-only instruction needs no source stage; the batch still fills the boot
         // with the leading window so a later source-using instruction can likely reuse it.
-        let sources = test_sources(20);
+        let sources = test_sources(MAX_SOURCE_DISKS + 8);
         let batch = select_source_batch(&sources, &[], "app", MAX_SOURCE_DISKS).unwrap();
         assert_eq!(
             source_labels(&batch),
-            (0..12).map(|i| format!("s{i}")).collect::<Vec<_>>()
+            (0..MAX_SOURCE_DISKS)
+                .map(|i| format!("s{i}"))
+                .collect::<Vec<_>>()
         );
     }
 
     #[test]
     fn source_batch_rejects_single_instruction_over_budget() {
-        let sources = test_sources(20);
+        let sources = test_sources(MAX_SOURCE_DISKS + 8);
         let needed: Vec<String> = (0..=MAX_SOURCE_DISKS).map(|i| format!("s{i}")).collect();
         let needed_refs: Vec<&str> = needed.iter().map(String::as_str).collect();
         let err = select_source_batch(&sources, &needed_refs, "app", MAX_SOURCE_DISKS).unwrap_err();
 
-        assert!(err.to_string().contains("at most 12 source stages"));
+        assert!(
+            err.to_string()
+                .contains(&format!("at most {MAX_SOURCE_DISKS} source stages"))
+        );
     }
 
     #[test]
