@@ -1,0 +1,40 @@
+# Target: a STOCK Debian Bookworm image that boots its OWN systemd under its
+# OWN kernel on the libkrun backend. Nothing virtkit-specific is baked in — vk-agent is
+# injected at boot from a virtkit-built preinit initramfs, not from this image.
+#
+# The image ships:
+#   /sbin/init            -> systemd (PID 1 after the preinit hands off)
+#   /boot/vmlinuz-<ver>   -> the Debian kernel (virtkit reads it host-side to boot)
+#   /lib/modules/<ver>/   -> the matching modules (virtkit seeds the preinit initramfs
+#                            with virtio_mmio/virtio_blk/ext4/virtio_vsock/virtio_net
+#                            from here, so the modular kernel can reach its rootfs+vsock)
+FROM debian:bookworm
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        systemd systemd-sysv \
+        linux-image-amd64 \
+        iproute2 kmod; \
+    rm -rf /var/lib/apt/lists/*
+
+# A oneshot marker unit the e2e test looks for — proof that systemd became PID 1, reached
+# multi-user.target, and ran a unit inside the microVM. Enabled by a static symlink (no
+# running daemon at build time).
+RUN set -eux; \
+    printf '%s\n' \
+      '[Unit]' \
+      'Description=virtkit systemd-boot marker' \
+      '[Service]' \
+      'Type=oneshot' \
+      'ExecStart=/bin/sh -c "echo VIRTKIT_SYSTEMD_UP > /run/virtkit-systemd-up"' \
+      'RemainAfterExit=yes' \
+      '[Install]' \
+      'WantedBy=multi-user.target' \
+      > /etc/systemd/system/virtkit-marker.service; \
+    mkdir -p /etc/systemd/system/multi-user.target.wants; \
+    ln -sf ../virtkit-marker.service \
+      /etc/systemd/system/multi-user.target.wants/virtkit-marker.service
+
+# The image's own init. virtkit's preinit execs this after loading modules + switch_root.
+CMD ["/sbin/init"]
