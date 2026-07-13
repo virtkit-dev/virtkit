@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `vk status --to <addr>` probes a running guest's agent: it round-trips the status
+  request over the exec channel and prints the reply, or exits non-zero if the agent does
+  not answer. A liveness check that exercises the agent protocol — stronger than a socket
+  stat — so external tooling can ask "is this VM up?" with `vk` alone, no separate agent
+  binary.
+
 ### Changed
 
 - `vk run --compose --primary` now builds the primary VM's image in the same pass as its

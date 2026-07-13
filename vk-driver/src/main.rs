@@ -317,6 +317,16 @@ enum Cmd {
         #[arg(long)]
         to: SocketAddr,
     },
+    /// Probe a running guest's agent: round-trip the status request to `--to` (the
+    /// exec channel, e.g. vsock-auto://DIR/vsock.sock:4444) and print the reply, or
+    /// exit non-zero if it does not answer. A liveness check that actually exercises
+    /// the agent protocol — stronger than a socket stat — so external tooling can ask
+    /// "is this VM up?" with `vk` alone, no separate agent binary.
+    Status {
+        /// Agent address to dial (the run's exec channel)
+        #[arg(long)]
+        to: SocketAddr,
+    },
     /// Filtering ssh-agent proxy: serve the ssh-agent protocol on `--listen`, relaying to
     /// the real agent at `--upstream` but exposing only the keys in the `--allow` .pub
     /// files (refusing to sign with or list any other key). The host side of forwarding a
@@ -1463,6 +1473,16 @@ async fn cli_main() -> ExitCode {
         Cmd::Connect { to } => match vk_core::forward::run_connect(&to).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
+        },
+        // Agent liveness probe: round-trip the status request (same client the boot
+        // readiness wait uses) so a caller can check the VM is up with vk alone.
+        Cmd::Status { to } => match vk_core::status::get_status(&to).await {
+            Ok(status) => {
+                println!("{status}");
+                ExitCode::SUCCESS
+            }
+            // get_status yields a boxed std error; wrap it for the anyhow-typed reporter.
+            Err(e) => fail(&anyhow::anyhow!("{e}"), 1),
         },
         // run_forward only returns on a bind error; otherwise it serves until the
         // process is killed (cleanup tears the detached child down).
