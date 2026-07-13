@@ -25,6 +25,12 @@ All notable changes to virtkit will be documented in this file.
   sibling services. Stages they share (a common base Dockerfile) build or restore once
   for the whole set instead of once for the primary and again for the siblings, so a warm
   boot no longer pays the shared work twice.
+- `vk run --compose` now builds only the services it starts — the profile-enabled set (or a
+  `--primary`'s dependency closure) plus the primary — instead of every declared service. A
+  profiled-down `build:` service is still provisioned (addressable, reservable) but its image
+  builds on demand at its first `vk service up`; `image:` services are still pulled up front,
+  as they cannot be built on demand. Declare `depends_on` for any service a `--primary` needs
+  booted at start-up, so it lands in the eager set.
 
 ## [0.12.0] - 2026-07-13
 

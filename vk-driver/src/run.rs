@@ -1306,15 +1306,37 @@ struct PlannedServices {
     reservations: Vec<(String, String)>,
 }
 
-/// Build every image a `--compose` run needs in ONE unified build: the `--primary` primary
-/// (exported to the run's bootable `root.ext4`) and every other declared service (each to
-/// its own `svc-<name>/image.ext4`). One build means stages shared across the compose
-/// Dockerfile — a common base — build or restore once for the whole set instead of once per
-/// pass, and independent services build concurrently over a single job pool. Like
-/// [`plan_services`], EVERY declared unit is materialized (warmth comes from the instruction
-/// cache) so the manager can start a profiled-down sibling on demand later. Returns the
-/// per-service [`Built`](crate::build::Built) config map keyed by service name. `primary_idx`
-/// is `None` for a compose-up run — every unit is a sibling, nothing exports to root.ext4.
+/// The units [`build_compose_images`] materializes up front, in `order`: the primary plus the
+/// eager start set (`on`), and every `image:` service (which can't build on demand — the sync
+/// start path only builds `build:` units). A superset of the eager boot set, never a subset,
+/// so nothing that boots at start-up is left unbuilt.
+fn eager_build_selection(
+    units: &[crate::compose::Unit],
+    order: &[usize],
+    primary_idx: Option<usize>,
+    on: &[bool],
+) -> Vec<usize> {
+    order
+        .iter()
+        .copied()
+        .filter(|&i| {
+            Some(i) == primary_idx
+                || on[i]
+                || matches!(units[i].source, crate::compose::Source::Image(_))
+        })
+        .collect()
+}
+
+/// Build the images a `--compose` run needs at start-up in ONE unified build: the `--primary`
+/// primary (exported to the run's bootable `root.ext4`) and every service that boots eagerly
+/// (each to its own `svc-<name>/image.ext4`), plus every `image:` service. One build means
+/// stages shared across the compose Dockerfile — a common base — build or restore once for the
+/// whole set instead of once per pass, and independent services build concurrently over a
+/// single job pool. A profiled-down `build:` service outside the eager set is left unbuilt —
+/// the manager builds it on demand at its first `vk service up`; `image:` services can't build
+/// on demand, so they are always materialized here. Returns the per-service
+/// [`Built`](crate::build::Built) config map keyed by service name. `primary_idx` is `None`
+/// for a compose-up run — every unit is a sibling, nothing exports to root.ext4.
 fn build_compose_images(
     args: &RunArgs,
     work: &Path,
@@ -1328,9 +1350,22 @@ fn build_compose_images(
     }
     // Boot order keeps the dashboard rows (and plan_services' slot assignment) stable.
     let order = crate::compose::boot_order(units)?;
+    // Build the eager set — the units plan_services boots at start-up: the primary plus the
+    // profile-enabled (or a --primary's dependency-closure) set — and, on top of that, every
+    // `image:` service. A profiled-down `build:` service outside the eager set is provisioned
+    // but NOT built here: the manager builds it on demand at its first `vk service up`. But an
+    // `image:` service can't be built on demand (the sync start path only builds `build:`
+    // units — see `ensure_unit_build_sync`), so it is always materialized up front, whether it
+    // starts eagerly or not. `selected` is thus a superset of the eager start set — never a
+    // subset — so nothing that boots at start-up is left unbuilt.
+    let on = match primary_idx {
+        Some(idx) => crate::compose::dependency_closure(units, idx),
+        None => crate::compose::enabled(units, &args.profiles),
+    };
+    let selected = eager_build_selection(units, &order, primary_idx, &on);
     // Each sibling's export dir must exist before the build writes its image.ext4 into it
     // (the primary's root.ext4 sits directly in work/).
-    for &i in &order {
+    for &i in &selected {
         if Some(i) == primary_idx {
             continue;
         }
@@ -1347,14 +1382,16 @@ fn build_compose_images(
             Some(work.join(format!("svc-{}", unit.name)).join("image.ext4"))
         }
     };
-    let units_to_build = compose_build_units(&args.build_args, units, &order, out_of);
+    let units_to_build = compose_build_units(&args.build_args, units, &selected, out_of);
     let opts = service_build_options(args, kernel, agent);
     crate::build::build_units(units_to_build, &opts)
 }
 
-/// Materialize EVERY declared unit into the work dir — like the `-f` build
-/// itself, warmth comes from the instruction cache — so the manager can start a
-/// profiled-down unit on demand later; only `start` boots eagerly.
+/// Provision EVERY declared unit — address it and give it a runtime dir + config — so the
+/// manager can start any of them later; only `start` boots eagerly. A unit built up front
+/// (the eager set, by [`build_compose_images`]) carries its real image config; a profiled-down
+/// `build:` unit is not built yet, so it gets a placeholder config until the manager builds it
+/// on demand at first start.
 fn plan_services(
     args: &RunArgs,
     work: &Path,
@@ -1407,14 +1444,27 @@ fn plan_services(
         slot += 1;
     }
 
-    // Address + provision each pre-built image (built by build_compose_images in the same
-    // unified pass as the primary), layering its compose overrides over the image.
+    // Address + provision each service, layering its compose overrides over the image
+    // config. A unit built up front (build_compose_images, the eager set) carries its image
+    // config; a profiled-down one is not built yet, so it gets the compose overrides alone as
+    // a placeholder — the manager builds it on demand at first start and adopts the real
+    // image config then.
     for s in sited {
         let unit = &units[s.unit];
-        let config = built
-            .get(&unit.name)
-            .map(|b| crate::compose::merged_config(&b.config, unit))
-            .with_context(|| format!("internal: service {} not built", unit.name))?;
+        let config = match built.get(&unit.name) {
+            Some(b) => crate::compose::merged_config(&b.config, unit),
+            None => {
+                // Only a profiled-down `build:` sibling reaches here: build_compose_images
+                // materializes the eager set and every image: service, so anything that boots
+                // eagerly (or pulls an image) must already be in `built`.
+                debug_assert!(
+                    !on[s.unit] && matches!(unit.source, crate::compose::Source::Build { .. }),
+                    "service {} is eagerly started or an image: service but was not built",
+                    unit.name
+                );
+                crate::compose::merged_config(&vk_core::runcfg::RunConfig::default(), unit)
+            }
+        };
         let ip = crate::units::nth_static_ip(gw, prefix, s.slot)?;
         planned
             .listen
@@ -2736,6 +2786,42 @@ mod tests {
             .filter(|u| matches!(u.input, crate::build::UnitInput::Image(_)))
             .count();
         assert_eq!(images, 1);
+    }
+
+    #[test]
+    fn eager_build_selection_defers_profiled_builds_but_keeps_image_services() {
+        // web: no profile → eager. extra: a build behind the `debug` profile → profiled-down,
+        // deferred to on-demand start. img: an image service behind `debug` → can't build on
+        // demand, so it must be materialized up front regardless.
+        let yaml = "services:\n\
+             \x20 web:\n    build: ./web\n\
+             \x20 extra:\n    build: ./extra\n    profiles: [debug]\n\
+             \x20 img:\n    image: redis:7\n    profiles: [debug]\n";
+        let units = crate::compose::parse(yaml, Path::new("/base"), &|_| None).unwrap();
+        let idx = |n: &str| units.iter().position(|u| u.name == n).unwrap();
+        let order = crate::compose::boot_order(&units).unwrap();
+        // no active profiles, no --primary: the profile-enabled set boots.
+        let on = crate::compose::enabled(&units, &[]);
+        let selected = eager_build_selection(&units, &order, None, &on);
+
+        assert!(
+            selected.contains(&idx("web")),
+            "an eager service is built up front"
+        );
+        assert!(
+            selected.contains(&idx("img")),
+            "an image: service is always materialized — it can't build on demand"
+        );
+        assert!(
+            !selected.contains(&idx("extra")),
+            "a profiled-down build: service is deferred to its first `vk service up`"
+        );
+        // Never a subset of the eager boot set: everything `on` boots, so everything `on`
+        // must be built up front.
+        assert!(
+            (0..units.len()).all(|i| !on[i] || selected.contains(&i)),
+            "selected must cover the whole eager start set"
+        );
     }
 
     #[test]
