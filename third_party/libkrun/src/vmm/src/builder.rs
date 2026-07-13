@@ -847,6 +847,15 @@ pub fn build_microvm(
         };
         intc = Arc::new(Mutex::new(IrqChipDevice::new(ioapic)));
 
+        // Share the KVM GSI routing manager with the device manager so virtio-pci
+        // devices can install MSI-X routes. Must be set before any device is
+        // attached (which registers the device and wires its MSI-X vectors).
+        #[cfg(target_os = "linux")]
+        {
+            let gsi_routes = Arc::new(Mutex::new(devices::legacy::GsiRoutes::new(vm.fd_arc())));
+            mmio_device_manager.set_pci_gsi_routes(gsi_routes);
+        }
+
         attach_legacy_devices(
             &vm,
             vm_resources.split_irqchip,

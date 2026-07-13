@@ -20,6 +20,7 @@ use std::os::unix::io::RawFd;
 use std::env;
 use std::result;
 use std::sync::atomic::{fence, Ordering};
+use std::sync::Arc;
 #[cfg(not(test))]
 use std::sync::Barrier;
 use std::thread;
@@ -487,7 +488,7 @@ impl KvmContext {
 
 /// A wrapper around creating and using a VM.
 pub struct Vm {
-    fd: VmFd,
+    fd: Arc<VmFd>,
     next_mem_slot: u32,
 
     // X86 specific fields.
@@ -524,7 +525,7 @@ impl Vm {
             arch::x86_64::msr::supported_guest_msrs(kvm).map_err(Error::GuestMSRs)?;
 
         Ok(Vm {
-            fd: vm_fd,
+            fd: Arc::new(vm_fd),
             next_mem_slot: 0,
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             supported_cpuid,
@@ -563,7 +564,7 @@ impl Vm {
         };
 
         Ok(Vm {
-            fd: vm_fd,
+            fd: Arc::new(vm_fd),
             next_mem_slot: 0,
             supported_cpuid,
             supported_msrs,
@@ -608,7 +609,7 @@ impl Vm {
         vm_fd.enable_cap(&cap).map_err(Error::VmApicBusClockRate)?;
 
         Ok(Vm {
-            fd: vm_fd,
+            fd: Arc::new(vm_fd),
             next_mem_slot: 0,
             supported_cpuid,
             supported_msrs,
@@ -826,6 +827,13 @@ impl Vm {
     /// Gets a reference to the kvm file descriptor owned by this VM.
     pub fn fd(&self) -> &VmFd {
         &self.fd
+    }
+
+    /// Gets a cloneable handle to the kvm VM file descriptor. Shared with
+    /// devices (e.g. the virtio-pci MSI-X GSI-routing manager) that need to
+    /// call VM ioctls after construction.
+    pub fn fd_arc(&self) -> Arc<VmFd> {
+        self.fd.clone()
     }
 
     #[allow(unused)]

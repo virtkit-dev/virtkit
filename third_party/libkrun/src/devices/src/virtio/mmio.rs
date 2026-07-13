@@ -92,6 +92,13 @@ struct InterruptTransportInner {
     /// (rather than in the transport) because devices raise config-change
     /// interrupts through the `InterruptTransport` clone they own.
     config_generation: AtomicU8,
+    /// MSI-X delivery state for the virtio-pci transport. `None` for the
+    /// virtio-mmio transport and until the pci transport attaches it. When
+    /// present and enabled by the guest, used-queue / config-change signals go
+    /// through MSI-X instead of the INTx line. Interior-mutable so it can be
+    /// attached through a shared clone (`set_msix(&self)`).
+    #[cfg(target_arch = "x86_64")]
+    msix: Mutex<Option<Arc<Mutex<super::msix::MsixConfig>>>>,
 }
 
 #[derive(Clone)]
@@ -106,7 +113,30 @@ impl InterruptTransport {
             event: EventFd::new(0).map_err(CreateMmioTransportError::CreateInterruptEventFd)?,
             intc,
             irq_line: None,
+            #[cfg(target_arch = "x86_64")]
+            msix: Mutex::new(None),
         })))
+    }
+
+    /// Attach the virtio-pci MSI-X configuration so used-queue / config-change
+    /// signals can be delivered as MSI-X when the guest enables it. Interior
+    /// mutability keeps the signature `&self` so it can be called through a
+    /// shared clone before activation.
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_msix(&self, cfg: Arc<Mutex<super::msix::MsixConfig>>) {
+        *self.0.msix.lock().unwrap() = Some(cfg);
+    }
+
+    /// Deliver `vector` over MSI-X if attached and the guest has enabled it.
+    /// Returns true if the interrupt was handled by MSI-X (so the caller must
+    /// not fall back to INTx).
+    #[cfg(target_arch = "x86_64")]
+    fn try_signal_msix(&self, vector: usize) -> bool {
+        if let Some(cfg) = self.0.msix.lock().unwrap().as_ref() {
+            cfg.lock().unwrap().signal(vector)
+        } else {
+            false
+        }
     }
 
     pub fn status(&self) -> &AtomicUsize {
@@ -148,6 +178,12 @@ impl InterruptTransport {
 
     pub fn try_signal_used_queue(&self) -> Result<(), crate::Error> {
         debug!(target: &self.0.log_target, "interrupt: signal_used_queue");
+        // Prefer MSI-X (vector 1, shared by all queues) when the guest enabled
+        // it; otherwise fall back to the legacy INTx path.
+        #[cfg(target_arch = "x86_64")]
+        if self.try_signal_msix(1) {
+            return Ok(());
+        }
         self.try_signal(VIRTIO_MMIO_INT_VRING)
     }
 
@@ -157,6 +193,11 @@ impl InterruptTransport {
         // value at common-config offset 0x15 and the guest re-reads the device
         // config space.
         self.0.config_generation.fetch_add(1, Ordering::SeqCst);
+        // Prefer MSI-X (vector 0, config-change) when the guest enabled it.
+        #[cfg(target_arch = "x86_64")]
+        if self.try_signal_msix(0) {
+            return Ok(());
+        }
         self.try_signal(VIRTIO_MMIO_INT_CONFIG)
     }
 

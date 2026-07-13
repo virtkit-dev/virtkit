@@ -13,6 +13,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::bus::BusDevice;
+use crate::virtio::MsixConfig;
+
+/// PCI capability id for MSI-X (PCI_CAP_ID_MSIX).
+const PCI_CAP_ID_MSIX: u8 = 0x11;
+/// PCI capability id for vendor-specific capabilities (PCI_CAP_ID_VNDR).
+const PCI_CAP_ID_VNDR: u8 = 0x09;
 
 /// Number of 32-bit registers exposed per function in legacy config space.
 /// Type-0 header is 16 dwords (64 bytes); the type-1 mechanism can address 64
@@ -47,6 +53,10 @@ pub struct PciDevice {
     /// Byte offset (within config space) of the last capability's `next` pointer,
     /// so a freshly added capability can be linked into the list.
     last_capability_next_ptr: Option<usize>,
+    /// MSI-X wiring, if this function has an MSI-X capability: the dword register
+    /// index of the message-control word and the shared MSI-X config. A write to
+    /// that register is forwarded to `MsixConfig::set_msg_ctl`.
+    msix: Option<(usize, Arc<Mutex<MsixConfig>>)>,
 }
 
 impl PciDevice {
@@ -57,6 +67,7 @@ impl PciDevice {
             bar_sizes: [None; NUM_CONFIG_REGISTERS],
             next_capability_offset: FIRST_CAPABILITY_OFFSET,
             last_capability_next_ptr: None,
+            msix: None,
         }
     }
 
@@ -147,17 +158,17 @@ impl PciDevice {
         self.bar_sizes[hi] = Some(size);
     }
 
-    /// Append a vendor-specific (virtio) capability to the capability list,
-    /// returning the byte offset at which it was placed. `body` is the capability
-    /// payload following the 1-byte id and 1-byte next-pointer (i.e. it starts at
-    /// the virtio `cap_len` field). The capability is dword-padded.
-    pub fn add_vendor_capability(&mut self, body: &[u8]) -> usize {
+    /// Append a capability with the given `id` to the capability list, returning
+    /// the byte offset at which it was placed. `body` is the capability payload
+    /// following the 1-byte id and 1-byte next-pointer. The capability is
+    /// dword-padded and linked into the list.
+    fn add_capability(&mut self, id: u8, body: &[u8]) -> usize {
         let cap_offset = self.next_capability_offset;
 
-        // Assemble the full capability bytes: id (0x09 = vendor specific), next
-        // pointer (patched to 0 for now; linked below), then the body.
+        // Assemble the full capability bytes: id, next pointer (patched to 0 for
+        // now; linked below), then the body.
         let mut bytes = Vec::with_capacity(2 + body.len());
-        bytes.push(0x09u8); // PCI_CAP_ID_VNDR
+        bytes.push(id);
         bytes.push(0x00u8); // next pointer, terminates the list for now
         bytes.extend_from_slice(body);
         // Pad to a dword boundary.
@@ -185,6 +196,49 @@ impl PciDevice {
         // This capability's next pointer is its second byte.
         self.last_capability_next_ptr = Some(cap_offset + 1);
         self.next_capability_offset = cap_offset + bytes.len();
+        cap_offset
+    }
+
+    /// Append a vendor-specific (virtio) capability to the capability list,
+    /// returning the byte offset at which it was placed. `body` is the capability
+    /// payload following the 1-byte id and 1-byte next-pointer (i.e. it starts at
+    /// the virtio `cap_len` field). The capability is dword-padded.
+    pub fn add_vendor_capability(&mut self, body: &[u8]) -> usize {
+        self.add_capability(PCI_CAP_ID_VNDR, body)
+    }
+
+    /// Append an MSI-X capability (id 0x11) pointing at the given BAR offsets and
+    /// attach the shared `MsixConfig`. The 12-byte capability is: id, next,
+    /// message-control (le16), table offset|BIR (le32), PBA offset|BIR (le32).
+    /// Only the message-control enable (bit 15) and function-mask (bit 14) bits
+    /// are made writable; a write to that word is forwarded to the `MsixConfig`.
+    pub fn add_msix_capability(
+        &mut self,
+        table_bir_offset: u32,
+        pba_bir_offset: u32,
+        table_size: u16,
+        msix: Arc<Mutex<MsixConfig>>,
+    ) -> usize {
+        // Message control: bits 10:0 = table_size - 1; enable/mask start clear.
+        let msg_ctl: u16 = table_size.saturating_sub(1) & 0x7ff;
+        // Table / PBA: offset (dword-aligned) | BIR (BAR0 == 0).
+        let table = table_bir_offset & 0xffff_fff8;
+        let pba = pba_bir_offset & 0xffff_fff8;
+
+        let mut body = Vec::with_capacity(10);
+        body.extend_from_slice(&msg_ctl.to_le_bytes());
+        body.extend_from_slice(&table.to_le_bytes());
+        body.extend_from_slice(&pba.to_le_bytes());
+
+        let cap_offset = self.add_capability(PCI_CAP_ID_MSIX, &body);
+
+        // The message-control word occupies bytes 2..4 of the capability, i.e.
+        // the upper 16 bits of the capability's first dword. Make only bits 30
+        // and 31 (function-mask / enable, within this dword) writable.
+        let msg_ctl_reg = cap_offset / 4;
+        self.writable_bits[msg_ctl_reg] |= 0xc000_0000;
+
+        self.msix = Some((msg_ctl_reg, msix));
         cap_offset
     }
 
@@ -238,6 +292,16 @@ impl PciDevice {
 
         let writable = self.writable_bits[register] & mask;
         self.registers[register] = (self.registers[register] & !writable) | (value & writable);
+
+        // Forward MSI-X message-control changes (enable / function-mask) to the
+        // MSI-X config. The message-control word is the upper 16 bits of the
+        // capability's first dword.
+        if let Some((msg_ctl_reg, msix)) = &self.msix {
+            if register == *msg_ctl_reg {
+                let msg_ctl = (self.registers[register] >> 16) as u16;
+                msix.lock().unwrap().set_msg_ctl(msg_ctl);
+            }
+        }
     }
 }
 
@@ -556,6 +620,34 @@ mod tests {
         // Restore base.
         write_reg(&mut cfg, 1, 4, 0xd000_0000);
         assert_eq!(read_reg(&mut cfg, 1, 4) & 0xffff_fff0, 0xd000_0000);
+    }
+
+    #[test]
+    fn msix_capability_layout_and_msg_ctl_forwarding() {
+        let mut ep = PciDevice::new_endpoint(0x1af4, 0x1042, 0x01, 0x00, 0x00, 1, 11);
+        let msix = Arc::new(Mutex::new(MsixConfig::new()));
+        let cap_off = ep.add_msix_capability(0x8000, 0x4_8000, 2, msix.clone());
+
+        // Capability id byte is 0x11 (MSI-X).
+        let reg = cap_off / 4;
+        assert_eq!(ep.registers[reg] & 0xff, u32::from(PCI_CAP_ID_MSIX));
+        // Message control (upper 16 bits): table_size - 1 == 1.
+        let msg_ctl = (ep.registers[reg] >> 16) as u16;
+        assert_eq!(msg_ctl & 0x7ff, 1);
+        assert!(!msix.lock().unwrap().enabled());
+
+        // Table / PBA offset|BIR dwords.
+        assert_eq!(ep.registers[reg + 1], 0x8000);
+        assert_eq!(ep.registers[reg + 2], 0x4_8000);
+
+        // Drive the whole config space through the CF8/CFC path and set the
+        // enable bit (bit 15 of msg_ctl == bit 31 of the dword).
+        let mut bus = PciBus::new();
+        bus.add_device(1, Arc::new(Mutex::new(ep)));
+        let mut cfg = PciConfigIo::new(Arc::new(Mutex::new(bus)));
+        let cur = read_reg(&mut cfg, 1, reg as u32);
+        write_reg(&mut cfg, 1, reg as u32, cur | 0x8000_0000);
+        assert!(msix.lock().unwrap().enabled());
     }
 
     #[test]

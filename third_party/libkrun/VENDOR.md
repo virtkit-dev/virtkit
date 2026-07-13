@@ -119,3 +119,21 @@ routed through an MP-table PCI-bus INTSRC entry (KVM irqfd, single-pulse). The b
 attaches over virtio-pci instead of virtio-mmio on x86_64 (00:01.0 for the first device). MSI-X
 and multi-device slot allocation are out of scope here (added separately). x86_64 only; additive.
 Covered by `legacy::pci` unit tests. Search for `VirtioPciDevice`.
+
+`src/devices/src/virtio/msix.rs` (new) + `src/devices/src/legacy/gsi.rs` (new) +
+`src/devices/src/virtio/{pci.rs,mmio.rs}` + `src/devices/src/legacy/pci.rs` +
+`src/vmm/src/device_manager/kvm/mmio.rs` + `src/vmm/src/builder.rs` +
+`src/vmm/src/linux/vstate.rs` — MSI-X for the virtio-pci transport, so many virtio devices
+can be attached without exhausting the scarce IOAPIC pins.
+Each virtio-pci device advertises a two-vector MSI-X capability (vector 0 = config, vector 1 =
+shared across all virtqueues, since libkrun's `InterruptTransport` carries no queue index); the
+`MsixConfig` table/PBA live in BAR0 while the capability's message-control (enable/mask) lives
+in config space, both sharing one `Arc<Mutex<MsixConfig>>`. Interrupts are delivered by writing
+a per-vector eventfd registered with `KVM_IRQFD` against a dedicated MSI GSI (>= 24); a
+`GsiRoutes` manager owns `KVM_SET_GSI_ROUTING`, re-supplying the default IOAPIC/PIC routes
+(0..=23) on every commit because the ioctl replaces the whole table. INTx is retained as a
+fallback on a single shared, shareable GSI (PCI INTx is level-shareable), so it no longer
+consumes one pin per device. `Vm.fd` became `Arc<VmFd>` so routing ioctls can run off the
+config-write path. x86_64 only; additive — the virtio-mmio transport, other arches, and the
+INTx path when the guest leaves MSI-X disabled are unchanged. Covered by `virtio::msix`,
+`legacy::gsi`, and `legacy::pci` unit tests. Search for `MsixConfig` and `GsiRoutes`.

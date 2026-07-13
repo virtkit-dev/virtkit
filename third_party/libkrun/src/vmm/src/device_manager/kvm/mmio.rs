@@ -89,6 +89,12 @@ const MMIO_LEN: u64 = 0x1000;
 #[cfg(target_arch = "x86_64")]
 const PCI_MMIO_BASE: u64 = 0xe000_0000;
 
+/// Upper bound (exclusive) on KVM MSI GSIs used for MSI-X vectors. KVM allows up
+/// to 4095 routes; cap well below that to leave head-room for the default
+/// IOAPIC/PIC entries and any future use.
+#[cfg(target_arch = "x86_64")]
+const MSI_GSI_MAX: u32 = 1024;
+
 /// Manages the complexities of registering a MMIO device.
 pub struct MMIODeviceManager {
     pub bus: devices::Bus,
@@ -107,6 +113,19 @@ pub struct MMIODeviceManager {
     /// MP table can emit matching PCI-bus interrupt-source entries.
     #[cfg(target_arch = "x86_64")]
     pci_irqs: Vec<(u8, u8, u32)>,
+    /// Shared INTx GSI for all virtio-pci devices. PCI INTx is level-triggered
+    /// and shareable, so a single scarce IOAPIC GSI serves every device (KVM
+    /// allows multiple irqfds on one GSI). Allocated lazily on the first device.
+    #[cfg(target_arch = "x86_64")]
+    pci_intx_gsi: Option<u32>,
+    /// Next free KVM MSI GSI for MSI-X vectors. Starts at the IOAPIC pin count
+    /// (24); MSI GSIs live above the IOAPIC pins and are plentiful (~1000).
+    #[cfg(target_arch = "x86_64")]
+    next_msi_gsi: u32,
+    /// Shared KVM GSI routing manager for MSI-X routes, set by the builder
+    /// before any virtio-pci device is registered.
+    #[cfg(target_arch = "x86_64")]
+    pci_gsi_routes: Option<Arc<Mutex<devices::legacy::GsiRoutes>>>,
 }
 
 impl MMIODeviceManager {
@@ -127,6 +146,12 @@ impl MMIODeviceManager {
             next_pci_device_number: 1,
             #[cfg(target_arch = "x86_64")]
             pci_irqs: Vec::new(),
+            #[cfg(target_arch = "x86_64")]
+            pci_intx_gsi: None,
+            #[cfg(target_arch = "x86_64")]
+            next_msi_gsi: arch::x86_64::layout::IOAPIC_NUM_PINS,
+            #[cfg(target_arch = "x86_64")]
+            pci_gsi_routes: None,
         }
     }
 
@@ -198,12 +223,24 @@ impl MMIODeviceManager {
         Ok(ret)
     }
 
-    /// Register a virtio-pci device: allocate a bus-0 slot and an INTx GSI, wire
-    /// the device's interrupt eventfd to it via `KVM_IRQFD`, register the
-    /// per-queue notify ioeventfds inside the device's BAR0 window, place the
-    /// BAR0 MMIO region on the bus, and return the assigned (device_number,
-    /// bar_base, gsi). The caller is expected to add the returned config space to
-    /// the `PciBus` at `device_number`.
+    /// Attach the shared KVM GSI routing manager, used to install MSI-X routes.
+    /// Must be called by the builder before any virtio-pci device is registered.
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_pci_gsi_routes(&mut self, routes: Arc<Mutex<devices::legacy::GsiRoutes>>) {
+        self.pci_gsi_routes = Some(routes);
+    }
+
+    /// Register a virtio-pci device: allocate a bus-0 slot, wire the device's
+    /// INTx eventfd to the shared INTx GSI, allocate MSI-X GSIs and register the
+    /// per-vector irqfds, register the per-queue notify ioeventfds inside the
+    /// device's BAR0 window, place the BAR0 MMIO region on the bus, and return
+    /// the assigned (device_number, bar_base, intx_gsi). The caller adds the
+    /// returned config space to the `PciBus` at `device_number`.
+    ///
+    /// All virtio-pci devices share one level-triggered, shareable INTx GSI (KVM
+    /// allows multiple irqfds per GSI), so bus-0 slots (max 31), not GSIs, are
+    /// the limiting resource. MSI-X vectors draw from the plentiful KVM MSI GSI
+    /// pool above the IOAPIC pins.
     #[cfg(target_arch = "x86_64")]
     pub fn register_virtio_pci_device(
         &mut self,
@@ -214,21 +251,49 @@ impl MMIODeviceManager {
     ) -> Result<(u8, u64, u32, Arc<Mutex<devices::virtio::VirtioPciDevice>>)> {
         use devices::virtio::CAPABILITY_BAR_SIZE;
 
-        if self.irq > self.last_irq {
-            return Err(Error::IrqsExhausted);
-        }
         // Bus 0 has 32 slots; slot 0 is the host bridge, so endpoints occupy
-        // 1..=31. Running out of slots is a distinct exhaustion from GSIs.
+        // 1..=31. Slots, not GSIs, are the limiting resource now.
         if self.next_pci_device_number > 31 {
             return Err(Error::PciSlotsExhausted);
         }
         let device_number = self.next_pci_device_number;
-
         let bar_base = self.pci_mmio_base;
-        let gsi = self.irq;
 
         let mut device = device;
-        device.set_irq_line(gsi);
+
+        // INTx: allocate the shared GSI once (from the scarce IOAPIC pool) and
+        // reuse it for every virtio-pci device. PCI INTx is shareable.
+        let intx_gsi = match self.pci_intx_gsi {
+            Some(gsi) => gsi,
+            None => {
+                if self.irq > self.last_irq {
+                    return Err(Error::IrqsExhausted);
+                }
+                let gsi = self.irq;
+                self.irq += 1;
+                self.pci_intx_gsi = Some(gsi);
+                gsi
+            }
+        };
+        device.set_irq_line(intx_gsi);
+
+        // MSI-X: allocate one KVM MSI GSI per vector and register its irqfd.
+        let vector_irqfds = device.vector_irqfds();
+        let num_vectors = vector_irqfds.len() as u32;
+        if self.next_msi_gsi + num_vectors > MSI_GSI_MAX {
+            return Err(Error::IrqsExhausted);
+        }
+        let mut msi_gsis = Vec::with_capacity(vector_irqfds.len());
+        for (i, evt) in vector_irqfds.iter().enumerate() {
+            let gsi = self.next_msi_gsi + i as u32;
+            vm.register_irqfd(evt, gsi).map_err(Error::RegisterIrqFd)?;
+            msi_gsis.push(gsi);
+        }
+        self.next_msi_gsi += num_vectors;
+        device.set_msix_gsis(&msi_gsis);
+        if let Some(routes) = &self.pci_gsi_routes {
+            device.set_msix_routes(routes.clone());
+        }
 
         // Per-queue notify: each queue's eventfd fires on a write to its own
         // address inside the notify region (address-based, no datamatch).
@@ -239,8 +304,8 @@ impl MMIODeviceManager {
                 .map_err(Error::RegisterIoEvent)?;
         }
 
-        // INTx: the device asserts `gsi` by writing this eventfd.
-        vm.register_irqfd(device.interrupt_evt(), gsi)
+        // INTx: the device asserts the shared GSI by writing this eventfd.
+        vm.register_irqfd(device.interrupt_evt(), intx_gsi)
             .map_err(Error::RegisterIrqFd)?;
 
         let device = Arc::new(Mutex::new(device));
@@ -253,18 +318,17 @@ impl MMIODeviceManager {
             MMIODeviceInfo {
                 addr: bar_base,
                 _len: CAPABILITY_BAR_SIZE,
-                _irq: gsi,
+                _irq: intx_gsi,
             },
         );
 
-        // Record the INTx route (interrupt pin A == 1) for the MP table.
-        self.pci_irqs.push((device_number, 1, gsi));
+        // Record the shared INTx route (interrupt pin A == 1) for the MP table.
+        self.pci_irqs.push((device_number, 1, intx_gsi));
 
         self.pci_mmio_base += CAPABILITY_BAR_SIZE;
-        self.irq += 1;
         self.next_pci_device_number += 1;
 
-        Ok((device_number, bar_base, gsi, device))
+        Ok((device_number, bar_base, intx_gsi, device))
     }
 
     /// Append a registered MMIO device to the kernel cmdline.

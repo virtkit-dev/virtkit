@@ -29,6 +29,8 @@ pub mod gpu;
 pub mod input;
 pub mod linux_errno;
 mod mmio;
+#[cfg(target_arch = "x86_64")]
+mod msix;
 #[cfg(feature = "net")]
 pub mod net;
 #[cfg(target_arch = "x86_64")]
@@ -51,6 +53,8 @@ pub use self::fs::*;
 #[cfg(feature = "gpu")]
 pub use self::gpu::*;
 pub use self::mmio::*;
+#[cfg(target_arch = "x86_64")]
+pub use self::msix::MsixConfig;
 #[cfg(feature = "net")]
 pub use self::net::Net;
 #[cfg(target_arch = "x86_64")]

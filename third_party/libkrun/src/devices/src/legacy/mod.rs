@@ -9,6 +9,8 @@ pub mod aia;
 pub mod gic;
 #[cfg(target_os = "macos")]
 mod gicv3;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod gsi;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod hvfgicv3;
 #[cfg(target_arch = "x86_64")]
@@ -53,6 +55,8 @@ pub use self::cmos::Cmos;
 pub use self::gicv3::GicV3;
 #[cfg(target_arch = "aarch64")]
 pub use self::gpio::Gpio;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub use self::gsi::GsiRoutes;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use self::hvfgicv3::HvfGicV3;
 #[cfg(target_arch = "x86_64")]

@@ -29,9 +29,12 @@ use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use super::device::{DeviceQueue, QueueConfig, VirtioDevice};
 use super::mmio::{CreateMmioTransportError, InterruptTransport};
+use super::msix::{MsixConfig, MSIX_TABLE_ENTRY_SIZE, NUM_VECTORS};
 use super::queue::Queue;
 use super::{device_status, TYPE_BLOCK, TYPE_NET};
 use crate::bus::BusDevice;
+#[cfg(target_os = "linux")]
+use crate::legacy::GsiRoutes;
 use crate::legacy::{IrqChip, PciDevice};
 
 /// virtio PCI vendor id.
@@ -48,6 +51,9 @@ const DEVICE_CONFIG_BAR_OFFSET: u64 = 0x4000;
 const DEVICE_CONFIG_SIZE: u64 = 0x1000;
 const NOTIFICATION_BAR_OFFSET: u64 = 0x6000;
 const NOTIFICATION_SIZE: u64 = 0x1000;
+/// MSI-X table and PBA regions inside BAR0 (both within CAPABILITY_BAR_SIZE).
+const MSIX_TABLE_BAR_OFFSET: u64 = 0x8000;
+const MSIX_PBA_BAR_OFFSET: u64 = 0x4_8000;
 /// The BAR size must be a power of two large enough to cover all regions.
 pub const CAPABILITY_BAR_SIZE: u64 = 0x8_0000;
 
@@ -69,15 +75,26 @@ struct CommonConfig {
     driver_feature_select: u32,
     driver_status: u8,
     queue_select: u16,
+    /// MSI-X vector selected for config-change interrupts (common-config 0x10).
+    /// 0xffff (`VIRTIO_MSI_NO_VECTOR`) until the driver assigns one. Recorded for
+    /// driver compatibility but not consulted for delivery: this transport uses a
+    /// fixed two-vector model (vector 0 config, vector 1 shared by all queues).
+    msix_config: u16,
+    /// MSI-X vector selected per virtqueue (common-config 0x1a, indexed by the
+    /// selected queue). 0xffff until the driver assigns one. Like `msix_config`,
+    /// recorded but not consulted — every queue shares the one queue vector.
+    queue_msix_vector: Vec<u16>,
 }
 
 impl CommonConfig {
-    fn new() -> Self {
+    fn new(num_queues: usize) -> Self {
         CommonConfig {
             device_feature_select: 0,
             driver_feature_select: 0,
             driver_status: 0,
             queue_select: 0,
+            msix_config: 0xffff,
+            queue_msix_vector: vec![0xffff; num_queues],
         }
     }
 }
@@ -129,6 +146,10 @@ pub struct VirtioPciDevice {
 
     interrupt: InterruptTransport,
     device_activated: bool,
+
+    /// MSI-X table / PBA state, shared with the `InterruptTransport` (for
+    /// delivery) and with the PCI config space (for message-control writes).
+    msix: Arc<Mutex<MsixConfig>>,
 }
 
 impl VirtioPciDevice {
@@ -160,16 +181,21 @@ impl VirtioPciDevice {
             ));
         }
 
+        let interrupt = InterruptTransport::new(intc, log_target)?;
+        let msix = Arc::new(Mutex::new(MsixConfig::new()));
+        interrupt.set_msix(msix.clone());
+
         Ok(VirtioPciDevice {
             device,
             mem,
-            common_config: CommonConfig::new(),
+            common_config: CommonConfig::new(queue_config.len()),
             queues: Some(queues),
             queue_state,
             queue_evts,
             queue_config,
-            interrupt: InterruptTransport::new(intc, log_target)?,
+            interrupt,
             device_activated: false,
+            msix,
         })
     }
 
@@ -199,6 +225,26 @@ impl VirtioPciDevice {
     /// Offset within BAR0 at which queue `i` is notified.
     pub fn queue_notify_offset(i: usize) -> u64 {
         NOTIFICATION_BAR_OFFSET + i as u64 * u64::from(NOTIFY_OFF_MULTIPLIER)
+    }
+
+    /// The per-vector MSI-X eventfds, in vector order, for the device manager to
+    /// register as `KVM_IRQFD`s against the assigned MSI GSIs.
+    pub fn vector_irqfds(&self) -> Vec<Arc<EventFd>> {
+        self.msix.lock().unwrap().vector_irqfds()
+    }
+
+    /// Assign the KVM MSI GSIs for the MSI-X vectors (vector order).
+    pub fn set_msix_gsis(&self, gsis: &[u32]) {
+        let mut msix = self.msix.lock().unwrap();
+        for (i, &gsi) in gsis.iter().enumerate() {
+            msix.set_gsi(i, gsi);
+        }
+    }
+
+    /// Attach the shared KVM GSI routing manager to the MSI-X config.
+    #[cfg(target_os = "linux")]
+    pub fn set_msix_routes(&self, routes: Arc<Mutex<GsiRoutes>>) {
+        self.msix.lock().unwrap().set_routes(routes);
     }
 
     /// Build the legacy PCI config space (header + BAR0 + virtio capabilities)
@@ -249,6 +295,15 @@ impl VirtioPciDevice {
             NOTIFICATION_SIZE as u32,
             NOTIFY_OFF_MULTIPLIER,
         ));
+
+        // MSI-X capability: table and PBA both in BAR0 (BIR 0). Attach the shared
+        // `MsixConfig` so config-space message-control writes reach it.
+        dev.add_msix_capability(
+            MSIX_TABLE_BAR_OFFSET as u32,
+            MSIX_PBA_BAR_OFFSET as u32,
+            NUM_VECTORS,
+            self.msix.clone(),
+        );
 
         dev
     }
@@ -340,7 +395,7 @@ impl VirtioPciDevice {
                 .map(|q| QueueState::new(q.get_max_size()))
                 .collect();
             self.queues = Some(queues);
-            self.common_config = CommonConfig::new();
+            self.common_config = CommonConfig::new(self.queue_config.len());
         }
     }
 
@@ -363,7 +418,7 @@ impl VirtioPciDevice {
             }
             (0x08, 4) => self.common_config.driver_feature_select as u64,
             (0x0c, 4) => 0, // driver_feature is write-only from the driver's view
-            (0x10, 2) => 0xffff, // msix_config: no vector configured (INTx only)
+            (0x10, 2) => u64::from(self.common_config.msix_config),
             (0x12, 2) => self.queue_state.len() as u64,
             (0x14, 1) => self.common_config.driver_status as u64,
             (0x15, 1) => u64::from(self.interrupt.config_generation()),
@@ -373,7 +428,13 @@ impl VirtioPciDevice {
             (0x18, 2) => {
                 self.with_queue(0, |q| if q.size == 0 { q.max_size } else { q.size }) as u64
             }
-            (0x1a, 2) => 0xffff, // queue_msix_vector: none
+            (0x1a, 2) => u64::from(
+                self.common_config
+                    .queue_msix_vector
+                    .get(self.common_config.queue_select as usize)
+                    .copied()
+                    .unwrap_or(0xffff),
+            ),
             (0x1c, 2) => u64::from(self.with_queue(false, |q| q.ready)),
             (0x1e, 2) => self.common_config.queue_select as u64, // queue_notify_off
             (0x20, 4) => self.with_queue(0, |q| q.desc_table.0 & 0xffff_ffff),
@@ -414,8 +475,16 @@ impl VirtioPciDevice {
             (0x2c, 4) => self.with_queue_mut(|q| set_hi(&mut q.avail_ring, v as u32)),
             (0x30, 4) => self.with_queue_mut(|q| set_lo(&mut q.used_ring, v as u32)),
             (0x34, 4) => self.with_queue_mut(|q| set_hi(&mut q.used_ring, v as u32)),
-            // msix_config / queue_msix_vector: accepted and ignored (INTx only).
-            (0x10, 2) | (0x1a, 2) => {}
+            // msix_config: the driver's selected config-change vector.
+            (0x10, 2) => self.common_config.msix_config = v as u16,
+            // queue_msix_vector: the driver's selected vector for the currently
+            // selected queue.
+            (0x1a, 2) => {
+                let idx = self.common_config.queue_select as usize;
+                if let Some(slot) = self.common_config.queue_msix_vector.get_mut(idx) {
+                    *slot = v as u16;
+                }
+            }
             _ => warn!(
                 "virtio-pci: invalid common cfg write 0x{offset:x} len {}",
                 data.len()
@@ -444,6 +513,18 @@ impl BusDevice for VirtioPciDevice {
             }
             o if (NOTIFICATION_BAR_OFFSET..NOTIFICATION_BAR_OFFSET + NOTIFICATION_SIZE)
                 .contains(&o) => {}
+            o if msix_table_region().contains(&o) => {
+                self.msix
+                    .lock()
+                    .unwrap()
+                    .read_table(o - MSIX_TABLE_BAR_OFFSET, data);
+            }
+            o if o >= MSIX_PBA_BAR_OFFSET => {
+                self.msix
+                    .lock()
+                    .unwrap()
+                    .read_pba(o - MSIX_PBA_BAR_OFFSET, data);
+            }
             _ => {}
         }
     }
@@ -472,9 +553,26 @@ impl BusDevice for VirtioPciDevice {
                     warn!("virtio-pci: notify to unknown queue {idx}");
                 }
             }
+            o if msix_table_region().contains(&o) => {
+                self.msix
+                    .lock()
+                    .unwrap()
+                    .write_table(o - MSIX_TABLE_BAR_OFFSET, data);
+            }
+            o if o >= MSIX_PBA_BAR_OFFSET => {
+                self.msix
+                    .lock()
+                    .unwrap()
+                    .write_pba(o - MSIX_PBA_BAR_OFFSET, data);
+            }
             _ => {}
         }
     }
+}
+
+/// The BAR0 byte range covered by the MSI-X table (NUM_VECTORS entries).
+fn msix_table_region() -> std::ops::Range<u64> {
+    MSIX_TABLE_BAR_OFFSET..MSIX_TABLE_BAR_OFFSET + u64::from(NUM_VECTORS) * MSIX_TABLE_ENTRY_SIZE
 }
 
 // --- helpers -----------------------------------------------------------------
