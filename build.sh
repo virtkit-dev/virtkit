@@ -119,6 +119,17 @@ RUSTFLAGS_VAL="--remap-path-prefix=/work=/src --remap-path-prefix=/work/target/.
 # linker — the link step dominates an incremental rebuild, so this is the biggest win.
 # Gated to --fast, so the reproducible release link is untouched.
 [ -n "$FAST" ] && RUSTFLAGS_VAL="$RUSTFLAGS_VAL -C link-arg=-fuse-ld=mold"
+# Resolve the source commit on the host and thread it into the compile as VK_GIT_COMMIT,
+# so `vk --version` and dist/build-info.txt report the same value. The build sandbox can't
+# reliably run git itself (the dogfood guest runs as root against a host-owned /work, which
+# trips git's dubious-ownership check), so its `git rev-parse` fallback yields "unknown".
+# VK_GIT_COMMIT lets a caller supply the commit — the --bootstrap-check rebuild runs in a
+# tree copy with no .git, so it inherits the outer build's commit.
+if [ -z "${VK_GIT_COMMIT:-}" ]; then
+  VK_GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+  [ -n "$(git status --porcelain 2>/dev/null)" ] && VK_GIT_COMMIT="$VK_GIT_COMMIT (dirty)"
+fi
+commit="$VK_GIT_COMMIT"
 BUILD_ENV=(
   HOME=/tmp
   CARGO_HOME=/work/target/.cargo-home
@@ -126,6 +137,7 @@ BUILD_ENV=(
   SOURCE_DATE_EPOCH=0
   "RUSTFLAGS=$RUSTFLAGS_VAL"
   "CFLAGS_x86_64_unknown_linux_musl=-ffile-prefix-map=/work=/src -ffile-prefix-map=/work/target/.cargo-home=/cargo"
+  "VK_GIT_COMMIT=$commit"
 )
 # --fast: trim the dev profile's debuginfo to line tables — keeps file:line in panics/
 # backtraces but drops the bulky per-variable/type DWARF, so codegen and every relink are
@@ -228,14 +240,8 @@ done
 ( cd "$OUT" && sha256sum vk > vk.sha256 && sha256sum vk-agent > vk-agent.sha256 )
 base_image=$(sed -nE 's/^FROM (rust:[^ ]*).*$/\1/p' .devcontainer/Dockerfile)
 toolchain=$(sed -nE 's/^channel = "(.*)"$/\1/p' rust-toolchain.toml)
-# VK_GIT_COMMIT lets the caller supply the commit — the --bootstrap-check rebuild runs
-# in a tree copy with no .git, so it inherits the outer build's commit instead of "unknown".
-if [ -n "${VK_GIT_COMMIT:-}" ]; then
-  commit="$VK_GIT_COMMIT"
-else
-  commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)
-  [ -n "$(git status --porcelain 2>/dev/null)" ] && commit="$commit (dirty)"
-fi
+# $commit was resolved above (before the compile) and threaded into the build as
+# VK_GIT_COMMIT, so the embedded `vk --version` stamp and this manifest agree.
 # --fast produces the debug profile: unoptimized, unstripped, not reproducible. Stamp the
 # manifest so its hashes are never mistaken for a release artifact — the release "Verify"
 # recipe would rebuild the release profile and fail sha256sum -c against these debug bytes.
