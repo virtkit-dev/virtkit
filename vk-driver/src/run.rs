@@ -935,6 +935,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             NET_VSOCK_PORT,
             gw,
             agent.to_path_buf(),
+            manager_build_opts(args, kernel, agent),
             planned.units,
         )))
     };
@@ -1287,9 +1288,10 @@ fn teardown_run(
 /// Every declared compose unit, materialized and addressed, plus which ones
 /// boot eagerly and what the switch must serve for them.
 struct PlannedServices {
-    /// (unit, runtime dir) for the manager — the `--primary` primary excluded
-    /// (it boots as the run VM, not as a sibling)
-    units: Vec<(crate::units::Provisioned, PathBuf)>,
+    /// (provisioned service, runtime dir, compose unit) for the manager — the `--primary`
+    /// primary excluded (it boots as the run VM, not as a sibling). The compose unit rides
+    /// along so the manager can build a profiled-down service on demand.
+    units: Vec<(crate::units::Provisioned, PathBuf, crate::compose::Unit)>,
     /// names to boot eagerly: the profile-enabled set, or the primary's
     /// dependency closure
     start: Vec<String>,
@@ -1446,6 +1448,7 @@ fn plan_services(
                 kernel: unit.kernel.clone(),
             },
             s.dir,
+            unit.clone(),
         ));
         if on[s.unit] {
             planned.start.push(unit.name.clone());
@@ -1490,6 +1493,7 @@ async fn compose_up(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path) ->
         NET_VSOCK_PORT,
         gw,
         agent.to_path_buf(),
+        manager_build_opts(args, kernel, agent),
         planned.units,
     ));
     for name in &planned.start {
@@ -1518,6 +1522,20 @@ async fn compose_up(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path) ->
     let _ = switch.kill();
     let _ = switch.wait();
     Ok(())
+}
+
+/// The builder wiring the service manager needs to build a profiled-down `build:` service
+/// on demand at its first start — the same embedded kernel/agent, cache and build args the
+/// up-front `build_compose_images` used, so an on-demand build restores from the same cache.
+fn manager_build_opts(args: &RunArgs, kernel: &Path, agent: &Path) -> crate::units::BuildOpts {
+    crate::units::BuildOpts {
+        build_args: args.build_args.clone(),
+        kernel: kernel.to_path_buf(),
+        cloud_hypervisor: args.cloud_hypervisor.clone(),
+        agent: agent.to_path_buf(),
+        cache_registry: args.cache_registry.clone(),
+        cache_insecure: args.cache_insecure,
+    }
 }
 
 /// The build options common to every compose service build (the embedded kernel/agent, the

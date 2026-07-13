@@ -19,6 +19,9 @@ use vk_core::fleetctl::{Frame, Reply, Request, UnitStatus};
 struct UnitState {
     svc: crate::units::Provisioned,
     dir: PathBuf,
+    /// The compose unit behind this service — its build recipe + overrides, so a
+    /// profiled-down service can be built on demand the first time it is started.
+    unit: crate::compose::Unit,
     child: Option<Child>,
     aux: Vec<Child>,
 }
@@ -33,6 +36,9 @@ pub struct Manager {
     /// the vk-agent every service boot's initramfs carries (the owner holds the
     /// embedded-asset handle this path stays valid through)
     agent: PathBuf,
+    /// the builder wiring (cache, build args, embedded kernel/agent) for building a
+    /// profiled-down `build:` service on demand at its first start
+    build: crate::units::BuildOpts,
     units: Mutex<HashMap<String, UnitState>>,
 }
 
@@ -43,7 +49,8 @@ impl Manager {
         net_port: u32,
         gateway: Ipv4Addr,
         agent: PathBuf,
-        units: impl IntoIterator<Item = (crate::units::Provisioned, PathBuf)>,
+        build: crate::units::BuildOpts,
+        units: impl IntoIterator<Item = (crate::units::Provisioned, PathBuf, crate::compose::Unit)>,
     ) -> Manager {
         Manager {
             kernel,
@@ -51,15 +58,17 @@ impl Manager {
             net_port,
             gateway,
             agent,
+            build,
             units: Mutex::new(
                 units
                     .into_iter()
-                    .map(|(svc, dir)| {
+                    .map(|(svc, dir, unit)| {
                         (
                             svc.name.clone(),
                             UnitState {
                                 svc,
                                 dir,
+                                unit,
                                 child: None,
                                 aux: Vec::new(),
                             },
@@ -75,6 +84,9 @@ impl Manager {
         self.units.lock().unwrap().len()
     }
 
+    /// Dispatch a request to a single (non-streaming) reply. `handle_control` intercepts
+    /// `Start`/`Restart` to stream build progress (see `stream_start`); the `Start`/`Restart`
+    /// arms here are the non-streaming fallback (a null progress sink) for any other caller.
     pub fn handle(&self, req: Request) -> Reply {
         match req {
             Request::List => self.list(),
@@ -120,6 +132,37 @@ impl Manager {
     }
 
     pub fn start(&self, name: &str) -> Reply {
+        self.start_streamed(name, None)
+    }
+
+    /// Start a service, building its image first if it is not already materialized (a
+    /// profiled-down `build:` service, brought up on demand) — streaming that build's
+    /// progress to `sink` when set. The image build is long and runs WITHOUT the units lock
+    /// held (only `list`/`status` would otherwise stall behind it); the lock is re-taken for
+    /// the quick boot. A fresh image skips the build, so an already-materialized service
+    /// (every eager start) just boots, exactly as before. Concurrent first-starts of the same
+    /// service are serialized inside `ensure_unit_build_sync` (a per-image build flock), not by
+    /// the units lock — so they cannot race the in-place image write.
+    pub fn start_streamed(&self, name: &str, sink: Option<crate::build::ProgressSink>) -> Reply {
+        // Snapshot the build inputs under the lock, then release it for the build.
+        let (unit, ext4) = {
+            let mut u = self.units.lock().unwrap();
+            let Some(st) = u.get_mut(name) else {
+                return Reply::err(format!("no such unit {name:?}"));
+            };
+            if state_of(st) == "running" {
+                return Reply::ok(format!("{name} already running ({})", st.svc.ip));
+            }
+            (st.unit.clone(), st.svc.ext4.clone())
+        };
+
+        // Build/ensure the image (lock released) — a fresh image returns instantly.
+        let config = match crate::units::ensure_unit_build_sync(&unit, &ext4, &self.build, sink) {
+            Ok(config) => config,
+            Err(e) => return Reply::err(format!("building {name}: {e:#}")),
+        };
+
+        // Re-take the lock for the boot; re-check running in case a concurrent start won.
         let mut u = self.units.lock().unwrap();
         let Some(st) = u.get_mut(name) else {
             return Reply::err(format!("no such unit {name:?}"));
@@ -127,6 +170,9 @@ impl Manager {
         if state_of(st) == "running" {
             return Reply::ok(format!("{name} already running ({})", st.svc.ip));
         }
+        // The freshly-built image's own config (env/user/entrypoint) is known only after the
+        // build, so adopt it before booting — a profiled-down service had no config yet.
+        st.svc.config = config;
         match crate::units::boot_unit(
             &st.svc,
             &st.dir,
@@ -240,7 +286,50 @@ async fn handle_control(conn: tokio::net::UnixStream, mgr: Arc<Manager>) -> Resu
         let Ok(req) = vk_core::fleetctl::read_msg::<_, Request>(&mut rd).await else {
             return Ok(());
         };
-        let reply = mgr.handle(req); // sync; the unit lock is never held across an await
-        vk_core::fleetctl::write_msg(&mut wr, &Frame::Done(reply)).await?;
+        match req {
+            // Start/Restart may build the image on demand — a long, blocking op whose
+            // progress streams back as Progress frames, then a terminal Done.
+            Request::Start { unit } => stream_start(&mut wr, &mgr, unit, false).await?,
+            Request::Restart { unit } => stream_start(&mut wr, &mgr, unit, true).await?,
+            other => {
+                let reply = mgr.handle(other); // sync; the unit lock is never held across an await
+                vk_core::fleetctl::write_msg(&mut wr, &Frame::Done(reply)).await?;
+            }
+        }
     }
+}
+
+/// Handle a Start/Restart by running the (possibly image-building) start on a blocking
+/// thread and forwarding its build progress to the peer as `Progress` frames, then the
+/// terminal `Done`. The build sink pushes lines onto an unbounded channel this drains until
+/// the blocking task finishes and drops it; a write error (peer gone) abandons the stream
+/// while the detached build runs to completion.
+async fn stream_start(
+    wr: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+    mgr: &Arc<Manager>,
+    unit: String,
+    restart: bool,
+) -> Result<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let sink: crate::build::ProgressSink = Arc::new(move |line: &str| {
+        let _ = tx.send(line.to_string());
+    });
+    let mgr = Arc::clone(mgr);
+    let task = tokio::task::spawn_blocking(move || {
+        if restart {
+            let _ = mgr.stop(&unit);
+        }
+        mgr.start_streamed(&unit, Some(sink))
+    });
+    // Drain build progress until the task drops its sink (build + boot done). A write error
+    // here (peer gone) returns via `?`, dropping the receiver and detaching the build — it
+    // runs to completion, warming the store for the next start; its outcome (or a panic) is
+    // then unobserved. Only the drained path below surfaces a task panic as a `Reply::err`.
+    while let Some(line) = rx.recv().await {
+        vk_core::fleetctl::write_msg(wr, &Frame::Progress(line)).await?;
+    }
+    let reply = task
+        .await
+        .unwrap_or_else(|e| Reply::err(format!("start task failed: {e}")));
+    vk_core::fleetctl::write_msg(wr, &Frame::Done(reply)).await
 }

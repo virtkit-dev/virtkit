@@ -83,6 +83,7 @@ pub fn ensure_unit_build(
     target: Option<&str>,
     stage_key: &str,
     out: &Path,
+    progress_sink: Option<crate::build::ProgressSink>,
 ) -> Result<()> {
     let expected = fingerprint(&[stage_key]);
     if unit_fresh(out, &expected) {
@@ -110,7 +111,7 @@ pub fn ensure_unit_build(
         require_cached: false,
         build_jobs: None,
         debug: false,
-        progress_sink: None,
+        progress_sink,
     })?;
     let uuid = parse_uuid(&expected).expect("fingerprint is a canonical UUID");
     crate::ext4::set_uuid(out, &uuid)
@@ -212,12 +213,12 @@ mod tests {
         crate::ext4::set_uuid(&out, &parse_uuid(&expected).unwrap()).unwrap();
 
         // UUID matches but the sidecar is missing -> stale (a boot needs the config).
-        assert!(ensure_unit_build(&recipe, Some("svc"), key, &out).is_err());
+        assert!(ensure_unit_build(&recipe, Some("svc"), key, &out, None).is_err());
         std::fs::write(crate::build::config_sidecar(&out), "{}").unwrap();
         // UUID + sidecar -> fresh, no build attempted.
-        ensure_unit_build(&recipe, Some("svc"), key, &out).unwrap();
+        ensure_unit_build(&recipe, Some("svc"), key, &out, None).unwrap();
         // a different stage key -> stale again.
-        assert!(ensure_unit_build(&recipe, Some("svc"), "other", &out).is_err());
+        assert!(ensure_unit_build(&recipe, Some("svc"), "other", &out, None).is_err());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

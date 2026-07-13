@@ -60,39 +60,88 @@ pub async fn ensure_unit(
     build: &BuildOpts,
 ) -> Result<RunConfig> {
     match &unit.source {
-        crate::compose::Source::Build {
-            dockerfiles,
-            context,
-            target,
-            args,
-        } => {
-            let mut build_args = build.build_args.clone();
-            build_args.extend(args.iter().cloned());
-            // compose semantics: one context for all the service's files.
-            let contexts = vec![context.clone(); dockerfiles.len()];
-            let key = crate::build::target_stage_key(
-                dockerfiles,
-                &contexts,
-                &build_args,
-                target.as_deref(),
-            )?;
-            let recipe = crate::ensure::BuildRecipe {
-                dockerfiles: dockerfiles.clone(),
-                contexts,
-                build_args,
-                kernel: Some(build.kernel.clone()),
-                cloud_hypervisor: Some(build.cloud_hypervisor.clone()),
-                agent: Some(build.agent.clone()),
-                cache_registry: build.cache_registry.clone(),
-                cache_insecure: build.cache_insecure,
-            };
-            crate::ensure::ensure_unit_build(&recipe, target.as_deref(), &key, ext4)?;
+        crate::compose::Source::Build { .. } => {
+            // No streaming here (the CI/eager paths): the on-demand manager start uses
+            // ensure_unit_build_sync with a sink.
+            return materialize_build_unit(unit, ext4, build, None);
         }
         crate::compose::Source::Image(image) => {
             crate::ensure::ensure_unit_pull(image, ext4).await?;
         }
     }
-    // The boot config: the image's defaults (its sidecar) + the compose overrides.
+    read_merged_config(unit, ext4)
+}
+
+/// Ensure a `build:` unit's clean image synchronously — the microVM build path never
+/// awaits — streaming its build progress to `sink` when set, and return its merged runtime
+/// config. This is the on-demand start path (the service manager builds a profiled-down
+/// `build:` service the first time it is brought up). Errors for an `image:` unit: those
+/// need the async pull and are materialized up front, not on demand.
+pub fn ensure_unit_build_sync(
+    unit: &crate::compose::Unit,
+    ext4: &Path,
+    build: &BuildOpts,
+    sink: Option<crate::build::ProgressSink>,
+) -> Result<RunConfig> {
+    match &unit.source {
+        crate::compose::Source::Build { .. } => {
+            // The build writes the image in place at `ext4` (a non-atomic flatten), and the
+            // manager releases the units lock across it — so two concurrent first-starts of
+            // the same service would corrupt each other's write. A blocking flock beside the
+            // image serializes them: the first builds, the rest block then find it fresh (the
+            // fingerprint short-circuit in `ensure_unit_build`), mirroring `ensure_unit_store`.
+            let _lock = lock_exclusive(&build_lock_path(ext4))?;
+            materialize_build_unit(unit, ext4, build, sink)
+        }
+        crate::compose::Source::Image(_) => anyhow::bail!(
+            "on-demand start of the image: service {:?} is not supported — \
+             image services are materialized up front",
+            unit.name
+        ),
+    }
+}
+
+/// Build a `build:` unit's ext4 (skipping when its fingerprint already matches), streaming
+/// to `sink` if set, then return its merged runtime config. Panics if `unit.source` is not
+/// `Build` — callers dispatch on the source first.
+fn materialize_build_unit(
+    unit: &crate::compose::Unit,
+    ext4: &Path,
+    build: &BuildOpts,
+    sink: Option<crate::build::ProgressSink>,
+) -> Result<RunConfig> {
+    let crate::compose::Source::Build {
+        dockerfiles,
+        context,
+        target,
+        args,
+    } = &unit.source
+    else {
+        unreachable!("materialize_build_unit requires a build: source")
+    };
+    let mut build_args = build.build_args.clone();
+    build_args.extend(args.iter().cloned());
+    // compose semantics: one context for all the service's files.
+    let contexts = vec![context.clone(); dockerfiles.len()];
+    let key =
+        crate::build::target_stage_key(dockerfiles, &contexts, &build_args, target.as_deref())?;
+    let recipe = crate::ensure::BuildRecipe {
+        dockerfiles: dockerfiles.clone(),
+        contexts,
+        build_args,
+        kernel: Some(build.kernel.clone()),
+        cloud_hypervisor: Some(build.cloud_hypervisor.clone()),
+        agent: Some(build.agent.clone()),
+        cache_registry: build.cache_registry.clone(),
+        cache_insecure: build.cache_insecure,
+    };
+    crate::ensure::ensure_unit_build(&recipe, target.as_deref(), &key, ext4, sink)?;
+    read_merged_config(unit, ext4)
+}
+
+/// The unit's boot config: the image's own defaults (its sidecar, written by the build /
+/// pull) layered with the unit's compose overrides.
+fn read_merged_config(unit: &crate::compose::Unit, ext4: &Path) -> Result<RunConfig> {
     let sidecar = crate::build::config_sidecar(ext4);
     let image_cfg = RunConfig::from_json(
         &std::fs::read_to_string(&sidecar)
@@ -163,6 +212,14 @@ pub async fn ensure_unit_store(
     // GC readiness: record last use on every ensure (hit or miss), best-effort.
     let _ = std::fs::File::create(dir.join(".used"));
     Ok((ext4, config))
+}
+
+/// The lock file guarding an on-demand build of the image at `ext4` (a sibling `.build.lock`),
+/// so concurrent first-starts of the same service serialize instead of racing the in-place write.
+fn build_lock_path(ext4: &Path) -> PathBuf {
+    let mut p = ext4.as_os_str().to_os_string();
+    p.push(".build.lock");
+    PathBuf::from(p)
 }
 
 /// A held image lock; released when dropped (flock releases on the last close).
@@ -500,6 +557,34 @@ mod tests {
             .expect("second flock holder never acquired");
         t.join().unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn on_demand_build_rejects_an_image_service() {
+        // `image:` services need the async pull and are materialized up front; the sync
+        // on-demand start path must refuse one rather than silently do nothing.
+        let unit = crate::compose::parse(
+            "services:\n  redis:\n    image: redis:7\n",
+            Path::new("."),
+            &|_| None,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let opts = BuildOpts {
+            build_args: vec![],
+            kernel: "/nonexistent".into(),
+            cloud_hypervisor: "/nonexistent".into(),
+            agent: "/nonexistent".into(),
+            cache_registry: Some("none".into()),
+            cache_insecure: false,
+        };
+        let err = ensure_unit_build_sync(&unit, Path::new("/nonexistent/image.ext4"), &opts, None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("materialized up front"),
+            "expected an image-service rejection, got: {err:#}"
+        );
     }
 
     #[test]

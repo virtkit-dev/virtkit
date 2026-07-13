@@ -37,7 +37,7 @@ use serde::Deserialize;
 use vk_core::runcfg::RunConfig;
 
 /// One declared service, mapped from a compose `services.<name>` entry.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Unit {
     pub name: String,
     /// guest hostname (compose `hostname`, default: the service name)
@@ -66,7 +66,7 @@ pub struct Unit {
 }
 
 /// Where a unit's image comes from.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Source {
     /// pulled from a registry (fingerprint: the manifest digest)
     Image(String),
