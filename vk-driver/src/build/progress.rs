@@ -91,6 +91,11 @@ struct Tty {
     /// reports how long the RUN/COPY took — not that plus the snapshot + cache push that
     /// `cache_save` folds in after it (which would inflate a trivial step to minutes).
     ran: Mutex<HashMap<(StageId, usize), Duration>>,
+    /// the most recently started cell's label, mirrored into the terminal title so a parallel
+    /// build's title tracks the latest work item (empty until the first cell starts).
+    activity: Mutex<String>,
+    /// whether to emit terminal-title (OSC) updates; suppressed by `VIRTKIT_NO_TITLE`.
+    title: bool,
 }
 
 /// bars-map key for the `index`-th export tail (no real stage has this id, so the
@@ -106,7 +111,7 @@ const RESTORE_NUM: usize = 0;
 const FINISH_NUM: usize = usize::MAX;
 
 enum Backend {
-    Tty(Tty),
+    Tty(Box<Tty>),
     Plain,
     Disabled,
 }
@@ -148,7 +153,10 @@ impl Progress {
         let dumb = std::env::var("TERM").map(|t| t == "dumb").unwrap_or(false);
         let color = std::env::var_os("NO_COLOR").is_none();
         if !forced_plain && !dumb && std::io::stdout().is_terminal() {
-            Arc::new(Progress::new_backend(Backend::Tty(Tty::new()), color))
+            Arc::new(Progress::new_backend(
+                Backend::Tty(Box::new(Tty::new())),
+                color,
+            ))
         } else {
             Arc::new(Progress::new_backend(Backend::Plain, false))
         }
@@ -209,9 +217,7 @@ impl Progress {
             stages: map,
             export_seqs,
         });
-        if let Backend::Tty(tty) = &self.backend {
-            tty.header.set_message(self.header_msg());
-        }
+        self.refresh_header();
     }
 
     /// The output sink for `stage`'s guest commands: routes each chunk here (line-buffered,
@@ -430,6 +436,11 @@ impl Progress {
                     self.paint(&line, "\x1b[1;31m")
                 };
                 let _ = tty.println(styled);
+                tty.set_title(&format!(
+                    "vk build {tag} ({}/{})",
+                    self.done.load(Ordering::Relaxed),
+                    self.total.load(Ordering::Relaxed),
+                ));
             }
             Backend::Plain => println!("#0 {tag}"),
             Backend::Disabled => {}
@@ -446,17 +457,14 @@ impl Progress {
         };
         match &self.backend {
             Backend::Tty(tty) => {
+                let msg = format!("[{} {}/{}] {}", sm.name, num, sm.total, sm.label(num));
                 let pb = tty.mp.add(ProgressBar::new_spinner());
                 pb.set_style(self.step_style());
-                pb.set_message(format!(
-                    "[{} {}/{}] {}",
-                    sm.name,
-                    num,
-                    sm.total,
-                    sm.label(num)
-                ));
+                pb.set_message(msg.clone());
                 pb.enable_steady_tick(Duration::from_millis(120));
                 tty.bars.lock().unwrap().insert((stage, num), pb);
+                *tty.activity.lock().unwrap() = msg;
+                self.refresh_header();
             }
             Backend::Plain => {
                 println!(
@@ -552,6 +560,8 @@ impl Progress {
     fn refresh_header(&self) {
         if let Backend::Tty(tty) = &self.backend {
             tty.header.set_message(self.header_msg());
+            let activity = tty.activity.lock().unwrap();
+            tty.set_title(&build_title(&self.header_msg(), &activity));
         }
     }
 
@@ -681,13 +691,38 @@ impl Tty {
         );
         header.set_prefix("[+] Building");
         header.enable_steady_tick(Duration::from_millis(120));
-        Tty {
+        let tty = Tty {
             mp,
             sep,
             header,
             bars: Mutex::new(HashMap::new()),
             ran: Mutex::new(HashMap::new()),
+            activity: Mutex::new(String::new()),
+            title: std::env::var_os("VIRTKIT_NO_TITLE").is_none(),
+        };
+        // Save the terminal's current title on the xterm title stack so it can be restored on
+        // exit (paired with the `\x1b[23;2t` pop in `Drop`). Must precede any `set_title`.
+        tty.write_seq("\x1b[22;2t");
+        tty
+    }
+
+    /// Write a raw control sequence to the terminal, serialized against indicatif's draws by
+    /// the shared stdout lock. No-op when title updates are disabled or the target is hidden.
+    /// The save (`Tty::new`) and restore (`Drop`) go through the same gate, and `is_hidden()`
+    /// is stable for a stdout draw target's lifetime, so the stack push/pop stay paired.
+    fn write_seq(&self, seq: &str) {
+        if !self.title || self.mp.is_hidden() {
+            return;
         }
+        let mut out = io::stdout().lock();
+        let _ = out.write_all(seq.as_bytes());
+        let _ = out.flush();
+    }
+
+    /// Set the terminal window title (OSC 2, BEL-terminated). No visible glyph, so it needs no
+    /// indicatif suspend; the shared stdout lock keeps the sequence intact against indicatif.
+    fn set_title(&self, title: &str) {
+        self.write_seq(&format!("\x1b]2;{title}\x07"));
     }
 
     fn println(&self, line: impl AsRef<str>) -> io::Result<()> {
@@ -712,6 +747,14 @@ impl Tty {
             }
             out.flush()
         })
+    }
+}
+
+impl Drop for Tty {
+    /// Restore the terminal title saved in [`Tty::new`] (pop the xterm title stack), so `vk`
+    /// leaves the title as it found it — on success, failure, or an early error return.
+    fn drop(&mut self) {
+        self.write_seq("\x1b[23;2t");
     }
 }
 
@@ -757,6 +800,16 @@ fn right_align_to(head: &str, status: &str, width: usize) -> String {
     let head = clip(head, width.saturating_sub(sw + 1));
     let pad = width.saturating_sub(head.chars().count() + sw).max(1);
     format!("{head}{}{status}", " ".repeat(pad))
+}
+
+/// The terminal-title string for an in-progress build: the header counts, plus the current
+/// activity clipped to a title-sized budget when there is one.
+fn build_title(counts: &str, activity: &str) -> String {
+    if activity.is_empty() {
+        format!("vk build ({counts})")
+    } else {
+        format!("vk build ({counts}) {}", clip(activity, 72))
+    }
 }
 
 /// Clip `s` to at most `max` characters, marking a truncation with a trailing ellipsis.
@@ -828,7 +881,7 @@ mod tests {
     #[test]
     fn tty_mode_drives_without_panicking() {
         drive(&Arc::new(Progress::new_backend(
-            Backend::Tty(Tty::new()),
+            Backend::Tty(Box::new(Tty::new())),
             false,
         )));
     }
@@ -854,7 +907,10 @@ mod tests {
     /// snapshot is restored — so the count does not race ahead of a running restore pull.
     #[test]
     fn cached_cells_count_only_after_restore() {
-        let p = Arc::new(Progress::new_backend(Backend::Tty(Tty::new()), false));
+        let p = Arc::new(Progress::new_backend(
+            Backend::Tty(Box::new(Tty::new())),
+            false,
+        ));
         p.init(two_stages(), 1);
         p.stage_fully_cached(0); // stage 0's single cell is now cached...
         assert_eq!(
@@ -875,7 +931,10 @@ mod tests {
     /// folds the remainder into `done` so the final count is never stuck below what resolved.
     #[test]
     fn finish_flushes_pending_cached_cells() {
-        let p = Arc::new(Progress::new_backend(Backend::Tty(Tty::new()), false));
+        let p = Arc::new(Progress::new_backend(
+            Backend::Tty(Box::new(Tty::new())),
+            false,
+        ));
         p.init(two_stages(), 1);
         p.stage_fully_cached(0); // stage 0's cell resolves as a cache hit...
         assert_eq!(
@@ -896,7 +955,10 @@ mod tests {
     fn step_failure_drives_without_panicking() {
         for p in [
             Arc::new(Progress::new_backend(Backend::Plain, false)),
-            Arc::new(Progress::new_backend(Backend::Tty(Tty::new()), false)),
+            Arc::new(Progress::new_backend(
+                Backend::Tty(Box::new(Tty::new())),
+                false,
+            )),
         ] {
             p.init(two_stages(), 1);
             p.base_start(1);
@@ -913,7 +975,10 @@ mod tests {
     fn failed_restore_spinner_is_drained_by_finish() {
         for p in [
             Arc::new(Progress::new_backend(Backend::Plain, false)),
-            Arc::new(Progress::new_backend(Backend::Tty(Tty::new()), false)),
+            Arc::new(Progress::new_backend(
+                Backend::Tty(Box::new(Tty::new())),
+                false,
+            )),
         ] {
             p.init(two_stages(), 1);
             p.stage_fully_cached(0);
@@ -926,6 +991,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `clip` keeps a string within its character budget, ellipsizing only when it must, and
+    /// counts by chars (not bytes) so a multibyte label is clipped on a char boundary.
+    #[test]
+    fn clip_respects_char_budget() {
+        assert_eq!(clip("abc", 5), "abc"); // under budget: untouched
+        assert_eq!(clip("abcde", 5), "abcde"); // exact fit: no ellipsis
+        assert_eq!(clip("abcdef", 5), "abcd…"); // over budget: last char is the ellipsis
+        assert_eq!(clip("abc", 0), ""); // zero budget: empty
+        assert_eq!(clip("abc", 1), "…"); // budget of one: just the ellipsis
+        // Multibyte input clips by chars, and the result stays within the char budget.
+        let clipped = clip("héllo wörld", 5);
+        assert_eq!(clipped.chars().count(), 5);
+        assert!(clipped.ends_with('…'));
+    }
+
+    /// The terminal title carries the counts alone until a cell starts, then appends the
+    /// current activity clipped to the title budget.
+    #[test]
+    fn build_title_appends_clipped_activity() {
+        assert_eq!(build_title("2/5", ""), "vk build (2/5)");
+        assert_eq!(
+            build_title("2/5", "[build 1/2] RUN cargo build"),
+            "vk build (2/5) [build 1/2] RUN cargo build"
+        );
+        let long = build_title("2/5", &"x".repeat(100));
+        assert!(long.starts_with("vk build (2/5) "));
+        assert!(
+            long.ends_with('…'),
+            "an over-long activity is clipped: {long:?}"
+        );
     }
 
     #[test]

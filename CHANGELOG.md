@@ -11,6 +11,9 @@ All notable changes to virtkit will be documented in this file.
   not answer. A liveness check that exercises the agent protocol — stronger than a socket
   stat — so external tooling can ask "is this VM up?" with `vk` alone, no separate agent
   binary.
+- `vk build` mirrors build progress into the terminal title so the tab tracks the running
+  counts and current step at a glance, restoring the terminal's original title when it
+  exits. Set `VIRTKIT_NO_TITLE` (to any value) to suppress it.
 
 ### Changed
 
