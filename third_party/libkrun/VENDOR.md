@@ -97,3 +97,13 @@ impossible to observe. When `serial_devices` is empty, the implicit console is e
 `console_output` is set, a serial is added writing (append) to that file so COM1 (0x3f8, IRQ 4)
 carries early boot. Additive only; the embedded kernel keeps `console=hvc0` and never triggers it.
 Search for `virtkit: give the guest an early 16550 COM1 console`.
+
+`src/devices/src/legacy/pci.rs` (new) + `src/devices/src/legacy/mod.rs` +
+`src/vmm/src/device_manager/legacy.rs` — a minimal legacy PCI host bridge so a guest kernel
+enumerates a PCI bus, the foundation for virtio-pci support. `PciConfigIo` implements the type-1
+config mechanism on the PIO bus at 0xcf8 (CONFIG_ADDRESS latch) / 0xcfc (CONFIG_DATA window),
+with the BDF/register decode adapted from cloud-hypervisor's `PciConfigIo`; a `PciBus` holds a
+single host-bridge `PciDevice` at 00:00.0 (vendor 0x1b36 / device 0x0008, class 0x060000, header
+type 0). Registered by `PortIODeviceManager`. x86_64 only; additive — no upstream behaviour
+change until PCI devices are attached later. Covered by `legacy::pci` unit tests.
+Search for `PciConfigIo`.

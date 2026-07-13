@@ -42,6 +42,7 @@ pub struct PortIODeviceManager {
     pub cmos: Arc<Mutex<devices::legacy::Cmos>>,
     pub stdio_serial: Vec<Arc<Mutex<devices::legacy::Serial>>>,
     pub i8042: Arc<Mutex<devices::legacy::I8042Device>>,
+    pub pci_config_io: Arc<Mutex<devices::legacy::PciConfigIo>>,
 
     pub com_evt_1: EventFd,
     pub com_evt_2: EventFd,
@@ -79,11 +80,25 @@ impl PortIODeviceManager {
             kbd_evt.try_clone().map_err(Error::EventFd)?,
         )));
 
+        // Legacy PCI: a single host bridge at 00:00.0 reachable via the type-1
+        // 0xCF8/0xCFC config mechanism. No devices hang off it yet.
+        let mut pci_bus = devices::legacy::PciBus::new();
+        pci_bus.add_device(
+            0,
+            Arc::new(Mutex::new(devices::legacy::PciDevice::new_host_bridge(
+                0x1b36, 0x0008,
+            ))),
+        );
+        let pci_config_io = Arc::new(Mutex::new(devices::legacy::PciConfigIo::new(Arc::new(
+            Mutex::new(pci_bus),
+        ))));
+
         Ok(PortIODeviceManager {
             io_bus,
             cmos,
             stdio_serial,
             i8042,
+            pci_config_io,
             com_evt_1: evts[0].try_clone().map_err(Error::EventFd)?,
             com_evt_2: evts[1].try_clone().map_err(Error::EventFd)?,
             com_evt_3: evts[2].try_clone().map_err(Error::EventFd)?,
@@ -141,6 +156,10 @@ impl PortIODeviceManager {
             .map_err(Error::BusError)?;
         self.io_bus
             .insert(self.i8042.clone(), 0x060, 0x5)
+            .map_err(Error::BusError)?;
+        // Type-1 PCI config: CONFIG_ADDRESS at 0xcf8, CONFIG_DATA at 0xcfc.
+        self.io_bus
+            .insert(self.pci_config_io.clone(), 0xcf8, 0x8)
             .map_err(Error::BusError)?;
         Ok(())
     }

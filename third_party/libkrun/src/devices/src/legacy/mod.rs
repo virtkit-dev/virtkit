@@ -24,6 +24,8 @@ mod kvmgicv2;
 mod kvmgicv3;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod kvmioapic;
+#[cfg(target_arch = "x86_64")]
+mod pci;
 #[cfg(target_arch = "aarch64")]
 mod rtc_pl031;
 #[cfg(target_os = "macos")]
@@ -68,6 +70,8 @@ pub use self::kvmgicv2::KvmGicV2;
 pub use self::kvmgicv3::KvmGicV3;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use self::kvmioapic::KvmIoapic;
+#[cfg(target_arch = "x86_64")]
+pub use self::pci::{PciBus, PciConfigIo, PciDevice};
 #[cfg(target_arch = "aarch64")]
 pub use self::rtc_pl031::RTC;
 pub use self::serial::Serial;
