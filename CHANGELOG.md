@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-13
+
 ### Added
 
 - `vk run` can boot a container image on its own kernel and hand PID 1 to the image's
@@ -671,7 +673,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/wallix/virtkit/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/wallix/virtkit/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/wallix/virtkit/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/wallix/virtkit/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/wallix/virtkit/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/wallix/virtkit/compare/v0.8.0...v0.9.0
