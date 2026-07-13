@@ -14,6 +14,10 @@ All notable changes to virtkit will be documented in this file.
 - `vk build` mirrors build progress into the terminal title so the tab tracks the running
   counts and current step at a glance, restoring the terminal's original title when it
   exits. Set `VIRTKIT_NO_TITLE` (to any value) to suppress it.
+- `vk service up|down|status <name>` controls the run's compose services from inside the
+  guest, over the vsock control plane. `up` builds a service's image on first use — build
+  progress streams live to the terminal — then boots it, so a profiled-down service can be
+  brought up on demand instead of built up front with the rest.
 
 ### Changed
 

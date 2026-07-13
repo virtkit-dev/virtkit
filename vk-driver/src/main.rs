@@ -179,6 +179,26 @@ enum RegistryCmd {
 }
 
 #[derive(Subcommand)]
+enum ServiceCmd {
+    /// Bring a service up: build its image on first use (a profiled-down service — build
+    /// progress streams live), then boot it. A no-op if it is already running.
+    Up {
+        /// service name (as declared in the compose file)
+        name: String,
+    },
+    /// Stop a running service (a no-op if already stopped).
+    Down {
+        /// service name
+        name: String,
+    },
+    /// Print a service's state and address, or every declared service when no name is given.
+    Status {
+        /// service name; omit to list all services
+        name: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// Preflight: check this host is usable by the current user — /dev/kvm access,
@@ -201,6 +221,13 @@ enum Cmd {
     Registry {
         #[command(subcommand)]
         cmd: RegistryCmd,
+    },
+    /// Control the run's compose services from inside the guest: bring one up (building its
+    /// image on demand, streaming build progress), take it down, or query state. Speaks the
+    /// vsock control plane to the host service manager, so it only works inside a vk VM.
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
     },
     /// Build a Dockerfile target and export it as a bootable ext4 image — a from-scratch
     /// builder (no docker, no buildkit). Each RUN executes in a microVM guest (the
@@ -777,6 +804,48 @@ fn raise_nofile() {
     }
 }
 
+/// Drive a `vk service` subcommand against the host service manager over the vsock control
+/// plane. `up` streams the on-demand build's progress to stderr as it arrives, then prints
+/// the final reply; `down`/`status` are single round-trips.
+async fn service_cmd(cmd: &ServiceCmd) -> ExitCode {
+    use vk_core::fleetctl::{Client, Request};
+    let mut client = Client::new();
+    let reply = match cmd {
+        ServiceCmd::Up { name } => {
+            // build progress goes to stderr so stdout carries only the final result line.
+            let mut on_progress = |line: &str| eprintln!("{line}");
+            client
+                .request_streamed(&Request::Start { unit: name.clone() }, &mut on_progress)
+                .await
+        }
+        ServiceCmd::Down { name } => client.request(&Request::Stop { unit: name.clone() }).await,
+        ServiceCmd::Status { name: Some(n) } => {
+            client.request(&Request::Status { unit: n.clone() }).await
+        }
+        ServiceCmd::Status { name: None } => client.request(&Request::List).await,
+    };
+    match reply {
+        Ok(reply) => {
+            for u in &reply.units {
+                println!("{:<16} {:<9} {}", u.name, u.state, u.ip);
+            }
+            if !reply.message.is_empty() {
+                if reply.ok {
+                    println!("{}", reply.message);
+                } else {
+                    eprintln!("{}", reply.message);
+                }
+            }
+            if reply.ok {
+                ExitCode::SUCCESS
+            } else {
+                exit_code(1)
+            }
+        }
+        Err(e) => fail(&e, 1),
+    }
+}
+
 async fn cli_main() -> ExitCode {
     // reqwest/rustls are compiled with no built-in crypto provider (rustls-no-provider,
     // to keep aws-lc-rs out of the build); install ring — the backend russh already
@@ -784,6 +853,11 @@ async fn cli_main() -> ExitCode {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cli = Cli::parse();
+    // `service` talks to the host manager over vsock and needs no host config — handle it
+    // before Config::load so it works from inside a guest that has none.
+    if let Cmd::Service { cmd } = &cli.cmd {
+        return service_cmd(cmd).await;
+    }
     let cfg = match Config::load() {
         Ok(cfg) => cfg,
         Err(e) => return fail(&e, 2),
@@ -1515,7 +1589,8 @@ async fn cli_main() -> ExitCode {
         | Cmd::Build { .. }
         | Cmd::OciPull { .. }
         | Cmd::DockerHash { .. }
-        | Cmd::Fingerprint { .. } => {
+        | Cmd::Fingerprint { .. }
+        | Cmd::Service { .. } => {
             unreachable!()
         }
     }
