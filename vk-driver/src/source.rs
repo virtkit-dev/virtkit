@@ -25,7 +25,7 @@ pub enum Source {
 /// one pass, so sizes must be known up front — see `ext4::build_from_tar_stream`).
 pub struct TarHints {
     /// upper bound on the unpacked file-data bytes: exact for an OCI pull (the
-    /// merger's spill size), `docker image inspect .Size` for a docker export
+    /// merger's spill size), the container's `SizeRootFs` for a docker export
     pub data_bytes: u64,
     /// exact entry count when known (OCI pull)
     pub entries: Option<u64>,
@@ -162,6 +162,22 @@ fn docker_inspect(docker: &Path, image: &str, format: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// The container's total rootfs size in bytes (`docker inspect -s .SizeRootFs`), or
+/// `None` if the query fails. Needs `-s` (docker only computes sizes on request).
+fn docker_container_rootfs_size(docker: &Path, cid: &str) -> Option<u64> {
+    let out = Command::new(docker)
+        .args(["inspect", "-s", "--format", "{{.SizeRootFs}}", cid])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
 /// `docker image inspect` an image's `Config.Env` (one `KEY=VALUE` per line).
 fn docker_config_env(docker: &Path, image: &str) -> Result<Vec<(String, String)>> {
     Ok(
@@ -183,14 +199,6 @@ fn docker_export_stream<T>(
     image: &str,
     consume: impl FnOnce(&mut dyn Read, &TarHints) -> Result<T>,
 ) -> Result<T> {
-    let hints = TarHints {
-        // .Size is the image's unpacked byte total — the data upper bound.
-        data_bytes: docker_inspect(docker, image, "{{.Size}}")?
-            .trim()
-            .parse::<u64>()
-            .context("parsing docker image inspect .Size")?,
-        entries: None,
-    };
     let create = Command::new(docker)
         .args(["create", image, "/sbin/init"])
         .stderr(Stdio::piped())
@@ -203,6 +211,24 @@ fn docker_export_stream<T>(
         );
     }
     let cid = String::from_utf8_lossy(&create.stdout).trim().to_string();
+    // Upper bound on the unpacked rootfs bytes. The container's SizeRootFs is the
+    // real total; the image's `.Size` undercounts kernel-heavy images severalfold
+    // (measured ~3x on a Debian + linux-image image), which would undersize the
+    // ext4. Fall back to `.Size` if the container query fails, then to 0 if that
+    // fails too — a 0 is safe because `TarHints::image_bytes` floors the ext4 at a
+    // fixed margin, so the build still succeeds (or bails cleanly "out of space").
+    let data_bytes = docker_container_rootfs_size(docker, &cid)
+        .filter(|&n| n > 0)
+        .or_else(|| {
+            docker_inspect(docker, image, "{{.Size}}")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    let hints = TarHints {
+        data_bytes,
+        entries: None,
+    };
     let result = (|| {
         let mut child = Command::new(docker)
             .args(["export", &cid])
