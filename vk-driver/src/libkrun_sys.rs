@@ -17,7 +17,7 @@
 
 use std::ffi::CString;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 // libkrun's C-ABI entry points, called directly from the linked `krun` crate
 // (rlib -> shares virtkit's std; compiler-checked signatures). Every call returns
@@ -30,9 +30,55 @@ use krun::{
 
 use crate::vmm::{Disk, Net, VmSpec};
 
+// `krun_set_kernel` kernel-format tags (see the vendored libkrun `KernelFormat`). On x86_64
+// libkrun loads a raw ELF `vmlinux` directly (ELF), or scans an "Image" for a compression magic,
+// decompresses it, and ELF-loads the result — which is exactly what a distro `bzImage`'s payload
+// decompresses to. So a stock gzip/zstd/bzip2 `bzImage` boots via the matching IMAGE_* tag.
 const KRUN_KERNEL_FORMAT_ELF: u32 = 1;
+const KRUN_KERNEL_FORMAT_IMAGE_BZ2: u32 = 3;
+const KRUN_KERNEL_FORMAT_IMAGE_GZ: u32 = 4;
+const KRUN_KERNEL_FORMAT_IMAGE_ZSTD: u32 = 5;
 const KRUN_DISK_FORMAT_RAW: u32 = 0;
 const KRUN_DISK_FORMAT_QCOW2: u32 = 1;
+
+/// Pick the `krun_set_kernel` format tag for `data` (a kernel image). A raw ELF `vmlinux` is
+/// `ELF`; anything else is treated as an "Image" whose payload libkrun decompresses then ELF-loads
+/// — so we return the tag for the compression whose magic appears EARLIEST, mirroring libkrun's own
+/// first-occurrence scan (a stock `bzImage` carries its real payload after the boot setup, and the
+/// earliest magic is that payload). Returns `None` for a format libkrun can't load (e.g. xz/lz4, or
+/// a raw uncompressed non-ELF), so the caller can point the user at `scripts/extract-vmlinux`.
+fn detect_kernel_format(data: &[u8]) -> Option<u32> {
+    if data.starts_with(b"\x7fELF") {
+        return Some(KRUN_KERNEL_FORMAT_ELF);
+    }
+    let first = |needle: &[u8]| data.windows(needle.len()).position(|w| w == needle);
+    [
+        (
+            first(&[0x28, 0xb5, 0x2f, 0xfd]),
+            KRUN_KERNEL_FORMAT_IMAGE_ZSTD,
+        ), // zstd
+        (first(&[0x1f, 0x8b, 0x08]), KRUN_KERNEL_FORMAT_IMAGE_GZ), // gzip
+        (first(b"BZh"), KRUN_KERNEL_FORMAT_IMAGE_BZ2),             // bzip2
+    ]
+    .into_iter()
+    .filter_map(|(pos, fmt)| pos.map(|p| (p, fmt)))
+    .min_by_key(|&(p, _)| p)
+    .map(|(_, fmt)| fmt)
+}
+
+/// The `krun_set_kernel` format tag for the kernel at `path`, or a clear error if libkrun cannot
+/// load it. Reads the file to sniff its magic (the same bytes libkrun itself scans).
+fn kernel_format(path: &std::path::Path) -> Result<u32> {
+    let data = std::fs::read(path).with_context(|| format!("reading kernel {}", path.display()))?;
+    detect_kernel_format(&data).with_context(|| {
+        format!(
+            "unsupported kernel {}: libkrun boots an ELF vmlinux or a gzip/zstd/bzip2-compressed \
+             bzImage. For an xz/lz4-compressed or otherwise unrecognized image, supply the ELF \
+             vmlinux (e.g. via the kernel tree's `scripts/extract-vmlinux`).",
+            path.display()
+        )
+    })
+}
 
 /// Check a libkrun call's return: `>= 0` ok, negative errno on failure.
 fn ck(what: &str, rc: i32) -> Result<()> {
@@ -110,7 +156,9 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
             krun_set_console_output(ctx, serial_log.as_ptr()),
         )?;
 
-        // our own kernel + cmdline; PID 1 is chosen by `init=` on the cmdline.
+        // our own kernel + cmdline; PID 1 is chosen by `init=` on the cmdline. The format is
+        // sniffed from the image so a custom (e.g. stock distro) kernel boots, not just our ELF.
+        let kformat = kernel_format(&spec.kernel)?;
         let kernel = cstr(&spec.kernel.to_string_lossy());
         let cmdline = cstr(&spec.cmdline.replace("console=ttyS0", "console=hvc0"));
         let initramfs = spec.initramfs.as_ref().map(|p| cstr(&p.to_string_lossy()));
@@ -119,7 +167,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
             krun_set_kernel(
                 ctx,
                 kernel.as_ptr(),
-                KRUN_KERNEL_FORMAT_ELF,
+                kformat,
                 initramfs.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
                 cmdline.as_ptr(),
             ),
@@ -209,7 +257,10 @@ unsafe fn add_disk(ctx: u32, index: usize, disk: &Disk) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{mem_mib, parse_mac};
+    use super::{
+        KRUN_KERNEL_FORMAT_ELF, KRUN_KERNEL_FORMAT_IMAGE_BZ2, KRUN_KERNEL_FORMAT_IMAGE_GZ,
+        KRUN_KERNEL_FORMAT_IMAGE_ZSTD, detect_kernel_format, mem_mib, parse_mac,
+    };
 
     #[test]
     fn mac_roundtrip() {
@@ -228,6 +279,45 @@ mod tests {
         assert!(parse_mac("52:54:00:d2:f0").is_err()); // too few
         assert!(parse_mac("52:54:00:d2:f0:01:02").is_err()); // too many
         assert!(parse_mac("52:54:00:zz:f0:01").is_err()); // non-hex
+    }
+
+    #[test]
+    fn kernel_format_detection() {
+        // A raw ELF vmlinux (our embedded kernel) → ELF.
+        assert_eq!(
+            detect_kernel_format(b"\x7fELF\x02\x01\x01"),
+            Some(KRUN_KERNEL_FORMAT_ELF)
+        );
+        // A bzImage: an `MZ` PE header + boot setup, then the real compressed payload. The
+        // earliest compression magic is the payload; pick its format (matching libkrun's scan).
+        let mut zst = b"MZ".to_vec();
+        zst.extend(std::iter::repeat_n(0u8, 4096)); // stand-in for the boot setup
+        zst.extend_from_slice(&[0x28, 0xb5, 0x2f, 0xfd]); // zstd payload
+        assert_eq!(
+            detect_kernel_format(&zst),
+            Some(KRUN_KERNEL_FORMAT_IMAGE_ZSTD)
+        );
+        let mut gz = b"MZ\x00\x00".to_vec();
+        gz.extend_from_slice(&[0x1f, 0x8b, 0x08]);
+        assert_eq!(detect_kernel_format(&gz), Some(KRUN_KERNEL_FORMAT_IMAGE_GZ));
+        assert_eq!(
+            detect_kernel_format(b"MZ....BZh9"),
+            Some(KRUN_KERNEL_FORMAT_IMAGE_BZ2)
+        );
+        // Earliest magic wins: a real zstd payload before a spurious later gzip byte-sequence.
+        let mut mixed = vec![0u8; 200];
+        mixed.extend_from_slice(&[0x28, 0xb5, 0x2f, 0xfd]); // zstd first
+        mixed.extend_from_slice(&[0x1f, 0x8b, 0x08]); // spurious gzip later
+        assert_eq!(
+            detect_kernel_format(&mixed),
+            Some(KRUN_KERNEL_FORMAT_IMAGE_ZSTD)
+        );
+        // Unsupported: xz-compressed or an unrecognized blob → None (caller errors with guidance).
+        assert_eq!(
+            detect_kernel_format(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]),
+            None
+        );
+        assert_eq!(detect_kernel_format(b"not a kernel"), None);
     }
 
     #[test]
