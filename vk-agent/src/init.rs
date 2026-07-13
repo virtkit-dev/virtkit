@@ -933,19 +933,32 @@ fn link_ci_tools(cmdline: &HashMap<String, String>) {
 
 /// Bring eth0 up on the shared LAN: fork the tap bridge (`net`) to the host
 /// switch over VIRTKIT_NET_PORT, then DHCP or a static address.
+/// Argv for the `vk-agent net` tap bridge: the vsock backend + eth0, plus the
+/// run-assigned `--mac` when `VIRTKIT_VM_MAC` is set (so an image-init sibling that
+/// DHCPs eth0 matches the switch's per-MAC reservation and lands on its advertised
+/// IP). Absent the var, the tap keeps a kernel-random MAC — today's behavior.
+fn net_args(port: &str, cmdline: &HashMap<String, String>) -> Vec<String> {
+    let mut args = vec![
+        "--socket".into(),
+        format!("vsock://{port}"),
+        "net".into(),
+        "--iface".into(),
+        "eth0".into(),
+    ];
+    if let Some(mac) = cmdline.get("VIRTKIT_VM_MAC") {
+        args.push("--mac".into());
+        args.push(mac.clone());
+    }
+    args
+}
+
 fn configure_network(cmdline: &HashMap<String, String>) {
     let Some(port) = cmdline.get("VIRTKIT_NET_PORT") else {
         return;
     };
     // The bridge is long-running (reaped by supervise; inherited by the service on
     // exec). It carries ethernet frames over vsock with no host privileges.
-    if let Err(e) = fork_agent(&[
-        "--socket".into(),
-        format!("vsock://{port}"),
-        "net".into(),
-        "--iface".into(),
-        "eth0".into(),
-    ]) {
+    if let Err(e) = fork_agent(&net_args(port, cmdline)) {
         warn!("vk-agent init: net bridge failed to start: {e}");
         return;
     }
@@ -982,13 +995,7 @@ fn configure_network_fullvm(cmdline: &HashMap<String, String>) {
     let Some(port) = cmdline.get("VIRTKIT_NET_PORT") else {
         return;
     };
-    if let Err(e) = fork_agent(&[
-        "--socket".into(),
-        format!("vsock://{port}"),
-        "net".into(),
-        "--iface".into(),
-        "eth0".into(),
-    ]) {
+    if let Err(e) = fork_agent(&net_args(port, cmdline)) {
         warn!("vk-agent image-init: net bridge failed to start: {e}");
         return;
     }

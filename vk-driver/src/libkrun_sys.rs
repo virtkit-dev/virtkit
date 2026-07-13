@@ -105,23 +105,6 @@ fn cstr(s: &str) -> CString {
     CString::new(s).expect("nul byte in libkrun argument")
 }
 
-/// Parse a `aa:bb:cc:dd:ee:ff` MAC into the 6 bytes `krun_add_net_tap` expects.
-fn parse_mac(s: &str) -> Result<[u8; 6]> {
-    let mut mac = [0u8; 6];
-    let mut octets = s.split(':');
-    for byte in &mut mac {
-        let octet = octets
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("MAC {s:?} has fewer than six octets"))?;
-        *byte = u8::from_str_radix(octet, 16)
-            .map_err(|_| anyhow::anyhow!("invalid MAC octet {octet:?} in {s:?}"))?;
-    }
-    if octets.next().is_some() {
-        bail!("MAC {s:?} has more than six octets");
-    }
-    Ok(mac)
-}
-
 /// Parse a memory size token into MiB for `krun_set_vm_config`, accepting the same
 /// forms as the CLI and cloud-hypervisor (`<n>G`, `<n>M`, plain MiB — see
 /// `run::parse_mem_mib`).
@@ -230,7 +213,8 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
             Net::None => {}
             Net::Tap { tap, mac } => {
                 let tap_c = cstr(tap);
-                let mac = parse_mac(mac)?;
+                let mac = crate::switch::parse_mac(mac)
+                    .ok_or_else(|| anyhow::anyhow!("invalid MAC {mac:?}"))?;
                 ck(
                     "krun_add_net_tap",
                     krun_add_net_tap(ctx, tap_c.as_ptr(), mac.as_ptr(), 0, 0),
@@ -291,27 +275,8 @@ unsafe fn add_disk(ctx: u32, index: usize, disk: &Disk) -> Result<()> {
 mod tests {
     use super::{
         KRUN_KERNEL_FORMAT_ELF, KRUN_KERNEL_FORMAT_IMAGE_BZ2, KRUN_KERNEL_FORMAT_IMAGE_GZ,
-        KRUN_KERNEL_FORMAT_IMAGE_ZSTD, console_cmdline, detect_kernel_format, mem_mib, parse_mac,
+        KRUN_KERNEL_FORMAT_IMAGE_ZSTD, console_cmdline, detect_kernel_format, mem_mib,
     };
-
-    #[test]
-    fn mac_roundtrip() {
-        assert_eq!(
-            parse_mac("52:54:00:d2:f0:01").unwrap(),
-            [0x52, 0x54, 0x00, 0xd2, 0xf0, 0x01]
-        );
-        assert_eq!(
-            parse_mac("aa:bb:cc:dd:ee:ff").unwrap(),
-            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]
-        );
-    }
-
-    #[test]
-    fn mac_rejects_malformed() {
-        assert!(parse_mac("52:54:00:d2:f0").is_err()); // too few
-        assert!(parse_mac("52:54:00:d2:f0:01:02").is_err()); // too many
-        assert!(parse_mac("52:54:00:zz:f0:01").is_err()); // non-hex
-    }
 
     #[test]
     fn kernel_format_detection() {

@@ -585,6 +585,7 @@ fn spawn_switch(
     let cfg = &ctx.cfg;
     let mut listen = vec![ctx.net_vsock_sock(cfg.net.net_port)];
     let mut hosts = Vec::new();
+    let mut reservations = Vec::new();
     for svc in services {
         listen.push(
             ctx.job_dir
@@ -593,12 +594,16 @@ fn spawn_switch(
         );
         let ip = svc.ip.split('/').next().unwrap_or_default();
         hosts.push((svc.hostname.clone(), ip.to_string()));
+        if let Ok(ip4) = ip.parse::<Ipv4Addr>() {
+            reservations.push((crate::units::mac_for_ip(ip4), ip.to_string()));
+        }
     }
     crate::switch::spawn(&crate::switch::Spawn {
         listen,
         gateway,
         prefix,
         hosts,
+        reservations,
         allow_ip: cfg.egress.allow_ip.clone(),
         allow_name: effective_allow_names(cfg, ctx)?,
         log: ctx.switch_log(),

@@ -43,6 +43,63 @@ struct IfReq {
     _pad: [u8; 22],
 }
 
+/// `struct ifreq` variant carrying a `sockaddr` (the hardware address), for
+/// SIOCSIFHWADDR. `sa_family` (ARPHRD_ETHER) precedes the six address bytes.
+#[repr(C)]
+struct IfReqHw {
+    name: [libc::c_char; libc::IFNAMSIZ],
+    sa_family: libc::c_ushort,
+    sa_data: [u8; 14],
+}
+
+const ARPHRD_ETHER: libc::c_ushort = 1;
+
+/// Parse a colon-separated MAC (`aa:bb:cc:dd:ee:ff`) into 6 bytes.
+fn parse_mac(s: &str) -> Result<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut parts = s.split(':');
+    for byte in &mut out {
+        let part = parts
+            .next()
+            .with_context(|| format!("MAC {s:?} too short"))?;
+        *byte = u8::from_str_radix(part, 16).with_context(|| format!("bad MAC octet in {s:?}"))?;
+    }
+    if parts.next().is_some() {
+        bail!("MAC {s:?} has too many octets");
+    }
+    Ok(out)
+}
+
+/// Set `name`'s hardware address via SIOCSIFHWADDR (must be done while the link is
+/// down, before `set_up`).
+fn set_hwaddr(name: &str, mac: [u8; 6]) -> Result<()> {
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("socket(AF_INET)");
+    }
+    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+    if name.len() >= libc::IFNAMSIZ {
+        bail!("interface name {name:?} too long");
+    }
+    let mut req: IfReqHw = unsafe { std::mem::zeroed() };
+    for (dst, b) in req.name.iter_mut().zip(name.as_bytes()) {
+        *dst = *b as libc::c_char;
+    }
+    req.sa_family = ARPHRD_ETHER;
+    req.sa_data[..6].copy_from_slice(&mac);
+    if unsafe {
+        libc::ioctl(
+            sock.as_raw_fd(),
+            libc::SIOCSIFHWADDR as libc::Ioctl,
+            &raw mut req,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error()).context("SIOCSIFHWADDR");
+    }
+    Ok(())
+}
+
 fn ifreq(name: &str) -> Result<IfReq> {
     if name.len() >= libc::IFNAMSIZ {
         bail!(
@@ -107,10 +164,15 @@ fn set_up(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Create tap `iface`, bring it up, and bridge it to the network backend reached
-/// at `target` (qemu framing) until either side closes.
-pub async fn run_net(target: &SocketAddr, iface: &str) -> Result<()> {
+/// Create tap `iface`, optionally set its hardware address to `mac` (so the vk
+/// switch can match a per-MAC DHCP reservation), bring it up, and bridge it to the
+/// network backend reached at `target` (qemu framing) until either side closes.
+pub async fn run_net(target: &SocketAddr, iface: &str, mac: Option<&str>) -> Result<()> {
     let tap = open_tap(iface).with_context(|| format!("creating tap {iface}"))?;
+    if let Some(mac) = mac {
+        let bytes = parse_mac(mac)?;
+        set_hwaddr(iface, bytes).with_context(|| format!("setting {iface} MAC to {mac}"))?;
+    }
     set_up(iface).with_context(|| format!("bringing {iface} up"))?;
     let conn = raw_connect(target)
         .await

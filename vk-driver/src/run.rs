@@ -894,6 +894,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             &[],
             &planned.listen,
             &planned.hosts,
+            &planned.reservations,
         )
         .await?;
         cmdline.push_str(&frag);
@@ -1279,6 +1280,10 @@ struct PlannedServices {
     listen: Vec<PathBuf>,
     /// alias -> ip for the gateway resolver
     hosts: Vec<(String, String)>,
+    /// per-sibling DHCP reservations (mac, ip): a sibling's deterministic MAC ->
+    /// its run-assigned IP, so an image-init sibling that DHCPs eth0 lands on the
+    /// address the resolver advertises for its name
+    reservations: Vec<(String, String)>,
 }
 
 /// Materialize EVERY declared unit into the work dir — like the `-f` build
@@ -1297,6 +1302,7 @@ fn plan_services(
         start: Vec::new(),
         listen: Vec::new(),
         hosts: Vec::new(),
+        reservations: Vec::new(),
     };
     if args.compose.is_none() {
         return Ok(planned);
@@ -1369,6 +1375,11 @@ fn plan_services(
                 .hosts
                 .push((unit.hostname.to_ascii_lowercase(), ip.to_string()));
         }
+        // Reserve this sibling's deterministic MAC (== the one boot_unit puts on the
+        // cmdline) to its IP, so a DHCPing image-init sibling gets its advertised IP.
+        planned
+            .reservations
+            .push((crate::units::mac_for_ip(ip), ip.to_string()));
         planned.units.push((
             crate::units::Provisioned {
                 name: unit.name.clone(),
@@ -1417,6 +1428,7 @@ async fn compose_up(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path) ->
         &[],
         &planned.listen,
         &planned.hosts,
+        &planned.reservations,
     )
     .await?;
 
@@ -2108,6 +2120,7 @@ pub(crate) const CONTEXT_MOUNT: &str = "/run/virtkit-context";
 /// Spawn a `vk switch` giving one VM a userspace LAN + egress over `vsock` (DHCP +
 /// DNS + transparent proxy, unrestricted). Returns the switch child and the cmdline
 /// fragment the guest agent needs to bring up its tap. Waits for the switch to bind.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_vm_switch(
     vsock: &Path,
     work: &Path,
@@ -2116,6 +2129,7 @@ async fn spawn_vm_switch(
     allow_name: &[String],
     extra_listen: &[PathBuf],
     hosts: &[(String, String)],
+    reservations: &[(String, String)],
 ) -> Result<(Child, String)> {
     let (gw, prefix, guest_ip) = crate::net::switch_addrs(RUN_SUBNET)?;
     let mut listen = vsock.to_path_buf().into_os_string();
@@ -2127,6 +2141,7 @@ async fn spawn_vm_switch(
         gateway: gw,
         prefix,
         hosts: hosts.to_vec(),
+        reservations: reservations.to_vec(),
         allow_ip: allow_ip.to_vec(),
         allow_name: allow_name.to_vec(),
         log: work.join("switch.log"),
@@ -2325,6 +2340,7 @@ pub(crate) async fn boot_session(
             NET_VSOCK_PORT,
             allow_ip,
             allow_name,
+            &[],
             &[],
             &[],
         )

@@ -350,6 +350,10 @@ enum Cmd {
         /// service name the gateway resolver answers locally: name=ip (repeatable)
         #[arg(long = "host")]
         host: Vec<String>,
+        /// per-MAC DHCP reservation: mac=ip (repeatable). A guest with this MAC gets
+        /// exactly this address instead of a pool lease.
+        #[arg(long = "reserve", value_name = "MAC=IP")]
+        reserve: Vec<String>,
         /// egress allowlist — destination IPv4 CIDR for direct (non-proxied) egress,
         /// optionally port-scoped as CIDR:port (repeatable). With no
         /// --allow-ip/--allow-name, egress is unrestricted.
@@ -1367,6 +1371,7 @@ async fn cli_main() -> ExitCode {
         gateway,
         prefix,
         host,
+        reserve,
         allow_ip,
         allow_name,
     } = &cli.cmd
@@ -1384,11 +1389,25 @@ async fn cli_main() -> ExitCode {
                 None => return fail(&anyhow::anyhow!("bad --host {h:?} (want name=ip)"), 2),
             }
         }
+        let mut reservations = std::collections::HashMap::new();
+        for r in reserve {
+            match r.split_once('=').and_then(|(m, ip)| {
+                Some((
+                    switch::parse_mac(m)?,
+                    ip.parse::<std::net::Ipv4Addr>().ok()?,
+                ))
+            }) {
+                Some((mac, ip)) => {
+                    reservations.insert(mac, ip);
+                }
+                None => return fail(&anyhow::anyhow!("bad --reserve {r:?} (want mac=ip)"), 2),
+            }
+        }
         let egress = match switch::Egress::new(allow_ip, allow_name) {
             Ok(e) => e,
             Err(e) => return fail(&e, 2),
         };
-        return match switch::run(listen, *gateway, *prefix, hosts, egress).await {
+        return match switch::run(listen, *gateway, *prefix, hosts, reservations, egress).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         };

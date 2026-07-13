@@ -56,6 +56,20 @@ struct Cfg {
 type Mac = [u8; 6];
 type PortId = u32;
 
+/// Parse a colon-separated MAC (`aa:bb:cc:dd:ee:ff`) into 6 bytes; None if it is
+/// not six hex octets.
+pub fn parse_mac(s: &str) -> Option<Mac> {
+    let mut out = [0u8; 6];
+    let mut parts = s.split(':');
+    for byte in &mut out {
+        *byte = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    if parts.next().is_some() {
+        return None; // more than six octets
+    }
+    Some(out)
+}
+
 /// Egress policy — which off-subnet destinations the switch originates flows to.
 /// Default `AllowAll` (dev use is unrestricted); CI passes an allowlist.
 /// Direct (non-proxied) TCP/UDP egress is gated by destination IP (`allows_ip`);
@@ -242,6 +256,9 @@ struct Inner {
     ip_mac: HashMap<Ipv4Addr, Mac>,
     /// DHCP: stable lease per client MAC
     leases: HashMap<Mac, Ipv4Addr>,
+    /// DHCP: per-MAC address reservations (run-assigned svc.ips). A reserved MAC
+    /// gets its fixed IP; the pool skips reserved IPs so it never collides.
+    reservations: HashMap<Mac, Ipv4Addr>,
     next_idx: u32,
 }
 
@@ -268,6 +285,10 @@ pub struct Spawn {
     pub prefix: u8,
     /// resolver entries served over the gateway DNS (`name=ip`)
     pub hosts: Vec<(String, String)>,
+    /// per-MAC DHCP reservations (`mac`, `ip`): a guest with this MAC gets exactly
+    /// this address instead of a pool lease, so an image-init sibling that DHCPs
+    /// eth0 lands on the IP the resolver advertises for its name
+    pub reservations: Vec<(String, String)>,
     pub allow_ip: Vec<String>,
     pub allow_name: Vec<String>,
     pub log: PathBuf,
@@ -296,6 +317,9 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
     }
     for (name, ip) in &opts.hosts {
         cmd.arg("--host").arg(format!("{name}={ip}"));
+    }
+    for (mac, ip) in &opts.reservations {
+        cmd.arg("--reserve").arg(format!("{mac}={ip}"));
     }
     for a in &opts.allow_ip {
         cmd.arg("--allow-ip").arg(a);
@@ -326,6 +350,7 @@ pub async fn run(
     gateway: Ipv4Addr,
     prefix: u8,
     hosts: HashMap<String, Ipv4Addr>,
+    reservations: HashMap<Mac, Ipv4Addr>,
     egress: Egress,
 ) -> Result<()> {
     if listen.is_empty() {
@@ -354,6 +379,7 @@ pub async fn run(
         cfg: Cfg { gateway, prefix },
         inner: Mutex::new(Inner {
             next_idx: FIRST_LEASE,
+            reservations,
             ..Inner::default()
         }),
         egress_tx,
@@ -375,11 +401,12 @@ pub async fn run(
 
     eprintln!(
         "switch: {} port(s), gateway {}/{} (ARP + DHCP + DNS + egress, shared LAN); \
-         resolver: {} service name(s), upstream {}; egress: {}",
+         resolver: {} service name(s), {} DHCP reservation(s), upstream {}; egress: {}",
         listen.len(),
         gateway,
         prefix,
         sw.hosts.len(),
+        sw.inner.lock().unwrap().reservations.len(),
         upstream,
         if restricted {
             "allowlist"
@@ -1053,13 +1080,25 @@ fn dhcp_option(opts: &[u8], code: u8) -> Option<&[u8]> {
     None
 }
 
-/// A stable per-MAC lease from the subnet pool (same MAC always gets the same IP).
+/// The address for `mac`: its run-assigned reservation if it has one, else a stable
+/// per-MAC lease from the subnet pool (same MAC always gets the same IP). Reserved
+/// IPs are skipped when advancing the pool so a non-reserved guest never collides
+/// with a reserved address.
 fn alloc_lease(inner: &mut Inner, cfg: &Cfg, mac: Mac) -> Option<Ipv4Addr> {
+    if let Some(ip) = inner.reservations.get(&mac).copied() {
+        inner.leases.insert(mac, ip);
+        return Some(ip);
+    }
     if let Some(ip) = inner.leases.get(&mac).copied() {
         return Some(ip);
     }
-    let ip = nth_host(cfg.gateway, cfg.prefix, inner.next_idx).ok()?;
-    inner.next_idx += 1;
+    let ip = loop {
+        let ip = nth_host(cfg.gateway, cfg.prefix, inner.next_idx).ok()?;
+        inner.next_idx += 1;
+        if !inner.reservations.values().any(|r| *r == ip) {
+            break ip;
+        }
+    };
     inner.leases.insert(mac, ip);
     Some(ip)
 }
@@ -1091,6 +1130,25 @@ fn nth_host(gateway: Ipv4Addr, prefix: u8, index: u32) -> Result<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mac_roundtrip() {
+        assert_eq!(
+            parse_mac("52:54:00:d2:f0:01"),
+            Some([0x52, 0x54, 0x00, 0xd2, 0xf0, 0x01])
+        );
+        assert_eq!(
+            parse_mac("aa:bb:cc:dd:ee:ff"),
+            Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        );
+    }
+
+    #[test]
+    fn mac_rejects_malformed() {
+        assert_eq!(parse_mac("52:54:00:d2:f0"), None); // too few
+        assert_eq!(parse_mac("52:54:00:d2:f0:01:02"), None); // too many
+        assert_eq!(parse_mac("52:54:00:zz:f0:01"), None); // non-hex
+    }
 
     #[test]
     fn egress_allowlist() {
@@ -1253,6 +1311,7 @@ mod tests {
                 Ipv4Addr::new(192, 168, 127, 1),
                 24,
                 HashMap::new(),
+                HashMap::new(),
                 Egress::AllowAll,
             )
             .await;
@@ -1361,6 +1420,50 @@ mod tests {
         assert_eq!(
             alloc_lease(&mut inner, &cfg, a),
             Some(Ipv4Addr::new(192, 168, 127, 2))
+        );
+    }
+
+    #[test]
+    fn reserved_mac_gets_its_ip_and_pool_skips_it() {
+        let cfg = Cfg {
+            gateway: Ipv4Addr::new(192, 168, 127, 1),
+            prefix: 24,
+        };
+        let reserved_mac = [0x52, 0x54, 0x00, 0xa8, 0x7f, 0xfe];
+        let reserved_ip = Ipv4Addr::new(192, 168, 127, 254);
+        let mut inner = Inner {
+            next_idx: FIRST_LEASE,
+            reservations: HashMap::from([(reserved_mac, reserved_ip)]),
+            ..Inner::default()
+        };
+        // The reserved MAC always gets its reserved IP, not a pool address.
+        assert_eq!(
+            alloc_lease(&mut inner, &cfg, reserved_mac),
+            Some(reserved_ip)
+        );
+        // …and it is recorded as a lease (so ARP/DNS route-back stays consistent).
+        assert_eq!(inner.leases.get(&reserved_mac), Some(&reserved_ip));
+        // A non-reserved MAC still draws from the pool bottom (.2).
+        assert_eq!(
+            alloc_lease(&mut inner, &cfg, [0xbb; 6]),
+            Some(Ipv4Addr::new(192, 168, 127, 2))
+        );
+
+        // A reserved IP inside the pool range is skipped when advancing the pool.
+        let low_reserved = Ipv4Addr::new(192, 168, 127, 3);
+        let mut inner = Inner {
+            next_idx: FIRST_LEASE,
+            reservations: HashMap::from([([0x52, 0x54, 0x00, 0xa8, 0x7f, 0x03], low_reserved)]),
+            ..Inner::default()
+        };
+        assert_eq!(
+            alloc_lease(&mut inner, &cfg, [0xaa; 6]),
+            Some(Ipv4Addr::new(192, 168, 127, 2))
+        );
+        // .3 is reserved for another MAC, so the next pool lease is .4, not .3.
+        assert_eq!(
+            alloc_lease(&mut inner, &cfg, [0xcc; 6]),
+            Some(Ipv4Addr::new(192, 168, 127, 4))
         );
     }
 }

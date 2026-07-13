@@ -121,6 +121,10 @@ enum Commands {
         /// tap interface to create and bring up
         #[arg(long, default_value = "eth0")]
         iface: String,
+        /// hardware address to assign the tap (aa:bb:cc:dd:ee:ff). Lets the vk
+        /// switch match a per-MAC DHCP reservation; omit for a kernel-random MAC.
+        #[arg(long)]
+        mac: Option<String>,
     },
     /// Run an SSH server (russh) on --socket — pubkey auth, pty/shell + exec — so
     /// a stock ssh client (hence VS Code Remote-SSH) reaches the guest over vsock
@@ -374,7 +378,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
                 std::process::exit(1)
             }
         }
-        Commands::Net { iface } => {
+        Commands::Net { iface, mac } => {
             TermLogger::init(
                 LevelFilter::Info,
                 Config::default(),
@@ -386,7 +390,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
                 },
             )
             .unwrap();
-            if let Err(e) = vk_agent::tap::run_net(&socket, &iface).await {
+            if let Err(e) = vk_agent::tap::run_net(&socket, &iface, mac.as_deref()).await {
                 error!("net: {e:#}");
                 std::process::exit(1)
             }

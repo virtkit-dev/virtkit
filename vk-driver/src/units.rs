@@ -203,6 +203,18 @@ pub fn nth_static_ip(gateway: Ipv4Addr, prefix: u8, n: u32) -> Result<Ipv4Addr> 
     Ok(Ipv4Addr::from(network | (hosts as u32 - n)))
 }
 
+/// A stable, locally-administered unicast MAC for a sibling from its run-assigned
+/// IPv4: `52:54:00:<octet2>:<octet3>:<octet4>`. The `52:54:00` prefix is the
+/// QEMU-style locally-administered unicast OUI; the last three octets carry the
+/// low three IPv4 octets, so every host on a /24 (up to a /8) LAN gets a distinct
+/// MAC. The switch keys a DHCP reservation on this MAC to hand the sibling its
+/// svc.ip (== the address the resolver advertises for its name), instead of a pool
+/// lease.
+pub fn mac_for_ip(ip: Ipv4Addr) -> String {
+    let o = ip.octets();
+    format!("52:54:00:{:02x}:{:02x}:{:02x}", o[1], o[2], o[3])
+}
+
 /// First vsock CID handed to services — clear of the reserved CIDs (0-2) and the
 /// primary VM's default (3).
 pub const FIRST_SERVICE_CID: u32 = 100;
@@ -309,6 +321,19 @@ pub fn boot_unit(
     }
     let shared_mem = !shares.is_empty();
 
+    // The sibling's deterministic MAC, derived from its run-assigned IP. Passed on
+    // the cmdline so the agent sets the tap's hardware address to it, letting the
+    // switch honor its per-MAC DHCP reservation and hand back this exact IP (== the
+    // address the resolver advertises for the sibling's name). Harmless for the
+    // static path (it sets its address directly); required for the image-init path,
+    // whose own systemd DHCPs eth0.
+    let mac = svc
+        .ip
+        .split('/')
+        .next()
+        .and_then(|s| s.parse::<Ipv4Addr>().ok())
+        .map(mac_for_ip);
+
     // Build and spawn the VMM. On any failure, kill the virtiofsd children already
     // spawned above before returning — Child's Drop does not kill, so a soft error
     // return would otherwise orphan them for the owner's lifetime.
@@ -341,6 +366,9 @@ pub fn boot_unit(
                 svc.hostname, svc.ip
             )
         };
+        if let Some(mac) = &mac {
+            cmdline.push_str(&format!(" VIRTKIT_VM_MAC={mac}"));
+        }
         if !virtiofs.is_empty() {
             cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS={virtiofs}"));
         }
