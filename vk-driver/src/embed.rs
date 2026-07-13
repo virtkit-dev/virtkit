@@ -64,6 +64,15 @@ mod blob {
     use std::arch::global_asm;
 
     global_asm!(concat!(
+        // Content stamps (from build.rs) — unused by the asm, but referencing them
+        // makes this module recompile (and re-run `.incbin`) whenever a blob's bytes
+        // change, not just its path. Without this an agent-only rebuild would ship a
+        // stale embed, since cargo keys `.incbin` recompilation on the path env only.
+        "# vk embed stamps ",
+        env!("VK_EMBED_KERNEL_STAMP"),
+        " ",
+        env!("VK_EMBED_AGENT_STAMP"),
+        "\n",
         ".section .rodata.vk_embed_kernel,\"a\",@progbits\n",
         ".globl VK_EMBED_KERNEL_START\n",
         "VK_EMBED_KERNEL_START:\n",

@@ -65,7 +65,13 @@ fn embed(src_var: &str, path_var: &str) {
     if std::env::var_os("CARGO_FEATURE_EMBED").is_none() {
         return;
     }
-    let path = match std::env::var_os(src_var) {
+    // A content stamp of the embedded blob, emitted as a rustc-env the `.incbin`
+    // module references. `.incbin` splices the file at assemble time, but cargo keys
+    // recompilation on the *path* env (stable here) and on source text — never on the
+    // included file's content. Without this stamp, rebuilding only the agent leaves
+    // `vk` embedding the previous blob (a silent stale-embed footgun). A changed stamp
+    // forces the embed module to recompile and re-run `.incbin`.
+    let (path, stamp) = match std::env::var_os(src_var) {
         Some(p) if !p.is_empty() => {
             let p = PathBuf::from(p);
             // A set var naming a missing file is a build-system bug (typo, path drift),
@@ -76,7 +82,8 @@ fn embed(src_var: &str, path_var: &str) {
                 p.display()
             );
             println!("cargo::rerun-if-changed={}", p.display());
-            std::fs::canonicalize(&p).unwrap_or(p)
+            let stamp = content_stamp(&p);
+            (std::fs::canonicalize(&p).unwrap_or(p), stamp)
         }
         _ => {
             println!(
@@ -86,8 +93,18 @@ fn embed(src_var: &str, path_var: &str) {
             let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
             let empty = out_dir.join(format!("{path_var}.empty"));
             std::fs::write(&empty, []).expect("write empty embed placeholder");
-            empty
+            (empty, 0)
         }
     };
     println!("cargo::rustc-env={path_var}={}", path.display());
+    println!("cargo::rustc-env={src_var}_STAMP={stamp:016x}");
+}
+
+/// A 64-bit content hash of `p`, so the embed module recompiles when the blob changes.
+fn content_stamp(p: &std::path::Path) -> u64 {
+    use std::hash::Hasher;
+    let bytes = std::fs::read(p).unwrap_or_default();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write(&bytes);
+    h.finish()
 }
