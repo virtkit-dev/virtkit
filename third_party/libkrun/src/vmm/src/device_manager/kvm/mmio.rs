@@ -77,6 +77,13 @@ type Result<T> = ::std::result::Result<T, Error>;
 /// Currently hardcoded to 4K.
 const MMIO_LEN: u64 = 0x1000;
 
+/// Base for virtio-pci BAR windows, placed high in the 32-bit MMIO gap so it
+/// never overlaps the low-growing virtio-mmio transport allocations (which
+/// start at `arch::MMIO_MEM_START` == 0xd000_0000 and grow upward). Each BAR is
+/// `CAPABILITY_BAR_SIZE` and 512KiB-aligned; the gap runs up to 4GiB.
+#[cfg(target_arch = "x86_64")]
+const PCI_MMIO_BASE: u64 = 0xe000_0000;
+
 /// Manages the complexities of registering a MMIO device.
 pub struct MMIODeviceManager {
     pub bus: devices::Bus,
@@ -84,6 +91,13 @@ pub struct MMIODeviceManager {
     irq: u32,
     last_irq: u32,
     id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
+    /// Next free base for a virtio-pci BAR window.
+    #[cfg(target_arch = "x86_64")]
+    pci_mmio_base: u64,
+    /// PCI INTx routes as (device number, interrupt pin 1-based, GSI), so the
+    /// MP table can emit matching PCI-bus interrupt-source entries.
+    #[cfg(target_arch = "x86_64")]
+    pci_irqs: Vec<(u8, u8, u32)>,
 }
 
 impl MMIODeviceManager {
@@ -98,7 +112,18 @@ impl MMIODeviceManager {
             last_irq: irq_interval.1,
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
+            #[cfg(target_arch = "x86_64")]
+            pci_mmio_base: PCI_MMIO_BASE,
+            #[cfg(target_arch = "x86_64")]
+            pci_irqs: Vec::new(),
         }
+    }
+
+    /// PCI INTx routing table collected during device registration, as
+    /// (device number, interrupt pin, GSI). Consumed when building the MP table.
+    #[cfg(target_arch = "x86_64")]
+    pub fn pci_irqs(&self) -> &[(u8, u8, u32)] {
+        &self.pci_irqs
     }
 
     /// Register a MMIO IOAPIC device.
@@ -160,6 +185,68 @@ impl MMIODeviceManager {
         self.irq += 1;
 
         Ok(ret)
+    }
+
+    /// Register a virtio-pci device: allocate an INTx GSI, wire the device's
+    /// interrupt eventfd to it via `KVM_IRQFD`, register the per-queue notify
+    /// ioeventfds inside the device's BAR0 window, place the BAR0 MMIO region on
+    /// the bus, and return the assigned (bar_base, gsi). The caller is expected
+    /// to add the returned config space to the `PciBus`.
+    #[cfg(target_arch = "x86_64")]
+    pub fn register_virtio_pci_device(
+        &mut self,
+        vm: &VmFd,
+        device: devices::virtio::VirtioPciDevice,
+        type_id: u32,
+        device_id: String,
+        device_number: u8,
+    ) -> Result<(u64, u32, Arc<Mutex<devices::virtio::VirtioPciDevice>>)> {
+        use devices::virtio::CAPABILITY_BAR_SIZE;
+
+        if self.irq > self.last_irq {
+            return Err(Error::IrqsExhausted);
+        }
+
+        let bar_base = self.pci_mmio_base;
+        let gsi = self.irq;
+
+        let mut device = device;
+        device.set_irq_line(gsi);
+
+        // Per-queue notify: each queue's eventfd fires on a write to its own
+        // address inside the notify region (address-based, no datamatch).
+        for (i, queue_evt) in device.queue_evts().iter().enumerate() {
+            let notify_addr = bar_base + devices::virtio::VirtioPciDevice::queue_notify_offset(i);
+            let io_addr = IoEventAddress::Mmio(notify_addr);
+            vm.register_ioevent(queue_evt, &io_addr, kvm_ioctls::NoDatamatch)
+                .map_err(Error::RegisterIoEvent)?;
+        }
+
+        // INTx: the device asserts `gsi` by writing this eventfd.
+        vm.register_irqfd(device.interrupt_evt(), gsi)
+            .map_err(Error::RegisterIrqFd)?;
+
+        let device = Arc::new(Mutex::new(device));
+        self.bus
+            .insert(device.clone(), bar_base, CAPABILITY_BAR_SIZE)
+            .map_err(Error::BusError)?;
+
+        self.id_to_dev_info.insert(
+            (DeviceType::Virtio(type_id), device_id),
+            MMIODeviceInfo {
+                addr: bar_base,
+                _len: CAPABILITY_BAR_SIZE,
+                _irq: gsi,
+            },
+        );
+
+        // Record the INTx route (interrupt pin A == 1) for the MP table.
+        self.pci_irqs.push((device_number, 1, gsi));
+
+        self.pci_mmio_base += CAPABILITY_BAR_SIZE;
+        self.irq += 1;
+
+        Ok((bar_base, gsi, device))
     }
 
     /// Append a registered MMIO device to the kernel cmdline.

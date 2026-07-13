@@ -107,3 +107,15 @@ single host-bridge `PciDevice` at 00:00.0 (vendor 0x1b36 / device 0x0008, class 
 type 0). Registered by `PortIODeviceManager`. x86_64 only; additive — no upstream behaviour
 change until PCI devices are attached later. Covered by `legacy::pci` unit tests.
 Search for `PciConfigIo`.
+
+`src/devices/src/virtio/pci.rs` (new) + `src/devices/src/legacy/pci.rs` +
+`src/arch/src/x86_64/{mod.rs,mptable.rs}` + `src/vmm/src/device_manager/kvm/mmio.rs` +
+`src/vmm/src/builder.rs` — a modern virtio-pci transport over legacy INTx.
+`VirtioPciDevice` wraps a `VirtioDevice` and serves the virtio common /
+ISR / device / notify structures out of a single 64-bit BAR0 on the MMIO bus, with a vendor
+capability list pointing a driver at each structure; `PciDevice` gains a type-0 endpoint
+header, 64-bit memory-BAR sizing, and capability-list assembly. Interrupts use legacy INTx
+routed through an MP-table PCI-bus INTSRC entry (KVM irqfd, single-pulse). The block device now
+attaches over virtio-pci instead of virtio-mmio on x86_64 (00:01.0 for the first device). MSI-X
+and multi-device slot allocation are out of scope here (added separately). x86_64 only; additive.
+Covered by `legacy::pci` unit tests. Search for `VirtioPciDevice`.

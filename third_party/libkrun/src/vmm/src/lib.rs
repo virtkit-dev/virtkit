@@ -290,6 +290,7 @@ impl Vmm {
                 cmdline_len,
                 initrd,
                 vcpus.len() as u8,
+                self.mmio_device_manager.pci_irqs(),
             )
             .map_err(Error::ConfigureSystem)?;
         }

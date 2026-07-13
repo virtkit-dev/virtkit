@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Minimal legacy PCI support: a type-1 (0xCF8/0xCFC) configuration mechanism
-// exposing a single host bridge at 00:00.0, so the guest can enumerate a PCI
-// bus. No BARs, capabilities, MSI, or ACPI. Semantics follow cloud-hypervisor's
-// `pci::PciConfigIo` / `parse_io_config_address`, adapted to libkrun's
-// `BusDevice` trait (which has no `Barrier` return).
+// exposing a host bridge at 00:00.0 plus general endpoint functions, so the
+// guest can enumerate a PCI bus and drive a virtio-pci device over INTx.
+// Semantics follow cloud-hypervisor's `pci::PciConfigIo` /
+// `parse_io_config_address` and `pci::PciConfiguration`, adapted to libkrun's
+// `BusDevice` trait (which has no `Barrier` return). MSI/MSI-X and ACPI are
+// deliberately out of scope here.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,37 +16,176 @@ use crate::bus::BusDevice;
 
 /// Number of 32-bit registers exposed per function in legacy config space.
 /// Type-0 header is 16 dwords (64 bytes); the type-1 mechanism can address 64
-/// dwords (256 bytes) per function.
+/// dwords (256 bytes) per function, which is where the capability list lives.
 const NUM_CONFIG_REGISTERS: usize = 64;
 
+/// First dword index available for the PCI capability list (0x40). The 64-byte
+/// header occupies dwords 0..16; capabilities are placed from 0x40 onwards.
+const FIRST_CAPABILITY_OFFSET: usize = 0x40;
+
+/// Dword index of the first BAR (BAR0) in a type-0 header.
+const BAR0_REGISTER: usize = 4;
+
 /// A single PCI function's configuration space, addressed as 32-bit registers.
+///
+/// Besides the raw register array this tracks, per BAR, whether the low bits
+/// encode the region size (so a driver probing BAR size by writing all-ones and
+/// reading back gets the size mask, and the assigned base otherwise).
 pub struct PciDevice {
     /// 32-bit configuration registers (dword-indexed).
     registers: [u32; NUM_CONFIG_REGISTERS],
+    /// Writable-bit mask per register (1 = driver may change the bit). Used to
+    /// keep read-only fields (ids, class, caps) stable while letting the command
+    /// register and BAR bases be written.
+    writable_bits: [u32; NUM_CONFIG_REGISTERS],
+    /// For each BAR dword, `Some(size)` if it is a memory BAR whose size is
+    /// `size`. Sizing (write 0xffff_ffff, read back the size mask) is handled
+    /// for the low dword; the high dword of a 64-bit BAR returns its size mask.
+    bar_sizes: [Option<u64>; NUM_CONFIG_REGISTERS],
+    /// Next free dword index for appending a capability.
+    next_capability_offset: usize,
+    /// Byte offset (within config space) of the last capability's `next` pointer,
+    /// so a freshly added capability can be linked into the list.
+    last_capability_next_ptr: Option<usize>,
 }
 
 impl PciDevice {
+    fn empty() -> Self {
+        PciDevice {
+            registers: [0u32; NUM_CONFIG_REGISTERS],
+            writable_bits: [0u32; NUM_CONFIG_REGISTERS],
+            bar_sizes: [None; NUM_CONFIG_REGISTERS],
+            next_capability_offset: FIRST_CAPABILITY_OFFSET,
+            last_capability_next_ptr: None,
+        }
+    }
+
     /// Build a minimal host-bridge config space.
     ///
     /// `vendor_id`/`device_id` identify the bridge; class code is set to
     /// "bridge device / host bridge" (0x06 / 0x00), prog-if 0, revision 0,
     /// header type 0. Everything else reads back as 0.
     pub fn new_host_bridge(vendor_id: u16, device_id: u16) -> Self {
-        let mut registers = [0u32; NUM_CONFIG_REGISTERS];
+        let mut dev = Self::empty();
 
         // Register 0x00: device id (upper 16) | vendor id (lower 16).
-        registers[0] = (u32::from(device_id) << 16) | u32::from(vendor_id);
+        dev.registers[0] = (u32::from(device_id) << 16) | u32::from(vendor_id);
 
         // Register 0x02: class code (upper 8) | subclass (bits 16-23) |
         // prog-if (bits 8-15) | revision id (bits 0-7).
         // Class 0x06 (bridge), subclass 0x00 (host bridge), prog-if 0, rev 0.
-        registers[2] = 0x0600_0000;
+        dev.registers[2] = 0x06 << 24;
 
-        // Register 0x03: BIST | header type | latency timer | cache line size.
-        // Header type 0x00 (single-function endpoint-style header).
-        registers[3] = 0x0000_0000;
+        // Register 0x03: header type 0x00.
+        dev.registers[3] = 0x0000_0000;
 
-        PciDevice { registers }
+        dev
+    }
+
+    /// Build the config space of a PCI endpoint (header type 0).
+    ///
+    /// `class`/`subclass`/`prog_if` set register 0x02; `interrupt_pin` /
+    /// `interrupt_line` set the low two bytes of register 0x0f. The command
+    /// register (0x01, low 16 bits) is made writable so the driver can enable
+    /// memory-space decoding. `status` advertises the presence of a capability
+    /// list (bit 4).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_endpoint(
+        vendor_id: u16,
+        device_id: u16,
+        class: u8,
+        subclass: u8,
+        prog_if: u8,
+        interrupt_pin: u8,
+        interrupt_line: u8,
+    ) -> Self {
+        let mut dev = Self::empty();
+
+        dev.registers[0] = (u32::from(device_id) << 16) | u32::from(vendor_id);
+
+        // Command register (low 16) is writable; status register (high 16)
+        // advertises a capability list at bit 4.
+        dev.registers[1] = 0x0010 << 16;
+        dev.writable_bits[1] = 0x0000_ffff;
+
+        dev.registers[2] =
+            (u32::from(class) << 24) | (u32::from(subclass) << 16) | (u32::from(prog_if) << 8);
+
+        // Header type 0x00, single function.
+        dev.registers[3] = 0x0000_0000;
+
+        // Register 0x0d (byte 0x34): capabilities pointer -> first cap offset.
+        dev.registers[0x0d] = FIRST_CAPABILITY_OFFSET as u32;
+
+        // Register 0x0f: interrupt pin (byte 1) | interrupt line (byte 0).
+        dev.registers[0x0f] = (u32::from(interrupt_pin) << 8) | u32::from(interrupt_line);
+        // interrupt_line (byte 0) is conventionally writable by firmware/driver.
+        dev.writable_bits[0x0f] = 0x0000_00ff;
+
+        dev
+    }
+
+    /// Program a 64-bit memory BAR at `bar_index` (0 => BAR0/BAR1 pair).
+    ///
+    /// `base` is the assigned guest-physical base; `size` the region size (power
+    /// of two). The low dword carries the memory-type bits (64-bit, non-prefetch)
+    /// and lets the driver read back the size mask while probing; both dwords are
+    /// writable so a standard BAR write-then-restore leaves the assigned base.
+    pub fn set_memory_bar_64(&mut self, bar_index: usize, base: u64, size: u64) {
+        let lo = BAR0_REGISTER + bar_index * 2;
+        let hi = lo + 1;
+
+        // Low dword: base bits | 0b100 (64-bit memory, non-prefetchable).
+        self.registers[lo] = ((base & 0xffff_fff0) as u32) | 0b100;
+        self.registers[hi] = (base >> 32) as u32;
+
+        // The address bits are writable; the low 4 type bits are fixed.
+        self.writable_bits[lo] = 0xffff_fff0;
+        self.writable_bits[hi] = 0xffff_ffff;
+
+        self.bar_sizes[lo] = Some(size);
+        self.bar_sizes[hi] = Some(size);
+    }
+
+    /// Append a vendor-specific (virtio) capability to the capability list,
+    /// returning the byte offset at which it was placed. `body` is the capability
+    /// payload following the 1-byte id and 1-byte next-pointer (i.e. it starts at
+    /// the virtio `cap_len` field). The capability is dword-padded.
+    pub fn add_vendor_capability(&mut self, body: &[u8]) -> usize {
+        let cap_offset = self.next_capability_offset;
+
+        // Assemble the full capability bytes: id (0x09 = vendor specific), next
+        // pointer (patched to 0 for now; linked below), then the body.
+        let mut bytes = Vec::with_capacity(2 + body.len());
+        bytes.push(0x09u8); // PCI_CAP_ID_VNDR
+        bytes.push(0x00u8); // next pointer, terminates the list for now
+        bytes.extend_from_slice(body);
+        // Pad to a dword boundary.
+        while bytes.len() % 4 != 0 {
+            bytes.push(0);
+        }
+
+        // Write the capability bytes into the register array.
+        for (i, chunk) in bytes.chunks(4).enumerate() {
+            let mut word = 0u32;
+            for (b, byte) in chunk.iter().enumerate() {
+                word |= u32::from(*byte) << (b * 8);
+            }
+            self.registers[cap_offset / 4 + i] = word;
+        }
+
+        // Link the previous capability's next pointer to this one.
+        if let Some(prev_next) = self.last_capability_next_ptr {
+            let reg = prev_next / 4;
+            let shift = (prev_next % 4) * 8;
+            self.registers[reg] =
+                (self.registers[reg] & !(0xffu32 << shift)) | ((cap_offset as u32) << shift);
+        }
+
+        // This capability's next pointer is its second byte.
+        self.last_capability_next_ptr = Some(cap_offset + 1);
+        self.next_capability_offset = cap_offset + bytes.len();
+        cap_offset
     }
 
     /// Read a 32-bit configuration register by dword index.
@@ -52,18 +193,52 @@ impl PciDevice {
         self.registers.get(register).copied().unwrap_or(0)
     }
 
-    /// Write a (possibly partial) 32-bit configuration register.
-    ///
-    /// For A1 the host bridge has no writable state (no BARs), so writes are
-    /// accepted and dropped. Kept for symmetry with the read path and to make
-    /// the intent explicit.
-    fn write_config_register(&mut self, _register: usize, _offset: u64, _data: &[u8]) {
-        // Host bridge: no writable registers in A1. Ignore.
+    /// Write a (possibly partial) 32-bit configuration register, honouring the
+    /// per-register writable-bit mask and BAR-sizing semantics.
+    fn write_config_register(&mut self, register: usize, offset: u64, data: &[u8]) {
+        if register >= NUM_CONFIG_REGISTERS {
+            return;
+        }
+        if offset as usize + data.len() > 4 {
+            return;
+        }
+
+        // Assemble the incoming bytes into a value/mask aligned to the register.
+        let mut value = 0u32;
+        let mut mask = 0u32;
+        for (i, byte) in data.iter().enumerate() {
+            let shift = (offset as usize + i) * 8;
+            value |= u32::from(*byte) << shift;
+            mask |= 0xffu32 << shift;
+        }
+
+        // BAR sizing: if a memory BAR is written all-ones (over the masked bytes),
+        // report the size mask on the next read; any other value assigns the base.
+        if let Some(size) = self.bar_sizes[register] {
+            let writable = self.writable_bits[register] & mask;
+            let incoming = value & writable;
+            if incoming == writable && writable != 0 {
+                // Driver probing size: report ~(size-1) over the address bits.
+                let size_mask = !(size.wrapping_sub(1));
+                let dword = if (register - BAR0_REGISTER) % 2 == 0 {
+                    // Low dword keeps its type bits.
+                    (size_mask as u32 & 0xffff_fff0) | (self.registers[register] & 0x0000_000f)
+                } else {
+                    (size_mask >> 32) as u32
+                };
+                self.registers[register] =
+                    (self.registers[register] & !writable) | (dword & writable);
+                return;
+            }
+        }
+
+        let writable = self.writable_bits[register] & mask;
+        self.registers[register] = (self.registers[register] & !writable) | (value & writable);
     }
 }
 
 /// A PCI bus holding functions keyed by device number. Device 0 is the host
-/// bridge.
+/// bridge; endpoints (e.g. the virtio-pci block device) live at higher slots.
 pub struct PciBus {
     devices: HashMap<u8, Arc<Mutex<PciDevice>>>,
 }
@@ -103,6 +278,14 @@ impl PciConfigIo {
         }
     }
 
+    /// Attach an endpoint function at `device_number` (00:`device_number`.0).
+    pub fn add_pci_device(&self, device_number: u8, device: Arc<Mutex<PciDevice>>) {
+        self.pci_bus
+            .lock()
+            .unwrap()
+            .add_device(device_number, device);
+    }
+
     fn config_space_read(&self) -> u32 {
         let enabled = (self.config_address & 0x8000_0000) != 0;
         if !enabled {
@@ -112,7 +295,7 @@ impl PciConfigIo {
         let (bus, device, function, register) =
             parse_io_config_address(self.config_address & !0x8000_0000);
 
-        // Only bus 0, function 0 exist in A1.
+        // Only bus 0, function 0 exist.
         if bus != 0 || function > 0 {
             return 0xffff_ffff;
         }
@@ -253,6 +436,12 @@ mod tests {
         u32::from_le_bytes(data)
     }
 
+    fn write_reg(cfg: &mut PciConfigIo, device: u32, register: u32, value: u32) {
+        let addr = 0x8000_0000 | (device << 11) | (register << 2);
+        cfg.write(0, 0, &addr.to_le_bytes());
+        cfg.write(0, 4, &value.to_le_bytes());
+    }
+
     #[test]
     fn host_bridge_vendor_device() {
         let mut cfg = PciConfigIo::new(bus_with_host_bridge());
@@ -316,5 +505,64 @@ mod tests {
         let mut data = [0u8; 4];
         cfg.read(0, 4, &mut data);
         assert_eq!(u32::from_le_bytes(data), (0x0008 << 16) | 0x1b36);
+    }
+
+    #[test]
+    fn endpoint_ids_and_class() {
+        let ep = PciDevice::new_endpoint(0x1af4, 0x1042, 0x01, 0x00, 0x00, 1, 11);
+        let mut bus = PciBus::new();
+        bus.add_device(
+            0,
+            Arc::new(Mutex::new(PciDevice::new_host_bridge(0x1b36, 0x0008))),
+        );
+        bus.add_device(1, Arc::new(Mutex::new(ep)));
+        let mut cfg = PciConfigIo::new(Arc::new(Mutex::new(bus)));
+
+        assert_eq!(read_reg(&mut cfg, 1, 0), (0x1042 << 16) | 0x1af4);
+        let reg2 = read_reg(&mut cfg, 1, 2);
+        assert_eq!(reg2 >> 24, 0x01); // mass storage
+                                      // capabilities pointer present
+        assert_eq!(
+            read_reg(&mut cfg, 1, 0x0d) & 0xff,
+            FIRST_CAPABILITY_OFFSET as u32
+        );
+        // interrupt line/pin
+        let reg_f = read_reg(&mut cfg, 1, 0x0f);
+        assert_eq!(reg_f & 0xff, 11);
+        assert_eq!((reg_f >> 8) & 0xff, 1);
+    }
+
+    #[test]
+    fn bar_sizing_reports_size_mask_then_base() {
+        let mut ep = PciDevice::new_endpoint(0x1af4, 0x1042, 0x01, 0x00, 0x00, 1, 11);
+        ep.set_memory_bar_64(0, 0xd000_0000, 0x8_0000);
+        let mut bus = PciBus::new();
+        bus.add_device(1, Arc::new(Mutex::new(ep)));
+        let mut cfg = PciConfigIo::new(Arc::new(Mutex::new(bus)));
+
+        // Initial base with 64-bit memory type bits (0b100).
+        assert_eq!(read_reg(&mut cfg, 1, 4), 0xd000_0000 | 0b100);
+        // Probe size: write all ones, read back size mask (keeping type bits).
+        write_reg(&mut cfg, 1, 4, 0xffff_ffff);
+        let sized = read_reg(&mut cfg, 1, 4);
+        assert_eq!(
+            sized & 0xffff_fff0,
+            (!(0x8_0000u64 - 1)) as u32 & 0xffff_fff0
+        );
+        // Restore base.
+        write_reg(&mut cfg, 1, 4, 0xd000_0000);
+        assert_eq!(read_reg(&mut cfg, 1, 4) & 0xffff_fff0, 0xd000_0000);
+    }
+
+    #[test]
+    fn vendor_capability_is_linked() {
+        let mut ep = PciDevice::new_endpoint(0x1af4, 0x1042, 0x01, 0x00, 0x00, 1, 11);
+        let off0 = ep.add_vendor_capability(&[0, 1, 2, 3]);
+        let off1 = ep.add_vendor_capability(&[4, 5, 6, 7]);
+        assert_eq!(off0, FIRST_CAPABILITY_OFFSET);
+        // First cap's next pointer should point at the second cap.
+        let reg = off0 / 4;
+        let next = (ep.registers[reg] >> 8) & 0xff;
+        assert_eq!(next as usize, off1);
     }
 }

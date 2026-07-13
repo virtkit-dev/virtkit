@@ -118,7 +118,7 @@ impl InterruptTransport {
         self.0.irq_line
     }
 
-    fn set_irq_line(&mut self, irq_line: u32) {
+    pub fn set_irq_line(&mut self, irq_line: u32) {
         debug!(target: &self.0.log_target, "set_irq_line: {irq_line}");
         match Arc::get_mut(&mut self.0) {
             None => {

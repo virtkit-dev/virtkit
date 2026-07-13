@@ -2263,9 +2263,56 @@ fn attach_block_devices(
         // clean-shutdown flush.
         vmm.exit_observers.push(block.clone());
 
+        // Attach the block device over virtio-pci (BAR + INTx) instead
+        // of virtio-mmio, so a stock kernel mounts its rootfs off /dev/vda.
+        #[cfg(target_arch = "x86_64")]
+        {
+            attach_pci_device(vmm, id, intc.clone(), block.clone()).map_err(RegisterBlockDevice)?;
+        }
         // The device mutex mustn't be locked here otherwise it will deadlock.
+        #[cfg(not(target_arch = "x86_64"))]
         attach_mmio_device(vmm, id, intc.clone(), block.clone()).map_err(RegisterBlockDevice)?;
     }
+
+    Ok(())
+}
+
+/// Attaches a virtio device over the virtio-pci transport (BAR0 + INTx). The
+/// transport's BAR window is placed on the MMIO bus and its config space on the
+/// legacy PCI bus (00:01.0 for the first such device).
+#[cfg(target_arch = "x86_64")]
+fn attach_pci_device(
+    vmm: &mut Vmm,
+    id: String,
+    intc: IrqChip,
+    device: Arc<Mutex<dyn VirtioDevice>>,
+) -> std::result::Result<(), device_manager::mmio::Error> {
+    let pci_device =
+        devices::virtio::VirtioPciDevice::new(vmm.guest_memory().clone(), intc, device)?;
+
+    let type_id = pci_device.device_type_id();
+
+    // First (and only, for A2) virtio-pci endpoint sits at 00:01.0.
+    let device_number: u8 = 1;
+    let (bar_base, gsi, transport) = vmm.mmio_device_manager.register_virtio_pci_device(
+        vmm.vm.fd(),
+        pci_device,
+        type_id,
+        id,
+        device_number,
+    )?;
+
+    // Build the PCI config space (header + BAR0 + virtio caps + INTx line) and
+    // hang it off the host bridge at slot 1 (00:01.0).
+    let config = transport
+        .lock()
+        .unwrap()
+        .pci_config_space(bar_base, gsi as u8);
+    vmm.pio_device_manager
+        .pci_config_io
+        .lock()
+        .unwrap()
+        .add_pci_device(device_number, Arc::new(Mutex::new(config)));
 
     Ok(())
 }
