@@ -12,7 +12,7 @@ use std::process::Child;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use vk_core::fleetctl::{Reply, Request, UnitStatus};
+use vk_core::fleetctl::{Frame, Reply, Request, UnitStatus};
 
 /// A declared service unit, its runtime dir (sockets/overlay/console), its running
 /// VMM child (if started), and the virtiofsd children backing its volume shares.
@@ -241,6 +241,6 @@ async fn handle_control(conn: tokio::net::UnixStream, mgr: Arc<Manager>) -> Resu
             return Ok(());
         };
         let reply = mgr.handle(req); // sync; the unit lock is never held across an await
-        vk_core::fleetctl::write_msg(&mut wr, &reply).await?;
+        vk_core::fleetctl::write_msg(&mut wr, &Frame::Done(reply)).await?;
     }
 }
