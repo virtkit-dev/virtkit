@@ -563,6 +563,10 @@ async fn plan_services(
             cid: crate::units::FIRST_SERVICE_CID + slot as u32,
             config,
             volumes: Vec::new(),
+            // The GitLab `services:` model carries no per-service init/kernel axes, so
+            // every executor service keeps the default agent-as-PID1 pinned-kernel boot.
+            init: crate::run::InitSource::Default,
+            kernel: crate::run::KernelSource::Default,
         });
     }
     Ok(out)

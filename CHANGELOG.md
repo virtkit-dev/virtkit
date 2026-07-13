@@ -4,6 +4,17 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `vk run` can boot a container image on its own kernel and hand PID 1 to the image's
+  own init/systemd instead of virtkit's pinned kernel and agent: `--kernel image` boots
+  the image's `/boot/vmlinuz` (with its modules), `--kernel <path>` boots a supplied
+  kernel, and `--init image` runs the image's `/sbin/init`. The `image` axes read the
+  image's disk, so they need a disk-backed boot and are incompatible with `--ram`.
+- A compose service can choose these per service with an `x-virtkit: { init:, kernel: }`
+  marker, honored the same whether the service runs as the `--primary` VM or as a
+  background sibling.
+
 ## [0.11.0] - 2026-07-12
 
 ### Added

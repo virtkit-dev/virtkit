@@ -55,6 +55,14 @@ pub struct Unit {
     /// started at start-up unless one of its profiles is activated (`--profile`)
     /// or an enabled service depends on it — `virtctl start` works regardless
     pub profiles: Vec<String>,
+    /// Who runs as PID 1 in this unit's guest (compose `x-virtkit.init`), applied
+    /// identically whether the unit boots as the primary (`--primary`) or a sibling.
+    /// `Default` = vk-agent; `Image` = the image's own `/sbin/init`.
+    pub init: crate::run::InitSource,
+    /// Which kernel this unit's guest boots on (compose `x-virtkit.kernel`), applied
+    /// identically primary or sibling. `Default` = the pinned kernel; `Image` = the
+    /// image's own kernel + modules; `Path` = an explicit kernel file.
+    pub kernel: crate::run::KernelSource,
 }
 
 /// Where a unit's image comes from.
@@ -455,6 +463,15 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
         Some(h) => h,
         None => name.to_string(),
     };
+    // The per-service init/kernel axes (compose `x-virtkit`): absent key/subkey =
+    // Default, so an unmarked service keeps today's agent-as-PID1 pinned-kernel boot.
+    let (init, kernel) = match svc.x_virtkit {
+        Some(x) => (x.init()?, x.kernel()?),
+        None => (
+            crate::run::InitSource::Default,
+            crate::run::KernelSource::Default,
+        ),
+    };
     Ok(Unit {
         name: name.to_string(),
         hostname,
@@ -466,6 +483,8 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
         depends_on,
         volumes,
         profiles: svc.profiles,
+        init,
+        kernel,
     })
 }
 
@@ -640,6 +659,46 @@ struct ComposeService {
     volumes: Vec<String>,
     #[serde(default)]
     profiles: Vec<String>,
+    /// vk extension: per-service init/kernel axes (compose `x-*` extension key).
+    /// Only `x-virtkit` is recognized; any other `x-*` key still errors like any
+    /// unsupported key (deny_unknown_fields), matching the strict-parse contract.
+    #[serde(rename = "x-virtkit", default)]
+    x_virtkit: Option<XVirtkit>,
+}
+
+/// The `x-virtkit` per-service marker: the init/kernel axes as compose strings,
+/// parsed into [`crate::run::InitSource`] / [`crate::run::KernelSource`]. An absent
+/// subkey defaults to `Default`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct XVirtkit {
+    #[serde(default)]
+    init: Option<String>,
+    #[serde(default)]
+    kernel: Option<String>,
+}
+
+impl XVirtkit {
+    /// `init: default|image` → [`crate::run::InitSource`] (absent = Default).
+    fn init(&self) -> Result<crate::run::InitSource> {
+        match self.init.as_deref() {
+            None | Some("default") => Ok(crate::run::InitSource::Default),
+            Some("image") => Ok(crate::run::InitSource::Image),
+            Some(other) => {
+                bail!("x-virtkit.init: expected \"default\" or \"image\", got {other:?}")
+            }
+        }
+    }
+
+    /// `kernel: default|image|<path>` → [`crate::run::KernelSource`] (absent =
+    /// Default; a non-keyword string is a kernel file path).
+    fn kernel(&self) -> Result<crate::run::KernelSource> {
+        Ok(match self.kernel.as_deref() {
+            None => crate::run::KernelSource::Default,
+            // Infallible parser: "default"/"image" map to those variants, else a Path.
+            Some(s) => crate::run::KernelSource::parse(s).unwrap(),
+        })
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -1000,6 +1059,57 @@ mod tests {
         // user override
         unit.user = Some("root".into());
         assert_eq!(merged_config(&image, &unit).user, "root");
+    }
+
+    #[test]
+    fn x_virtkit_marker_sets_the_init_kernel_axes() {
+        use crate::run::{InitSource, KernelSource};
+        // no marker → Default/Default (today's behavior)
+        let u = one("services:\n  s:\n    image: x\n");
+        assert_eq!(u.init, InitSource::Default);
+        assert_eq!(u.kernel, KernelSource::Default);
+        // both axes set to image
+        let u =
+            one("services:\n  s:\n    image: x\n    x-virtkit: { init: image, kernel: image }\n");
+        assert_eq!(u.init, InitSource::Image);
+        assert_eq!(u.kernel, KernelSource::Image);
+        // partial: only init
+        let u = one("services:\n  s:\n    image: x\n    x-virtkit: { init: image }\n");
+        assert_eq!(u.init, InitSource::Image);
+        assert_eq!(u.kernel, KernelSource::Default);
+        // partial: only kernel, and a path value → Path
+        let u = one("services:\n  s:\n    image: x\n    x-virtkit: { kernel: /boot/vmlinux }\n");
+        assert_eq!(u.init, InitSource::Default);
+        assert_eq!(u.kernel, KernelSource::Path("/boot/vmlinux".into()));
+        // explicit "default" is the same as absent
+        let u = one(
+            "services:\n  s:\n    image: x\n    x-virtkit: { init: default, kernel: default }\n",
+        );
+        assert_eq!(u.init, InitSource::Default);
+        assert_eq!(u.kernel, KernelSource::Default);
+        // a bad init value errors naming it; an unknown x-virtkit subkey errors
+        assert!(
+            parse(
+                "services:\n  s:\n    image: x\n    x-virtkit: { init: systemd }\n",
+                Path::new("/b")
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                "services:\n  s:\n    image: x\n    x-virtkit: { foo: bar }\n",
+                Path::new("/b")
+            )
+            .is_err()
+        );
+        // an unrelated x-* key is still a hard error (only x-virtkit is recognized)
+        assert!(
+            parse(
+                "services:\n  s:\n    image: x\n    x-bake: {}\n",
+                Path::new("/b")
+            )
+            .is_err()
+        );
     }
 
     #[test]

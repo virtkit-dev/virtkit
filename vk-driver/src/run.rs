@@ -20,6 +20,36 @@ use crate::source::Source;
 use crate::timing::{Phase, Timings};
 use crate::vmm::Vmm;
 
+/// Who runs as PID 1 in the guest. `Default` = vk-agent (virtkit's default); `Image`
+/// = the image's own init (`/sbin/init`, e.g. systemd) via the preinit handoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum InitSource {
+    Default,
+    Image,
+}
+
+/// Which kernel the guest boots on. `Default` = virtkit's pinned/embedded kernel
+/// (virtio + ext4 built in); `Image` = the image's own `/boot/vmlinuz` + its modules,
+/// extracted host-side; `Path` = an explicit vmlinux/bzImage file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KernelSource {
+    Default,
+    Image,
+    Path(PathBuf),
+}
+
+impl KernelSource {
+    /// clap `value_parser`: the literal `default`/`image` map to those variants,
+    /// anything else is a path to a kernel file.
+    pub fn parse(s: &str) -> std::result::Result<Self, std::convert::Infallible> {
+        Ok(match s {
+            "default" => KernelSource::Default,
+            "image" => KernelSource::Image,
+            other => KernelSource::Path(PathBuf::from(other)),
+        })
+    }
+}
+
 const VSOCK_PORT: u32 = 4444;
 /// vsock port the guest SSH-agent forwarder dials; the host splices it to `$SSH_AUTH_SOCK`.
 pub(crate) const SSH_AGENT_VSOCK_PORT: u32 = 2223;
@@ -81,8 +111,9 @@ pub struct RunArgs {
     /// host dir shared read-write into the guest (at WORKDIR_MOUNT); the command runs
     /// there, so its outputs land back on the host. `None` = no share.
     pub workdir: Option<PathBuf>,
-    /// `None` uses the kernel embedded in `vk` (or the on-disk default).
-    pub kernel: Option<PathBuf>,
+    /// Which kernel the guest boots on: virtkit's pinned kernel (`Default`), the
+    /// image's own kernel + modules (`Image`), or an explicit kernel file (`Path`).
+    pub kernel: KernelSource,
     /// `None` uses the vk-agent embedded in `vk` (or the on-disk default).
     pub agent: Option<PathBuf>,
     pub cloud_hypervisor: PathBuf,
@@ -101,6 +132,10 @@ pub struct RunArgs {
     /// boot the rootfs as a cpio initramfs held in RAM instead of the default
     /// native-ext4 disk (needs --mem of roughly three times the image size)
     pub ram: bool,
+    /// Who runs as PID 1 in the guest: vk-agent (`Default`) or the image's own
+    /// init/systemd (`Image`), the latter via the preinit handoff. `Image` requires
+    /// an ext4 (a `-f` build or a non-`--ram` image).
+    pub init: InitSource,
     /// attach an interactive shell once the guest is up (needs a terminal)
     pub shell: bool,
     /// give the guest egress via a userspace `vk switch` (DHCP + DNS + proxy);
@@ -187,14 +222,21 @@ pub async fn run(args: &RunArgs) -> Result<()> {
     // Held for the VM's lifetime: an embedded asset lives in a memfd whose
     // /proc/self/fd path is only valid while the fd is open.
     let agent = crate::embed::resolve(crate::embed::Asset::Agent, args.agent.as_deref())?;
-    let kernel = crate::embed::resolve(crate::embed::Asset::Kernel, args.kernel.as_deref())?;
     if !agent.is_embedded() && !agent.path.is_file() {
         bail!(
             "vk-agent not found at {} (pass --agent, or use a `vk` with it embedded)",
             agent.path.display()
         );
     }
-    if !kernel.is_embedded() && !kernel.path.is_file() {
+    // Resolve the pinned/explicit kernel: `--kernel <path>` wins, else the embedded
+    // pinned kernel. With `--kernel image` the boot kernel is extracted from the image
+    // instead, so a pinned kernel need not exist — skip its is-file check.
+    let kernel_path = match &args.kernel {
+        KernelSource::Path(p) => Some(p.as_path()),
+        KernelSource::Default | KernelSource::Image => None,
+    };
+    let kernel = crate::embed::resolve(crate::embed::Asset::Kernel, kernel_path)?;
+    if args.kernel != KernelSource::Image && !kernel.is_embedded() && !kernel.path.is_file() {
         bail!(
             "kernel not found at {} (pass --kernel, or use a `vk` with it embedded)",
             kernel.path.display()
@@ -381,6 +423,37 @@ async fn resolve_source(args: &RunArgs) -> Result<Source> {
 }
 
 async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path) -> Result<()> {
+    // Both non-default axes boot the image from an ext4 (the modular image kernel
+    // mounts /dev/vda; the image's init pivots into it), so they need an ext4 — a `-f`
+    // build or a non-`--ram` image — never the pure-RAM cpio path.
+    if args.init == InitSource::Image && args.ram {
+        bail!("--init image is incompatible with --ram");
+    }
+    if args.kernel == KernelSource::Image && args.ram {
+        bail!("--kernel image is incompatible with --ram");
+    }
+    // The image-init preinit applies the virtkit setup the image's own init won't do
+    // (host volume mounts, symlinks, the ssh/exec serves, env, and an eth0 bridge the
+    // image DHCPs on) before handing off to systemd. The host-exec channel, compose
+    // and an interactive shell are not wired for image init yet — reject them rather
+    // than silently ignore.
+    if args.init == InitSource::Image {
+        let unsupported = [
+            (args.host_exec, "--host-exec"),
+            (args.compose.is_some(), "--compose"),
+            (args.shell, "--shell"),
+        ]
+        .into_iter()
+        .filter(|(set, _)| *set)
+        .map(|(_, name)| name)
+        .collect::<Vec<_>>();
+        if !unsupported.is_empty() {
+            bail!(
+                "--init image does not support {} yet",
+                unsupported.join(", ")
+            );
+        }
+    }
     // A Dockerfile boot reuses the build pipeline: build (or cache-restore, with a
     // registry) the target into an ext4, then boot it through the disk path below — so
     // `run -f Dockerfile` needs no explicit `--out` ext4. Otherwise fetch the rootfs tar
@@ -412,6 +485,9 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     // leaves the guest agent without a run user and the host-exec socket unchowned
     // (root-only). Set on both primary paths below; empty means root.
     let mut primary_user = String::new();
+    // The --primary primary's own init/kernel axes (from its `x-virtkit` marker),
+    // merged with the CLI axes below. None for a non-compose / non-primary boot.
+    let mut primary_axes: Option<(InitSource, KernelSource)> = None;
     let dockerfile_ext4 = if let Some(name) = &args.primary {
         let idx = compose_units
             .iter()
@@ -435,6 +511,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         primary_user = cfg.user.clone();
         primary_hostname = Some(unit.hostname.clone());
         primary_volumes = unit.volumes.clone();
+        primary_axes = Some((unit.init, unit.kernel.clone()));
         primary = Some(cfg);
         primary_idx = Some(idx);
         Some(out)
@@ -467,6 +544,40 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         image_env = built.config.env;
         Some(out)
     };
+
+    // Effective init/kernel axes for the boot. Precedence, per the uniform-axes model:
+    //   1. a non-`Default` CLI `--init`/`--kernel` overrides every unit (a run-wide force);
+    //   2. otherwise the --primary primary's own marker axes apply;
+    //   3. absent both → `Default` (today's behavior).
+    // Non-compose boots (plain image / `-f`) have no marker, so they keep the CLI axes.
+    let (marker_init, marker_kernel) = primary_axes
+        .clone()
+        .unwrap_or((InitSource::Default, KernelSource::Default));
+    let eff_init = if args.init != InitSource::Default {
+        args.init
+    } else {
+        marker_init
+    };
+    let eff_kernel = if args.kernel != KernelSource::Default {
+        args.kernel.clone()
+    } else {
+        marker_kernel
+    };
+    // The pinned/explicit kernel `fullvm::prepare` boots on for a non-image kernel axis
+    // (Default or Path). A CLI `--kernel <path>` was already resolved into `kernel` by
+    // `run()`; a marker `kernel: <path>` (when the CLI left kernel Default) is resolved
+    // here so a per-service kernel file also works for the primary.
+    let pinned_kernel: PathBuf = match &eff_kernel {
+        KernelSource::Path(p) if args.kernel == KernelSource::Default => p.clone(),
+        _ => kernel.to_path_buf(),
+    };
+    // The effective-axes counterpart of the CLI `--ram` guards above: a primary whose
+    // marker (not the CLI flag) selects an image axis also needs an ext4, never the cpio
+    // path. `--primary` forces the ext4 disk path anyway, so this only ever fires if that
+    // invariant is broken — a belt-and-braces check on the merged axes.
+    if args.ram && (eff_init == InitSource::Image || eff_kernel == KernelSource::Image) {
+        bail!("a service's x-virtkit image init/kernel is incompatible with --ram");
+    }
 
     // 1. the rootfs source (docker export or registry pull) for an image boot, unless a
     // Dockerfile build already produced the ext4 above. The rootfs tar itself never
@@ -547,8 +658,93 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         injects.push(("etc/virtkit/env", &env_capture, 0o644));
     }
     let t_media = Instant::now();
+    // The kernel the VM boots on. Normally the pinned kernel passed in; when the
+    // kernel axis is `image`, fullvm::prepare below overrides it with the kernel
+    // extracted from the image.
+    let mut boot_kernel = pinned_kernel.clone();
+    // Either non-default axis boots via the preinit initramfs: the image's own init
+    // needs the agent-as-/init handoff, and a modular image kernel needs the module
+    // initramfs. A default/default run keeps the existing non-image branches below.
+    // The axes are the merged effective values (CLI force > primary marker > default).
     let (disks, initramfs, mut cmdline): (Vec<crate::vmm::Disk>, Option<PathBuf>, String) =
-        if let Some(ext4) = &dockerfile_ext4 {
+        if eff_init == InitSource::Image || eff_kernel == KernelSource::Image {
+            // Boot via the preinit initramfs. First get the raw ext4: a `-f` build already
+            // produced one (dockerfile_ext4), otherwise build root.ext4 from the image
+            // source exactly as the disk path below does.
+            let ext4 = if let Some(ext4) = &dockerfile_ext4 {
+                ext4.clone()
+            } else {
+                println!("virtkit: building ext4 rootfs");
+                let rootfs = medium("root.ext4")?;
+                let source = source.as_ref().expect("an image boot resolved a source");
+                source
+                    .stream_tar(work, |tar, hints| {
+                        // The preinit boot keeps the image byte-clean: the agent rides the
+                        // preinit initramfs, not the rootfs, so nothing is injected here. Leave a
+                        // small free-space margin so the exact-fit estimate never trips.
+                        crate::ext4::build_from_tar_stream(
+                            tar,
+                            &[],
+                            hints.image_bytes(),
+                            16384, // 64 MiB slack for the guest's own writes at boot
+                            Some(hints.inode_count()),
+                            &crate::ext4::FsId {
+                                with_journal: true,
+                                ..Default::default()
+                            },
+                            &rootfs,
+                        )
+                    })
+                    .await?;
+                rootfs
+            };
+            // Build the preinit initramfs (agent as /init that insmods any modules, pivots,
+            // and for --init image execs /sbin/init); with --kernel image also extract the
+            // image's kernel. The boot config carries the effective env, applied before handoff.
+            let boot_cfg = vk_core::runcfg::RunConfig {
+                env: image_env.clone(),
+                user: primary_user.clone(),
+                ..Default::default()
+            };
+            let kernel_medium = medium("vmlinuz")?;
+            let preinit = medium("initramfs.cpio")?;
+            let boot = crate::fullvm::prepare(
+                &ext4,
+                agent,
+                &kernel_medium,
+                &preinit,
+                Some(&boot_cfg),
+                &eff_kernel,
+                &pinned_kernel,
+            )?;
+            boot_kernel = boot.kernel;
+            // throwaway rw qcow2 overlay over the ro raw ext4 (rw raw errors on tmpfs)
+            let overlay = medium("overlay.qcow2")?;
+            crate::qcow2::create_overlay(&overlay, &ext4)?;
+            // Base handoff cmdline; the per-axis tokens are appended below so the guest
+            // agent and the console gating can each read the axis that concerns them.
+            let mut kcmd = format!(
+                "console=ttyS0 pci=conf1 VIRTKIT_PIVOT=/dev/vda \
+                 VIRTKIT_VSOCK_PORT={VSOCK_PORT} VIRTKIT_HOSTNAME={}",
+                primary_hostname.as_deref().unwrap_or("vm")
+            );
+            // A modular image kernel has no early hvc0: keep console on ttyS0 (see the
+            // console gating in libkrun_sys). The pinned kernel has hvc0, so kernel==default
+            // leaves the rewrite in place.
+            if eff_kernel == KernelSource::Image {
+                kcmd.push_str(" VIRTKIT_KERNEL=image");
+            }
+            // The image's own init takes PID 1 via the handoff. When init==default the agent
+            // stays PID 1 and pivots via the existing VIRTKIT_PIVOT path — no VIRTKIT_INIT.
+            if eff_init == InitSource::Image {
+                kcmd.push_str(" VIRTKIT_INIT=image VIRTKIT_HANDOFF=/sbin/init");
+            }
+            (
+                vec![crate::vmm::Disk::overlay(overlay)],
+                Some(boot.initramfs),
+                kcmd,
+            )
+        } else if let Some(ext4) = &dockerfile_ext4 {
             // A Dockerfile build exports a *clean* ext4 (no agent baked in). Boot it the way
             // the builder boots its own stages: a minimal initramfs holds the agent as `/init`,
             // which pivots into the ext4 at /dev/vda — so the booted image stays byte-clean.
@@ -886,7 +1082,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             .to_string()
     };
     let spec = crate::vmm::VmSpec {
-        kernel: kernel.to_path_buf(),
+        kernel: boot_kernel,
         cmdline,
         disks,
         initramfs,
@@ -1182,6 +1378,11 @@ fn plan_services(
                 cid: crate::units::FIRST_SERVICE_CID + s.slot,
                 config,
                 volumes: unit.volumes.clone(),
+                // The unit's per-service init/kernel axes drive its boot identically
+                // whether it lands here (sibling) or as the primary — the whole point
+                // of the uniform axes.
+                init: unit.init,
+                kernel: unit.kernel.clone(),
             },
             s.dir,
         ));

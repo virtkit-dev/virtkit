@@ -13,8 +13,8 @@
 #   2. a vk-agent preinit that modprobes those, mounts the rootfs, switch_roots, forks a
 #      persistent `vk-agent serve` (reparented to systemd), then execs /sbin/init.
 #
-# The `--full-vm` invocation below is the intended interface; the flag name is TBD. What
-# is fixed is the OUTCOME asserted at the end. Run:  VK=./dist/vk tests/systemd-boot-e2e.sh
+# The `--init image --kernel image` invocation below is the intended interface. What is
+# fixed is the OUTCOME asserted at the end. Run:  VK=./dist/vk tests/systemd-boot-e2e.sh
 # Needs: a `vk` with an embedded agent, KVM, and build tooling.
 set -euo pipefail
 
@@ -27,19 +27,27 @@ here="$(cd "$(dirname "$0")" && pwd)"
 df="$here/systemd-boot/Dockerfile"
 ctx="$here/systemd-boot"
 
-echo "== build the stock Debian+systemd+kernel image =="
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-img="$work/debian-systemd.ext4"
-"$VK" build -f "$df" --context "$ctx" --out "$img"
-
-echo "== boot it as a full VM (own kernel + systemd handoff) and probe from the host =="
+echo "== build the stock Debian+systemd+kernel image and boot it as a full VM in one step =="
+# One step: `run --init image --kernel image -f` builds the Dockerfile into an ext4, then
 # virtkit extracts the image's /boot/vmlinuz, builds the preinit initramfs from its
-# /lib/modules, boots libkrun, and hands off to systemd; the reparented vk-agent serve
-# carries this exec over vsock.
+# /lib/modules, boots libkrun on that kernel, and hands off to systemd; the reparented
+# vk-agent serve carries this exec over vsock.
 out="$(
-  "$VK" run --full-vm "$img" -- \
-    sh -c 'systemctl is-system-running --wait || true; echo "---"; cat /run/virtkit-systemd-up 2>/dev/null || echo NO-MARKER' \
+  "$VK" run --init image --kernel image -f "$df" --context "$ctx" -- \
+    sh -c '
+      # The vk-agent serve becomes reachable the instant it forks — before the
+      # exec'"'"'d systemd has finished booting and created its bus socket. Poll until
+      # systemd reports a run state (its bus can be absent at first, so `--wait` alone
+      # would error out), then read the marker the oneshot unit writes at multi-user.
+      for i in $(seq 1 120); do
+        state=$(systemctl is-system-running 2>/dev/null || true)
+        case "$state" in running|degraded) break;; esac
+        sleep 1
+      done
+      echo "system-state: ${state:-unknown}"
+      echo "---"
+      cat /run/virtkit-systemd-up 2>/dev/null || echo NO-MARKER
+    ' \
     2>&1
 )"
 echo "$out"

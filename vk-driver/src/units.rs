@@ -28,6 +28,14 @@ pub struct Provisioned {
     pub cid: u32,
     pub config: RunConfig,
     pub volumes: Vec<crate::compose::Volume>,
+    /// Who runs as PID 1 in this unit's guest (its compose `x-virtkit.init`): the
+    /// vk-agent (`Default`, today's service medium) or the image's own `/sbin/init`
+    /// (`Image`, the preinit handoff). Uniform with the primary path.
+    pub init: crate::run::InitSource,
+    /// Which kernel this unit boots on (its compose `x-virtkit.kernel`): the pinned
+    /// kernel (`Default`), the image's own kernel + modules (`Image`), or an explicit
+    /// file (`Path`). Uniform with the primary path.
+    pub kernel: crate::run::KernelSource,
 }
 
 /// The builder wiring for `build:` units, shared across a consumer's units (each
@@ -199,6 +207,12 @@ pub fn nth_static_ip(gateway: Ipv4Addr, prefix: u8, n: u32) -> Result<Ipv4Addr> 
 /// primary VM's default (3).
 pub const FIRST_SERVICE_CID: u32 = 100;
 
+/// vsock port the reparented `vk-agent serve` listens on in an image-init sibling
+/// (the preinit boot's `VIRTKIT_VSOCK_PORT`). Siblings are reached over the LAN, not
+/// vsock exec, so nothing on the host dials this — it just gives the serve a port
+/// (the agent's own default is the same value). Mirrors the primary path's port.
+const VSOCK_PORT: u32 = 4444;
+
 /// Boot one unit in `dir` (its runtime state: overlay, sockets, console, boot
 /// initramfs — distinct from where the image lives): a throwaway CoW overlay over
 /// its clean ext4, booted through the agent initramfs which also carries the unit's
@@ -223,10 +237,48 @@ pub fn boot_unit(
     create_overlay(&svc.ext4, &overlay)?;
     let _ = std::fs::remove_file(&vsock);
 
-    // The boot medium: agent + the unit's merged config, rebuilt on every start so
-    // it always reflects the owner's current view.
+    // The init/kernel axes are a uniform per-unit property (from the unit's compose
+    // `x-virtkit` marker), applied identically here for a sibling and in the primary
+    // path (`run::build_and_boot`). A non-default axis boots via the preinit
+    // initramfs — the image's own init needs the agent-as-/init handoff, and a
+    // modular image kernel needs the module initramfs — exactly like the primary.
+    let image_boot =
+        svc.init == crate::run::InitSource::Image || svc.kernel == crate::run::KernelSource::Image;
+    // The boot medium + boot kernel. Default/Default: the agent-service medium (agent
+    // + the unit's config as VIRTKIT_MODE=service). Otherwise: the preinit medium,
+    // reading the unit's clean ext4 (the overlay's ro backing) to extract the image
+    // kernel/modules and build the agent-as-/init initramfs.
     let cpio = dir.join("initramfs.cpio");
-    crate::initramfs::build_agent_initramfs_with_config(agent, Some(&svc.config), &cpio)?;
+    let boot_kernel;
+    let handoff_frag;
+    if image_boot {
+        let boot = crate::fullvm::prepare(
+            &svc.ext4,
+            agent,
+            &dir.join("vmlinuz"),
+            &cpio,
+            Some(&svc.config),
+            &svc.kernel,
+            kernel,
+        )?;
+        boot_kernel = boot.kernel;
+        // Per-axis handoff tokens, mirroring the primary path: keep ttyS0 for a
+        // modular image kernel (no early hvc0), hand PID 1 to /sbin/init for image init.
+        let mut frag = String::new();
+        if svc.kernel == crate::run::KernelSource::Image {
+            frag.push_str(" VIRTKIT_KERNEL=image");
+        }
+        if svc.init == crate::run::InitSource::Image {
+            frag.push_str(" VIRTKIT_INIT=image VIRTKIT_HANDOFF=/sbin/init");
+        }
+        handoff_frag = frag;
+    } else {
+        // The boot medium: agent + the unit's merged config, rebuilt on every start so
+        // it always reflects the owner's current view.
+        crate::initramfs::build_agent_initramfs_with_config(agent, Some(&svc.config), &cpio)?;
+        boot_kernel = kernel.to_path_buf();
+        handoff_frag = String::new();
+    }
 
     // compose volumes: each bind mount is its own virtiofs share.
     let mut aux: Vec<Child> = Vec::new();
@@ -261,14 +313,34 @@ pub fn boot_unit(
     // spawned above before returning — Child's Drop does not kill, so a soft error
     // return would otherwise orphan them for the owner's lifetime.
     let spawn_vmm = move || -> Result<Child> {
-        // Static address + the gateway as resolver (its DNS answers the service names
-        // and forwards the rest), so the unit resolves siblings without /etc/hosts.
-        let mut cmdline = format!(
-            "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda VIRTKIT_MODE=service \
-             VIRTKIT_HOSTNAME={} VIRTKIT_NET_PORT={net_port} \
-             VIRTKIT_VM_IP={} VIRTKIT_VM_DNS={gateway}",
-            svc.hostname, svc.ip
-        );
+        // Two boot shapes, one per axis state. Both keep the same LAN wiring — the
+        // switch bridge port, the static address, the gateway resolver — and the
+        // virtiofs shares, so networking and volumes work identically; only who takes
+        // PID 1 and which kernel/initramfs boots differ.
+        let mut cmdline = if image_boot {
+            // Preinit boot, mirroring the primary path (`run::build_and_boot`): the
+            // agent rides the initramfs as /init, pivots, then either stays PID 1
+            // (kernel=image only) or execs /sbin/init (init=image). VIRTKIT_VSOCK_PORT
+            // gives the reparented `vk-agent serve` its port; the handoff tokens
+            // (VIRTKIT_KERNEL/VIRTKIT_INIT) were computed above.
+            format!(
+                "console=ttyS0 pci=conf1 VIRTKIT_PIVOT=/dev/vda \
+                 VIRTKIT_VSOCK_PORT={VSOCK_PORT} VIRTKIT_HOSTNAME={} \
+                 VIRTKIT_NET_PORT={net_port} VIRTKIT_VM_IP={} VIRTKIT_VM_DNS={gateway}{handoff_frag}",
+                svc.hostname, svc.ip
+            )
+        } else {
+            // Default agent-service boot: the agent stays PID 1 and forks the unit's
+            // entrypoint (VIRTKIT_MODE=service). Static address + the gateway as
+            // resolver (its DNS answers the service names and forwards the rest), so
+            // the unit resolves siblings without /etc/hosts.
+            format!(
+                "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda VIRTKIT_MODE=service \
+                 VIRTKIT_HOSTNAME={} VIRTKIT_NET_PORT={net_port} \
+                 VIRTKIT_VM_IP={} VIRTKIT_VM_DNS={gateway}",
+                svc.hostname, svc.ip
+            )
+        };
         if !virtiofs.is_empty() {
             cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS={virtiofs}"));
         }
@@ -277,7 +349,7 @@ pub fn boot_unit(
         // guest→host switch bridge needs mapping.
         let vsock_ports = vec![crate::vmm::VsockPort::bridge(&vsock, net_port)];
         let spec = crate::vmm::VmSpec {
-            kernel: kernel.to_path_buf(),
+            kernel: boot_kernel,
             cmdline,
             disks: vec![crate::vmm::Disk::overlay(overlay)],
             initramfs: Some(cpio),

@@ -79,6 +79,30 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     // The boot config rides the initramfs, which the pivot below hides — read it first.
     let boot_config = read_boot_config();
 
+    // Mount /proc up front so the kernel cmdline is readable now — every path below
+    // is cmdline-driven, and the module load / init check run before the pivot that
+    // would otherwise be the first to mount it. Harmless if already mounted.
+    let _ = std::fs::create_dir_all("/proc");
+    let _ = mount("proc", "/proc", "proc", 0);
+
+    let cmdline = read_cmdline();
+
+    // A modular image kernel (`--kernel image`) ships its boot-critical modules on the
+    // preinit initramfs with a `/virtkit-modules` load list — insmod them before any
+    // path mounts /dev/vda, in BOTH init modes. Absent (pinned kernel, or a plain run)
+    // there is no list, so this is a no-op.
+    if std::path::Path::new("/virtkit-modules").exists() {
+        load_preinit_modules();
+    }
+
+    // Image init (`vk run --init image`): the image runs its OWN init/systemd. Handled
+    // entirely by run_full_vm — pivot into the real root, fork a reparented serve, then
+    // exec the image's init so systemd (not this agent) becomes PID 1. Gated on the
+    // cmdline token so every default-init boot path stays unchanged.
+    if cmdline.get("VIRTKIT_INIT").map(String::as_str) == Some("image") {
+        return run_full_vm(socket, &cmdline, boot_config.as_ref());
+    }
+
     // If booted from the agent-only initramfs (`VIRTKIT_PIVOT=<root dev>`), mount the
     // real image ext4 and switch into it — keeping this process as PID 1 — so the agent
     // never lives inside the image. A no-op on the legacy in-rootfs `init=` boot.
@@ -88,7 +112,6 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
 
     mount_api_filesystems()?;
     apply_sysctls(); // honor /etc/sysctl.d/*.conf — there is no systemd-sysctl here
-    let cmdline = read_cmdline();
     bring_up_loopback();
     set_hostname(&cmdline);
     write_self_hosts(&cmdline);
@@ -152,6 +175,122 @@ fn pivot_to_real_root() -> Result<bool> {
     std::env::set_current_dir("/").context("chdir / after chroot")?;
     info!("vk-agent init: pivoted into real root {dev}");
     Ok(true)
+}
+
+/// Image-init handoff (`vk run --init image`): pivot into the real root, apply the
+/// virtkit-provided setup the image's init won't do itself (host volume mounts,
+/// symlinks, the ssh and exec serves, image env), fork a reparented `vk-agent serve`,
+/// then exec the image's own init (systemd) so it becomes PID 1.
+///
+/// Any modular image kernel's boot-critical modules are already loaded by the caller
+/// (`run_init`) before this runs — they must precede the pivot, which mounts the ext4
+/// rootfs at `/dev/vda`. The serves are forked just before the exec; once the exec
+/// makes systemd PID 1, they reparent to it and keep carrying the run's `-- <cmd>` /
+/// ssh over vsock. Only setup the image's init does not own is applied here —
+/// networking is left to the image (deferred).
+fn run_full_vm(
+    socket: &SocketAddr,
+    cmdline: &HashMap<String, String>,
+    cfg: Option<&RunConfig>,
+) -> Result<()> {
+    // The pivot is mandatory here: the whole point is to hand off to the image's own
+    // /sbin/init, which only exists in the real root. Unlike the serve-mode path (which
+    // can keep serving in place), continuing without the pivot would just exec the
+    // initramfs's own tree — so fail loudly instead.
+    pivot_to_real_root().context("vk-agent image-init: pivot to real root")?;
+    // Re-mount /proc and /dev in the pivoted root before the setup below: the
+    // pivot's MS_MOVE hid the initramfs mounts, so the new root has neither. /proc
+    // is needed because `spawn_serve` execs `/proc/self/exe` (else exit 127); /dev
+    // (devtmpfs) is needed for device nodes the setup opens, e.g. /dev/net/tun for
+    // the eth0 bridge. systemd re-mounts both after the handoff (already-mounted is
+    // fine).
+    let _ = std::fs::create_dir_all("/proc");
+    let _ = mount("proc", "/proc", "proc", 0);
+    let _ = std::fs::create_dir_all("/dev");
+    let _ = mount("devtmpfs", "/dev", "devtmpfs", 0);
+
+    // Apply only the virtkit-provided setup the image's own init won't do: host
+    // volume mounts (`--volume`/`--workdir`), symlinks, an eth0 bridge to the vk
+    // switch, and the run's env (so the served command and ssh sessions inherit it).
+    // Each is a no-op unless its cmdline param is set.
+    load_image_env();
+    apply_boot_config(cfg);
+    materialize_env(cfg);
+    mount_virtiofs(cmdline);
+    apply_symlinks(cmdline);
+    configure_network_fullvm(cmdline);
+
+    // The vsock services the run exposes, forked before the exec so they reparent to
+    // systemd and keep serving: ssh-serve (`--ssh`), the host-agent forwarder
+    // (`--ssh-agent`), and the exec channel that carries `-- <cmd>`. The first two are
+    // gated on their cmdline params.
+    maybe_ssh_serve(cmdline);
+    maybe_ssh_agent(cmdline);
+    let _serve = spawn_serve(socket, None)?;
+
+    let handoff = cmdline
+        .get("VIRTKIT_HANDOFF")
+        .cloned()
+        .unwrap_or_else(|| "/sbin/init".to_string());
+    info!("vk-agent image-init: exec {handoff} (systemd takes PID 1)");
+    exec_argv(&[handoff]); // never returns; this process becomes the image's init
+}
+
+/// Load the boot-critical modules listed (one absolute `.ko` path per line) in the
+/// preinit's `/virtkit-modules`, in order. Runs while the initramfs is still the
+/// root, so both the list and the `.ko` files are present. A single module failing
+/// (or already loaded) never aborts the boot.
+fn load_preinit_modules() {
+    let list = match std::fs::read_to_string("/virtkit-modules") {
+        Ok(list) => list,
+        Err(e) => {
+            warn!("vk-agent preinit: no /virtkit-modules ({e}) — loading no modules");
+            return;
+        }
+    };
+    let mods: Vec<&str> = list
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let mut loaded = 0;
+    for path in &mods {
+        if insmod(path) {
+            loaded += 1;
+        }
+    }
+    info!(
+        "vk-agent preinit: loaded {loaded}/{} preinit modules",
+        mods.len()
+    );
+}
+
+/// `insmod` one module via `finit_module(2)` (load straight from the open fd, no
+/// params). `EEXIST`/`EBUSY` mean it is already loaded — fine. Any other error is
+/// logged and skipped: a missing optional module must not stall the boot.
+fn insmod(path: &str) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("vk-agent preinit: opening module {path} failed: {e}");
+            return false;
+        }
+    };
+    let params = c"";
+    // SAFETY: `file` outlives the call, so the fd is valid; params is a valid C string.
+    let rc = unsafe { libc::syscall(libc::SYS_finit_module, file.as_raw_fd(), params.as_ptr(), 0) };
+    if rc == 0 {
+        return true;
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::EEXIST) | Some(libc::EBUSY) => true, // already loaded — fine
+        _ => {
+            warn!("vk-agent preinit: loading module {path} failed: {e}");
+            false
+        }
+    }
 }
 
 /// Mount the kernel API filesystems a from-scratch rootfs lacks. Best effort:
@@ -831,6 +970,68 @@ fn configure_network(cmdline: &HashMap<String, String>) {
     }
     // DNS is written separately (write_resolv_conf) so it applies to the kernel `ip=`
     // pool net too, not just this vsock-bridge static path.
+}
+
+/// Full-VM networking: create the eth0 tap bridged to the vk switch over vsock and
+/// bring its link up, but leave *addressing* to the image's own DHCP client — so an
+/// image already set to DHCP eth0 needs no change. As a fallback for images not
+/// configured to DHCP, fork a child that waits a grace period and, if eth0 still has
+/// no address, runs `dhclient` itself. The bridge and the fallback child reparent to
+/// the image's init after the exec.
+fn configure_network_fullvm(cmdline: &HashMap<String, String>) {
+    let Some(port) = cmdline.get("VIRTKIT_NET_PORT") else {
+        return;
+    };
+    if let Err(e) = fork_agent(&[
+        "--socket".into(),
+        format!("vsock://{port}"),
+        "net".into(),
+        "--iface".into(),
+        "eth0".into(),
+    ]) {
+        warn!("vk-agent image-init: net bridge failed to start: {e}");
+        return;
+    }
+    // Fork a watcher rather than blocking here: the tap can take a moment to appear,
+    // and the image's own DHCP client races us. The watcher waits for eth0, gives the
+    // image a grace period to configure it, then falls back to dhclient. It reparents
+    // to the image's init after the exec below.
+    // SAFETY: single-threaded preinit (no tokio); the child only waits and runs a
+    // helper before _exit.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        if !wait_for_iface("eth0", 150) {
+            warn!("vk-agent image-init: eth0 never appeared");
+            unsafe { libc::_exit(0) };
+        }
+        // Give the image's own DHCP client a head start; only step in if it didn't.
+        std::thread::sleep(Duration::from_secs(8));
+        if iface_configured("eth0") {
+            info!("vk-agent image-init: eth0 configured by the image");
+        } else {
+            info!("vk-agent image-init: image did not configure eth0 — running dhclient");
+            if !run_cmd("dhclient", &["-1", "eth0"]) {
+                warn!("vk-agent image-init: dhclient fallback failed (no dhcp client in image?)");
+            }
+        }
+        unsafe { libc::_exit(0) };
+    }
+    // Seed /etc/resolv.conf with the switch's resolver so name resolution works even
+    // on images that DHCP an address but don't wire up DNS (no systemd-resolved).
+    write_resolv_conf(cmdline);
+}
+
+/// Whether `iface` has an address/route yet — proxied by an entry in
+/// `/proc/net/route` (a freshly link-up-only interface has none; a DHCP'd or
+/// statically-configured one does). Avoids depending on iproute2 in the image.
+fn iface_configured(iface: &str) -> bool {
+    std::fs::read_to_string("/proc/net/route")
+        .map(|s| {
+            s.lines()
+                .skip(1)
+                .any(|l| l.split_whitespace().next() == Some(iface))
+        })
+        .unwrap_or(false)
 }
 
 /// Apply a static `VIRTKIT_VM_IP` (`a.b.c.d/prefix`) + `VIRTKIT_VM_GW` to eth0 via

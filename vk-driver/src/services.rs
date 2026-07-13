@@ -53,6 +53,10 @@ pub fn to_units(services: Vec<Service>) -> Vec<crate::compose::Unit> {
             depends_on: Vec::new(),
             volumes: Vec::new(),
             profiles: Vec::new(),
+            // The GitLab `services:` model has no init/kernel axes: every executor
+            // service keeps the default agent-as-PID1 pinned-kernel boot.
+            init: crate::run::InitSource::Default,
+            kernel: crate::run::KernelSource::Default,
         })
         .collect()
 }

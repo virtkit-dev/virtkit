@@ -29,6 +29,7 @@ mod ensure;
 mod executor;
 mod ext4;
 mod ext4_read;
+mod fullvm;
 mod image;
 mod initramfs;
 mod jobctx;
@@ -408,10 +409,10 @@ enum Cmd {
         /// command there, so its outputs land back on the host
         #[arg(long, value_name = "DIR")]
         workdir: Option<PathBuf>,
-        /// Pinned guest kernel (the pinned vmlinux: virtio + ext4 built in).
-        /// Defaults to the copy embedded in `vk`.
-        #[arg(long)]
-        kernel: Option<PathBuf>,
+        /// Kernel: `default` (virtkit's pinned kernel), `image` (the image's own
+        /// /boot/vmlinuz + modules), or a path to a vmlinux/bzImage.
+        #[arg(long, default_value = "default", value_parser = run::KernelSource::parse)]
+        kernel: run::KernelSource,
         /// Where the rootfs comes from: oci (registry pull, no docker daemon), docker
         /// (docker export), or auto (registry, falling back to docker for an unpushed image)
         #[arg(long, value_enum, default_value = "auto")]
@@ -447,6 +448,11 @@ enum Cmd {
         /// scratch, but the guest needs --mem of roughly three times the image size
         #[arg(long)]
         ram: bool,
+        /// Who runs as PID 1: `default` (vk-agent) or `image` (the image's own
+        /// init/systemd, via the preinit handoff). `image` needs an image or `-f`
+        /// build and is incompatible with --ram.
+        #[arg(long, default_value = "default")]
+        init: run::InitSource,
         /// Drop into an interactive shell in the guest (requires a terminal);
         /// ignores any trailing command
         #[arg(long)]
@@ -801,6 +807,7 @@ async fn cli_main() -> ExitCode {
         boot_timeout,
         vm_name,
         ram,
+        init,
         shell,
         net,
         compose,
@@ -927,6 +934,7 @@ async fn cli_main() -> ExitCode {
             boot_timeout_secs: *boot_timeout,
             vm_name: vm_name.clone(),
             ram: *ram,
+            init: *init,
             shell: *shell,
             // services live on the run switch's LAN: --compose implies it.
             net: *net || compose.is_some(),

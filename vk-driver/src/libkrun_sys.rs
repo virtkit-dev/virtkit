@@ -181,10 +181,17 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         // sniffed from the image so a custom (e.g. stock distro) kernel boots, not just our ELF.
         let kformat = kernel_format(&spec.kernel)?;
         let kernel = cstr(&spec.kernel.to_string_lossy());
-        let cmdline_str = console_cmdline(
-            &spec.cmdline,
-            std::env::var_os("VIRTKIT_CONSOLE_SERIAL").is_some(),
-        );
+        // An image kernel (VIRTKIT_KERNEL=image) is a stock, modular kernel whose
+        // virtio_console (hvc0) is not loaded in the preinit, so it must keep the
+        // always-present legacy COM1 (ttyS0, served by the early-console patch) — else
+        // the guest console is dead early and the agent stalls before the serve is up.
+        // The pinned kernel has hvc0, so kernel==default keeps the hvc0 rewrite.
+        let keep_serial = std::env::var_os("VIRTKIT_CONSOLE_SERIAL").is_some()
+            || spec
+                .cmdline
+                .split_whitespace()
+                .any(|t| t == "VIRTKIT_KERNEL=image");
+        let cmdline_str = console_cmdline(&spec.cmdline, keep_serial);
         let cmdline = cstr(&cmdline_str);
         let initramfs = spec.initramfs.as_ref().map(|p| cstr(&p.to_string_lossy()));
         ck(
