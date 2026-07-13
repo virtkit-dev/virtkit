@@ -131,6 +131,10 @@ fn checkpoint_secs() -> u64 {
         .unwrap_or(CHECKPOINT_SECS)
 }
 
+/// A sink for a build's plain `#N …` progress lines (see [`Options::progress_sink`]) — the
+/// streamed transport the service manager forwards to a guest that requested a service start.
+pub type ProgressSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 /// What/how to build.
 pub struct Options {
     /// Dockerfile(s), merged into one stage namespace (see [`Plan::from_dockerfiles`]).
@@ -184,6 +188,19 @@ pub struct Options {
     /// early instead of letting it poison the cache or ship in the image. Off by default
     /// (an `e2fsck` per instruction is not free).
     pub debug: bool,
+    /// When set, the build streams its plain `#N …` progress lines to this sink instead of
+    /// the terminal — used by the service manager to forward an on-demand build's progress
+    /// to the guest that requested the start. `None` = the default terminal/plain reporter.
+    pub progress_sink: Option<ProgressSink>,
+}
+
+/// The reporter for a build: the routed sink when [`Options::progress_sink`] is set (a
+/// streamed on-demand build), else the default terminal/plain dashboard.
+fn build_progress(opts: &Options) -> Arc<Progress> {
+    match &opts.progress_sink {
+        Some(sink) => Progress::routed(Arc::clone(sink)),
+        None => Progress::new(),
+    }
 }
 
 /// `--require-cached` refusal: the target needs stages whose final snapshots are
@@ -546,7 +563,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     // Live build overview (Docker/buildkit-style): a dashboard in a terminal, plain `#N`
     // lines otherwise. The drivers populate it (which stages/steps run) once they know the
     // needed set, and route each stage's guest output through it.
-    let progress = Progress::new();
+    let progress = build_progress(opts);
     let result = (|| -> Result<Built> {
         // The microVM backend drives stages in parallel over the dependency DAG (each
         // stage on its own guest); the host backend (FROM scratch + COPY) stays
@@ -712,7 +729,7 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
         }
     };
 
-    let progress = Progress::new();
+    let progress = build_progress(opts);
     let result = (|| -> Result<HashMap<String, Built>> {
         /// One resolved target of a unit: its stage index and where it exports.
         struct Tgt {
@@ -3533,6 +3550,7 @@ ENTRYPOINT run me
             require_cached: false,
             build_jobs: None,
             debug: false,
+            progress_sink: None,
         };
         let via_file = build_host(&opts(tmp.join("a.ext4"))).unwrap();
         let via_inputs = build_inputs_host(
@@ -3590,6 +3608,7 @@ ENTRYPOINT run me
             require_cached: false,
             build_jobs: None,
             debug: false,
+            progress_sink: None,
         })
         .unwrap();
         let sidecar = config_sidecar(&out);
@@ -3796,6 +3815,7 @@ RUN ship
             require_cached: false,
             build_jobs: j,
             debug: false,
+            progress_sink: None,
         };
         // Explicit --build-jobs wins and is floored to 1.
         assert_eq!(resolve_build_jobs(&opts(Some(3)), 2048), 3);

@@ -555,6 +555,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             require_cached: args.require_cached,
             build_jobs: None,
             debug: false,
+            progress_sink: None,
         };
         let built = crate::build::build(&opts)?;
         primary_user = built.config.user;
@@ -1547,6 +1548,7 @@ pub(crate) fn service_build_options(
         require_cached: args.require_cached,
         build_jobs: None,
         debug: false,
+        progress_sink: None,
     }
 }
 

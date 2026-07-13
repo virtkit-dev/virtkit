@@ -113,6 +113,10 @@ const FINISH_NUM: usize = usize::MAX;
 enum Backend {
     Tty(Box<Tty>),
     Plain,
+    /// Plain-style `#N …` lines routed to a sink instead of stdout — the streamed
+    /// on-demand build the service manager forwards to the guest that requested a
+    /// service start, so its `vk service up` sees live build progress.
+    Routed(super::ProgressSink),
     Disabled,
 }
 
@@ -159,6 +163,25 @@ impl Progress {
             ))
         } else {
             Arc::new(Progress::new_backend(Backend::Plain, false))
+        }
+    }
+
+    /// A reporter that streams plain `#N …` lines to `sink` instead of stdout — used to
+    /// forward an in-process build's progress to a remote consumer (the guest that asked the
+    /// service manager to bring a service up). Like [`Progress::new`], [`Progress::init`]
+    /// must be called before any event.
+    pub fn routed(sink: super::ProgressSink) -> Arc<Self> {
+        Arc::new(Progress::new_backend(Backend::Routed(sink), false))
+    }
+
+    /// Emit one already-formatted plain line to the plain/routed target — stdout for the
+    /// plain backend, the sink for a routed (streamed) build. Only the `Plain`/`Routed`
+    /// event arms call it; the tty/disabled backends render (or drop) their own lines.
+    fn plain_line(&self, args: std::fmt::Arguments) {
+        match &self.backend {
+            Backend::Plain => println!("{args}"),
+            Backend::Routed(sink) => sink(&std::fmt::format(args)),
+            Backend::Tty(_) | Backend::Disabled => {}
         }
     }
 
@@ -280,7 +303,9 @@ impl Progress {
                 let line = self.paint(&right_align(&head, "FAILED"), "\x1b[31m");
                 let _ = tty.println(line);
             }
-            Backend::Plain => println!("#{} ERROR", sm.seq(num)),
+            Backend::Plain | Backend::Routed(_) => {
+                self.plain_line(format_args!("#{} ERROR", sm.seq(num)))
+            }
             Backend::Disabled => {}
         }
     }
@@ -300,7 +325,9 @@ impl Progress {
                 let line = self.dim(&right_align(&format!(" => [{}]", sm.name), "CACHED"));
                 let _ = tty.println(line);
             }
-            Backend::Plain => println!("#{} CACHED [{}]", sm.seq(1), sm.name),
+            Backend::Plain | Backend::Routed(_) => {
+                self.plain_line(format_args!("#{} CACHED [{}]", sm.seq(1), sm.name))
+            }
             Backend::Disabled => {}
         }
         self.refresh_header();
@@ -364,9 +391,9 @@ impl Progress {
                 pb.enable_steady_tick(Duration::from_millis(120));
                 tty.bars.lock().unwrap().insert(export_key(index), pb);
             }
-            Backend::Plain => {
+            Backend::Plain | Backend::Routed(_) => {
                 let seq = self.export_seq(index);
-                println!("#{seq} exporting to image");
+                self.plain_line(format_args!("#{seq} exporting to image"));
             }
             Backend::Disabled => {}
         }
@@ -392,7 +419,7 @@ impl Progress {
                 let _ = tty.println(line);
                 self.refresh_header();
             }
-            Backend::Plain => println!("#{seq} DONE"),
+            Backend::Plain | Backend::Routed(_) => self.plain_line(format_args!("#{seq} DONE")),
             Backend::Disabled => {}
         }
     }
@@ -442,7 +469,7 @@ impl Progress {
                     self.total.load(Ordering::Relaxed),
                 ));
             }
-            Backend::Plain => println!("#0 {tag}"),
+            Backend::Plain | Backend::Routed(_) => self.plain_line(format_args!("#0 {tag}")),
             Backend::Disabled => {}
         }
     }
@@ -466,15 +493,15 @@ impl Progress {
                 *tty.activity.lock().unwrap() = msg;
                 self.refresh_header();
             }
-            Backend::Plain => {
-                println!(
+            Backend::Plain | Backend::Routed(_) => {
+                self.plain_line(format_args!(
                     "#{} [{} {}/{}] {}",
                     sm.seq(num),
                     sm.name,
                     num,
                     sm.total,
                     sm.label(num)
-                );
+                ));
             }
             Backend::Disabled => {}
         }
@@ -536,22 +563,22 @@ impl Progress {
                 };
                 let _ = tty.println(line);
             }
-            Backend::Plain => match outcome {
+            Backend::Plain | Backend::Routed(_) => match outcome {
                 // a ran cell already printed its `#N [stage …]` start line, so just close it;
                 // a cached cell never started, so print the whole line.
-                Outcome::Ran => println!(
+                Outcome::Ran => self.plain_line(format_args!(
                     "#{} DONE {}",
                     sm.seq(num),
                     fmt_dur(elapsed.unwrap_or_default())
-                ),
-                Outcome::Cached => println!(
+                )),
+                Outcome::Cached => self.plain_line(format_args!(
                     "#{} CACHED [{} {}/{}] {}",
                     sm.seq(num),
                     sm.name,
                     num,
                     sm.total,
                     sm.label(num)
-                ),
+                )),
             },
             Backend::Disabled => {}
         }
@@ -640,9 +667,9 @@ impl Progress {
                 let prefix = self.dim(&format!("#{seq}"));
                 let _ = tty.print_lines(lines.iter().map(|l| format!("{prefix} {l}")));
             }
-            Backend::Plain => {
+            Backend::Plain | Backend::Routed(_) => {
                 for l in lines {
-                    println!("#{seq} {l}");
+                    self.plain_line(format_args!("#{seq} {l}"));
                 }
             }
             Backend::Disabled => {}
@@ -1033,5 +1060,26 @@ mod tests {
         p.base_done(1, Outcome::Ran);
         p.finish(true);
         assert!(matches!(p.stage_sink(1), OutputSink::Inherit));
+    }
+
+    #[test]
+    fn routed_mode_streams_plain_lines_to_the_sink() {
+        // The routed backend must emit the same `#N …` lines the plain backend prints, but
+        // to the sink instead of stdout — the transport the manager forwards to the guest.
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let lines = Arc::clone(&lines);
+            Arc::new(move |l: &str| lines.lock().unwrap().push(l.to_string()))
+                as Arc<dyn Fn(&str) + Send + Sync>
+        };
+        let p = Progress::routed(sink);
+        drive(&p);
+        let got = lines.lock().unwrap();
+        assert!(!got.is_empty(), "routed build must stream lines");
+        assert!(got.iter().all(|l| l.starts_with('#')), "plain `#N …` lines");
+        assert!(got.iter().any(|l| l.contains("exporting to image")));
+        assert!(got.iter().any(|l| l.contains("FINISHED")));
+        // routed guest output must carry through, not inherit stdout
+        assert!(matches!(p.stage_sink(1), OutputSink::Routed(_)));
     }
 }

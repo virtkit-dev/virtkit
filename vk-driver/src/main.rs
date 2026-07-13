@@ -1187,6 +1187,7 @@ async fn cli_main() -> ExitCode {
             require_cached: *require_cached,
             build_jobs: *build_jobs,
             debug: *debug,
+            progress_sink: None,
         };
         // A compose file, or more than one --target, builds several images together in one
         // pass: their common stages build once and the rest run concurrently. Each image
