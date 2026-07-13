@@ -212,23 +212,27 @@ impl PciDevice {
             mask |= 0xffu32 << shift;
         }
 
-        // BAR sizing: if a memory BAR is written all-ones (over the masked bytes),
-        // report the size mask on the next read; any other value assigns the base.
-        if let Some(size) = self.bar_sizes[register] {
-            let writable = self.writable_bits[register] & mask;
-            let incoming = value & writable;
-            if incoming == writable && writable != 0 {
-                // Driver probing size: report ~(size-1) over the address bits.
-                let size_mask = !(size.wrapping_sub(1));
-                let dword = if (register - BAR0_REGISTER) % 2 == 0 {
-                    // Low dword keeps its type bits.
-                    (size_mask as u32 & 0xffff_fff0) | (self.registers[register] & 0x0000_000f)
-                } else {
-                    (size_mask >> 32) as u32
-                };
-                self.registers[register] =
-                    (self.registers[register] & !writable) | (dword & writable);
-                return;
+        // BAR sizing: a driver probes the region size by writing an all-ones
+        // dword and reading back the size mask. Only a full 32-bit write (all
+        // four bytes) is a size probe; a partial write is a normal base update,
+        // so require `mask == 0xffff_ffff` before entering the size branch.
+        if mask == 0xffff_ffff {
+            if let Some(size) = self.bar_sizes[register] {
+                let writable = self.writable_bits[register] & mask;
+                let incoming = value & writable;
+                if incoming == writable && writable != 0 {
+                    // Driver probing size: report ~(size-1) over the address bits.
+                    let size_mask = !(size.wrapping_sub(1));
+                    let dword = if (register - BAR0_REGISTER) % 2 == 0 {
+                        // Low dword keeps its type bits.
+                        (size_mask as u32 & 0xffff_fff0) | (self.registers[register] & 0x0000_000f)
+                    } else {
+                        (size_mask >> 32) as u32
+                    };
+                    self.registers[register] =
+                        (self.registers[register] & !writable) | (dword & writable);
+                    return;
+                }
             }
         }
 

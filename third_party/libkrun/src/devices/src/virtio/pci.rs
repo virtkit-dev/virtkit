@@ -68,7 +68,6 @@ struct CommonConfig {
     device_feature_select: u32,
     driver_feature_select: u32,
     driver_status: u8,
-    config_generation: u8,
     queue_select: u16,
 }
 
@@ -78,8 +77,36 @@ impl CommonConfig {
             device_feature_select: 0,
             driver_feature_select: 0,
             driver_status: 0,
-            config_generation: 0,
             queue_select: 0,
+        }
+    }
+}
+
+/// A snapshot of a virtqueue's programmed registers (max/selected size, ready
+/// flag, ring addresses). The transport hands the live `Queue`s to the device on
+/// activation (which then owns them), so it keeps this per-queue snapshot
+/// resident to answer post-`DRIVER_OK` reads of the common-config queue fields
+/// (0x18/0x1c/0x20-0x34) coherently. Mirrors the intent of cloud-hypervisor's
+/// resident `queues` on the transport.
+#[derive(Clone, Copy)]
+struct QueueState {
+    max_size: u16,
+    size: u16,
+    ready: bool,
+    desc_table: GuestAddress,
+    avail_ring: GuestAddress,
+    used_ring: GuestAddress,
+}
+
+impl QueueState {
+    fn new(max_size: u16) -> Self {
+        QueueState {
+            max_size,
+            size: 0,
+            ready: false,
+            desc_table: GuestAddress(0),
+            avail_ring: GuestAddress(0),
+            used_ring: GuestAddress(0),
         }
     }
 }
@@ -91,9 +118,12 @@ pub struct VirtioPciDevice {
 
     common_config: CommonConfig,
 
-    // Queues owned by the transport during negotiation; moved to the device on
-    // activation.
-    queues: Vec<Queue>,
+    // Live queues owned by the transport during negotiation; moved to the device
+    // on activation (`None` afterwards). `queue_state` mirrors their programmed
+    // registers and stays resident so common-config reads remain coherent once
+    // the queues have been handed off.
+    queues: Option<Vec<Queue>>,
+    queue_state: Vec<QueueState>,
     queue_evts: Vec<Arc<EventFd>>,
     queue_config: Vec<QueueConfig>,
 
@@ -117,7 +147,11 @@ impl VirtioPciDevice {
         let queue_config: Vec<QueueConfig> = locked.queue_config().to_vec();
         drop(locked);
 
-        let queues = queue_config.iter().map(|c| Queue::new(c.size)).collect();
+        let queues: Vec<Queue> = queue_config.iter().map(|c| Queue::new(c.size)).collect();
+        let queue_state = queues
+            .iter()
+            .map(|q| QueueState::new(q.get_max_size()))
+            .collect();
         let mut queue_evts = Vec::with_capacity(queue_config.len());
         for _ in &queue_config {
             queue_evts.push(Arc::new(
@@ -130,7 +164,8 @@ impl VirtioPciDevice {
             device,
             mem,
             common_config: CommonConfig::new(),
-            queues,
+            queues: Some(queues),
+            queue_state,
             queue_evts,
             queue_config,
             interrupt: InterruptTransport::new(intc, log_target)?,
@@ -222,18 +257,28 @@ impl VirtioPciDevice {
         self.device.lock().expect("Poisoned device lock")
     }
 
-    fn with_queue<U, F: FnOnce(&Queue) -> U>(&self, d: U, f: F) -> U {
-        self.queues
+    /// Read the selected queue's snapshot (resident across activation).
+    fn with_queue<U, F: FnOnce(&QueueState) -> U>(&self, d: U, f: F) -> U {
+        self.queue_state
             .get(self.common_config.queue_select as usize)
             .map_or(d, f)
     }
 
+    /// Mutate the selected queue: update the resident snapshot and, while the
+    /// live queues are still owned by the transport (pre-activation), the queue
+    /// itself. `f` receives the live `Queue` when available so the same closure
+    /// programs both.
     fn with_queue_mut<F: FnOnce(&mut Queue)>(&mut self, f: F) {
-        if let Some(q) = self
-            .queues
-            .get_mut(self.common_config.queue_select as usize)
-        {
+        let idx = self.common_config.queue_select as usize;
+        if let Some(q) = self.queues.as_mut().and_then(|qs| qs.get_mut(idx)) {
             f(q);
+            if let Some(state) = self.queue_state.get_mut(idx) {
+                state.size = q.size;
+                state.ready = q.ready;
+                state.desc_table = q.desc_table;
+                state.avail_ring = q.avail_ring;
+                state.used_ring = q.used_ring;
+            }
         }
     }
 
@@ -241,9 +286,11 @@ impl VirtioPciDevice {
         if self.device_activated {
             return;
         }
-        let mut device_queues: Vec<DeviceQueue> = self
-            .queues
-            .drain(..)
+        let Some(queues) = self.queues.take() else {
+            return;
+        };
+        let mut device_queues: Vec<DeviceQueue> = queues
+            .into_iter()
             .zip(self.queue_evts.iter().cloned())
             .map(|(queue, event)| DeviceQueue::new(queue, event))
             .collect();
@@ -283,11 +330,16 @@ impl VirtioPciDevice {
                 self.locked_device().reset();
             }
             self.device_activated = false;
-            self.queues = self
+            let queues: Vec<Queue> = self
                 .queue_config
                 .iter()
                 .map(|c| Queue::new(c.size))
                 .collect();
+            self.queue_state = queues
+                .iter()
+                .map(|q| QueueState::new(q.get_max_size()))
+                .collect();
+            self.queues = Some(queues);
             self.common_config = CommonConfig::new();
         }
     }
@@ -298,38 +350,29 @@ impl VirtioPciDevice {
         let v: u64 = match (offset, data.len()) {
             (0x00, 4) => self.common_config.device_feature_select as u64,
             (0x04, 4) => {
+                // The PCI transport is modern-only and each device already
+                // advertises VIRTIO_F_VERSION_1 in its feature bits, so the page
+                // is returned as-is (no extra OR).
                 let features = self.locked_device().avail_features();
                 let sel = self.common_config.device_feature_select;
-                let mut page = if sel < 2 {
-                    (features >> (sel * 32)) as u32
+                if sel < 2 {
+                    (features >> (sel * 32)) as u32 as u64
                 } else {
                     0
-                };
-                // Force-advertise VIRTIO_F_VERSION_1 (bit 32) on the high page: a
-                // modern virtio-pci device must offer it. This must stay consistent
-                // with the wrapped device's `avail_features()` (every device virtkit
-                // wraps already sets it, so this is a belt-and-braces guarantee).
-                if sel == 1 {
-                    page |= 0x1;
                 }
-                page as u64
             }
             (0x08, 4) => self.common_config.driver_feature_select as u64,
             (0x0c, 4) => 0, // driver_feature is write-only from the driver's view
             (0x10, 2) => 0xffff, // msix_config: no vector configured (INTx only)
-            (0x12, 2) => self.queues.len() as u64,
+            (0x12, 2) => self.queue_state.len() as u64,
             (0x14, 1) => self.common_config.driver_status as u64,
-            (0x15, 1) => self.common_config.config_generation as u64,
+            (0x15, 1) => u64::from(self.interrupt.config_generation()),
             (0x16, 2) => self.common_config.queue_select as u64,
             // queue_size: advertise the device max until the driver selects a
             // smaller size (a fresh queue has size 0, max_size = the device max).
-            (0x18, 2) => self.with_queue(0, |q| {
-                if q.size == 0 {
-                    q.get_max_size()
-                } else {
-                    q.size
-                }
-            }) as u64,
+            (0x18, 2) => {
+                self.with_queue(0, |q| if q.size == 0 { q.max_size } else { q.size }) as u64
+            }
             (0x1a, 2) => 0xffff, // queue_msix_vector: none
             (0x1c, 2) => u64::from(self.with_queue(false, |q| q.ready)),
             (0x1e, 2) => self.common_config.queue_select as u64, // queue_notify_off

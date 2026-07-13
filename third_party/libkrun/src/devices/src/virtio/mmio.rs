@@ -7,7 +7,7 @@
 
 use std::fmt::{Display, Formatter};
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use utils::eventfd::EFD_NONBLOCK;
@@ -86,6 +86,12 @@ struct InterruptTransportInner {
     event: EventFd,
     intc: IrqChip,
     irq_line: Option<u32>,
+    /// Monotonic counter bumped on every config-change signal. The virtio-pci
+    /// transport surfaces the low byte as the common-config `config_generation`
+    /// (0x15) so the guest re-reads device config after a change. Shared here
+    /// (rather than in the transport) because devices raise config-change
+    /// interrupts through the `InterruptTransport` clone they own.
+    config_generation: AtomicU8,
 }
 
 #[derive(Clone)]
@@ -96,6 +102,7 @@ impl InterruptTransport {
         Ok(Self(Arc::new(InterruptTransportInner {
             log_target,
             status: AtomicUsize::new(0),
+            config_generation: AtomicU8::new(0),
             event: EventFd::new(0).map_err(CreateMmioTransportError::CreateInterruptEventFd)?,
             intc,
             irq_line: None,
@@ -146,7 +153,16 @@ impl InterruptTransport {
 
     pub fn try_signal_config_change(&self) -> Result<(), crate::Error> {
         debug!(target: &self.0.log_target, "interrupt: signal_config_change");
+        // Bump the config generation so the virtio-pci transport reports a new
+        // value at common-config offset 0x15 and the guest re-reads the device
+        // config space.
+        self.0.config_generation.fetch_add(1, Ordering::SeqCst);
         self.try_signal(VIRTIO_MMIO_INT_CONFIG)
+    }
+
+    /// The current config generation (bumped on each config-change signal).
+    pub fn config_generation(&self) -> u8 {
+        self.0.config_generation.load(Ordering::SeqCst)
     }
 
     pub fn signal_used_queue(&self) {

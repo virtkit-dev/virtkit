@@ -1883,7 +1883,28 @@ fn create_vcpus_riscv64(
     Ok(vcpus)
 }
 
+/// Attaches a virtio device via the transport appropriate for the target: the
+/// virtio-pci transport on x86_64 (so a stock kernel binds it off the PCI bus),
+/// and the virtio-mmio transport elsewhere. All virtio devices go through here
+/// so each lands on its own PCI slot on x86_64.
+fn attach_virtio_device(
+    vmm: &mut Vmm,
+    id: String,
+    intc: IrqChip,
+    device: Arc<Mutex<dyn VirtioDevice>>,
+) -> std::result::Result<(), device_manager::mmio::Error> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        attach_pci_device(vmm, id, intc, device)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        attach_mmio_device(vmm, id, intc, device)
+    }
+}
+
 /// Attaches an virtio mmio device to the device manager.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 fn attach_mmio_device(
     vmm: &mut Vmm,
     id: String,
@@ -1957,7 +1978,7 @@ fn attach_fs_devices(
         fs.lock().unwrap().set_map_sender(map_sender.clone());
 
         // The device mutex mustn't be locked here otherwise it will deadlock.
-        attach_mmio_device(vmm, id, intc.clone(), fs).map_err(RegisterFsDevice)?;
+        attach_virtio_device(vmm, id, intc.clone(), fs).map_err(RegisterFsDevice)?;
     }
 
     Ok(())
@@ -2184,7 +2205,7 @@ fn attach_console_devices(
         .map_err(RegisterFsSigwinch)?;
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
-    attach_mmio_device(vmm, format!("hvc{id_number}"), intc, console)
+    attach_virtio_device(vmm, format!("hvc{id_number}"), intc, console)
         .map_err(RegisterConsoleDevice)?;
 
     Ok(())
@@ -2199,7 +2220,7 @@ fn attach_net_devices(
     for net_device in net_devices.list.iter() {
         let id = net_device.lock().unwrap().id().to_string();
 
-        attach_mmio_device(vmm, id, intc.clone(), net_device.clone())
+        attach_virtio_device(vmm, id, intc.clone(), net_device.clone())
             .map_err(StartMicrovmError::RegisterNetDevice)?;
     }
     Ok(())
@@ -2220,7 +2241,7 @@ fn attach_unixsock_vsock_device(
     let id = String::from(unix_vsock.lock().unwrap().id());
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
-    attach_mmio_device(vmm, id, intc, unix_vsock.clone()).map_err(RegisterVsockDevice)?;
+    attach_virtio_device(vmm, id, intc, unix_vsock.clone()).map_err(RegisterVsockDevice)?;
 
     Ok(())
 }
@@ -2242,7 +2263,7 @@ fn attach_balloon_device(
     let id = String::from(balloon.lock().unwrap().id());
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
-    attach_mmio_device(vmm, id, intc.clone(), balloon).map_err(RegisterBalloonDevice)?;
+    attach_virtio_device(vmm, id, intc.clone(), balloon).map_err(RegisterBalloonDevice)?;
 
     Ok(())
 }
@@ -2263,15 +2284,10 @@ fn attach_block_devices(
         // clean-shutdown flush.
         vmm.exit_observers.push(block.clone());
 
-        // Attach the block device over virtio-pci (BAR + INTx) instead
-        // of virtio-mmio, so a stock kernel mounts its rootfs off /dev/vda.
-        #[cfg(target_arch = "x86_64")]
-        {
-            attach_pci_device(vmm, id, intc.clone(), block.clone()).map_err(RegisterBlockDevice)?;
-        }
-        // The device mutex mustn't be locked here otherwise it will deadlock.
-        #[cfg(not(target_arch = "x86_64"))]
-        attach_mmio_device(vmm, id, intc.clone(), block.clone()).map_err(RegisterBlockDevice)?;
+        // Attach over virtio-pci on x86_64 (so a stock kernel mounts its rootfs
+        // off /dev/vda) and virtio-mmio elsewhere. The device mutex mustn't be
+        // locked here otherwise it will deadlock.
+        attach_virtio_device(vmm, id, intc.clone(), block.clone()).map_err(RegisterBlockDevice)?;
     }
 
     Ok(())
@@ -2292,18 +2308,14 @@ fn attach_pci_device(
 
     let type_id = pci_device.device_type_id();
 
-    // First (and only, for A2) virtio-pci endpoint sits at 00:01.0.
-    let device_number: u8 = 1;
-    let (bar_base, gsi, transport) = vmm.mmio_device_manager.register_virtio_pci_device(
-        vmm.vm.fd(),
-        pci_device,
-        type_id,
-        id,
-        device_number,
-    )?;
+    // The device manager allocates the next free bus-0 slot (00:01.0, 00:02.0,
+    // …), GSI and BAR window.
+    let (device_number, bar_base, gsi, transport) = vmm
+        .mmio_device_manager
+        .register_virtio_pci_device(vmm.vm.fd(), pci_device, type_id, id)?;
 
     // Build the PCI config space (header + BAR0 + virtio caps + INTx line) and
-    // hang it off the host bridge at slot 1 (00:01.0).
+    // hang it off the host bridge at the assigned slot.
     let config = transport
         .lock()
         .unwrap()
@@ -2334,7 +2346,7 @@ fn attach_rng_device(
     let id = String::from(rng.lock().unwrap().id());
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
-    attach_mmio_device(vmm, id, intc.clone(), rng).map_err(RegisterRngDevice)?;
+    attach_virtio_device(vmm, id, intc.clone(), rng).map_err(RegisterRngDevice)?;
 
     Ok(())
 }

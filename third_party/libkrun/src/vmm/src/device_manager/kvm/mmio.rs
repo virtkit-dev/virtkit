@@ -33,6 +33,9 @@ pub enum Error {
     EventFd(io::Error),
     /// No more IRQs are available.
     IrqsExhausted,
+    /// No more PCI bus-0 slots are available.
+    #[cfg(target_arch = "x86_64")]
+    PciSlotsExhausted,
     /// Registering an IO Event failed.
     RegisterIoEvent(kvm_ioctls::Error),
     /// Registering an IRQ FD failed.
@@ -55,6 +58,8 @@ impl fmt::Display for Error {
             }
             Error::EventFd(ref e) => write!(f, "failed to create or clone event descriptor: {e}"),
             Error::IrqsExhausted => write!(f, "no more IRQs are available"),
+            #[cfg(target_arch = "x86_64")]
+            Error::PciSlotsExhausted => write!(f, "no more PCI slots are available"),
             Error::RegisterIoEvent(ref e) => write!(f, "failed to register IO event: {e}"),
             Error::RegisterIrqFd(ref e) => write!(f, "failed to register irqfd: {e}"),
             Error::DeviceNotFound => write!(f, "the device couldn't be found"),
@@ -94,6 +99,10 @@ pub struct MMIODeviceManager {
     /// Next free base for a virtio-pci BAR window.
     #[cfg(target_arch = "x86_64")]
     pci_mmio_base: u64,
+    /// Next free PCI device (slot) number on bus 0. Slot 0 is the host bridge;
+    /// virtio-pci endpoints are handed 00:01.0, 00:02.0, … as they register.
+    #[cfg(target_arch = "x86_64")]
+    next_pci_device_number: u8,
     /// PCI INTx routes as (device number, interrupt pin 1-based, GSI), so the
     /// MP table can emit matching PCI-bus interrupt-source entries.
     #[cfg(target_arch = "x86_64")]
@@ -114,6 +123,8 @@ impl MMIODeviceManager {
             id_to_dev_info: HashMap::new(),
             #[cfg(target_arch = "x86_64")]
             pci_mmio_base: PCI_MMIO_BASE,
+            #[cfg(target_arch = "x86_64")]
+            next_pci_device_number: 1,
             #[cfg(target_arch = "x86_64")]
             pci_irqs: Vec::new(),
         }
@@ -187,11 +198,12 @@ impl MMIODeviceManager {
         Ok(ret)
     }
 
-    /// Register a virtio-pci device: allocate an INTx GSI, wire the device's
-    /// interrupt eventfd to it via `KVM_IRQFD`, register the per-queue notify
-    /// ioeventfds inside the device's BAR0 window, place the BAR0 MMIO region on
-    /// the bus, and return the assigned (bar_base, gsi). The caller is expected
-    /// to add the returned config space to the `PciBus`.
+    /// Register a virtio-pci device: allocate a bus-0 slot and an INTx GSI, wire
+    /// the device's interrupt eventfd to it via `KVM_IRQFD`, register the
+    /// per-queue notify ioeventfds inside the device's BAR0 window, place the
+    /// BAR0 MMIO region on the bus, and return the assigned (device_number,
+    /// bar_base, gsi). The caller is expected to add the returned config space to
+    /// the `PciBus` at `device_number`.
     #[cfg(target_arch = "x86_64")]
     pub fn register_virtio_pci_device(
         &mut self,
@@ -199,13 +211,18 @@ impl MMIODeviceManager {
         device: devices::virtio::VirtioPciDevice,
         type_id: u32,
         device_id: String,
-        device_number: u8,
-    ) -> Result<(u64, u32, Arc<Mutex<devices::virtio::VirtioPciDevice>>)> {
+    ) -> Result<(u8, u64, u32, Arc<Mutex<devices::virtio::VirtioPciDevice>>)> {
         use devices::virtio::CAPABILITY_BAR_SIZE;
 
         if self.irq > self.last_irq {
             return Err(Error::IrqsExhausted);
         }
+        // Bus 0 has 32 slots; slot 0 is the host bridge, so endpoints occupy
+        // 1..=31. Running out of slots is a distinct exhaustion from GSIs.
+        if self.next_pci_device_number > 31 {
+            return Err(Error::PciSlotsExhausted);
+        }
+        let device_number = self.next_pci_device_number;
 
         let bar_base = self.pci_mmio_base;
         let gsi = self.irq;
@@ -245,8 +262,9 @@ impl MMIODeviceManager {
 
         self.pci_mmio_base += CAPABILITY_BAR_SIZE;
         self.irq += 1;
+        self.next_pci_device_number += 1;
 
-        Ok((bar_base, gsi, device))
+        Ok((device_number, bar_base, gsi, device))
     }
 
     /// Append a registered MMIO device to the kernel cmdline.
