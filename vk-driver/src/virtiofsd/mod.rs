@@ -6,7 +6,7 @@
 //! (`Server<PassthroughFs>` — the same code the libkrun backend uses in-process),
 //! carried over the vhost-user transport cloud-hypervisor speaks. The bridge:
 //! vhost-user delivers descriptor chains as virtio-queue chains over vm-memory
-//! 0.16; libkrun's `Reader`/`Writer` take vm-memory 0.17 `VolatileSlice`s. Both are
+//! 0.18; libkrun's `Reader`/`Writer` take vm-memory 0.17 `VolatileSlice`s. Both are
 //! (ptr, len) views over the same mmap'd guest memory, so each slice is re-wrapped
 //! by pointer (see `collect_slices`).
 //!
@@ -44,12 +44,14 @@ use virtio_bindings::bindings::virtio_ring::{
 };
 use virtio_queue::{DescriptorChain, QueueOwnedT};
 use vm_memory::{
-    GuestAddressSpace, GuestMemory, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap,
-    GuestMemoryRegion, VolatileMemory,
+    GuestAddressSpace, GuestMemoryAtomic, GuestMemoryBackend, GuestMemoryLoadGuard,
+    GuestMemoryMmap, GuestMemoryRegion, VolatileMemory,
 };
 use vm_memory_krun::VolatileSlice as KrunVolatileSlice;
 use vmm_sys_util::epoll::EventSet;
-use vmm_sys_util::eventfd::EventFd;
+use vmm_sys_util::event::{
+    EventConsumer, EventFlag, EventNotifier, new_event_consumer_and_notifier,
+};
 
 use idmap::{IdMap, IdMapFs, IdTable};
 
@@ -205,7 +207,7 @@ struct DaemonOpts {
     seccomp: seccomp::Action,
 }
 
-fn serve<F>(fs: F, opts: DaemonOpts) -> Result<()>
+fn serve<F>(fs: F, mut opts: DaemonOpts) -> Result<()>
 where
     F: FileSystem<Inode = u64, Handle = u64> + Send + Sync + 'static,
 {
@@ -228,7 +230,8 @@ where
         server: Arc::new(Server::new(fs)),
         mem: RwLock::new(None),
         event_idx: AtomicBool::new(false),
-        exit_event: EventFd::new(libc::EFD_NONBLOCK).context("creating the exit eventfd")?,
+        exit_event: new_event_consumer_and_notifier(EventFlag::NONBLOCK)
+            .context("creating the exit eventfd")?,
         exit_code: Arc::new(AtomicI32::new(0)),
         tag,
         pool,
@@ -245,7 +248,7 @@ where
     seccomp::enable(opts.seccomp)?;
 
     daemon
-        .start(opts.listener)
+        .start(&mut opts.listener)
         .map_err(|e| anyhow!("starting the vhost-user daemon: {e:?}"))?;
     daemon
         .wait()
@@ -277,9 +280,9 @@ fn other_err<E: std::fmt::Debug>(e: E) -> io::Error {
 }
 
 /// Collect a chain's readable or writable descriptors as libkrun (vm-memory 0.17)
-/// VolatileSlices over the vhost-user-mapped guest memory.
+/// VolatileSlices over the vhost-user-mapped (vm-memory 0.18) guest memory.
 ///
-/// SAFETY contract for the rewrap: each 0.16 slice is a validated (ptr, len) view of
+/// SAFETY contract for the rewrap: each 0.18 slice is a validated (ptr, len) view of
 /// a guest memory region mapped in this process; the returned 0.17 slices are the
 /// same bytes with the same lifetime 'a (the memory guard held by the caller across
 /// the whole request). The vhost-user protocol quiesces queues before the memory
@@ -320,7 +323,7 @@ struct Backend<F: FileSystem<Inode = u64, Handle = u64> + Send + Sync + 'static>
     server: Arc<Server<F>>,
     mem: RwLock<Option<Mem>>,
     event_idx: AtomicBool,
-    exit_event: EventFd,
+    exit_event: (EventConsumer, EventNotifier),
     /// libkrun's guest-exit ioctl channel — meaningless for a CH share, never read.
     exit_code: Arc<AtomicI32>,
     tag: Option<String>,
@@ -503,7 +506,8 @@ impl<F: FileSystem<Inode = u64, Handle = u64> + Send + Sync + 'static> VhostUser
         }
     }
 
-    fn exit_event(&self, _thread_index: usize) -> Option<EventFd> {
-        self.exit_event.try_clone().ok()
+    fn exit_event(&self, _thread_index: usize) -> Option<(EventConsumer, EventNotifier)> {
+        let (consumer, notifier) = &self.exit_event;
+        Some((consumer.try_clone().ok()?, notifier.try_clone().ok()?))
     }
 }

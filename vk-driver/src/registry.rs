@@ -37,9 +37,9 @@ use crate::image::{self, Reference, ResolvedImage};
 use crate::jobctx::JobCtx;
 
 // CDC parameters for runner.ext4 (FastCDC v2020): min 1 MiB, avg 4 MiB, max 16 MiB.
-const CDC_MIN: u32 = 1 << 20;
-const CDC_AVG: u32 = 4 << 20;
-const CDC_MAX: u32 = 16 << 20;
+const CDC_MIN: usize = 1 << 20;
+const CDC_AVG: usize = 4 << 20;
+const CDC_MAX: usize = 16 << 20;
 // Fixed zstd level: identical raw chunks must compress to identical bytes for the
 // blob digest (sha256 of the compressed bytes) to dedup. Shared with regserve's
 // transparent storage compression.

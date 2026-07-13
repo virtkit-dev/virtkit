@@ -18,8 +18,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use log::{debug, info, warn};
 use russh::keys::PublicKey;
-use russh::server::{Auth, Config, Handle, Handler, Msg, Session};
-use russh::{Channel, ChannelId};
+use russh::server::{Auth, ChannelOpenHandle, Config, Handle, Handler, Msg, Session};
+use russh::{Channel, ChannelId, ChannelOpenFailure};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
@@ -165,10 +165,12 @@ impl Handler for ServerHandler {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         self.channels.insert(channel.id(), channel);
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn pty_request(
@@ -332,19 +334,21 @@ impl Handler for ServerHandler {
         port_to_connect: u32,
         _originator_address: &str,
         _originator_port: u32,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         let port = port_to_connect.min(u32::from(u16::MAX)) as u16;
         match TcpStream::connect((host_to_connect, port)).await {
             Ok(tcp) => {
+                reply.accept().await;
                 tokio::spawn(tcpip_bridge(channel, tcp));
-                Ok(true)
             }
             Err(e) => {
                 warn!("ssh: direct-tcpip {host_to_connect}:{port}: {e}");
-                Ok(false)
+                reply.reject(ChannelOpenFailure::ConnectFailed).await;
             }
         }
+        Ok(())
     }
 }
 

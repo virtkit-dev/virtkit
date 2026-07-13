@@ -58,7 +58,7 @@ regex = "1"
 # block-level dedup, each chunk zstd-compressed independently. fastcdc is pure Rust;
 # zstd vendors its C (gcc/musl-dev are in the build image), so the binary stays
 # musl-static.
-fastcdc = "3"
+fastcdc = "4"
 zstd = "0.13"
 # tokio features are member-specific; only the version is pinned here.
 tokio = { version = "1" }
@@ -96,7 +96,7 @@ rand = "0.10"
 # rather than russh's default aws-lc-rs, while keeping `rsa` so the SSH server can
 # accept clients' RSA keys. The rsa crate carries RUSTSEC-2023-0071 (Marvin, no
 # fixed release); it is suppressed in .cargo/audit.toml (see that file).
-russh = { version = "0.61.2", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh = { version = "0.62", default-features = false, features = ["flate2", "ring", "rsa"] }
 russh-sftp = "2"
 # /run/vk control filesystem (`ctlfs`, vk-agent): pure-Rust FUSE, mounted by
 # PID-1 root directly through the mount syscall (no fusermount, no libfuse).

@@ -48,15 +48,15 @@ jsonwebtoken.workspace = true
 # in-process); only the vhost-user transport comes from crates.io, pinned to the
 # stack proven against cloud-hypervisor. The seccomp sandbox is pure-Rust
 # (seccompiler) — no libseccomp, no libcap-ng, no C linking.
-vhost = { version = "0.13", features = ["vhost-user-backend"], optional = true }
-vhost-user-backend = { version = "0.17", optional = true }
-virtio-queue = { version = "0.14", optional = true }
+vhost = { version = "0.17", features = ["vhost-user-backend"], optional = true }
+vhost-user-backend = { version = "0.23", optional = true }
+virtio-queue = { version = "0.18", optional = true }
 virtio-bindings = { version = "0.2", optional = true }
-vm-memory = { version = "0.16", features = ["backend-mmap", "backend-atomic"], optional = true }
+vm-memory = { version = "0.18", features = ["backend-mmap", "backend-atomic"], optional = true }
 # libkrun's vm-memory (the Reader/Writer VolatileSlice type), renamed so both
-# versions coexist; the daemon re-wraps 0.16 slices as 0.17 by pointer.
+# versions coexist; the daemon re-wraps 0.18 slices as 0.17 by pointer.
 vm-memory-krun = { package = "vm-memory", version = "=0.17.1", features = ["backend-mmap"], optional = true }
-vmm-sys-util = { version = "0.12", optional = true }
+vmm-sys-util = { version = "0.15", optional = true }
 seccompiler = { version = "0.5", optional = true }
 log.workspace = true
 indicatif.workspace = true
