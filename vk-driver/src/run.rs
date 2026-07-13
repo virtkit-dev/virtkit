@@ -488,24 +488,42 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     // The --primary primary's own init/kernel axes (from its `x-virtkit` marker),
     // merged with the CLI axes below. None for a non-compose / non-primary boot.
     let mut primary_axes: Option<(InitSource, KernelSource)> = None;
+    // Resolve the --primary primary's index up front — it drives both the unified compose
+    // build below and the sibling provisioning later.
+    if let Some(name) = &args.primary {
+        primary_idx = Some(
+            compose_units
+                .iter()
+                .position(|u| &u.name == name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--primary {name:?}: no such compose service (declared: {})",
+                        compose_units
+                            .iter()
+                            .map(|u| u.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?,
+        );
+    }
+
+    // Build every compose image the run needs in ONE unified build — the --primary primary
+    // (-> root.ext4) and every sibling (-> svc-<name>/image.ext4) — so stages shared across
+    // the compose Dockerfile build or restore once for the whole set instead of once per
+    // pass. Empty (and skipped) for a non-compose boot; the primary's config is read out of
+    // it just below, the siblings' by plan_services further down.
+    let compose_built = if args.compose.is_some() {
+        build_compose_images(args, work, kernel, agent, &compose_units, primary_idx)?
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let dockerfile_ext4 = if let Some(name) = &args.primary {
-        let idx = compose_units
-            .iter()
-            .position(|u| &u.name == name)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--primary {name:?}: no such compose service (declared: {})",
-                    compose_units
-                        .iter()
-                        .map(|u| u.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })?;
-        let unit = &compose_units[idx];
-        let out = work.join("root.ext4");
-        let built = build_service_image(args, unit, &out, kernel, agent)
-            .with_context(|| format!("service {name}"))?;
+        let unit = &compose_units[primary_idx.expect("primary_idx resolved when --primary set")];
+        let built = compose_built
+            .get(name)
+            .with_context(|| format!("internal: primary service {name} not built"))?;
         let cfg = crate::compose::merged_config(&built.config, unit);
         image_env = cfg.env.clone();
         primary_user = cfg.user.clone();
@@ -513,8 +531,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         primary_volumes = unit.volumes.clone();
         primary_axes = Some((unit.init, unit.kernel.clone()));
         primary = Some(cfg);
-        primary_idx = Some(idx);
-        Some(out)
+        Some(work.join("root.ext4"))
     } else if args.dockerfiles.is_empty() {
         None
     } else {
@@ -869,7 +886,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
 
     // Compose services: sibling unit VMs on the run switch, resolvable by alias
     // over its DNS, torn down with the run.
-    let planned = plan_services(args, work, kernel, agent, &compose_units, primary_idx)?;
+    let planned = plan_services(args, work, &compose_units, primary_idx, &compose_built)?;
     // With sibling services under management, the agent exposes their control
     // plane at /run/vk/services (a FUSE bridge to the manager over vsock).
     if !planned.units.is_empty() {
@@ -1286,16 +1303,61 @@ struct PlannedServices {
     reservations: Vec<(String, String)>,
 }
 
-/// Materialize EVERY declared unit into the work dir — like the `-f` build
-/// itself, warmth comes from the instruction cache — so the manager can start a
-/// profiled-down unit on demand later; only `start` boots eagerly.
-fn plan_services(
+/// Build every image a `--compose` run needs in ONE unified build: the `--primary` primary
+/// (exported to the run's bootable `root.ext4`) and every other declared service (each to
+/// its own `svc-<name>/image.ext4`). One build means stages shared across the compose
+/// Dockerfile — a common base — build or restore once for the whole set instead of once per
+/// pass, and independent services build concurrently over a single job pool. Like
+/// [`plan_services`], EVERY declared unit is materialized (warmth comes from the instruction
+/// cache) so the manager can start a profiled-down sibling on demand later. Returns the
+/// per-service [`Built`](crate::build::Built) config map keyed by service name. `primary_idx`
+/// is `None` for a compose-up run — every unit is a sibling, nothing exports to root.ext4.
+fn build_compose_images(
     args: &RunArgs,
     work: &Path,
     kernel: &Path,
     agent: &Path,
     units: &[crate::compose::Unit],
     primary_idx: Option<usize>,
+) -> Result<std::collections::HashMap<String, crate::build::Built>> {
+    if units.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    // Boot order keeps the dashboard rows (and plan_services' slot assignment) stable.
+    let order = crate::compose::boot_order(units)?;
+    // Each sibling's export dir must exist before the build writes its image.ext4 into it
+    // (the primary's root.ext4 sits directly in work/).
+    for &i in &order {
+        if Some(i) == primary_idx {
+            continue;
+        }
+        let dir = work.join(format!("svc-{}", units[i].name));
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    // The primary exports to root.ext4; every sibling to the svc-<name>/image.ext4
+    // plan_services provisions from.
+    let primary_name = primary_idx.map(|i| units[i].name.clone());
+    let out_of = |unit: &crate::compose::Unit| -> Option<PathBuf> {
+        if Some(&unit.name) == primary_name.as_ref() {
+            Some(work.join("root.ext4"))
+        } else {
+            Some(work.join(format!("svc-{}", unit.name)).join("image.ext4"))
+        }
+    };
+    let units_to_build = compose_build_units(&args.build_args, units, &order, out_of);
+    let opts = service_build_options(args, kernel, agent);
+    crate::build::build_units(units_to_build, &opts)
+}
+
+/// Materialize EVERY declared unit into the work dir — like the `-f` build
+/// itself, warmth comes from the instruction cache — so the manager can start a
+/// profiled-down unit on demand later; only `start` boots eagerly.
+fn plan_services(
+    args: &RunArgs,
+    work: &Path,
+    units: &[crate::compose::Unit],
+    primary_idx: Option<usize>,
+    built: &std::collections::HashMap<String, crate::build::Built>,
 ) -> Result<PlannedServices> {
     let mut planned = PlannedServices {
         units: Vec::new(),
@@ -1324,7 +1386,6 @@ fn plan_services(
         ext4: PathBuf,
         slot: u32,
     }
-    let mut selected = Vec::new();
     let mut sited = Vec::new();
     let mut slot = 0u32;
     for &i in &order {
@@ -1333,9 +1394,7 @@ fn plan_services(
         }
         let unit = &units[i];
         let dir = work.join(format!("svc-{}", unit.name));
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let ext4 = dir.join("image.ext4");
-        selected.push(i);
         sited.push(Sited {
             unit: i,
             dir,
@@ -1345,18 +1404,8 @@ fn plan_services(
         slot += 1;
     }
 
-    // Build every sibling image in ONE unified build, so independent services build
-    // concurrently over a single job pool and services sharing a Dockerfile build their
-    // common stages once (warmth still comes from the instruction cache). Each service's
-    // image exports to its own dir; the returned map is keyed by service name.
-    let out_of = |unit: &crate::compose::Unit| {
-        Some(work.join(format!("svc-{}", unit.name)).join("image.ext4"))
-    };
-    let units_to_build = compose_build_units(&args.build_args, units, &selected, out_of);
-    let opts = service_build_options(args, kernel, agent);
-    let built = crate::build::build_units(units_to_build, &opts)?;
-
-    // Address + provision each built image, layering its compose overrides over the image.
+    // Address + provision each pre-built image (built by build_compose_images in the same
+    // unified pass as the primary), layering its compose overrides over the image.
     for s in sited {
         let unit = &units[s.unit];
         let config = built
@@ -1415,7 +1464,8 @@ async fn compose_up(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path) ->
     if units.is_empty() {
         bail!("{} declares no services", compose.display());
     }
-    let planned = plan_services(args, work, kernel, agent, &units, None)?;
+    let built = build_compose_images(args, work, kernel, agent, &units, None)?;
+    let planned = plan_services(args, work, &units, None, &built)?;
 
     // The switch binds every unit's socket; no VM ever dials the base socket
     // (there is no primary), it is just the switch's canonical listen path.
@@ -1467,39 +1517,6 @@ async fn compose_up(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path) ->
     let _ = switch.kill();
     let _ = switch.wait();
     Ok(())
-}
-
-/// Materialize one compose service's clean image into the work dir: a `build:`
-/// unit through the builder directly, an `image:` unit as the synthetic
-/// single-`FROM` plan — both warmed by the instruction cache (a pulled base is
-/// digest-keyed, so a repeat run restores instead of re-pulling).
-fn build_service_image(
-    args: &RunArgs,
-    unit: &crate::compose::Unit,
-    out: &Path,
-    kernel: &Path,
-    agent: &Path,
-) -> Result<crate::build::Built> {
-    let mut opts = service_build_options(args, kernel, agent);
-    opts.out = Some(out.to_path_buf());
-    match &unit.source {
-        crate::compose::Source::Build {
-            dockerfiles,
-            context,
-            target,
-            args: unit_args,
-        } => {
-            opts.dockerfiles = dockerfiles.clone();
-            // compose semantics: one context for all the service's files.
-            opts.contexts = vec![context.clone(); dockerfiles.len()];
-            opts.target = target.clone();
-            opts.build_args.extend(unit_args.iter().cloned());
-            crate::build::build(&opts)
-        }
-        crate::compose::Source::Image(image) => {
-            crate::build::build_inputs(vec![crate::build::image_plan_input(image)?], &opts)
-        }
-    }
 }
 
 /// The build options common to every compose service build (the embedded kernel/agent, the

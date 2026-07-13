@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- `vk run --compose --primary` now builds the primary VM's image in the same pass as its
+  sibling services. Stages they share (a common base Dockerfile) build or restore once
+  for the whole set instead of once for the primary and again for the siblings, so a warm
+  boot no longer pays the shared work twice.
+
 ## [0.12.0] - 2026-07-13
 
 ### Added
