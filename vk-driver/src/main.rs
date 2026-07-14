@@ -349,25 +349,23 @@ enum Cmd {
         #[arg(long)]
         to: SocketAddr,
     },
-    /// plumbing: splice stdio to `--to` — the SSH `ProxyCommand` shape. ssh hands its
-    /// protocol stream on stdio; we relay it to the guest's ssh-serve (`run --ssh`
+    /// plumbing: splice stdio to the target address — the SSH `ProxyCommand` shape. ssh
+    /// hands its protocol stream on stdio; we relay it to the guest's ssh-serve (`run --ssh`
     /// prints the full invocation). Addresses: a unix path, vsock-mux://<path>:<port>,
     /// vsock-auto://<path>:<port> (best path per backend),
     /// tcp://host:port.
     Connect {
         /// Target address to dial
-        #[arg(long)]
-        to: SocketAddr,
+        addr: SocketAddr,
     },
-    /// Probe a running guest's agent: round-trip the status request to `--to` (the
-    /// exec channel, e.g. vsock-auto://DIR/vsock.sock:4444) and print the reply, or
+    /// Probe a running guest's agent: round-trip the status request to the given address
+    /// (the exec channel, e.g. vsock-auto://DIR/vsock.sock:4444) and print the reply, or
     /// exit non-zero if it does not answer. A liveness check that actually exercises
     /// the agent protocol — stronger than a socket stat — so external tooling can ask
     /// "is this VM up?" with `vk` alone, no separate agent binary.
     Status {
         /// Agent address to dial (the run's exec channel)
-        #[arg(long)]
-        to: SocketAddr,
+        addr: SocketAddr,
     },
     /// Run a command in a live guest over its agent exec channel — an interactive
     /// shell or a one-shot command, as `--user` in `--dir`. Reuses the same client
@@ -1599,13 +1597,13 @@ async fn cli_main() -> ExitCode {
             },
         },
         // stdio↔socket splice for an SSH ProxyCommand; returns when either side closes.
-        Cmd::Connect { to } => match vk_core::forward::run_connect(&to).await {
+        Cmd::Connect { addr } => match vk_core::forward::run_connect(&addr).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         },
         // Agent liveness probe: round-trip the status request (same client the boot
         // readiness wait uses) so a caller can check the VM is up with vk alone.
-        Cmd::Status { to } => match vk_core::status::get_status(&to).await {
+        Cmd::Status { addr } => match vk_core::status::get_status(&addr).await {
             Ok(status) => {
                 println!("{status}");
                 ExitCode::SUCCESS

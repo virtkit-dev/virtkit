@@ -19,6 +19,9 @@ All notable changes to virtkit will be documented in this file.
   of every declared service. So a cache-warming prebuild matches what the boot needs, and a
   profiled-down service is left for its first on-demand `vk service up`. New `--primary <name>`
   / `--profile <name>` scope the build to the same set the matching `vk run --compose` boots.
+- `vk connect` and `vk status` now take the address as a positional argument instead of the
+  `--to <addr>` flag (`vk connect <addr>`, `vk status <addr>`), matching `vk exec`. The
+  `run --ssh` ProxyCommand hint is emitted in the new form.
 
 ## [0.13.0] - 2026-07-13
 

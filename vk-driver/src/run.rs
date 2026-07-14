@@ -1165,7 +1165,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
         };
         println!(
             "virtkit: ssh: ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-             -o ProxyCommand=\"'{}' connect --to '{target}'\" {}@vk-run",
+             -o ProxyCommand=\"'{}' connect '{target}'\" {}@vk-run",
             exe.display(),
             args.ssh_user
         );
