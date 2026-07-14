@@ -21,6 +21,11 @@ RUN apk add --no-cache $(grep -vE '^[[:space:]]*(#|$)' /tmp/apk-pins.txt)
 # so no `rustup target add`. Versions follow rust-toolchain.toml.
 RUN rustup component add clippy rustfmt
 
+# cargo-audit for audit.sh (RUSTSEC advisory scan). Not a rustup component, so install the
+# pinned version as a binary; --locked builds it from its published Cargo.lock so the image
+# stays reproducible. Lands in CARGO_HOME/bin (on PATH) and is chowned to dev below.
+RUN cargo install cargo-audit --locked --version 0.22.2
+
 # Non-root dev user owning the cargo/rustup homes so it can populate the registry
 # cache and honour rust-toolchain.toml without root.
 ARG USERNAME=dev

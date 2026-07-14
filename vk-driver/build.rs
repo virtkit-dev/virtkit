@@ -86,10 +86,16 @@ fn embed(src_var: &str, path_var: &str) {
             (std::fs::canonicalize(&p).unwrap_or(p), stamp)
         }
         _ => {
-            println!(
-                "cargo::warning={src_var} unset — `vk` built without an embedded \
-                 blob; set it (see build.sh) for a self-contained binary"
-            );
+            // Only warn for a release build: a non-embedded release artifact is a
+            // shippable-binary footgun worth flagging. In debug (dev iteration, and
+            // `cargo check`/`clippy`) the fallback to --kernel/--agent is the norm, so
+            // the warning is pure noise — notably it cluttered every `lint.sh` run.
+            if std::env::var_os("PROFILE").as_deref() == Some(std::ffi::OsStr::new("release")) {
+                println!(
+                    "cargo::warning={src_var} unset — `vk` built without an embedded \
+                     blob; set it (see build.sh) for a self-contained binary"
+                );
+            }
             let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
             let empty = out_dir.join(format!("{path_var}.empty"));
             std::fs::write(&empty, []).expect("write empty embed placeholder");
