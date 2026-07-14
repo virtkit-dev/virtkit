@@ -491,21 +491,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     // Resolve the --primary primary's index up front — it drives both the unified compose
     // build below and the sibling provisioning later.
     if let Some(name) = &args.primary {
-        primary_idx = Some(
-            compose_units
-                .iter()
-                .position(|u| &u.name == name)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--primary {name:?}: no such compose service (declared: {})",
-                        compose_units
-                            .iter()
-                            .map(|u| u.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                })?,
-        );
+        primary_idx = Some(resolve_primary(&compose_units, name)?);
     }
 
     // Build every compose image the run needs in ONE unified build — the --primary primary
@@ -1325,6 +1311,44 @@ fn eager_build_selection(
                 || matches!(units[i].source, crate::compose::Source::Image(_))
         })
         .collect()
+}
+
+/// Resolve a `--primary` service name to its index in `units`, erroring with the list of
+/// declared services when it isn't found — so the build and run paths report the same message.
+fn resolve_primary(units: &[crate::compose::Unit], name: &str) -> Result<usize> {
+    units.iter().position(|u| u.name == name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--primary {name:?}: no such compose service (declared: {})",
+            units
+                .iter()
+                .map(|u| u.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
+/// The compose service indices `vk build --compose` builds: exactly the set `vk run --compose`
+/// would boot for the same `--profile` / `--primary` selection — the enabled set (profiled-down
+/// services excluded) or, with `--primary`, that service plus its dependency closure — and every
+/// `image:` service. Computed the same way as [`build_compose_images`], so a `--compose` build
+/// warms precisely what a boot needs and leaves a profiled-down `build:` service for its first
+/// on-demand `vk service up`. Name a service's profile with `--profile` to build it anyway.
+pub(crate) fn compose_build_selection(
+    units: &[crate::compose::Unit],
+    profiles: &[String],
+    primary: Option<&str>,
+) -> Result<Vec<usize>> {
+    let primary_idx = match primary {
+        Some(name) => Some(resolve_primary(units, name)?),
+        None => None,
+    };
+    let order = crate::compose::boot_order(units)?;
+    let on = match primary_idx {
+        Some(idx) => crate::compose::dependency_closure(units, idx),
+        None => crate::compose::enabled(units, profiles),
+    };
+    Ok(eager_build_selection(units, &order, primary_idx, &on))
 }
 
 /// Build the images a `--compose` run needs at start-up in ONE unified build: the `--primary`
@@ -2822,6 +2846,62 @@ mod tests {
             (0..units.len()).all(|i| !on[i] || selected.contains(&i)),
             "selected must cover the whole eager start set"
         );
+    }
+
+    #[test]
+    fn compose_build_selection_scopes_by_profile_and_primary() {
+        // dev depends on redis+mysql; runner is behind the `runner` profile; cache is an
+        // image service behind `debug`. Mirrors the wab dev-LAN shape.
+        let yaml = "services:\n\
+             \x20 dev:\n    build: ./dev\n    depends_on: [redis, mysql]\n\
+             \x20 redis:\n    build: ./redis\n\
+             \x20 mysql:\n    build: ./mysql\n\
+             \x20 runner:\n    build: ./runner\n    profiles: [runner]\n\
+             \x20 cache:\n    image: redis:7\n    profiles: [debug]\n";
+        let units = crate::compose::parse(yaml, Path::new("/base"), &|_| None).unwrap();
+        let idx = |n: &str| units.iter().position(|u| u.name == n).unwrap();
+        let names = |sel: Vec<usize>| {
+            let mut v: Vec<&str> = sel.iter().map(|&i| units[i].name.as_str()).collect();
+            v.sort();
+            v
+        };
+
+        // No --profile / --primary: the profile-enabled set — every service with no profile
+        // (dev, redis, mysql) plus always-materialized image services (cache), but NOT the
+        // profiled-down build services (runner). This is what a `vk run --compose` boots.
+        let sel = compose_build_selection(&units, &[], None).unwrap();
+        assert_eq!(names(sel.clone()), ["cache", "dev", "mysql", "redis"]);
+        assert!(
+            !sel.contains(&idx("runner")),
+            "a profiled build service is not built by default"
+        );
+
+        // --primary dev: the boot set — dev + its closure (redis, mysql) + image services
+        // (cache), but NOT the profiled-down build service `runner`.
+        let sel = compose_build_selection(&units, &[], Some("dev")).unwrap();
+        assert_eq!(names(sel.clone()), ["cache", "dev", "mysql", "redis"]);
+        assert!(
+            !sel.contains(&idx("runner")),
+            "a profiled build service is deferred"
+        );
+
+        // --profile runner (no primary): the enabled set now includes runner, plus the
+        // always-materialized image service.
+        let sel = compose_build_selection(&units, &["runner".to_string()], None).unwrap();
+        assert!(sel.contains(&idx("runner")) && sel.contains(&idx("cache")));
+
+        // --primary on a profiled build service builds it (plus its closure, which is empty
+        // here) and the image services — no profile needed to reach it as the primary.
+        let sel = compose_build_selection(&units, &[], Some("runner")).unwrap();
+        assert_eq!(names(sel), ["cache", "runner"]);
+
+        // An unknown --profile matches no service, so it is a silent no-op: the selection is
+        // exactly the default profile-enabled set, not an error.
+        let sel = compose_build_selection(&units, &["nope".to_string()], None).unwrap();
+        assert_eq!(names(sel), ["cache", "dev", "mysql", "redis"]);
+
+        // An unknown --primary is a clear error, not a silent empty build.
+        assert!(compose_build_selection(&units, &[], Some("nope")).is_err());
     }
 
     #[test]

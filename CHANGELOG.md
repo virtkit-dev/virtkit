@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- `vk build --compose` now builds the services `vk run --compose` would boot — the
+  profile-enabled set (profiled-down services excluded) plus every `image:` service — instead
+  of every declared service. So a cache-warming prebuild matches what the boot needs, and a
+  profiled-down service is left for its first on-demand `vk service up`. New `--primary <name>`
+  / `--profile <name>` scope the build to the same set the matching `vk run --compose` boots.
+
 ## [0.13.0] - 2026-07-13
 
 ### Added

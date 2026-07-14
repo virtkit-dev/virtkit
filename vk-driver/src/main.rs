@@ -245,12 +245,26 @@ enum Cmd {
         /// with none they only warm the instruction cache
         #[arg(long)]
         target: Vec<String>,
-        /// build every service declared in this compose file (like the targets `vk run
-        /// --compose` would build) in one pass — services sharing a Dockerfile build their
-        /// common stages once. Warms the cache; with --out each exports to <out>/<name>.ext4.
-        /// Excludes -f/--target
+        /// build the services `vk run --compose` would boot — the enabled set (profiled-down
+        /// services excluded) plus every image: service — in one pass, so a prebuild warms
+        /// exactly what a boot needs. Services sharing a Dockerfile build their common stages
+        /// once. Warms the cache; with --out each exports to <out>/<name>.ext4. Excludes -f/--target
         #[arg(long)]
         compose: Option<PathBuf>,
+        /// with --compose, also build the services this profile enables (repeatable) — the
+        /// same profiled services `vk run --compose --profile` would boot
+        #[arg(
+            long = "profile",
+            value_name = "NAME",
+            requires = "compose",
+            conflicts_with = "primary"
+        )]
+        profile: Vec<String>,
+        /// with --compose, build the set `vk run --compose --primary <NAME>` would boot (this
+        /// service plus its dependency closure, and every image: service) rather than the
+        /// default profile-enabled set
+        #[arg(long, value_name = "NAME", requires = "compose")]
+        primary: Option<String>,
         /// build context for COPY (repeatable, zipped positionally with -f;
         /// default: each Dockerfile's own directory)
         #[arg(long)]
@@ -1193,6 +1207,8 @@ async fn cli_main() -> ExitCode {
         file,
         target,
         compose,
+        profile,
+        primary,
         context,
         out,
         print_plan,
@@ -1288,7 +1304,9 @@ async fn cli_main() -> ExitCode {
             let units = if let Some(path) = compose {
                 if !target.is_empty() {
                     return fail(
-                        &anyhow::anyhow!("--compose builds every service; --target does not apply"),
+                        &anyhow::anyhow!(
+                            "--compose selects services from the compose file; --target does not apply"
+                        ),
                         2,
                     );
                 }
@@ -1312,7 +1330,11 @@ async fn cli_main() -> ExitCode {
                         1,
                     );
                 }
-                let selected: Vec<usize> = (0..cunits.len()).collect();
+                let selected =
+                    match run::compose_build_selection(&cunits, profile, primary.as_deref()) {
+                        Ok(s) => s,
+                        Err(e) => return fail(&e, 2),
+                    };
                 run::compose_build_units(&opts.build_args, &cunits, &selected, |u| {
                     out_file(&u.name)
                 })
