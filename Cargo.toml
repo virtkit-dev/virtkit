@@ -60,6 +60,10 @@ regex = "1"
 # musl-static.
 fastcdc = "4"
 zstd = "0.13"
+# .ko.xz kernel-module decompression for `vk run --kernel image` (fullvm): pure Rust,
+# so it needs no C liblzma and the binary stays musl-static (zstd/gz are covered by the
+# crates above).
+lzma-rs = "0.3"
 # tokio features are member-specific; only the version is pinned here.
 tokio = { version = "1" }
 toml = "1"

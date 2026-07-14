@@ -4,8 +4,9 @@
 //! host-side (no mount, via [`crate::ext4_read::Ext4Reader`]) and, for the image
 //! kernel, extracts the two pieces libkrun needs: the raw kernel `vmlinuz` and the
 //! boot-critical kernel modules. It then assembles the preinit initramfs the agent
-//! boots from — the agent as `/init` plus any `.ko` files and an ordered load list —
-//! so the preinit can `insmod` virtio/ext4 before mounting the real root and (for
+//! boots from — the agent as `/init` plus any `.ko` files (decompressed from a distro's
+//! `.ko.xz`/`.ko.zst`/`.ko.gz`) and an ordered load list — so the preinit can `insmod`
+//! virtio/ext4 before mounting the real root and (for
 //! image init) exec'ing the image's `/sbin/init`. With `--kernel default` the pinned
 //! kernel has virtio/ext4 built in, so no extraction and no modules are needed.
 
@@ -100,17 +101,26 @@ pub fn prepare(
         let rel_paths = resolve_module_paths(&dep_text, WANTED_MODULES);
 
         for rel in &rel_paths {
-            if rel.ends_with(".ko.xz") || rel.ends_with(".ko.zst") || rel.ends_with(".ko.gz") {
-                bail!("compressed modules unsupported: {rel} (bookworm ships uncompressed .ko)");
-            }
             let abs_in_image = format!("/lib/modules/{ver}/{rel}");
-            match reader.read_file(&abs_in_image) {
-                Ok(bytes) => {
-                    load_order_abs.push(format!("/lib/modules/{ver}/{rel}"));
-                    modules.push((rel.clone(), bytes));
+            let raw = match reader.read_file(&abs_in_image) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!("virtkit: skipping module {abs_in_image} (unreadable: {e:#})");
+                    continue;
                 }
-                Err(e) => eprintln!("virtkit: skipping module {abs_in_image} (unreadable: {e:#})"),
-            }
+            };
+            // Modern distros ship compressed modules (Debian .ko.xz, others .ko.zst /
+            // .ko.gz). The agent insmods raw .ko, so decompress here and store the module
+            // under its plain .ko name (both in the initramfs and the load list).
+            let (ko_rel, bytes) = match decompress_module(rel, raw) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("virtkit: skipping module {abs_in_image} ({e:#})");
+                    continue;
+                }
+            };
+            load_order_abs.push(format!("/lib/modules/{ver}/{ko_rel}"));
+            modules.push((ko_rel, bytes));
         }
         kernel_out.to_path_buf()
     } else {
@@ -278,6 +288,34 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Decompress a module read from the image if its `rel` path carries a compression
+/// suffix, returning the plain `.ko` relative path and the raw module bytes. An
+/// uncompressed `.ko` passes through unchanged. The agent insmods raw `.ko`, so this is
+/// where a distro's `.ko.xz` / `.ko.zst` / `.ko.gz` becomes loadable.
+///
+/// The handled suffixes must stay in sync with the accepted list in
+/// `resolve_module_paths`; a suffix accepted there but not here falls through as a
+/// plain `.ko` and fails to load.
+fn decompress_module(rel: &str, raw: Vec<u8>) -> Result<(String, Vec<u8>)> {
+    use std::io::Read;
+    if let Some(stem) = rel.strip_suffix(".xz") {
+        let mut out = Vec::new();
+        lzma_rs::xz_decompress(&mut &raw[..], &mut out).context("xz-decompressing module")?;
+        Ok((stem.to_string(), out))
+    } else if let Some(stem) = rel.strip_suffix(".zst") {
+        let out = zstd::decode_all(&raw[..]).context("zstd-decompressing module")?;
+        Ok((stem.to_string(), out))
+    } else if let Some(stem) = rel.strip_suffix(".gz") {
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(&raw[..])
+            .read_to_end(&mut out)
+            .context("gunzipping module")?;
+        Ok((stem.to_string(), out))
+    } else {
+        Ok((rel.to_string(), raw))
+    }
+}
+
 /// Resolve wanted module basenames to their relative paths (under
 /// `/lib/modules/<ver>`) from a `modules.dep` body, preserving the wanted order
 /// and skipping any not present. Each `modules.dep` line is `path.ko:`
@@ -295,7 +333,16 @@ fn resolve_module_paths(dep_text: &str, wanted: &[&str]) -> Vec<String> {
             continue;
         }
         let file = path.rsplit('/').next().unwrap_or(path);
-        if let Some(base) = file.strip_suffix(".ko") {
+        // Accept an optional compression suffix (Debian .ko.xz, others .ko.zst/.ko.gz)
+        // so a modular distro kernel resolves; the compressed path is kept as the value
+        // and decompressed at extraction time by `decompress_module` (keep the two
+        // suffix lists in sync).
+        let stem = file
+            .strip_suffix(".xz")
+            .or_else(|| file.strip_suffix(".zst"))
+            .or_else(|| file.strip_suffix(".gz"))
+            .unwrap_or(file);
+        if let Some(base) = stem.strip_suffix(".ko") {
             by_name
                 .entry(base.to_string())
                 .or_insert_with(|| path.to_string());
@@ -364,6 +411,69 @@ kernel/net/vmw_vsock/vsock.ko:
     fn resolve_module_paths_empty_when_none_match() {
         let dep = "kernel/foo/bar.ko:\nkernel/baz/qux.ko: kernel/foo/bar.ko\n";
         assert!(resolve_module_paths(dep, &["virtio", "ext4"]).is_empty());
+    }
+
+    #[test]
+    fn resolve_module_paths_accepts_compressed() {
+        // A modular distro kernel: .ko.xz (Debian), .ko.zst and .ko.gz all resolve, and
+        // the compressed path is preserved for decompression at extraction time.
+        let dep = "\
+kernel/drivers/virtio/virtio.ko.xz:
+kernel/drivers/block/virtio_blk.ko.xz: kernel/drivers/virtio/virtio.ko.xz
+kernel/fs/ext4/ext4.ko.zst:
+kernel/net/vmw_vsock/vsock.ko.gz:
+";
+        let got = resolve_module_paths(dep, &["virtio", "virtio_blk", "ext4", "vsock"]);
+        assert_eq!(
+            got,
+            vec![
+                "kernel/drivers/virtio/virtio.ko.xz".to_string(),
+                "kernel/drivers/block/virtio_blk.ko.xz".to_string(),
+                "kernel/fs/ext4/ext4.ko.zst".to_string(),
+                "kernel/net/vmw_vsock/vsock.ko.gz".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn decompress_module_plain_passthrough() {
+        let raw = b"raw .ko bytes".to_vec();
+        let (rel, out) = decompress_module("kernel/x/foo.ko", raw.clone()).unwrap();
+        assert_eq!(rel, "kernel/x/foo.ko");
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn decompress_module_gz_roundtrips() {
+        use std::io::Write;
+        let plain = b"fake ext4.ko payload".to_vec();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&plain).unwrap();
+        let (rel, out) =
+            decompress_module("kernel/fs/ext4/ext4.ko.gz", enc.finish().unwrap()).unwrap();
+        assert_eq!(rel, "kernel/fs/ext4/ext4.ko");
+        assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn decompress_module_zst_roundtrips() {
+        let plain = b"fake vsock.ko payload".to_vec();
+        let z = zstd::encode_all(&plain[..], 0).unwrap();
+        let (rel, out) = decompress_module("kernel/net/vsock.ko.zst", z).unwrap();
+        assert_eq!(rel, "kernel/net/vsock.ko");
+        assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn decompress_module_xz_roundtrips() {
+        // .ko.xz is the motivating Debian format and the only one using the pure-Rust
+        // lzma-rs path, so pin a round-trip through its own encoder.
+        let plain = b"fake virtio_blk.ko payload".to_vec();
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut &plain[..], &mut xz).unwrap();
+        let (rel, out) = decompress_module("kernel/drivers/block/virtio_blk.ko.xz", xz).unwrap();
+        assert_eq!(rel, "kernel/drivers/block/virtio_blk.ko");
+        assert_eq!(out, plain);
     }
 
     #[test]

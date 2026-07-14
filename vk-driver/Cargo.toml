@@ -27,6 +27,7 @@ flate2.workspace = true
 sha2.workspace = true
 fastcdc.workspace = true
 zstd.workspace = true
+lzma-rs.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
 tokio-util.workspace = true
 toml.workspace = true

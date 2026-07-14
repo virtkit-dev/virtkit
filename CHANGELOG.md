@@ -62,6 +62,14 @@ All notable changes to virtkit will be documented in this file.
   as they cannot be built on demand. Declare `depends_on` for any service a `--primary` needs
   booted at start-up, so it lands in the eager set.
 
+### Fixed
+
+- `vk run --kernel image` now boots modular distro kernels that ship **compressed**
+  modules: fullvm decompresses `.ko.xz` / `.ko.zst` / `.ko.gz` when assembling the preinit
+  initramfs, instead of skipping them and coming up with no virtio-blk / vsock. Previously
+  only uncompressed `.ko` (older Debian) worked; a stock Debian 13 kernel loaded 0 modules
+  and never reached the agent.
+
 ## [0.12.0] - 2026-07-13
 
 ### Added
