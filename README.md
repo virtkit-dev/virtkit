@@ -113,6 +113,14 @@ the Rust toolchain, the base-image digest, and the apk pins together.
 
 - `run` — boot an image (or a Dockerfile target) as a microVM and run a command
   or an interactive shell in it.
+- `exec` — run a command (or open a shell) in an already-running guest over its
+  agent channel, reproducing the command's own exit status.
+- `status` — probe a running guest's agent and print its reply, or exit non-zero
+  if it does not answer.
+- `connect` — splice stdio to a running guest, the shape SSH's `ProxyCommand`
+  wants (`vk run --ssh` prints the full invocation).
+- `service up` / `service down` / `service status` — from inside the primary,
+  control the run's compose services (build on demand + boot, stop, or query state).
 - `gitlab config` / `gitlab prepare` / `gitlab run` / `gitlab cleanup` — the GitLab custom-executor lifecycle.
 - `build` — build a Dockerfile into a bootable image, each `RUN` in a microVM.
 - `switch` — the guest network gateway (spawned per run/job).
@@ -122,14 +130,15 @@ the Rust toolchain, the base-image digest, and the apk pins together.
   registry, with chunk-level deduplication to keep transfers small.
 - `virtiofsd` — the bundled virtio-fs daemon for sharing host directories
   (used with the Cloud Hypervisor backend).
-- `forward` / `launch` — plumbing: byte forwarder / standalone microVM launcher.
+- `forward` — plumbing: a byte forwarder splicing one address to another.
 
 `vk-agent`:
 
 - `init` — PID 1 for the guest (also runs the image's entrypoint or hands off
   to systemd, depending on `VIRTKIT_MODE`).
-- `serve` — the in-VM command server; `exec` / `connect` / `forward` are the
-  host-side clients (e.g. `connect` works as an SSH `ProxyCommand`).
+- `serve` — the in-VM command server that the host's `vk exec` / `vk connect` /
+  `vk status` dial (so a host needs only `vk`, no separate `vk-agent`). The same
+  `exec` / `connect` / `forward` clients also exist here as `vk-agent` subcommands.
 - `net` — connect a guest NIC to the host's network switch.
 
 ## Layout
