@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `vk exec <addr> [--user U] [--dir D] [-t] -- <cmd>` runs a command in a live guest
+  over its agent exec channel — an interactive shell or a one-shot command, with stdio (or a
+  pty under `-t`) streamed and the command's exit status reproduced as `vk`'s own. It reuses
+  the same client the in-guest agent embeds, so a host reaches a running VM with `vk` alone,
+  no separate `vk-agent` binary.
+
 ### Changed
 
 - `vk build --compose` now builds the services `vk run --compose` would boot — the

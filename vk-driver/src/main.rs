@@ -26,6 +26,7 @@ mod detach;
 mod dockerhash;
 mod embed;
 mod ensure;
+mod exec;
 mod executor;
 mod ext4;
 mod ext4_read;
@@ -367,6 +368,37 @@ enum Cmd {
         /// Agent address to dial (the run's exec channel)
         #[arg(long)]
         to: SocketAddr,
+    },
+    /// Run a command in a live guest over its agent exec channel — an interactive
+    /// shell or a one-shot command, as `--user` in `--dir`. Reuses the same client
+    /// the in-guest agent embeds, so a host reaches a running VM with `vk` alone,
+    /// no separate `vk-agent` binary. `vk` exits with the command's own status.
+    #[command(arg_required_else_help = true)]
+    Exec {
+        /// Agent address to dial (the run's exec channel, e.g. vsock-auto://DIR/vsock.sock:4444)
+        addr: SocketAddr,
+        /// Background mode: no stdio, do not wait for the command to exit
+        #[arg(short, long)]
+        background: bool,
+        /// Start the remote process with an empty environment
+        #[arg(long)]
+        clear_env: bool,
+        /// Add an environment variable, syntax KEY=value (repeatable)
+        #[arg(long)]
+        env: Vec<String>,
+        /// Working directory for the remote process (default: the agent's own)
+        #[arg(long)]
+        dir: Option<String>,
+        /// Allocate a remote pty and run interactively (requires local stdin/stdout
+        /// to be a terminal; incompatible with --background)
+        #[arg(short = 't', long)]
+        tty: bool,
+        /// Run the remote process as this Unix user (drops uid/gid/groups)
+        #[arg(long)]
+        user: Option<String>,
+        /// Command to run, followed by its arguments (use `--` to end vk's own flags)
+        cmd: String,
+        args: Vec<String>,
     },
     /// Filtering ssh-agent proxy: serve the ssh-agent protocol on `--listen`, relaying to
     /// the real agent at `--upstream` but exposing only the keys in the `--allow` .pub
@@ -1580,6 +1612,21 @@ async fn cli_main() -> ExitCode {
             }
             // get_status yields a boxed std error; wrap it for the anyhow-typed reporter.
             Err(e) => fail(&anyhow::anyhow!("{e}"), 1),
+        },
+        // Run a command in a live guest, reproducing its exit status as our own.
+        Cmd::Exec {
+            addr,
+            background,
+            clear_env,
+            env,
+            dir,
+            tty,
+            user,
+            cmd,
+            args,
+        } => match exec::run(addr, background, clear_env, env, dir, tty, user, cmd, args).await {
+            Ok(result) => exec::exit(result),
+            Err(e) => fail(&e, 1),
         },
         // run_forward only returns on a bind error; otherwise it serves until the
         // process is killed (cleanup tears the detached child down).
