@@ -604,6 +604,14 @@ enum Cmd {
         /// skipped
         #[arg(long = "symlink", value_name = "SRC:DST")]
         symlink: Vec<String>,
+        /// attach a raw host disk image as a block device (repeatable), ordered after
+        /// any rootfs disk (so typically /dev/vdb, vdc, …; but /dev/vda first under
+        /// --ram, which has no rootfs disk). The guest reads/writes it directly (no
+        /// virtiofs), so it can partition, mkfs and install into a disk image; append
+        /// `:ro` for read-only. HOST is a raw image file (qemu-img / truncate); qcow2
+        /// is not accepted here.
+        #[arg(long = "disk", value_name = "HOST[:ro]")]
+        disk: Vec<String>,
         /// extra environment for the guest command and its login shells (repeatable);
         /// wins over the image env and any --env-file
         #[arg(long = "env", value_name = "KEY=VALUE")]
@@ -953,6 +961,7 @@ async fn cli_main() -> ExitCode {
         state_dir,
         volume,
         symlink,
+        disk,
         env,
         env_file,
         host_exec,
@@ -1044,6 +1053,8 @@ async fn cli_main() -> ExitCode {
             Ok(v) => v,
             Err(e) => return fail(&e, 2),
         };
+        // --disk HOST[:ro]: raw block devices attached after any rootfs disk.
+        let extra_disks = parse_disks(disk);
         let args = run::RunArgs {
             image: image.clone().unwrap_or_default(),
             dockerfiles: file.clone(),
@@ -1082,6 +1093,7 @@ async fn cli_main() -> ExitCode {
             state_dir: state_dir.clone(),
             volumes,
             symlinks,
+            extra_disks,
             env: extra_env,
             host_exec: *host_exec,
             host_exec_wrapper: host_exec_wrapper.clone(),
@@ -1701,6 +1713,20 @@ fn parse_injects(specs: &[String]) -> anyhow::Result<Vec<(String, PathBuf, u16)>
     Ok(out)
 }
 
+/// Parse `--disk HOST[:ro]` specs into `(host path, read-only)` pairs. A trailing
+/// `:ro` marks the disk read-only; everything else is the host path (paths with a
+/// literal `:` are rare enough that only the `:ro` suffix is special-cased — a file
+/// genuinely named `foo:ro` can only attach read-only).
+fn parse_disks(specs: &[String]) -> Vec<(PathBuf, bool)> {
+    specs
+        .iter()
+        .map(|d| match d.strip_suffix(":ro") {
+            Some(p) => (PathBuf::from(p), true),
+            None => (PathBuf::from(d), false),
+        })
+        .collect()
+}
+
 /// Collect the extra guest env from `--env-file`s (in order, later files win)
 /// then `--env` flags (they win over every file), upserted into one list — the
 /// same upsert the guest applies. `#` and blank lines in a file are skipped.
@@ -1821,6 +1847,30 @@ mod tests {
         let err = collect_extra_env(&[dir.join("missing.env")], &[]).unwrap_err();
         assert!(format!("{err:#}").contains("missing.env"), "{err:#}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --disk parses HOST[:ro]: a trailing `:ro` marks the disk read-only, everything
+    // else is the host path verbatim; specs are attached in the order given.
+    #[test]
+    fn disk_specs_parse() {
+        assert_eq!(
+            parse_disks(&[
+                "img.raw".to_string(),
+                "/abs/data.img:ro".to_string(),
+                "rel/scratch.img".to_string(),
+            ]),
+            vec![
+                (PathBuf::from("img.raw"), false),
+                (PathBuf::from("/abs/data.img"), true),
+                (PathBuf::from("rel/scratch.img"), false),
+            ]
+        );
+        // only the `:ro` suffix is special; a path merely containing `:` is kept whole
+        assert_eq!(
+            parse_disks(&["weird:name.img".to_string()]),
+            vec![(PathBuf::from("weird:name.img"), false)]
+        );
+        assert!(parse_disks(&[]).is_empty());
     }
 
     // --cpus takes a plain number or `host` (the host's logical CPU count, >= 1);

@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `vk run --disk HOST[:ro]` (repeatable) attaches a raw host disk image to the guest as
+  a block device, ordered after any rootfs disk. The guest reads/writes it directly — no
+  virtiofs — so it can partition, mkfs and install into a disk image, e.g. assemble a
+  bootable VM image. `:ro` marks the disk read-only.
+
 ## [0.14.0] - 2026-07-14
 
 ### Added

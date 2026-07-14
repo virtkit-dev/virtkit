@@ -181,6 +181,11 @@ pub struct RunArgs {
     /// share escape hatch (virtiofs shares directories only); dangling sources
     /// are skipped by the agent
     pub symlinks: Vec<(String, String)>,
+    /// raw host disk images attached after any rootfs disk (so vdb, vdc, … — but vda
+    /// first under `--ram`, which has no rootfs disk) with the read-only flag — `vk run
+    /// --disk`. The guest reads/writes them directly, so it can partition and install
+    /// into a disk image (see the runner host-image build).
+    pub extra_disks: Vec<(PathBuf, bool)>,
     /// extra environment for the guest (`--env`/`--env-file`, flags last so they
     /// win), appended to the image env and persisted in-guest for login shells
     pub env: Vec<(String, String)>,
@@ -1087,6 +1092,16 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             .unwrap_or(&args.image)
             .to_string()
     };
+    // --disk: raw host images appended after any rootfs disk (so vdb, vdc, … — vda
+    // first under --ram, which seeds no rootfs disk), so the guest can
+    // partition/mkfs/install into a disk image directly. Paths are canonicalized so a
+    // relative --disk resolves against the caller's cwd like the rootfs media do.
+    let mut disks = disks;
+    for (path, readonly) in &args.extra_disks {
+        let abs = std::fs::canonicalize(path)
+            .with_context(|| format!("--disk {}: cannot access", path.display()))?;
+        disks.push(crate::vmm::Disk::raw(abs, *readonly));
+    }
     let spec = crate::vmm::VmSpec {
         kernel: boot_kernel,
         cmdline,

@@ -85,6 +85,19 @@ impl Disk {
         }
     }
 
+    /// A raw disk attached as-is (no qcow2, no backing chain) — a plain block device
+    /// handed to the guest after the rootfs (vdb, vdc, …). Used by `vk run --disk`
+    /// to expose a host file the guest writes directly, e.g. a disk image being
+    /// partitioned and installed into.
+    pub fn raw(path: PathBuf, readonly: bool) -> Self {
+        Disk {
+            path,
+            qcow2: false,
+            readonly,
+            dirty_control_socket: None,
+        }
+    }
+
     /// Enable dirty-block tracking, serving the drain protocol on `socket` (libkrun only).
     pub fn with_dirty_control(mut self, socket: PathBuf) -> Self {
         self.dirty_control_socket = Some(socket);
