@@ -158,6 +158,14 @@ enum RegistryCmd {
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Report a registry store's usage and content: on-disk size (both storage
+    /// forms), dedup savings, and a per-repository breakdown (tags, latest tag,
+    /// logical size). Read-only.
+    Status {
+        /// Store directory [default: $XDG_DATA_HOME/virtkit/registry].
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Garbage-collect a registry store: drop tags idle past the retention window,
     /// then sweep the blobs no surviving manifest references and stale uploads
     /// (both after a grace window). Takes the store lock exclusive, briefly
@@ -1517,6 +1525,16 @@ async fn cli_main() -> ExitCode {
                     Err(e) => return fail(&e, 2),
                 };
                 match regserve::install_service(*addr, &root) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => fail(&e, 1),
+                }
+            }
+            RegistryCmd::Status { root } => {
+                let root = match root.clone().map(Ok).unwrap_or_else(regserve::default_root) {
+                    Ok(r) => r,
+                    Err(e) => return fail(&e, 2),
+                };
+                match regserve::status(root) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => fail(&e, 1),
                 }

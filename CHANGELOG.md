@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `vk registry status [--root DIR]` reports a store's usage and content: on-disk size
+  (zstd + identity blobs), a per-repository breakdown (tags, latest tag, logical size),
+  the combined dedup+zstd packing factor (logical content ÷ bytes on disk), and the bytes
+  held in blobs no tag references. Read-only.
+
 ### Fixed
 
 - A static-addressed guest (the default build/RUN net) no longer hands off to the job

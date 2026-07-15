@@ -19,7 +19,7 @@
 //!   repos/<name>/manifests/<hex>  sidecar: that manifest's Content-Type
 //!   uploads/<id>                  in-progress blob uploads (this process only)
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -348,6 +348,108 @@ impl Store {
         Ok(report)
     }
 
+    /// Read-only usage snapshot: on-disk blob totals (both storage forms), in-flight
+    /// uploads, and a per-repository breakdown — each repo's tag count, latest tag (by
+    /// mtime), and logical size (the blobs its tagged manifests reference, counted once
+    /// per repo). `logical_naive` (every reference, no dedup) over `referenced_ondisk`
+    /// (the distinct referenced blobs' actual on-disk bytes) is the combined dedup+zstd
+    /// packing factor. The size and packing figures cover tag-reachable manifests only;
+    /// `total_manifests` counts every manifest sidecar, tagged or digest-pinned. Taken
+    /// under the shared lock, so it never reads a store a gc is mid-sweep on.
+    pub(crate) fn stats(&self) -> Result<StoreStats> {
+        let _lock = self.lock_shared()?;
+        let mut s = StoreStats::default();
+
+        // physical: every stored blob, split by storage form.
+        for (sub, count, bytes) in [
+            ("blobs/sha256", &mut s.identity_blobs, &mut s.identity_bytes),
+            ("blobs/zstd", &mut s.zstd_blobs, &mut s.zstd_bytes),
+        ] {
+            for blob in dir_files(&self.root.join(sub)) {
+                *count += 1;
+                *bytes += std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
+            }
+        }
+        for up in dir_files(&self.root.join("uploads")) {
+            s.uploads += 1;
+            s.upload_bytes += std::fs::metadata(&up).map(|m| m.len()).unwrap_or(0);
+        }
+
+        // per-repo content: a repo is a dir under repos/ holding a tags/ + manifests/.
+        let base = self.root.join("repos");
+        let mut repo_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+        for kind in ["tags", "manifests"] {
+            for d in self.repo_dirs(kind) {
+                if let Some(p) = d.parent() {
+                    repo_dirs.insert(p.to_path_buf());
+                }
+            }
+        }
+        // distinct blobs referenced by any manifest, so `referenced_ondisk` counts each
+        // one's real on-disk size once (the manifest blob itself included — it is live too).
+        let mut referenced: HashSet<String> = HashSet::new();
+        let ondisk = |hex: &str, s: &mut StoreStats, seen: &mut HashSet<String>| {
+            if seen.insert(hex.to_string())
+                && let Some((path, _)) = self.find_blob(hex)
+            {
+                s.referenced_ondisk += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            }
+        };
+        for repo_dir in repo_dirs {
+            let name = repo_dir
+                .strip_prefix(&base)
+                .unwrap_or(repo_dir.as_path())
+                .to_string_lossy()
+                .into_owned();
+            let mut r = RepoStat {
+                name,
+                ..Default::default()
+            };
+            r.manifests = dir_files(&repo_dir.join("manifests")).len();
+            // distinct manifests reachable from this repo's tags, and the latest tag.
+            let mut manifest_hexes: BTreeSet<String> = BTreeSet::new();
+            let mut latest: Option<(SystemTime, String)> = None;
+            for tag in dir_files(&repo_dir.join("tags")) {
+                r.tags += 1;
+                if let Ok(digest) = std::fs::read_to_string(&tag) {
+                    manifest_hexes.insert(digest.trim().trim_start_matches("sha256:").to_string());
+                }
+                if let Some(n) = tag.file_name().and_then(|n| n.to_str()) {
+                    let m = std::fs::metadata(&tag)
+                        .and_then(|m| m.modified())
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    if latest.as_ref().is_none_or(|(t, _)| m > *t) {
+                        latest = Some((m, n.to_string()));
+                    }
+                }
+            }
+            r.latest_tag = latest.map(|(_, n)| n);
+            // logical (uncompressed) size of the blobs those manifests reference, deduped
+            // within the repo; `logical_naive`/`referenced_ondisk` accumulate globally.
+            let mut repo_seen: HashSet<String> = HashSet::new();
+            for hex in &manifest_hexes {
+                ondisk(hex, &mut s, &mut referenced);
+                let Some(bytes) = self.get_blob(hex)? else {
+                    continue;
+                };
+                // the manifest blob is in `referenced_ondisk` (above), so its own bytes
+                // count toward the logical total too — keeps the packing ratio symmetric.
+                s.logical_naive += bytes.len() as u64;
+                for (dhex, size) in manifest_blob_sizes(&bytes) {
+                    s.logical_naive += size;
+                    ondisk(&dhex, &mut s, &mut referenced);
+                    if repo_seen.insert(dhex) {
+                        r.logical_bytes += size;
+                    }
+                }
+            }
+            s.total_tags += r.tags;
+            s.total_manifests += r.manifests;
+            s.repos.push(r);
+        }
+        Ok(s)
+    }
+
     /// Every `tags/` or `manifests/` directory under `repos/` — repo names may be
     /// nested (`bundles/appbuilder`), so walk down to the layout dirs. A repo path
     /// *component* itself named `tags`/`manifests` would be indistinguishable from
@@ -383,6 +485,37 @@ pub(crate) struct GcReport {
     pub(crate) uploads_dropped: usize,
 }
 
+/// A [`Store::stats`] snapshot: on-disk totals plus a per-repo breakdown.
+#[derive(Default)]
+pub(crate) struct StoreStats {
+    pub(crate) identity_blobs: usize,
+    pub(crate) identity_bytes: u64,
+    pub(crate) zstd_blobs: usize,
+    pub(crate) zstd_bytes: u64,
+    pub(crate) uploads: usize,
+    pub(crate) upload_bytes: u64,
+    pub(crate) total_tags: usize,
+    pub(crate) total_manifests: usize,
+    /// each tagged manifest plus its config/layer references, summed with no dedup — the
+    /// logical (uncompressed) content the store stands in for
+    pub(crate) logical_naive: u64,
+    /// the distinct referenced blobs' actual on-disk bytes (compressed, deduped);
+    /// `logical_naive` over this is the combined dedup+zstd packing factor
+    pub(crate) referenced_ondisk: u64,
+    pub(crate) repos: Vec<RepoStat>,
+}
+
+/// One repository's line in a [`StoreStats`].
+#[derive(Default)]
+pub(crate) struct RepoStat {
+    pub(crate) name: String,
+    pub(crate) tags: usize,
+    pub(crate) manifests: usize,
+    pub(crate) latest_tag: Option<String>,
+    /// size of the blobs this repo's tagged manifests reference, deduped within the repo
+    pub(crate) logical_bytes: u64,
+}
+
 /// The digest hexes a manifest references: its config and every layer, read
 /// structurally (`config.digest`, `layers[].digest`) so the gc mark needs no OCI
 /// types and tolerates media types it doesn't know. An image index (`manifests[]`)
@@ -399,6 +532,29 @@ fn manifest_digest_hexes(manifest: &[u8]) -> Result<Vec<String>> {
         .filter_map(|d| d?.as_str())
         .map(|d| d.trim_start_matches("sha256:").to_string())
         .collect())
+}
+
+/// `(digest hex, descriptor size)` for a manifest's config and every layer, read
+/// structurally like [`manifest_digest_hexes`]. Tolerant: an unparseable blob yields
+/// nothing (a status read must not fail on one odd manifest), and a missing `size`
+/// counts as 0.
+fn manifest_blob_sizes(manifest: &[u8]) -> Vec<(String, u64)> {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(manifest) else {
+        return Vec::new();
+    };
+    let layers = v.pointer("/layers").and_then(|l| l.as_array());
+    std::iter::once(v.pointer("/config"))
+        .chain(layers.into_iter().flatten().map(Some))
+        .flatten()
+        .filter_map(|d| {
+            let hex = d.pointer("/digest").and_then(|x| x.as_str())?;
+            let size = d
+                .pointer("/size")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            Some((hex.trim_start_matches("sha256:").to_string(), size))
+        })
+        .collect()
 }
 
 /// The files directly inside `dir` (a missing dir reads as empty; subdirectories
@@ -1059,6 +1215,85 @@ pub fn gc(root: PathBuf, retention: Duration, grace: Duration, dry_run: bool) ->
         r.uploads_dropped,
     );
     Ok(())
+}
+
+/// `vk registry status` — print a read-only usage + content report for the store at
+/// `root`: on-disk size, dedup savings, and a per-repository breakdown; see
+/// [`Store::stats`].
+pub fn status(root: PathBuf) -> Result<()> {
+    let store = Store::new(root)?;
+    let s = store.stats()?;
+    let blobs = s.identity_blobs + s.zstd_blobs;
+    let blob_bytes = s.identity_bytes + s.zstd_bytes;
+    println!("vk registry: {}", store.root.display());
+    println!(
+        "  on disk:  {} in {} blob(s) ({} zstd + {} identity)",
+        human_bytes(blob_bytes),
+        blobs,
+        human_bytes(s.zstd_bytes),
+        human_bytes(s.identity_bytes),
+    );
+    if s.uploads > 0 {
+        println!(
+            "  uploads:  {} in flight ({})",
+            s.uploads,
+            human_bytes(s.upload_bytes),
+        );
+    }
+    println!(
+        "  content:  {} repo(s), {} tag(s), {} manifest(s)",
+        s.repos.len(),
+        s.total_tags,
+        s.total_manifests,
+    );
+    if s.referenced_ondisk > 0 {
+        println!(
+            "  packing:  {} of content in {} on disk ({:.1}x by dedup + zstd)",
+            human_bytes(s.logical_naive),
+            human_bytes(s.referenced_ondisk),
+            s.logical_naive as f64 / s.referenced_ondisk as f64,
+        );
+    }
+    let reclaimable = blob_bytes.saturating_sub(s.referenced_ondisk);
+    if reclaimable > 1 << 20 {
+        println!(
+            "  gc:       {} in blobs no tag references (vk registry gc)",
+            human_bytes(reclaimable),
+        );
+    }
+    if !s.repos.is_empty() {
+        println!();
+        println!(
+            "  {:<40} {:>5} {:>10}  LATEST",
+            "REPOSITORY", "TAGS", "SIZE"
+        );
+        for r in &s.repos {
+            println!(
+                "  {:<40} {:>5} {:>10}  {}",
+                r.name,
+                r.tags,
+                human_bytes(r.logical_bytes),
+                r.latest_tag.as_deref().unwrap_or("-"),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A byte count in binary units (`B`, `KiB`, ... `PiB`), one decimal past `B`.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
 }
 
 /// Default store root: `$XDG_DATA_HOME/virtkit/registry`, else `~/.local/share/...`.
@@ -1726,5 +1961,85 @@ mod tests {
             sha256_hex_raw(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[test]
+    fn human_bytes_scales_binary_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(human_bytes(1 << 30), "1.0 GiB");
+    }
+
+    #[test]
+    fn manifest_blob_sizes_reads_config_and_layers() {
+        let m = br#"{"config":{"digest":"sha256:aa","size":10},
+                     "layers":[{"digest":"sha256:bb","size":20},
+                               {"digest":"sha256:cc","size":30}]}"#;
+        assert_eq!(
+            manifest_blob_sizes(m),
+            vec![("aa".into(), 10), ("bb".into(), 20), ("cc".into(), 30),]
+        );
+        assert!(manifest_blob_sizes(b"not json").is_empty());
+    }
+
+    /// stats() over a store with one repo and one manifest reachable from two tags: the
+    /// manifest is counted once (both tags resolve to it), logical_naive sums the manifest
+    /// plus its config and layers, and referenced_ondisk sums each distinct blob's real
+    /// (compressed) size, strictly below the raw content since the layers are stored zstd.
+    #[test]
+    fn stats_reports_packing_and_repo() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-stats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        // distinct, highly-compressible blobs (stored zstd, so on-disk << raw).
+        let cfg = vec![3u8; 1_000];
+        let a = vec![1u8; 40_000];
+        let b = vec![2u8; 60_000];
+        let dc = store.put_blob(&cfg).unwrap();
+        let da = store.put_blob(&a).unwrap();
+        let db = store.put_blob(&b).unwrap();
+        let manifest = format!(
+            r#"{{"config":{{"digest":"{dc}","size":{}}},
+                 "layers":[{{"digest":"{da}","size":{}}},
+                           {{"digest":"{db}","size":{}}}]}}"#,
+            cfg.len(),
+            a.len(),
+            b.len(),
+        );
+        // one manifest under two tags — both resolve to the same digest.
+        store
+            .put_manifest(
+                "bundles/app",
+                "v1",
+                DEFAULT_MANIFEST_TYPE,
+                manifest.as_bytes(),
+            )
+            .unwrap();
+        store
+            .put_manifest(
+                "bundles/app",
+                "v2",
+                DEFAULT_MANIFEST_TYPE,
+                manifest.as_bytes(),
+            )
+            .unwrap();
+
+        let s = store.stats().unwrap();
+        let raw = (cfg.len() + a.len() + b.len()) as u64;
+        assert_eq!(s.repos.len(), 1);
+        assert_eq!(s.repos[0].name, "bundles/app");
+        assert_eq!(s.repos[0].tags, 2);
+        assert_eq!(s.total_manifests, 1);
+        // the manifest counts once (deduped across the two tags): its own bytes plus
+        // config + both layers. the per-repo SIZE covers only what it references.
+        assert_eq!(s.logical_naive, raw + manifest.len() as u64);
+        assert_eq!(s.repos[0].logical_bytes, raw);
+        // on disk: the three distinct blobs (compressed) + the manifest, each once.
+        assert!(s.referenced_ondisk > 0 && s.referenced_ondisk < raw);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
