@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-15
+
 ### Added
 
 - `vk build --disk <path>` attaches a caller-owned raw disk read-write to the target
@@ -749,7 +751,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/wallix/virtkit/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/wallix/virtkit/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/wallix/virtkit/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/wallix/virtkit/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/wallix/virtkit/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/wallix/virtkit/compare/v0.11.0...v0.12.0
