@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- A static-addressed guest (the default build/RUN net) no longer hands off to the job
+  before its vsock bridge is forwarding: the agent waits for the gateway to answer ARP
+  after setting the address. Previously the job's first DNS query could hit a not-yet-live
+  bridge and fail name resolution outright (getaddrinfo exhausting its retries).
+
 ## [0.15.0] - 2026-07-15
 
 ### Added

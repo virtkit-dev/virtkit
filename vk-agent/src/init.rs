@@ -979,6 +979,20 @@ fn configure_network(cmdline: &HashMap<String, String>) {
         // shelling out left them with no address/route and a broken resolver.
         if let Err(e) = set_static_network(ip, gw) {
             warn!("vk-agent init: configuring eth0 {ip} via {gw} failed: {e:#}");
+        } else {
+            // The ioctl sets the address instantly, but the forked bridge still has to dial
+            // the host switch before frames flow. Block until the gateway answers ARP so the
+            // job's first DNS query isn't dropped into a not-yet-forwarding bridge (which
+            // fails name resolution outright — getaddrinfo exhausts its retries). The switch
+            // itself answers ARP for the gateway, so the probe works under any egress policy.
+            // Skipped when addressing failed above — there is nothing to wait for.
+            const GATEWAY_TRIES: u32 = 100;
+            if !wait_for_gateway(gw, GATEWAY_TRIES) {
+                warn!(
+                    "vk-agent init: gateway {gw} unreachable after {}s; continuing anyway",
+                    GATEWAY_TRIES / 10
+                );
+            }
         }
     }
     // DNS is written separately (write_resolv_conf) so it applies to the kernel `ip=`
@@ -1081,6 +1095,48 @@ fn resolv_conf(dns: &str) -> String {
         .filter(|s| !s.is_empty())
         .map(|ns| format!("nameserver {ns}\n"))
         .collect()
+}
+
+/// Wait up to `tries` × 100 ms for the default gateway to become reachable. A poke
+/// datagram makes the kernel ARP for the gateway (payload irrelevant — a drop while the
+/// bridge is still connecting just re-ARPs next poll); a completed `/proc/net/arp` entry
+/// means the switch answered, i.e. the bridge is forwarding. The switch itself answers
+/// ARP for the gateway, so the probe works under any egress policy.
+fn wait_for_gateway(gw: &str, tries: u32) -> bool {
+    for _ in 0..tries {
+        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            let _ = sock.send_to(&[0], (gw, 53));
+        }
+        if gateway_reachable(gw) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// True when `/proc/net/arp` lists `gw` with a resolved hardware address (ATF_COM set).
+fn gateway_reachable(gw: &str) -> bool {
+    std::fs::read_to_string("/proc/net/arp")
+        .map(|text| arp_has_resolved_entry(&text, gw))
+        .unwrap_or(false)
+}
+
+/// True when an `/proc/net/arp` dump lists `gw` with the ATF_COM flag set — a resolved
+/// hardware address. Columns: IP address, HW type, Flags, HW address, Mask, Device.
+fn arp_has_resolved_entry(text: &str, gw: &str) -> bool {
+    /// `/proc/net/arp` flag for a completed (resolved) entry — `ATF_COM`.
+    const ATF_COM: u32 = 0x2;
+    for line in text.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 3
+            && cols[0] == gw
+            && let Ok(flags) = u32::from_str_radix(cols[2].trim_start_matches("0x"), 16)
+        {
+            return flags & ATF_COM != 0;
+        }
+    }
+    false
 }
 
 /// Wait up to `tries` × 100 ms for a network interface to appear.
@@ -1702,6 +1758,26 @@ mod tests {
             "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
         );
         assert_eq!(resolv_conf(""), "");
+    }
+
+    #[test]
+    fn arp_resolved_entry_detected() {
+        let header =
+            "IP address       HW type     Flags       HW address            Mask     Device\n";
+        let resolved = format!(
+            "{header}192.168.127.1    0x1         0x2         52:54:00:12:34:56     *        eth0\n"
+        );
+        assert!(arp_has_resolved_entry(&resolved, "192.168.127.1"));
+        // Entry present but ATF_COM (0x2) not set — still resolving, not reachable.
+        let pending = format!(
+            "{header}192.168.127.1    0x1         0x0         00:00:00:00:00:00     *        eth0\n"
+        );
+        assert!(!arp_has_resolved_entry(&pending, "192.168.127.1"));
+        // Gateway not listed.
+        assert!(!arp_has_resolved_entry(&resolved, "10.0.0.1"));
+        // Header only / empty input.
+        assert!(!arp_has_resolved_entry(header, "192.168.127.1"));
+        assert!(!arp_has_resolved_entry("", "192.168.127.1"));
     }
 
     #[test]
