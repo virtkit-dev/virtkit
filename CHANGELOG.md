@@ -6,6 +6,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- The GitLab executor now honours the job's standard `image:` (CI_JOB_IMAGE) — no
+  `MICROVM_IMAGE` needed (`services:` was already supported). `image:` is booted directly,
+  accepted only under the `[docker] repo` allowlist (a bare docker-hub-style name maps onto
+  the repo; a ref naming another registry is refused). `MICROVM_IMAGE` stays as the explicit
+  override for the `local/`/`registry/` sources; a job with no image boots `local/default`.
 - The GitLab executor's `MICROVM_IMAGE: docker/<name>` now boots the image **directly**:
   the native OCI client pulls it, the embedded vk-agent is injected as PID 1 and the
   embedded kernel boots it — the same path `vk run --source oci` uses. Registry auth is a

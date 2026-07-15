@@ -57,25 +57,18 @@ pub enum ResolvedImage {
 /// treated as `local/default`.
 pub fn resolve(ctx: &JobCtx) -> Result<ResolvedImage> {
     let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
-    let Some((prefix, rest)) = image_ref.split_once('/') else {
-        bail!(
-            "invalid MICROVM_IMAGE {image_ref:?} (want local/<name>, \
-             registry/<name>[:tag|@sha256:…], or docker/<name>[:tag|@sha256:…])"
-        );
-    };
-    match prefix {
+    match image_ref.split_once('/') {
         // local/<name> = a bundle directory under [local] dir.
-        "local" => crate::local::resolve(ctx, rest),
+        Some(("local", rest)) => crate::local::resolve(ctx, rest),
         // registry/<name>[:tag|@digest] = a bundle in the [registry] repo,
         // pulled+cached natively (CDC+zstd chunk dedup).
-        "registry" => crate::registry::resolve(ctx, rest),
+        Some(("registry", rest)) => crate::registry::resolve(ctx, rest),
         // docker/<name>[:tag|@digest] = an OCI image of the [docker] repo, pulled
         // and booted directly (embedded kernel + agent; digest-keyed local cache).
-        "docker" => crate::dockerimg::resolve(ctx, rest),
-        _ => bail!(
-            "invalid MICROVM_IMAGE {image_ref:?} (want local/<name>, \
-             registry/<name>[:tag|@sha256:…], or docker/<name>[:tag|@sha256:…])"
-        ),
+        Some(("docker", rest)) => crate::dockerimg::resolve(ctx, rest),
+        // anything else = a raw OCI reference (the job's `image:`): booted directly,
+        // accepted only under the [docker] repo allowlist.
+        _ => crate::dockerimg::resolve_image(ctx, image_ref),
     }
 }
 
@@ -88,7 +81,7 @@ pub(crate) fn resolved_from_dir(dir: &Path, kind: BootKind) -> ResolvedImage {
     let vmlinuz = dir.join("vmlinuz");
     match kind {
         // self-booting (systemd): the image's own kernel + initrd if it shipped
-        // one, otherwise the embedded shared kernel with no initrd.
+        // one, otherwise the embedded shared kernel, booting the ext4 root directly.
         BootKind::Systemd => {
             let (kernel, initrd) = if vmlinuz.is_file() {
                 (Some(vmlinuz), Some(dir.join("initrd.img")))
@@ -102,7 +95,8 @@ pub(crate) fn resolved_from_dir(dir: &Path, kind: BootKind) -> ResolvedImage {
                 generic: false,
             }
         }
-        // generic: the embedded shared kernel (virtio + ext4 built in, no initrd).
+        // generic: the embedded shared kernel (virtio + ext4 built in), mounting the
+        // ext4 root directly.
         BootKind::GenericDisk => ResolvedImage::Disk {
             rootfs,
             kernel: None,

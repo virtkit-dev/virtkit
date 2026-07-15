@@ -52,10 +52,13 @@ impl JobCtx {
             bail!("invalid job id {job_id:?}");
         }
         let job_dir = cfg.state_dir().join("jobs").join(&job_id);
-        // MICROVM_IMAGE job variable (VM_IMAGE for manual runs); parsed and
-        // validated by image::resolve
+        // The job's image, in precedence order: MICROVM_IMAGE (explicit source override,
+        // VM_IMAGE for manual runs) → the GitLab `image:` (CI_JOB_IMAGE) → unset, which
+        // image::resolve treats as local/default. A bare `image:` is booted directly under
+        // the [docker] repo allowlist; the local/registry/docker/ forms select a source.
         let image_ref = std::env::var("CUSTOM_ENV_MICROVM_IMAGE")
             .or_else(|_| std::env::var("VM_IMAGE"))
+            .or_else(|_| std::env::var("CUSTOM_ENV_CI_JOB_IMAGE"))
             .ok()
             .filter(|s| !s.is_empty());
         let job_var = |name: &str| {
