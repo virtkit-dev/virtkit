@@ -164,6 +164,21 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         crate::embed::Asset::Kernel,
         kernel_opt.as_deref().or(cfg.build.kernel.as_deref()),
     )?;
+    // Each guest and service build boots as a VMM subprocess; an embedded kernel lives in
+    // a memfd whose /proc/self/fd path the child cannot open, so write it to a real file
+    // in the job dir (tmpfs) once and boot from that. A bundle- or config-supplied kernel
+    // is already a real path.
+    let kernel_path = if kernel.is_embedded() {
+        let p = ctx.job_dir.join("vmlinux");
+        let mut src = std::fs::File::open(&kernel.path).context("reading the embedded kernel")?;
+        let mut dst = std::fs::File::create(&p)
+            .with_context(|| format!("materializing the kernel to {}", p.display()))?;
+        std::io::copy(&mut src, &mut dst)
+            .with_context(|| format!("materializing the kernel to {}", p.display()))?;
+        p
+    } else {
+        kernel.path.clone()
+    };
     let mut children: Vec<std::process::Child> = Vec::new();
     // Every guest gets a throwaway CoW overlay over the ro base rootfs.
     let overlay = ctx.overlay();
@@ -285,7 +300,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             // before the guest dials it; then point the agent at it. The same
             // shared LAN/egress core `run --compose` uses.
             let (gateway, prefix, guest_ip) = crate::net::switch_addrs(&cfg.net.subnet)?;
-            let services = plan_services(ctx, gateway, prefix, &agent.path, &kernel.path).await?;
+            let services = plan_services(ctx, gateway, prefix, &agent.path, &kernel_path).await?;
             // the switch binds each service's vsock socket at startup: the
             // runtime dirs must exist before it spawns.
             for svc in &services {
@@ -298,7 +313,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                 let (child, aux) = crate::units::boot_unit(
                     svc,
                     &dir,
-                    &kernel.path,
+                    &kernel_path,
                     cfg.cloud_hypervisor(),
                     &agent.path,
                     cfg.net.net_port,
@@ -396,7 +411,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     }
 
     let spec = crate::vmm::VmSpec {
-        kernel: kernel.path.clone(),
+        kernel: kernel_path.clone(),
         cmdline,
         disks,
         initramfs,
