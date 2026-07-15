@@ -9,18 +9,17 @@
 //!   - `registry/<name>[:tag|@sha256:…]` — a bundle in the host-configured
 //!     `[registry] repo` (the allowlist), pulled+cached natively with CDC+zstd
 //!     chunk dedup (see registry.rs). Only the name/reference is job-controlled.
-//!   - `docker/<name>[:tag|@sha256:…]` — a docker image of the host-configured
-//!     `[convert] repo` (the allowlist), turned into a bootable bundle on demand
-//!     (see convert.rs). Only the name/reference is job-controlled.
+//!   - `docker/<name>[:tag|@sha256:…]` — a docker image in the host-configured
+//!     `[docker] repo` (the allowlist), pulled and booted directly via OCI on
+//!     demand (see dockerimg.rs). Only the name/reference is job-controlled.
 //!
-//! This module is the thin dispatcher plus the reference-parsing, oras and
-//! local-cache helpers shared with the conversion, registry and local paths.
+//! This module is the thin dispatcher plus the reference-parsing and local-cache
+//! helpers shared with the docker, registry and local paths.
 
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{SocketAddr, UnixListener};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
@@ -41,11 +40,13 @@ pub enum BootKind {
 pub enum ResolvedImage {
     /// A CoW ext4 rootfs booted off /dev/vda. `generic=false`: a self-booting
     /// image — its own kernel + initrd, the agent (service mode) hands off to systemd.
-    /// `generic=true`: the pinned shared kernel (virtio+ext4 built in, so
+    /// `generic=true`: the embedded shared kernel (virtio+ext4 built in, so
     /// `initrd=None`), the agent as PID 1, `ip=` networking.
+    /// `kernel=None` boots vk's embedded kernel (a kernel-less bundle / OCI image);
+    /// `Some(path)` boots a kernel the bundle ships.
     Disk {
         rootfs: PathBuf,
-        kernel: PathBuf,
+        kernel: Option<PathBuf>,
         initrd: Option<PathBuf>,
         generic: bool,
     },
@@ -68,9 +69,9 @@ pub fn resolve(ctx: &JobCtx) -> Result<ResolvedImage> {
         // registry/<name>[:tag|@digest] = a bundle in the [registry] repo,
         // pulled+cached natively (CDC+zstd chunk dedup).
         "registry" => crate::registry::resolve(ctx, rest),
-        // docker/<name>[:tag|@digest] = a docker image of the [convert] repo,
-        // turned into a bootable bundle on demand (digest-keyed local cache).
-        "docker" => crate::convert::resolve(ctx, rest),
+        // docker/<name>[:tag|@digest] = an OCI image of the [docker] repo, pulled
+        // and booted directly (embedded kernel + agent; digest-keyed local cache).
+        "docker" => crate::dockerimg::resolve(ctx, rest),
         _ => bail!(
             "invalid MICROVM_IMAGE {image_ref:?} (want local/<name>, \
              registry/<name>[:tag|@sha256:…], or docker/<name>[:tag|@sha256:…])"
@@ -78,25 +79,21 @@ pub fn resolve(ctx: &JobCtx) -> Result<ResolvedImage> {
     }
 }
 
-/// Return a `ResolvedImage` from a cached/baked bundle dir, shared by the
-/// registry and local paths: the boot shape from the recorded `boot.kind`,
-/// and which kernel/initrd files the bundle ships. `generic_kernel` is the
-/// shared pinned kernel a kernel-less bundle boots.
-pub(crate) fn resolved_from_dir(
-    generic_kernel: &Path,
-    dir: &Path,
-    kind: BootKind,
-) -> ResolvedImage {
+/// Return a `ResolvedImage` from a cached/baked bundle dir, shared by the registry and
+/// local paths: the boot shape from the recorded `boot.kind`, and which kernel/initrd
+/// files the bundle ships. A bundle that ships no kernel boots vk's embedded one
+/// (`kernel=None`).
+pub(crate) fn resolved_from_dir(dir: &Path, kind: BootKind) -> ResolvedImage {
     let rootfs = dir.join("runner.ext4");
     let vmlinuz = dir.join("vmlinuz");
     match kind {
         // self-booting (systemd): the image's own kernel + initrd if it shipped
-        // one, otherwise the shared host kernel with no initrd.
+        // one, otherwise the embedded shared kernel with no initrd.
         BootKind::Systemd => {
             let (kernel, initrd) = if vmlinuz.is_file() {
-                (vmlinuz, Some(dir.join("initrd.img")))
+                (Some(vmlinuz), Some(dir.join("initrd.img")))
             } else {
-                (generic_kernel.to_path_buf(), None)
+                (None, None)
             };
             ResolvedImage::Disk {
                 rootfs,
@@ -105,10 +102,10 @@ pub(crate) fn resolved_from_dir(
                 generic: false,
             }
         }
-        // generic: the pinned shared kernel (virtio + ext4 built in, no initrd).
+        // generic: the embedded shared kernel (virtio + ext4 built in, no initrd).
         BootKind::GenericDisk => ResolvedImage::Disk {
             rootfs,
-            kernel: generic_kernel.to_path_buf(),
+            kernel: None,
             initrd: None,
             generic: true,
         },
@@ -241,56 +238,6 @@ pub(crate) fn gc(images_dir: &Path, current: &Path, keep: u32) {
         println!("virtkit: evicting cached image {}", dir.display());
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
-
-/// oras invocation for the [convert] path (TLS/auth wiring); the password goes
-/// through stdin, never argv.
-pub(crate) fn oras_run(
-    oras: &Path,
-    ca_file: Option<&Path>,
-    username: &str,
-    password_file: Option<&Path>,
-    args: &[&str],
-) -> Result<String> {
-    let mut cmd = Command::new(oras);
-    cmd.args(args);
-    if let Some(ca) = ca_file {
-        cmd.arg("--ca-file").arg(ca);
-    }
-    let mut password = None;
-    if !username.is_empty() {
-        let file = password_file.context("registry username set but no password_file")?;
-        password = Some(
-            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?,
-        );
-        cmd.args(["--username", username, "--password-stdin"]);
-    }
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawning {}", oras.display()))?;
-    if let Some(pass) = password {
-        use std::io::Write;
-        child
-            .stdin
-            .take()
-            .context("no stdin pipe")?
-            .write_all(pass.trim_end().as_bytes())?;
-    } else {
-        drop(child.stdin.take());
-    }
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        bail!(
-            "oras {} failed ({}): {}",
-            args.first().unwrap_or(&""),
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[cfg(test)]

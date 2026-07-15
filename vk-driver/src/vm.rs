@@ -34,11 +34,8 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // Fail-fast preflight in the runner-visible process (crisp errors beat a
     // supervisor log pointer); the supervisor re-resolves from the same env.
     let (kernel, media, _generic) = resolve_media(ctx)?;
-    for p in media
-        .files()
-        .into_iter()
-        .chain(std::iter::once(kernel.as_path()))
-    {
+    // A `None` kernel boots vk's embedded copy — nothing to stat.
+    for p in media.files().into_iter().chain(kernel.as_deref()) {
         if !p.is_file() {
             bail!("image file missing: {}", p.display());
         }
@@ -124,8 +121,9 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     }
 }
 
-/// Resolve MICROVM_IMAGE to the boot files (kernel + rootfs + optional initrd).
-fn resolve_media(ctx: &JobCtx) -> Result<(PathBuf, Media, bool)> {
+/// Resolve MICROVM_IMAGE to the boot files: an optional kernel (`None` = boot vk's
+/// embedded kernel), the rootfs + optional initrd, and whether it is a generic boot.
+fn resolve_media(ctx: &JobCtx) -> Result<(Option<PathBuf>, Media, bool)> {
     match crate::image::resolve(ctx)? {
         ResolvedImage::Disk {
             rootfs,
@@ -155,13 +153,17 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         .with_context(|| format!("writing {}", ctx.supervisor_pidfile().display()))?;
 
     let cfg = &ctx.cfg;
-    let (kernel, media, generic) = resolve_media(ctx)?;
+    let (kernel_opt, media, generic) = resolve_media(ctx)?;
     let (cpus, mem) = vm_size(ctx)?;
-    // The agent backs each service boot (it rides the boot initramfs) and any
-    // service build; an embedded copy lives in a memfd whose path is valid only
-    // while this handle is open — supervise runs for the job's whole life.
-    // `[build] agent` overrides, as everywhere else.
+    // The agent and kernel back each guest boot (they ride the boot media) and any
+    // service build; an embedded copy lives in a memfd whose path is valid only while
+    // its handle is open — supervise runs for the job's whole life. `[build] agent`/
+    // `[build] kernel` override; a bundle that ships its own kernel resolves to that.
     let agent = crate::embed::resolve(crate::embed::Asset::Agent, cfg.build.agent.as_deref())?;
+    let kernel = crate::embed::resolve(
+        crate::embed::Asset::Kernel,
+        kernel_opt.as_deref().or(cfg.build.kernel.as_deref()),
+    )?;
     let mut children: Vec<std::process::Child> = Vec::new();
     // Every guest gets a throwaway CoW overlay over the ro base rootfs.
     let overlay = ctx.overlay();
@@ -283,7 +285,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             // before the guest dials it; then point the agent at it. The same
             // shared LAN/egress core `run --compose` uses.
             let (gateway, prefix, guest_ip) = crate::net::switch_addrs(&cfg.net.subnet)?;
-            let services = plan_services(ctx, gateway, prefix, &agent.path).await?;
+            let services = plan_services(ctx, gateway, prefix, &agent.path, &kernel.path).await?;
             // the switch binds each service's vsock socket at startup: the
             // runtime dirs must exist before it spawns.
             for svc in &services {
@@ -296,7 +298,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                 let (child, aux) = crate::units::boot_unit(
                     svc,
                     &dir,
-                    &cfg.local.generic_kernel,
+                    &kernel.path,
                     cfg.cloud_hypervisor(),
                     &agent.path,
                     cfg.net.net_port,
@@ -394,7 +396,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     }
 
     let spec = crate::vmm::VmSpec {
-        kernel,
+        kernel: kernel.path.clone(),
         cmdline,
         disks,
         initramfs,
@@ -534,6 +536,7 @@ async fn plan_services(
     gateway: Ipv4Addr,
     prefix: u8,
     agent: &Path,
+    kernel: &Path,
 ) -> Result<Vec<crate::units::Provisioned>> {
     let units = crate::services::to_units(crate::services::from_env()?);
     if units.is_empty() {
@@ -541,7 +544,7 @@ async fn plan_services(
     }
     let build = crate::units::BuildOpts {
         build_args: Vec::new(),
-        kernel: ctx.cfg.local.generic_kernel.clone(),
+        kernel: kernel.to_path_buf(),
         cloud_hypervisor: ctx.cfg.cloud_hypervisor().to_path_buf(),
         agent: agent.to_path_buf(),
         cache_registry: None,

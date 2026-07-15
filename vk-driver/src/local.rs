@@ -5,9 +5,9 @@
 //! Each `<[local] dir>/<name>/` is a baked bundle — a `runner.ext4`, a
 //! `boot.kind`, and OPTIONALLY a `vmlinuz` + `initrd.img` — produced by
 //! build-image.sh or pulled into place. Nothing is fetched: this is the
-//! on-disk counterpart of the registry/convert cached-dir path, resolved to a
+//! on-disk counterpart of the registry/docker cached-dir path, resolved to a
 //! `ResolvedImage` exactly the same way (the boot shape from `boot.kind`,
-//! the shared `[local] generic_kernel` for kernel-less bundles).
+//! vk's embedded kernel for kernel-less bundles).
 
 use anyhow::{Context, Result, bail};
 
@@ -35,9 +35,5 @@ pub fn resolve(ctx: &JobCtx, name: &str) -> Result<ResolvedImage> {
         format!("local image {name:?}: unsupported boot.kind marker — rebuild the image")
     })?;
     println!("virtkit: image local/{name} ({boot_kind:?})");
-    Ok(image::resolved_from_dir(
-        &ctx.cfg.local.generic_kernel,
-        &dir,
-        boot_kind,
-    ))
+    Ok(image::resolved_from_dir(&dir, boot_kind))
 }

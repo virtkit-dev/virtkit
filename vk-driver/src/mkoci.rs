@@ -237,7 +237,7 @@ fn blob_path(digest: &str) -> String {
 }
 
 /// Render `/etc/virtkit/env`: raw KEY=VALUE lines, dropping any without `=` (the
-/// agent takes the rest of the line verbatim). Mirrors convert.rs::render_env_file.
+/// agent takes the rest of the line verbatim). Mirrors dockerimg.rs::render_env.
 fn render_env_file(env: &[String]) -> String {
     let mut out = String::new();
     for line in env {

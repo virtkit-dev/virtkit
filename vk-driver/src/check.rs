@@ -1,7 +1,7 @@
 //! `vk check`: host preflight. Verifies the current user can actually boot
 //! microVMs (/dev/kvm access, the selected VMM backend, a guest kernel + agent)
 //! and that each feature the config enables has its host side in place (net.mode
-//! taps, [convert]'s docker daemon, [registry] store/credentials, ...). Prints one
+//! taps, [docker] credentials, [registry] store/credentials, ...). Prints one
 //! line per check; the caller turns "any check failed" into the exit code.
 
 use std::os::fd::AsRawFd;
@@ -21,8 +21,8 @@ pub enum Feature {
     Kernel,
     /// the configured net.mode's host side (/dev/net/tun + taps where needed)
     Net,
-    /// [convert]: the docker daemon answers, oras/agent/kernel are present
-    Convert,
+    /// [docker]: the OCI image registry credentials/CA are readable
+    Docker,
     /// [registry]: local store writable, or remote credential files readable
     Registry,
     /// gitlab executor: per-job state dir writable, [gitlab] tools dir readable
@@ -40,7 +40,7 @@ impl Feature {
             Feature::Vmm => "vmm",
             Feature::Kernel => "kernel",
             Feature::Net => "net",
-            Feature::Convert => "convert",
+            Feature::Docker => "docker",
             Feature::Registry => "registry",
             Feature::Gitlab => "gitlab",
             Feature::Share => "share",
@@ -122,7 +122,7 @@ fn evaluate(cfg: &Config, feature: Feature) -> Outcome {
         Feature::Vmm => vmm(cfg),
         Feature::Kernel => kernel(),
         Feature::Net => net(cfg),
-        Feature::Convert => convert(cfg),
+        Feature::Docker => docker(cfg),
         Feature::Registry => registry(cfg),
         Feature::Gitlab => gitlab(cfg),
         Feature::Share => share(cfg),
@@ -236,42 +236,32 @@ fn net(cfg: &Config) -> Outcome {
     }
 }
 
-fn convert(cfg: &Config) -> Outcome {
-    let Some(c) = &cfg.convert else {
-        return skip("[convert] not configured");
+fn docker(cfg: &Config) -> Outcome {
+    let Some(d) = &cfg.docker else {
+        return skip("[docker] not configured");
     };
-    let Some(docker) = resolve_bin(&c.docker) else {
-        return fail(format!("docker not runnable: {}", c.docker.display()));
-    };
-    // the real gate is daemon access (the docker group), so ask the daemon
-    let daemon = match std::process::Command::new(&docker)
-        .args(["version", "--format", "{{.Server.Version}}"])
-        .output()
+    // The image is pulled with the native OCI client and booted on the embedded kernel +
+    // agent, so the only host inputs are the registry credential files — check they are
+    // readable, like [registry] does.
+    let mut problems = Vec::new();
+    if let Some(ca) = &d.ca_file
+        && !access_ok(ca, libc::R_OK)
     {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        Ok(out) => {
-            return fail(format!(
-                "docker daemon unreachable: {} (is the user in the docker group?)",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        Err(e) => return fail(format!("running {}: {e}", docker.display())),
-    };
-    let mut missing = Vec::new();
-    if resolve_bin(&c.oras).is_none() {
-        missing.push(format!("oras not runnable: {}", c.oras.display()));
+        problems.push(format!("ca_file unreadable: {}", ca.display()));
     }
-    for (name, p) in [("agent", &c.agent), ("generic_kernel", &c.generic_kernel)] {
-        if !p.is_file() {
-            missing.push(format!("{name} missing: {}", p.display()));
+    if !d.username.is_empty() {
+        match &d.password_file {
+            Some(p) if !access_ok(p, libc::R_OK) => {
+                problems.push(format!("password_file unreadable: {}", p.display()));
+            }
+            Some(_) => {}
+            None => problems.push("username set but no password_file".into()),
         }
     }
-    if missing.is_empty() {
-        ok(format!(
-            "docker daemon v{daemon}; oras, agent and kernel present"
-        ))
+    if problems.is_empty() {
+        ok(format!("OCI image registry {} reachable-by-config", d.repo))
     } else {
-        fail(missing.join("; "))
+        fail(problems.join("; "))
     }
 }
 
@@ -423,7 +413,7 @@ mod tests {
     #[test]
     fn unconfigured_feature_skips() {
         let cfg = Config::default();
-        for f in [Feature::Convert, Feature::Registry] {
+        for f in [Feature::Docker, Feature::Registry] {
             assert_eq!(evaluate(&cfg, f).status, Status::Skip);
         }
     }

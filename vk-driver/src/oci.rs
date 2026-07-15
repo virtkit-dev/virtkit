@@ -56,6 +56,44 @@ pub async fn resolve_digest(reference: &str) -> Result<String> {
         .with_context(|| format!("resolving manifest digest for {reference}"))
 }
 
+/// Resolve `reference` to its manifest digest against an authenticated/TLS registry —
+/// the executor keys its per-image cache on the digest, and a digest-pinned ref returns
+/// without a round-trip. Mirrors [`resolve_digest`] but carries the `[docker]` creds so a
+/// private corp registry answers.
+pub async fn resolve_digest_auth(
+    reference: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+    ca_pem: Option<Vec<u8>>,
+    insecure: bool,
+) -> Result<String> {
+    let parsed: Reference = reference
+        .parse()
+        .with_context(|| format!("parsing OCI reference {reference:?}"))?;
+    if let Some(digest) = parsed.digest() {
+        return Ok(digest.to_string());
+    }
+    let mut cfg = ClientConfig::default();
+    if insecure {
+        cfg.protocol = ClientProtocol::Http;
+    }
+    if let Some(data) = ca_pem {
+        cfg.extra_root_certificates.push(Certificate {
+            encoding: CertificateEncoding::Pem,
+            data,
+        });
+    }
+    let client = oci_client::Client::new(cfg);
+    let auth = match (username, password) {
+        (Some(u), Some(p)) => RegistryAuth::Basic(u.to_string(), p.to_string()),
+        _ => RegistryAuth::Anonymous,
+    };
+    client
+        .fetch_manifest_digest(&parsed, &auth)
+        .await
+        .with_context(|| format!("resolving manifest digest for {reference}"))
+}
+
 /// Whether `reference` resolves in its registry: `Ok(true)` if the manifest is present,
 /// `Ok(false)` if the registry reports it unknown (name/manifest not found), and `Err`
 /// for auth/network/other failures. Lets an `auto` source fall back to docker *only* when

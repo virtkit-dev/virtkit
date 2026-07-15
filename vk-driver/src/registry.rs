@@ -15,7 +15,7 @@
 //! offset, and an all-zero chunk is skipped so its region stays a hole — the ext4
 //! sparse file is never densified.
 //!
-//! Same caching model as the `[convert]` path: digest-keyed bundle dir under
+//! Same caching model as the `docker/` path: digest-keyed bundle dir under
 //! `state_dir`, the abstract-socket pull lock + mtime GC shared via image.rs, and
 //! a `ResolvedImage` returned from the cached dir keyed on `boot.kind`.
 
@@ -97,7 +97,7 @@ pub fn push(cfg: &Config, dir: &Path, image_ref: &str) -> Result<String> {
 }
 
 /// Pull+cache a registry bundle for a job, returning a `ResolvedImage` exactly like
-/// `convert::resolve` does. `image_ref` is what followed `registry/` in MICROVM_IMAGE.
+/// `dockerimg::resolve` does. `image_ref` is what followed `registry/` in MICROVM_IMAGE.
 pub fn resolve(ctx: &JobCtx, image_ref: &str) -> Result<ResolvedImage> {
     let rg = ctx.cfg.registry.as_ref().context(
         "MICROVM_IMAGE uses the registry/ form but the host has no [registry] configured",
@@ -717,7 +717,7 @@ fn sanitize_component(name: &str) -> String {
 /// the future on a dedicated OS thread with its own runtime — a nested
 /// `Runtime::block_on` on the calling thread would panic. A multi-thread runtime
 /// (+ its blocking pool) lets the push fan out chunk compression and uploads.
-fn block_on<F>(fut: F) -> F::Output
+pub(crate) fn block_on<F>(fut: F) -> F::Output
 where
     F: std::future::Future + Send,
     F::Output: Send,
@@ -736,7 +736,7 @@ where
 }
 
 /// Build an oci-client `Client` + `RegistryAuth` from a `[registry]` section, the same
-/// construction `oci.rs` uses for the convert/launch paths (rustls, optional PEM CA,
+/// construction `oci.rs` uses for the docker and launch paths (rustls, optional PEM CA,
 /// Basic vs Anonymous auth).
 fn client(rg: &Registry) -> Result<(oci_client::Client, RegistryAuth)> {
     let mut cfg = ClientConfig::default();
@@ -873,7 +873,7 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
 
     let boot_kind = image::read_boot_kind(dir).with_context(|| {
         format!(
-            "bundle {}: unsupported boot.kind marker — reconvert it",
+            "bundle {}: unsupported boot.kind marker — re-push it",
             dir.display()
         )
     })?;
@@ -977,10 +977,7 @@ async fn resolve_async(
         format!("registry bundle {name}@{digest}: unsupported boot.kind marker — re-push it")
     })?;
     println!("virtkit: image {name}@{digest} (registry bundle, {boot_kind:?})");
-    Ok((
-        image::resolved_from_dir(&rg.generic_kernel, &dir, boot_kind),
-        dir,
-    ))
+    Ok((image::resolved_from_dir(&dir, boot_kind), dir))
 }
 
 /// Pull the manifest + config + every blob into `dir`, under the shared pull lock,
@@ -1257,12 +1254,12 @@ fn bundle_dir(cfg: &Config, name: &str, digest: &str) -> std::path::PathBuf {
 }
 
 /// A cached bundle is present and usable: runner.ext4 plus the boot marker (which
-/// also records how to boot it). Mirrors `convert::bundle_complete`.
+/// also records how to boot it).
 fn bundle_present(dir: &Path) -> bool {
     dir.join("runner.ext4").is_file() && dir.join("boot.kind").is_file()
 }
 
-/// Record the boot flavour in the bundle (the convert path's marker), so a cache
+/// Record the boot flavour in the bundle (the `boot.kind` marker), so a cache
 /// hit knows how to boot it. The string is the one stored in the config blob.
 fn write_boot_kind(dir: &Path, tag: &str) -> Result<()> {
     std::fs::write(dir.join("boot.kind"), tag)

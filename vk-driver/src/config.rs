@@ -31,10 +31,10 @@ pub struct Config {
     /// the IPs it resolved for an allowed name). Empty (the default) = unrestricted
     /// — dev use leaves it empty; CI sets it as the corp egress gate.
     pub egress: Egress,
-    /// On-demand docker-image → bootable-bundle conversion, backing the
+    /// Direct OCI boot of a registry image, backing the
     /// `MICROVM_IMAGE: docker/<name>[:tag|@sha256:…]` form; absent = that
     /// form is rejected
-    pub convert: Option<Convert>,
+    pub docker: Option<Docker>,
     /// Native OCI bundle registry (push/pull with CDC+zstd chunk dedup), backing the
     /// `MICROVM_IMAGE: registry/<name>[:tag|@sha256:…]` form; absent = that form
     /// is rejected
@@ -121,26 +121,13 @@ pub struct Egress {
     pub allow_name: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Local {
     /// Directory of local guest bundles: each `<dir>/<name>/` is a bundle
     /// (`runner.ext4` + `boot.kind` [+ `vmlinuz` + `initrd.img`]). Unset =
     /// `<state_dir>/images` (see `Local::dir`).
     pub dir: Option<PathBuf>,
-    /// Pinned guest kernel for generic (kernel-less) bundles — the shared vmlinux
-    /// with virtio + ext4 built in, booted directly when a bundle ships no kernel.
-    #[serde(default = "default_generic_kernel")]
-    pub generic_kernel: PathBuf,
-}
-
-impl Default for Local {
-    fn default() -> Self {
-        Local {
-            dir: None,
-            generic_kernel: default_generic_kernel(),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,63 +195,33 @@ impl Default for Guest {
     }
 }
 
+/// `[docker]` — boot a registry OCI image directly: the native OCI client fetches it,
+/// the embedded vk-agent is injected as PID 1 and the embedded kernel boots it. Registry
+/// auth mirrors `[registry]`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Convert {
-    /// Registry repository prefix for the docker images — fixed host side on
-    /// purpose: this is the allowlist (jobs only pick name[:ref]),
-    /// e.g. "registry.example.com/team"
+pub struct Docker {
+    /// Registry repository prefix for the images — fixed host side on purpose: this is
+    /// the allowlist (jobs only pick name[:ref]), e.g. "registry.example.com/team"
     pub repo: String,
-    /// docker CLI driving the host daemon (pull + the root conversion
-    /// container; the runner user must be in the docker group)
-    #[serde(default = "default_docker")]
-    pub docker: PathBuf,
-    /// The guest agent (virtkit-agent) injected into the converted rootfs as
-    /// PID 1; staged on the host next to virtkit by the runner provisioning
-    #[serde(default = "default_host_agent")]
-    pub agent: PathBuf,
-    /// ext4 size of the produced rootfs (sparse file)
-    #[serde(default = "default_rootfs_size")]
-    pub rootfs_size: String,
-    /// Pinned guest kernel for generic (kernel-less) OCI images (alpine,
-    /// distroless, …): the pinned vmlinux, with virtio (blk/net/vsock) + ext4
-    /// built in, so such images boot it directly — no per-image kernel, initrd
-    /// or modules.
-    #[serde(default = "default_generic_kernel")]
-    pub generic_kernel: PathBuf,
-    /// tag → digest resolution (same wiring as [registry])
-    #[serde(default = "default_oras")]
-    pub oras: PathBuf,
+    /// PEM CA bundle the registry's TLS cert chains to (rustls). Absent = system roots.
     #[serde(default)]
     pub ca_file: Option<PathBuf>,
-    /// Registry credentials, shared by oras and docker pull (empty username =
-    /// anonymous). The docker daemon must also trust the registry TLS cert
-    /// (/etc/docker/certs.d/<registry>/ca.crt).
+    /// HTTP Basic username. Empty = anonymous.
     #[serde(default)]
     pub username: String,
+    /// Path to a file holding the Basic-auth password (read at runtime, trailing newline
+    /// trimmed; only when `username` is set). Provision out of band, 0600.
     #[serde(default)]
     pub password_file: Option<PathBuf>,
-    /// Cached conversions kept per image
+    /// Plain HTTP registry (a local/insecure registry); default TLS.
+    #[serde(default)]
+    pub insecure: bool,
+    /// Cached image rootfs builds kept per image.
     #[serde(default = "default_keep")]
     pub keep: u32,
 }
 
-fn default_docker() -> PathBuf {
-    "docker".into()
-}
-fn default_host_agent() -> PathBuf {
-    "/usr/local/lib/vk/vk-agent".into()
-}
-fn default_rootfs_size() -> String {
-    "32G".into()
-}
-fn default_generic_kernel() -> PathBuf {
-    "/usr/local/lib/vk/vmlinux".into()
-}
-
-fn default_oras() -> PathBuf {
-    "/usr/local/bin/oras".into()
-}
 fn default_keep() -> u32 {
     3
 }
@@ -303,10 +260,6 @@ pub struct Registry {
     /// either form from the chunk media type regardless.
     #[serde(default)]
     pub transparent_zstd: Option<bool>,
-    /// Pinned guest kernel for generic (kernel-less) bundles — the shared vmlinux
-    /// with virtio + ext4 built in, booted directly when a bundle ships no kernel.
-    #[serde(default = "default_generic_kernel")]
-    pub generic_kernel: PathBuf,
     /// Cached pulled bundles kept per image
     #[serde(default = "default_keep")]
     pub keep: u32,
@@ -328,8 +281,8 @@ impl Registry {
     }
 
     /// Build a `Registry` for the build-sharing path, from the
-    /// CLI flags rather than a config file. `generic_kernel`/`keep` are irrelevant to
-    /// push/pull-by-fingerprint (only `resolve` boots), so they take their defaults.
+    /// CLI flags rather than a config file. `keep` is irrelevant to
+    /// push/pull-by-fingerprint (only `resolve` boots), so it takes its default.
     pub fn for_share(
         repo: String,
         insecure: bool,
@@ -345,7 +298,6 @@ impl Registry {
             password_file,
             insecure,
             transparent_zstd,
-            generic_kernel: default_generic_kernel(),
             keep: default_keep(),
         }
     }

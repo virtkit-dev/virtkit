@@ -4,6 +4,18 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- The GitLab executor's `MICROVM_IMAGE: docker/<name>` now boots the image **directly**:
+  the native OCI client pulls it, the embedded vk-agent is injected as PID 1 and the
+  embedded kernel boots it — the same path `vk run --source oci` uses. Registry auth is a
+  slim `[docker]` section (repo/ca_file/username/password_file/insecure), replacing
+  `[convert]`. Job `.gitlab-ci.yml` files are unchanged (`docker/<ref>` is repurposed).
+- A kernel-less bundle (generic-disk `local`/`registry`/`docker` image) now boots vk's
+  **embedded** kernel instead of a configured `generic_kernel` file, so the host needs no
+  separate `vmlinux`. `generic_kernel` is dropped from `[local]`/`[registry]`, and a bundle
+  that ships its own kernel still boots it.
+
 ## [0.16.0] - 2026-07-15
 
 ### Added
