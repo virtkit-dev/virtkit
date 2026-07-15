@@ -2339,6 +2339,10 @@ pub(crate) async fn boot_session(
     // `RUN --mount=type=bind,from=scratch,rw` targets; its guest device is recorded on the
     // returned `VmSession`. Same ephemeral, caller-owned lifecycle as `tmp_disk`.
     scratch_disk: Option<&Path>,
+    // `Some((kernel, initramfs))` → `FROM --kernel=image`: boot the stage's RUNs on this
+    // extracted image kernel + fullvm preinit initramfs (agent + modules) instead of the
+    // pinned build kernel + the plain agent initramfs. `None` = the normal build boot.
+    image_kernel: Option<(&Path, &Path)>,
     cancel: Option<CancellationToken>,
     timings: &Timings,
 ) -> Result<VmSession> {
@@ -2352,7 +2356,11 @@ pub(crate) async fn boot_session(
     // (which inherits the fd via pass_fds below) has spawned, i.e. past spawn_vmm.
     let mut pass_fds: Vec<i32> = Vec::new();
     let mut _cpio: Option<crate::scratch::ScratchFile> = None;
-    let cpio = if crate::vmm::libkrun_selected() {
+    let cpio = if let Some((_, initramfs)) = image_kernel {
+        // --kernel=image: fullvm already built the preinit initramfs (agent as /init +
+        // the boot-critical modules) from the image; use it as-is.
+        initramfs.to_path_buf()
+    } else if crate::vmm::libkrun_selected() {
         let s = crate::scratch::scratch(&work, "initramfs.cpio")?;
         let path = s.path.clone();
         pass_fds.push(s.fd());
@@ -2361,9 +2369,11 @@ pub(crate) async fn boot_session(
     } else {
         work.join("initramfs.cpio")
     };
-    let t_ir = Instant::now();
-    crate::initramfs::build_agent_initramfs(agent, &cpio)?;
-    timings.probe("boot.initramfs", t_ir.elapsed());
+    if image_kernel.is_none() {
+        let t_ir = Instant::now();
+        crate::initramfs::build_agent_initramfs(agent, &cpio)?;
+        timings.probe("boot.initramfs", t_ir.elapsed());
+    }
     // Boot the stage's rw qcow2 image directly: it is a CoW overlay over its backing (the
     // base ext4 or the parent stage), so the guest's writes accumulate into it and it
     // becomes the stage's result — no separate boot overlay, no commit. (A raw-rw disk
@@ -2432,6 +2442,11 @@ pub(crate) async fn boot_session(
     if let Some(dev) = &tmp_dev {
         cmdline.push_str(&format!(" VIRTKIT_TMP_DEV=/dev/{dev}"));
     }
+    // --kernel=image: a modular image kernel has no early hvc0 (console stays on ttyS0)
+    // and the preinit reads this to insmod the ride-along modules before the pivot.
+    if image_kernel.is_some() {
+        cmdline.push_str(" VIRTKIT_KERNEL=image");
+    }
     let vsock = work.join("vsock.sock");
     let console = work.join("console.log");
 
@@ -2480,8 +2495,10 @@ pub(crate) async fn boot_session(
         vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, NET_VSOCK_PORT));
     }
     // virtio-fs (the context share) requires shared guest memory (shared_mem).
+    // --kernel=image boots the extracted image kernel; otherwise the pinned build kernel.
+    let boot_kernel = image_kernel.map(|(k, _)| k).unwrap_or(kernel);
     let spec = crate::vmm::VmSpec {
-        kernel: kernel.to_path_buf(),
+        kernel: boot_kernel.to_path_buf(),
         cmdline,
         disks,
         initramfs: Some(cpio),
@@ -3060,10 +3077,11 @@ mod tests {
                 "1G",
                 120,
                 &[data],
-                None,
-                None,
-                None,
-                None,
+                None, // context
+                None, // tmp_disk
+                None, // scratch_disk
+                None, // image_kernel (--kernel=image)
+                None, // cancel
                 &Timings::new(),
             )
             .await

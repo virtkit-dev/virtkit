@@ -6,6 +6,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- `vk build`: `FROM --kernel=image <base>` runs that stage's RUN steps on the base image's
+  own kernel (the preinit boot `vk run --kernel image` uses) instead of vk's minimal
+  embedded build kernel — so a RUN can partition disks, `mkfs.btrfs`, use device-mapper,
+  etc. The base must already carry a kernel (install it in a prior stage and `FROM` it);
+  toggling the flag busts the stage's cache.
 - `vk run --disk HOST[:ro]` (repeatable) attaches a raw host disk image to the guest as
   a block device, ordered after any rootfs disk. The guest reads/writes it directly — no
   virtiofs — so it can partition, mkfs and install into a disk image, e.g. assemble a

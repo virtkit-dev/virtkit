@@ -35,6 +35,10 @@ pub struct Stage {
     pub index: usize,
     pub name: Option<String>,
     pub base: Base,
+    /// `FROM --kernel=image`: run this stage's RUN steps on the kernel from its base
+    /// image (the preinit boot), not vk's embedded build kernel. The base must carry a
+    /// kernel (build one in a prior stage and `FROM` it).
+    pub image_kernel: bool,
     /// Instructions after the `FROM`, in order (the `FROM` itself excluded).
     pub instructions: Vec<Instruction>,
     /// Build-context root the stage's `COPY` (no `--from`) resolves against — the
@@ -133,6 +137,7 @@ impl Plan {
                             index,
                             name: f.as_name.clone(),
                             base: Base::Scratch, // placeholder until pass 2
+                            image_kernel: f.image_kernel,
                             instructions: Vec::new(),
                             context: input.context.clone(),
                         });

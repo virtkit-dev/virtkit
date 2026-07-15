@@ -45,6 +45,10 @@ pub struct From {
     pub image: String,
     pub as_name: Option<String>,
     pub platform: Option<String>,
+    /// `FROM --kernel=image`: run this stage's RUN steps on the kernel in its base image
+    /// (the preinit boot `vk run --kernel image` uses), not vk's embedded build kernel — so
+    /// a RUN can partition disks, mkfs.btrfs, etc. The base must already carry a kernel.
+    pub image_kernel: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -222,9 +226,15 @@ fn parse_instruction(line: &str) -> Result<Instruction> {
 fn parse_from(rest: &str) -> Result<From> {
     let (flags, words) = split_flags(rest);
     let mut platform = None;
+    // `--kernel=image`: run this stage's RUNs on the base image's own kernel (the preinit
+    // boot). Mirrors the `vk run --kernel image` CLI. Only `image` is accepted for now.
+    let mut image_kernel = false;
     for (k, v) in flags {
-        if k == "platform" {
-            platform = Some(v);
+        match k.as_str() {
+            "platform" => platform = Some(v),
+            "kernel" if v.eq_ignore_ascii_case("image") => image_kernel = true,
+            "kernel" => bail!("FROM --kernel: expected `image`, got {v:?}"),
+            _ => {} // ignore unknown FROM flags, as before
         }
     }
     // <image> [AS <name>]
@@ -243,6 +253,7 @@ fn parse_from(rest: &str) -> Result<From> {
         image,
         as_name,
         platform,
+        image_kernel,
     })
 }
 
@@ -491,6 +502,7 @@ mod tests {
                 image: "debian".into(),
                 as_name: Some("base".into()),
                 platform: None,
+                image_kernel: false,
             })
         );
         assert_eq!(
@@ -498,9 +510,38 @@ mod tests {
             Instruction::From(From {
                 image: "base".into(),
                 as_name: None,
-                platform: None
+                platform: None,
+                image_kernel: false,
             })
         );
+    }
+
+    #[test]
+    fn from_kernel_image_flag() {
+        let df = parse("FROM --kernel=image base AS disk\n").unwrap();
+        assert_eq!(
+            df.instructions[0],
+            Instruction::From(From {
+                image: "base".into(),
+                as_name: Some("disk".into()),
+                platform: None,
+                image_kernel: true,
+            })
+        );
+        // without AS, and composing with --platform
+        let df = parse("FROM --platform=linux/amd64 --kernel=image base\n").unwrap();
+        let Instruction::From(f) = &df.instructions[0] else {
+            panic!("expected FROM");
+        };
+        assert!(f.image_kernel && f.as_name.is_none() && f.platform.is_some());
+        // default: no flag → embedded kernel
+        let df = parse("FROM base AS x\n").unwrap();
+        let Instruction::From(f) = &df.instructions[0] else {
+            panic!("expected FROM");
+        };
+        assert!(!f.image_kernel);
+        // a bad --kernel value is an error
+        assert!(parse("FROM --kernel=host base\n").is_err());
     }
 
     #[test]

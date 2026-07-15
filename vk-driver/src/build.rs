@@ -1006,6 +1006,12 @@ fn resolve_stages(
                 .map(|r| r.final_key.clone())
                 .context("internal: parent stage resolved out of order")?,
         };
+        // The kernel a stage's RUNs run under is part of its identity: `FROM --kernel=image`
+        // can produce different bytes (a RUN partitions/mkfs on a full kernel) than the
+        // embedded build kernel, so fold it into the key to bust the cache when toggled.
+        if stage.image_kernel {
+            key = hash_key(&format!("{key}\nKERNEL=image"));
+        }
         // Seed the shell state: a stage inherits its base — a prior stage's final
         // state, or (for FROM <image>) the image config's ENV/USER/WORKDIR/
         // ENTRYPOINT/CMD — so RUNs get the base PATH etc. and the runtime config
@@ -1503,6 +1509,8 @@ fn build_stage(
         &stage_source_rootfs(plan, &stage.instructions, committed),
         &stage.context,
     )?;
+    // `FROM --kernel=image`: this stage's RUNs boot on the base image's own kernel.
+    ex.stage_kernel(stage.image_kernel);
     // Instruction-level cache + lazy base: every step carries the chained key; the base
     // rootfs is materialized only when something must actually run (the first cache
     // miss). A fully-cached prefix never pulls/flattens the base. `fs` is None until
@@ -3464,6 +3472,24 @@ RUN ship
         let (lib2, app2) = keys(&a.replace("RUN one", "RUN two"));
         assert_ne!(lib1, lib2);
         assert_eq!(app1, app2);
+    }
+
+    #[test]
+    fn kernel_image_flag_changes_stage_key() {
+        // Toggling `FROM --kernel=image` must bust the cache: a RUN can produce different
+        // bytes under the image's own kernel than under the embedded build kernel.
+        let ba = Vars::new();
+        let key = |src: &str| {
+            let plan = plan_one(src, &ba);
+            let order = plan.all_order().unwrap();
+            let mut ex = DryRun::new();
+            resolve_stages(&plan, &order, &ba, &mut ex, None).unwrap()[&0]
+                .final_key
+                .clone()
+        };
+        let plain = key("FROM alpine AS x\nRUN one\n");
+        let imgk = key("FROM --kernel=image alpine AS x\nRUN one\n");
+        assert_ne!(plain, imgk);
     }
 
     #[test]

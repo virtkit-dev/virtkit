@@ -148,6 +148,11 @@ pub trait Executor {
     /// is interrupted when another stage fails. Default: ignored — only the microVM
     /// backend boots guests that a cancellation can interrupt.
     fn set_cancel(&mut self, _cancel: CancellationToken) {}
+
+    /// Declare whether this stage runs its RUNs on the base image's own kernel
+    /// (`FROM --kernel=image`) rather than vk's embedded build kernel. Called at stage
+    /// begin, before the first boot. Default: ignored — only the microVM backend boots.
+    fn stage_kernel(&mut self, _image_kernel: bool) {}
 }
 
 /// Records every primitive without doing anything — drives the whole pipeline on any
@@ -339,6 +344,13 @@ pub struct MicroVm {
     /// the current stage's long-lived guest (booted on its first RUN, reused for the
     /// rest, committed + torn down by `stage_end`). `None` between stages.
     session: Option<crate::run::VmSession>,
+    /// `FROM --kernel=image`: the current stage runs its RUNs on the base image's own
+    /// kernel, not vk's embedded build kernel. Set by `stage_kernel`, cleared at `stage_end`.
+    stage_image_kernel: bool,
+    /// The (kernel, preinit initramfs) extracted from a `--kernel=image` stage's rootfs,
+    /// prepared once at its first boot (flatten the rootfs to raw + `fullvm::prepare`) and
+    /// reused across the stage's reboots. Cleared at `stage_end`.
+    image_kernel_boot: Option<crate::fullvm::FullVmBoot>,
     /// cache key of the last snapshot saved/restored in this stage — the parent a diff
     /// push re-chunks against (only its dirty clusters). Seeded from the base image on
     /// `from_image`; `None` means a full push (no known parent chunks).
@@ -845,6 +857,8 @@ impl MicroVm {
             cache,
             images: Arc::new(Mutex::new(HashMap::new())),
             session: None,
+            stage_image_kernel: false,
+            image_kernel_boot: None,
             parent_key: None,
             parent_digest: None,
             journal,
@@ -904,6 +918,8 @@ impl MicroVm {
             timings: Arc::clone(&self.timings),
             net: self.net.clone(),
             session: None,
+            stage_image_kernel: false,
+            image_kernel_boot: None,
             parent_key: None,
             parent_digest: None,
             sources: Vec::new(),
@@ -1023,6 +1039,42 @@ impl MicroVm {
             None
         };
         let source_paths: Vec<PathBuf> = subset.iter().map(|(_, path)| path.clone()).collect();
+        // `FROM --kernel=image`: boot this stage's RUNs on the base image's own kernel.
+        // Extract it once (flatten the stage rootfs to raw so fullvm can read the ext4,
+        // then fullvm::prepare) and reuse the (kernel, preinit initramfs) across reboots.
+        if self.stage_image_kernel && self.image_kernel_boot.is_none() {
+            let work = self.scratch.join(format!(
+                "imgkernel-{}",
+                fs.label.replace(['/', '\\', ':'], "_")
+            ));
+            std::fs::create_dir_all(&work)?;
+            let raw = work.join("rootfs.raw");
+            crate::qcow2::flatten_to_raw(&ext4, &raw).with_context(|| {
+                format!(
+                    "--kernel=image: flattening {} to read its kernel",
+                    ext4.display()
+                )
+            })?;
+            let boot = crate::fullvm::prepare(
+                &raw,
+                &self.agent,
+                &work.join("vmlinuz"),
+                &work.join("initramfs.cpio"),
+                None,
+                &crate::run::KernelSource::Image,
+                &self.kernel,
+            )
+            .context(
+                "--kernel=image: extracting the base image's kernel — the base must install \
+                 a kernel (e.g. in a prior stage)",
+            )?;
+            let _ = std::fs::remove_file(&raw);
+            self.image_kernel_boot = Some(boot);
+        }
+        let image_kernel = self
+            .image_kernel_boot
+            .as_ref()
+            .map(|b| (b.kernel.as_path(), b.initramfs.as_path()));
         let s = block_on(crate::run::boot_session(
             &self.cloud_hypervisor,
             &self.kernel,
@@ -1036,6 +1088,7 @@ impl MicroVm {
             Some(&context),
             tmp_disk.as_deref(),
             scratch_disk.as_deref(),
+            image_kernel,
             self.cancel.clone(),
             &self.timings,
         ))?;
@@ -2170,6 +2223,12 @@ impl Executor for MicroVm {
         self.sources.clear();
         self.source_dev.clear();
         self.context = None;
+        // Drop the per-stage image-kernel selection and its extracted boot scratch.
+        self.stage_image_kernel = false;
+        if let Some(boot) = self.image_kernel_boot.take() {
+            let _ = std::fs::remove_file(&boot.kernel);
+            let _ = std::fs::remove_file(&boot.initramfs);
+        }
         Ok(())
     }
 
@@ -2178,6 +2237,14 @@ impl Executor for MicroVm {
     }
     fn set_cancel(&mut self, cancel: CancellationToken) {
         self.cancel = Some(cancel);
+    }
+    fn stage_kernel(&mut self, image_kernel: bool) {
+        self.stage_image_kernel = image_kernel;
+        // A stale extraction from a prior stage on this worker must never leak in.
+        if let Some(boot) = self.image_kernel_boot.take() {
+            let _ = std::fs::remove_file(&boot.kernel);
+            let _ = std::fs::remove_file(&boot.initramfs);
+        }
     }
 }
 
