@@ -146,6 +146,12 @@ pub struct Options {
     pub contexts: Vec<PathBuf>,
     /// ext4 output path (unused in `--print-plan`).
     pub out: Option<PathBuf>,
+    /// `--disk <path>`: a caller-owned raw disk file attached read-write to the *target*
+    /// stage's RUN guests as `/dev/vdb` (sources shift to `vdc`+). Its writes are the
+    /// artifact — a RUN can partition it, mkfs and install a bootloader. Not snapshotted
+    /// and never removed (the caller sizes and owns it). Pairs with `FROM --kernel=image`,
+    /// which gives the RUNs a kernel that can drive block devices.
+    pub out_disk: Option<PathBuf>,
     /// Parse + plan + print the build order and primitives, build nothing.
     pub print_plan: bool,
     /// cloud-hypervisor binary, only used when `VIRTKIT_VMM=cloud-hypervisor` selects
@@ -535,17 +541,20 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     // target as an ext4 (via virtkit's own builder — no docker/buildkit/mke2fs). The host
     // backend (tests only) handles just FROM scratch + COPY and errors on RUN / FROM
     // <image>; the microVM backend handles the full shape.
-    let out = opts
-        .out
-        .as_deref()
-        .context("build needs --out <file> (or --print-plan)")?;
+    // `--out` exports the target stage's rootfs ext4; `--disk` writes the artifact into a
+    // caller-owned disk during the build. At least one is required (or --print-plan). With
+    // only `--disk`, the disk is the sole output and no rootfs ext4 is exported.
+    let out = opts.out.as_deref();
+    let anchor = out
+        .or(opts.out_disk.as_deref())
+        .context("build needs --out <file> or --disk <file> (or --print-plan)")?;
     // Scratch placement + naming: see [`build_scratch`]. Keyed by pid + an in-process
     // counter, so two builds in one process (e.g. `run --compose` materializing several
     // services, or parallel tests) never share — the first one's cleanup would otherwise
     // delete the second's scratch.
     static BUILD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let scratch = build_scratch(out, seq)?;
+    let scratch = build_scratch(anchor, seq)?;
     // Self-heal: a build normally removes its scratch on exit (even on error), but a hard
     // kill (SIGKILL/OOM/Ctrl-C/panic) orphans it. Before starting, drop any sibling
     // scratch whose owning process is gone, so crashed runs don't accumulate.
@@ -581,6 +590,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
                 jobs,
                 opts.require_cached,
                 opts.build_cache,
+                opts.out_disk.as_deref(),
                 &progress,
                 &timings,
             )?;
@@ -604,18 +614,22 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
         let fs = committed
             .get(&target)
             .context("internal: target stage not committed")?;
-        progress.export_start(0);
-        let t_export = Instant::now();
-        ex.export_ext4(fs, out)?;
-        timings.record(Phase::Export, "", t_export.elapsed());
-        progress.export_done(0);
         let st = states.get(&target).cloned().unwrap_or_default();
         let config = run_config(&st);
-        // The sidecar persists the config the image itself deliberately does not
-        // carry (clean-image model: config is supplied at boot, never baked in).
-        let sidecar = config_sidecar(out);
-        std::fs::write(&sidecar, serde_json::to_vec_pretty(&config)?)
-            .with_context(|| format!("writing {}", sidecar.display()))?;
+        // Export the target's rootfs ext4 only when --out is given; a --disk-only build
+        // has already written its artifact into the caller's disk during the RUNs.
+        if let Some(out) = out {
+            progress.export_start(0);
+            let t_export = Instant::now();
+            ex.export_ext4(fs, out)?;
+            timings.record(Phase::Export, "", t_export.elapsed());
+            progress.export_done(0);
+            // The sidecar persists the config the image itself deliberately does not
+            // carry (clean-image model: config is supplied at boot, never baked in).
+            let sidecar = config_sidecar(out);
+            std::fs::write(&sidecar, serde_json::to_vec_pretty(&config)?)
+                .with_context(|| format!("writing {}", sidecar.display()))?;
+        }
         Ok(Built { config })
     })();
     // Leave the final dashboard frame on screen (FINISHED/FAILED) before any teardown log.
@@ -623,15 +637,18 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     timings.render();
     let _ = std::fs::remove_dir_all(&scratch); // best-effort scratch cleanup
     let built = result?;
-    println!(
-        "virtkit: built {} -> {}",
-        inputs
-            .iter()
-            .map(|i| i.origin.display().to_string())
-            .collect::<Vec<_>>()
-            .join(" + "),
-        out.display()
-    );
+    let srcs = inputs
+        .iter()
+        .map(|i| i.origin.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" + ");
+    match out {
+        Some(out) => println!("virtkit: built {srcs} -> {}", out.display()),
+        None => println!(
+            "virtkit: built {srcs} -> disk {}",
+            opts.out_disk.as_deref().unwrap().display()
+        ),
+    }
     Ok(built)
 }
 
@@ -1829,6 +1846,7 @@ fn drive_microvm(
     jobs: usize,
     require_cached: bool,
     cache: BuildCache,
+    out_disk: Option<&Path>,
     progress: &Arc<Progress>,
     timings: &Arc<Timings>,
 ) -> Result<(HashMap<usize, Rootfs>, HashMap<usize, ShellState>)> {
@@ -1838,6 +1856,22 @@ fn drive_microvm(
     // Single-target driver: the target is the order's last stage.
     let targets = [*order.last().context("internal: empty build order")?];
     let resolved = resolve_all(plan, order, build_args, &mut probe, &targets)?;
+    // `vk build --disk`: the target stage writes the caller's disk as an external side
+    // effect the instruction cache does not capture, so it must never be served from
+    // cache — a restore would skip the disk-writing RUNs and leave the disk untouched.
+    // Mark its instruction keys non-cacheable; the probe (below) then keeps it out of
+    // `cached_final` (deps still get pulled into `needed`), and the target worker refuses
+    // to restore/save them, so its RUNs always run. Everything else caches normally.
+    let uncacheable: std::collections::HashSet<String> = out_disk
+        .map(|_| {
+            resolved[&targets[0]]
+                .steps
+                .iter()
+                .map(|s| s.key.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    probe.set_uncacheable(uncacheable.clone());
     let (needed, cached_final) =
         compute_needed(plan, order, &resolved, &mut probe, require_cached, &targets)?;
     drop(probe);
@@ -1872,6 +1906,13 @@ fn drive_microvm(
         // A fresh per-stage worker: its own guest + cache-push state, sharing only the
         // committed-image maps with `base`.
         let mut ex = base.worker();
+        // `vk build --disk`: on the target stage's worker only, attach the caller's disk
+        // (so exactly one stage writes it — no concurrent rw sharing) and mark its
+        // instruction keys non-cacheable so its RUNs always run.
+        if idx == targets[0] {
+            ex.set_out_disk(out_disk.map(Path::to_path_buf));
+            ex.set_uncacheable(uncacheable.clone());
+        }
         build_stage(
             plan,
             &resolved,
@@ -3562,6 +3603,7 @@ ENTRYPOINT run me
             target: None,
             contexts: vec![],
             out: Some(out),
+            out_disk: None,
             print_plan: false,
             cloud_hypervisor: None,
             kernel: None,
@@ -3620,6 +3662,7 @@ ENTRYPOINT run me
             target: None,
             contexts: vec![],
             out: Some(out.clone()),
+            out_disk: None,
             print_plan: false,
             cloud_hypervisor: None,
             kernel: None,
@@ -3827,6 +3870,7 @@ RUN ship
             target: None,
             contexts: vec![],
             out: None,
+            out_disk: None,
             print_plan: false,
             cloud_hypervisor: None,
             kernel: None,

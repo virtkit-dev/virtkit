@@ -95,6 +95,7 @@ pub fn ensure_unit_build(
         target: target.map(String::from),
         contexts: recipe.contexts.clone(),
         out: Some(out.to_path_buf()),
+        out_disk: None,
         print_plan: false,
         cloud_hypervisor: recipe.cloud_hypervisor.clone(),
         kernel: recipe.kernel.clone(),

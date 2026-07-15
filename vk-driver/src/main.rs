@@ -273,6 +273,13 @@ enum Cmd {
         /// ext4 output path
         #[arg(long)]
         out: Option<PathBuf>,
+        /// attach this caller-owned raw disk file read-write to the target stage's RUN
+        /// guests as /dev/vdb (sources shift to vdc+). Its writes are the artifact — a RUN
+        /// can partition it, mkfs and install a bootloader. Size + own the file yourself
+        /// (e.g. `qemu-img create -f raw disk.raw 12G`); vk never creates or removes it.
+        /// Pairs with `FROM --kernel=image` for a kernel that can drive the disk.
+        #[arg(long = "disk", value_name = "PATH")]
+        disk: Option<PathBuf>,
         /// parse + plan + print the build order and primitives; build nothing
         #[arg(long = "print-plan")]
         print_plan: bool,
@@ -1253,6 +1260,7 @@ async fn cli_main() -> ExitCode {
         primary,
         context,
         out,
+        disk,
         print_plan,
         cloud_hypervisor,
         kernel,
@@ -1295,6 +1303,21 @@ async fn cli_main() -> ExitCode {
         // cloud_hypervisor for the build guest's VMM). bool flags are opt-in, so a set
         // flag or a config `true` enables them.
         let b = &cfg.build;
+        // Canonicalize --disk like `vk run --disk` (run.rs), so a relative path resolves
+        // against the caller's cwd and a missing/inaccessible file fails clearly up front
+        // rather than as a cryptic VMM boot error mid-build. vk never creates the file.
+        let out_disk = match disk {
+            Some(p) => match std::fs::canonicalize(p) {
+                Ok(abs) => Some(abs),
+                Err(e) => {
+                    return fail(
+                        &anyhow::anyhow!("--disk {}: cannot access: {e}", p.display()),
+                        1,
+                    );
+                }
+            },
+            None => None,
+        };
         let opts = build::Options {
             dockerfiles: file.clone(),
             // build_units (the multi-target / --compose path) reads targets from its units;
@@ -1302,6 +1325,7 @@ async fn cli_main() -> ExitCode {
             target: target.first().cloned(),
             contexts: context.clone(),
             out: out.clone(),
+            out_disk,
             print_plan: *print_plan,
             cloud_hypervisor: cloud_hypervisor
                 .clone()

@@ -532,6 +532,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             target: args.target.clone(),
             contexts: args.contexts.clone(),
             out: Some(out.clone()),
+            out_disk: None,
             print_plan: false,
             cloud_hypervisor: Some(args.cloud_hypervisor.clone()),
             kernel: Some(kernel.to_path_buf()),
@@ -1641,6 +1642,7 @@ pub(crate) fn service_build_options(
         target: None,
         contexts: Vec::new(),
         out: None,
+        out_disk: None,
         print_plan: false,
         cloud_hypervisor: Some(args.cloud_hypervisor.clone()),
         kernel: Some(kernel.to_path_buf()),
@@ -2343,6 +2345,10 @@ pub(crate) async fn boot_session(
     // extracted image kernel + fullvm preinit initramfs (agent + modules) instead of the
     // pinned build kernel + the plain agent initramfs. `None` = the normal build boot.
     image_kernel: Option<(&Path, &Path)>,
+    // `Some(path)` → `vk build --disk`: attach this caller-owned raw disk read-write right
+    // after the rootfs, so it is always `/dev/vdb` for the stage's RUNs (sources follow at
+    // `vdc`+). Not snapshotted; the caller owns its lifecycle.
+    out_disk: Option<&Path>,
     cancel: Option<CancellationToken>,
     timings: &Timings,
 ) -> Result<VmSession> {
@@ -2390,6 +2396,12 @@ pub(crate) async fn boot_session(
         None => crate::vmm::Disk::overlay(image.to_path_buf()),
     };
     let mut disks: Vec<crate::vmm::Disk> = vec![overlay];
+    // `vk build --disk`: the caller-owned target disk, attached read-write immediately after
+    // the rootfs so it is always /dev/vdb for the stage's RUNs (before the sources below).
+    // Raw + not snapshotted; the RUNs' writes to it are the build artifact.
+    if let Some(p) = out_disk {
+        disks.push(crate::vmm::Disk::raw(p.to_path_buf(), false));
+    }
     // Source stages for COPY --from / RUN --mount=from, attached read-only as the next
     // virtio-blk disks (vdb, vdc, … in order) for the guest to mount and read. A forked
     // source is a qcow2 over its parent (its backing chain is resolved); a base source is
@@ -3081,6 +3093,7 @@ mod tests {
                 None, // tmp_disk
                 None, // scratch_disk
                 None, // image_kernel (--kernel=image)
+                None, // out_disk (--disk)
                 None, // cancel
                 &Timings::new(),
             )

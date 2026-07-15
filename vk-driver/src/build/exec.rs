@@ -351,6 +351,14 @@ pub struct MicroVm {
     /// prepared once at its first boot (flatten the rootfs to raw + `fullvm::prepare`) and
     /// reused across the stage's reboots. Cleared at `stage_end`.
     image_kernel_boot: Option<crate::fullvm::FullVmBoot>,
+    /// `vk build --disk`: a caller-owned raw disk attached rw as `/dev/vdb` to this
+    /// worker's RUN guests (set only on the target stage's worker). Its writes are the
+    /// build artifact; never snapshotted, created, or removed by vk.
+    out_disk: Option<PathBuf>,
+    /// Instruction keys this worker must never restore from or save to the cache — the
+    /// `--disk` target stage's steps, whose disk output the cache does not capture. Empty
+    /// for every normal stage. See [`MicroVm::set_uncacheable`].
+    uncacheable_keys: std::collections::HashSet<String>,
     /// cache key of the last snapshot saved/restored in this stage — the parent a diff
     /// push re-chunks against (only its dirty clusters). Seeded from the base image on
     /// `from_image`; `None` means a full push (no known parent chunks).
@@ -687,6 +695,14 @@ pub(crate) fn vd_name(n: usize) -> String {
     format!("vd{s}")
 }
 
+/// `/dev` path for the `index`-th source disk. Sources follow the rootfs (`vda`), so they
+/// start at `vdb`; with `vk build --disk` the caller's target disk takes `vdb` and sources
+/// shift one later to `vdc+`. Must stay in step with `boot_session`'s disk ordering.
+fn source_dev_path(index: usize, has_out_disk: bool) -> String {
+    let src_base = 1 + has_out_disk as usize;
+    format!("/dev/{}", vd_name(index + src_base))
+}
+
 /// Cache repo (under the registry's repo prefix) holding the instruction snapshots.
 const CACHE_REPO: &str = "dfcache";
 
@@ -859,6 +875,8 @@ impl MicroVm {
             session: None,
             stage_image_kernel: false,
             image_kernel_boot: None,
+            out_disk: None,
+            uncacheable_keys: std::collections::HashSet::new(),
             parent_key: None,
             parent_digest: None,
             journal,
@@ -883,6 +901,20 @@ impl MicroVm {
             stage_prev_extents: HashMap::new(),
             dirty_carry: HashMap::new(),
         }
+    }
+
+    /// Attach a caller-owned raw disk as `/dev/vdb` to this worker's RUN guests
+    /// (`vk build --disk`). The driver calls this only on the target stage's worker, so
+    /// exactly one stage writes the disk (no concurrent rw sharing).
+    pub fn set_out_disk(&mut self, path: Option<PathBuf>) {
+        self.out_disk = path;
+    }
+
+    /// Mark these instruction keys non-cacheable (never restored or saved) — the
+    /// `--disk` target stage's steps, so its disk-writing RUNs always run. The driver
+    /// sets this on the cache probe and the target stage's worker.
+    pub fn set_uncacheable(&mut self, keys: std::collections::HashSet<String>) {
+        self.uncacheable_keys = keys;
     }
 
     /// Memory each stage guest reserves, in MiB — the parallel driver divides available
@@ -920,6 +952,10 @@ impl MicroVm {
             session: None,
             stage_image_kernel: false,
             image_kernel_boot: None,
+            // Set by the driver on the target stage's worker only (`set_out_disk` /
+            // `set_uncacheable`); a fresh worker inherits neither.
+            out_disk: None,
+            uncacheable_keys: std::collections::HashSet::new(),
             parent_key: None,
             parent_digest: None,
             sources: Vec::new(),
@@ -974,7 +1010,11 @@ impl MicroVm {
         // budget; a boot carrying *both* disks costs one extra, so drop the source budget then.
         let want_tmp = self.tmp_disk_enabled;
         let want_scratch = needs_scratch || self.scratch_disk.is_some();
-        let extra = (want_tmp as usize + want_scratch as usize).saturating_sub(1);
+        // `vk build --disk` attaches one more rw device (the target disk at /dev/vdb), so it
+        // costs a source slot too. One scratch slot is already in the source budget.
+        let want_out_disk = self.out_disk.is_some();
+        let extra =
+            (want_tmp as usize + want_scratch as usize + want_out_disk as usize).saturating_sub(1);
         let max_sources = MAX_SOURCE_DISKS - extra;
 
         let subset = select_source_batch(&self.sources, needed, &fs.label, max_sources)?;
@@ -1089,13 +1129,15 @@ impl MicroVm {
             tmp_disk.as_deref(),
             scratch_disk.as_deref(),
             image_kernel,
+            self.out_disk.as_deref(),
             self.cancel.clone(),
             &self.timings,
         ))?;
+        let has_out_disk = self.out_disk.is_some();
         self.source_dev = subset
             .iter()
             .enumerate()
-            .map(|(i, (label, _))| (label.clone(), format!("/dev/{}", vd_name(i + 1))))
+            .map(|(i, (label, _))| (label.clone(), source_dev_path(i, has_out_disk)))
             .collect();
         self.session = Some(s);
         Ok(())
@@ -1920,6 +1962,12 @@ impl Executor for MicroVm {
     }
 
     fn cache_has(&mut self, key: &str) -> bool {
+        // Keys marked non-cacheable (a `vk build --disk` stage, whose disk output is an
+        // external side effect the cache does not capture) never hit — restoring would
+        // skip the disk-writing RUNs.
+        if self.uncacheable_keys.contains(key) {
+            return false;
+        }
         match &self.cache {
             Some(rg) => crate::registry::exists(rg, CACHE_REPO, key),
             None => false,
@@ -1946,6 +1994,11 @@ impl Executor for MicroVm {
         Ok(())
     }
     fn cache_save(&mut self, fs: &Rootfs, key: &str) -> Result<()> {
+        // Don't cache a non-cacheable key (a `--disk` stage): a later build restoring it
+        // would skip the disk-writing RUNs.
+        if self.uncacheable_keys.contains(key) {
+            return Ok(());
+        }
         let Some(rg) = self.cache.clone() else {
             return Ok(());
         };
@@ -2421,6 +2474,16 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_dev_shifts_to_vdc_with_out_disk() {
+        // No --disk: rootfs is vda, sources start at vdb.
+        assert_eq!(source_dev_path(0, false), "/dev/vdb");
+        assert_eq!(source_dev_path(1, false), "/dev/vdc");
+        // --disk: the target disk takes vdb, so sources shift one later to vdc+.
+        assert_eq!(source_dev_path(0, true), "/dev/vdc");
+        assert_eq!(source_dev_path(1, true), "/dev/vdd");
+    }
 
     #[test]
     fn coalesce_merges_touching_and_overlapping() {

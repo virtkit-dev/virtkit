@@ -6,6 +6,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- `vk build --disk <path>` attaches a caller-owned raw disk read-write to the target
+  stage's RUN guests as `/dev/vdb` (sources shift to `vdc`+); its writes are the artifact,
+  so a RUN can partition it, mkfs and install a bootloader. Pairs with `FROM --kernel=image`
+  (a kernel that can drive block devices). `--out` is optional when `--disk` is given — the
+  disk is then the sole output, no rootfs ext4 is exported.
 - `vk build`: `FROM --kernel=image <base>` runs that stage's RUN steps on the base image's
   own kernel (the preinit boot `vk run --kernel image` uses) instead of vk's minimal
   embedded build kernel — so a RUN can partition disks, `mkfs.btrfs`, use device-mapper,
