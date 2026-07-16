@@ -102,9 +102,9 @@ pub struct RunArgs {
     /// Instruction cache for a Dockerfile boot: each stage's ext4 is pushed/pulled by
     /// its content key, so a repeat boot restores instead of rebuilding. A registry
     /// repo, an absolute store directory path, or `none` to disable; `None` = the
-    /// builtin local store (`regserve::default_root`).
+    /// builtin local store (`vk_registry::default_root`).
     pub cache_registry: Option<String>,
-    /// the cache registry speaks plain HTTP (a loopback regserve).
+    /// the cache registry speaks plain HTTP (a loopback vk-registry).
     pub cache_insecure: bool,
     /// `--build-arg NAME=VALUE` overrides for the Dockerfile build.
     pub build_args: Vec<(String, String)>,

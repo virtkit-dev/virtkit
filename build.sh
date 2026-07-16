@@ -158,7 +158,9 @@ if [ -e "$OUT/vmlinux" ]; then
 else
   echo "warning: $OUT/vmlinux not found — building vk without an embedded kernel (run ./build-kernel.sh first)" >&2
 fi
-BUILD_CMD="cargo build $CARGO_PROFILE_FLAG -p vk-agent && env $EMBED_ENV cargo build $CARGO_PROFILE_FLAG -p vk-driver"
+# vk-registry is the standalone central-server binary; it embeds nothing, so it builds
+# plainly (no EMBED_ENV) alongside vk.
+BUILD_CMD="cargo build $CARGO_PROFILE_FLAG -p vk-agent && env $EMBED_ENV cargo build $CARGO_PROFILE_FLAG -p vk-driver && cargo build $CARGO_PROFILE_FLAG -p vk-registry"
 
 compile_start=$SECONDS
 if [ -n "$VK_BIN" ]; then
@@ -229,15 +231,15 @@ mkdir -p "$OUT"
 # Replace atomically (write a temp, then rename): a plain cp truncates the destination and
 # would fail "Text file busy" if the old $OUT/vk is still being executed (e.g. by a
 # previous --use-virtkit / --bootstrap-check run); rename never does.
-for b in vk vk-agent; do
+for b in vk vk-agent vk-registry; do
   cp "target/$TARGET/$PROFILE_DIR/$b" "$OUT/.$b.tmp"
   mv -f "$OUT/.$b.tmp" "$OUT/$b"
 done
 
 # Reproducibility manifest: the pinned inputs and the artifact hashes. Anyone can
 # rebuild from the same commit + inputs and confirm byte-for-byte:
-#   git checkout <git_commit> && ./build.sh && sha256sum -c dist/vk.sha256 dist/vk-agent.sha256
-( cd "$OUT" && sha256sum vk > vk.sha256 && sha256sum vk-agent > vk-agent.sha256 )
+#   git checkout <git_commit> && ./build.sh && sha256sum -c dist/vk.sha256 dist/vk-agent.sha256 dist/vk-registry.sha256
+( cd "$OUT" && sha256sum vk > vk.sha256 && sha256sum vk-agent > vk-agent.sha256 && sha256sum vk-registry > vk-registry.sha256 )
 base_image=$(sed -nE 's/^FROM (rust:[^ ]*).*$/\1/p' .devcontainer/Dockerfile)
 toolchain=$(sed -nE 's/^channel = "(.*)"$/\1/p' rust-toolchain.toml)
 # $commit was resolved above (before the compile) and threaded into the build as

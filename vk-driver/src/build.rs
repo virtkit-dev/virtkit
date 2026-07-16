@@ -159,12 +159,12 @@ pub struct Options {
     pub cloud_hypervisor: Option<PathBuf>,
     pub kernel: Option<PathBuf>,
     pub agent: Option<PathBuf>,
-    /// instruction-cache destination: a registry repo (e.g. a `vk registry serve` at
+    /// instruction-cache destination: a registry repo (e.g. a `vk-registry` at
     /// `127.0.0.1:5000`), an absolute store directory path (accessed in-process), or
     /// `none` to disable caching. `None` = the builtin local store
-    /// (`regserve::default_root`).
+    /// (`vk_registry::default_root`).
     pub cache_registry: Option<String>,
-    /// the cache registry speaks plain HTTP (a loopback regserve).
+    /// the cache registry speaks plain HTTP (a loopback vk-registry).
     pub cache_insecure: bool,
     /// how aggressively the instruction cache is populated (see [`BuildCache`]).
     pub build_cache: BuildCache,
@@ -318,7 +318,7 @@ fn cache_repo(cache_registry: Option<&str>) -> Result<Option<String>> {
         ),
         Some(repo) => Some(repo.to_string()),
         None => Some(
-            crate::regserve::default_root()
+            vk_registry::default_root()
                 .context("resolving the builtin cache store dir")?
                 .display()
                 .to_string(),

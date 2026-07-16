@@ -1,16 +1,16 @@
-//! `vk registry serve` — an embedded, local OCI registry server.
+//! The `vk-registry` server library: a content-addressed OCI-distribution store plus the
+//! HTTP server, pull-through relay, build-once lock, and client auth built on it.
 //!
-//! A minimal implementation of the OCI distribution v2 API, just enough for the
-//! `vk registry push`/`pull` client (registry.rs) and the executor's pull
-//! path: blob existence/upload (chunked + monolithic) and manifest put/get. It
-//! backs a **content-addressed store on the local filesystem**, so every worktree
-//! that points its `[registry]` at this server shares one blob pool — a chunk
-//! pushed from one worktree is instantly reused by the others (the FastCDC+zstd
-//! dedup the client already does, now shared host-wide).
+//! A minimal implementation of the OCI distribution v2 API — blob existence/upload
+//! (chunked + monolithic) and manifest put/get — over a **content-addressed store on the
+//! local filesystem**, so every client that points its `[registry]` at this server shares
+//! one blob pool (the FastCDC+zstd dedup the client already does, now shared). `vk` links
+//! this crate for its in-process `Store`; the `vk-registry` binary runs the server.
 //!
-//! Intended for a single user on loopback (`127.0.0.1`): no auth, no TLS (pair it
-//! with `[registry] insecure = true`). Install it as a `systemd --user` service
-//! with `vk registry install-service`.
+//! Meant to run centrally and be shared by many runners: optional TLS (`tls_cert`/
+//! `tls_key`) and client auth (a bearer token file, or HTTP Basic) gate it on a shared
+//! network, and a loopback deployment can still run open. Install it as a `systemd --user`
+//! service with `vk-registry install-service`. See `DESIGN.md` and the `config` module.
 //!
 //! Store layout under `--root` (default `$XDG_DATA_HOME/virtkit/registry`):
 //!   blobs/sha256/<hex>            content-addressed blobs (chunks, configs,
@@ -38,20 +38,67 @@ use hyper_util::rt::TokioIo;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
+pub mod auth;
+pub mod client;
+pub mod config;
+pub mod lock;
+pub mod relay;
+
+pub use client::{Held, LockClient};
+pub use config::ServerConfig;
+
+/// Everything a connection handler needs: the content-addressed store, the relay
+/// upstreams (empty ⇒ a plain local registry, no mirroring), the build-once lock
+/// authority, the client-auth scheme, and the optional TLS acceptor. Cheap to
+/// clone-share via `Arc`.
+pub struct ServerState {
+    pub store: Arc<Store>,
+    pub upstreams: Vec<relay::Upstream>,
+    pub locks: lock::LockManager,
+    pub auth: auth::Auth,
+    pub tls: Option<tokio_rustls::TlsAcceptor>,
+}
+
 /// Default content type for a manifest whose Content-Type sidecar is missing.
 const DEFAULT_MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+
+/// Fixed zstd level: identical raw chunks must compress to identical bytes for a
+/// compressed-digest chunk to dedup. Shared by the client push path (registry.rs),
+/// the transparent-zstd upload, and this store's adaptive storage compression.
+pub const ZSTD_LEVEL: i32 = 1;
+
+/// Capability header a cooperating server sets on its `GET /v2/` response, so an
+/// auto-mode client knows it may push transparent-zstd (uncompressed-digest) chunks.
+/// Absent on any dumb OCI registry.
+pub const TRANSPARENT_ZSTD_HEADER: &str = "x-virtkit-transparent-zstd";
+
+/// zstd-compress `raw`, embedding the decompressed size in the frame header so the
+/// registry can report a canonical `Content-Length` on HEAD without decompressing
+/// (`zstd::encode_all` omits the content size). Shared by the transparent-zstd client
+/// push and this store's storage compression.
+pub fn zstd_with_size(raw: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let mut enc = zstd::stream::write::Encoder::new(Vec::new(), ZSTD_LEVEL)
+        .context("creating the zstd encoder")?;
+    enc.set_pledged_src_size(Some(raw.len() as u64))
+        .context("setting the zstd pledged size")?;
+    enc.include_contentsize(true)
+        .context("enabling the zstd content size")?;
+    enc.write_all(raw).context("zstd-compressing")?;
+    enc.finish().context("finishing the zstd frame")
+}
 
 /// The on-disk content-addressed store. Shared by the HTTP handlers below and the
 /// in-process build-cache backend (`registry::local`), so both write identical
 /// on-disk state. Cheap to clone-share via `Arc`.
-pub(crate) struct Store {
+pub struct Store {
     root: PathBuf,
     /// monotonic upload-id source (unique within this server process)
     next_upload: AtomicU64,
 }
 
 impl Store {
-    pub(crate) fn new(root: PathBuf) -> Result<Self> {
+    pub fn new(root: PathBuf) -> Result<Self> {
         for sub in ["blobs/sha256", "blobs/zstd", "uploads", "repos"] {
             let p = root.join(sub);
             std::fs::create_dir_all(&p).with_context(|| format!("creating {}", p.display()))?;
@@ -97,7 +144,7 @@ impl Store {
     /// Whether the blob (either form) is present. A hit bumps the blob's mtime: the
     /// caller is about to *reference* it without rewriting it (the dedup fast path),
     /// and that mtime is what the [`Store::gc`] sweep honours.
-    pub(crate) fn has_blob(&self, hex: &str) -> bool {
+    pub fn has_blob(&self, hex: &str) -> bool {
         match self.find_blob(hex) {
             Some((path, _)) => {
                 touch(&path);
@@ -110,7 +157,7 @@ impl Store {
     /// Store raw canonical bytes content-addressed, adaptively compressed (the zstd
     /// form only when it actually shrinks). Idempotent: a present blob is only
     /// touched, and the compression is skipped. Returns the `sha256:<hex>` digest.
-    pub(crate) fn put_blob(&self, raw: &[u8]) -> Result<String> {
+    pub fn put_blob(&self, raw: &[u8]) -> Result<String> {
         let hex = sha256_hex_raw(raw);
         self.put_blob_at(&hex, raw)?;
         Ok(format!("sha256:{hex}"))
@@ -120,7 +167,7 @@ impl Store {
     /// where the client's digest is trusted (see `finish_upload`).
     fn put_blob_at(&self, hex: &str, raw: &[u8]) -> Result<()> {
         if !self.has_blob(hex) {
-            let z = crate::registry::zstd_with_size(raw)?;
+            let z = zstd_with_size(raw)?;
             if z.len() < raw.len() {
                 atomic_write(&self.zstd_blob_path(hex), &z)?;
             } else {
@@ -131,7 +178,7 @@ impl Store {
     }
 
     /// The canonical bytes of a blob (decompressing the zstd form), `None` if absent.
-    pub(crate) fn get_blob(&self, hex: &str) -> Result<Option<Vec<u8>>> {
+    pub fn get_blob(&self, hex: &str) -> Result<Option<Vec<u8>>> {
         let Some((path, is_zstd)) = self.find_blob(hex) else {
             return Ok(None);
         };
@@ -147,7 +194,7 @@ impl Store {
     /// Store manifest bytes (content-addressed) + the Content-Type sidecar, and point
     /// the tag at it (a digest reference is already self-describing). Returns the
     /// manifest digest.
-    pub(crate) fn put_manifest(
+    pub fn put_manifest(
         &self,
         name: &str,
         reference: &str,
@@ -176,7 +223,7 @@ impl Store {
     /// Resolve a tag or digest reference to `(digest, manifest bytes, content type)`,
     /// `None` if absent. A tag hit bumps the tag file's mtime — the "last used"
     /// record [`Store::gc`] keys its tag retention on.
-    pub(crate) fn get_manifest(
+    pub fn get_manifest(
         &self,
         name: &str,
         reference: &str,
@@ -213,13 +260,13 @@ impl Store {
     /// Shared holders never block each other. flock is advisory and
     /// filesystem-local — fine for `$XDG_DATA_HOME`; a store root on NFS is
     /// unsupported.
-    pub(crate) fn lock_shared(&self) -> Result<LockGuard> {
+    pub fn lock_shared(&self) -> Result<LockGuard> {
         self.flock(libc::LOCK_SH)
     }
 
     /// Take the store lock exclusive (blocks until all shared holders drop) — the
     /// [`Store::gc`] lock; see [`Store::lock_shared`].
-    pub(crate) fn lock_exclusive(&self) -> Result<LockGuard> {
+    pub fn lock_exclusive(&self) -> Result<LockGuard> {
         self.flock(libc::LOCK_EX)
     }
 
@@ -248,12 +295,7 @@ impl Store {
     /// (an alive push keeps appending, so its session file stays fresh). Orphaned
     /// `.tmp.*` files from a crashed `atomic_write` age out with the blob sweep.
     /// `dry_run` reports without removing anything.
-    pub(crate) fn gc(
-        &self,
-        retention: Duration,
-        grace: Duration,
-        dry_run: bool,
-    ) -> Result<GcReport> {
+    pub fn gc(&self, retention: Duration, grace: Duration, dry_run: bool) -> Result<GcReport> {
         let _lock = self.lock_exclusive()?;
         let now = SystemTime::now();
         // Idle = mtime older than the window. An unreadable mtime — or one in the
@@ -356,7 +398,7 @@ impl Store {
     /// packing factor. The size and packing figures cover tag-reachable manifests only;
     /// `total_manifests` counts every manifest sidecar, tagged or digest-pinned. Taken
     /// under the shared lock, so it never reads a store a gc is mid-sweep on.
-    pub(crate) fn stats(&self) -> Result<StoreStats> {
+    pub fn stats(&self) -> Result<StoreStats> {
         let _lock = self.lock_shared()?;
         let mut s = StoreStats::default();
 
@@ -476,44 +518,44 @@ impl Store {
 
 /// What a [`Store::gc`] pass removed (or, on a dry run, would remove).
 #[derive(Default)]
-pub(crate) struct GcReport {
-    pub(crate) tags_dropped: usize,
-    pub(crate) manifests_dropped: usize,
-    pub(crate) blobs_dropped: usize,
+pub struct GcReport {
+    pub tags_dropped: usize,
+    pub manifests_dropped: usize,
+    pub blobs_dropped: usize,
     /// stored (on-disk) bytes of the dropped blobs
-    pub(crate) bytes_freed: u64,
-    pub(crate) uploads_dropped: usize,
+    pub bytes_freed: u64,
+    pub uploads_dropped: usize,
 }
 
 /// A [`Store::stats`] snapshot: on-disk totals plus a per-repo breakdown.
 #[derive(Default)]
-pub(crate) struct StoreStats {
-    pub(crate) identity_blobs: usize,
-    pub(crate) identity_bytes: u64,
-    pub(crate) zstd_blobs: usize,
-    pub(crate) zstd_bytes: u64,
-    pub(crate) uploads: usize,
-    pub(crate) upload_bytes: u64,
-    pub(crate) total_tags: usize,
-    pub(crate) total_manifests: usize,
+pub struct StoreStats {
+    pub identity_blobs: usize,
+    pub identity_bytes: u64,
+    pub zstd_blobs: usize,
+    pub zstd_bytes: u64,
+    pub uploads: usize,
+    pub upload_bytes: u64,
+    pub total_tags: usize,
+    pub total_manifests: usize,
     /// each tagged manifest plus its config/layer references, summed with no dedup — the
     /// logical (uncompressed) content the store stands in for
-    pub(crate) logical_naive: u64,
+    pub logical_naive: u64,
     /// the distinct referenced blobs' actual on-disk bytes (compressed, deduped);
     /// `logical_naive` over this is the combined dedup+zstd packing factor
-    pub(crate) referenced_ondisk: u64,
-    pub(crate) repos: Vec<RepoStat>,
+    pub referenced_ondisk: u64,
+    pub repos: Vec<RepoStat>,
 }
 
 /// One repository's line in a [`StoreStats`].
 #[derive(Default)]
-pub(crate) struct RepoStat {
-    pub(crate) name: String,
-    pub(crate) tags: usize,
-    pub(crate) manifests: usize,
-    pub(crate) latest_tag: Option<String>,
+pub struct RepoStat {
+    pub name: String,
+    pub tags: usize,
+    pub manifests: usize,
+    pub latest_tag: Option<String>,
     /// size of the blobs this repo's tagged manifests reference, deduped within the repo
-    pub(crate) logical_bytes: u64,
+    pub logical_bytes: u64,
 }
 
 /// The digest hexes a manifest references: its config and every layer, read
@@ -571,7 +613,7 @@ fn dir_files(dir: &Path) -> Vec<PathBuf> {
 
 /// A held store lock (see [`Store::lock_shared`]); released when dropped (flock
 /// releases on the last close of the fd).
-pub(crate) struct LockGuard {
+pub struct LockGuard {
     _file: std::fs::File,
 }
 
@@ -582,36 +624,63 @@ fn touch(path: &Path) {
     let _ = std::fs::File::open(path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
 }
 
-/// Run the registry until the process is stopped. `addr` is the listen address
-/// (loopback for single-user use); `root` is the store directory.
+/// Run a plain local registry until the process is stopped (no relay upstreams).
+/// `addr` is the listen address; `root` is the store directory.
 pub async fn serve(addr: SocketAddr, root: PathBuf) -> Result<()> {
+    serve_config(ServerConfig::local(addr, root)).await
+}
+
+/// Run the registry from a full [`ServerConfig`] (relay upstreams, listen address,
+/// store root).
+pub async fn serve_config(cfg: ServerConfig) -> Result<()> {
+    let addr = cfg.addr;
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
-    serve_on(listener, root).await
+    let tls = cfg.build_tls()?;
+    let mut state = cfg.into_state()?;
+    state.tls = tls;
+    serve_on(listener, Arc::new(state)).await
 }
 
 /// Serve on an already-bound listener (so the caller can pick an ephemeral port and
 /// learn it first). The store is content-addressed and written atomically, so several
 /// servers may serve the same `root` concurrently.
-pub async fn serve_on(listener: TcpListener, root: PathBuf) -> Result<()> {
-    let store = Arc::new(Store::new(root)?);
+pub async fn serve_on(listener: TcpListener, state: Arc<ServerState>) -> Result<()> {
     if let Ok(addr) = listener.local_addr() {
+        let mode = if state.upstreams.is_empty() {
+            "local".to_string()
+        } else {
+            format!("mirror ({} upstream(s))", state.upstreams.len())
+        };
         eprintln!(
-            "vk registry: serving {} on http://{addr}",
-            store.root.display()
+            "vk-registry: serving {} [{mode}] on http://{addr}",
+            state.store.root.display()
         );
     }
     loop {
         let (stream, _peer) = listener.accept().await.context("accept")?;
-        let store = store.clone();
+        let state = state.clone();
         tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            let svc = service_fn(move |req| handle(req, store.clone()));
-            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
-                eprintln!("vk registry: connection error: {e}");
+            match &state.tls {
+                Some(acceptor) => match acceptor.accept(stream).await {
+                    Ok(tls) => serve_conn(TokioIo::new(tls), state.clone()).await,
+                    Err(e) => eprintln!("vk-registry: TLS handshake error: {e}"),
+                },
+                None => serve_conn(TokioIo::new(stream), state.clone()).await,
             }
         });
+    }
+}
+
+/// Serve one HTTP/1 connection over any transport (plain TCP or TLS).
+async fn serve_conn<I>(io: I, state: Arc<ServerState>)
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    let svc = service_fn(move |req| handle(req, state.clone()));
+    if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+        eprintln!("vk-registry: connection error: {e}");
     }
 }
 
@@ -619,9 +688,9 @@ pub async fn serve_on(listener: TcpListener, root: PathBuf) -> Result<()> {
 /// connection).
 async fn handle(
     req: Request<Incoming>,
-    store: Arc<Store>,
+    state: Arc<ServerState>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    Ok(route(req, store).await.unwrap_or_else(|e| {
+    Ok(route(req, state).await.unwrap_or_else(|e| {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL",
@@ -630,7 +699,23 @@ async fn handle(
     }))
 }
 
-async fn route(req: Request<Incoming>, store: Arc<Store>) -> Result<Response<Full<Bytes>>> {
+async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
+    // Client auth (when configured), except the `/v2/` version probe — kept open so
+    // capability detection (transparent-zstd) and Docker's auth discovery still work.
+    if state.auth.enabled() {
+        let p = req.uri().path();
+        let probe = p == "/v2" || p == "/v2/";
+        if !probe && !state.auth.allows(&req) {
+            return Ok(state.auth.challenge());
+        }
+    }
+
+    // The build-once lock API lives under `/lock/<action>` (all POST), outside the
+    // `/v2/` OCI namespace; names are `?name=` params.
+    if req.uri().path().starts_with("/lock/") {
+        return lock::route(&state.locks, req).await;
+    }
+    let store = state.store.clone();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
@@ -647,7 +732,7 @@ async fn route(req: Request<Incoming>, store: Arc<Store>) -> Result<Response<Ful
         return Response::builder()
             .status(StatusCode::OK)
             .header("Docker-Distribution-Api-Version", "registry/2.0")
-            .header(crate::registry::TRANSPARENT_ZSTD_HEADER, "1")
+            .header(TRANSPARENT_ZSTD_HEADER, "1")
             .body(Full::new(Bytes::from_static(b"{}")))
             .map_err(Into::into);
     }
@@ -702,7 +787,14 @@ async fn route(req: Request<Incoming>, store: Arc<Store>) -> Result<Response<Ful
         }
         let head = method == Method::HEAD;
         return match method {
-            Method::GET | Method::HEAD => get_blob(&store, digest, head, accept_zstd),
+            Method::GET | Method::HEAD => {
+                let local = get_blob(&store, digest, head, accept_zstd)?;
+                if local.status() == StatusCode::NOT_FOUND && !state.upstreams.is_empty() {
+                    relay::get_blob(&state, name, digest, head, accept_zstd).await
+                } else {
+                    Ok(local)
+                }
+            }
             _ => Ok(error_response(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "UNSUPPORTED",
@@ -734,7 +826,13 @@ async fn route(req: Request<Incoming>, store: Arc<Store>) -> Result<Response<Ful
                 put_manifest(&store, name, reference, &ctype, &body)
             }
             Method::GET | Method::HEAD => {
-                get_manifest(&store, name, reference, method == Method::HEAD)
+                let head = method == Method::HEAD;
+                let local = get_manifest(&store, name, reference, head)?;
+                if local.status() == StatusCode::NOT_FOUND && !state.upstreams.is_empty() {
+                    relay::get_manifest(&state, name, reference, head).await
+                } else {
+                    Ok(local)
+                }
             }
             _ => Ok(error_response(
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -872,7 +970,7 @@ fn finish_upload(
 /// identity blob is served verbatim. A zstd-stored blob is served verbatim (with
 /// `Content-Encoding: zstd`) when the client accepts zstd, else decompressed — so a
 /// plain OCI client always gets the canonical bytes and verifies the digest.
-fn get_blob(
+pub(crate) fn get_blob(
     store: &Store,
     digest: &str,
     head: bool,
@@ -970,7 +1068,7 @@ fn put_manifest(
 }
 
 /// GET/HEAD /v2/<name>/manifests/<tag|digest>.
-fn get_manifest(
+pub(crate) fn get_manifest(
     store: &Store,
     name: &str,
     reference: &str,
@@ -1030,7 +1128,11 @@ fn accepted_upload(name: &str, id: &str, size: u64) -> Result<Response<Full<Byte
 }
 
 /// An OCI error response: the documented `{ "errors": [ { code, message } ] }` body.
-fn error_response(status: StatusCode, code: &str, message: &str) -> Response<Full<Bytes>> {
+pub(crate) fn error_response(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) -> Response<Full<Bytes>> {
     let body =
         serde_json::json!({ "errors": [ { "code": code, "message": message } ] }).to_string();
     Response::builder()
@@ -1056,7 +1158,7 @@ fn header_has(req: &Request<Incoming>, name: hyper::header::HeaderName, needle: 
 }
 
 /// The decompressed length of a zstd frame, read from its header (no full decode);
-/// `None` if the frame doesn't record it (see [`crate::registry::zstd_with_size`]).
+/// `None` if the frame doesn't record it (see [`zstd_with_size`]).
 fn zstd_frame_len(frame: &[u8]) -> Option<u64> {
     zstd::zstd_safe::get_frame_content_size(frame)
         .ok()
@@ -1110,7 +1212,7 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn sha256_hex_raw(data: &[u8]) -> String {
+pub(crate) fn sha256_hex_raw(data: &[u8]) -> String {
     let d = Sha256::digest(data);
     let mut s = String::with_capacity(64);
     for b in d {
@@ -1326,7 +1428,7 @@ pub fn install_service(addr: SocketAddr, root: &Path) -> Result<()> {
          After=network.target\n\
          \n\
          [Service]\n\
-         ExecStart={exe} registry serve --addr {addr} --root {root}\n\
+         ExecStart={exe} serve --addr {addr} --root {root}\n\
          Restart=on-failure\n\
          \n\
          [Install]\n\
@@ -1927,12 +2029,12 @@ mod tests {
         // the shared encoder embeds the content size (encode_all does not), so HEAD can
         // read the canonical length from the frame header without decompressing.
         let raw = vec![7u8; 50_000];
-        let frame = crate::registry::zstd_with_size(&raw).unwrap();
+        let frame = zstd_with_size(&raw).unwrap();
         assert_eq!(zstd_frame_len(&frame), Some(50_000));
         assert_eq!(zstd::decode_all(&frame[..]).unwrap(), raw);
         // encode_all (no pledged size) omits it — the reason that helper exists.
         assert_eq!(
-            zstd_frame_len(&zstd::encode_all(&raw[..], crate::registry::ZSTD_LEVEL).unwrap()),
+            zstd_frame_len(&zstd::encode_all(&raw[..], ZSTD_LEVEL).unwrap()),
             None
         );
     }

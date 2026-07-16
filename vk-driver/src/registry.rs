@@ -35,15 +35,15 @@ use sha2::{Digest, Sha256};
 use crate::config::{Config, Registry};
 use crate::image::{self, Reference, ResolvedImage};
 use crate::jobctx::JobCtx;
+// The content-addressed store lives in the standalone vk-registry crate; the client
+// paths here share its digest/compression conventions (ZSTD_LEVEL so re-pushed chunks
+// dedup, the transparent-zstd capability header, and the size-embedding zstd encoder).
+use vk_registry::{TRANSPARENT_ZSTD_HEADER, ZSTD_LEVEL, zstd_with_size};
 
 // CDC parameters for runner.ext4 (FastCDC v2020): min 1 MiB, avg 4 MiB, max 16 MiB.
 const CDC_MIN: usize = 1 << 20;
 const CDC_AVG: usize = 4 << 20;
 const CDC_MAX: usize = 16 << 20;
-// Fixed zstd level: identical raw chunks must compress to identical bytes for the
-// blob digest (sha256 of the compressed bytes) to dedup. Shared with regserve's
-// transparent storage compression.
-pub(crate) const ZSTD_LEVEL: i32 = 1;
 
 // Media types for the bundle artifact.
 const ARTIFACT_TYPE: &str = "application/vnd.wallix.microvm.bundle";
@@ -53,10 +53,6 @@ const CONFIG_MEDIA_TYPE: &str = "application/vnd.wallix.microvm.bundle.config.v1
 // chunk: digest over the *uncompressed* bytes, the registry stores them zstd.
 const CHUNK_MEDIA_TYPE: &str = "application/vnd.wallix.microvm.ext4.chunk.zstd";
 const CHUNK_MEDIA_TYPE_RAW: &str = "application/vnd.wallix.microvm.ext4.chunk";
-// Capability header a cooperating `regserve` sets on its `GET /v2/` probe response,
-// so an auto-mode client knows it can push transparent-zstd (uncompressed-digest)
-// chunks. Absent on any dumb OCI registry.
-pub(crate) const TRANSPARENT_ZSTD_HEADER: &str = "x-virtkit-transparent-zstd";
 const KERNEL_MEDIA_TYPE: &str = "application/vnd.wallix.microvm.kernel";
 const INITRD_MEDIA_TYPE: &str = "application/vnd.wallix.microvm.initrd";
 
@@ -1277,22 +1273,6 @@ fn sha256_hex(data: &[u8]) -> String {
     s
 }
 
-/// zstd-compress `raw`, embedding the decompressed size in the frame header so the
-/// registry can report a canonical `Content-Length` on HEAD without decompressing
-/// (`zstd::encode_all` omits the content size). Shared by the transparent-zstd client
-/// push and regserve's storage compression.
-pub(crate) fn zstd_with_size(raw: &[u8]) -> Result<Vec<u8>> {
-    use std::io::Write;
-    let mut enc = zstd::stream::write::Encoder::new(Vec::new(), ZSTD_LEVEL)
-        .context("creating the zstd encoder")?;
-    enc.set_pledged_src_size(Some(raw.len() as u64))
-        .context("setting the zstd pledged size")?;
-    enc.include_contentsize(true)
-        .context("enabling the zstd content size")?;
-    enc.write_all(raw).context("zstd-compressing")?;
-    enc.finish().context("finishing the zstd frame")
-}
-
 /// Probe `GET /v2/` for the [`TRANSPARENT_ZSTD_HEADER`] a cooperating `regserve`
 /// advertises. Any failure — a dumb registry, a network/TLS error, a missing CA —
 /// yields `false`: fall back to the compressed-digest path. Only called in auto mode
@@ -1484,10 +1464,10 @@ fn chunkmap_put(dir: &Path, raw_hex: &str, digest: &str, size: i64) {
 /// manifests, adaptively compressed blobs), so a `vk registry serve` on the same
 /// root serves what local builds pushed and vice versa. Every operation holds the
 /// store lock shared for its whole check→reference window; `vk registry gc` takes
-/// it exclusive (see `regserve::Store::lock_shared`).
+/// it exclusive (see `vk_registry::Store::lock_shared`).
 mod local {
     use super::*;
-    use crate::regserve::Store;
+    use vk_registry::Store;
 
     pub(super) fn exists(root: &Path, name: &str, tag: &str) -> bool {
         let inner = || -> Result<bool> {
@@ -2265,7 +2245,7 @@ mod tests {
         }
         assert!(exists(&rg, "dfcache", "live"));
 
-        let store = crate::regserve::Store::new(root.clone()).unwrap();
+        let store = vk_registry::Store::new(root.clone()).unwrap();
         let report = store.gc(day * 30, day, false).unwrap();
         assert_eq!(report.tags_dropped, 1);
         assert!(

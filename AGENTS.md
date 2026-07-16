@@ -4,7 +4,8 @@ This file provides guidance to AI coding assistants (Claude Code, Copilot, etc.)
 
 ## Project Overview
 
-virtkit — a rootless microVM toolkit shipped as two static-musl binaries, with the
+virtkit — a rootless microVM toolkit shipped as static-musl binaries (`vk` + the
+embedded `vk-agent`, plus the optional `vk-registry` central server), with the
 VMM built in. It boots OCI/Docker images as fast microVMs on its embedded
 [libkrun](https://github.com/containers/libkrun) VMM ([Cloud Hypervisor](https://www.cloudhypervisor.org/)
 stays available as an external backend via `VIRTKIT_VMM=cloud-hypervisor`), gives
@@ -15,7 +16,7 @@ The same codebase powers local compose-service VMs and a GitLab custom executor.
 
 ## Architecture
 
-A Cargo workspace (`Cargo.toml`, edition 2024) with three crates:
+A Cargo workspace (`Cargo.toml`, edition 2024) with four crates:
 
 - **`vk-core/`** — the shared host↔guest library: the wire protocol (`messages`,
   `framing`, `addr`, `net`, `status`, `fleetctl`) plus the runtime helpers both sides
@@ -31,6 +32,12 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with three crates:
 - **`vk-agent/`** — the guest PID 1 / agent (depends on `vk-core`): brings a systemd-less
   guest up (mounts, networking, hostname, virtio-fs, optional SSH) and serves an exec
   channel over `vsock` so the host can run commands inside the VM.
+- **`vk-registry/`** — the content-addressed OCI store (lib) plus a standalone server
+  (bin). `vk-driver` links the lib for its in-process build cache. The `vk-registry`
+  binary is a central OCI-distribution daemon meant to be shared by every runner: it
+  serves the store over HTTP(S), fronts upstream registries as a pull-through cache
+  (caching only digest-addressed content), coordinates build-once via a lease/heartbeat
+  lock API (`/lock`), and is a backend for the `task` build cache. See its `DESIGN.md`.
 
 libkrun is vendored (its own cargo workspace, locally patched) under
 `third_party/libkrun` — see its `VENDOR.md` for the patch list.

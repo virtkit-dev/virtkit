@@ -4,6 +4,30 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- New `vk-registry` binary: a standalone OCI-distribution server backed by the same
+  content-addressed store `vk` uses, meant to run centrally and be shared by every
+  runner. `vk-registry serve` (plus `gc`/`status`/`install-service`) replaces the old
+  `vk registry serve`.
+- `vk-registry` is a **pull-through mirror**: configure `[[upstream]]` entries (routed
+  by repo-name prefix) and it relays images from upstream registries, caching only
+  digest-addressed content (`@sha256:…` manifests and all blobs); tags are relayed live.
+  Upstream credentials stay in `vk-registry`, so its clients never see them.
+- `vk-registry` serves a **build-once lock** at `/lock/{acquire,renew,release,status}`
+  (all POST; names as `?name=` params): a leased, heartbeat-renewed, release-if-owner lock
+  so many runners building the same content-key build it once and the rest wait then pull.
+  Acquiring several names at once is **atomic all-or-nothing** (with blocker reporting),
+  for a step that builds several images together — the `ci-lock-mgr.sh` model, without Redis.
+- `vk-registry` supports **TLS** (`tls_cert`/`tls_key`) and **client auth** (a bearer
+  token file, or HTTP Basic), so it can be exposed on a shared network.
+
+### Removed
+
+- `vk registry serve` and `vk registry install-service` — serving a store over HTTP now
+  lives in the `vk-registry` binary. `vk` still uses its local filesystem store
+  in-process by default (no daemon), and keeps `registry push`/`pull`/`inspect`/`status`/`gc`.
+
 ### Changed
 
 - The GitLab executor now honours the job's standard `image:` (CI_JOB_IMAGE) — no

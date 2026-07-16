@@ -4512,9 +4512,35 @@ dependencies = [
  "virtio-bindings",
  "virtio-queue",
  "vk-core",
+ "vk-registry",
  "vm-memory 0.17.1",
  "vm-memory 0.18.0",
  "vmm-sys-util 0.15.0",
+ "zstd",
+]
+
+[[package]]
+name = "vk-registry"
+version = "0.16.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "jemallocator",
+ "libc",
+ "oci-client",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tokio-rustls",
+ "toml",
  "zstd",
 ]
 

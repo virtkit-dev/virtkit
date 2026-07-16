@@ -43,7 +43,6 @@ mod net;
 mod oci;
 mod qcow2;
 mod registry;
-mod regserve;
 mod run;
 mod scratch;
 mod services;
@@ -138,26 +137,8 @@ enum RegistryCmd {
         /// Source reference, <name>[:tag|@sha256:…]
         reference: String,
     },
-    /// Run a local OCI registry server backed by a content-addressed store, so
-    /// every worktree pointing its [registry] here shares one bundle pool (a
-    /// chunk pushed from one is reused by the rest). Loopback, no auth/TLS — pair
-    /// with `[registry] insecure = true`.
-    Serve {
-        /// Listen address (use a loopback address — there is no auth).
-        #[arg(long, default_value = "127.0.0.1:5000")]
-        addr: std::net::SocketAddr,
-        /// Store directory [default: $XDG_DATA_HOME/virtkit/registry].
-        #[arg(long)]
-        root: Option<PathBuf>,
-    },
-    /// Install + start a `systemd --user` unit running `registry serve`, so the
-    /// shared store is always available (survives logout/reboot).
-    InstallService {
-        #[arg(long, default_value = "127.0.0.1:5000")]
-        addr: std::net::SocketAddr,
-        #[arg(long)]
-        root: Option<PathBuf>,
-    },
+    // Serving a store over HTTP now lives in the standalone `vk-registry` daemon;
+    // `vk` accesses its local filesystem store in-process (registry.rs `mod local`).
     /// Report a registry store's usage and content: on-disk size (both storage
     /// forms), dedup savings, and a per-repository breakdown (tags, latest tag,
     /// logical size). Read-only.
@@ -300,12 +281,12 @@ enum Cmd {
         kernel: Option<PathBuf>,
         #[arg(long)]
         agent: Option<PathBuf>,
-        /// instruction cache: a registry repo (e.g. 127.0.0.1:5000 of a `vk registry
-        /// serve`), an absolute store directory path (accessed in-process), or `none`
-        /// to disable. Default: the builtin local store `vk registry serve` also uses.
+        /// instruction cache: a registry repo (e.g. 127.0.0.1:5000 of a `vk-registry`
+        /// server), an absolute store directory path (accessed in-process), or `none`
+        /// to disable. Default: the builtin local store `vk-registry` also uses.
         #[arg(long = "cache-registry")]
         cache_registry: Option<String>,
-        /// the cache registry speaks plain HTTP (a loopback regserve); registry
+        /// the cache registry speaks plain HTTP (a loopback vk-registry); registry
         /// caches only — the builtin/path store has no transport
         #[arg(long = "cache-insecure")]
         cache_insecure: bool,
@@ -482,10 +463,10 @@ enum Cmd {
         /// instruction cache for the --file build (push/pull each stage's ext4 by
         /// content key, so a repeat boot restores instead of rebuilding): a registry
         /// repo, an absolute store directory path, or `none` to disable. Default:
-        /// the builtin local store `vk registry serve` also uses.
+        /// the builtin local store `vk-registry` also uses.
         #[arg(long = "cache-registry")]
         cache_registry: Option<String>,
-        /// the cache registry speaks plain HTTP (a loopback regserve); registry
+        /// the cache registry speaks plain HTTP (a loopback vk-registry); registry
         /// caches only — the builtin/path store has no transport
         #[arg(long = "cache-insecure")]
         cache_insecure: bool,
@@ -1509,32 +1490,16 @@ async fn cli_main() -> ExitCode {
                 }
                 Err(e) => fail(&e, 1),
             },
-            RegistryCmd::Serve { addr, root } => {
-                let root = match root.clone().map(Ok).unwrap_or_else(regserve::default_root) {
-                    Ok(r) => r,
-                    Err(e) => return fail(&e, 2),
-                };
-                match regserve::serve(*addr, root).await {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => fail(&e, 1),
-                }
-            }
-            RegistryCmd::InstallService { addr, root } => {
-                let root = match root.clone().map(Ok).unwrap_or_else(regserve::default_root) {
-                    Ok(r) => r,
-                    Err(e) => return fail(&e, 2),
-                };
-                match regserve::install_service(*addr, &root) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => fail(&e, 1),
-                }
-            }
             RegistryCmd::Status { root } => {
-                let root = match root.clone().map(Ok).unwrap_or_else(regserve::default_root) {
+                let root = match root
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(vk_registry::default_root)
+                {
                     Ok(r) => r,
                     Err(e) => return fail(&e, 2),
                 };
-                match regserve::status(root) {
+                match vk_registry::status(root) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => fail(&e, 1),
                 }
@@ -1545,12 +1510,16 @@ async fn cli_main() -> ExitCode {
                 grace_days,
                 dry_run,
             } => {
-                let root = match root.clone().map(Ok).unwrap_or_else(regserve::default_root) {
+                let root = match root
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(vk_registry::default_root)
+                {
                     Ok(r) => r,
                     Err(e) => return fail(&e, 2),
                 };
                 let days = |d: u64| std::time::Duration::from_secs(d * 86_400);
-                match regserve::gc(root, days(*retention_days), days(*grace_days), *dry_run) {
+                match vk_registry::gc(root, days(*retention_days), days(*grace_days), *dry_run) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => fail(&e, 1),
                 }
