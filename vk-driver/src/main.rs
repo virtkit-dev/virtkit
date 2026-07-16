@@ -43,6 +43,7 @@ mod net;
 mod oci;
 mod qcow2;
 mod registry;
+mod regproxy;
 mod run;
 mod scratch;
 mod services;
@@ -440,6 +441,10 @@ enum Cmd {
         /// `corp.example.com` (repeatable).
         #[arg(long = "allow-name", value_name = "SUFFIX")]
         allow_name: Vec<String>,
+        /// redirect guest flows to a sentinel address to a host-local registry proxy:
+        /// `<sentinel-ip>=<host:port>` (set internally by `vk run --registry-proxy`).
+        #[arg(long = "registry-proxy", value_name = "IP=ADDR")]
+        registry_proxy: Option<String>,
     },
     /// Dev: run a docker/OCI image as a microVM — boot it from a native ext4 disk
     /// (or a cpio initramfs in RAM with --ram), virtkit-agent as PID 1 over vsock, and
@@ -542,6 +547,12 @@ enum Cmd {
         /// (DHCP + DNS + transparent proxy over vsock)
         #[arg(long)]
         net: bool,
+        /// Run a host-local credential-injecting registry proxy forwarding to this
+        /// upstream registry base URL (scheme://host); the guest reaches it
+        /// credential-free at `registry.vk`, injecting `--username`/`--password`/`--ca`.
+        /// Needs `--net`. The job never sees the credentials.
+        #[arg(long = "registry-proxy", value_name = "URL")]
+        registry_proxy: Option<String>,
         /// boot this compose file's services as sibling microVMs on the run's LAN
         /// (implies --net): the command reaches them by alias; everything is torn
         /// down when the run exits. No readiness wait — retry the first connect.
@@ -946,6 +957,7 @@ async fn cli_main() -> ExitCode {
         init,
         shell,
         net,
+        registry_proxy,
         compose,
         profile,
         primary,
@@ -1077,6 +1089,7 @@ async fn cli_main() -> ExitCode {
             shell: *shell,
             // services live on the run switch's LAN: --compose implies it.
             net: *net || compose.is_some(),
+            registry_proxy: registry_proxy.clone(),
             compose: compose.clone(),
             profiles: profile.clone(),
             primary: primary.clone(),
@@ -1534,6 +1547,7 @@ async fn cli_main() -> ExitCode {
         reserve,
         allow_ip,
         allow_name,
+        registry_proxy,
     } = &cli.cmd
     {
         let mut hosts = std::collections::HashMap::new();
@@ -1567,7 +1581,25 @@ async fn cli_main() -> ExitCode {
             Ok(e) => e,
             Err(e) => return fail(&e, 2),
         };
-        return match switch::run(listen, *gateway, *prefix, hosts, reservations, egress).await {
+        let proxy = match registry_proxy
+            .as_deref()
+            .map(parse_registry_proxy)
+            .transpose()
+        {
+            Ok(p) => p,
+            Err(e) => return fail(&e, 2),
+        };
+        return match switch::run(
+            listen,
+            *gateway,
+            *prefix,
+            hosts,
+            reservations,
+            egress,
+            proxy,
+        )
+        .await
+        {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         };
@@ -1689,6 +1721,20 @@ async fn cli_main() -> ExitCode {
 fn fail(e: &anyhow::Error, code: i32) -> ExitCode {
     eprintln!("virtkit: error: {e:#}");
     exit_code(code)
+}
+
+/// Parse a switch `--registry-proxy` value `<sentinel-ip>=<host:port>`.
+fn parse_registry_proxy(s: &str) -> anyhow::Result<(std::net::Ipv4Addr, std::net::SocketAddr)> {
+    let (ip, addr) = s
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("registry-proxy {s:?}: want <ip>=<host:port>"))?;
+    let ip = ip
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|e| anyhow::anyhow!("registry-proxy sentinel {ip:?}: {e}"))?;
+    let addr = addr
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| anyhow::anyhow!("registry-proxy addr {addr:?}: {e}"))?;
+    Ok((ip, addr))
 }
 
 /// `--require-cached` refusals get their own exit code (3), so scripts can branch

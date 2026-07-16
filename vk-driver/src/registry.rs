@@ -22,7 +22,9 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use oci_client::Reference as OciReference;
@@ -1300,6 +1302,134 @@ fn http_client(rg: &Registry) -> Result<reqwest::Client> {
         );
     }
     b.build().context("building the registry HTTP client")
+}
+
+// ---- build-once lock (client of the vk-registry /lock API) ----
+
+/// Lease TTL requested for a build-once lock; renewed by the heartbeat below.
+const BUILD_LOCK_TTL: Duration = Duration::from_secs(30);
+/// How long an acquire blocks for a peer to finish before giving up (then we build
+/// uncoordinated rather than stall the build forever).
+const BUILD_LOCK_WAIT: Duration = Duration::from_secs(3600);
+
+/// The base URL (`scheme://authority`) of a remote vk-registry's lock endpoint, or
+/// `None` for a local filesystem store (no lock server) — the authority is the repo
+/// prefix up to its first `/`, scheme from `insecure`.
+fn lock_base(rg: &Registry) -> Option<String> {
+    if rg.local_root().is_some() {
+        return None;
+    }
+    let repo = rg
+        .repo
+        .strip_prefix("http://")
+        .or_else(|| rg.repo.strip_prefix("https://"))
+        .unwrap_or(&rg.repo);
+    let authority = repo.split('/').next().unwrap_or(repo);
+    let scheme = if rg.insecure { "http" } else { "https" };
+    Some(format!("{scheme}://{authority}"))
+}
+
+/// A held cross-runner build-once lock. Renews the lease on a background heartbeat until
+/// dropped; `Drop` stops the heartbeat and releases the lock (best-effort).
+pub struct BuildLock {
+    inner: Option<BuildLockInner>,
+}
+
+struct BuildLockInner {
+    client: Arc<vk_registry::LockClient>,
+    held: vk_registry::Held,
+    /// `(stopped, condvar)`: a Condvar (not a bare flag) so `Drop` wakes the heartbeat out
+    /// of its wait at once instead of blocking a whole renew interval on `join`.
+    stop: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    heartbeat: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Acquire a build-once lock on `key` against the (remote) cache registry `rg`, so peers
+/// building the same content-key don't duplicate the work. Returns `None` for a local
+/// store (no lock server) or if acquisition fails/times out — the caller then builds
+/// uncoordinated. Blocks until acquired or [`BUILD_LOCK_WAIT`].
+pub fn build_lock(rg: &Registry, key: &str) -> Option<BuildLock> {
+    let base = lock_base(rg)?;
+    let http = http_client(rg).ok()?;
+    let client = Arc::new(vk_registry::LockClient::new(base, None, http));
+    let holder = format!("vk pid={}", std::process::id());
+
+    let acq_client = client.clone();
+    let acq_key = key.to_string();
+    let held = block_on(async move {
+        acq_client
+            .acquire(&acq_key, BUILD_LOCK_TTL, BUILD_LOCK_WAIT, &holder)
+            .await
+    });
+    let held = match held {
+        Ok(Some(h)) => h,
+        _ => return None,
+    };
+
+    // heartbeat: renew the lease on its own thread + runtime until stopped. The stop signal
+    // is a Condvar so Drop wakes the wait immediately rather than blocking `join` for up to
+    // a full renew interval.
+    let stop = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let hb_client = client.clone();
+    let hb_stop = stop.clone();
+    let hb_held = vk_registry::Held {
+        name: held.name.clone(),
+        owner: held.owner.clone(),
+    };
+    let heartbeat = std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        let (lock, cvar) = &*hb_stop;
+        loop {
+            let mut stopped = lock.lock().unwrap();
+            if !*stopped {
+                // wait up to a third of the TTL, or until Drop signals stop.
+                let (g, _) = cvar.wait_timeout(stopped, BUILD_LOCK_TTL / 3).unwrap();
+                stopped = g;
+            }
+            if *stopped {
+                break;
+            }
+            drop(stopped);
+            // Best-effort: a lost lease (renew returns Ok(false)/Err — e.g. a pause exceeded
+            // the TTL and a peer reacquired) just means the build proceeds uncoordinated;
+            // correctness is unaffected, only cross-runner dedup. Not surfaced here to keep
+            // the live build dashboard's terminal clean.
+            let _ = rt.block_on(hb_client.renew(&hb_held, BUILD_LOCK_TTL));
+        }
+    });
+
+    Some(BuildLock {
+        inner: Some(BuildLockInner {
+            client,
+            held,
+            stop,
+            heartbeat: Some(heartbeat),
+        }),
+    })
+}
+
+impl Drop for BuildLock {
+    fn drop(&mut self) {
+        let Some(mut inner) = self.inner.take() else {
+            return;
+        };
+        {
+            let (lock, cvar) = &*inner.stop;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        if let Some(hb) = inner.heartbeat.take() {
+            let _ = hb.join();
+        }
+        let client = inner.client;
+        let held = inner.held;
+        let _ = block_on(async move { client.release(&held).await });
+    }
 }
 
 /// Optional HTTP Basic credentials from the registry config (username + password

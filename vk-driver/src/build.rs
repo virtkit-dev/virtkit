@@ -1520,6 +1520,28 @@ fn build_stage(
         ex.stage_end(&fs)?;
         return Ok(fs);
     }
+    // Build-once across runners: take the lock on this stage's final content key (a no-op
+    // unless the cache is a remote vk-registry) so peers building the same stage don't
+    // duplicate it. After acquiring, re-check the cache — a peer may have finished while we
+    // waited — and restore instead of building. The guard is held for the whole stage
+    // (through the final `cache_save`) and releases on return.
+    let _build_lock = match steps.last().map(|s| s.key.clone()) {
+        Some(final_key) => {
+            let guard = ex.build_lock(&final_key);
+            if guard.is_some() && ex.cache_has(&final_key) {
+                progress.stage_fully_cached(display);
+                progress.restore_start(display, &name);
+                let t_restore = Instant::now();
+                let fs = restore_into(ex, &name, &final_key)?;
+                timings.record(Phase::CachePull, &name, t_restore.elapsed());
+                progress.restore_done(display);
+                ex.stage_end(&fs)?;
+                return Ok(fs);
+            }
+            guard
+        }
+        None => None,
+    };
     // Declare the stage's inputs — the source stages it copies/mounts from, and its
     // build context — so the backend can attach them before the guest boots.
     ex.stage_sources(

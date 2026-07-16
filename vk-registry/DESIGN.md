@@ -177,13 +177,19 @@ boundary alignment (see the note below); client-side compression is independent 
 
 ## Credential injection (opt-in, per VM)
 
-Off by default; enabled per VM on `vk build` / `vk run` (not global). When enabled, `vk`
-exposes an **unauthenticated** registry endpoint to that guest (via the userspace switch
-+ DNS, e.g. `registry.vk`) and reverse-proxies it to the remote `vk-registry`, injecting
-the runner's credential on the guest→registry leg. The job/guest sees a plain endpoint
-and never holds the secret; the credential lives in the runner's `vk` config; only
-`vk-registry` ever talks to any upstream with upstream creds. Guests that do not opt in
-get no registry access this way.
+Off by default; opt-in per VM via `vk run --registry-proxy <upstream-url>` (needs `--net`).
+When set, `vk` runs a host-local reverse proxy (`regproxy.rs`) on loopback that forwards to
+the upstream registry, injecting the runner's `--username`/`--password`/`--ca` credential
+(`reqwest` Basic auth). The guest reaches it **credential-free** at `registry.vk` (a hint
+also exported as `VIRTKIT_REGISTRY`). Delivery: the switch's resolver maps `registry.vk` to
+an unroutable sentinel (`240.0.0.1`), and its TCP egress (`proxy_tcp`) special-cases that
+sentinel — splicing the flow to the loopback proxy instead of egressing. So the proxy is
+never bound to a network interface; it is reachable only through that per-VM redirect, and
+the job never holds the secret. A guest that doesn't opt in has no such path.
+
+Not yet wired into the GitLab executor path (`vm.rs`/`JobCtx`), which would take its
+upstream + credentials from the host `[registry]` config rather than CLI flags — a
+follow-up reusing the same `regproxy` + switch redirect.
 
 ## Auth / TLS
 
@@ -222,15 +228,16 @@ Each step is one concern, independently buildable.
 5. **Pull-through relay.** Multi-upstream namespace routing, digest-only caching,
    streaming tee, `put_manifest_by_digest`.
 6. **Lock API.** In-process leased lock manager + the four endpoints.
-7. **Build-once in runners.** Wrap `registry.rs`'s push path in acquire→recheck→build→
-   push→release with a heartbeat.
+7. **Build-once in runners.** `Executor::build_lock` (a `registry.rs` `BuildLock` guard,
+   `LockClient` + heartbeat over `block_on`); `build_stage` takes it on the stage's final
+   key, re-checks the cache, and restores instead of rebuilding when a peer won.
 8. **`task` `vk://` locker.** New `lock.Locker`, wired in `evalCacheLocker` beside
    `redis://`.
 9. **`task` vk-optimized upload.** Capability-detect `x-virtkit-transparent-zstd` in
    `ocicas`; compress chunks client-side (uncompressed-digest, `Content-Encoding: zstd`,
    frame content size), adaptive + fallback to raw for dumb registries.
-10. **Credential injection.** Per-VM opt-in flag on `build`/`run`; the guest→registry
-    reverse-proxy that injects the runner credential.
+10. **Credential injection.** `vk run --registry-proxy` opt-in: `regproxy.rs` loopback
+    proxy + the switch sentinel/DNS redirect. (Executor path is a follow-up.)
 11. **Ship.** `build.sh`/`release.yml`/`.gitlab-ci.yml` build + sign the third
     reproducible binary; README + AGENTS.md architecture section.
 

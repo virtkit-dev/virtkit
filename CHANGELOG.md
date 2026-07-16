@@ -21,6 +21,13 @@ All notable changes to virtkit will be documented in this file.
   for a step that builds several images together — the `ci-lock-mgr.sh` model, without Redis.
 - `vk-registry` supports **TLS** (`tls_cert`/`tls_key`) and **client auth** (a bearer
   token file, or HTTP Basic), so it can be exposed on a shared network.
+- `vk` image builds now take that **build-once lock** per stage when the instruction
+  cache is a remote `vk-registry`: peers building the same stage wait and pull the result
+  instead of rebuilding it. A no-op for the default local (on-disk) cache.
+- `vk run --registry-proxy <url>` runs a host-local credential-injecting registry proxy:
+  the guest reaches it credential-free at `registry.vk` and `vk` adds the
+  `--username`/`--password`/`--ca` credential on the way to the upstream, so the job never
+  holds the secret (needs `--net`; opt-in per VM).
 
 ### Removed
 

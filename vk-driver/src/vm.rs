@@ -624,6 +624,7 @@ fn spawn_switch(
         reservations,
         allow_ip: cfg.egress.allow_ip.clone(),
         allow_name: effective_allow_names(cfg, ctx)?,
+        registry_proxy: None,
         log: ctx.switch_log(),
     })
     .context("spawning the per-job switch")

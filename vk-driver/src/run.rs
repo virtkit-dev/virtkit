@@ -141,6 +141,11 @@ pub struct RunArgs {
     /// give the guest egress via a userspace `vk switch` (DHCP + DNS + proxy);
     /// forced on by `compose` (the services live on that switch's LAN)
     pub net: bool,
+    /// opt-in credential-injecting registry proxy: the upstream registry base URL
+    /// (`scheme://host`). `vk` runs a host-local proxy forwarding to it with the
+    /// `--username`/`--password`/`--ca` credentials, and the guest reaches it
+    /// credential-free at `registry.vk` (needs `--net`). `None` = disabled.
+    pub registry_proxy: Option<String>,
     /// compose file whose services boot as sibling unit VMs on the run switch,
     /// resolvable by alias, torn down with the run. Images materialize per run
     /// into the work dir; the instruction cache provides repeat-run warmth.
@@ -896,6 +901,27 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
     // forks a tap bridged to it and takes the static address from the cmdline fragment).
     // With services it also pre-listens on their sockets and answers their aliases.
     let mut switch = if args.net {
+        // Opt-in credential proxy: run a host-local proxy that injects the runner's
+        // registry credentials, and redirect the guest's `registry.vk` (a sentinel
+        // class-E address the switch special-cases) to it — the job stays credential-free.
+        let mut hosts = planned.hosts.clone();
+        let registry_proxy = match &args.registry_proxy {
+            Some(upstream) => {
+                const SENTINEL: std::net::Ipv4Addr = std::net::Ipv4Addr::new(240, 0, 0, 1);
+                let cfg = crate::regproxy::ProxyCfg::from_parts(
+                    upstream,
+                    args.username.clone(),
+                    args.password.clone(),
+                    args.ca.clone(),
+                    args.insecure,
+                )?;
+                let addr = crate::regproxy::spawn(cfg).await?;
+                hosts.push(("registry.vk".to_string(), SENTINEL.to_string()));
+                cmdline.push_str(" VIRTKIT_REGISTRY=registry.vk");
+                Some((SENTINEL, addr))
+            }
+            None => None,
+        };
         let (child, frag) = spawn_vm_switch(
             &vsock,
             work,
@@ -903,13 +929,20 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             &[],
             &[],
             &planned.listen,
-            &planned.hosts,
+            &hosts,
             &planned.reservations,
+            registry_proxy,
         )
         .await?;
         cmdline.push_str(&frag);
         Some(child)
     } else {
+        if args.registry_proxy.is_some() {
+            bail!(
+                "--registry-proxy requires --net: the guest reaches the credential proxy \
+                 through the switch's sentinel redirect, which only exists with networking"
+            );
+        }
         None
     };
 
@@ -1573,6 +1606,7 @@ async fn compose_up(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path) ->
         &planned.listen,
         &planned.hosts,
         &planned.reservations,
+        None,
     )
     .await?;
 
@@ -2258,6 +2292,7 @@ async fn spawn_vm_switch(
     extra_listen: &[PathBuf],
     hosts: &[(String, String)],
     reservations: &[(String, String)],
+    registry_proxy: Option<(std::net::Ipv4Addr, std::net::SocketAddr)>,
 ) -> Result<(Child, String)> {
     let (gw, prefix, guest_ip) = crate::net::switch_addrs(RUN_SUBNET)?;
     let mut listen = vsock.to_path_buf().into_os_string();
@@ -2272,6 +2307,7 @@ async fn spawn_vm_switch(
         reservations: reservations.to_vec(),
         allow_ip: allow_ip.to_vec(),
         allow_name: allow_name.to_vec(),
+        registry_proxy,
         log: work.join("switch.log"),
     })?;
     let frag = format!(
@@ -2496,6 +2532,7 @@ pub(crate) async fn boot_session(
             &[],
             &[],
             &[],
+            None,
         )
         .await?;
         switch = Some(child);

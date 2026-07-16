@@ -132,6 +132,14 @@ pub trait Executor {
         Ok(())
     }
 
+    /// Acquire a cross-runner build-once lock on `key` (a stage's final content hash) when
+    /// the cache is a remote vk-registry offering a lock endpoint, so peers building the
+    /// same stage don't duplicate it. `None` = uncoordinated (local cache, no cache, or the
+    /// registry has no lock). The guard releases on drop. Default: no lock.
+    fn build_lock(&mut self, _key: &str) -> Option<crate::registry::BuildLock> {
+        None
+    }
+
     /// Finalize a stage once all its instructions have run (default: nothing). The
     /// microVM backend uses this to shut down the stage's long-lived guest, whose writes
     /// are already persisted in the stage image (the booted disk).
@@ -1972,6 +1980,10 @@ impl Executor for MicroVm {
             Some(rg) => crate::registry::exists(rg, CACHE_REPO, key),
             None => false,
         }
+    }
+    fn build_lock(&mut self, key: &str) -> Option<crate::registry::BuildLock> {
+        // Namespace the lock key by the cache repo so unrelated stores don't collide.
+        crate::registry::build_lock(self.cache.as_ref()?, &format!("{CACHE_REPO}/{key}"))
     }
     fn cache_restore(&mut self, fs: &Rootfs, key: &str) -> Result<()> {
         let Some(rg) = self.cache.clone() else {

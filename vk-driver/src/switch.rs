@@ -189,6 +189,9 @@ struct EgressGuard {
     policy: Egress,
     gateway: Ipv4Addr,
     pinned: Mutex<HashMap<Ipv4Addr, Instant>>,
+    /// `(sentinel, host)`: a guest flow to `sentinel` is redirected to the host-local
+    /// credential registry proxy at `host` (see regproxy.rs). `None` = disabled.
+    registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
 }
 
 impl EgressGuard {
@@ -197,7 +200,12 @@ impl EgressGuard {
             policy,
             gateway,
             pinned: Mutex::new(HashMap::new()),
+            registry_proxy: None,
         }
+    }
+    fn with_registry_proxy(mut self, redirect: Option<(Ipv4Addr, SocketAddr)>) -> Self {
+        self.registry_proxy = redirect;
+        self
     }
     fn restricted(&self) -> bool {
         !matches!(self.policy, Egress::AllowAll)
@@ -291,6 +299,9 @@ pub struct Spawn {
     pub reservations: Vec<(String, String)>,
     pub allow_ip: Vec<String>,
     pub allow_name: Vec<String>,
+    /// `(sentinel, host)`: redirect a guest flow to `sentinel` to the host-local
+    /// credential registry proxy at `host` (see regproxy.rs). `None` = disabled.
+    pub registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
     pub log: PathBuf,
 }
 
@@ -327,6 +338,10 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
     for n in &opts.allow_name {
         cmd.arg("--allow-name").arg(n);
     }
+    if let Some((sentinel, host)) = opts.registry_proxy {
+        cmd.arg("--registry-proxy")
+            .arg(format!("{sentinel}={host}"));
+    }
     cmd.stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -345,6 +360,7 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
     Ok(child)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     listen: &[PathBuf],
     gateway: Ipv4Addr,
@@ -352,6 +368,7 @@ pub async fn run(
     hosts: HashMap<String, Ipv4Addr>,
     reservations: HashMap<Mac, Ipv4Addr>,
     egress: Egress,
+    registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
 ) -> Result<()> {
     if listen.is_empty() {
         bail!("switch: at least one --listen is required");
@@ -370,7 +387,7 @@ pub async fn run(
             tx: ret_tx,
         },
     );
-    let guard = Arc::new(EgressGuard::new(egress, gateway));
+    let guard = Arc::new(EgressGuard::new(egress, gateway).with_registry_proxy(registry_proxy));
     let restricted = guard.restricted();
     tokio::spawn(accept_loop(ip_stack, guard.clone()));
 
@@ -606,15 +623,24 @@ async fn accept_loop(mut ip_stack: IpStack, egress: Arc<EgressGuard>) {
 /// destination (egress through the host's own socket).
 async fn proxy_tcp(mut guest: ipstack::IpStackTcpStream, egress: Arc<EgressGuard>) {
     let dst = guest.peer_addr();
-    if !egress.allows(dst) {
-        eprintln!("switch: egress denied (tcp) {dst}");
-        return;
-    }
-    match TcpStream::connect(dst).await {
+    // Registry proxy: a flow to the sentinel address is spliced to the host-local
+    // credential proxy instead of egressing (it bypasses the egress allowlist — it is our
+    // own host service, and it never touches the guest's credentials).
+    let target = match egress.registry_proxy {
+        Some((sentinel, host)) if dst.ip() == IpAddr::V4(sentinel) => host,
+        _ => {
+            if !egress.allows(dst) {
+                eprintln!("switch: egress denied (tcp) {dst}");
+                return;
+            }
+            dst
+        }
+    };
+    match TcpStream::connect(target).await {
         Ok(mut host) => {
             let _ = tokio::io::copy_bidirectional(&mut guest, &mut host).await;
         }
-        Err(e) => eprintln!("switch: tcp connect {dst}: {e}"),
+        Err(e) => eprintln!("switch: tcp connect {target}: {e}"),
     }
 }
 
@@ -1313,6 +1339,7 @@ mod tests {
                 HashMap::new(),
                 HashMap::new(),
                 Egress::AllowAll,
+                None,
             )
             .await;
         });
