@@ -29,6 +29,9 @@ All notable changes to virtkit will be documented in this file.
   holds the secret. Opt in per VM with `vk run --registry-proxy <url>` (needs `--net`), or
   runner-wide for executor jobs with `[registry] proxy_guests = true` (uses the runner's
   `[registry]` credentials). Bodies stream, so large layers pass through without buffering.
+- `vk build --tag <name>:<tag>` builds a single target and publishes it to the configured
+  `[registry]` as a bootable bundle (chunks dedup against the build cache), ready to boot
+  via the executor's `MICROVM_IMAGE: registry/<name>:<tag>`.
 
 ### Removed
 

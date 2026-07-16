@@ -263,6 +263,13 @@ enum Cmd {
         /// ext4 output path
         #[arg(long)]
         out: Option<PathBuf>,
+        /// build the target and publish it to the `[registry]` repo as `<name>:<tag>`, a
+        /// bootable bundle the executor pulls with `MICROVM_IMAGE: registry/<name>:<tag>`.
+        /// The rootfs is byte-clean (its Env/User ride the bundle config), and its chunks
+        /// dedup against `--cache-registry`, so a co-located registry makes this a near
+        /// no-op (only the manifest is written).
+        #[arg(long = "tag", value_name = "NAME:TAG")]
+        tag: Option<String>,
         /// attach this caller-owned raw disk file read-write to the target stage's RUN
         /// guests as /dev/vdb (sources shift to vdc+). Its writes are the artifact — a RUN
         /// can partition it, mkfs and install a bootloader. Size + own the file yourself
@@ -1262,6 +1269,7 @@ async fn cli_main() -> ExitCode {
         primary,
         context,
         out,
+        tag,
         disk,
         print_plan,
         cloud_hypervisor,
@@ -1320,13 +1328,46 @@ async fn cli_main() -> ExitCode {
             },
             None => None,
         };
+        // --tag publishes the single built target as a bundle. It builds a byte-clean ext4
+        // to a scratch dir (whose `runner.ext4.json` config sidecar rides the bundle), then
+        // pushes; incompatible with the multi-target/--compose path.
+        if tag.is_some() && (compose.is_some() || target.len() > 1) {
+            return fail(
+                &anyhow::anyhow!(
+                    "--tag builds a single target; not usable with --compose or multiple --target"
+                ),
+                2,
+            );
+        }
+        if tag.is_some() && out.is_some() {
+            return fail(
+                &anyhow::anyhow!(
+                    "--tag publishes the built bundle to the registry; --out does not apply"
+                ),
+                2,
+            );
+        }
+        let tag_bundle = tag
+            .as_ref()
+            .map(|_| std::env::temp_dir().join(format!("vk-tag-{}", std::process::id())));
+        // Export renames/flattens into `<tag_bundle>/runner.ext4` but does not create the
+        // parent, so make the scratch dir up front.
+        if let Some(dir) = &tag_bundle
+            && let Err(e) = std::fs::create_dir_all(dir)
+        {
+            return fail(
+                &anyhow::anyhow!("creating the --tag scratch dir {}: {e}", dir.display()),
+                1,
+            );
+        }
+        let tag_out = tag_bundle.as_ref().map(|d| d.join("runner.ext4"));
         let opts = build::Options {
             dockerfiles: file.clone(),
             // build_units (the multi-target / --compose path) reads targets from its units;
             // the single-image path uses this one (default: the last stage).
             target: target.first().cloned(),
             contexts: context.clone(),
-            out: out.clone(),
+            out: tag_out.clone().or_else(|| out.clone()),
             out_disk,
             print_plan: *print_plan,
             cloud_hypervisor: cloud_hypervisor
@@ -1437,7 +1478,25 @@ async fn cli_main() -> ExitCode {
             };
         }
         return match build::build(&opts) {
-            Ok(_) => ExitCode::SUCCESS,
+            Ok(_) => match (&tag_bundle, tag) {
+                (Some(dir), Some(t)) => {
+                    // Byte-clean bundle: agent as PID 1 (from the boot), Env/User from the
+                    // sidecar — boot.kind is generic-disk. Publish; chunks dedup against the
+                    // build cache, so a co-located registry writes only the manifest.
+                    let r = std::fs::write(dir.join("boot.kind"), "generic-disk")
+                        .map_err(anyhow::Error::from)
+                        .and_then(|()| crate::registry::push(&cfg, dir, t));
+                    let _ = std::fs::remove_dir_all(dir);
+                    match r {
+                        Ok(digest) => {
+                            println!("virtkit: tagged registry/{t} ({digest})");
+                            ExitCode::SUCCESS
+                        }
+                        Err(e) => fail(&e, 1),
+                    }
+                }
+                _ => ExitCode::SUCCESS,
+            },
             Err(e) if is_not_cached(&e) => fail(&e, 3),
             Err(e) => fail(&e, 1),
         };

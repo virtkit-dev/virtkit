@@ -75,6 +75,12 @@ struct BundleConfig {
     compression: String,
     has_kernel: bool,
     has_initrd: bool,
+    /// The image's runtime config (Env/User/Workdir/Cmd) — what a `vk build` writes as
+    /// the `<out>.json` sidecar. Carried so the guest boots as the image intends (e.g.
+    /// drops to its `User`); the rootfs itself stays byte-clean (config applied at boot,
+    /// not baked). Absent for older bundles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_config: Option<vk_core::runcfg::RunConfig>,
 }
 
 /// Push a local bundle dir to `<registry.repo>/<name>:<tag>`. Returns the manifest
@@ -488,6 +494,8 @@ async fn push_ext4_diff_async(
         compression: "zstd".to_string(),
         has_kernel: false,
         has_initrd: false,
+        // The build-sharing path pushes an ext4 by fingerprint; no runtime config rides it.
+        run_config: None,
     };
     let config_json = serde_json::to_vec(&config).context("serializing the bundle config")?;
     let config_digest = sha256_hex(&config_json);
@@ -875,6 +883,12 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
             dir.display()
         )
     })?;
+    // The image's runtime config, if the bundle dir carries the `runner.ext4.json` sidecar
+    // a `vk build` writes next to its ext4. Carried in the manifest so the guest applies it
+    // at boot without baking anything into the (byte-clean, dedup-friendly) rootfs.
+    let run_config = std::fs::read(dir.join("runner.ext4.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
     let config = BundleConfig {
         total_size,
         chunk_count,
@@ -882,6 +896,7 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
         compression: "zstd".to_string(),
         has_kernel,
         has_initrd,
+        run_config,
     };
     let config_json = serde_json::to_vec(&config).context("serializing the bundle config")?;
     let config_digest = sha256_hex(&config_json);
@@ -1107,6 +1122,16 @@ async fn pull_into(
     }
 
     write_boot_kind(&tmp, &config.boot_kind)?;
+    // Restore the runtime-config sidecar next to runner.ext4, so the boot applies the
+    // image's Env/User without baking them into the rootfs (`image::resolved_from_dir`
+    // reads it).
+    if let Some(rc) = &config.run_config {
+        std::fs::write(
+            tmp.join("runner.ext4.json"),
+            serde_json::to_vec_pretty(rc).context("serializing the bundle run config")?,
+        )
+        .context("writing the run-config sidecar")?;
+    }
     if !bundle_present(&tmp) {
         bail!("pull of {name}@{digest} produced an incomplete bundle");
     }
@@ -1837,6 +1862,7 @@ mod local {
             compression: "zstd".to_string(),
             has_kernel: false,
             has_initrd: false,
+            run_config: None,
         };
         let config_json = serde_json::to_vec(&config).context("serializing the bundle config")?;
         let config_digest = store.put_blob(&config_json)?;
@@ -1915,6 +1941,37 @@ mod tests {
         // sharded by the first two hex chars (no flat pile of entries)
         assert!(dir.join("ab").join(&hex[2..]).is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bundle_config_round_trips_run_config() {
+        use vk_core::runcfg::RunConfig;
+        let rc = RunConfig {
+            env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+            user: "app".into(),
+            ..Default::default()
+        };
+        let cfg = BundleConfig {
+            total_size: 4096,
+            chunk_count: 2,
+            boot_kind: "generic-disk".into(),
+            compression: "zstd".into(),
+            has_kernel: false,
+            has_initrd: false,
+            run_config: Some(rc.clone()),
+        };
+        // the config blob push writes and pull reads must preserve run_config verbatim.
+        let json = serde_json::to_vec(&cfg).unwrap();
+        let back: BundleConfig = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.run_config, Some(rc));
+
+        // an older bundle's config (no run_config key) still decodes, as None.
+        let legacy = serde_json::json!({
+            "total_size": 4096, "chunk_count": 2, "boot_kind": "generic-disk",
+            "compression": "zstd", "has_kernel": false, "has_initrd": false,
+        });
+        let back: BundleConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.run_config, None);
     }
 
     /// High-entropy pseudo-random bytes (a splitmix64 stream) so the CDC gear-hash
