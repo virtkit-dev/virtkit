@@ -64,7 +64,7 @@
 # journal = false                                       # add an ext4 journal to the export
 
 # MICROVM_IMAGE is prefix-based (the prefix names the source): unset = local/default;
-# `local/<name>` = a bundle dir under [local] dir; `registry/<name>[:tag|@digest]` =
+# `local/<name>` = a bundle dir under [local] dir; `virtkit/<name>[:tag|@digest]` =
 # a [registry] bundle; `docker/<name>[:tag|@digest]` = an on-demand [convert]
 # conversion.
 
@@ -77,7 +77,7 @@
 
 # [registry]             # native OCI bundle registry: push/pull guest bundles with
 #                        # content-defined chunk dedup (CDC + per-chunk zstd), no
-#                        # oras, no docker. Backs the registry/<name> MICROVM_IMAGE form.
+#                        # oras, no docker. Backs the virtkit/<name> MICROVM_IMAGE form.
 # repo = "registry.example.com/team"   # fixed host-side = the image allowlist
 # ca_file = "/etc/virtkit/registry-ca.crt"  # PEM CA the registry TLS chains to
 # username = "ci-push"             # HTTP Basic; empty = anonymous (no auth)

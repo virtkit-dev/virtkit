@@ -179,7 +179,7 @@ Exit codes follow the custom-executor contract: script failures exit with
 - `local/<name>` — a bundle directory under `[local] dir` (`<dir>/<name>/`), resolved
   straight from disk. `<name>` is a single safe component; local bundles are never
   tagged or digested.
-- `registry/<name>[:tag|@sha256:…]` — a bundle in the `[registry]` repo, pulled+cached
+- `virtkit/<name>[:tag|@sha256:…]` — a bundle in the `[registry]` repo, pulled+cached
   natively with content-defined chunk dedup (CDC + per-chunk zstd).
 - `docker/<name>[:tag|@sha256:…]` — an on-demand `[convert]` conversion of a docker
   image (see below).
@@ -187,7 +187,7 @@ Exit codes follow the custom-executor contract: script failures exit with
 ```yaml
 my-job:
   variables:
-    MICROVM_IMAGE: registry/myimage     # :tag (default latest) or @sha256:…
+    MICROVM_IMAGE: virtkit/myimage     # :tag (default latest) or @sha256:…
 ```
 
 With `[convert]` configured, `MICROVM_IMAGE: docker/<name>[:tag|@sha256:…]`

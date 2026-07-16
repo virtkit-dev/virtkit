@@ -6,6 +6,12 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- `vk build --tag <name>:<tag>` builds the target and publishes it as a bootable bundle
+  to the `[registry]` repo, pulled by the executor with `MICROVM_IMAGE: virtkit/<name>:<tag>`.
+  The rootfs is byte-clean — the image's Env/User ride the bundle config and are applied at
+  boot (the embedded agent rides a preinit initramfs, the model `vk run -f` uses) — so its
+  chunks dedup against `--cache-registry`: co-located, publishing writes only the manifest.
+  The native-bundle prefix is `virtkit/` (was `registry/`), distinct from the `docker/` OCI path.
 - New `vk-registry` binary: a standalone OCI-distribution server backed by the same
   content-addressed store `vk` uses, meant to run centrally and be shared by every
   runner. `vk-registry serve` (plus `gc`/`status`/`install-service`) replaces the old
@@ -29,9 +35,6 @@ All notable changes to virtkit will be documented in this file.
   holds the secret. Opt in per VM with `vk run --registry-proxy <url>` (needs `--net`), or
   runner-wide for executor jobs with `[registry] proxy_guests = true` (uses the runner's
   `[registry]` credentials). Bodies stream, so large layers pass through without buffering.
-- `vk build --tag <name>:<tag>` builds a single target and publishes it to the configured
-  `[registry]` as a bootable bundle (chunks dedup against the build cache), ready to boot
-  via the executor's `MICROVM_IMAGE: registry/<name>:<tag>`.
 
 ### Removed
 
@@ -45,13 +48,13 @@ All notable changes to virtkit will be documented in this file.
   `MICROVM_IMAGE` needed (`services:` was already supported). `image:` is booted directly,
   accepted only under the `[docker] repo` allowlist (a bare docker-hub-style name maps onto
   the repo; a ref naming another registry is refused). `MICROVM_IMAGE` stays as the explicit
-  override for the `local/`/`registry/` sources; a job with no image boots `local/default`.
+  override for the `local/`/`virtkit/` sources; a job with no image boots `local/default`.
 - The GitLab executor's `MICROVM_IMAGE: docker/<name>` now boots the image **directly**:
   the native OCI client pulls it, the embedded vk-agent is injected as PID 1 and the
   embedded kernel boots it — the same path `vk run --source oci` uses. Registry auth is a
   slim `[docker]` section (repo/ca_file/username/password_file/insecure), replacing
   `[convert]`. Job `.gitlab-ci.yml` files are unchanged (`docker/<ref>` is repurposed).
-- A kernel-less bundle (generic-disk `local`/`registry`/`docker` image) now boots vk's
+- A kernel-less bundle (generic-disk `local`/`virtkit`/`docker` image) now boots vk's
   **embedded** kernel instead of a configured `generic_kernel` file, so the host needs no
   separate `vmlinux`. `generic_kernel` is dropped from `[local]`/`[registry]`, and a bundle
   that ships its own kernel still boots it.

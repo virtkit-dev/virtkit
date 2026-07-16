@@ -36,7 +36,7 @@ pub struct Config {
     /// form is rejected
     pub docker: Option<Docker>,
     /// Native OCI bundle registry (push/pull with CDC+zstd chunk dedup), backing the
-    /// `MICROVM_IMAGE: registry/<name>[:tag|@sha256:…]` form; absent = that form
+    /// `MICROVM_IMAGE: virtkit/<name>[:tag|@sha256:…]` form; absent = that form
     /// is rejected
     pub registry: Option<Registry>,
     /// Local guest bundles on the host filesystem, backing the

@@ -1,5 +1,5 @@
 //! Native OCI bundle registry with content-defined chunk deduplication, backing the
-//! `MICROVM_IMAGE: registry/<name>[:tag|@sha256:…]` form.
+//! `MICROVM_IMAGE: virtkit/<name>[:tag|@sha256:…]` form.
 //!
 //! A guest bundle (a `runner.ext4`, a `boot.kind`, and OPTIONALLY a `vmlinuz` +
 //! `initrd.img`) is pushed/pulled to/from an OCI registry directly — no `oras`,
@@ -101,10 +101,10 @@ pub fn push(cfg: &Config, dir: &Path, image_ref: &str) -> Result<String> {
 }
 
 /// Pull+cache a registry bundle for a job, returning a `ResolvedImage` exactly like
-/// `dockerimg::resolve` does. `image_ref` is what followed `registry/` in MICROVM_IMAGE.
+/// `dockerimg::resolve` does. `image_ref` is what followed `virtkit/` in MICROVM_IMAGE.
 pub fn resolve(ctx: &JobCtx, image_ref: &str) -> Result<ResolvedImage> {
     let rg = ctx.cfg.registry.as_ref().context(
-        "MICROVM_IMAGE uses the registry/ form but the host has no [registry] configured",
+        "MICROVM_IMAGE uses the virtkit/ form but the host has no [registry] configured",
     )?;
     let (name, reference) = image::parse_ref(image_ref)?;
     let (resolved, _dir) = block_on(resolve_async(ctx, rg, &name, reference))?;

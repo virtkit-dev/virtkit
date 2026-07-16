@@ -6,7 +6,7 @@
 //!   - `local/<name>` — a bundle directory under the host-configured
 //!     `[local] dir` (see local.rs). `<name>` is a single safe path component;
 //!     local bundles are never tagged or digested.
-//!   - `registry/<name>[:tag|@sha256:…]` — a bundle in the host-configured
+//!   - `virtkit/<name>[:tag|@sha256:…]` — a bundle in the host-configured
 //!     `[registry] repo` (the allowlist), pulled+cached natively with CDC+zstd
 //!     chunk dedup (see registry.rs). Only the name/reference is job-controlled.
 //!   - `docker/<name>[:tag|@sha256:…]` — a docker image in the host-configured
@@ -49,6 +49,10 @@ pub enum ResolvedImage {
         kernel: Option<PathBuf>,
         initrd: Option<PathBuf>,
         generic: bool,
+        /// The image's runtime config (Env/User/Workdir/Cmd), applied at boot so the guest
+        /// runs as the image intends. `None` when the image carries it baked in (the
+        /// `docker/` path writes `/etc/virtkit/{env,user}`) or ships none.
+        config: Option<vk_core::runcfg::RunConfig>,
     },
 }
 
@@ -60,9 +64,9 @@ pub fn resolve(ctx: &JobCtx) -> Result<ResolvedImage> {
     match image_ref.split_once('/') {
         // local/<name> = a bundle directory under [local] dir.
         Some(("local", rest)) => crate::local::resolve(ctx, rest),
-        // registry/<name>[:tag|@digest] = a bundle in the [registry] repo,
-        // pulled+cached natively (CDC+zstd chunk dedup).
-        Some(("registry", rest)) => crate::registry::resolve(ctx, rest),
+        // virtkit/<name>[:tag|@digest] = a native virtkit bundle in the [registry] repo,
+        // pulled+cached natively (CDC+zstd chunk dedup); published by `vk build --tag`.
+        Some(("virtkit", rest)) => crate::registry::resolve(ctx, rest),
         // docker/<name>[:tag|@digest] = an OCI image of the [docker] repo, pulled
         // and booted directly (embedded kernel + agent; digest-keyed local cache).
         Some(("docker", rest)) => crate::dockerimg::resolve(ctx, rest),
@@ -79,6 +83,11 @@ pub fn resolve(ctx: &JobCtx) -> Result<ResolvedImage> {
 pub(crate) fn resolved_from_dir(dir: &Path, kind: BootKind) -> ResolvedImage {
     let rootfs = dir.join("runner.ext4");
     let vmlinuz = dir.join("vmlinuz");
+    // The image's runtime config, written next to runner.ext4 by the bundle pull (from the
+    // manifest's run_config); the boot applies it. Absent for bundles built without it.
+    let config = std::fs::read(dir.join("runner.ext4.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
     match kind {
         // self-booting (systemd): the image's own kernel + initrd if it shipped
         // one, otherwise the embedded shared kernel, booting the ext4 root directly.
@@ -93,6 +102,7 @@ pub(crate) fn resolved_from_dir(dir: &Path, kind: BootKind) -> ResolvedImage {
                 kernel,
                 initrd,
                 generic: false,
+                config,
             }
         }
         // generic: the embedded shared kernel (virtio + ext4 built in), mounting the
@@ -102,6 +112,7 @@ pub(crate) fn resolved_from_dir(dir: &Path, kind: BootKind) -> ResolvedImage {
             kernel: None,
             initrd: None,
             generic: true,
+            config,
         },
     }
 }

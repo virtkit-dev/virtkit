@@ -15,10 +15,12 @@ use crate::image::ResolvedImage;
 use crate::jobctx::JobCtx;
 
 /// The boot medium: a read-only base rootfs (booted through a CoW overlay) plus a
-/// self-booting image's own initrd, if it shipped one.
+/// self-booting image's own initrd, if it shipped one, and the image's runtime config
+/// (Env/User), applied at boot for a byte-clean generic bundle.
 struct Media {
     rootfs: PathBuf,
     initrd: Option<PathBuf>,
+    config: Option<vk_core::runcfg::RunConfig>,
 }
 
 impl Media {
@@ -132,7 +134,16 @@ fn resolve_media(ctx: &JobCtx) -> Result<(Option<PathBuf>, Media, bool)> {
             kernel,
             initrd,
             generic,
-        } => Ok((kernel, Media { rootfs, initrd }, generic)),
+            config,
+        } => Ok((
+            kernel,
+            Media {
+                rootfs,
+                initrd,
+                config,
+            },
+            generic,
+        )),
     }
 }
 
@@ -171,23 +182,37 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     let overlay = ctx.overlay();
     crate::qcow2::create_overlay(&overlay, &media.rootfs)?;
 
-    let mut cmdline = if generic {
-        // generic guest (the default bundle): virtkit-agent is PID 1 on the ext4
-        // root (virtio-blk + ext4 built into the pinned kernel) and serves the exec
-        // channel directly — no systemd.
-        format!(
-            "console=ttyS0 root=/dev/vda rw rootfstype=ext4 init=/usr/local/bin/vk-agent \
-             VIRTKIT_HOSTNAME={} VIRTKIT_VSOCK_PORT={}",
-            cfg.vm.hostname, cfg.vm.vsock_port
+    let (mut cmdline, initramfs) = if generic {
+        // generic guest: the embedded agent rides a preinit initramfs as /init, pivots
+        // into the ext4 root on /dev/vda and serves the exec channel — the rootfs stays
+        // byte-clean (no baked agent), and the image's Env/User are applied from the
+        // bundle config. Same model `vk run -f`/`vk build` use.
+        let cpio = ctx.job_dir.join("initramfs.cpio");
+        crate::initramfs::build_agent_initramfs_with_config(
+            &agent.path,
+            media.config.as_ref(),
+            &cpio,
+        )
+        .context("building the guest preinit initramfs")?;
+        (
+            format!(
+                "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda \
+                 VIRTKIT_HOSTNAME={} VIRTKIT_VSOCK_PORT={}",
+                cfg.vm.hostname, cfg.vm.vsock_port
+            ),
+            Some(cpio),
         )
     } else {
-        // self-booting image: virtkit-agent is PID 1, execs the image's captured
-        // entrypoint (VIRTKIT_MODE=service) which brings up systemd; the in-guest
-        // serve agent then runs as a systemd unit.
-        format!(
-            "console=ttyS0 root=/dev/vda rw rootfstype=ext4 init=/usr/local/bin/vk-agent \
-             VIRTKIT_MODE=service VIRTKIT_HOSTNAME={}",
-            cfg.vm.hostname
+        // self-booting image: virtkit-agent (baked) is PID 1, execs the image's captured
+        // entrypoint (VIRTKIT_MODE=service) which brings up systemd; the in-guest serve
+        // agent then runs as a systemd unit. The image ships its own initrd, if any.
+        (
+            format!(
+                "console=ttyS0 root=/dev/vda rw rootfstype=ext4 init=/usr/local/bin/vk-agent \
+                 VIRTKIT_MODE=service VIRTKIT_HOSTNAME={}",
+                cfg.vm.hostname
+            ),
+            media.initrd.clone(),
         )
     };
 
@@ -373,7 +398,6 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // self-booting image's initrd. A generic guest on the pinned kernel ships
     // no initrd (virtio-blk + ext4 built in).
     let disks = vec![crate::vmm::Disk::overlay(overlay.clone())];
-    let initramfs = media.initrd;
 
     // shared=on (set via shared_mem): required by virtio-fs, harmless without.
     // vsock ports the guest uses: the exec channel always, plus the switch bridge in

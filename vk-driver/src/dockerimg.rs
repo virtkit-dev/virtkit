@@ -117,6 +117,8 @@ fn resolve_full(
         kernel: None,
         initrd: None,
         generic: true,
+        // Env/User are baked into the rootfs as /etc/virtkit/{env,user} at build time.
+        config: None,
     })
 }
 

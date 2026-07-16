@@ -264,7 +264,7 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
         /// build the target and publish it to the `[registry]` repo as `<name>:<tag>`, a
-        /// bootable bundle the executor pulls with `MICROVM_IMAGE: registry/<name>:<tag>`.
+        /// bootable bundle the executor pulls with `MICROVM_IMAGE: virtkit/<name>:<tag>`.
         /// The rootfs is byte-clean (its Env/User ride the bundle config), and its chunks
         /// dedup against `--cache-registry`, so a co-located registry makes this a near
         /// no-op (only the manifest is written).
@@ -1489,7 +1489,7 @@ async fn cli_main() -> ExitCode {
                     let _ = std::fs::remove_dir_all(dir);
                     match r {
                         Ok(digest) => {
-                            println!("virtkit: tagged registry/{t} ({digest})");
+                            println!("virtkit: tagged virtkit/{t} ({digest})");
                             ExitCode::SUCCESS
                         }
                         Err(e) => fail(&e, 1),
