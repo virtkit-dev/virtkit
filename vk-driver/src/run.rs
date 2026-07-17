@@ -2155,7 +2155,7 @@ async fn run_shell(addr: &SocketAddr) -> Result<()> {
     Ok(())
 }
 
-fn spawn_vmm(vmm: &dyn Vmm, spec: &crate::vmm::VmSpec) -> Result<Child> {
+pub(crate) fn spawn_vmm(vmm: &dyn Vmm, spec: &crate::vmm::VmSpec) -> Result<Child> {
     let log = std::fs::File::create(spec.serial_log.with_extension("vmm.log"))?;
     let mut cmd = vmm.command(spec);
     cmd.stdin(Stdio::null())

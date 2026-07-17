@@ -11,7 +11,7 @@
 
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Child;
 
 use anyhow::{Context, Result, bail};
 use vk_core::runcfg::RunConfig;
@@ -452,16 +452,11 @@ pub fn boot_unit(
             pass_fds: Vec::new(),
             proc_name: crate::vmm::resolve_proc_name(&svc.name),
         };
-        let log = std::fs::File::create(&console)?;
         let vmm = crate::vmm::selected(cloud_hypervisor);
-        // Tied (PDEATHSIG) like the virtiofsd aux children: a service VMM dies with
-        // its owner — the run or the CI job supervisor — rather than leaking
-        // on a hard kill that skips the explicit teardown.
-        let mut cmd = vmm.command(&spec);
-        cmd.stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log);
-        crate::spawn::spawn_tied(cmd).with_context(|| format!("spawning {}", vmm.name()))
+        // The one VMM spawn shared with `vk run`/`vk build`/the job VM: tied (PDEATHSIG)
+        // so a service VMM dies with its owner, and clears CLOEXEC on the embedded-kernel
+        // and pass-fds so they survive the exec into the VMM subprocess.
+        crate::run::spawn_vmm(&*vmm, &spec).with_context(|| format!("spawning {}", vmm.name()))
     };
     match spawn_vmm() {
         Ok(child) => Ok((child, aux)),

@@ -77,6 +77,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         if let Some(status) = sup.try_wait()? {
             log_tail(&ctx.supervisor_log(), 15);
             log_tail(&ctx.console_log(), 30);
+            log_tail(&ctx.vmm_log(), 20);
             bail!(
                 "the job supervisor exited during boot ({status}, see {})",
                 ctx.supervisor_log().display()
@@ -109,6 +110,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             Err(e) => {
                 if Instant::now() >= deadline {
                     log_tail(&ctx.console_log(), 30);
+                    log_tail(&ctx.vmm_log(), 20);
                     bail!(
                         "VM not ready after {}s ({e}) — console tail above, logs in {}",
                         cfg.vm.boot_timeout_secs,
@@ -164,21 +166,6 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         crate::embed::Asset::Kernel,
         kernel_opt.as_deref().or(cfg.build.kernel.as_deref()),
     )?;
-    // Each guest and service build boots as a VMM subprocess; an embedded kernel lives in
-    // a memfd whose /proc/self/fd path the child cannot open, so write it to a real file
-    // in the job dir (tmpfs) once and boot from that. A bundle- or config-supplied kernel
-    // is already a real path.
-    let kernel_path = if kernel.is_embedded() {
-        let p = ctx.job_dir.join("vmlinux");
-        let mut src = std::fs::File::open(&kernel.path).context("reading the embedded kernel")?;
-        let mut dst = std::fs::File::create(&p)
-            .with_context(|| format!("materializing the kernel to {}", p.display()))?;
-        std::io::copy(&mut src, &mut dst)
-            .with_context(|| format!("materializing the kernel to {}", p.display()))?;
-        p
-    } else {
-        kernel.path.clone()
-    };
     let mut children: Vec<std::process::Child> = Vec::new();
     // Every guest gets a throwaway CoW overlay over the ro base rootfs.
     let overlay = ctx.overlay();
@@ -300,7 +287,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             // before the guest dials it; then point the agent at it. The same
             // shared LAN/egress core `run --compose` uses.
             let (gateway, prefix, guest_ip) = crate::net::switch_addrs(&cfg.net.subnet)?;
-            let services = plan_services(ctx, gateway, prefix, &agent.path, &kernel_path).await?;
+            let services = plan_services(ctx, gateway, prefix, &agent.path, &kernel.path).await?;
             // the switch binds each service's vsock socket at startup: the
             // runtime dirs must exist before it spawns.
             for svc in &services {
@@ -313,7 +300,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                 let (child, aux) = crate::units::boot_unit(
                     svc,
                     &dir,
-                    &kernel_path,
+                    &kernel.path,
                     cfg.cloud_hypervisor(),
                     &agent.path,
                     cfg.net.net_port,
@@ -411,7 +398,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     }
 
     let spec = crate::vmm::VmSpec {
-        kernel: kernel_path.clone(),
+        kernel: kernel.path.clone(),
         cmdline,
         disks,
         initramfs,
@@ -443,8 +430,10 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         );
     }
     let vmm = crate::vmm::selected(cfg.cloud_hypervisor());
-    let ch_command = vmm.command(&spec);
-    let mut vmm_child = spawn_tied_logged(ch_command, &ctx.ch_log())
+    // The one VMM spawn shared with `vk run`/`vk build`: it clears CLOEXEC on the
+    // embedded-kernel (and any pass-fd) so those fds survive the exec into the VMM
+    // subprocess — open-coding a plain spawn here silently dropped them.
+    let mut vmm_child = crate::run::spawn_vmm(&*vmm, &spec)
         .with_context(|| format!("spawning the {} VMM", vmm.name()))?;
 
     // Own the job until told to stop (SIGTERM: cleanup or a stale-state sweep) or

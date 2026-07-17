@@ -105,8 +105,10 @@ impl JobCtx {
     pub fn console_log(&self) -> PathBuf {
         self.job_dir.join("console.log")
     }
-    pub fn ch_log(&self) -> PathBuf {
-        self.job_dir.join("ch.log")
+    /// The VMM subprocess's own stdout/stderr (vk's boot errors), written by `spawn_vmm`
+    /// next to the guest serial console.
+    pub fn vmm_log(&self) -> PathBuf {
+        self.job_dir.join("console.vmm.log")
     }
     pub fn net_lease(&self) -> PathBuf {
         self.job_dir.join("net.lease")
