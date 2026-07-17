@@ -265,53 +265,66 @@ mod tests {
     use super::*;
 
     // A fake upstream that records the Authorization header + path of the last request
-    // and replies 200 with a marker body.
-    async fn fake_upstream() -> (SocketAddr, Arc<std::sync::Mutex<(String, String)>>) {
+    // and replies 200 with a marker body. It runs on its own dedicated thread + runtime
+    // (like the proxy's `spawn_blocking` and the vk-registry e2e servers) so its accept
+    // loop never competes with the test's runtime threads — which caused acceptance stalls
+    // and flakes when many of these servers ran concurrently under `cargo test`.
+    fn fake_upstream() -> (SocketAddr, Arc<std::sync::Mutex<(String, String)>>) {
         let seen = Arc::new(std::sync::Mutex::new((String::new(), String::new())));
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
         let s = seen.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let s = s.clone();
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let svc = service_fn(move |req: Request<Incoming>| {
-                        let s = s.clone();
-                        async move {
-                            let auth = req
-                                .headers()
-                                .get(hyper::header::AUTHORIZATION)
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("")
-                                .to_string();
-                            let path = req.uri().path().to_string();
-                            *s.lock().unwrap() = (auth, path);
-                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
-                        }
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = TcpListener::from_std(listener).unwrap();
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let s = s.clone();
+                    tokio::spawn(async move {
+                        let io = TokioIo::new(stream);
+                        let svc = service_fn(move |req: Request<Incoming>| {
+                            let s = s.clone();
+                            async move {
+                                let auth = req
+                                    .headers()
+                                    .get(hyper::header::AUTHORIZATION)
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let path = req.uri().path().to_string();
+                                *s.lock().unwrap() = (auth, path);
+                                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
+                                    b"ok",
+                                ))))
+                            }
+                        });
+                        let _ = http1::Builder::new().serve_connection(io, svc).await;
                     });
-                    let _ = http1::Builder::new().serve_connection(io, svc).await;
-                });
-            }
+                }
+            });
         });
         (addr, seen)
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn injects_basic_auth_and_forwards_path() {
         // reqwest (rustls-no-provider) needs a crypto provider before a client builds.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let (up_addr, seen) = fake_upstream().await;
+        let (up_addr, seen) = fake_upstream();
         let cfg = ProxyCfg {
             upstream: format!("http://{up_addr}"),
             username: Some("robot".to_string()),
             password: Some("s3cret".to_string()),
             client: reqwest::Client::new(),
         };
-        let proxy = spawn(cfg).await.unwrap();
+        let proxy = spawn_blocking(cfg).unwrap();
 
         // the "guest" hits the proxy with NO credentials.
         let r = reqwest::Client::new()
@@ -334,17 +347,17 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn refuses_paths_outside_v2() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let (up_addr, seen) = fake_upstream().await;
+        let (up_addr, seen) = fake_upstream();
         let cfg = ProxyCfg {
             upstream: format!("http://{up_addr}"),
             username: Some("robot".to_string()),
             password: Some("s3cret".to_string()),
             client: reqwest::Client::new(),
         };
-        let proxy = spawn(cfg).await.unwrap();
+        let proxy = spawn_blocking(cfg).unwrap();
 
         // a path outside /v2/ (here the lock control plane) is refused with 403 and never
         // reaches the upstream — the host credential is never lent to it.
