@@ -87,12 +87,16 @@ prefix = "ghcr.io"
 url    = "https://ghcr.io"
 ```
 
-Two net-new `Store` methods:
+How persistence works:
 
-- **streaming tee** — relay upstream→client while writing to a store temp file, promote
-  to `blobs/sha256/<hex>` on digest match; never buffer a multi-GB layer in memory.
-- **`put_manifest_by_digest(digest, ctype, body)`** — cache a relayed manifest keyed by
-  digest with no tag (tags are never persisted).
+- **Blobs stream to disk** — a pulled blob is streamed into a store temp file (bounded
+  memory, never a multi-GB layer in RAM), hashed as it arrives, verified against the
+  requested digest, then promoted to `blobs/sha256/<hex>` and served from the store. A
+  relayed layer is already compressed, so it is stored identity (the adaptive-zstd path
+  wouldn't shrink it). `Store::uploads_dir`/`identity_blob_path` expose the staging seam.
+- **Manifests** — a digest-referenced manifest is persisted with the existing
+  `put_manifest` (a digest reference writes no tag), so relayed manifests are cached
+  without ever creating a mutable tag.
 
 ## Locking — the server is the authority
 
@@ -187,9 +191,10 @@ sentinel — splicing the flow to the loopback proxy instead of egressing. So th
 never bound to a network interface; it is reachable only through that per-VM redirect, and
 the job never holds the secret. A guest that doesn't opt in has no such path.
 
-Not yet wired into the GitLab executor path (`vm.rs`/`JobCtx`), which would take its
-upstream + credentials from the host `[registry]` config rather than CLI flags — a
-follow-up reusing the same `regproxy` + switch redirect.
+The GitLab executor opts in runner-wide with `[registry] proxy_guests = true`: each job's
+switch (`vm.rs`) starts the same `regproxy` forwarding to the host `[registry]` with its
+credentials, exposed to the job at `registry.vk`. Proxy bodies stream both ways, so a job
+pushing/pulling multi-GB layers through it never buffers a whole blob.
 
 ## Auth / TLS
 
@@ -226,7 +231,7 @@ Each step is one concern, independently buildable.
    `install-service` — regserve serving as a standalone daemon.
 4. **TLS + auth** for network exposure.
 5. **Pull-through relay.** Multi-upstream namespace routing, digest-only caching,
-   streaming tee, `put_manifest_by_digest`.
+   blobs streamed to disk (bounded memory), digest-referenced manifest persistence.
 6. **Lock API.** In-process leased lock manager + the four endpoints.
 7. **Build-once in runners.** `Executor::build_lock` (a `registry.rs` `BuildLock` guard,
    `LockClient` + heartbeat over `block_on`); `build_stage` takes it on the stage's final
@@ -236,8 +241,9 @@ Each step is one concern, independently buildable.
 9. **`task` vk-optimized upload.** Capability-detect `x-virtkit-transparent-zstd` in
    `ocicas`; compress chunks client-side (uncompressed-digest, `Content-Encoding: zstd`,
    frame content size), adaptive + fallback to raw for dumb registries.
-10. **Credential injection.** `vk run --registry-proxy` opt-in: `regproxy.rs` loopback
-    proxy + the switch sentinel/DNS redirect. (Executor path is a follow-up.)
+10. **Credential injection.** `regproxy.rs` loopback proxy + the switch sentinel/DNS
+    redirect, opt-in per VM (`vk run --registry-proxy`) or runner-wide for executor jobs
+    (`[registry] proxy_guests`). Streams both ways.
 11. **Ship.** `build.sh`/`release.yml`/`.gitlab-ci.yml` build + sign the third
     reproducible binary; README + AGENTS.md architecture section.
 

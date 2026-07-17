@@ -112,6 +112,15 @@ impl Store {
     fn blob_path(&self, hex: &str) -> PathBuf {
         self.root.join("blobs/sha256").join(hex)
     }
+    /// The identity-store destination for a blob, and the temp/uploads directory to
+    /// stage it in — for the relay, which streams a pulled blob to disk (bounded memory)
+    /// then promotes it here. Both are under the store root, so a rename is atomic.
+    pub fn identity_blob_path(&self, hex: &str) -> PathBuf {
+        self.blob_path(hex)
+    }
+    pub fn uploads_dir(&self) -> PathBuf {
+        self.root.join("uploads")
+    }
     /// Transparently-compressed blob: the stored bytes are a zstd frame; the canonical
     /// (digested) bytes are its decompression (hex = sha256 of the decompressed form).
     fn zstd_blob_path(&self, hex: &str) -> PathBuf {
@@ -1212,14 +1221,18 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn sha256_hex_raw(data: &[u8]) -> String {
-    let d = Sha256::digest(data);
-    let mut s = String::with_capacity(64);
-    for b in d {
-        use std::fmt::Write;
+/// Lowercase hex of a byte slice.
+pub(crate) fn hex_of(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
         write!(s, "{b:02x}").unwrap();
     }
     s
+}
+
+pub(crate) fn sha256_hex_raw(data: &[u8]) -> String {
+    hex_of(&Sha256::digest(data))
 }
 
 /// A repository name: one or more `/`-separated path components, each a non-empty

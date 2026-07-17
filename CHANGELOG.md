@@ -24,10 +24,11 @@ All notable changes to virtkit will be documented in this file.
 - `vk` image builds now take that **build-once lock** per stage when the instruction
   cache is a remote `vk-registry`: peers building the same stage wait and pull the result
   instead of rebuilding it. A no-op for the default local (on-disk) cache.
-- `vk run --registry-proxy <url>` runs a host-local credential-injecting registry proxy:
-  the guest reaches it credential-free at `registry.vk` and `vk` adds the
-  `--username`/`--password`/`--ca` credential on the way to the upstream, so the job never
-  holds the secret (needs `--net`; opt-in per VM).
+- Credential-injecting registry proxy: the guest reaches a registry credential-free at
+  `registry.vk` and `vk` adds the credential on the way to the upstream, so the job never
+  holds the secret. Opt in per VM with `vk run --registry-proxy <url>` (needs `--net`), or
+  runner-wide for executor jobs with `[registry] proxy_guests = true` (uses the runner's
+  `[registry]` credentials). Bodies stream, so large layers pass through without buffering.
 
 ### Removed
 

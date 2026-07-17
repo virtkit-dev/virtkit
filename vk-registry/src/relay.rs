@@ -10,15 +10,23 @@
 //! of this server never needs the upstream credentials — the reason a central
 //! `vk-registry` can front a private registry for many runners.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
+use futures::StreamExt;
 use http_body_util::Full;
 use hyper::{Response, StatusCode};
 use reqwest::Method as RMethod;
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 
 use crate::{
     ServerState, error_response, get_blob as serve_blob_local, get_manifest as serve_manifest_local,
 };
+
+/// Unique suffix source for a relay's staging temp file (per process).
+static RELAY_TMP: AtomicU64 = AtomicU64::new(0);
 
 /// Manifest media types we accept from upstream (OCI + Docker, image + index).
 const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json,\
@@ -96,12 +104,62 @@ pub async fn get_blob(
             digest,
         ));
     }
-    // NOTE: buffered in memory then stored; a streaming tee (upstream → client + store)
-    // is the planned optimization for multi-GB layers. See DESIGN.md.
-    let bytes = resp.bytes().await.context("reading the upstream blob")?;
-    let got = state.store.put_blob(&bytes)?;
+    // Stream the upstream blob to a temp file (bounded memory — layers can be GBs),
+    // hashing as we go; verify it matches the requested digest, then promote it into the
+    // identity blob store and serve it back from there. A relayed layer is already
+    // compressed, so identity storage is right (the adaptive-zstd path wouldn't shrink it).
+    let hex = digest.trim_start_matches("sha256:");
+    let uploads = state.store.uploads_dir();
+    tokio::fs::create_dir_all(&uploads)
+        .await
+        .with_context(|| format!("creating {}", uploads.display()))?;
+    let tmp = uploads.join(format!(
+        ".relay-{}-{}",
+        std::process::id(),
+        RELAY_TMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = tokio::fs::File::create(&tmp)
+        .await
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    let mut hasher = Sha256::new();
+    let mut stream = resp.bytes_stream();
+    let mut write_result = Ok(());
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                hasher.update(&chunk);
+                if let Err(e) = file.write_all(&chunk).await {
+                    write_result = Err(anyhow::Error::from(e).context("writing the relayed blob"));
+                    break;
+                }
+            }
+            Err(e) => {
+                write_result = Err(anyhow::Error::from(e).context("reading the upstream blob"));
+                break;
+            }
+        }
+    }
+    let flush = file.flush().await;
+    drop(file);
+    if let Err(e) = write_result.and(flush.map_err(Into::into)) {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    let got = format!("sha256:{}", crate::hex_of(&hasher.finalize()));
     if got != digest {
+        let _ = tokio::fs::remove_file(&tmp).await;
         bail!("upstream blob digest mismatch for {name}: got {got}, want {digest}");
+    }
+    {
+        // shared store lock (vs. an exclusive gc) across the promote; see Store::lock_shared.
+        let _lock = state.store.lock_shared()?;
+        if state.store.has_blob(hex) {
+            let _ = tokio::fs::remove_file(&tmp).await;
+        } else {
+            tokio::fs::rename(&tmp, state.store.identity_blob_path(hex))
+                .await
+                .with_context(|| format!("promoting the relayed blob {digest}"))?;
+        }
     }
     serve_blob_local(&state.store, digest, head, accept_zstd)
 }

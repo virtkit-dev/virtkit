@@ -605,6 +605,21 @@ fn spawn_switch(
             reservations.push((crate::units::mac_for_ip(ip4), ip.to_string()));
         }
     }
+    // Opt-in credential proxy: expose the runner's `[registry]` to the job at
+    // `registry.vk`, injecting its credentials, so the job stays credential-free. The
+    // switch redirects the sentinel (an unroutable class-E address) to the host-local
+    // proxy; see regproxy.rs / switch.rs.
+    let registry_proxy = match &cfg.registry {
+        Some(rg) if rg.proxy_guests => {
+            const SENTINEL: Ipv4Addr = Ipv4Addr::new(240, 0, 0, 1);
+            let addr =
+                crate::regproxy::spawn_blocking(crate::regproxy::ProxyCfg::from_registry(rg)?)
+                    .context("starting the job registry proxy")?;
+            hosts.push(("registry.vk".to_string(), SENTINEL.to_string()));
+            Some((SENTINEL, addr))
+        }
+        _ => None,
+    };
     crate::switch::spawn(&crate::switch::Spawn {
         listen,
         gateway,
@@ -613,7 +628,7 @@ fn spawn_switch(
         reservations,
         allow_ip: cfg.egress.allow_ip.clone(),
         allow_name: effective_allow_names(cfg, ctx)?,
-        registry_proxy: None,
+        registry_proxy,
         log: ctx.switch_log(),
     })
     .context("spawning the per-job switch")

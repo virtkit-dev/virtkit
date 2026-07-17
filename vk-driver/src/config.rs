@@ -263,6 +263,11 @@ pub struct Registry {
     /// Cached pulled bundles kept per image
     #[serde(default = "default_keep")]
     pub keep: u32,
+    /// Run a credential-injecting registry proxy for executor guests: each job's switch
+    /// exposes this registry at `registry.vk`, injecting these credentials, so a job
+    /// pushes/pulls without ever holding the secret. Off by default.
+    #[serde(default)]
+    pub proxy_guests: bool,
 }
 
 impl Registry {
@@ -299,6 +304,7 @@ impl Registry {
             insecure,
             transparent_zstd,
             keep: default_keep(),
+            proxy_guests: false,
         }
     }
 }
