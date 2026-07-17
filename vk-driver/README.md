@@ -144,7 +144,6 @@ state_dir = "/var/lib/virtkit"
 [local]
 # baked guest bundles live under <dir>/<name>/; the default guest is local/default
 dir = "/usr/local/lib/virtkit/images"
-generic_kernel = "/usr/local/lib/virtkit/vmlinux"
 
 [net]
 mode = "pool"
@@ -181,8 +180,8 @@ Exit codes follow the custom-executor contract: script failures exit with
   tagged or digested.
 - `virtkit/<name>[:tag|@sha256:…]` — a bundle in the `[registry]` repo, pulled+cached
   natively with content-defined chunk dedup (CDC + per-chunk zstd).
-- `docker/<name>[:tag|@sha256:…]` — an on-demand `[convert]` conversion of a docker
-  image (see below).
+- `docker/<name>[:tag|@sha256:…]` — an OCI image from the `[docker]` repo, pulled with
+  the native OCI client and booted directly (embedded kernel + agent; see below).
 
 ```yaml
 my-job:
@@ -190,8 +189,9 @@ my-job:
     MICROVM_IMAGE: virtkit/myimage     # :tag (default latest) or @sha256:…
 ```
 
-With `[convert]` configured, `MICROVM_IMAGE: docker/<name>[:tag|@sha256:…]`
-boots a Docker image on demand: the executor resolves the tag, pulls the image
-through the host daemon, and streams it into a sparse ext4 (injecting
-`virtkit-agent` as PID 1). Conversions are cached and GC'd; staleness is a
-UUID compare against the build fingerprint.
+With `[docker]` configured, `MICROVM_IMAGE: docker/<name>[:tag|@sha256:…]` boots an OCI
+image on demand — the same path `vk run --source oci` uses: the native OCI client pulls
+the resolved digest from the `[docker] repo` (the allowlist), flattens it into a sparse
+ext4 with `virtkit-agent` injected as PID 1, and boots it on vk's embedded kernel. The
+image's Env/User are captured so the guest runs like `docker run` would. Results are
+cached (digest-keyed) under `<state_dir>/docker/` and GC'd; no Docker daemon is involved.

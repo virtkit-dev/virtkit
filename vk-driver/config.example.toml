@@ -65,15 +65,14 @@
 
 # MICROVM_IMAGE is prefix-based (the prefix names the source): unset = local/default;
 # `local/<name>` = a bundle dir under [local] dir; `virtkit/<name>[:tag|@digest]` =
-# a [registry] bundle; `docker/<name>[:tag|@digest]` = an on-demand [convert]
-# conversion.
+# a [registry] bundle; `docker/<name>[:tag|@digest]` = an OCI image booted directly
+# from the [docker] repo.
 
 # [local]                # local guest bundles on the host filesystem. Each
 #                        # <dir>/<name>/ is a baked bundle (runner.ext4 + boot.kind
 #                        # [+ vmlinuz + initrd.img]). Backs the local/<name> form.
+#                        # A kernel-less bundle boots vk's embedded kernel.
 # dir = "/usr/local/lib/vk/images"   # default: <state_dir>/images
-# generic_kernel = "/usr/local/lib/vk/vmlinux"  # shared kernel for
-#                                  # generic (kernel-less) bundles
 
 # [registry]             # native OCI bundle registry: push/pull guest bundles with
 #                        # content-defined chunk dedup (CDC + per-chunk zstd), no
@@ -85,24 +84,19 @@
 #                                  # (kept out of this config); read at runtime,
 #                                  # provision it 0600. Sent over TLS — see ca_file.
 # insecure = false                 # plain HTTP (a local/insecure registry)
-# generic_kernel = "/usr/local/lib/vk/vmlinux"  # shared kernel for
-#                                  # generic (kernel-less) bundles
 # keep = 3                         # cached pulled bundles per image (GC)
 
-# [convert]              # docker images → bootable bundles on demand. MICROVM_IMAGE
-#                        # is `docker/<name>[:tag|@digest]`.
+# [docker]               # OCI images booted directly on demand (native OCI client, no
+#                        # docker daemon). MICROVM_IMAGE is `docker/<name>[:tag|@digest]`;
+#                        # the image is pulled, flattened to a bootable ext4 with the
+#                        # embedded vk-agent as PID 1, and booted on vk's embedded kernel.
 # repo = "registry.example.com/team"   # fixed host-side = the image allowlist
-# docker = "/usr/bin/docker"       # host daemon: pull + the root conversion container
-# agent = "/usr/local/lib/vk/vk-agent"  # the agent, injected as PID 1
-# rootfs_size = "32G"              # ext4 size of the converted rootfs (sparse)
-# generic_kernel = "/usr/local/lib/vk/vmlinux"  # shared kernel for
-#                                  # kernel-less OCI images (alpine/distroless)
-# oras = "/usr/local/bin/oras"     # tag → digest resolution
-# ca_file = "/etc/virtkit/registry-ca.crt"
-# username = "ci-push"             # also drives docker pull (--config); the
-# password_file = "/etc/virtkit/registry-password"  # daemon must trust the
-#                                  # registry cert (/etc/docker/certs.d)
-# keep = 3                         # cached conversions per image (GC)
+# ca_file = "/etc/virtkit/registry-ca.crt"  # PEM CA the registry TLS chains to
+# username = "ci-push"             # HTTP Basic; empty = anonymous
+# password_file = "/etc/virtkit/registry-password"   # file holding the password
+#                                  # (read at runtime, provision it 0600)
+# insecure = false                 # plain HTTP (a local/insecure registry)
+# keep = 3                         # cached image rootfs builds per image (GC)
 
 # [services]            # CI `services:` support. Each declared service boots as a
 #                       # sibling microVM on the per-job switch, resolvable by its
