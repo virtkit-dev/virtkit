@@ -343,6 +343,48 @@ fn base_dirs(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Drop chunk blobs in `<registry_root>/chunks/` that no cached bundle references. Each
+/// pulled bundle records the chunk digests it was reassembled from in a `chunks.list`; the
+/// union over every still-present bundle is the live set. A chunk is only a re-pull
+/// optimization shared across bundles, so once every bundle that used it has been evicted it
+/// is dead weight — this ties the deduped chunk store's lifetime to the idle-evicted bundles.
+/// Re-materializing a swept chunk just re-downloads it. Best-effort.
+pub(crate) fn sweep_chunks(registry_root: &Path) {
+    let Ok(entries) = std::fs::read_dir(registry_root.join("chunks")) else {
+        return;
+    };
+    let mut live = std::collections::HashSet::new();
+    for base in base_dirs(registry_root) {
+        if let Ok(list) = std::fs::read_to_string(base.join("chunks.list")) {
+            live.extend(
+                list.lines()
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty())
+                    .map(str::to_string),
+            );
+        }
+    }
+    let mut dropped = 0usize;
+    for e in entries.flatten() {
+        let p = e.path();
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Skip a chunk being staged into the store right now (`pull_chunk` writes `<hex>.tmp`
+        // then renames). An in-flight *bundle* is instead kept live by its `chunks.list`,
+        // which `pull_into` writes into the staging dir before fetching any chunk.
+        if name.ends_with(".tmp") || live.contains(name) {
+            continue;
+        }
+        if std::fs::remove_file(&p).is_ok() {
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        println!("virtkit: swept {dropped} unreferenced cache chunk(s)");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,5 +574,64 @@ mod tests {
         evict_eventually(&root, &evict);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sweep_chunks_drops_only_unreferenced_blobs() {
+        let root = std::env::temp_dir().join(format!("vk-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // A cached bundle referencing chunk "aaa" (and nothing else).
+        let bundle = root.join("img").join("deadbeef");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("runner.ext4"), b"x").unwrap();
+        std::fs::write(bundle.join("chunks.list"), "aaa\n").unwrap();
+        // The chunk store: a referenced blob, an orphan, and an in-flight temp.
+        let chunks = root.join("chunks");
+        std::fs::create_dir_all(&chunks).unwrap();
+        for f in ["aaa", "bbb", "ccc.tmp"] {
+            std::fs::write(chunks.join(f), b"z").unwrap();
+        }
+
+        sweep_chunks(&root);
+        assert!(chunks.join("aaa").exists(), "a referenced chunk is kept");
+        assert!(!chunks.join("bbb").exists(), "an orphan chunk is dropped");
+        assert!(
+            chunks.join("ccc.tmp").exists(),
+            "an in-flight chunk is left alone"
+        );
+
+        // Once the only bundle referencing "aaa" is evicted, "aaa" becomes reclaimable.
+        std::fs::remove_dir_all(&bundle).unwrap();
+        sweep_chunks(&root);
+        assert!(
+            !chunks.join("aaa").exists(),
+            "a chunk no remaining bundle references is dropped"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sweep_chunks_keeps_chunks_of_an_in_flight_bundle() {
+        // A pull stages a bundle in `<digest>.tmp/` and writes its `chunks.list` before
+        // fetching any chunk, so a concurrent sweep must count that staging bundle as live
+        // and not reclaim the chunks it is still reassembling.
+        let root = std::env::temp_dir().join(format!("vk-sweep-inflight-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let staging = root.join("img").join("deadbeef.tmp");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("runner.ext4"), b"x").unwrap();
+        std::fs::write(staging.join("chunks.list"), "aaa\n").unwrap();
+        let chunks = root.join("chunks");
+        std::fs::create_dir_all(&chunks).unwrap();
+        std::fs::write(chunks.join("aaa"), b"z").unwrap();
+
+        sweep_chunks(&root);
+        assert!(
+            chunks.join("aaa").exists(),
+            "a chunk referenced by an in-flight staging bundle is kept"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

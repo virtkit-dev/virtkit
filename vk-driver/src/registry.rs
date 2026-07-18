@@ -1007,10 +1007,9 @@ async fn resolve_async(
         ensure_bundle_pulled(&client, &auth, rg, ctx.cfg.state_dir(), name, &reference).await?;
     image::mark_used(&dir);
     if pulled {
-        image::gc_idle(
-            &ctx.cfg.state_dir().join("registry"),
-            ctx.cfg.image_cache_idle(),
-        );
+        let registry_root = ctx.cfg.state_dir().join("registry");
+        image::gc_idle(&registry_root, ctx.cfg.image_cache_idle());
+        image::sweep_chunks(&registry_root);
     }
     let boot_kind = image::read_boot_kind(&dir).with_context(|| {
         format!("registry bundle {name}@{digest}: unsupported boot.kind marker — re-push it")
@@ -1085,6 +1084,18 @@ async fn pull_into(
         })
         .cloned()
         .collect();
+    // The chunk digests this bundle is made of. Record them into the staging bundle *now*,
+    // before any chunk is fetched into the shared store, so a concurrent `sweep_chunks`
+    // (which keys the live set off each present bundle's `chunks.list`) counts this in-flight
+    // pull as live and never reclaims a chunk it is still reassembling from. `runner.ext4`
+    // already exists, so the staging dir is a `base_dirs` entry from here on. A later cache
+    // GC uses the same list to drop chunk blobs no cached bundle references any more.
+    let chunk_hexes: Vec<String> = chunk_layers
+        .iter()
+        .map(|l| l.digest.trim_start_matches("sha256:").to_string())
+        .collect();
+    std::fs::write(tmp.join("chunks.list"), chunk_hexes.join("\n"))
+        .context("writing the chunk manifest")?;
     let chunks_cache = chunks_cache_dir(dir);
     let out = std::sync::Arc::new(out);
     let fetched = AtomicUsize::new(0);

@@ -190,6 +190,18 @@ enum ServiceCmd {
 }
 
 #[derive(Subcommand)]
+enum CacheCmd {
+    /// Evict image bases no VM is using and that are idle past the threshold, plus any
+    /// registry chunks no remaining bundle references.
+    Gc {
+        /// Idle threshold in seconds; `0` reclaims every base no VM is currently using.
+        /// Default: the config's `image_cache_idle_secs` (30 min).
+        #[arg(long)]
+        idle_secs: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// Preflight: check this host is usable by the current user — /dev/kvm access,
@@ -201,6 +213,14 @@ enum Cmd {
         /// turn out unconfigured (repeatable)
         #[arg(long = "feature", value_enum, value_name = "FEATURE")]
         feature: Vec<check::Feature>,
+    },
+    /// Reclaim the host image cache: evict materialized bases (`<state_dir>/{registry,
+    /// docker}`) idle past the timeout and drop unreferenced registry chunks. Reclaim
+    /// otherwise happens on each pull, so this is for a cron or manual sweep on an
+    /// otherwise-idle runner.
+    Cache {
+        #[command(subcommand)]
+        cmd: CacheCmd,
     },
     /// GitLab custom-executor lifecycle (config / prepare / run / cleanup)
     Gitlab {
@@ -934,6 +954,23 @@ async fn cli_main() -> ExitCode {
         } else {
             exit_code(1)
         };
+    }
+    if let Cmd::Cache {
+        cmd: CacheCmd::Gc { idle_secs },
+    } = &cli.cmd
+    {
+        let idle = idle_secs
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_else(|| cfg.image_cache_idle());
+        let registry = cfg.state_dir().join("registry");
+        image::gc_idle(&registry, idle);
+        image::sweep_chunks(&registry);
+        image::gc_idle(&cfg.state_dir().join("docker"), idle);
+        println!(
+            "virtkit: cache gc done (idle threshold {}s)",
+            idle.as_secs()
+        );
+        return ExitCode::SUCCESS;
     }
     // `run` is a standalone dev path: no JobCtx (no CUSTOM_ENV_* job context).
     if let Cmd::Run {
@@ -1760,6 +1797,7 @@ async fn cli_main() -> ExitCode {
         },
         // handled above, before JobCtx
         Cmd::Check { .. }
+        | Cmd::Cache { .. }
         | Cmd::Registry { .. }
         | Cmd::Switch { .. }
         | Cmd::Run { .. }

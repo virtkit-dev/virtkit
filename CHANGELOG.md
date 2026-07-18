@@ -6,6 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- `vk cache gc [--idle-secs N]` reclaims the host image cache on demand: evicts materialized
+  bases (`<state_dir>/{registry,docker}`) idle past the threshold (`0` = every base no VM is
+  using) and drops registry chunks no cached bundle still references. Reclaim otherwise runs
+  after each pull, so this is for a cron or manual sweep on an idle runner.
 - `vk build --tag <name>:<tag>` builds the target and publishes it as a bootable bundle
   to the `[registry]` repo, pulled by the executor with `MICROVM_IMAGE: virtkit/<name>:<tag>`.
   The rootfs is byte-clean — the image's Env/User ride the bundle config and are applied at
@@ -48,6 +52,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- The deduped registry chunk store (`<state_dir>/registry/chunks/`) is now bounded: a pull
+  records the chunk digests it used in the bundle's `chunks.list`, and the GC drops any chunk
+  no remaining cached bundle references. Its lifetime tracks the (idle-evicted) bundles, so
+  the compressed tier no longer grows without limit.
 - Materialized image bases (`<state_dir>/{registry,docker}/…/runner.ext4`) are now kept by
   **reference count + idle timeout** rather than `keep = N` versions: a base is pinned by a
   shared advisory lock while any VM overlays it (the kernel drops it if the job crashes), and
