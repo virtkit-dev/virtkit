@@ -1524,6 +1524,9 @@ fn plan_services(
         }
         let unit = &units[i];
         let dir = work.join(format!("svc-{}", unit.name));
+        // The switch binds each service's vsock socket under this dir at startup, and the
+        // boot writes the overlay/console here — so it must exist before either runs.
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         sited.push(Sited { unit: i, dir, slot });
         slot += 1;
     }
