@@ -12,7 +12,7 @@
 //! This is the OCI-direct path `vk run --source oci` uses, wired into the executor, so a
 //! runner host provisions the guest with just the `vk` binary.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
@@ -116,80 +116,34 @@ fn build(
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
     println!("virtkit: pulling {full} ...");
-    crate::registry::block_on(build_async(
-        full.to_string(),
-        username,
-        password,
+    // Flatten the image byte-clean (the agent rides the boot initramfs) and capture its
+    // Config into the runner.ext4.json sidecar — the shared OCI-flatten core. A journalled
+    // fs and no freshness UUID: the digest-keyed cache dir is this image's identity.
+    let rootfs = tmp.join("runner.ext4");
+    crate::registry::block_on(crate::source::oci_flatten(
+        full,
+        username.as_deref(),
+        password.as_deref(),
         ca_pem,
         insecure,
-        tmp.clone(),
+        0,
+        &crate::ext4::FsId {
+            with_journal: true,
+            ..Default::default()
+        },
+        &rootfs,
     ))?;
     std::fs::write(
         tmp.join("boot.kind"),
         image::boot_kind_tag(BootKind::GenericDisk),
     )
     .with_context(|| format!("writing the boot marker in {}", tmp.display()))?;
-    if !tmp.join("runner.ext4").is_file() {
+    if !rootfs.is_file() {
         bail!("OCI direct build of {full} produced no rootfs");
     }
     let _ = std::fs::remove_dir_all(dir);
     std::fs::rename(&tmp, dir)
         .with_context(|| format!("promoting {} to {}", tmp.display(), dir.display()))
-}
-
-async fn build_async(
-    full: String,
-    username: Option<String>,
-    password: Option<String>,
-    ca_pem: Option<Vec<u8>>,
-    insecure: bool,
-    tmp: PathBuf,
-) -> Result<()> {
-    // Capture the image config a plain rootfs tar drops, so the guest runs like
-    // `docker run`: the boot applies Config.Env (PATH, …), User, WorkingDir, Entrypoint and
-    // Cmd from this sidecar next to the rootfs, rather than baking them into the ext4.
-    let cfg = crate::oci::pull_config(
-        &full,
-        username.as_deref(),
-        password.as_deref(),
-        ca_pem.clone(),
-        insecure,
-    )
-    .await?;
-    let run_config = vk_core::runcfg::RunConfig {
-        env: cfg.env,
-        user: cfg.user.unwrap_or_default(),
-        workdir: cfg.workdir.unwrap_or_default(),
-        entrypoint: cfg.entrypoint,
-        cmd: cfg.cmd,
-    };
-    std::fs::write(tmp.join("runner.ext4.json"), run_config.to_json())
-        .with_context(|| format!("writing the run-config sidecar in {}", tmp.display()))?;
-    let rootfs = tmp.join("runner.ext4");
-    let source = crate::source::Source::Oci {
-        reference: full,
-        username,
-        password,
-        ca_pem,
-        insecure,
-    };
-    source
-        .stream_tar(&tmp, |tar, hints| {
-            crate::ext4::build_from_tar_stream(
-                tar,
-                &[], // byte-clean: nothing injected (the agent rides the boot initramfs)
-                hints.image_bytes(),
-                0,
-                Some(hints.inode_count()),
-                &crate::ext4::FsId {
-                    with_journal: true,
-                    ..Default::default()
-                },
-                &rootfs,
-            )
-        })
-        .await?;
-    Ok(())
 }
 
 /// Map a job's `image:` onto the `[docker] repo` allowlist. A ref already under the repo

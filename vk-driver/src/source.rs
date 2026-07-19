@@ -120,6 +120,56 @@ impl Source {
     }
 }
 
+/// Pull an OCI `reference` and flatten it into a byte-clean ext4 at `out` — nothing
+/// injected, since the embedded agent rides the boot initramfs — then write the image's
+/// runtime config (`Env`/`User`/`WorkingDir`/`Entrypoint`/`Cmd`) to `config_sidecar(out)`
+/// for the boot to apply. `extra_blocks` is writable free-space headroom beyond the sparse
+/// fit (a guest boots through a CoW overlay, but the filesystem still needs free blocks to
+/// allocate); `fs_id` sets the journal and any freshness UUID. The shared core of the
+/// executor's OCI-direct image path (`dockerimg.rs`) and the units OCI service path
+/// (`ensure.rs`). Returns the config it wrote.
+#[allow(clippy::too_many_arguments)]
+pub async fn oci_flatten(
+    reference: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+    ca_pem: Option<Vec<u8>>,
+    insecure: bool,
+    extra_blocks: u64,
+    fs_id: &crate::ext4::FsId,
+    out: &Path,
+) -> Result<vk_core::runcfg::RunConfig> {
+    let config: vk_core::runcfg::RunConfig =
+        crate::oci::pull_config(reference, username, password, ca_pem.clone(), insecure)
+            .await?
+            .into();
+    let source = Source::Oci {
+        reference: reference.to_string(),
+        username: username.map(str::to_string),
+        password: password.map(str::to_string),
+        ca_pem,
+        insecure,
+    };
+    let scratch = out.parent().unwrap_or_else(|| Path::new("."));
+    source
+        .stream_tar(scratch, |tar, hints| {
+            crate::ext4::build_from_tar_stream(
+                tar,
+                &[],
+                hints.image_bytes(),
+                extra_blocks,
+                Some(hints.inode_count()),
+                fs_id,
+                out,
+            )
+        })
+        .await?;
+    let sidecar = crate::build::config_sidecar(out);
+    std::fs::write(&sidecar, config.to_json())
+        .with_context(|| format!("writing {}", sidecar.display()))?;
+    Ok(config)
+}
+
 /// Stream `produce`'s output through an OS pipe into `consume`, the producer on its
 /// own thread. Once `consume` returns Ok, its unread tail (e.g. the padding after a
 /// tar's archive terminator) is drained so the producer finishes cleanly instead of

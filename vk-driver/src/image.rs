@@ -25,8 +25,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::jobctx::JobCtx;
 
-/// The boot flavour recorded per converted bundle (`boot.kind`), so a cache hit
-/// — which skips the conversion — still knows how to boot it.
+/// The boot flavour recorded per cached bundle (`boot.kind`), so a cache hit
+/// — which skips the pull/build — still knows how to boot it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootKind {
     /// The image ships its own kernel + systemd (a self-booting ext4 bundle).
@@ -50,8 +50,8 @@ pub enum ResolvedImage {
         initrd: Option<PathBuf>,
         generic: bool,
         /// The image's runtime config (Env/User/Workdir/Cmd), applied at boot so the guest
-        /// runs as the image intends. `None` when the image carries it baked in (the
-        /// `docker/` path writes `/etc/virtkit/{env,user}`) or ships none.
+        /// runs as the image intends. `None` for a bundle/image that ships no config sidecar
+        /// (an older bundle, or a self-booting systemd image that carries its own).
         config: Option<vk_core::runcfg::RunConfig>,
     },
 }

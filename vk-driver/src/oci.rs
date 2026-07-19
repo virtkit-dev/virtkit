@@ -34,6 +34,18 @@ pub struct ImageConfig {
     pub cmd: Vec<String>,
 }
 
+impl From<ImageConfig> for vk_core::runcfg::RunConfig {
+    fn from(c: ImageConfig) -> Self {
+        Self {
+            env: c.env,
+            user: c.user.unwrap_or_default(),
+            workdir: c.workdir.unwrap_or_default(),
+            entrypoint: c.entrypoint,
+            cmd: c.cmd,
+        }
+    }
+}
+
 /// Resolve `reference` to its manifest digest (`sha256:…`), anonymously — for the build
 /// cache key, so a moved tag changes the key (and a stale cached base is not reused).
 /// Errors (offline, private registry) propagate; the caller falls back to keying by ref.
