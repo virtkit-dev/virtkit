@@ -16,6 +16,12 @@ All notable changes to virtkit will be documented in this file.
   boot (the embedded agent rides a preinit initramfs, the model `vk run -f` uses) — so its
   chunks dedup against `--cache-registry`: co-located, publishing writes only the manifest.
   The native-bundle prefix is `virtkit/` (was `registry/`), distinct from the `docker/` OCI path.
+- The GitLab executor can boot the job's image built from the project's own git sources:
+  `MICROVM_IMAGE: build:<dockerfile>[#<stage>]` builds that Dockerfile stage and boots it,
+  taking `--build-arg`s from `MICROVM_BUILD_ARG_<NAME>` job variables. Built images are cached
+  and shared across jobs and runners. It requires the new `[gitlab] host_checkout` mode (off by
+  default), which checks the sources out on the host and shares them into the job over a
+  filesystem mount, keeping the git credential out of the guest.
 - CI `services:` accept the `virtkit/<name>[:tag]` prefix: a service sourced from a
   `[registry]` bundle is pulled (CDC+zstd dedup) and booted on the same clean-image unit
   path as an OCI service (agent initramfs + embedded kernel applying the bundle config).

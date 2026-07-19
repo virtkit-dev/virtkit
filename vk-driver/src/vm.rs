@@ -33,22 +33,16 @@ impl Media {
 
 pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     let cfg = &ctx.cfg;
-    // Fail-fast preflight in the runner-visible process (crisp errors beat a
-    // supervisor log pointer); the supervisor re-resolves from the same env.
-    let (kernel, media, _generic) = resolve_media(ctx)?;
-    // A `None` kernel boots vk's embedded copy — nothing to stat.
-    for p in media.files().into_iter().chain(kernel.as_deref()) {
-        if !p.is_file() {
-            bail!("image file missing: {}", p.display());
-        }
-    }
+    // Cheap fail-fast checks first (crisp errors in the runner-visible process beat a
+    // supervisor-log pointer).
     if unsafe { libc::access(c"/dev/kvm".as_ptr(), libc::R_OK | libc::W_OK) } != 0 {
         bail!("no rw access to /dev/kvm (is the runner user in the kvm group?)");
     }
     let (cpus, mem) = vm_size(ctx)?;
 
     // A leftover job (failed cleanup, retried job id) must not leak: signal its
-    // supervisor — everything it owns cascades by PDEATHSIG — and drop the state.
+    // supervisor — everything it owns cascades by PDEATHSIG — and drop the state. Done before
+    // the checkout so a dying supervisor is not still virtio-fs-sharing the checkout dir.
     stop_supervisor(ctx);
     crate::net::release(ctx);
     if ctx.job_dir.exists() {
@@ -58,10 +52,11 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     std::fs::create_dir_all(&ctx.job_dir)
         .with_context(|| format!("creating {}", ctx.job_dir.display()))?;
 
-    // [gitlab] host_checkout: check the sources out on the host NOW — before the guest boots —
-    // so supervise can share the tree in and the git token never enters the guest (the job
-    // sets GIT_STRATEGY: none). Crisp errors here (the runner-visible prepare) beat a
-    // supervisor-log pointer; like any prepare failure a checkout error exits system_failure.
+    // [gitlab] host_checkout: check the sources out on the host NOW — before resolving the
+    // image (a `build:` image is built from these sources) and before the guest boots — so
+    // supervise can share the tree in and the git token never enters the guest (the job sets
+    // GIT_STRATEGY: none). Crisp errors here (the runner-visible prepare) beat a supervisor-log
+    // pointer; like any prepare failure a checkout error exits system_failure.
     if cfg.gitlab.as_ref().is_some_and(|g| g.host_checkout) {
         let url = ctx
             .ci_repo_url
@@ -75,6 +70,16 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         println!("virtkit: host checkout of {sha} -> {}", dest.display());
         crate::checkout::ensure(url, ctx.ci_commit_ref.as_deref().unwrap_or(""), sha, &dest)
             .context("host checkout")?;
+    }
+
+    // Resolve (and, for a `build:` image, build) the boot media in the runner-visible process;
+    // the supervisor re-resolves from the same env (a fingerprint hit for a build). A `None`
+    // kernel boots vk's embedded copy — nothing to stat.
+    let (kernel, media, _generic) = resolve_media(ctx)?;
+    for p in media.files().into_iter().chain(kernel.as_deref()) {
+        if !p.is_file() {
+            bail!("image file missing: {}", p.display());
+        }
     }
 
     // ONE detached process owns the job from here (the runner protocol requires
@@ -146,8 +151,15 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
 
 /// Resolve MICROVM_IMAGE to the boot files: an optional kernel (`None` = boot vk's
 /// embedded kernel), the rootfs + optional initrd, and whether it is a generic boot.
+///
+/// `MICROVM_IMAGE: build:<dockerfile>[#<stage>]` builds a **git-defined** image from the
+/// host-side checkout into the shared build tier and boots that; any other form resolves
+/// through the shared image cache (`resolve_ref`).
 fn resolve_media(ctx: &JobCtx) -> Result<(Option<PathBuf>, Media, bool)> {
     let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
+    if let Some(spec) = image_ref.strip_prefix("build:") {
+        return resolve_build_form(ctx, spec);
+    }
     match crate::image::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), image_ref)? {
         ResolvedImage::Disk {
             rootfs,
@@ -165,6 +177,118 @@ fn resolve_media(ctx: &JobCtx) -> Result<(Option<PathBuf>, Media, bool)> {
             generic,
         )),
     }
+}
+
+/// Build a git-defined image (`MICROVM_IMAGE: build:<dockerfile>[#<stage>]`) from the
+/// host-side checkout into the shared build tier, and return it as generic-disk boot media
+/// (embedded kernel, agent + config riding the preinit initramfs — the byte-clean model
+/// `vk build`/bundles use). Requires `[gitlab] host_checkout`: the Dockerfile + context are
+/// the checked-out sources. `--build-arg`s come from `CUSTOM_ENV_MICROVM_BUILD_ARG_<NAME>`.
+fn resolve_build_form(ctx: &JobCtx, spec: &str) -> Result<(Option<PathBuf>, Media, bool)> {
+    let cfg = &ctx.cfg;
+    if !cfg.gitlab.as_ref().is_some_and(|g| g.host_checkout) {
+        bail!(
+            "MICROVM_IMAGE build: requires [gitlab] host_checkout — the Dockerfile and its \
+             context are the checked-out sources"
+        );
+    }
+    let (rel_dockerfile, stage) = match spec.split_once('#') {
+        Some((f, s)) => (f, Some(s)),
+        None => (spec, None),
+    };
+    let checkout = ctx.host_checkout_dir();
+    // The Dockerfile path is job-controlled; confine it to the checkout so a `build:` job
+    // cannot read another tenant's checkout or an arbitrary host file during the host-side
+    // build (this runs outside the microVM boundary).
+    let dockerfile = confined_dockerfile(&checkout, rel_dockerfile)?;
+    // compose semantics: the repo root is the one build context (Dockerfile COPYs are
+    // repo-relative), matching how ci-buildimage.sh builds these stages.
+    let dockerfiles = vec![dockerfile];
+    let contexts = vec![checkout];
+    let build_args = ci_build_args();
+    let stage_key = crate::build::target_stage_key(&dockerfiles, &contexts, &build_args, stage)
+        .context("computing the git-defined image's stage fingerprint")?;
+    let recipe = crate::ensure::BuildRecipe {
+        dockerfiles,
+        contexts,
+        build_args,
+        kernel: cfg.build.kernel.clone(),
+        cloud_hypervisor: Some(cfg.cloud_hypervisor().to_path_buf()),
+        agent: cfg.build.agent.clone(),
+        cache_registry: cfg.build.cache_registry.clone(),
+        cache_insecure: cfg.build.cache_insecure,
+    };
+    let dir = crate::ensure::ensure_build_tier(
+        cfg.state_dir(),
+        cfg.image_cache_idle(),
+        &recipe,
+        stage,
+        &stage_key,
+        None,
+    )
+    .context("building the git-defined job image")?;
+    let rootfs = dir.join("runner.ext4");
+    // The stage's Env/User captured by the build (applied at boot via the preinit initramfs).
+    let config = std::fs::read_to_string(crate::build::config_sidecar(&rootfs))
+        .ok()
+        .and_then(|s| vk_core::runcfg::RunConfig::from_json(&s).ok());
+    Ok((
+        None,
+        Media {
+            rootfs,
+            initrd: None,
+            config,
+        },
+        true,
+    ))
+}
+
+/// Resolve the job-controlled Dockerfile path against the checkout root, refusing to escape
+/// it. Rejects an absolute path (`Path::join` would discard the base) and any `..`/root
+/// component up front, then canonicalizes and re-checks the prefix so a symlink committed in
+/// the repo cannot redirect the read outside the checkout (`read_to_string` follows symlinks).
+/// A `build:` job fully controls its repo, so this is the boundary that keeps it inside its
+/// own tree on a shared runner. The checked path is later read in a separate syscall, but the
+/// checkout is host-private to this job and the job author owns its contents, so the resolve↔read
+/// window is not a cross-tenant boundary — the confinement guards against reaching *another*
+/// tenant's tree or the host, not against the job racing itself.
+fn confined_dockerfile(checkout: &Path, rel: &str) -> Result<PathBuf> {
+    use std::path::Component;
+    let rel_path = Path::new(rel);
+    if rel_path.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        bail!(
+            "MICROVM_IMAGE build: Dockerfile path must be relative and stay inside the repo: \
+             {rel:?}"
+        );
+    }
+    let joined = checkout.join(rel_path);
+    let canon = joined
+        .canonicalize()
+        .with_context(|| format!("resolving the git-defined Dockerfile {}", joined.display()))?;
+    let root = checkout
+        .canonicalize()
+        .with_context(|| format!("resolving the checkout {}", checkout.display()))?;
+    if !canon.starts_with(&root) {
+        bail!("MICROVM_IMAGE build: Dockerfile {rel:?} resolves outside the repo checkout");
+    }
+    Ok(canon)
+}
+
+/// `--build-arg`s for a git-defined image, from `CUSTOM_ENV_MICROVM_BUILD_ARG_<NAME>=<value>`
+/// job variables (e.g. `MICROVM_BUILD_ARG_DEVUSER_UID=1000`).
+fn ci_build_args() -> Vec<(String, String)> {
+    std::env::vars()
+        .filter_map(|(k, v)| {
+            k.strip_prefix("CUSTOM_ENV_MICROVM_BUILD_ARG_")
+                .filter(|n| !n.is_empty())
+                .map(|n| (n.to_string(), v))
+        })
+        .collect()
 }
 
 /// The detached job supervisor (`vk gitlab supervise <job_dir>`, spawned by
@@ -1085,5 +1209,40 @@ mod tests {
         assert_eq!(prefix_to_netmask(8), "255.0.0.0");
         assert_eq!(prefix_to_netmask(0), "0.0.0.0");
         assert_eq!(prefix_to_netmask(32), "255.255.255.255");
+    }
+
+    #[test]
+    fn confined_dockerfile_stays_inside_the_checkout() {
+        let root = std::env::temp_dir().join(format!("vk-confine-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("docker")).unwrap();
+        std::fs::write(root.join("Dockerfile"), b"FROM scratch\n").unwrap();
+        std::fs::write(root.join("docker").join("ci"), b"FROM scratch\n").unwrap();
+
+        // A plain repo-relative Dockerfile resolves inside the checkout.
+        assert!(confined_dockerfile(&root, "Dockerfile").is_ok());
+        assert!(confined_dockerfile(&root, "docker/ci").is_ok());
+
+        // Absolute paths (which `Path::join` would honour, discarding the base) and `..`
+        // traversal are refused before any read.
+        assert!(confined_dockerfile(&root, "/etc/passwd").is_err());
+        assert!(confined_dockerfile(&root, "../../etc/passwd").is_err());
+        assert!(confined_dockerfile(&root, "docker/../../escape").is_err());
+
+        // A symlink committed in the repo that points outside the checkout is refused after
+        // canonicalization, even though it has no `..` component.
+        let outside = std::env::temp_dir().join(format!("vk-confine-out-{}", std::process::id()));
+        let _ = std::fs::remove_file(&outside);
+        std::fs::write(&outside, b"FROM scratch\n").unwrap();
+        let link = root.join("evil");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(
+            confined_dockerfile(&root, "evil").is_err(),
+            "a symlink escaping the checkout must be refused"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&outside);
     }
 }
