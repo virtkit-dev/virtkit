@@ -252,12 +252,51 @@ pub async fn run(args: &RunArgs) -> Result<()> {
             kernel.path.display()
         );
     }
+    // The host config drives image resolution (registry/docker proxy, local dir) and the
+    // shared image cache location. `vk run` is rootless and usually has no config file, so a
+    // missing one yields defaults; its cache lives under $XDG_DATA_HOME rather than the CI
+    // default /var/lib/virtkit (unwritable for a dev), unless the config pins a state_dir.
+    let cfg = crate::config::Config::load()?;
+    let state_dir = match &cfg.state_dir {
+        Some(dir) => dir.clone(),
+        None => default_data_base()?,
+    };
+
     // No primary (no image, no -f, no --primary) + a compose file = compose up:
     // services only, held until ctrl-c.
     if args.image.is_empty() && args.dockerfiles.is_empty() && args.primary.is_none() {
-        return compose_up(args, &work.path, &agent.path, &kernel.path).await;
+        return compose_up(
+            args,
+            &cfg,
+            &state_dir,
+            &work.path,
+            &agent.path,
+            &kernel.path,
+        )
+        .await;
     }
-    build_and_boot(args, &work.path, &agent.path, &kernel.path).await
+    build_and_boot(
+        args,
+        &cfg,
+        &state_dir,
+        &work.path,
+        &agent.path,
+        &kernel.path,
+    )
+    .await
+}
+
+/// Default base for `vk run`'s durable shared image cache: `$XDG_DATA_HOME/virtkit`, else
+/// `~/.local/share/virtkit`. Distinct from `default_scratch_base` (the transient launch
+/// scratch under `$XDG_CACHE_HOME`): the materialized image bases and built stages here
+/// persist across runs (bounded by idle eviction), so they belong in the data dir — the
+/// same home the instruction store (`vk_registry::default_root`) uses.
+pub(crate) fn default_data_base() -> Result<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(xdg).join("virtkit"));
+    }
+    let home = std::env::var_os("HOME").context("neither XDG_DATA_HOME nor HOME is set")?;
+    Ok(PathBuf::from(home).join(".local/share/virtkit"))
 }
 
 /// Default base for a run's launch scratch: `$XDG_CACHE_HOME/virtkit`, else
@@ -432,7 +471,14 @@ async fn resolve_source(args: &RunArgs) -> Result<Source> {
     }
 }
 
-async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path) -> Result<()> {
+async fn build_and_boot(
+    args: &RunArgs,
+    cfg: &crate::config::Config,
+    state_dir: &Path,
+    work: &Path,
+    agent: &Path,
+    kernel: &Path,
+) -> Result<()> {
     // Both non-default axes boot the image from an ext4 (the modular image kernel
     // mounts /dev/vda; the image's init pivots into it), so they need an ext4 — a `-f`
     // build or a non-`--ram` image — never the pure-RAM cpio path.
@@ -884,7 +930,7 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
 
     // Compose services: sibling unit VMs on the run switch, resolvable by alias
     // over its DNS, torn down with the run.
-    let planned = plan_services(args, work, &compose_units, primary_idx, &compose_built)?;
+    let planned = plan_services(args, cfg, state_dir, work, &compose_units, primary_idx)?;
     // With sibling services under management, the agent exposes their control
     // plane at /run/vk/services (a FUSE bridge to the manager over vsock).
     if !planned.units.is_empty() {
@@ -961,6 +1007,8 @@ async fn build_and_boot(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path
             gw,
             agent.to_path_buf(),
             manager_build_opts(args, kernel, agent),
+            state_dir.to_path_buf(),
+            cfg.image_cache_idle(),
             planned.units,
         )))
     };
@@ -1341,10 +1389,11 @@ struct PlannedServices {
     reservations: Vec<(String, String)>,
 }
 
-/// The units [`build_compose_images`] materializes up front, in `order`: the primary plus the
-/// eager start set (`on`), and every `image:` service (which can't build on demand — the sync
-/// start path only builds `build:` units). A superset of the eager boot set, never a subset,
-/// so nothing that boots at start-up is left unbuilt.
+/// The units in `order` a `--compose` selection materializes up front: the primary plus the
+/// eager start set (`on`), and every `image:` service. Used by `vk build --compose` (which
+/// exports each selected unit, image services included). The `vk run` path
+/// ([`build_compose_images`]) reuses this but skips non-primary `image:` services — those
+/// resolve through the shared image cache (`image::resolve_ref`) rather than a build.
 fn eager_build_selection(
     units: &[crate::compose::Unit],
     order: &[usize],
@@ -1400,16 +1449,13 @@ pub(crate) fn compose_build_selection(
     Ok(eager_build_selection(units, &order, primary_idx, &on))
 }
 
-/// Build the images a `--compose` run needs at start-up in ONE unified build: the `--primary`
-/// primary (exported to the run's bootable `root.ext4`) and every service that boots eagerly
-/// (each to its own `svc-<name>/image.ext4`), plus every `image:` service. One build means
-/// stages shared across the compose Dockerfile — a common base — build or restore once for the
-/// whole set instead of once per pass, and independent services build concurrently over a
-/// single job pool. A profiled-down `build:` service outside the eager set is left unbuilt —
-/// the manager builds it on demand at its first `vk service up`; `image:` services can't build
-/// on demand, so they are always materialized here. Returns the per-service
-/// [`Built`](crate::build::Built) config map keyed by service name. `primary_idx` is `None`
-/// for a compose-up run — every unit is a sibling, nothing exports to root.ext4.
+/// Materialize the `--primary` primary up front, exported to the run's bootable `root.ext4`
+/// (it boots as the run VM, not a sibling). Sibling services are NOT built here: an `image:`
+/// sibling resolves through the shared image cache (`image::resolve_ref`) in `plan_services`,
+/// and a `build:` sibling materializes into the shared build tier on its first start (the
+/// manager, via `ensure_unit_build_sync`) — so both dedup across runs and runners. Returns
+/// the primary's [`Built`](crate::build::Built) config keyed by its name (empty for a
+/// compose-up run, which has no primary).
 fn build_compose_images(
     args: &RunArgs,
     work: &Path,
@@ -1418,59 +1464,31 @@ fn build_compose_images(
     units: &[crate::compose::Unit],
     primary_idx: Option<usize>,
 ) -> Result<std::collections::HashMap<String, crate::build::Built>> {
-    if units.is_empty() {
+    let Some(primary_idx) = primary_idx else {
         return Ok(std::collections::HashMap::new());
-    }
-    // Boot order keeps the dashboard rows (and plan_services' slot assignment) stable.
-    let order = crate::compose::boot_order(units)?;
-    // Build the eager set — the units plan_services boots at start-up: the primary plus the
-    // profile-enabled (or a --primary's dependency-closure) set — and, on top of that, every
-    // `image:` service. A profiled-down `build:` service outside the eager set is provisioned
-    // but NOT built here: the manager builds it on demand at its first `vk service up`. But an
-    // `image:` service can't be built on demand (the sync start path only builds `build:`
-    // units — see `ensure_unit_build_sync`), so it is always materialized up front, whether it
-    // starts eagerly or not. `selected` is thus a superset of the eager start set — never a
-    // subset — so nothing that boots at start-up is left unbuilt.
-    let on = match primary_idx {
-        Some(idx) => crate::compose::dependency_closure(units, idx),
-        None => crate::compose::enabled(units, &args.profiles),
     };
-    let selected = eager_build_selection(units, &order, primary_idx, &on);
-    // Each sibling's export dir must exist before the build writes its image.ext4 into it
-    // (the primary's root.ext4 sits directly in work/).
-    for &i in &selected {
-        if Some(i) == primary_idx {
-            continue;
-        }
-        let dir = work.join(format!("svc-{}", units[i].name));
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    }
-    // The primary exports to root.ext4; every sibling to the svc-<name>/image.ext4
-    // plan_services provisions from.
-    let primary_name = primary_idx.map(|i| units[i].name.clone());
-    let out_of = |unit: &crate::compose::Unit| -> Option<PathBuf> {
-        if Some(&unit.name) == primary_name.as_ref() {
-            Some(work.join("root.ext4"))
-        } else {
-            Some(work.join(format!("svc-{}", unit.name)).join("image.ext4"))
-        }
-    };
-    let units_to_build = compose_build_units(&args.build_args, units, &selected, out_of);
+    // Only the primary is selected; its target exports to root.ext4.
+    let out_of = |_unit: &crate::compose::Unit| -> Option<PathBuf> { Some(work.join("root.ext4")) };
+    let units_to_build = compose_build_units(&args.build_args, units, &[primary_idx], out_of);
     let opts = service_build_options(args, kernel, agent);
     crate::build::build_units(units_to_build, &opts)
 }
 
-/// Provision EVERY declared unit — address it and give it a runtime dir + config — so the
-/// manager can start any of them later; only `start` boots eagerly. A unit built up front
-/// (the eager set, by [`build_compose_images`]) carries its real image config; a profiled-down
-/// `build:` unit is not built yet, so it gets a placeholder config until the manager builds it
-/// on demand at first start.
+/// Provision EVERY declared unit — address it, give it a runtime dir, resolve its clean
+/// image, and merge its config — so the manager can start any of them later; only `start`
+/// boots eagerly. An `image:` sibling resolves through the shared image cache
+/// (`image::resolve_ref`, the same digest-keyed cache the CI job + services use) and carries
+/// its real config. A `build:` sibling addresses its shared build-tier ext4 (a pure function
+/// of the stage fingerprint) but is not built yet — it gets the compose overrides alone as a
+/// placeholder until the manager builds it on demand at first start and adopts the real image
+/// config.
 fn plan_services(
     args: &RunArgs,
+    cfg: &crate::config::Config,
+    state_dir: &Path,
     work: &Path,
     units: &[crate::compose::Unit],
     primary_idx: Option<usize>,
-    built: &std::collections::HashMap<String, crate::build::Built>,
 ) -> Result<PlannedServices> {
     let mut planned = PlannedServices {
         units: Vec::new(),
@@ -1490,13 +1508,12 @@ fn plan_services(
         None => crate::compose::enabled(units, &args.profiles),
     };
     let (gw, prefix, _) = crate::net::switch_addrs(RUN_SUBNET)?;
-    // Site each sibling (its runtime dir + build spec + address slot), excluding the
-    // primary (it boots as the run VM, not a sibling). Kept in boot order so the eager
-    // `start` list and slot/IP assignment stay stable.
+    // Site each sibling (its runtime dir + address slot), excluding the primary (it boots as
+    // the run VM, not a sibling). Kept in boot order so the eager `start` list and slot/IP
+    // assignment stay stable.
     struct Sited {
         unit: usize,
         dir: PathBuf,
-        ext4: PathBuf,
         slot: u32,
     }
     let mut sited = Vec::new();
@@ -1507,35 +1524,46 @@ fn plan_services(
         }
         let unit = &units[i];
         let dir = work.join(format!("svc-{}", unit.name));
-        let ext4 = dir.join("image.ext4");
-        sited.push(Sited {
-            unit: i,
-            dir,
-            ext4,
-            slot,
-        });
+        sited.push(Sited { unit: i, dir, slot });
         slot += 1;
     }
 
-    // Address + provision each service, layering its compose overrides over the image
-    // config. A unit built up front (build_compose_images, the eager set) carries its image
-    // config; a profiled-down one is not built yet, so it gets the compose overrides alone as
-    // a placeholder — the manager builds it on demand at first start and adopts the real
-    // image config then.
+    // Resolve each service's clean image (its cache path) and merge its compose overrides
+    // over the image config.
     for s in sited {
         let unit = &units[s.unit];
-        let config = match built.get(&unit.name) {
-            Some(b) => crate::compose::merged_config(&b.config, unit),
-            None => {
-                // Only a profiled-down `build:` sibling reaches here: build_compose_images
-                // materializes the eager set and every image: service, so anything that boots
-                // eagerly (or pulls an image) must already be in `built`.
-                debug_assert!(
-                    !on[s.unit] && matches!(unit.source, crate::compose::Source::Build { .. }),
-                    "service {} is eagerly started or an image: service but was not built",
-                    unit.name
-                );
-                crate::compose::merged_config(&vk_core::runcfg::RunConfig::default(), unit)
+        let (ext4, config) = match &unit.source {
+            crate::compose::Source::Image(image) => {
+                // Pull+cache through the shared image cache; a services image must be
+                // generic-disk (the agent + config ride the boot initramfs).
+                let crate::image::ResolvedImage::Disk {
+                    rootfs,
+                    generic,
+                    config,
+                    ..
+                } = crate::image::resolve_ref(cfg, state_dir, image)
+                    .with_context(|| format!("service {}", unit.name))?;
+                if !generic {
+                    bail!(
+                        "service {:?} resolves to a self-booting (systemd) image; a `services:` \
+                         image must be generic-disk",
+                        unit.name
+                    );
+                }
+                (
+                    rootfs,
+                    crate::compose::merged_config(&config.unwrap_or_default(), unit),
+                )
+            }
+            crate::compose::Source::Build { .. } => {
+                // The shared build tier ext4, addressed by stage fingerprint — materialized on
+                // demand by the manager at first start, which then adopts the built config. A
+                // placeholder (compose overrides only) until then.
+                let ext4 = crate::units::build_unit_ext4(state_dir, &args.build_args, unit)?;
+                (
+                    ext4,
+                    crate::compose::merged_config(&vk_core::runcfg::RunConfig::default(), unit),
+                )
             }
         };
         let ip = crate::units::nth_static_ip(gw, prefix, s.slot)?;
@@ -1559,7 +1587,7 @@ fn plan_services(
             crate::units::Provisioned {
                 name: unit.name.clone(),
                 hostname: unit.hostname.clone(),
-                ext4: s.ext4,
+                ext4,
                 ip: format!("{ip}/{prefix}"),
                 cid: crate::units::FIRST_SERVICE_CID + s.slot,
                 config,
@@ -1582,7 +1610,14 @@ fn plan_services(
 
 /// `vk run --compose` with no primary — compose up: boot the enabled services
 /// on the run LAN and hold until ctrl-c; everything dies with this process.
-async fn compose_up(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path) -> Result<()> {
+async fn compose_up(
+    args: &RunArgs,
+    cfg: &crate::config::Config,
+    state_dir: &Path,
+    work: &Path,
+    agent: &Path,
+    kernel: &Path,
+) -> Result<()> {
     let compose = args
         .compose
         .as_ref()
@@ -1591,8 +1626,9 @@ async fn compose_up(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path) ->
     if units.is_empty() {
         bail!("{} declares no services", compose.display());
     }
-    let built = build_compose_images(args, work, kernel, agent, &units, None)?;
-    let planned = plan_services(args, work, &units, None, &built)?;
+    // compose-up has no primary — every unit is a sibling, so there is nothing to build up
+    // front here (siblings resolve/build via plan_services + the manager).
+    let planned = plan_services(args, cfg, state_dir, work, &units, None)?;
 
     // The switch binds every unit's socket; no VM ever dials the base socket
     // (there is no primary), it is just the switch's canonical listen path.
@@ -1618,6 +1654,8 @@ async fn compose_up(args: &RunArgs, work: &Path, agent: &Path, kernel: &Path) ->
         gw,
         agent.to_path_buf(),
         manager_build_opts(args, kernel, agent),
+        state_dir.to_path_buf(),
+        cfg.image_cache_idle(),
         planned.units,
     ));
     for name in &planned.start {

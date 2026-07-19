@@ -24,6 +24,10 @@ struct UnitState {
     unit: crate::compose::Unit,
     child: Option<Child>,
     aux: Vec<Child>,
+    /// Reference on the shared-cache base this unit overlays (image tier or build tier),
+    /// held while the unit runs so the idle GC never evicts a base under a live overlay.
+    /// Acquired at boot, dropped on stop.
+    guard: Option<crate::image::UseGuard>,
 }
 
 /// The manager owns the declared service units. units::boot_unit is sync, so the
@@ -39,10 +43,15 @@ pub struct Manager {
     /// the builder wiring (cache, build args, embedded kernel/agent) for building a
     /// profiled-down `build:` service on demand at its first start
     build: crate::units::BuildOpts,
+    /// the shared cache root a `build:` unit materializes into, and how long a base may sit
+    /// idle before the on-demand build path's GC evicts it
+    state_dir: PathBuf,
+    idle: std::time::Duration,
     units: Mutex<HashMap<String, UnitState>>,
 }
 
 impl Manager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         kernel: PathBuf,
         cloud_hypervisor: PathBuf,
@@ -50,6 +59,8 @@ impl Manager {
         gateway: Ipv4Addr,
         agent: PathBuf,
         build: crate::units::BuildOpts,
+        state_dir: PathBuf,
+        idle: std::time::Duration,
         units: impl IntoIterator<Item = (crate::units::Provisioned, PathBuf, crate::compose::Unit)>,
     ) -> Manager {
         Manager {
@@ -59,6 +70,8 @@ impl Manager {
             gateway,
             agent,
             build,
+            state_dir,
+            idle,
             units: Mutex::new(
                 units
                     .into_iter()
@@ -71,6 +84,7 @@ impl Manager {
                                 unit,
                                 child: None,
                                 aux: Vec::new(),
+                                guard: None,
                             },
                         )
                     })
@@ -141,11 +155,13 @@ impl Manager {
     /// held (only `list`/`status` would otherwise stall behind it); the lock is re-taken for
     /// the quick boot. A fresh image skips the build, so an already-materialized service
     /// (every eager start) just boots, exactly as before. Concurrent first-starts of the same
-    /// service are serialized inside `ensure_unit_build_sync` (a per-image build flock), not by
-    /// the units lock — so they cannot race the in-place image write.
+    /// `build:` stage are serialized inside `ensure_unit_build_sync` (the shared build tier's
+    /// per-stage pull lock), not by the units lock — so they cannot race the tier write, and
+    /// share the one tier entry. An `image:` unit was resolved/pulled at provisioning, so it
+    /// skips the build and just boots.
     pub fn start_streamed(&self, name: &str, sink: Option<crate::build::ProgressSink>) -> Reply {
-        // Snapshot the build inputs under the lock, then release it for the build.
-        let (unit, ext4) = {
+        // Snapshot the unit under the lock, then release it for the (possibly long) build.
+        let unit = {
             let mut u = self.units.lock().unwrap();
             let Some(st) = u.get_mut(name) else {
                 return Reply::err(format!("no such unit {name:?}"));
@@ -153,13 +169,24 @@ impl Manager {
             if state_of(st) == "running" {
                 return Reply::ok(format!("{name} already running ({})", st.svc.ip));
             }
-            (st.unit.clone(), st.svc.ext4.clone())
+            st.unit.clone()
         };
 
-        // Build/ensure the image (lock released) — a fresh image returns instantly.
-        let config = match crate::units::ensure_unit_build_sync(&unit, &ext4, &self.build, sink) {
-            Ok(config) => config,
-            Err(e) => return Reply::err(format!("building {name}: {e:#}")),
+        // A `build:` unit materializes into the shared build tier (lock released for the
+        // build) — a fresh stage returns instantly; an `image:` unit was already pulled.
+        let built_config = if matches!(unit.source, crate::compose::Source::Build { .. }) {
+            match crate::units::ensure_unit_build_sync(
+                &unit,
+                &self.state_dir,
+                self.idle,
+                &self.build,
+                sink,
+            ) {
+                Ok(config) => Some(config),
+                Err(e) => return Reply::err(format!("building {name}: {e:#}")),
+            }
+        } else {
+            None
         };
 
         // Re-take the lock for the boot; re-check running in case a concurrent start won.
@@ -170,9 +197,18 @@ impl Manager {
         if state_of(st) == "running" {
             return Reply::ok(format!("{name} already running ({})", st.svc.ip));
         }
-        // The freshly-built image's own config (env/user/entrypoint) is known only after the
+        // A freshly-built image's own config (env/user/entrypoint) is known only after the
         // build, so adopt it before booting — a profiled-down service had no config yet.
-        st.svc.config = config;
+        if let Some(config) = built_config {
+            st.svc.config = config;
+        }
+        // Reference the shared-cache base for the unit's running lifetime, so the idle GC
+        // never evicts a base under this live overlay. `None` for a rootfs outside the
+        // managed tiers (nothing to reference-count there).
+        let guard = match crate::image::acquire_use_lock_for(&self.state_dir, &st.svc.ext4) {
+            Ok(guard) => guard,
+            Err(e) => return Reply::err(format!("referencing {name} image: {e:#}")),
+        };
         match crate::units::boot_unit(
             &st.svc,
             &st.dir,
@@ -186,6 +222,7 @@ impl Manager {
                 let ip = st.svc.ip.clone();
                 st.child = Some(child);
                 st.aux = aux;
+                st.guard = guard;
                 Reply::ok(format!("started {name} ({ip})"))
             }
             Err(e) => Reply::err(format!("starting {name}: {e:#}")),
@@ -207,6 +244,8 @@ impl Manager {
             let _ = a.kill();
             let _ = a.wait();
         }
+        // release the shared-cache base reference now the overlay is gone
+        st.guard = None;
         Reply::ok(if was_running {
             format!("stopped {name}")
         } else {
@@ -225,6 +264,7 @@ impl Manager {
                 let _ = a.kill();
                 let _ = a.wait();
             }
+            st.guard = None;
         }
     }
 

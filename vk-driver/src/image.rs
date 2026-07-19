@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::jobctx::JobCtx;
+use crate::config::Config;
 
 /// The boot flavour recorded per cached bundle (`boot.kind`), so a cache hit
 /// — which skips the pull/build — still knows how to boot it.
@@ -57,30 +57,25 @@ pub enum ResolvedImage {
     },
 }
 
-/// Resolve the job's MICROVM_IMAGE to a concrete bootable image. The variable is
-/// prefix-based (the prefix names the source, split on the FIRST `/`); unset is
-/// treated as `local/default`.
-pub fn resolve(ctx: &JobCtx) -> Result<ResolvedImage> {
-    resolve_ref(ctx, ctx.image_ref.as_deref().unwrap_or("local/default"))
-}
-
-/// Resolve an explicit MICROVM_IMAGE-style `image_ref` — the same prefix dispatch and
-/// digest-keyed cache `resolve` applies to the job's own image. Service units resolve
-/// their `image:` through here too, so a job image and a service naming the same ref
-/// share one cache entry (each boots its own CoW overlay over the shared rootfs).
-pub fn resolve_ref(ctx: &JobCtx, image_ref: &str) -> Result<ResolvedImage> {
+/// Resolve an explicit MICROVM_IMAGE-style `image_ref` to a concrete bootable image,
+/// caching materialized bases under `state_dir`. The reference is prefix-based (the
+/// prefix names the source, split on the FIRST `/`). Every consumer — the CI job image,
+/// CI/compose service `image:` units, and `vk run` — resolves through here, so the same
+/// ref shares one digest-keyed cache entry (each boots its own CoW overlay over the
+/// shared rootfs). Takes just `(&Config, state_dir)` so a non-CI caller need not build a
+/// `JobCtx`.
+pub fn resolve_ref(cfg: &Config, state_dir: &Path, image_ref: &str) -> Result<ResolvedImage> {
     match image_ref.split_once('/') {
         // local/<name> = a bundle directory under [local] dir.
-        Some(("local", rest)) => crate::local::resolve(ctx, rest),
+        Some(("local", rest)) => crate::local::resolve(cfg, state_dir, rest),
         // virtkit/<name>[:tag|@digest] = a native virtkit bundle in the [registry] repo,
         // pulled+cached natively (CDC+zstd chunk dedup); published by `vk build --tag`.
-        Some(("virtkit", rest)) => crate::registry::resolve(ctx, rest),
-        // docker/<name>[:tag|@digest] = an OCI image of the [docker] repo, pulled
-        // and booted directly (embedded kernel + agent; digest-keyed local cache).
-        Some(("docker", rest)) => crate::dockerimg::resolve(ctx, rest),
-        // anything else = a raw OCI reference (the job's `image:`): booted directly,
-        // accepted only under the [docker] repo allowlist.
-        _ => crate::dockerimg::resolve_image(ctx, image_ref),
+        Some(("virtkit", rest)) => crate::registry::resolve(cfg, state_dir, rest),
+        // docker/<name>[:tag|@digest] = an OCI image, pulled and booted directly
+        // (embedded kernel + agent; digest-keyed local cache).
+        Some(("docker", rest)) => crate::dockerimg::resolve(cfg, state_dir, rest),
+        // anything else = a raw OCI reference (the job's `image:`): booted directly.
+        _ => crate::dockerimg::resolve_image(cfg, state_dir, image_ref),
     }
 }
 
@@ -251,15 +246,26 @@ pub(crate) struct UseGuard {
     _file: std::fs::File,
 }
 
+/// The managed cache tiers under `state_dir`: pulled registry bundles, pulled docker
+/// images, and built `build:` stages. A base in any of these is reference-counted and
+/// idle-evicted; a baked `[local]` bundle or an ephemeral rootfs is not.
+pub(crate) fn cache_tiers(state_dir: &Path) -> [PathBuf; 3] {
+    [
+        state_dir.join("registry"),
+        state_dir.join("docker"),
+        state_dir.join("build"),
+    ]
+}
+
 /// Take a shared-lock reference on the materialized base backing `rootfs`, iff it lives in
-/// the managed cache (`<state_dir>/{registry,docker}/…`). Returns `None` for a baked
-/// `[local]` bundle or an ephemeral rootfs — nothing there is reference-counted or evicted.
-/// Hold the returned guard for the overlay's whole lifetime.
+/// a managed cache tier (see [`cache_tiers`]). Returns `None` for a baked `[local]` bundle
+/// or an ephemeral rootfs — nothing there is reference-counted or evicted. Hold the returned
+/// guard for the overlay's whole lifetime.
 pub(crate) fn acquire_use_lock_for(state_dir: &Path, rootfs: &Path) -> Result<Option<UseGuard>> {
     let Some(dir) = rootfs.parent() else {
         return Ok(None);
     };
-    if !dir.starts_with(state_dir.join("registry")) && !dir.starts_with(state_dir.join("docker")) {
+    if !cache_tiers(state_dir).iter().any(|t| dir.starts_with(t)) {
         return Ok(None);
     }
     let path = dir.join(".inuse");

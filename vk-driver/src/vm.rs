@@ -128,7 +128,8 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
 /// Resolve MICROVM_IMAGE to the boot files: an optional kernel (`None` = boot vk's
 /// embedded kernel), the rootfs + optional initrd, and whether it is a generic boot.
 fn resolve_media(ctx: &JobCtx) -> Result<(Option<PathBuf>, Media, bool)> {
-    match crate::image::resolve(ctx)? {
+    let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
+    match crate::image::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), image_ref)? {
         ResolvedImage::Disk {
             rootfs,
             kernel,
@@ -598,7 +599,7 @@ async fn plan_services(
             generic,
             config,
             ..
-        } = crate::image::resolve_ref(ctx, image_ref)
+        } = crate::image::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), image_ref)
             .with_context(|| format!("service {}", unit.name))?;
         if !generic {
             bail!(

@@ -10,8 +10,9 @@
 //! cache instead (see image.rs), so there is no pull path here.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 fn sha256_hex(data: impl AsRef<[u8]>) -> String {
@@ -116,6 +117,55 @@ pub fn ensure_unit_build(
     })?;
     let uuid = parse_uuid(&expected).expect("fingerprint is a canonical UUID");
     crate::ext4::set_uuid(out, &uuid)
+}
+
+/// The shared build-cache tier directory for a `build:` stage: `<state_dir>/build/<uuid>/`,
+/// keyed by the stage's content fingerprint (the same value stamped into the ext4). An
+/// identical stage — same base, instructions, copied files — maps to the same dir, so it is
+/// built once and shared across services, runs, and runners. Slots into the generic
+/// idle-eviction GC (`image::gc_idle`/`base_dirs`) like the pulled `registry/`/`docker/`
+/// tiers.
+pub fn build_tier_dir(state_dir: &Path, stage_key: &str) -> PathBuf {
+    state_dir.join("build").join(fingerprint(&[stage_key]))
+}
+
+/// Ensure a `build:` stage is materialized in the shared build tier, returning its cache dir
+/// (holding `runner.ext4` + its config sidecar). On a fingerprint miss it builds under a
+/// pull lock into a tmp sibling, stamps the UUID, and promotes atomically — so a killed
+/// build never leaves a half-image a freshness check would trust, and concurrent identical
+/// builds serialize (the loser then finds it fresh). Marks the base used and runs idle GC on
+/// the tier. `sink` streams build progress when set.
+pub fn ensure_build_tier(
+    state_dir: &Path,
+    idle: Duration,
+    recipe: &BuildRecipe,
+    target: Option<&str>,
+    stage_key: &str,
+    sink: Option<crate::build::ProgressSink>,
+) -> Result<PathBuf> {
+    let dir = build_tier_dir(state_dir, stage_key);
+    let expected = fingerprint(&[stage_key]);
+    if unit_fresh(&dir.join("runner.ext4"), &expected) {
+        crate::image::mark_used(&dir);
+        return Ok(dir);
+    }
+    let _lock = crate::image::acquire_pull_lock(&dir, "build", &expected)?;
+    // Re-check under the lock: a concurrent build of the same stage may have just promoted it.
+    if unit_fresh(&dir.join("runner.ext4"), &expected) {
+        crate::image::mark_used(&dir);
+        return Ok(dir);
+    }
+    let tmp = dir.with_extension("tmp");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    // ensure_unit_build writes the ext4 + config sidecar and stamps the UUID at the out path.
+    ensure_unit_build(recipe, target, stage_key, &tmp.join("runner.ext4"), sink)?;
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::rename(&tmp, &dir)
+        .with_context(|| format!("promoting {} to {}", tmp.display(), dir.display()))?;
+    crate::image::mark_used(&dir);
+    crate::image::gc_idle(&state_dir.join("build"), idle);
+    Ok(dir)
 }
 
 #[cfg(test)]

@@ -52,6 +52,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- `vk run --compose` now reuses the same host image cache as CI: `image:` services are
+  downloaded once and `build:` services are built once, then shared across runs (and runners)
+  instead of copied per run. The cache lives in your user data dir, so a rootless dev needs no
+  system-wide state directory. `vk cache gc` reclaims it alongside the other cached images.
 - The deduped registry chunk store (`<state_dir>/registry/chunks/`) is now bounded: a pull
   records the chunk digests it used in the bundle's `chunks.list`, and the GC drops any chunk
   no remaining cached bundle references. Its lifetime tracks the (idle-evicted) bundles, so
@@ -66,15 +70,19 @@ All notable changes to virtkit will be documented in this file.
 - CI `services:` now resolve their `image:` through the same digest-keyed cache the job's
   own image uses and boot a CoW overlay over the shared read-only rootfs, instead of a
   second per-service image store (with its own copy, UUID stamp and lock). A job image and
-  a service naming the same ref share one cache entry. A service image ref is subject to the
-  `[docker]` allowlist like a job image (a bare name maps onto the `[docker]` repo) rather
-  than an anonymous pull. `[services] store_dir` is retained for config compatibility but no
-  longer consulted.
+  a service naming the same ref share one cache entry. A service image ref resolves exactly
+  like a job image (direct pull by default, `[docker]` proxy routing when configured).
+  `[services] store_dir` is retained for config compatibility but no longer consulted.
 - The GitLab executor now honours the job's standard `image:` (CI_JOB_IMAGE) — no
-  `MICROVM_IMAGE` needed (`services:` was already supported). `image:` is booted directly,
-  accepted only under the `[docker] repo` allowlist (a bare docker-hub-style name maps onto
-  the repo; a ref naming another registry is refused). `MICROVM_IMAGE` stays as the explicit
-  override for the `local/`/`virtkit/` sources; a job with no image boots `local/default`.
+  `MICROVM_IMAGE` needed (`services:` was already supported). `image:` is booted directly.
+  `MICROVM_IMAGE` stays as the explicit override for the `local/`/`virtkit/` sources; a job
+  with no image boots `local/default`.
+- Image references are now pulled **directly** from whatever registry they name, by default
+  and with no allowlist — the microVM boundary is the security model, so the image source is
+  not gated. The `[docker]` section becomes an OPTIONAL registry proxy: it *routes* bare
+  docker-hub-style names through a shared pull-through cache (with its credentials) while a
+  ref that names its own registry is still pulled directly; it never refuses an image. This
+  applies uniformly to a job's `image:`, `MICROVM_IMAGE: docker/<ref>`, and `services:`.
 - The GitLab executor's `MICROVM_IMAGE: docker/<name>` now boots the image **directly**:
   the native OCI client pulls it, the embedded vk-agent is injected as PID 1 and the
   embedded kernel boots it — the same path `vk run --source oci` uses. Registry auth is a

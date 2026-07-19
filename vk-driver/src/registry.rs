@@ -36,7 +36,6 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{Config, Registry};
 use crate::image::{self, Reference, ResolvedImage};
-use crate::jobctx::JobCtx;
 // The content-addressed store lives in the standalone vk-registry crate; the client
 // paths here share its digest/compression conventions (ZSTD_LEVEL so re-pushed chunks
 // dedup, the transparent-zstd capability header, and the size-embedding zstd encoder).
@@ -102,12 +101,12 @@ pub fn push(cfg: &Config, dir: &Path, image_ref: &str) -> Result<String> {
 
 /// Pull+cache a registry bundle for a job, returning a `ResolvedImage` exactly like
 /// `dockerimg::resolve` does. `image_ref` is what followed `virtkit/` in MICROVM_IMAGE.
-pub fn resolve(ctx: &JobCtx, image_ref: &str) -> Result<ResolvedImage> {
-    let rg = ctx.cfg.registry.as_ref().context(
+pub fn resolve(cfg: &Config, state_dir: &Path, image_ref: &str) -> Result<ResolvedImage> {
+    let rg = cfg.registry.as_ref().context(
         "MICROVM_IMAGE uses the virtkit/ form but the host has no [registry] configured",
     )?;
     let (name, reference) = image::parse_ref(image_ref)?;
-    let (resolved, _dir) = block_on(resolve_async(ctx, rg, &name, reference))?;
+    let (resolved, _dir) = block_on(resolve_async(cfg, state_dir, rg, &name, reference))?;
     Ok(resolved)
 }
 
@@ -120,15 +119,13 @@ pub fn pull(cfg: Config, image_ref: &str) -> Result<std::path::PathBuf> {
             .context("`registry pull` needs a [registry] section in the config")?;
         image::parse_ref(image_ref)?
     };
-    // resolve caches under the JobCtx's state_dir; a CLI pull builds a throwaway
-    // JobCtx so it shares the exact same cache layout as a job's pull.
-    let ctx = JobCtx::new_for_job(cfg, "registry-pull".into())?;
-    let rg = ctx
-        .cfg
+    // A CLI pull caches under the config's own state_dir, sharing the exact same
+    // cache layout as a job's pull.
+    let rg = cfg
         .registry
         .as_ref()
         .expect("registry presence checked above");
-    let (_resolved, dir) = block_on(resolve_async(&ctx, rg, &name, reference))?;
+    let (_resolved, dir) = block_on(resolve_async(&cfg, cfg.state_dir(), rg, &name, reference))?;
     Ok(dir)
 }
 
@@ -997,18 +994,19 @@ async fn ensure_bundle_pulled(
 }
 
 async fn resolve_async(
-    ctx: &JobCtx,
+    cfg: &Config,
+    state_dir: &Path,
     rg: &Registry,
     name: &str,
     reference: Reference,
 ) -> Result<(ResolvedImage, std::path::PathBuf)> {
     let (client, auth) = client(rg)?;
     let (dir, digest, pulled) =
-        ensure_bundle_pulled(&client, &auth, rg, ctx.cfg.state_dir(), name, &reference).await?;
+        ensure_bundle_pulled(&client, &auth, rg, state_dir, name, &reference).await?;
     image::mark_used(&dir);
     if pulled {
-        let registry_root = ctx.cfg.state_dir().join("registry");
-        image::gc_idle(&registry_root, ctx.cfg.image_cache_idle());
+        let registry_root = state_dir.join("registry");
+        image::gc_idle(&registry_root, cfg.image_cache_idle());
         image::sweep_chunks(&registry_root);
     }
     let boot_kind = image::read_boot_kind(&dir).with_context(|| {

@@ -11,12 +11,14 @@
 
 use anyhow::{Context, Result, bail};
 
+use std::path::Path;
+
+use crate::config::Config;
 use crate::image::{self, ResolvedImage};
-use crate::jobctx::JobCtx;
 
 /// Resolve a local bundle `<[local] dir>/<name>/` to a `ResolvedImage`. `name` is a
 /// single safe path component (local bundles are never tagged or digested).
-pub fn resolve(ctx: &JobCtx, name: &str) -> Result<ResolvedImage> {
+pub fn resolve(cfg: &Config, state_dir: &Path, name: &str) -> Result<ResolvedImage> {
     // a single safe path component: no separators, no tag/digest, no leading dot.
     if name.is_empty() || name.starts_with('.') || name.contains(['/', ':', '@']) {
         bail!(
@@ -24,7 +26,7 @@ pub fn resolve(ctx: &JobCtx, name: &str) -> Result<ResolvedImage> {
              local bundles are not tagged or digested)"
         );
     }
-    let dir = ctx.cfg.local_dir().join(name);
+    let dir = cfg.local_dir_under(state_dir).join(name);
     if !dir.join("runner.ext4").is_file() || !dir.join("boot.kind").is_file() {
         bail!(
             "local image {name:?} not found at {} — bake it with build-image.sh or pull it",

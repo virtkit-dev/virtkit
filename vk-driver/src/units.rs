@@ -51,44 +51,14 @@ pub struct BuildOpts {
     pub cache_insecure: bool,
 }
 
-/// Ensure a `build:` unit's clean image synchronously — the microVM build path never
-/// awaits — streaming its build progress to `sink` when set, and return its merged runtime
-/// config. This is the on-demand start path (the service manager builds a profiled-down
-/// `build:` service the first time it is brought up). Errors for an `image:` unit: those
-/// need the async pull and are materialized up front, not on demand.
-pub fn ensure_unit_build_sync(
+/// The build recipe + target + stage key for a `build:` unit, shared by the ext4-path
+/// helper and the materialize path so both agree on the stage identity. Errors for an
+/// `image:` unit (callers dispatch on the source first).
+fn build_recipe(
     unit: &crate::compose::Unit,
-    ext4: &Path,
-    build: &BuildOpts,
-    sink: Option<crate::build::ProgressSink>,
-) -> Result<RunConfig> {
-    match &unit.source {
-        crate::compose::Source::Build { .. } => {
-            // The build writes the image in place at `ext4` (a non-atomic flatten), and the
-            // manager releases the units lock across it — so two concurrent first-starts of
-            // the same service would corrupt each other's write. A blocking flock beside the
-            // image serializes them: the first builds, the rest block then find it fresh (the
-            // fingerprint short-circuit in `ensure_unit_build`).
-            let _lock = lock_exclusive(&build_lock_path(ext4))?;
-            materialize_build_unit(unit, ext4, build, sink)
-        }
-        crate::compose::Source::Image(_) => anyhow::bail!(
-            "on-demand start of the image: service {:?} is not supported — \
-             image services are materialized up front",
-            unit.name
-        ),
-    }
-}
-
-/// Build a `build:` unit's ext4 (skipping when its fingerprint already matches), streaming
-/// to `sink` if set, then return its merged runtime config. Panics if `unit.source` is not
-/// `Build` — callers dispatch on the source first.
-fn materialize_build_unit(
-    unit: &crate::compose::Unit,
-    ext4: &Path,
-    build: &BuildOpts,
-    sink: Option<crate::build::ProgressSink>,
-) -> Result<RunConfig> {
+    global_build_args: &[(String, String)],
+    build: Option<&BuildOpts>,
+) -> Result<(crate::ensure::BuildRecipe, Option<String>, String)> {
     let crate::compose::Source::Build {
         dockerfiles,
         context,
@@ -96,9 +66,9 @@ fn materialize_build_unit(
         args,
     } = &unit.source
     else {
-        unreachable!("materialize_build_unit requires a build: source")
+        bail!("service {:?} is not a build: unit", unit.name)
     };
-    let mut build_args = build.build_args.clone();
+    let mut build_args = global_build_args.to_vec();
     build_args.extend(args.iter().cloned());
     // compose semantics: one context for all the service's files.
     let contexts = vec![context.clone(); dockerfiles.len()];
@@ -108,14 +78,53 @@ fn materialize_build_unit(
         dockerfiles: dockerfiles.clone(),
         contexts,
         build_args,
-        kernel: Some(build.kernel.clone()),
-        cloud_hypervisor: Some(build.cloud_hypervisor.clone()),
-        agent: Some(build.agent.clone()),
-        cache_registry: build.cache_registry.clone(),
-        cache_insecure: build.cache_insecure,
+        kernel: build.map(|b| b.kernel.clone()),
+        cloud_hypervisor: build.map(|b| b.cloud_hypervisor.clone()),
+        agent: build.map(|b| b.agent.clone()),
+        cache_registry: build.and_then(|b| b.cache_registry.clone()),
+        cache_insecure: build.is_some_and(|b| b.cache_insecure),
     };
-    crate::ensure::ensure_unit_build(&recipe, target.as_deref(), &key, ext4, sink)?;
-    read_merged_config(unit, ext4)
+    Ok((recipe, target.clone(), key))
+}
+
+/// The shared build-tier ext4 path a `build:` unit resolves to, without building it: a pure
+/// function of the stage fingerprint, so provisioning can address a unit before (or without)
+/// materializing it. `global_build_args` are the run-wide `--build-arg`s the manager also
+/// applies. Errors for an `image:` unit.
+pub fn build_unit_ext4(
+    state_dir: &Path,
+    global_build_args: &[(String, String)],
+    unit: &crate::compose::Unit,
+) -> Result<PathBuf> {
+    let (_recipe, _target, key) = build_recipe(unit, global_build_args, None)?;
+    Ok(crate::ensure::build_tier_dir(state_dir, &key).join("runner.ext4"))
+}
+
+/// Ensure a `build:` unit is materialized in the shared build tier synchronously — the
+/// microVM build path never awaits — streaming its build progress to `sink` when set, and
+/// return its merged runtime config. This is the on-demand start path (the service manager
+/// builds a profiled-down `build:` service the first time it is brought up). Concurrent
+/// first-starts of the same stage serialize inside `ensure_build_tier` (a per-stage pull
+/// lock), and share the one tier entry. Errors for an `image:` unit: those need the async
+/// pull and are materialized up front, not on demand.
+pub fn ensure_unit_build_sync(
+    unit: &crate::compose::Unit,
+    state_dir: &Path,
+    idle: std::time::Duration,
+    build: &BuildOpts,
+    sink: Option<crate::build::ProgressSink>,
+) -> Result<RunConfig> {
+    if let crate::compose::Source::Image(_) = &unit.source {
+        anyhow::bail!(
+            "on-demand start of the image: service {:?} is not supported — \
+             image services are materialized up front",
+            unit.name
+        );
+    }
+    let (recipe, target, key) = build_recipe(unit, &build.build_args, Some(build))?;
+    let dir =
+        crate::ensure::ensure_build_tier(state_dir, idle, &recipe, target.as_deref(), &key, sink)?;
+    read_merged_config(unit, &dir.join("runner.ext4"))
 }
 
 /// The unit's boot config: the image's own defaults (its sidecar, written by the build /
@@ -128,33 +137,6 @@ fn read_merged_config(unit: &crate::compose::Unit, ext4: &Path) -> Result<RunCon
     )
     .with_context(|| format!("parsing {}", sidecar.display()))?;
     Ok(crate::compose::merged_config(&image_cfg, unit))
-}
-
-/// The lock file guarding an on-demand build of the image at `ext4` (a sibling `.build.lock`),
-/// so concurrent first-starts of the same service serialize instead of racing the in-place write.
-fn build_lock_path(ext4: &Path) -> PathBuf {
-    let mut p = ext4.as_os_str().to_os_string();
-    p.push(".build.lock");
-    PathBuf::from(p)
-}
-
-/// A held image lock; released when dropped (flock releases on the last close).
-struct LockGuard {
-    _file: std::fs::File,
-}
-
-/// Blocking exclusive `flock` on `path` (created if absent). Advisory and
-/// filesystem-local — fine for a runner state dir; a store on NFS is unsupported.
-fn lock_exclusive(path: &Path) -> Result<LockGuard> {
-    use std::os::unix::io::AsRawFd;
-    let f = std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
-    // SAFETY: the fd is owned by `f`, which the guard keeps alive; flock returns
-    // 0 or -1/errno and blocks until the lock is granted.
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("locking {}", path.display()));
-    }
-    Ok(LockGuard { _file: f })
 }
 
 /// The `n`th static service address, counted from the TOP of the subnet down
@@ -399,33 +381,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn flock_serializes_holders() {
-        let tmp = std::env::temp_dir().join(format!("vk-unitlock-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let path = tmp.join("x.lock");
-        let guard = lock_exclusive(&path).unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let p2 = path.clone();
-        let t = std::thread::spawn(move || {
-            let _g = lock_exclusive(&p2).unwrap(); // blocks until the first drops
-            tx.send(()).unwrap();
-        });
-        // the second locker must still be waiting …
-        assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(300))
-                .is_err(),
-            "second flock holder did not block"
-        );
-        drop(guard);
-        // … and proceeds once released.
-        rx.recv_timeout(std::time::Duration::from_secs(5))
-            .expect("second flock holder never acquired");
-        t.join().unwrap();
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
     fn on_demand_build_rejects_an_image_service() {
         // `image:` services need the async pull and are materialized up front; the sync
         // on-demand start path must refuse one rather than silently do nothing.
@@ -445,8 +400,14 @@ mod tests {
             cache_registry: Some("none".into()),
             cache_insecure: false,
         };
-        let err = ensure_unit_build_sync(&unit, Path::new("/nonexistent/image.ext4"), &opts, None)
-            .unwrap_err();
+        let err = ensure_unit_build_sync(
+            &unit,
+            Path::new("/nonexistent/state"),
+            std::time::Duration::from_secs(1800),
+            &opts,
+            None,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("materialized up front"),
             "expected an image-service rejection, got: {err:#}"

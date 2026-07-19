@@ -203,14 +203,19 @@ impl Default for Guest {
     }
 }
 
-/// `[docker]` — boot a registry OCI image directly: the native OCI client fetches it,
-/// the embedded vk-agent is injected as PID 1 and the embedded kernel boots it. Registry
-/// auth mirrors `[registry]`.
+/// `[docker]` — OPTIONAL registry proxy for direct OCI image boots. Absent (the default),
+/// an image reference is pulled directly from whatever registry it names: the microVM
+/// boundary is the security model, so image sources are not gated. Present, it *routes*
+/// bare docker-hub-style names through the configured `repo` (with these credentials) — a
+/// shared pull-through cache for the CI runners — while a ref that names its own registry
+/// is still pulled directly. It never refuses an image. The native OCI client fetches the
+/// image, the embedded vk-agent is PID 1, the embedded kernel boots it. Auth mirrors
+/// `[registry]`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Docker {
-    /// Registry repository prefix for the images — fixed host side on purpose: this is
-    /// the allowlist (jobs only pick name[:ref]), e.g. "registry.example.com/team"
+    /// Registry repository prefix bare image names are routed through, e.g.
+    /// "registry.example.com/team" — a pull-through cache/proxy, not an allowlist.
     pub repo: String,
     /// PEM CA bundle the registry's TLS cert chains to (rustls). Absent = system roots.
     #[serde(default)]
@@ -395,11 +400,14 @@ impl Config {
             .unwrap_or(Path::new("/var/lib/virtkit"))
     }
 
-    /// The local-bundles directory: `[local] dir` if set, else `<state_dir>/images`.
-    pub fn local_dir(&self) -> PathBuf {
+    /// The local-bundles directory resolved against a caller-chosen `state_dir`:
+    /// `[local] dir` if set, else `<state_dir>/images`. Threading the state dir (rather
+    /// than reading the config default) lets a non-CI caller (`vk run`) share the resolve
+    /// path while keeping its cache under its own state dir.
+    pub fn local_dir_under(&self, state_dir: &Path) -> PathBuf {
         match &self.local.dir {
             Some(dir) => dir.clone(),
-            None => self.state_dir().join("images"),
+            None => state_dir.join("images"),
         }
     }
 

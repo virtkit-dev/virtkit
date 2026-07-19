@@ -962,10 +962,20 @@ async fn cli_main() -> ExitCode {
         let idle = idle_secs
             .map(std::time::Duration::from_secs)
             .unwrap_or_else(|| cfg.image_cache_idle());
-        let registry = cfg.state_dir().join("registry");
+        // Sweep the same state dir `vk run`/the executor cache under: a configured state_dir
+        // (the CI runner), else the rootless dev default ($XDG_DATA_HOME/virtkit).
+        let state_dir = match &cfg.state_dir {
+            Some(d) => d.clone(),
+            None => match run::default_data_base() {
+                Ok(d) => d,
+                Err(e) => return fail(&e, 2),
+            },
+        };
+        let registry = state_dir.join("registry");
         image::gc_idle(&registry, idle);
         image::sweep_chunks(&registry);
-        image::gc_idle(&cfg.state_dir().join("docker"), idle);
+        image::gc_idle(&state_dir.join("docker"), idle);
+        image::gc_idle(&state_dir.join("build"), idle);
         println!(
             "virtkit: cache gc done (idle threshold {}s)",
             idle.as_secs()

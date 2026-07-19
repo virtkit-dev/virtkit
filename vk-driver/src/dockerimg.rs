@@ -1,7 +1,10 @@
-//! Boot a `docker/<name>[:tag|@sha256:…]` job image DIRECTLY from its registry.
+//! Boot a `docker/<name>[:tag|@sha256:…]` (or bare `image:`) job image DIRECTLY from its
+//! registry.
 //!
-//! The reference is resolved against the host-configured `[docker] repo` (the
-//! allowlist, same model as `[registry]`), pulled with the native OCI client, and
+//! By default the reference is pulled directly from whatever registry it names — the
+//! microVM boundary is the security model, so the image source is not gated. An optional
+//! `[docker]` proxy only *routes* bare names through a shared pull-through cache; it never
+//! refuses an image (see `route`). The image is pulled with the native OCI client and
 //! flattened into a byte-clean bootable ext4 booted on the embedded kernel (the agent
 //! rides the boot initramfs, nothing is injected into the rootfs). The image's
 //! Config.Env/User/WorkingDir/Entrypoint/Cmd are captured into a `runner.ext4.json`
@@ -16,86 +19,131 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
+use crate::config::Config;
 use crate::image::{self, BootKind, Reference, ResolvedImage};
-use crate::jobctx::JobCtx;
 
-/// `MICROVM_IMAGE: docker/<name>[:tag|@digest]` — a name under the `[docker] repo`.
-pub fn resolve(ctx: &JobCtx, image_ref: &str) -> Result<ResolvedImage> {
-    let dk = docker_cfg(ctx)?;
+/// `MICROVM_IMAGE: docker/<name>[:tag|@digest]`. With a `[docker]` proxy configured the
+/// name is repo-relative (routed onto the proxy's repo); with none it is a raw OCI ref
+/// pulled directly.
+pub fn resolve(cfg: &Config, state_dir: &Path, image_ref: &str) -> Result<ResolvedImage> {
     let (name, reference) = image::parse_ref(image_ref)?;
-    let full = match &reference {
-        Reference::Digest(d) => format!("{}/{}@{}", dk.repo, name, d),
-        Reference::Tag(t) => format!("{}/{}:{}", dk.repo, name, t),
+    let (full, creds) = match &cfg.docker {
+        Some(dk) => {
+            let full = match &reference {
+                Reference::Digest(d) => format!("{}/{}@{}", dk.repo, name, d),
+                Reference::Tag(t) => format!("{}/{}:{}", dk.repo, name, t),
+            };
+            (full, Creds::from_docker(dk)?)
+        }
+        None => {
+            let full = match &reference {
+                Reference::Digest(d) => format!("{name}@{d}"),
+                Reference::Tag(t) => format!("{name}:{t}"),
+            };
+            (full, Creds::anon())
+        }
     };
-    resolve_full(ctx, dk, &name, &full)
+    resolve_full(cfg, state_dir, &name, &full, &creds)
 }
 
-/// The job's GitLab `image:` (CI_JOB_IMAGE): a full or bare OCI ref, accepted only when it
-/// resolves under the `[docker] repo` allowlist — a bare docker-hub-style name maps onto
-/// the repo, a ref naming another registry is refused.
-pub fn resolve_image(ctx: &JobCtx, image: &str) -> Result<ResolvedImage> {
-    let dk = docker_cfg(ctx)?;
-    let (full, name) = normalize(&dk.repo, image)?;
-    resolve_full(ctx, dk, &name, &full)
+/// The job's GitLab `image:` (CI_JOB_IMAGE): a full or bare OCI ref. Pulled directly by
+/// default (the microVM boundary is the security model, not an image-source allowlist).
+/// A `[docker]` proxy only *routes* pulls: a bare docker-hub-style name is fetched through
+/// the configured repo (with its credentials); a ref that names its own registry is pulled
+/// from there directly. Nothing is refused on the basis of where the image lives.
+pub fn resolve_image(cfg: &Config, state_dir: &Path, image: &str) -> Result<ResolvedImage> {
+    let (full, name, creds) = match &cfg.docker {
+        Some(dk) => match route(&dk.repo, image)? {
+            Route::Repo { full, name } => (full, name, Creds::from_docker(dk)?),
+            Route::Direct => (image.to_string(), ref_cache_name(image)?, Creds::anon()),
+        },
+        None => (image.to_string(), ref_cache_name(image)?, Creds::anon()),
+    };
+    resolve_full(cfg, state_dir, &name, &full, &creds)
 }
 
-fn docker_cfg(ctx: &JobCtx) -> Result<&crate::config::Docker> {
-    ctx.cfg
-        .docker
-        .as_ref()
-        .context("the job selects an image but the host has no [docker] configured")
+/// Registry credentials for one pull. Anonymous for a direct pull; from `[docker]` when a
+/// bare name is routed onto the configured proxy repo.
+struct Creds {
+    username: Option<String>,
+    password: Option<String>,
+    ca_pem: Option<Vec<u8>>,
+    insecure: bool,
 }
 
-/// Pull + cache + boot the registry ref `full` (cache-keyed by `name` + digest).
+impl Creds {
+    fn anon() -> Creds {
+        Creds {
+            username: None,
+            password: None,
+            ca_pem: None,
+            insecure: false,
+        }
+    }
+
+    fn from_docker(dk: &crate::config::Docker) -> Result<Creds> {
+        let ca_pem = dk
+            .ca_file
+            .as_ref()
+            .map(|p| std::fs::read(p).with_context(|| format!("reading {}", p.display())))
+            .transpose()?;
+        let password = dk
+            .password_file
+            .as_ref()
+            .map(|p| {
+                std::fs::read_to_string(p)
+                    .map(|s| s.trim_end().to_string())
+                    .with_context(|| format!("reading {}", p.display()))
+            })
+            .transpose()?;
+        let username = (!dk.username.is_empty()).then(|| dk.username.clone());
+        Ok(Creds {
+            username,
+            password,
+            ca_pem,
+            insecure: dk.insecure,
+        })
+    }
+}
+
+/// Pull + cache + boot the OCI ref `full` with `creds` (cache-keyed by `name` + digest).
 fn resolve_full(
-    ctx: &JobCtx,
-    dk: &crate::config::Docker,
+    cfg: &Config,
+    state_dir: &Path,
     name: &str,
     full: &str,
+    creds: &Creds,
 ) -> Result<ResolvedImage> {
-    let ca_pem = dk
-        .ca_file
-        .as_ref()
-        .map(|p| std::fs::read(p).with_context(|| format!("reading {}", p.display())))
-        .transpose()?;
-    let password = dk
-        .password_file
-        .as_ref()
-        .map(|p| {
-            std::fs::read_to_string(p)
-                .map(|s| s.trim_end().to_string())
-                .with_context(|| format!("reading {}", p.display()))
-        })
-        .transpose()?;
-    let username = (!dk.username.is_empty()).then(|| dk.username.clone());
-
     let digest = crate::registry::block_on(crate::oci::resolve_digest_auth(
         full,
-        username.as_deref(),
-        password.as_deref(),
-        ca_pem.clone(),
-        dk.insecure,
+        creds.username.as_deref(),
+        creds.password.as_deref(),
+        creds.ca_pem.clone(),
+        creds.insecure,
     ))
     .with_context(|| format!("resolving {full}"))?;
 
     // Pull by the resolved digest, not the tag, so the digest-keyed cache dir is always
     // populated with exactly that content even if the tag moves under us (mirrors the
-    // registry bundle path, which pulls via make_digest_ref). `full` always starts with
-    // `{repo}/`, so `{repo}/{name}` reconstructs the same ref with the tag dropped.
-    // The rootfs is a byte-clean flatten (the embedded agent rides the boot initramfs),
-    // so the digest keys the cache — a vk update changes the boot agent, not the image.
-    let pinned = format!("{}/{}@{}", dk.repo, name, digest);
+    // registry bundle path, which pulls via make_digest_ref). The rootfs is a byte-clean
+    // flatten (the embedded agent rides the boot initramfs), so the digest keys the cache
+    // — a vk update changes the boot agent, not the image.
+    let pinned = pin_digest(full, &digest);
 
-    let images_dir = ctx.cfg.state_dir().join("docker").join(name);
+    let images_dir = state_dir.join("docker").join(name);
     let dir = images_dir.join(digest.trim_start_matches("sha256:"));
     if !dir.join("runner.ext4").is_file() {
         let _lock = image::acquire_pull_lock(&dir, name, &digest)?;
         if !dir.join("runner.ext4").is_file() {
-            build(&pinned, username, password, ca_pem, dk.insecure, &dir)?;
-            image::gc_idle(
-                &ctx.cfg.state_dir().join("docker"),
-                ctx.cfg.image_cache_idle(),
-            );
+            build(
+                &pinned,
+                creds.username.clone(),
+                creds.password.clone(),
+                creds.ca_pem.clone(),
+                creds.insecure,
+                &dir,
+            )?;
+            image::gc_idle(&state_dir.join("docker"), cfg.image_cache_idle());
         }
     }
     image::mark_used(&dir);
@@ -150,25 +198,64 @@ fn build(
         .with_context(|| format!("promoting {} to {}", tmp.display(), dir.display()))
 }
 
-/// Map a job's `image:` onto the `[docker] repo` allowlist. A ref already under the repo
-/// passes through; a bare docker-hub-style name (no registry host) maps onto the repo; a
-/// ref naming a different registry is refused. Returns `(full registry ref, cache name)`.
-fn normalize(repo: &str, image: &str) -> Result<(String, String)> {
+/// How an `image:` resolves against a configured `[docker]` proxy repo.
+#[derive(Debug, PartialEq)]
+enum Route {
+    /// Fetch through the proxy repo (its credentials): the full ref + the cache name.
+    Repo { full: String, name: String },
+    /// The ref names its own registry — pull it from there directly (anonymous).
+    Direct,
+}
+
+/// Route a job's `image:` against a `[docker]` proxy `repo`. A ref already under the repo,
+/// or a bare docker-hub-style name (no registry host), is fetched *through* the repo; a ref
+/// that names its own registry is pulled directly. Nothing is refused — the proxy routes,
+/// it does not gate.
+fn route(repo: &str, image: &str) -> Result<Route> {
     let prefix = format!("{repo}/");
     if let Some(rest) = image.strip_prefix(&prefix) {
-        return Ok((image.to_string(), name_of(rest)?));
+        return Ok(Route::Repo {
+            full: image.to_string(),
+            name: name_of(rest)?,
+        });
     }
-    // A registry host is the first `/`-segment carrying a `.`/`:` (or `localhost`); absent
-    // one this is a bare docker-hub name, which we map onto the repo.
+    // A registry host is the first `/`-segment carrying a `.`/`:` (or `localhost`); a ref
+    // that names one is pulled from there directly, otherwise it is a bare docker-hub name
+    // routed onto the proxy repo.
     if let Some((host, _)) = image.split_once('/')
         && (host.contains('.') || host.contains(':') || host == "localhost")
     {
-        bail!(
-            "image {image:?} is not under the allowed registry {repo:?} — push it there, \
-             or set MICROVM_IMAGE for another source"
-        );
+        return Ok(Route::Direct);
     }
-    Ok((format!("{prefix}{image}"), name_of(image)?))
+    Ok(Route::Repo {
+        full: format!("{prefix}{image}"),
+        name: name_of(image)?,
+    })
+}
+
+/// Pin a resolved digest onto `full`, dropping any existing `:tag`/`@digest`, so the pull
+/// fetches exactly the resolved content even if the tag moves. The tag is a `:` after the
+/// last `/` (a registry-host `:port` before the first `/` is left intact).
+fn pin_digest(full: &str, digest: &str) -> String {
+    let base = full.split('@').next().unwrap_or(full);
+    let tag_at = match base.rfind('/') {
+        Some(slash) => base[slash..].find(':').map(|i| slash + i),
+        None => base.find(':'),
+    };
+    let repo = tag_at.map_or(base, |i| &base[..i]);
+    format!("{repo}@{digest}")
+}
+
+/// The cache-key name for any OCI ref: drop a leading registry host, then defer to
+/// `name_of` for the tag/digest strip and path-component validation.
+fn ref_cache_name(image: &str) -> Result<String> {
+    let repo_rel = match image.split_once('/') {
+        Some((host, rest)) if host.contains('.') || host.contains(':') || host == "localhost" => {
+            rest
+        }
+        _ => image,
+    };
+    name_of(repo_rel)
 }
 
 /// The cache-key name for a repo-relative ref: its repository path with any `:tag`/
@@ -200,37 +287,80 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_maps_bare_names_onto_the_repo() {
+    fn route_maps_bare_names_but_passes_other_registries_through() {
         let repo = "10.10.140.49/common/wab-ci";
-        // bare docker-hub-style name → mapped onto the repo
+        // bare docker-hub-style name → routed onto the proxy repo
         assert_eq!(
-            normalize(repo, "wabbuilder:v1").unwrap(),
-            (format!("{repo}/wabbuilder:v1"), "wabbuilder".into())
+            route(repo, "wabbuilder:v1").unwrap(),
+            Route::Repo {
+                full: format!("{repo}/wabbuilder:v1"),
+                name: "wabbuilder".into()
+            }
         );
         assert_eq!(
-            normalize(repo, "alpine").unwrap(),
-            (format!("{repo}/alpine"), "alpine".into())
+            route(repo, "alpine").unwrap(),
+            Route::Repo {
+                full: format!("{repo}/alpine"),
+                name: "alpine".into()
+            }
         );
-        // already under the repo → passes through
+        // already under the repo → passes through the proxy
         assert_eq!(
-            normalize(repo, &format!("{repo}/team/img:t")).unwrap(),
-            (format!("{repo}/team/img:t"), "team/img".into())
+            route(repo, &format!("{repo}/team/img:t")).unwrap(),
+            Route::Repo {
+                full: format!("{repo}/team/img:t"),
+                name: "team/img".into()
+            }
         );
-        // a different registry → refused
-        assert!(normalize(repo, "docker.io/library/alpine:3.20").is_err());
-        assert!(normalize(repo, "evil.example.com/x").is_err());
+        // a different registry → pulled directly, NOT refused (isolation is the boundary)
+        assert_eq!(
+            route(repo, "docker.io/library/alpine:3.20").unwrap(),
+            Route::Direct
+        );
+        assert_eq!(route(repo, "evil.example.com/x").unwrap(), Route::Direct);
     }
 
     #[test]
-    fn normalize_refuses_path_traversal() {
+    fn route_refuses_path_traversal_when_mapping_onto_the_repo() {
         let repo = "10.10.140.49/common/wab-ci";
         // `..` in a bare name maps onto the repo but must not escape the cache root.
-        assert!(normalize(repo, "foo/../../../bar").is_err());
+        assert!(route(repo, "foo/../../../bar").is_err());
         // `..` in the tail of a repo-prefixed ref (the pass-through branch) is refused too.
-        assert!(normalize(repo, &format!("{repo}/../evil/x")).is_err());
-        assert!(normalize(repo, &format!("{repo}/team/../evil")).is_err());
+        assert!(route(repo, &format!("{repo}/../evil/x")).is_err());
+        assert!(route(repo, &format!("{repo}/team/../evil")).is_err());
         // a bare `..` component is refused.
-        assert!(normalize(repo, "..").is_err());
+        assert!(route(repo, "..").is_err());
+    }
+
+    #[test]
+    fn ref_cache_name_drops_registry_host_and_validates() {
+        // bare and repo-relative refs keep their repository path
+        assert_eq!(ref_cache_name("redis:7").unwrap(), "redis");
+        assert_eq!(ref_cache_name("library/redis:7").unwrap(), "library/redis");
+        // a registry host is stripped for the cache key
+        assert_eq!(ref_cache_name("ghcr.io/foo/bar:1").unwrap(), "foo/bar");
+        assert_eq!(
+            ref_cache_name("localhost:5000/img@sha256:d").unwrap(),
+            "img"
+        );
+        // traversal in the repository path is still refused
+        assert!(ref_cache_name("ghcr.io/../evil").is_err());
+    }
+
+    #[test]
+    fn pin_digest_replaces_tag_and_keeps_host_port() {
+        assert_eq!(pin_digest("redis:7", "sha256:d"), "redis@sha256:d");
+        assert_eq!(
+            pin_digest("ghcr.io/foo/bar:1", "sha256:d"),
+            "ghcr.io/foo/bar@sha256:d"
+        );
+        // an existing @digest is dropped before re-pinning
+        assert_eq!(pin_digest("img@sha256:old", "sha256:new"), "img@sha256:new");
+        // a registry-host :port (before the first '/') is preserved; no tag to strip
+        assert_eq!(
+            pin_digest("localhost:5000/img", "sha256:d"),
+            "localhost:5000/img@sha256:d"
+        );
     }
 
     #[test]
