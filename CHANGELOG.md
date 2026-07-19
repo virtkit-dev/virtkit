@@ -17,7 +17,7 @@ All notable changes to virtkit will be documented in this file.
   chunks dedup against `--cache-registry`: co-located, publishing writes only the manifest.
   The native-bundle prefix is `virtkit/` (was `registry/`), distinct from the `docker/` OCI path.
 - The GitLab executor can boot the job's image built from the project's own git sources:
-  `MICROVM_IMAGE: build:<dockerfile>[#<stage>]` builds that Dockerfile stage and boots it,
+  `MICROVM_IMAGE: dockerfile:<path>[#<stage>]` builds that Dockerfile stage and boots it,
   taking `--build-arg`s from `MICROVM_BUILD_ARG_<NAME>` job variables. Built images are cached
   and shared across jobs and runners. It requires the new `[gitlab] host_checkout` mode (off by
   default), which checks the sources out on the host and shares them into the job over a

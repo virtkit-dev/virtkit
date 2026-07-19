@@ -53,10 +53,11 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         .with_context(|| format!("creating {}", ctx.job_dir.display()))?;
 
     // [gitlab] host_checkout: check the sources out on the host NOW — before resolving the
-    // image (a `build:` image is built from these sources) and before the guest boots — so
-    // supervise can share the tree in and the git token never enters the guest (the job sets
-    // GIT_STRATEGY: none). Crisp errors here (the runner-visible prepare) beat a supervisor-log
-    // pointer; like any prepare failure a checkout error exits system_failure.
+    // image (a `dockerfile:`/`compose:` image is built from these sources) and before the
+    // guest boots — so supervise can share the tree in and the git token never enters the
+    // guest (the job sets GIT_STRATEGY: none). Crisp errors here (the runner-visible prepare)
+    // beat a supervisor-log pointer; like any prepare failure a checkout error exits
+    // system_failure.
     if cfg.gitlab.as_ref().is_some_and(|g| g.host_checkout) {
         let url = ctx
             .ci_repo_url
@@ -72,7 +73,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             .context("host checkout")?;
     }
 
-    // Resolve (and, for a `build:` image, build) the boot media in the runner-visible process;
+    // Resolve (and, for a `dockerfile:` image, build) the boot media in the runner-visible process;
     // the supervisor re-resolves from the same env (a fingerprint hit for a build). A `None`
     // kernel boots vk's embedded copy — nothing to stat.
     let (kernel, media, _generic) = resolve_media(ctx)?;
@@ -88,7 +89,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // just hits the fresh tier. Non-build services are left for supervise (a pull is quick).
     for unit in crate::services::to_units(crate::services::from_env()?) {
         if let crate::compose::Source::Image(image) = &unit.source
-            && let Some(spec) = image.strip_prefix("build:")
+            && let Some(spec) = image.strip_prefix("dockerfile:")
         {
             build_git_image(ctx, spec).with_context(|| format!("service {}", unit.name))?;
         }
@@ -164,13 +165,13 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
 /// Resolve MICROVM_IMAGE to the boot files: an optional kernel (`None` = boot vk's
 /// embedded kernel), the rootfs + optional initrd, and whether it is a generic boot.
 ///
-/// `MICROVM_IMAGE: build:<dockerfile>[#<stage>]` builds a **git-defined** image from the
+/// `MICROVM_IMAGE: dockerfile:<path>[#<stage>]` builds a **git-defined** image from the
 /// host-side checkout into the shared build tier and boots that; any other form resolves
 /// through the shared image cache (`resolve_ref`).
 fn resolve_media(ctx: &JobCtx) -> Result<(Option<PathBuf>, Media, bool)> {
     let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
-    if let Some(spec) = image_ref.strip_prefix("build:") {
-        return resolve_build_form(ctx, spec);
+    if let Some(spec) = image_ref.strip_prefix("dockerfile:") {
+        return resolve_dockerfile_form(ctx, spec);
     }
     match crate::image::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), image_ref)? {
         ResolvedImage::Disk {
@@ -191,10 +192,10 @@ fn resolve_media(ctx: &JobCtx) -> Result<(Option<PathBuf>, Media, bool)> {
     }
 }
 
-/// The job's primary as a git-defined image (`MICROVM_IMAGE: build:<dockerfile>[#<stage>]`):
+/// The job's primary as a git-defined image (`MICROVM_IMAGE: dockerfile:<path>[#<stage>]`):
 /// build it and return it as generic-disk boot media (embedded kernel, agent + config riding
 /// the preinit initramfs — the byte-clean model `vk build`/bundles use).
-fn resolve_build_form(ctx: &JobCtx, spec: &str) -> Result<(Option<PathBuf>, Media, bool)> {
+fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<(Option<PathBuf>, Media, bool)> {
     let (rootfs, config) = build_git_image(ctx, spec)?;
     Ok((
         None,
@@ -207,9 +208,9 @@ fn resolve_build_form(ctx: &JobCtx, spec: &str) -> Result<(Option<PathBuf>, Medi
     ))
 }
 
-/// Build a git-defined image `<dockerfile>[#<stage>]` from the host-side checkout into the
-/// shared build tier and return its rootfs + captured runtime config. Shared by the job's
-/// primary (`resolve_build_form`) and its git-defined services (`plan_services`). Requires
+/// Build a git-defined image `<path>[#<stage>]` from the host-side checkout into the shared
+/// build tier and return its rootfs + captured runtime config. Shared by the job's primary
+/// (`resolve_dockerfile_form`) and its git-defined services (`plan_services`). Requires
 /// `[gitlab] host_checkout`: the Dockerfile + context are the checked-out sources.
 /// `--build-arg`s come from `CUSTOM_ENV_MICROVM_BUILD_ARG_<NAME>`.
 fn build_git_image(
@@ -219,8 +220,8 @@ fn build_git_image(
     let cfg = &ctx.cfg;
     if !cfg.gitlab.as_ref().is_some_and(|g| g.host_checkout) {
         bail!(
-            "a build: image requires [gitlab] host_checkout — the Dockerfile and its context \
-             are the checked-out sources"
+            "a git-defined (dockerfile:/compose:) image requires [gitlab] host_checkout — the \
+             Dockerfile and its context are the checked-out sources"
         );
     }
     let (rel_dockerfile, stage) = match spec.split_once('#') {
@@ -228,7 +229,7 @@ fn build_git_image(
         None => (spec, None),
     };
     let checkout = ctx.host_checkout_dir();
-    // The Dockerfile path is job-controlled; confine it to the checkout so a `build:` job
+    // The Dockerfile path is job-controlled; confine it to the checkout so a `dockerfile:` job
     // cannot read another tenant's checkout or an arbitrary host file during the host-side
     // build (this runs outside the microVM boundary).
     let dockerfile = confined_dockerfile(&checkout, rel_dockerfile)?;
@@ -270,7 +271,7 @@ fn build_git_image(
 /// it. Rejects an absolute path (`Path::join` would discard the base) and any `..`/root
 /// component up front, then canonicalizes and re-checks the prefix so a symlink committed in
 /// the repo cannot redirect the read outside the checkout (`read_to_string` follows symlinks).
-/// A `build:` job fully controls its repo, so this is the boundary that keeps it inside its
+/// A `dockerfile:` job fully controls its repo, so this is the boundary that keeps it inside its
 /// own tree on a shared runner. The checked path is later read in a separate syscall, but the
 /// checkout is host-private to this job and the job author owns its contents, so the resolve↔read
 /// window is not a cross-tenant boundary — the confinement guards against reaching *another*
@@ -284,10 +285,7 @@ fn confined_dockerfile(checkout: &Path, rel: &str) -> Result<PathBuf> {
             Component::ParentDir | Component::RootDir | Component::Prefix(_)
         )
     }) {
-        bail!(
-            "MICROVM_IMAGE build: Dockerfile path must be relative and stay inside the repo: \
-             {rel:?}"
-        );
+        bail!("dockerfile: path must be relative and stay inside the repo: {rel:?}");
     }
     let joined = checkout.join(rel_path);
     let canon = joined
@@ -297,7 +295,7 @@ fn confined_dockerfile(checkout: &Path, rel: &str) -> Result<PathBuf> {
         .canonicalize()
         .with_context(|| format!("resolving the checkout {}", checkout.display()))?;
     if !canon.starts_with(&root) {
-        bail!("MICROVM_IMAGE build: Dockerfile {rel:?} resolves outside the repo checkout");
+        bail!("dockerfile: path {rel:?} resolves outside the repo checkout");
     }
     Ok(canon)
 }
@@ -772,7 +770,7 @@ async fn probe_guest_shell(ctx: &JobCtx, addr: &vk_core::addr::SocketAddr) {
 /// Map the job's `services:` onto provisioned units, assigning static addresses from the top
 /// of the job subnet and CIDs from the service range, and merging each unit's boot config
 /// (image defaults + service `variables:`/entrypoint/command overrides). A service named
-/// `build:<dockerfile>[#<stage>]` is a **git-defined** service: it builds that stage from the
+/// `dockerfile:<path>[#<stage>]` is a **git-defined** service: it builds that stage from the
 /// host checkout into the shared build tier (like the primary), so a CI service need not be a
 /// pre-published bundle. Any other name resolves through the shared digest-keyed cache the
 /// job's own image uses (a job image and a service naming the same ref share one cache entry).
@@ -787,11 +785,11 @@ fn plan_services(
         // The GitLab `services:` model carries no per-service init/kernel axes or build args, so
         // every executor service keeps the default agent-as-PID1 pinned-kernel boot (`to_units`
         // sets `Default`).
-        // A `build:` service is git-defined (built from the checkout, like the primary); any
+        // A `dockerfile:` service is git-defined (built from the checkout, like the primary); any
         // other name is image-only (`to_units`) and resolves through the shared digest-keyed
         // cache the job's own image uses (also the `vk run --compose` path).
         let git_spec = match &unit.source {
-            crate::compose::Source::Image(image) => image.strip_prefix("build:"),
+            crate::compose::Source::Image(image) => image.strip_prefix("dockerfile:"),
             _ => None,
         };
         let prov = if let Some(spec) = git_spec {
