@@ -2,11 +2,12 @@
 //!
 //! The reference is resolved against the host-configured `[docker] repo` (the
 //! allowlist, same model as `[registry]`), pulled with the native OCI client, and
-//! flattened into a bootable ext4 with the embedded vk-agent injected as PID 1 and
-//! booted on the embedded kernel. The image's Config.Env/User are captured into
-//! `/etc/virtkit/{env,user}` so the guest runs like `docker run` would. Results cache
-//! under `<state_dir>/docker/<name>/<digest>-<agentfp>/` with the same pull lock + GC as
-//! the bundle registry.
+//! flattened into a byte-clean bootable ext4 booted on the embedded kernel (the agent
+//! rides the boot initramfs, nothing is injected into the rootfs). The image's
+//! Config.Env/User/WorkingDir/Entrypoint/Cmd are captured into a `runner.ext4.json`
+//! sidecar the boot applies, so the guest runs like `docker run` would. Results cache
+//! under `<state_dir>/docker/<name>/<digest>/` with the same pull lock + GC as the
+//! bundle registry.
 //!
 //! This is the OCI-direct path `vk run --source oci` uses, wired into the executor, so a
 //! runner host provisions the guest with just the `vk` binary.
@@ -68,13 +69,6 @@ fn resolve_full(
         .transpose()?;
     let username = (!dk.username.is_empty()).then(|| dk.username.clone());
 
-    // the embedded vk-agent (or the `[build] agent` override) is injected as PID 1;
-    // fold its identity into the cache key so a vk update re-bakes the rootfs.
-    let agent = crate::embed::resolve(crate::embed::Asset::Agent, ctx.cfg.build.agent.as_deref())?;
-    let agent_bytes =
-        std::fs::read(&agent.path).context("reading the vk-agent to inject as PID 1")?;
-    let agent_fp = image::fnv64(&[agent_bytes.as_slice()]);
-
     let digest = crate::registry::block_on(crate::oci::resolve_digest_auth(
         full,
         username.as_deref(),
@@ -84,50 +78,34 @@ fn resolve_full(
     ))
     .with_context(|| format!("resolving {full}"))?;
 
-    // pull by the resolved digest, not the tag, so the digest-keyed cache dir is always
+    // Pull by the resolved digest, not the tag, so the digest-keyed cache dir is always
     // populated with exactly that content even if the tag moves under us (mirrors the
     // registry bundle path, which pulls via make_digest_ref). `full` always starts with
     // `{repo}/`, so `{repo}/{name}` reconstructs the same ref with the tag dropped.
+    // The rootfs is a byte-clean flatten (the embedded agent rides the boot initramfs),
+    // so the digest keys the cache — a vk update changes the boot agent, not the image.
     let pinned = format!("{}/{}@{}", dk.repo, name, digest);
 
     let images_dir = ctx.cfg.state_dir().join("docker").join(name);
-    let dir = images_dir.join(format!(
-        "{}-{agent_fp:016x}",
-        digest.trim_start_matches("sha256:")
-    ));
+    let dir = images_dir.join(digest.trim_start_matches("sha256:"));
     if !dir.join("runner.ext4").is_file() {
         let _lock = image::acquire_pull_lock(&dir, name, &digest)?;
         if !dir.join("runner.ext4").is_file() {
-            build(
-                &pinned,
-                &agent.path,
-                username,
-                password,
-                ca_pem,
-                dk.insecure,
-                &dir,
-            )?;
+            build(&pinned, username, password, ca_pem, dk.insecure, &dir)?;
             image::gc(&images_dir, &dir, dk.keep);
         }
     }
     println!("virtkit: image {full}@{digest} (OCI direct boot)");
-    // generic-disk boot: the embedded kernel (kernel=None), the agent as PID 1.
-    Ok(ResolvedImage::Disk {
-        rootfs: dir.join("runner.ext4"),
-        kernel: None,
-        initrd: None,
-        generic: true,
-        // Env/User are baked into the rootfs as /etc/virtkit/{env,user} at build time.
-        config: None,
-    })
+    // generic-disk boot: the boot applies the image's Env/User/WorkingDir/Entrypoint/Cmd
+    // from the runner.ext4.json sidecar (`resolved_from_dir` loads it) — no baking.
+    Ok(image::resolved_from_dir(&dir, BootKind::GenericDisk))
 }
 
-/// Pull + flatten the image into `dir/runner.ext4`, injecting the agent and the captured
-/// Env/User. A tmp sibling is promoted on success so a killed prepare never leaves a
-/// half-built rootfs a cache check would trust.
+/// Pull + flatten the image into `dir/runner.ext4` (byte-clean) and write its captured
+/// runtime config to `runner.ext4.json`. A tmp sibling is promoted on success so a killed
+/// prepare never leaves a half-built rootfs a cache check would trust.
 fn build(
     full: &str,
-    agent_path: &Path,
     username: Option<String>,
     password: Option<String>,
     ca_pem: Option<Vec<u8>>,
@@ -140,7 +118,6 @@ fn build(
     println!("virtkit: pulling {full} ...");
     crate::registry::block_on(build_async(
         full.to_string(),
-        agent_path.to_path_buf(),
         username,
         password,
         ca_pem,
@@ -162,16 +139,15 @@ fn build(
 
 async fn build_async(
     full: String,
-    agent_path: PathBuf,
     username: Option<String>,
     password: Option<String>,
     ca_pem: Option<Vec<u8>>,
     insecure: bool,
     tmp: PathBuf,
 ) -> Result<()> {
-    // capture the image config a plain rootfs tar drops, so the guest runs like
-    // `docker run`: the agent restores Config.Env (PATH, …) and drops the stage
-    // scripts to Config.User. Injected as /etc/virtkit/{env,user} next to the agent.
+    // Capture the image config a plain rootfs tar drops, so the guest runs like
+    // `docker run`: the boot applies Config.Env (PATH, …), User, WorkingDir, Entrypoint and
+    // Cmd from this sidecar next to the rootfs, rather than baking them into the ext4.
     let cfg = crate::oci::pull_config(
         &full,
         username.as_deref(),
@@ -180,16 +156,16 @@ async fn build_async(
         insecure,
     )
     .await?;
-    let env_file = tmp.join("virtkit.env");
-    let user_file = tmp.join("virtkit.user");
-    std::fs::write(&env_file, render_env(&cfg.env))?;
-    std::fs::write(&user_file, format!("{}\n", cfg.user.unwrap_or_default()))?;
+    let run_config = vk_core::runcfg::RunConfig {
+        env: cfg.env,
+        user: cfg.user.unwrap_or_default(),
+        workdir: cfg.workdir.unwrap_or_default(),
+        entrypoint: cfg.entrypoint,
+        cmd: cfg.cmd,
+    };
+    std::fs::write(tmp.join("runner.ext4.json"), run_config.to_json())
+        .with_context(|| format!("writing the run-config sidecar in {}", tmp.display()))?;
     let rootfs = tmp.join("runner.ext4");
-    let injects: [(&str, &Path, u16); 3] = [
-        ("usr/local/bin/vk-agent", agent_path.as_path(), 0o755),
-        ("etc/virtkit/env", env_file.as_path(), 0o644),
-        ("etc/virtkit/user", user_file.as_path(), 0o644),
-    ];
     let source = crate::source::Source::Oci {
         reference: full,
         username,
@@ -201,7 +177,7 @@ async fn build_async(
         .stream_tar(&tmp, |tar, hints| {
             crate::ext4::build_from_tar_stream(
                 tar,
-                &injects,
+                &[], // byte-clean: nothing injected (the agent rides the boot initramfs)
                 hints.image_bytes(),
                 0,
                 Some(hints.inode_count()),
@@ -213,17 +189,7 @@ async fn build_async(
             )
         })
         .await?;
-    let _ = std::fs::remove_file(&env_file);
-    let _ = std::fs::remove_file(&user_file);
     Ok(())
-}
-
-/// Render `Config.Env` as raw KEY=VALUE lines (the agent splits on the first '=' and
-/// takes the rest of the line verbatim).
-fn render_env(env: &[(String, String)]) -> String {
-    env.iter()
-        .map(|(k, v)| format!("{k}={v}\n"))
-        .collect::<String>()
 }
 
 /// Map a job's `image:` onto the `[docker] repo` allowlist. A ref already under the repo
@@ -319,22 +285,5 @@ mod tests {
         assert!(name_of("foo/../bar").is_err());
         assert!(name_of("..").is_err());
         assert!(name_of("").is_err());
-    }
-
-    #[test]
-    fn render_env_emits_key_equals_value_lines() {
-        let env = [
-            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
-            // values may themselves contain '=' — the agent splits on the first one,
-            // so the rest must be emitted verbatim.
-            ("OPTS".to_string(), "a=b=c".to_string()),
-            ("EMPTY".to_string(), String::new()),
-        ];
-        assert_eq!(render_env(&env), "PATH=/usr/bin:/bin\nOPTS=a=b=c\nEMPTY=\n");
-    }
-
-    #[test]
-    fn render_env_empty_is_empty() {
-        assert_eq!(render_env(&[]), "");
     }
 }

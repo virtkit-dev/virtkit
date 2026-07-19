@@ -58,6 +58,12 @@ All notable changes to virtkit will be documented in this file.
   **embedded** kernel instead of a configured `generic_kernel` file, so the host needs no
   separate `vmlinux`. `generic_kernel` is dropped from `[local]`/`[registry]`, and a bundle
   that ships its own kernel still boots it.
+- The `docker/` OCI-direct path now flattens a **byte-clean** rootfs and carries the image's
+  Config (Env/User/WorkingDir/Entrypoint/Cmd) in a `runner.ext4.json` sidecar the boot
+  applies — the same model bundles and OCI `services:` use — instead of baking
+  `/etc/virtkit/{env,user}` into the ext4 (which also dropped WorkingDir/Entrypoint/Cmd). The
+  cache key is the image digest alone (no agent fingerprint), since the agent rides the boot
+  initramfs rather than the rootfs.
 
 ## [0.16.0] - 2026-07-15
 
