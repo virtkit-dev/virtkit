@@ -87,11 +87,20 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // stage build is far slower than a boot, so building it here (rather than in supervise's
     // plan_services) keeps the guest boot within the runner's readiness budget. supervise then
     // just hits the fresh tier. Non-build services are left for supervise (a pull is quick).
-    for unit in crate::services::to_units(crate::services::from_env()?) {
-        if let crate::compose::Source::Image(image) = &unit.source
-            && let Some(spec) = image.strip_prefix("dockerfile:")
-        {
-            build_git_image(ctx, spec).with_context(|| format!("service {}", unit.name))?;
+    let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
+    if let Some(spec) = image_ref.strip_prefix("compose:") {
+        for unit in compose_service_units(&load_compose_fleet(ctx, spec)?)? {
+            if matches!(unit.source, crate::compose::Source::Build { .. }) {
+                build_compose_unit(ctx, &unit).with_context(|| format!("service {}", unit.name))?;
+            }
+        }
+    } else {
+        for unit in crate::services::to_units(crate::services::from_env()?) {
+            if let crate::compose::Source::Image(image) = &unit.source
+                && let Some(spec) = image.strip_prefix("dockerfile:")
+            {
+                build_git_image(ctx, spec).with_context(|| format!("service {}", unit.name))?;
+            }
         }
     }
 
@@ -172,6 +181,10 @@ fn resolve_media(ctx: &JobCtx) -> Result<(Option<PathBuf>, Media, bool)> {
     let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
     if let Some(spec) = image_ref.strip_prefix("dockerfile:") {
         return resolve_dockerfile_form(ctx, spec);
+    }
+    if let Some(spec) = image_ref.strip_prefix("compose:") {
+        let fleet = load_compose_fleet(ctx, spec)?;
+        return compose_unit_media(ctx, &fleet.units[fleet.primary]);
     }
     match crate::image::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), image_ref)? {
         ResolvedImage::Disk {
@@ -287,15 +300,23 @@ fn confined_dockerfile(checkout: &Path, rel: &str) -> Result<PathBuf> {
     }) {
         bail!("dockerfile: path must be relative and stay inside the repo: {rel:?}");
     }
-    let joined = checkout.join(rel_path);
-    let canon = joined
-        .canonicalize()
-        .with_context(|| format!("resolving the git-defined Dockerfile {}", joined.display()))?;
     let root = checkout
         .canonicalize()
         .with_context(|| format!("resolving the checkout {}", checkout.display()))?;
-    if !canon.starts_with(&root) {
-        bail!("dockerfile: path {rel:?} resolves outside the repo checkout");
+    confine_under(&root, &checkout.join(rel_path))
+}
+
+/// Require an already-joined path to stay within `root` (a canonicalized checkout root):
+/// canonicalize it and assert the prefix, defeating `..`/absolute/symlink escape. Used to
+/// confine a compose file's job-authored `build:` context/Dockerfile paths, which the shared
+/// compose parser resolves relative to the file without any confinement (fine for a trusted
+/// `vk run --compose`, unsafe for an untrusted executor job).
+fn confine_under(root: &Path, path: &Path) -> Result<PathBuf> {
+    let canon = path
+        .canonicalize()
+        .with_context(|| format!("resolving {}", path.display()))?;
+    if !canon.starts_with(root) {
+        bail!("path {} resolves outside the repo checkout", path.display());
     }
     Ok(canon)
 }
@@ -310,6 +331,190 @@ fn ci_build_args() -> Vec<(String, String)> {
                 .map(|n| (n.to_string(), v))
         })
         .collect()
+}
+
+/// A `compose:<file>#<primary>` job's fleet, loaded from the host checkout: the parsed compose
+/// units, the primary index (the job VM the stages exec into), and which units boot (the
+/// primary's dependency closure, plus any `MICROVM_PROFILE`-enabled set). The primary + its
+/// deps always boot; a profile can pull in extra services.
+struct ComposeFleet {
+    units: Vec<crate::compose::Unit>,
+    primary: usize,
+    enabled: Vec<bool>,
+}
+
+/// Parse `compose:<file>#<primary>` and load the fleet from the host checkout. Requires
+/// `[gitlab] host_checkout` (the compose file + its build contexts are the checked-out
+/// sources) and a `#<primary>` naming the job VM. `MICROVM_PROFILE` (space/comma separated)
+/// selects extra services.
+fn load_compose_fleet(ctx: &JobCtx, spec: &str) -> Result<ComposeFleet> {
+    if !ctx.cfg.gitlab.as_ref().is_some_and(|g| g.host_checkout) {
+        bail!(
+            "a compose: image requires [gitlab] host_checkout — the compose file and its build \
+             contexts are the checked-out sources"
+        );
+    }
+    let (rel_file, primary_name) = spec.split_once('#').with_context(|| {
+        format!("compose: image {spec:?} must name the primary service: compose:<file>#<service>")
+    })?;
+    let checkout = ctx.host_checkout_dir();
+    let file = confined_dockerfile(&checkout, rel_file)?;
+    // The compose file is job-authored (untrusted): interpolate only the job's own
+    // `CUSTOM_ENV_*` variables (plus the committed `.env`), never the executor's ambient
+    // process environment, so it cannot pull runner-level secrets into an image or sibling.
+    let mut units = crate::compose::load_with_env(&file, &|name| {
+        std::env::var(format!("CUSTOM_ENV_{name}")).ok()
+    })?;
+    let primary = units
+        .iter()
+        .position(|u| u.name == primary_name)
+        .with_context(|| {
+            format!(
+                "compose: primary {primary_name:?} is not a service in {rel_file} (declared: {})",
+                units
+                    .iter()
+                    .map(|u| u.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+    let profiles: Vec<String> = std::env::var("CUSTOM_ENV_MICROVM_PROFILE")
+        .unwrap_or_default()
+        .split([',', ' ', '\t'])
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    // Boot the primary + its dependency closure, plus anything a profile enables.
+    let mut enabled = crate::compose::enabled(&units, &profiles);
+    for (i, on) in crate::compose::dependency_closure(&units, primary)
+        .into_iter()
+        .enumerate()
+    {
+        enabled[i] |= on;
+    }
+    enabled[primary] = true;
+    // Confine every booting unit to the checkout: its `build:` context/Dockerfiles are
+    // job-authored paths resolved on the host (outside the microVM boundary), so — like the
+    // `dockerfile:` primary — they must not escape into another tenant's tree or the host. A
+    // `volumes:` bind mount would punch a host path straight through the boundary into an
+    // untrusted guest, so it is refused outright on the executor.
+    let root = checkout
+        .canonicalize()
+        .with_context(|| format!("resolving the checkout {}", checkout.display()))?;
+    for (i, unit) in units.iter_mut().enumerate() {
+        if !enabled[i] {
+            continue;
+        }
+        if !unit.volumes.is_empty() {
+            bail!(
+                "compose service {:?}: volumes: are not supported on the GitLab executor — a \
+                 bind mount would expose a host path across the microVM boundary",
+                unit.name
+            );
+        }
+        if let crate::compose::Source::Build {
+            context,
+            dockerfiles,
+            ..
+        } = &mut unit.source
+        {
+            *context = confine_under(&root, context)?;
+            for df in dockerfiles.iter_mut() {
+                *df = confine_under(&root, df)?;
+            }
+        }
+    }
+    Ok(ComposeFleet {
+        units,
+        primary,
+        enabled,
+    })
+}
+
+/// The enabled service units of a compose fleet — every booting unit except the primary — in
+/// boot order, for provisioning + warming as siblings.
+fn compose_service_units(fleet: &ComposeFleet) -> Result<Vec<crate::compose::Unit>> {
+    Ok(crate::compose::boot_order(&fleet.units)?
+        .into_iter()
+        .filter(|&i| i != fleet.primary && fleet.enabled[i])
+        .map(|i| fleet.units[i].clone())
+        .collect())
+}
+
+/// Resolve one compose unit to boot media: a `build:` unit is built into the shared build tier
+/// (from the host checkout), an `image:` unit resolves through the shared image cache. Its
+/// compose `environment`/`user` overrides are merged into the boot config either way.
+fn compose_unit_media(
+    ctx: &JobCtx,
+    unit: &crate::compose::Unit,
+) -> Result<(Option<PathBuf>, Media, bool)> {
+    match &unit.source {
+        crate::compose::Source::Build { .. } => {
+            let (rootfs, config) = build_compose_unit(ctx, unit)?;
+            Ok((
+                None,
+                Media {
+                    rootfs,
+                    initrd: None,
+                    config: Some(config),
+                },
+                true,
+            ))
+        }
+        crate::compose::Source::Image(image) => {
+            let crate::image::ResolvedImage::Disk {
+                rootfs,
+                kernel,
+                initrd,
+                generic,
+                config,
+            } = crate::image::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), image)?;
+            let config = Some(crate::compose::merged_config(
+                &config.unwrap_or_default(),
+                unit,
+            ));
+            Ok((
+                kernel,
+                Media {
+                    rootfs,
+                    initrd,
+                    config,
+                },
+                generic,
+            ))
+        }
+    }
+}
+
+/// Build a compose `build:` unit into the shared build tier (from the host checkout) and return
+/// its rootfs + merged runtime config. The build wiring comes from `[build]` (embedded kernel/
+/// agent by default); `--build-arg`s from `CUSTOM_ENV_MICROVM_BUILD_ARG_*` plus the unit's own.
+fn build_compose_unit(
+    ctx: &JobCtx,
+    unit: &crate::compose::Unit,
+) -> Result<(PathBuf, vk_core::runcfg::RunConfig)> {
+    let cfg = &ctx.cfg;
+    // Held across the build: an embedded asset lives in a memfd whose /proc/self/fd path is
+    // valid only while the handle is open, and the build is synchronous.
+    let agent = crate::embed::resolve(crate::embed::Asset::Agent, cfg.build.agent.as_deref())?;
+    let kernel = crate::embed::resolve(crate::embed::Asset::Kernel, cfg.build.kernel.as_deref())?;
+    let build = crate::units::BuildOpts {
+        build_args: ci_build_args(),
+        kernel: kernel.path.clone(),
+        cloud_hypervisor: cfg.cloud_hypervisor().to_path_buf(),
+        agent: agent.path.clone(),
+        cache_registry: cfg.build.cache_registry.clone(),
+        cache_insecure: cfg.build.cache_insecure,
+    };
+    let ext4 = crate::units::build_unit_ext4(cfg.state_dir(), &build.build_args, unit)?;
+    let config = crate::units::ensure_unit_build_sync(
+        unit,
+        cfg.state_dir(),
+        cfg.image_cache_idle(),
+        &build,
+        None,
+    )?;
+    Ok((ext4, config))
 }
 
 /// The detached job supervisor (`vk gitlab supervise <job_dir>`, spawned by
@@ -767,27 +972,28 @@ async fn probe_guest_shell(ctx: &JobCtx, addr: &vk_core::addr::SocketAddr) {
     );
 }
 
-/// Map the job's `services:` onto provisioned units, assigning static addresses from the top
-/// of the job subnet and CIDs from the service range, and merging each unit's boot config
-/// (image defaults + service `variables:`/entrypoint/command overrides). A service named
-/// `dockerfile:<path>[#<stage>]` is a **git-defined** service: it builds that stage from the
-/// host checkout into the shared build tier (like the primary), so a CI service need not be a
-/// pre-published bundle. Any other name resolves through the shared digest-keyed cache the
-/// job's own image uses (a job image and a service naming the same ref share one cache entry).
+/// Map the job's services onto provisioned units, assigning static addresses from the top of
+/// the job subnet and CIDs from the service range, and merging each unit's boot config. The
+/// services come from a `compose:<file>#<primary>` fleet (every enabled unit but the primary)
+/// or, otherwise, from the GitLab `services:` list (`CI_JOB_SERVICES`). A `dockerfile:` service
+/// (or a compose `build:` unit) is git-defined — built from the host checkout into the shared
+/// build tier; any other name resolves through the shared digest-keyed cache the job's own image
+/// uses (a job image and a service naming the same ref share one cache entry).
 fn plan_services(
     ctx: &JobCtx,
     gateway: Ipv4Addr,
     prefix: u8,
 ) -> Result<Vec<crate::units::Provisioned>> {
-    let units = crate::services::to_units(crate::services::from_env()?);
+    let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
+    let units = match image_ref.strip_prefix("compose:") {
+        Some(spec) => compose_service_units(&load_compose_fleet(ctx, spec)?)?,
+        None => crate::services::to_units(crate::services::from_env()?),
+    };
     let mut out = Vec::new();
     for (slot, unit) in units.into_iter().enumerate() {
-        // The GitLab `services:` model carries no per-service init/kernel axes or build args, so
-        // every executor service keeps the default agent-as-PID1 pinned-kernel boot (`to_units`
-        // sets `Default`).
-        // A `dockerfile:` service is git-defined (built from the checkout, like the primary); any
-        // other name is image-only (`to_units`) and resolves through the shared digest-keyed
-        // cache the job's own image uses (also the `vk run --compose` path).
+        // A `dockerfile:` service (the CI_JOB_SERVICES form) builds from the checkout via the
+        // tier; a compose `build:` unit and any plain image ref go through the shared provision
+        // path (Build -> tier ext4, built up front by prepare's warm pass; Image -> resolve_ref).
         let git_spec = match &unit.source {
             crate::compose::Source::Image(image) => image.strip_prefix("dockerfile:"),
             _ => None,
@@ -801,7 +1007,7 @@ fn plan_services(
             crate::units::provision(
                 &ctx.cfg,
                 ctx.cfg.state_dir(),
-                &[],
+                &ci_build_args(),
                 &unit,
                 gateway,
                 prefix,
@@ -1273,5 +1479,24 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn confine_under_rejects_paths_outside_the_root() {
+        // Guards a compose file's job-authored `build:` context/Dockerfile paths, which arrive
+        // already joined (absolute or `..`-laden) from the shared parser.
+        let root = std::env::temp_dir().join(format!("vk-confine-under-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("ctx")).unwrap();
+        let canon_root = root.canonicalize().unwrap();
+
+        // An in-checkout context resolves.
+        assert!(confine_under(&canon_root, &root.join("ctx")).is_ok());
+        // An absolute path outside the checkout (what `base.join("/etc")` yields) is refused.
+        assert!(confine_under(&canon_root, Path::new("/etc")).is_err());
+        // A `..` traversal out of the checkout is refused after canonicalization.
+        assert!(confine_under(&canon_root, &root.join("ctx").join("../../..")).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

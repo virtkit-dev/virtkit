@@ -22,6 +22,11 @@ All notable changes to virtkit will be documented in this file.
   and shared across jobs and runners. It requires the new `[gitlab] host_checkout` mode (off by
   default), which checks the sources out on the host and shares them into the job over a
   filesystem mount, keeping the git credential out of the guest.
+- The GitLab executor can also boot a whole fleet from a compose file in the git sources:
+  `MICROVM_IMAGE: compose:<file>#<primary>` builds/pulls every service the file describes,
+  boots `<primary>` as the job VM and the rest as siblings on the job network, resolvable by
+  alias — so a job's image, its services, and their wiring live in one file. `MICROVM_PROFILE`
+  selects optional services. Same `host_checkout` requirement as `dockerfile:`.
 - CI `services:` accept the `virtkit/<name>[:tag]` prefix: a service sourced from a
   `[registry]` bundle is pulled (CDC+zstd dedup) and booted on the same clean-image unit
   path as an OCI service (agent initramfs + embedded kernel applying the bundle config).

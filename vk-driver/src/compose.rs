@@ -224,15 +224,24 @@ pub fn dependency_closure(units: &[Unit], root: usize) -> Vec<bool> {
 /// env wins) — so machine-specific values (a repo path, a uid) stay out of the
 /// committed file.
 pub fn load(path: &Path) -> Result<Vec<Unit>> {
+    load_with_env(path, &|name| std::env::var(name).ok())
+}
+
+/// Like `load`, but the caller supplies how a `${VAR}` name resolves against the *ambient*
+/// environment (the sibling `.env` is still layered underneath, ambient winning per docker
+/// precedence). The GitLab executor passes a resolver restricted to job (`CUSTOM_ENV_*`)
+/// variables, so an untrusted committed compose file cannot interpolate runner-level secrets
+/// out of the executor's process environment.
+pub fn load_with_env(path: &Path, ambient: &dyn Fn(&str) -> Option<String>) -> Result<Vec<Unit>> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     let dotenv = load_dotenv(base)?;
     let resolve = |name: &str| {
-        // process environment first (docker precedence), then the sibling .env. A
-        // set-but-empty process value wins over a .env value — and, being empty, is
+        // ambient environment first (docker precedence), then the sibling .env. A
+        // set-but-empty ambient value wins over a .env value — and, being empty, is
         // then treated as unset by `interpolate` (so it takes a default or errors).
-        std::env::var(name).ok().or_else(|| {
+        ambient(name).or_else(|| {
             dotenv
                 .iter()
                 .find(|(k, _)| k == name)
@@ -1277,5 +1286,40 @@ mod tests {
             .pop()
             .unwrap();
         assert_eq!(u2.volumes.len(), 1);
+    }
+
+    #[test]
+    fn load_with_env_uses_the_supplied_resolver_over_dotenv() {
+        // The executor passes a resolver restricted to job variables; `load_with_env` must
+        // interpolate from it (layered over the sibling `.env`, ambient winning) rather than
+        // the process environment.
+        let dir = std::env::temp_dir().join(format!("vk-loadenv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("compose.yml"),
+            "services:\n  app:\n    image: ${AMBIENT}/img:${FROM_DOTENV}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join(".env"), "FROM_DOTENV=v1\nAMBIENT=dotenv-loses\n").unwrap();
+
+        let ambient = |name: &str| (name == "AMBIENT").then(|| "reg".to_string());
+        let units = load_with_env(&dir.join("compose.yml"), &ambient).unwrap();
+        match &units[0].source {
+            // AMBIENT came from the resolver (winning over .env), FROM_DOTENV from .env.
+            Source::Image(img) => assert_eq!(img, "reg/img:v1"),
+            other => panic!("expected an image source, got {other:?}"),
+        }
+
+        // A variable the resolver does not provide and `.env` lacks is a hard error — it is
+        // NOT silently pulled from the process environment.
+        std::fs::write(
+            dir.join("compose.yml"),
+            "services:\n  app:\n    image: img:${PATH}\n",
+        )
+        .unwrap();
+        assert!(load_with_env(&dir.join("compose.yml"), &|_| None).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
