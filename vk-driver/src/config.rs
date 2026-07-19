@@ -114,6 +114,14 @@ pub struct Auth {
 #[serde(deny_unknown_fields, default)]
 pub struct Gitlab {
     pub dir: Option<PathBuf>,
+    /// Check the job's git sources out on the HOST at prepare and share the tree into the
+    /// guest over virtio-fs, instead of the in-guest `get_sources` clone. The job then sets
+    /// `GIT_STRATEGY: none` so the checkout is reused and the git token never enters the guest
+    /// (a security win), and the host has the tree available to build a git-defined image
+    /// (`ci-boots-git-defined-images`). Off by default. Trade-off: a read-write virtio-fs
+    /// share into an untrusted job guest is added host-side attack surface.
+    #[serde(default)]
+    pub host_checkout: bool,
 }
 
 /// Egress allowlist for the per-job switch (`net.mode = "switch"`). Both lists

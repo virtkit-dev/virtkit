@@ -29,6 +29,20 @@ pub struct JobCtx {
     pub build_failure: i32,
     /// Exit code telling gitlab-runner the *environment* failed (retryable)
     pub system_failure: i32,
+
+    // `[gitlab] host_checkout`: the job's git sources, checked out on the host at prepare and
+    // shared into the guest, instead of the in-guest `get_sources` clone (see checkout.rs).
+    /// CI_REPOSITORY_URL (GitLab embeds the job token) — the clone source.
+    pub ci_repo_url: Option<String>,
+    /// CI_COMMIT_SHA — the exact commit checked out.
+    pub ci_commit_sha: Option<String>,
+    /// CI_COMMIT_REF_NAME — the branch/tag fetched so the sha resolves.
+    pub ci_commit_ref: Option<String>,
+    /// CI_PROJECT_DIR — the guest path GitLab expects the checkout at (the virtio-fs mount point).
+    pub ci_project_dir: Option<String>,
+    /// CI_CONCURRENT_ID + CI_PROJECT_PATH_SLUG, keying the reused host checkout dir.
+    concurrent_id: String,
+    project_slug: String,
 }
 
 impl JobCtx {
@@ -77,7 +91,26 @@ impl JobCtx {
             egress_allow_name_req: job_var("MICROVM_EGRESS_ALLOW_NAME"),
             build_failure: exit_code_env("BUILD_FAILURE_EXIT_CODE", 1),
             system_failure: exit_code_env("SYSTEM_FAILURE_EXIT_CODE", 2),
+            ci_repo_url: job_var("CI_REPOSITORY_URL"),
+            ci_commit_sha: job_var("CI_COMMIT_SHA"),
+            ci_commit_ref: job_var("CI_COMMIT_REF_NAME"),
+            ci_project_dir: job_var("CI_PROJECT_DIR"),
+            // Slug + concurrent id are safe path components by GitLab's own rules; sanitize
+            // defensively so a surprising value can never escape the checkouts root.
+            concurrent_id: safe_component(job_var("CI_CONCURRENT_ID"), "0"),
+            project_slug: safe_component(job_var("CI_PROJECT_PATH_SLUG"), "repo"),
         })
+    }
+
+    /// The host directory the job's sources are checked out into for `[gitlab] host_checkout`,
+    /// keyed by the runner's concurrent slot + project so sequential jobs reuse it (a fetch, not
+    /// a re-clone) while concurrent jobs on the same runner stay isolated.
+    pub fn host_checkout_dir(&self) -> PathBuf {
+        self.cfg
+            .state_dir()
+            .join("checkouts")
+            .join(&self.concurrent_id)
+            .join(&self.project_slug)
     }
 
     pub fn overlay(&self) -> PathBuf {
@@ -142,6 +175,23 @@ impl JobCtx {
         let mut p = self.vsock_sock().into_os_string();
         p.push(format!("_{port}"));
         PathBuf::from(p)
+    }
+}
+
+/// A single safe path component from an optional env value: keep only alphanumerics, `-`, `_`
+/// and `.`, reject a leading dot / emptiness, and fall back to `default` otherwise. Guards the
+/// `host_checkout` cache path against a crafted CI_CONCURRENT_ID / CI_PROJECT_PATH_SLUG.
+fn safe_component(v: Option<String>, default: &str) -> String {
+    match v {
+        Some(s)
+            if !s.is_empty()
+                && !s.starts_with('.')
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) =>
+        {
+            s
+        }
+        _ => default.to_string(),
     }
 }
 

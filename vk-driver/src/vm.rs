@@ -58,6 +58,25 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     std::fs::create_dir_all(&ctx.job_dir)
         .with_context(|| format!("creating {}", ctx.job_dir.display()))?;
 
+    // [gitlab] host_checkout: check the sources out on the host NOW — before the guest boots —
+    // so supervise can share the tree in and the git token never enters the guest (the job
+    // sets GIT_STRATEGY: none). Crisp errors here (the runner-visible prepare) beat a
+    // supervisor-log pointer; like any prepare failure a checkout error exits system_failure.
+    if cfg.gitlab.as_ref().is_some_and(|g| g.host_checkout) {
+        let url = ctx
+            .ci_repo_url
+            .as_deref()
+            .context("host_checkout is set but CI_REPOSITORY_URL is unset")?;
+        let sha = ctx
+            .ci_commit_sha
+            .as_deref()
+            .context("host_checkout is set but CI_COMMIT_SHA is unset")?;
+        let dest = ctx.host_checkout_dir();
+        println!("virtkit: host checkout of {sha} -> {}", dest.display());
+        crate::checkout::ensure(url, ctx.ci_commit_ref.as_deref().unwrap_or(""), sha, &dest)
+            .context("host checkout")?;
+    }
+
     // ONE detached process owns the job from here (the runner protocol requires
     // this stage to exit — ready is signaled by exiting 0): the supervisor spawns
     // the switch/virtiofsds/forwards/VMM as tied children, supervises them, and
@@ -276,6 +295,40 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             read_only: true,
         });
         cmdline.push_str(" VIRTKIT_TOOLS=vktools:/run/virtkit-tools");
+    }
+
+    // [gitlab] host_checkout: the sources checked out on the host in prepare, shared
+    // read-write into the guest at CI_PROJECT_DIR. The job sets GIT_STRATEGY: none so its
+    // get_sources reuses this tree — the git token never enters the guest. A rw virtio-fs
+    // share into an untrusted guest is added attack surface; opt-in only.
+    if cfg.gitlab.as_ref().is_some_and(|g| g.host_checkout) {
+        let mount = ctx
+            .ci_project_dir
+            .as_deref()
+            .context("host_checkout is set but CI_PROJECT_DIR is unset")?;
+        let host_dir = ctx.host_checkout_dir();
+        let sock = ctx.job_dir.join("cibuild-vfsd.sock");
+        if !crate::vmm::libkrun_selected() {
+            let mut vfsd = cfg.virtiofsd_command();
+            vfsd.arg(format!("--socket-path={}", sock.display()))
+                .arg(format!("--shared-dir={}", host_dir.display()))
+                .args(["--cache=auto", "--sandbox=none"]);
+            children.push(
+                spawn_tied_logged(vfsd, &ctx.job_dir.join("cibuild-vfsd.log"))
+                    .context("spawning the checkout virtiofsd")?,
+            );
+            wait_for_socket(&sock, Duration::from_secs(5))
+                .context("the checkout virtiofsd did not create its socket")?;
+        }
+        shares.push(crate::vmm::FsShare {
+            tag: "cibuild".into(),
+            socket: sock,
+            host_dir,
+            read_only: false,
+        });
+        // The agent mounts VIRTKIT_VIRTIOFS shares at boot; CI supervise sets no other, so a
+        // plain assignment is safe (the guest mkdir -p's the mount point).
+        cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS=cibuild:{mount}"));
     }
 
     let mut net = crate::vmm::Net::None;

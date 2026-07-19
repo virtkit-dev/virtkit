@@ -18,6 +18,7 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 mod build;
 mod check;
+mod checkout;
 mod compose;
 mod config;
 mod cpio;
