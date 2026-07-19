@@ -82,6 +82,18 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         }
     }
 
+    // Warm any git-defined service images into the build tier NOW, alongside the primary — a
+    // stage build is far slower than a boot, so building it here (rather than in supervise's
+    // plan_services) keeps the guest boot within the runner's readiness budget. supervise then
+    // just hits the fresh tier. Non-build services are left for supervise (a pull is quick).
+    for unit in crate::services::to_units(crate::services::from_env()?) {
+        if let crate::compose::Source::Image(image) = &unit.source
+            && let Some(spec) = image.strip_prefix("build:")
+        {
+            build_git_image(ctx, spec).with_context(|| format!("service {}", unit.name))?;
+        }
+    }
+
     // ONE detached process owns the job from here (the runner protocol requires
     // this stage to exit — ready is signaled by exiting 0): the supervisor spawns
     // the switch/virtiofsds/forwards/VMM as tied children, supervises them, and
@@ -179,17 +191,36 @@ fn resolve_media(ctx: &JobCtx) -> Result<(Option<PathBuf>, Media, bool)> {
     }
 }
 
-/// Build a git-defined image (`MICROVM_IMAGE: build:<dockerfile>[#<stage>]`) from the
-/// host-side checkout into the shared build tier, and return it as generic-disk boot media
-/// (embedded kernel, agent + config riding the preinit initramfs — the byte-clean model
-/// `vk build`/bundles use). Requires `[gitlab] host_checkout`: the Dockerfile + context are
-/// the checked-out sources. `--build-arg`s come from `CUSTOM_ENV_MICROVM_BUILD_ARG_<NAME>`.
+/// The job's primary as a git-defined image (`MICROVM_IMAGE: build:<dockerfile>[#<stage>]`):
+/// build it and return it as generic-disk boot media (embedded kernel, agent + config riding
+/// the preinit initramfs — the byte-clean model `vk build`/bundles use).
 fn resolve_build_form(ctx: &JobCtx, spec: &str) -> Result<(Option<PathBuf>, Media, bool)> {
+    let (rootfs, config) = build_git_image(ctx, spec)?;
+    Ok((
+        None,
+        Media {
+            rootfs,
+            initrd: None,
+            config,
+        },
+        true,
+    ))
+}
+
+/// Build a git-defined image `<dockerfile>[#<stage>]` from the host-side checkout into the
+/// shared build tier and return its rootfs + captured runtime config. Shared by the job's
+/// primary (`resolve_build_form`) and its git-defined services (`plan_services`). Requires
+/// `[gitlab] host_checkout`: the Dockerfile + context are the checked-out sources.
+/// `--build-arg`s come from `CUSTOM_ENV_MICROVM_BUILD_ARG_<NAME>`.
+fn build_git_image(
+    ctx: &JobCtx,
+    spec: &str,
+) -> Result<(PathBuf, Option<vk_core::runcfg::RunConfig>)> {
     let cfg = &ctx.cfg;
     if !cfg.gitlab.as_ref().is_some_and(|g| g.host_checkout) {
         bail!(
-            "MICROVM_IMAGE build: requires [gitlab] host_checkout — the Dockerfile and its \
-             context are the checked-out sources"
+            "a build: image requires [gitlab] host_checkout — the Dockerfile and its context \
+             are the checked-out sources"
         );
     }
     let (rel_dockerfile, stage) = match spec.split_once('#') {
@@ -226,21 +257,13 @@ fn resolve_build_form(ctx: &JobCtx, spec: &str) -> Result<(Option<PathBuf>, Medi
         &stage_key,
         None,
     )
-    .context("building the git-defined job image")?;
+    .with_context(|| format!("building the git-defined image {spec:?}"))?;
     let rootfs = dir.join("runner.ext4");
     // The stage's Env/User captured by the build (applied at boot via the preinit initramfs).
     let config = std::fs::read_to_string(crate::build::config_sidecar(&rootfs))
         .ok()
         .and_then(|s| vk_core::runcfg::RunConfig::from_json(&s).ok());
-    Ok((
-        None,
-        Media {
-            rootfs,
-            initrd: None,
-            config,
-        },
-        true,
-    ))
+    Ok((rootfs, config))
 }
 
 /// Resolve the job-controlled Dockerfile path against the checkout root, refusing to escape
@@ -746,12 +769,13 @@ async fn probe_guest_shell(ctx: &JobCtx, addr: &vk_core::addr::SocketAddr) {
     );
 }
 
-/// Map the job's `services:` onto provisioned units: parse + alias-map, resolve each
-/// service `image:` through the same digest-keyed cache the job's own image uses (so a
-/// job image and a service naming the same ref share one cache entry — each boots its
-/// own CoW overlay over the shared read-only rootfs), assign static addresses from the
-/// top of the job subnet and CIDs from the service range, and merge each unit's boot
-/// config (image defaults + service `variables:`/entrypoint/command overrides).
+/// Map the job's `services:` onto provisioned units, assigning static addresses from the top
+/// of the job subnet and CIDs from the service range, and merging each unit's boot config
+/// (image defaults + service `variables:`/entrypoint/command overrides). A service named
+/// `build:<dockerfile>[#<stage>]` is a **git-defined** service: it builds that stage from the
+/// host checkout into the shared build tier (like the primary), so a CI service need not be a
+/// pre-published bundle. Any other name resolves through the shared digest-keyed cache the
+/// job's own image uses (a job image and a service naming the same ref share one cache entry).
 fn plan_services(
     ctx: &JobCtx,
     gateway: Ipv4Addr,
@@ -760,26 +784,33 @@ fn plan_services(
     let units = crate::services::to_units(crate::services::from_env()?);
     let mut out = Vec::new();
     for (slot, unit) in units.into_iter().enumerate() {
-        if matches!(unit.source, crate::compose::Source::Build { .. }) {
-            bail!(
-                "service {:?} uses build:, which the CI executor does not support — \
-                 publish it as a virtkit/ bundle or a docker image",
-                unit.name
-            );
-        }
-        // The shared provisioning path (also used by `vk run --compose`): resolve the service
-        // image through the digest-keyed cache and address it. The GitLab `services:` model
-        // carries no per-service init/kernel axes or build args, so every executor service
-        // keeps the default agent-as-PID1 pinned-kernel boot (`to_units` sets `Default`).
-        out.push(crate::units::provision(
-            &ctx.cfg,
-            ctx.cfg.state_dir(),
-            &[],
-            &unit,
-            gateway,
-            prefix,
-            slot as u32,
-        )?);
+        // The GitLab `services:` model carries no per-service init/kernel axes or build args, so
+        // every executor service keeps the default agent-as-PID1 pinned-kernel boot (`to_units`
+        // sets `Default`).
+        // A `build:` service is git-defined (built from the checkout, like the primary); any
+        // other name is image-only (`to_units`) and resolves through the shared digest-keyed
+        // cache the job's own image uses (also the `vk run --compose` path).
+        let git_spec = match &unit.source {
+            crate::compose::Source::Image(image) => image.strip_prefix("build:"),
+            _ => None,
+        };
+        let prov = if let Some(spec) = git_spec {
+            let (ext4, config) =
+                build_git_image(ctx, spec).with_context(|| format!("service {}", unit.name))?;
+            let merged = crate::compose::merged_config(&config.unwrap_or_default(), &unit);
+            crate::units::provisioned(&unit, ext4, merged, gateway, prefix, slot as u32)?
+        } else {
+            crate::units::provision(
+                &ctx.cfg,
+                ctx.cfg.state_dir(),
+                &[],
+                &unit,
+                gateway,
+                prefix,
+                slot as u32,
+            )?
+        };
+        out.push(prov);
     }
     Ok(out)
 }

@@ -176,6 +176,21 @@ pub fn provision(
             )
         }
     };
+    provisioned(unit, ext4, config, gateway, prefix, slot)
+}
+
+/// Assemble a [`Provisioned`] from an already-resolved image + merged config: assign the
+/// static address (`slot`) and CID, and carry the unit's volumes + init/kernel axes. Shared by
+/// `provision` and the CI executor's git-defined-service path (which resolves its image its own
+/// way but addresses it identically).
+pub fn provisioned(
+    unit: &crate::compose::Unit,
+    ext4: PathBuf,
+    config: RunConfig,
+    gateway: Ipv4Addr,
+    prefix: u8,
+    slot: u32,
+) -> Result<Provisioned> {
     let ip = nth_static_ip(gateway, prefix, slot)?;
     Ok(Provisioned {
         name: unit.name.clone(),
