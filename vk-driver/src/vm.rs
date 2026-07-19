@@ -321,7 +321,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             // before the guest dials it; then point the agent at it. The same
             // shared LAN/egress core `run --compose` uses.
             let (gateway, prefix, guest_ip) = crate::net::switch_addrs(&cfg.net.subnet)?;
-            let services = plan_services(ctx, gateway, prefix).await?;
+            let services = plan_services(ctx, gateway, prefix)?;
             // Reference each service's shared base for the job's life, like the primary above.
             for svc in &services {
                 if let Some(g) = crate::image::acquire_use_lock_for(cfg.state_dir(), &svc.ext4)? {
@@ -575,54 +575,34 @@ async fn probe_guest_shell(ctx: &JobCtx, addr: &vk_core::addr::SocketAddr) {
 /// own CoW overlay over the shared read-only rootfs), assign static addresses from the
 /// top of the job subnet and CIDs from the service range, and merge each unit's boot
 /// config (image defaults + service `variables:`/entrypoint/command overrides).
-async fn plan_services(
+fn plan_services(
     ctx: &JobCtx,
     gateway: Ipv4Addr,
     prefix: u8,
 ) -> Result<Vec<crate::units::Provisioned>> {
     let units = crate::services::to_units(crate::services::from_env()?);
-    if units.is_empty() {
-        return Ok(Vec::new());
-    }
     let mut out = Vec::new();
     for (slot, unit) in units.into_iter().enumerate() {
-        let image_ref = match &unit.source {
-            crate::compose::Source::Image(image) => image.as_str(),
-            crate::compose::Source::Build { .. } => bail!(
+        if matches!(unit.source, crate::compose::Source::Build { .. }) {
+            bail!(
                 "service {:?} uses build:, which the CI executor does not support — \
                  publish it as a virtkit/ bundle or a docker image",
                 unit.name
-            ),
-        };
-        let crate::image::ResolvedImage::Disk {
-            rootfs,
-            generic,
-            config,
-            ..
-        } = crate::image::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), image_ref)
-            .with_context(|| format!("service {}", unit.name))?;
-        if !generic {
-            bail!(
-                "service {:?} resolves to a self-booting (systemd) image; a `services:` \
-                 image must be generic-disk",
-                unit.name
             );
         }
-        let config = crate::compose::merged_config(&config.unwrap_or_default(), &unit);
-        let ip = crate::units::nth_static_ip(gateway, prefix, slot as u32)?;
-        out.push(crate::units::Provisioned {
-            name: unit.name,
-            hostname: unit.hostname,
-            ext4: rootfs,
-            ip: format!("{ip}/{prefix}"),
-            cid: crate::units::FIRST_SERVICE_CID + slot as u32,
-            config,
-            volumes: Vec::new(),
-            // The GitLab `services:` model carries no per-service init/kernel axes, so
-            // every executor service keeps the default agent-as-PID1 pinned-kernel boot.
-            init: crate::run::InitSource::Default,
-            kernel: crate::run::KernelSource::Default,
-        });
+        // The shared provisioning path (also used by `vk run --compose`): resolve the service
+        // image through the digest-keyed cache and address it. The GitLab `services:` model
+        // carries no per-service init/kernel axes or build args, so every executor service
+        // keeps the default agent-as-PID1 pinned-kernel boot (`to_units` sets `Default`).
+        out.push(crate::units::provision(
+            &ctx.cfg,
+            ctx.cfg.state_dir(),
+            &[],
+            &unit,
+            gateway,
+            prefix,
+            slot as u32,
+        )?);
     }
     Ok(out)
 }

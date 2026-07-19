@@ -1528,81 +1528,35 @@ fn plan_services(
         slot += 1;
     }
 
-    // Resolve each service's clean image (its cache path) and merge its compose overrides
-    // over the image config.
+    // Resolve + address each service through the shared provisioning path (the same one the
+    // CI executor uses), then derive the switch's per-unit listen socket, resolver aliases and
+    // DHCP reservation from it.
     for s in sited {
         let unit = &units[s.unit];
-        let (ext4, config) = match &unit.source {
-            crate::compose::Source::Image(image) => {
-                // Pull+cache through the shared image cache; a services image must be
-                // generic-disk (the agent + config ride the boot initramfs).
-                let crate::image::ResolvedImage::Disk {
-                    rootfs,
-                    generic,
-                    config,
-                    ..
-                } = crate::image::resolve_ref(cfg, state_dir, image)
-                    .with_context(|| format!("service {}", unit.name))?;
-                if !generic {
-                    bail!(
-                        "service {:?} resolves to a self-booting (systemd) image; a `services:` \
-                         image must be generic-disk",
-                        unit.name
-                    );
-                }
-                (
-                    rootfs,
-                    crate::compose::merged_config(&config.unwrap_or_default(), unit),
-                )
-            }
-            crate::compose::Source::Build { .. } => {
-                // The shared build tier ext4, addressed by stage fingerprint — materialized on
-                // demand by the manager at first start, which then adopts the built config. A
-                // placeholder (compose overrides only) until then.
-                let ext4 = crate::units::build_unit_ext4(state_dir, &args.build_args, unit)?;
-                (
-                    ext4,
-                    crate::compose::merged_config(&vk_core::runcfg::RunConfig::default(), unit),
-                )
-            }
-        };
-        let ip = crate::units::nth_static_ip(gw, prefix, s.slot)?;
+        let prov =
+            crate::units::provision(cfg, state_dir, &args.build_args, unit, gw, prefix, s.slot)?;
+        let ip = prov.addr.to_string();
         planned
             .listen
             .push(s.dir.join(format!("vsock.sock_{NET_VSOCK_PORT}")));
         planned
             .hosts
-            .push((unit.name.to_ascii_lowercase(), ip.to_string()));
+            .push((unit.name.to_ascii_lowercase(), ip.clone()));
         if unit.hostname != unit.name {
             planned
                 .hosts
-                .push((unit.hostname.to_ascii_lowercase(), ip.to_string()));
+                .push((unit.hostname.to_ascii_lowercase(), ip.clone()));
         }
         // Reserve this sibling's deterministic MAC (== the one boot_unit puts on the
         // cmdline) to its IP, so a DHCPing image-init sibling gets its advertised IP.
         planned
             .reservations
-            .push((crate::units::mac_for_ip(ip), ip.to_string()));
-        planned.units.push((
-            crate::units::Provisioned {
-                name: unit.name.clone(),
-                hostname: unit.hostname.clone(),
-                ext4,
-                ip: format!("{ip}/{prefix}"),
-                cid: crate::units::FIRST_SERVICE_CID + s.slot,
-                config,
-                volumes: unit.volumes.clone(),
-                // The unit's per-service init/kernel axes drive its boot identically
-                // whether it lands here (sibling) or as the primary — the whole point
-                // of the uniform axes.
-                init: unit.init,
-                kernel: unit.kernel.clone(),
-            },
-            s.dir,
-            unit.clone(),
-        ));
-        if on[s.unit] {
-            planned.start.push(unit.name.clone());
+            .push((crate::units::mac_for_ip(prov.addr), ip.clone()));
+        let starts = on[s.unit];
+        let name = prov.name.clone();
+        planned.units.push((prov, s.dir, unit.clone()));
+        if starts {
+            planned.start.push(name);
         }
     }
     Ok(planned)

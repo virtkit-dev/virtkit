@@ -16,6 +16,8 @@ use std::process::Child;
 use anyhow::{Context, Result, bail};
 use vk_core::runcfg::RunConfig;
 
+use crate::config::Config;
+
 /// One service unit, ready to boot: its ensured clean image, its address on the
 /// owner's LAN, and the merged runtime config rendered into the boot initramfs on
 /// every start.
@@ -25,6 +27,8 @@ pub struct Provisioned {
     pub ext4: PathBuf,
     /// static address, `ip/prefix`
     pub ip: String,
+    /// the same address without the prefix, for deriving the MAC / DHCP reservation.
+    pub addr: Ipv4Addr,
     pub cid: u32,
     pub config: RunConfig,
     pub volumes: Vec<crate::compose::Volume>,
@@ -125,6 +129,66 @@ pub fn ensure_unit_build_sync(
     let dir =
         crate::ensure::ensure_build_tier(state_dir, idle, &recipe, target.as_deref(), &key, sink)?;
     read_merged_config(unit, &dir.join("runner.ext4"))
+}
+
+/// Provision one service unit at address `slot`: resolve its clean image to a cache path and
+/// merge its runtime config, shared by `vk run --compose` and the CI executor so both address
+/// services identically. An `image:` unit resolves through the shared image cache
+/// (`image::resolve_ref` — a services image must be generic-disk) and carries its real config.
+/// A `build:` unit addresses its shared build-tier ext4 (a pure function of the stage
+/// fingerprint) but is not built here — it gets the compose overrides alone as a placeholder
+/// until the owner materializes it on demand and adopts the built config.
+pub fn provision(
+    cfg: &Config,
+    state_dir: &Path,
+    global_build_args: &[(String, String)],
+    unit: &crate::compose::Unit,
+    gateway: Ipv4Addr,
+    prefix: u8,
+    slot: u32,
+) -> Result<Provisioned> {
+    let (ext4, config) = match &unit.source {
+        crate::compose::Source::Image(image) => {
+            let crate::image::ResolvedImage::Disk {
+                rootfs,
+                generic,
+                config,
+                ..
+            } = crate::image::resolve_ref(cfg, state_dir, image)
+                .with_context(|| format!("service {}", unit.name))?;
+            if !generic {
+                bail!(
+                    "service {:?} resolves to a self-booting (systemd) image; a `services:` \
+                     image must be generic-disk",
+                    unit.name
+                );
+            }
+            (
+                rootfs,
+                crate::compose::merged_config(&config.unwrap_or_default(), unit),
+            )
+        }
+        crate::compose::Source::Build { .. } => {
+            let ext4 = build_unit_ext4(state_dir, global_build_args, unit)?;
+            (
+                ext4,
+                crate::compose::merged_config(&RunConfig::default(), unit),
+            )
+        }
+    };
+    let ip = nth_static_ip(gateway, prefix, slot)?;
+    Ok(Provisioned {
+        name: unit.name.clone(),
+        hostname: unit.hostname.clone(),
+        ext4,
+        ip: format!("{ip}/{prefix}"),
+        addr: ip,
+        cid: FIRST_SERVICE_CID + slot,
+        config,
+        volumes: unit.volumes.clone(),
+        init: unit.init,
+        kernel: unit.kernel.clone(),
+    })
 }
 
 /// The unit's boot config: the image's own defaults (its sidecar, written by the build /
