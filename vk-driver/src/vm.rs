@@ -312,7 +312,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             // before the guest dials it; then point the agent at it. The same
             // shared LAN/egress core `run --compose` uses.
             let (gateway, prefix, guest_ip) = crate::net::switch_addrs(&cfg.net.subnet)?;
-            let services = plan_services(ctx, gateway, prefix, &agent.path, &kernel.path).await?;
+            let services = plan_services(ctx, gateway, prefix).await?;
             // the switch binds each service's vsock socket at startup: the
             // runtime dirs must exist before it spawns.
             for svc in &services {
@@ -554,42 +554,51 @@ async fn probe_guest_shell(ctx: &JobCtx, addr: &vk_core::addr::SocketAddr) {
     );
 }
 
-/// Map the job's `services:` onto provisioned units: parse + alias-map, ensure
-/// each clean image in the shared content-addressed store (first job pays the
-/// pull, concurrent jobs flock and share), assign static addresses from the top
-/// of the job subnet and CIDs from the service range, and merge each unit's boot
+/// Map the job's `services:` onto provisioned units: parse + alias-map, resolve each
+/// service `image:` through the same digest-keyed cache the job's own image uses (so a
+/// job image and a service naming the same ref share one cache entry — each boots its
+/// own CoW overlay over the shared read-only rootfs), assign static addresses from the
+/// top of the job subnet and CIDs from the service range, and merge each unit's boot
 /// config (image defaults + service `variables:`/entrypoint/command overrides).
 async fn plan_services(
     ctx: &JobCtx,
     gateway: Ipv4Addr,
     prefix: u8,
-    agent: &Path,
-    kernel: &Path,
 ) -> Result<Vec<crate::units::Provisioned>> {
     let units = crate::services::to_units(crate::services::from_env()?);
     if units.is_empty() {
         return Ok(Vec::new());
     }
-    let build = crate::units::BuildOpts {
-        build_args: Vec::new(),
-        kernel: kernel.to_path_buf(),
-        cloud_hypervisor: ctx.cfg.cloud_hypervisor().to_path_buf(),
-        agent: agent.to_path_buf(),
-        cache_registry: None,
-        cache_insecure: false,
-    };
-    let store = ctx.cfg.services_store();
-    std::fs::create_dir_all(&store).with_context(|| format!("creating {}", store.display()))?;
     let mut out = Vec::new();
     for (slot, unit) in units.into_iter().enumerate() {
-        let (ext4, config) = crate::units::ensure_unit_store(&unit, &store, &build)
-            .await
+        let image_ref = match &unit.source {
+            crate::compose::Source::Image(image) => image.as_str(),
+            crate::compose::Source::Build { .. } => bail!(
+                "service {:?} uses build:, which the CI executor does not support — \
+                 publish it as a virtkit/ bundle or a docker image",
+                unit.name
+            ),
+        };
+        let crate::image::ResolvedImage::Disk {
+            rootfs,
+            generic,
+            config,
+            ..
+        } = crate::image::resolve_ref(ctx, image_ref)
             .with_context(|| format!("service {}", unit.name))?;
+        if !generic {
+            bail!(
+                "service {:?} resolves to a self-booting (systemd) image; a `services:` \
+                 image must be generic-disk",
+                unit.name
+            );
+        }
+        let config = crate::compose::merged_config(&config.unwrap_or_default(), &unit);
         let ip = crate::units::nth_static_ip(gateway, prefix, slot as u32)?;
         out.push(crate::units::Provisioned {
             name: unit.name,
             hostname: unit.hostname,
-            ext4,
+            ext4: rootfs,
             ip: format!("{ip}/{prefix}"),
             cid: crate::units::FIRST_SERVICE_CID + slot as u32,
             config,

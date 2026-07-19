@@ -29,7 +29,7 @@ pub enum Feature {
     Gitlab,
     /// [share]: shared dir readable, a virtiofsd available when needed
     Share,
-    /// [services]: the shared service-image store is writable
+    /// [services]: the shared image cache CI services pull into is writable
     Services,
 }
 
@@ -345,12 +345,13 @@ fn share(cfg: &Config) -> Outcome {
 }
 
 fn services(cfg: &Config) -> Outcome {
-    // CI services boot as sibling microVMs from the shared image store; the
-    // check is that the store is (creatable and) writable by this user.
-    let store = cfg.services_store();
+    // CI services boot as sibling microVMs from the same digest-keyed image cache the
+    // job's own image uses (`<state_dir>/registry`); the check is that that cache is
+    // (creatable and) writable by this user.
+    let store = cfg.state_dir().join("registry");
     if let Err(e) = std::fs::create_dir_all(&store) {
         return fail(format!(
-            "service store {} not creatable: {e}",
+            "image cache {} not creatable: {e}",
             store.display()
         ));
     }
@@ -358,10 +359,10 @@ fn services(cfg: &Config) -> Outcome {
     match std::fs::write(&probe, b"ok") {
         Ok(()) => {
             let _ = std::fs::remove_file(&probe);
-            ok(format!("service image store {} writable", store.display()))
+            ok(format!("service image cache {} writable", store.display()))
         }
         Err(e) => fail(format!(
-            "service image store {} not writable: {e}",
+            "service image cache {} not writable: {e}",
             store.display()
         )),
     }

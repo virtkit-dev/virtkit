@@ -12,6 +12,10 @@ All notable changes to virtkit will be documented in this file.
   boot (the embedded agent rides a preinit initramfs, the model `vk run -f` uses) — so its
   chunks dedup against `--cache-registry`: co-located, publishing writes only the manifest.
   The native-bundle prefix is `virtkit/` (was `registry/`), distinct from the `docker/` OCI path.
+- CI `services:` accept the `virtkit/<name>[:tag]` prefix: a service sourced from a
+  `[registry]` bundle is pulled (CDC+zstd dedup) and booted on the same clean-image unit
+  path as an OCI service (agent initramfs + embedded kernel applying the bundle config).
+  Generic-disk bundles only; a `virtkit/` service without a `[registry]` config is a clear error.
 - New `vk-registry` binary: a standalone OCI-distribution server backed by the same
   content-addressed store `vk` uses, meant to run centrally and be shared by every
   runner. `vk-registry serve` (plus `gc`/`status`/`install-service`) replaces the old
@@ -44,6 +48,13 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- CI `services:` now resolve their `image:` through the same digest-keyed cache the job's
+  own image uses and boot a CoW overlay over the shared read-only rootfs, instead of a
+  second per-service image store (with its own copy, UUID stamp and lock). A job image and
+  a service naming the same ref share one cache entry. A service image ref is subject to the
+  `[docker]` allowlist like a job image (a bare name maps onto the `[docker]` repo) rather
+  than an anonymous pull. `[services] store_dir` is retained for config compatibility but no
+  longer consulted.
 - The GitLab executor now honours the job's standard `image:` (CI_JOB_IMAGE) — no
   `MICROVM_IMAGE` needed (`services:` was already supported). `image:` is booted directly,
   accepted only under the `[docker] repo` allowlist (a bare docker-hub-style name maps onto

@@ -312,9 +312,9 @@ impl Registry {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Services {
-    /// Shared content-addressed store for CI service images: ensured once per
-    /// content fingerprint (manifest digest), shared by every job on the runner.
-    /// Default: `<state_dir>/services`.
+    /// Retained for config compatibility; no longer consulted. CI service images now
+    /// share the job's digest-keyed image cache under `<state_dir>` (see image.rs),
+    /// rather than a separate per-service store.
     pub store_dir: Option<PathBuf>,
 }
 
@@ -397,15 +397,6 @@ impl Config {
         self.state_dir
             .as_deref()
             .unwrap_or(Path::new("/var/lib/virtkit"))
-    }
-
-    /// The CI service-image store: `[services] store_dir` if set, else
-    /// `<state_dir>/services`.
-    pub fn services_store(&self) -> PathBuf {
-        self.services
-            .as_ref()
-            .and_then(|s| s.store_dir.clone())
-            .unwrap_or_else(|| self.state_dir().join("services"))
     }
 
     /// The local-bundles directory: `[local] dir` if set, else `<state_dir>/images`.

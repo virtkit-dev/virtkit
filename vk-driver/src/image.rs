@@ -60,7 +60,14 @@ pub enum ResolvedImage {
 /// prefix-based (the prefix names the source, split on the FIRST `/`); unset is
 /// treated as `local/default`.
 pub fn resolve(ctx: &JobCtx) -> Result<ResolvedImage> {
-    let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
+    resolve_ref(ctx, ctx.image_ref.as_deref().unwrap_or("local/default"))
+}
+
+/// Resolve an explicit MICROVM_IMAGE-style `image_ref` — the same prefix dispatch and
+/// digest-keyed cache `resolve` applies to the job's own image. Service units resolve
+/// their `image:` through here too, so a job image and a service naming the same ref
+/// share one cache entry (each boots its own CoW overlay over the shared rootfs).
+pub fn resolve_ref(ctx: &JobCtx, image_ref: &str) -> Result<ResolvedImage> {
     match image_ref.split_once('/') {
         // local/<name> = a bundle directory under [local] dir.
         Some(("local", rest)) => crate::local::resolve(ctx, rest),

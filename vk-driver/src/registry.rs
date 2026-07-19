@@ -958,6 +958,44 @@ async fn push_file(
     })
 }
 
+/// Resolve `reference` to its manifest digest and ensure the bundle is present in its
+/// digest-keyed cache dir (`state_dir/registry/<name>/<digest>/`), pulling it if absent.
+/// Returns the cache dir, the resolved digest, and whether this call performed the pull (so
+/// the caller GCs only after a fresh pull). Called by `resolve_async`, which now serves both
+/// the primary `virtkit/` job image and a `virtkit/` service unit from one cache entry.
+async fn ensure_bundle_pulled(
+    client: &oci_client::Client,
+    auth: &RegistryAuth,
+    rg: &Registry,
+    state_dir: &Path,
+    name: &str,
+    reference: &Reference,
+) -> Result<(PathBuf, String, bool)> {
+    // tag -> digest (or the @digest verbatim), so the cache is content-addressed.
+    let digest = match reference {
+        Reference::Digest(d) => d.clone(),
+        Reference::Tag(tag) => {
+            let image = make_ref(rg, name, tag)?;
+            client
+                .fetch_manifest_digest(&image, auth)
+                .await
+                .with_context(|| format!("resolving {name}:{tag} against {}", rg.repo))?
+        }
+    };
+    let dir = state_dir
+        .join("registry")
+        .join(name)
+        .join(digest.trim_start_matches("sha256:"));
+    let pulled = if bundle_present(&dir) {
+        false
+    } else {
+        let image = make_digest_ref(rg, name, &digest)?;
+        pull_into(client, auth, &image, name, &digest, &dir).await?;
+        true
+    };
+    Ok((dir, digest, pulled))
+}
+
 async fn resolve_async(
     ctx: &JobCtx,
     rg: &Registry,
@@ -965,27 +1003,12 @@ async fn resolve_async(
     reference: Reference,
 ) -> Result<(ResolvedImage, std::path::PathBuf)> {
     let (client, auth) = client(rg)?;
-
-    // tag -> digest (or the @digest verbatim), so the cache is content-addressed.
-    let digest = match &reference {
-        Reference::Digest(d) => d.clone(),
-        Reference::Tag(tag) => {
-            let image = make_ref(rg, name, tag)?;
-            client
-                .fetch_manifest_digest(&image, &auth)
-                .await
-                .with_context(|| format!("resolving {name}:{tag} against {}", rg.repo))?
-        }
-    };
-    let dir = bundle_dir(&ctx.cfg, name, &digest);
-
-    if !bundle_present(&dir) {
-        let image = make_digest_ref(rg, name, &digest)?;
-        pull_into(&client, &auth, &image, name, &digest, &dir).await?;
+    let (dir, digest, pulled) =
+        ensure_bundle_pulled(&client, &auth, rg, ctx.cfg.state_dir(), name, &reference).await?;
+    if pulled {
         let images_dir = ctx.cfg.state_dir().join("registry").join(name);
         image::gc(&images_dir, &dir, rg.keep);
     }
-
     let boot_kind = image::read_boot_kind(&dir).with_context(|| {
         format!("registry bundle {name}@{digest}: unsupported boot.kind marker — re-push it")
     })?;
@@ -1266,14 +1289,6 @@ fn chunk_placement(layer: &OciDescriptor) -> Result<(u64, u64)> {
             .with_context(|| format!("chunk {} has a non-numeric {key}", layer.digest))
     };
     Ok((parse(ANN_OFFSET)?, parse(ANN_LENGTH)?))
-}
-
-/// The digest-keyed cache dir for a bundle: `state_dir/registry/<name>/<digest-hex>/`.
-fn bundle_dir(cfg: &Config, name: &str, digest: &str) -> std::path::PathBuf {
-    cfg.state_dir()
-        .join("registry")
-        .join(name)
-        .join(digest.trim_start_matches("sha256:"))
 }
 
 /// A cached bundle is present and usable: runner.ext4 plus the boot marker (which

@@ -1,17 +1,17 @@
-//! Unit ensure — bring each service's ext4 up to date before boot. Each image is
-//! content-addressed: its ext4 UUID is a fingerprint of what it was built from, so
-//! the staleness check is a UUID compare.
+//! `build:` unit ensure — bring a compose `build:` service's ext4 up to date before
+//! boot. The image is content-addressed: its ext4 UUID is a fingerprint of the stage
+//! it was built from (the chained content identity of the base digest, instructions,
+//! copied files and source stages), so the staleness check is a UUID compare.
 //!
-//! Service units are byte-clean images (no agent, no config baked in — both arrive
-//! at boot) produced in-process: built from a Dockerfile stage of the merged
-//! plan (fingerprint = the builder's stage key, the chained content identity of
-//! everything the stage is made of) or pulled from a registry (fingerprint = the
-//! image's manifest digest). Both leave the runtime config next to the image as the
-//! builder's JSON sidecar, so a fresh unit boots without rebuilding anything.
+//! The image is byte-clean (no agent, no config baked in — both arrive at boot) built
+//! in-process from a Dockerfile stage of the merged plan, leaving the runtime config
+//! next to the image as the builder's JSON sidecar so a fresh unit boots without
+//! rebuilding. Pulled units (`image:`/`virtkit/`) resolve through the shared image
+//! cache instead (see image.rs), so there is no pull path here.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use sha2::{Digest, Sha256};
 
 fn sha256_hex(data: impl AsRef<[u8]>) -> String {
@@ -116,62 +116,6 @@ pub fn ensure_unit_build(
     })?;
     let uuid = parse_uuid(&expected).expect("fingerprint is a canonical UUID");
     crate::ext4::set_uuid(out, &uuid)
-}
-
-/// Ensure an `image:` unit's image: a byte-clean ext4 of the pulled rootfs (no agent
-/// — it rides the boot initramfs), UUID = `fingerprint(manifest digest)`, runtime
-/// config sidecar from the image's OCI config. Anonymous registry access.
-pub async fn ensure_unit_pull(image: &str, out: &Path) -> Result<()> {
-    let digest = crate::oci::resolve_digest(image)
-        .await
-        .with_context(|| format!("resolving {image}"))?;
-    let expected = fingerprint(&[&digest]);
-    if unit_fresh(out, &expected) {
-        println!("virtkit: {} fresh ({image}@{digest})", out.display());
-        return Ok(());
-    }
-    let source = crate::source::Source::Oci {
-        reference: image.to_string(),
-        username: None,
-        password: None,
-        ca_pem: None,
-        insecure: false,
-    };
-    let uuid = parse_uuid(&expected).expect("fingerprint is a canonical UUID");
-    let scratch = out.parent().unwrap_or_else(|| Path::new("."));
-    source
-        .stream_tar(scratch, |tar, hints| {
-            // Same sizing as the `vk run` image path, plus writable headroom for the
-            // service's own writes: units boot through a CoW overlay, but the
-            // *filesystem* still needs free blocks to allocate (mirrors the builder's
-            // bases).
-            crate::ext4::build_from_tar_stream(
-                tar,
-                &[], // clean image: nothing injected
-                hints.image_bytes(),
-                32u64 * 1024 * 1024 * 1024 / 4096,
-                Some(hints.inode_count()),
-                &crate::ext4::FsId {
-                    uuid: Some(uuid),
-                    label: None,
-                    with_journal: false,
-                },
-                out,
-            )
-        })
-        .await?;
-    let cfg = crate::oci::pull_config(image, None, None, None, false).await?;
-    let config = vk_core::runcfg::RunConfig {
-        env: cfg.env,
-        user: cfg.user.unwrap_or_default(),
-        workdir: cfg.workdir.unwrap_or_default(),
-        entrypoint: cfg.entrypoint,
-        cmd: cfg.cmd,
-    };
-    let sidecar = crate::build::config_sidecar(out);
-    std::fs::write(&sidecar, config.to_json())
-        .with_context(|| format!("writing {}", sidecar.display()))?;
-    Ok(())
 }
 
 #[cfg(test)]
