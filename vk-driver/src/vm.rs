@@ -178,6 +178,14 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         kernel_opt.as_deref().or(cfg.build.kernel.as_deref()),
     )?;
     let mut children: Vec<std::process::Child> = Vec::new();
+    // Reference the materialized image bases this job overlays (the primary plus every
+    // service) for the whole life of `supervise`, so the cache's idle GC cannot evict a
+    // base out from under a running overlay. A shared advisory lock the kernel drops when
+    // this process exits — held in this Vec until supervise returns (job teardown).
+    let mut use_guards: Vec<crate::image::UseGuard> = Vec::new();
+    if let Some(g) = crate::image::acquire_use_lock_for(cfg.state_dir(), &media.rootfs)? {
+        use_guards.push(g);
+    }
     // Every guest gets a throwaway CoW overlay over the ro base rootfs.
     let overlay = ctx.overlay();
     crate::qcow2::create_overlay(&overlay, &media.rootfs)?;
@@ -313,6 +321,12 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             // shared LAN/egress core `run --compose` uses.
             let (gateway, prefix, guest_ip) = crate::net::switch_addrs(&cfg.net.subnet)?;
             let services = plan_services(ctx, gateway, prefix).await?;
+            // Reference each service's shared base for the job's life, like the primary above.
+            for svc in &services {
+                if let Some(g) = crate::image::acquire_use_lock_for(cfg.state_dir(), &svc.ext4)? {
+                    use_guards.push(g);
+                }
+            }
             // the switch binds each service's vsock socket at startup: the
             // runtime dirs must exist before it spawns.
             for svc in &services {

@@ -18,6 +18,7 @@
 
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{SocketAddr, UnixListener};
 use std::path::{Path, PathBuf};
 
@@ -233,23 +234,113 @@ pub(crate) fn acquire_pull_lock(dir: &Path, name: &str, digest: &str) -> Result<
     }
 }
 
-/// Keep the `keep` most recently pulled versions of this image (plus the one
-/// just resolved, always).
-pub(crate) fn gc(images_dir: &Path, current: &Path, keep: u32) {
-    let Ok(entries) = std::fs::read_dir(images_dir) else {
-        return;
+/// Mark a resolved base as freshly used: ensure its `.inuse` lock file exists and bump the
+/// `.used` idle marker to now, so the idle GC never reclaims a base the executor is about to
+/// overlay. Called on every resolve (hit or miss). Best-effort.
+pub(crate) fn mark_used(dir: &Path) {
+    let _ = std::fs::File::create(dir.join(".inuse"));
+    let _ = std::fs::File::create(dir.join(".used"));
+}
+
+/// A held reference to a materialized image base: a shared advisory lock on the base's
+/// `.inuse`, kept for the whole lifetime of the VM overlaying it. The kernel drops the lock
+/// when this process exits for any reason, so a crashed job never pins a base — and
+/// `gc_idle`, which needs a non-blocking *exclusive* lock to evict, can therefore never
+/// reclaim a base under a live overlay. Released on drop.
+pub(crate) struct UseGuard {
+    _file: std::fs::File,
+}
+
+/// Take a shared-lock reference on the materialized base backing `rootfs`, iff it lives in
+/// the managed cache (`<state_dir>/{registry,docker}/…`). Returns `None` for a baked
+/// `[local]` bundle or an ephemeral rootfs — nothing there is reference-counted or evicted.
+/// Hold the returned guard for the overlay's whole lifetime.
+pub(crate) fn acquire_use_lock_for(state_dir: &Path, rootfs: &Path) -> Result<Option<UseGuard>> {
+    let Some(dir) = rootfs.parent() else {
+        return Ok(None);
     };
-    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir() && p != current && p.extension().is_none())
-        .filter_map(|p| Some((p.metadata().ok()?.modified().ok()?, p)))
-        .collect();
-    dirs.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
-    for (_, dir) in dirs.into_iter().skip(keep.saturating_sub(1) as usize) {
-        println!("virtkit: evicting cached image {}", dir.display());
-        let _ = std::fs::remove_dir_all(&dir);
+    if !dir.starts_with(state_dir.join("registry")) && !dir.starts_with(state_dir.join("docker")) {
+        return Ok(None);
     }
+    let path = dir.join(".inuse");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    // SAFETY: the fd is owned by `file`, kept alive by the returned guard. LOCK_SH contends
+    // only with the GC's momentary exclusive lock.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("shared-locking {}", path.display()));
+    }
+    let _ = std::fs::File::create(dir.join(".used"));
+    Ok(Some(UseGuard { _file: file }))
+}
+
+/// Evict every materialized base under `root` that no process is overlaying and that has
+/// been idle at least `idle`. A live overlay holds a shared lock on the base's `.inuse`, so
+/// the non-blocking exclusive lock here fails and that base is skipped — a running base is
+/// never reclaimed. A base whose `.used` marker is missing (still being set up) is left
+/// alone. Best-effort.
+pub(crate) fn gc_idle(root: &Path, idle: std::time::Duration) {
+    let now = std::time::SystemTime::now();
+    for base in base_dirs(root) {
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(base.join(".inuse"))
+        else {
+            continue;
+        };
+        // A live overlay holds LOCK_SH; a non-blocking LOCK_EX then fails (EWOULDBLOCK).
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            continue;
+        }
+        let idle_ok = match std::fs::metadata(base.join(".used")).and_then(|m| m.modified()) {
+            // A `.used` timestamp can read microseconds *ahead* of `now`: the filesystem stamps
+            // mtime from a coarse clock while `now` is precise, so under load the marker can
+            // appear to be in the future. Treat that as "used just now" (zero elapsed) rather
+            // than "keep forever", so a zero idle window still reclaims an unreferenced base.
+            Ok(t) => now.duration_since(t).unwrap_or_default() >= idle,
+            Err(_) => false, // missing/unreadable marker: mid-materialize, leave alone
+        };
+        if !idle_ok {
+            continue;
+        }
+        // Hold the exclusive lock across removal: a would-be new consumer's shared lock
+        // blocks on it, then finds the base gone and re-materializes.
+        println!("virtkit: evicting idle image base {}", base.display());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// Every materialized base under `root`: a directory directly holding a `runner.ext4`. The
+/// name between `root` and the digest can be multi-level (a `team/img` docker repo), so walk
+/// down, treating any dir with a `runner.ext4` as a base and not descending into it.
+fn base_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if dir.join("runner.ext4").is_file() {
+            out.push(dir);
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -318,5 +409,128 @@ mod tests {
         ] {
             assert!(parse_ref(bad).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    /// Run `gc_idle` until `base` is evicted. `gc_idle`'s liveness probe is a non-blocking
+    /// exclusive `flock`; a *concurrent* test that spawns a subprocess (e.g. the qcow2 tests
+    /// run `qemu-img`) briefly leaks this test's `.inuse` lock fd into the forked child across
+    /// `fork()`, keeping the shared lock alive until the child `exec`s and drops it. That makes
+    /// a single-shot eviction check racy under parallel load, so retry — exactly as the periodic
+    /// production GC would. Converges once the transient inheriting child is gone.
+    fn evict_eventually(root: &Path, base: &Path) {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            gc_idle(root, Duration::ZERO);
+            if !base.exists() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "base {} was not reclaimed within the timeout",
+                base.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn gc_idle_reference_counts_and_respects_the_timeout() {
+        use std::time::Duration;
+        let tmp = std::env::temp_dir().join(format!("vk-gcidle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("registry");
+        // A materialized base under the managed cache: <root>/<name>/<digest>/runner.ext4.
+        let base = |name: &str| -> PathBuf {
+            let d = root.join(name).join("deadbeef");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("runner.ext4"), b"x").unwrap();
+            d
+        };
+        let rootfs = |d: &Path| d.join("runner.ext4");
+
+        // Idle (marked used, no live overlay): a zero timeout evicts it.
+        let idle = base("idle");
+        mark_used(&idle);
+        evict_eventually(&root, &idle);
+
+        // Referenced: a held use-lock survives a zero timeout, and is reclaimed once dropped.
+        let live = base("live");
+        mark_used(&live);
+        let guard = acquire_use_lock_for(&tmp, &rootfs(&live)).unwrap();
+        assert!(
+            guard.is_some(),
+            "a base under the managed cache is reference-counted"
+        );
+        gc_idle(&root, Duration::ZERO);
+        assert!(
+            live.exists(),
+            "a base under a live overlay must never be evicted"
+        );
+        drop(guard);
+        evict_eventually(&root, &live);
+
+        // No `.used` marker (mid-materialize): never evicted, even at a zero timeout.
+        let fresh = base("fresh");
+        gc_idle(&root, Duration::ZERO);
+        assert!(
+            fresh.exists(),
+            "a base still being set up (no .used) must be left alone"
+        );
+
+        // A non-zero timeout keeps a just-used base (its `.used` is recent).
+        mark_used(&fresh);
+        gc_idle(&root, Duration::from_secs(3600));
+        assert!(
+            fresh.exists(),
+            "a recently used base must survive within the idle window"
+        );
+
+        // A base outside the managed cache is not reference-counted.
+        let unmanaged = tmp.join("elsewhere");
+        std::fs::create_dir_all(&unmanaged).unwrap();
+        assert!(
+            acquire_use_lock_for(&tmp, &unmanaged.join("runner.ext4"))
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn gc_idle_tolerates_a_used_marker_in_the_future() {
+        // The filesystem stamps `.used` from a coarse clock while `gc_idle` reads a precise
+        // one, so under load the marker can read slightly ahead of `now`. Such a base must
+        // still be reclaimable at a zero idle window (treated as elapsed 0), and still kept
+        // within a non-zero window — never wrongly pinned forever by the skew.
+        use std::time::{Duration, SystemTime};
+        let tmp = std::env::temp_dir().join(format!("vk-gcidle-future-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("registry");
+        let base = |name: &str| -> PathBuf {
+            let d = root.join(name).join("deadbeef");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("runner.ext4"), b"x").unwrap();
+            // Stamp `.used` a minute into the future to force the skew deterministically.
+            let f = std::fs::File::create(d.join(".used")).unwrap();
+            f.set_times(
+                std::fs::FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(60)),
+            )
+            .unwrap();
+            d
+        };
+
+        let keep = base("keep");
+        gc_idle(&root, Duration::from_secs(3600));
+        assert!(
+            keep.exists(),
+            "a future-skewed base must survive a non-zero idle window"
+        );
+
+        let evict = base("evict");
+        evict_eventually(&root, &evict);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

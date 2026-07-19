@@ -48,6 +48,13 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- Materialized image bases (`<state_dir>/{registry,docker}/…/runner.ext4`) are now kept by
+  **reference count + idle timeout** rather than `keep = N` versions: a base is pinned by a
+  shared advisory lock while any VM overlays it (the kernel drops it if the job crashes), and
+  evicted once idle longer than `image_cache_idle_secs` (default 1800 / 30 min). This bounds
+  disk to the active working set — the compressed chunk store is the durable tier, the full
+  ext4 is transient and re-materialized on demand. The `[registry]`/`[docker]` `keep` field
+  is **removed**; a config that sets it must drop it.
 - CI `services:` now resolve their `image:` through the same digest-keyed cache the job's
   own image uses and boot a CoW overlay over the shared read-only rootfs, instead of a
   second per-service image store (with its own copy, UUID stamp and lock). A job image and

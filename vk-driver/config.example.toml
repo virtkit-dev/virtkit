@@ -4,6 +4,9 @@
 # state_dir = "/var/lib/virtkit"          # job state: <state_dir>/jobs/<job id>/
 # cloud_hypervisor = "/usr/local/bin/cloud-hypervisor"
 # virtiofsd = "/usr/local/bin/virtiofsd"      # external virtiofsd (default: bundled)
+# image_cache_idle_secs = 1800   # a materialized image base (registry/docker) left idle
+#                                # this many seconds is evicted at the next fresh pull into
+#                                # that tier; a base under a live overlay is never evicted. 30 min.
 
 [vm]
 # cpus = 4
@@ -84,7 +87,6 @@
 #                                  # (kept out of this config); read at runtime,
 #                                  # provision it 0600. Sent over TLS — see ca_file.
 # insecure = false                 # plain HTTP (a local/insecure registry)
-# keep = 3                         # cached pulled bundles per image (GC)
 
 # [docker]               # OCI images booted directly on demand (native OCI client, no
 #                        # docker daemon). MICROVM_IMAGE is `docker/<name>[:tag|@digest]`;
@@ -96,7 +98,6 @@
 # password_file = "/etc/virtkit/registry-password"   # file holding the password
 #                                  # (read at runtime, provision it 0600)
 # insecure = false                 # plain HTTP (a local/insecure registry)
-# keep = 3                         # cached image rootfs builds per image (GC)
 
 # [services]            # CI `services:` support. Each declared service boots as a
 #                       # sibling microVM on the per-job switch, resolvable by its

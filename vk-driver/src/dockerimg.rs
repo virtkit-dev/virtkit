@@ -92,9 +92,13 @@ fn resolve_full(
         let _lock = image::acquire_pull_lock(&dir, name, &digest)?;
         if !dir.join("runner.ext4").is_file() {
             build(&pinned, username, password, ca_pem, dk.insecure, &dir)?;
-            image::gc(&images_dir, &dir, dk.keep);
+            image::gc_idle(
+                &ctx.cfg.state_dir().join("docker"),
+                ctx.cfg.image_cache_idle(),
+            );
         }
     }
+    image::mark_used(&dir);
     println!("virtkit: image {full}@{digest} (OCI direct boot)");
     // generic-disk boot: the boot applies the image's Env/User/WorkingDir/Entrypoint/Cmd
     // from the runner.ext4.json sidecar (`resolved_from_dir` loads it) — no baking.

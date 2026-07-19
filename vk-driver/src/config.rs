@@ -55,6 +55,14 @@ pub struct Config {
     /// Defaults for `vk build` so a runner need not pass them every invocation;
     /// see [`Build`]. A CLI flag always overrides the matching config value.
     pub build: Build,
+    /// Materialized image bases (`<state_dir>/{registry,docker}/…/runner.ext4`) that have
+    /// sat idle this many seconds — no VM overlaying them — are evicted the next time that
+    /// same cache tier (`registry/` or `docker/`) takes a fresh pull; a base under a live
+    /// overlay is never touched (reference-counted). Keep this well above zero: a near-zero
+    /// value races the brief window between resolving a base and locking it. Default 1800
+    /// (30 min). The compressed chunk store is the durable tier; the full ext4 is transient
+    /// and re-materialized on demand.
+    pub image_cache_idle_secs: Option<u64>,
 }
 
 /// Defaults for `vk build` (the experimental microVM Dockerfile builder). Every
@@ -217,13 +225,6 @@ pub struct Docker {
     /// Plain HTTP registry (a local/insecure registry); default TLS.
     #[serde(default)]
     pub insecure: bool,
-    /// Cached image rootfs builds kept per image.
-    #[serde(default = "default_keep")]
-    pub keep: u32,
-}
-
-fn default_keep() -> u32 {
-    3
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -260,9 +261,6 @@ pub struct Registry {
     /// either form from the chunk media type regardless.
     #[serde(default)]
     pub transparent_zstd: Option<bool>,
-    /// Cached pulled bundles kept per image
-    #[serde(default = "default_keep")]
-    pub keep: u32,
     /// Run a credential-injecting registry proxy for executor guests: each job's switch
     /// exposes this registry at `registry.vk`, injecting these credentials, so a job
     /// pushes/pulls without ever holding the secret. Off by default.
@@ -285,9 +283,8 @@ impl Registry {
             .then(|| PathBuf::from(&self.repo))
     }
 
-    /// Build a `Registry` for the build-sharing path, from the
-    /// CLI flags rather than a config file. `keep` is irrelevant to
-    /// push/pull-by-fingerprint (only `resolve` boots), so it takes its default.
+    /// Build a `Registry` for the build-sharing path, from the CLI flags rather than a
+    /// config file (only push/pull-by-fingerprint; nothing boots or is cache-evicted here).
     pub fn for_share(
         repo: String,
         insecure: bool,
@@ -303,7 +300,6 @@ impl Registry {
             password_file,
             insecure,
             transparent_zstd,
-            keep: default_keep(),
             proxy_guests: false,
         }
     }
@@ -405,6 +401,12 @@ impl Config {
             Some(dir) => dir.clone(),
             None => self.state_dir().join("images"),
         }
+    }
+
+    /// How long a materialized image base may sit idle (no live overlay) before the
+    /// cache GC evicts it. Default 30 min.
+    pub fn image_cache_idle(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.image_cache_idle_secs.unwrap_or(1800))
     }
 
     pub fn cloud_hypervisor(&self) -> &Path {

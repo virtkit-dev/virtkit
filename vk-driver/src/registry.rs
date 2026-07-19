@@ -1005,9 +1005,12 @@ async fn resolve_async(
     let (client, auth) = client(rg)?;
     let (dir, digest, pulled) =
         ensure_bundle_pulled(&client, &auth, rg, ctx.cfg.state_dir(), name, &reference).await?;
+    image::mark_used(&dir);
     if pulled {
-        let images_dir = ctx.cfg.state_dir().join("registry").join(name);
-        image::gc(&images_dir, &dir, rg.keep);
+        image::gc_idle(
+            &ctx.cfg.state_dir().join("registry"),
+            ctx.cfg.image_cache_idle(),
+        );
     }
     let boot_kind = image::read_boot_kind(&dir).with_context(|| {
         format!("registry bundle {name}@{digest}: unsupported boot.kind marker — re-push it")
