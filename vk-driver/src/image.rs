@@ -420,13 +420,32 @@ mod tests {
 
     #[test]
     fn pull_lock_excludes_and_releases() {
-        let dir = Path::new("/tmp/virtkit-test-pull-lock");
-        let addr = pull_lock_addr(dir).unwrap();
+        // A per-process dir keys a per-process abstract socket name: cargo runs test binaries
+        // in parallel, so a fixed name would collide with a concurrent vk-driver test process.
+        let dir =
+            std::env::temp_dir().join(format!("virtkit-test-pull-lock-{}", std::process::id()));
+        let addr = pull_lock_addr(&dir).unwrap();
         let held = UnixListener::bind_addr(&addr).unwrap();
         let err = UnixListener::bind_addr(&addr).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
         drop(held);
-        UnixListener::bind_addr(&addr).unwrap();
+        // A concurrent test that spawns a subprocess can briefly inherit this listener fd across
+        // `fork()`, keeping the abstract name bound past our drop until the child execs; retry
+        // the rebind until it frees rather than failing on that transient contention.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match UnixListener::bind_addr(&addr) {
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the lock addr stayed bound after release"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("rebinding the released lock addr failed: {e}"),
+            }
+        }
     }
 
     #[test]
