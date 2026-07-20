@@ -50,10 +50,21 @@ pub fn ensure(url: &str, ref_name: &str, sha: &str, dest: &Path) -> Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        // clone without checkout; the explicit detach below pins the exact commit.
+        // Clone without checkout; the explicit detach below pins the exact commit.
+        // `--filter=blob:none` makes this a blobless partial clone: commits and trees
+        // transfer but historical file blobs do not — the checkout below lazily fetches
+        // only the blobs of the one pinned commit. The filter is recorded on the remote,
+        // so the reused-slot `fetch` below stays blobless too.
         let dest_s = dest.to_str().context("checkout dir is not utf-8")?;
         run(
-            Command::new("git").args(["clone", "--no-checkout", "--", url, dest_s]),
+            Command::new("git").args([
+                "clone",
+                "--no-checkout",
+                "--filter=blob:none",
+                "--",
+                url,
+                dest_s,
+            ]),
             "clone",
         )?;
     }
