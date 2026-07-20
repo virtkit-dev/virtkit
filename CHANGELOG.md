@@ -109,6 +109,7 @@ All notable changes to virtkit will be documented in this file.
   `/etc/virtkit/{env,user}` into the ext4 (which also dropped WorkingDir/Entrypoint/Cmd). The
   cache key is the image digest alone (no agent fingerprint), since the agent rides the boot
   initramfs rather than the rootfs.
+- The pinned guest kernel is bumped to 6.18.39.
 
 ## [0.16.0] - 2026-07-15
 

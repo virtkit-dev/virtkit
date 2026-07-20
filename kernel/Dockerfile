@@ -14,10 +14,10 @@
 FROM virtkit-build AS build
 USER root
 
-ARG KERNEL_VERSION=6.18.38
+ARG KERNEL_VERSION=6.18.39
 # Primary source: the pinned tarball from cdn.kernel.org, integrity-checked against this
 # sha256. https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc
-ARG KERNEL_SHA256=ac26e508abd56e9f8b89872b6e10c49fc823bcc70d8068a5d8504c1a7c4ff045
+ARG KERNEL_SHA256=a7a7e3d2ae9d95e74197223a8d4eb5f6be7aac21b6e6de27e9685d001c1f8cb0
 # Fallback source (used automatically when the CDN is unavailable): the PGP-signed stable
 # git tag v${KERNEL_VERSION} on the gregkh/linux GitHub mirror. KERNEL_COMMIT is the
 # immutable commit that signed tag resolves to; verified below against Greg KH's vendored
