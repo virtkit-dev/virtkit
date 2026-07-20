@@ -3,9 +3,10 @@
 # inputs.
 #
 # Rewrites the channel in rust-toolchain.toml, the base image (tag + digest) in the
-# devcontainer Dockerfile, and the apk build-dep versions in apk-pins.txt, keeping the
-# pin reproducible. Review the diff, then run ./build.sh. Idempotent: a no-op when
-# already current. Requires docker (resolves the image digest + apk versions).
+# devcontainer Dockerfile, the pinned cargo-audit version, and the apk build-dep versions
+# in apk-pins.txt, keeping the pin reproducible. Review the diff, then run ./build.sh.
+# Idempotent: a no-op when already current. Requires docker (resolves the image digest +
+# apk versions).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -25,6 +26,15 @@ IMG="rust:${LATEST}-${ALPINE_TAG}"
 docker pull -q "$IMG" >/dev/null
 DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMG" | sed -E 's/.*@//')
 sed -i -E "s#^FROM rust:[^ ]*#FROM ${IMG}@${DIGEST}#" .devcontainer/Dockerfile
+
+# Re-pin cargo-audit (baked into the image for audit.sh) to its latest release. Ask the
+# registry rather than scraping — the first "cargo-audit = " line is the crate itself.
+AUDIT=$(cargo search cargo-audit | grep -E '^cargo-audit = ' | head -1 | sed -E 's/^cargo-audit = "([^"]+)".*/\1/')
+case "$AUDIT" in
+    [0-9]*) ;; # a version starts with a digit
+    *) echo >&2 "ERROR: could not resolve latest cargo-audit version (got '$AUDIT')"; exit 1 ;;
+esac
+sed -i -E "s#(cargo install cargo-audit --locked --version )[0-9.]+#\1${AUDIT}#" .devcontainer/Dockerfile
 
 # Re-pin the apk packages to the versions the (digest-pinned) base image resolves —
 # Alpine has no snapshot service, so the image digest freezes the toolchain but
@@ -76,6 +86,7 @@ pin_apk kernel/apk-pins.txt \
 echo "updated:"
 grep -E '^channel' rust-toolchain.toml
 grep -E '^FROM'    .devcontainer/Dockerfile
+grep -E 'cargo install cargo-audit' .devcontainer/Dockerfile
 for pins in .devcontainer/apk-pins.txt kernel/apk-pins.txt; do
     echo "apk pins ($pins):"
     grep -vE '^[[:space:]]*(#|$)' "$pins" | sed 's/^/  /'
