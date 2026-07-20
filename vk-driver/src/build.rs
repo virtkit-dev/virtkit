@@ -1540,7 +1540,10 @@ fn build_stage(
     // (through the final `cache_save`) and releases on return.
     let _build_lock = match steps.last().map(|s| s.key.clone()) {
         Some(final_key) => {
-            let guard = ex.build_lock(&final_key);
+            // On contention the lock names its holder; show it under this stage until acquired.
+            let mut on_wait = |holder: &str| progress.wait_lock_start(display, &name, holder);
+            let guard = ex.build_lock(&final_key, &mut on_wait);
+            progress.wait_lock_done(display);
             if guard.is_some() && ex.cache_has(&final_key) {
                 progress.stage_fully_cached(display);
                 progress.restore_start(display, &name);

@@ -110,6 +110,10 @@ const RESTORE_NUM: usize = 0;
 /// bars-map cell num for a stage's transient "finishing" spinner (real cells are 1..=total).
 const FINISH_NUM: usize = usize::MAX;
 
+/// bars-map cell num for a stage's transient "waiting for a concurrent build" spinner (real
+/// cells are 1..=total; distinct from [`RESTORE_NUM`] and [`FINISH_NUM`]).
+const WAIT_LOCK_NUM: usize = usize::MAX - 1;
+
 enum Backend {
     Tty(Box<Tty>),
     Plain,
@@ -358,6 +362,34 @@ impl Progress {
             pb.finish_and_clear();
         }
         self.refresh_header();
+    }
+
+    /// Show a transient spinner while this stage waits on a cross-runner build-once lock a peer
+    /// holds — the peer is building the same stage, so we park until it releases and then restore
+    /// its result rather than rebuild. `holder` names who owns the build. Cleared by
+    /// [`Progress::wait_lock_done`], or drained by [`Progress::finish`] on error.
+    pub fn wait_lock_start(&self, stage: StageId, name: &str, holder: &str) {
+        let msg = format!("[{name}] waiting for a concurrent build (held by {holder})");
+        match &self.backend {
+            Backend::Tty(tty) => {
+                let pb = tty.mp.add(ProgressBar::new_spinner());
+                pb.set_style(self.step_style());
+                pb.set_message(msg);
+                pb.enable_steady_tick(Duration::from_millis(120));
+                tty.bars.lock().unwrap().insert((stage, WAIT_LOCK_NUM), pb);
+            }
+            // Off-terminal (CI logs) the wait is exactly where a stuck build is diagnosed, so
+            // emit the holder as a plain line too.
+            Backend::Plain | Backend::Routed(_) => self.plain_line(format_args!("{msg}")),
+            Backend::Disabled => {}
+        }
+    }
+    pub fn wait_lock_done(&self, stage: StageId) {
+        if let Backend::Tty(tty) = &self.backend
+            && let Some(pb) = tty.bars.lock().unwrap().remove(&(stage, WAIT_LOCK_NUM))
+        {
+            pb.finish_and_clear();
+        }
     }
 
     /// Show a transient spinner while a stage's guest shuts down at `stage_end` — after the last
@@ -1015,6 +1047,30 @@ mod tests {
                 assert!(
                     tty.bars.lock().unwrap().is_empty(),
                     "finish must drain the leftover restore spinner"
+                );
+            }
+        }
+    }
+
+    /// A build that errors while parked on a peer's build-once lock leaves its wait spinner
+    /// without a matching `wait_lock_done`; `finish(false)` must drain it so no steady-tick bar
+    /// lingers, in each live mode.
+    #[test]
+    fn wait_lock_spinner_is_drained_by_finish() {
+        for p in [
+            Arc::new(Progress::new_backend(Backend::Plain, false)),
+            Arc::new(Progress::new_backend(
+                Backend::Tty(Box::new(Tty::new())),
+                false,
+            )),
+        ] {
+            p.init(two_stages(), 1);
+            p.wait_lock_start(0, "base", "job 42"); // no wait_lock_done: the build failed
+            p.finish(false);
+            if let Backend::Tty(tty) = &p.backend {
+                assert!(
+                    tty.bars.lock().unwrap().is_empty(),
+                    "finish must drain the leftover wait-lock spinner"
                 );
             }
         }

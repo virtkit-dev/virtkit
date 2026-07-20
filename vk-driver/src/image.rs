@@ -207,7 +207,7 @@ fn pull_lock_addr(h: u64) -> std::io::Result<SocketAddr> {
 }
 
 /// Ask the current lock holder who it is, over the same abstract socket it holds: the
-/// holder's responder answers each connection with its `job_identity()`. None if nothing
+/// holder's responder answers each connection with its `jobctx::job_identity()`. None if nothing
 /// answers in time (holder crashed, or racing our connect) — best-effort diagnostics.
 fn query_holder(addr: &SocketAddr) -> Option<String> {
     let mut s = UnixStream::connect_addr(addr).ok()?;
@@ -216,22 +216,6 @@ fn query_holder(addr: &SocketAddr) -> Option<String> {
     s.read_to_string(&mut buf).ok()?;
     let who = buf.trim();
     (!who.is_empty()).then(|| who.to_string())
-}
-
-/// The current job's identity for holder reporting: its GitLab job URL (clickable) when the
-/// executor exported one, else the job id, else the pid — never empty.
-fn job_identity() -> String {
-    if let Ok(url) = std::env::var("CUSTOM_ENV_CI_JOB_URL")
-        && !url.is_empty()
-    {
-        return url;
-    }
-    if let Ok(id) = std::env::var("CUSTOM_ENV_CI_JOB_ID")
-        && !id.is_empty()
-    {
-        return format!("job {id}");
-    }
-    format!("pid {}", std::process::id())
 }
 
 /// FNV-1a over concatenated byte slices (cache keys and lock names, not
@@ -292,7 +276,7 @@ pub(crate) fn acquire_pull_lock(dir: &Path, name: &str, digest: &str) -> Result<
 }
 
 /// Start the holder's responder: a thread that owns a clone of the bound `lock` and answers
-/// each waiter's connection with our `job_identity()` until the guard is dropped. It uses a
+/// each waiter's connection with our `jobctx::job_identity()` until the guard is dropped. It uses a
 /// non-blocking accept + a stop flag so drop ends it promptly (a bounded join). The guard
 /// keeps the original `lock`, so even if this thread dies the socket stays bound (the lock
 /// is held); a dead responder only means waiters get no name, never a released lock.
@@ -300,7 +284,7 @@ fn spawn_holder(lock: UnixListener) -> PullLock {
     let stop = Arc::new(AtomicBool::new(false));
     let responder = match lock.try_clone() {
         Ok(accept_sock) => {
-            let id = job_identity();
+            let id = crate::jobctx::job_identity();
             let stop = stop.clone();
             Some(std::thread::spawn(move || {
                 let _ = accept_sock.set_nonblocking(true);

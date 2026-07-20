@@ -135,8 +135,13 @@ pub trait Executor {
     /// Acquire a cross-runner build-once lock on `key` (a stage's final content hash) when
     /// the cache is a remote vk-registry offering a lock endpoint, so peers building the
     /// same stage don't duplicate it. `None` = uncoordinated (local cache, no cache, or the
-    /// registry has no lock). The guard releases on drop. Default: no lock.
-    fn build_lock(&mut self, _key: &str) -> Option<crate::registry::BuildLock> {
+    /// registry has no lock). The guard releases on drop. `on_wait` is called once with the
+    /// current holder's identity if the lock is contended, before parking. Default: no lock.
+    fn build_lock(
+        &mut self,
+        _key: &str,
+        _on_wait: &mut dyn FnMut(&str),
+    ) -> Option<crate::registry::BuildLock> {
         None
     }
 
@@ -1981,9 +1986,17 @@ impl Executor for MicroVm {
             None => false,
         }
     }
-    fn build_lock(&mut self, key: &str) -> Option<crate::registry::BuildLock> {
+    fn build_lock(
+        &mut self,
+        key: &str,
+        on_wait: &mut dyn FnMut(&str),
+    ) -> Option<crate::registry::BuildLock> {
         // Namespace the lock key by the cache repo so unrelated stores don't collide.
-        crate::registry::build_lock(self.cache.as_ref()?, &format!("{CACHE_REPO}/{key}"))
+        crate::registry::build_lock(
+            self.cache.as_ref()?,
+            &format!("{CACHE_REPO}/{key}"),
+            on_wait,
+        )
     }
     fn cache_restore(&mut self, fs: &Rootfs, key: &str) -> Result<()> {
         let Some(rg) = self.cache.clone() else {

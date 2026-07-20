@@ -129,6 +129,35 @@ impl LockClient {
         Ok(body.released)
     }
 
+    /// The identity currently holding `name`, or `None` if it is free (best-effort: any
+    /// transport/parse error also maps to `None`). Lets a waiter name who blocks it before
+    /// parking on a contended [`Self::acquire`].
+    pub async fn holder(&self, name: &str) -> Option<String> {
+        let resp = self
+            .auth(self.client.post(self.url("status")))
+            .query(&[("name", name)])
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            name: String,
+            holder: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Body {
+            holders: Vec<Entry>,
+        }
+        let body: Body = resp.json().await.ok()?;
+        body.holders
+            .into_iter()
+            .find(|h| h.name == name)
+            .map(|h| h.holder)
+    }
+
     // ---- single-lock convenience: a one-name batch ----
 
     /// Acquire `name`, long-polling up to `wait`. `Ok(Some(held))` on success, `Ok(None)`

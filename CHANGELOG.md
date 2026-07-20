@@ -19,6 +19,9 @@ All notable changes to virtkit will be documented in this file.
   "waiting for a concurrent pull" message now names the holding job (its `CI_JOB_URL`, else
   job id/pid), served by the holder over the lock's own abstract socket — so a stuck build is
   traceable to the job that owns it.
+- The cross-runner `vk-registry` build-once lock records the same job identity as its holder,
+  and a runner waiting on a contended stage now shows "waiting for a concurrent build (held by
+  …)" — so a build blocked behind a peer names the job that holds it.
 
 ### Changed
 

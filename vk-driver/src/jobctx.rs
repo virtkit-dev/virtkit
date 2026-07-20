@@ -210,6 +210,23 @@ fn exit_code_env(name: &str, fallback: i32) -> i32 {
         .unwrap_or(fallback)
 }
 
+/// The current job's identity for lock-holder reporting: its GitLab job URL (clickable) when
+/// the executor exported one, else the job id, else the pid — never empty. Shared by both
+/// the image pull lock and the vk-registry build-once lock so a waiter names who holds it.
+pub(crate) fn job_identity() -> String {
+    if let Ok(url) = std::env::var("CUSTOM_ENV_CI_JOB_URL")
+        && !url.is_empty()
+    {
+        return url;
+    }
+    if let Ok(id) = std::env::var("CUSTOM_ENV_CI_JOB_ID")
+        && !id.is_empty()
+    {
+        return format!("job {id}");
+    }
+    format!("pid {}", std::process::id())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

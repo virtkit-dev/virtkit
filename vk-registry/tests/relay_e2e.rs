@@ -252,8 +252,18 @@ async fn lock_client_round_trips_against_the_server() {
         .is_none(),
         "a held lock must refuse a second acquirer"
     );
+    // a waiter can ask who holds the key before it parks.
+    assert_eq!(
+        c.holder("build/x").await.as_deref(),
+        Some("runner-1"),
+        "status names the current holder"
+    );
     assert!(c.renew(&held, Duration::from_secs(30)).await.unwrap());
     c.release(&held).await.unwrap();
+    assert!(
+        c.holder("build/x").await.is_none(),
+        "a released key has no holder"
+    );
     // after release, acquire succeeds again.
     let again = c
         .acquire(

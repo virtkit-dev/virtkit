@@ -1396,26 +1396,46 @@ struct BuildLockInner {
     heartbeat: Option<std::thread::JoinHandle<()>>,
 }
 
+/// One acquire attempt on `key`, long-polling up to `wait` (`Duration::ZERO` tries once and
+/// returns immediately). `None` if the wait elapsed with the key still held, or on any
+/// transport error — the caller treats both as "not acquired".
+fn acquire_once(
+    client: &Arc<vk_registry::LockClient>,
+    key: &str,
+    holder: &str,
+    wait: Duration,
+) -> Option<vk_registry::Held> {
+    let client = client.clone();
+    let key = key.to_string();
+    let holder = holder.to_string();
+    block_on(async move { client.acquire(&key, BUILD_LOCK_TTL, wait, &holder).await })
+        .ok()
+        .flatten()
+}
+
 /// Acquire a build-once lock on `key` against the (remote) cache registry `rg`, so peers
 /// building the same content-key don't duplicate the work. Returns `None` for a local
 /// store (no lock server) or if acquisition fails/times out — the caller then builds
 /// uncoordinated. Blocks until acquired or [`BUILD_LOCK_WAIT`].
-pub fn build_lock(rg: &Registry, key: &str) -> Option<BuildLock> {
+///
+/// The lease records this job's identity (`jobctx::job_identity`) as the holder, so a
+/// peer waiting on the same key can name who owns the build. When the first (non-blocking)
+/// attempt finds the key already held, `on_wait` is called once with that holder's identity
+/// before parking — the caller uses it to show a "waiting for a concurrent build" message.
+pub fn build_lock(rg: &Registry, key: &str, on_wait: &mut dyn FnMut(&str)) -> Option<BuildLock> {
     let base = lock_base(rg)?;
     let http = http_client(rg).ok()?;
     let client = Arc::new(vk_registry::LockClient::new(base, None, http));
-    let holder = format!("vk pid={}", std::process::id());
+    let identity = crate::jobctx::job_identity();
 
-    let acq_client = client.clone();
-    let acq_key = key.to_string();
-    let held = block_on(async move {
-        acq_client
-            .acquire(&acq_key, BUILD_LOCK_TTL, BUILD_LOCK_WAIT, &holder)
-            .await
-    });
-    let held = match held {
-        Ok(Some(h)) => h,
-        _ => return None,
+    // Try once without blocking; on contention, name the holder before we park on the wait.
+    let held = match acquire_once(&client, key, &identity, Duration::ZERO) {
+        Some(h) => h,
+        None => {
+            let who = block_on(client.holder(key));
+            on_wait(who.as_deref().unwrap_or("another runner"));
+            acquire_once(&client, key, &identity, BUILD_LOCK_WAIT)?
+        }
     };
 
     // heartbeat: renew the lease on its own thread + runtime until stopped. The stop signal
