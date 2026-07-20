@@ -92,12 +92,26 @@
 #                        # docker daemon). MICROVM_IMAGE is `docker/<name>[:tag|@digest]`;
 #                        # the image is pulled, flattened to a bootable ext4 with the
 #                        # embedded vk-agent as PID 1, and booted on vk's embedded kernel.
-# repo = "registry.example.com/team"   # fixed host-side = the image allowlist
+#                        # Every field is optional — the section may be empty, or carry
+#                        # only a [docker.mirror].
+# repo = "registry.example.com/team"   # the docker/<name> form + bare names route here;
+#                                  # omit for a mirror-only [docker]
 # ca_file = "/etc/virtkit/registry-ca.crt"  # PEM CA the registry TLS chains to
 # username = "ci-push"             # HTTP Basic; empty = anonymous
 # password_file = "/etc/virtkit/registry-password"   # file holding the password
 #                                  # (read at runtime, provision it 0600)
 # insecure = false                 # plain HTTP (a local/insecure registry)
+
+# [docker.mirror]        # Docker Hub pull-through mirror = the `registry-mirrors` equivalent.
+#                        # Bare docker-hub names and explicit docker.io/… refs are fetched
+#                        # through it (library/ added for official images), with NO direct
+#                        # fallback — so jobs need no direct Docker Hub egress. Only Docker
+#                        # Hub is routed; other registries are untouched. Auth is its own.
+# repo = "hq-nexus.example.com:8440"  # the Hub proxy (Nexus/Artifactory/registry:2)
+# ca_file = "/etc/virtkit/mirror-ca.crt"   # PEM CA the mirror TLS chains to
+# username = ""                    # HTTP Basic; empty = anonymous
+# password_file = "/etc/virtkit/mirror-password"   # file holding the password
+# insecure = false                 # plain HTTP
 
 # [services]            # CI `services:` support. Each declared service boots as a
 #                       # sibling microVM on the per-job switch, resolvable by its

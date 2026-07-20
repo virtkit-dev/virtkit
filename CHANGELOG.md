@@ -4,6 +4,23 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `[docker.mirror]`: a Docker Hub pull-through mirror, the equivalent of Docker's
+  `registry-mirrors`. Bare docker-hub names and explicit `docker.io/…` refs in a job's
+  `image:` are fetched through the configured mirror (with the `library/` prefix added for
+  official images) and, unlike Docker, with NO direct-to-Hub fallback — so an `image:` job
+  needs no direct Docker Hub egress. Only Docker Hub is routed; other registries are
+  untouched. The mirror carries its own optional auth
+  (`ca_file`/`username`/`password_file`/`insecure`), independent of `[docker]`.
+
+### Changed
+
+- `[docker].repo` is now optional: `[docker]` may be empty or carry only a `[docker.mirror]`.
+  The `docker/<name>` MICROVM_IMAGE form and bare `image:` names route through `repo` when
+  set; with no repo, `docker/<name>` is pulled directly, while a bare `image:` Hub ref goes
+  through `[docker.mirror]` if configured (else direct).
+
 ## [0.19.0] - 2026-07-20
 
 ### Added

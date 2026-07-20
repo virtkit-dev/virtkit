@@ -258,10 +258,32 @@ fn docker(cfg: &Config) -> Outcome {
             None => problems.push("username set but no password_file".into()),
         }
     }
-    if problems.is_empty() {
-        ok(format!("OCI image registry {} reachable-by-config", d.repo))
-    } else {
-        fail(problems.join("; "))
+    if let Some(m) = &d.mirror {
+        if let Some(ca) = &m.ca_file
+            && !access_ok(ca, libc::R_OK)
+        {
+            problems.push(format!("mirror ca_file unreadable: {}", ca.display()));
+        }
+        if !m.username.is_empty() {
+            match &m.password_file {
+                Some(p) if !access_ok(p, libc::R_OK) => {
+                    problems.push(format!("mirror password_file unreadable: {}", p.display()));
+                }
+                Some(_) => {}
+                None => problems.push("mirror username set but no password_file".into()),
+            }
+        }
+    }
+    if !problems.is_empty() {
+        return fail(problems.join("; "));
+    }
+    let repo = d.repo.as_deref().unwrap_or("(none)");
+    match &d.mirror {
+        Some(m) => ok(format!(
+            "OCI image registry {repo} + Docker Hub mirror {} reachable-by-config",
+            m.repo
+        )),
+        None => ok(format!("OCI image registry {repo} reachable-by-config")),
     }
 }
 

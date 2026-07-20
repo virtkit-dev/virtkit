@@ -227,17 +227,22 @@ impl Default for Guest {
 /// `[docker]` — OPTIONAL registry proxy for direct OCI image boots. Absent (the default),
 /// an image reference is pulled directly from whatever registry it names: the microVM
 /// boundary is the security model, so image sources are not gated. Present, it *routes*
-/// bare docker-hub-style names through the configured `repo` (with these credentials) — a
-/// shared pull-through cache for the CI runners — while a ref that names its own registry
-/// is still pulled directly. It never refuses an image. The native OCI client fetches the
-/// image, the embedded vk-agent is PID 1, the embedded kernel boots it. Auth mirrors
-/// `[registry]`.
+/// pulls: the `docker/<name>` MICROVM_IMAGE form and bare docker-hub-style names go
+/// through `repo` (with these credentials); a `[docker.mirror]` redirects Docker Hub
+/// references onto a pull-through mirror instead (the `registry-mirrors` equivalent);
+/// any other registry is still pulled directly. It never refuses an image. The native
+/// OCI client fetches the image, the embedded vk-agent is PID 1, the embedded kernel
+/// boots it. Auth mirrors `[registry]`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Docker {
-    /// Registry repository prefix bare image names are routed through, e.g.
-    /// "registry.example.com/team" — a pull-through cache/proxy, not an allowlist.
-    pub repo: String,
+    /// Registry repository prefix the `docker/<name>` form and bare image names are routed
+    /// through, e.g. "registry.example.com/team" — a pull-through cache/proxy, not an
+    /// allowlist. Absent = no such source (e.g. a `[docker]` present only to carry a
+    /// `[docker.mirror]`); a `docker/<name>` job then pulls the bare name directly.
+    /// Optional so the section can be empty or mirror-only.
+    #[serde(default)]
+    pub repo: Option<String>,
     /// PEM CA bundle the registry's TLS cert chains to (rustls). Absent = system roots.
     #[serde(default)]
     pub ca_file: Option<PathBuf>,
@@ -249,6 +254,38 @@ pub struct Docker {
     #[serde(default)]
     pub password_file: Option<PathBuf>,
     /// Plain HTTP registry (a local/insecure registry); default TLS.
+    #[serde(default)]
+    pub insecure: bool,
+    /// Docker Hub pull-through mirror (the `registry-mirrors` equivalent): bare
+    /// docker-hub names and explicit `docker.io/…` refs are fetched through it — with
+    /// the `library/` prefix added for official images, and NO direct-to-Hub fallback —
+    /// so a job needs no direct Docker Hub egress. Absent = Hub refs use the legacy
+    /// routing (bare names onto `repo`, host-qualified refs pulled directly).
+    #[serde(default)]
+    pub mirror: Option<Mirror>,
+}
+
+/// `[docker.mirror]` — a Docker Hub pull-through cache (a Nexus/Artifactory/`registry:2`
+/// proxy of `registry-1.docker.io`). ONLY Docker Hub references route through it — a bare
+/// name, or one explicitly under docker.io/index.docker.io/registry-1.docker.io; any other
+/// registry is left untouched. Auth is independent of the `[docker]` repo (a mirror usually
+/// carries its own account).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mirror {
+    /// Registry prefix Hub pulls are rewritten onto, e.g. "hq-nexus.example.com:8440".
+    pub repo: String,
+    /// PEM CA bundle the mirror's TLS cert chains to (rustls). Absent = system roots.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// HTTP Basic username. Empty = anonymous.
+    #[serde(default)]
+    pub username: String,
+    /// Path to a file holding the Basic-auth password (read at runtime, trailing newline
+    /// trimmed; only when `username` is set). Provision out of band, 0600.
+    #[serde(default)]
+    pub password_file: Option<PathBuf>,
+    /// Plain HTTP mirror (a local/insecure registry); default TLS.
     #[serde(default)]
     pub insecure: bool,
 }
@@ -522,6 +559,52 @@ mod tests {
     #[test]
     fn net_port_default() {
         assert_eq!(Net::default().net_port, 1024);
+    }
+
+    #[test]
+    fn docker_section_may_be_empty_or_mirror_only() {
+        // An empty [docker] parses (every field defaults) — repo is optional now.
+        let empty: Config = toml::from_str("[docker]\n").unwrap();
+        let d = empty.docker.as_ref().unwrap();
+        assert!(d.repo.is_none() && d.mirror.is_none());
+        // A mirror-only [docker]: no repo, just the Hub pull-through.
+        let cfg: Config = toml::from_str(
+            r#"
+            [docker.mirror]
+            repo = "hq-nexus.example.com:8440"
+            "#,
+        )
+        .unwrap();
+        let d = cfg.docker.as_ref().unwrap();
+        assert!(d.repo.is_none());
+        assert_eq!(d.mirror.as_ref().unwrap().repo, "hq-nexus.example.com:8440");
+    }
+
+    #[test]
+    fn docker_with_repo_and_mirror_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [docker]
+            repo = "10.10.140.49/common/wab-ci"
+            username = "ci-push"
+
+            [docker.mirror]
+            repo = "hq-nexus.example.com:8440"
+            insecure = true
+            "#,
+        )
+        .unwrap();
+        let d = cfg.docker.as_ref().unwrap();
+        assert_eq!(d.repo.as_deref(), Some("10.10.140.49/common/wab-ci"));
+        assert_eq!(d.username, "ci-push");
+        let m = d.mirror.as_ref().unwrap();
+        assert_eq!(m.repo, "hq-nexus.example.com:8440");
+        assert!(m.insecure);
+    }
+
+    #[test]
+    fn docker_rejects_unknown_fields() {
+        assert!(toml::from_str::<Config>("[docker]\nrepoo = \"x\"\n").is_err());
     }
 
     #[test]
