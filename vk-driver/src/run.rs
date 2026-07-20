@@ -529,6 +529,10 @@ async fn build_and_boot(
         None => Vec::new(),
     };
     let mut image_env: Vec<(String, String)> = Vec::new();
+    // The image's entrypoint and workdir, applied to the guest command like `docker
+    // run`: the entrypoint is prepended to a trailing command, the workdir is its cwd.
+    let mut image_entrypoint: Vec<String> = Vec::new();
+    let mut image_workdir = String::new();
     // The --primary primary's merged config: env for the command, argv as the
     // default command, hostname for the guest.
     let mut primary: Option<vk_core::runcfg::RunConfig> = None;
@@ -568,6 +572,8 @@ async fn build_and_boot(
             .with_context(|| format!("internal: primary service {name} not built"))?;
         let cfg = crate::compose::merged_config(&built.config, unit);
         image_env = cfg.env.clone();
+        image_entrypoint = cfg.entrypoint.clone();
+        image_workdir = cfg.workdir.clone();
         primary_user = cfg.user.clone();
         primary_hostname = Some(unit.hostname.clone());
         primary_volumes = unit.volumes.clone();
@@ -604,6 +610,8 @@ async fn build_and_boot(
         let built = crate::build::build(&opts)?;
         primary_user = built.config.user;
         image_env = built.config.env;
+        image_entrypoint = built.config.entrypoint;
+        image_workdir = built.config.workdir;
         Some(out)
     };
 
@@ -649,9 +657,12 @@ async fn build_and_boot(
             let t_source = Instant::now();
             let source = resolve_source(args).await?;
             timings.record(Phase::SourcePull, "", t_source.elapsed());
-            // Inherit the image's configured environment (PATH etc.) for the guest
-            // command, as `docker run` does.
-            image_env = source.config_env().await?;
+            // Inherit the image's configured environment (PATH etc.), entrypoint and
+            // workdir for the guest command, as `docker run` does.
+            let cfg = source.run_config().await?;
+            image_env = cfg.env;
+            image_entrypoint = cfg.entrypoint;
+            image_workdir = cfg.workdir;
             Some(source)
         }
         Some(_) => None,
@@ -1326,6 +1337,8 @@ async fn build_and_boot(
         args,
         ssh_config.as_deref(),
         &image_env,
+        &image_entrypoint,
+        &image_workdir,
         &fallback_argv,
         &timings,
     )
@@ -2006,6 +2019,45 @@ fn user_script(command: &[String]) -> String {
     }
 }
 
+/// The shell body a run executes in the guest, `docker run`-style. With no trailing
+/// command the fallback runs (a `--primary` service's entrypoint+cmd, else the boot-info
+/// probe). A trailing command has the image's entrypoint prepended and is quoted as an
+/// argv; with no entrypoint a single word stays a shell one-liner (the CLI's documented
+/// shorthand). It runs in the effective cwd: the `--workdir` share (WORKDIR_MOUNT, so its
+/// outputs land back on the host), else the image's WORKDIR — `/` is the default either
+/// way, so no `cd` is emitted for it.
+fn guest_command_body(
+    command: &[String],
+    image_entrypoint: &[String],
+    image_workdir: &str,
+    workdir_share: bool,
+    fallback_argv: &[String],
+) -> String {
+    let script = if command.is_empty() {
+        user_script(fallback_argv)
+    } else if image_entrypoint.is_empty() {
+        user_script(command)
+    } else {
+        image_entrypoint
+            .iter()
+            .chain(command)
+            .map(|a| sh_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let cwd = if workdir_share {
+        Some(WORKDIR_MOUNT)
+    } else if !image_workdir.is_empty() && image_workdir != "/" {
+        Some(image_workdir)
+    } else {
+        None
+    };
+    match cwd {
+        Some(dir) => format!("cd {} && {script}", sh_quote(dir)),
+        None => script,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive(
     ch: &mut Child,
@@ -2014,6 +2066,8 @@ async fn drive(
     args: &RunArgs,
     ssh_config: Option<&str>,
     image_env: &[(String, String)],
+    image_entrypoint: &[String],
+    image_workdir: &str,
     fallback_argv: &[String],
     timings: &Timings,
 ) -> Result<()> {
@@ -2050,17 +2104,13 @@ async fn drive(
     if args.shell {
         return run_shell(addr).await;
     }
-    let user_script = user_script(if args.command.is_empty() {
-        fallback_argv
-    } else {
-        &args.command
-    });
-    // A `--workdir` share mounts the live tree at WORKDIR_MOUNT; run the command there so it
-    // sees the shared files and writes its outputs back to the host.
-    let body = match &args.workdir {
-        Some(_) => format!("cd {WORKDIR_MOUNT} && {user_script}"),
-        None => user_script,
-    };
+    let body = guest_command_body(
+        &args.command,
+        image_entrypoint,
+        image_workdir,
+        args.workdir.is_some(),
+        fallback_argv,
+    );
     // Apply the built image's environment first (PATH etc.), so the command runs like
     // `docker run` — the base image's PATH puts toolchains in scope. The command's own
     // exports (if any) come after and win.
@@ -3032,6 +3082,43 @@ mod tests {
             user_script(&["echo", "it's"].map(String::from)),
             "'echo' 'it'\\''s'"
         );
+    }
+
+    #[test]
+    fn guest_command_body_applies_entrypoint_and_workdir() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // A trailing command with an image entrypoint: the entrypoint is prepended,
+        // docker-run style, and the whole argv is quoted (no shell-one-liner shorthand).
+        assert_eq!(
+            guest_command_body(&s(&["--version"]), &s(&["/app/bin"]), "/app", false, &[]),
+            "cd '/app' && '/app/bin' '--version'"
+        );
+        // No entrypoint: a single word stays a shell one-liner, run in the image workdir.
+        assert_eq!(
+            guest_command_body(&s(&["make test"]), &[], "/src", false, &[]),
+            "cd '/src' && make test"
+        );
+        // The --workdir share overrides the image workdir (its outputs land on the host).
+        assert_eq!(
+            guest_command_body(&s(&["ls"]), &s(&["/entry"]), "/app", true, &[]),
+            format!("cd {} && '/entry' 'ls'", sh_quote(WORKDIR_MOUNT))
+        );
+        // A `/` (or empty) image workdir emits no cd — `/` is the default.
+        assert_eq!(guest_command_body(&s(&["ls"]), &[], "/", false, &[]), "ls");
+        assert_eq!(guest_command_body(&s(&["ls"]), &[], "", false, &[]), "ls");
+        // No trailing command: the fallback (a --primary entrypoint+cmd) runs, in workdir.
+        assert_eq!(
+            guest_command_body(
+                &[],
+                &s(&["/entry"]),
+                "/app",
+                false,
+                &s(&["/entry", "serve"])
+            ),
+            "cd '/app' && '/entry' 'serve'"
+        );
+        // No command and no fallback: the boot-info probe.
+        assert!(guest_command_body(&[], &[], "", false, &[]).starts_with("echo PID1="));
     }
 
     #[test]

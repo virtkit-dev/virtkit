@@ -25,6 +25,12 @@ All notable changes to virtkit will be documented in this file.
   set; with no repo, `docker/<name>` is pulled directly, while a bare `image:` Hub ref goes
   through `[docker.mirror]` if configured (else direct).
 
+### Fixed
+
+- `vk run <image> <command>` now runs the command under the image's `ENTRYPOINT` and in its
+  `WORKDIR`, as `docker run` does — previously the entrypoint was dropped and the command ran
+  from `/`.
+
 ## [0.19.0] - 2026-07-20
 
 ### Added

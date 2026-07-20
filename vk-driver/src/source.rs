@@ -95,12 +95,13 @@ impl Source {
         }
     }
 
-    /// The image's configured environment (`Config.Env` as `(KEY, VALUE)` pairs), so a
-    /// command run in the booted guest sees the image's `PATH` etc. — as `docker run`
-    /// does. From the registry config (OCI) or `docker image inspect` (docker).
-    pub async fn config_env(&self) -> Result<Vec<(String, String)>> {
+    /// The image's runtime config (`Env`/`User`/`WorkingDir`/`Entrypoint`/`Cmd`), so a
+    /// command run in the booted guest sees the image's `PATH`, runs under its
+    /// entrypoint and in its workdir — as `docker run` does. From the registry config
+    /// (OCI) or `docker image inspect` (docker).
+    pub async fn run_config(&self) -> Result<vk_core::runcfg::RunConfig> {
         match self {
-            Source::Docker { docker, image } => docker_config_env(docker, image),
+            Source::Docker { docker, image } => docker_run_config(docker, image),
             Source::Oci {
                 reference,
                 username,
@@ -115,7 +116,7 @@ impl Source {
                 *insecure,
             )
             .await?
-            .env),
+            .into()),
         }
     }
 }
@@ -228,17 +229,40 @@ fn docker_container_rootfs_size(docker: &Path, cid: &str) -> Option<u64> {
         .ok()
 }
 
-/// `docker image inspect` an image's `Config.Env` (one `KEY=VALUE` per line).
-fn docker_config_env(docker: &Path, image: &str) -> Result<Vec<(String, String)>> {
-    Ok(
-        docker_inspect(docker, image, "{{range .Config.Env}}{{println .}}{{end}}")?
-            .lines()
-            .filter_map(|l| {
-                l.split_once('=')
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-            })
-            .collect(),
-    )
+/// `docker image inspect` an image's runtime config (`Env`/`User`/`WorkingDir`/
+/// `Entrypoint`/`Cmd`), the docker-daemon counterpart of the OCI `pull_config`.
+fn docker_run_config(docker: &Path, image: &str) -> Result<vk_core::runcfg::RunConfig> {
+    let env = docker_inspect(docker, image, "{{range .Config.Env}}{{println .}}{{end}}")?
+        .lines()
+        .filter_map(|l| {
+            l.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        })
+        .collect();
+    Ok(vk_core::runcfg::RunConfig {
+        env,
+        user: docker_inspect(docker, image, "{{.Config.User}}")?
+            .trim()
+            .to_string(),
+        workdir: docker_inspect(docker, image, "{{.Config.WorkingDir}}")?
+            .trim()
+            .to_string(),
+        entrypoint: docker_inspect_argv(docker, image, "Entrypoint")?,
+        cmd: docker_inspect_argv(docker, image, "Cmd")?,
+    })
+}
+
+/// `docker image inspect` an image's `Config.<field>` argv (`Entrypoint`/`Cmd`), one
+/// element per line — empty when the field is null.
+fn docker_inspect_argv(docker: &Path, image: &str, field: &str) -> Result<Vec<String>> {
+    Ok(docker_inspect(
+        docker,
+        image,
+        &format!("{{{{range .Config.{field}}}}}{{{{println .}}}}{{{{end}}}}"),
+    )?
+    .lines()
+    .map(str::to_string)
+    .collect())
 }
 
 /// `docker export` a local image's rootfs, streaming the child's stdout into
