@@ -3,7 +3,7 @@
 virtkit runs Docker images as lightweight virtual machines. It boots an OCI
 image as a microVM in about a second, each with its own kernel, so whatever
 runs inside is isolated from the host. There's no daemon and nothing to install
-as root: it's two static binaries running as an ordinary user process, and the
+as root: it's a single static binary running as an ordinary user process, and the
 only thing it needs from the host is access to `/dev/kvm`.
 
 On top of that base you get docker-compose-style services running as real VMs
@@ -100,7 +100,7 @@ pins.
 ## Build
 
 ```sh
-./build.sh         # -> dist/{vk, vk-agent, *.sha256, build-info.txt}
+./build.sh         # -> dist/{vk, vk-agent, vk-registry, *.sha256, build-info.txt}
 ./build-kernel.sh  # -> dist/vmlinux (the guest kernel; rebuilt only on a pin bump)
 ```
 
@@ -120,15 +120,20 @@ the Rust toolchain, the base-image digest, and the apk pins together.
   if it does not answer.
 - `connect` — splice stdio to a running guest, the shape SSH's `ProxyCommand`
   wants (`vk run --ssh` prints the full invocation).
+- `check` — preflight the host for the current user: `/dev/kvm` access, the VMM
+  backend, a guest kernel/agent, and the host side of each configured feature.
 - `service up` / `service down` / `service status` — from inside the primary,
   control the run's compose services (build on demand + boot, stop, or query state).
 - `gitlab config` / `gitlab prepare` / `gitlab run` / `gitlab cleanup` — the GitLab custom-executor lifecycle.
 - `build` — build a Dockerfile into a bootable image, each `RUN` in a microVM.
+- `cache gc` — reclaim the host image cache: evict image bases no VM is using and
+  idle past the timeout, and drop unreferenced registry chunks.
 - `switch` — the guest network gateway (spawned per run/job).
 - `mkext-tar` / `mkext` — build a bootable ext4 image from a rootfs tar / directory.
 - `oci-pull` — pull and flatten an OCI image to a rootfs tar.
-- `registry push` / `registry pull` — push/pull guest bundles to/from an OCI
-  registry, with chunk-level deduplication to keep transfers small.
+- `registry push` / `registry pull` / `registry inspect` / `registry status` /
+  `registry gc` — manage guest bundles in an OCI store: push/pull with chunk-level
+  deduplication to keep transfers small, inspect a bundle, report store usage, reclaim it.
 - `virtiofsd` — the bundled virtio-fs daemon for sharing host directories
   (used with the Cloud Hypervisor backend).
 - `forward` — plumbing: a byte forwarder splicing one address to another.
@@ -148,6 +153,7 @@ the Rust toolchain, the base-image digest, and the apk pins together.
 vk-core/         shared host↔guest library (wire protocol + exec/pty/dockerignore)
 vk-driver/       host driver crate
 vk-agent/        guest agent crate (PID 1 + exec server)
+vk-registry/     optional central OCI-distribution server (build-once lock + pull-through cache)
 third_party/     vendored libkrun (locally patched — see its VENDOR.md)
 kernel/          guest kernel build (Dockerfile + config fragment)
 build.sh         build the binaries -> dist/
