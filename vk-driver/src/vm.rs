@@ -205,7 +205,7 @@ fn resolve_media(ctx: &JobCtx) -> Result<(Option<PathBuf>, Media, bool)> {
     }
 }
 
-/// The job's primary as a git-defined image (`MICROVM_IMAGE: dockerfile:<path>[?context=<dir>][#<stage>]`):
+/// The job's primary as a git-defined image (`MICROVM_IMAGE: dockerfile:<path>[?context=<dir>&arg=<N>=<V>][#<stage>]`):
 /// build it and return it as generic-disk boot media (embedded kernel, agent + config riding
 /// the preinit initramfs — the byte-clean model `vk build`/bundles use).
 fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<(Option<PathBuf>, Media, bool)> {
@@ -221,12 +221,12 @@ fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<(Option<PathBuf>,
     ))
 }
 
-/// Build a git-defined image `<path>[?context=<dir>][#<stage>]` from the host-side checkout into
+/// Build a git-defined image `<path>[?context=<dir>&arg=<N>=<V>][#<stage>]` from the host-side checkout into
 /// the shared build tier and return its rootfs + captured runtime config. Shared by the job's
 /// primary (`resolve_dockerfile_form`) and its git-defined services (`plan_services`). Requires
 /// `[gitlab] host_checkout`: the Dockerfile + context are the checked-out sources. The context
-/// defaults to the Dockerfile's directory; `?context=<dir>` overrides it.
-/// `--build-arg`s come from `CUSTOM_ENV_MICROVM_BUILD_ARG_<NAME>`.
+/// defaults to the Dockerfile's directory; `?context=<dir>` overrides it. `--build-arg`s come
+/// from `?arg=<NAME>=<VALUE>` parameters (repeatable).
 fn build_git_image(
     ctx: &JobCtx,
     spec: &str,
@@ -238,16 +238,21 @@ fn build_git_image(
              Dockerfile and its context are the checked-out sources"
         );
     }
-    let (rel_dockerfile, rel_context, stage) = parse_dockerfile_spec(spec)?;
+    let parsed = parse_dockerfile_spec(spec)?;
+    let stage = parsed.stage;
     let checkout = ctx.host_checkout_dir();
     // The Dockerfile path is job-controlled; confine it to the checkout so a `dockerfile:` job
     // cannot read another tenant's checkout or an arbitrary host file during the host-side
     // build (this runs outside the microVM boundary).
-    let dockerfile = confined_dockerfile(&checkout, rel_dockerfile)?;
-    let context = resolve_build_context(&checkout, &dockerfile, rel_context)?;
+    let dockerfile = confined_dockerfile(&checkout, parsed.path)?;
+    let context = resolve_build_context(&checkout, &dockerfile, parsed.context)?;
     let dockerfiles = vec![dockerfile];
     let contexts = vec![context];
-    let build_args = ci_build_args();
+    let build_args: Vec<(String, String)> = parsed
+        .build_args
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
     let stage_key = crate::build::target_stage_key(&dockerfiles, &contexts, &build_args, stage)
         .context("computing the git-defined image's stage fingerprint")?;
     let recipe = crate::ensure::BuildRecipe {
@@ -343,14 +348,28 @@ fn resolve_build_context(
     }
 }
 
-/// Parse a `dockerfile:` image spec's body — `<path>[?context=<dir>][#<stage>]` — into its
-/// Dockerfile path, an optional context override, and an optional build target. Query before
-/// fragment, URL-style: `?context=<dir>` overrides the build context (default: the Dockerfile's
-/// own directory) and `#<stage>` selects a target — the `#` binds first, so a `?context=` after
-/// a `#` lands inside the stage rather than being parsed as a parameter. Anything other than a
-/// single non-empty `context=<dir>` — an unknown parameter, an empty value, or a repeated
-/// `context=` — is rejected so a typo fails loudly rather than silently building the wrong context.
-fn parse_dockerfile_spec(spec: &str) -> Result<(&str, Option<&str>, Option<&str>)> {
+/// Parsed body of a `dockerfile:` image ref — `<path>[?<params>][#<stage>]`, query before
+/// fragment (URL-style). `<params>` are `&`-separated `key=value`.
+struct DockerfileSpec<'a> {
+    /// The Dockerfile, relative to the checkout.
+    path: &'a str,
+    /// `context=<dir>`: the build context, defaulting to the Dockerfile's own directory.
+    context: Option<&'a str>,
+    /// `#<stage>`: the build target, if any.
+    stage: Option<&'a str>,
+    /// `arg=<NAME>=<VALUE>` (repeatable): `--build-arg`s for the build.
+    build_args: Vec<(&'a str, &'a str)>,
+}
+
+/// Parse a `dockerfile:` image spec's body into a [`DockerfileSpec`]. Query before fragment,
+/// URL-style: the `#` binds first, so a `?`-parameter placed after a `#` lands inside the stage
+/// rather than being parsed. `<params>` are `&`-separated `key=value`: `context=<dir>` overrides
+/// the build context (default: the Dockerfile's own directory) and `arg=<NAME>=<VALUE>`
+/// (repeatable) supplies a `--build-arg`. Anything else — an unknown parameter, an empty or
+/// repeated `context=`, or an `arg` missing its `=VALUE` — is rejected so a typo fails loudly
+/// rather than silently building the wrong thing. A build-arg `VALUE` may itself contain `=`, but
+/// no value can contain `&` (the parameter separator) or `#` (the stage delimiter).
+fn parse_dockerfile_spec(spec: &str) -> Result<DockerfileSpec<'_>> {
     let (head, stage) = match spec.split_once('#') {
         Some((h, s)) => (h, Some(s)),
         None => (spec, None),
@@ -360,6 +379,7 @@ fn parse_dockerfile_spec(spec: &str) -> Result<(&str, Option<&str>, Option<&str>
         None => (head, None),
     };
     let mut context = None;
+    let mut build_args = Vec::new();
     for kv in query
         .into_iter()
         .flat_map(|q| q.split('&'))
@@ -375,22 +395,23 @@ fn parse_dockerfile_spec(spec: &str) -> Result<(&str, Option<&str>, Option<&str>
                 bail!("dockerfile: context specified more than once in {query:?}")
             }
             Some(("context", v)) => context = Some(v),
-            _ => bail!("unknown dockerfile: parameter {kv:?} (expected context=<dir>)"),
+            Some(("arg", v)) => {
+                let nv = v
+                    .split_once('=')
+                    .with_context(|| format!("dockerfile: arg must be NAME=VALUE: {v:?}"))?;
+                build_args.push(nv);
+            }
+            _ => bail!(
+                "unknown dockerfile: parameter {kv:?} (expected context=<dir> or arg=NAME=VALUE)"
+            ),
         }
     }
-    Ok((path, context, stage))
-}
-
-/// `--build-arg`s for a git-defined image, from `CUSTOM_ENV_MICROVM_BUILD_ARG_<NAME>=<value>`
-/// job variables (e.g. `MICROVM_BUILD_ARG_DEVUSER_UID=1000`).
-fn ci_build_args() -> Vec<(String, String)> {
-    std::env::vars()
-        .filter_map(|(k, v)| {
-            k.strip_prefix("CUSTOM_ENV_MICROVM_BUILD_ARG_")
-                .filter(|n| !n.is_empty())
-                .map(|n| (n.to_string(), v))
-        })
-        .collect()
+    Ok(DockerfileSpec {
+        path,
+        context,
+        stage,
+        build_args,
+    })
 }
 
 /// A `compose:<file>#<primary>` job's fleet, loaded from the host checkout: the parsed compose
@@ -548,7 +569,7 @@ fn compose_unit_media(
 
 /// Build a compose `build:` unit into the shared build tier (from the host checkout) and return
 /// its rootfs + merged runtime config. The build wiring comes from `[build]` (embedded kernel/
-/// agent by default); `--build-arg`s from `CUSTOM_ENV_MICROVM_BUILD_ARG_*` plus the unit's own.
+/// agent by default); `--build-arg`s are the unit's own (from the compose file / its `.env`).
 fn build_compose_unit(
     ctx: &JobCtx,
     unit: &crate::compose::Unit,
@@ -559,7 +580,9 @@ fn build_compose_unit(
     let agent = crate::embed::resolve(crate::embed::Asset::Agent, cfg.build.agent.as_deref())?;
     let kernel = crate::embed::resolve(crate::embed::Asset::Kernel, cfg.build.kernel.as_deref())?;
     let build = crate::units::BuildOpts {
-        build_args: ci_build_args(),
+        // A compose unit's build args are its own (compose file / `.env`); there is no
+        // executor-global build-arg channel.
+        build_args: vec![],
         kernel: kernel.path.clone(),
         cloud_hypervisor: cfg.cloud_hypervisor().to_path_buf(),
         agent: agent.path.clone(),
@@ -1067,7 +1090,7 @@ fn plan_services(
             crate::units::provision(
                 &ctx.cfg,
                 ctx.cfg.state_dir(),
-                &ci_build_args(),
+                &[],
                 &unit,
                 gateway,
                 prefix,
@@ -1542,47 +1565,58 @@ mod tests {
     }
 
     #[test]
-    fn parse_dockerfile_spec_splits_path_context_and_stage() {
-        // Bare path: no context override, no stage — the context defaults to the Dockerfile's dir.
-        assert_eq!(
-            parse_dockerfile_spec("docker/wabbuilder/Dockerfile").unwrap(),
-            ("docker/wabbuilder/Dockerfile", None, None)
-        );
+    fn parse_dockerfile_spec_splits_path_params_and_stage() {
+        // Bare path: no params, no stage — the context defaults to the Dockerfile's dir.
+        let p = parse_dockerfile_spec("docker/wabbuilder/Dockerfile").unwrap();
+        assert_eq!(p.path, "docker/wabbuilder/Dockerfile");
+        assert_eq!(p.context, None);
+        assert_eq!(p.stage, None);
+        assert!(p.build_args.is_empty());
+
         // `#<stage>` selects a target.
-        assert_eq!(
-            parse_dockerfile_spec("docker/wabbuilder/Dockerfile#bastion-builder").unwrap(),
-            (
-                "docker/wabbuilder/Dockerfile",
-                None,
-                Some("bastion-builder")
-            )
-        );
-        // `?context=<dir>` overrides the context; query comes before the `#` fragment.
-        assert_eq!(
-            parse_dockerfile_spec("docker/wabbuilder/Dockerfile?context=.#bastion-builder")
-                .unwrap(),
-            (
-                "docker/wabbuilder/Dockerfile",
-                Some("."),
-                Some("bastion-builder")
-            )
-        );
+        let p = parse_dockerfile_spec("docker/wabbuilder/Dockerfile#bastion-builder").unwrap();
+        assert_eq!(p.path, "docker/wabbuilder/Dockerfile");
+        assert_eq!(p.context, None);
+        assert_eq!(p.stage, Some("bastion-builder"));
+        assert!(p.build_args.is_empty());
+
+        // `?context=<dir>` plus repeated `?arg=NAME=VALUE`; query comes before the `#` fragment,
+        // and a build-arg value may itself contain `=`.
+        let p = parse_dockerfile_spec(
+            "docker/wabbuilder/Dockerfile?context=.&arg=UID=1000&arg=KV=a=b#bastion-builder",
+        )
+        .unwrap();
+        assert_eq!(p.path, "docker/wabbuilder/Dockerfile");
+        assert_eq!(p.context, Some("."));
+        assert_eq!(p.stage, Some("bastion-builder"));
+        assert_eq!(p.build_args, vec![("UID", "1000"), ("KV", "a=b")]);
+
         // A context override without a stage.
-        assert_eq!(
-            parse_dockerfile_spec("a/Dockerfile?context=a/ctx").unwrap(),
-            ("a/Dockerfile", Some("a/ctx"), None)
-        );
-        // An empty query (`?` with nothing after it) leaves the path bare, no context.
-        assert_eq!(
-            parse_dockerfile_spec("a/Dockerfile?").unwrap(),
-            ("a/Dockerfile", None, None)
-        );
+        let p = parse_dockerfile_spec("a/Dockerfile?context=a/ctx").unwrap();
+        assert_eq!(p.path, "a/Dockerfile");
+        assert_eq!(p.context, Some("a/ctx"));
+        assert_eq!(p.stage, None);
+        assert!(p.build_args.is_empty());
+
+        // A param-only spec without a stage.
+        let p = parse_dockerfile_spec("a/Dockerfile?arg=X=y").unwrap();
+        assert_eq!(p.stage, None);
+        assert_eq!(p.build_args, vec![("X", "y")]);
+
+        // An empty query (`?` with nothing after it) leaves the path bare, no params.
+        let p = parse_dockerfile_spec("a/Dockerfile?").unwrap();
+        assert_eq!(p.path, "a/Dockerfile");
+        assert_eq!(p.context, None);
+        assert_eq!(p.stage, None);
+        assert!(p.build_args.is_empty());
+
         // The `#` binds before the `?`, so a `?context=` placed after a `#` is swallowed by the
         // stage rather than parsed as a parameter — pin that ordering.
-        assert_eq!(
-            parse_dockerfile_spec("a/Dockerfile#s?context=.").unwrap(),
-            ("a/Dockerfile", None, Some("s?context=."))
-        );
+        let p = parse_dockerfile_spec("a/Dockerfile#s?context=.").unwrap();
+        assert_eq!(p.path, "a/Dockerfile");
+        assert_eq!(p.context, None);
+        assert_eq!(p.stage, Some("s?context=."));
+
         // An unknown parameter is rejected rather than silently ignored.
         assert!(parse_dockerfile_spec("a/Dockerfile?ctx=.#s").is_err());
         // A known parameter mixed with an unknown one still fails loudly.
@@ -1592,6 +1626,8 @@ mod tests {
         assert!(parse_dockerfile_spec("a/Dockerfile?context=").is_err());
         // A repeated `context=` is rejected rather than silently taking one.
         assert!(parse_dockerfile_spec("a/Dockerfile?context=a&context=b").is_err());
+        // An `arg` missing its `=VALUE` is rejected.
+        assert!(parse_dockerfile_spec("a/Dockerfile?arg=NOEQUALS").is_err());
     }
 
     #[test]

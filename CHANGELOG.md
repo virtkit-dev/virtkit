@@ -10,6 +10,9 @@ All notable changes to virtkit will be documented in this file.
   `docker build <dir>`) instead of the repo root, so a Dockerfile outside the repo root finds
   its `COPY` sources and `.dockerignore`. Add `?context=<dir>` to the image ref to override it
   (e.g. `?context=.` for the previous repo-root context).
+- The GitLab executor's `dockerfile:` image ref takes an `?arg=<NAME>=<VALUE>` parameter
+  (repeatable) supplying a `--build-arg` — e.g. `dockerfile:<path>?context=.&arg=UID=1000#<stage>`.
+  It replaces the `MICROVM_BUILD_ARG_<NAME>` job variables, which are no longer read.
 
 ## [0.18.0] - 2026-07-20
 
