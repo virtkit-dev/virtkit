@@ -16,11 +16,14 @@
 //! This module is the thin dispatcher plus the reference-parsing and local-cache
 //! helpers shared with the docker, registry and local paths.
 
+use std::io::{Read, Write};
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
-use std::os::unix::net::{SocketAddr, UnixListener};
+use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 
@@ -194,10 +197,41 @@ pub(crate) fn parse_digest(s: &str) -> Option<String> {
 /// holding process dies, and unlike a lock file it cannot be unlinked by a
 /// cache cleanup (an `rm -rf images/` mid-pull would let two prepares race
 /// again). A hash collision only serializes two unrelated pulls.
-fn pull_lock_addr(dir: &Path) -> std::io::Result<SocketAddr> {
+fn pull_lock_hash(dir: &Path) -> u64 {
     // FNV-1a, to stay within the 108-byte sun_path limit
-    let h = fnv64(&[dir.as_os_str().as_bytes()]);
+    fnv64(&[dir.as_os_str().as_bytes()])
+}
+
+fn pull_lock_addr(h: u64) -> std::io::Result<SocketAddr> {
     SocketAddr::from_abstract_name(format!("virtkit-pull-{h:016x}"))
+}
+
+/// Ask the current lock holder who it is, over the same abstract socket it holds: the
+/// holder's responder answers each connection with its `job_identity()`. None if nothing
+/// answers in time (holder crashed, or racing our connect) — best-effort diagnostics.
+fn query_holder(addr: &SocketAddr) -> Option<String> {
+    let mut s = UnixStream::connect_addr(addr).ok()?;
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+    let mut buf = String::new();
+    s.read_to_string(&mut buf).ok()?;
+    let who = buf.trim();
+    (!who.is_empty()).then(|| who.to_string())
+}
+
+/// The current job's identity for holder reporting: its GitLab job URL (clickable) when the
+/// executor exported one, else the job id, else the pid — never empty.
+fn job_identity() -> String {
+    if let Ok(url) = std::env::var("CUSTOM_ENV_CI_JOB_URL")
+        && !url.is_empty()
+    {
+        return url;
+    }
+    if let Ok(id) = std::env::var("CUSTOM_ENV_CI_JOB_ID")
+        && !id.is_empty()
+    {
+        return format!("job {id}");
+    }
+    format!("pid {}", std::process::id())
 }
 
 /// FNV-1a over concatenated byte slices (cache keys and lock names, not
@@ -211,21 +245,85 @@ pub(crate) fn fnv64(parts: &[&[u8]]) -> u64 {
         })
 }
 
-pub(crate) fn acquire_pull_lock(dir: &Path, name: &str, digest: &str) -> Result<UnixListener> {
-    let addr = pull_lock_addr(dir)?;
+/// A held pull lock. The bound abstract socket IS the lock (the kernel frees it when this
+/// process dies); `_sock` keeps it bound for the whole hold — independent of the responder —
+/// so the lock is never released early even if that thread exits. The responder answers
+/// waiters with this job's identity; dropping the guard stops it and frees the socket.
+pub(crate) struct PullLock {
+    _sock: UnixListener,
+    stop: Arc<AtomicBool>,
+    responder: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for PullLock {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.responder.take() {
+            let _ = h.join();
+        }
+        // `_sock` drops after this, releasing the abstract socket.
+    }
+}
+
+pub(crate) fn acquire_pull_lock(dir: &Path, name: &str, digest: &str) -> Result<PullLock> {
+    let addr = pull_lock_addr(pull_lock_hash(dir))?;
     let mut waiting = false;
     loop {
         match UnixListener::bind_addr(&addr) {
-            Ok(lock) => return Ok(lock),
+            Ok(lock) => return Ok(spawn_holder(lock)),
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 if !waiting {
-                    println!("virtkit: waiting for a concurrent pull of {name}@{digest} ...");
+                    match query_holder(&addr) {
+                        Some(who) => println!(
+                            "virtkit: waiting for a concurrent pull of {name}@{digest} \
+                             (held by {who}) ..."
+                        ),
+                        None => println!(
+                            "virtkit: waiting for a concurrent pull of {name}@{digest} ..."
+                        ),
+                    }
                     waiting = true;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
             Err(e) => return Err(e).context("binding the pull-lock socket"),
         }
+    }
+}
+
+/// Start the holder's responder: a thread that owns a clone of the bound `lock` and answers
+/// each waiter's connection with our `job_identity()` until the guard is dropped. It uses a
+/// non-blocking accept + a stop flag so drop ends it promptly (a bounded join). The guard
+/// keeps the original `lock`, so even if this thread dies the socket stays bound (the lock
+/// is held); a dead responder only means waiters get no name, never a released lock.
+fn spawn_holder(lock: UnixListener) -> PullLock {
+    let stop = Arc::new(AtomicBool::new(false));
+    let responder = match lock.try_clone() {
+        Ok(accept_sock) => {
+            let id = job_identity();
+            let stop = stop.clone();
+            Some(std::thread::spawn(move || {
+                let _ = accept_sock.set_nonblocking(true);
+                while !stop.load(Ordering::Relaxed) {
+                    match accept_sock.accept() {
+                        Ok((mut s, _)) => {
+                            let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+                            let _ = s.write_all(id.as_bytes());
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }))
+        }
+        Err(_) => None,
+    };
+    PullLock {
+        _sock: lock,
+        stop,
+        responder,
     }
 }
 
@@ -424,7 +522,7 @@ mod tests {
         // in parallel, so a fixed name would collide with a concurrent vk-driver test process.
         let dir =
             std::env::temp_dir().join(format!("virtkit-test-pull-lock-{}", std::process::id()));
-        let addr = pull_lock_addr(&dir).unwrap();
+        let addr = pull_lock_addr(pull_lock_hash(&dir)).unwrap();
         let held = UnixListener::bind_addr(&addr).unwrap();
         let err = UnixListener::bind_addr(&addr).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
@@ -432,6 +530,32 @@ mod tests {
         // A concurrent test that spawns a subprocess can briefly inherit this listener fd across
         // `fork()`, keeping the abstract name bound past our drop until the child execs; retry
         // the rebind until it frees rather than failing on that transient contention.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match UnixListener::bind_addr(&addr) {
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the lock addr stayed bound after release"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("rebinding the released lock addr failed: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn pull_lock_answers_holder_identity_then_releases() {
+        let dir = std::env::temp_dir().join(format!("virtkit-test-holder-{}", std::process::id()));
+        let addr = pull_lock_addr(pull_lock_hash(&dir)).unwrap();
+        let lock = acquire_pull_lock(&dir, "build", "sha256:x").unwrap();
+        // a waiter reads the holder's identity over the lock socket (pid fallback, no CI env)
+        let who = query_holder(&addr).expect("the holder should answer");
+        assert!(!who.trim().is_empty());
+        // released on drop: the addr binds again (retry for fork-inherited fd races)
+        drop(lock);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             match UnixListener::bind_addr(&addr) {
