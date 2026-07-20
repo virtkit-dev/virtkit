@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-20
+
 ### Added
 
 - `vk cache gc [--idle-secs N]` reclaims the host image cache on demand: evicts materialized
@@ -874,7 +876,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/wallix/virtkit/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/wallix/virtkit/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/wallix/virtkit/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/wallix/virtkit/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/wallix/virtkit/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/wallix/virtkit/compare/v0.13.0...v0.14.0
