@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- A `dockerfile:` image's build context now defaults to the Dockerfile's own directory (like
+  `docker build <dir>`) instead of the repo root, so a Dockerfile outside the repo root finds
+  its `COPY` sources and `.dockerignore`. Add `?context=<dir>` to the image ref to override it
+  (e.g. `?context=.` for the previous repo-root context).
+
 ## [0.18.0] - 2026-07-20
 
 ### Added

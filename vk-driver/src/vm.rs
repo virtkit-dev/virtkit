@@ -205,7 +205,7 @@ fn resolve_media(ctx: &JobCtx) -> Result<(Option<PathBuf>, Media, bool)> {
     }
 }
 
-/// The job's primary as a git-defined image (`MICROVM_IMAGE: dockerfile:<path>[#<stage>]`):
+/// The job's primary as a git-defined image (`MICROVM_IMAGE: dockerfile:<path>[?context=<dir>][#<stage>]`):
 /// build it and return it as generic-disk boot media (embedded kernel, agent + config riding
 /// the preinit initramfs — the byte-clean model `vk build`/bundles use).
 fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<(Option<PathBuf>, Media, bool)> {
@@ -221,10 +221,11 @@ fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<(Option<PathBuf>,
     ))
 }
 
-/// Build a git-defined image `<path>[#<stage>]` from the host-side checkout into the shared
-/// build tier and return its rootfs + captured runtime config. Shared by the job's primary
-/// (`resolve_dockerfile_form`) and its git-defined services (`plan_services`). Requires
-/// `[gitlab] host_checkout`: the Dockerfile + context are the checked-out sources.
+/// Build a git-defined image `<path>[?context=<dir>][#<stage>]` from the host-side checkout into
+/// the shared build tier and return its rootfs + captured runtime config. Shared by the job's
+/// primary (`resolve_dockerfile_form`) and its git-defined services (`plan_services`). Requires
+/// `[gitlab] host_checkout`: the Dockerfile + context are the checked-out sources. The context
+/// defaults to the Dockerfile's directory; `?context=<dir>` overrides it.
 /// `--build-arg`s come from `CUSTOM_ENV_MICROVM_BUILD_ARG_<NAME>`.
 fn build_git_image(
     ctx: &JobCtx,
@@ -237,19 +238,15 @@ fn build_git_image(
              Dockerfile and its context are the checked-out sources"
         );
     }
-    let (rel_dockerfile, stage) = match spec.split_once('#') {
-        Some((f, s)) => (f, Some(s)),
-        None => (spec, None),
-    };
+    let (rel_dockerfile, rel_context, stage) = parse_dockerfile_spec(spec)?;
     let checkout = ctx.host_checkout_dir();
     // The Dockerfile path is job-controlled; confine it to the checkout so a `dockerfile:` job
     // cannot read another tenant's checkout or an arbitrary host file during the host-side
     // build (this runs outside the microVM boundary).
     let dockerfile = confined_dockerfile(&checkout, rel_dockerfile)?;
-    // compose semantics: the repo root is the one build context (Dockerfile COPYs are
-    // repo-relative), matching how ci-buildimage.sh builds these stages.
+    let context = resolve_build_context(&checkout, &dockerfile, rel_context)?;
     let dockerfiles = vec![dockerfile];
-    let contexts = vec![checkout];
+    let contexts = vec![context];
     let build_args = ci_build_args();
     let stage_key = crate::build::target_stage_key(&dockerfiles, &contexts, &build_args, stage)
         .context("computing the git-defined image's stage fingerprint")?;
@@ -298,7 +295,7 @@ fn confined_dockerfile(checkout: &Path, rel: &str) -> Result<PathBuf> {
             Component::ParentDir | Component::RootDir | Component::Prefix(_)
         )
     }) {
-        bail!("dockerfile: path must be relative and stay inside the repo: {rel:?}");
+        bail!("dockerfile:/context path must be relative and stay inside the repo: {rel:?}");
     }
     let root = checkout
         .canonicalize()
@@ -319,6 +316,69 @@ fn confine_under(root: &Path, path: &Path) -> Result<PathBuf> {
         bail!("path {} resolves outside the repo checkout", path.display());
     }
     Ok(canon)
+}
+
+/// Resolve a git-defined image's build context against the checkout. It defaults to the
+/// (already-confined) Dockerfile's own directory — like `docker build <dir>`, so the
+/// Dockerfile's `COPY`/`.dockerignore` paths are relative to where it lives — and re-confines
+/// that directory, so a degenerate Dockerfile path resolving to the checkout root itself (whose
+/// parent lies outside the checkout) is rejected rather than escaping it. A `?context=<dir>`
+/// override is confined to the checkout the same way the Dockerfile path is.
+fn resolve_build_context(
+    checkout: &Path,
+    dockerfile: &Path,
+    rel_context: Option<&str>,
+) -> Result<PathBuf> {
+    match rel_context {
+        Some(rel) => confined_dockerfile(checkout, rel),
+        None => {
+            let root = checkout
+                .canonicalize()
+                .with_context(|| format!("resolving the checkout {}", checkout.display()))?;
+            let parent = dockerfile
+                .parent()
+                .context("a dockerfile: path has no parent directory")?;
+            confine_under(&root, parent)
+        }
+    }
+}
+
+/// Parse a `dockerfile:` image spec's body — `<path>[?context=<dir>][#<stage>]` — into its
+/// Dockerfile path, an optional context override, and an optional build target. Query before
+/// fragment, URL-style: `?context=<dir>` overrides the build context (default: the Dockerfile's
+/// own directory) and `#<stage>` selects a target — the `#` binds first, so a `?context=` after
+/// a `#` lands inside the stage rather than being parsed as a parameter. Anything other than a
+/// single non-empty `context=<dir>` — an unknown parameter, an empty value, or a repeated
+/// `context=` — is rejected so a typo fails loudly rather than silently building the wrong context.
+fn parse_dockerfile_spec(spec: &str) -> Result<(&str, Option<&str>, Option<&str>)> {
+    let (head, stage) = match spec.split_once('#') {
+        Some((h, s)) => (h, Some(s)),
+        None => (spec, None),
+    };
+    let (path, query) = match head.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (head, None),
+    };
+    let mut context = None;
+    for kv in query
+        .into_iter()
+        .flat_map(|q| q.split('&'))
+        .filter(|s| !s.is_empty())
+    {
+        match kv.split_once('=') {
+            Some(("context", "")) => {
+                bail!(
+                    "dockerfile: context= value must not be empty (use context=. for the repo root)"
+                )
+            }
+            Some(("context", _)) if context.is_some() => {
+                bail!("dockerfile: context specified more than once in {query:?}")
+            }
+            Some(("context", v)) => context = Some(v),
+            _ => bail!("unknown dockerfile: parameter {kv:?} (expected context=<dir>)"),
+        }
+    }
+    Ok((path, context, stage))
 }
 
 /// `--build-arg`s for a git-defined image, from `CUSTOM_ENV_MICROVM_BUILD_ARG_<NAME>=<value>`
@@ -1479,6 +1539,90 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn parse_dockerfile_spec_splits_path_context_and_stage() {
+        // Bare path: no context override, no stage — the context defaults to the Dockerfile's dir.
+        assert_eq!(
+            parse_dockerfile_spec("docker/wabbuilder/Dockerfile").unwrap(),
+            ("docker/wabbuilder/Dockerfile", None, None)
+        );
+        // `#<stage>` selects a target.
+        assert_eq!(
+            parse_dockerfile_spec("docker/wabbuilder/Dockerfile#bastion-builder").unwrap(),
+            (
+                "docker/wabbuilder/Dockerfile",
+                None,
+                Some("bastion-builder")
+            )
+        );
+        // `?context=<dir>` overrides the context; query comes before the `#` fragment.
+        assert_eq!(
+            parse_dockerfile_spec("docker/wabbuilder/Dockerfile?context=.#bastion-builder")
+                .unwrap(),
+            (
+                "docker/wabbuilder/Dockerfile",
+                Some("."),
+                Some("bastion-builder")
+            )
+        );
+        // A context override without a stage.
+        assert_eq!(
+            parse_dockerfile_spec("a/Dockerfile?context=a/ctx").unwrap(),
+            ("a/Dockerfile", Some("a/ctx"), None)
+        );
+        // An empty query (`?` with nothing after it) leaves the path bare, no context.
+        assert_eq!(
+            parse_dockerfile_spec("a/Dockerfile?").unwrap(),
+            ("a/Dockerfile", None, None)
+        );
+        // The `#` binds before the `?`, so a `?context=` placed after a `#` is swallowed by the
+        // stage rather than parsed as a parameter — pin that ordering.
+        assert_eq!(
+            parse_dockerfile_spec("a/Dockerfile#s?context=.").unwrap(),
+            ("a/Dockerfile", None, Some("s?context=."))
+        );
+        // An unknown parameter is rejected rather than silently ignored.
+        assert!(parse_dockerfile_spec("a/Dockerfile?ctx=.#s").is_err());
+        // A known parameter mixed with an unknown one still fails loudly.
+        assert!(parse_dockerfile_spec("a/Dockerfile?context=.&bogus=1").is_err());
+        // An empty `context=` value is a mistake (use `context=.` for the repo root), not a
+        // silent revert to the old repo-root default.
+        assert!(parse_dockerfile_spec("a/Dockerfile?context=").is_err());
+        // A repeated `context=` is rejected rather than silently taking one.
+        assert!(parse_dockerfile_spec("a/Dockerfile?context=a&context=b").is_err());
+    }
+
+    #[test]
+    fn resolve_build_context_defaults_to_the_dockerfile_dir_and_stays_confined() {
+        let root = std::env::temp_dir().join(format!("vk-ctx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("docker").join("ci")).unwrap();
+        std::fs::write(root.join("docker").join("Dockerfile"), b"FROM scratch\n").unwrap();
+        let canon_root = root.canonicalize().unwrap();
+
+        // With no override, the context defaults to the (confined) Dockerfile's own directory.
+        let dockerfile = confined_dockerfile(&root, "docker/Dockerfile").unwrap();
+        assert_eq!(
+            resolve_build_context(&root, &dockerfile, None).unwrap(),
+            canon_root.join("docker")
+        );
+
+        // A `?context=<dir>` override is confined and resolves inside the checkout.
+        assert_eq!(
+            resolve_build_context(&root, &dockerfile, Some("docker/ci")).unwrap(),
+            canon_root.join("docker").join("ci")
+        );
+        // An override escaping the checkout is refused, the same way the Dockerfile path is.
+        assert!(resolve_build_context(&root, &dockerfile, Some("../escape")).is_err());
+
+        // A degenerate Dockerfile path that resolves to the checkout root itself would default
+        // its context to the root's parent — outside the checkout — so it is refused.
+        let root_as_dockerfile = confined_dockerfile(&root, ".").unwrap();
+        assert!(resolve_build_context(&root, &root_as_dockerfile, None).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
