@@ -138,6 +138,9 @@ pub struct RunArgs {
     pub init: InitSource,
     /// attach an interactive shell once the guest is up (needs a terminal)
     pub shell: bool,
+    /// allocate a pty for the command and wire it to the local terminal, so it runs
+    /// interactively (`docker run -t`; needs a terminal). Ignored under `--shell`.
+    pub tty: bool,
     /// give the guest egress via a userspace `vk switch` (DHCP + DNS + proxy);
     /// forced on by `compose` (the services live on that switch's LAN)
     pub net: bool,
@@ -215,8 +218,9 @@ pub struct RunArgs {
 
 pub async fn run(args: &RunArgs) -> Result<()> {
     // SAFETY: isatty has no failure mode beyond returning 0
-    if args.shell && unsafe { libc::isatty(0) != 1 || libc::isatty(1) != 1 } {
-        bail!("--shell requires stdin and stdout to be a terminal");
+    if (args.shell || args.tty) && unsafe { libc::isatty(0) != 1 || libc::isatty(1) != 1 } {
+        let flag = if args.shell { "--shell" } else { "-t" };
+        bail!("{flag} requires stdin and stdout to be a terminal");
     }
     // The VMM process-name template for every VM this run boots (the primary, plus any
     // compose siblings and Dockerfile stage builds, which reach it via the process-global).
@@ -491,13 +495,14 @@ async fn build_and_boot(
     // The image-init preinit applies the virtkit setup the image's own init won't do
     // (host volume mounts, symlinks, the ssh/exec serves, env, and an eth0 bridge the
     // image DHCPs on) before handing off to systemd. The host-exec channel, compose
-    // and an interactive shell are not wired for image init yet — reject them rather
-    // than silently ignore.
+    // and an interactive pty (--shell or -t) are not wired for image init yet — reject
+    // them rather than silently ignore.
     if args.init == InitSource::Image {
         let unsupported = [
             (args.host_exec, "--host-exec"),
             (args.compose.is_some(), "--compose"),
             (args.shell, "--shell"),
+            (args.tty, "-t"),
         ]
         .into_iter()
         .filter(|(set, _)| *set)
@@ -2131,18 +2136,26 @@ async fn drive(
         script.push_str(&format!("export {k}={}; ", sh_quote(v)));
     }
     script.push_str(&body);
-    let command = vec!["sh".into(), "-c".into(), script];
     let t_exec = Instant::now();
-    let result = crate::executor::exec_script(
-        addr,
-        &command,
-        Vec::new(),
-        None,
-        &crate::executor::OutputSink::Inherit,
-        None,
-    )
-    .await
-    .context("running the command in the guest")?;
+    // `-t`: run the command interactively under a remote pty wired to the local terminal
+    // (`docker run -t`); otherwise relay its stdout/stderr straight through.
+    let result = if args.tty {
+        run_tty(addr, "sh", vec!["-c".into(), script])
+            .await
+            .context("running the command in the guest (tty)")?
+    } else {
+        let command = vec!["sh".into(), "-c".into(), script];
+        crate::executor::exec_script(
+            addr,
+            &command,
+            Vec::new(),
+            None,
+            &crate::executor::OutputSink::Inherit,
+            None,
+        )
+        .await
+        .context("running the command in the guest")?
+    };
     timings.record(Phase::Exec, "", t_exec.elapsed());
     match result.code {
         Some(0) | None => Ok(()),
@@ -2174,18 +2187,21 @@ async fn write_guest_ssh_config(addr: &SocketAddr, config: &str) -> Result<()> {
     }
 }
 
-/// Attach an interactive shell to the guest: a remote PTY wired to the local
-/// terminal (raw mode), sized to it. Returns when the shell exits, whatever its
-/// status — a shell that quits non-zero is not a launch failure.
-async fn run_shell(addr: &SocketAddr) -> Result<()> {
+/// Run `name args…` interactively in the guest over a remote PTY wired to the local
+/// terminal (raw mode), sized to it. Returns when the process exits, with its result.
+async fn run_tty(
+    addr: &SocketAddr,
+    name: &str,
+    args: Vec<String>,
+) -> Result<vk_core::messages::CmdResult> {
     use vk_core::messages::{CmdExec, RunMode, Tty};
     let (rows, cols) = vk_core::pty::get_winsize(0).unwrap_or((24, 80));
     let (stream, sink) = vk_core::net::connect(addr)
         .await
         .context("connecting to the VM's vk-agent")?;
     let exec = CmdExec {
-        name: "sh".into(),
-        args: vec!["-i".into()],
+        name: name.into(),
+        args,
         env: vec![],
         clear_env: false,
         mode: RunMode::Interactive,
@@ -2197,7 +2213,13 @@ async fn run_shell(addr: &SocketAddr) -> Result<()> {
         }),
         user: None,
     };
-    vk_core::exec::client::client_run_tty(stream, sink, exec)
+    vk_core::exec::client::client_run_tty(stream, sink, exec).await
+}
+
+/// Attach an interactive shell to the guest. Returns when the shell exits, whatever its
+/// status — a shell that quits non-zero is not a launch failure.
+async fn run_shell(addr: &SocketAddr) -> Result<()> {
+    run_tty(addr, "sh", vec!["-i".into()])
         .await
         .context("interactive guest shell")?;
     Ok(())

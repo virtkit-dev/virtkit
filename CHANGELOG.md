@@ -13,6 +13,8 @@ All notable changes to virtkit will be documented in this file.
   needs no direct Docker Hub egress. Only Docker Hub is routed; other registries are
   untouched. The mirror carries its own optional auth
   (`ca_file`/`username`/`password_file`/`insecure`), independent of `[docker]`.
+- `vk run -t`/`--tty`: allocate a pty for the trailing command and wire it to the local
+  terminal, so it runs interactively (`docker run -t`).
 - Concurrent-pull diagnostics: when a prepare waits on the local pull/build lock, the
   "waiting for a concurrent pull" message now names the holding job (its `CI_JOB_URL`, else
   job id/pid), served by the holder over the lock's own abstract socket — so a stuck build is

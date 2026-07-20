@@ -571,6 +571,10 @@ enum Cmd {
         /// ignores any trailing command
         #[arg(long)]
         shell: bool,
+        /// Allocate a pty for the trailing command and wire it to the local terminal,
+        /// so it runs interactively (`docker run -t`; requires a terminal)
+        #[arg(short = 't', long = "tty", conflicts_with = "detach")]
+        tty: bool,
         /// Give the guest network egress via a userspace `vk switch`
         /// (DHCP + DNS + transparent proxy over vsock)
         #[arg(long)]
@@ -1011,6 +1015,7 @@ async fn cli_main() -> ExitCode {
         ram,
         init,
         shell,
+        tty,
         net,
         registry_proxy,
         compose,
@@ -1047,6 +1052,7 @@ async fn cli_main() -> ExitCode {
         if services_only
             && (!command.is_empty()
                 || *shell
+                || *tty
                 || *ssh
                 || !ssh_key.is_empty()
                 || *ssh_agent
@@ -1061,7 +1067,7 @@ async fn cli_main() -> ExitCode {
             return fail(
                 &anyhow::anyhow!(
                     "--compose without an image/-f/--primary is services-only (compose up) — \
-                     there is no primary VM for a command, --shell, --ssh, --workdir, \
+                     there is no primary VM for a command, --shell, -t, --ssh, --workdir, \
                      --volume, --symlink, --env, --env-file, or --host-exec"
                 ),
                 2,
@@ -1142,6 +1148,7 @@ async fn cli_main() -> ExitCode {
             ram: *ram,
             init: *init,
             shell: *shell,
+            tty: *tty,
             // services live on the run switch's LAN: --compose implies it.
             net: *net || compose.is_some(),
             registry_proxy: registry_proxy.clone(),
