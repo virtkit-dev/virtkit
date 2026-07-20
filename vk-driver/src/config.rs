@@ -122,6 +122,11 @@ pub struct Gitlab {
     /// share into an untrusted job guest is added host-side attack surface.
     #[serde(default)]
     pub host_checkout: bool,
+    /// Root directory the `host_checkout` trees are cloned into on the host, keyed under it by
+    /// the runner's concurrent slot + project. Unset = `<state_dir>/checkouts`. Point it at the
+    /// runner's RAM-backed builds tmpfs (e.g. `/builds`) so the clone and every in-job write to
+    /// the shared tree stay in host RAM instead of hitting the state disk.
+    pub checkout_dir: Option<PathBuf>,
 }
 
 /// Egress allowlist for the per-job switch (`net.mode = "switch"`). Both lists
@@ -463,6 +468,24 @@ mod tests {
             cfg.gitlab.as_ref().unwrap().dir.as_deref(),
             Some(Path::new("/usr/local/lib/vk/ci-tools"))
         );
+    }
+
+    #[test]
+    fn gitlab_checkout_dir_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [gitlab]
+            host_checkout = true
+            checkout_dir = "/builds"
+            "#,
+        )
+        .unwrap();
+        let g = cfg.gitlab.as_ref().unwrap();
+        assert!(g.host_checkout);
+        assert_eq!(g.checkout_dir.as_deref(), Some(Path::new("/builds")));
+        // absent = None: the on-disk `<state_dir>/checkouts` default is preserved
+        let bare: Config = toml::from_str("[gitlab]\ndir = \"/x\"\n").unwrap();
+        assert!(bare.gitlab.as_ref().unwrap().checkout_dir.is_none());
     }
 
     #[test]

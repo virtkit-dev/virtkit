@@ -106,11 +106,19 @@ impl JobCtx {
     /// keyed by the runner's concurrent slot + project so sequential jobs reuse it (a fetch, not
     /// a re-clone) while concurrent jobs on the same runner stay isolated.
     pub fn host_checkout_dir(&self) -> PathBuf {
-        self.cfg
-            .state_dir()
-            .join("checkouts")
-            .join(&self.concurrent_id)
-            .join(&self.project_slug)
+        // `[gitlab] checkout_dir` (e.g. the RAM-backed /builds tmpfs) overrides the on-disk
+        // default so the clone and the job's writes to the shared tree stay in host RAM. The
+        // slot/project key still comes from sanitized env, never a job-controlled absolute path.
+        let root = match self
+            .cfg
+            .gitlab
+            .as_ref()
+            .and_then(|g| g.checkout_dir.as_ref())
+        {
+            Some(dir) => dir.clone(),
+            None => self.cfg.state_dir().join("checkouts"),
+        };
+        root.join(&self.concurrent_id).join(&self.project_slug)
     }
 
     pub fn overlay(&self) -> PathBuf {
@@ -200,4 +208,63 @@ fn exit_code_env(name: &str, fallback: i32) -> i32 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(fallback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Gitlab;
+
+    // A JobCtx with a fixed slot/project key, built directly so `host_checkout_dir` is
+    // exercised without depending on the ambient CI_* env.
+    fn ctx(cfg: Config) -> JobCtx {
+        JobCtx {
+            cfg,
+            job_id: "job1".into(),
+            job_dir: PathBuf::from("/tmp/job1"),
+            image_ref: None,
+            cpus_req: None,
+            mem_req: None,
+            user_req: None,
+            egress_allow_name_req: None,
+            build_failure: 1,
+            system_failure: 2,
+            ci_repo_url: None,
+            ci_commit_sha: None,
+            ci_commit_ref: None,
+            ci_project_dir: None,
+            concurrent_id: "0".into(),
+            project_slug: "myproj".into(),
+        }
+    }
+
+    #[test]
+    fn host_checkout_dir_defaults_under_state_dir() {
+        let cfg = Config {
+            state_dir: Some(PathBuf::from("/var/lib/vk")),
+            ..Default::default()
+        };
+        assert_eq!(
+            ctx(cfg).host_checkout_dir(),
+            PathBuf::from("/var/lib/vk/checkouts/0/myproj")
+        );
+    }
+
+    #[test]
+    fn host_checkout_dir_honors_checkout_dir_override() {
+        let cfg = Config {
+            state_dir: Some(PathBuf::from("/var/lib/vk")),
+            gitlab: Some(Gitlab {
+                host_checkout: true,
+                checkout_dir: Some(PathBuf::from("/builds")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // The override replaces the `<state_dir>/checkouts` root; the slot/project key is unchanged.
+        assert_eq!(
+            ctx(cfg).host_checkout_dir(),
+            PathBuf::from("/builds/0/myproj")
+        );
+    }
 }

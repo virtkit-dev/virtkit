@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `[gitlab] checkout_dir` overrides where the `host_checkout` mode clones a job's sources on
+  the host (default `<state_dir>/checkouts`), so a runner can keep the checkout and the job's
+  writes on a RAM-backed tmpfs instead of the state disk.
+
 ## [0.17.0] - 2026-07-20
 
 ### Added
