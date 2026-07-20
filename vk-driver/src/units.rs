@@ -53,6 +53,7 @@ pub struct BuildOpts {
     pub agent: PathBuf,
     pub cache_registry: Option<String>,
     pub cache_insecure: bool,
+    pub cache_auth: crate::build::CacheAuth,
 }
 
 /// The build recipe + target + stage key for a `build:` unit, shared by the ext4-path
@@ -87,6 +88,7 @@ fn build_recipe(
         agent: build.map(|b| b.agent.clone()),
         cache_registry: build.and_then(|b| b.cache_registry.clone()),
         cache_insecure: build.is_some_and(|b| b.cache_insecure),
+        cache_auth: build.map(|b| b.cache_auth.clone()).unwrap_or_default(),
     };
     Ok((recipe, target.clone(), key))
 }
@@ -478,6 +480,7 @@ mod tests {
             agent: "/nonexistent".into(),
             cache_registry: Some("none".into()),
             cache_insecure: false,
+            cache_auth: Default::default(),
         };
         let err = ensure_unit_build_sync(
             &unit,

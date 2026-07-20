@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `[build]` gained `cache_ca_file`, `cache_username` and `cache_password_file`: the shared
+  instruction-cache registry (`cache_registry`) can now be a remote vk-registry gated by TLS
+  (a private/self-signed CA) and HTTP Basic auth. This is also what the build-once `/lock/`
+  uses, so a central authenticated vk-registry gives cross-runner build-cache sharing and a
+  fleet-wide build lock. Previously the cache client was anonymous over the system roots.
+
 ### Changed
 
 - A `dockerfile:` image's build context now defaults to the Dockerfile's own directory (like

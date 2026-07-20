@@ -264,6 +264,11 @@ fn build_git_image(
         agent: cfg.build.agent.clone(),
         cache_registry: cfg.build.cache_registry.clone(),
         cache_insecure: cfg.build.cache_insecure,
+        cache_auth: crate::build::CacheAuth {
+            ca_file: cfg.build.cache_ca_file.clone(),
+            username: cfg.build.cache_username.clone(),
+            password_file: cfg.build.cache_password_file.clone(),
+        },
     };
     let dir = crate::ensure::ensure_build_tier(
         cfg.state_dir(),
@@ -588,6 +593,11 @@ fn build_compose_unit(
         agent: agent.path.clone(),
         cache_registry: cfg.build.cache_registry.clone(),
         cache_insecure: cfg.build.cache_insecure,
+        cache_auth: crate::build::CacheAuth {
+            ca_file: cfg.build.cache_ca_file.clone(),
+            username: cfg.build.cache_username.clone(),
+            password_file: cfg.build.cache_password_file.clone(),
+        },
     };
     let ext4 = crate::units::build_unit_ext4(cfg.state_dir(), &build.build_args, unit)?;
     let config = crate::units::ensure_unit_build_sync(

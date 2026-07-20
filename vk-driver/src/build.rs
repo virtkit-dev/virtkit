@@ -135,6 +135,16 @@ fn checkpoint_secs() -> u64 {
 /// streamed transport the service manager forwards to a guest that requested a service start.
 pub type ProgressSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
+/// CA + HTTP Basic credentials for the build-cache registry (a remote vk-registry), so a
+/// TLS-and-auth-gated cache/lock server is reachable. All-empty (the `Default`) = anonymous
+/// over the system roots — a loopback or open cache, and the local-store case.
+#[derive(Debug, Clone, Default)]
+pub struct CacheAuth {
+    pub ca_file: Option<PathBuf>,
+    pub username: String,
+    pub password_file: Option<PathBuf>,
+}
+
 /// What/how to build.
 pub struct Options {
     /// Dockerfile(s), merged into one stage namespace (see [`Plan::from_dockerfiles`]).
@@ -166,6 +176,9 @@ pub struct Options {
     pub cache_registry: Option<String>,
     /// the cache registry speaks plain HTTP (a loopback vk-registry).
     pub cache_insecure: bool,
+    /// CA + Basic auth for the cache registry when it is a remote, TLS-and-auth-gated
+    /// vk-registry. `Default` (empty) for a loopback/open cache or the local store.
+    pub cache_auth: CacheAuth,
     /// how aggressively the instruction cache is populated (see [`BuildCache`]).
     pub build_cache: BuildCache,
     /// add an ext4 journal to the exported image (the build stays journal-less).
@@ -460,9 +473,9 @@ fn make_microvm(
         crate::config::Registry::for_share(
             repo,
             opts.cache_insecure,
-            None,
-            String::new(),
-            None,
+            opts.cache_auth.ca_file.clone(),
+            opts.cache_auth.username.clone(),
+            opts.cache_auth.password_file.clone(),
             None,
         )
     });
@@ -3632,6 +3645,7 @@ ENTRYPOINT run me
             agent: None,
             cache_registry: Some("none".into()),
             cache_insecure: false,
+            cache_auth: Default::default(),
             build_cache: BuildCache::default(),
             journal: false,
             tmp_tmpfs: false,
@@ -3691,6 +3705,7 @@ ENTRYPOINT run me
             agent: None,
             cache_registry: Some("none".into()),
             cache_insecure: false,
+            cache_auth: Default::default(),
             build_cache: BuildCache::default(),
             journal: false,
             tmp_tmpfs: false,
@@ -3899,6 +3914,7 @@ RUN ship
             agent: None,
             cache_registry: None,
             cache_insecure: false,
+            cache_auth: Default::default(),
             build_cache: BuildCache::default(),
             journal: false,
             tmp_tmpfs: false,

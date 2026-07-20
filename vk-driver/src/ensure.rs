@@ -65,6 +65,7 @@ pub struct BuildRecipe {
     pub agent: Option<PathBuf>,
     pub cache_registry: Option<String>,
     pub cache_insecure: bool,
+    pub cache_auth: crate::build::CacheAuth,
 }
 
 /// A unit image is fresh when its UUID is the expected fingerprint *and* its runtime
@@ -103,6 +104,7 @@ pub fn ensure_unit_build(
         agent: recipe.agent.clone(),
         cache_registry: recipe.cache_registry.clone(),
         cache_insecure: recipe.cache_insecure,
+        cache_auth: recipe.cache_auth.clone(),
         build_cache: crate::build::BuildCache::default(),
         journal: false,
         tmp_tmpfs: false,
@@ -202,6 +204,7 @@ mod tests {
             agent: None,
             cache_registry: Some("none".into()),
             cache_insecure: false,
+            cache_auth: Default::default(),
         };
         let key = "deadbeef";
         let expected = fingerprint(&[key]);

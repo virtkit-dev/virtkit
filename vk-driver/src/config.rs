@@ -82,6 +82,14 @@ pub struct Build {
     pub cache_registry: Option<String>,
     /// the cache registry speaks plain HTTP (a loopback vk-registry).
     pub cache_insecure: bool,
+    /// PEM CA the cache registry's TLS cert chains to (rustls). Absent = system roots; set
+    /// it when `cache_registry` is a remote vk-registry with a private/self-signed cert.
+    pub cache_ca_file: Option<PathBuf>,
+    /// HTTP Basic username for the cache registry. Empty = anonymous.
+    pub cache_username: String,
+    /// Path to a file holding the cache registry's Basic-auth password (read at runtime,
+    /// trailing newline trimmed; only when `cache_username` is set). Provision 0600 out of band.
+    pub cache_password_file: Option<PathBuf>,
     /// how aggressively the instruction cache is populated: `auto` (default), `layers`
     /// (one snapshot per stage), or `instructions` (one per RUN/COPY).
     pub build_cache: crate::build::BuildCache,

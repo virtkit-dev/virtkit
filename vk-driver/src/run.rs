@@ -590,6 +590,7 @@ async fn build_and_boot(
             agent: Some(agent.to_path_buf()),
             cache_registry: args.cache_registry.clone(),
             cache_insecure: args.cache_insecure,
+            cache_auth: Default::default(),
             build_cache: crate::build::BuildCache::default(),
             journal: false,
             tmp_tmpfs: false,
@@ -1654,6 +1655,7 @@ fn manager_build_opts(args: &RunArgs, kernel: &Path, agent: &Path) -> crate::uni
         agent: agent.to_path_buf(),
         cache_registry: args.cache_registry.clone(),
         cache_insecure: args.cache_insecure,
+        cache_auth: Default::default(),
     }
 }
 
@@ -1678,6 +1680,7 @@ pub(crate) fn service_build_options(
         agent: Some(agent.to_path_buf()),
         cache_registry: args.cache_registry.clone(),
         cache_insecure: args.cache_insecure,
+        cache_auth: Default::default(),
         build_cache: crate::build::BuildCache::default(),
         journal: false,
         tmp_tmpfs: false,

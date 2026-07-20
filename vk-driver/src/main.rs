@@ -1426,6 +1426,11 @@ async fn cli_main() -> ExitCode {
             agent: agent.clone().or_else(|| b.agent.clone()),
             cache_registry: cache_registry.clone().or_else(|| b.cache_registry.clone()),
             cache_insecure: *cache_insecure || b.cache_insecure,
+            cache_auth: crate::build::CacheAuth {
+                ca_file: b.cache_ca_file.clone(),
+                username: b.cache_username.clone(),
+                password_file: b.cache_password_file.clone(),
+            },
             build_cache,
             journal: *journal || b.journal,
             tmp_tmpfs: *build_tmp_tmpfs || b.tmp_tmpfs,
