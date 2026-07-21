@@ -25,6 +25,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- `vk run --cloud-hypervisor` now defaults to the `cloud_hypervisor` binary set in the
+  config (matching `vk build`), instead of ignoring it and always using `cloud-hypervisor`
+  from `PATH`.
 - `vk --help` now shows only the everyday commands (`run`, `build`, `exec`, `gc`,
   `check`) plus usage examples; `vk help-all` lists the advanced/plumbing commands.
 - The host image-cache sweep is now `vk gc` (was `vk cache gc`).

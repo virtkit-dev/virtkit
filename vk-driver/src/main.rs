@@ -581,9 +581,10 @@ enum Cmd {
         /// Static (musl) vk-agent injected as PID 1. Defaults to the copy embedded in `vk`.
         #[arg(long = "agent")]
         agent: Option<PathBuf>,
-        /// cloud-hypervisor binary
-        #[arg(long, default_value = "cloud-hypervisor")]
-        cloud_hypervisor: PathBuf,
+        /// cloud-hypervisor binary (default: the config's top-level `cloud_hypervisor`,
+        /// else `cloud-hypervisor` on PATH). Only used with VIRTKIT_VMM=cloud-hypervisor.
+        #[arg(long)]
+        cloud_hypervisor: Option<PathBuf>,
         /// vCPUs: a number, or `host` for as many as the host has (its logical CPU count)
         #[arg(long, default_value = "2", value_parser = parse_cpus)]
         cpus: u32,
@@ -1402,7 +1403,11 @@ async fn cli_main() -> ExitCode {
             workdir: workdir.clone(),
             kernel: kernel.clone(),
             agent: agent.clone(),
-            cloud_hypervisor: cloud_hypervisor.clone(),
+            // CLI flag wins; else the config's top-level cloud_hypervisor (bare
+            // "cloud-hypervisor" when unset). vk run has no [build] tier to consult.
+            cloud_hypervisor: cloud_hypervisor
+                .clone()
+                .unwrap_or_else(|| cfg.cloud_hypervisor().to_path_buf()),
             source: *source,
             ca: ca.clone(),
             username: username.clone(),
