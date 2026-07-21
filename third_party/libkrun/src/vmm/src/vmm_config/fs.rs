@@ -15,4 +15,7 @@ pub struct FsDeviceConfig {
     pub gid_map: Vec<String>,
     #[cfg(not(feature = "aws-nitro"))]
     pub virtual_entries: Vec<VirtualDirEntry>,
+    /// How long (ms) the guest may cache a failed (ENOENT) lookup. `0` = no caching
+    /// (the previous behavior: every miss round-trips).
+    pub negative_timeout_ms: u32,
 }

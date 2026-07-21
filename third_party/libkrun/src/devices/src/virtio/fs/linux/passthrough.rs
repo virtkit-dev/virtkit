@@ -342,6 +342,13 @@ pub struct Config {
     /// The default value for this option is 5 seconds.
     pub attr_timeout: Duration,
 
+    /// How long the FUSE client may cache a failed (ENOENT) lookup. Zero (the default)
+    /// disables caching: every miss is a round-trip, which build tools that probe many
+    /// nonexistent paths (compiler include search) pay thousands of times. A nonzero
+    /// value bounds how long a host-created file can stay invisible to the guest after
+    /// a miss on the same name.
+    pub negative_timeout: Duration,
+
     /// The caching policy the file system should use. See the documentation of `CachePolicy` for
     /// more details.
     pub cache_policy: CachePolicy,
@@ -391,6 +398,7 @@ impl Default for Config {
         Config {
             entry_timeout: Duration::from_secs(5),
             attr_timeout: Duration::from_secs(5),
+            negative_timeout: Duration::ZERO,
             cache_policy: Default::default(),
             writeback: false,
             root_dir: String::from("/"),
@@ -977,7 +985,24 @@ impl FileSystem for PassthroughFs {
             )
         };
         if fd < 0 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            // A zero-inode entry with a timeout lets the FUSE client cache the
+            // ENOENT (the kernel sends no FORGET for nodeid 0); a plain error
+            // reply creates a negative dentry the client must revalidate on
+            // every touch.
+            if !self.cfg.negative_timeout.is_zero() && err.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(Entry {
+                    inode: 0,
+                    generation: 0,
+                    // Safe: a fully-zeroed stat64 is a valid value of the C
+                    // struct; the client ignores attrs on a negative entry.
+                    attr: unsafe { std::mem::zeroed() },
+                    attr_flags: 0,
+                    attr_timeout: Duration::ZERO,
+                    entry_timeout: self.cfg.negative_timeout,
+                });
+            }
+            return Err(err);
         }
 
         // Safe because we just opened this fd.
@@ -2235,5 +2260,77 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.raw_os_error(), Some(libc::ENOTTY));
+    }
+
+    fn tmp_root() -> String {
+        // Unique per call: the tests run in parallel and each roots its own dir.
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "vk-ptf-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.to_str().unwrap().to_owned()
+    }
+
+    fn ctx() -> Context {
+        Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        }
+    }
+
+    // Returns the fs alongside its root path so the caller can remove the temp dir.
+    fn rooted_fs(negative_timeout: Duration) -> (PassthroughFs, String) {
+        let root_dir = tmp_root();
+        let cfg = Config {
+            root_dir: root_dir.clone(),
+            negative_timeout,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
+        // init() registers the root inode that lookup() traverses from.
+        fs.init(FsOptions::empty()).unwrap();
+        (fs, root_dir)
+    }
+
+    #[test]
+    fn negative_lookup_caches_miss_when_timeout_set() {
+        let timeout = Duration::from_millis(500);
+        let (fs, root) = rooted_fs(timeout);
+
+        let entry = fs
+            .lookup(
+                ctx(),
+                fuse::ROOT_ID,
+                &CString::new("does-not-exist").unwrap(),
+            )
+            .unwrap();
+
+        // A zero-inode entry carrying the timeout tells the client to cache the miss.
+        assert_eq!(entry.inode, 0);
+        assert_eq!(entry.entry_timeout, timeout);
+        assert_eq!(entry.attr_timeout, Duration::ZERO);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn negative_lookup_errors_when_timeout_zero() {
+        let (fs, root) = rooted_fs(Duration::ZERO);
+
+        // Entry isn't Debug, so match rather than unwrap_err().
+        match fs.lookup(
+            ctx(),
+            fuse::ROOT_ID,
+            &CString::new("does-not-exist").unwrap(),
+        ) {
+            Ok(_) => panic!("expected ENOENT, got a cached negative entry"),
+            Err(err) => assert_eq!(err.raw_os_error(), Some(libc::ENOENT)),
+        }
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

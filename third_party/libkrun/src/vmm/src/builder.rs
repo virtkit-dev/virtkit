@@ -1963,6 +1963,7 @@ fn attach_fs_devices(
                 config.uid_map.clone(),
                 config.gid_map.clone(),
                 config.virtual_entries.clone(),
+                config.negative_timeout_ms,
             )
             .unwrap(),
         ));

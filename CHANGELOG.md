@@ -12,6 +12,12 @@ All notable changes to virtkit will be documented in this file.
   `checkout_overlay` already gives, now on a plain `vk run` (e.g. a pre-commit hook that checks
   the tree without being able to mutate it).
 
+### Changed
+
+- **Faster builds that probe many missing paths.** virtio-fs now caches negative lookups, so
+  guest tools that walk include or `PATH` directories no longer pay a host round-trip for each
+  nonexistent path.
+
 ## [0.24.0] - 2026-07-22
 
 ### Added

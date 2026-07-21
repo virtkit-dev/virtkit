@@ -69,6 +69,7 @@ impl Fs {
         uid_map: Vec<String>,
         gid_map: Vec<String>,
         virtual_entries: Vec<VirtualDirEntry>,
+        negative_timeout_ms: u32,
     ) -> super::Result<Fs> {
         let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
@@ -79,6 +80,7 @@ impl Fs {
 
         let fs_cfg = shared_dir.map(|root_dir| passthrough::Config {
             root_dir,
+            negative_timeout: std::time::Duration::from_millis(negative_timeout_ms.into()),
             ..Default::default()
         });
 

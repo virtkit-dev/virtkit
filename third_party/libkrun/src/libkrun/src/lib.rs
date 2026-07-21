@@ -636,6 +636,7 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
                 read_only: false,
                 uid_map: Vec::new(),
                 gid_map: Vec::new(),
+                negative_timeout_ms: 0,
                 virtual_entries: {
                     #[allow(unused_mut)]
                     let mut v = Vec::new();
@@ -779,6 +780,7 @@ pub unsafe extern "C" fn krun_add_virtiofs4(
                 uid_map,
                 gid_map,
                 virtual_entries,
+                negative_timeout_ms: 0,
             });
         }
         Entry::Vacant(_) => return -libc::ENOENT,
@@ -2496,6 +2498,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                 uid_map: Vec::new(),
                 gid_map: Vec::new(),
                 virtual_entries,
+                negative_timeout_ms: 0,
             });
 
             ctx_cfg.set_block_root(device, fstype, options);
