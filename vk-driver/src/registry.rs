@@ -1330,14 +1330,21 @@ fn sha256_hex(data: &[u8]) -> String {
 /// Probe `GET /v2/` for the [`TRANSPARENT_ZSTD_HEADER`] a cooperating `regserve`
 /// advertises. Any failure — a dumb registry, a network/TLS error, a missing CA —
 /// yields `false`: fall back to the compressed-digest path. Only called in auto mode
-/// (`transparent_zstd` unset); the probe needs no auth (we only read our own header).
+/// (`transparent_zstd` unset). Sends Basic auth: an authenticated vk-registry challenges
+/// `/v2/` (401) like every other path, so an anonymous probe would just 401 and mis-detect
+/// as `false`.
 async fn detect_transparent_zstd(rg: &Registry, image: &OciReference) -> bool {
     let Ok(http) = http_client(rg) else {
         return false;
     };
     let scheme = if rg.insecure { "http" } else { "https" };
     let url = format!("{scheme}://{}/v2/", image.resolve_registry());
-    match http.get(&url).send().await {
+    let req = http.get(&url);
+    let req = match basic_auth(rg) {
+        Ok(Some((u, p))) => req.basic_auth(u, Some(p)),
+        _ => req,
+    };
+    match req.send().await {
         Ok(resp) => resp.headers().contains_key(TRANSPARENT_ZSTD_HEADER),
         Err(_) => false,
     }

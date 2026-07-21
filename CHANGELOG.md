@@ -6,6 +6,12 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- Authenticated `vk-registry` now challenges the `GET /v2/` version probe (401 +
+  `WWW-Authenticate`) instead of answering it 200. An OCI client (oci_client's
+  `store_auth_if_needed`) probes `/v2/` to discover whether it must authenticate; a 200
+  made it assume anonymous access and then 401 on the actual blob requests — so build-cache
+  pushes to an auth-gated registry silently failed ("not cached"). vk-driver's
+  transparent-zstd capability probe now authenticates its own `/v2/` request to match.
 - `vk build`'s live dashboard no longer garbles (a stranded progress line, a duplicated
   header/rule, a large blank gap) when a `RUN` step prints a carriage-return progress bar
   (a `foo\rbar…` line with no newline): the current frame now updates one pinned line in

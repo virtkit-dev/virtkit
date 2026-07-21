@@ -709,14 +709,13 @@ async fn handle(
 }
 
 async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
-    // Client auth (when configured), except the `/v2/` version probe — kept open so
-    // capability detection (transparent-zstd) and Docker's auth discovery still work.
-    if state.auth.enabled() {
-        let p = req.uri().path();
-        let probe = p == "/v2" || p == "/v2/";
-        if !probe && !state.auth.allows(&req) {
-            return Ok(state.auth.challenge());
-        }
+    // Client auth (when configured) on every path, including the `/v2/` version probe.
+    // Returning 401 + WWW-Authenticate on `/v2/` is exactly how OCI clients discover they
+    // must authenticate (oci_client's store_auth_if_needed probes `/v2/`): leaving it open
+    // (200) makes the client assume no auth is needed and then 401 on the real blob
+    // requests. Capability detection (transparent-zstd) authenticates its own `/v2/` probe.
+    if state.auth.enabled() && !state.auth.allows(&req) {
+        return Ok(state.auth.challenge());
     }
 
     // The build-once lock API lives under `/lock/<action>` (all POST), outside the

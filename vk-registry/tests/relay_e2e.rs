@@ -280,7 +280,7 @@ async fn lock_client_round_trips_against_the_server() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bearer_auth_gates_everything_but_the_probe() {
+async fn bearer_auth_gates_everything_including_the_probe() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = tmp("auth");
     let state = Arc::new(ServerState {
@@ -295,11 +295,24 @@ async fn bearer_auth_gates_everything_but_the_probe() {
     let url = spawn(state);
     let http = reqwest::Client::new();
 
-    // the /v2/ version probe is open (capability detection).
+    // the /v2/ version probe requires auth too: its 401 is what triggers an OCI client's
+    // auth discovery. Unauthenticated → 401 + challenge; with the token → success.
     let r = http.get(format!("{url}/v2/")).send().await.unwrap();
+    assert_eq!(
+        r.status().as_u16(),
+        401,
+        "probe must challenge when auth is on"
+    );
+    assert!(r.headers().contains_key("www-authenticate"));
+    let r = http
+        .get(format!("{url}/v2/"))
+        .bearer_auth("s3cret")
+        .send()
+        .await
+        .unwrap();
     assert!(
         r.status().is_success(),
-        "probe should be open, got {}",
+        "authed probe should succeed, got {}",
         r.status()
     );
 
@@ -364,9 +377,17 @@ async fn basic_auth_gates_and_challenges() {
     let url = spawn(state);
     let http = reqwest::Client::new();
 
-    // the /v2/ version probe is open.
+    // the /v2/ version probe requires auth too (401 → client auth discovery); with
+    // credentials it succeeds.
+    let r = http.get(format!("{url}/v2/")).send().await.unwrap();
+    assert_eq!(
+        r.status().as_u16(),
+        401,
+        "probe must challenge when auth is on"
+    );
     assert!(
         http.get(format!("{url}/v2/"))
+            .basic_auth("u", Some("p"))
             .send()
             .await
             .unwrap()

@@ -1,7 +1,8 @@
 //! Client authentication for the network-exposed server. A single scheme at a time:
 //! a static bearer token, or HTTP Basic — enough to gate a central registry shared by
-//! many runners. The `GET /v2/` version probe is always allowed (unauthenticated
-//! capability detection); everything else needs credentials when auth is configured.
+//! many runners. When auth is configured every path needs credentials, including the
+//! `GET /v2/` version probe — its 401 + `WWW-Authenticate` is how OCI clients discover
+//! they must authenticate before the real blob requests.
 
 use bytes::Bytes;
 use http_body_util::Full;
