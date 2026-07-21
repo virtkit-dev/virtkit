@@ -7,7 +7,9 @@ architecture overview and build instructions.
 
 ## Configuration
 
-`/etc/virtkit/config.toml`, override with `VIRTKIT_CONFIG=`.
+The first file found is read: `--config <path>`, `$VIRTKIT_CONFIG`,
+`~/.config/virtkit/config.toml`, `/etc/virtkit/config.toml`. `vk config` prints
+the effective configuration (and `vk config --example` an annotated template).
 See [`config.example.toml`](config.example.toml) for the full reference;
 minimal working configs for each mode are shown below.
 

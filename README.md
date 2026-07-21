@@ -80,7 +80,7 @@ You don't need any of this to use the tool, but if you're curious:
 Guests boot on an embedded [libkrun](https://github.com/containers/libkrun)
 VMM, so there's no external hypervisor to install; a stock kernel and stock KVM
 are enough. [Cloud Hypervisor](https://www.cloudhypervisor.org/) also works as
-an external backend (`VIRTKIT_VMM=cloud-hypervisor`).
+an external backend (the `vmm` config key, or `VIRTKIT_VMM=cloud-hypervisor`).
 
 Guest networking is a userspace switch living inside the `vk` process. Traffic
 leaves through the host's regular sockets, which is why no privileged network
@@ -151,6 +151,42 @@ instead.
 guest's PID 1, `serve` is the in-VM command server that `vk exec` / `vk
 connect` / `vk status` dial, and `net` connects a guest NIC to the host's
 network switch.
+
+## Configuration
+
+`vk` reads a single optional TOML file — the first that exists of:
+
+1. `--config <path>` (a global flag, valid on any subcommand)
+2. `$VIRTKIT_CONFIG`
+3. `~/.config/virtkit/config.toml` (`$XDG_CONFIG_HOME`)
+4. `/etc/virtkit/config.toml`
+
+An explicit path (flag or env var) that doesn't exist is an error; the user and
+system paths are skipped when absent. Every setting has a default, so with no
+file at all `vk` still runs — the file is only needed to point at a registry, a
+GitLab tools dir, egress rules, and the like. `vk-driver/config.example.toml` is
+the annotated reference for every key.
+
+Inspect and bootstrap it with `vk config`:
+
+- `vk config` — the effective configuration as TOML, headed by which file it came from
+- `vk config --example` — the annotated template to copy into place
+- `vk config --path` — just the resolved config file path
+
+`vk check` also reports the file in use, and `vk paths` shows where each host
+path (state dir, image cache, registry store) resolves to.
+
+Most things live in the config file or in CLI flags. The handful of environment
+variables are:
+
+| Variable | Effect |
+| --- | --- |
+| `VIRTKIT_CONFIG` | config file path (between `--config` and the user/system files) |
+| `VIRTKIT_VMM` | VMM backend (`cloud-hypervisor`); overrides the `vmm` config key |
+| `VIRTKIT_DEBUG=1` | verbose VMM/guest debug logging |
+| `VIRTKIT_TIMING=1` | per-phase build/boot timing breakdown |
+| `VIRTKIT_PROGRESS=plain` | plain build progress instead of the live dashboard (CI logs) |
+| `VIRTKIT_NO_TITLE` | suppress terminal-title updates (keeps the dashboard) |
 
 ## Layout
 
