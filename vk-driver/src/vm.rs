@@ -217,6 +217,11 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // cmdline is the pid-reuse guard for the later signal.
     let mut sup_cmd = Command::new(crate::spawn::self_exe());
     sup_cmd.args(["gitlab", "supervise"]).arg(&ctx.job_dir);
+    // The supervisor re-loads the config; pin it to the file THIS phase resolved,
+    // which the inherited environment alone does not carry when it came from --config.
+    if let Some(src) = &ctx.cfg.source {
+        sup_cmd.arg("--config").arg(src);
+    }
     let mut sup =
         spawn_detached(sup_cmd, &ctx.supervisor_log()).context("spawning the job supervisor")?;
 

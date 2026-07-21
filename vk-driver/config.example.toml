@@ -1,4 +1,5 @@
-# virtkit configuration — /etc/virtkit/config.toml (or VIRTKIT_CONFIG=).
+# virtkit configuration. The first file found wins (exactly one is read):
+#   --config <path>  >  $VIRTKIT_CONFIG  >  ~/.config/virtkit/config.toml  >  /etc/virtkit/config.toml
 # Example targeting a bootable guest bundle; every key is optional.
 
 # state_dir = "/var/lib/virtkit"          # job state: <state_dir>/jobs/<job id>/

@@ -99,6 +99,10 @@ Examples:
 Run 'vk help-all' to also list the advanced/plumbing commands."
 )]
 struct Cli {
+    /// Config file [default: the first of $VIRTKIT_CONFIG,
+    /// ~/.config/virtkit/config.toml, /etc/virtkit/config.toml]
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -984,22 +988,28 @@ fn effective_state_dir(cfg: &Config) -> anyhow::Result<PathBuf> {
 fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
     use std::fmt::Write;
     let mut out = String::new();
-    let (config_path, from_env) = match std::env::var_os("VIRTKIT_CONFIG") {
-        Some(p) => (PathBuf::from(p), true),
-        None => (PathBuf::from(config::DEFAULT_PATH), false),
-    };
-    // An explicit VIRTKIT_CONFIG that can't be read already failed Config::load.
-    let config_note = match (config_path.is_file(), from_env) {
-        (_, true) => "from VIRTKIT_CONFIG",
-        (true, false) => "default location",
-        (false, false) => "missing; built-in defaults",
-    };
+    // Which file Config::load read is recorded on the config itself; classify it
+    // against the chain's fixed tiers for the note (an explicit --config /
+    // VIRTKIT_CONFIG path that can't be read already failed Config::load).
+    let user = config::user_path();
+    match &cfg.source {
+        Some(p) => {
+            let note = if user.as_deref() == Some(p.as_path()) {
+                "user config"
+            } else if p.as_path() == Path::new(config::DEFAULT_PATH) {
+                "system config"
+            } else {
+                "from --config / VIRTKIT_CONFIG"
+            };
+            writeln!(out, "config file     {} ({note})", p.display())?;
+        }
+        None => writeln!(out, "config file     (none found; built-in defaults)")?,
+    }
     writeln!(
         out,
-        "config file     {} ({config_note})",
-        config_path.display()
+        "                chain: --config > $VIRTKIT_CONFIG > ~/.config/virtkit/config.toml > {}",
+        config::DEFAULT_PATH
     )?;
-    writeln!(out, "                override: VIRTKIT_CONFIG=<path>")?;
     writeln!(out)?;
     let state_note = match &cfg.state_dir {
         Some(_) => "`state_dir` in the config",
@@ -1153,7 +1163,7 @@ async fn cli_main() -> ExitCode {
     if let Cmd::Service { cmd } = &cli.cmd {
         return service_cmd(cmd).await;
     }
-    let cfg = match Config::load() {
+    let cfg = match Config::load(cli.config.as_deref()) {
         Ok(cfg) => cfg,
         Err(e) => return fail(&e, 2),
     };
@@ -1377,7 +1387,7 @@ async fn cli_main() -> ExitCode {
             detach_log: detach_log.clone(),
             command: command.clone(),
         };
-        return match run::run(&args).await {
+        return match run::run(&args, &cfg).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) if is_not_cached(&e) => fail(&e, 3),
             Err(e) => fail(&e, 1),

@@ -6,6 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- The config file is now looked up along a standard chain — the first of `--config <path>`
+  (a new global flag), `$VIRTKIT_CONFIG`, `~/.config/virtkit/config.toml`,
+  `/etc/virtkit/config.toml` wins — so a rootless user gets a real config location
+  instead of needing the environment variable.
 - `vk paths` prints the effective host paths — config file, state dir, image cache,
   registry store — where each value comes from, and how to override it.
 - `[gitlab] checkout_overlay` (default on): jobs build the `host_checkout` tree on an

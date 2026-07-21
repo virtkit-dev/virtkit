@@ -10,7 +10,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use crate::config::{self, Config};
+use crate::config::Config;
 use crate::embed::Asset;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
@@ -347,7 +347,7 @@ fn gitlab(cfg: &Config) -> Outcome {
     // run() escalates to a "requested but not enabled" failure (this check only
     // runs when named with --feature) rather than a confusing permission error
     // on the default root-owned state dir.
-    if std::env::var_os("VIRTKIT_CONFIG").is_none() && !Path::new(config::DEFAULT_PATH).exists() {
+    if cfg.source.is_none() {
         return skip("no config file (gitlab executor not set up on this host)");
     }
     let jobs = cfg.state_dir().join("jobs");

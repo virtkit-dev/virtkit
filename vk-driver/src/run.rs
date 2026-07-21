@@ -216,7 +216,7 @@ pub struct RunArgs {
     pub command: Vec<String>,
 }
 
-pub async fn run(args: &RunArgs) -> Result<()> {
+pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
     // SAFETY: isatty has no failure mode beyond returning 0
     if (args.shell || args.tty) && unsafe { libc::isatty(0) != 1 || libc::isatty(1) != 1 } {
         let flag = if args.shell { "--shell" } else { "-t" };
@@ -256,11 +256,11 @@ pub async fn run(args: &RunArgs) -> Result<()> {
             kernel.path.display()
         );
     }
-    // The host config drives image resolution (registry/docker proxy, local dir) and the
-    // shared image cache location. `vk run` is rootless and usually has no config file, so a
-    // missing one yields defaults; its cache lives under $XDG_DATA_HOME rather than the CI
-    // default /var/lib/virtkit (unwritable for a dev), unless the config pins a state_dir.
-    let cfg = crate::config::Config::load()?;
+    // The host config (loaded once in cli_main) drives image resolution (registry/docker
+    // proxy, local dir) and the shared image cache location. `vk run` is rootless and
+    // usually has no config file, so defaults apply; its cache then lives under
+    // $XDG_DATA_HOME rather than the CI default /var/lib/virtkit (unwritable for a dev),
+    // unless the config pins a state_dir.
     let state_dir = match &cfg.state_dir {
         Some(dir) => dir.clone(),
         None => default_data_base()?,
@@ -269,25 +269,9 @@ pub async fn run(args: &RunArgs) -> Result<()> {
     // No primary (no image, no -f, no --primary) + a compose file = compose up:
     // services only, held until ctrl-c.
     if args.image.is_empty() && args.dockerfiles.is_empty() && args.primary.is_none() {
-        return compose_up(
-            args,
-            &cfg,
-            &state_dir,
-            &work.path,
-            &agent.path,
-            &kernel.path,
-        )
-        .await;
+        return compose_up(args, cfg, &state_dir, &work.path, &agent.path, &kernel.path).await;
     }
-    build_and_boot(
-        args,
-        &cfg,
-        &state_dir,
-        &work.path,
-        &agent.path,
-        &kernel.path,
-    )
-    .await
+    build_and_boot(args, cfg, &state_dir, &work.path, &agent.path, &kernel.path).await
 }
 
 /// Default base for `vk run`'s durable shared image cache: `$XDG_DATA_HOME/virtkit`, else

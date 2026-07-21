@@ -1,7 +1,9 @@
-//! virtkit configuration (/etc/virtkit/config.toml, override with
-//! VIRTKIT_CONFIG=). Every field has a default so the file can stay minimal;
-//! a missing file yields the defaults (enough for `config`, not for `prepare`,
-//! which validates the image paths).
+//! virtkit configuration. Exactly one TOML file is read, the first found of:
+//! the `--config` flag, `$VIRTKIT_CONFIG`, the user config
+//! (`~/.config/virtkit/config.toml`), the system config
+//! (/etc/virtkit/config.toml). Every field has a default so the file can stay
+//! minimal; no file at all yields the defaults (enough for `config`, not for
+//! `prepare`, which validates the image paths).
 
 use std::path::{Path, PathBuf};
 
@@ -63,6 +65,10 @@ pub struct Config {
     /// (30 min). The compressed chunk store is the durable tier; the full ext4 is transient
     /// and re-materialized on demand.
     pub image_cache_idle_secs: Option<u64>,
+    /// The file this config was loaded from; None = built-in defaults (no file
+    /// found). Set by [`Config::load`], not a config key.
+    #[serde(skip)]
+    pub source: Option<PathBuf>,
 }
 
 /// Defaults for `vk build` (the experimental microVM Dockerfile builder). Every
@@ -465,21 +471,51 @@ impl Default for Net {
     }
 }
 
+/// The user-level config path: `$XDG_CONFIG_HOME/virtkit/config.toml`, else
+/// `~/.config/virtkit/config.toml`. None when neither XDG_CONFIG_HOME nor HOME
+/// is set (a bare service environment) — the system path still applies then.
+pub fn user_path() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(xdg).join("virtkit/config.toml"));
+    }
+    let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
+    Some(PathBuf::from(home).join(".config/virtkit/config.toml"))
+}
+
+/// The pure tail of [`Config::load`]: read `explicit` when given (any failure,
+/// including absence, is an error — the caller named that file), else the first
+/// existing fallback; nothing found = the built-in defaults. The loaded file is
+/// recorded in `Config::source`. Split from `load` so tests can drive it
+/// without mutating the process environment.
+fn load_resolved(explicit: Option<PathBuf>, fallbacks: &[PathBuf]) -> Result<Config> {
+    let path = match explicit {
+        Some(p) => p,
+        None => match fallbacks.iter().find(|p| p.is_file()) {
+            Some(p) => p.clone(),
+            None => return Ok(Config::default()),
+        },
+    };
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let mut cfg: Config =
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    cfg.source = Some(path);
+    Ok(cfg)
+}
+
 impl Config {
-    pub fn load() -> Result<Config> {
-        let (path, explicit) = match std::env::var_os("VIRTKIT_CONFIG") {
-            Some(p) => (PathBuf::from(p), true),
-            None => (PathBuf::from(DEFAULT_PATH), false),
-        };
-        match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => {
-                Ok(Config::default())
-            }
-            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-        }
+    /// Load the config from the first file found: the `--config` flag, then
+    /// `$VIRTKIT_CONFIG`, then the user config, then the system config (see the
+    /// module doc). Exactly one file is read — no merging across tiers.
+    pub fn load(flag: Option<&Path>) -> Result<Config> {
+        let explicit = flag
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os("VIRTKIT_CONFIG").map(PathBuf::from));
+        let fallbacks: Vec<PathBuf> = user_path()
+            .into_iter()
+            .chain([PathBuf::from(DEFAULT_PATH)])
+            .collect();
+        load_resolved(explicit, &fallbacks)
     }
 
     pub fn state_dir(&self) -> &Path {
@@ -529,6 +565,70 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scratch dir of config files for the load_resolved tests; removed on drop.
+    struct Dir(PathBuf);
+    impl Dir {
+        fn new(tag: &str) -> Dir {
+            let d = std::env::temp_dir().join(format!("vk-cfg-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            Dir(d)
+        }
+        fn file(&self, name: &str, text: &str) -> PathBuf {
+            let p = self.0.join(name);
+            std::fs::write(&p, text).unwrap();
+            p
+        }
+    }
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn load_explicit_file_wins_over_fallbacks() {
+        let dir = Dir::new("explicit");
+        let explicit = dir.file("explicit.toml", "[vm]\ncpus = 7\n");
+        let fallback = dir.file("fallback.toml", "[vm]\ncpus = 9\n");
+        let cfg = load_resolved(Some(explicit.clone()), std::slice::from_ref(&fallback)).unwrap();
+        assert_eq!(cfg.vm.cpus, 7);
+        assert_eq!(cfg.source.as_deref(), Some(explicit.as_path()));
+    }
+
+    #[test]
+    fn load_explicit_missing_is_an_error() {
+        let dir = Dir::new("explicit-missing");
+        let fallback = dir.file("fallback.toml", "[vm]\ncpus = 9\n");
+        // The caller named the file; silently falling back would mask the typo.
+        assert!(load_resolved(Some(dir.0.join("nope.toml")), &[fallback]).is_err());
+    }
+
+    #[test]
+    fn load_first_existing_fallback_wins() {
+        let dir = Dir::new("fallbacks");
+        let user = dir.file("user.toml", "[vm]\ncpus = 2\n");
+        let system = dir.file("system.toml", "[vm]\ncpus = 3\n");
+        let missing = dir.0.join("missing.toml");
+        let cfg = load_resolved(None, &[missing, user.clone(), system]).unwrap();
+        assert_eq!(cfg.vm.cpus, 2);
+        assert_eq!(cfg.source.as_deref(), Some(user.as_path()));
+    }
+
+    #[test]
+    fn load_nothing_found_yields_defaults() {
+        let dir = Dir::new("none");
+        let cfg = load_resolved(None, &[dir.0.join("a.toml"), dir.0.join("b.toml")]).unwrap();
+        assert_eq!(cfg.vm.cpus, Vm::default().cpus);
+        assert!(cfg.source.is_none());
+    }
+
+    #[test]
+    fn load_parse_error_is_fatal_even_from_a_fallback() {
+        let dir = Dir::new("bad");
+        let bad = dir.file("bad.toml", "not toml at all [");
+        assert!(load_resolved(None, &[bad]).is_err());
+    }
 
     #[test]
     fn gitlab_tools_dir_parses() {
