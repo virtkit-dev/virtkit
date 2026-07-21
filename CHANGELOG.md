@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `[gitlab] checkout_overlay` (default on): jobs build the `host_checkout` tree on an
+  in-guest overlay — the virtio-fs share becomes the read-only lower layer, all writes go
+  to a guest tmpfs — so metadata-heavy builds run at guest-native speed instead of paying a
+  synchronous virtio-fs round-trip per file operation. The read-only export also means the
+  guest can no longer modify the host checkout. Build writes now count against guest RAM
+  (capped at half the VM memory); raise `MICROVM_MEM` for jobs with large build trees.
+
 ### Fixed
 
 - `[gitlab] host_checkout` jobs whose image runs as a non-root user no longer fail with

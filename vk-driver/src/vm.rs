@@ -120,6 +120,23 @@ fn checkout_id_maps(
     }
 }
 
+/// The virtio-fs tag of the host_checkout share. The cmdline helper and the FsShare
+/// registration must agree on it: the agent mounts whatever tag the cmdline names.
+const CIBUILD_TAG: &str = "cibuild";
+
+/// The cmdline fragment mounting the host_checkout share in the guest. The agent mounts
+/// VIRTKIT_VIRTIOFS shares at boot (mkdir -p'ing the mount point); CI supervise sets no
+/// other share, so a plain assignment is safe. With `overlay`, VIRTKIT_VIRTIOFS_OVERLAY
+/// tells the agent to build the tree on a tmpfs-backed overlay above the (then read-only)
+/// share instead of mounting it directly.
+fn checkout_virtiofs_cmdline(mount: &str, overlay: bool) -> String {
+    let mut s = format!(" VIRTKIT_VIRTIOFS={CIBUILD_TAG}:{mount}");
+    if overlay {
+        s.push_str(&format!(" VIRTKIT_VIRTIOFS_OVERLAY={CIBUILD_TAG}"));
+    }
+    s
+}
+
 pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     let cfg = &ctx.cfg;
     // Cheap fail-fast checks first (crisp errors in the runner-visible process beat a
@@ -836,10 +853,13 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     }
 
     // [gitlab] host_checkout: the sources checked out on the host in prepare, shared
-    // read-write into the guest at CI_PROJECT_DIR. The job sets GIT_STRATEGY: none so its
-    // get_sources reuses this tree — the git token never enters the guest. A rw virtio-fs
-    // share into an untrusted guest is added attack surface; opt-in only.
-    if cfg.gitlab.as_ref().is_some_and(|g| g.host_checkout) {
+    // into the guest at CI_PROJECT_DIR. The job sets GIT_STRATEGY: none so its
+    // get_sources reuses this tree — the git token never enters the guest. With
+    // checkout_overlay (the default) the share is exported read-only and the guest
+    // builds on an overlay above it; checkout_overlay = false exports it read-write,
+    // which is added attack surface toward an untrusted guest.
+    if let Some(gl) = cfg.gitlab.as_ref().filter(|g| g.host_checkout) {
+        let overlay = gl.checkout_overlay;
         let mount = ctx
             .ci_project_dir
             .as_deref()
@@ -869,6 +889,9 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             vfsd.arg(format!("--socket-path={}", sock.display()))
                 .arg(format!("--shared-dir={}", host_dir.display()))
                 .args(["--cache=auto", "--sandbox=none"]);
+            if overlay {
+                vfsd.arg("--readonly");
+            }
             for m in &uid_map {
                 vfsd.arg(format!("--uid-map={m}"));
             }
@@ -883,16 +906,14 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                 .context("the checkout virtiofsd did not create its socket")?;
         }
         shares.push(crate::vmm::FsShare {
-            tag: "cibuild".into(),
+            tag: CIBUILD_TAG.into(),
             socket: sock,
             host_dir,
-            read_only: false,
+            read_only: overlay,
             uid_map,
             gid_map,
         });
-        // The agent mounts VIRTKIT_VIRTIOFS shares at boot; CI supervise sets no other, so a
-        // plain assignment is safe (the guest mkdir -p's the mount point).
-        cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS=cibuild:{mount}"));
+        cmdline.push_str(&checkout_virtiofs_cmdline(mount, overlay));
     }
 
     let mut net = crate::vmm::Net::None;
@@ -1598,6 +1619,18 @@ mod tests {
         ctx.cpus_req = cpus_req.map(String::from);
         ctx.mem_req = mem_req.map(String::from);
         ctx
+    }
+
+    #[test]
+    fn checkout_virtiofs_cmdline_pins_the_agent_contract() {
+        assert_eq!(
+            checkout_virtiofs_cmdline("/builds/grp/proj", false),
+            " VIRTKIT_VIRTIOFS=cibuild:/builds/grp/proj"
+        );
+        assert_eq!(
+            checkout_virtiofs_cmdline("/builds/grp/proj", true),
+            " VIRTKIT_VIRTIOFS=cibuild:/builds/grp/proj VIRTKIT_VIRTIOFS_OVERLAY=cibuild"
+        );
     }
 
     #[test]

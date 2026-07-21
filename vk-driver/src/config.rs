@@ -122,7 +122,7 @@ pub struct Auth {
 /// PATH (`/usr/local/bin`), but only for a tool the job image does not already
 /// provide (per-image opt-out, checked in-guest). Dynamic: the binaries stay on the
 /// host and are baked into no bundle, so updating them needs no re-conversion.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Gitlab {
     pub dir: Option<PathBuf>,
@@ -130,15 +130,34 @@ pub struct Gitlab {
     /// guest over virtio-fs, instead of the in-guest `get_sources` clone. The job then sets
     /// `GIT_STRATEGY: none` so the checkout is reused and the git token never enters the guest
     /// (a security win), and the host has the tree available to build a git-defined image
-    /// (`ci-boots-git-defined-images`). Off by default. Trade-off: a read-write virtio-fs
-    /// share into an untrusted job guest is added host-side attack surface.
-    #[serde(default)]
+    /// (`ci-boots-git-defined-images`). Off by default.
     pub host_checkout: bool,
     /// Root directory the `host_checkout` trees are cloned into on the host, keyed under it by
     /// the runner's concurrent slot + project. Unset = `<state_dir>/checkouts`. Point it at the
-    /// runner's RAM-backed builds tmpfs (e.g. `/builds`) so the clone and every in-job write to
-    /// the shared tree stay in host RAM instead of hitting the state disk.
+    /// runner's RAM-backed builds tmpfs (e.g. `/builds`) so the clone (and, with
+    /// `checkout_overlay = false`, every in-job write to the shared tree) stays in host RAM
+    /// instead of hitting the state disk.
     pub checkout_dir: Option<PathBuf>,
+    /// Mount the `host_checkout` tree in the guest behind a tmpfs-backed overlayfs (default
+    /// on). The share is then exported read-only — the guest can never touch the host tree —
+    /// and every in-job write runs at guest-native speed instead of a 50–90µs synchronous
+    /// virtio-fs round-trip per op. Guest writes land in guest RAM (an overlay tmpfs capped
+    /// at half the VM memory; raise MICROVM_MEM if a job needs more) and are discarded with
+    /// the VM, which prepare's re-clean of the checkout did anyway. `false` restores the
+    /// direct read-write mount — a rw virtio-fs share into an untrusted job guest is added
+    /// host-side attack surface.
+    pub checkout_overlay: bool,
+}
+
+impl Default for Gitlab {
+    fn default() -> Self {
+        Gitlab {
+            dir: None,
+            host_checkout: false,
+            checkout_dir: None,
+            checkout_overlay: true,
+        }
+    }
 }
 
 /// Egress allowlist for the per-job switch (`net.mode = "switch"`). Both lists
@@ -548,6 +567,17 @@ mod tests {
     fn no_gitlab_section_means_no_tools() {
         let cfg = Config::default();
         assert!(cfg.gitlab.is_none());
+    }
+
+    #[test]
+    fn gitlab_checkout_overlay_defaults_on() {
+        // Both construction paths must agree: serde with the field absent, and Default.
+        let cfg: Config = toml::from_str("[gitlab]\nhost_checkout = true\n").unwrap();
+        assert!(cfg.gitlab.as_ref().unwrap().checkout_overlay);
+        assert!(Gitlab::default().checkout_overlay);
+        let off: Config =
+            toml::from_str("[gitlab]\nhost_checkout = true\ncheckout_overlay = false\n").unwrap();
+        assert!(!off.gitlab.as_ref().unwrap().checkout_overlay);
     }
 
     #[test]
