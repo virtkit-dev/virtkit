@@ -15,6 +15,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- `vk --help` now shows only the everyday commands (`run`, `build`, `exec`, `gc`,
+  `check`) plus usage examples; `vk help-all` lists the advanced/plumbing commands.
 - The host image-cache sweep is now `vk gc` (was `vk cache gc`).
 - `vk check` no longer checks the CI-executor features (`gitlab`, `services`) by
   default; name them with `--feature` to check them.

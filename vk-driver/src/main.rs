@@ -87,7 +87,16 @@ fn parse_cpus(s: &str) -> Result<u32, String> {
 #[derive(Parser)]
 #[command(
     version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("VK_GIT_HASH"), ")"),
-    about
+    about,
+    after_help = "\
+Examples:
+  vk run alpine                          boot alpine:latest, interactive shell
+  vk run alpine -- cat /etc/os-release   run one command, exit with its status
+  vk run debian:trixie-slim --mem 2G --cpus 4
+  vk run -f Dockerfile                   build the last stage and boot it
+  vk check                               preflight this host
+
+Run 'vk help-all' to also list the advanced/plumbing commands."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -198,6 +207,7 @@ enum Cmd {
     /// config enables (net.mode taps, [docker], [registry], ...). The CI-executor
     /// features (gitlab, services) are checked only when named with --feature. One
     /// line per check; exits non-zero if any fails.
+    #[command(display_order = 5)]
     Check {
         /// check only these features, failing (instead of skipping) any that
         /// turn out unconfigured (repeatable)
@@ -208,6 +218,7 @@ enum Cmd {
     /// docker, build}`) no VM is using and that are idle past the threshold, and drop
     /// unreferenced registry chunks. Reclaim otherwise happens on each pull, so this
     /// is for a cron or manual sweep on an otherwise-idle runner.
+    #[command(display_order = 4)]
     Gc {
         /// Idle threshold in seconds; `0` reclaims every base no VM is currently using.
         /// Default: the config's `image_cache_idle_secs` (30 min).
@@ -215,12 +226,14 @@ enum Cmd {
         idle_secs: Option<u64>,
     },
     /// GitLab custom-executor lifecycle (config / prepare / run / cleanup)
+    #[command(hide = true)]
     Gitlab {
         #[command(subcommand)]
         cmd: GitlabCmd,
     },
     /// Native OCI bundle registry: push/pull guest bundles with content-defined chunk
     /// deduplication (CDC + per-chunk zstd), no oras, no docker.
+    #[command(hide = true)]
     Registry {
         #[command(subcommand)]
         cmd: RegistryCmd,
@@ -228,6 +241,7 @@ enum Cmd {
     /// Control the run's compose services from inside the guest: bring one up (building its
     /// image on demand, streaming build progress), take it down, or query state. Speaks the
     /// vsock control plane to the host service manager, so it only works inside a vk VM.
+    #[command(hide = true)]
     Service {
         #[command(subcommand)]
         cmd: ServiceCmd,
@@ -237,6 +251,7 @@ enum Cmd {
     /// embedded libkrun by default) and instruction snapshots are cached
     /// (`--cache-registry`). `--print-plan` parses + plans + prints the build without
     /// running it.
+    #[command(display_order = 2)]
     Build {
         /// Dockerfile to build (repeatable: the files merge into one stage namespace,
         /// so a FROM/COPY --from in one file can name a stage declared in another)
@@ -357,6 +372,7 @@ enum Cmd {
     /// `--listen` and splice each connection to `--to`, opaque to the protocol.
     /// Long-running, spawned detached per job — e.g. the VMM's per-port vsock
     /// unix socket -> a host-local service the guest must not reach directly.
+    #[command(hide = true)]
     Forward {
         /// Local address to listen on (a unix socket path, tcp://host:port, ...)
         #[arg(long)]
@@ -370,6 +386,7 @@ enum Cmd {
     /// prints the full invocation). Addresses: a unix path, vsock-mux://<path>:<port>,
     /// vsock-auto://<path>:<port> (best path per backend),
     /// tcp://host:port.
+    #[command(hide = true)]
     Connect {
         /// Target address to dial
         addr: SocketAddr,
@@ -379,6 +396,7 @@ enum Cmd {
     /// exit non-zero if it does not answer. A liveness check that actually exercises
     /// the agent protocol — stronger than a socket stat — so external tooling can ask
     /// "is this VM up?" with `vk` alone, no separate agent binary.
+    #[command(hide = true)]
     Status {
         /// Agent address to dial (the run's exec channel)
         addr: SocketAddr,
@@ -387,7 +405,7 @@ enum Cmd {
     /// shell or a one-shot command, as `--user` in `--dir`. Reuses the same client
     /// the in-guest agent embeds, so a host reaches a running VM with `vk` alone,
     /// no separate `vk-agent` binary. `vk` exits with the command's own status.
-    #[command(arg_required_else_help = true)]
+    #[command(arg_required_else_help = true, display_order = 3)]
     Exec {
         /// Agent address to dial (the run's exec channel, e.g. vsock-auto://DIR/vsock.sock:4444)
         addr: SocketAddr,
@@ -418,6 +436,7 @@ enum Cmd {
     /// the real agent at `--upstream` but exposing only the keys in the `--allow` .pub
     /// files (refusing to sign with or list any other key). The host side of forwarding a
     /// subset of the agent into a guest.
+    #[command(hide = true)]
     SshAgentProxy {
         /// Unix socket to serve on (the VMM's per-port vsock socket)
         #[arg(long)]
@@ -433,6 +452,7 @@ enum Cmd {
     /// qemu vhost transport on each VM's hybrid-vsock guest-port socket, answers
     /// ARP + serves DHCP, and proxies guest TCP/UDP out through the host's own
     /// sockets — no host privileges, multi-VM on one LAN. Replaces gvproxy.
+    #[command(hide = true)]
     Switch {
         /// VM qemu socket(s) to accept on (Cloud Hypervisor's <vsock.sock>_<port>);
         /// repeatable — one per VM on the shared LAN.
@@ -468,6 +488,7 @@ enum Cmd {
     /// Dev: run a docker/OCI image as a microVM — boot it from a native ext4 disk
     /// (or a cpio initramfs in RAM with --ram), virtkit-agent as PID 1 over vsock, and
     /// run a command or interactive shell.
+    #[command(display_order = 1)]
     Run {
         /// Image to boot (docker ref, or OCI reference with --source oci), e.g. alpine:3.20.
         /// Omit when booting a Dockerfile target with --file.
@@ -698,6 +719,7 @@ enum Cmd {
     /// the stage's last instruction) — the exact identity virtkit's instruction cache
     /// stores the stage's snapshot under. Prints `stage:key` lines. Resolves base
     /// digests + base image config over the network so the key matches a real build.
+    #[command(hide = true)]
     DockerHash {
         /// Dockerfile to analyze (default: Dockerfile; repeatable: the files merge
         /// into one stage namespace, exactly as `vk build` sees them)
@@ -718,6 +740,7 @@ enum Cmd {
     /// formatted 8-4-4-4-12, reads the image's UUID, and exits 0 if they match (fresh)
     /// or 1 if they differ or the image is missing (stale). Always prints the UUID on
     /// stdout so the caller can pass it to `mkext-tar --uuid` on a stale build.
+    #[command(hide = true)]
     Fingerprint {
         /// ext4 image to check for freshness
         ext4: PathBuf,
@@ -725,11 +748,14 @@ enum Cmd {
         parts: Vec<String>,
     },
     /// Dev: build an ext4 image from a directory tree (native, no mke2fs).
+    #[command(hide = true)]
     Mkext { src: PathBuf, out: PathBuf },
     /// Dev: verify the native qcow2 reader against `qemu-img convert` for an image.
+    #[command(hide = true)]
     Qcow2Verify { path: PathBuf },
     /// Build an ext4 image from a rootfs tar (e.g. `docker export`), injecting
     /// host files at guest paths. Native, no mke2fs, no root.
+    #[command(hide = true)]
     MkextTar {
         /// rootfs tar (ownership/mode from its headers), or "-" to STREAM stdin
         /// (e.g. `docker export | … -`) — single pass, no intermediate tar
@@ -761,6 +787,7 @@ enum Cmd {
     /// `buildctl --output type=oci` produces): flatten its layers AND extract the
     /// image config (Env/User/Entrypoint/Cmd into /etc/virtkit/{env,user,cmd}),
     /// no docker/podman. Replaces the podman load→create→export→mkext-tar chain.
+    #[command(hide = true)]
     MkextOci {
         /// OCI image archive (tar), or "-" to STREAM stdin (spooled to a temp
         /// file first: OCI archives need random access, index.json is last)
@@ -781,8 +808,14 @@ enum Cmd {
         #[arg(long)]
         label: Option<String>,
     },
+    /// List the advanced/plumbing commands `vk --help` hides, along with the
+    /// everyday ones. (`vk virtiofsd` dispatches on raw argv before this CLI
+    /// and appears in neither help; see the README.)
+    #[command(hide = true)]
+    HelpAll,
     /// Dev: pull an OCI image from a registry (no docker) and flatten it to a
     /// rootfs tar.
+    #[command(hide = true)]
     OciPull {
         reference: String,
         out: PathBuf,
@@ -935,6 +968,16 @@ async fn cli_main() -> ExitCode {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cli = Cli::parse();
+    if let Cmd::HelpAll = &cli.cmd {
+        // CommandFactory::command() names the command after the package
+        // (vk-driver); only the parse path picks up the argv[0] bin name.
+        let mut help = <Cli as clap::CommandFactory>::command()
+            .bin_name("vk")
+            .mut_subcommands(|c| c.hide(false))
+            .after_help(None::<&str>);
+        let _ = help.print_help();
+        return ExitCode::SUCCESS;
+    }
     // `service` talks to the host manager over vsock and needs no host config — handle it
     // before Config::load so it works from inside a guest that has none.
     if let Cmd::Service { cmd } = &cli.cmd {
@@ -1807,6 +1850,7 @@ async fn cli_main() -> ExitCode {
         // handled above, before JobCtx
         Cmd::Check { .. }
         | Cmd::Gc { .. }
+        | Cmd::HelpAll
         | Cmd::Registry { .. }
         | Cmd::Switch { .. }
         | Cmd::Run { .. }
@@ -1960,6 +2004,21 @@ impl<R: std::io::Read> std::io::Read for ProgressReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `vk --help` is a curated list: a new Cmd variant must either join it
+    // deliberately or carry #[command(hide = true)].
+    #[test]
+    fn everyday_help_is_curated() {
+        let cmd = <Cli as clap::CommandFactory>::command();
+        let visible: Vec<_> = cmd
+            .get_subcommands()
+            .filter(|c| !c.is_hide_set())
+            .map(|c| c.get_name().to_string())
+            .collect();
+        let mut sorted = visible.clone();
+        sorted.sort();
+        assert_eq!(sorted, ["build", "check", "exec", "gc", "run"]);
+    }
 
     // A --inject value parses to a single (guest, host, mode) entry with the guest path
     // normalized to image-relative form.
