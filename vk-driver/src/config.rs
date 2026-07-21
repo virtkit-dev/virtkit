@@ -8,11 +8,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PATH: &str = "/etc/virtkit/config.toml";
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// Per-job state lives under <state_dir>/jobs/<job id>/
@@ -21,6 +21,17 @@ pub struct Config {
     pub cloud_hypervisor: Option<PathBuf>,
     /// virtiofsd binary, only needed when [share] is set
     pub virtiofsd: Option<PathBuf>,
+    /// Materialized image bases (`<state_dir>/{registry,docker}/…/runner.ext4`) that have
+    /// sat idle this many seconds — no VM overlaying them — are evicted the next time that
+    /// same cache tier (`registry/` or `docker/`) takes a fresh pull; a base under a live
+    /// overlay is never touched (reference-counted). Keep this well above zero: a near-zero
+    /// value races the brief window between resolving a base and locking it. Default 1800
+    /// (30 min). The compressed chunk store is the durable tier; the full ext4 is transient
+    /// and re-materialized on demand.
+    ///
+    /// (A scalar, so it must stay ahead of the table-typed fields below for TOML
+    /// serialization — a bare key after a `[section]` would bind to that section.)
+    pub image_cache_idle_secs: Option<u64>,
     pub vm: Vm,
     pub guest: Guest,
     /// Dev only: host dir shared as the guest's /workdir over virtio-fs (the POC
@@ -57,14 +68,6 @@ pub struct Config {
     /// Defaults for `vk build` so a runner need not pass them every invocation;
     /// see [`Build`]. A CLI flag always overrides the matching config value.
     pub build: Build,
-    /// Materialized image bases (`<state_dir>/{registry,docker}/…/runner.ext4`) that have
-    /// sat idle this many seconds — no VM overlaying them — are evicted the next time that
-    /// same cache tier (`registry/` or `docker/`) takes a fresh pull; a base under a live
-    /// overlay is never touched (reference-counted). Keep this well above zero: a near-zero
-    /// value races the brief window between resolving a base and locking it. Default 1800
-    /// (30 min). The compressed chunk store is the durable tier; the full ext4 is transient
-    /// and re-materialized on demand.
-    pub image_cache_idle_secs: Option<u64>,
     /// The file this config was loaded from; None = built-in defaults (no file
     /// found). Set by [`Config::load`], not a config key.
     #[serde(skip)]
@@ -74,7 +77,7 @@ pub struct Config {
 /// Defaults for `vk build` (the experimental microVM Dockerfile builder). Every
 /// field backs a CLI flag; the flag wins when given, so this just sets a host's defaults
 /// (e.g. the shared instruction-cache registry and the build guest's kernel/agent).
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Build {
     /// cloud-hypervisor for the build guest (default: the top-level `cloud_hypervisor`).
@@ -114,7 +117,7 @@ pub struct Build {
 /// Host credentials forwarded into job VMs. The SSH agent is relayed over a vsock
 /// forward to the runner's `$SSH_AUTH_SOCK`, so the guest's ssh/git use the host keys
 /// without the keys ever entering the guest (same model as the services registry proxy).
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Auth {
     /// Forward the runner's SSH agent into every job VM (no-op if `$SSH_AUTH_SOCK` is
@@ -128,7 +131,7 @@ pub struct Auth {
 /// PATH (`/usr/local/bin`), but only for a tool the job image does not already
 /// provide (per-image opt-out, checked in-guest). Dynamic: the binaries stay on the
 /// host and are baked into no bundle, so updating them needs no re-conversion.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Gitlab {
     pub dir: Option<PathBuf>,
@@ -168,7 +171,7 @@ impl Default for Gitlab {
 
 /// Egress allowlist for the per-job switch (`net.mode = "switch"`). Both lists
 /// empty = unrestricted; passed through to `vk switch --allow-ip/--allow-name`.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Egress {
     /// Allowed destination IPv4 CIDRs for direct (non-DNS-resolved) egress, each
@@ -179,7 +182,7 @@ pub struct Egress {
     pub allow_name: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Local {
     /// Directory of local guest bundles: each `<dir>/<name>/` is a bundle
@@ -188,7 +191,7 @@ pub struct Local {
     pub dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Vm {
     pub cpus: u32,
@@ -228,7 +231,7 @@ impl Default for Vm {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Guest {
     /// Paths inside the VM, reported to gitlab-runner by `config`
@@ -262,7 +265,7 @@ impl Default for Guest {
 /// any other registry is still pulled directly. It never refuses an image. The native
 /// OCI client fetches the image, the embedded vk-agent is PID 1, the embedded kernel
 /// boots it. Auth mirrors `[registry]`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Docker {
     /// Registry repository prefix the `docker/<name>` form and bare image names are routed
@@ -299,7 +302,7 @@ pub struct Docker {
 /// name, or one explicitly under docker.io/index.docker.io/registry-1.docker.io; any other
 /// registry is left untouched. Auth is independent of the `[docker]` repo (a mirror usually
 /// carries its own account).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Mirror {
     /// Registry prefix Hub pulls are rewritten onto, e.g. "hq-nexus.example.com:8440".
@@ -319,7 +322,7 @@ pub struct Mirror {
     pub insecure: bool,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Registry {
     /// Registry repository prefix for the bundles — fixed host side: the
@@ -404,7 +407,7 @@ impl Registry {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Services {
     /// Retained for config compatibility; no longer consulted. CI service images now
@@ -413,7 +416,7 @@ pub struct Services {
     pub store_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Share {
     pub dir: PathBuf,
@@ -425,7 +428,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Net {
     /// "none"; "tap" (pre-created persistent tap; one VM at a time per tap);
@@ -628,6 +631,40 @@ mod tests {
         let dir = Dir::new("bad");
         let bad = dir.file("bad.toml", "not toml at all [");
         assert!(load_resolved(None, &[bad]).is_err());
+    }
+
+    // `vk config` serializes the effective config to TOML; the defaults must
+    // round-trip, and a scalar like image_cache_idle_secs must stay ahead of the
+    // `[section]` tables (a value emitted after a table would re-parse into it).
+    #[test]
+    fn effective_config_round_trips() {
+        let text = toml::to_string(&Config::default()).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.vm.cpus, Config::default().vm.cpus);
+
+        let populated: Config = toml::from_str(
+            r#"
+            image_cache_idle_secs = 900
+            [vm]
+            cpus = 6
+            [docker]
+            repo = "reg.example.com/team"
+            [registry]
+            repo = "reg.example.com/bundles"
+            [build]
+            build_cache = "layers"
+            "#,
+        )
+        .unwrap();
+        let text = toml::to_string(&populated).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.image_cache_idle_secs, Some(900));
+        assert_eq!(back.vm.cpus, 6);
+        assert_eq!(
+            back.docker.as_ref().unwrap().repo.as_deref(),
+            Some("reg.example.com/team")
+        );
+        assert_eq!(back.build.build_cache, crate::build::BuildCache::Layers);
     }
 
     #[test]

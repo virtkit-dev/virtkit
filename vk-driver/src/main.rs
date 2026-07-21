@@ -237,6 +237,19 @@ enum Cmd {
         #[arg(long)]
         gitlab: bool,
     },
+    /// Print the effective configuration as TOML — the built-in defaults merged with
+    /// the loaded config file, with a header naming which file it came from. Use it to
+    /// see what a `vk` invocation actually sees. `--example` prints the annotated
+    /// template instead; `--path` prints just the resolved config file path.
+    #[command(hide = true)]
+    Config {
+        /// print the annotated example config template instead of the effective config
+        #[arg(long)]
+        example: bool,
+        /// print only the resolved config file path (exit 1 if none is in use)
+        #[arg(long, conflicts_with = "example")]
+        path: bool,
+    },
     /// GitLab custom-executor lifecycle (config / prepare / run / cleanup)
     #[command(hide = true)]
     Gitlab {
@@ -983,6 +996,34 @@ fn effective_state_dir(cfg: &Config) -> anyhow::Result<PathBuf> {
     }
 }
 
+/// `vk config`: print the effective configuration as TOML (defaults merged with the
+/// loaded file), headed by which file it came from; or with `path`, just that file's
+/// path (exit 1 when no file is in use). `--example` is handled before Config::load.
+fn config_cmd(cfg: &Config, path: bool) -> ExitCode {
+    if path {
+        return match &cfg.source {
+            Some(p) => {
+                println!("{}", p.display());
+                ExitCode::SUCCESS
+            }
+            None => exit_code(1),
+        };
+    }
+    let toml = match toml::to_string(cfg) {
+        Ok(t) => t,
+        Err(e) => return fail(&anyhow::anyhow!(e).context("serializing the config"), 1),
+    };
+    match &cfg.source {
+        Some(p) => println!(
+            "# effective configuration (defaults merged with {})",
+            p.display()
+        ),
+        None => println!("# effective configuration (no config file found; built-in defaults)"),
+    }
+    print!("{toml}");
+    ExitCode::SUCCESS
+}
+
 /// The `vk paths` report: each effective host path, where it comes from, and how
 /// to override it. Built as a string so tests can assert on the resolutions.
 fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
@@ -1163,10 +1204,23 @@ async fn cli_main() -> ExitCode {
     if let Cmd::Service { cmd } = &cli.cmd {
         return service_cmd(cmd).await;
     }
+    // `vk config --example` prints the bundled annotated template — before Config::load,
+    // so a broken config file on disk cannot keep the user from seeing a valid example.
+    if let Cmd::Config { example: true, .. } = &cli.cmd {
+        print!("{}", include_str!("../config.example.toml"));
+        return ExitCode::SUCCESS;
+    }
     let cfg = match Config::load(cli.config.as_deref()) {
         Ok(cfg) => cfg,
         Err(e) => return fail(&e, 2),
     };
+    if let Cmd::Config {
+        example: false,
+        path,
+    } = &cli.cmd
+    {
+        return config_cmd(&cfg, *path);
+    }
     if let Cmd::Check { feature } = &cli.cmd {
         return if check::run(&cfg, feature) {
             ExitCode::SUCCESS
@@ -2035,6 +2089,7 @@ async fn cli_main() -> ExitCode {
         // handled above, before JobCtx
         Cmd::Check { .. }
         | Cmd::Paths { .. }
+        | Cmd::Config { .. }
         | Cmd::Gc { .. }
         | Cmd::HelpAll
         | Cmd::Registry { .. }

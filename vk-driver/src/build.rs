@@ -69,7 +69,7 @@ use crate::timing::{Phase, Timings};
 /// regardless. The mode only changes *which* intermediate `RUN`/`COPY` snapshots are
 /// pushed on a cold or partial build — trading the per-instruction commit overhead (a
 /// guest freeze + diff + push per step) against how much of a stage a later edit re-runs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BuildCache {
     /// Checkpoint past a work threshold: a stage's final step is always cached (so

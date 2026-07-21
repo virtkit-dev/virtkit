@@ -110,6 +110,16 @@ pub fn run(cfg: &Config, requested: &[Feature]) -> bool {
         default_sweep()
     };
 
+    // Lead with the config file in use (informational — does not affect all_ok), so a
+    // surprising check result can be traced to the wrong or missing file at a glance.
+    match &cfg.source {
+        Some(p) => println!("{:<4} {:<8} {}", "ok", "config", p.display()),
+        None => println!(
+            "{:<4} {:<8} no config file (built-in defaults)",
+            "skip", "config"
+        ),
+    }
+
     let mut all_ok = true;
     for f in features {
         let mut outcome = evaluate(cfg, f);
