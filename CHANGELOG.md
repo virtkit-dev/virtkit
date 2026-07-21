@@ -13,6 +13,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- The build-once `/lock/` client authenticates with the cache registry's credentials now,
+  not just a bearer token — and the driver builds it with those credentials instead of
+  tokenless. Against an auth-gated registry the lock API previously `401`'d, so runners
+  never serialized fleet-wide and each rebuilt the same image independently. `LockClient`
+  takes a `ClientAuth` (None / Basic / Bearer).
 - `[gitlab] host_checkout` jobs whose image runs as a non-root user no longer fail with
   `Permission denied` under `/builds`. The checked-out sources are shared into the guest
   with a virtio-fs map that squashes every guest id onto the host user vk runs as (the

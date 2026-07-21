@@ -44,7 +44,7 @@ pub mod config;
 pub mod lock;
 pub mod relay;
 
-pub use client::{Held, LockClient};
+pub use client::{ClientAuth, Held, LockClient};
 pub use config::ServerConfig;
 
 /// Everything a connection handler needs: the content-addressed store, the relay

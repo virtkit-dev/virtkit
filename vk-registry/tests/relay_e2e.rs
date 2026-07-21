@@ -157,7 +157,7 @@ async fn multi_lock_is_atomic_all_or_nothing() {
         tls: None,
     });
     let url = spawn(state);
-    let c = LockClient::new(url, None, reqwest::Client::new());
+    let c = LockClient::new(url, vk_registry::ClientAuth::None, reqwest::Client::new());
     let ttl = Duration::from_secs(30);
     let zero = Duration::from_secs(0);
     let ab = vec!["img/a".to_string(), "img/b".to_string()];
@@ -214,6 +214,87 @@ async fn multi_lock_is_atomic_all_or_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_client_authenticates_with_basic() {
+    use std::time::Duration;
+    use vk_registry::{ClientAuth, LockClient};
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tmp("lockauth");
+    let state = Arc::new(ServerState {
+        store: Arc::new(Store::new(dir.clone()).unwrap()),
+        upstreams: vec![],
+        locks: LockManager::new(),
+        auth: vk_registry::auth::Auth::Basic {
+            user: "u".into(),
+            pass: "p".into(),
+        },
+        tls: None,
+    });
+    let url = spawn(state);
+    let ttl = Duration::from_secs(30);
+    let zero = Duration::from_secs(0);
+    // Tokenless → the gated /lock/ API rejects it (was the bug: a bearer-only, tokenless
+    // client 401'd against any auth-gated registry).
+    let anon = LockClient::new(url.clone(), ClientAuth::None, reqwest::Client::new());
+    assert!(
+        anon.acquire("k", ttl, zero, "h").await.is_err(),
+        "an unauthenticated lock client must be rejected"
+    );
+    // Basic credentials → acquire succeeds.
+    let c = LockClient::new(
+        url,
+        ClientAuth::Basic {
+            user: "u".into(),
+            pass: "p".into(),
+        },
+        reqwest::Client::new(),
+    );
+    assert!(
+        c.acquire("k", ttl, zero, "h").await.unwrap().is_some(),
+        "a Basic-authenticated lock client must acquire"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_client_authenticates_with_bearer() {
+    use std::time::Duration;
+    use vk_registry::{ClientAuth, LockClient};
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tmp("lockbearer");
+    let state = Arc::new(ServerState {
+        store: Arc::new(Store::new(dir.clone()).unwrap()),
+        upstreams: vec![],
+        locks: LockManager::new(),
+        auth: vk_registry::auth::Auth::Bearer {
+            token: "s3cret".into(),
+        },
+        tls: None,
+    });
+    let url = spawn(state);
+    let ttl = Duration::from_secs(30);
+    let zero = Duration::from_secs(0);
+    // Tokenless → the gated /lock/ API rejects it.
+    let anon = LockClient::new(url.clone(), ClientAuth::None, reqwest::Client::new());
+    assert!(
+        anon.acquire("k", ttl, zero, "h").await.is_err(),
+        "an unauthenticated lock client must be rejected"
+    );
+    // Bearer token → acquire succeeds.
+    let c = LockClient::new(
+        url,
+        ClientAuth::Bearer {
+            token: "s3cret".into(),
+        },
+        reqwest::Client::new(),
+    );
+    assert!(
+        c.acquire("k", ttl, zero, "h").await.unwrap().is_some(),
+        "a Bearer-authenticated lock client must acquire"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lock_client_round_trips_against_the_server() {
     use std::time::Duration;
     use vk_registry::LockClient;
@@ -227,7 +308,7 @@ async fn lock_client_round_trips_against_the_server() {
         tls: None,
     });
     let url = spawn(state);
-    let c = LockClient::new(url, None, reqwest::Client::new());
+    let c = LockClient::new(url, vk_registry::ClientAuth::None, reqwest::Client::new());
 
     let held = c
         .acquire(

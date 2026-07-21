@@ -8,10 +8,24 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+/// How a client authenticates to the server — matches the server's [`crate::auth::Auth`]
+/// schemes so a lock client can talk to a registry gated by either Basic or a static bearer
+/// token (or none). The bearer-only past made the `/lock/` API 401 against a Basic registry.
+#[derive(Clone, Default)]
+pub enum ClientAuth {
+    /// No credentials (loopback / trusted network).
+    #[default]
+    None,
+    /// HTTP Basic.
+    Basic { user: String, pass: String },
+    /// Static bearer token.
+    Bearer { token: String },
+}
+
 /// A handle to the vk-registry `/lock` endpoint on `base` (`scheme://host`).
 pub struct LockClient {
     base: String,
-    token: Option<String>,
+    auth: ClientAuth,
     client: reqwest::Client,
 }
 
@@ -23,10 +37,10 @@ pub struct Held {
 }
 
 impl LockClient {
-    pub fn new(base: impl Into<String>, token: Option<String>, client: reqwest::Client) -> Self {
+    pub fn new(base: impl Into<String>, auth: ClientAuth, client: reqwest::Client) -> Self {
         LockClient {
             base: base.into(),
-            token,
+            auth,
             client,
         }
     }
@@ -36,9 +50,10 @@ impl LockClient {
     }
 
     fn auth(&self, r: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.token {
-            Some(t) => r.bearer_auth(t),
-            None => r,
+        match &self.auth {
+            ClientAuth::None => r,
+            ClientAuth::Basic { user, pass } => r.basic_auth(user, Some(pass)),
+            ClientAuth::Bearer { token } => r.bearer_auth(token),
         }
     }
 

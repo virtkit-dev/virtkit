@@ -1432,7 +1432,14 @@ fn acquire_once(
 pub fn build_lock(rg: &Registry, key: &str, on_wait: &mut dyn FnMut(&str)) -> Option<BuildLock> {
     let base = lock_base(rg)?;
     let http = http_client(rg).ok()?;
-    let client = Arc::new(vk_registry::LockClient::new(base, None, http));
+    // Authenticate the lock API with the cache registry's own credentials — the /lock/
+    // endpoint is gated like every other path, so a tokenless client 401s against an
+    // auth-gated registry (no fleet-wide build-once serialization).
+    let auth = match basic_auth(rg).ok().flatten() {
+        Some((user, pass)) => vk_registry::ClientAuth::Basic { user, pass },
+        None => vk_registry::ClientAuth::None,
+    };
+    let client = Arc::new(vk_registry::LockClient::new(base, auth, http));
     let identity = crate::jobctx::job_identity();
 
     // Try once without blocking; on contention, name the holder before we park on the wait.
