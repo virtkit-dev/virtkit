@@ -1235,6 +1235,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fsbench"
+version = "0.21.0"
+
+[[package]]
 name = "fuser"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
