@@ -60,7 +60,7 @@ rm -rf "$CACHE"
 echo "### $PROCS concurrent 'vk build' processes -> shared fresh cache"
 pids=()
 for p in $(seq 1 "$PROCS"); do
-  VIRTKIT_BUILD_JOBS=1 "$VK" build -f "$WORK/Dockerfile" --target all \
+  "$VK" build -f "$WORK/Dockerfile" --target all --build-jobs 1 \
     --cache-registry "$CACHE" --out "$WORK/all-$p.ext4" \
     > "$WORK/build-$p.log" 2>&1 &
   pids+=($!)

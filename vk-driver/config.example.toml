@@ -70,6 +70,11 @@
 # cache_password_file = "/etc/virtkit/registry-password"
 # cache_token_file = "/etc/virtkit/registry-token"      # static bearer (wins over Basic)
 # journal = false                                       # add an ext4 journal to the export
+# jobs = 4               # max stages built concurrently (--build-jobs overrides;
+#                        # default: auto, bounded by host RAM). 1 = sequential
+# cpus = 8               # per-stage build guest vCPUs (default: host CPUs, capped 16)
+# mem = "8G"             # per-stage build guest RAM (default: 4G)
+# cache_checkpoint_secs = 20  # `auto` cache mode: seconds of run time before a checkpoint
 
 # MICROVM_IMAGE is prefix-based (the prefix names the source): unset = local/default;
 # `local/<name>` = a bundle dir under [local] dir; `virtkit/<name>[:tag|@digest]` =

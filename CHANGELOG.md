@@ -25,6 +25,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- Build-guest tuning moved from environment variables to the `[build]` config section:
+  `jobs`, `cpus`, `mem`, and `cache_checkpoint_secs` replace `VIRTKIT_BUILD_JOBS`,
+  `VIRTKIT_BUILD_CPUS`, `VIRTKIT_BUILD_MEM`, and `VIRTKIT_BUILD_CACHE_CHECKPOINT_SECS`
+  (which are no longer read). `vk build --build-jobs` still overrides `jobs`.
 - `vk run --cloud-hypervisor` now defaults to the `cloud_hypervisor` binary set in the
   config (matching `vk build`), instead of ignoring it and always using `cloud-hypervisor`
   from `PATH`.

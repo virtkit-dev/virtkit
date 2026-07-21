@@ -75,7 +75,7 @@ pub enum BuildCache {
     /// Checkpoint past a work threshold: a stage's final step is always cached (so
     /// stage-level reuse and `COPY --from` still hit), plus any intermediate step once
     /// the uncommitted run time since the last checkpoint crosses [`CHECKPOINT_SECS`]
-    /// (override `VIRTKIT_BUILD_CACHE_CHECKPOINT_SECS`). Trivial steps fold into the
+    /// (override `[build] cache_checkpoint_secs`). Trivial steps fold into the
     /// next checkpoint's delta, so a long stage pays a handful of commits instead of one
     /// per instruction, while a late-instruction edit still resumes from a recent
     /// checkpoint.
@@ -104,31 +104,68 @@ impl std::str::FromStr for BuildCache {
     }
 }
 
-/// `auto` mode's checkpoint threshold (seconds): an intermediate snapshot is pushed once
-/// this much uncommitted run time has accrued since the last checkpoint. Bounds the work
-/// a late-instruction edit re-runs while sparing trivial steps a commit each.
+/// `auto` mode's default checkpoint threshold (seconds): an intermediate snapshot is
+/// pushed once this much uncommitted run time has accrued since the last checkpoint.
+/// Bounds the work a late-instruction edit re-runs while sparing trivial steps a commit
+/// each. The config's `[build] cache_checkpoint_secs` overrides it per build.
 const CHECKPOINT_SECS: u64 = 20;
 
+// Host-wide build-guest tuning, set once from `[build]` by [`set_tuning`] (formerly the
+// VIRTKIT_BUILD_{CPUS,MEM,CACHE_CHECKPOINT_SECS} env vars). None of these has a CLI flag, so
+// a process global carries each to every build path — the primary `-f` build, compose
+// service builds, the on-demand manager build — and to the parallel stage workers, without
+// threading them through the per-build `Options`. `--build-jobs` stays on `Options` because
+// it *does* have a flag.
+static CHECKPOINT_DEFAULT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(CHECKPOINT_SECS);
+/// `[build] cpus`, or 0 when unset (→ the host CPU count, see [`exec::resolve_build_cpus`]).
+static BUILD_CPUS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// `[build] mem`, or None when unset (→ 4G, see [`exec::resolve_build_mem`]).
+static BUILD_MEM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Apply the host's `[build]` tuning process-wide. Called once from `cli_main` after the
+/// config loads (and by the re-exec'd `gitlab supervise` that runs the on-demand builder),
+/// before any build starts.
+pub fn set_tuning(build: &crate::config::Build) {
+    use std::sync::atomic::Ordering::Relaxed;
+    CHECKPOINT_DEFAULT.store(
+        build.cache_checkpoint_secs.unwrap_or(CHECKPOINT_SECS),
+        Relaxed,
+    );
+    BUILD_CPUS.store(build.cpus.unwrap_or(0), Relaxed);
+    *BUILD_MEM.lock().unwrap() = build.mem.clone();
+}
+
+/// The configured per-stage build vCPUs (`[build] cpus`), None when unset.
+pub(crate) fn configured_build_cpus() -> Option<u32> {
+    match BUILD_CPUS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// The configured per-stage build RAM (`[build] mem`), None when unset.
+pub(crate) fn configured_build_mem() -> Option<String> {
+    BUILD_MEM.lock().unwrap().clone()
+}
+
 // Test-only override for `checkpoint_secs`: forces the `auto` threshold on the current
-// thread so a test can exercise it without mutating the process environment (which would
-// race other tests' concurrent reads under the multithreaded runner). Thread-local, so it
-// is invisible to other tests — `build_stage` reads it on the caller's thread.
+// thread so a test can exercise it without touching the process global (which would race
+// other tests under the multithreaded runner). Thread-local, so it is invisible to other
+// tests — `build_stage` reads it on the caller's thread.
 #[cfg(test)]
 thread_local! {
     static CHECKPOINT_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
-/// The effective `auto` checkpoint threshold, `VIRTKIT_BUILD_CACHE_CHECKPOINT_SECS`
-/// overriding the [`CHECKPOINT_SECS`] default.
+/// The effective `auto` checkpoint threshold: the test override if set, else the
+/// process-wide value from [`set_tuning`].
 fn checkpoint_secs() -> u64 {
     #[cfg(test)]
     if let Some(secs) = CHECKPOINT_OVERRIDE.with(std::cell::Cell::get) {
         return secs;
     }
-    std::env::var("VIRTKIT_BUILD_CACHE_CHECKPOINT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(CHECKPOINT_SECS)
+    CHECKPOINT_DEFAULT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A sink for a build's plain `#N …` progress lines (see [`Options::progress_sink`]) — the
@@ -198,10 +235,14 @@ pub struct Options {
     /// [`NotCached`] error (exit 3 at the CLI), so a caller can branch on
     /// cached-vs-cold without paying for the build.
     pub require_cached: bool,
-    /// Max stages built concurrently (microVM backend). `Some` (the `--build-jobs`
-    /// flag) takes precedence over `VIRTKIT_BUILD_JOBS`, which takes precedence over
-    /// the `None` = auto default (bounded by host RAM, each stage guest reserving a
-    /// fixed slice). `1` forces the sequential build. Ignored by the host backend.
+    /// Max stages built concurrently (microVM backend). `Some` (the `--build-jobs` flag,
+    /// or the config's `[build] jobs`) overrides the `None` = auto default (bounded by
+    /// host RAM, each stage guest reserving a fixed slice). `1` forces the sequential
+    /// build. Ignored by the host backend.
+    ///
+    /// The other build-guest tuning knobs — per-stage `cpus`/`mem` and the `auto`
+    /// checkpoint threshold — are host-wide (no CLI flag), so they ride the process-global
+    /// build tuning set once from `[build]` (see [`set_tuning`]), not this per-build struct.
     pub build_jobs: Option<usize>,
     /// Verify every stage snapshot with `e2fsck` (best-effort) as it crosses the cache
     /// boundary — after a cache load, and before an upload — to catch a corrupt ext4
@@ -491,11 +532,15 @@ fn make_microvm(
              --cloud-hypervisor",
         )?
     };
+    let cpus = exec::resolve_build_cpus(configured_build_cpus(), exec::host_cpus());
+    let mem = exec::resolve_build_mem(configured_build_mem().as_deref());
     Ok(MicroVm::new(
         ch,
         kernel.to_path_buf(),
         agent.to_path_buf(),
         scratch.to_path_buf(),
+        cpus,
+        mem,
         cache,
         opts.journal,
         opts.net.clone(),
@@ -1972,17 +2017,12 @@ fn drive_microvm(
 }
 
 /// Resolve the parallel build's job count: explicit `--build-jobs`, else the
-/// `VIRTKIT_BUILD_JOBS` env override, else RAM-auto — each stage guest reserves
-/// `mem_mib`, so cap concurrency at ~80% of available RAM divided by that, clamped to a
-/// sane ceiling. CPU is intentionally allowed to oversubscribe (the host scheduler
-/// time-slices); RAM overcommit would OOM.
+/// `opts.build_jobs` (the `--build-jobs` flag or `[build] jobs`) when set, else RAM-auto —
+/// each stage guest reserves `mem_mib`, so cap concurrency at ~80% of available RAM
+/// divided by that, clamped to a sane ceiling. CPU is intentionally allowed to
+/// oversubscribe (the host scheduler time-slices); RAM overcommit would OOM.
 fn resolve_build_jobs(opts: &Options, mem_mib: u64) -> usize {
     if let Some(j) = opts.build_jobs {
-        return j.max(1);
-    }
-    if let Ok(v) = std::env::var("VIRTKIT_BUILD_JOBS")
-        && let Ok(j) = v.trim().parse::<usize>()
-    {
         return j.max(1);
     }
     let avail = mem_available_mib().unwrap_or(8 * 1024);
@@ -3930,13 +3970,11 @@ RUN ship
             debug: false,
             progress_sink: None,
         };
-        // Explicit --build-jobs wins and is floored to 1.
+        // Explicit build_jobs (--build-jobs, or [build] jobs) wins and is floored to 1.
         assert_eq!(resolve_build_jobs(&opts(Some(3)), 2048), 3);
         assert_eq!(resolve_build_jobs(&opts(Some(0)), 2048), 1);
-        // Auto is RAM-bounded and clamped to [1, 16]. (Skip when the env override is set.)
-        if std::env::var("VIRTKIT_BUILD_JOBS").is_err() {
-            assert_eq!(resolve_build_jobs(&opts(None), u64::MAX / 2), 1);
-            assert!((1..=16).contains(&resolve_build_jobs(&opts(None), 1)));
-        }
+        // Auto is RAM-bounded and clamped to [1, 16].
+        assert_eq!(resolve_build_jobs(&opts(None), u64::MAX / 2), 1);
+        assert!((1..=16).contains(&resolve_build_jobs(&opts(None), 1)));
     }
 }

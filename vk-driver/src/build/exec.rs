@@ -819,38 +819,28 @@ fn base_cache_key(image: &str) -> String {
     s
 }
 
-/// Per-stage build guest vCPUs: `VIRTKIT_BUILD_CPUS` if set, else the host's logical
-/// CPU count, clamped to 16 to bound oversubscription. CPU oversubscribes across
-/// concurrent stages by design (see `resolve_build_jobs`), so each heavy stage — the
-/// build's critical path — gets real parallelism instead of a 2-vCPU throttle.
-fn build_cpus() -> u32 {
-    let host = std::thread::available_parallelism()
+/// The host's logical CPU count (fallback 4) — the default per-stage build guest vCPUs
+/// before the [`resolve_build_cpus`] clamp.
+pub(crate) fn host_cpus() -> u32 {
+    std::thread::available_parallelism()
         .map(|n| n.get() as u32)
-        .unwrap_or(4);
-    resolve_build_cpus(std::env::var("VIRTKIT_BUILD_CPUS").ok().as_deref(), host)
+        .unwrap_or(4)
 }
 
-/// A positive `VIRTKIT_BUILD_CPUS` overriding `host` verbatim (an explicit request is
-/// honoured uncapped); anything absent, blank, zero, or unparseable falls back to `host`
-/// clamped to 16, bounding per-stage oversubscription.
-fn resolve_build_cpus(env: Option<&str>, host: u32) -> u32 {
-    env.and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or(host.min(16))
+/// Per-stage build guest vCPUs: the configured `[build] cpus` verbatim when it is `>= 1`
+/// (an explicit request is honoured uncapped); unset falls back to `host` clamped to 16,
+/// bounding per-stage oversubscription. CPU oversubscribes across concurrent stages by
+/// design (see `resolve_build_jobs`), so each heavy stage gets real parallelism.
+pub(crate) fn resolve_build_cpus(cfg: Option<u32>, host: u32) -> u32 {
+    cfg.filter(|&n| n >= 1).unwrap_or(host.min(16))
 }
 
-/// Per-stage build guest RAM: `VIRTKIT_BUILD_MEM` if set, else 4G — headroom for the
-/// parallel compile/link processes a high-vCPU stage now spawns. Raising this lowers the
-/// RAM-derived job count (`resolve_build_jobs`), trading stage concurrency for per-stage
-/// throughput — which suits builds whose critical path is a few heavy stages.
-fn build_mem() -> String {
-    resolve_build_mem(std::env::var("VIRTKIT_BUILD_MEM").ok().as_deref())
-}
-
-/// A non-blank `VIRTKIT_BUILD_MEM` (trimmed) overriding the 4G default. Passed through to
-/// the VMM as-is, like `--mem`, so richer cloud-hypervisor syntax stays usable.
-fn resolve_build_mem(env: Option<&str>) -> String {
-    env.map(str::trim)
+/// Per-stage build guest RAM: the configured `[build] mem` (trimmed, non-blank) else 4G —
+/// headroom for the parallel compile/link processes a high-vCPU stage spawns. Raising it
+/// lowers the RAM-derived job count (`resolve_build_jobs`), trading stage concurrency for
+/// per-stage throughput. Passed to the VMM as-is, like `--mem`.
+pub(crate) fn resolve_build_mem(cfg: Option<&str>) -> String {
+    cfg.map(str::trim)
         .filter(|v| !v.is_empty())
         .map(String::from)
         .unwrap_or_else(|| "4G".into())
@@ -863,6 +853,8 @@ impl MicroVm {
         kernel: PathBuf,
         agent: PathBuf,
         scratch: PathBuf,
+        cpus: u32,
+        mem: String,
         cache: Option<crate::config::Registry>,
         journal: bool,
         net: crate::build::BuildNet,
@@ -875,8 +867,8 @@ impl MicroVm {
             kernel,
             agent,
             scratch,
-            cpus: build_cpus(),
-            mem: build_mem(),
+            cpus,
+            mem,
             boot_timeout_secs: 120,
             debug,
             // 32 GiB of writable headroom: a real image (full toolchains + large apt
@@ -2558,17 +2550,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_build_cpus_prefers_valid_env_over_host() {
-        // A valid positive override wins and is honoured uncapped.
-        assert_eq!(resolve_build_cpus(Some("8"), 4), 8);
-        assert_eq!(resolve_build_cpus(Some(" 32 "), 4), 32);
-        assert_eq!(resolve_build_cpus(Some("64"), 8), 64);
-        // Absent, blank, zero, or non-numeric falls back to the host count.
+    fn resolve_build_cpus_prefers_configured_over_host() {
+        // A configured positive value wins and is honoured uncapped.
+        assert_eq!(resolve_build_cpus(Some(8), 4), 8);
+        assert_eq!(resolve_build_cpus(Some(64), 8), 64);
+        // Unset or zero falls back to the host count.
         assert_eq!(resolve_build_cpus(None, 8), 8);
-        assert_eq!(resolve_build_cpus(Some(""), 8), 8);
-        assert_eq!(resolve_build_cpus(Some("0"), 8), 8);
-        assert_eq!(resolve_build_cpus(Some("abc"), 8), 8);
-        // The host-derived default is clamped to 16; an explicit override is not.
+        assert_eq!(resolve_build_cpus(Some(0), 8), 8);
+        // The host-derived default is clamped to 16; an explicit value is not.
         assert_eq!(resolve_build_cpus(None, 64), 16);
     }
 

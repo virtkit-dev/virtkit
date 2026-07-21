@@ -112,6 +112,19 @@ pub struct Build {
     /// scratch. Disk-backed `/tmp` (the default) bounds bulk `/tmp` writes by disk rather
     /// than ½·guest-RAM; set this to trade that for a RAM tmpfs. Default off (disk-backed).
     pub tmp_tmpfs: bool,
+    /// max stages built concurrently on the microVM backend (`--build-jobs` overrides).
+    /// Unset = auto, bounded by host RAM (each stage guest reserves `mem`). `1` forces a
+    /// sequential build.
+    pub jobs: Option<usize>,
+    /// per-stage build guest vCPUs. Unset = the host's logical CPU count, clamped to 16.
+    pub cpus: Option<u32>,
+    /// per-stage build guest RAM, e.g. "8G". Unset = 4G. A larger value lowers the
+    /// RAM-derived `jobs` count, trading stage concurrency for per-stage throughput.
+    pub mem: Option<String>,
+    /// `auto` cache mode only: seconds of uncommitted run time in a stage before an
+    /// intermediate snapshot is checkpointed. Unset = 20. Smaller = more snapshots (a late
+    /// edit re-runs less), larger = fewer commits.
+    pub cache_checkpoint_secs: Option<u64>,
 }
 
 /// Host credentials forwarded into job VMs. The SSH agent is relayed over a vsock

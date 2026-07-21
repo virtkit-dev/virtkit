@@ -383,8 +383,8 @@ enum Cmd {
         #[arg(long = "require-cached")]
         require_cached: bool,
         /// max stages built concurrently on the microVM backend (independent stages
-        /// build in parallel over the dependency graph). Default: auto, bounded by host
-        /// RAM; also settable via VIRTKIT_BUILD_JOBS. 1 forces a sequential build
+        /// build in parallel over the dependency graph). Default: `[build] jobs`, else
+        /// auto, bounded by host RAM. 1 forces a sequential build
         #[arg(long = "build-jobs", value_name = "N")]
         build_jobs: Option<usize>,
         /// verify each stage snapshot with e2fsck as it crosses the instruction cache
@@ -1215,6 +1215,8 @@ async fn cli_main() -> ExitCode {
         Ok(cfg) => cfg,
         Err(e) => return fail(&e, 2),
     };
+    // Apply the host's `[build]` tuning process-wide, before any build path runs.
+    build::set_tuning(&cfg.build);
     if let Cmd::Config {
         example: false,
         path,
@@ -1717,7 +1719,7 @@ async fn cli_main() -> ExitCode {
             build_args,
             net,
             require_cached: *require_cached,
-            build_jobs: *build_jobs,
+            build_jobs: build_jobs.or(b.jobs),
             debug: *debug,
             progress_sink: None,
         };

@@ -592,7 +592,7 @@ async fn build_and_boot(
             build_args: args.build_args.clone(),
             net: args.build_net.clone(),
             require_cached: args.require_cached,
-            build_jobs: None,
+            build_jobs: cfg.build.jobs,
             debug: false,
             progress_sink: None,
         };
