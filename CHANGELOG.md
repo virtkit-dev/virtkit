@@ -6,6 +6,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- `[registry]` and `[build]` gained `token_file`/`cache_token_file`: a static bearer token
+  to authenticate to a registry gated by `Auth::Bearer` (takes precedence over Basic when
+  set). The driver's registry client (oci_client, raw-HTTP push/probe, and the `/lock/`
+  client) previously spoke only Basic, so it could not authenticate to a bearer-gated
+  vk-registry at all.
 - libkrun's built-in virtio-fs now supports UID/GID mapping (`krun_add_virtiofs4` with
   `uid_map`/`gid_map`, virtiofsd `--uid-map`/`--gid-map`-compatible spec strings;
   `krun_add_virtiofs3` delegates with none). The soft-idmap engine that the bundled

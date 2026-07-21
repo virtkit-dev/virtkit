@@ -90,6 +90,10 @@ pub struct Build {
     /// Path to a file holding the cache registry's Basic-auth password (read at runtime,
     /// trailing newline trimmed; only when `cache_username` is set). Provision 0600 out of band.
     pub cache_password_file: Option<PathBuf>,
+    /// Path to a file holding a static bearer token for the cache registry — an alternative
+    /// to `cache_username`/`cache_password_file` for a registry gated by `Auth::Bearer`.
+    /// Takes precedence over Basic; read at runtime (trimmed), provision 0600.
+    pub cache_token_file: Option<PathBuf>,
     /// how aggressively the instruction cache is populated: `auto` (default), `layers`
     /// (one snapshot per stage), or `instructions` (one per RUN/COPY).
     pub build_cache: crate::build::BuildCache,
@@ -309,6 +313,11 @@ pub struct Registry {
     /// Sent over the (TLS, see `ca_file`) connection; pair with an HTTPS `repo`.
     #[serde(default)]
     pub password_file: Option<PathBuf>,
+    /// Path to a file holding a static bearer token — an alternative to `username`/
+    /// `password_file` for a registry gated by `Auth::Bearer`. Takes precedence over Basic
+    /// when set; read at runtime (trimmed), provision 0600. Sent over TLS (see `ca_file`).
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
     /// Plain HTTP registry (a local/insecure registry); default TLS
     #[serde(default)]
     pub insecure: bool,
@@ -354,6 +363,7 @@ impl Registry {
         ca_file: Option<PathBuf>,
         username: String,
         password_file: Option<PathBuf>,
+        token_file: Option<PathBuf>,
         transparent_zstd: Option<bool>,
     ) -> Registry {
         Registry {
@@ -361,6 +371,7 @@ impl Registry {
             ca_file,
             username,
             password_file,
+            token_file,
             insecure,
             transparent_zstd,
             proxy_guests: false,

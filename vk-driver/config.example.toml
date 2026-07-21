@@ -64,6 +64,10 @@
 # agent = "/usr/local/lib/vk/vk-agent"        # injected as PID 1
 # cache_registry = "127.0.0.1:5000"                     # shared instruction cache
 # cache_insecure = true                                 # the cache registry is plain HTTP
+# cache_ca_file = "/etc/virtkit/registry-ca.crt"        # PEM CA for a TLS cache registry
+# cache_username = "ci-push"                            # HTTP Basic; empty = anonymous
+# cache_password_file = "/etc/virtkit/registry-password"
+# cache_token_file = "/etc/virtkit/registry-token"      # static bearer (wins over Basic)
 # journal = false                                       # add an ext4 journal to the export
 
 # MICROVM_IMAGE is prefix-based (the prefix names the source): unset = local/default;
@@ -86,6 +90,8 @@
 # password_file = "/etc/virtkit/registry-password"   # file holding the password
 #                                  # (kept out of this config); read at runtime,
 #                                  # provision it 0600. Sent over TLS — see ca_file.
+# token_file = "/etc/virtkit/registry-token"   # static bearer token instead of Basic
+#                                  # (for an Auth::Bearer registry); wins over username
 # insecure = false                 # plain HTTP (a local/insecure registry)
 
 # [docker]               # OCI images booted directly on demand (native OCI client, no

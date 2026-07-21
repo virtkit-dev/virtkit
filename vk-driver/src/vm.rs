@@ -268,6 +268,7 @@ fn build_git_image(
             ca_file: cfg.build.cache_ca_file.clone(),
             username: cfg.build.cache_username.clone(),
             password_file: cfg.build.cache_password_file.clone(),
+            token_file: cfg.build.cache_token_file.clone(),
         },
     };
     let dir = crate::ensure::ensure_build_tier(
@@ -597,6 +598,7 @@ fn build_compose_unit(
             ca_file: cfg.build.cache_ca_file.clone(),
             username: cfg.build.cache_username.clone(),
             password_file: cfg.build.cache_password_file.clone(),
+            token_file: cfg.build.cache_token_file.clone(),
         },
     };
     let ext4 = crate::units::build_unit_ext4(cfg.state_dir(), &build.build_args, unit)?;

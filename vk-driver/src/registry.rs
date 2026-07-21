@@ -754,18 +754,7 @@ fn client(rg: &Registry) -> Result<(oci_client::Client, RegistryAuth)> {
         cfg.protocol = ClientProtocol::Http;
     }
     let client = oci_client::Client::new(cfg);
-    let auth = if rg.username.is_empty() {
-        RegistryAuth::Anonymous
-    } else {
-        let file = rg
-            .password_file
-            .as_ref()
-            .context("registry.username set but no registry.password_file")?;
-        let password =
-            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-        RegistryAuth::Basic(rg.username.clone(), password.trim_end().to_string())
-    };
-    Ok((client, auth))
+    Ok((client, cred(rg)?.registry_auth()))
 }
 
 /// `<registry.repo>/<name>` parsed into an oci-client `Reference` at `tag`/`digest`.
@@ -1330,20 +1319,19 @@ fn sha256_hex(data: &[u8]) -> String {
 /// Probe `GET /v2/` for the [`TRANSPARENT_ZSTD_HEADER`] a cooperating `regserve`
 /// advertises. Any failure — a dumb registry, a network/TLS error, a missing CA —
 /// yields `false`: fall back to the compressed-digest path. Only called in auto mode
-/// (`transparent_zstd` unset). Sends Basic auth: an authenticated vk-registry challenges
-/// `/v2/` (401) like every other path, so an anonymous probe would just 401 and mis-detect
-/// as `false`.
+/// (`transparent_zstd` unset). Sends the configured credential (Basic or bearer): an
+/// authenticated vk-registry challenges `/v2/` (401) like every other path, so an anonymous
+/// probe would just 401 and mis-detect as `false`.
 async fn detect_transparent_zstd(rg: &Registry, image: &OciReference) -> bool {
     let Ok(http) = http_client(rg) else {
         return false;
     };
     let scheme = if rg.insecure { "http" } else { "https" };
     let url = format!("{scheme}://{}/v2/", image.resolve_registry());
-    let req = http.get(&url);
-    let req = match basic_auth(rg) {
-        Ok(Some((u, p))) => req.basic_auth(u, Some(p)),
-        _ => req,
-    };
+    let mut req = http.get(&url);
+    if let Ok(c) = cred(rg) {
+        req = c.apply(req);
+    }
     match req.send().await {
         Ok(resp) => resp.headers().contains_key(TRANSPARENT_ZSTD_HEADER),
         Err(_) => false,
@@ -1435,10 +1423,7 @@ pub fn build_lock(rg: &Registry, key: &str, on_wait: &mut dyn FnMut(&str)) -> Op
     // Authenticate the lock API with the cache registry's own credentials — the /lock/
     // endpoint is gated like every other path, so a tokenless client 401s against an
     // auth-gated registry (no fleet-wide build-once serialization).
-    let auth = match basic_auth(rg).ok().flatten() {
-        Some((user, pass)) => vk_registry::ClientAuth::Basic { user, pass },
-        None => vk_registry::ClientAuth::None,
-    };
+    let auth = cred(rg).map(|c| c.client_auth()).unwrap_or_default();
     let client = Arc::new(vk_registry::LockClient::new(base, auth, http));
     let identity = crate::jobctx::job_identity();
 
@@ -1518,21 +1503,78 @@ impl Drop for BuildLock {
     }
 }
 
-/// Optional HTTP Basic credentials from the registry config (username + password
-/// file). None when no username is set (anonymous).
-fn basic_auth(rg: &Registry) -> Result<Option<(String, String)>> {
-    if rg.username.is_empty() {
-        return Ok(None);
+/// Client credentials resolved from the registry config: a static bearer token
+/// (`token_file`) takes precedence over Basic (`username` + `password_file`), else none.
+/// One resolver for every client path (oci_client, raw HTTP, the lock API) so the driver
+/// can authenticate to a registry gated by either Basic or a static bearer token.
+enum Cred {
+    None,
+    Basic { user: String, pass: String },
+    Bearer { token: String },
+}
+
+fn cred(rg: &Registry) -> Result<Cred> {
+    if let Some(tf) = &rg.token_file {
+        // A bearer token carries no meaningful surrounding whitespace, so trim both ends
+        // (unlike a password below, which may legitimately begin with whitespace and is
+        // only `trim_end`ed). An empty token_file is a misconfiguration, not a request to
+        // stay anonymous: reject it rather than send an empty `Bearer ` that only 401s.
+        let token = std::fs::read_to_string(tf)
+            .with_context(|| format!("reading {}", tf.display()))?
+            .trim()
+            .to_string();
+        if token.is_empty() {
+            bail!("registry.token_file {} is empty", tf.display());
+        }
+        return Ok(Cred::Bearer { token });
     }
-    let file = rg
-        .password_file
-        .as_ref()
-        .context("registry.username set but no registry.password_file")?;
-    let pw = std::fs::read_to_string(file)
-        .with_context(|| format!("reading {}", file.display()))?
-        .trim_end()
-        .to_string();
-    Ok(Some((rg.username.clone(), pw)))
+    if !rg.username.is_empty() {
+        let file = rg
+            .password_file
+            .as_ref()
+            .context("registry.username set but no registry.password_file")?;
+        let pass = std::fs::read_to_string(file)
+            .with_context(|| format!("reading {}", file.display()))?
+            .trim_end()
+            .to_string();
+        return Ok(Cred::Basic {
+            user: rg.username.clone(),
+            pass,
+        });
+    }
+    Ok(Cred::None)
+}
+
+impl Cred {
+    /// The oci_client auth for the manifest/blob paths.
+    fn registry_auth(&self) -> RegistryAuth {
+        match self {
+            Cred::None => RegistryAuth::Anonymous,
+            Cred::Basic { user, pass } => RegistryAuth::Basic(user.clone(), pass.clone()),
+            Cred::Bearer { token } => RegistryAuth::Bearer(token.clone()),
+        }
+    }
+    /// Attach the credential to a raw reqwest request.
+    fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self {
+            Cred::None => req,
+            Cred::Basic { user, pass } => req.basic_auth(user, Some(pass)),
+            Cred::Bearer { token } => req.bearer_auth(token),
+        }
+    }
+    /// The lock-client auth for the build-once `/lock/` API.
+    fn client_auth(&self) -> vk_registry::ClientAuth {
+        match self {
+            Cred::None => vk_registry::ClientAuth::None,
+            Cred::Basic { user, pass } => vk_registry::ClientAuth::Basic {
+                user: user.clone(),
+                pass: pass.clone(),
+            },
+            Cred::Bearer { token } => vk_registry::ClientAuth::Bearer {
+                token: token.clone(),
+            },
+        }
+    }
 }
 
 /// Upload an already-zstd-compressed blob under `digest` (the digest of its
@@ -1550,11 +1592,8 @@ async fn push_blob_zstd(
     let scheme = if rg.insecure { "http" } else { "https" };
     let registry = image.resolve_registry();
     let repo = image.repository();
-    let auth = basic_auth(rg)?;
-    let with_auth = |req: reqwest::RequestBuilder| match &auth {
-        Some((u, p)) => req.basic_auth(u, Some(p)),
-        None => req,
-    };
+    let auth = cred(rg)?;
+    let with_auth = |req: reqwest::RequestBuilder| auth.apply(req);
 
     // 1. begin an upload session.
     let uploads = format!("{scheme}://{registry}/v2/{repo}/blobs/uploads/");
@@ -2075,7 +2114,123 @@ mod tests {
             String::new(),
             None,
             None,
+            None,
         )
+    }
+
+    /// Build a `Registry` with the auth-relevant fields set (the rest defaulted).
+    fn auth_registry(
+        username: &str,
+        password_file: Option<PathBuf>,
+        token_file: Option<PathBuf>,
+    ) -> Registry {
+        Registry::for_share(
+            "example.com/img".to_string(),
+            false,
+            None,
+            username.to_string(),
+            password_file,
+            token_file,
+            None,
+        )
+    }
+
+    #[test]
+    fn cred_resolves_precedence_and_reads_files() {
+        let dir = std::env::temp_dir().join(format!("vk-cred-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // trailing newline/whitespace is trimmed from both files.
+        let token = dir.join("token");
+        std::fs::write(&token, "  tok3n\n").unwrap();
+        // leading whitespace is significant for a password (trim_end only); trailing is not.
+        let pass = dir.join("pass");
+        std::fs::write(&pass, "  s3cret\n").unwrap();
+
+        // neither set → None.
+        assert!(matches!(
+            cred(&auth_registry("", None, None)).unwrap(),
+            Cred::None
+        ));
+
+        // username + password_file → Basic (password trimmed of trailing whitespace only).
+        match cred(&auth_registry("u", Some(pass.clone()), None)).unwrap() {
+            Cred::Basic { user, pass } => {
+                assert_eq!(user, "u");
+                assert_eq!(pass, "  s3cret", "trim_end keeps leading whitespace");
+            }
+            _ => panic!("expected Basic"),
+        }
+
+        // token_file → Bearer, trimmed both ends.
+        match cred(&auth_registry("", None, Some(token.clone()))).unwrap() {
+            Cred::Bearer { token } => assert_eq!(token, "tok3n"),
+            _ => panic!("expected Bearer"),
+        }
+
+        // token_file wins even when a username/password is also configured.
+        match cred(&auth_registry("u", Some(pass), Some(token))).unwrap() {
+            Cred::Bearer { token } => assert_eq!(token, "tok3n"),
+            _ => panic!("expected Bearer to win over Basic"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cred_errors_on_missing_and_empty_token_file() {
+        let dir = std::env::temp_dir().join(format!("vk-cred-err-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // `Cred` deliberately derives no Debug (no secret leak), so unwrap_err() is out —
+        // match the error out by hand.
+        let err = |r: Result<Cred>| match r {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+
+        // a missing token_file surfaces an error naming the path.
+        let missing = dir.join("absent");
+        let e = err(cred(&auth_registry("", None, Some(missing.clone()))));
+        assert!(e.contains(&missing.display().to_string()), "got: {e}");
+
+        // an empty (whitespace-only) token_file is rejected rather than sent as `Bearer `.
+        let empty = dir.join("empty");
+        std::fs::write(&empty, "  \n").unwrap();
+        let e = err(cred(&auth_registry("", None, Some(empty))));
+        assert!(e.contains("empty"), "got: {e}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cred_maps_to_each_client_auth_type() {
+        // The three consumers translate a resolved Cred to the right target variant.
+        assert!(matches!(
+            Cred::None.registry_auth(),
+            RegistryAuth::Anonymous
+        ));
+        assert!(matches!(
+            Cred::Bearer { token: "t".into() }.registry_auth(),
+            RegistryAuth::Bearer(t) if t == "t"
+        ));
+        assert!(matches!(
+            Cred::Basic { user: "u".into(), pass: "p".into() }.registry_auth(),
+            RegistryAuth::Basic(u, p) if u == "u" && p == "p"
+        ));
+        assert!(matches!(
+            Cred::Bearer { token: "t".into() }.client_auth(),
+            vk_registry::ClientAuth::Bearer { token } if token == "t"
+        ));
+        assert!(matches!(
+            Cred::Basic { user: "u".into(), pass: "p".into() }.client_auth(),
+            vk_registry::ClientAuth::Basic { user, pass } if user == "u" && pass == "p"
+        ));
+        assert!(matches!(
+            Cred::None.client_auth(),
+            vk_registry::ClientAuth::None
+        ));
     }
 
     /// Full local-backend round-trip through the PUBLIC dispatch: push a sparse

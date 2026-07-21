@@ -143,6 +143,7 @@ pub struct CacheAuth {
     pub ca_file: Option<PathBuf>,
     pub username: String,
     pub password_file: Option<PathBuf>,
+    pub token_file: Option<PathBuf>,
 }
 
 /// What/how to build.
@@ -476,6 +477,7 @@ fn make_microvm(
             opts.cache_auth.ca_file.clone(),
             opts.cache_auth.username.clone(),
             opts.cache_auth.password_file.clone(),
+            opts.cache_auth.token_file.clone(),
             None,
         )
     });

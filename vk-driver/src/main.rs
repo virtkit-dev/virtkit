@@ -1437,6 +1437,7 @@ async fn cli_main() -> ExitCode {
                 ca_file: b.cache_ca_file.clone(),
                 username: b.cache_username.clone(),
                 password_file: b.cache_password_file.clone(),
+                token_file: b.cache_token_file.clone(),
             },
             build_cache,
             journal: *journal || b.journal,
