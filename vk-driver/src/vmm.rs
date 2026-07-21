@@ -218,6 +218,12 @@ pub struct VmSpec {
     pub balloon: bool,
     /// Serial console log file (`--serial file=…`).
     pub serial_log: PathBuf,
+    /// Keep `console=ttyS0` instead of rewriting it to `console=hvc0` (libkrun): needed
+    /// for a BYO stock kernel whose virtio-console (hvc0) is modular, so early boot output
+    /// only reaches the legacy serial. Set by `vk run --console-serial`. An image kernel
+    /// keeps serial regardless (via the `VIRTKIT_KERNEL=image` cmdline token).
+    #[serde(default)]
+    pub console_serial: bool,
     /// CH API socket for graceful shutdown (the detached CI VM). `None` = no API
     /// socket (the held-`Child` paths kill the process directly).
     pub api_socket: Option<PathBuf>,
@@ -431,6 +437,7 @@ mod tests {
             },
             balloon: true,
             serial_log: "/job/console.log".into(),
+            console_serial: false,
             api_socket: Some("/job/api.sock".into()),
             pass_fds: Vec::new(),
             proc_name: "vk:ci".into(),
@@ -496,6 +503,7 @@ mod tests {
             net: Net::None,
             balloon: false,
             serial_log: "/w/console.log".into(),
+            console_serial: false,
             api_socket: None,
             pass_fds: Vec::new(),
             proc_name: "vk:build".into(),

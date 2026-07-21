@@ -69,7 +69,7 @@ fn detect_kernel_format(data: &[u8]) -> Option<u32> {
 /// Normalise the guest cmdline's console token. The embedded kernel has virtio_console built
 /// in (hvc0) from early boot, so by default CH's `console=ttyS0` is rewritten to `console=hvc0`
 /// (the safe, pre-patch behaviour). A BYO/stock distro kernel has virtio_console as a module and
-/// only emits early output on the legacy serial, so `keep_serial` (VIRTKIT_CONSOLE_SERIAL=1)
+/// only emits early output on the legacy serial, so `keep_serial` (`vk run --console-serial`)
 /// leaves `console=ttyS0` in place, served by the COM1 patch in the vendored builder.rs.
 fn console_cmdline(cmdline: &str, keep_serial: bool) -> String {
     if keep_serial {
@@ -152,8 +152,8 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         //     early boot -> rewrite console=ttyS0 -> console=hvc0 (the safe default;
         //     preserves the pre-patch behaviour).
         //   - BYO/stock distro kernel (e.g. modular Debian): virtio_console is a module,
-        //     so early output only appears on the legacy serial -> set
-        //     VIRTKIT_CONSOLE_SERIAL=1 to keep console=ttyS0 (served by the COM1 patch).
+        //     so early output only appears on the legacy serial -> `vk run --console-serial`
+        //     (spec.console_serial) keeps console=ttyS0 (served by the COM1 patch).
         let serial_log = cstr(&spec.serial_log.to_string_lossy());
         ck(
             "krun_set_console_output",
@@ -169,7 +169,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         // always-present legacy COM1 (ttyS0, served by the early-console patch) — else
         // the guest console is dead early and the agent stalls before the serve is up.
         // The pinned kernel has hvc0, so kernel==default keeps the hvc0 rewrite.
-        let keep_serial = std::env::var_os("VIRTKIT_CONSOLE_SERIAL").is_some()
+        let keep_serial = spec.console_serial
             || spec
                 .cmdline
                 .split_whitespace()
@@ -337,7 +337,7 @@ mod tests {
             console_cmdline(cmdline, false),
             "init=/vk-agent console=hvc0 root=/dev/vda"
         );
-        // VIRTKIT_CONSOLE_SERIAL=1 (BYO kernel): keep ttyS0 untouched.
+        // --console-serial (BYO kernel): keep ttyS0 untouched.
         assert_eq!(console_cmdline(cmdline, true), cmdline);
         // No console token present: unchanged either way.
         assert_eq!(console_cmdline("init=/vk-agent", false), "init=/vk-agent");

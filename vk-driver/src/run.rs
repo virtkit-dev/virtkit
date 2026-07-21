@@ -114,6 +114,9 @@ pub struct RunArgs {
     /// Which kernel the guest boots on: virtkit's pinned kernel (`Default`), the
     /// image's own kernel + modules (`Image`), or an explicit kernel file (`Path`).
     pub kernel: KernelSource,
+    /// Keep `console=ttyS0` (don't rewrite to hvc0) for a BYO stock kernel whose
+    /// virtio-console is modular (`vk run --console-serial`). See [`crate::vmm::VmSpec`].
+    pub console_serial: bool,
     /// `None` uses the vk-agent embedded in `vk` (or the on-disk default).
     pub agent: Option<PathBuf>,
     pub cloud_hypervisor: PathBuf,
@@ -1204,6 +1207,7 @@ async fn build_and_boot(
         net: crate::vmm::Net::None,
         balloon: false,
         serial_log: console.clone(),
+        console_serial: args.console_serial,
         api_socket: None,
         pass_fds,
         proc_name: crate::vmm::resolve_proc_name(&unit_name),
@@ -2621,6 +2625,8 @@ pub(crate) async fn boot_session(
         net: crate::vmm::Net::None,
         balloon: false,
         serial_log: console.clone(),
+        // build stages boot the pinned kernel (hvc0), never a BYO serial-only kernel.
+        console_serial: false,
         api_socket: None,
         pass_fds,
         // `stem` is the stage ext4's name — the closest identity this build VM has.
@@ -3302,6 +3308,7 @@ mod tests {
             net: crate::vmm::Net::None,
             balloon: false,
             serial_log: dir.join("console.log"),
+            console_serial: false,
             api_socket: None,
             pass_fds: vec![medium.fd()],
             proc_name: "vk:test".into(),

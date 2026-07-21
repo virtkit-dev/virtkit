@@ -564,6 +564,11 @@ enum Cmd {
         /// /boot/vmlinuz + modules), or a path to a vmlinux/bzImage.
         #[arg(long, default_value = "default", value_parser = run::KernelSource::parse)]
         kernel: run::KernelSource,
+        /// keep console=ttyS0 for a BYO stock kernel (`--kernel <path>`) whose
+        /// virtio-console (hvc0) is a module, so early boot output reaches the legacy
+        /// serial. Unneeded for the default or an image kernel.
+        #[arg(long = "console-serial")]
+        console_serial: bool,
         /// Where the rootfs comes from: oci (registry pull, no docker daemon), docker
         /// (docker export), or auto (registry, falling back to docker for an unpushed image)
         #[arg(long, value_enum, default_value = "auto")]
@@ -1271,6 +1276,7 @@ async fn cli_main() -> ExitCode {
         build_allow_name,
         workdir,
         kernel,
+        console_serial,
         source,
         ca,
         username,
@@ -1404,6 +1410,7 @@ async fn cli_main() -> ExitCode {
             build_args,
             workdir: workdir.clone(),
             kernel: kernel.clone(),
+            console_serial: *console_serial,
             agent: agent.clone(),
             // CLI flag wins; else the config's top-level cloud_hypervisor (bare
             // "cloud-hypervisor" when unset). vk run has no [build] tier to consult.

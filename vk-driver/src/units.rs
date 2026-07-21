@@ -429,6 +429,8 @@ pub fn boot_unit(
             net: crate::vmm::Net::None,
             balloon: false,
             serial_log: console.clone(),
+            // an image (stock) kernel keeps serial via the VIRTKIT_KERNEL=image token.
+            console_serial: false,
             api_socket: None,
             pass_fds: Vec::new(),
             proc_name: crate::vmm::resolve_proc_name(&svc.name),
