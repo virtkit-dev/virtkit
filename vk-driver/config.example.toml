@@ -3,6 +3,7 @@
 # Example targeting a bootable guest bundle; every key is optional.
 
 # state_dir = "/var/lib/virtkit"          # job state: <state_dir>/jobs/<job id>/
+# vmm = "libkrun"                          # or "cloud-hypervisor"; VIRTKIT_VMM overrides
 # cloud_hypervisor = "/usr/local/bin/cloud-hypervisor"
 # virtiofsd = "/usr/local/bin/virtiofsd"      # external virtiofsd (default: bundled)
 # image_cache_idle_secs = 1800   # a materialized image base (registry/docker) left idle

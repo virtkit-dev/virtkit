@@ -1220,8 +1220,10 @@ async fn cli_main() -> ExitCode {
         Ok(cfg) => cfg,
         Err(e) => return fail(&e, 2),
     };
-    // Apply the host's `[build]` tuning process-wide, before any build path runs.
+    // Apply the host's `[build]` tuning and VMM-backend choice process-wide, before any
+    // build or boot path runs (VIRTKIT_VMM still overrides the config key).
     build::set_tuning(&cfg.build);
+    vmm::set_config_backend(cfg.vmm);
     if let Cmd::Config {
         example: false,
         path,

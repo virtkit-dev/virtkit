@@ -25,6 +25,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- A top-level `vmm` config key selects the VMM backend (`libkrun` or `cloud-hypervisor`),
+  so a host need not set `VIRTKIT_VMM` in every environment; the environment variable still
+  overrides the key when set.
 - `vk run --console-serial` replaces the `VIRTKIT_CONSOLE_SERIAL` environment variable for
   keeping `console=ttyS0` with a BYO stock kernel whose virtio-console is modular.
 - Build-guest tuning moved from environment variables to the `[build]` config section:

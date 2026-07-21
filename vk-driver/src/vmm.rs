@@ -346,18 +346,34 @@ impl Vmm for Libkrun {
     }
 }
 
+/// The `[vmm]` config choice, set once in `cli_main` from the loaded config. `None` (not
+/// yet set, or the key was absent) leaves the backend to the env var / libkrun default.
+static CONFIG_BACKEND: std::sync::OnceLock<Option<crate::config::VmmBackend>> =
+    std::sync::OnceLock::new();
+
+/// Record the config's `vmm` key so [`libkrun_selected`] can consult it. Called once after
+/// the config loads, before any boot. The `VIRTKIT_VMM` env var still takes precedence.
+pub fn set_config_backend(backend: Option<crate::config::VmmBackend>) {
+    let _ = CONFIG_BACKEND.set(backend);
+}
+
 /// Whether the libkrun backend is selected. libkrun is the default when it is compiled
-/// in (the `libkrun` feature); set `VIRTKIT_VMM=cloud-hypervisor` to opt out — e.g. for
-/// Windows guests, which libkrun cannot boot. Read on each call so every CI phase
-/// (prepare/run/cleanup run as separate processes) agrees — gitlab-runner passes the
-/// same environment to each exec.
+/// in (the `libkrun` feature). The precedence is `VIRTKIT_VMM` (read on each call so every
+/// CI phase — prepare/run/cleanup, separate processes sharing gitlab-runner's environment —
+/// agrees), then the config `vmm` key, then libkrun. Set `cloud-hypervisor` to opt out —
+/// e.g. for Windows guests, which libkrun cannot boot.
 pub fn libkrun_selected() -> bool {
     if !cfg!(feature = "libkrun") {
         return false;
     }
+    match std::env::var("VIRTKIT_VMM").ok().as_deref() {
+        Some("cloud-hypervisor") | Some("cloud_hypervisor") | Some("ch") => return false,
+        Some("libkrun") => return true,
+        _ => {}
+    }
     !matches!(
-        std::env::var("VIRTKIT_VMM").ok().as_deref(),
-        Some("cloud-hypervisor") | Some("cloud_hypervisor") | Some("ch")
+        CONFIG_BACKEND.get().copied().flatten(),
+        Some(crate::config::VmmBackend::CloudHypervisor)
     )
 }
 

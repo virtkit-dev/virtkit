@@ -21,6 +21,10 @@ pub struct Config {
     pub cloud_hypervisor: Option<PathBuf>,
     /// virtiofsd binary, only needed when [share] is set
     pub virtiofsd: Option<PathBuf>,
+    /// VMM backend: `libkrun` (the default, embedded in `vk`) or `cloud-hypervisor` (an
+    /// external binary — e.g. for Windows guests, which libkrun cannot boot). The
+    /// `VIRTKIT_VMM` environment variable overrides this key. Unset = libkrun.
+    pub vmm: Option<VmmBackend>,
     /// Materialized image bases (`<state_dir>/{registry,docker}/…/runner.ext4`) that have
     /// sat idle this many seconds — no VM overlaying them — are evicted the next time that
     /// same cache tier (`registry/` or `docker/`) takes a fresh pull; a base under a live
@@ -72,6 +76,16 @@ pub struct Config {
     /// found). Set by [`Config::load`], not a config key.
     #[serde(skip)]
     pub source: Option<PathBuf>,
+}
+
+/// VMM backend selector for the `vmm` config key. Accepts the same spellings the
+/// `VIRTKIT_VMM` env var does (`cloud_hypervisor`, `ch`), so a typo fails at parse time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VmmBackend {
+    Libkrun,
+    #[serde(alias = "cloud_hypervisor", alias = "ch")]
+    CloudHypervisor,
 }
 
 /// Defaults for `vk build` (the experimental microVM Dockerfile builder). Every
@@ -678,6 +692,23 @@ mod tests {
             Some("reg.example.com/team")
         );
         assert_eq!(back.build.build_cache, crate::build::BuildCache::Layers);
+    }
+
+    #[test]
+    fn vmm_key_parses_all_spellings_and_rejects_junk() {
+        let cfg: Config = toml::from_str("vmm = \"cloud-hypervisor\"\n").unwrap();
+        assert_eq!(cfg.vmm, Some(VmmBackend::CloudHypervisor));
+        // the env var's alternative spellings are accepted as aliases too
+        for s in ["cloud_hypervisor", "ch"] {
+            let cfg: Config = toml::from_str(&format!("vmm = {s:?}\n")).unwrap();
+            assert_eq!(cfg.vmm, Some(VmmBackend::CloudHypervisor));
+        }
+        assert_eq!(
+            toml::from_str::<Config>("vmm = \"libkrun\"\n").unwrap().vmm,
+            Some(VmmBackend::Libkrun)
+        );
+        assert!(Config::default().vmm.is_none());
+        assert!(toml::from_str::<Config>("vmm = \"qemu\"\n").is_err());
     }
 
     #[test]
