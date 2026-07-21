@@ -23,7 +23,7 @@ use anyhow::{Context, Result, bail};
 // (rlib -> shares virtkit's std; compiler-checked signatures). Every call returns
 // >= 0 on success, a negative errno on failure.
 use krun::{
-    krun_add_disk2, krun_add_net_tap, krun_add_virtiofs3, krun_add_vsock_port2, krun_create_ctx,
+    krun_add_disk2, krun_add_net_tap, krun_add_virtiofs4, krun_add_vsock_port2, krun_create_ctx,
     krun_disable_implicit_init, krun_init_log, krun_set_block_dirty_socket,
     krun_set_console_output, krun_set_kernel, krun_set_vm_config, krun_start_enter,
 };
@@ -200,9 +200,21 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         for share in &spec.shares {
             let tag = cstr(&share.tag);
             let dir = cstr(&share.host_dir.to_string_lossy());
+            // The id-map rules for this share, joined by ',' as krun_add_virtiofs4 expects;
+            // an empty map yields an empty string, which the FFI treats as an identity map.
+            let uid_map = cstr(&share.uid_map.join(","));
+            let gid_map = cstr(&share.gid_map.join(","));
             ck(
-                "krun_add_virtiofs3",
-                krun_add_virtiofs3(ctx, tag.as_ptr(), dir.as_ptr(), 0, share.read_only),
+                "krun_add_virtiofs4",
+                krun_add_virtiofs4(
+                    ctx,
+                    tag.as_ptr(),
+                    dir.as_ptr(),
+                    0,
+                    share.read_only,
+                    uid_map.as_ptr(),
+                    gid_map.as_ptr(),
+                ),
             )?;
         }
 

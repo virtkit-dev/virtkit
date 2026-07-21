@@ -16,7 +16,6 @@
 //! libkrun's fail-closed read-only wrapper; `--uid-map`/`--gid-map` are served by
 //! [`idmap::IdMapFs`] (virtiofsd-compatible soft id mapping).
 
-mod idmap;
 mod seccomp;
 
 use std::collections::VecDeque;
@@ -30,6 +29,7 @@ use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
 use devices::virtio::descriptor_utils::{Reader as KrunReader, Writer as KrunWriter};
 use devices::virtio::fs::filesystem::FileSystem;
+use devices::virtio::fs::idmap::{IdMap, IdMapFs, IdTable};
 use devices::virtio::fs::passthrough::{CachePolicy, Config as FsConfig, PassthroughFs};
 use devices::virtio::fs::read_only::PassthroughFsRo;
 use devices::virtio::fs::single_file::SingleFileFs;
@@ -52,8 +52,6 @@ use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::event::{
     EventConsumer, EventFlag, EventNotifier, new_event_consumer_and_notifier,
 };
-
-use idmap::{IdMap, IdMapFs, IdTable};
 
 type Mem = GuestMemoryAtomic<GuestMemoryMmap>;
 type Chain = DescriptorChain<GuestMemoryLoadGuard<GuestMemoryMmap>>;

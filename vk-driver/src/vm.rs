@@ -709,6 +709,8 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             socket: vfsd_sock,
             host_dir: share.dir.clone(),
             read_only: share.readonly,
+            uid_map: Vec::new(),
+            gid_map: Vec::new(),
         });
     }
 
@@ -736,6 +738,8 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             socket: sock,
             host_dir: dir.clone(),
             read_only: true,
+            uid_map: Vec::new(),
+            gid_map: Vec::new(),
         });
         cmdline.push_str(" VIRTKIT_TOOLS=vktools:/run/virtkit-tools");
     }
@@ -751,11 +755,28 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             .context("host_checkout is set but CI_PROJECT_DIR is unset")?;
         let host_dir = ctx.host_checkout_dir();
         let sock = ctx.job_dir.join("cibuild-vfsd.sock");
+
+        // The checkout tree is 0700 and owned by the user vk runs as (protects the embedded
+        // git token at rest). Squash EVERY guest id onto that owner: a job image running as
+        // any user then reads+writes the tree as its owner, so a non-root job works without
+        // having to resolve the job's uid before boot.
+        use std::os::unix::fs::MetadataExt;
+        let owner = std::fs::metadata(&host_dir)
+            .with_context(|| format!("stat host checkout dir {}", host_dir.display()))?;
+        let uid_map = vec![format!("squash-guest:0:{}:{}", owner.uid(), u32::MAX)];
+        let gid_map = vec![format!("squash-guest:0:{}:{}", owner.gid(), u32::MAX)];
+
         if !crate::vmm::libkrun_selected() {
             let mut vfsd = cfg.virtiofsd_command();
             vfsd.arg(format!("--socket-path={}", sock.display()))
                 .arg(format!("--shared-dir={}", host_dir.display()))
                 .args(["--cache=auto", "--sandbox=none"]);
+            for m in &uid_map {
+                vfsd.arg(format!("--uid-map={m}"));
+            }
+            for m in &gid_map {
+                vfsd.arg(format!("--gid-map={m}"));
+            }
             children.push(
                 spawn_tied_logged(vfsd, &ctx.job_dir.join("cibuild-vfsd.log"))
                     .context("spawning the checkout virtiofsd")?,
@@ -768,6 +789,8 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             socket: sock,
             host_dir,
             read_only: false,
+            uid_map,
+            gid_map,
         });
         // The agent mounts VIRTKIT_VIRTIOFS shares at boot; CI supervise sets no other, so a
         // plain assignment is safe (the guest mkdir -p's the mount point).

@@ -353,6 +353,8 @@ pub fn boot_unit(
             socket: sock,
             host_dir: vol.host.clone(),
             read_only: vol.read_only,
+            uid_map: Vec::new(),
+            gid_map: Vec::new(),
         });
     }
     let shared_mem = !shares.is_empty();

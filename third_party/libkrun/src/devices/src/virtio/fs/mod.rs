@@ -5,6 +5,9 @@ mod device;
 #[allow(dead_code)]
 pub mod filesystem;
 pub mod fuse;
+// public (local patch, see VENDOR.md): the virtiofsd-compatible soft UID/GID id-map
+// wrapper, usable by both the in-process virtio-fs device and the external `vk virtiofsd`.
+pub mod idmap;
 mod inode_alloc;
 #[allow(dead_code)]
 mod multikey;
@@ -39,6 +42,8 @@ pub use self::filesystem::ExportTable;
 // Local patch (see VENDOR.md): expose the transport-agnostic FUSE server pieces so an
 // external vhost-user daemon can drive PassthroughFs without this crate's Fs device.
 pub use self::filesystem::FileSystem;
+// Local patch (see VENDOR.md): expose the soft id-map wrapper and its parsed tables.
+pub use self::idmap::{IdMap, IdMapFs, IdTable};
 pub use self::inode_alloc::InodeAllocator;
 pub use self::server::Server;
 

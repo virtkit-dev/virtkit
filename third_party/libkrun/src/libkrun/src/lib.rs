@@ -634,6 +634,8 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
                 // Default to a conservative 512 MB window.
                 shm_size: Some(1 << 29),
                 read_only: false,
+                uid_map: Vec::new(),
+                gid_map: Vec::new(),
                 virtual_entries: {
                     #[allow(unused_mut)]
                     let mut v = Vec::new();
@@ -684,6 +686,33 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
     shm_size: u64,
     read_only: bool,
 ) -> i32 {
+    krun_add_virtiofs4(
+        ctx_id,
+        c_tag,
+        c_path,
+        shm_size,
+        read_only,
+        std::ptr::null(),
+        std::ptr::null(),
+    )
+}
+
+/// Like `krun_add_virtiofs3`, but with virtio-fs UID/GID id-mapping. `c_uid_map` /
+/// `c_gid_map` are comma-separated virtiofsd-style id-map spec strings
+/// (`type:from:to[:count]`, e.g. `map:1000:1000:1`); a NULL or empty string means
+/// identity (no remapping — behaviour identical to `krun_add_virtiofs3`).
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub unsafe extern "C" fn krun_add_virtiofs4(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_path: *const c_char,
+    shm_size: u64,
+    read_only: bool,
+    c_uid_map: *const c_char,
+    c_gid_map: *const c_char,
+) -> i32 {
     if c_tag.is_null() {
         return -libc::EINVAL;
     }
@@ -701,6 +730,27 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
             Ok(path) => Some(path),
             Err(_) => return -libc::EINVAL,
         }
+    };
+
+    // Parse a NULL/empty spec string into an empty (identity) map; otherwise split
+    // on ',' into individual virtiofsd-style rules (validated later, in the worker).
+    let id_map = |p: *const c_char| -> Result<Vec<String>, ()> {
+        if p.is_null() {
+            return Ok(Vec::new());
+        }
+        let s = CStr::from_ptr(p).to_str().map_err(|_| ())?;
+        Ok(s.split(',')
+            .filter(|r| !r.is_empty())
+            .map(|r| r.to_string())
+            .collect())
+    };
+    let uid_map = match id_map(c_uid_map) {
+        Ok(m) => m,
+        Err(()) => return -libc::EINVAL,
+    };
+    let gid_map = match id_map(c_gid_map) {
+        Ok(m) => m,
+        Err(()) => return -libc::EINVAL,
     };
 
     let shm = if shm_size > 0 {
@@ -726,6 +776,8 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
                 shared_dir: path.map(|p| p.to_string()),
                 shm_size: shm,
                 read_only,
+                uid_map,
+                gid_map,
                 virtual_entries,
             });
         }
@@ -2441,6 +2493,8 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                 // Default to a conservative 512 MB window.
                 shm_size: Some(1 << 29),
                 read_only: false,
+                uid_map: Vec::new(),
+                gid_map: Vec::new(),
                 virtual_entries,
             });
 

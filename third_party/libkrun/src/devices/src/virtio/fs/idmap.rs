@@ -1,4 +1,5 @@
-//! Soft UID/GID mapping for the bundled virtio-fs daemon.
+//! Soft UID/GID mapping for virtio-fs, shared by libkrun's built-in device and the
+//! bundled `vk virtiofsd` daemon.
 //!
 //! Unprivileged translation of ownership between guest and host, compatible with
 //! virtiofsd's `--uid-map`/`--gid-map` internal-idmap syntax (`type:args…`):
@@ -22,16 +23,16 @@
 use std::ffi::CStr;
 use std::io;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
+use std::sync::Arc;
 use std::time::Duration;
 
-use devices::virtio::bindings;
-use devices::virtio::fs::filesystem::{
+use crate::virtio::bindings;
+use crate::virtio::fs::filesystem::{
     Context, DirEntry, Entry, Extensions, FileSystem, FsOptions, GetxattrReply, ListxattrReply,
     OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
-use devices::virtio::fs::fuse;
+use crate::virtio::fs::fuse;
 
 /// One direction of one rule.
 #[derive(Clone, Copy, Debug, PartialEq)]

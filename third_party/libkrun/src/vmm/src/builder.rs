@@ -1960,6 +1960,8 @@ fn attach_fs_devices(
                 config.shared_dir.clone(),
                 exit_code.clone(),
                 config.read_only,
+                config.uid_map.clone(),
+                config.gid_map.clone(),
                 config.virtual_entries.clone(),
             )
             .unwrap(),

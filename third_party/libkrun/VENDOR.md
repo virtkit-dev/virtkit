@@ -17,6 +17,16 @@ that a static `libkrun.a` link hits.
 
 ## Local patches
 
+`src/devices/src/virtio/fs/{idmap.rs,mod.rs,worker.rs}` + `src/vmm/src/vmm_config/fs.rs`
++ `src/vmm/src/builder.rs` + `src/libkrun/src/lib.rs` — UID/GID mapping for virtio-fs
+shares. A new `idmap` module (soft, virtiofsd `--uid-map`/`--gid-map`-compatible: `map:`,
+`squash-guest:`, `forbid-guest:`, …) wraps `PassthroughFs` inside `AugmentFs` when a map is
+configured; `FsDeviceConfig` carries the maps and `krun_add_virtiofs4(…, uid_map, gid_map)`
+sets them (`krun_add_virtiofs3` delegates with none). The `idmap` module is the same engine
+the bundled `vk virtiofsd` uses (moved here from vk-driver so both backends share it).
+Additive: with no map, behaviour is unchanged. Used by virtkit to squash the GitLab
+`host_checkout` share onto the host runner user so a non-root job can write it.
+
 `src/devices/src/virtio/descriptor_utils.rs` + `src/devices/src/virtio/fs/mod.rs` —
 expose the fs engine to external transports: `Reader/Writer::from_volatile_slices`
 constructors (build a FUSE request view from buffers collected by another virtio

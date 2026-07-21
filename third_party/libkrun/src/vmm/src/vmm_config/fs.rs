@@ -9,6 +9,10 @@ pub struct FsDeviceConfig {
     pub shared_dir: Option<String>,
     pub shm_size: Option<usize>,
     pub read_only: bool,
+    /// virtiofsd-style UID id-map spec strings (`type:from:to[:count]`); empty = identity.
+    pub uid_map: Vec<String>,
+    /// virtiofsd-style GID id-map spec strings (same format as `uid_map`); empty = identity.
+    pub gid_map: Vec<String>,
     #[cfg(not(feature = "aws-nitro"))]
     pub virtual_entries: Vec<VirtualDirEntry>,
 }

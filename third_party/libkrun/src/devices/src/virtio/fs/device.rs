@@ -49,6 +49,8 @@ pub struct Fs {
     shm_region: Option<VirtioShmRegion>,
     passthrough_cfg: Option<passthrough::Config>,
     read_only: bool,
+    uid_map: Vec<String>,
+    gid_map: Vec<String>,
     virtual_entries: Vec<VirtualDirEntry>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
@@ -58,11 +60,14 @@ pub struct Fs {
 }
 
 impl Fs {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         fs_id: String,
         shared_dir: Option<String>,
         exit_code: Arc<AtomicI32>,
         read_only: bool,
+        uid_map: Vec<String>,
+        gid_map: Vec<String>,
         virtual_entries: Vec<VirtualDirEntry>,
     ) -> super::Result<Fs> {
         let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
@@ -85,6 +90,8 @@ impl Fs {
             shm_region: None,
             passthrough_cfg: fs_cfg,
             read_only,
+            uid_map,
+            gid_map,
             virtual_entries,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
@@ -197,6 +204,8 @@ impl VirtioDevice for Fs {
             self.shm_region.clone(),
             self.passthrough_cfg.clone(),
             self.read_only,
+            self.uid_map.clone(),
+            self.gid_map.clone(),
             virtual_entries,
             self.worker_stopfd.try_clone().unwrap(),
             self.exit_code.clone(),

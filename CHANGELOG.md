@@ -4,8 +4,20 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- libkrun's built-in virtio-fs now supports UID/GID mapping (`krun_add_virtiofs4` with
+  `uid_map`/`gid_map`, virtiofsd `--uid-map`/`--gid-map`-compatible spec strings;
+  `krun_add_virtiofs3` delegates with none). The soft-idmap engine that the bundled
+  `vk virtiofsd` used moved into the shared fs device crate so both backends use it.
+
 ### Fixed
 
+- `[gitlab] host_checkout` jobs whose image runs as a non-root user no longer fail with
+  `Permission denied` under `/builds`. The checked-out sources are shared into the guest
+  with a virtio-fs map that squashes every guest id onto the host user vk runs as (the
+  `0700` checkout's owner), so the job reads and writes the tree as its owner whatever the
+  image's user — without the host having to resolve that user's id before boot.
 - Authenticated `vk-registry` now challenges the `GET /v2/` version probe (401 +
   `WWW-Authenticate`) instead of answering it 200. An OCI client (oci_client's
   `store_auth_if_needed`) probes `/v2/` to discover whether it must authenticate; a 200

@@ -129,6 +129,14 @@ pub struct FsShare {
     pub socket: PathBuf,
     pub host_dir: PathBuf,
     pub read_only: bool,
+    /// virtiofsd-style UID id-map spec strings (`type:from:to[:count]`) applied at the
+    /// guest↔host boundary; empty = identity. Under cloud-hypervisor these become
+    /// `--uid-map` args to the bundled virtiofsd; under libkrun they go to
+    /// `krun_add_virtiofs4`. `gid_map` is the same for GIDs.
+    #[serde(default)]
+    pub uid_map: Vec<String>,
+    #[serde(default)]
+    pub gid_map: Vec<String>,
 }
 
 /// Guest networking. `switch`-mode guests add no device here — the in-guest agent
@@ -408,6 +416,8 @@ mod tests {
                 socket: "/job/vfsd.sock".into(),
                 host_dir: "/host/workdir".into(),
                 read_only: false,
+                uid_map: Vec::new(),
+                gid_map: Vec::new(),
             }],
             vsock_cid: 3,
             vsock_socket: "/job/vsock.sock".into(),

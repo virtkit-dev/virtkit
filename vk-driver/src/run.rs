@@ -1071,6 +1071,8 @@ async fn build_and_boot(
             socket: sock,
             host_dir: host_dir.clone(),
             read_only: false,
+            uid_map: Vec::new(),
+            gid_map: Vec::new(),
         });
     }
     // A --primary primary gets its compose volumes, and any primary its `--volume`
@@ -1121,6 +1123,8 @@ async fn build_and_boot(
             socket: sock,
             host_dir: vol.host.clone(),
             read_only: vol.read_only,
+            uid_map: Vec::new(),
+            gid_map: Vec::new(),
         });
     }
     if !virtiofs.is_empty() {
@@ -2583,6 +2587,8 @@ pub(crate) async fn boot_session(
             socket: sock,
             host_dir: ctx.to_path_buf(),
             read_only: true,
+            uid_map: Vec::new(),
+            gid_map: Vec::new(),
         });
     }
 
