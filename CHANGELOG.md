@@ -13,6 +13,11 @@ All notable changes to virtkit will be documented in this file.
   guest can no longer modify the host checkout. Build writes now count against guest RAM
   (capped at half the VM memory); raise `MICROVM_MEM` for jobs with large build trees.
 
+### Changed
+
+- `vk check` no longer checks the CI-executor features (`gitlab`, `services`) by
+  default; name them with `--feature` to check them.
+
 ### Fixed
 
 - `[gitlab] host_checkout` jobs whose image runs as a non-root user no longer fail with

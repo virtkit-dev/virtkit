@@ -207,8 +207,9 @@ enum CacheCmd {
 enum Cmd {
     /// Preflight: check this host is usable by the current user — /dev/kvm access,
     /// the VMM backend, a guest kernel/agent, and the host side of each feature the
-    /// config enables (net.mode taps, [docker], [registry], ...). One line per
-    /// check; exits non-zero if any fails.
+    /// config enables (net.mode taps, [docker], [registry], ...). The CI-executor
+    /// features (gitlab, services) are checked only when named with --feature. One
+    /// line per check; exits non-zero if any fails.
     Check {
         /// check only these features, failing (instead of skipping) any that
         /// turn out unconfigured (repeatable)

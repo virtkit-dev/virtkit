@@ -1,8 +1,10 @@
 //! `vk check`: host preflight. Verifies the current user can actually boot
 //! microVMs (/dev/kvm access, the selected VMM backend, a guest kernel + agent)
 //! and that each feature the config enables has its host side in place (net.mode
-//! taps, [docker] credentials, [registry] store/credentials, ...). Prints one
-//! line per check; the caller turns "any check failed" into the exit code.
+//! taps, [docker] credentials, [registry] store/credentials, ...). The
+//! CI-executor features (gitlab, services) are checked only when named with
+//! `--feature`. Prints one line per check; the caller turns "any check failed"
+//! into the exit code.
 
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
@@ -34,6 +36,14 @@ pub enum Feature {
 }
 
 impl Feature {
+    /// CI-executor features (the gitlab runner and its sibling service VMs) are
+    /// checked only when named with `--feature`: their state dirs live under a
+    /// root-owned default path, so sweeping them would fail every host that just
+    /// boots VMs without running CI.
+    fn ci_executor_only(self) -> bool {
+        matches!(self, Feature::Gitlab | Feature::Services)
+    }
+
     fn name(self) -> &'static str {
         match self {
             Feature::Kvm => "kvm",
@@ -82,9 +92,10 @@ fn fail(detail: impl Into<String>) -> Outcome {
 }
 
 /// Run the checks and print one line each; returns whether every check passed.
-/// No `--feature` = the full default sweep, where a feature the config leaves
-/// unconfigured is skipped; naming features checks exactly those, and one that
-/// turns out unconfigured fails (the caller asserted it should be usable).
+/// No `--feature` = the default sweep (every feature except the CI-executor
+/// ones), where a feature the config leaves unconfigured is skipped; naming
+/// features checks exactly those, and one that turns out unconfigured fails
+/// (the caller asserted it should be usable).
 pub fn run(cfg: &Config, requested: &[Feature]) -> bool {
     let explicit = !requested.is_empty();
     let features: Vec<Feature> = if explicit {
@@ -96,7 +107,7 @@ pub fn run(cfg: &Config, requested: &[Feature]) -> bool {
         }
         v
     } else {
-        <Feature as clap::ValueEnum>::value_variants().to_vec()
+        default_sweep()
     };
 
     let mut all_ok = true;
@@ -114,6 +125,15 @@ pub fn run(cfg: &Config, requested: &[Feature]) -> bool {
         all_ok &= outcome.status != Status::Fail;
     }
     all_ok
+}
+
+/// The features checked when none are named.
+fn default_sweep() -> Vec<Feature> {
+    <Feature as clap::ValueEnum>::value_variants()
+        .iter()
+        .copied()
+        .filter(|f| !f.ci_executor_only())
+        .collect()
 }
 
 fn evaluate(cfg: &Config, feature: Feature) -> Outcome {
@@ -323,8 +343,10 @@ fn registry(cfg: &Config) -> Outcome {
 }
 
 fn gitlab(cfg: &Config) -> Outcome {
-    // Without a config file this host runs no executor — the state dir (root-owned
-    // by default) is then irrelevant, and failing on it would flag working dev setups.
+    // Without a config file this host runs no executor — return a skip that
+    // run() escalates to a "requested but not enabled" failure (this check only
+    // runs when named with --feature) rather than a confusing permission error
+    // on the default root-owned state dir.
     if std::env::var_os("VIRTKIT_CONFIG").is_none() && !Path::new(config::DEFAULT_PATH).exists() {
         return skip("no config file (gitlab executor not set up on this host)");
     }
@@ -431,13 +453,24 @@ mod tests {
 
     // A feature the default config leaves unconfigured is a skip, so the default
     // sweep passes on hosts that don't use it; run() escalates it to a failure
-    // only when named explicitly. (Services need no configuration — their image
-    // store defaults under state_dir — so they are always checked, never skipped.)
+    // only when named explicitly.
     #[test]
     fn unconfigured_feature_skips() {
         let cfg = Config::default();
         for f in [Feature::Docker, Feature::Registry] {
             assert_eq!(evaluate(&cfg, f).status, Status::Skip);
+        }
+    }
+
+    // The CI-executor features probe root-owned default state dirs, so they run
+    // only when named with --feature; the default sweep covers everything else.
+    #[test]
+    fn default_sweep_omits_ci_executor_features() {
+        let sweep = default_sweep();
+        assert!(!sweep.contains(&Feature::Gitlab));
+        assert!(!sweep.contains(&Feature::Services));
+        for f in <Feature as clap::ValueEnum>::value_variants() {
+            assert_eq!(sweep.contains(f), !f.ci_executor_only());
         }
     }
 
