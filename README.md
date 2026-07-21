@@ -122,6 +122,8 @@ the Rust toolchain, the base-image digest, and the apk pins together.
   wants (`vk run --ssh` prints the full invocation).
 - `check` — preflight the host for the current user: `/dev/kvm` access, the VMM
   backend, a guest kernel/agent, and the host side of each configured feature.
+- `paths` — print the effective host paths (config file, state dir, image cache,
+  registry store), where each comes from, and how to override it.
 - `service up` / `service down` / `service status` — from inside the primary,
   control the run's compose services (build on demand + boot, stop, or query state).
 - `gitlab config` / `gitlab prepare` / `gitlab run` / `gitlab cleanup` — the GitLab custom-executor lifecycle.

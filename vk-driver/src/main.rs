@@ -225,6 +225,14 @@ enum Cmd {
         #[arg(long)]
         idle_secs: Option<u64>,
     },
+    /// Print the effective host paths — config file, state dir, image cache,
+    /// registry store — where each comes from, and how to override it.
+    #[command(hide = true)]
+    Paths {
+        /// also show the gitlab executor's paths (jobs dir, checkouts, tools dir)
+        #[arg(long)]
+        gitlab: bool,
+    },
     /// GitLab custom-executor lifecycle (config / prepare / run / cleanup)
     #[command(hide = true)]
     Gitlab {
@@ -961,6 +969,168 @@ async fn service_cmd(cmd: &ServiceCmd) -> ExitCode {
     }
 }
 
+/// The state dir `vk run`/`vk gc` cache under: a configured `state_dir` (the CI
+/// runner), else the rootless dev default (`$XDG_DATA_HOME/virtkit`). Distinct
+/// from `Config::state_dir()`, the executor's root-owned `/var/lib/virtkit` default.
+fn effective_state_dir(cfg: &Config) -> anyhow::Result<PathBuf> {
+    match &cfg.state_dir {
+        Some(d) => Ok(d.clone()),
+        None => run::default_data_base(),
+    }
+}
+
+/// The `vk paths` report: each effective host path, where it comes from, and how
+/// to override it. Built as a string so tests can assert on the resolutions.
+fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let (config_path, from_env) = match std::env::var_os("VIRTKIT_CONFIG") {
+        Some(p) => (PathBuf::from(p), true),
+        None => (PathBuf::from(config::DEFAULT_PATH), false),
+    };
+    // An explicit VIRTKIT_CONFIG that can't be read already failed Config::load.
+    let config_note = match (config_path.is_file(), from_env) {
+        (_, true) => "from VIRTKIT_CONFIG",
+        (true, false) => "default location",
+        (false, false) => "missing; built-in defaults",
+    };
+    writeln!(
+        out,
+        "config file     {} ({config_note})",
+        config_path.display()
+    )?;
+    writeln!(out, "                override: VIRTKIT_CONFIG=<path>")?;
+    writeln!(out)?;
+    let state_note = match &cfg.state_dir {
+        Some(_) => "`state_dir` in the config",
+        None => "default: $XDG_DATA_HOME/virtkit",
+    };
+    let state_dir = effective_state_dir(cfg)?;
+    writeln!(
+        out,
+        "state dir       {} ({state_note})",
+        state_dir.display()
+    )?;
+    writeln!(
+        out,
+        "                the root of everything vk stores on this host"
+    )?;
+    writeln!(
+        out,
+        "                override: `state_dir` in the config (unset, the CI executor uses /var/lib/virtkit)"
+    )?;
+    writeln!(
+        out,
+        "  registry/     image cache: bundles pulled from the [registry] remote"
+    )?;
+    writeln!(
+        out,
+        "  docker/       image cache: docker/OCI images converted to bootable disks"
+    )?;
+    writeln!(
+        out,
+        "  build/        image cache: compose `build:` stage snapshots"
+    )?;
+    let images = cfg.local_dir_under(&state_dir);
+    if images == state_dir.join("images") {
+        writeln!(
+            out,
+            "  images/       baked `local/<name>` bundles (override: `[local] dir`)"
+        )?;
+    } else {
+        writeln!(
+            out,
+            "  images        {} (`[local] dir`) — baked `local/<name>` bundles",
+            images.display()
+        )?;
+    }
+    writeln!(
+        out,
+        "                the three image-cache tiers hold ready-to-boot disks; `vk gc` reclaims"
+    )?;
+    writeln!(
+        out,
+        "                idle ones. images/ is never reclaimed."
+    )?;
+    writeln!(out)?;
+    // The instruction cache, `vk-registry serve` and `vk registry status`/`gc` all
+    // default to this store. A `[registry] repo` does NOT move it — that only routes
+    // `vk registry push`/`pull`/`inspect` — so a local repo is reported separately.
+    let store = vk_registry::default_root()?;
+    writeln!(
+        out,
+        "registry store  {} (default: $XDG_DATA_HOME/virtkit/registry)",
+        store.display()
+    )?;
+    writeln!(
+        out,
+        "                a separate content-addressed store: the build/instruction cache, and"
+    )?;
+    writeln!(
+        out,
+        "                what `vk-registry serve` serves; `vk registry status`/`gc` operate on it"
+    )?;
+    if store == state_dir.join("registry") {
+        writeln!(
+            out,
+            "                (it shares this directory with the image cache's registry/ tier;"
+        )?;
+        writeln!(
+            out,
+            "                the layouts are independent and each GC ignores the other's files)"
+        )?;
+    }
+    writeln!(
+        out,
+        "                override: `--cache-registry`/`[build] cache_registry` (instruction cache),"
+    )?;
+    writeln!(out, "                `--root` on `vk registry status`/`gc`")?;
+    if let Some(repo) = cfg.registry.as_ref().and_then(|r| r.local_root()) {
+        writeln!(
+            out,
+            "bundle repo     {} (`[registry] repo`) — `vk registry push`/`pull`/`inspect` use it in-process",
+            repo.display()
+        )?;
+    }
+    if gitlab {
+        // The executor roots its state at Config::state_dir() (/var/lib/virtkit when
+        // unset) — not the dev default `vk run` caches under (see jobctx.rs).
+        let exec_state = cfg.state_dir();
+        writeln!(out)?;
+        writeln!(out, "gitlab executor")?;
+        writeln!(
+            out,
+            "  jobs dir      {} (per-job runtime state, removed at job cleanup)",
+            exec_state.join("jobs").display()
+        )?;
+        let (checkouts, checkouts_note) =
+            match cfg.gitlab.as_ref().and_then(|g| g.checkout_dir.clone()) {
+                Some(d) => (d, "`[gitlab] checkout_dir` in the config"),
+                None => (
+                    exec_state.join("checkouts"),
+                    "default: <executor state dir>/checkouts",
+                ),
+            };
+        writeln!(
+            out,
+            "  checkouts     {} ({checkouts_note}) — host_checkout clones, never reclaimed",
+            checkouts.display()
+        )?;
+        match cfg.gitlab.as_ref().and_then(|g| g.dir.as_ref()) {
+            Some(d) => writeln!(
+                out,
+                "  tools dir     {} (`[gitlab] dir`) — static tools shared read-only into job VMs",
+                d.display()
+            )?,
+            None => writeln!(out, "  tools dir     (unset; override: `[gitlab] dir`)")?,
+        }
+    } else {
+        writeln!(out)?;
+        writeln!(out, "gitlab executor paths: `vk paths --gitlab`")?;
+    }
+    Ok(out)
+}
+
 async fn cli_main() -> ExitCode {
     // reqwest/rustls are compiled with no built-in crypto provider (rustls-no-provider,
     // to keep aws-lc-rs out of the build); install ring — the backend russh already
@@ -994,18 +1164,23 @@ async fn cli_main() -> ExitCode {
             exit_code(1)
         };
     }
+    if let Cmd::Paths { gitlab } = &cli.cmd {
+        return match paths_report(&cfg, *gitlab) {
+            Ok(report) => {
+                print!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e, 2),
+        };
+    }
     if let Cmd::Gc { idle_secs } = &cli.cmd {
         let idle = idle_secs
             .map(std::time::Duration::from_secs)
             .unwrap_or_else(|| cfg.image_cache_idle());
-        // Sweep the same state dir `vk run`/the executor cache under: a configured state_dir
-        // (the CI runner), else the rootless dev default ($XDG_DATA_HOME/virtkit).
-        let state_dir = match &cfg.state_dir {
-            Some(d) => d.clone(),
-            None => match run::default_data_base() {
-                Ok(d) => d,
-                Err(e) => return fail(&e, 2),
-            },
+        // Sweep the same state dir `vk run`/the executor cache under.
+        let state_dir = match effective_state_dir(&cfg) {
+            Ok(d) => d,
+            Err(e) => return fail(&e, 2),
         };
         let registry = state_dir.join("registry");
         image::gc_idle(&registry, idle);
@@ -1849,6 +2024,7 @@ async fn cli_main() -> ExitCode {
         },
         // handled above, before JobCtx
         Cmd::Check { .. }
+        | Cmd::Paths { .. }
         | Cmd::Gc { .. }
         | Cmd::HelpAll
         | Cmd::Registry { .. }
@@ -2004,6 +2180,18 @@ impl<R: std::io::Read> std::io::Read for ProgressReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `vk paths --gitlab` must report the jobs root the executor actually uses:
+    // Config::state_dir() (/var/lib/virtkit when unset), not the XDG dev default
+    // `vk run` caches under.
+    #[test]
+    fn paths_report_gitlab_matches_jobctx() {
+        let ctx =
+            jobctx::JobCtx::new_for_job(config::Config::default(), "job-1".to_string()).unwrap();
+        let report = paths_report(&config::Config::default(), true).unwrap();
+        let jobs_root = ctx.job_dir.parent().unwrap();
+        assert!(report.contains(&format!("jobs dir      {}", jobs_root.display())));
+    }
 
     // `vk --help` is a curated list: a new Cmd variant must either join it
     // deliberately or carry #[command(hide = true)].

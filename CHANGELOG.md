@@ -6,6 +6,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- `vk paths` prints the effective host paths — config file, state dir, image cache,
+  registry store — where each value comes from, and how to override it.
 - `[gitlab] checkout_overlay` (default on): jobs build the `host_checkout` tree on an
   in-guest overlay — the virtio-fs share becomes the read-only lower layer, all writes go
   to a guest tmpfs — so metadata-heavy builds run at guest-native speed instead of paying a
