@@ -21,6 +21,11 @@
 //!                        vsock port; then DHCP (VIRTKIT_NET_DHCP=1) or a static
 //!                        VIRTKIT_VM_IP / VIRTKIT_VM_GW / VIRTKIT_VM_DNS
 //!   VIRTKIT_VIRTIOFS     tag:path[,tag:path] virtiofs shares to mount
+//!   VIRTKIT_VIRTIOFS_OVERLAY  tag[,tag] — mount these shares as the read-only lower
+//!                        layer of a tmpfs-backed overlayfs at their path, so every
+//!                        write under the mountpoint runs at guest-native speed. A
+//!                        listed share that fails to overlay-mount fails the boot (no
+//!                        silent fallback to the far slower direct mount)
 //!   VIRTKIT_SYMLINKS     src:dest[,src:dest] — after virtiofs mounts, create each
 //!                        `dest` as a symlink pointing to `src`. Entries where `src`
 //!                        does not exist are silently skipped.
@@ -49,7 +54,7 @@
 //!
 //! The whole module is sync: no tokio in PID 1.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -119,7 +124,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     export_default_run_user(); // so served stages drop to the image's USER
     apply_boot_config(boot_config.as_ref()); // the boot config wins over any capture
     materialize_env(boot_config.as_ref()); // persist the merged env for login shells
-    mount_virtiofs(&cmdline);
+    mount_virtiofs(&cmdline)?;
     apply_symlinks(&cmdline);
     link_ci_tools(&cmdline); // host CI tools (git/git-lfs/…) onto PATH, if the image lacks them
     configure_network(&cmdline);
@@ -216,7 +221,7 @@ fn run_full_vm(
     load_image_env();
     apply_boot_config(cfg);
     materialize_env(cfg);
-    mount_virtiofs(cmdline);
+    mount_virtiofs(cmdline)?;
     apply_symlinks(cmdline);
     configure_network_fullvm(cmdline);
 
@@ -743,16 +748,42 @@ fn materialize_env(cfg: Option<&RunConfig>) {
 }
 
 /// Mount the virtiofs shares named on the cmdline (VIRTKIT_VIRTIOFS=tag:path,...).
-fn mount_virtiofs(cmdline: &HashMap<String, String>) {
+///
+/// Tags listed in VIRTKIT_VIRTIOFS_OVERLAY are not mounted at their path directly: the
+/// share becomes the read-only lower layer of an overlayfs whose upper/work live on a
+/// guest tmpfs, so writes under the path never cross virtio-fs (each synchronous
+/// create/write/unlink round-trip costs 50–90µs vs ~2µs on tmpfs). An overlay share
+/// that fails to mount fails the boot: falling back to the direct mount would silently
+/// run the workload 15–50× slower.
+fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<()> {
+    let mut overlay = overlay_tags(cmdline)?;
     let Some(spec) = cmdline.get("VIRTKIT_VIRTIOFS") else {
-        return;
+        if !overlay.is_empty() {
+            bail!(
+                "VIRTKIT_VIRTIOFS_OVERLAY names {} but VIRTKIT_VIRTIOFS declares no shares",
+                sorted_join(&overlay)
+            );
+        }
+        return Ok(());
     };
     let _ = run_cmd("modprobe", &["virtiofs"]); // built-in on our kernel; harmless
+    let mut overlaid: HashSet<String> = HashSet::new();
     for entry in spec.split(',').filter(|e| !e.is_empty()) {
         let Some((tag, path)) = entry.split_once(':') else {
             warn!("vk-agent init: bad VIRTKIT_VIRTIOFS entry {entry:?} (want tag:path)");
             continue;
         };
+        if overlay.remove(tag) {
+            mount_share_overlay(tag, path)
+                .with_context(|| format!("overlay-mounting virtiofs share {tag} at {path}"))?;
+            overlaid.insert(tag.to_string());
+            continue;
+        }
+        // A duplicated overlay tag must not fall through here: the plain mount would
+        // silently shadow the overlay and restore the very slowdown it exists to avoid.
+        if overlaid.contains(tag) {
+            bail!("VIRTKIT_VIRTIOFS lists overlay share {tag} more than once");
+        }
         let mountpoint = Path::new(path);
         let created_parents = match create_mountpoint(mountpoint) {
             Ok(created) => created,
@@ -773,6 +804,127 @@ fn mount_virtiofs(cmdline: &HashMap<String, String>) {
             chown_created_mount_parents(mountpoint, &created_parents);
         }
     }
+    if !overlay.is_empty() {
+        bail!(
+            "VIRTKIT_VIRTIOFS_OVERLAY names {} but VIRTKIT_VIRTIOFS declares no such share",
+            sorted_join(&overlay)
+        );
+    }
+    Ok(())
+}
+
+/// Root under which overlay-backed shares keep their private lower/upper/work mounts.
+const OVERLAY_ROOT: &str = "/run/virtkit-overlay";
+
+/// The share tags VIRTKIT_VIRTIOFS_OVERLAY marks for an in-guest overlay.
+///
+/// A tag becomes a path component under OVERLAY_ROOT, so anything that would escape it
+/// (`/`, `.`, `..`) is rejected rather than resolved outside the private root.
+fn overlay_tags(cmdline: &HashMap<String, String>) -> Result<HashSet<String>> {
+    let Some(spec) = cmdline.get("VIRTKIT_VIRTIOFS_OVERLAY") else {
+        return Ok(HashSet::new());
+    };
+    let mut tags = HashSet::new();
+    for tag in spec.split(',').filter(|t| !t.is_empty()) {
+        if tag.contains('/') || tag == "." || tag == ".." {
+            bail!("VIRTKIT_VIRTIOFS_OVERLAY tag {tag:?} is not a valid share tag");
+        }
+        tags.insert(tag.to_string());
+    }
+    Ok(tags)
+}
+
+/// The tags of a set, sorted and comma-joined for a stable error message.
+fn sorted_join(tags: &HashSet<String>) -> String {
+    let mut tags: Vec<&str> = tags.iter().map(String::as_str).collect();
+    tags.sort_unstable();
+    tags.join(", ")
+}
+
+/// The private paths backing one overlay share.
+struct OverlayDirs {
+    /// The read-only virtiofs mount serving as the overlay's lower layer.
+    lower: String,
+    /// The tmpfs mountpoint holding upper+work.
+    rw: String,
+    upper: String,
+    work: String,
+}
+
+fn overlay_dirs(tag: &str) -> OverlayDirs {
+    let base = format!("{OVERLAY_ROOT}/{tag}");
+    OverlayDirs {
+        lower: format!("{base}/lower"),
+        rw: format!("{base}/rw"),
+        upper: format!("{base}/rw/upper"),
+        work: format!("{base}/rw/work"),
+    }
+}
+
+/// The overlay mount data string. `redirect_dir=on`: builds rename directories, and
+/// without it rename(2) of a lower dir fails with EXDEV. `metacopy=on`: chmod/chown of
+/// a lower file copies up its metadata only, not the data. `index=off`: the index
+/// feature needs exportfs (file-handle) support the virtiofs lower lacks; the cost is
+/// only that a lower hardlink copies up as independent files.
+fn overlay_data(lower: &str, upper: &str, work: &str) -> String {
+    format!(
+        "lowerdir={lower},upperdir={upper},workdir={work},redirect_dir=on,metacopy=on,index=off"
+    )
+}
+
+/// Mount the virtiofs share `tag` at `path` behind an overlayfs: the share is the
+/// read-only lower layer, upper/work live on a dedicated guest tmpfs. Only first-touch
+/// reads of lower files cross virtio-fs (and then stay in the guest page cache); the
+/// host never sees guest writes.
+fn mount_share_overlay(tag: &str, path: &str) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let OverlayDirs {
+        lower,
+        rw,
+        upper,
+        work,
+    } = overlay_dirs(tag);
+    std::fs::create_dir_all(&lower).with_context(|| format!("creating {lower}"))?;
+    mount(tag, &lower, "virtiofs", libc::MS_RDONLY)
+        .with_context(|| format!("mounting virtiofs {tag} (lower layer) at {lower}"))?;
+    // A dedicated tmpfs (not the shared /run) keeps bulk build writes away from the
+    // agent's runtime dirs. No size= : the kernel default (half the guest RAM) is the
+    // cap, and the VM memory size is the lever when a job needs more.
+    std::fs::create_dir_all(&rw).with_context(|| format!("creating {rw}"))?;
+    mount_data(
+        "tmpfs",
+        &rw,
+        "tmpfs",
+        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOATIME,
+        "mode=0755",
+    )
+    .with_context(|| format!("mounting the overlay upper tmpfs at {rw}"))?;
+    std::fs::create_dir(&upper).with_context(|| format!("creating {upper}"))?;
+    std::fs::create_dir(&work).with_context(|| format!("creating {work}"))?;
+    // A dir present in both layers takes its merged metadata from the UPPER one: the
+    // upper root must replicate the lower root's ownership/mode, or the merged tree
+    // would appear root-owned 0755 and the mapped job user could not create files in it.
+    let meta = std::fs::metadata(&lower).with_context(|| format!("stat {lower}"))?;
+    std::os::unix::fs::chown(&upper, Some(meta.uid()), Some(meta.gid()))
+        .with_context(|| format!("chown {upper} to the share owner"))?;
+    std::fs::set_permissions(
+        &upper,
+        std::fs::Permissions::from_mode(meta.mode() & 0o7777),
+    )
+    .with_context(|| format!("chmod {upper} to the share mode"))?;
+    let mountpoint = Path::new(path);
+    let created_parents = create_mountpoint(mountpoint)
+        .with_context(|| format!("creating overlay mountpoint {path}"))?;
+    mount_data(
+        "overlay",
+        path,
+        "overlay",
+        0,
+        &overlay_data(&lower, &upper, &work),
+    )
+    .with_context(|| format!("mounting the overlay at {path}"))?;
+    chown_created_mount_parents(mountpoint, &created_parents);
+    Ok(())
 }
 
 /// Create a mountpoint without losing which parent directories were synthesized.
@@ -1638,6 +1790,60 @@ mod tests {
         assert_eq!(m.get("VIRTKIT_HOSTNAME").unwrap(), "runner");
         assert_eq!(m.get("VIRTKIT_VM_DNS").unwrap(), "1.1.1.1,8.8.8.8");
         assert!(!m.contains_key("ro"));
+    }
+
+    #[test]
+    fn overlay_tags_absent_is_empty() {
+        assert!(overlay_tags(&HashMap::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn overlay_tags_splits_commas() {
+        let m = HashMap::from([(
+            "VIRTKIT_VIRTIOFS_OVERLAY".to_string(),
+            "cibuild,b".to_string(),
+        )]);
+        let tags = overlay_tags(&m).unwrap();
+        assert_eq!(
+            tags,
+            HashSet::from(["cibuild".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn overlay_tags_reject_path_escapes() {
+        for bad in ["a/b", "/abs", ".", ".."] {
+            let m = HashMap::from([("VIRTKIT_VIRTIOFS_OVERLAY".to_string(), bad.to_string())]);
+            let err = overlay_tags(&m).unwrap_err().to_string();
+            assert!(err.contains(&format!("{bad:?}")), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn mount_virtiofs_rejects_overlay_tags_without_shares() {
+        let m = HashMap::from([(
+            "VIRTKIT_VIRTIOFS_OVERLAY".to_string(),
+            "cibuild,extra".to_string(),
+        )]);
+        let err = mount_virtiofs(&m).unwrap_err().to_string();
+        assert!(err.contains("cibuild, extra"), "{err}");
+    }
+
+    #[test]
+    fn overlay_dirs_live_under_the_private_root() {
+        let dirs = overlay_dirs("cibuild");
+        assert_eq!(dirs.lower, "/run/virtkit-overlay/cibuild/lower");
+        assert_eq!(dirs.rw, "/run/virtkit-overlay/cibuild/rw");
+        assert_eq!(dirs.upper, "/run/virtkit-overlay/cibuild/rw/upper");
+        assert_eq!(dirs.work, "/run/virtkit-overlay/cibuild/rw/work");
+    }
+
+    #[test]
+    fn overlay_data_pins_the_mount_options() {
+        assert_eq!(
+            overlay_data("/l", "/u", "/w"),
+            "lowerdir=/l,upperdir=/u,workdir=/w,redirect_dir=on,metacopy=on,index=off"
+        );
     }
 
     #[test]
