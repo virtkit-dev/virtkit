@@ -110,44 +110,47 @@ the Rust toolchain, the base-image digest, and the apk pins together.
 
 ## Subcommands
 
-`vk`:
+The ones you'll actually type:
 
-- `run` — boot an image (or a Dockerfile target) as a microVM and run a command
-  or an interactive shell in it.
-- `exec` — run a command (or open a shell) in an already-running guest over its
-  agent channel, reproducing the command's own exit status.
-- `status` — probe a running guest's agent and print its reply, or exit non-zero
-  if it does not answer.
-- `connect` — splice stdio to a running guest, the shape SSH's `ProxyCommand`
-  wants (`vk run --ssh` prints the full invocation).
+- `run` — boot an image, a Dockerfile target (`-f`), or a compose file as
+  microVM(s) and run a command or an interactive shell (`--shell`, `-t`).
+  This is where most of the flags live: `--net`, `--workdir`, `--volume`,
+  `--ssh`, `--compose`, `--detach`, ...
+- `build` — build a Dockerfile into a bootable ext4 image, each stage's `RUN`s
+  executing in a microVM, instruction snapshots cached (`--build-cache`).
+  `--tag` publishes the result to the `[registry]` as a bootable bundle the CI
+  executor can pull.
+- `exec` — run a command (or an interactive shell with `-t`) in an
+  already-running guest over its agent channel, reproducing the command's own
+  exit status.
 - `check` — preflight the host for the current user: `/dev/kvm` access, the VMM
-  backend, a guest kernel/agent, and the host side of each configured feature.
-- `paths` — print the effective host paths (config file, state dir, image cache,
-  registry store), where each comes from, and how to override it.
-- `service up` / `service down` / `service status` — from inside the primary,
-  control the run's compose services (build on demand + boot, stop, or query state).
-- `gitlab config` / `gitlab prepare` / `gitlab run` / `gitlab cleanup` — the GitLab custom-executor lifecycle.
-- `build` — build a Dockerfile into a bootable image, each `RUN` in a microVM.
+  backend, a guest kernel/agent, and the host side of each configured feature
+  (the CI-executor features only when named with `--feature`).
 - `gc` — reclaim the host image cache: evict image bases no VM is using and
   idle past the timeout, and drop unreferenced registry chunks.
-- `switch` — the guest network gateway (spawned per run/job).
-- `mkext-tar` / `mkext` — build a bootable ext4 image from a rootfs tar / directory.
-- `oci-pull` — pull and flatten an OCI image to a rootfs tar.
+- `service up` / `service down` / `service status` — from inside the primary,
+  control the run's compose services (build on demand + boot, stop, or query state).
+- `gitlab config` / `gitlab prepare` / `gitlab run` / `gitlab cleanup` — the
+  GitLab custom-executor lifecycle.
 - `registry push` / `registry pull` / `registry inspect` / `registry status` /
-  `registry gc` — manage guest bundles in an OCI store: push/pull with chunk-level
-  deduplication to keep transfers small, inspect a bundle, report store usage, reclaim it.
-- `virtiofsd` — the bundled virtio-fs daemon for sharing host directories
-  (used with the Cloud Hypervisor backend).
-- `forward` — plumbing: a byte forwarder splicing one address to another.
+  `registry gc` — manage guest bundles in an OCI store, with chunk-level
+  deduplication to keep transfers small.
 
-`vk-agent`:
+The rest is plumbing the commands above spawn for themselves, or development
+tooling — listed by `vk help-all`, each documented in `vk help <cmd>`: `status`
+and `connect` (probe / splice stdio to a running guest — the shape SSH's
+`ProxyCommand` wants), `paths` (print the effective host paths and how to
+override each), `switch`, `forward` and `ssh-agent-proxy` (the per-run network
+gateway and forwarders), and the image toolbox (`mkext`, `mkext-tar`,
+`mkext-oci`, `oci-pull`, `docker-hash`, `fingerprint`, `qcow2-verify`).
+`virtiofsd` (the bundled virtio-fs daemon for the Cloud Hypervisor backend)
+dispatches before the CLI and documents itself via `vk virtiofsd --help`
+instead.
 
-- `init` — PID 1 for the guest (also runs the image's entrypoint or hands off
-  to systemd, depending on `VIRTKIT_MODE`).
-- `serve` — the in-VM command server that the host's `vk exec` / `vk connect` /
-  `vk status` dial (so a host needs only `vk`, no separate `vk-agent`). The same
-  `exec` / `connect` / `forward` clients also exist here as `vk-agent` subcommands.
-- `net` — connect a guest NIC to the host's network switch.
+`vk-agent` (embedded in `vk`; you rarely invoke it yourself): `init` is the
+guest's PID 1, `serve` is the in-VM command server that `vk exec` / `vk
+connect` / `vk status` dial, and `net` connects a guest NIC to the host's
+network switch.
 
 ## Layout
 
