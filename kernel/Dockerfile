@@ -1,4 +1,4 @@
-# The microVM guest kernel (vmlinux): vanilla Linux + a vendored config fragment
+# The microVM guest kernel (vmlinux): vanilla Linux + kernel/patches/ + a vendored config fragment
 # (kernel-fragment.config — kata's non-confidential x86_64 set: virtio blk/net/vsock/pci
 # + ext4 + virtio-fs/FUSE + IP autoconfig, all built in, CONFIG_MODULES off) + virtkit's
 # removals overlay (kernel-removals.config — drops options virtkit never uses:
@@ -62,6 +62,15 @@ COPY kernel-fragment.config /build/kernel-fragment.config
 COPY kernel-removals.config /build/kernel-removals.config
 
 WORKDIR /build/linux-${KERNEL_VERSION}
+# Local patches on top of the pinned vanilla source, applied with -p1 in lexical order.
+# Keep them few, each documented in its own header, and preferably on their way
+# upstream — every KERNEL_VERSION bump must re-check that they still apply and are
+# still needed. `git apply` is the applier (git is a pinned build dep; `patch` is not).
+COPY patches/ /build/patches/
+RUN set -e; for p in /build/patches/*.patch; do \
+        echo "applying $(basename "$p")"; git apply --verbose -p1 "$p"; \
+    done
+
 # Reproducible build metadata: no current date / user@host baked into the kernel banner.
 ENV KBUILD_BUILD_TIMESTAMP="@0" KBUILD_BUILD_USER=virtkit KBUILD_BUILD_HOST=virtkit \
     SOURCE_DATE_EPOCH=0

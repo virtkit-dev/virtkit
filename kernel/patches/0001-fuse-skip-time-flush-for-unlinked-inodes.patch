@@ -1,0 +1,41 @@
+fuse: don't flush times of unlinked inodes to the server
+
+With writeback_cache the client owns file timestamps: unlink dirties the
+victim's ctime (fuse_entry_unlinked -> fuse_update_ctime_in_cache ->
+mark_inode_dirty_sync), and the dirty inode is later flushed through
+fuse_write_inode -> fuse_flush_times -> a synchronous SETATTR round trip
+to the server -- for a file that no longer has any path. Nothing can
+observe those timestamps except fstat() through a still-open fd of the
+unlinked file, which may now see a stale ctime: the same fudge network
+filesystems make routinely.
+
+Measured on virtkit's virtio-fs (20k-file create/unlink storm per
+variant, server-side syscall counts): writeback_cache went from 0 to
+100k utimensat calls for 60k unlinked files, and unlink-heavy phases
+ran 30-40% slower than with writeback off. With this patch the
+dead-inode SETATTRs disappear and unlink cost returns to the
+non-writeback baseline, keeping writeback's multi-write win (~4x).
+
+Hardlinked files keep the flush: the skip triggers only once i_nlink
+reaches 0.
+
+Candidate for upstream submission; carried here until then. Re-check
+applicability on every kernel bump (fs/fuse/file.c, fuse_write_inode).
+
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -2002,6 +2002,14 @@ int fuse_write_inode(struct inode *inode, struct writeback_control *wbc)
+ 	struct fuse_file *ff;
+ 	int err;
+ 
++	/*
++	 * The timestamps of an unlinked inode are observable only through a
++	 * still-open fd; don't pay a synchronous SETATTR round trip to the
++	 * server for them (writeback_cache dirties ctime on every unlink).
++	 */
++	if (inode->i_nlink == 0)
++		return 0;
++
+ 	ff = __fuse_write_file_get(fi);
+ 	err = fuse_flush_times(inode, ff);
+ 	if (ff)
