@@ -2200,7 +2200,40 @@ impl FileSystem for PassthroughFs {
                 ret.extend_from_slice(&handle.to_ne_bytes());
                 Ok(ret)
             }
-            _ => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+            // ENOTTY is the conventional response for an ioctl this filesystem does not
+            // implement. In particular, overlayfs treats it as absent fileattr support and
+            // can still copy files up from a virtio-fs lower layer.
+            _ => Err(io::Error::from_raw_os_error(libc::ENOTTY)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_ioctl_returns_enotty() {
+        let fs = PassthroughFs::new(Config::default(), Arc::new(InodeAllocator::new())).unwrap();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let err = fs
+            .ioctl(
+                Context {
+                    uid: 0,
+                    gid: 0,
+                    pid: 0,
+                },
+                0,
+                0,
+                0,
+                u32::MAX,
+                0,
+                0,
+                0,
+                &exit_code,
+            )
+            .unwrap_err();
+
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTTY));
     }
 }
