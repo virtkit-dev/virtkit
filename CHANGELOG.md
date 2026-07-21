@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- `vk build`'s live dashboard no longer garbles (a stranded progress line, a duplicated
+  header/rule, a large blank gap) when a `RUN` step prints a carriage-return progress bar
+  (a `foo\rbar…` line with no newline): the current frame now updates one pinned line in
+  place. Most visible on a terminal that is not tall or wide enough.
+
 ## [0.20.0] - 2026-07-21
 
 ### Added

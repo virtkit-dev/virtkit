@@ -114,6 +114,11 @@ const FINISH_NUM: usize = usize::MAX;
 /// cells are 1..=total; distinct from [`RESTORE_NUM`] and [`FINISH_NUM`]).
 const WAIT_LOCK_NUM: usize = usize::MAX - 1;
 
+/// bars-map cell num for a stage's transient live "output tail" — the current partial
+/// (carriage-return-updated) guest line, shown in place until a newline commits it to the
+/// scrolling log (real cells are 1..=total; distinct from the other transient sentinels).
+const OUTPUT_TAIL_NUM: usize = usize::MAX - 2;
+
 enum Backend {
     Tty(Box<Tty>),
     Plain,
@@ -652,28 +657,29 @@ impl Progress {
 
     // ---- guest output routing --------------------------------------------------------
 
-    /// Accept a chunk of a stage's guest output, split it into complete lines, and print
-    /// each (stage-prefixed). A trailing partial line is held until the next chunk or
-    /// [`flush_partial`].
+    /// Accept a chunk of a stage's guest output. Complete (newline-terminated) lines are
+    /// printed to the scrolling log, each with its carriage-return overwrites collapsed to the
+    /// final visible text. The remaining partial — including a carriage-return progress frame
+    /// with no trailing newline — updates the stage's live [output tail](Self::set_output_tail)
+    /// in place, so a `foo\rbar\r…` progress stream refreshes one pinned line instead of being
+    /// buffered whole and dumped as an unwrapped mega-line that derails the dashboard.
+    /// Progress is emitted on a single stream in practice, so the tail tracks whichever fd
+    /// last carried a partial.
     fn emit(&self, stage: StageId, fd: u8, bytes: &[u8]) {
         if matches!(self.backend, Backend::Disabled) {
             return;
         }
-        let mut lines: Vec<String> = Vec::new();
-        {
+        let (lines, tail) = {
             let mut buf = self.line_buf.lock().unwrap();
-            let b = buf.entry((stage, fd)).or_default();
-            b.extend_from_slice(bytes);
-            while let Some(nl) = b.iter().position(|&c| c == b'\n') {
-                let line: Vec<u8> = b.drain(..=nl).collect();
-                lines.push(String::from_utf8_lossy(&line[..line.len() - 1]).into_owned());
-            }
-        }
+            fold_output(buf.entry((stage, fd)).or_default(), bytes)
+        };
         self.print_output(stage, &lines);
+        self.set_output_tail(stage, (!tail.is_empty()).then_some(tail.as_str()));
     }
 
-    /// Flush a stage's held partial line (e.g. a prompt with no trailing newline) at a step
-    /// boundary so it is not swallowed.
+    /// Commit a stage's held partial line (a prompt or a final progress frame with no trailing
+    /// newline) to the scrolling log at a step boundary so it is not swallowed, and clear the
+    /// live output tail (now committed above).
     fn flush_partial(&self, stage: StageId) {
         let mut lines: Vec<String> = Vec::new();
         {
@@ -682,11 +688,46 @@ impl Progress {
                 if let Some(b) = buf.get_mut(&(stage, fd))
                     && !b.is_empty()
                 {
-                    lines.push(String::from_utf8_lossy(&std::mem::take(b)).into_owned());
+                    let visible = visible_tail(&std::mem::take(b));
+                    if !visible.is_empty() {
+                        lines.push(visible);
+                    }
                 }
             }
         }
         self.print_output(stage, &lines);
+        self.set_output_tail(stage, None);
+    }
+
+    /// Update `stage`'s transient live output-tail cell to `text`, or clear it when `None`.
+    /// Tty only: rendered as a width-truncated line ({wide_msg}) in the pinned block, so a
+    /// carriage-return progress frame updates in place and never wraps — a wrapped line would
+    /// break indicatif's line accounting, the very corruption this cell exists to avoid.
+    /// Plain/routed backends have no in-place line, so a partial surfaces only when a newline
+    /// (or [`flush_partial`](Self::flush_partial)) commits it.
+    fn set_output_tail(&self, stage: StageId, text: Option<&str>) {
+        let Backend::Tty(tty) = &self.backend else {
+            return;
+        };
+        match text {
+            Some(t) if !t.is_empty() => {
+                let prefix = self.dim(&format!("#{}", self.output_seq(stage)));
+                let msg = format!("{prefix} {t}");
+                let mut bars = tty.bars.lock().unwrap();
+                bars.entry((stage, OUTPUT_TAIL_NUM))
+                    .or_insert_with(|| {
+                        let pb = tty.mp.add(ProgressBar::new_spinner());
+                        pb.set_style(ProgressStyle::with_template("{wide_msg}").unwrap());
+                        pb
+                    })
+                    .set_message(msg);
+            }
+            _ => {
+                if let Some(pb) = tty.bars.lock().unwrap().remove(&(stage, OUTPUT_TAIL_NUM)) {
+                    pb.finish_and_clear();
+                }
+            }
+        }
     }
 
     fn print_output(&self, stage: StageId, lines: &[String]) {
@@ -869,6 +910,40 @@ fn build_title(counts: &str, activity: &str) -> String {
     } else {
         format!("vk build ({counts}) {}", clip(activity, 72))
     }
+}
+
+/// Fold a chunk of raw guest bytes for one output stream into the complete lines it
+/// terminated and the current visible "tail" (the partial after the last newline). `buf`
+/// carries the unterminated remainder across chunks. Applies terminal carriage-return
+/// semantics: `\r` returns to column 0 so following text overwrites, `\r\n` is a plain line
+/// end, and each result is the final visible segment. `buf` is kept bounded — bytes a later
+/// carriage return has already overwritten are dropped rather than accumulated.
+fn fold_output(buf: &mut Vec<u8>, chunk: &[u8]) -> (Vec<String>, String) {
+    buf.extend_from_slice(chunk);
+    let mut lines = Vec::new();
+    while let Some(nl) = buf.iter().position(|&c| c == b'\n') {
+        let line: Vec<u8> = buf.drain(..=nl).collect();
+        lines.push(visible_tail(&line[..line.len() - 1])); // drop the '\n', collapse '\r's
+    }
+    // Drop everything up to and including the last interior carriage return: it has been
+    // overwritten and can never become visible. A lone trailing '\r' is kept — it may begin a
+    // '\r\n' whose '\n' lands in the next chunk.
+    let end = buf.len() - usize::from(buf.last() == Some(&b'\r'));
+    if let Some(i) = buf[..end].iter().rposition(|&c| c == b'\r') {
+        buf.drain(..=i);
+    }
+    (lines, visible_tail(buf))
+}
+
+/// The visible text of a (newline-stripped) line after applying carriage-return overwrites:
+/// the segment following the last interior `\r`, with a lone trailing `\r` dropped.
+fn visible_tail(b: &[u8]) -> String {
+    let end = b.len() - usize::from(b.last() == Some(&b'\r'));
+    let start = b[..end]
+        .iter()
+        .rposition(|&c| c == b'\r')
+        .map_or(0, |i| i + 1);
+    String::from_utf8_lossy(&b[start..end]).into_owned()
 }
 
 /// Clip `s` to at most `max` characters, marking a truncation with a trailing ellipsis.
@@ -1074,6 +1149,116 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `fold_output` splits complete lines on `\n`, honours carriage-return overwrites
+    /// (interior `\r` keeps only the final segment; `\r\n` is a plain line end), and returns
+    /// the current partial as the live tail.
+    #[test]
+    fn fold_output_applies_carriage_return_semantics() {
+        let mut buf = Vec::new();
+        // plain newline-terminated lines, no partial left over.
+        assert_eq!(
+            fold_output(&mut buf, b"one\ntwo\n"),
+            (vec!["one".into(), "two".into()], String::new())
+        );
+        assert!(buf.is_empty());
+        // '\r\n' is an ordinary line end (the '\r' must not blank the line).
+        assert_eq!(
+            fold_output(&mut buf, b"crlf\r\n"),
+            (vec!["crlf".into()], String::new())
+        );
+        // interior '\r' overwrites: only the segment after the last '\r' survives.
+        assert_eq!(
+            fold_output(&mut buf, b"a\rb\rc\n"),
+            (vec!["c".into()], String::new())
+        );
+        // a carriage-return progress frame with no newline is returned as the live tail.
+        assert_eq!(
+            fold_output(&mut buf, b"Read 1%\rRead 2%\r"),
+            (vec![], "Read 2%".into())
+        );
+        // an empty chunk commits nothing and leaves an empty tail.
+        let mut buf = Vec::new();
+        assert_eq!(fold_output(&mut buf, b""), (vec![], String::new()));
+        assert!(buf.is_empty());
+        // a lone '\r' is held (it may begin a '\r\n'), not shown as a blank tail; the '\n'
+        // arriving next commits the empty line the overwrite left behind.
+        assert_eq!(fold_output(&mut buf, b"\r"), (vec![], String::new()));
+        assert_eq!(
+            fold_output(&mut buf, b"\n"),
+            (vec!["".into()], String::new())
+        );
+        // multibyte content survives an interior '\r' overwrite (the cut is on the ASCII
+        // '\r', never inside a codepoint): "é" is 0xC3 0xA9.
+        assert_eq!(
+            fold_output(&mut buf, "old\rné\n".as_bytes()),
+            (vec!["né".into()], String::new())
+        );
+    }
+
+    /// `fold_output` keeps `buf` bounded across chunks: a long carriage-return progress stream
+    /// (no newline) never accumulates the overwritten frames — `buf` holds ~one frame — and a
+    /// `\r\n` split across chunks still yields the intended line.
+    #[test]
+    fn fold_output_bounds_the_partial_buffer() {
+        let mut buf = Vec::new();
+        for i in 0..1000 {
+            let (lines, tail) = fold_output(&mut buf, format!("Read {i}%\r").as_bytes());
+            assert!(lines.is_empty());
+            assert_eq!(tail, format!("Read {i}%"));
+        }
+        assert!(
+            buf.len() < 32,
+            "overwritten frames must not accumulate, got {} bytes",
+            buf.len()
+        );
+        // a '\r\n' whose '\n' arrives in the next chunk still ends the line cleanly.
+        assert_eq!(fold_output(&mut buf, b"done\r"), (vec![], "done".into()));
+        assert_eq!(
+            fold_output(&mut buf, b"\n"),
+            (vec!["done".into()], String::new())
+        );
+    }
+
+    /// A carriage-return progress frame with no trailing newline shows in the live output-tail
+    /// cell; a newline commits it and clears the cell; `finish` drains any leftover tail.
+    #[test]
+    fn output_tail_tracks_and_is_drained() {
+        let p = Arc::new(Progress::new_backend(
+            Backend::Tty(Box::new(Tty::new())),
+            false,
+        ));
+        p.init(two_stages(), 1);
+        p.base_start(1);
+        p.base_done(1, Outcome::Ran);
+        p.step_start(1, 0);
+        let has_tail = |p: &Arc<Progress>| {
+            let Backend::Tty(tty) = &p.backend else {
+                unreachable!()
+            };
+            tty.bars.lock().unwrap().contains_key(&(1, OUTPUT_TAIL_NUM))
+        };
+        // a bare progress frame (no newline) is held live in the tail cell.
+        p.emit(1, 1, b"Read: 5.65 GiB / 32.6 GiB ==> 1%\r");
+        assert!(
+            has_tail(&p),
+            "a carriage-return frame must show in the tail"
+        );
+        // a newline commits the line and clears the tail cell.
+        p.emit(1, 1, b"Read: 32.6 GiB / 32.6 GiB ==> 100%\n");
+        assert!(!has_tail(&p), "a committed line must clear the tail");
+        // a leftover tail (frame still pending) is drained by finish.
+        p.emit(1, 1, b"trailing\r");
+        assert!(has_tail(&p));
+        p.finish(false);
+        let Backend::Tty(tty) = &p.backend else {
+            unreachable!()
+        };
+        assert!(
+            tty.bars.lock().unwrap().is_empty(),
+            "finish must drain the leftover output tail"
+        );
     }
 
     /// `clip` keeps a string within its character budget, ellipsizing only when it must, and
