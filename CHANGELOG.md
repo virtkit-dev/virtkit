@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-07-21
+
 ### Added
 
 - `[registry]` and `[build]` gained `token_file`/`cache_token_file`: a static bearer token
@@ -973,7 +975,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/wallix/virtkit/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/wallix/virtkit/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/wallix/virtkit/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/wallix/virtkit/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/wallix/virtkit/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/wallix/virtkit/compare/v0.17.0...v0.18.0
