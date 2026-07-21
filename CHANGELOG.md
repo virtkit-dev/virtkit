@@ -15,6 +15,7 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- The host image-cache sweep is now `vk gc` (was `vk cache gc`).
 - `vk check` no longer checks the CI-executor features (`gitlab`, `services`) by
   default; name them with `--feature` to check them.
 

@@ -126,7 +126,7 @@ the Rust toolchain, the base-image digest, and the apk pins together.
   control the run's compose services (build on demand + boot, stop, or query state).
 - `gitlab config` / `gitlab prepare` / `gitlab run` / `gitlab cleanup` — the GitLab custom-executor lifecycle.
 - `build` — build a Dockerfile into a bootable image, each `RUN` in a microVM.
-- `cache gc` — reclaim the host image cache: evict image bases no VM is using and
+- `gc` — reclaim the host image cache: evict image bases no VM is using and
   idle past the timeout, and drop unreferenced registry chunks.
 - `switch` — the guest network gateway (spawned per run/job).
 - `mkext-tar` / `mkext` — build a bootable ext4 image from a rootfs tar / directory.
