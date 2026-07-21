@@ -31,6 +31,95 @@ impl Media {
     }
 }
 
+/// Resolve a `name`'s uid and primary gid from a `/etc/passwd` blob
+/// (`name:passwd:uid:gid:…` per line). A non-UTF-8 line, or a name-matching line whose uid/gid
+/// fields are absent or unparseable, is skipped and the scan continues. None if none resolves.
+fn passwd_lookup(passwd: &[u8], name: &str) -> Option<(u32, u32)> {
+    for line in passwd.split(|&b| b == b'\n') {
+        let Ok(line) = std::str::from_utf8(line) else {
+            continue;
+        };
+        let f: Vec<&str> = line.split(':').collect();
+        if f.first() == Some(&name)
+            && let (Some(uid), Some(gid)) = (f.get(2), f.get(3))
+            && let (Ok(uid), Ok(gid)) = (uid.parse(), gid.parse())
+        {
+            return Some((uid, gid));
+        }
+    }
+    None
+}
+
+/// Resolve a `name`'s gid from an `/etc/group` blob (`name:passwd:gid:…` per line). Lines are
+/// skipped on non-UTF-8 or an unparseable gid, like `passwd_lookup`. None if none resolves.
+fn group_lookup(group: &[u8], name: &str) -> Option<u32> {
+    for line in group.split(|&b| b == b'\n') {
+        let Ok(line) = std::str::from_utf8(line) else {
+            continue;
+        };
+        let f: Vec<&str> = line.split(':').collect();
+        if f.first() == Some(&name)
+            && let Some(gid) = f.get(2)
+            && let Ok(gid) = gid.parse()
+        {
+            return Some(gid);
+        }
+    }
+    None
+}
+
+/// The guest job user's (uid, gid) for the `cibuild` host_checkout share. Accepts the Docker
+/// `User` forms `name`, `uid`, `name:group`, and `uid:gid` (either half may be a name). The user
+/// half gives the uid and a default primary gid — numeric, else resolved against the guest rootfs
+/// `/etc/passwd`; an explicit `:group` overrides the gid — numeric, else against `/etc/group`.
+/// Both files are read out of `rootfs` without mounting. None when the user is empty or root
+/// (uid 0 already writes the host-owned tree) or when resolution fails (don't guess an id).
+fn guest_run_user_ids(user: &str, rootfs: &Path) -> Option<(u32, u32)> {
+    let user = user.trim();
+    if user.is_empty() || user == "root" || user == "0" {
+        return None;
+    }
+    let (user_part, group_part) = match user.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (user, None),
+    };
+    // Read a file out of the guest rootfs without mounting it, for name resolution.
+    let read_rootfs = |path: &str| -> Option<Vec<u8>> {
+        crate::ext4_read::Ext4Reader::open(rootfs)
+            .ok()?
+            .read_file(path)
+            .ok()
+    };
+    let (uid, mut gid) = match user_part.parse::<u32>() {
+        Ok(uid) => (uid, uid),
+        Err(_) => passwd_lookup(&read_rootfs("/etc/passwd")?, user_part)?,
+    };
+    if let Some(group) = group_part {
+        gid = match group.parse::<u32>() {
+            Ok(g) => g,
+            Err(_) => group_lookup(&read_rootfs("/etc/group")?, group)?,
+        };
+    }
+    Some((uid, gid))
+}
+
+/// The 1:1 virtio-fs UID/GID maps for the host_checkout share: the guest job user's ids mapped
+/// onto the host `owner`'s `(uid, gid)`. Empty (no map) when the run user is root or unresolvable
+/// — the tree then stays owned by the host user vk runs as on the guest side too.
+fn checkout_id_maps(
+    run_user: &str,
+    rootfs: &Path,
+    owner: (u32, u32),
+) -> (Vec<String>, Vec<String>) {
+    match guest_run_user_ids(run_user, rootfs) {
+        Some((guid, ggid)) => (
+            vec![format!("map:{guid}:{}:1", owner.0)],
+            vec![format!("map:{ggid}:{}:1", owner.1)],
+        ),
+        None => (Vec::new(), Vec::new()),
+    }
+}
+
 pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     let cfg = &ctx.cfg;
     // Cheap fail-fast checks first (crisp errors in the runner-visible process beat a
@@ -759,14 +848,21 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         let sock = ctx.job_dir.join("cibuild-vfsd.sock");
 
         // The checkout tree is 0700 and owned by the user vk runs as (protects the embedded
-        // git token at rest). Squash EVERY guest id onto that owner: a job image running as
-        // any user then reads+writes the tree as its owner, so a non-root job works without
-        // having to resolve the job's uid before boot.
+        // git token at rest). Map the guest job user 1:1 onto that host owner, both ways: the
+        // guest writes the tree as the owner, and — since the guest FUSE enforces perms on the
+        // ownership it SEES — the tree must appear owned by the job user, so host-owned files
+        // map back to the job user guest-side. We resolve the job's ids here; the run user is
+        // MICROVM_USER, else the image `User`; root (or a failed resolve) needs no map.
         use std::os::unix::fs::MetadataExt;
         let owner = std::fs::metadata(&host_dir)
             .with_context(|| format!("stat host checkout dir {}", host_dir.display()))?;
-        let uid_map = vec![format!("squash-guest:0:{}:{}", owner.uid(), u32::MAX)];
-        let gid_map = vec![format!("squash-guest:0:{}:{}", owner.gid(), u32::MAX)];
+        let run_user = ctx
+            .user_req
+            .clone()
+            .or_else(|| media.config.as_ref().map(|c| c.user.clone()))
+            .unwrap_or_default();
+        let (uid_map, gid_map) =
+            checkout_id_maps(&run_user, &media.rootfs, (owner.uid(), owner.gid()));
 
         if !crate::vmm::libkrun_selected() {
             let mut vfsd = cfg.virtiofsd_command();
@@ -1502,6 +1598,95 @@ mod tests {
         ctx.cpus_req = cpus_req.map(String::from);
         ctx.mem_req = mem_req.map(String::from);
         ctx
+    }
+
+    #[test]
+    fn passwd_lookup_resolves_uid_and_primary_gid() {
+        let passwd = b"root:x:0:0:root:/root:/bin/sh\ndev:x:1000:1001:dev:/home/dev:/bin/bash\n";
+        assert_eq!(passwd_lookup(passwd, "dev"), Some((1000, 1001)));
+        assert_eq!(passwd_lookup(passwd, "root"), Some((0, 0)));
+        assert_eq!(passwd_lookup(passwd, "nobody"), None);
+        // A name-matching line with an unparseable uid is skipped, not fatal: the later good
+        // line for the same name still resolves.
+        let dup = b"dev:x:bogus:1001:::\ndev:x:1000:1001:::\n";
+        assert_eq!(passwd_lookup(dup, "dev"), Some((1000, 1001)));
+    }
+
+    #[test]
+    fn group_lookup_resolves_gid() {
+        let group = b"root:x:0:\nstaff:x:50:dev\ndev:x:1001:\n";
+        assert_eq!(group_lookup(group, "staff"), Some(50));
+        assert_eq!(group_lookup(group, "dev"), Some(1001));
+        assert_eq!(group_lookup(group, "nogroup"), None);
+    }
+
+    #[test]
+    fn run_user_ids_numeric_and_root_branches() {
+        let no_rootfs = Path::new("/nonexistent/runner.ext4");
+        assert_eq!(guest_run_user_ids("1000", no_rootfs), Some((1000, 1000)));
+        assert_eq!(
+            guest_run_user_ids("1000:2000", no_rootfs),
+            Some((1000, 2000))
+        );
+        assert_eq!(guest_run_user_ids("", no_rootfs), None);
+        assert_eq!(guest_run_user_ids("root", no_rootfs), None);
+        assert_eq!(guest_run_user_ids("0", no_rootfs), None);
+        // Any half that is a name needs the rootfs; with none readable it resolves to nothing
+        // (no guess) rather than the old squash's blanket owner map.
+        assert_eq!(guest_run_user_ids("dev", no_rootfs), None);
+        assert_eq!(guest_run_user_ids("1000:staff", no_rootfs), None);
+        assert_eq!(guest_run_user_ids("dev:2000", no_rootfs), None);
+    }
+
+    #[test]
+    fn run_user_ids_resolves_names_against_a_real_rootfs() {
+        // Build a throwaway ext4 image carrying just /etc/passwd and /etc/group, then resolve
+        // name-form `User` values against it exactly as the pre-boot path does.
+        let dir = std::env::temp_dir().join(format!("vk-vm-userids-{}", std::process::id()));
+        let src = dir.join("src");
+        std::fs::create_dir_all(src.join("etc")).unwrap();
+        std::fs::write(
+            src.join("etc/passwd"),
+            b"root:x:0:0:root:/root:/bin/sh\ndev:x:1000:1001:dev:/home/dev:/bin/bash\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("etc/group"), b"dev:x:1001:\nstaff:x:50:dev\n").unwrap();
+        let img = dir.join("rootfs.ext4");
+        crate::ext4::build_from_dir(&src, &img).unwrap();
+
+        // Plain name → uid + primary gid from /etc/passwd.
+        assert_eq!(guest_run_user_ids("dev", &img), Some((1000, 1001)));
+        // uid:group-name → uid kept, gid resolved from /etc/group.
+        assert_eq!(guest_run_user_ids("1000:staff", &img), Some((1000, 50)));
+        // name:group-name → both halves resolved.
+        assert_eq!(guest_run_user_ids("dev:staff", &img), Some((1000, 50)));
+        // Unknown name → no map.
+        assert_eq!(guest_run_user_ids("nobody", &img), None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn checkout_id_maps_direction_and_no_map() {
+        let no_rootfs = Path::new("/nonexistent/runner.ext4");
+        // A resolvable (here numeric) run user → a 1:1 map from the job's ids onto the owner's,
+        // uid and gid each in that order. Guards the spec string against an owner/job arg swap.
+        assert_eq!(
+            checkout_id_maps("1000:2000", no_rootfs, (5000, 6000)),
+            (
+                vec!["map:1000:5000:1".to_string()],
+                vec!["map:2000:6000:1".to_string()],
+            )
+        );
+        // Root or an unresolvable user → no map at all (the tree stays host-owner-owned).
+        assert_eq!(
+            checkout_id_maps("root", no_rootfs, (5000, 6000)),
+            (Vec::new(), Vec::new())
+        );
+        assert_eq!(
+            checkout_id_maps("dev", no_rootfs, (5000, 6000)),
+            (Vec::new(), Vec::new())
+        );
     }
 
     #[test]
