@@ -493,7 +493,7 @@ enum Cmd {
         #[arg(long = "registry-proxy", value_name = "IP=ADDR")]
         registry_proxy: Option<String>,
     },
-    /// Dev: run a docker/OCI image as a microVM — boot it from a native ext4 disk
+    /// Run a docker/OCI image as a microVM — boot it from a native ext4 disk
     /// (or a cpio initramfs in RAM with --ram), virtkit-agent as PID 1 over vsock, and
     /// run a command or interactive shell.
     #[command(display_order = 1)]
