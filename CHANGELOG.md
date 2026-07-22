@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-07-22
+
 ### Added
 
 - GitLab jobs whose egress the switch blocked now see each refused destination reported in
@@ -1059,7 +1061,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/wallix/virtkit/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/wallix/virtkit/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/wallix/virtkit/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/wallix/virtkit/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/wallix/virtkit/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/wallix/virtkit/compare/v0.19.0...v0.20.0
