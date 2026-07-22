@@ -12,7 +12,20 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+
+/// Deserialize a possibly-`null` field as its `Default`. `#[serde(default)]`
+/// alone only covers a *missing* key; GitLab runner 19.1 serializes an unset
+/// `entrypoint`/`command` as an explicit `null`, which would otherwise fail
+/// against a non-`Option` type. Applied uniformly to every optional field
+/// (`alias`/`variables` too) so any of them tolerates an explicit `null`.
+fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::deserialize(deserializer)?.unwrap_or_default())
+}
 
 /// One `CI_JOB_SERVICES` entry — the subset of the runner's serialization we
 /// consume (any other key the runner emits is ignored).
@@ -21,16 +34,16 @@ pub struct Service {
     /// Image reference, with the registry already variable-expanded by GitLab.
     pub name: String,
     /// Hostname the job reaches the service by; defaults from the image name.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub alias: String,
     /// Per-service environment (the service-level `variables:`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub variables: BTreeMap<String, String>,
     /// Entrypoint override (argv array); empty = the image's own.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub entrypoint: Vec<String>,
     /// Command override (argv array); empty = the image's own.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub command: Vec<String>,
 }
 
@@ -133,6 +146,25 @@ mod tests {
         assert_eq!(svcs[1].alias, "team__cache");
         assert_eq!(svcs[1].variables.get("X").unwrap(), "y");
         assert!(svcs[1].entrypoint.is_empty() && svcs[1].command.is_empty());
+    }
+
+    #[test]
+    fn parses_explicit_null_optional_fields() {
+        // GitLab runner 19.1 serializes an unset optional field as `null`
+        // rather than omitting the key; null must map to the empty default
+        // for every optional field, not just entrypoint/command.
+        let json = r#"[
+            {"name":"reg.io/team/db:1","alias":null,"variables":null,"entrypoint":null,"command":null}
+        ]"#;
+        // SAFETY: tests are single-threaded per process here; set + parse + clear
+        unsafe { std::env::set_var("CUSTOM_ENV_CI_JOB_SERVICES", json) };
+        let svcs = from_env().unwrap();
+        unsafe { std::env::remove_var("CUSTOM_ENV_CI_JOB_SERVICES") };
+        assert_eq!(svcs.len(), 1);
+        // alias:null -> empty -> derived from the image name
+        assert_eq!(svcs[0].alias, "team__db");
+        assert!(svcs[0].variables.is_empty());
+        assert!(svcs[0].entrypoint.is_empty() && svcs[0].command.is_empty());
     }
 
     #[test]
