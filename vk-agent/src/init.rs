@@ -1507,8 +1507,16 @@ fn run_service(cmdline: &HashMap<String, String>, config: Option<&RunConfig>) ->
     let service_pid = fork_exec(&argv)?;
     info!("vk-agent init: service pid {service_pid}");
 
-    // VIRTKIT_SERVE=1: optionally start the vsock exec server for live debugging.
-    // Connect with: vk-agent -s vsock-mux://<vsock.sock>:4444 exec -- <cmd>
+    // Power off on a forwarded shutdown even while the readiness gate below is still waiting.
+    install_term_handler();
+
+    // Gate readiness on the image's EXPOSEd ports before advertising the guest as up: the host
+    // (prepare) polls the exec server started just below, so holding it back until the ports
+    // accept connections keeps a CI job from racing a still-initializing service.
+    wait_for_exposed_ports(cmdline, &cfg, service_pid);
+
+    // VIRTKIT_SERVE=1: start the vsock exec server — the readiness signal prepare polls, also a
+    // live-debugging channel: vk-agent -s vsock-mux://<vsock.sock>:4444 exec -- <cmd>
     let serve_pid = if cmdline.get("VIRTKIT_SERVE").map(String::as_str) == Some("1") {
         let socket = socket_from_cmdline();
         match spawn_serve(&socket, None) {
@@ -1525,8 +1533,75 @@ fn run_service(cmdline: &HashMap<String, String>, config: Option<&RunConfig>) ->
         None
     };
 
-    install_term_handler();
     supervise_service(service_pid, serve_pid)
+}
+
+/// Hold guest readiness until every EXPOSEd TCP port accepts connections. The host observes
+/// readiness through the exec server the caller starts *after* this returns, so blocking here
+/// delays "ready" until the service truly listens — a CI job then never connects before, say,
+/// the database is up. Probes the guest's own LAN address, not loopback: a listener bound only
+/// to 127.0.0.1 (as some DB init phases briefly are) must not count as ready, since a peer over
+/// the LAN could not reach it. Orphans are reaped meanwhile; if the service process itself exits
+/// before its ports open, the VM powers off (as supervise_service would), which the host reads
+/// as the service failing to come up. No ports — or no known address — returns at once, leaving
+/// readiness at "the guest booted".
+fn wait_for_exposed_ports(
+    cmdline: &HashMap<String, String>,
+    cfg: &RunConfig,
+    service_pid: libc::pid_t,
+) {
+    if cfg.exposed_ports.is_empty() {
+        return;
+    }
+    let Some(ip) = guest_ip_from_cmdline(cmdline) else {
+        warn!("vk-agent init: no VIRTKIT_VM_IP — skipping the exposed-port readiness gate");
+        return;
+    };
+    for &port in &cfg.exposed_ports {
+        let target = std::net::SocketAddr::from((ip, port));
+        loop {
+            reap_orphans_or_poweroff(service_pid);
+            if std::net::TcpStream::connect_timeout(&target, Duration::from_secs(1)).is_ok() {
+                info!("vk-agent init: service port {port} ready");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+/// The guest's own LAN address from `VIRTKIT_VM_IP` (`a.b.c.d/prefix`), dropping the prefix.
+/// `None` when the key is absent (e.g. a DHCP boot) or unparseable, which leaves readiness at
+/// the boot-level gate.
+fn guest_ip_from_cmdline(cmdline: &HashMap<String, String>) -> Option<std::net::Ipv4Addr> {
+    cmdline
+        .get("VIRTKIT_VM_IP")
+        .and_then(|s| s.split('/').next())
+        .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+}
+
+/// Non-blocking reap of exited children while gating on readiness. If the reaped child is the
+/// service itself, power off — mirroring supervise_service's rule that the service exiting ends
+/// the guest, so a crash during init surfaces to the host as the service never becoming ready.
+fn reap_orphans_or_poweroff(service_pid: libc::pid_t) {
+    loop {
+        let mut status: libc::c_int = 0;
+        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if pid <= 0 {
+            break; // 0 = no child has exited; <0 = EINTR/ECHILD
+        }
+        if pid == service_pid {
+            let code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                -libc::WTERMSIG(status)
+            };
+            info!(
+                "vk-agent init: service exited (code {code}) before its ports opened; powering off"
+            );
+            poweroff();
+        }
+    }
 }
 
 /// Reap orphaned processes as PID 1; power off when the service child exits.
@@ -2053,7 +2128,30 @@ mod tests {
             workdir: "/data".into(),
             entrypoint: vec!["redis-server".into()],
             cmd: vec![],
+            exposed_ports: vec![6379],
         };
         assert_eq!(RunConfig::from_json(&cfg.to_json()).unwrap(), cfg);
+    }
+
+    #[test]
+    fn guest_ip_drops_the_prefix() {
+        let m: HashMap<String, String> =
+            [("VIRTKIT_VM_IP".to_string(), "10.0.2.15/24".to_string())]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            guest_ip_from_cmdline(&m),
+            Some("10.0.2.15".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn guest_ip_absent_or_unparseable_is_none() {
+        assert_eq!(guest_ip_from_cmdline(&HashMap::new()), None);
+        let m: HashMap<String, String> =
+            [("VIRTKIT_VM_IP".to_string(), "not-an-ip/24".to_string())]
+                .into_iter()
+                .collect();
+        assert_eq!(guest_ip_from_cmdline(&m), None);
     }
 }

@@ -354,6 +354,10 @@ fn run_config(st: &ShellState) -> vk_core::runcfg::RunConfig {
         workdir: st.workdir.clone(),
         entrypoint: st.entrypoint.clone(),
         cmd: st.cmd.clone(),
+        // EXPOSE is not tracked in ShellState, so a git-defined (dockerfile:) service
+        // gates readiness on the guest booting, not on its ports. Pulled images (the
+        // common services: case) carry ExposedPorts through the OCI config.
+        exposed_ports: Vec::new(),
     }
 }
 

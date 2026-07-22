@@ -123,7 +123,7 @@ impl Source {
 
 /// Pull an OCI `reference` and flatten it into a byte-clean ext4 at `out` — nothing
 /// injected, since the embedded agent rides the boot initramfs — then write the image's
-/// runtime config (`Env`/`User`/`WorkingDir`/`Entrypoint`/`Cmd`) to `config_sidecar(out)`
+/// runtime config (`Env`/`User`/`WorkingDir`/`Entrypoint`/`Cmd`/`ExposedPorts`) to `config_sidecar(out)`
 /// for the boot to apply. `extra_blocks` is writable free-space headroom beyond the sparse
 /// fit (a guest boots through a CoW overlay, but the filesystem still needs free blocks to
 /// allocate); `fs_id` sets the journal and any freshness UUID. The shared core of the
@@ -249,7 +249,28 @@ fn docker_run_config(docker: &Path, image: &str) -> Result<vk_core::runcfg::RunC
             .to_string(),
         entrypoint: docker_inspect_argv(docker, image, "Entrypoint")?,
         cmd: docker_inspect_argv(docker, image, "Cmd")?,
+        exposed_ports: docker_inspect_exposed_tcp_ports(docker, image)?,
     })
+}
+
+/// The image's `EXPOSE`d TCP ports via `docker image inspect` — one `"<port>/<proto>"`
+/// key per line — kept for tcp only, deduplicated. Mirrors the OCI pull path's
+/// `exposed_tcp_ports`, so both readiness gates see the same set.
+fn docker_inspect_exposed_tcp_ports(docker: &Path, image: &str) -> Result<Vec<u16>> {
+    let mut ports: Vec<u16> = docker_inspect(
+        docker,
+        image,
+        "{{range $p, $_ := .Config.ExposedPorts}}{{println $p}}{{end}}",
+    )?
+    .lines()
+    .filter_map(|l| {
+        let (port, proto) = l.trim().split_once('/').unwrap_or((l.trim(), "tcp"));
+        (proto == "tcp").then(|| port.parse().ok()).flatten()
+    })
+    .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    Ok(ports)
 }
 
 /// `docker image inspect` an image's `Config.<field>` argv (`Entrypoint`/`Cmd`), one

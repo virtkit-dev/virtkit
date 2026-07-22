@@ -32,6 +32,13 @@ pub struct RunConfig {
     /// entrypoint is empty).
     #[serde(default)]
     pub cmd: Vec<String>,
+    /// TCP ports the image declares via `EXPOSE` (the OCI config's `ExposedPorts`),
+    /// deduplicated. A CI `services:` guest gates its readiness on these: it does not
+    /// advertise itself as up until each is accepting connections, so the job never
+    /// races a still-initializing database. UDP ports are dropped (not probeable this
+    /// way); empty = no port gate (readiness is just "the guest booted").
+    #[serde(default)]
+    pub exposed_ports: Vec<u16>,
 }
 
 impl RunConfig {

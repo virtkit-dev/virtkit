@@ -32,6 +32,8 @@ pub struct ImageConfig {
     pub workdir: Option<String>,
     pub entrypoint: Vec<String>,
     pub cmd: Vec<String>,
+    /// TCP ports from the config's `ExposedPorts` (the guest gates readiness on them).
+    pub exposed_ports: Vec<u16>,
 }
 
 impl From<ImageConfig> for vk_core::runcfg::RunConfig {
@@ -42,6 +44,7 @@ impl From<ImageConfig> for vk_core::runcfg::RunConfig {
             workdir: c.workdir.unwrap_or_default(),
             entrypoint: c.entrypoint,
             cmd: c.cmd,
+            exposed_ports: c.exposed_ports,
         }
     }
 }
@@ -227,7 +230,27 @@ fn parse_config(json: &str) -> ImageConfig {
         workdir: nonempty(&c["WorkingDir"]),
         entrypoint: argv(&c["Entrypoint"]),
         cmd: argv(&c["Cmd"]),
+        exposed_ports: exposed_tcp_ports(&c["ExposedPorts"]),
     }
+}
+
+/// TCP ports from an OCI config's `ExposedPorts` — a set-valued object keyed by
+/// `"<port>/<proto>"` (e.g. `{"3306/tcp": {}, "33060/tcp": {}}`). Only `tcp` ports are
+/// kept (a readiness probe opens a TCP connection); entries without a proto default to
+/// tcp, per the OCI/Docker convention. Deduplicated and sorted for a stable sidecar.
+fn exposed_tcp_ports(v: &serde_json::Value) -> Vec<u16> {
+    let mut ports: Vec<u16> = v
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, _)| {
+            let (port, proto) = key.split_once('/').unwrap_or((key, "tcp"));
+            (proto == "tcp").then(|| port.parse().ok()).flatten()
+        })
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 fn config_cache_path(reference: &str) -> Option<PathBuf> {
@@ -622,6 +645,17 @@ mod tests {
         let empty = parse_config(r#"{"config":{"User":"","WorkingDir":""}}"#);
         assert!(empty.user.is_none() && empty.workdir.is_none() && empty.env.is_empty());
         assert!(parse_config("not json").env.is_empty());
+    }
+
+    #[test]
+    fn parse_exposed_ports_keeps_tcp_only_sorted_deduped() {
+        // set-valued object keyed by "<port>/<proto>"; udp dropped, tcp (and a
+        // proto-less entry, tcp by convention) kept, sorted and deduplicated.
+        let json = r#"{"config":{"ExposedPorts":{
+            "6379/tcp":{},"53/udp":{},"3306":{},"6379/tcp":{}}}}"#;
+        assert_eq!(parse_config(json).exposed_ports, vec![3306, 6379]);
+        // absent / empty -> no ports
+        assert!(parse_config(r#"{"config":{}}"#).exposed_ports.is_empty());
     }
 
     #[test]

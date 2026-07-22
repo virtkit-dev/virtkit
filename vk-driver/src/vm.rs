@@ -295,9 +295,10 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
 /// a crisp prepare failure (system_failure) instead of an opaque connection error mid-script.
 /// Readiness is the sibling's in-guest agent answering on its exec channel — the same signal
 /// the primary uses — served via `VIRTKIT_SERVE=1` and bridged to the host by `units::boot_unit`.
-/// The names come from the same unit list `plan_services` enumerates (the compose or env
-/// services, in the same order), so each `svc-<name>` path matches the dir the supervisor
-/// booted that sibling in.
+/// For an image that declares `EXPOSE`d ports the guest holds that channel back until each port
+/// accepts connections (see vk-agent's `wait_for_exposed_ports`), so a database service gates on
+/// the port being up, not merely on the guest booting. The names mirror `plan_services`, so each
+/// path addresses the same `svc-<name>` runtime dir.
 async fn wait_for_services(ctx: &JobCtx, names: &[String]) -> Result<()> {
     let cfg = &ctx.cfg;
     // The siblings boot concurrently in the supervisor, so a single readiness budget spans them

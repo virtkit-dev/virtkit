@@ -117,6 +117,8 @@ pub fn merged_config(image: &RunConfig, unit: &Unit) -> RunConfig {
         workdir: image.workdir.clone(),
         entrypoint,
         cmd,
+        // The readiness port gate is an image property; compose overrides never change it.
+        exposed_ports: image.exposed_ports.clone(),
     }
 }
 
@@ -1045,10 +1047,13 @@ mod tests {
             workdir: "/srv".into(),
             entrypoint: vec!["/bin/app".into()],
             cmd: vec!["--serve".into()],
+            exposed_ports: vec![5432],
         };
         let mut unit = one("services:\n  s:\n    image: x\n    environment: [PORT=2]\n");
         // env upserts; everything else keeps the image defaults
         let m = merged_config(&image, &unit);
+        // the readiness port gate is an image property preserved across the merge
+        assert_eq!(m.exposed_ports, [5432]);
         assert_eq!(
             m.env,
             [

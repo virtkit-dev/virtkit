@@ -25,6 +25,9 @@ All notable changes to virtkit will be documented in this file.
 - GitLab jobs no longer start their script before the declared `services:` are ready: a service
   that is slow or fails to boot now fails the job's prepare stage with a named error instead of
   surfacing as an opaque connection failure once the script first reaches it.
+- A `services:` container now counts as ready only once it accepts connections on the ports its
+  image exposes, not merely once its guest has booted, so a job no longer races a service that
+  is still initializing.
 
 ## [0.22.0] - 2026-07-22
 
