@@ -249,7 +249,14 @@ impl Drop for PullLock {
     }
 }
 
-pub(crate) fn acquire_pull_lock(dir: &Path, name: &str, digest: &str) -> Result<PullLock> {
+/// `verb` names the serialized operation in the wait message ("pull" for a registry/OCI
+/// fetch, "build" for a build-tier stage) — the lock itself is shared across both.
+pub(crate) fn acquire_pull_lock(
+    dir: &Path,
+    verb: &str,
+    name: &str,
+    digest: &str,
+) -> Result<PullLock> {
     let addr = pull_lock_addr(pull_lock_hash(dir))?;
     let mut waiting = false;
     loop {
@@ -259,11 +266,11 @@ pub(crate) fn acquire_pull_lock(dir: &Path, name: &str, digest: &str) -> Result<
                 if !waiting {
                     match query_holder(&addr) {
                         Some(who) => println!(
-                            "virtkit: waiting for a concurrent pull of {name}@{digest} \
+                            "virtkit: waiting for a concurrent {verb} of {name}@{digest} \
                              (held by {who}) ..."
                         ),
                         None => println!(
-                            "virtkit: waiting for a concurrent pull of {name}@{digest} ..."
+                            "virtkit: waiting for a concurrent {verb} of {name}@{digest} ..."
                         ),
                     }
                     waiting = true;
@@ -534,7 +541,7 @@ mod tests {
     fn pull_lock_answers_holder_identity_then_releases() {
         let dir = std::env::temp_dir().join(format!("virtkit-test-holder-{}", std::process::id()));
         let addr = pull_lock_addr(pull_lock_hash(&dir)).unwrap();
-        let lock = acquire_pull_lock(&dir, "build", "sha256:x").unwrap();
+        let lock = acquire_pull_lock(&dir, "build", "myimg", "sha256:x").unwrap();
         // a waiter reads the holder's identity over the lock socket (pid fallback, no CI env)
         let who = query_holder(&addr).expect("the holder should answer");
         assert!(!who.trim().is_empty());

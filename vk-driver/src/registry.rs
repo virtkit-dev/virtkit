@@ -1015,7 +1015,7 @@ async fn pull_into(
     digest: &str,
     dir: &Path,
 ) -> Result<()> {
-    let _lock = image::acquire_pull_lock(dir, name, digest)?;
+    let _lock = image::acquire_pull_lock(dir, "pull", name, digest)?;
     if bundle_present(dir) {
         return Ok(());
     }

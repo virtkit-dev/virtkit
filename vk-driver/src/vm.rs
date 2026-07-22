@@ -225,7 +225,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     let mut sup =
         spawn_detached(sup_cmd, &ctx.supervisor_log()).context("spawning the job supervisor")?;
 
-    println!("virtkit: booting microVM (cpus={cpus}, mem={mem})");
+    println!("virtkit: booting microVM {image_ref} (cpus={cpus}, mem={mem})");
 
     // Ready = the in-guest virtkit-agent answers on vsock. The supervisor exiting
     // during boot (the VMM died, a helper failed to start) fails the poll fast.
@@ -388,6 +388,7 @@ fn build_git_image(
         &recipe,
         stage,
         &stage_key,
+        spec,
         None,
     )
     .with_context(|| format!("building the git-defined image {spec:?}"))?;

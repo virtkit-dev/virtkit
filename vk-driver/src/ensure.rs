@@ -136,13 +136,15 @@ pub fn build_tier_dir(state_dir: &Path, stage_key: &str) -> PathBuf {
 /// pull lock into a tmp sibling, stamps the UUID, and promotes atomically — so a killed
 /// build never leaves a half-image a freshness check would trust, and concurrent identical
 /// builds serialize (the loser then finds it fresh). Marks the base used and runs idle GC on
-/// the tier. `sink` streams build progress when set.
+/// the tier. `label` names the stage (its compose service / git-defined image name) in the
+/// concurrent-build wait message. `sink` streams build progress when set.
 pub fn ensure_build_tier(
     state_dir: &Path,
     idle: Duration,
     recipe: &BuildRecipe,
     target: Option<&str>,
     stage_key: &str,
+    label: &str,
     sink: Option<crate::build::ProgressSink>,
 ) -> Result<PathBuf> {
     let dir = build_tier_dir(state_dir, stage_key);
@@ -151,7 +153,9 @@ pub fn ensure_build_tier(
         crate::image::mark_used(&dir);
         return Ok(dir);
     }
-    let _lock = crate::image::acquire_pull_lock(&dir, "build", &expected)?;
+    // `label` (the service / git-defined image name) names the stage in the concurrent-build
+    // wait message; the fingerprint is the cache identity.
+    let _lock = crate::image::acquire_pull_lock(&dir, "build", label, &expected)?;
     // Re-check under the lock: a concurrent build of the same stage may have just promoted it.
     if unit_fresh(&dir.join("runner.ext4"), &expected) {
         crate::image::mark_used(&dir);

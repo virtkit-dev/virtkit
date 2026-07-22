@@ -161,7 +161,7 @@ fn resolve_full(
     let images_dir = state_dir.join("docker").join(name);
     let dir = images_dir.join(digest.trim_start_matches("sha256:"));
     if !dir.join("runner.ext4").is_file() {
-        let _lock = image::acquire_pull_lock(&dir, name, &digest)?;
+        let _lock = image::acquire_pull_lock(&dir, "pull", name, &digest)?;
         if !dir.join("runner.ext4").is_file() {
             build(
                 &pinned,

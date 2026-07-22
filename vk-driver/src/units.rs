@@ -128,8 +128,15 @@ pub fn ensure_unit_build_sync(
         );
     }
     let (recipe, target, key) = build_recipe(unit, &build.build_args, Some(build))?;
-    let dir =
-        crate::ensure::ensure_build_tier(state_dir, idle, &recipe, target.as_deref(), &key, sink)?;
+    let dir = crate::ensure::ensure_build_tier(
+        state_dir,
+        idle,
+        &recipe,
+        target.as_deref(),
+        &key,
+        &unit.name,
+        sink,
+    )?;
     read_merged_config(unit, &dir.join("runner.ext4"))
 }
 
