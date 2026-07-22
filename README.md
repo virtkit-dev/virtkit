@@ -54,7 +54,9 @@ against it out of the box.
 
 Isolate GitLab CI jobs. The custom executor gives every job a fresh microVM and
 destroys it when the job ends. Concurrent jobs work, and Docker images from your
-`.gitlab-ci.yml` are converted on demand.
+`.gitlab-ci.yml` are converted on demand. See the
+[GitLab CI guide](docs/gitlab-ci.md) for job variables, per-phase egress control,
+and services.
 
 Build Dockerfiles without Docker. `vk build` runs each `RUN` instruction in its
 own microVM, caches per instruction, and produces an image you can boot straight
@@ -131,7 +133,7 @@ The ones you'll actually type:
 - `service up` / `service down` / `service status` — from inside the primary,
   control the run's compose services (build on demand + boot, stop, or query state).
 - `gitlab config` / `gitlab prepare` / `gitlab run` / `gitlab cleanup` — the
-  GitLab custom-executor lifecycle.
+  GitLab custom-executor lifecycle (see the [GitLab CI guide](docs/gitlab-ci.md)).
 - `registry push` / `registry pull` / `registry inspect` / `registry status` /
   `registry gc` — manage guest bundles in an OCI store, with chunk-level
   deduplication to keep transfers small.

@@ -122,7 +122,9 @@ vk registry pull runner:20260625
 
 ### GitLab CI executor
 
-Runs each CI job in a throwaway microVM. Wire up in
+Runs each CI job in a throwaway microVM. For a task-oriented guide (job variables,
+per-phase and per-service egress, services) see
+[`docs/gitlab-ci.md`](../docs/gitlab-ci.md). Wire up in
 `/etc/gitlab-runner/config.toml`:
 
 ```toml
