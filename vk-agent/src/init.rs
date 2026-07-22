@@ -313,6 +313,16 @@ fn mount_api_filesystems() -> Result<()> {
         ("sysfs", "/sys", "sysfs", 0),
         ("devtmpfs", "/dev", "devtmpfs", 0),
         ("devpts", "/dev/pts", "devpts", 0),
+        // POSIX shared memory: devtmpfs does not provide /dev/shm, but Python's
+        // multiprocessing (shared_memory, semaphores) and other libs need it — without
+        // it they fail with ENOENT on /dev/shm. tmpfs defaults to mode 1777 (like /tmp),
+        // so an unprivileged process can create segments. Mounted after /dev exists.
+        (
+            "tmpfs",
+            "/dev/shm",
+            "tmpfs",
+            libc::MS_NOSUID | libc::MS_NODEV,
+        ),
     ];
     for (src, target, fstype, flags) in mounts {
         if !std::path::Path::new(target).exists() {

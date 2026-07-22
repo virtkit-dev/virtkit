@@ -33,6 +33,8 @@ All notable changes to virtkit will be documented in this file.
 - Compose service VMs on a switch subnet other than the default can now reach off-subnet hosts;
   they were booted without a gateway and fell back to an off-link default route that failed to
   install.
+- Guest processes that use POSIX shared memory (Python `multiprocessing`, redis-py's shm locks)
+  no longer fail on a missing `/dev/shm`; the guest mounts a tmpfs there at boot.
 
 ## [0.22.0] - 2026-07-22
 
