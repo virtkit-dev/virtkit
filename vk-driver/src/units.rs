@@ -262,11 +262,11 @@ pub fn mac_for_ip(ip: Ipv4Addr) -> String {
 /// primary VM's default (3).
 pub const FIRST_SERVICE_CID: u32 = 100;
 
-/// vsock port the reparented `vk-agent serve` listens on in an image-init sibling
-/// (the preinit boot's `VIRTKIT_VSOCK_PORT`). Siblings are reached over the LAN, not
-/// vsock exec, so nothing on the host dials this — it just gives the serve a port
-/// (the agent's own default is the same value). Mirrors the primary path's port.
-const VSOCK_PORT: u32 = 4444;
+/// vsock port each sibling's `vk-agent serve` listens on — a preinit boot's reparented
+/// serve (its `VIRTKIT_VSOCK_PORT`) or the default service boot's `VIRTKIT_SERVE=1`
+/// server. The job supervisor's `prepare` dials it (bridged to the host in `boot_unit`)
+/// to gate on each service's readiness. Mirrors the primary path's port.
+pub const VSOCK_PORT: u32 = 4444;
 
 /// Boot one unit in `dir` (its runtime state: overlay, sockets, console, boot
 /// initramfs — distinct from where the image lives): a throwaway CoW overlay over
@@ -403,9 +403,11 @@ pub fn boot_unit(
             // Default agent-service boot: the agent stays PID 1 and forks the unit's
             // entrypoint (VIRTKIT_MODE=service). Static address + the gateway as
             // resolver (its DNS answers the service names and forwards the rest), so
-            // the unit resolves siblings without /etc/hosts.
+            // the unit resolves siblings without /etc/hosts. VIRTKIT_SERVE=1 brings up
+            // the vsock exec server (on VSOCK_PORT) so prepare can poll readiness.
             format!(
                 "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda VIRTKIT_MODE=service \
+                 VIRTKIT_SERVE=1 VIRTKIT_VSOCK_PORT={VSOCK_PORT} \
                  VIRTKIT_HOSTNAME={} VIRTKIT_NET_PORT={net_port} \
                  VIRTKIT_VM_IP={} VIRTKIT_VM_DNS={gateway}",
                 svc.hostname, svc.ip
@@ -418,9 +420,15 @@ pub fn boot_unit(
             cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS={virtiofs}"));
         }
 
-        // units are reached over the switch network, not vsock exec; only the
-        // guest→host switch bridge needs mapping.
-        let vsock_ports = vec![crate::vmm::VsockPort::bridge(&vsock, net_port)];
+        // The guest→host switch bridge, plus a host→guest exec channel: the agent
+        // serves it (a preinit boot's reparented serve, or the default boot's
+        // VIRTKIT_SERVE=1 above), and the job supervisor's prepare polls it to gate on
+        // the service's readiness. libkrun needs the explicit per-port listener;
+        // cloud-hypervisor derives it from the base socket and ignores the entry.
+        let vsock_ports = vec![
+            crate::vmm::VsockPort::bridge(&vsock, net_port),
+            crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT),
+        ];
         let spec = crate::vmm::VmSpec {
             kernel: boot_kernel,
             cmdline,

@@ -194,11 +194,13 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // plan_services) keeps the guest boot within the runner's readiness budget. supervise then
     // just hits the fresh tier. Non-build services are left for supervise (a pull is quick).
     let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
+    let mut service_names: Vec<String> = Vec::new();
     if let Some(spec) = image_ref.strip_prefix("compose:") {
         for unit in compose_service_units(&load_compose_fleet(ctx, spec)?)? {
             if matches!(unit.source, crate::compose::Source::Build { .. }) {
                 build_compose_unit(ctx, &unit).with_context(|| format!("service {}", unit.name))?;
             }
+            service_names.push(unit.name);
         }
     } else {
         for unit in crate::services::to_units(crate::services::from_env()?) {
@@ -207,6 +209,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             {
                 build_git_image(ctx, spec).with_context(|| format!("service {}", unit.name))?;
             }
+            service_names.push(unit.name);
         }
     }
 
@@ -264,6 +267,10 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
                     start.elapsed().as_secs_f32()
                 );
                 probe_guest_shell(ctx, &addr).await;
+                // Only signal ready (exit 0) once the services the job declared are up too:
+                // they boot concurrently in the supervisor and the job script runs the moment
+                // this stage exits.
+                wait_for_services(ctx, &service_names).await?;
                 return Ok(());
             }
             Err(e) => {
@@ -280,6 +287,49 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// Gate `prepare` on every declared service's readiness. Each service boots concurrently in
+/// the detached supervisor as a sibling VM, and gitlab-runner runs the job script the instant
+/// prepare exits — so a service still coming up, or one that died at boot, must surface here as
+/// a crisp prepare failure (system_failure) instead of an opaque connection error mid-script.
+/// Readiness is the sibling's in-guest agent answering on its exec channel — the same signal
+/// the primary uses — served via `VIRTKIT_SERVE=1` and bridged to the host by `units::boot_unit`.
+/// The names come from the same unit list `plan_services` enumerates (the compose or env
+/// services, in the same order), so each `svc-<name>` path matches the dir the supervisor
+/// booted that sibling in.
+async fn wait_for_services(ctx: &JobCtx, names: &[String]) -> Result<()> {
+    let cfg = &ctx.cfg;
+    // The siblings boot concurrently in the supervisor, so a single readiness budget spans them
+    // all rather than a fresh one per service.
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(cfg.vm.boot_timeout_secs);
+    for name in names {
+        let dir = ctx.job_dir.join(format!("svc-{name}"));
+        let addr = crate::vmm::exec_addr(&dir.join("vsock.sock"), crate::units::VSOCK_PORT);
+        loop {
+            match vk_core::status::get_status(&addr).await {
+                Ok(_) => {
+                    println!(
+                        "vk: service {name} ready in {:.1}s",
+                        start.elapsed().as_secs_f32()
+                    );
+                    break;
+                }
+                Err(e) => {
+                    if Instant::now() >= deadline {
+                        log_tail(&dir.join("console.log"), 30);
+                        bail!(
+                            "service {name} not ready after {}s ({e}) — console tail above",
+                            cfg.vm.boot_timeout_secs
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve MICROVM_IMAGE to the boot files: an optional kernel (`None` = boot vk's
