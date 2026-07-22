@@ -1314,6 +1314,7 @@ fn spawn_switch(
         allow_name: effective_allow_names(cfg, ctx)?,
         registry_proxy,
         log: ctx.switch_log(),
+        denied_log: Some(ctx.egress_denied_log()),
     })
     .context("spawning the per-job switch")
 }

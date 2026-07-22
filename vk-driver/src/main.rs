@@ -25,6 +25,7 @@ mod cpio;
 mod detach;
 mod dockerhash;
 mod dockerimg;
+mod egress_report;
 mod embed;
 mod ensure;
 mod exec;
@@ -509,6 +510,10 @@ enum Cmd {
         /// `<sentinel-ip>=<host:port>` (set internally by `vk run --registry-proxy`).
         #[arg(long = "registry-proxy", value_name = "IP=ADDR")]
         registry_proxy: Option<String>,
+        /// append each egress denial as a typed record here for the job trace to surface
+        /// (set internally by the gitlab executor; see egress_report).
+        #[arg(long = "denied-log", value_name = "PATH")]
+        denied_log: Option<PathBuf>,
     },
     /// Run a docker/OCI image as a microVM — boot it from a native ext4 disk
     /// (or a cpio initramfs in RAM with --ram), virtkit-agent as PID 1 over vsock, and
@@ -1951,6 +1956,7 @@ async fn cli_main() -> ExitCode {
         allow_ip,
         allow_name,
         registry_proxy,
+        denied_log,
     } = &cli.cmd
     {
         let mut hosts = std::collections::HashMap::new();
@@ -2000,6 +2006,7 @@ async fn cli_main() -> ExitCode {
             reservations,
             egress,
             proxy,
+            denied_log.clone(),
         )
         .await
         {

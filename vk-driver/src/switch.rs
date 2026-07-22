@@ -192,6 +192,9 @@ struct EgressGuard {
     /// `(sentinel, host)`: a guest flow to `sentinel` is redirected to the host-local
     /// credential registry proxy at `host` (see regproxy.rs). `None` = disabled.
     registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
+    /// Where denials are appended as typed records for the job trace (see egress_report).
+    /// `None` = don't record (dev `vk run`, or an unrestricted policy that denies nothing).
+    denied_log: Option<PathBuf>,
 }
 
 impl EgressGuard {
@@ -201,11 +204,23 @@ impl EgressGuard {
             gateway,
             pinned: Mutex::new(HashMap::new()),
             registry_proxy: None,
+            denied_log: None,
         }
     }
     fn with_registry_proxy(mut self, redirect: Option<(Ipv4Addr, SocketAddr)>) -> Self {
         self.registry_proxy = redirect;
         self
+    }
+    fn with_denied_log(mut self, path: Option<PathBuf>) -> Self {
+        self.denied_log = path;
+        self
+    }
+    /// Record a refused flow to the denial channel for the job trace to surface. Paired
+    /// with the switch's own `eprintln!` operator log at each call site.
+    fn record_denial(&self, proto: crate::egress_report::Proto, target: &str) {
+        if let Some(path) = &self.denied_log {
+            crate::egress_report::append(path, proto, target);
+        }
     }
     fn restricted(&self) -> bool {
         !matches!(self.policy, Egress::AllowAll)
@@ -271,6 +286,7 @@ impl EgressGuard {
             return None;
         }
         eprintln!("switch: egress denied (tcp) {} — sent RST", syn.dst);
+        self.record_denial(crate::egress_report::Proto::Tcp, &syn.dst.to_string());
         tcp_rst_frame(&syn, client_mac)
     }
 }
@@ -324,6 +340,9 @@ pub struct Spawn {
     /// credential registry proxy at `host` (see regproxy.rs). `None` = disabled.
     pub registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
     pub log: PathBuf,
+    /// Where the switch appends typed egress-denial records for the job trace (see
+    /// egress_report). `None` = don't record (dev `vk run`).
+    pub denied_log: Option<PathBuf>,
 }
 
 /// Spawn the switch as a tied child of this process (this binary's `switch`
@@ -363,6 +382,9 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
         cmd.arg("--registry-proxy")
             .arg(format!("{sentinel}={host}"));
     }
+    if let Some(denied) = &opts.denied_log {
+        cmd.arg("--denied-log").arg(denied);
+    }
     cmd.stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -390,6 +412,7 @@ pub async fn run(
     reservations: HashMap<Mac, Ipv4Addr>,
     egress: Egress,
     registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
+    denied_log: Option<PathBuf>,
 ) -> Result<()> {
     if listen.is_empty() {
         bail!("switch: at least one --listen is required");
@@ -408,7 +431,11 @@ pub async fn run(
             tx: ret_tx,
         },
     );
-    let guard = Arc::new(EgressGuard::new(egress, gateway).with_registry_proxy(registry_proxy));
+    let guard = Arc::new(
+        EgressGuard::new(egress, gateway)
+            .with_registry_proxy(registry_proxy)
+            .with_denied_log(denied_log),
+    );
     let restricted = guard.restricted();
     tokio::spawn(accept_loop(ip_stack, guard.clone()));
 
@@ -660,7 +687,12 @@ async fn proxy_tcp(mut guest: ipstack::IpStackTcpStream, egress: Arc<EgressGuard
         Some((sentinel, host)) if dst.ip() == IpAddr::V4(sentinel) => host,
         _ => {
             if !egress.allows(dst) {
+                // Fallback deny path: a denied SYN is normally RST'd earlier in
+                // `reject_denied_syn` before ipstack completes the handshake, so this only
+                // fires for a flow that slipped through (e.g. a DNS pin expiring between the
+                // SYN and here). Per-stage dedup collapses any double-record.
                 eprintln!("switch: egress denied (tcp) {dst}");
+                egress.record_denial(crate::egress_report::Proto::Tcp, &dst.to_string());
                 return;
             }
             dst
@@ -680,6 +712,7 @@ async fn proxy_udp(mut guest: ipstack::IpStackUdpStream, egress: Arc<EgressGuard
     let dst = guest.peer_addr();
     if !egress.allows(dst) {
         eprintln!("switch: egress denied (udp) {dst}");
+        egress.record_denial(crate::egress_report::Proto::Udp, &dst.to_string());
         return;
     }
     let bind: SocketAddr = if dst.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }
@@ -756,6 +789,7 @@ async fn handle_dns(
             resp
         } else {
             eprintln!("switch: dns refused (egress allowlist): {name}");
+            egress.record_denial(crate::egress_report::Proto::Dns, &name);
             Some(dns_nxdomain(&query, qend))
         }
     } else {
@@ -1568,6 +1602,7 @@ mod tests {
                 HashMap::new(),
                 HashMap::new(),
                 Egress::AllowAll,
+                None,
                 None,
             )
             .await;

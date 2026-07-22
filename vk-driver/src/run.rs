@@ -2371,6 +2371,9 @@ async fn spawn_vm_switch(
         allow_name: allow_name.to_vec(),
         registry_proxy,
         log: work.join("switch.log"),
+        // Dev `vk run` has no gitlab job trace to surface denials into; the switch's own
+        // log (eprintln) is enough interactively.
+        denied_log: None,
     })?;
     let frag = format!(
         " VIRTKIT_NET_PORT={net_port} VIRTKIT_VM_IP={guest_ip}/{prefix} \

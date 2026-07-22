@@ -176,6 +176,11 @@ impl JobCtx {
     pub fn switch_log(&self) -> PathBuf {
         self.job_dir.join("switch.log")
     }
+    /// Typed egress-denial records the switch appends and each `run` stage drains into the
+    /// job trace (see egress_report). Separate from the human `switch.log`.
+    pub fn egress_denied_log(&self) -> PathBuf {
+        self.job_dir.join("egress-denied.log")
+    }
     /// The host unix socket Cloud Hypervisor surfaces a guest connection to host
     /// vsock port `port` on (`<vsock.sock>_<port>`) — where the switch listens
     /// for the in-guest agent's eth0 bridge.

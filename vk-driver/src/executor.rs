@@ -61,7 +61,7 @@ pub async fn run_stage(ctx: &JobCtx, script_path: &Path) -> Result<CmdResult> {
         .with_context(|| format!("reading stage script {}", script_path.display()))?;
     // None => virtkit-agent falls back to VIRTKIT_DEFAULT_RUN_USER (the guest
     // image's USER), so an unset MICROVM_USER runs as the image default.
-    exec_script(
+    let result = exec_script(
         &vsock_addr(ctx),
         &guest_shell(ctx),
         script,
@@ -69,7 +69,54 @@ pub async fn run_stage(ctx: &JobCtx, script_path: &Path) -> Result<CmdResult> {
         &OutputSink::Inherit,
         None,
     )
-    .await
+    .await;
+    // Surface egress the switch blocked during this step into the job trace: the switch
+    // logs allowlist refusals to a host-side file the job never sees, so a script that
+    // fails because it could not reach a host would otherwise get no hint why. Reported
+    // whether the step passed or failed.
+    report_egress_blocks(ctx);
+    result
+}
+
+/// Forward the per-job switch's egress refusals into the job trace. The switch
+/// (`net.mode = "switch"`) appends a typed denial record per refusal to its denial channel
+/// (see egress_report), which the running job never sees. This drains only the records
+/// added since the previous stage — a byte offset persisted in the job dir — so each block
+/// is reported once, in the stage during which it happened, then prints them deduplicated
+/// to stderr (gitlab-runner captures it). Best-effort: no channel (net.mode != "switch")
+/// or an IO error is a silent no-op.
+fn report_egress_blocks(ctx: &JobCtx) {
+    let pos_file = ctx.job_dir.join("egress-denied.offset");
+    let start: u64 = std::fs::read_to_string(&pos_file)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let (denials, new_offset) = crate::egress_report::read_since(&ctx.egress_denied_log(), start);
+    if new_offset == start {
+        return; // nothing new (and no offset to persist)
+    }
+
+    // Unique denials in first-seen order, counting repeats so a retry loop hammering one
+    // blocked host does not flood the trace.
+    let mut seen: Vec<(String, usize)> = Vec::new();
+    for d in &denials {
+        let msg = d.display();
+        match seen.iter_mut().find(|(m, _)| *m == msg) {
+            Some((_, n)) => *n += 1,
+            None => seen.push((msg, 1)),
+        }
+    }
+    if !seen.is_empty() {
+        eprintln!("virtkit: egress blocked by the allowlist:");
+        for (msg, n) in &seen {
+            if *n > 1 {
+                eprintln!("  {msg} (x{n})");
+            } else {
+                eprintln!("  {msg}");
+            }
+        }
+    }
+    let _ = std::fs::write(&pos_file, new_offset.to_string());
 }
 
 /// The exec-channel connect address for this job's VM, matching the selected backend

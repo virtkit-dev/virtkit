@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- GitLab jobs whose egress the switch blocked now see each refused destination reported in
+  the job trace, so a script that fails for lack of network access shows why instead of
+  failing silently.
+
 ### Changed
 
 - Boot and concurrent-lock progress lines now name the image ref being booted and the operation
