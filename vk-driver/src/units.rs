@@ -40,6 +40,19 @@ pub struct Provisioned {
     /// kernel (`Default`), the image's own kernel + modules (`Image`), or an explicit
     /// file (`Path`). Uniform with the primary path.
     pub kernel: crate::run::KernelSource,
+    /// This service's own egress override, from `MICROVM_EGRESS_ALLOW_IP` / `_ALLOW_NAME`
+    /// in its `variables:`. `None` = the key was absent (share the run policy); `Some` (incl.
+    /// an empty string = deny that dimension) = a restricted per-service allowlist, narrowed
+    /// against the host `[egress]` cap by the executor. See vm.rs `spawn_switch`.
+    pub egress_allow_ip_req: Option<String>,
+    pub egress_allow_name_req: Option<String>,
+}
+
+/// Read a service's egress override var from its `variables:` (`unit.environment`). Unlike a
+/// job-level variable, a *present but empty* value is meaningful — it denies that dimension
+/// (an empty allowlist) — so it is kept, not filtered; only an absent key yields `None`.
+pub fn service_egress_req(env: &[(String, String)], key: &str) -> Option<String> {
+    env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
 }
 
 /// The builder wiring for `build:` units, shared across a consumer's units (each
@@ -223,6 +236,8 @@ pub fn provisioned(
         volumes: unit.volumes.clone(),
         init: unit.init,
         kernel: unit.kernel.clone(),
+        egress_allow_ip_req: service_egress_req(&unit.environment, "MICROVM_EGRESS_ALLOW_IP"),
+        egress_allow_name_req: service_egress_req(&unit.environment, "MICROVM_EGRESS_ALLOW_NAME"),
     })
 }
 

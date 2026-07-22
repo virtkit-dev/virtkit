@@ -13,6 +13,13 @@ All notable changes to virtkit will be documented in this file.
   `MICROVM_EGRESS_ALLOW_NAME` (run) and `MICROVM_BUILD_EGRESS_ALLOW_IP` /
   `MICROVM_BUILD_EGRESS_ALLOW_NAME` (build), never widen; set them at the GitLab group/project
   level and override per job.
+- **Per-service egress.** A `services:` entry (or compose sibling) can set its own
+  `MICROVM_EGRESS_ALLOW_IP` / `MICROVM_EGRESS_ALLOW_NAME` in its `variables:` to get an egress
+  allowlist distinct from the primary — e.g. a database service pinned to no external egress
+  (`MICROVM_EGRESS_ALLOW_NAME: ""`) while the job keeps its own. It narrows the host `[egress]`
+  cap like any other request; a service that sets nothing shares the run policy. The switch
+  now enforces egress per source VM, with DNS pins scoped per source so one service's
+  resolution never admits another's connection.
 - **`allowlist = []` now denies everything.** An explicit empty allow list means "nothing
   allowed"; leaving a list absent keeps it unrestricted (unchanged). A phase is unrestricted
   only when both its lists are absent.

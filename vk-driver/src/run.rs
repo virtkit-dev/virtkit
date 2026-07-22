@@ -2414,6 +2414,9 @@ async fn spawn_vm_switch(
         allow_ip: allow_ip.to_vec(),
         allow_name: allow_name.to_vec(),
         restrict,
+        // Per-service egress overrides are a CI feature (from a service's `variables:`);
+        // dev `vk run --compose` siblings share the run policy.
+        per_source: Vec::new(),
         registry_proxy,
         log: work.join("switch.log"),
         // Dev `vk run` has no gitlab job trace to surface denials into; the switch's own

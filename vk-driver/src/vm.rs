@@ -202,6 +202,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     let mut service_names: Vec<String> = Vec::new();
     if let Some(spec) = image_ref.strip_prefix("compose:") {
         for unit in compose_service_units(&load_compose_fleet(ctx, spec)?)? {
+            validate_service_egress(cfg, &unit)?;
             if matches!(unit.source, crate::compose::Source::Build { .. }) {
                 build_compose_unit(ctx, &unit).with_context(|| format!("service {}", unit.name))?;
             }
@@ -209,6 +210,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         }
     } else {
         for unit in crate::services::to_units(crate::services::from_env()?) {
+            validate_service_egress(cfg, &unit)?;
             if let crate::compose::Source::Image(image) = &unit.source
                 && let Some(spec) = image.strip_prefix("dockerfile:")
             {
@@ -1369,6 +1371,7 @@ fn spawn_switch(
         _ => None,
     };
     let (allow_ip, allow_name, restrict) = effective_run_egress(cfg, ctx)?;
+    let per_source = service_per_source(cfg, services)?;
     crate::switch::spawn(&crate::switch::Spawn {
         listen,
         gateway,
@@ -1378,6 +1381,7 @@ fn spawn_switch(
         allow_ip,
         allow_name,
         restrict,
+        per_source,
         registry_proxy,
         log: ctx.switch_log(),
         denied_log: Some(ctx.egress_denied_log()),
@@ -1404,6 +1408,55 @@ fn effective_run_egress(
     )?;
     let restrict = ips.is_some() || names.is_some();
     Ok((ips.unwrap_or_default(), names.unwrap_or_default(), restrict))
+}
+
+/// Validate a service's own egress request against the host `[egress]` cap, in prepare, so a
+/// bad `MICROVM_EGRESS_ALLOW_*` in a service's `variables:` fails with a crisp job-visible
+/// error rather than an opaque switch failure in the detached supervisor. No-op when the
+/// service declared none.
+fn validate_service_egress(cfg: &crate::config::Config, unit: &crate::compose::Unit) -> Result<()> {
+    let ip_req = crate::units::service_egress_req(&unit.environment, "MICROVM_EGRESS_ALLOW_IP");
+    let name_req = crate::units::service_egress_req(&unit.environment, "MICROVM_EGRESS_ALLOW_NAME");
+    if ip_req.is_none() && name_req.is_none() {
+        return Ok(());
+    }
+    effective_policy(
+        cfg.egress.allow_ip.as_deref(),
+        cfg.egress.allow_name.as_deref(),
+        ip_req.as_deref(),
+        name_req.as_deref(),
+        &format!("service {:?} MICROVM_EGRESS_ALLOW_IP", unit.name),
+        &format!("service {:?} MICROVM_EGRESS_ALLOW_NAME", unit.name),
+    )?;
+    Ok(())
+}
+
+/// Per-source egress overrides for the switch: one entry per service that set its own
+/// `MICROVM_EGRESS_ALLOW_IP` / `_ALLOW_NAME` in its `variables:`, narrowed against the host
+/// `[egress]` cap (a service can restrict itself but not exceed the cap). A declaring service
+/// is always a restricted allowlist (empty = deny); a service that declared nothing gets no
+/// entry and shares the run policy. Returns `(source-ip, allow_ip, allow_name)` per override.
+#[allow(clippy::type_complexity)]
+fn service_per_source(
+    cfg: &crate::config::Config,
+    services: &[crate::units::Provisioned],
+) -> Result<Vec<(Ipv4Addr, Vec<String>, Vec<String>)>> {
+    let mut out = Vec::new();
+    for svc in services {
+        if svc.egress_allow_ip_req.is_none() && svc.egress_allow_name_req.is_none() {
+            continue;
+        }
+        let (ips, names) = effective_policy(
+            cfg.egress.allow_ip.as_deref(),
+            cfg.egress.allow_name.as_deref(),
+            svc.egress_allow_ip_req.as_deref(),
+            svc.egress_allow_name_req.as_deref(),
+            &format!("service {:?} MICROVM_EGRESS_ALLOW_IP", svc.name),
+            &format!("service {:?} MICROVM_EGRESS_ALLOW_NAME", svc.name),
+        )?;
+        out.push((svc.addr, ips.unwrap_or_default(), names.unwrap_or_default()));
+    }
+    Ok(out)
 }
 
 /// This job's effective build-phase egress ([`crate::build::BuildNet`]) plus its build-audit

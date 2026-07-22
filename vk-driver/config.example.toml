@@ -74,6 +74,11 @@
 # for the build phase: MICROVM_BUILD_EGRESS_ALLOW_IP, MICROVM_BUILD_EGRESS_ALLOW_NAME,
 # MICROVM_BUILD_EGRESS_AUDIT. Against an absent (unconstrained) cap a variable defines the
 # list freely; against an empty (deny-all) cap it can add nothing.
+#
+# A single service can override the run policy for itself by setting MICROVM_EGRESS_ALLOW_IP /
+# MICROVM_EGRESS_ALLOW_NAME in its OWN `variables:` (narrowed against the same [egress] cap) —
+# e.g. a DB service with `MICROVM_EGRESS_ALLOW_NAME: ""` gets no external egress while the job
+# keeps its own. A service that sets neither shares the run policy.
 
 # [auth]                 # host credentials forwarded into job VMs.
 # ssh_agent = true       # forward the runner's $SSH_AUTH_SOCK so the guest's ssh/git use

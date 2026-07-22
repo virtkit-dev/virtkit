@@ -516,6 +516,12 @@ enum Cmd {
         /// executor when a job configures egress).
         #[arg(long = "egress-restrict")]
         egress_restrict: bool,
+        /// per-source egress override `<src-ip>;<cidr,cidr>;<name,name>` (repeatable): flows
+        /// from that source use this restricted allowlist instead of the default; an empty
+        /// field is an empty (deny) list. Set internally by the gitlab executor for a service
+        /// that declared its own MICROVM_EGRESS_ALLOW_* in its `variables:`.
+        #[arg(long = "source-egress", value_name = "IP;CIDRS;NAMES")]
+        source_egress: Vec<String>,
         /// redirect guest flows to a sentinel address to a host-local registry proxy:
         /// `<sentinel-ip>=<host:port>` (set internally by `vk run --registry-proxy`).
         #[arg(long = "registry-proxy", value_name = "IP=ADDR")]
@@ -1995,6 +2001,7 @@ async fn cli_main() -> ExitCode {
         allow_ip,
         allow_name,
         egress_restrict,
+        source_egress,
         registry_proxy,
         denied_log,
         audit_log,
@@ -2047,6 +2054,10 @@ async fn cli_main() -> ExitCode {
             Ok(p) => p,
             Err(e) => return fail(&e, 2),
         };
+        let per_source = match parse_source_egress(source_egress) {
+            Ok(m) => m,
+            Err(e) => return fail(&e, 2),
+        };
         return match switch::run(
             listen,
             *gateway,
@@ -2054,6 +2065,7 @@ async fn cli_main() -> ExitCode {
             hosts,
             reservations,
             egress,
+            per_source,
             proxy,
             denied_log.clone(),
             audit_log.clone(),
@@ -2203,6 +2215,38 @@ fn parse_registry_proxy(s: &str) -> anyhow::Result<(std::net::Ipv4Addr, std::net
     Ok((ip, addr))
 }
 
+/// Parse the repeatable `--source-egress <ip>;<cidr,cidr>;<name,name>` into a per-source
+/// policy map. Each spec is a restricted allowlist (empty fields = deny), so an entry always
+/// yields `Egress::restricted` — never unrestricted. The executor emits these; a malformed
+/// one is a bug in that emission, so it fails the switch.
+fn parse_source_egress(
+    specs: &[String],
+) -> anyhow::Result<std::collections::HashMap<std::net::Ipv4Addr, switch::Egress>> {
+    let split = |s: &str| -> Vec<String> {
+        s.split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let mut map = std::collections::HashMap::new();
+    for spec in specs {
+        let mut fields = spec.splitn(3, ';');
+        let (ip, ips, names) = (
+            fields.next().unwrap_or_default(),
+            fields.next().unwrap_or_default(),
+            fields.next().unwrap_or_default(),
+        );
+        let ip = ip
+            .parse::<std::net::Ipv4Addr>()
+            .map_err(|e| anyhow::anyhow!("source-egress source ip {ip:?}: {e}"))?;
+        let policy = switch::Egress::restricted(&split(ips), &split(names))
+            .map_err(|e| anyhow::anyhow!("source-egress {spec:?}: {e}"))?;
+        map.insert(ip, policy);
+    }
+    Ok(map)
+}
+
 /// `--require-cached` refusals get their own exit code (3), so scripts can branch
 /// on cached-vs-cold. Checked at the chain root — contexts may wrap the error.
 fn is_not_cached(e: &anyhow::Error) -> bool {
@@ -2320,6 +2364,24 @@ impl<R: std::io::Read> std::io::Read for ProgressReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_egress_specs_parse() {
+        let m = parse_source_egress(&[
+            "10.0.0.5;10.0.0.0/8,1.2.3.4:443;corp.com".to_string(),
+            "10.0.0.6;;".to_string(), // deny-all: empty ip + name fields
+        ])
+        .unwrap();
+        // A populated allowlist admits within it and refuses outside.
+        let a = &m[&"10.0.0.5".parse().unwrap()];
+        assert!(a.allows_host("corp.com") && a.contains_cidr("10.1.2.3/32").unwrap());
+        assert!(!a.allows_host("evil.com"));
+        // The empty spec is deny-all (restricted, not AllowAll).
+        let b = &m[&"10.0.0.6".parse().unwrap()];
+        assert!(!b.allows_host("corp.com") && !b.contains_cidr("10.0.0.0/8").unwrap());
+        // A bad source ip is rejected.
+        assert!(parse_source_egress(&["nope;;".to_string()]).is_err());
+    }
 
     // `vk paths --gitlab` must report the jobs root the executor actually uses:
     // Config::state_dir() (/var/lib/virtkit when unset), not the XDG dev default

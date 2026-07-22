@@ -215,9 +215,15 @@ impl Egress {
 /// allowed CIDR or an IP we just resolved for an allowed name. A restricted switch
 /// serves a single job VM, so the pin set is per-switch (not keyed by VM).
 struct EgressGuard {
+    /// The default policy — the primary guest and any service without its own override.
     policy: Egress,
+    /// Per-source overrides, keyed by the source VM's IPv4 (a service that declared its own
+    /// egress in its `variables:`). A flow's policy is `per_source[src]` or `policy`.
+    per_source: HashMap<Ipv4Addr, Egress>,
     gateway: Ipv4Addr,
-    pinned: Mutex<HashMap<Ipv4Addr, Instant>>,
+    /// DNS-pinned A-records, keyed by `(source, resolved_ip)` so one VM's resolution never
+    /// admits a connection from another VM with a different policy (per-source isolation).
+    pinned: Mutex<HashMap<(Ipv4Addr, Ipv4Addr), Instant>>,
     /// `(sentinel, host)`: a guest flow to `sentinel` is redirected to the host-local
     /// credential registry proxy at `host` (see regproxy.rs). `None` = disabled.
     registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
@@ -234,12 +240,17 @@ impl EgressGuard {
     fn new(policy: Egress, gateway: Ipv4Addr) -> Self {
         EgressGuard {
             policy,
+            per_source: HashMap::new(),
             gateway,
             pinned: Mutex::new(HashMap::new()),
             registry_proxy: None,
             denied_log: None,
             audit_log: None,
         }
+    }
+    fn with_per_source(mut self, per_source: HashMap<Ipv4Addr, Egress>) -> Self {
+        self.per_source = per_source;
+        self
     }
     fn with_registry_proxy(mut self, redirect: Option<(Ipv4Addr, SocketAddr)>) -> Self {
         self.registry_proxy = redirect;
@@ -267,57 +278,67 @@ impl EgressGuard {
             crate::egress_report::append_contact(path, name);
         }
     }
+    /// Any restriction at all — the default policy or any per-source override. Drives the
+    /// startup log summary.
     fn restricted(&self) -> bool {
-        !matches!(self.policy, Egress::AllowAll)
+        !matches!(self.policy, Egress::AllowAll) || !self.per_source.is_empty()
     }
-    /// May the resolver answer this name? (allowed names get forwarded + pinned.)
-    fn name_allowed(&self, host: &str) -> bool {
-        self.policy.allows_host(host)
+    /// The policy that governs flows from source `src`: its per-source override, else the
+    /// default. Source is the guest's own IPv4 (each VM has a fixed/leased address).
+    fn policy_for(&self, src: Ipv4Addr) -> &Egress {
+        self.per_source.get(&src).unwrap_or(&self.policy)
     }
-    /// Pin the A-records returned for an allowed name for its TTL (+ a small grace),
-    /// so the guest's imminent connection to one of them is permitted.
-    fn record(&self, ips: &[Ipv4Addr], ttl: u32) {
-        if !self.restricted() || ips.is_empty() {
+    /// May `src`'s resolver answer this name? (allowed names get forwarded + pinned.)
+    fn name_allowed(&self, src: Ipv4Addr, host: &str) -> bool {
+        self.policy_for(src).allows_host(host)
+    }
+    /// Pin the A-records returned for an allowed name for its TTL (+ a small grace), scoped
+    /// to the resolving source so the guest's imminent connection to one of them is
+    /// permitted — and only that guest's, not another VM's.
+    fn record(&self, src: Ipv4Addr, ips: &[Ipv4Addr], ttl: u32) {
+        if matches!(self.policy_for(src), Egress::AllowAll) || ips.is_empty() {
             return;
         }
         let until = Instant::now() + Duration::from_secs(u64::from(ttl).max(30) + 60);
         let mut pinned = self.pinned.lock().unwrap();
         for ip in ips {
-            pinned.insert(*ip, until);
+            pinned.insert((src, *ip), until);
         }
     }
-    /// May the guest open a direct flow to `dst`? Unrestricted => yes. Otherwise DNS
-    /// must go to our resolver (so pinning holds), and the dst must be in the static
-    /// allowlist or freshly pinned by an allowed-name lookup.
-    fn allows(&self, dst: SocketAddr) -> bool {
-        if !self.restricted() {
+    /// May `src` open a direct flow to `dst`? Unrestricted => yes. Otherwise DNS must go to
+    /// our resolver (so pinning holds), and the dst must be in `src`'s static allowlist or
+    /// freshly pinned by one of `src`'s own allowed-name lookups.
+    fn allows(&self, src: Ipv4Addr, dst: SocketAddr) -> bool {
+        let policy = self.policy_for(src);
+        if matches!(policy, Egress::AllowAll) {
             return true;
         }
         if dst.port() == DNS_PORT && dst.ip() != IpAddr::V4(self.gateway) {
             return false; // force DNS through the switch
         }
-        if self.policy.allows_ip(dst.ip(), dst.port()) {
+        if policy.allows_ip(dst.ip(), dst.port()) {
             return true;
         }
         let IpAddr::V4(v4) = dst.ip() else {
             return false;
         };
         let mut pinned = self.pinned.lock().unwrap();
-        match pinned.get(&v4) {
+        match pinned.get(&(src, v4)) {
             Some(&until) if until > Instant::now() => true,
             Some(_) => {
-                pinned.remove(&v4);
+                pinned.remove(&(src, v4));
                 false
             }
             None => false,
         }
     }
 
-    /// If `ip` opens a TCP connection this policy denies, return the RST frame
-    /// refusing it; otherwise `None`, so the packet egresses normally. Rejecting
-    /// the SYN (rather than letting ipstack complete the handshake and then drop
-    /// the flow) makes the guest's connect() fail at once with ECONNREFUSED
-    /// instead of stalling until a client read timeout.
+    /// If the SYN in `ip` opens a TCP connection its source's policy denies, return the RST
+    /// frame refusing it; otherwise `None`, so the packet egresses normally. Rejecting the
+    /// SYN (rather than letting ipstack complete the handshake and then drop the flow) makes
+    /// the guest's connect() fail at once with ECONNREFUSED instead of stalling until a read
+    /// timeout. The source IPv4 comes from the SYN itself, so the right per-source policy
+    /// applies.
     fn reject_denied_syn(&self, ip: &[u8], client_mac: Mac) -> Option<Vec<u8>> {
         let syn = parse_tcp_syn(ip)?;
         // The registry-proxy sentinel bypasses the allowlist (a host-local
@@ -327,7 +348,7 @@ impl EgressGuard {
         {
             return None;
         }
-        if self.allows(SocketAddr::V4(syn.dst)) {
+        if self.allows(*syn.src.ip(), SocketAddr::V4(syn.dst)) {
             return None;
         }
         eprintln!("switch: egress denied (tcp) {} — sent RST", syn.dst);
@@ -386,6 +407,10 @@ pub struct Spawn {
     /// CI executor for a phase whose egress is configured (so `allow_name = []` = deny all);
     /// `false` for dev `vk run`, where an unset allowlist means unrestricted.
     pub restrict: bool,
+    /// Per-source egress overrides — a service that set its own `MICROVM_EGRESS_ALLOW_*`
+    /// (see vm.rs). Each entry `(source-ip, allow_ip, allow_name)` is always a restricted
+    /// allowlist (empty = deny); a source with no entry uses the default (run) policy.
+    pub per_source: Vec<(Ipv4Addr, Vec<String>, Vec<String>)>,
     /// `(sentinel, host)`: redirect a guest flow to `sentinel` to the host-local
     /// credential registry proxy at `host` (see regproxy.rs). `None` = disabled.
     pub registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
@@ -434,6 +459,13 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
     if opts.restrict {
         cmd.arg("--egress-restrict");
     }
+    for (ip, ips, names) in &opts.per_source {
+        // `<src-ip>;<cidr,cidr>;<name,name>` — a source's own restricted allowlist. IPv4
+        // CIDRs and DNS names never contain a semicolon, so it is an unambiguous separator;
+        // an empty field is an empty (deny) list.
+        cmd.arg("--source-egress")
+            .arg(format!("{ip};{};{}", ips.join(","), names.join(",")));
+    }
     if let Some((sentinel, host)) = opts.registry_proxy {
         cmd.arg("--registry-proxy")
             .arg(format!("{sentinel}={host}"));
@@ -470,6 +502,7 @@ pub async fn run(
     hosts: HashMap<String, Ipv4Addr>,
     reservations: HashMap<Mac, Ipv4Addr>,
     egress: Egress,
+    per_source: HashMap<Ipv4Addr, Egress>,
     registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
     denied_log: Option<PathBuf>,
     audit_log: Option<PathBuf>,
@@ -492,8 +525,10 @@ pub async fn run(
         },
     );
     let audit = audit_log.is_some();
+    let per_source_count = per_source.len();
     let guard = Arc::new(
         EgressGuard::new(egress, gateway)
+            .with_per_source(per_source)
             .with_registry_proxy(registry_proxy)
             .with_denied_log(denied_log)
             .with_audit_log(audit_log),
@@ -528,7 +563,7 @@ pub async fn run(
 
     eprintln!(
         "switch: {} port(s), gateway {}/{} (ARP + DHCP + DNS + egress, shared LAN); \
-         resolver: {} service name(s), {} DHCP reservation(s), upstream {}; egress: {}",
+         resolver: {} service name(s), {} DHCP reservation(s), upstream {}; egress: {}{}",
         listen.len(),
         gateway,
         prefix,
@@ -540,6 +575,11 @@ pub async fn run(
             (true, false) => "allowlist",
             (false, true) => "unrestricted + audit",
             (false, false) => "unrestricted",
+        },
+        if per_source_count > 0 {
+            format!(" ({per_source_count} per-service override(s))")
+        } else {
+            String::new()
         },
     );
     let mut accepts = Vec::new();
@@ -739,17 +779,29 @@ async fn accept_loop(mut ip_stack: IpStack, egress: Arc<EgressGuard>) {
     }
 }
 
+/// The IPv4 source of a guest egress flow (ipstack's `local_addr`), for per-source policy.
+/// `None` for an IPv6 flow — egress is IPv4-only, so such a flow is denied by the caller.
+fn guest_src(local: SocketAddr) -> Option<Ipv4Addr> {
+    match local {
+        SocketAddr::V4(a) => Some(*a.ip()),
+        SocketAddr::V6(_) => None,
+    }
+}
+
 /// Terminate a guest TCP flow and splice it to a host connection to its original
 /// destination (egress through the host's own socket).
 async fn proxy_tcp(mut guest: ipstack::IpStackTcpStream, egress: Arc<EgressGuard>) {
     let dst = guest.peer_addr();
+    // The guest's own address, so the right per-source policy applies (`local_addr` is the
+    // flow's source; egress is IPv4).
+    let src = guest_src(guest.local_addr());
     // Registry proxy: a flow to the sentinel address is spliced to the host-local
     // credential proxy instead of egressing (it bypasses the egress allowlist — it is our
     // own host service, and it never touches the guest's credentials).
     let target = match egress.registry_proxy {
         Some((sentinel, host)) if dst.ip() == IpAddr::V4(sentinel) => host,
         _ => {
-            if !egress.allows(dst) {
+            if !src.is_some_and(|s| egress.allows(s, dst)) {
                 // Fallback deny path: a denied SYN is normally RST'd earlier in
                 // `reject_denied_syn` before ipstack completes the handshake, so this only
                 // fires for a flow that slipped through (e.g. a DNS pin expiring between the
@@ -773,7 +825,8 @@ async fn proxy_tcp(mut guest: ipstack::IpStackTcpStream, egress: Arc<EgressGuard
 /// closes the stream after its udp_timeout, ending the task.
 async fn proxy_udp(mut guest: ipstack::IpStackUdpStream, egress: Arc<EgressGuard>) {
     let dst = guest.peer_addr();
-    if !egress.allows(dst) {
+    let src = guest_src(guest.local_addr());
+    if !src.is_some_and(|s| egress.allows(s, dst)) {
         eprintln!("switch: egress denied (udp) {dst}");
         egress.record_denial(crate::egress_report::Proto::Udp, &dst.to_string());
         return;
@@ -843,18 +896,19 @@ async fn handle_dns(
             // needn't be allowlisted. Forward it without pinning (its answer is a
             // name, not an A-record to admit for egress).
             forward_upstream(&query, upstream).await
-        } else if egress.name_allowed(&name) {
+        } else if egress.name_allowed(client_ip, &name) {
             // Audit: count the guest's A-record lookups as its external contacts (egress
             // is IPv4, so an A query is what precedes a connection); the paired AAAA query
             // for the same name is not double-counted.
             if qtype == TYPE_A {
                 egress.record_contact(&name);
             }
-            // forward, then pin the A-records so the guest's connection is allowed
+            // forward, then pin the A-records (scoped to this resolving guest) so its
+            // connection is allowed — and only its, not another VM's with a different policy.
             let resp = forward_upstream(&query, upstream).await;
             if let Some(r) = &resp {
                 let (ips, ttl) = parse_a_records(r);
-                egress.record(&ips, ttl);
+                egress.record(client_ip, &ips, ttl);
             }
             resp
         } else {
@@ -1603,17 +1657,39 @@ mod tests {
     #[test]
     fn egress_guard_pins_and_blocks() {
         let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let src = Ipv4Addr::new(192, 168, 231, 2);
         let g = EgressGuard::new(Egress::new(&[], &["corp.example.com".into()]).unwrap(), gw);
         let corp: SocketAddr = "10.20.30.40:443".parse().unwrap();
-        assert!(!g.allows(corp)); // not resolved yet
-        g.record(&[Ipv4Addr::new(10, 20, 30, 40)], 300); // resolver pinned it
-        assert!(g.allows(corp)); // now allowed
-        assert!(!g.allows("8.8.8.8:443".parse().unwrap())); // unrelated dst
-        assert!(!g.allows("8.8.8.8:53".parse().unwrap())); // DNS forced through the switch
+        assert!(!g.allows(src, corp)); // not resolved yet
+        g.record(src, &[Ipv4Addr::new(10, 20, 30, 40)], 300); // resolver pinned it for this src
+        assert!(g.allows(src, corp)); // now allowed
+        assert!(!g.allows(src, "8.8.8.8:443".parse().unwrap())); // unrelated dst
+        assert!(!g.allows(src, "8.8.8.8:53".parse().unwrap())); // DNS forced through the switch
+        // a different source does NOT inherit src's pin (per-source isolation)
+        let other = Ipv4Addr::new(192, 168, 231, 3);
+        assert!(!g.allows(other, corp));
         // unrestricted guard allows anything
         let any = EgressGuard::new(Egress::AllowAll, gw);
-        assert!(any.allows("8.8.8.8:443".parse().unwrap()));
-        assert!(any.allows("8.8.8.8:53".parse().unwrap()));
+        assert!(any.allows(src, "8.8.8.8:443".parse().unwrap()));
+        assert!(any.allows(src, "8.8.8.8:53".parse().unwrap()));
+    }
+
+    #[test]
+    fn egress_guard_per_source_override() {
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        // Default policy allows corp.example.com; a service source is pinned to deny-all.
+        let db = Ipv4Addr::new(192, 168, 231, 5);
+        let mut per = HashMap::new();
+        per.insert(db, Egress::restricted(&[], &[]).unwrap());
+        let g = EgressGuard::new(Egress::new(&["10.0.0.0/8".into()], &[]).unwrap(), gw)
+            .with_per_source(per);
+        let primary = Ipv4Addr::new(192, 168, 231, 2);
+        // The default source may reach the allowlisted CIDR; the overridden service may not.
+        assert!(g.allows(primary, "10.1.2.3:443".parse().unwrap()));
+        assert!(!g.allows(db, "10.1.2.3:443".parse().unwrap()));
+        // The DB's deny-all policy refuses every name at the resolver, so it never resolves
+        // (and thus never pins) an external host — no egress at all.
+        assert!(!g.name_allowed(db, "example.com"));
     }
 
     #[test]
@@ -1707,6 +1783,7 @@ mod tests {
                 HashMap::new(),
                 HashMap::new(),
                 Egress::AllowAll,
+                HashMap::new(),
                 None,
                 None,
                 None,
