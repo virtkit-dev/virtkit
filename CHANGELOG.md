@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-07-22
+
 ### Added
 
 - The config file is now looked up along a standard chain — the first of `--config <path>`
@@ -50,6 +52,9 @@ All notable changes to virtkit will be documented in this file.
   a non-root job.)
 - A guest connection to an egress-denied destination now fails immediately with
   `ECONNREFUSED` instead of stalling until the guest's own read timeout.
+- Reverse-DNS (PTR) lookups from a guest are now forwarded to the upstream resolver
+  instead of being refused with `NXDOMAIN`, so tools that reverse-resolve an
+  already-permitted peer no longer stall or emit log noise.
 
 ## [0.21.0] - 2026-07-21
 
@@ -1022,7 +1027,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/wallix/virtkit/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/wallix/virtkit/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/wallix/virtkit/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/wallix/virtkit/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/wallix/virtkit/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/wallix/virtkit/compare/v0.18.0...v0.19.0
