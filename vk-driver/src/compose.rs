@@ -81,12 +81,17 @@ pub enum Source {
     },
 }
 
-/// A bind mount (`host:guest[:ro]`); named volumes are not supported.
+/// A bind mount (`host:guest[:ro|:overlay]`); named volumes are not supported.
 #[derive(Debug, Clone)]
 pub struct Volume {
     pub host: PathBuf,
     pub guest: String,
     pub read_only: bool,
+    /// Mount the share as the read-only lower layer of a tmpfs-backed overlayfs at `guest`,
+    /// instead of mounting it directly: the guest reads the host tree but every write lands in
+    /// guest RAM and never crosses back. Implies `read_only` for the share itself. Directory
+    /// binds only (a single-file bind has nothing to overlay).
+    pub overlay: bool,
     /// The host path is a regular file (not a directory): a single-file bind. Virtio-fs shares
     /// a directory, so this is served by a single-file fs (root = just this file) and linked
     /// into place in the guest, rather than mounted at `guest` directly.
@@ -529,8 +534,8 @@ fn map_build(build: serde_yaml_ng::Value, base: &Path) -> Result<Source> {
     })
 }
 
-/// A bind-mount `host:guest[:ro|rw]`. A source that is not a path (a compose named
-/// volume) is rejected — there is no volume manager here. Public: `run -v/--volume`
+/// A bind-mount `host:guest[:ro|rw|overlay]`. A source that is not a path (a compose
+/// named volume) is rejected — there is no volume manager here. Public: `run -v/--volume`
 /// parses the same syntax, anchored at the caller's cwd instead of the compose
 /// file's directory.
 pub fn parse_volume(spec: &str, base: &Path) -> Result<Volume> {
@@ -538,7 +543,7 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Volume> {
     let (host, guest, mode) = match parts.as_slice() {
         [h, g] => (*h, *g, "rw"),
         [h, g, m] => (*h, *g, *m),
-        _ => bail!("bad volume {spec:?} (want host:guest[:ro])"),
+        _ => bail!("bad volume {spec:?} (want host:guest[:ro|:overlay])"),
     };
     if !(host.starts_with('/') || host.starts_with('.') || host.starts_with('~')) {
         bail!("volume {spec:?}: named volumes are not supported (bind-mount a path)");
@@ -546,10 +551,13 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Volume> {
     if host.starts_with('~') {
         bail!("volume {spec:?}: ~ expansion is not supported (use an absolute path)");
     }
-    let read_only = match mode {
-        "ro" => true,
-        "rw" => false,
-        other => bail!("volume {spec:?}: unsupported mode {other:?} (want ro or rw)"),
+    // `overlay` exports the share read-only and mounts it as an overlayfs lower layer guest-side
+    // (writes go to a guest tmpfs, never back to the host tree).
+    let (read_only, overlay) = match mode {
+        "ro" => (true, false),
+        "rw" => (false, false),
+        "overlay" => (true, true),
+        other => bail!("volume {spec:?}: unsupported mode {other:?} (want ro, rw or overlay)"),
     };
     if !guest.starts_with('/') {
         bail!("volume {spec:?}: the guest path must be absolute");
@@ -560,10 +568,14 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Volume> {
     let is_file = std::fs::metadata(&host)
         .map(|m| m.is_file())
         .unwrap_or(false);
+    if overlay && is_file {
+        bail!("volume {spec:?}: overlay mode needs a directory source, not a single file");
+    }
     Ok(Volume {
         host,
         guest: guest.to_string(),
         read_only,
+        overlay,
         is_file,
     })
 }
@@ -940,6 +952,19 @@ mod tests {
         let named = "services:\n  s:\n    image: x\n    volumes:\n      - dbdata:/var/lib\n";
         let err = parse(named, Path::new("/b")).unwrap_err();
         assert!(format!("{err:#}").contains("named volumes"), "{err:#}");
+    }
+
+    #[test]
+    fn volume_modes_ro_rw_overlay() {
+        let rw = parse_volume("/src:/dst", Path::new("/b")).unwrap();
+        assert!(!rw.read_only && !rw.overlay);
+        let ro = parse_volume("/src:/dst:ro", Path::new("/b")).unwrap();
+        assert!(ro.read_only && !ro.overlay);
+        // overlay implies a read-only share plus the guest-side overlay flag.
+        let ov = parse_volume("/src:/dst:overlay", Path::new("/b")).unwrap();
+        assert!(ov.read_only && ov.overlay);
+        let bad = parse_volume("/src:/dst:rox", Path::new("/b")).unwrap_err();
+        assert!(format!("{bad:#}").contains("unsupported mode"), "{bad:#}");
     }
 
     #[test]

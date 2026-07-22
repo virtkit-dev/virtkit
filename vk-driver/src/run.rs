@@ -1089,6 +1089,8 @@ async fn build_and_boot(
     // directory); its share is served by the single-file fs, mounted at a hidden dir, and
     // symlinked into place — collected here and merged into VIRTKIT_SYMLINKS below.
     let mut file_bind_links: Vec<(String, String)> = Vec::new();
+    // Tags the agent should mount behind a tmpfs-backed overlay (`-v host:guest:overlay`).
+    let mut overlay_tags: Vec<String> = Vec::new();
     for (i, vol) in primary_volumes.iter().chain(&args.volumes).enumerate() {
         let tag = format!("vol{i}");
         let sock = work.join(format!("vfsd-{tag}.sock"));
@@ -1124,6 +1126,9 @@ async fn build_and_boot(
             virtiofs.push(',');
         }
         virtiofs.push_str(&format!("{tag}:{mount_at}"));
+        if vol.overlay {
+            overlay_tags.push(tag.clone());
+        }
         shares.push(crate::vmm::FsShare {
             tag,
             socket: sock,
@@ -1135,6 +1140,12 @@ async fn build_and_boot(
     }
     if !virtiofs.is_empty() {
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS={virtiofs}"));
+    }
+    if !overlay_tags.is_empty() {
+        cmdline.push_str(&format!(
+            " VIRTKIT_VIRTIOFS_OVERLAY={}",
+            overlay_tags.join(",")
+        ));
     }
     // In-guest symlinks, created by the agent after the mounts: explicit `--symlink`s plus one
     // per single-file bind (target -> the file inside its hidden single-file share mount). A

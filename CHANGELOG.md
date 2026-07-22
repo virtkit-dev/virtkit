@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Overlay mode for `vk run -v` volumes.** `-v HOST:GUEST:overlay` shares the host directory
+  read-only and layers a RAM-backed overlay on top guest-side, so the guest reads the host
+  tree but every write stays in the guest and never reaches the host — the same isolation CI's
+  `checkout_overlay` already gives, now on a plain `vk run` (e.g. a pre-commit hook that checks
+  the tree without being able to mutate it).
+
 ## [0.24.0] - 2026-07-22
 
 ### Added

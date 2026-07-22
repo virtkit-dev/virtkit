@@ -715,8 +715,10 @@ enum Cmd {
         #[arg(long = "state-dir", value_name = "DIR")]
         state_dir: Option<PathBuf>,
         /// bind-mount an extra host dir into the guest (repeatable), beyond --workdir
-        /// — e.g. persistent state a throwaway VM should keep on the host
-        #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+        /// — e.g. persistent state a throwaway VM should keep on the host. `:ro`
+        /// shares read-only; `:overlay` shares read-only behind a tmpfs-backed overlay
+        /// (the guest reads the host tree but writes stay in guest RAM, never touching it)
+        #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|:overlay]")]
         volume: Vec<String>,
         /// create an in-guest symlink after the mounts (repeatable) — the single-file
         /// share escape hatch (virtiofs shares directories only); a dangling SRC is
