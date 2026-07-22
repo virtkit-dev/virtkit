@@ -181,11 +181,21 @@ pub fn exists(rg: &Registry, name: &str, tag: &str) -> bool {
 /// the tag to (`None` if the tag is absent). The caller pins that digest so a later diff
 /// push re-chunks against *exactly* this content, even if a concurrent build clobbers the
 /// tag with byte-different (equivalent) bytes in between.
-pub fn try_pull_ext4(rg: &Registry, name: &str, tag: &str, dest: &Path) -> Result<Option<String>> {
+/// `label` is the human name shown in the pull progress lines (e.g. the Dockerfile
+/// stage being restored) instead of the opaque `<repo>@<digest>` — the cache repo is
+/// always `dfcache`, so the digest alone is unreadable in a job trace. Pass `name`
+/// when there is no better label.
+pub fn try_pull_ext4(
+    rg: &Registry,
+    name: &str,
+    tag: &str,
+    dest: &Path,
+    label: &str,
+) -> Result<Option<String>> {
     if let Some(root) = rg.local_root() {
         return local::try_pull_ext4(&root, name, tag, dest);
     }
-    block_on(try_pull_ext4_async(rg, name, tag, dest))
+    block_on(try_pull_ext4_async(rg, name, tag, dest, label))
 }
 
 async fn try_pull_ext4_async(
@@ -193,6 +203,7 @@ async fn try_pull_ext4_async(
     name: &str,
     tag: &str,
     dest: &Path,
+    label: &str,
 ) -> Result<Option<String>> {
     let (client, auth) = client(rg)?;
     let image = make_ref(rg, name, tag)?;
@@ -205,7 +216,7 @@ async fn try_pull_ext4_async(
     let bundle = parent.join(format!(".vkpull-{}", sanitize_component(name)));
     let _ = std::fs::remove_dir_all(&bundle);
     let dref = make_digest_ref(rg, name, &digest)?;
-    pull_into(&client, &auth, &dref, name, &digest, &bundle).await?;
+    pull_into(&client, &auth, &dref, name, &digest, &bundle, label).await?;
     let runner = bundle.join("runner.ext4");
     let _ = std::fs::remove_file(dest);
     std::fs::rename(&runner, dest)
@@ -976,7 +987,7 @@ async fn ensure_bundle_pulled(
         false
     } else {
         let image = make_digest_ref(rg, name, &digest)?;
-        pull_into(client, auth, &image, name, &digest, &dir).await?;
+        pull_into(client, auth, &image, name, &digest, &dir, name).await?;
         true
     };
     Ok((dir, digest, pulled))
@@ -1014,12 +1025,15 @@ async fn pull_into(
     name: &str,
     digest: &str,
     dir: &Path,
+    label: &str,
 ) -> Result<()> {
-    let _lock = image::acquire_pull_lock(dir, "pull", name, digest)?;
+    // `label` (a Dockerfile stage, a bundle name) is what the trace shows; the cache
+    // repo is always `dfcache`, so `name@digest` alone is unreadable.
+    let _lock = image::acquire_pull_lock(dir, "pull", label, digest)?;
     if bundle_present(dir) {
         return Ok(());
     }
-    println!("virtkit: registry: pulling {name}@{digest} ...");
+    println!("virtkit: registry: pulling {label} ...");
     let (manifest, _) = client
         .pull_manifest(image, auth)
         .await
@@ -1124,7 +1138,7 @@ async fn pull_into(
         reused.load(Ordering::Relaxed),
     );
     println!(
-        "virtkit: registry: {} ext4 chunks ({fetched} fetched, {reused} cached)",
+        "virtkit: registry: {label}: {} ext4 chunks ({fetched} fetched, {reused} cached)",
         fetched + reused
     );
 
@@ -2268,7 +2282,7 @@ mod tests {
 
         let dest = dir.join("dest.ext4");
         assert!(
-            try_pull_ext4(&rg, "dfcache", "k1", &dest)
+            try_pull_ext4(&rg, "dfcache", "k1", &dest, "dfcache")
                 .unwrap()
                 .is_some()
         );
@@ -2287,7 +2301,7 @@ mod tests {
         }
         // an absent tag pulls nothing and reports false
         assert!(
-            try_pull_ext4(&rg, "dfcache", "missing", &dir.join("no.ext4"))
+            try_pull_ext4(&rg, "dfcache", "missing", &dir.join("no.ext4"), "dfcache")
                 .unwrap()
                 .is_none()
         );
@@ -2340,7 +2354,7 @@ mod tests {
         );
         let dest = dir.join("child.ext4");
         assert!(
-            try_pull_ext4(&rg, "dfcache", "child", &dest)
+            try_pull_ext4(&rg, "dfcache", "child", &dest, "dfcache")
                 .unwrap()
                 .is_some()
         );
@@ -2391,7 +2405,9 @@ mod tests {
         .unwrap();
 
         let dest = dir.join("child.ext4");
-        try_pull_ext4(&rg, "hc", "child", &dest).unwrap().unwrap();
+        try_pull_ext4(&rg, "hc", "child", &dest, "hc")
+            .unwrap()
+            .unwrap();
         let child = std::fs::read(&dest).unwrap();
         let mut expected = std::fs::read(&base).unwrap();
         let (hs, hl) = (hole.0 as usize, hole.1 as usize);
@@ -2457,7 +2473,7 @@ mod tests {
 
         let dest = dir.join("child.ext4");
         assert!(
-            try_pull_ext4(&rg, "dfcache", "child", &dest)
+            try_pull_ext4(&rg, "dfcache", "child", &dest, "dfcache")
                 .unwrap()
                 .is_some()
         );
@@ -2509,7 +2525,11 @@ mod tests {
                         std::thread::yield_now();
                     }
                     let dest = dir.join(format!("pull{t}.ext4"));
-                    assert!(try_pull_ext4(rg, "dfcache", &tag, &dest).unwrap().is_some());
+                    assert!(
+                        try_pull_ext4(rg, "dfcache", &tag, &dest, "dfcache")
+                            .unwrap()
+                            .is_some()
+                    );
                     assert_eq!(
                         &std::fs::read(&dest).unwrap(),
                         want,
@@ -2599,7 +2619,11 @@ mod tests {
                             std::thread::yield_now();
                         }
                         let dest = dir.join(format!("pull-{tag}.ext4"));
-                        assert!(try_pull_ext4(rg, "dc", &tag, &dest).unwrap().is_some());
+                        assert!(
+                            try_pull_ext4(rg, "dc", &tag, &dest, "dc")
+                                .unwrap()
+                                .is_some()
+                        );
                         assert_eq!(
                             &std::fs::read(&dest).unwrap(),
                             want,
@@ -2659,7 +2683,7 @@ mod tests {
         assert!(!exists(&rg, "dfcache", "dead"));
         let dest = dir.join("live-after-gc.ext4");
         assert!(
-            try_pull_ext4(&rg, "dfcache", "live", &dest)
+            try_pull_ext4(&rg, "dfcache", "live", &dest, "dfcache")
                 .unwrap()
                 .is_some()
         );

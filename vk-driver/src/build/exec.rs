@@ -1208,7 +1208,7 @@ impl MicroVm {
             return Ok(());
         }
         let pulled = self.image_path(&format!("verify-{}", key.replace([':', '/'], "_")));
-        let digest = crate::registry::try_pull_ext4(rg, CACHE_REPO, key, &pulled)
+        let digest = crate::registry::try_pull_ext4(rg, CACHE_REPO, key, &pulled, context)
             .with_context(|| format!("--debug: pulling {context} back to verify the reassembly"))?;
         if digest.is_none() {
             bail!(
@@ -1543,7 +1543,8 @@ impl Executor for MicroVm {
         let base_key = base_cache_key(&base_id);
         if let Some(rg) = self.cache.clone()
             && crate::registry::exists(&rg, CACHE_REPO, &base_key)
-            && let Some(digest) = crate::registry::try_pull_ext4(&rg, CACHE_REPO, &base_key, &ext4)?
+            && let Some(digest) =
+                crate::registry::try_pull_ext4(&rg, CACHE_REPO, &base_key, &ext4, image)?
         {
             self.verify_ext4(&ext4, &format!("cached base image {image} (after load)"))?;
             self.wrap_base(stage, &ext4)?;
@@ -1997,7 +1998,8 @@ impl Executor for MicroVm {
         // pull the snapshot's ext4 (chunk-cached, byte-exact), then wrap it in a rw qcow2 so
         // any remaining instructions can boot it directly and write into the overlay.
         let ext4 = self.image_path(&fs.label);
-        let Some(digest) = crate::registry::try_pull_ext4(&rg, CACHE_REPO, key, &ext4)? else {
+        let Some(digest) = crate::registry::try_pull_ext4(&rg, CACHE_REPO, key, &ext4, &fs.label)?
+        else {
             bail!("cached instruction {key} vanished from the registry");
         };
         // `--debug`: a reassembled snapshot must be a clean ext4 before the build boots or
