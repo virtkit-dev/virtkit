@@ -83,7 +83,15 @@ pub fn ensure(url: &str, ref_name: &str, sha: &str, dest: &Path) -> Result<()> {
             "fetch",
         )?;
     }
-    git(dest, &["checkout", "--detach", "--force", sha], "checkout")?;
+    // Detach onto exactly `sha`. HEAD is moved with `update-ref` rather than
+    // `git checkout --detach`: this per-slot repo is always on a detached HEAD, and after a
+    // force-pushed branch the prior HEAD commit is unreachable, so `checkout` would spill a
+    // noisy "you are leaving N commits behind" orphan warning into the job trace. Moving HEAD
+    // by ref skips that detection; `reset --hard` then syncs the index + working tree (lazily
+    // fetching the pinned commit's blobs from the blobless promisor remote). `sha` is
+    // validated hex above, so it cannot be read as an option even without a `--` guard.
+    git(dest, &["update-ref", "--no-deref", "HEAD", sha], "detach")?;
+    git(dest, &["reset", "--hard", sha], "reset")?;
     git(dest, &["clean", "-ffdx"], "clean")?;
     Ok(())
 }
