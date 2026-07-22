@@ -1532,9 +1532,13 @@ fn effective_policy(
     Ok((ips, names))
 }
 
-/// Split a space/comma/newline-separated job-variable list into non-empty items.
+/// Split a space/comma/newline-separated job-variable list into non-empty items. A `#`
+/// begins an end-of-line comment (the rest of that line is dropped), so a YAML block-scalar
+/// list can annotate each entry inline — e.g. `crates.io   # Rust registry`.
 fn split_req(req: &str) -> Vec<String> {
-    req.split([',', ' ', '\t', '\n'])
+    req.lines()
+        .map(|line| line.split_once('#').map_or(line, |(head, _)| head))
+        .flat_map(|line| line.split([',', ' ', '\t']))
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -1872,6 +1876,31 @@ mod tests {
         assert!(narrow_ips(Some(&ipcap), "10.1.2.0/24", "V").is_ok());
         assert!(narrow_ips(Some(&ipcap), "192.168.0.0/16", "V").is_err());
         assert!(narrow_ips(Some(&[]), "10.0.0.0/8", "V").is_err());
+    }
+
+    #[test]
+    fn split_req_strips_inline_comments() {
+        // `#` begins an end-of-line comment; entries still split on comma/space/newline and a
+        // whole-line comment yields nothing.
+        assert_eq!(
+            split_req("crates.io # Rust registry\npypi.org, debian.org\n# whole-line comment\n"),
+            vec![
+                "crates.io".to_string(),
+                "pypi.org".to_string(),
+                "debian.org".to_string()
+            ]
+        );
+        // Comment text never leaks in as a bogus allowlist entry.
+        assert_eq!(
+            narrow_names(None, "a.com # note", "V").unwrap(),
+            vec!["a.com".to_string()]
+        );
+        // `\r\n` line endings are stripped and a `#` with no leading space still starts a
+        // comment.
+        assert_eq!(
+            split_req("crates.io#tight\r\ndebian.org\r\n"),
+            vec!["crates.io".to_string(), "debian.org".to_string()]
+        );
     }
 
     #[test]

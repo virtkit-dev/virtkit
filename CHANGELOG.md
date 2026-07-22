@@ -11,6 +11,9 @@ All notable changes to virtkit will be documented in this file.
   tree but every write stays in the guest and never reaches the host — the same isolation CI's
   `checkout_overlay` already gives, now on a plain `vk run` (e.g. a pre-commit hook that checks
   the tree without being able to mutate it).
+- **Inline comments in the `MICROVM_EGRESS_*` lists.** A `#` in an egress job variable begins
+  an end-of-line comment, so a YAML block-scalar allowlist can annotate each entry inline
+  (`crates.io   # Rust registry`) instead of duplicating the entries in a separate comment.
 
 ### Changed
 

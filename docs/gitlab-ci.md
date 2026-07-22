@@ -109,7 +109,8 @@ The list semantics are the load-bearing part:
 
 A job may **narrow** its egress to a subset of the host cap, never widen it. Each
 variable is a **list** — one or more entries separated by spaces, commas, tabs, or
-newlines (empty entries are ignored):
+newlines (empty entries are ignored). A `#` begins an end-of-line comment, so a
+block-scalar list can document each entry inline:
 
 ```yaml
 least-privilege-job:
@@ -127,10 +128,10 @@ list readable one-per-line (newlines are valid separators):
 ```yaml
   variables:
     MICROVM_EGRESS_ALLOW_NAME: |      # a string, split on newlines — not a YAML list
-      crates.io
-      static.crates.io
-      index.crates.io
-      debian.org
+      crates.io          # Rust registry
+      static.crates.io   # crate downloads
+      index.crates.io    # sparse index
+      debian.org         # apt mirrors (also covers deb./security.)
 ```
 
 ```yaml
