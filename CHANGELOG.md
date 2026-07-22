@@ -48,6 +48,8 @@ All notable changes to virtkit will be documented in this file.
 - `[gitlab] host_checkout` jobs whose image runs as a non-root user no longer fail with
   `Permission denied` under `/builds`. (The map shipped in 0.21.0 did not actually work for
   a non-root job.)
+- A guest connection to an egress-denied destination now fails immediately with
+  `ECONNREFUSED` instead of stalling until the guest's own read timeout.
 
 ## [0.21.0] - 2026-07-21
 

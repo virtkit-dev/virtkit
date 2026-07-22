@@ -17,7 +17,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -251,6 +251,27 @@ impl EgressGuard {
             }
             None => false,
         }
+    }
+
+    /// If `ip` opens a TCP connection this policy denies, return the RST frame
+    /// refusing it; otherwise `None`, so the packet egresses normally. Rejecting
+    /// the SYN (rather than letting ipstack complete the handshake and then drop
+    /// the flow) makes the guest's connect() fail at once with ECONNREFUSED
+    /// instead of stalling until a client read timeout.
+    fn reject_denied_syn(&self, ip: &[u8], client_mac: Mac) -> Option<Vec<u8>> {
+        let syn = parse_tcp_syn(ip)?;
+        // The registry-proxy sentinel bypasses the allowlist (a host-local
+        // service, spliced in proxy_tcp), so it must never be rejected here.
+        if let Some((sentinel, _)) = self.registry_proxy
+            && *syn.dst.ip() == sentinel
+        {
+            return None;
+        }
+        if self.allows(SocketAddr::V4(syn.dst)) {
+            return None;
+        }
+        eprintln!("switch: egress denied (tcp) {} — sent RST", syn.dst);
+        tcp_rst_frame(&syn, client_mac)
     }
 }
 
@@ -546,6 +567,15 @@ impl Switch {
                             query, hosts, upstream, gw, cip, src_port, mac, tx, egress,
                         ));
                     }
+                } else if let Some(rst) = self
+                    .egress
+                    .reject_denied_syn(ip, frame[6..12].try_into().unwrap())
+                {
+                    // A new connection the egress policy denies: refuse it with a
+                    // RST so the guest's connect() fails immediately, instead of
+                    // ipstack completing the handshake and then black-holing the
+                    // flow (which leaves the guest stalled until a read timeout).
+                    send(inner, port, &rst);
                 } else {
                     // off-subnet (default route): egress via the shared ipstack
                     let _ = self.egress_tx.send(ip.to_vec());
@@ -907,6 +937,49 @@ fn dns_frame(
     Some(out)
 }
 
+/// A connection-opening TCP SYN parsed from a guest IPv4 packet.
+struct TcpSyn {
+    src: SocketAddrV4,
+    dst: SocketAddrV4,
+    seq: u32,
+}
+
+/// Parse `ip` (an IPv4 packet, no ethernet header) as a connection-opening TCP
+/// segment. `Some` only for a pure SYN (SYN set, ACK clear) — the packet that
+/// opens a connection; SYN-ACKs, retransmits carrying ACK, and mid-flow segments
+/// return `None` so only the initial handshake is ever rejected.
+fn parse_tcp_syn(ip: &[u8]) -> Option<TcpSyn> {
+    let v4 = etherparse::Ipv4Slice::from_slice(ip).ok()?;
+    if v4.header().protocol() != etherparse::IpNumber::TCP {
+        return None;
+    }
+    let tcp = etherparse::TcpHeaderSlice::from_slice(v4.payload().payload).ok()?;
+    if !tcp.syn() || tcp.ack() {
+        return None;
+    }
+    Some(TcpSyn {
+        src: SocketAddrV4::new(v4.header().source_addr(), tcp.source_port()),
+        dst: SocketAddrV4::new(v4.header().destination_addr(), tcp.destination_port()),
+        seq: tcp.sequence_number(),
+    })
+}
+
+/// Build the ethernet frame refusing `syn`: a RST+ACK from the SYN's destination
+/// back to the guest (`client_mac`), sourced from the gateway MAC like the other
+/// gateway-originated replies. seq=0, ack=SYN.seq+1 per RFC 793 (a SYN spans one
+/// sequence number), so no per-connection state is needed for the guest to
+/// accept it and fail its connect() with ECONNREFUSED.
+fn tcp_rst_frame(syn: &TcpSyn, client_mac: Mac) -> Option<Vec<u8>> {
+    let builder = etherparse::PacketBuilder::ethernet2(GW_MAC, client_mac)
+        .ipv4(syn.dst.ip().octets(), syn.src.ip().octets(), 64)
+        .tcp(syn.dst.port(), syn.src.port(), 0, 0)
+        .rst()
+        .ack(syn.seq.wrapping_add(1));
+    let mut out = Vec::with_capacity(builder.size(0));
+    builder.write(&mut out, &[]).ok()?;
+    Some(out)
+}
+
 /// A tun-like device for ipstack backed by two channels: it reads the off-subnet
 /// IP packets the switch forwards and writes the IP packets ipstack emits back.
 struct ChannelDevice {
@@ -1156,6 +1229,151 @@ fn nth_host(gateway: Ipv4Addr, prefix: u8, index: u32) -> Result<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcp_syn_reject_builds_rst() {
+        let guest = Ipv4Addr::new(192, 168, 231, 2);
+        let denied = Ipv4Addr::new(10, 10, 140, 49);
+        let client_mac: Mac = [0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc];
+        let seq = 0x1234_5678u32;
+
+        // A guest SYN opening 192.168.231.2:44444 -> 10.10.140.49:443.
+        let mut syn_ip = Vec::new();
+        etherparse::PacketBuilder::ipv4(guest.octets(), denied.octets(), 64)
+            .tcp(44444, 443, seq, 64240)
+            .syn()
+            .write(&mut syn_ip, &[])
+            .unwrap();
+
+        // It parses as a pure SYN with the expected 5-tuple + seq.
+        let parsed = parse_tcp_syn(&syn_ip).expect("pure SYN parses");
+        assert_eq!(parsed.src, SocketAddrV4::new(guest, 44444));
+        assert_eq!(parsed.dst, SocketAddrV4::new(denied, 443));
+        assert_eq!(parsed.seq, seq);
+
+        // The refusal frame: eth GW_MAC -> client_mac, carrying a RST+ACK from the
+        // denied host:port back to the guest, seq=0, ack=SYN.seq+1.
+        let frame = tcp_rst_frame(&parsed, client_mac).expect("rst frame built");
+        assert_eq!(&frame[0..6], &client_mac); // eth dst = guest
+        assert_eq!(&frame[6..12], &GW_MAC); // eth src = gateway
+        assert_eq!(u16::from_be_bytes([frame[12], frame[13]]), ETHERTYPE_IPV4);
+
+        let v4 = etherparse::Ipv4Slice::from_slice(&frame[14..]).unwrap();
+        assert_eq!(v4.header().source_addr(), denied);
+        assert_eq!(v4.header().destination_addr(), guest);
+        let tcp = etherparse::TcpHeaderSlice::from_slice(v4.payload().payload).unwrap();
+        assert_eq!(tcp.source_port(), 443);
+        assert_eq!(tcp.destination_port(), 44444);
+        assert!(tcp.rst(), "RST flag set");
+        assert!(tcp.ack(), "ACK flag set");
+        assert_eq!(tcp.sequence_number(), 0);
+        assert_eq!(tcp.acknowledgment_number(), seq.wrapping_add(1));
+    }
+
+    #[test]
+    fn tcp_syn_parse_ignores_non_opening_segments() {
+        let a = Ipv4Addr::new(192, 168, 231, 2);
+        let b = Ipv4Addr::new(10, 10, 140, 49);
+
+        // A SYN-ACK (handshake reply) does not open a connection from the guest.
+        let mut synack = Vec::new();
+        etherparse::PacketBuilder::ipv4(a.octets(), b.octets(), 64)
+            .tcp(44444, 443, 1, 64240)
+            .syn()
+            .ack(99)
+            .write(&mut synack, &[])
+            .unwrap();
+        assert!(parse_tcp_syn(&synack).is_none(), "SYN-ACK is not rejected");
+
+        // A plain ACK (mid-flow segment) is ignored.
+        let mut ack = Vec::new();
+        etherparse::PacketBuilder::ipv4(a.octets(), b.octets(), 64)
+            .tcp(44444, 443, 2, 64240)
+            .ack(100)
+            .write(&mut ack, &[])
+            .unwrap();
+        assert!(
+            parse_tcp_syn(&ack).is_none(),
+            "mid-flow ACK is not rejected"
+        );
+
+        // A non-TCP (UDP) packet is ignored.
+        let mut udp = Vec::new();
+        etherparse::PacketBuilder::ipv4(a.octets(), b.octets(), 64)
+            .udp(1000, 2000)
+            .write(&mut udp, &[1, 2, 3])
+            .unwrap();
+        assert!(parse_tcp_syn(&udp).is_none(), "UDP is not a TCP SYN");
+    }
+
+    #[test]
+    fn parse_tcp_syn_honors_ip_options() {
+        let guest = Ipv4Addr::new(192, 168, 231, 2);
+        let denied = Ipv4Addr::new(10, 10, 140, 49);
+
+        // A pure SYN, then splice 4 bytes of IPv4 options (NOPs) after the fixed
+        // 20-byte header: IHL 5 -> 6 and total length += 4. parse_tcp_syn must
+        // locate the TCP header via IHL, not a hardcoded 20-byte offset.
+        let mut ip = Vec::new();
+        etherparse::PacketBuilder::ipv4(guest.octets(), denied.octets(), 64)
+            .tcp(44444, 443, 7, 64240)
+            .syn()
+            .write(&mut ip, &[])
+            .unwrap();
+        ip[0] = 0x46; // version 4, IHL 6 (24-byte header)
+        let total = u16::from_be_bytes([ip[2], ip[3]]) + 4;
+        ip[2..4].copy_from_slice(&total.to_be_bytes());
+        ip.splice(20..20, [0x01, 0x01, 0x01, 0x01]); // 4 NOP option bytes
+
+        let parsed = parse_tcp_syn(&ip).expect("SYN with IP options parses");
+        assert_eq!(parsed.src, SocketAddrV4::new(guest, 44444));
+        assert_eq!(parsed.dst, SocketAddrV4::new(denied, 443));
+        assert_eq!(parsed.seq, 7);
+    }
+
+    #[test]
+    fn reject_denied_syn_honors_policy() {
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let guest = Ipv4Addr::new(192, 168, 231, 2);
+        let client_mac: Mac = [0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc];
+        let sentinel = Ipv4Addr::new(10, 0, 0, 254);
+
+        // Allow 10.20.0.0/16; redirect a sentinel flow to the registry proxy.
+        let guard = EgressGuard::new(Egress::new(&["10.20.0.0/16".into()], &[]).unwrap(), gw)
+            .with_registry_proxy(Some((sentinel, "127.0.0.1:9000".parse().unwrap())));
+
+        let syn_to = |dst: Ipv4Addr| {
+            let mut ip = Vec::new();
+            etherparse::PacketBuilder::ipv4(guest.octets(), dst.octets(), 64)
+                .tcp(44444, 443, 1, 64240)
+                .syn()
+                .write(&mut ip, &[])
+                .unwrap();
+            ip
+        };
+
+        // A denied dst is refused with a RST frame.
+        assert!(
+            guard
+                .reject_denied_syn(&syn_to(Ipv4Addr::new(203, 0, 113, 5)), client_mac)
+                .is_some(),
+            "denied dst is refused with a RST"
+        );
+        // An allowed dst returns None, so the SYN egresses normally.
+        assert!(
+            guard
+                .reject_denied_syn(&syn_to(Ipv4Addr::new(10, 20, 30, 40)), client_mac)
+                .is_none(),
+            "allowed dst egresses"
+        );
+        // The registry-proxy sentinel is exempt from the allowlist.
+        assert!(
+            guard
+                .reject_denied_syn(&syn_to(sentinel), client_mac)
+                .is_none(),
+            "sentinel is exempt"
+        );
+    }
 
     #[test]
     fn mac_roundtrip() {
