@@ -1044,7 +1044,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                 std::fs::create_dir_all(ctx.job_dir.join(format!("svc-{}", svc.name)))
                     .with_context(|| format!("creating service dir for {}", svc.name))?;
             }
-            children.push(spawn_switch(ctx, gateway, prefix, &services)?);
+            children.push(spawn_switch(ctx, gateway, prefix, guest_ip, &services)?);
             for svc in &services {
                 let dir = ctx.job_dir.join(format!("svc-{}", svc.name));
                 let (child, aux) = crate::units::boot_unit(
@@ -1337,18 +1337,21 @@ fn spawn_switch(
     ctx: &JobCtx,
     gateway: Ipv4Addr,
     prefix: u8,
+    guest_ip: Ipv4Addr,
     services: &[crate::units::Provisioned],
 ) -> Result<std::process::Child> {
     let cfg = &ctx.cfg;
-    let mut listen = vec![ctx.net_vsock_sock(cfg.net.net_port)];
+    // Each listen socket is bound to its VM's assigned address so the switch can trust the
+    // source of a frame (see switch.rs): the primary at `guest_ip`, each service at its addr.
+    let mut listen = vec![(ctx.net_vsock_sock(cfg.net.net_port), guest_ip)];
     let mut hosts = Vec::new();
     let mut reservations = Vec::new();
     for svc in services {
-        listen.push(
-            ctx.job_dir
-                .join(format!("svc-{}", svc.name))
-                .join(format!("vsock.sock_{}", cfg.net.net_port)),
-        );
+        let socket = ctx
+            .job_dir
+            .join(format!("svc-{}", svc.name))
+            .join(format!("vsock.sock_{}", cfg.net.net_port));
+        listen.push((socket, svc.addr));
         let ip = svc.ip.split('/').next().unwrap_or_default();
         hosts.push((svc.hostname.clone(), ip.to_string()));
         if let Ok(ip4) = ip.parse::<Ipv4Addr>() {

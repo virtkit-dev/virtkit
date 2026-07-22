@@ -284,7 +284,8 @@ impl EgressGuard {
         !matches!(self.policy, Egress::AllowAll) || !self.per_source.is_empty()
     }
     /// The policy that governs flows from source `src`: its per-source override, else the
-    /// default. Source is the guest's own IPv4 (each VM has a fixed/leased address).
+    /// default. `src` is authenticated by `handle_frame` against the address bound to its
+    /// port, so a guest cannot forge a sibling's source to select the sibling's policy.
     fn policy_for(&self, src: Ipv4Addr) -> &Egress {
         self.per_source.get(&src).unwrap_or(&self.policy)
     }
@@ -361,10 +362,17 @@ impl EgressGuard {
 struct Inner {
     /// frame sink for each connected VM (its writer task)
     ports: HashMap<PortId, UnboundedSender<Vec<u8>>>,
-    /// learned source MAC -> port
+    /// learned source MAC -> port (inter-VM L2 delivery)
     mac_port: HashMap<Mac, PortId>,
-    /// IP -> MAC, so ipstack's egress replies route back to the owning VM
+    /// IP -> MAC, so egress replies carry the owning VM's ethernet destination. Only the VM
+    /// whose port is bound to an IP can source frames from it (see `handle_frame`), so each
+    /// entry is set by that IP's real owner.
     ip_mac: HashMap<Ipv4Addr, Mac>,
+    /// Authoritative IP -> port, from the executor-assigned address of each listen socket (a
+    /// VM cannot choose which per-VM socket its frames arrive on). Selects the source's egress
+    /// policy on ingress and routes egress replies on return — neither trusts a guest-supplied
+    /// address.
+    ip_port: HashMap<Ipv4Addr, PortId>,
     /// DHCP: stable lease per client MAC
     leases: HashMap<Mac, Ipv4Addr>,
     /// DHCP: per-MAC address reservations (run-assigned svc.ips). A reserved MAC
@@ -391,7 +399,10 @@ struct Switch {
 /// the gateway identity, the resolver's local names, the egress allowlists
 /// (empty = unrestricted), and where the log goes.
 pub struct Spawn {
-    pub listen: Vec<PathBuf>,
+    /// One socket per VM on the LAN, each paired with the address the executor assigned that
+    /// VM. The switch binds the address to the socket's port so a guest can only source its
+    /// own IP (see `handle_frame`).
+    pub listen: Vec<(PathBuf, Ipv4Addr)>,
     pub gateway: Ipv4Addr,
     pub prefix: u8,
     /// resolver entries served over the gateway DNS (`name=ip`)
@@ -440,9 +451,11 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
         .arg(opts.gateway.to_string())
         .arg("--prefix")
         .arg(opts.prefix.to_string());
-    for l in &opts.listen {
+    for (l, ip) in &opts.listen {
         let _ = std::fs::remove_file(l);
-        cmd.arg("--listen").arg(l);
+        // `<socket-path>=<ip>`: the switch binds the socket's port to this address. The path
+        // comes first (an IPv4 address never contains `=`), so it is split off from the right.
+        cmd.arg("--listen").arg(format!("{}={ip}", l.display()));
     }
     for (name, ip) in &opts.hosts {
         cmd.arg("--host").arg(format!("{name}={ip}"));
@@ -481,7 +494,7 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
         .stderr(log);
     let mut child = crate::spawn::spawn_tied(cmd).context("spawning the switch subprocess")?;
     let deadline = Instant::now() + Duration::from_secs(5);
-    for l in &opts.listen {
+    for (l, _) in &opts.listen {
         while !l.exists() {
             if Instant::now() >= deadline {
                 let _ = child.kill();
@@ -496,7 +509,7 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
-    listen: &[PathBuf],
+    listen: &[(PathBuf, Ipv4Addr)],
     gateway: Ipv4Addr,
     prefix: u8,
     hosts: HashMap<String, Ipv4Addr>,
@@ -583,17 +596,18 @@ pub async fn run(
         },
     );
     let mut accepts = Vec::new();
-    for path in listen {
+    for (path, bound_ip) in listen {
         let _ = std::fs::remove_file(path);
         let listener =
             UnixListener::bind(path).with_context(|| format!("switch: bind {}", path.display()))?;
         let sw = sw.clone();
+        let bound_ip = *bound_ip;
         accepts.push(tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((conn, _)) => {
                         let sw = sw.clone();
-                        tokio::spawn(async move { sw.serve_port(conn).await });
+                        tokio::spawn(async move { sw.serve_port(conn, bound_ip).await });
                     }
                     Err(e) => {
                         eprintln!("switch: accept: {e}");
@@ -612,10 +626,17 @@ pub async fn run(
 impl Switch {
     /// One connected VM: register a port, pump its frames into the switch, and
     /// drain queued frames back to it, until it disconnects.
-    async fn serve_port(self: Arc<Self>, conn: UnixStream) {
+    async fn serve_port(self: Arc<Self>, conn: UnixStream, bound_ip: Ipv4Addr) {
         let port = self.next_port.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = unbounded_channel::<Vec<u8>>();
-        self.inner.lock().unwrap().ports.insert(port, tx);
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.ports.insert(port, tx);
+            // Bind this socket's assigned address to its port authoritatively (a reconnect on
+            // the same socket rebinds to the new port). This is the only trustworthy source
+            // identity — the guest picks its frames' addresses, not its socket.
+            inner.ip_port.insert(bound_ip, port);
+        }
 
         let (rd, wr) = conn.into_split();
         let writer = tokio::spawn(writer_task(wr, rx));
@@ -643,10 +664,23 @@ impl Switch {
         let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
 
         let mut inner = self.inner.lock().unwrap();
-        inner.mac_port.insert(src, port);
-        if ethertype == ETHERTYPE_IPV4
-            && let Some(sip) = ipv4_src(&frame[14..])
+        let sip = (ethertype == ETHERTYPE_IPV4)
+            .then(|| ipv4_src(&frame[14..]))
+            .flatten();
+        // Anti-spoofing: a guest may only source IPv4 from the address bound to its port.
+        // Drop a frame whose source is neither unspecified (pre-config, e.g. a DHCP DISCOVER
+        // from 0.0.0.0) nor its port's bound address. This is what lets the switch trust the
+        // source to select the egress policy (`policy_for`) and to route egress replies
+        // (`route_in`): a VM cannot forge a sibling's address to borrow its policy or steal
+        // its replies, since it cannot choose which socket its frames arrive on.
+        if let Some(sip) = sip
+            && !sip.is_unspecified()
+            && inner.ip_port.get(&sip) != Some(&port)
         {
+            return;
+        }
+        inner.mac_port.insert(src, port);
+        if let Some(sip) = sip {
             inner.ip_mac.insert(sip, src);
         }
 
@@ -719,10 +753,13 @@ impl Switch {
     fn route_in(&self, ip: &[u8]) {
         let Some(dip) = ipv4_dst(ip) else { return };
         let inner = self.inner.lock().unwrap();
-        let Some(mac) = inner.ip_mac.get(&dip).copied() else {
+        // Route by the authoritative IP -> port binding, not the learned `mac_port` (which a
+        // guest can poison by sourcing a forged MAC), so an egress reply reaches only the VM
+        // that actually owns the destination address.
+        let Some(&port) = inner.ip_port.get(&dip) else {
             return;
         };
-        let Some(&port) = inner.mac_port.get(&mac) else {
+        let Some(mac) = inner.ip_mac.get(&dip).copied() else {
             return;
         };
         send(&inner, port, &wrap_eth(ip, mac));
@@ -739,7 +776,9 @@ impl Switch {
         let mut inner = self.inner.lock().unwrap();
         inner.ports.remove(&port);
         inner.mac_port.retain(|_, p| *p != port);
-        // leases/ip_mac kept: the VM keeps its address across a reconnect
+        // Drop this port's authoritative address binding; a reconnect on the same socket
+        // rebinds it. leases/ip_mac are kept: the VM keeps its address across a reconnect.
+        inner.ip_port.retain(|_, p| *p != port);
     }
 }
 
@@ -1751,6 +1790,15 @@ mod tests {
         f
     }
 
+    /// A minimal 20-byte IPv4-header stand-in with `src` at bytes 12..16 (where `ipv4_src`
+    /// reads it), plus an optional tail — enough for the switch's source-based handling.
+    fn ipv4_payload(src: Ipv4Addr, tail: &[u8]) -> Vec<u8> {
+        let mut p = vec![0x45u8; 20];
+        p[12..16].copy_from_slice(&src.octets());
+        p.extend_from_slice(tail);
+        p
+    }
+
     async fn send(s: &mut UnixStream, frame: &[u8]) {
         s.write_all(&(frame.len() as u32).to_be_bytes())
             .await
@@ -1774,7 +1822,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("switchtest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (sa, sb) = (dir.join("a.sock"), dir.join("b.sock"));
-        let listen = vec![sa.clone(), sb.clone()];
+        let (ip_a, ip_b) = (
+            Ipv4Addr::new(192, 168, 127, 2),
+            Ipv4Addr::new(192, 168, 127, 3),
+        );
+        let listen = vec![(sa.clone(), ip_a), (sb.clone(), ip_b)];
         tokio::spawn(async move {
             let _ = run(
                 &listen,
@@ -1800,12 +1852,16 @@ mod tests {
         let mut b = UnixStream::connect(&sb).await.unwrap();
         let (mac_a, mac_b) = ([2, 0, 0, 0, 0, 0xaa], [2, 0, 0, 0, 0, 0xbb]);
 
-        // B sends first so the switch learns mac_b → B's port.
-        send(&mut b, &eth(mac_a, mac_b, ETHERTYPE_IPV4, &[0x45; 20])).await;
+        // B sends first (from its own address) so the switch learns mac_b → B's port.
+        send(
+            &mut b,
+            &eth(mac_a, mac_b, ETHERTYPE_IPV4, &ipv4_payload(ip_b, b"")),
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Unicast A → B is delivered to B.
-        let unicast = eth(mac_b, mac_a, ETHERTYPE_IPV4, b"to-b-unicast-payload");
+        // Unicast A → B (from A's own address) is delivered to B.
+        let unicast = eth(mac_b, mac_a, ETHERTYPE_IPV4, &ipv4_payload(ip_a, b"to-b"));
         send(&mut a, &unicast).await;
         let got = tokio::time::timeout(Duration::from_secs(2), recv(&mut b))
             .await
@@ -1819,6 +1875,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, bcast);
+    }
+
+    /// A VM may only source IPv4 from the address bound to its socket: a frame forging a
+    /// sibling's source is dropped before it can flood, egress, or select that sibling's
+    /// egress policy. Since the source drives `policy_for`/`route_in`, this is the isolation
+    /// that makes per-service egress sound against an untrusted guest.
+    #[tokio::test]
+    async fn drops_source_spoofed_frames() {
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("switchspoof-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sa, sb) = (dir.join("a.sock"), dir.join("b.sock"));
+        let (ip_a, ip_b) = (
+            Ipv4Addr::new(192, 168, 127, 2),
+            Ipv4Addr::new(192, 168, 127, 3),
+        );
+        let listen = vec![(sa.clone(), ip_a), (sb.clone(), ip_b)];
+        tokio::spawn(async move {
+            let _ = run(
+                &listen,
+                Ipv4Addr::new(192, 168, 127, 1),
+                24,
+                HashMap::new(),
+                HashMap::new(),
+                Egress::AllowAll,
+                HashMap::new(),
+                None,
+                None,
+                None,
+            )
+            .await;
+        });
+        for _ in 0..100 {
+            if sa.exists() && sb.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut a = UnixStream::connect(&sa).await.unwrap();
+        let mut b = UnixStream::connect(&sb).await.unwrap();
+        let mac_b = [2, 0, 0, 0, 0, 0xbb];
+
+        // B broadcasts a frame forging A's source address: it is dropped before the flood,
+        // so A receives nothing.
+        let spoofed = eth(
+            BCAST_MAC,
+            mac_b,
+            ETHERTYPE_IPV4,
+            &ipv4_payload(ip_a, b"spoof"),
+        );
+        send(&mut b, &spoofed).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), recv(&mut a))
+                .await
+                .is_err(),
+            "a source-spoofed broadcast must be dropped, not flooded"
+        );
+
+        // The same broadcast from B's own address floods normally, reaching A — proving the
+        // drop above is the spoof check, not a dead flood path.
+        let honest = eth(
+            BCAST_MAC,
+            mac_b,
+            ETHERTYPE_IPV4,
+            &ipv4_payload(ip_b, b"honest"),
+        );
+        send(&mut b, &honest).await;
+        let got = tokio::time::timeout(Duration::from_secs(2), recv(&mut a))
+            .await
+            .unwrap();
+        assert_eq!(got, honest);
     }
 
     /// Build a minimal DNS query for `name` with the given qtype.

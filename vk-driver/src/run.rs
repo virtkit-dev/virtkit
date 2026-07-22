@@ -1418,8 +1418,9 @@ struct PlannedServices {
     /// dependency closure
     start: Vec<String>,
     /// per-unit switch sockets (up or down — an on-demand start dials a
-    /// listening LAN)
-    listen: Vec<PathBuf>,
+    /// listening LAN), each paired with the sibling's assigned address so the
+    /// switch binds the socket to it (a sibling can only source its own IP)
+    listen: Vec<(PathBuf, std::net::Ipv4Addr)>,
     /// alias -> ip for the gateway resolver
     hosts: Vec<(String, String)>,
     /// per-sibling DHCP reservations (mac, ip): a sibling's deterministic MAC ->
@@ -1578,9 +1579,10 @@ fn plan_services(
         let prov =
             crate::units::provision(cfg, state_dir, &args.build_args, unit, gw, prefix, s.slot)?;
         let ip = prov.addr.to_string();
-        planned
-            .listen
-            .push(s.dir.join(format!("vsock.sock_{NET_VSOCK_PORT}")));
+        planned.listen.push((
+            s.dir.join(format!("vsock.sock_{NET_VSOCK_PORT}")),
+            prov.addr,
+        ));
         planned
             .hosts
             .push((unit.name.to_ascii_lowercase(), ip.clone()));
@@ -2391,7 +2393,7 @@ async fn spawn_vm_switch(
     net_port: u32,
     allow_ip: &[String],
     allow_name: &[String],
-    extra_listen: &[PathBuf],
+    extra_listen: &[(PathBuf, std::net::Ipv4Addr)],
     hosts: &[(String, String)],
     reservations: &[(String, String)],
     registry_proxy: Option<(std::net::Ipv4Addr, std::net::SocketAddr)>,
@@ -2403,7 +2405,8 @@ async fn spawn_vm_switch(
     let (gw, prefix, guest_ip) = crate::net::switch_addrs(RUN_SUBNET)?;
     let mut listen = vsock.to_path_buf().into_os_string();
     listen.push(format!("_{net_port}"));
-    let mut all_listen = vec![PathBuf::from(listen)];
+    // The primary VM's socket is bound to its own address; each sibling's to its assigned IP.
+    let mut all_listen = vec![(PathBuf::from(listen), guest_ip)];
     all_listen.extend(extra_listen.iter().cloned());
     let child = crate::switch::spawn(&crate::switch::Spawn {
         listen: all_listen,

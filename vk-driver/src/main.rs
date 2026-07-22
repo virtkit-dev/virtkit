@@ -485,10 +485,12 @@ enum Cmd {
     /// sockets — no host privileges, multi-VM on one LAN. Replaces gvproxy.
     #[command(hide = true)]
     Switch {
-        /// VM qemu socket(s) to accept on (Cloud Hypervisor's <vsock.sock>_<port>);
-        /// repeatable — one per VM on the shared LAN.
-        #[arg(long = "listen", required = true)]
-        listen: Vec<PathBuf>,
+        /// VM qemu socket to accept on, paired with the VM's assigned address as
+        /// `<vsock.sock>_<port>=<ip>` (Cloud Hypervisor's socket); repeatable — one per VM on
+        /// the shared LAN. The switch binds the address to the socket so the VM can only
+        /// source its own IP.
+        #[arg(long = "listen", required = true, value_name = "SOCKET=IP")]
+        listen: Vec<String>,
         /// Gateway IPv4 — also the DHCP server and DNS address.
         #[arg(long, default_value = "192.168.127.1")]
         gateway: std::net::Ipv4Addr,
@@ -2007,6 +2009,17 @@ async fn cli_main() -> ExitCode {
         audit_log,
     } = &cli.cmd
     {
+        let mut listen_bind = Vec::with_capacity(listen.len());
+        for l in listen {
+            // `<socket-path>=<ip>`; split from the right since a socket path may contain '='
+            // but an IPv4 address never does.
+            match l.rsplit_once('=').and_then(|(path, ip)| {
+                Some((PathBuf::from(path), ip.parse::<std::net::Ipv4Addr>().ok()?))
+            }) {
+                Some(pair) => listen_bind.push(pair),
+                None => return fail(&anyhow::anyhow!("bad --listen {l:?} (want socket=ip)"), 2),
+            }
+        }
         let mut hosts = std::collections::HashMap::new();
         for h in host {
             match h.split_once('=').and_then(|(n, ip)| {
@@ -2059,7 +2072,7 @@ async fn cli_main() -> ExitCode {
             Err(e) => return fail(&e, 2),
         };
         return match switch::run(
-            listen,
+            &listen_bind,
             *gateway,
             *prefix,
             hosts,
