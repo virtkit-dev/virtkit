@@ -66,6 +66,12 @@ pub struct BuildRecipe {
     pub cache_registry: Option<String>,
     pub cache_insecure: bool,
     pub cache_auth: crate::build::CacheAuth,
+    /// Egress policy for the build's RUN guests (`[egress.build]`, narrowed per job).
+    /// `BuildNet::All` = unrestricted (the docker-build-like default when unconfigured).
+    pub net: crate::build::BuildNet,
+    /// Audit the build's RUN egress into the job trace (`[egress.build] audit` /
+    /// `MICROVM_BUILD_EGRESS_AUDIT`).
+    pub audit: bool,
 }
 
 /// A unit image is fresh when its UUID is the expected fingerprint *and* its runtime
@@ -109,10 +115,10 @@ pub fn ensure_unit_build(
         journal: false,
         tmp_tmpfs: false,
         build_args: recipe.build_args.clone(),
-        // unrestricted RUN egress, like `docker build` (and `vk build`'s default) —
-        // service stages install packages.
-        net: crate::build::BuildNet::All,
-        audit: false,
+        // Build-phase egress: the CI job's effective `[egress.build]` policy (unrestricted
+        // by default, like `docker build`, when unconfigured) + its build-audit flag.
+        net: recipe.net.clone(),
+        audit: recipe.audit,
         require_cached: false,
         build_jobs: None,
         debug: false,
@@ -210,6 +216,8 @@ mod tests {
             cache_registry: Some("none".into()),
             cache_insecure: false,
             cache_auth: Default::default(),
+            net: crate::build::BuildNet::All,
+            audit: false,
         };
         let key = "deadbeef";
         let expected = fingerprint(&[key]);

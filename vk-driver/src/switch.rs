@@ -127,6 +127,15 @@ impl Cidr4 {
     fn matches(&self, ip: Ipv4Addr, port: u16) -> bool {
         (u32::from(ip) & mask4(self.prefix)) == self.net && self.port.is_none_or(|p| p == port)
     }
+    /// Is `other` entirely within this rule (this ⊇ other)? Used host-side to check a
+    /// per-job `allow_ip` request stays inside the configured cap: `other`'s network must
+    /// sit in this CIDR (so this prefix is no longer than other's), and if this rule is
+    /// port-scoped `other` must carry the same port (an unscoped cap admits any).
+    fn contains(&self, other: &Cidr4) -> bool {
+        self.prefix <= other.prefix
+            && (other.net & mask4(self.prefix)) == self.net
+            && self.port.is_none_or(|p| Some(p) == other.port)
+    }
 }
 
 /// IPv4 netmask for a prefix length (0 => 0.0.0.0, avoiding the `u32 << 32` UB).
@@ -140,17 +149,37 @@ fn mask4(prefix: u8) -> u32 {
 
 impl Egress {
     /// Build a policy from `--allow-ip` CIDRs + `--allow-name` suffixes; empty both
-    /// => `AllowAll`.
+    /// => `AllowAll`. The dev/CLI convenience path where an unset allowlist means
+    /// unrestricted; the CI executor uses [`Egress::restricted`] so an explicit empty
+    /// allowlist denies everything instead.
     pub fn new(ips: &[String], names: &[String]) -> Result<Egress> {
         if ips.is_empty() && names.is_empty() {
             return Ok(Egress::AllowAll);
         }
+        Self::restricted(ips, names)
+    }
+    /// Build an allowlist policy that is *always* restricted — empty lists deny everything
+    /// (`Egress::Allow { ips: [], names: [] }`), never collapsing to `AllowAll`. The CI
+    /// executor uses this when a job's phase configures egress (see the switch's
+    /// `--egress-restrict`), so `allow_name = []` means "no names", not "any name".
+    pub fn restricted(ips: &[String], names: &[String]) -> Result<Egress> {
         let ips = ips.iter().map(|s| Cidr4::parse(s)).collect::<Result<_>>()?;
         let names = names
             .iter()
             .map(|s| s.trim_start_matches('.').to_ascii_lowercase())
             .collect();
         Ok(Egress::Allow { ips, names })
+    }
+    /// Is the CIDR request `cidr` (`a.b.c.d/prefix[:port]`) entirely within this policy?
+    /// `AllowAll` contains anything; an `Allow` policy contains it iff some allowed rule
+    /// does (see [`Cidr4::contains`]). Host-side check that a per-job `allow_ip` request
+    /// stays inside the configured cap — the executor's `narrow_ips`.
+    pub fn contains_cidr(&self, cidr: &str) -> Result<bool> {
+        let req = Cidr4::parse(cidr)?;
+        Ok(match self {
+            Egress::AllowAll => true,
+            Egress::Allow { ips, .. } => ips.iter().any(|c| c.contains(&req)),
+        })
     }
     /// Direct (non-proxied) egress: allow only listed IPv4 ranges, each optionally scoped
     /// to a destination port (IPv6 denied under an allowlist).
@@ -165,7 +194,7 @@ impl Egress {
     }
     /// Resolver name check: allow a host equal to or under an allowed suffix.
     /// Also used host-side to validate a per-job allow_name request stays within
-    /// the configured cap (the executor's `effective_allow_names`).
+    /// the configured cap (the executor's `narrow_names`).
     pub fn allows_host(&self, host: &str) -> bool {
         match self {
             Egress::AllowAll => true,
@@ -352,6 +381,11 @@ pub struct Spawn {
     pub reservations: Vec<(String, String)>,
     pub allow_ip: Vec<String>,
     pub allow_name: Vec<String>,
+    /// Force allowlist mode even when both lists are empty: an empty allowlist then denies
+    /// everything (`Egress::restricted`) instead of collapsing to unrestricted. Set by the
+    /// CI executor for a phase whose egress is configured (so `allow_name = []` = deny all);
+    /// `false` for dev `vk run`, where an unset allowlist means unrestricted.
+    pub restrict: bool,
     /// `(sentinel, host)`: redirect a guest flow to `sentinel` to the host-local
     /// credential registry proxy at `host` (see regproxy.rs). `None` = disabled.
     pub registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
@@ -396,6 +430,9 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
     }
     for n in &opts.allow_name {
         cmd.arg("--allow-name").arg(n);
+    }
+    if opts.restrict {
+        cmd.arg("--egress-restrict");
     }
     if let Some((sentinel, host)) = opts.registry_proxy {
         cmd.arg("--registry-proxy")
@@ -1494,6 +1531,41 @@ mod tests {
         assert!(matches!(Egress::new(&[], &[]).unwrap(), Egress::AllowAll));
         let any = Egress::default();
         assert!(any.allows_ip("8.8.8.8".parse().unwrap(), 443) && any.allows_host("evil.com"));
+    }
+
+    #[test]
+    fn restricted_empty_denies_everything() {
+        // `restricted` never collapses to AllowAll — an empty allowlist is deny-all,
+        // unlike `new` (the dev default) which treats empty as unrestricted.
+        let deny = Egress::restricted(&[], &[]).unwrap();
+        assert!(matches!(deny, Egress::Allow { .. }));
+        assert!(!deny.allows_host("anything.com"));
+        assert!(!deny.allows_ip("8.8.8.8".parse().unwrap(), 443));
+    }
+
+    #[test]
+    fn contains_cidr_subset_check() {
+        let cap =
+            Egress::restricted(&["10.0.0.0/8".into(), "192.168.0.0/16:443".into()], &[]).unwrap();
+        // subset of an unscoped cap rule
+        assert!(cap.contains_cidr("10.1.2.0/24").unwrap());
+        assert!(cap.contains_cidr("10.1.2.3/32").unwrap());
+        // a superset (wider prefix) is not contained
+        assert!(!cap.contains_cidr("10.0.0.0/4").unwrap());
+        // a sibling range outside the cap
+        assert!(!cap.contains_cidr("172.16.0.0/12").unwrap());
+        // port must match a port-scoped cap rule
+        assert!(cap.contains_cidr("192.168.1.0/24:443").unwrap());
+        assert!(!cap.contains_cidr("192.168.1.0/24").unwrap()); // any-port request widens the cap
+        assert!(!cap.contains_cidr("192.168.1.0/24:80").unwrap());
+        // an empty allowlist contains nothing; AllowAll contains everything
+        assert!(
+            !Egress::restricted(&[], &[])
+                .unwrap()
+                .contains_cidr("10.0.0.0/8")
+                .unwrap()
+        );
+        assert!(Egress::AllowAll.contains_cidr("8.8.8.8/32").unwrap());
     }
 
     #[test]

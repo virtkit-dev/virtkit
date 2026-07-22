@@ -50,13 +50,30 @@
 # count = 32
 # subnet = "192.168.231.0/24"
 
-# [egress]               # allowlist for net.mode = "switch" (empty = unrestricted).
+# [egress]               # RUN-phase allowlist for net.mode = "switch" (the booted job guest
+#                        # and the service VMs sharing its LAN). An ABSENT list is
+#                        # unrestricted; an explicit empty list denies that dimension
+#                        # (allow_name = [] => no DNS). A phase is unrestricted only when both
+#                        # lists are absent.
 # allow_ip = ["10.0.0.0/8", "1.2.3.4:5432"]  # direct (non-DNS) egress CIDRs, optionally
 #                                            # port-scoped as CIDR:port (else any port)
 # allow_name = ["corp.example.com"]    # DNS suffixes (dot-anchored: also *.corp.example.com)
 # audit = true           # audit mode: list every external domain each job contacts (and how
-#                        # many times) at the end of its trace. Works with an empty allowlist
-#                        # (observe without blocking). A job can also set MICROVM_EGRESS_AUDIT.
+#                        # many times) at the end of its trace. Leave the lists absent
+#                        # (unrestricted) + audit = true to observe without blocking. A job
+#                        # can also set MICROVM_EGRESS_AUDIT.
+#
+# [egress.build]         # BUILD-phase allowlist — a git-defined image / compose build:
+#                        # service's RUN steps. Same shape/semantics as [egress]. Absent
+#                        # (the default) = unrestricted, like `docker build`.
+# allow_name = ["deb.debian.org", "crates.io"]
+# audit = true
+#
+# A CI job may only NARROW these caps, never widen (subset-of-config), via job variables —
+# for the run phase: MICROVM_EGRESS_ALLOW_IP, MICROVM_EGRESS_ALLOW_NAME, MICROVM_EGRESS_AUDIT;
+# for the build phase: MICROVM_BUILD_EGRESS_ALLOW_IP, MICROVM_BUILD_EGRESS_ALLOW_NAME,
+# MICROVM_BUILD_EGRESS_AUDIT. Against an absent (unconstrained) cap a variable defines the
+# list freely; against an empty (deny-all) cap it can add nothing.
 
 # [auth]                 # host credentials forwarded into job VMs.
 # ssh_agent = true       # forward the runner's $SSH_AUTH_SOCK so the guest's ssh/git use

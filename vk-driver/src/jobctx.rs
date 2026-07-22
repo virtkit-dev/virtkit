@@ -20,15 +20,23 @@ pub struct JobCtx {
     /// the guest image's baked default (VIRTKIT_DEFAULT_RUN_USER). None = use
     /// that default.
     pub user_req: Option<String>,
-    /// MICROVM_EGRESS_ALLOW_NAME job variable (space/comma separated): narrow this
-    /// job's switch egress to a subset of the host [egress] allow_name cap. None =
-    /// use the full cap. A name outside the cap fails the job (a job can narrow but
-    /// never widen its egress).
+    /// MICROVM_EGRESS_ALLOW_IP / _ALLOW_NAME job variables (space/comma separated): narrow
+    /// this job's run-phase switch egress to a subset of the host `[egress]` allow_ip /
+    /// allow_name cap. None = use the cap unchanged. A request outside the cap fails the job
+    /// (a job can narrow but never widen its egress); against an absent (unconstrained) cap
+    /// dimension the variable defines the list freely.
+    pub egress_allow_ip_req: Option<String>,
     pub egress_allow_name_req: Option<String>,
-    /// MICROVM_EGRESS_AUDIT job variable: when truthy, audit this job's egress even if
-    /// the host `[egress] audit` toggle is off. Auditing only observes (it never widens
+    /// MICROVM_BUILD_EGRESS_ALLOW_IP / _ALLOW_NAME: the same, for the build phase (git-defined
+    /// image / compose `build:` RUN steps), narrowing the `[egress.build]` cap.
+    pub egress_build_allow_ip_req: Option<String>,
+    pub egress_build_allow_name_req: Option<String>,
+    /// MICROVM_EGRESS_AUDIT job variable: when truthy, audit this job's run-phase egress even
+    /// if the host `[egress] audit` toggle is off. Auditing only observes (it never widens
     /// egress), so a job may turn it on for itself.
     pub egress_audit_req: bool,
+    /// MICROVM_BUILD_EGRESS_AUDIT: the same, for the build phase (`[egress.build] audit`).
+    pub egress_build_audit_req: bool,
     /// Exit code telling gitlab-runner the *script* failed (job failure)
     pub build_failure: i32,
     /// Exit code telling gitlab-runner the *environment* failed (retryable)
@@ -92,8 +100,13 @@ impl JobCtx {
             cpus_req: job_var("MICROVM_CPUS"),
             mem_req: job_var("MICROVM_MEM"),
             user_req: job_var("MICROVM_USER"),
+            egress_allow_ip_req: job_var("MICROVM_EGRESS_ALLOW_IP"),
             egress_allow_name_req: job_var("MICROVM_EGRESS_ALLOW_NAME"),
+            egress_build_allow_ip_req: job_var("MICROVM_BUILD_EGRESS_ALLOW_IP"),
+            egress_build_allow_name_req: job_var("MICROVM_BUILD_EGRESS_ALLOW_NAME"),
             egress_audit_req: job_var("MICROVM_EGRESS_AUDIT").is_some_and(|v| is_truthy(&v)),
+            egress_build_audit_req: job_var("MICROVM_BUILD_EGRESS_AUDIT")
+                .is_some_and(|v| is_truthy(&v)),
             build_failure: exit_code_env("BUILD_FAILURE_EXIT_CODE", 1),
             system_failure: exit_code_env("SYSTEM_FAILURE_EXIT_CODE", 2),
             ci_repo_url: job_var("CI_REPOSITORY_URL"),
@@ -192,10 +205,15 @@ impl JobCtx {
     pub fn egress_audit_log(&self) -> PathBuf {
         self.job_dir.join("egress-audit.log")
     }
-    /// Whether this job audits its egress: the host `[egress] audit` toggle or the job's
-    /// own `MICROVM_EGRESS_AUDIT` request (either enables it — audit only observes).
+    /// Whether this job audits its run-phase egress: the host `[egress] audit` toggle or the
+    /// job's own `MICROVM_EGRESS_AUDIT` request (either enables it — audit only observes).
     pub fn egress_audit(&self) -> bool {
         self.cfg.egress.audit || self.egress_audit_req
+    }
+    /// Whether this job audits its build-phase egress: `[egress.build] audit` or the job's
+    /// own `MICROVM_BUILD_EGRESS_AUDIT` request.
+    pub fn egress_build_audit(&self) -> bool {
+        self.cfg.egress.build.audit || self.egress_build_audit_req
     }
     /// The host unix socket Cloud Hypervisor surfaces a guest connection to host
     /// vsock port `port` on (`<vsock.sock>_<port>`) — where the switch listens
@@ -273,8 +291,12 @@ mod tests {
             cpus_req: None,
             mem_req: None,
             user_req: None,
+            egress_allow_ip_req: None,
             egress_allow_name_req: None,
+            egress_build_allow_ip_req: None,
+            egress_build_allow_name_req: None,
             egress_audit_req: false,
+            egress_build_audit_req: false,
             build_failure: 1,
             system_failure: 2,
             ci_repo_url: None,

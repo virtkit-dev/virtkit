@@ -54,6 +54,11 @@ pub struct BuildOpts {
     pub cache_registry: Option<String>,
     pub cache_insecure: bool,
     pub cache_auth: crate::build::CacheAuth,
+    /// Egress policy for the unit build's RUN guests (`[egress.build]`, narrowed per job);
+    /// `BuildNet::All` = unrestricted default.
+    pub net: crate::build::BuildNet,
+    /// Audit the unit build's RUN egress into the job trace.
+    pub audit: bool,
 }
 
 /// The build recipe + target + stage key for a `build:` unit, shared by the ext4-path
@@ -89,6 +94,12 @@ fn build_recipe(
         cache_registry: build.and_then(|b| b.cache_registry.clone()),
         cache_insecure: build.is_some_and(|b| b.cache_insecure),
         cache_auth: build.map(|b| b.cache_auth.clone()).unwrap_or_default(),
+        // `build = None` is the ext4-path/fingerprint call that never builds, so the egress
+        // default is irrelevant there; the real build passes the job's `[egress.build]` policy.
+        net: build
+            .map(|b| b.net.clone())
+            .unwrap_or(crate::build::BuildNet::All),
+        audit: build.is_some_and(|b| b.audit),
     };
     Ok((recipe, target.clone(), key))
 }
@@ -502,6 +513,8 @@ mod tests {
             cache_registry: Some("none".into()),
             cache_insecure: false,
             cache_auth: Default::default(),
+            net: crate::build::BuildNet::All,
+            audit: false,
         };
         let err = ensure_unit_build_sync(
             &unit,

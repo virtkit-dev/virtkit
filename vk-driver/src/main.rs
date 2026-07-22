@@ -511,6 +511,11 @@ enum Cmd {
         /// `corp.example.com` (repeatable).
         #[arg(long = "allow-name", value_name = "SUFFIX")]
         allow_name: Vec<String>,
+        /// force allowlist mode even with no --allow-ip/--allow-name, so an empty allowlist
+        /// denies everything instead of being unrestricted (set internally by the gitlab
+        /// executor when a job configures egress).
+        #[arg(long = "egress-restrict")]
+        egress_restrict: bool,
         /// redirect guest flows to a sentinel address to a host-local registry proxy:
         /// `<sentinel-ip>=<host:port>` (set internally by `vk run --registry-proxy`).
         #[arg(long = "registry-proxy", value_name = "IP=ADDR")]
@@ -1989,6 +1994,7 @@ async fn cli_main() -> ExitCode {
         reserve,
         allow_ip,
         allow_name,
+        egress_restrict,
         registry_proxy,
         denied_log,
         audit_log,
@@ -2021,7 +2027,15 @@ async fn cli_main() -> ExitCode {
                 None => return fail(&anyhow::anyhow!("bad --reserve {r:?} (want mac=ip)"), 2),
             }
         }
-        let egress = match switch::Egress::new(allow_ip, allow_name) {
+        // --egress-restrict forces allowlist mode: an empty allowlist denies everything
+        // (the CI executor sets it when a job configures egress) rather than collapsing to
+        // unrestricted the way the dev `vk switch` / `vk run` path does.
+        let built = if *egress_restrict {
+            switch::Egress::restricted(allow_ip, allow_name)
+        } else {
+            switch::Egress::new(allow_ip, allow_name)
+        };
+        let egress = match built {
             Ok(e) => e,
             Err(e) => return fail(&e, 2),
         };

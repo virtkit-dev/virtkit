@@ -6,12 +6,22 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
-- **Egress audit mode**: the switch records every external domain a guest resolves and
-  prints a "domains contacted" summary, letting a job observe its egress — with or without an
-  allowlist — to discover the allowlist it needs. Enable it in CI with `[egress] audit` (or
-  the `MICROVM_EGRESS_AUDIT` job variable), or on the command line with `vk run --audit-egress`
-  for the booted guest and `--build-audit-egress` (on `vk run` and `vk build`) for a build's
-  `RUN` steps.
+- **Separate build/run egress allowlists for CI.** `[egress]` now governs the run phase (the
+  booted job guest and its service VMs) and a new `[egress.build]` governs the build phase (a
+  git-defined image / compose `build:` service's `RUN` steps) — previously the build ran with
+  unrestricted egress. A CI job may only *narrow* either cap via `MICROVM_EGRESS_ALLOW_IP` /
+  `MICROVM_EGRESS_ALLOW_NAME` (run) and `MICROVM_BUILD_EGRESS_ALLOW_IP` /
+  `MICROVM_BUILD_EGRESS_ALLOW_NAME` (build), never widen; set them at the GitLab group/project
+  level and override per job.
+- **`allowlist = []` now denies everything.** An explicit empty allow list means "nothing
+  allowed"; leaving a list absent keeps it unrestricted (unchanged). A phase is unrestricted
+  only when both its lists are absent.
+- **Egress audit mode**: the switch records every external domain a guest resolves and prints
+  a "domains contacted" summary, letting a job observe its egress — with or without an
+  allowlist — to discover the allowlist it needs. Enable it in CI with `[egress] audit` /
+  `[egress.build] audit` (or the `MICROVM_EGRESS_AUDIT` / `MICROVM_BUILD_EGRESS_AUDIT` job
+  variables), or on the command line with `vk run --audit-egress` for the booted guest and
+  `--build-audit-egress` (on `vk run` and `vk build`) for a build's `RUN` steps.
 
 ## [0.23.0] - 2026-07-22
 

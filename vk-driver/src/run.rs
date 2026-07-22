@@ -999,6 +999,8 @@ async fn build_and_boot(
             &planned.reservations,
             registry_proxy,
             args.audit_egress.then(|| work.join(AUDIT_LOG)),
+            // Dev `vk run` egress is unrestricted (no allowlist plumbed here).
+            false,
         )
         .await?;
         cmdline.push_str(&frag);
@@ -1638,6 +1640,7 @@ async fn compose_up(
         &planned.reservations,
         None,
         args.audit_egress.then(|| work.join(AUDIT_LOG)),
+        false,
     )
     .await?;
 
@@ -1699,6 +1702,9 @@ fn manager_build_opts(args: &RunArgs, kernel: &Path, agent: &Path) -> crate::uni
         cache_registry: args.cache_registry.clone(),
         cache_insecure: args.cache_insecure,
         cache_auth: Default::default(),
+        // Dev `vk run --compose` service builds share the run's `--build-net` / build-audit.
+        net: args.build_net.clone(),
+        audit: args.build_audit_egress,
     }
 }
 
@@ -2390,6 +2396,9 @@ async fn spawn_vm_switch(
     reservations: &[(String, String)],
     registry_proxy: Option<(std::net::Ipv4Addr, std::net::SocketAddr)>,
     audit_log: Option<PathBuf>,
+    // Force allowlist mode even with empty lists (deny-all) — the CI build phase sets this
+    // for a restricted `[egress.build]`. Dev `vk run` passes `false` (unset = unrestricted).
+    restrict: bool,
 ) -> Result<(Child, String)> {
     let (gw, prefix, guest_ip) = crate::net::switch_addrs(RUN_SUBNET)?;
     let mut listen = vsock.to_path_buf().into_os_string();
@@ -2404,6 +2413,7 @@ async fn spawn_vm_switch(
         reservations: reservations.to_vec(),
         allow_ip: allow_ip.to_vec(),
         allow_name: allow_name.to_vec(),
+        restrict,
         registry_proxy,
         log: work.join("switch.log"),
         // Dev `vk run` has no gitlab job trace to surface denials into; the switch's own
@@ -2643,6 +2653,9 @@ pub(crate) async fn boot_session(
             &[],
             None,
             audit_log.map(Path::to_path_buf),
+            // A restricted build policy (`BuildNet::Allow`, incl. empty = deny) forces
+            // allowlist mode; `BuildNet::All` is unrestricted.
+            matches!(net, crate::build::BuildNet::Allow { .. }),
         )
         .await?;
         switch = Some(child);

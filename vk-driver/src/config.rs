@@ -196,23 +196,46 @@ impl Default for Gitlab {
     }
 }
 
-/// Egress allowlist for the per-job switch (`net.mode = "switch"`). Both lists
-/// empty = unrestricted; passed through to `vk switch --allow-ip/--allow-name`.
+/// One phase's egress allowlist for the per-job switch (`net.mode = "switch"`).
+///
+/// An *absent* list is unconstrained; a *present* list is an allowlist, so an explicit
+/// empty list (`allow_name = []`) denies that dimension. A policy is unrestricted only
+/// when both lists are absent (`audit` may still be on — the observe-to-discover mode);
+/// once either is present the phase is a restricted allowlist and an omitted list denies
+/// its dimension (DNS-resolved IPs of allowed names stay reachable via pinning).
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct EgressPolicy {
+    /// Allowed destination IPv4 CIDRs for direct (non-DNS-resolved) egress, each
+    /// optionally scoped to a single port as `CIDR:port` (e.g. `10.0.0.0/8:443`).
+    /// `None` = unconstrained; `Some([])` = deny all direct-IP egress.
+    pub allow_ip: Option<Vec<String>>,
+    /// Allowed DNS name suffixes, dot-anchored (e.g. `corp.example.com` also allows
+    /// `*.corp.example.com`). `None` = unconstrained; `Some([])` = deny all names.
+    pub allow_name: Option<Vec<String>>,
+    /// Audit mode: record every external domain this phase's guest resolves and print the
+    /// "domains contacted" summary into the job trace. Independent of the allowlist — leave
+    /// both lists absent (unrestricted egress) and set `audit = true` to observe without
+    /// blocking and discover the allowlist a job needs. A job may also opt in per-run with
+    /// the `MICROVM_EGRESS_AUDIT` / `MICROVM_BUILD_EGRESS_AUDIT` variables.
+    pub audit: bool,
+}
+
+/// Egress for the CI job: the flat `[egress]` keys govern the run phase (the booted job
+/// guest, and the service VMs sharing its LAN); the `[egress.build]` subtable governs the
+/// build phase (git-defined image / compose `build:` service `RUN` steps). Each phase is an
+/// [`EgressPolicy`]; a job may only *narrow* either via `MICROVM_EGRESS_*` /
+/// `MICROVM_BUILD_EGRESS_*` variables, never widen.
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Egress {
-    /// Allowed destination IPv4 CIDRs for direct (non-DNS-resolved) egress, each
-    /// optionally scoped to a single port as `CIDR:port` (e.g. `10.0.0.0/8:443`).
-    pub allow_ip: Vec<String>,
-    /// Allowed DNS name suffixes, dot-anchored (e.g. `corp.example.com` also
-    /// allows `*.corp.example.com`).
-    pub allow_name: Vec<String>,
-    /// Audit mode: record every external domain each job's guest resolves and print the
-    /// per-job "domains contacted" summary into the job trace. Independent of the
-    /// allowlist — with both lists empty (unrestricted egress) it observes without
-    /// blocking, so a job can discover the allowlist it needs. A job may also opt in
-    /// per-run with the `MICROVM_EGRESS_AUDIT` variable.
+    /// Run phase (booted guest). Absent lists = unrestricted; `[]` = deny.
+    pub allow_ip: Option<Vec<String>>,
+    pub allow_name: Option<Vec<String>>,
     pub audit: bool,
+    /// `[egress.build]` — build phase RUN egress. Absent (the default) = unrestricted, as
+    /// `docker build`.
+    pub build: EgressPolicy,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -774,14 +797,28 @@ mod tests {
             [egress]
             allow_ip = ["10.0.0.0/8", "192.168.1.1/32"]
             allow_name = ["corp.example.com", "github.com"]
+
+            [egress.build]
+            allow_name = []
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.egress.allow_ip, ["10.0.0.0/8", "192.168.1.1/32"]);
-        assert_eq!(cfg.egress.allow_name, ["corp.example.com", "github.com"]);
-        // absent [egress] = unrestricted (both lists empty)
+        assert_eq!(
+            cfg.egress.allow_ip.as_deref(),
+            Some(&["10.0.0.0/8".to_string(), "192.168.1.1/32".to_string()][..])
+        );
+        assert_eq!(
+            cfg.egress.allow_name.as_deref(),
+            Some(&["corp.example.com".to_string(), "github.com".to_string()][..])
+        );
+        // [egress.build] present with an explicit empty list = deny all names for the
+        // build phase (Some([])), distinct from an absent list (None = unconstrained).
+        assert_eq!(cfg.egress.build.allow_name.as_deref(), Some(&[][..]));
+        assert_eq!(cfg.egress.build.allow_ip, None);
+        // absent [egress] = unrestricted (both lists None)
         let none = Config::default();
-        assert!(none.egress.allow_ip.is_empty() && none.egress.allow_name.is_empty());
+        assert!(none.egress.allow_ip.is_none() && none.egress.allow_name.is_none());
+        assert!(none.egress.build.allow_ip.is_none() && none.egress.build.allow_name.is_none());
     }
 
     #[test]

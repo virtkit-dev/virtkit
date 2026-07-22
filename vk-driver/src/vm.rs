@@ -145,6 +145,11 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         bail!("no rw access to /dev/kvm (is the runner user in the kvm group?)");
     }
     let (cpus, mem) = vm_size(ctx)?;
+    // Validate the run-phase egress narrowing here so a MICROVM_EGRESS_ALLOW_* request
+    // outside the `[egress]` cap fails with a crisp job-visible error — the switch itself is
+    // spawned later in the detached supervisor, whose log the job never sees. (The build
+    // phase validates in build_git_image / build_compose_unit, also in prepare.)
+    effective_run_egress(cfg, ctx)?;
 
     // A leftover job (failed cleanup, retried job id) must not leak: signal its
     // supervisor — everything it owns cascades by PDEATHSIG — and drop the state. Done before
@@ -417,6 +422,7 @@ fn build_git_image(
         .collect();
     let stage_key = crate::build::target_stage_key(&dockerfiles, &contexts, &build_args, stage)
         .context("computing the git-defined image's stage fingerprint")?;
+    let (net, audit) = effective_build_egress(cfg, ctx)?;
     let recipe = crate::ensure::BuildRecipe {
         dockerfiles,
         contexts,
@@ -432,6 +438,8 @@ fn build_git_image(
             password_file: cfg.build.cache_password_file.clone(),
             token_file: cfg.build.cache_token_file.clone(),
         },
+        net,
+        audit,
     };
     let dir = crate::ensure::ensure_build_tier(
         cfg.state_dir(),
@@ -748,6 +756,9 @@ fn build_compose_unit(
     // valid only while the handle is open, and the build is synchronous.
     let agent = crate::embed::resolve(crate::embed::Asset::Agent, cfg.build.agent.as_deref())?;
     let kernel = crate::embed::resolve(crate::embed::Asset::Kernel, cfg.build.kernel.as_deref())?;
+    // A compose `build:` service's RUN egress is the build phase — same `[egress.build]`
+    // policy and audit as the git-defined primary.
+    let (net, audit) = effective_build_egress(cfg, ctx)?;
     let build = crate::units::BuildOpts {
         // A compose unit's build args are its own (compose file / `.env`); there is no
         // executor-global build-arg channel.
@@ -763,6 +774,8 @@ fn build_compose_unit(
             password_file: cfg.build.cache_password_file.clone(),
             token_file: cfg.build.cache_token_file.clone(),
         },
+        net,
+        audit,
     };
     let ext4 = crate::units::build_unit_ext4(cfg.state_dir(), &build.build_args, unit)?;
     let config = crate::units::ensure_unit_build_sync(
@@ -1355,14 +1368,16 @@ fn spawn_switch(
         }
         _ => None,
     };
+    let (allow_ip, allow_name, restrict) = effective_run_egress(cfg, ctx)?;
     crate::switch::spawn(&crate::switch::Spawn {
         listen,
         gateway,
         prefix,
         hosts,
         reservations,
-        allow_ip: cfg.egress.allow_ip.clone(),
-        allow_name: effective_allow_names(cfg, ctx)?,
+        allow_ip,
+        allow_name,
+        restrict,
         registry_proxy,
         log: ctx.switch_log(),
         denied_log: Some(ctx.egress_denied_log()),
@@ -1371,38 +1386,134 @@ fn spawn_switch(
     .context("spawning the per-job switch")
 }
 
-/// The switch `--allow-name` list for this job: the host `[egress]` cap by default,
-/// or the job's `MICROVM_EGRESS_ALLOW_NAME` subset of it. The cap is host-only, so a
-/// job can restrict its own egress (least privilege) but never widen it.
-fn effective_allow_names(cfg: &crate::config::Config, ctx: &JobCtx) -> Result<Vec<String>> {
-    match &ctx.egress_allow_name_req {
-        None => Ok(cfg.egress.allow_name.clone()),
-        Some(req) => narrow_allow_names(&cfg.egress.allow_ip, &cfg.egress.allow_name, req),
-    }
+/// This job's effective run-phase switch egress: the host `[egress]` cap narrowed by the
+/// job's `MICROVM_EGRESS_ALLOW_IP` / `_ALLOW_NAME` requests, returned as `(allow_ip,
+/// allow_name, restrict)` for `switch::Spawn`. `restrict` is true when either dimension is
+/// configured, so an empty allowlist denies (see the switch's `--egress-restrict`).
+fn effective_run_egress(
+    cfg: &crate::config::Config,
+    ctx: &JobCtx,
+) -> Result<(Vec<String>, Vec<String>, bool)> {
+    let (ips, names) = effective_policy(
+        cfg.egress.allow_ip.as_deref(),
+        cfg.egress.allow_name.as_deref(),
+        ctx.egress_allow_ip_req.as_deref(),
+        ctx.egress_allow_name_req.as_deref(),
+        "MICROVM_EGRESS_ALLOW_IP",
+        "MICROVM_EGRESS_ALLOW_NAME",
+    )?;
+    let restrict = ips.is_some() || names.is_some();
+    Ok((ips.unwrap_or_default(), names.unwrap_or_default(), restrict))
 }
 
-/// Parse a space/comma separated `MICROVM_EGRESS_ALLOW_NAME` request and check each
-/// name falls within the host `[egress]` cap, using the switch's own suffix
-/// semantics. A name outside the cap is an error — the job cannot widen its egress.
+/// This job's effective build-phase egress ([`crate::build::BuildNet`]) plus its build-audit
+/// flag: the `[egress.build]` cap narrowed by `MICROVM_BUILD_EGRESS_ALLOW_IP` / `_ALLOW_NAME`.
+/// Both dimensions absent ⇒ `BuildNet::All` (unrestricted, as `docker build`); otherwise a
+/// restricted `BuildNet::Allow` whose empty lists deny.
+fn effective_build_egress(
+    cfg: &crate::config::Config,
+    ctx: &JobCtx,
+) -> Result<(crate::build::BuildNet, bool)> {
+    let (ips, names) = effective_policy(
+        cfg.egress.build.allow_ip.as_deref(),
+        cfg.egress.build.allow_name.as_deref(),
+        ctx.egress_build_allow_ip_req.as_deref(),
+        ctx.egress_build_allow_name_req.as_deref(),
+        "MICROVM_BUILD_EGRESS_ALLOW_IP",
+        "MICROVM_BUILD_EGRESS_ALLOW_NAME",
+    )?;
+    let net = match (ips, names) {
+        (None, None) => crate::build::BuildNet::All,
+        (ips, names) => crate::build::BuildNet::Allow {
+            ips: ips.unwrap_or_default(),
+            names: names.unwrap_or_default(),
+        },
+    };
+    Ok((net, ctx.egress_build_audit()))
+}
+
+/// Narrow a phase's `(allow_ip, allow_name)` config cap by the job's requests. Each
+/// dimension: an absent request keeps the config cap unchanged; a present request must fall
+/// within the cap (`narrow_ips`/`narrow_names`) and becomes the effective list. `None` in
+/// the result = that dimension is unconstrained; `Some(list)` = an allowlist (empty = deny).
 ///
-/// The check is against the *full* host policy `Egress::new(allow_ip, allow_name)`,
-/// not `allow_name` alone: the host egress is unrestricted only when both lists are
-/// empty (`Egress::AllowAll`). An empty `allow_name` with a non-empty `allow_ip`
-/// denies all names, so the job cannot add any — otherwise a job could append a name
-/// to an IP-only cap and widen its egress.
-fn narrow_allow_names(allow_ip: &[String], cap: &[String], req: &str) -> Result<Vec<String>> {
-    let requested: Vec<String> = req
-        .split([',', ' ', '\t', '\n'])
+/// Once *either* dimension is configured the phase is a restricted allowlist, so an absent
+/// sibling dimension denies its dimension rather than staying unconstrained — this matches
+/// enforcement (`restrict = ips.is_some() || names.is_some()`). Validating against that
+/// collapsed cap is a security boundary: without it a job could pass e.g. a
+/// `MICROVM_EGRESS_ALLOW_IP` against a name-only cap and widen its egress past the cap.
+#[allow(clippy::type_complexity)]
+fn effective_policy(
+    cap_ip: Option<&[String]>,
+    cap_name: Option<&[String]>,
+    ip_req: Option<&str>,
+    name_req: Option<&str>,
+    ip_var: &str,
+    name_var: &str,
+) -> Result<(Option<Vec<String>>, Option<Vec<String>>)> {
+    // A restricted phase denies an omitted dimension, so validate against that collapsed
+    // (deny-all) cap rather than treating the absent list as unconstrained.
+    let restricted = cap_ip.is_some() || cap_name.is_some();
+    let cap_ip = if restricted {
+        Some(cap_ip.unwrap_or(&[]))
+    } else {
+        cap_ip
+    };
+    let cap_name = if restricted {
+        Some(cap_name.unwrap_or(&[]))
+    } else {
+        cap_name
+    };
+
+    let ips = match ip_req {
+        Some(req) => Some(narrow_ips(cap_ip, req, ip_var)?),
+        None => cap_ip.map(<[String]>::to_vec),
+    };
+    let names = match name_req {
+        Some(req) => Some(narrow_names(cap_name, req, name_var)?),
+        None => cap_name.map(<[String]>::to_vec),
+    };
+    Ok((ips, names))
+}
+
+/// Split a space/comma/newline-separated job-variable list into non-empty items.
+fn split_req(req: &str) -> Vec<String> {
+    req.split([',', ' ', '\t', '\n'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .collect();
-    let policy = crate::switch::Egress::new(allow_ip, cap)?;
+        .collect()
+}
+
+/// Validate a job's requested DNS-name list against the config `cap` (`None` = unconstrained
+/// ⇒ the request defines the list freely; `Some(list)` ⇒ each request must be within a cap
+/// suffix, `Some([])` ⇒ none). A name outside the cap fails the job — it can narrow, not widen.
+fn narrow_names(cap: Option<&[String]>, req: &str, var: &str) -> Result<Vec<String>> {
+    let requested = split_req(req);
+    let policy = match cap {
+        None => crate::switch::Egress::AllowAll,
+        Some(c) => crate::switch::Egress::restricted(&[], c)?,
+    };
     for name in &requested {
         if !policy.allows_host(name) {
-            bail!(
-                "MICROVM_EGRESS_ALLOW_NAME {name:?} is not within the host [egress] allow_name cap"
-            );
+            bail!("{var} {name:?} is not within the configured allow_name cap");
+        }
+    }
+    Ok(requested)
+}
+
+/// Validate a job's requested IPv4 CIDR list against the config `cap` (`None` = unconstrained;
+/// `Some(list)` ⇒ each request must be a subset of some cap rule; `Some([])` ⇒ none). A CIDR
+/// outside the cap fails the job.
+fn narrow_ips(cap: Option<&[String]>, req: &str, var: &str) -> Result<Vec<String>> {
+    let requested = split_req(req);
+    let policy = match cap {
+        None => crate::switch::Egress::AllowAll,
+        Some(c) => crate::switch::Egress::restricted(c, &[])?,
+    };
+    for ip in &requested {
+        if !policy.contains_cidr(ip)? {
+            bail!("{var} {ip:?} is not within the configured allow_ip cap");
         }
     }
     Ok(requested)
@@ -1684,6 +1795,85 @@ mod tests {
     }
 
     #[test]
+    fn narrowing_honors_the_config_cap() {
+        // Unconstrained cap (None): the request defines the list freely.
+        assert_eq!(
+            narrow_names(None, "a.com, b.com", "V").unwrap(),
+            vec!["a.com".to_string(), "b.com".to_string()]
+        );
+        assert_eq!(
+            narrow_ips(None, "8.8.8.8/32", "V").unwrap(),
+            vec!["8.8.8.8/32".to_string()]
+        );
+
+        // Some(cap): within is accepted, outside fails, and an empty cap (deny-all) rejects any.
+        let cap = ["corp.example.com".to_string()];
+        assert!(narrow_names(Some(&cap), "api.corp.example.com", "V").is_ok());
+        assert!(narrow_names(Some(&cap), "evil.com", "V").is_err());
+        assert!(narrow_names(Some(&[]), "anything.com", "V").is_err());
+
+        let ipcap = ["10.0.0.0/8".to_string()];
+        assert!(narrow_ips(Some(&ipcap), "10.1.2.0/24", "V").is_ok());
+        assert!(narrow_ips(Some(&ipcap), "192.168.0.0/16", "V").is_err());
+        assert!(narrow_ips(Some(&[]), "10.0.0.0/8", "V").is_err());
+    }
+
+    #[test]
+    fn a_job_var_cannot_widen_the_omitted_dimension() {
+        // A name-only run cap denies all direct-IP egress, so an IP job var may add nothing:
+        // the job cannot escape the cap by populating the dimension the config left absent.
+        let mut cfg = Config::default();
+        cfg.egress.allow_name = Some(vec!["corp.example.com".into()]);
+        let mut c = JobCtx::new_for_job(cfg, "1".into()).unwrap();
+        c.egress_allow_ip_req = Some("8.8.8.8/32".into());
+        assert!(effective_run_egress(&c.cfg, &c).is_err());
+
+        // Symmetrically for the build phase: an IP-only cap denies names.
+        let mut cfg = Config::default();
+        cfg.egress.build.allow_ip = Some(vec!["10.0.0.0/8".into()]);
+        let mut c = JobCtx::new_for_job(cfg, "1".into()).unwrap();
+        c.egress_build_allow_name_req = Some("evil.com".into());
+        assert!(effective_build_egress(&c.cfg, &c).is_err());
+
+        // But with both dimensions absent (unrestricted / audit-to-discover) a job var still
+        // defines its dimension freely — the collapse only applies to a restricted phase.
+        let mut c = JobCtx::new_for_job(Config::default(), "1".into()).unwrap();
+        c.egress_allow_ip_req = Some("8.8.8.8/32".into());
+        let (ips, names, restrict) = effective_run_egress(&c.cfg, &c).unwrap();
+        assert_eq!(ips, vec!["8.8.8.8/32".to_string()]);
+        assert!(names.is_empty() && restrict);
+    }
+
+    #[test]
+    fn effective_build_egress_maps_config_and_job_vars() {
+        // Absent [egress.build] => unrestricted (BuildNet::All), audit off.
+        let mut cfg = Config::default();
+        let c = JobCtx::new_for_job(cfg, "1".into()).unwrap();
+        let (net, audit) = effective_build_egress(&c.cfg, &c).unwrap();
+        assert!(matches!(net, crate::build::BuildNet::All) && !audit);
+
+        // Configured allow_name (+ audit) => restricted Allow, audit on. A job var narrows it.
+        cfg = Config::default();
+        cfg.egress.build.allow_name = Some(vec!["crates.io".into(), "pypi.org".into()]);
+        cfg.egress.build.audit = true;
+        let mut c = JobCtx::new_for_job(cfg, "1".into()).unwrap();
+        c.egress_build_allow_name_req = Some("crates.io".into());
+        let (net, audit) = effective_build_egress(&c.cfg, &c).unwrap();
+        match net {
+            crate::build::BuildNet::Allow { names, ips } => {
+                assert_eq!(names, vec!["crates.io".to_string()]);
+                assert!(ips.is_empty());
+            }
+            other => panic!("expected Allow, got {other:?}"),
+        }
+        assert!(audit);
+
+        // A job var outside the cap fails the job.
+        c.egress_build_allow_name_req = Some("evil.com".into());
+        assert!(effective_build_egress(&c.cfg, &c).is_err());
+    }
+
+    #[test]
     fn checkout_virtiofs_cmdline_pins_the_agent_contract() {
         assert_eq!(
             checkout_virtiofs_cmdline("/builds/grp/proj", false),
@@ -1801,31 +1991,6 @@ mod tests {
         assert!(vm_size(&ctx(Some("0"), None)).is_err());
         assert!(vm_size(&ctx(None, Some("64"))).is_err());
         assert!(vm_size(&ctx(None, Some("4096M"))).is_err());
-    }
-
-    #[test]
-    fn per_job_allow_name_narrows_within_cap() {
-        let cap = vec!["corp.example.com".to_string(), "github.com".to_string()];
-        // a subset (exact + under a suffix) is accepted, returned as the job's set
-        assert_eq!(
-            narrow_allow_names(&[], &cap, "gitlab.corp.example.com, github.com").unwrap(),
-            vec![
-                "gitlab.corp.example.com".to_string(),
-                "github.com".to_string()
-            ]
-        );
-        // a name outside the cap fails the job (no widening)
-        assert!(narrow_allow_names(&[], &cap, "pypi.org").is_err());
-        assert!(narrow_allow_names(&[], &cap, "gitlab.corp.example.com pypi.org").is_err());
-        // both caps empty = unrestricted host egress (AllowAll), so any name is within it
-        assert_eq!(
-            narrow_allow_names(&[], &[], "anything.example").unwrap(),
-            vec!["anything.example".to_string()]
-        );
-        // an IP-only cap (allow_ip set, allow_name empty) allows NO names: the host
-        // permits no name egress, so a job cannot add one and widen past the cap.
-        let ip_cap = vec!["10.0.0.0/8".to_string()];
-        assert!(narrow_allow_names(&ip_cap, &[], "evil.example").is_err());
     }
 
     #[test]
