@@ -396,20 +396,22 @@ pub fn boot_unit(
             format!(
                 "console=ttyS0 pci=conf1 VIRTKIT_PIVOT=/dev/vda \
                  VIRTKIT_VSOCK_PORT={VSOCK_PORT} VIRTKIT_HOSTNAME={} \
-                 VIRTKIT_NET_PORT={net_port} VIRTKIT_VM_IP={} VIRTKIT_VM_DNS={gateway}{handoff_frag}",
+                 VIRTKIT_NET_PORT={net_port} VIRTKIT_VM_IP={} VIRTKIT_VM_GW={gateway} \
+                 VIRTKIT_VM_DNS={gateway}{handoff_frag}",
                 svc.hostname, svc.ip
             )
         } else {
             // Default agent-service boot: the agent stays PID 1 and forks the unit's
-            // entrypoint (VIRTKIT_MODE=service). Static address + the gateway as
-            // resolver (its DNS answers the service names and forwards the rest), so
-            // the unit resolves siblings without /etc/hosts. VIRTKIT_SERVE=1 brings up
-            // the vsock exec server (on VSOCK_PORT) so prepare can poll readiness.
+            // entrypoint (VIRTKIT_MODE=service). Static address, the switch gateway as
+            // both default route and resolver (its DNS answers the service names and
+            // forwards the rest), so the unit resolves siblings without /etc/hosts and
+            // can reach off-subnet hosts. VIRTKIT_SERVE=1 brings up the vsock exec
+            // server (on VSOCK_PORT) so prepare can poll readiness.
             format!(
                 "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda VIRTKIT_MODE=service \
                  VIRTKIT_SERVE=1 VIRTKIT_VSOCK_PORT={VSOCK_PORT} \
                  VIRTKIT_HOSTNAME={} VIRTKIT_NET_PORT={net_port} \
-                 VIRTKIT_VM_IP={} VIRTKIT_VM_DNS={gateway}",
+                 VIRTKIT_VM_IP={} VIRTKIT_VM_GW={gateway} VIRTKIT_VM_DNS={gateway}",
                 svc.hostname, svc.ip
             )
         };

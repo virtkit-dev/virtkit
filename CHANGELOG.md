@@ -28,6 +28,9 @@ All notable changes to virtkit will be documented in this file.
 - A `services:` container now counts as ready only once it accepts connections on the ports its
   image exposes, not merely once its guest has booted, so a job no longer races a service that
   is still initializing.
+- Compose service VMs on a switch subnet other than the default can now reach off-subnet hosts;
+  they were booted without a gateway and fell back to an off-link default route that failed to
+  install.
 
 ## [0.22.0] - 2026-07-22
 
