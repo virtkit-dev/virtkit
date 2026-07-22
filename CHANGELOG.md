@@ -9,6 +9,8 @@ All notable changes to virtkit will be documented in this file.
 - Boot and concurrent-lock progress lines now name the image ref being booted and the operation
   (pull vs build) with a human-readable image or service name, instead of a bare `build` literal
   and a build fingerprint.
+- The job trace no longer echoes git's own fetch/clone transfer summary for the host checkout;
+  virtkit's `host checkout of <sha>` line stands in for it.
 - The host checkout no longer spills git's orphan-commit warning ("leaving N commits behind")
   into the job trace when it moves to a force-pushed ref.
 

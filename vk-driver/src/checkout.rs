@@ -59,6 +59,7 @@ pub fn ensure(url: &str, ref_name: &str, sha: &str, dest: &Path) -> Result<()> {
         run(
             Command::new("git").args([
                 "clone",
+                "--quiet",
                 "--no-checkout",
                 "--filter=blob:none",
                 "--",
@@ -73,13 +74,15 @@ pub fn ensure(url: &str, ref_name: &str, sha: &str, dest: &Path) -> Result<()> {
     std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("securing {}", dest.display()))?;
     // Fetch the ref tip so `sha` is reachable, then detach onto exactly that commit. `--`
-    // guards a ref that begins with '-'; `sha` is validated hex above.
+    // guards a ref that begins with '-'; `sha` is validated hex above. `--quiet` drops git's
+    // transfer summary (the "From <url>" / "forced update" block) from the job trace —
+    // virtkit already prints its own `host checkout of <sha>` line.
     if ref_name.is_empty() {
-        git(dest, &["fetch", "--prune", "origin"], "fetch")?;
+        git(dest, &["fetch", "--quiet", "--prune", "origin"], "fetch")?;
     } else {
         git(
             dest,
-            &["fetch", "--prune", "origin", "--", ref_name],
+            &["fetch", "--quiet", "--prune", "origin", "--", ref_name],
             "fetch",
         )?;
     }
