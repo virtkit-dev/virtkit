@@ -741,7 +741,12 @@ async fn handle_dns(
     let response = if let Some(r) = local_answer(&query, &hosts) {
         Some(r) // service name: on-subnet, not subject to egress pinning
     } else if let Some((name, _qtype, qend)) = parse_question(&query) {
-        if egress.name_allowed(&name) {
+        if is_reverse_dns(&name) {
+            // A PTR lookup resolves an IP to a name; it never opens a flow, so it
+            // needn't be allowlisted. Forward it without pinning (its answer is a
+            // name, not an A-record to admit for egress).
+            forward_upstream(&query, upstream).await
+        } else if egress.name_allowed(&name) {
             // forward, then pin the A-records so the guest's connection is allowed
             let resp = forward_upstream(&query, upstream).await;
             if let Some(r) = &resp {
@@ -804,6 +809,12 @@ fn dns_query(ip: &[u8], gateway: Ipv4Addr) -> Option<(u16, &[u8])> {
         return None;
     }
     Some((u16::from_be_bytes([udp[0], udp[1]]), udp.get(8..)?))
+}
+
+/// A reverse-DNS (PTR) query name — IPv4 `*.in-addr.arpa` or IPv6 `*.ip6.arpa`.
+/// `name` is already lowercased and stripped of any trailing dot by `parse_question`.
+fn is_reverse_dns(name: &str) -> bool {
+    name.ends_with(".in-addr.arpa") || name.ends_with(".ip6.arpa")
 }
 
 /// Parse the first DNS question: lowercased name, qtype, and the byte offset just
@@ -1625,6 +1636,21 @@ mod tests {
         assert_eq!(u16::from_be_bytes([aaaa[6], aaaa[7]]), 0); // ANCOUNT 0
         // unknown name -> not answered locally (caller forwards upstream)
         assert!(local_answer(&dns_question(3, "github.com", 1), &hosts).is_none());
+    }
+
+    #[test]
+    fn reverse_dns_is_recognized() {
+        // PTR names are forwarded regardless of the allowlist (they open no flow).
+        assert!(is_reverse_dns("68.1.10.10.in-addr.arpa"));
+        assert!(is_reverse_dns(
+            "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa"
+        ));
+        // forward names are not reverse lookups
+        assert!(!is_reverse_dns("repo.maven.apache.org"));
+        assert!(!is_reverse_dns("in-addr.arpa.evil.com"));
+        // the bare zone (no address label) is not a PTR query
+        assert!(!is_reverse_dns("in-addr.arpa"));
+        assert!(!is_reverse_dns("ip6.arpa"));
     }
 
     #[test]
