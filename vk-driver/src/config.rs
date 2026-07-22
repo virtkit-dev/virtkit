@@ -207,6 +207,12 @@ pub struct Egress {
     /// Allowed DNS name suffixes, dot-anchored (e.g. `corp.example.com` also
     /// allows `*.corp.example.com`).
     pub allow_name: Vec<String>,
+    /// Audit mode: record every external domain each job's guest resolves and print the
+    /// per-job "domains contacted" summary into the job trace. Independent of the
+    /// allowlist — with both lists empty (unrestricted egress) it observes without
+    /// blocking, so a job can discover the allowlist it needs. A job may also opt in
+    /// per-run with the `MICROVM_EGRESS_AUDIT` variable.
+    pub audit: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

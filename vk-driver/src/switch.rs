@@ -195,6 +195,10 @@ struct EgressGuard {
     /// Where denials are appended as typed records for the job trace (see egress_report).
     /// `None` = don't record (dev `vk run`, or an unrestricted policy that denies nothing).
     denied_log: Option<PathBuf>,
+    /// Audit mode: where every allowed external domain the guest resolves is appended for
+    /// the end-of-job "domains contacted" summary (see egress_report). `None` = audit off.
+    /// Independent of the allowlist — an unrestricted policy still records every contact.
+    audit_log: Option<PathBuf>,
 }
 
 impl EgressGuard {
@@ -205,6 +209,7 @@ impl EgressGuard {
             pinned: Mutex::new(HashMap::new()),
             registry_proxy: None,
             denied_log: None,
+            audit_log: None,
         }
     }
     fn with_registry_proxy(mut self, redirect: Option<(Ipv4Addr, SocketAddr)>) -> Self {
@@ -215,11 +220,22 @@ impl EgressGuard {
         self.denied_log = path;
         self
     }
+    fn with_audit_log(mut self, path: Option<PathBuf>) -> Self {
+        self.audit_log = path;
+        self
+    }
     /// Record a refused flow to the denial channel for the job trace to surface. Paired
     /// with the switch's own `eprintln!` operator log at each call site.
     fn record_denial(&self, proto: crate::egress_report::Proto, target: &str) {
         if let Some(path) = &self.denied_log {
             crate::egress_report::append(path, proto, target);
+        }
+    }
+    /// Record an allowed external domain the guest resolved to the audit channel, for the
+    /// end-of-job "domains contacted" summary. No-op when audit is off.
+    fn record_contact(&self, name: &str) {
+        if let Some(path) = &self.audit_log {
+            crate::egress_report::append_contact(path, name);
         }
     }
     fn restricted(&self) -> bool {
@@ -343,6 +359,9 @@ pub struct Spawn {
     /// Where the switch appends typed egress-denial records for the job trace (see
     /// egress_report). `None` = don't record (dev `vk run`).
     pub denied_log: Option<PathBuf>,
+    /// Audit mode: where the switch appends every allowed external domain the guest
+    /// resolves, for the end-of-job "domains contacted" summary. `None` = audit off.
+    pub audit_log: Option<PathBuf>,
 }
 
 /// Spawn the switch as a tied child of this process (this binary's `switch`
@@ -385,6 +404,9 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
     if let Some(denied) = &opts.denied_log {
         cmd.arg("--denied-log").arg(denied);
     }
+    if let Some(audit) = &opts.audit_log {
+        cmd.arg("--audit-log").arg(audit);
+    }
     cmd.stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -413,6 +435,7 @@ pub async fn run(
     egress: Egress,
     registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
     denied_log: Option<PathBuf>,
+    audit_log: Option<PathBuf>,
 ) -> Result<()> {
     if listen.is_empty() {
         bail!("switch: at least one --listen is required");
@@ -431,10 +454,12 @@ pub async fn run(
             tx: ret_tx,
         },
     );
+    let audit = audit_log.is_some();
     let guard = Arc::new(
         EgressGuard::new(egress, gateway)
             .with_registry_proxy(registry_proxy)
-            .with_denied_log(denied_log),
+            .with_denied_log(denied_log)
+            .with_audit_log(audit_log),
     );
     let restricted = guard.restricted();
     tokio::spawn(accept_loop(ip_stack, guard.clone()));
@@ -473,10 +498,11 @@ pub async fn run(
         sw.hosts.len(),
         sw.inner.lock().unwrap().reservations.len(),
         upstream,
-        if restricted {
-            "allowlist"
-        } else {
-            "unrestricted"
+        match (restricted, audit) {
+            (true, true) => "allowlist + audit",
+            (true, false) => "allowlist",
+            (false, true) => "unrestricted + audit",
+            (false, false) => "unrestricted",
         },
     );
     let mut accepts = Vec::new();
@@ -771,15 +797,22 @@ async fn handle_dns(
     tx: UnboundedSender<Vec<u8>>,
     egress: Arc<EgressGuard>,
 ) {
+    const TYPE_A: u16 = 1;
     let response = if let Some(r) = local_answer(&query, &hosts) {
         Some(r) // service name: on-subnet, not subject to egress pinning
-    } else if let Some((name, _qtype, qend)) = parse_question(&query) {
+    } else if let Some((name, qtype, qend)) = parse_question(&query) {
         if is_reverse_dns(&name) {
             // A PTR lookup resolves an IP to a name; it never opens a flow, so it
             // needn't be allowlisted. Forward it without pinning (its answer is a
             // name, not an A-record to admit for egress).
             forward_upstream(&query, upstream).await
         } else if egress.name_allowed(&name) {
+            // Audit: count the guest's A-record lookups as its external contacts (egress
+            // is IPv4, so an A query is what precedes a connection); the paired AAAA query
+            // for the same name is not double-counted.
+            if qtype == TYPE_A {
+                egress.record_contact(&name);
+            }
             // forward, then pin the A-records so the guest's connection is allowed
             let resp = forward_upstream(&query, upstream).await;
             if let Some(r) = &resp {
@@ -1602,6 +1635,7 @@ mod tests {
                 HashMap::new(),
                 HashMap::new(),
                 Egress::AllowAll,
+                None,
                 None,
                 None,
             )

@@ -391,6 +391,10 @@ pub struct MicroVm {
     timings: Arc<Timings>,
     /// egress policy for the stage guests (no network / unrestricted / allowlist).
     net: crate::build::BuildNet,
+    /// audit mode (`--build-audit-egress`): the shared channel every stage switch appends the
+    /// external domains its RUNs resolve to, drained into the post-build summary. `None` =
+    /// off. All workers share this one path (they share `scratch`).
+    audit_log: Option<PathBuf>,
     /// source-stage ext4s available to attach read-only to this stage's guest, in the
     /// first-use order computed by the driver. A boot attaches only a budget-sized subset.
     sources: Vec<(String, PathBuf)>,
@@ -860,6 +864,7 @@ impl MicroVm {
         net: crate::build::BuildNet,
         debug: bool,
         tmp_disk_enabled: bool,
+        audit_log: Option<PathBuf>,
         timings: Arc<Timings>,
     ) -> Self {
         MicroVm {
@@ -887,6 +892,7 @@ impl MicroVm {
             journal,
             timings,
             net,
+            audit_log,
             sources: Vec::new(),
             source_dev: HashMap::new(),
             tmp_disk_enabled,
@@ -954,6 +960,7 @@ impl MicroVm {
             journal: self.journal,
             timings: Arc::clone(&self.timings),
             net: self.net.clone(),
+            audit_log: self.audit_log.clone(),
             session: None,
             stage_image_kernel: false,
             image_kernel_boot: None,
@@ -1135,6 +1142,7 @@ impl MicroVm {
             scratch_disk.as_deref(),
             image_kernel,
             self.out_disk.as_deref(),
+            self.audit_log.as_deref(),
             self.cancel.clone(),
             &self.timings,
         ))?;

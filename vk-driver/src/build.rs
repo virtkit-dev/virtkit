@@ -230,6 +230,10 @@ pub struct Options {
     pub build_args: Vec<(String, String)>,
     /// Egress for the microVM build's `RUN` guests (see [`BuildNet`]).
     pub net: BuildNet,
+    /// Audit mode (`--build-audit-egress`): record every external domain the build's `RUN`
+    /// steps resolve and print a "domains contacted" summary after the build. Observes only
+    /// — egress is still governed by `net`.
+    pub audit: bool,
     /// Restores from the instruction cache are allowed, but nothing may actually
     /// build: any stage whose final snapshot is not cached aborts the build with a
     /// [`NotCached`] error (exit 3 at the CLI), so a caller can branch on
@@ -550,6 +554,9 @@ fn make_microvm(
         opts.net.clone(),
         opts.debug,
         !opts.tmp_tmpfs,
+        // Audit channel shared across the build's parallel stage switches (all workers
+        // share `scratch`); the summary is drained once the build finishes.
+        opts.audit.then(|| scratch.join(crate::run::AUDIT_LOG)),
         Arc::clone(timings),
     ))
 }
@@ -699,6 +706,16 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     // Leave the final dashboard frame on screen (FINISHED/FAILED) before any teardown log.
     progress.finish(result.is_ok());
     timings.render();
+    // `--build-audit-egress`: the domains the build's RUN steps contacted (read before the
+    // scratch, which holds the audit channel, is removed). After the dashboard froze, so it is
+    // safe to print. "during the build" distinguishes it from a `vk run` guest summary. A
+    // no-op when audit was off.
+    if let Some(summary) = crate::egress_report::contacts_summary(
+        &scratch.join(crate::run::AUDIT_LOG),
+        "external domains contacted during the build (audit)",
+    ) {
+        eprintln!("{summary}");
+    }
     let _ = std::fs::remove_dir_all(&scratch); // best-effort scratch cleanup
     let built = result?;
     let srcs = inputs
@@ -1019,6 +1036,16 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
     // Leave the final dashboard frame on screen before any teardown log.
     progress.finish(result.is_ok());
     timings.render();
+    // `--build-audit-egress`: the domains the build's RUN steps contacted (read before the
+    // scratch, which holds the audit channel, is removed). After the dashboard froze, so it is
+    // safe to print. "during the build" distinguishes it from a `vk run` guest summary. A
+    // no-op when audit was off.
+    if let Some(summary) = crate::egress_report::contacts_summary(
+        &scratch.join(crate::run::AUDIT_LOG),
+        "external domains contacted during the build (audit)",
+    ) {
+        eprintln!("{summary}");
+    }
     let _ = std::fs::remove_dir_all(&scratch); // best-effort scratch cleanup
     let built = result?;
     for u in &units {
@@ -3700,6 +3727,7 @@ ENTRYPOINT run me
             tmp_tmpfs: false,
             build_args: vec![],
             net: BuildNet::None,
+            audit: false,
             require_cached: false,
             build_jobs: None,
             debug: false,
@@ -3760,6 +3788,7 @@ ENTRYPOINT run me
             tmp_tmpfs: false,
             build_args: vec![],
             net: BuildNet::None, // host backend: no RUN guests, no network
+            audit: false,
             require_cached: false,
             build_jobs: None,
             debug: false,
@@ -3969,6 +3998,7 @@ RUN ship
             tmp_tmpfs: false,
             build_args: vec![],
             net: BuildNet::All,
+            audit: false,
             require_cached: false,
             build_jobs: j,
             debug: false,

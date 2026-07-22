@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Egress audit mode**: the switch records every external domain a guest resolves and
+  prints a "domains contacted" summary, letting a job observe its egress — with or without an
+  allowlist — to discover the allowlist it needs. Enable it in CI with `[egress] audit` (or
+  the `MICROVM_EGRESS_AUDIT` job variable), or on the command line with `vk run --audit-egress`
+  for the booted guest and `--build-audit-egress` (on `vk run` and `vk build`) for a build's
+  `RUN` steps.
+
 ## [0.23.0] - 2026-07-22
 
 ### Added

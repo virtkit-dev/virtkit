@@ -74,6 +74,11 @@ const GUEST_AGENT: &str = "/proc/self/exe";
 /// Guest mountpoint of a `--workdir` host-dir share (the live tree the command runs in).
 const WORKDIR_MOUNT: &str = "/work";
 
+/// Audit-mode channel filename in a switch's work dir (or the build scratch): the switch
+/// appends every external domain the guest resolves, the caller prints the summary at the
+/// end (see egress_report). Same basename the gitlab executor uses in the job dir.
+pub(crate) const AUDIT_LOG: &str = "egress-audit.log";
+
 /// Where a `run <image>` rootfs comes from.
 #[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
 pub enum SourceMode {
@@ -147,6 +152,14 @@ pub struct RunArgs {
     /// give the guest egress via a userspace `vk switch` (DHCP + DNS + proxy);
     /// forced on by `compose` (the services live on that switch's LAN)
     pub net: bool,
+    /// `--audit-egress`: record every external domain the *booted guest* resolves and print
+    /// a "domains contacted" summary (with per-domain counts) when the run ends. Requires
+    /// `net` (the switch is the resolver); observes without restricting egress.
+    pub audit_egress: bool,
+    /// `--build-audit-egress`: audit the `-f`/`--compose` *build*'s `RUN` egress instead of
+    /// (or as well as) the booted guest — the build-phase counterpart of `audit_egress`,
+    /// mirroring `--net` vs `--build-net`. Unused for a plain image boot (no build).
+    pub build_audit_egress: bool,
     /// opt-in credential-injecting registry proxy: the upstream registry base URL
     /// (`scheme://host`). `vk` runs a host-local proxy forwarding to it with the
     /// `--username`/`--password`/`--ca` credentials, and the guest reaches it
@@ -594,6 +607,9 @@ async fn build_and_boot(
             tmp_tmpfs: false,
             build_args: args.build_args.clone(),
             net: args.build_net.clone(),
+            // `--build-audit-egress` audits this `-f` build's RUN egress; `--audit-egress`
+            // (handled below) audits the booted guest — the same split as --net/--build-net.
+            audit: args.build_audit_egress,
             require_cached: args.require_cached,
             build_jobs: cfg.build.jobs,
             debug: false,
@@ -982,6 +998,7 @@ async fn build_and_boot(
             &hosts,
             &planned.reservations,
             registry_proxy,
+            args.audit_egress.then(|| work.join(AUDIT_LOG)),
         )
         .await?;
         cmdline.push_str(&frag);
@@ -1348,6 +1365,15 @@ async fn build_and_boot(
         &mut ssh_forward,
         &mut host_exec_serve,
     );
+    // Audit summary (`--audit-egress`): the switch is stopped, so its channel is complete. A
+    // no-op when audit was off (no channel written). The guest phase — a `-f` build's own
+    // `--build-audit-egress` summary already printed after the build, above.
+    if let Some(summary) = crate::egress_report::contacts_summary(
+        &work.join(AUDIT_LOG),
+        "external domains contacted (audit)",
+    ) {
+        eprintln!("{summary}");
+    }
     timings.render();
     result
 }
@@ -1611,6 +1637,7 @@ async fn compose_up(
         &planned.hosts,
         &planned.reservations,
         None,
+        args.audit_egress.then(|| work.join(AUDIT_LOG)),
     )
     .await?;
 
@@ -1651,6 +1678,12 @@ async fn compose_up(
     mgr.stop_all();
     let _ = switch.kill();
     let _ = switch.wait();
+    if let Some(summary) = crate::egress_report::contacts_summary(
+        &work.join(AUDIT_LOG),
+        "external domains contacted (audit)",
+    ) {
+        eprintln!("{summary}");
+    }
     Ok(())
 }
 
@@ -1696,6 +1729,7 @@ pub(crate) fn service_build_options(
         tmp_tmpfs: false,
         build_args: args.build_args.clone(),
         net: args.build_net.clone(),
+        audit: args.build_audit_egress,
         require_cached: args.require_cached,
         build_jobs: None,
         debug: false,
@@ -2355,6 +2389,7 @@ async fn spawn_vm_switch(
     hosts: &[(String, String)],
     reservations: &[(String, String)],
     registry_proxy: Option<(std::net::Ipv4Addr, std::net::SocketAddr)>,
+    audit_log: Option<PathBuf>,
 ) -> Result<(Child, String)> {
     let (gw, prefix, guest_ip) = crate::net::switch_addrs(RUN_SUBNET)?;
     let mut listen = vsock.to_path_buf().into_os_string();
@@ -2374,6 +2409,9 @@ async fn spawn_vm_switch(
         // Dev `vk run` has no gitlab job trace to surface denials into; the switch's own
         // log (eprintln) is enough interactively.
         denied_log: None,
+        // Audit mode (`--audit-egress` / `--build-audit-egress`) records every external
+        // domain the guest resolves; the caller prints the summary when the run/build ends.
+        audit_log,
     })?;
     let frag = format!(
         " VIRTKIT_NET_PORT={net_port} VIRTKIT_VM_IP={guest_ip}/{prefix} \
@@ -2450,6 +2488,10 @@ pub(crate) async fn boot_session(
     // after the rootfs, so it is always `/dev/vdb` for the stage's RUNs (sources follow at
     // `vdc`+). Not snapshotted; the caller owns its lifecycle.
     out_disk: Option<&Path>,
+    // `Some(path)` → audit mode (`--build-audit-egress`): the build's switch appends every
+    // external domain a `RUN` step resolves here (a channel shared across the build's stages),
+    // for the post-build "domains contacted" summary. `None` = no audit.
+    audit_log: Option<&Path>,
     cancel: Option<CancellationToken>,
     timings: &Timings,
 ) -> Result<VmSession> {
@@ -2600,6 +2642,7 @@ pub(crate) async fn boot_session(
             &[],
             &[],
             None,
+            audit_log.map(Path::to_path_buf),
         )
         .await?;
         switch = Some(child);
@@ -3237,6 +3280,7 @@ mod tests {
                 None, // scratch_disk
                 None, // image_kernel (--kernel=image)
                 None, // out_disk (--disk)
+                None, // audit_log
                 None, // cancel
                 &Timings::new(),
             )

@@ -1366,6 +1366,7 @@ fn spawn_switch(
         registry_proxy,
         log: ctx.switch_log(),
         denied_log: Some(ctx.egress_denied_log()),
+        audit_log: ctx.egress_audit().then(|| ctx.egress_audit_log()),
     })
     .context("spawning the per-job switch")
 }

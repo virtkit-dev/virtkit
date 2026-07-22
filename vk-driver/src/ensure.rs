@@ -112,6 +112,7 @@ pub fn ensure_unit_build(
         // unrestricted RUN egress, like `docker build` (and `vk build`'s default) —
         // service stages install packages.
         net: crate::build::BuildNet::All,
+        audit: false,
         require_cached: false,
         build_jobs: None,
         debug: false,

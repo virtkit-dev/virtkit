@@ -69,6 +69,69 @@ pub fn append(path: &Path, proto: Proto, target: &str) {
     }
 }
 
+/// Append one contacted external domain to the audit channel `path` (create-or-append).
+/// Audit mode (see switch's `EgressGuard`) records every allowed external name the guest
+/// resolves; unlike the denial channel this is a plain one-name-per-line file, drained
+/// once at the end of the job rather than per stage. The `name` is a guest-controlled DNS
+/// name, so — like `append` — control characters are neutralized to `U+FFFD` (no forged or
+/// torn lines in the summary) and the record is one `write_all`, so concurrent stage
+/// switches sharing a build's channel never interleave fragments. Best-effort: IO errors
+/// are dropped, exactly like `append`.
+pub fn append_contact(path: &Path, name: &str) {
+    let name: String = name
+        .chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect();
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(format!("{name}\n").as_bytes());
+    }
+}
+
+/// Read the audit channel `path` and return each contacted domain paired with its contact
+/// count, ordered most-contacted first (ties broken by name) for a stable job-trace summary.
+/// A missing file (audit off, or the switch recorded nothing) yields an empty list. Unlike
+/// the denial channel there is no offset: the whole file is one job's contacts, read once.
+pub fn read_contacts(path: &Path) -> Vec<(String, usize)> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for name in text.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        *counts.entry(name).or_default() += 1;
+    }
+    let mut counts: Vec<(String, usize)> = counts
+        .into_iter()
+        .map(|(n, c)| (n.to_string(), c))
+        .collect();
+    counts.sort_by(|(an, ac), (bn, bc)| bc.cmp(ac).then_with(|| an.cmp(bn)));
+    counts
+}
+
+/// Format the audit channel at `path` as a "domains contacted" block for a trace: the line
+/// `virtkit: {header}:` followed by one indented `name (xN)` line per domain, counts aligned,
+/// most-contacted first. `None` when audit recorded nothing, so the caller prints nothing.
+/// `header` names the phase (e.g. `external domains contacted (audit)`), letting a `vk run`
+/// that both builds and boots distinguish its build-phase summary from the guest one.
+/// Shared by the gitlab executor, `vk run`, and `vk build` so every surface reads identically.
+pub fn contacts_summary(path: &Path, header: &str) -> Option<String> {
+    let contacts = read_contacts(path);
+    if contacts.is_empty() {
+        return None;
+    }
+    // Char count, not byte length: the `{:<width$}` padding below measures in chars, so a
+    // multibyte name (e.g. a sanitized `U+FFFD`) would misalign the count column otherwise.
+    let width = contacts
+        .iter()
+        .map(|(n, _)| n.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut s = format!("virtkit: {header}:");
+    for (name, count) in &contacts {
+        s.push_str(&format!("\n  {name:<width$}  (x{count})"));
+    }
+    Some(s)
+}
+
 /// Read the denials appended to `path` since byte `offset`, returning them with the new
 /// offset to persist. Only whole lines are consumed — a partial trailing line (the writer
 /// mid-append) is left for next time, so a record is never torn. A file shorter than
@@ -151,6 +214,67 @@ mod tests {
             }]
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contacts_are_counted_and_ranked() {
+        let dir = std::env::temp_dir().join(format!("vk-egress-audit-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("egress-audit.log");
+        let _ = std::fs::remove_file(&path);
+
+        // Missing file: no contacts.
+        assert_eq!(read_contacts(&path), Vec::<(String, usize)>::new());
+
+        for name in [
+            "crates.io",
+            "github.com",
+            "crates.io",
+            "crates.io",
+            "github.com",
+        ] {
+            append_contact(&path, name);
+        }
+        // Most-contacted first; equal counts fall back to name order.
+        assert_eq!(
+            read_contacts(&path),
+            vec![("crates.io".into(), 3), ("github.com".into(), 2)]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_sanitizes_control_chars_and_formats_summary() {
+        let dir = std::env::temp_dir().join(format!("vk-egress-audit-fmt-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("egress-audit.log");
+        let _ = std::fs::remove_file(&path);
+
+        // Missing file: no summary to print.
+        assert_eq!(contacts_summary(&path, "domains contacted (audit)"), None);
+
+        // A guest DNS name smuggling a newline, trying to forge a second summary line: the
+        // control char must be neutralized so it stays one record.
+        append_contact(&path, "evil\nforged.example.com");
+        assert_eq!(
+            read_contacts(&path),
+            vec![("evil\u{fffd}forged.example.com".into(), 1)]
+        );
+
+        append_contact(&path, "crates.io");
+        append_contact(&path, "crates.io");
+        let summary = contacts_summary(&path, "domains contacted (audit)").unwrap();
+        let lines: Vec<&str> = summary.lines().collect();
+        // Header, then one line per domain, most-contacted first.
+        assert_eq!(lines[0], "virtkit: domains contacted (audit):");
+        assert!(lines[1].starts_with("  crates.io") && lines[1].ends_with("(x2)"));
+        assert!(
+            lines[2].starts_with("  evil\u{fffd}forged.example.com") && lines[2].ends_with("(x1)")
+        );
+        // The count column is aligned: both `(xN)` markers start at the same char offset.
+        let marker_col = |l: &str| l.chars().count() - "(xN)".chars().count();
+        assert_eq!(marker_col(lines[1]), marker_col(lines[2]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

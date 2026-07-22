@@ -117,7 +117,8 @@ enum GitlabCmd {
     /// run_exec: run one stage script inside the VM
     Run {
         script: PathBuf,
-        /// Stage name (prepare_script, get_sources, build_script, ...), unused
+        /// Stage name (prepare_script, get_sources, build_script, ...). Used to emit the
+        /// egress audit summary once, on the final stage (see executor::run_stage).
         stage: Option<String>,
     },
     /// cleanup_exec: stop the VM and remove the job state (idempotent)
@@ -378,6 +379,10 @@ enum Cmd {
         /// (repeatable; any --build-allow-* flag turns filtering on)
         #[arg(long = "build-allow-name", value_name = "SUFFIX")]
         build_allow_name: Vec<String>,
+        /// audit egress: list every external domain the build's RUN steps contact (and how
+        /// many times) after the build. Observes only — it does not restrict egress
+        #[arg(long = "build-audit-egress")]
+        build_audit_egress: bool,
         /// restores from the instruction cache are allowed, but nothing may build:
         /// a cache miss aborts with exit code 3, so scripts can branch
         /// cached-vs-cold without paying for a build
@@ -514,6 +519,11 @@ enum Cmd {
         /// (set internally by the gitlab executor; see egress_report).
         #[arg(long = "denied-log", value_name = "PATH")]
         denied_log: Option<PathBuf>,
+        /// audit mode: append every allowed external domain the guest resolves here, for
+        /// the end-of-job "domains contacted" summary (set internally by the gitlab
+        /// executor; see egress_report).
+        #[arg(long = "audit-log", value_name = "PATH")]
+        audit_log: Option<PathBuf>,
     },
     /// Run a docker/OCI image as a microVM — boot it from a native ext4 disk
     /// (or a cpio initramfs in RAM with --ram), virtkit-agent as PID 1 over vsock, and
@@ -627,6 +637,15 @@ enum Cmd {
         /// (DHCP + DNS + transparent proxy over vsock)
         #[arg(long)]
         net: bool,
+        /// audit the booted guest's egress: list every external domain it contacts (and how
+        /// many times) when the run ends. Observes only — it does not restrict egress.
+        /// Requires --net (or --compose).
+        #[arg(long = "audit-egress")]
+        audit_egress: bool,
+        /// audit the `-f`/`--compose` build's RUN egress (the build-phase counterpart of
+        /// --audit-egress, like --build-net to --net). Prints after the build; observes only.
+        #[arg(long = "build-audit-egress")]
+        build_audit_egress: bool,
         /// Run a host-local credential-injecting registry proxy forwarding to this
         /// upstream registry base URL (scheme://host); the guest reaches it
         /// credential-free at `registry.vk`, injecting `--username`/`--password`/`--ca`.
@@ -1300,6 +1319,8 @@ async fn cli_main() -> ExitCode {
         shell,
         tty,
         net,
+        audit_egress,
+        build_audit_egress,
         registry_proxy,
         compose,
         profile,
@@ -1352,6 +1373,15 @@ async fn cli_main() -> ExitCode {
                     "--compose without an image/-f/--primary is services-only (compose up) — \
                      there is no primary VM for a command, --shell, -t, --ssh, --workdir, \
                      --volume, --symlink, --env, --env-file, or --host-exec"
+                ),
+                2,
+            );
+        }
+        if *audit_egress && !*net && compose.is_none() {
+            return fail(
+                &anyhow::anyhow!(
+                    "--audit-egress lists the domains the guest contacts through the switch, so \
+                     it requires --net (or --compose)"
                 ),
                 2,
             );
@@ -1439,6 +1469,8 @@ async fn cli_main() -> ExitCode {
             tty: *tty,
             // services live on the run switch's LAN: --compose implies it.
             net: *net || compose.is_some(),
+            audit_egress: *audit_egress,
+            build_audit_egress: *build_audit_egress,
             registry_proxy: registry_proxy.clone(),
             compose: compose.clone(),
             profiles: profile.clone(),
@@ -1627,6 +1659,7 @@ async fn cli_main() -> ExitCode {
         build_net,
         build_allow_ip,
         build_allow_name,
+        build_audit_egress,
         require_cached,
         build_jobs,
         debug,
@@ -1732,6 +1765,7 @@ async fn cli_main() -> ExitCode {
             tmp_tmpfs: *build_tmp_tmpfs || b.tmp_tmpfs,
             build_args,
             net,
+            audit: *build_audit_egress,
             require_cached: *require_cached,
             build_jobs: build_jobs.or(b.jobs),
             debug: *debug,
@@ -1957,6 +1991,7 @@ async fn cli_main() -> ExitCode {
         allow_name,
         registry_proxy,
         denied_log,
+        audit_log,
     } = &cli.cmd
     {
         let mut hosts = std::collections::HashMap::new();
@@ -2007,6 +2042,7 @@ async fn cli_main() -> ExitCode {
             egress,
             proxy,
             denied_log.clone(),
+            audit_log.clone(),
         )
         .await
         {
@@ -2038,19 +2074,21 @@ async fn cli_main() -> ExitCode {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(&e, ctx.system_failure),
             },
-            GitlabCmd::Run { script, stage: _ } => match executor::run_stage(&ctx, &script).await {
-                Ok(result) => match (result.code, result.signal) {
-                    (Some(0), _) => ExitCode::SUCCESS,
-                    // non-zero exit: the script already reported its error
-                    (Some(_), _) => exit_code(ctx.build_failure),
-                    (None, signal) => {
-                        eprintln!("virtkit: stage script killed by signal {signal:?}");
-                        exit_code(ctx.build_failure)
-                    }
-                },
-                // can't reach/drive the VM: environment problem, job is retryable
-                Err(e) => fail(&e, ctx.system_failure),
-            },
+            GitlabCmd::Run { script, stage } => {
+                match executor::run_stage(&ctx, &script, stage.as_deref()).await {
+                    Ok(result) => match (result.code, result.signal) {
+                        (Some(0), _) => ExitCode::SUCCESS,
+                        // non-zero exit: the script already reported its error
+                        (Some(_), _) => exit_code(ctx.build_failure),
+                        (None, signal) => {
+                            eprintln!("virtkit: stage script killed by signal {signal:?}");
+                            exit_code(ctx.build_failure)
+                        }
+                    },
+                    // can't reach/drive the VM: environment problem, job is retryable
+                    Err(e) => fail(&e, ctx.system_failure),
+                }
+            }
             GitlabCmd::Supervise { job_dir } => match vm::supervise(&ctx, &job_dir).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(&e, 1),

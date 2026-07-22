@@ -54,6 +54,9 @@
 # allow_ip = ["10.0.0.0/8", "1.2.3.4:5432"]  # direct (non-DNS) egress CIDRs, optionally
 #                                            # port-scoped as CIDR:port (else any port)
 # allow_name = ["corp.example.com"]    # DNS suffixes (dot-anchored: also *.corp.example.com)
+# audit = true           # audit mode: list every external domain each job contacts (and how
+#                        # many times) at the end of its trace. Works with an empty allowlist
+#                        # (observe without blocking). A job can also set MICROVM_EGRESS_AUDIT.
 
 # [auth]                 # host credentials forwarded into job VMs.
 # ssh_agent = true       # forward the runner's $SSH_AUTH_SOCK so the guest's ssh/git use

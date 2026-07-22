@@ -56,7 +56,12 @@ impl OutputSink {
     }
 }
 
-pub async fn run_stage(ctx: &JobCtx, script_path: &Path) -> Result<CmdResult> {
+/// gitlab-runner's final `run_exec` sub-stage, run unconditionally after every other stage
+/// (even after a failed script). Its output still lands in the job trace — unlike
+/// `cleanup_exec` — so it is where the once-per-job egress audit summary is emitted.
+const FINAL_STAGE: &str = "cleanup_file_variables";
+
+pub async fn run_stage(ctx: &JobCtx, script_path: &Path, stage: Option<&str>) -> Result<CmdResult> {
     let script = std::fs::read(script_path)
         .with_context(|| format!("reading stage script {}", script_path.display()))?;
     // None => virtkit-agent falls back to VIRTKIT_DEFAULT_RUN_USER (the guest
@@ -75,6 +80,11 @@ pub async fn run_stage(ctx: &JobCtx, script_path: &Path) -> Result<CmdResult> {
     // fails because it could not reach a host would otherwise get no hint why. Reported
     // whether the step passed or failed.
     report_egress_blocks(ctx);
+    // On the last stage, print the once-per-job "domains contacted" audit summary (a no-op
+    // unless audit is on), so it appears at the end of the trace.
+    if stage == Some(FINAL_STAGE) {
+        report_egress_audit(ctx);
+    }
     result
 }
 
@@ -117,6 +127,20 @@ fn report_egress_blocks(ctx: &JobCtx) {
         }
     }
     let _ = std::fs::write(&pos_file, new_offset.to_string());
+}
+
+/// Print the per-job egress audit summary — every external domain the switch saw this
+/// job's guest resolve, most-contacted first — into the job trace. In audit mode
+/// (`[egress] audit` or `MICROVM_EGRESS_AUDIT`) the switch records each contact to its
+/// audit channel (see egress_report); this drains the whole file once, at the end of the
+/// job. Best-effort: audit off (no channel) or nothing contacted is a silent no-op.
+fn report_egress_audit(ctx: &JobCtx) {
+    if let Some(summary) = crate::egress_report::contacts_summary(
+        &ctx.egress_audit_log(),
+        "external domains contacted (audit)",
+    ) {
+        eprintln!("{summary}");
+    }
 }
 
 /// The exec-channel connect address for this job's VM, matching the selected backend

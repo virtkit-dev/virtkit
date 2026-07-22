@@ -25,6 +25,10 @@ pub struct JobCtx {
     /// use the full cap. A name outside the cap fails the job (a job can narrow but
     /// never widen its egress).
     pub egress_allow_name_req: Option<String>,
+    /// MICROVM_EGRESS_AUDIT job variable: when truthy, audit this job's egress even if
+    /// the host `[egress] audit` toggle is off. Auditing only observes (it never widens
+    /// egress), so a job may turn it on for itself.
+    pub egress_audit_req: bool,
     /// Exit code telling gitlab-runner the *script* failed (job failure)
     pub build_failure: i32,
     /// Exit code telling gitlab-runner the *environment* failed (retryable)
@@ -89,6 +93,7 @@ impl JobCtx {
             mem_req: job_var("MICROVM_MEM"),
             user_req: job_var("MICROVM_USER"),
             egress_allow_name_req: job_var("MICROVM_EGRESS_ALLOW_NAME"),
+            egress_audit_req: job_var("MICROVM_EGRESS_AUDIT").is_some_and(|v| is_truthy(&v)),
             build_failure: exit_code_env("BUILD_FAILURE_EXIT_CODE", 1),
             system_failure: exit_code_env("SYSTEM_FAILURE_EXIT_CODE", 2),
             ci_repo_url: job_var("CI_REPOSITORY_URL"),
@@ -181,6 +186,17 @@ impl JobCtx {
     pub fn egress_denied_log(&self) -> PathBuf {
         self.job_dir.join("egress-denied.log")
     }
+    /// Audit channel: every allowed external domain the switch saw this job's guest
+    /// resolve, appended one-per-line and drained into the end-of-job "domains contacted"
+    /// summary (see egress_report). Written only when audit is on.
+    pub fn egress_audit_log(&self) -> PathBuf {
+        self.job_dir.join("egress-audit.log")
+    }
+    /// Whether this job audits its egress: the host `[egress] audit` toggle or the job's
+    /// own `MICROVM_EGRESS_AUDIT` request (either enables it — audit only observes).
+    pub fn egress_audit(&self) -> bool {
+        self.cfg.egress.audit || self.egress_audit_req
+    }
     /// The host unix socket Cloud Hypervisor surfaces a guest connection to host
     /// vsock port `port` on (`<vsock.sock>_<port>`) — where the switch listens
     /// for the in-guest agent's eth0 bridge.
@@ -206,6 +222,15 @@ fn safe_component(v: Option<String>, default: &str) -> String {
         }
         _ => default.to_string(),
     }
+}
+
+/// A truthy job-variable value (`1`/`true`/`yes`/`on`, case-insensitive). Anything else —
+/// including `0`/`false` — is false, so `MICROVM_EGRESS_AUDIT: "0"` disables it explicitly.
+fn is_truthy(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn exit_code_env(name: &str, fallback: i32) -> i32 {
@@ -249,6 +274,7 @@ mod tests {
             mem_req: None,
             user_req: None,
             egress_allow_name_req: None,
+            egress_audit_req: false,
             build_failure: 1,
             system_failure: 2,
             ci_repo_url: None,
