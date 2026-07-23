@@ -922,6 +922,8 @@ pub struct VcpuConfig {
     pub cpu_template: Option<CpuFeaturesTemplate>,
     /// Enable nested virtualization in the CPUID configuration.
     pub nested_enabled: bool,
+    /// Expose the guest PMU in the CPUID configuration (virtkit patch, see VENDOR.md).
+    pub pmu_enabled: bool,
 }
 
 // Using this for easier explicit type-casting to help IDEs interpret the code.
@@ -1185,7 +1187,8 @@ impl Vcpu {
             vcpu_config.ht_enabled,
             vcpu_config.nested_enabled,
         )
-        .map_err(Error::CpuId)?;
+        .map_err(Error::CpuId)?
+        .with_pmu_enabled(vcpu_config.pmu_enabled);
 
         filter_cpuid(&mut self.cpuid, &cpuid_vm_spec).map_err(|e| {
             error!("Failure in configuring CPUID for vcpu {}: {:?}", self.id, e);
@@ -1909,6 +1912,7 @@ mod tests {
             ht_enabled: false,
             cpu_template: None,
             nested_enabled: false,
+            pmu_enabled: false,
         };
 
         assert!(vcpu

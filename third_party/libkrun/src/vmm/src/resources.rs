@@ -179,6 +179,8 @@ pub struct VmResources {
     pub smbios_oem_strings: Option<Vec<String>>,
     /// Whether to enable nested virtualization.
     pub nested_enabled: bool,
+    /// Whether to expose the guest PMU (virtkit patch, see VENDOR.md).
+    pub pmu_enabled: bool,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
     /// Do not create an implicit console device in the guest
@@ -204,6 +206,8 @@ impl VmResources {
             cpu_template: self.vm_config().cpu_template,
             #[cfg(target_os = "linux")]
             nested_enabled: self.nested_enabled,
+            #[cfg(target_os = "linux")]
+            pmu_enabled: self.pmu_enabled,
         }
     }
 
@@ -432,6 +436,7 @@ mod tests {
             console_output: None,
             smbios_oem_strings: None,
             nested_enabled: false,
+            pmu_enabled: false,
             split_irqchip: false,
             disable_implicit_console: false,
             serial_consoles: Vec::new(),
@@ -450,6 +455,8 @@ mod tests {
             cpu_template: vm_resources.vm_config().cpu_template,
             #[cfg(target_os = "linux")]
             nested_enabled: vm_resources.nested_enabled,
+            #[cfg(target_os = "linux")]
+            pmu_enabled: vm_resources.pmu_enabled,
         };
 
         let vcpu_config = vm_resources.vcpu_config();

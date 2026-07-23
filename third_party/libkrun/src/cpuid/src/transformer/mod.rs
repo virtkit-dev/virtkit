@@ -23,6 +23,9 @@ pub struct VmSpec {
     ht_enabled: bool,
     /// Specifies whether nested virtualization is enabled.
     nested_enabled: bool,
+    /// Specifies whether the guest PMU is exposed (leaf 0xA left as KVM reports
+    /// it) instead of zeroed. virtkit patch, default false — see VENDOR.md.
+    pmu_enabled: bool,
     /// The desired brand string for the guest.
     brand_string: BrandString,
 }
@@ -44,8 +47,21 @@ impl VmSpec {
             cpu_count,
             ht_enabled,
             nested_enabled,
+            pmu_enabled: false,
             brand_string: BrandString::from_vendor_id(&cpu_vendor_id),
         })
+    }
+
+    /// Expose the guest PMU (virtkit patch): keep CPUID leaf 0xA as KVM reports
+    /// it instead of zeroing it, so KVM's vPMU backs in-guest hardware counters.
+    pub fn with_pmu_enabled(mut self, enabled: bool) -> Self {
+        self.pmu_enabled = enabled;
+        self
+    }
+
+    /// Returns whether the guest PMU is exposed (virtkit patch)
+    pub fn pmu_enabled(&self) -> bool {
+        self.pmu_enabled
     }
 
     /// Returns an immutable reference to cpu_vendor_id

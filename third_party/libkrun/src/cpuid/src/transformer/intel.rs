@@ -108,9 +108,15 @@ fn update_power_management_entry(
     Ok(())
 }
 
-fn update_perf_mon_entry(entry: &mut kvm_cpuid_entry2, _vm_spec: &VmSpec) -> Result<(), Error> {
+fn update_perf_mon_entry(entry: &mut kvm_cpuid_entry2, vm_spec: &VmSpec) -> Result<(), Error> {
     // Architectural Performance Monitor Leaf
-    // Disable PMU
+    // Disable PMU by default: exposing host performance counters to the guest
+    // widens the side-channel surface. `krun_set_pmu(ctx, true)` (virtkit patch,
+    // see VENDOR.md) keeps the leaf as KVM reports it, so KVM's vPMU virtualizes
+    // the counters for in-guest `perf` hardware events.
+    if vm_spec.pmu_enabled() {
+        return Ok(());
+    }
     entry.eax = 0;
     entry.ebx = 0;
     entry.ecx = 0;

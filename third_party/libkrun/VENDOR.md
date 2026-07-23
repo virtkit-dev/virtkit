@@ -147,3 +147,13 @@ consumes one pin per device. `Vm.fd` became `Arc<VmFd>` so routing ioctls can ru
 config-write path. x86_64 only; additive — the virtio-mmio transport, other arches, and the
 INTx path when the guest leaves MSI-X disabled are unchanged. Covered by `virtio::msix`,
 `legacy::gsi`, and `legacy::pci` unit tests. Search for `MsixConfig` and `GsiRoutes`.
+
+`src/cpuid/src/transformer/{mod.rs,intel.rs}` + `src/vmm/src/linux/vstate.rs` +
+`src/vmm/src/resources.rs` + `src/vmm/src/builder.rs` + `src/libkrun/src/lib.rs` —
+opt-in guest PMU: `krun_set_pmu(ctx, enabled)` (mirroring `krun_set_nested_virt`)
+plumbs `VmResources.pmu_enabled` through `VcpuConfig` into the cpuid `VmSpec`, and
+`update_perf_mon_entry` then leaves leaf 0xA as KVM reports it instead of zeroing
+it, so KVM's vPMU backs in-guest `perf` hardware counters (cycles, instructions).
+Default remains off — host performance counters are a side-channel surface, so
+only trusted guests (dev VMs) should enable this, never untrusted CI jobs.
+Additive: without the call, behaviour is unchanged. Used by `vk run --pmu`.

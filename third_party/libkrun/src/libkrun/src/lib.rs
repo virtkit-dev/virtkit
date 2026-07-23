@@ -1995,6 +1995,23 @@ pub unsafe extern "C" fn krun_set_console_output(ctx_id: u32, c_filepath: *const
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
+/// Expose the guest PMU (virtkit patch, see VENDOR.md): keep CPUID leaf 0xA as
+/// KVM reports it so in-guest perf gets hardware counters via KVM's vPMU.
+/// Default off — host performance counters are a side-channel surface, so this
+/// is only for trusted guests (dev VMs), never untrusted CI jobs.
+pub unsafe extern "C" fn krun_set_pmu(ctx_id: u32, enabled: bool) -> i32 {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            cfg.vmr.pmu_enabled = enabled;
+            KRUN_SUCCESS
+        }
+        Entry::Vacant(_) => -libc::ENOENT,
+    }
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
 pub unsafe extern "C" fn krun_set_nested_virt(ctx_id: u32, enabled: bool) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
