@@ -561,6 +561,18 @@ fn make_microvm(
     ))
 }
 
+/// Stamp an exported ext4 with its content-freshness UUID — `fingerprint([stage_key])`, the
+/// identity `vk fingerprint` (and the dev-VM staleness check) expects a bootable image to
+/// carry. The export tail (flatten + `normalize_superblock`) leaves the flattened base/cache
+/// UUID untouched, so without this a freshly built/exported image never matches its own stage
+/// key. Both export paths ([`build_backend`] and [`build_units`]) call this on every exported
+/// image.
+fn stamp_stage_uuid(out: &Path, stage_key: &str) -> Result<()> {
+    let uuid = crate::ensure::parse_uuid(&crate::ensure::fingerprint(&[stage_key]))
+        .expect("fingerprint is a canonical UUID");
+    crate::ext4::set_uuid(out, &uuid)
+}
+
 /// [`build`] for a caller that already holds parsed [`PlanInput`]s — e.g. `vk run
 /// --compose` materializing an `image:` service as the synthetic single-`FROM`
 /// plan, with no Dockerfile on disk. `opts.dockerfiles`/`opts.contexts` are the
@@ -695,6 +707,15 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
             ex.export_ext4(fs, out)?;
             timings.record(Phase::Export, "", t_export.elapsed());
             progress.export_done(0);
+            // Stamp the exported image with its content-freshness UUID (fingerprint of the
+            // target's stage key) so `vk fingerprint` matches it. The keys are re-derived
+            // read-only via the drive backend (base digests/configs it already memoized).
+            let key = resolve_stages(&plan, &order, &build_args, ex.as_mut(), None)?
+                .get(&target)
+                .context("internal: target stage not resolved")?
+                .final_key
+                .clone();
+            stamp_stage_uuid(out, &key)?;
             // The sidecar persists the config the image itself deliberately does not
             // carry (clean-image model: config is supplied at boot, never baked in).
             let sidecar = config_sidecar(out);
@@ -1009,6 +1030,15 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
                     timings.record(Phase::Export, &t.label, t_export.elapsed());
                     progress.export_done(export_i);
                     export_i += 1;
+                    // Stamp the content-freshness UUID (fingerprint of the target's stage key)
+                    // so `vk fingerprint` — and the dev-VM staleness check on the exported
+                    // root.ext4 — matches it; the export tail otherwise leaves the base UUID.
+                    let key = &u
+                        .resolved
+                        .get(&t.idx)
+                        .context("internal: target stage not resolved")?
+                        .final_key;
+                    stamp_stage_uuid(out, key)?;
                     let sidecar = config_sidecar(out);
                     let st = u
                         .resolved
@@ -3803,6 +3833,104 @@ ENTRYPOINT run me
         assert_eq!(cfg.user, "svc");
         assert_eq!(cfg.workdir, "/srv");
         assert_eq!(cfg.argv(), ["/bin/app", "--port", "6379"]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn export_stamps_the_stage_key_freshness_uuid() {
+        // Regression: an exported image must carry fingerprint([stage_key]) as its ext4 UUID,
+        // so `vk fingerprint` (and the dev-VM staleness check) matches a freshly built image.
+        // The export tail (flatten + normalize_superblock) otherwise leaves the base UUID,
+        // which never equals the fingerprint — the source of the perpetual "stale" prompt.
+        let tmp = std::env::temp_dir().join(format!("vk-fp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("f"), "x").unwrap();
+        std::fs::write(tmp.join("Dockerfile"), "FROM scratch\nCOPY f /f\n").unwrap();
+        let out = tmp.join("img.ext4");
+        let dockerfiles = vec![tmp.join("Dockerfile")];
+        build_host(&Options {
+            dockerfiles: dockerfiles.clone(),
+            target: None,
+            contexts: vec![],
+            out: Some(out.clone()),
+            out_disk: None,
+            print_plan: false,
+            cloud_hypervisor: None,
+            kernel: None,
+            agent: None,
+            cache_registry: Some("none".into()),
+            cache_insecure: false,
+            cache_auth: Default::default(),
+            build_cache: BuildCache::default(),
+            journal: false,
+            tmp_tmpfs: false,
+            build_args: vec![],
+            net: BuildNet::None,
+            audit: false,
+            require_cached: false,
+            build_jobs: None,
+            debug: false,
+            progress_sink: None,
+        })
+        .unwrap();
+        // The stamped UUID must equal fingerprint([the target's stage key]).
+        let key = target_stage_key(&dockerfiles, &[], &[], None).unwrap();
+        let expected = crate::ensure::fingerprint(&[&key]);
+        assert_eq!(
+            crate::ext4::fs_uuid(&out).as_deref(),
+            Some(expected.as_str())
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stamp_stage_uuid_overwrites_the_export_tail_uuid() {
+        // The `build_units` (`vk build --compose` / `vk run --compose --primary`) export path
+        // can only run end-to-end under a microVM, like all of `build_units`. It funnels
+        // through the same `stamp_stage_uuid` helper as the host-testable `build_backend` path,
+        // so pin that shared helper's contract directly: whatever UUID the export tail leaves
+        // (here, an image built without any explicit stamp), stamping replaces it with
+        // fingerprint([stage_key]) — the identity `vk fingerprint` expects.
+        let tmp = std::env::temp_dir().join(format!("vk-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("Dockerfile"), "FROM scratch\nCOPY Dockerfile /d\n").unwrap();
+        let out = tmp.join("img.ext4");
+        build_host(&Options {
+            dockerfiles: vec![tmp.join("Dockerfile")],
+            target: None,
+            contexts: vec![],
+            out: Some(out.clone()),
+            out_disk: None,
+            print_plan: false,
+            cloud_hypervisor: None,
+            kernel: None,
+            agent: None,
+            cache_registry: Some("none".into()),
+            cache_insecure: false,
+            cache_auth: Default::default(),
+            build_cache: BuildCache::default(),
+            journal: false,
+            tmp_tmpfs: false,
+            build_args: vec![],
+            net: BuildNet::None,
+            audit: false,
+            require_cached: false,
+            build_jobs: None,
+            debug: false,
+            progress_sink: None,
+        })
+        .unwrap();
+        // A synthetic key unrelated to the built content: stamping is a pure function of the
+        // key it is handed, independent of whatever the build left behind.
+        let key = "some-stage-key";
+        stamp_stage_uuid(&out, key).unwrap();
+        let expected = crate::ensure::fingerprint(&[key]);
+        assert_eq!(
+            crate::ext4::fs_uuid(&out).as_deref(),
+            Some(expected.as_str())
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

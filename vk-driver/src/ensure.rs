@@ -85,7 +85,8 @@ fn unit_fresh(out: &Path, expected_uuid: &str) -> bool {
 /// `fingerprint(stage_key)` — the stage key is the chained content identity of
 /// everything the stage is built from (base digest, instructions, copied files,
 /// source stages), so a UUID match means byte-equivalent content. Otherwise build
-/// the stage (the instruction cache makes that incremental) and stamp the UUID.
+/// the stage (the instruction cache makes that incremental); the build's export tail
+/// stamps that UUID onto the image.
 pub fn ensure_unit_build(
     recipe: &BuildRecipe,
     target: Option<&str>,
@@ -124,8 +125,7 @@ pub fn ensure_unit_build(
         debug: false,
         progress_sink,
     })?;
-    let uuid = parse_uuid(&expected).expect("fingerprint is a canonical UUID");
-    crate::ext4::set_uuid(out, &uuid)
+    Ok(())
 }
 
 /// The shared build-cache tier directory for a `build:` stage: `<state_dir>/build/<uuid>/`,

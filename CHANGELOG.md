@@ -23,6 +23,15 @@ All notable changes to virtkit will be documented in this file.
 - **Faster unlink-heavy build phases.** Removing a file no longer triggers a redundant
   per-file timestamp flush to the host, cutting 30-40% off unlink-heavy phases.
 
+### Fixed
+
+- **Exported images now carry their content-freshness UUID.** `vk build --out`, `vk build
+  --compose` and `vk run --compose --primary` stamp the exported ext4's UUID with
+  `fingerprint([stage_key])` (as a build-tier unit already was), so `vk fingerprint` matches a
+  freshly built image. Previously only the build-tier/`ensure` path stamped it; the plain
+  export left the flattened base/cache UUID, so a freshness check against an exported image
+  (e.g. a dev-VM staleness probe on `root.ext4`) always reported stale.
+
 ## [0.24.0] - 2026-07-22
 
 ### Added
