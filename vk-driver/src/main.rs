@@ -433,6 +433,12 @@ enum Cmd {
         /// which VM: a directory (default: the current directory), resolved via the VM registry
         /// `vk list` uses — or a raw agent address (`scheme://…`) to dial directly
         target: Option<String>,
+        /// print whether the VM's root image is `fresh`, `stale` (a fresh `vk run` would
+        /// rebuild it), or `unknown` — a single scriptable token. Skips the agent probe but
+        /// may resolve base image digests over the network; selects the VM by directory
+        /// (a raw address has no build recipe)
+        #[arg(long)]
+        stale: bool,
     },
     /// Run a command in a live guest over its agent exec channel — an interactive
     /// shell or a one-shot command, as `--user` in `--dir`. Reuses the same client
@@ -2213,10 +2219,33 @@ async fn cli_main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         },
+        // `--stale`: report the VM's root-image freshness as a single scriptable token — a
+        // directory-selected, host-side check that skips the agent probe. A raw address has
+        // no build recipe, so it is rejected here.
+        Cmd::Status {
+            target,
+            stale: true,
+        } => match target.as_deref() {
+            Some(s) if is_agent_addr(s) => fail(
+                &anyhow::anyhow!("--stale selects a VM by directory, not a raw agent address"),
+                2,
+            ),
+            other => match vms::resolve_one(other.map(Path::new)) {
+                Ok(entry) => {
+                    println!("{}", vms::freshness(&entry).as_str());
+                    ExitCode::SUCCESS
+                }
+                // Resolution errors exit 2, matching the probe arm below and `vk list`/`vk stop`.
+                Err(e) => fail(&e, 2),
+            },
+        },
         // Agent liveness probe: round-trip the status request (same client the boot readiness
         // wait uses) so a caller can check a VM is up with vk alone. The target is a directory
         // (default: cwd) resolved to its VM via the registry, or a raw agent address for plumbing.
-        Cmd::Status { target } => {
+        Cmd::Status {
+            target,
+            stale: false,
+        } => {
             let addr = match target.as_deref() {
                 Some(s) if is_agent_addr(s) => match s.parse::<SocketAddr>() {
                     Ok(a) => a,

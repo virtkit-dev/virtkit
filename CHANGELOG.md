@@ -13,6 +13,9 @@ All notable changes to virtkit will be documented in this file.
 - **`vk list --stale`.** Reports, per running VM, whether its root image still matches the
   working tree — whether a fresh `vk run` would rebuild it. Opt-in: it resolves base image
   digests (network I/O), so plain `vk list` stays offline.
+- **`vk status --stale`.** Prints a single `fresh` / `stale` / `unknown` word for the VM
+  launched from the current directory (or a given `DIR`), so a script can check image
+  freshness with a plain string compare — no JSON parsing needed.
 
 ### Changed
 

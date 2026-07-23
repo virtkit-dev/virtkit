@@ -84,6 +84,15 @@ impl Freshness {
             Freshness::Unknown => "-",
         }
     }
+    /// A scriptable one-word token for `vk status --stale`, so tooling can decide with a
+    /// plain string compare.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Freshness::Stale => "stale",
+            Freshness::Fresh => "fresh",
+            Freshness::Unknown => "unknown",
+        }
+    }
     fn json(self) -> Option<bool> {
         match self {
             Freshness::Stale => Some(true),
@@ -95,7 +104,8 @@ impl Freshness {
 
 /// Recompute the root image's build key from `entry`'s recipe and compare it to the key the
 /// image carries (its ext4 UUID is `fingerprint([stage_key])`). Resolves base image digests, so
-/// this does network I/O — only called for `vk list --stale`, never plain `list`.
+/// this does network I/O — only called behind an explicit `--stale` (`vk list --stale`,
+/// `vk status --stale`), never plain `list`.
 pub fn freshness(entry: &VmEntry) -> Freshness {
     let Some(r) = &entry.stale_recipe else {
         return Freshness::Unknown;
@@ -619,10 +629,13 @@ mod tests {
         assert_eq!(freshness(&e), Freshness::Unknown);
         assert_eq!(Freshness::Unknown.cell(), "-");
         assert_eq!(Freshness::Unknown.json(), None);
+        assert_eq!(Freshness::Unknown.as_str(), "unknown");
         assert_eq!(Freshness::Stale.cell(), "yes");
         assert_eq!(Freshness::Stale.json(), Some(true));
+        assert_eq!(Freshness::Stale.as_str(), "stale");
         assert_eq!(Freshness::Fresh.cell(), "no");
         assert_eq!(Freshness::Fresh.json(), Some(false));
+        assert_eq!(Freshness::Fresh.as_str(), "fresh");
     }
 
     #[test]

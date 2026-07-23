@@ -132,7 +132,8 @@ The ones you'll actually type:
 - `status` — probe a running VM's guest agent and print its reply (or exit
   non-zero if it does not answer): a liveness check that exercises the agent
   protocol, addressed by launch directory like `list`/`stop`, or by a raw agent
-  address for plumbing.
+  address for plumbing. With `--stale`, skip the probe and print a single
+  `fresh` / `stale` / `unknown` word for the VM's root image instead.
 - `check` — preflight the host for the current user: `/dev/kvm` access, the VMM
   backend, a guest kernel/agent, and the host side of each configured feature
   (the CI-executor features only when named with `--feature`).
