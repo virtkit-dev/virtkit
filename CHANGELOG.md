@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Direct-IP egress is now audited.** Egress to a hardcoded IP never touches the switch's
+  resolver, so it left no trace in the egress audit, which recorded only resolved domain names.
+  Direct dials are now recorded and printed as a separate "external IPs/ports contacted (audit)"
+  block on every surface (`vk run`, `vk build`, and the GitLab executor).
+
 ## [0.25.0] - 2026-07-23
 
 ### Added

@@ -69,35 +69,52 @@ pub fn append(path: &Path, proto: Proto, target: &str) {
     }
 }
 
-/// Append one contacted external domain to the audit channel `path` (create-or-append).
-/// Audit mode (see switch's `EgressGuard`) records every allowed external name the guest
-/// resolves; unlike the denial channel this is a plain one-name-per-line file, drained
-/// once at the end of the job rather than per stage. The `name` is a guest-controlled DNS
-/// name, so — like `append` — control characters are neutralized to `U+FFFD` (no forged or
-/// torn lines in the summary) and the record is one `write_all`, so concurrent stage
-/// switches sharing a build's channel never interleave fragments. Best-effort: IO errors
-/// are dropped, exactly like `append`.
-pub fn append_contact(path: &Path, name: &str) {
-    let name: String = name
+/// Append one audited external contact to the audit channel `path` (create-or-append). Audit
+/// mode (see switch's `EgressGuard`) records both the allowed external names the guest resolves
+/// (`kind = "name"`) and the external IPs it dials without a matching resolution (`kind = "ip"`),
+/// interleaved in one channel; the readers below split them back apart by kind. Unlike the
+/// denial channel this is drained once at the end of the job rather than per stage. `value` is
+/// guest-controlled, so — like `append` — control characters are neutralized to `U+FFFD` (no
+/// forged or torn lines in the summary) and the record is one `kind\tvalue` `write_all`, so
+/// concurrent stage switches sharing a build's channel never interleave fragments. Best-effort:
+/// IO errors are dropped, exactly like `append`.
+fn append_audit(path: &Path, kind: &str, value: &str) {
+    let value: String = value
         .chars()
         .map(|c| if c.is_control() { '\u{fffd}' } else { c })
         .collect();
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = f.write_all(format!("{name}\n").as_bytes());
+        let _ = f.write_all(format!("{kind}\t{value}\n").as_bytes());
     }
 }
 
-/// Read the audit channel `path` and return each contacted domain paired with its contact
-/// count, ordered most-contacted first (ties broken by name) for a stable job-trace summary.
-/// A missing file (audit off, or the switch recorded nothing) yields an empty list. Unlike
-/// the denial channel there is no offset: the whole file is one job's contacts, read once.
-pub fn read_contacts(path: &Path) -> Vec<(String, usize)> {
+/// Record one contacted external domain (see [`append_audit`]).
+pub fn append_contact(path: &Path, name: &str) {
+    append_audit(path, "name", name);
+}
+
+/// Record one external `ip:port` the guest dialed directly, i.e. without a resolution the
+/// switch handed it — the domains summary would otherwise miss it (see [`append_audit`]).
+pub fn append_ip_contact(path: &Path, ip_port: &str) {
+    append_audit(path, "ip", ip_port);
+}
+
+/// Read the audit channel `path` and return each `kind` contact paired with its count, ordered
+/// most-contacted first (ties broken by value) for a stable job-trace summary. A missing file
+/// (audit off, or the switch recorded nothing) yields an empty list. Unlike the denial channel
+/// there is no offset: the whole file is one job's contacts, read once.
+fn read_audit(path: &Path, kind: &str) -> Vec<(String, usize)> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for name in text.lines().map(str::trim).filter(|s| !s.is_empty()) {
-        *counts.entry(name).or_default() += 1;
+    for value in text.lines().filter_map(|l| {
+        l.split_once('\t')
+            .filter(|(k, _)| *k == kind)
+            .map(|(_, v)| v.trim())
+            .filter(|v| !v.is_empty())
+    }) {
+        *counts.entry(value).or_default() += 1;
     }
     let mut counts: Vec<(String, usize)> = counts
         .into_iter()
@@ -107,29 +124,49 @@ pub fn read_contacts(path: &Path) -> Vec<(String, usize)> {
     counts
 }
 
-/// Format the audit channel at `path` as a "domains contacted" block for a trace: the line
-/// `virtkit: {header}:` followed by one indented `name (xN)` line per domain, counts aligned,
-/// most-contacted first. `None` when audit recorded nothing, so the caller prints nothing.
-/// `header` names the phase (e.g. `external domains contacted (audit)`), letting a `vk run`
-/// that both builds and boots distinguish its build-phase summary from the guest one.
-/// Shared by the gitlab executor, `vk run`, and `vk build` so every surface reads identically.
-pub fn contacts_summary(path: &Path, header: &str) -> Option<String> {
-    let contacts = read_contacts(path);
+/// The contacted domains, most-contacted first (see [`read_audit`]).
+pub fn read_contacts(path: &Path) -> Vec<(String, usize)> {
+    read_audit(path, "name")
+}
+
+/// The directly-dialed external `ip:port`s, most-contacted first (see [`read_audit`]).
+pub fn read_ip_contacts(path: &Path) -> Vec<(String, usize)> {
+    read_audit(path, "ip")
+}
+
+/// Format `contacts` as a job-trace block: the line `virtkit: {header}:` followed by one
+/// indented `value (xN)` line per contact, counts aligned, most-contacted first. `None` when
+/// there is nothing to report, so the caller prints nothing.
+fn summary(contacts: &[(String, usize)], header: &str) -> Option<String> {
     if contacts.is_empty() {
         return None;
     }
     // Char count, not byte length: the `{:<width$}` padding below measures in chars, so a
-    // multibyte name (e.g. a sanitized `U+FFFD`) would misalign the count column otherwise.
+    // multibyte value (e.g. a sanitized `U+FFFD`) would misalign the count column otherwise.
     let width = contacts
         .iter()
         .map(|(n, _)| n.chars().count())
         .max()
         .unwrap_or(0);
     let mut s = format!("virtkit: {header}:");
-    for (name, count) in &contacts {
-        s.push_str(&format!("\n  {name:<width$}  (x{count})"));
+    for (value, count) in contacts {
+        s.push_str(&format!("\n  {value:<width$}  (x{count})"));
     }
     Some(s)
+}
+
+/// The "domains contacted" summary for a trace. `header` names the phase (e.g. `external
+/// domains contacted (audit)`), letting a `vk run` that both builds and boots distinguish its
+/// build-phase summary from the guest one. Shared by the gitlab executor, `vk run`, and
+/// `vk build` so every surface reads identically.
+pub fn contacts_summary(path: &Path, header: &str) -> Option<String> {
+    summary(&read_contacts(path), header)
+}
+
+/// The "IPs/ports contacted" summary for a trace — the guest's direct-IP egress the domains
+/// summary cannot show. Same shape and phase-header convention as [`contacts_summary`].
+pub fn ip_contacts_summary(path: &Path, header: &str) -> Option<String> {
+    summary(&read_ip_contacts(path), header)
 }
 
 /// Read the denials appended to `path` since byte `offset`, returning them with the new
@@ -241,6 +278,32 @@ mod tests {
             read_contacts(&path),
             vec![("crates.io".into(), 3), ("github.com".into(), 2)]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn names_and_ips_share_the_channel_without_crossing() {
+        let dir = std::env::temp_dir().join(format!("vk-egress-audit-ip-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("egress-audit.log");
+        let _ = std::fs::remove_file(&path);
+
+        append_contact(&path, "crates.io");
+        append_ip_contact(&path, "93.184.216.34:443");
+        append_ip_contact(&path, "93.184.216.34:443");
+        append_contact(&path, "crates.io");
+
+        // Each reader sees only its own kind, counted independently.
+        assert_eq!(read_contacts(&path), vec![("crates.io".into(), 2)]);
+        assert_eq!(
+            read_ip_contacts(&path),
+            vec![("93.184.216.34:443".into(), 2)]
+        );
+
+        let summary = ip_contacts_summary(&path, "external IPs/ports contacted (audit)").unwrap();
+        let lines: Vec<&str> = summary.lines().collect();
+        assert_eq!(lines[0], "virtkit: external IPs/ports contacted (audit):");
+        assert!(lines[1].starts_with("  93.184.216.34:443") && lines[1].ends_with("(x2)"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

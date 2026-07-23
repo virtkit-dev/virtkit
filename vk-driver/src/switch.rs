@@ -16,7 +16,7 @@
 //!     the owning VM by destination IP.
 
 use anyhow::{Context, Result, bail};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -230,10 +230,18 @@ struct EgressGuard {
     /// Where denials are appended as typed records for the job trace (see egress_report).
     /// `None` = don't record (dev `vk run`, or an unrestricted policy that denies nothing).
     denied_log: Option<PathBuf>,
-    /// Audit mode: where every allowed external domain the guest resolves is appended for
-    /// the end-of-job "domains contacted" summary (see egress_report). `None` = audit off.
-    /// Independent of the allowlist — an unrestricted policy still records every contact.
+    /// Audit mode: where the switch appends, for the end-of-job summaries (see egress_report),
+    /// every allowed external domain the guest resolves and every external IP it dials without
+    /// a matching resolution. `None` = audit off. Independent of the allowlist — an unrestricted
+    /// policy still records every contact.
     audit_log: Option<PathBuf>,
+    /// Audit mode: every external IP the switch handed a guest in a DNS answer, keyed by
+    /// `(source, resolved_ip)` so a subsequent connection from that same VM to one of them is
+    /// attributed to its name (already in the domains summary) rather than logged again as a
+    /// direct-IP contact — and one VM's resolution never masks another VM's direct dial to the
+    /// same IP. Tracked independently of `pinned` because audit runs even under `AllowAll`,
+    /// where nothing is pinned. Empty when audit is off.
+    dns_ips: Mutex<HashSet<(Ipv4Addr, Ipv4Addr)>>,
 }
 
 impl EgressGuard {
@@ -246,6 +254,7 @@ impl EgressGuard {
             registry_proxy: None,
             denied_log: None,
             audit_log: None,
+            dns_ips: Mutex::new(HashSet::new()),
         }
     }
     fn with_per_source(mut self, per_source: HashMap<Ipv4Addr, Egress>) -> Self {
@@ -277,6 +286,29 @@ impl EgressGuard {
         if let Some(path) = &self.audit_log {
             crate::egress_report::append_contact(path, name);
         }
+    }
+    /// Remember the A-record IPs the switch just handed `src` for an allowed name, so a
+    /// connection from that VM to one of them is not re-logged as a direct-IP contact. No-op
+    /// when audit is off (the direct-IP audit is the only reader of this set).
+    fn record_dns_ips(&self, src: Ipv4Addr, ips: &[Ipv4Addr]) {
+        if self.audit_log.is_none() {
+            return;
+        }
+        let mut dns_ips = self.dns_ips.lock().unwrap();
+        dns_ips.extend(ips.iter().map(|ip| (src, *ip)));
+    }
+    /// Record an allowed external `ip:port` that `src` dialed to the audit channel — but only
+    /// when the switch never resolved that IP for that same VM, so the "IPs/ports contacted"
+    /// summary shows exactly the direct-IP egress the "domains contacted" summary cannot
+    /// (dedup is on `(src, ip)`; DNS answers carry no port). No-op when audit is off.
+    fn record_ip_contact(&self, src: Ipv4Addr, dst: SocketAddrV4) {
+        let Some(path) = &self.audit_log else {
+            return;
+        };
+        if self.dns_ips.lock().unwrap().contains(&(src, *dst.ip())) {
+            return;
+        }
+        crate::egress_report::append_ip_contact(path, &dst.to_string());
     }
     /// Any restriction at all — the default policy or any per-source override. Drives the
     /// startup log summary.
@@ -849,6 +881,9 @@ async fn proxy_tcp(mut guest: ipstack::IpStackTcpStream, egress: Arc<EgressGuard
                 egress.record_denial(crate::egress_report::Proto::Tcp, &dst.to_string());
                 return;
             }
+            if let (Some(s), SocketAddr::V4(v4)) = (src, dst) {
+                egress.record_ip_contact(s, v4);
+            }
             dst
         }
     };
@@ -869,6 +904,9 @@ async fn proxy_udp(mut guest: ipstack::IpStackUdpStream, egress: Arc<EgressGuard
         eprintln!("switch: egress denied (udp) {dst}");
         egress.record_denial(crate::egress_report::Proto::Udp, &dst.to_string());
         return;
+    }
+    if let (Some(s), SocketAddr::V4(v4)) = (src, dst) {
+        egress.record_ip_contact(s, v4);
     }
     let bind: SocketAddr = if dst.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }
         .parse()
@@ -948,6 +986,10 @@ async fn handle_dns(
             if let Some(r) = &resp {
                 let (ips, ttl) = parse_a_records(r);
                 egress.record(client_ip, &ips, ttl);
+                // Audit: these IPs are now attributable to `name` for this VM, so a later
+                // connection from it is counted under the domains summary, not re-logged as a
+                // direct-IP contact.
+                egress.record_dns_ips(client_ip, &ips);
             }
             resp
         } else {
@@ -1729,6 +1771,46 @@ mod tests {
         // The DB's deny-all policy refuses every name at the resolver, so it never resolves
         // (and thus never pins) an external host — no egress at all.
         assert!(!g.name_allowed(db, "example.com"));
+    }
+
+    #[test]
+    fn audit_ip_contacts_dedup_resolved_per_source() {
+        let dir = std::env::temp_dir().join(format!("vk-switch-audit-ip-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("egress-audit.log");
+        let _ = std::fs::remove_file(&path);
+
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let vm_a = Ipv4Addr::new(192, 168, 231, 2);
+        let vm_b = Ipv4Addr::new(192, 168, 231, 3);
+        let resolved = Ipv4Addr::new(93, 184, 216, 34);
+        let direct = Ipv4Addr::new(1, 1, 1, 1);
+        // Audit runs even under AllowAll — nothing is pinned, yet contacts are still recorded.
+        let g = EgressGuard::new(Egress::AllowAll, gw).with_audit_log(Some(path.clone()));
+
+        // vm_a resolved `resolved` through the switch, then dials it: already attributed to the
+        // name in the domains summary, so it is NOT re-logged as a direct-IP contact.
+        g.record_dns_ips(vm_a, &[resolved]);
+        g.record_ip_contact(vm_a, SocketAddrV4::new(resolved, 443));
+        // vm_a dials an IP it never resolved: a genuine direct-IP contact, logged.
+        g.record_ip_contact(vm_a, SocketAddrV4::new(direct, 443));
+        // vm_b never resolved `resolved`, so vm_a's resolution must not mask vm_b's direct dial
+        // to the same IP — the per-source key keeps them distinct.
+        g.record_ip_contact(vm_b, SocketAddrV4::new(resolved, 8080));
+
+        // Only the two genuine direct dials survive; the resolved-then-dialed one is suppressed.
+        assert_eq!(
+            crate::egress_report::read_ip_contacts(&path),
+            vec![("1.1.1.1:443".into(), 1), ("93.184.216.34:8080".into(), 1),]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Audit off: both record entry points are silent no-ops (no channel to write to).
+        let off = dir.join("never-written.log");
+        let g = EgressGuard::new(Egress::AllowAll, gw);
+        g.record_dns_ips(vm_a, &[resolved]);
+        g.record_ip_contact(vm_a, SocketAddrV4::new(direct, 443));
+        assert!(!off.exists());
     }
 
     #[test]

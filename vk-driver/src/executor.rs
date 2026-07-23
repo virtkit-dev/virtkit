@@ -129,15 +129,22 @@ fn report_egress_blocks(ctx: &JobCtx) {
     let _ = std::fs::write(&pos_file, new_offset.to_string());
 }
 
-/// Print the per-job egress audit summary — every external domain the switch saw this
-/// job's guest resolve, most-contacted first — into the job trace. In audit mode
-/// (`[egress] audit` or `MICROVM_EGRESS_AUDIT`) the switch records each contact to its
-/// audit channel (see egress_report); this drains the whole file once, at the end of the
-/// job. Best-effort: audit off (no channel) or nothing contacted is a silent no-op.
+/// Print the per-job egress audit summary into the job trace: every external domain the switch
+/// saw this job's guest resolve, then every external IP it dialed directly (without a matching
+/// resolution), each most-contacted first. In audit mode (`[egress] audit` or
+/// `MICROVM_EGRESS_AUDIT`) the switch records each contact to its audit channel (see
+/// egress_report); this drains the whole file once, at the end of the job. Best-effort: audit
+/// off (no channel) or nothing contacted is a silent no-op.
 fn report_egress_audit(ctx: &JobCtx) {
     if let Some(summary) = crate::egress_report::contacts_summary(
         &ctx.egress_audit_log(),
         "external domains contacted (audit)",
+    ) {
+        eprintln!("{summary}");
+    }
+    if let Some(summary) = crate::egress_report::ip_contacts_summary(
+        &ctx.egress_audit_log(),
+        "external IPs/ports contacted (audit)",
     ) {
         eprintln!("{summary}");
     }

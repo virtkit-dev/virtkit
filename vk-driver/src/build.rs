@@ -737,6 +737,12 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     ) {
         eprintln!("{summary}");
     }
+    if let Some(summary) = crate::egress_report::ip_contacts_summary(
+        &scratch.join(crate::run::AUDIT_LOG),
+        "external IPs/ports contacted during the build (audit)",
+    ) {
+        eprintln!("{summary}");
+    }
     let _ = std::fs::remove_dir_all(&scratch); // best-effort scratch cleanup
     let built = result?;
     let srcs = inputs
@@ -1073,6 +1079,12 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
     if let Some(summary) = crate::egress_report::contacts_summary(
         &scratch.join(crate::run::AUDIT_LOG),
         "external domains contacted during the build (audit)",
+    ) {
+        eprintln!("{summary}");
+    }
+    if let Some(summary) = crate::egress_report::ip_contacts_summary(
+        &scratch.join(crate::run::AUDIT_LOG),
+        "external IPs/ports contacted during the build (audit)",
     ) {
         eprintln!("{summary}");
     }

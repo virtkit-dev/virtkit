@@ -1387,6 +1387,12 @@ async fn build_and_boot(
     ) {
         eprintln!("{summary}");
     }
+    if let Some(summary) = crate::egress_report::ip_contacts_summary(
+        &work.join(AUDIT_LOG),
+        "external IPs/ports contacted (audit)",
+    ) {
+        eprintln!("{summary}");
+    }
     timings.render();
     result
 }
@@ -1697,6 +1703,12 @@ async fn compose_up(
     if let Some(summary) = crate::egress_report::contacts_summary(
         &work.join(AUDIT_LOG),
         "external domains contacted (audit)",
+    ) {
+        eprintln!("{summary}");
+    }
+    if let Some(summary) = crate::egress_report::ip_contacts_summary(
+        &work.join(AUDIT_LOG),
+        "external IPs/ports contacted (audit)",
     ) {
         eprintln!("{summary}");
     }
