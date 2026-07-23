@@ -58,6 +58,7 @@ All build scripts wrap Docker, so the host needs only Docker — no local Rust s
 ./build.sh --fast                   # same, but the debug profile -> much faster iteration
 ./build-kernel.sh [--no-cache]      # guest kernel vmlinux -> dist/ (Docker; slow)
 ./audit.sh [--deny warnings]        # cargo-audit against the committed Cargo.lock
+./sweep.sh [--time 15]              # cargo-sweep stale target/ artifacts (default --installed)
 ./update.sh                         # bump the pinned Rust toolchain + re-pin apk deps
 ./update-kernel.sh [--lts|--stable] # bump the pinned guest kernel (defaults to LTS)
 ```

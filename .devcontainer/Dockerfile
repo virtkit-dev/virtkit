@@ -26,6 +26,11 @@ RUN rustup component add clippy rustfmt
 # stays reproducible. Lands in CARGO_HOME/bin (on PATH) and is chowned to dev below.
 RUN cargo install cargo-audit --locked --version 0.22.2
 
+# cargo-sweep for sweep.sh (reclaim stale target/ artifacts). Matches artifacts against the
+# installed toolchain, so it must run in this image where that toolchain lives. Pinned +
+# --locked for the same reproducibility reasons as cargo-audit above.
+RUN cargo install cargo-sweep --locked --version 0.8.0
+
 # Non-root dev user owning the cargo/rustup homes so it can populate the registry
 # cache and honour rust-toolchain.toml without root.
 ARG USERNAME=dev
