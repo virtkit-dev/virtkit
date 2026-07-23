@@ -46,6 +46,14 @@ const DNS_PORT: u16 = 53;
 const FALLBACK_DNS: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
 /// First host index handed out by DHCP (.1 is the gateway).
 const FIRST_LEASE: u32 = 2;
+/// Host-side connect timeout for a guest egress flow. ipstack completes the guest's
+/// TCP handshake in userspace *before* we dial the real destination, so the guest's
+/// connect() has already returned OK and it blocks on the first read. Without a bound,
+/// dialing an unreachable destination stalls on the OS default (~127s of SYN retries),
+/// which surfaces in the guest as a multi-minute hang (e.g. a TLS ClientHello with no
+/// ServerHello). Bounding the dial fails the flow in seconds — we drop the guest stream
+/// and ipstack RSTs it — so a dead backend degrades to a fast connection error, not a hang.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy)]
 struct Cfg {
@@ -887,11 +895,26 @@ async fn proxy_tcp(mut guest: ipstack::IpStackTcpStream, egress: Arc<EgressGuard
             dst
         }
     };
-    match TcpStream::connect(target).await {
+    match connect_egress(target, CONNECT_TIMEOUT).await {
         Ok(mut host) => {
             let _ = tokio::io::copy_bidirectional(&mut guest, &mut host).await;
         }
-        Err(e) => eprintln!("switch: tcp connect {target}: {e}"),
+        // Connect refused, failed, or timed out: return so the guest stream drops and
+        // ipstack RSTs it, failing the guest's flow at once instead of leaving it hung.
+        Err(e) => eprintln!("switch: tcp connect {target}: {e} — closing guest flow"),
+    }
+}
+
+/// Dial `target` for a guest egress flow, bounded by `timeout`. On expiry, returns a
+/// `TimedOut` error instead of blocking on the OS default connect timeout — see
+/// [`CONNECT_TIMEOUT`] for why an unbounded dial stalls the guest.
+async fn connect_egress(target: SocketAddr, timeout: Duration) -> std::io::Result<TcpStream> {
+    match tokio::time::timeout(timeout, TcpStream::connect(target)).await {
+        Ok(res) => res,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("connect timed out after {}s", timeout.as_secs()),
+        )),
     }
 }
 
@@ -1622,6 +1645,23 @@ mod tests {
                 .reject_denied_syn(&syn_to(sentinel), client_mac)
                 .is_none(),
             "sentinel is exempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_egress_never_hangs_on_unreachable() {
+        // 192.0.2.1 is TEST-NET-1 (RFC 5737): guaranteed unroutable, so the dial either
+        // black-holes (our timeout bounds it) or fails fast with a routing error. Either
+        // way connect_egress must return an error well within the OS default connect
+        // timeout — this is the fail-fast that stops a dead backend hanging the guest.
+        let target: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let start = Instant::now();
+        let res = connect_egress(target, Duration::from_millis(300)).await;
+        assert!(res.is_err(), "unreachable dial must error, not connect");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "dial must fail fast, took {:?}",
+            start.elapsed()
         );
     }
 

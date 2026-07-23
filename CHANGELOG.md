@@ -11,6 +11,13 @@ All notable changes to virtkit will be documented in this file.
   Direct dials are now recorded and printed as a separate "external IPs/ports contacted (audit)"
   block on every surface (`vk run`, `vk build`, and the GitLab executor).
 
+### Fixed
+
+- **A dead egress backend now fails fast instead of hanging the guest.** The switch dialed a
+  flow's real destination without a timeout, so an unreachable backend stalled the guest for
+  roughly two minutes on the OS default SYN retries. The dial is now bounded (10s), degrading a
+  dead backend to a prompt connection error.
+
 ## [0.25.0] - 2026-07-23
 
 ### Added
