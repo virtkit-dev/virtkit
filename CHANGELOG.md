@@ -14,6 +14,13 @@ All notable changes to virtkit will be documented in this file.
   working tree — whether a fresh `vk run` would rebuild it. Opt-in: it resolves base image
   digests (network I/O), so plain `vk list` stays offline.
 
+### Changed
+
+- **`vk status` selects a VM by directory.** Now an everyday command that, like `vk list`/`vk
+  stop`, probes the VM launched from the current directory (or a given `DIR`); a raw agent
+  address still works for tooling that already knows the socket. Previously it was hidden and
+  only accepted a hand-built `vsock-auto://…` address.
+
 ### Fixed
 
 - **Single-file bind: reading a bound file immediately after an atomic-rename replace.** A

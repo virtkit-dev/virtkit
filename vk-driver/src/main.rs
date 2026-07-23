@@ -423,15 +423,16 @@ enum Cmd {
         /// Target address to dial
         addr: SocketAddr,
     },
-    /// Probe a running guest's agent: round-trip the status request to the given address
-    /// (the exec channel, e.g. vsock-auto://DIR/vsock.sock:4444) and print the reply, or
-    /// exit non-zero if it does not answer. A liveness check that actually exercises
-    /// the agent protocol — stronger than a socket stat — so external tooling can ask
-    /// "is this VM up?" with `vk` alone, no separate agent binary.
-    #[command(hide = true)]
+    /// Probe a running VM's guest agent and print its reply, or exit non-zero if it does not
+    /// answer — a liveness check that exercises the agent protocol, stronger than a socket stat.
+    /// Selects the VM launched from the current directory by default; pass a DIR to select by
+    /// launch directory. A raw agent address (`vsock-auto://DIR/vsock.sock:4444`) probes it
+    /// directly, for plumbing that already knows the socket.
+    #[command(display_order = 7)]
     Status {
-        /// Agent address to dial (the run's exec channel)
-        addr: SocketAddr,
+        /// which VM: a directory (default: the current directory), resolved via the VM registry
+        /// `vk list` uses — or a raw agent address (`scheme://…`) to dial directly
+        target: Option<String>,
     },
     /// Run a command in a live guest over its agent exec channel — an interactive
     /// shell or a one-shot command, as `--user` in `--dir`. Reuses the same client
@@ -804,7 +805,7 @@ enum Cmd {
     /// Stop running vk VM(s): SIGTERM the managing `vk run` (which tears down the VM and any
     /// compose siblings), then wait for it to exit. Selects the VM launched from the current
     /// directory by default; pass a DIR to select by launch directory, or `--all`.
-    #[command(display_order = 7)]
+    #[command(display_order = 8)]
     Stop {
         /// stop the VM(s) launched from DIR or below it (default: the current directory)
         dir: Option<PathBuf>,
@@ -2212,16 +2213,33 @@ async fn cli_main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         },
-        // Agent liveness probe: round-trip the status request (same client the boot
-        // readiness wait uses) so a caller can check the VM is up with vk alone.
-        Cmd::Status { addr } => match vk_core::status::get_status(&addr).await {
-            Ok(status) => {
-                println!("{status}");
-                ExitCode::SUCCESS
+        // Agent liveness probe: round-trip the status request (same client the boot readiness
+        // wait uses) so a caller can check a VM is up with vk alone. The target is a directory
+        // (default: cwd) resolved to its VM via the registry, or a raw agent address for plumbing.
+        Cmd::Status { target } => {
+            let addr = match target.as_deref() {
+                Some(s) if is_agent_addr(s) => match s.parse::<SocketAddr>() {
+                    Ok(a) => a,
+                    Err(e) => return fail(&e, 2),
+                },
+                // Resolution/usage errors exit 2, matching `vk list`/`vk stop`; the code-1
+                // result below is reserved for a resolved VM whose agent does not answer.
+                other => match vms::resolve_one(other.map(Path::new))
+                    .and_then(|e| e.exec_addr.parse::<SocketAddr>())
+                {
+                    Ok(a) => a,
+                    Err(e) => return fail(&e, 2),
+                },
+            };
+            match vk_core::status::get_status(&addr).await {
+                Ok(status) => {
+                    println!("{status}");
+                    ExitCode::SUCCESS
+                }
+                // get_status yields a boxed std error; wrap it for the anyhow-typed reporter.
+                Err(e) => fail(&anyhow::anyhow!("{e}"), 1),
             }
-            // get_status yields a boxed std error; wrap it for the anyhow-typed reporter.
-            Err(e) => fail(&anyhow::anyhow!("{e}"), 1),
-        },
+        }
         // Run a command in a live guest, reproducing its exit status as our own.
         Cmd::Exec {
             addr,
@@ -2283,6 +2301,21 @@ async fn cli_main() -> ExitCode {
 fn fail(e: &anyhow::Error, code: i32) -> ExitCode {
     eprintln!("virtkit: error: {e:#}");
     exit_code(code)
+}
+
+/// True when `s` is a raw agent address (has a transport scheme) rather than a directory. Used
+/// by `vk status` to tell an explicit `vsock-auto://…` from a directory selector — a bare path
+/// otherwise parses as a `unix:` address, so scheme-matching is the only reliable split.
+fn is_agent_addr(s: &str) -> bool {
+    [
+        "systemd://",
+        "vsock://",
+        "vsock-mux://",
+        "vsock-auto://",
+        "tcp://",
+    ]
+    .iter()
+    .any(|scheme| s.starts_with(scheme))
 }
 
 /// Parse a switch `--registry-proxy` value `<sentinel-ip>=<host:port>`.
@@ -2491,7 +2524,12 @@ mod tests {
             .collect();
         let mut sorted = visible.clone();
         sorted.sort();
-        assert_eq!(sorted, ["build", "check", "exec", "gc", "run"]);
+        assert_eq!(
+            sorted,
+            [
+                "build", "check", "exec", "gc", "list", "run", "status", "stop"
+            ]
+        );
     }
 
     // A --inject value parses to a single (guest, host, mode) entry with the guest path

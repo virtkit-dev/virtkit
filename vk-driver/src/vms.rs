@@ -17,7 +17,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// One running VM's record. Serialized as `<slug(state_dir)>.json` in the registry dir.
@@ -259,6 +259,28 @@ fn matches_dir(entry: &VmEntry, filter: &Path) -> bool {
     match &entry.project_dir {
         Some(p) => p == filter || p.starts_with(filter),
         None => false,
+    }
+}
+
+/// Resolve the single running VM for a directory (default: the current directory) — the
+/// selector `vk status`/`vk stop <dir>` use. Errors when none match, or when more than one does
+/// (an ambiguous parent directory), so a by-directory command never acts on the wrong VM.
+pub fn resolve_one(dir: Option<&Path>) -> Result<VmEntry> {
+    let target = match dir {
+        Some(d) => canonical(d),
+        None => std::env::current_dir().context("resolving the current directory")?,
+    };
+    let mut matched: Vec<VmEntry> = running()
+        .into_iter()
+        .filter(|e| matches_dir(e, &target))
+        .collect();
+    match matched.len() {
+        0 => bail!("no running vk VM for {}", target.display()),
+        1 => Ok(matched.pop().unwrap()),
+        n => bail!(
+            "{n} running vk VMs match {} — name a more specific directory",
+            target.display()
+        ),
     }
 }
 

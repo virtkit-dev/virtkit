@@ -129,6 +129,10 @@ The ones you'll actually type:
   registers its VM, so `list` shows the running ones (with `--stale`, whether a
   fresh `run` would rebuild the image) and `stop` brings one down by the
   directory it was launched from (or `--all`).
+- `status` — probe a running VM's guest agent and print its reply (or exit
+  non-zero if it does not answer): a liveness check that exercises the agent
+  protocol, addressed by launch directory like `list`/`stop`, or by a raw agent
+  address for plumbing.
 - `check` — preflight the host for the current user: `/dev/kvm` access, the VMM
   backend, a guest kernel/agent, and the host side of each configured feature
   (the CI-executor features only when named with `--feature`).
@@ -143,8 +147,8 @@ The ones you'll actually type:
   deduplication to keep transfers small.
 
 The rest is plumbing the commands above spawn for themselves, or development
-tooling — listed by `vk help-all`, each documented in `vk help <cmd>`: `status`
-and `connect` (probe / splice stdio to a running guest — the shape SSH's
+tooling — listed by `vk help-all`, each documented in `vk help <cmd>`:
+`connect` (splice stdio to a running guest — the shape SSH's
 `ProxyCommand` wants), `paths` (print the effective host paths and how to
 override each), `switch`, `forward` and `ssh-agent-proxy` (the per-run network
 gateway and forwarders), and the image toolbox (`mkext`, `mkext-tar`,
