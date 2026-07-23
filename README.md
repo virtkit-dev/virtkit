@@ -125,11 +125,13 @@ The ones you'll actually type:
 - `exec` — run a command (or an interactive shell with `-t`) in an
   already-running guest over its agent channel, reproducing the command's own
   exit status. Addressed by launch directory like `list`/`stop`/`status` (or by
-  a raw agent address); the command goes after `--` (`vk exec -- ls -la`).
+  a raw agent address); the command goes after `--` (`vk exec -- ls -la`), and
+  `--service NAME` targets a running compose sibling instead of the primary.
 - `list` / `stop` — discover and tear down background VMs. A `run --state-dir`
-  registers its VM, so `list` shows the running ones (with `--stale`, whether a
-  fresh `run` would rebuild the image) and `stop` brings one down by the
-  directory it was launched from (or `--all`).
+  registers its VM, so `list` shows the running ones and their compose services
+  (with `--stale`, whether a fresh `run` would rebuild the image, services
+  included) and `stop` brings one down by the directory it was launched from
+  (or `--all`).
 - `status` — probe a running VM's guest agent and print its reply (or exit
   non-zero if it does not answer): a liveness check that exercises the agent
   protocol, addressed by launch directory like `list`/`stop`, or by a raw agent

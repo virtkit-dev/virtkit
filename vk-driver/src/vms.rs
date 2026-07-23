@@ -46,6 +46,23 @@ pub struct VmEntry {
     /// (nothing is built from a Dockerfile, so there is no working tree to drift from).
     #[serde(default)]
     pub stale_recipe: Option<StaleRecipe>,
+    /// Sibling compose services this run provisioned (empty for a non-compose run), including
+    /// services available for on-demand start. Each records its agent socket so `vk list` can
+    /// name it, `vk exec --service` can reach it while running, and `--stale` can fold a
+    /// `build:` service's image into the freshness check.
+    #[serde(default)]
+    pub services: Vec<ServiceEntry>,
+}
+
+/// A sibling compose service declared alongside the primary VM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceEntry {
+    pub name: String,
+    /// The service VM's agent exec channel, `vsock-auto://<svc-dir>/vsock.sock:4444`.
+    pub exec_addr: String,
+    /// Build recipe for a `build:` service (for `--stale`); `None` for an `image:` service.
+    #[serde(default)]
+    pub stale_recipe: Option<StaleRecipe>,
 }
 
 /// What the root image was built from, captured at boot so its freshness can be re-checked
@@ -102,12 +119,14 @@ impl Freshness {
     }
 }
 
-/// Recompute the root image's build key from `entry`'s recipe and compare it to the key the
-/// image carries (its ext4 UUID is `fingerprint([stage_key])`). Resolves base image digests, so
-/// this does network I/O — only called behind an explicit `--stale` (`vk list --stale`,
-/// `vk status --stale`), never plain `list`.
-pub fn freshness(entry: &VmEntry) -> Freshness {
-    let Some(r) = &entry.stale_recipe else {
+/// Recompute a recipe's build key and compare it to the key its image carries (the ext4 UUID is
+/// `fingerprint([stage_key])`). Resolves base image digests, so this does network I/O — only on
+/// `--stale`, never plain `list`.
+fn freshness_of_recipe(r: &StaleRecipe) -> Freshness {
+    // Read the on-disk image's stamped key first: it's a cheap local stat, and if the image is
+    // absent (a `build:` service that was never started/built) there is nothing to compare, so
+    // skip the network stage-key recompute entirely and report Unknown.
+    let Some(uuid) = crate::ext4::fs_uuid(&r.root_ext4) else {
         return Freshness::Unknown;
     };
     let Ok(key) = crate::build::target_stage_key(
@@ -118,11 +137,48 @@ pub fn freshness(entry: &VmEntry) -> Freshness {
     ) else {
         return Freshness::Unknown;
     };
-    let expected = crate::ensure::fingerprint(&[&key]);
-    match crate::ext4::fs_uuid(&r.root_ext4) {
-        Some(uuid) if uuid == expected => Freshness::Fresh,
-        Some(_) => Freshness::Stale,
-        None => Freshness::Unknown,
+    if uuid == crate::ensure::fingerprint(&[&key]) {
+        Freshness::Fresh
+    } else {
+        Freshness::Stale
+    }
+}
+
+/// Freshness of the VM's own root image (ignoring services). `Unknown` for an image boot.
+pub fn freshness(entry: &VmEntry) -> Freshness {
+    entry
+        .stale_recipe
+        .as_ref()
+        .map_or(Freshness::Unknown, freshness_of_recipe)
+}
+
+/// Combined freshness of the VM and its `build:` services: `Stale` if any component's image has
+/// drifted from the working tree (a fresh `vk run` would rebuild it), else `Fresh` if any is
+/// known current, else `Unknown`. So a sibling's Dockerfile change flags the workload, while an
+/// undeterminable component (image service, uncached/never-built image) never forces a nag.
+pub fn freshness_all(entry: &VmEntry) -> Freshness {
+    let services = entry.services.iter().map(|s| {
+        s.stale_recipe
+            .as_ref()
+            .map_or(Freshness::Unknown, freshness_of_recipe)
+    });
+    combine(std::iter::once(freshness(entry)).chain(services))
+}
+
+/// Fold component verdicts: any `Stale` wins, else any `Fresh`, else `Unknown`.
+fn combine(parts: impl Iterator<Item = Freshness>) -> Freshness {
+    let mut any_fresh = false;
+    for f in parts {
+        match f {
+            Freshness::Stale => return Freshness::Stale,
+            Freshness::Fresh => any_fresh = true,
+            Freshness::Unknown => {}
+        }
+    }
+    if any_fresh {
+        Freshness::Fresh
+    } else {
+        Freshness::Unknown
     }
 }
 
@@ -322,13 +378,56 @@ struct VmView<'a> {
     uptime_secs: u64,
     /// A double option so `--stale` is self-describing: the outer `None` (no `--stale`) omits
     /// the field, while `Some(None)` — freshness requested but unknown — serializes as an
-    /// explicit `null`, distinct from a known `true`/`false`.
+    /// explicit `null`, distinct from a known `true`/`false`. Reflects the VM *and* its services.
     #[serde(skip_serializing_if = "Option::is_none")]
     stale: Option<Option<bool>>,
+    /// Sibling compose services (empty for a non-compose VM).
+    services: Vec<ServiceView<'a>>,
+}
+
+#[derive(Serialize)]
+struct ServiceView<'a> {
+    name: &'a str,
+    exec_addr: &'a str,
+}
+
+fn view(entry: &VmEntry, freshness: Freshness, stale: bool) -> VmView<'_> {
+    VmView {
+        state_dir: &entry.state_dir,
+        project_dir: entry.project_dir.as_deref(),
+        pid: entry.pid,
+        label: &entry.label,
+        exec_addr: &entry.exec_addr,
+        ssh_addr: entry.ssh_addr.as_deref(),
+        created_secs: entry.created_secs,
+        uptime_secs: unix_now().saturating_sub(entry.created_secs),
+        stale: if stale { Some(freshness.json()) } else { None },
+        services: entry
+            .services
+            .iter()
+            .map(|service| ServiceView {
+                name: &service.name,
+                exec_addr: &service.exec_addr,
+            })
+            .collect(),
+    }
+}
+
+fn display_name(entry: &VmEntry) -> String {
+    if entry.services.is_empty() {
+        entry.label.clone()
+    } else {
+        let services: Vec<&str> = entry
+            .services
+            .iter()
+            .map(|service| service.name.as_str())
+            .collect();
+        format!("{} (+{})", entry.label, services.join(", "))
+    }
 }
 
 /// `vk list`: the running VMs (optionally only those under `filter`) as a table, or JSON. With
-/// `stale`, each VM's freshness is computed (network I/O — see `freshness`) and shown.
+/// `stale`, each VM's freshness is computed (network I/O — see `freshness_all`) and shown.
 pub fn list_report(filter: Option<&Path>, json: bool, stale: bool) -> Result<String> {
     let mut vms = running();
     if let Some(f) = filter {
@@ -339,7 +438,7 @@ pub fn list_report(filter: Option<&Path>, json: bool, stale: bool) -> Result<Str
         .iter()
         .map(|e| {
             if stale {
-                freshness(e)
+                freshness_all(e)
             } else {
                 Freshness::Unknown
             }
@@ -350,17 +449,7 @@ pub fn list_report(filter: Option<&Path>, json: bool, stale: bool) -> Result<Str
         let views: Vec<VmView> = vms
             .iter()
             .zip(&fresh)
-            .map(|(e, f)| VmView {
-                state_dir: &e.state_dir,
-                project_dir: e.project_dir.as_deref(),
-                pid: e.pid,
-                label: &e.label,
-                exec_addr: &e.exec_addr,
-                ssh_addr: e.ssh_addr.as_deref(),
-                created_secs: e.created_secs,
-                uptime_secs: unix_now().saturating_sub(e.created_secs),
-                stale: if stale { Some(f.json()) } else { None },
-            })
+            .map(|(entry, freshness)| view(entry, *freshness, stale))
             .collect();
         return Ok(serde_json::to_string_pretty(&views).context("serializing VM list")? + "\n");
     }
@@ -376,10 +465,11 @@ pub fn list_report(filter: Option<&Path>, json: bool, stale: bool) -> Result<Str
         .iter()
         .zip(&fresh)
         .map(|(e, f)| {
+            // NAME shows the primary plus its sibling services: `devcontainer (+redis, mysql)`.
             let mut row = vec![
                 e.pid.to_string(),
                 uptime(e.created_secs),
-                e.label.clone(),
+                display_name(e),
                 e.project_dir
                     .as_deref()
                     .map(|p| p.display().to_string())
@@ -523,6 +613,7 @@ mod tests {
             ssh_addr: None,
             created_secs: unix_now(),
             stale_recipe: None,
+            services: Vec::new(),
         }
     }
 
@@ -639,6 +730,59 @@ mod tests {
     }
 
     #[test]
+    fn freshness_all_folds_in_services() {
+        // No recipes anywhere (image primary + image services) -> nothing to judge, so the
+        // combined verdict is Unknown (never a spurious "stale").
+        let mut e = entry(PathBuf::from("/state/img"), None);
+        assert_eq!(freshness_all(&e), Freshness::Unknown);
+        e.services.push(ServiceEntry {
+            name: "db".into(),
+            exec_addr: "vsock-auto:///state/img/svc-db/vsock.sock:4444".into(),
+            stale_recipe: None,
+        });
+        assert_eq!(freshness_all(&e), Freshness::Unknown);
+    }
+
+    #[test]
+    fn combine_stale_dominates_then_fresh_then_unknown() {
+        use Freshness::*;
+        // Any stale component flags the workload, wherever it sits.
+        assert_eq!(combine([Fresh, Unknown, Stale].into_iter()), Stale);
+        assert_eq!(combine([Stale, Fresh].into_iter()), Stale);
+        // A known-current component upgrades an otherwise-unknown verdict.
+        assert_eq!(combine([Unknown, Fresh].into_iter()), Fresh);
+        // Nothing determinable stays unknown (never a spurious "stale").
+        assert_eq!(combine([Unknown, Unknown].into_iter()), Unknown);
+    }
+
+    #[test]
+    fn list_view_reports_compose_services_in_text_and_json() {
+        let mut e = entry(PathBuf::from("/state/app"), Some(PathBuf::from("/project")));
+        e.label = "app".into();
+        e.services = vec![
+            ServiceEntry {
+                name: "db".into(),
+                exec_addr: "vsock-auto:///state/app/svc-db/vsock.sock:4444".into(),
+                stale_recipe: None,
+            },
+            ServiceEntry {
+                name: "redis".into(),
+                exec_addr: "vsock-auto:///state/app/svc-redis/vsock.sock:4444".into(),
+                stale_recipe: None,
+            },
+        ];
+
+        assert_eq!(display_name(&e), "app (+db, redis)");
+        let json = serde_json::to_value(view(&e, Freshness::Unknown, false)).unwrap();
+        assert_eq!(json["services"][0]["name"], "db");
+        assert_eq!(
+            json["services"][0]["exec_addr"],
+            "vsock-auto:///state/app/svc-db/vsock.sock:4444"
+        );
+        assert_eq!(json["services"][1]["name"], "redis");
+    }
+
+    #[test]
     fn json_stale_field_distinguishes_absent_unknown_and_known() {
         let dir = PathBuf::from("/state/x");
         let view = |stale: Option<Option<bool>>| VmView {
@@ -651,6 +795,7 @@ mod tests {
             created_secs: 0,
             uptime_secs: 0,
             stale,
+            services: vec![],
         };
         // No `--stale`: the field is omitted entirely.
         let j = serde_json::to_string(&view(None)).unwrap();

@@ -450,6 +450,10 @@ enum Cmd {
         /// which VM: a directory (default: the current directory), resolved via the VM registry
         /// `vk list` uses — or a raw agent address (`scheme://…`) to dial directly
         target: Option<String>,
+        /// run in this compose sibling service of the selected VM (by name, as `vk list` shows)
+        /// instead of the primary; the service must be running
+        #[arg(long)]
+        service: Option<String>,
         /// Background mode: no stdio, do not wait for the command to exit
         #[arg(short, long)]
         background: bool,
@@ -2234,7 +2238,7 @@ async fn cli_main() -> ExitCode {
             ),
             other => match vms::resolve_one(other.map(Path::new)) {
                 Ok(entry) => {
-                    println!("{}", vms::freshness(&entry).as_str());
+                    println!("{}", vms::freshness_all(&entry).as_str());
                     ExitCode::SUCCESS
                 }
                 // Resolution errors exit 2, matching the probe arm below and `vk list`/`vk stop`.
@@ -2268,6 +2272,7 @@ async fn cli_main() -> ExitCode {
         // or a raw agent address); the command is the trailing `-- …` group.
         Cmd::Exec {
             target,
+            service,
             background,
             clear_env,
             env,
@@ -2280,7 +2285,7 @@ async fn cli_main() -> ExitCode {
             // clap's own usage-error exit. Any vk-chosen code can collide with the remote
             // command's status vk reproduces below; 2 matches what the old CLI returned
             // when the positional address failed to parse.
-            let addr = match resolve_agent_addr(target.as_deref()) {
+            let addr = match resolve_exec_addr(target.as_deref(), service.as_deref()) {
                 Ok(a) => a,
                 Err(e) => return fail(&e, 2),
             };
@@ -2360,12 +2365,43 @@ fn is_agent_addr(s: &str) -> bool {
 /// registry, defaulting to the current directory.
 fn resolve_agent_addr(target: Option<&str>) -> anyhow::Result<SocketAddr> {
     match target {
-        Some(s) if is_agent_addr(s) => Ok(s.parse::<SocketAddr>()?),
+        Some(s) if is_agent_addr(s) => s.parse::<SocketAddr>(),
         other => {
             let entry = vms::resolve_one(other.map(Path::new))?;
-            Ok(entry.exec_addr.parse::<SocketAddr>()?)
+            entry.exec_addr.parse::<SocketAddr>()
         }
     }
+}
+
+/// Resolve `vk exec`'s target to the agent address to dial: the primary VM (as
+/// `resolve_agent_addr`), or — with `--service` — a named sibling service of the VM selected by
+/// directory. A raw agent address can't name a service (it isn't a registry entry).
+fn resolve_exec_addr(target: Option<&str>, service: Option<&str>) -> anyhow::Result<SocketAddr> {
+    let Some(svc) = service else {
+        return resolve_agent_addr(target);
+    };
+    if target.is_some_and(is_agent_addr) {
+        anyhow::bail!("--service selects a VM by directory, not a raw agent address");
+    }
+    let entry = vms::resolve_one(target.map(Path::new))?;
+    resolve_service_addr(&entry, svc)
+}
+
+fn resolve_service_addr(entry: &vms::VmEntry, service: &str) -> anyhow::Result<SocketAddr> {
+    let found = entry
+        .services
+        .iter()
+        .find(|s| s.name == service)
+        .ok_or_else(|| {
+            let names: Vec<&str> = entry.services.iter().map(|s| s.name.as_str()).collect();
+            let have = if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(", ")
+            };
+            anyhow::anyhow!("no service {service:?} in this VM (services: {have})")
+        })?;
+    found.exec_addr.parse::<SocketAddr>()
 }
 
 /// Parse a switch `--registry-proxy` value `<sentinel-ip>=<host:port>`.
@@ -2586,7 +2622,45 @@ mod tests {
         assert_eq!(target.as_deref(), Some("/proj"));
         assert_eq!(command, ["true"]);
 
+        let cli = Cli::try_parse_from(["vk", "exec", "--service", "db", "--", "true"]).unwrap();
+        let Cmd::Exec {
+            service, command, ..
+        } = cli.cmd
+        else {
+            panic!("expected Cmd::Exec")
+        };
+        assert_eq!(service.as_deref(), Some("db"));
+        assert_eq!(command, ["true"]);
+
         assert!(Cli::try_parse_from(["vk", "exec", "ls", "-la"]).is_err());
+    }
+
+    #[test]
+    fn exec_service_selects_named_sibling_and_rejects_raw_address() {
+        let entry = vms::VmEntry {
+            state_dir: PathBuf::from("/state/app"),
+            project_dir: Some(PathBuf::from("/project")),
+            pid: 1,
+            label: "app".into(),
+            exec_addr: "vsock-auto:///state/app/vsock.sock:4444".into(),
+            ssh_addr: None,
+            created_secs: 0,
+            stale_recipe: None,
+            services: vec![vms::ServiceEntry {
+                name: "db".into(),
+                exec_addr: "vsock-auto:///state/app/svc-db/vsock.sock:4444".into(),
+                stale_recipe: None,
+            }],
+        };
+        assert_eq!(
+            resolve_service_addr(&entry, "db").unwrap(),
+            "vsock-auto:///state/app/svc-db/vsock.sock:4444"
+                .parse::<SocketAddr>()
+                .unwrap()
+        );
+
+        let err = resolve_exec_addr(Some("vsock://3:4444"), Some("db")).unwrap_err();
+        assert!(err.to_string().contains("not a raw agent address"), "{err}");
     }
 
     // `vk --help` is a curated list: a new Cmd variant must either join it

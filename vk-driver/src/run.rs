@@ -957,6 +957,42 @@ async fn build_and_boot(
         cmdline.push_str(" VIRTKIT_CTL=1");
     }
 
+    // Snapshot the sibling services for the VM registry (see vms.rs) before the manager takes
+    // ownership of `planned`: while running, each serves its agent at `<svc-dir>/vsock.sock` so
+    // `vk exec --service` can reach it, and a `build:` service carries its recipe so `vk list
+    // --stale` folds its image into the freshness check. Same context/build-arg derivation as
+    // `compose_build_units`, so a recomputed key matches the one the service booted with.
+    let service_entries: Vec<crate::vms::ServiceEntry> = planned
+        .units
+        .iter()
+        .map(|(prov, dir, unit)| {
+            let stale_recipe = match &unit.source {
+                crate::compose::Source::Build {
+                    dockerfiles,
+                    context,
+                    target,
+                    args: unit_args,
+                } => {
+                    let mut build_args = args.build_args.clone();
+                    build_args.extend(unit_args.iter().cloned());
+                    Some(crate::vms::StaleRecipe {
+                        dockerfiles: dockerfiles.clone(),
+                        contexts: vec![context.clone(); dockerfiles.len()],
+                        build_args,
+                        target: target.clone(),
+                        root_ext4: prov.ext4.clone(),
+                    })
+                }
+                crate::compose::Source::Image(_) => None,
+            };
+            crate::vms::ServiceEntry {
+                name: prov.name.clone(),
+                exec_addr: format!("vsock-auto://{}/vsock.sock:{VSOCK_PORT}", dir.display()),
+                stale_recipe,
+            }
+        })
+        .collect();
+
     // --host-exec: the guest agent presents /run/vk/host.sock, relayed over vsock
     // to a host-side `vk-agent serve` (spawned after boot, below).
     if args.host_exec {
@@ -1339,6 +1375,7 @@ async fn build_and_boot(
                 .then(|| format!("vsock-auto://{}:{SSH_VSOCK_PORT}", vsock.display())),
             created_secs: crate::vms::unix_now(),
             stale_recipe,
+            services: service_entries,
         })
     });
 

@@ -11,11 +11,17 @@ All notable changes to virtkit will be documented in this file.
   address) and `vk stop` brings one down by that directory (or `--all`) — no more grepping the
   process table to find and kill a background VM. `vk list --json` feeds scripts.
 - **`vk list --stale`.** Reports, per running VM, whether its root image still matches the
-  working tree — whether a fresh `vk run` would rebuild it. Opt-in: it resolves base image
-  digests (network I/O), so plain `vk list` stays offline.
+  working tree — whether a fresh `vk run` would rebuild it; for a compose run the verdict
+  covers the `build:` services' images too, so a service's Dockerfile drift flags the
+  workload. Opt-in: it resolves base image digests (network I/O), so plain `vk list` stays
+  offline.
 - **`vk status --stale`.** Prints a single `fresh` / `stale` / `unknown` word for the VM
   launched from the current directory (or a given `DIR`), so a script can check image
   freshness with a plain string compare — no JSON parsing needed.
+- **Compose services in `vk list` and `vk exec`.** A compose run's declared sibling services
+  (running or startable on demand) now show up in `vk list` (`app (+db, redis)`, and as a
+  `services` array under `--json`), and `vk exec --service NAME` runs a command in a named
+  running service instead of the primary.
 
 ### Changed
 
