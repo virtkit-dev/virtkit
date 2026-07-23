@@ -10,6 +10,9 @@ All notable changes to virtkit will be documented in this file.
   the running VMs (pid, uptime, name, the directory each was launched from, and its exec
   address) and `vk stop` brings one down by that directory (or `--all`) — no more grepping the
   process table to find and kill a background VM. `vk list --json` feeds scripts.
+- **`vk list --stale`.** Reports, per running VM, whether its root image still matches the
+  working tree — whether a fresh `vk run` would rebuild it. Opt-in: it resolves base image
+  digests (network I/O), so plain `vk list` stays offline.
 
 ## [0.26.0] - 2026-07-23
 

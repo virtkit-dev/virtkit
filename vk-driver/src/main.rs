@@ -796,6 +796,10 @@ enum Cmd {
         /// emit the entries as a JSON array instead of a table
         #[arg(long)]
         json: bool,
+        /// also report, per VM, whether a fresh `vk run` would rebuild its image (the working
+        /// tree drifted from what booted). Resolves base image digests, so it does network I/O.
+        #[arg(long)]
+        stale: bool,
     },
     /// Stop running vk VM(s): SIGTERM the managing `vk run` (which tears down the VM and any
     /// compose siblings), then wait for it to exit. Selects the VM launched from the current
@@ -1312,8 +1316,8 @@ async fn cli_main() -> ExitCode {
             Err(e) => fail(&e, 2),
         };
     }
-    if let Cmd::List { dir, json } = &cli.cmd {
-        return match vms::list_report(dir.as_deref(), *json) {
+    if let Cmd::List { dir, json, stale } = &cli.cmd {
+        return match vms::list_report(dir.as_deref(), *json, *stale) {
             Ok(report) => {
                 print!("{report}");
                 ExitCode::SUCCESS

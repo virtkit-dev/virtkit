@@ -41,6 +41,79 @@ pub struct VmEntry {
     pub ssh_addr: Option<String>,
     /// Unix time (seconds) the entry was recorded — the VM's start, for an uptime column.
     pub created_secs: u64,
+    /// Inputs to recompute the root image's build key against the working tree, so `vk list
+    /// --stale` can tell whether a fresh `vk run` would rebuild it. `None` for an image boot
+    /// (nothing is built from a Dockerfile, so there is no working tree to drift from).
+    #[serde(default)]
+    pub stale_recipe: Option<StaleRecipe>,
+}
+
+/// What the root image was built from, captured at boot so its freshness can be re-checked
+/// later without the caller re-deriving the recipe. Mirrors exactly how `vk run` forms the
+/// build inputs (a `-f` boot's args, or a compose `--primary` service's `build:` — its context
+/// replicated per Dockerfile, the run's build-args merged with the service's), so a recomputed
+/// key matches the one the boot stamped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaleRecipe {
+    pub dockerfiles: Vec<PathBuf>,
+    pub contexts: Vec<PathBuf>,
+    pub build_args: Vec<(String, String)>,
+    pub target: Option<String>,
+    /// The built root image whose ext4 UUID carries its stamped stage key.
+    pub root_ext4: PathBuf,
+}
+
+/// Whether the running VM's root image still matches the working tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// A fresh `vk run` would rebuild — the recomputed key no longer matches the image.
+    Stale,
+    /// The image matches the current sources.
+    Fresh,
+    /// Not determinable: an image boot (no recipe), the image is gone, or the key recompute
+    /// failed (e.g. a base digest could not be resolved). Never reported as stale, so a probe
+    /// failure never nags a rebuild — matching how the dev-VM scripts treat "unknown".
+    Unknown,
+}
+
+impl Freshness {
+    fn cell(self) -> &'static str {
+        match self {
+            Freshness::Stale => "yes",
+            Freshness::Fresh => "no",
+            Freshness::Unknown => "-",
+        }
+    }
+    fn json(self) -> Option<bool> {
+        match self {
+            Freshness::Stale => Some(true),
+            Freshness::Fresh => Some(false),
+            Freshness::Unknown => None,
+        }
+    }
+}
+
+/// Recompute the root image's build key from `entry`'s recipe and compare it to the key the
+/// image carries (its ext4 UUID is `fingerprint([stage_key])`). Resolves base image digests, so
+/// this does network I/O — only called for `vk list --stale`, never plain `list`.
+pub fn freshness(entry: &VmEntry) -> Freshness {
+    let Some(r) = &entry.stale_recipe else {
+        return Freshness::Unknown;
+    };
+    let Ok(key) = crate::build::target_stage_key(
+        &r.dockerfiles,
+        &r.contexts,
+        &r.build_args,
+        r.target.as_deref(),
+    ) else {
+        return Freshness::Unknown;
+    };
+    let expected = crate::ensure::fingerprint(&[&key]);
+    match crate::ext4::fs_uuid(&r.root_ext4) {
+        Some(uuid) if uuid == expected => Freshness::Fresh,
+        Some(_) => Freshness::Stale,
+        None => Freshness::Unknown,
+    }
 }
 
 /// The registry directory: `<data base>/vms`, alongside `vk run`'s image cache.
@@ -201,23 +274,76 @@ fn uptime(created_secs: u64) -> String {
     }
 }
 
-/// `vk list`: the running VMs (optionally only those under `filter`) as a table, or JSON.
-pub fn list_report(filter: Option<&Path>, json: bool) -> Result<String> {
+/// The public shape of a VM in `vk list --json`: the user-facing fields plus a computed
+/// `uptime_secs` and (with `--stale`) `stale`. Deliberately omits the internal `stale_recipe`,
+/// so the JSON stays a stable contract for scripts.
+#[derive(Serialize)]
+struct VmView<'a> {
+    state_dir: &'a Path,
+    project_dir: Option<&'a Path>,
+    pid: u32,
+    label: &'a str,
+    exec_addr: &'a str,
+    ssh_addr: Option<&'a str>,
+    created_secs: u64,
+    uptime_secs: u64,
+    /// A double option so `--stale` is self-describing: the outer `None` (no `--stale`) omits
+    /// the field, while `Some(None)` — freshness requested but unknown — serializes as an
+    /// explicit `null`, distinct from a known `true`/`false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stale: Option<Option<bool>>,
+}
+
+/// `vk list`: the running VMs (optionally only those under `filter`) as a table, or JSON. With
+/// `stale`, each VM's freshness is computed (network I/O — see `freshness`) and shown.
+pub fn list_report(filter: Option<&Path>, json: bool, stale: bool) -> Result<String> {
     let mut vms = running();
     if let Some(f) = filter {
         let f = canonical(f);
         vms.retain(|e| matches_dir(e, &f));
     }
+    let fresh: Vec<Freshness> = vms
+        .iter()
+        .map(|e| {
+            if stale {
+                freshness(e)
+            } else {
+                Freshness::Unknown
+            }
+        })
+        .collect();
+
     if json {
-        return Ok(serde_json::to_string_pretty(&vms).context("serializing VM list")? + "\n");
+        let views: Vec<VmView> = vms
+            .iter()
+            .zip(&fresh)
+            .map(|(e, f)| VmView {
+                state_dir: &e.state_dir,
+                project_dir: e.project_dir.as_deref(),
+                pid: e.pid,
+                label: &e.label,
+                exec_addr: &e.exec_addr,
+                ssh_addr: e.ssh_addr.as_deref(),
+                created_secs: e.created_secs,
+                uptime_secs: unix_now().saturating_sub(e.created_secs),
+                stale: if stale { Some(f.json()) } else { None },
+            })
+            .collect();
+        return Ok(serde_json::to_string_pretty(&views).context("serializing VM list")? + "\n");
     }
     if vms.is_empty() {
         return Ok("no running vk VMs\n".to_string());
     }
-    let rows: Vec<[String; 5]> = vms
+    // Columns: the STALE column is only added with `--stale`.
+    let mut headers: Vec<&str> = vec!["PID", "UPTIME", "NAME", "PROJECT", "EXEC ADDRESS"];
+    if stale {
+        headers.push("STALE");
+    }
+    let rows: Vec<Vec<String>> = vms
         .iter()
-        .map(|e| {
-            [
+        .zip(&fresh)
+        .map(|(e, f)| {
+            let mut row = vec![
                 e.pid.to_string(),
                 uptime(e.created_secs),
                 e.label.clone(),
@@ -226,18 +352,21 @@ pub fn list_report(filter: Option<&Path>, json: bool) -> Result<String> {
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "-".to_string()),
                 e.exec_addr.clone(),
-            ]
+            ];
+            if stale {
+                row.push(f.cell().to_string());
+            }
+            row
         })
         .collect();
-    let headers = ["PID", "UPTIME", "NAME", "PROJECT", "EXEC ADDRESS"];
-    let mut widths = headers.map(str::len);
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
     for row in &rows {
         for (i, cell) in row.iter().enumerate() {
             widths[i] = widths[i].max(cell.len());
         }
     }
     let mut out = String::new();
-    let fmt_row = |cells: &[String; 5], out: &mut String| {
+    let fmt_row = |cells: &[String], out: &mut String| {
         for (i, cell) in cells.iter().enumerate() {
             if i + 1 == cells.len() {
                 out.push_str(cell); // last column: no trailing pad
@@ -247,7 +376,10 @@ pub fn list_report(filter: Option<&Path>, json: bool) -> Result<String> {
         }
         out.push('\n');
     };
-    fmt_row(&headers.map(String::from), &mut out);
+    fmt_row(
+        &headers.iter().map(|h| h.to_string()).collect::<Vec<_>>(),
+        &mut out,
+    );
     for row in &rows {
         fmt_row(row, &mut out);
     }
@@ -357,6 +489,7 @@ mod tests {
             exec_addr: "vsock-auto:///tmp/x/vsock.sock:4444".into(),
             ssh_addr: None,
             created_secs: unix_now(),
+            stale_recipe: None,
         }
     }
 
@@ -453,6 +586,51 @@ mod tests {
         assert!(empty_selection_ok(false));
         // `vk stop DIR` naming a target that isn't running: not-found (exit 1).
         assert!(!empty_selection_ok(true));
+    }
+
+    #[test]
+    fn freshness_is_unknown_without_a_recipe() {
+        // An image boot records no recipe -> freshness can't be judged (never "stale").
+        let e = entry(PathBuf::from("/state/img"), None);
+        assert!(e.stale_recipe.is_none());
+        assert_eq!(freshness(&e), Freshness::Unknown);
+        assert_eq!(Freshness::Unknown.cell(), "-");
+        assert_eq!(Freshness::Unknown.json(), None);
+        assert_eq!(Freshness::Stale.cell(), "yes");
+        assert_eq!(Freshness::Stale.json(), Some(true));
+        assert_eq!(Freshness::Fresh.cell(), "no");
+        assert_eq!(Freshness::Fresh.json(), Some(false));
+    }
+
+    #[test]
+    fn json_stale_field_distinguishes_absent_unknown_and_known() {
+        let dir = PathBuf::from("/state/x");
+        let view = |stale: Option<Option<bool>>| VmView {
+            state_dir: &dir,
+            project_dir: None,
+            pid: 1,
+            label: "x",
+            exec_addr: "a",
+            ssh_addr: None,
+            created_secs: 0,
+            uptime_secs: 0,
+            stale,
+        };
+        // No `--stale`: the field is omitted entirely.
+        let j = serde_json::to_string(&view(None)).unwrap();
+        assert!(!j.contains("\"stale\""), "{j}");
+        // `--stale` but freshness unknown: an explicit null, not omitted.
+        assert!(
+            serde_json::to_string(&view(Some(None)))
+                .unwrap()
+                .contains("\"stale\":null")
+        );
+        // `--stale` with a verdict: the bool.
+        assert!(
+            serde_json::to_string(&view(Some(Some(true))))
+                .unwrap()
+                .contains("\"stale\":true")
+        );
     }
 
     #[test]

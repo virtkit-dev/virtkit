@@ -1292,6 +1292,42 @@ async fn build_and_boot(
         } else {
             "vm".to_string()
         };
+        // Capture what the root image was built from, so `vk list --stale` can later tell
+        // whether the working tree drifted. Mirror `compose_build_units` (compose --primary)
+        // and the `-f` build options exactly, so a recomputed key matches the stamped one.
+        // `None` for an image boot (nothing built from a Dockerfile).
+        let stale_recipe = dockerfile_ext4.as_ref().and_then(|root| {
+            if let Some(idx) = primary_idx {
+                if let crate::compose::Source::Build {
+                    dockerfiles,
+                    context,
+                    target,
+                    args: unit_args,
+                } = &compose_units[idx].source
+                {
+                    let mut build_args = args.build_args.clone();
+                    build_args.extend(unit_args.iter().cloned());
+                    return Some(crate::vms::StaleRecipe {
+                        dockerfiles: dockerfiles.clone(),
+                        contexts: vec![context.clone(); dockerfiles.len()],
+                        build_args,
+                        target: target.clone(),
+                        root_ext4: root.clone(),
+                    });
+                }
+                None // a compose --primary that is an image: (no build → no drift)
+            } else if !args.dockerfiles.is_empty() {
+                Some(crate::vms::StaleRecipe {
+                    dockerfiles: args.dockerfiles.clone(),
+                    contexts: args.contexts.clone(),
+                    build_args: args.build_args.clone(),
+                    target: args.target.clone(),
+                    root_ext4: root.clone(),
+                })
+            } else {
+                None
+            }
+        });
         crate::vms::register(crate::vms::VmEntry {
             state_dir: std::fs::canonicalize(work).unwrap_or_else(|_| work.to_path_buf()),
             project_dir: std::env::current_dir().ok(),
@@ -1302,6 +1338,7 @@ async fn build_and_boot(
                 .ssh
                 .then(|| format!("vsock-auto://{}:{SSH_VSOCK_PORT}", vsock.display())),
             created_secs: crate::vms::unix_now(),
+            stale_recipe,
         })
     });
 
