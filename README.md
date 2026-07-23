@@ -125,6 +125,10 @@ The ones you'll actually type:
 - `exec` — run a command (or an interactive shell with `-t`) in an
   already-running guest over its agent channel, reproducing the command's own
   exit status.
+- `list` / `stop` — discover and tear down background VMs. A `run --state-dir`
+  registers its VM, so `list` shows the running ones (with `--stale`, whether a
+  fresh `run` would rebuild the image) and `stop` brings one down by the
+  directory it was launched from (or `--all`).
 - `check` — preflight the host for the current user: `/dev/kvm` access, the VMM
   backend, a guest kernel/agent, and the host side of each configured feature
   (the CI-executor features only when named with `--feature`).

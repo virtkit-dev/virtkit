@@ -116,8 +116,9 @@ pub fn freshness(entry: &VmEntry) -> Freshness {
     }
 }
 
-/// The registry directory: `<data base>/vms`, alongside `vk run`'s image cache.
-fn registry_dir() -> Result<PathBuf> {
+/// The registry directory: `<data base>/vms`, alongside `vk run`'s image cache. Public so
+/// `vk paths` can report it.
+pub fn registry_dir() -> Result<PathBuf> {
     Ok(crate::run::default_data_base()?.join("vms"))
 }
 

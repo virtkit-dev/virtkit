@@ -1211,6 +1211,21 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
         "                override: `--cache-registry`/`[build] cache_registry` (instruction cache),"
     )?;
     writeln!(out, "                `--root` on `vk registry status`/`gc`")?;
+    writeln!(out)?;
+    let vms = vms::registry_dir()?;
+    writeln!(
+        out,
+        "vm registry     {} (default: $XDG_DATA_HOME/virtkit/vms)",
+        vms.display()
+    )?;
+    writeln!(
+        out,
+        "                one entry per `vk run --state-dir` VM; `vk list`/`vk stop` read it"
+    )?;
+    writeln!(
+        out,
+        "                (self-pruned as VMs exit — no `vk gc` needed)"
+    )?;
     if let Some(repo) = cfg.registry.as_ref().and_then(|r| r.local_root()) {
         writeln!(
             out,
