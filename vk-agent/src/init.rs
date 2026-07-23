@@ -1788,7 +1788,7 @@ fn fork_exec_wait(argv: &[String]) -> Result<i32> {
 /// On SIGTERM/SIGINT (e.g. a forwarded shutdown), power the VM off.
 fn install_term_handler() {
     // SAFETY: poweroff() is async-signal-safe enough for our purpose (sync +
-    // reboot syscalls); we never return from it.
+    // FIFREEZE via raw open/ioctl + reboot syscalls); we never return from it.
     unsafe {
         libc::signal(
             libc::SIGTERM,
@@ -1826,8 +1826,17 @@ fn supervise(serve_pid: libc::pid_t) -> Result<()> {
 /// Flush and power the VM off (the executor's cleanup also force-stops the VMM,
 /// but a clean poweroff on serve exit is tidier). Never returns.
 fn poweroff() -> ! {
+    // SAFETY: async-signal-safe syscall (poweroff also runs from the SIGTERM handler).
     unsafe {
         libc::sync();
+    }
+    // Freeze the root fs before power-off so its ext4 journal is checkpointed and the next
+    // mount runs no journal recovery; see `fsfreeze::freeze_for_poweroff`. `sync()` alone
+    // flushes dirty pages but leaves the journal open. Best-effort and no thaw: we are
+    // powering off.
+    crate::fsfreeze::freeze_for_poweroff(c"/");
+    // SAFETY: async-signal-safe syscall.
+    unsafe {
         libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
     }
     // reboot() should not return for PID 1; if it does, exit so the kernel panics

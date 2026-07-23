@@ -25,6 +25,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Clean journal on power-off.** The guest now freezes its root filesystem (FIFREEZE) before
+  `reboot`, checkpointing the ext4 journal and clearing its needs-recovery flag on disk.
+  Previously power-off only `sync`ed, so a journaled root (an OCI/docker-image boot) was left
+  with a dirty journal and the next mount of a persisted or checkpointed disk ran journal
+  recovery.
 - **Exported images now carry their content-freshness UUID.** `vk build --out`, `vk build
   --compose` and `vk run --compose --primary` stamp the exported ext4's UUID with
   `fingerprint([stage_key])` (as a build-tier unit already was), so `vk fingerprint` matches a

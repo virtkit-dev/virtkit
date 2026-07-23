@@ -57,6 +57,28 @@ pub fn thaw(path: &Path) -> Result<()> {
     ioctl_fs(path, FITHAW, "FITHAW")
 }
 
+/// Freeze the fs at `mountpoint` for an imminent power-off: FIFREEZE flushes and checkpoints
+/// the ext4 journal and clears its needs-recovery flag on disk (the same "no recovery needed"
+/// property the snapshot path relies on), so a journaled root — an OCI/docker-image boot —
+/// mounts without journal recovery next time. Without it the next mount of a persisted or
+/// checkpointed disk runs journal recovery.
+///
+/// Unlike [`freeze`], this is **async-signal-safe** (raw `open`/`ioctl`/`close`, a caller-owned
+/// `'static` C path, no allocation and no `Result`) so [`crate::init`]'s `poweroff` can call it
+/// from the `SIGTERM` handler. Best-effort — errors are ignored — and there is no thaw: the VM
+/// is powering off, so the freeze need never be undone.
+pub(crate) fn freeze_for_poweroff(mountpoint: &std::ffi::CStr) {
+    // SAFETY: raw syscalls only. `mountpoint` is a valid NUL-terminated C string; FIFREEZE
+    // ignores its third argument; a failed open yields fd < 0 and we skip the ioctl.
+    unsafe {
+        let fd = libc::open(mountpoint.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+        if fd >= 0 {
+            libc::ioctl(fd, FIFREEZE, 0);
+            libc::close(fd);
+        }
+    }
+}
+
 fn ioctl_fs(path: &Path, request: libc::Ioctl, name: &str) -> Result<()> {
     // The freeze lives on the superblock, not the fd, so it persists after this fd is
     // closed and the process exits — freeze and thaw can be separate invocations. A
@@ -103,5 +125,19 @@ pub fn trim_main(args: &[String]) -> i32 {
             eprintln!("fstrim: {e:#}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn freeze_for_poweroff_is_a_quiet_no_op_when_the_path_cannot_be_opened() {
+        // Best-effort contract: if the mountpoint cannot even be opened, the helper must
+        // return without panicking so poweroff() still proceeds to reboot(). A path that
+        // cannot exist keeps the test hermetic — open() fails, so the FIFREEZE ioctl is never
+        // issued and no real filesystem is ever touched (a test must never freeze a live fs).
+        freeze_for_poweroff(c"/vk-agent-nonexistent-freeze-target");
     }
 }
