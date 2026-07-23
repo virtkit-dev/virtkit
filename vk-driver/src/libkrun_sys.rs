@@ -25,7 +25,7 @@ use anyhow::{Context, Result, bail};
 use krun::{
     krun_add_disk2, krun_add_net_tap, krun_add_virtiofs4, krun_add_vsock_port2, krun_create_ctx,
     krun_disable_implicit_init, krun_init_log, krun_set_block_dirty_socket,
-    krun_set_console_output, krun_set_kernel, krun_set_vm_config, krun_start_enter,
+    krun_set_console_output, krun_set_kernel, krun_set_pmu, krun_set_vm_config, krun_start_enter,
 };
 
 use crate::vmm::{Disk, Net, VmSpec};
@@ -141,6 +141,13 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
             "krun_set_vm_config",
             krun_set_vm_config(ctx, cpus, mem_mib(&spec.mem)?),
         )?;
+
+        // Guest PMU (`vk run --pmu`, trusted guests only): the vendored patch keeps
+        // CPUID leaf 0xA as KVM reports it, so KVM's vPMU backs in-guest hardware
+        // counters. Off by default — see VmSpec::pmu.
+        if spec.pmu {
+            ck("krun_set_pmu", krun_set_pmu(ctx, true))?;
+        }
 
         // Guest console -> the serial-log file, matching CH's `--serial file=`; the
         // orchestrator reads that file for diagnostics. libkrun routes both its

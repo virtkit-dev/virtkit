@@ -122,6 +122,9 @@ pub struct RunArgs {
     /// Keep `console=ttyS0` (don't rewrite to hvc0) for a BYO stock kernel whose
     /// virtio-console is modular (`vk run --console-serial`). See [`crate::vmm::VmSpec`].
     pub console_serial: bool,
+    /// Expose the guest PMU to the primary VM (`vk run --pmu`, trusted guests
+    /// only). See [`crate::vmm::VmSpec::pmu`].
+    pub pmu: bool,
     /// `None` uses the vk-agent embedded in `vk` (or the on-disk default).
     pub agent: Option<PathBuf>,
     pub cloud_hypervisor: PathBuf,
@@ -1274,6 +1277,7 @@ async fn build_and_boot(
         balloon: false,
         serial_log: console.clone(),
         console_serial: args.console_serial,
+        pmu: args.pmu,
         api_socket: None,
         pass_fds,
         proc_name: crate::vmm::resolve_proc_name(&unit_name),
@@ -2817,6 +2821,7 @@ pub(crate) async fn boot_session(
         serial_log: console.clone(),
         // build stages boot the pinned kernel (hvc0), never a BYO serial-only kernel.
         console_serial: false,
+        pmu: false,
         api_socket: None,
         pass_fds,
         // `stem` is the stage ext4's name — the closest identity this build VM has.
@@ -3500,6 +3505,7 @@ mod tests {
             balloon: false,
             serial_log: dir.join("console.log"),
             console_serial: false,
+            pmu: false,
             api_socket: None,
             pass_fds: vec![medium.fd()],
             proc_name: "vk:test".into(),

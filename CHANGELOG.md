@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk run --pmu`.** Expose the guest PMU (libkrun backend): CPUID leaf 0xA is left as
+  KVM reports it instead of zeroed, so in-guest `perf` gets hardware counters (cycles,
+  instructions) via KVM's vPMU. Off by default and deliberately opt-in: host performance
+  counters are a side-channel surface, so enable it only for trusted guests (a dev VM),
+  never untrusted CI jobs. Needs `kvm.enable_pmu=Y` on the host; the cloud-hypervisor
+  backend has no equivalent and warns.
+
 ## [0.27.0] - 2026-07-23
 
 ### Added

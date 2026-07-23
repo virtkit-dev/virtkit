@@ -224,6 +224,13 @@ pub struct VmSpec {
     /// keeps serial regardless (via the `VIRTKIT_KERNEL=image` cmdline token).
     #[serde(default)]
     pub console_serial: bool,
+    /// Expose the guest PMU (`vk run --pmu`): the libkrun backend leaves CPUID
+    /// leaf 0xA as KVM reports it (vendored `krun_set_pmu` patch), so in-guest
+    /// perf gets hardware counters via KVM's vPMU. Default off — host counters
+    /// are a side-channel surface, for trusted dev VMs only. cloud-hypervisor
+    /// has no equivalent; that backend warns and boots without.
+    #[serde(default)]
+    pub pmu: bool,
     /// CH API socket for graceful shutdown (the detached CI VM). `None` = no API
     /// socket (the held-`Child` paths kill the process directly).
     pub api_socket: Option<PathBuf>,
@@ -259,6 +266,15 @@ pub struct CloudHypervisor {
 
 impl Vmm for CloudHypervisor {
     fn command(&self, spec: &VmSpec) -> Command {
+        // No CH equivalent of libkrun's krun_set_pmu (x86 CH exposes no vPMU knob):
+        // boot without rather than fail, but say so — otherwise the user only sees
+        // `<not supported>` from perf inside the guest.
+        if spec.pmu {
+            eprintln!(
+                "virtkit: warning: --pmu is not supported by the cloud-hypervisor backend; \
+                 booting without a guest PMU"
+            );
+        }
         let mut cmd = Command::new(&self.bin);
         if let Some(api) = &spec.api_socket {
             cmd.arg("--api-socket").arg(api);
@@ -454,6 +470,7 @@ mod tests {
             balloon: true,
             serial_log: "/job/console.log".into(),
             console_serial: false,
+            pmu: false,
             api_socket: Some("/job/api.sock".into()),
             pass_fds: Vec::new(),
             proc_name: "vk:ci".into(),
@@ -520,6 +537,7 @@ mod tests {
             balloon: false,
             serial_log: "/w/console.log".into(),
             console_serial: false,
+            pmu: false,
             api_socket: None,
             pass_fds: Vec::new(),
             proc_name: "vk:build".into(),

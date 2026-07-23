@@ -1164,6 +1164,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         // an image (stock) kernel keeps serial via the VIRTKIT_KERNEL=image cmdline token;
         // the executor has no BYO-kernel flag, so nothing forces it otherwise.
         console_serial: false,
+        pmu: false,
         // libkrun has no API socket (it is driven as a subprocess); cloud-hypervisor
         // uses one for graceful shutdown in graceful_vmm_stop.
         api_socket: (!crate::vmm::libkrun_selected()).then(|| ctx.api_sock()),

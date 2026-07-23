@@ -611,6 +611,12 @@ enum Cmd {
         /// serial. Unneeded for the default or an image kernel.
         #[arg(long = "console-serial")]
         console_serial: bool,
+        /// expose the guest PMU so in-guest `perf` gets hardware counters (cycles,
+        /// instructions) via KVM's vPMU. SECURITY: host performance counters are a
+        /// side-channel surface — enable only for trusted guests (a dev VM), never
+        /// untrusted CI jobs. libkrun backend only; default off.
+        #[arg(long)]
+        pmu: bool,
         /// Where the rootfs comes from: oci (registry pull, no docker daemon), docker
         /// (docker export), or auto (registry, falling back to docker for an unpushed image)
         #[arg(long, value_enum, default_value = "auto")]
@@ -1398,6 +1404,7 @@ async fn cli_main() -> ExitCode {
         workdir,
         kernel,
         console_serial,
+        pmu,
         source,
         ca,
         username,
@@ -1543,6 +1550,7 @@ async fn cli_main() -> ExitCode {
             workdir: workdir.clone(),
             kernel: kernel.clone(),
             console_serial: *console_serial,
+            pmu: *pmu,
             agent: agent.clone(),
             // CLI flag wins; else the config's top-level cloud_hypervisor (bare
             // "cloud-hypervisor" when unset). vk run has no [build] tier to consult.
