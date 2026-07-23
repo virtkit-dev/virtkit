@@ -23,6 +23,12 @@ All notable changes to virtkit will be documented in this file.
   stop`, probes the VM launched from the current directory (or a given `DIR`); a raw agent
   address still works for tooling that already knows the socket. Previously it was hidden and
   only accepted a hand-built `vsock-auto://…` address.
+- **`vk exec` selects a VM by directory, and takes the command after `--`.** Like
+  `vk status`/`vk list`/`vk stop`, the optional leading target is a directory resolved
+  through the VM registry (default: the current directory); a raw `scheme://…` agent
+  address still dials directly. The command is now the trailing `-- …` group
+  (`vk exec -- ls -la`) — breaking: previously it followed a mandatory raw address,
+  no `--` needed.
 
 ### Fixed
 

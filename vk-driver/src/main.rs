@@ -444,10 +444,12 @@ enum Cmd {
     /// shell or a one-shot command, as `--user` in `--dir`. Reuses the same client
     /// the in-guest agent embeds, so a host reaches a running VM with `vk` alone,
     /// no separate `vk-agent` binary. `vk` exits with the command's own status.
+    /// The command goes after `--`; the optional token before it selects the VM.
     #[command(arg_required_else_help = true, display_order = 3)]
     Exec {
-        /// Agent address to dial (the run's exec channel, e.g. vsock-auto://DIR/vsock.sock:4444)
-        addr: SocketAddr,
+        /// which VM: a directory (default: the current directory), resolved via the VM registry
+        /// `vk list` uses — or a raw agent address (`scheme://…`) to dial directly
+        target: Option<String>,
         /// Background mode: no stdio, do not wait for the command to exit
         #[arg(short, long)]
         background: bool,
@@ -467,9 +469,9 @@ enum Cmd {
         /// Run the remote process as this Unix user (drops uid/gid/groups)
         #[arg(long)]
         user: Option<String>,
-        /// Command to run, followed by its arguments (use `--` to end vk's own flags)
-        cmd: String,
-        args: Vec<String>,
+        /// Command to run and its arguments, after `--` (e.g. `vk exec -- ls -la`)
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
     },
     /// Filtering ssh-agent proxy: serve the ssh-agent protocol on `--listen`, relaying to
     /// the real agent at `--upstream` but exposing only the keys in the `--allow` .pub
@@ -2246,19 +2248,11 @@ async fn cli_main() -> ExitCode {
             target,
             stale: false,
         } => {
-            let addr = match target.as_deref() {
-                Some(s) if is_agent_addr(s) => match s.parse::<SocketAddr>() {
-                    Ok(a) => a,
-                    Err(e) => return fail(&e, 2),
-                },
-                // Resolution/usage errors exit 2, matching `vk list`/`vk stop`; the code-1
-                // result below is reserved for a resolved VM whose agent does not answer.
-                other => match vms::resolve_one(other.map(Path::new))
-                    .and_then(|e| e.exec_addr.parse::<SocketAddr>())
-                {
-                    Ok(a) => a,
-                    Err(e) => return fail(&e, 2),
-                },
+            // Resolution/usage errors exit 2, matching `vk list`/`vk stop`; the code-1
+            // result below is reserved for a resolved VM whose agent does not answer.
+            let addr = match resolve_agent_addr(target.as_deref()) {
+                Ok(a) => a,
+                Err(e) => return fail(&e, 2),
             };
             match vk_core::status::get_status(&addr).await {
                 Ok(status) => {
@@ -2269,21 +2263,35 @@ async fn cli_main() -> ExitCode {
                 Err(e) => fail(&anyhow::anyhow!("{e}"), 1),
             }
         }
-        // Run a command in a live guest, reproducing its exit status as our own.
+        // Run a command in a live guest, reproducing its exit status as our own. The target
+        // selects the VM the same way `vk status` does (directory via the registry, default cwd,
+        // or a raw agent address); the command is the trailing `-- …` group.
         Cmd::Exec {
-            addr,
+            target,
             background,
             clear_env,
             env,
             dir,
             tty,
             user,
-            cmd,
-            args,
-        } => match exec::run(addr, background, clear_env, env, dir, tty, user, cmd, args).await {
-            Ok(result) => exec::exit(result),
-            Err(e) => fail(&e, 1),
-        },
+            command,
+        } => {
+            // Resolution/usage errors exit 2, matching `vk status`/`vk list`/`vk stop` and
+            // clap's own usage-error exit. Any vk-chosen code can collide with the remote
+            // command's status vk reproduces below; 2 matches what the old CLI returned
+            // when the positional address failed to parse.
+            let addr = match resolve_agent_addr(target.as_deref()) {
+                Ok(a) => a,
+                Err(e) => return fail(&e, 2),
+            };
+            let mut command = command.into_iter();
+            let cmd = command.next().expect("clap: required = true");
+            let args: Vec<_> = command.collect();
+            match exec::run(addr, background, clear_env, env, dir, tty, user, cmd, args).await {
+                Ok(result) => exec::exit(result),
+                Err(e) => fail(&e, 1),
+            }
+        }
         // run_forward only returns on a bind error; otherwise it serves until the
         // process is killed (cleanup tears the detached child down).
         Cmd::Forward { listen, to } => {
@@ -2333,8 +2341,8 @@ fn fail(e: &anyhow::Error, code: i32) -> ExitCode {
 }
 
 /// True when `s` is a raw agent address (has a transport scheme) rather than a directory. Used
-/// by `vk status` to tell an explicit `vsock-auto://…` from a directory selector — a bare path
-/// otherwise parses as a `unix:` address, so scheme-matching is the only reliable split.
+/// to tell an explicit `vsock-auto://…` from a directory selector — a bare path otherwise parses
+/// as a `unix:` address, so scheme-matching is the only reliable split.
 fn is_agent_addr(s: &str) -> bool {
     [
         "systemd://",
@@ -2345,6 +2353,19 @@ fn is_agent_addr(s: &str) -> bool {
     ]
     .iter()
     .any(|scheme| s.starts_with(scheme))
+}
+
+/// Resolve a `vk status`/`vk exec` target to the agent address to dial: a raw `scheme://…`
+/// address is used as-is; anything else (or nothing) is a directory selecting the VM through the
+/// registry, defaulting to the current directory.
+fn resolve_agent_addr(target: Option<&str>) -> anyhow::Result<SocketAddr> {
+    match target {
+        Some(s) if is_agent_addr(s) => Ok(s.parse::<SocketAddr>()?),
+        other => {
+            let entry = vms::resolve_one(other.map(Path::new))?;
+            Ok(entry.exec_addr.parse::<SocketAddr>()?)
+        }
+    }
 }
 
 /// Parse a switch `--registry-proxy` value `<sentinel-ip>=<host:port>`.
@@ -2539,6 +2560,33 @@ mod tests {
         let report = paths_report(&config::Config::default(), true).unwrap();
         let jobs_root = ctx.job_dir.parent().unwrap();
         assert!(report.contains(&format!("jobs dir      {}", jobs_root.display())));
+    }
+
+    // `vk exec` CLI shape: the optional target precedes `--`, the command trails it,
+    // and a command without `--` is rejected rather than swallowed as the target.
+    #[test]
+    fn exec_cli_takes_target_then_dashdash_command() {
+        let cli = Cli::try_parse_from(["vk", "exec", "--", "ls", "-la"]).unwrap();
+        let Cmd::Exec {
+            target, command, ..
+        } = cli.cmd
+        else {
+            panic!("expected Cmd::Exec")
+        };
+        assert_eq!(target, None);
+        assert_eq!(command, ["ls", "-la"]);
+
+        let cli = Cli::try_parse_from(["vk", "exec", "/proj", "--", "true"]).unwrap();
+        let Cmd::Exec {
+            target, command, ..
+        } = cli.cmd
+        else {
+            panic!("expected Cmd::Exec")
+        };
+        assert_eq!(target.as_deref(), Some("/proj"));
+        assert_eq!(command, ["true"]);
+
+        assert!(Cli::try_parse_from(["vk", "exec", "ls", "-la"]).is_err());
     }
 
     // `vk --help` is a curated list: a new Cmd variant must either join it

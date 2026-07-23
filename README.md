@@ -124,7 +124,8 @@ The ones you'll actually type:
   executor can pull.
 - `exec` — run a command (or an interactive shell with `-t`) in an
   already-running guest over its agent channel, reproducing the command's own
-  exit status.
+  exit status. Addressed by launch directory like `list`/`stop`/`status` (or by
+  a raw agent address); the command goes after `--` (`vk exec -- ls -la`).
 - `list` / `stop` — discover and tear down background VMs. A `run --state-dir`
   registers its VM, so `list` shows the running ones (with `--stale`, whether a
   fresh `run` would rebuild the image) and `stop` brings one down by the
