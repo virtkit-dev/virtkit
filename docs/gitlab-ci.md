@@ -51,18 +51,34 @@ does not override the host default.
 
 ### Image selection
 
-`MICROVM_IMAGE` is prefix-based — the part before the first `/` names the source:
+`MICROVM_IMAGE` is prefix-based — the prefix names the source (when unset, the
+job's plain GitLab `image:` is read the same way):
 
 - unset → `local/default` (the baked default bundle);
 - `local/<name>` — a bundle directory under `[local] dir`;
 - `virtkit/<name>[:tag|@sha256:…]` — a bundle in the `[registry]` repo;
 - `docker/<name>[:tag|@sha256:…]` — an OCI image from the `[docker]` repo, booted
-  directly (embedded kernel + agent).
+  directly (embedded kernel + agent);
+- `dockerfile:<path>[?context=<dir>&arg=NAME=VALUE][#<stage>]` — a **git-defined**
+  image: virtkit builds the Dockerfile from the job's own checkout (each `RUN` in
+  a microVM, no Docker involved) and boots the result, so the job image lives in
+  the repo instead of a registry. `<path>` is relative to the repo root; the build
+  context defaults to the Dockerfile's directory (`?context=.` for the repo root),
+  `?arg=` supplies a `--build-arg` (repeatable), and `#<stage>` selects a stage.
+  Built images are cached and shared across jobs and runners. Requires
+  `[gitlab] host_checkout`;
+- `compose:<file>#<primary>` — a whole fleet from a compose file in the checkout:
+  boots `<primary>` as the job VM and the other services (built or pulled the
+  same way) as siblings on the job network. Same `host_checkout` requirement.
 
 ```yaml
 my-job:
   variables:
     MICROVM_IMAGE: virtkit/myimage      # :tag (default latest) or @sha256:…
+
+test-in-repo-image:
+  variables:
+    MICROVM_IMAGE: dockerfile:ci/Dockerfile#test   # built from this checkout, then booted
 ```
 
 ## Egress control

@@ -1,10 +1,12 @@
 # virtkit
 
-virtkit runs Docker images as lightweight virtual machines. It boots an OCI
-image as a microVM in about a second, each with its own kernel, so whatever
-runs inside is isolated from the host. There's no daemon and nothing to install
-as root: it's a single static binary running as an ordinary user process, and the
-only thing it needs from the host is access to `/dev/kvm`.
+virtkit builds and runs Docker images as lightweight virtual machines. It
+boots an OCI image as a microVM in about a second, each with its own kernel,
+so whatever runs inside is isolated from the host — and it builds Dockerfiles
+itself, no Docker needed, each `RUN` instruction executing in a microVM of its
+own. There's no daemon and nothing to install as root: it's a single static
+binary running as an ordinary user process, and the only thing it needs from
+the host is access to `/dev/kvm`.
 
 On top of that base you get docker-compose-style services running as real VMs
 (per run or long-lived) and a GitLab CI executor that hands every job a fresh,
@@ -32,6 +34,10 @@ Boot Docker images directly. `vk run alpine:latest --shell` pulls the image,
 converts it to a bootable disk, and drops you into a shell. Conversions are
 cached and only redone when the image actually changes.
 
+Build Dockerfiles without Docker. `vk build` runs each `RUN` instruction in its
+own microVM, caches per instruction, and produces an image you can boot straight
+away — `vk run -f Dockerfile` chains the two, build then boot, in one command.
+
 Boot an image on its own kernel and init. By default virtkit boots every image
 on its embedded kernel with `vk-agent` as PID 1, but `vk run --kernel image
 --init image` boots the image's own `/boot/vmlinuz` (with its modules) and hands
@@ -54,13 +60,10 @@ against it out of the box.
 
 Isolate GitLab CI jobs. The custom executor gives every job a fresh microVM and
 destroys it when the job ends. Concurrent jobs work, and Docker images from your
-`.gitlab-ci.yml` are converted on demand. See the
+`.gitlab-ci.yml` are converted on demand — or built on demand from a Dockerfile
+in the repo itself (`image: dockerfile:…`). See the
 [GitLab CI guide](docs/gitlab-ci.md) for job variables, per-phase egress control,
 and services.
-
-Build Dockerfiles without Docker. `vk build` runs each `RUN` instruction in its
-own microVM, caches per instruction, and produces an image you can boot straight
-away.
 
 Carry one file around. The hypervisor, the guest kernel, and the guest agent are
 all embedded in `vk`, so you can copy it to any Linux machine with `/dev/kvm`
