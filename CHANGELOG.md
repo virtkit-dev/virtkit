@@ -17,6 +17,14 @@ All notable changes to virtkit will be documented in this file.
   flow's real destination without a timeout, so an unreachable backend stalled the guest for
   roughly two minutes on the OS default SYN retries. The dial is now bounded (10s), degrading a
   dead backend to a prompt connection error.
+- **Single-file binds no longer corrupt shrinking rewrites.** A single-file bind now implements
+  `readdirplus` (it advertised `DO_READDIRPLUS` but never implemented it, so `ls` on the mount
+  failed with ENOSYS) and supports atomic-rename writers via `create`/`rename`/`unlink`. A
+  guest-created temp is backed by a fresh host file under a vk-controlled name in the bound
+  file's directory, so the rename onto the target is atomic while a pre-existing sibling still
+  can never be opened (single-file read isolation is preserved). Previously writers could not
+  create their temp and fell back to a non-truncating in-place rewrite, leaving a stale tail when
+  the new content was shorter — silent corruption of e.g. `~/.claude.json`.
 
 ## [0.25.0] - 2026-07-23
 
