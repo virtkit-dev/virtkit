@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk list` and `vk stop`.** A `vk run --state-dir` now registers its VM, so `vk list` shows
+  the running VMs (pid, uptime, name, the directory each was launched from, and its exec
+  address) and `vk stop` brings one down by that directory (or `--all`) — no more grepping the
+  process table to find and kill a background VM. `vk list --json` feeds scripts.
+
 ## [0.26.0] - 2026-07-23
 
 ### Added

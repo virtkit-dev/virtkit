@@ -1277,6 +1277,34 @@ async fn build_and_boot(
     let mut ssh_forward: Option<Child> = None;
     let mut host_exec_serve: Option<Child> = None;
 
+    // Record the VM in the host-side registry so `vk list`/`vk stop` can find it by the
+    // directory it was launched from. Only pinned (`--state-dir`) runs are tracked: they
+    // expose this stable exec socket and hold the state-dir lock the registry probes for
+    // liveness. The guard removes the entry on every exit path below — clean, error unwind,
+    // or the detached child returning. Kept alive to the end of the function.
+    let _vm_registration = args.state_dir.as_ref().map(|_| {
+        let label = if let Some(p) = &args.primary {
+            p.clone()
+        } else if !args.image.is_empty() {
+            args.image.clone()
+        } else if !args.dockerfiles.is_empty() {
+            format!("-f {}", args.target.as_deref().unwrap_or("(last stage)"))
+        } else {
+            "vm".to_string()
+        };
+        crate::vms::register(crate::vms::VmEntry {
+            state_dir: std::fs::canonicalize(work).unwrap_or_else(|_| work.to_path_buf()),
+            project_dir: std::env::current_dir().ok(),
+            pid: std::process::id(),
+            label,
+            exec_addr: format!("vsock-auto://{}:{VSOCK_PORT}", vsock.display()),
+            ssh_addr: args
+                .ssh
+                .then(|| format!("vsock-auto://{}:{SSH_VSOCK_PORT}", vsock.display())),
+            created_secs: crate::vms::unix_now(),
+        })
+    });
+
     // The ProxyCommand splices ssh's stdio onto the guest's vsock ssh port, so
     // the hostname after `user@` is only a known_hosts label. The host key is
     // ephemeral (fresh per boot, reached over a private channel), hence the

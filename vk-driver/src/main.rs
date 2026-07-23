@@ -60,6 +60,7 @@ mod units;
 mod virtiofsd;
 mod vm;
 mod vmm;
+mod vms;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -785,6 +786,31 @@ enum Cmd {
         #[arg(last = true)]
         command: Vec<String>,
     },
+    /// List the running vk VMs (those started with `--state-dir`): their pid, uptime, name,
+    /// the directory each was launched from, and its exec-channel address. With a DIR
+    /// argument, only VMs launched from DIR or a subdirectory. `--json` for scripting.
+    #[command(display_order = 6)]
+    List {
+        /// only VMs whose launch directory is DIR or below it (default: all)
+        dir: Option<PathBuf>,
+        /// emit the entries as a JSON array instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop running vk VM(s): SIGTERM the managing `vk run` (which tears down the VM and any
+    /// compose siblings), then wait for it to exit. Selects the VM launched from the current
+    /// directory by default; pass a DIR to select by launch directory, or `--all`.
+    #[command(display_order = 7)]
+    Stop {
+        /// stop the VM(s) launched from DIR or below it (default: the current directory)
+        dir: Option<PathBuf>,
+        /// stop every running vk VM
+        #[arg(long, conflicts_with = "dir")]
+        all: bool,
+        /// seconds to wait for each VM to go down before reporting it stuck
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
     /// Print each stage's build-cache key (its `stage_key`: the chained content key after
     /// the stage's last instruction) — the exact identity virtkit's instruction cache
     /// stores the stage's snapshot under. Prints `stage:key` lines. Resolves base
@@ -1282,6 +1308,28 @@ async fn cli_main() -> ExitCode {
             Ok(report) => {
                 print!("{report}");
                 ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e, 2),
+        };
+    }
+    if let Cmd::List { dir, json } = &cli.cmd {
+        return match vms::list_report(dir.as_deref(), *json) {
+            Ok(report) => {
+                print!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e, 2),
+        };
+    }
+    if let Cmd::Stop { dir, all, timeout } = &cli.cmd {
+        return match vms::stop_cmd(dir.as_deref(), *all, *timeout) {
+            Ok((report, all_down)) => {
+                print!("{report}");
+                if all_down {
+                    ExitCode::SUCCESS
+                } else {
+                    exit_code(1)
+                }
             }
             Err(e) => fail(&e, 2),
         };
@@ -2205,6 +2253,8 @@ async fn cli_main() -> ExitCode {
         | Cmd::OciPull { .. }
         | Cmd::DockerHash { .. }
         | Cmd::Fingerprint { .. }
+        | Cmd::List { .. }
+        | Cmd::Stop { .. }
         | Cmd::Service { .. } => {
             unreachable!()
         }
