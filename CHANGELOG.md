@@ -14,6 +14,14 @@ All notable changes to virtkit will be documented in this file.
   working tree — whether a fresh `vk run` would rebuild it. Opt-in: it resolves base image
   digests (network I/O), so plain `vk list` stays offline.
 
+### Fixed
+
+- **Single-file bind: reading a bound file immediately after an atomic-rename replace.** A
+  guest that rewrote a bound file (temp + rename) and then re-read it right away could see a
+  stale length or a transient "not found" until a one-second cache window elapsed. The
+  single-file mount now disables entry/attr caching (it serves one file — caching bought
+  nothing), so a read straight after the replace always resolves the current file.
+
 ## [0.26.0] - 2026-07-23
 
 ### Added

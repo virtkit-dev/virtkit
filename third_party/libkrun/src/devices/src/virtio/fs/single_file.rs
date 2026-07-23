@@ -48,7 +48,15 @@ type Handle = u64;
 /// files (see `Temp`) get inodes from `FIRST_TEMP_INODE` up.
 const FILE_INODE: Inode = 2;
 const FIRST_TEMP_INODE: Inode = 3;
-const TTL: Duration = Duration::from_secs(1);
+/// Entry- and attr-cache lifetime handed to the guest kernel: zero, i.e. no caching. A
+/// single-file bind serves exactly one file, so caching buys nothing — and a zero timeout keeps
+/// the guest correct across an atomic-rename replace of the bound file. A `rename` onto the
+/// bound name repoints the kernel's dentry at the (now-removed) temp inode and leaves the old
+/// size/mtime cached; without immediate re-lookup, a read of the bound file right after the
+/// rename would miss (ENOENT) or read the stale length until the timeout expired. Forcing a
+/// fresh `lookup`/`getattr` on every access resolves the bound name back to `FILE_INODE` with
+/// the current size.
+const TTL: Duration = Duration::from_secs(0);
 
 /// A guest-created scratch file, backed by a real file in the bound file's parent directory under
 /// a vk-controlled host name. The guest addresses it by the `name` it chose; that name is never
@@ -850,6 +858,21 @@ mod tests {
         assert_eq!(st.st_size, 11);
         let (rst, _) = fs.getattr(ctx(), fuse::ROOT_ID, None).unwrap();
         assert_eq!(rst.st_mode & libc::S_IFMT, libc::S_IFDIR);
+        std::fs::remove_dir_all(p.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn lookup_and_getattr_disable_caching() {
+        // The guest must revalidate on every access so a read straight after an atomic-rename
+        // replace resolves the current file rather than a stale cache entry; a nonzero timeout
+        // reintroduces the stale-size/ENOENT window.
+        let p = tmp_with(b"{}");
+        let fs = SingleFileFs::new(p.clone(), false).unwrap();
+        let e = fs.lookup(ctx(), fuse::ROOT_ID, &cs("secret.json")).unwrap();
+        assert_eq!(e.entry_timeout, Duration::ZERO);
+        assert_eq!(e.attr_timeout, Duration::ZERO);
+        let (_, ttl) = fs.getattr(ctx(), FILE_INODE, None).unwrap();
+        assert_eq!(ttl, Duration::ZERO);
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
