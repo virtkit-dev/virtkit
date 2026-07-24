@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-07-24
+
 ### Added
 
 - **`vk run --pmu`.** Expose the guest PMU (libkrun backend): CPUID leaf 0xA is left as
@@ -1199,7 +1201,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/wallix/virtkit/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/wallix/virtkit/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/wallix/virtkit/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/wallix/virtkit/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/wallix/virtkit/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/wallix/virtkit/compare/v0.24.0...v0.25.0
