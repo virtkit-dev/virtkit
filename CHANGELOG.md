@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Guest DNS no longer breaks when the host's `resolv.conf` separates `nameserver`
+  from its address with a tab (or any whitespace) instead of a single space.
+
 ## [0.28.0] - 2026-07-24
 
 ### Added

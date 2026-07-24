@@ -957,18 +957,34 @@ async fn proxy_udp(mut guest: ipstack::IpStackUdpStream, egress: Arc<EgressGuard
     }
 }
 
+/// The first `nameserver` from resolv.conf text. Per resolv.conf(5) the keyword and
+/// its value are separated by any run of whitespace (space(s) or tab) — matching only
+/// a single space silently drops tab-separated entries (as some provisioners emit),
+/// leaving the switch with no upstream and falling back to the public resolver.
+fn first_nameserver(text: &str) -> Option<std::net::IpAddr> {
+    text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("nameserver")?;
+        // Require a whitespace separator so `nameserverfoo` is not treated as a match,
+        // then read the first token — like glibc, ignore any trailing junk on the line.
+        rest.starts_with(|c: char| c.is_ascii_whitespace())
+            .then(|| {
+                rest.split_whitespace()
+                    .next()?
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+            })
+            .flatten()
+    })
+}
+
 /// The host's first configured resolver (from /etc/resolv.conf), used as the
 /// gateway resolver's upstream so guest DNS honors host policy. Falls back to a
 /// public resolver when resolv.conf names none.
 fn host_upstream() -> SocketAddr {
-    if let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") {
-        for line in text.lines() {
-            if let Some(rest) = line.trim().strip_prefix("nameserver ")
-                && let Ok(ip) = rest.trim().parse::<std::net::IpAddr>()
-            {
-                return SocketAddr::new(ip, DNS_PORT);
-            }
-        }
+    if let Ok(text) = std::fs::read_to_string("/etc/resolv.conf")
+        && let Some(ip) = first_nameserver(&text)
+    {
+        return SocketAddr::new(ip, DNS_PORT);
     }
     SocketAddr::new(FALLBACK_DNS.into(), DNS_PORT)
 }
@@ -2084,6 +2100,43 @@ mod tests {
         q.extend_from_slice(&qtype.to_be_bytes());
         q.extend_from_slice(&[0, 1]); // class IN
         q
+    }
+
+    #[test]
+    fn first_nameserver_tolerates_any_whitespace() {
+        use std::net::IpAddr;
+        // Tab-separated (as some provisioners emit) must parse, not just single-space.
+        assert_eq!(
+            first_nameserver("nameserver\t10.10.1.219\n"),
+            Some("10.10.1.219".parse::<IpAddr>().unwrap())
+        );
+        // Single space, multiple spaces, and leading indentation all work.
+        assert_eq!(
+            first_nameserver("nameserver 1.1.1.1"),
+            Some("1.1.1.1".parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(
+            first_nameserver("  nameserver   8.8.8.8  "),
+            Some("8.8.8.8".parse::<IpAddr>().unwrap())
+        );
+        // First entry wins; comments and other directives are skipped.
+        assert_eq!(
+            first_nameserver(
+                "# comment\nsearch corp.example.com\nnameserver\t9.9.9.9\nnameserver 1.1.1.1\n"
+            ),
+            Some("9.9.9.9".parse::<IpAddr>().unwrap())
+        );
+        // Only the first token is read, so a trailing inline comment is ignored.
+        assert_eq!(
+            first_nameserver("nameserver 1.1.1.1 # corp resolver\n"),
+            Some("1.1.1.1".parse::<IpAddr>().unwrap())
+        );
+        // A bare keyword, a glued token, a commented-out line, or no nameserver at
+        // all yields None.
+        assert_eq!(first_nameserver("nameserver\n"), None);
+        assert_eq!(first_nameserver("nameserverfoo 1.2.3.4\n"), None);
+        assert_eq!(first_nameserver(";nameserver 9.9.9.9\n"), None);
+        assert_eq!(first_nameserver("search corp.example.com\n"), None);
     }
 
     #[test]
