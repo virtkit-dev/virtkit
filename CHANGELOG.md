@@ -14,6 +14,8 @@ All notable changes to virtkit will be documented in this file.
 
 - Guest DNS no longer breaks when the host's `resolv.conf` separates `nameserver`
   from its address with a tab (or any whitespace) instead of a single space.
+- A `USER` given as `user:group`, `uid:gid`, a mixed name/id, or a bare numeric id
+  now resolves like Docker's, instead of only the bare-name form working.
 
 ## [0.28.0] - 2026-07-24
 

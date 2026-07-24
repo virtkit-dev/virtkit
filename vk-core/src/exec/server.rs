@@ -333,20 +333,111 @@ pub struct ResolvedUser {
     pub groups: Vec<libc::gid_t>,
 }
 
-/// Look up a user in the passwd/group databases. Done in the parent — getpwnam_r
-/// and getgrouplist are not async-signal-safe, so they must not run in pre_exec.
-pub fn resolve_user(name: &str) -> std::io::Result<ResolvedUser> {
-    use std::io::{Error, ErrorKind};
-    let c_name = std::ffi::CString::new(name)
-        .map_err(|_| Error::new(ErrorKind::InvalidInput, "user name contains NUL"))?;
+/// Split a Docker `USER` value into its user part and optional group part: the first
+/// `:` separates them (`user`, `user:group`, `uid:gid`, `uid:group`, `user:gid`).
+fn split_user_group(spec: &str) -> (&str, Option<&str>) {
+    match spec.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (spec, None),
+    }
+}
 
+/// A resolved passwd entry (or a bare numeric uid that has none).
+struct PasswdInfo {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    home: Option<std::ffi::OsString>,
+    shell: Option<std::ffi::OsString>,
+    /// The user's name, to feed getgrouplist. `None` for a bare numeric uid with no
+    /// passwd entry (nothing to enumerate supplementary groups against).
+    name: Option<std::ffi::CString>,
+}
+
+enum PasswdKey<'a> {
+    Name(&'a std::ffi::CStr),
+    Uid(libc::uid_t),
+}
+
+/// getpwnam_r / getpwuid_r into a [`PasswdInfo`]; `Ok(None)` when there is no such entry.
+fn passwd_lookup(key: PasswdKey) -> std::io::Result<Option<PasswdInfo>> {
+    use std::io::Error;
+    use std::os::unix::ffi::OsStrExt;
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0_i8; 4096];
     let mut result: *mut libc::passwd = std::ptr::null_mut();
     let rc = unsafe {
-        libc::getpwnam_r(
-            c_name.as_ptr(),
-            &mut pwd,
+        match key {
+            PasswdKey::Name(n) => libc::getpwnam_r(
+                n.as_ptr(),
+                &mut pwd,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut result,
+            ),
+            PasswdKey::Uid(u) => {
+                libc::getpwuid_r(u, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
+            }
+        }
+    };
+    if rc != 0 {
+        return Err(Error::from_raw_os_error(rc));
+    }
+    if result.is_null() {
+        return Ok(None);
+    }
+    let osstr = |p: *const libc::c_char| -> Option<std::ffi::OsString> {
+        if p.is_null() {
+            return None;
+        }
+        let b = unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes();
+        (!b.is_empty()).then(|| std::ffi::OsStr::from_bytes(b).to_os_string())
+    };
+    let name = (!pwd.pw_name.is_null())
+        .then(|| unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) }.to_owned());
+    Ok(Some(PasswdInfo {
+        uid: pwd.pw_uid,
+        gid: pwd.pw_gid,
+        home: osstr(pwd.pw_dir),
+        shell: osstr(pwd.pw_shell),
+        name,
+    }))
+}
+
+/// Resolve the user part of a `USER` value: a numeric uid (its passwd entry if any, else
+/// a bare uid with gid 0 — like `docker run --user <uid>` for an uid absent from
+/// /etc/passwd) or a name (getpwnam).
+fn resolve_passwd(user: &str) -> std::io::Result<PasswdInfo> {
+    use std::io::{Error, ErrorKind};
+    if let Ok(uid) = user.parse::<libc::uid_t>() {
+        return Ok(passwd_lookup(PasswdKey::Uid(uid))?.unwrap_or(PasswdInfo {
+            uid,
+            gid: 0,
+            home: None,
+            shell: None,
+            name: None,
+        }));
+    }
+    let c_name = std::ffi::CString::new(user)
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "user name contains NUL"))?;
+    passwd_lookup(PasswdKey::Name(&c_name))?
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("unknown user {user:?}")))
+}
+
+/// Resolve the group part of a `USER` value to a gid: numeric as-is, else getgrnam.
+fn resolve_gid(group: &str) -> std::io::Result<libc::gid_t> {
+    use std::io::{Error, ErrorKind};
+    if let Ok(gid) = group.parse::<libc::gid_t>() {
+        return Ok(gid);
+    }
+    let c = std::ffi::CString::new(group)
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "group name contains NUL"))?;
+    let mut grp: libc::group = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0_i8; 4096];
+    let mut result: *mut libc::group = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getgrnam_r(
+            c.as_ptr(),
+            &mut grp,
             buf.as_mut_ptr(),
             buf.len(),
             &mut result,
@@ -358,40 +449,20 @@ pub fn resolve_user(name: &str) -> std::io::Result<ResolvedUser> {
     if result.is_null() {
         return Err(Error::new(
             ErrorKind::NotFound,
-            format!("unknown user {name:?}"),
+            format!("unknown group {group:?}"),
         ));
     }
-    use std::os::unix::ffi::OsStrExt;
-    let home = if pwd.pw_dir.is_null() {
-        None
-    } else {
-        Some(
-            std::ffi::OsStr::from_bytes(unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }.to_bytes())
-                .to_os_string(),
-        )
-    };
-    let shell = if pwd.pw_shell.is_null() {
-        None
-    } else {
-        let b = unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) }.to_bytes();
-        if b.is_empty() {
-            None
-        } else {
-            Some(std::ffi::OsStr::from_bytes(b).to_os_string())
-        }
-    };
+    Ok(grp.gr_gid)
+}
 
-    // Supplementary groups: size the buffer up if the first call reports more.
+/// The supplementary group list a named user belongs to (getgrouplist), including
+/// `primary`. Sizes the buffer up if the first call reports more.
+fn grouplist(name: &std::ffi::CStr, primary: libc::gid_t) -> Vec<libc::gid_t> {
     let mut ngroups: libc::c_int = 32;
     let mut groups: Vec<libc::gid_t> = vec![0; ngroups as usize];
     loop {
         let rc = unsafe {
-            libc::getgrouplist(
-                c_name.as_ptr(),
-                pwd.pw_gid,
-                groups.as_mut_ptr(),
-                &mut ngroups,
-            )
+            libc::getgrouplist(name.as_ptr(), primary, groups.as_mut_ptr(), &mut ngroups)
         };
         if rc >= 0 {
             groups.truncate(ngroups as usize);
@@ -399,12 +470,31 @@ pub fn resolve_user(name: &str) -> std::io::Result<ResolvedUser> {
         }
         groups.resize(ngroups as usize, 0);
     }
+    groups
+}
 
+/// Resolve a Docker `USER` value (`user`, `user:group`, `uid`, `uid:gid`, and the mixed
+/// name/number forms) to the ids to drop to. Names go through getpwnam/getgrnam, numeric
+/// ids are taken as-is; an explicit group overrides the user's primary gid and, matching
+/// Docker, replaces the supplementary group set with just that group. Done in the parent —
+/// getpw*_r / getgrouplist are not async-signal-safe, so must not run in pre_exec.
+pub fn resolve_user(spec: &str) -> std::io::Result<ResolvedUser> {
+    let (user_part, group_part) = split_user_group(spec);
+    let pw = resolve_passwd(user_part)?;
+    let mut gid = pw.gid;
+    let groups = if let Some(g) = group_part {
+        gid = resolve_gid(g)?;
+        vec![gid]
+    } else if let Some(name) = &pw.name {
+        grouplist(name, pw.gid)
+    } else {
+        vec![gid]
+    };
     Ok(ResolvedUser {
-        uid: pwd.pw_uid,
-        gid: pwd.pw_gid,
-        home,
-        shell,
+        uid: pw.uid,
+        gid,
+        home: pw.home,
+        shell: pw.shell,
         groups,
     })
 }
@@ -420,11 +510,14 @@ fn apply_user(command: &mut Command, cmd: &CmdExec, user: &str) {
 
     match resolve_user(user) {
         Ok(ru) => {
+            // USER/LOGNAME name the login user, so export only the user part — never the
+            // raw `user:group` spec, whose group half is not part of the name.
+            let login = split_user_group(user).0;
             if !cmd.clear_env && !has_env("USER") {
-                command.env("USER", user);
+                command.env("USER", login);
             }
             if !cmd.clear_env && !has_env("LOGNAME") {
-                command.env("LOGNAME", user);
+                command.env("LOGNAME", login);
             }
             if let Some(home) = ru.home.as_ref().filter(|_| !has_env("HOME")) {
                 command.env("HOME", home);
@@ -857,10 +950,68 @@ async fn writer_task(
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecWrapper, TaskState, glob_match, wrap_cmd};
+    use super::{
+        ExecWrapper, TaskState, apply_user, glob_match, resolve_user, split_user_group, wrap_cmd,
+    };
     use crate::messages::{CmdExec, RunMode};
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn split_user_group_forms() {
+        assert_eq!(split_user_group("builder"), ("builder", None));
+        assert_eq!(
+            split_user_group("builder:builder"),
+            ("builder", Some("builder"))
+        );
+        assert_eq!(split_user_group("1000:1000"), ("1000", Some("1000")));
+        assert_eq!(split_user_group("builder:1000"), ("builder", Some("1000")));
+        assert_eq!(split_user_group(":grp"), ("", Some("grp")));
+    }
+
+    #[test]
+    fn resolve_user_handles_docker_forms() {
+        // root exists everywhere: name and numeric, with and without an explicit group.
+        for spec in ["root", "0"] {
+            let ru = resolve_user(spec).expect(spec);
+            assert_eq!((ru.uid, ru.gid), (0, 0), "spec {spec}");
+        }
+        // Explicit group overrides the primary gid and yields exactly that one group —
+        // the regression: `user:group` / `uid:gid` used to be fed whole to getpwnam.
+        for spec in ["root:0", "0:0"] {
+            let ru = resolve_user(spec).expect(spec);
+            assert_eq!((ru.uid, ru.gid), (0, 0), "spec {spec}");
+            assert_eq!(ru.groups, vec![0], "spec {spec}");
+        }
+        // A bare numeric uid with no passwd entry: taken as-is, gid defaults to 0.
+        let ru = resolve_user("4000000000").expect("numeric uid");
+        assert_eq!((ru.uid, ru.gid), (4_000_000_000, 0));
+        assert_eq!(ru.groups, vec![0]);
+        // An explicit numeric group still applies to an entry-less uid.
+        let ru = resolve_user("4000000000:4000000001").expect("uid:gid");
+        assert_eq!((ru.uid, ru.gid), (4_000_000_000, 4_000_000_001));
+        // A genuinely unknown user name still errors.
+        assert!(resolve_user("nosuchuser-zzz").is_err());
+    }
+
+    #[test]
+    fn apply_user_exports_login_name_not_the_group_spec() {
+        use std::ffi::OsStr;
+        use tokio::process::Command;
+        let mut command = Command::new("true");
+        apply_user(&mut command, &sample_cmd(), "root:0");
+        let std_cmd = command.as_std();
+        let env_val = |key| {
+            std_cmd
+                .get_envs()
+                .find(|(k, _)| *k == OsStr::new(key))
+                .and_then(|(_, v)| v)
+                .map(OsStr::to_owned)
+        };
+        // The `:group` half is dropped: USER/LOGNAME name the login user, not the spec.
+        assert_eq!(env_val("USER"), Some(OsStr::new("root").to_owned()));
+        assert_eq!(env_val("LOGNAME"), Some(OsStr::new("root").to_owned()));
+    }
 
     fn sample_cmd() -> CmdExec {
         CmdExec {
