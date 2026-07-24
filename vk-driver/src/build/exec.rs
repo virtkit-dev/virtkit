@@ -1496,6 +1496,19 @@ impl Drop for MicroVm {
 fn scratch_mount_target(specs: &[&Mount]) -> Result<Option<String>> {
     let mut scratch: Option<&Mount> = None;
     for m in specs {
+        // tmpfs mounts are RAM-backed and mounted separately (mount_tmpfs): they take no
+        // from=/source and are writable by nature, so they are exempt from the read-only
+        // stage/context-bind restrictions below. Only size= is honored — reject uid/gid/mode
+        // rather than silently ignore them (the guest mount never applies them).
+        if m.typ == "tmpfs" {
+            if m.uid.is_some() || m.gid.is_some() || m.mode.is_some() {
+                bail!(
+                    "RUN --mount=type=tmpfs at {:?}: only size= is supported (uid/gid/mode are not)",
+                    m.target
+                );
+            }
+            continue;
+        }
         if m.from.as_deref() == Some("scratch") {
             if scratch.is_some() {
                 bail!(
@@ -1730,6 +1743,10 @@ impl Executor for MicroVm {
         // (optional source (device, mountpoint), bind source path, bind target).
         type Bind = (Option<(String, String)>, String, String);
         let mut binds: Vec<Bind> = Vec::new();
+        // `type=tmpfs` mounts: an empty RAM-backed fs at the target for the RUN's duration
+        // (never committed to the layer). (target, size). Mounted after the binds, torn down
+        // with them.
+        let mut tmpfs: Vec<(String, Option<String>)> = Vec::new();
         for (i, m) in mounts.iter().enumerate() {
             // Scratch mounts are wired separately (mounted rw at the target, not bind-mounted).
             if m.spec.from.as_deref() == Some("scratch") {
@@ -1741,6 +1758,11 @@ impl Executor for MicroVm {
                 .target
                 .clone()
                 .context("RUN --mount=bind requires target=")?;
+            if m.spec.typ == "tmpfs" {
+                // tmpfs takes no from=/source; size= is its only honored option.
+                tmpfs.push((target, m.spec.size.clone()));
+                continue;
+            }
             match m.from {
                 Some(src_fs) => {
                     let dev = self.source_dev.get(&src_fs.label).with_context(|| {
@@ -1840,6 +1862,21 @@ impl Executor for MicroVm {
                 bail!("RUN --mount: bind-mounting {bindsrc} at {target} failed");
             }
         }
+        // Mount each tmpfs at its target: an empty RAM-backed fs for the RUN's duration,
+        // torn down afterwards so nothing lands in the committed layer. `size=` caps it
+        // (`-` = the kernel default, ½ RAM); the default 1777 mode lets a non-root RUN write.
+        for (target, size) in &tmpfs {
+            let ms = [
+                GUEST_AGENT.to_string(),
+                "mount".into(),
+                "--tmpfs".into(),
+                target.clone(),
+                size.clone().unwrap_or_else(|| "-".into()),
+            ];
+            if block_on(session.exec(&ms, None, &sink))? != 0 {
+                bail!("RUN --mount=type=tmpfs: mounting tmpfs at {target} failed");
+            }
+        }
         let code = block_on(session.exec(&argv, user, &sink))?;
         // Tear the mounts down (target before its device mountpoint), best-effort.
         for (device, _, target) in binds.iter().rev() {
@@ -1855,6 +1892,14 @@ impl Executor for MicroVm {
                     &sink,
                 ));
             }
+        }
+        // Unmount the tmpfs mounts (best-effort); their RAM-backed contents are discarded.
+        for (target, _) in &tmpfs {
+            let _ = block_on(session.exec(
+                &[GUEST_AGENT.to_string(), "umount".into(), target.clone()],
+                None,
+                &sink,
+            ));
         }
         // Unmount the scratch target too, so its (discarded) contents don't shadow the target
         // path for the next step; the scratch device itself stays attached for the stage.
@@ -2638,6 +2683,34 @@ mod tests {
         ] {
             assert!(scratch_mount_target(&[&spec]).is_err());
         }
+
+        // A tmpfs mount is exempt from the read-only checks (writable by nature, only size=
+        // honored) and is not a scratch target.
+        let tmpfs = Mount {
+            typ: "tmpfs".into(),
+            target: Some("/cache".into()),
+            size: Some("1g".into()),
+            ..Mount::default()
+        };
+        assert_eq!(scratch_mount_target(&[&tmpfs]).unwrap(), None);
+        // uid/gid/mode are not honored on tmpfs, so they are rejected rather than ignored.
+        for spec in [
+            Mount {
+                uid: Some("1000".into()),
+                ..tmpfs.clone()
+            },
+            Mount {
+                mode: Some("0700".into()),
+                ..tmpfs.clone()
+            },
+        ] {
+            assert!(scratch_mount_target(&[&spec]).is_err());
+        }
+        // A tmpfs alongside a from=scratch mount still yields the scratch target.
+        assert_eq!(
+            scratch_mount_target(&[&tmpfs, &scratch]).unwrap(),
+            Some("/s".into())
+        );
 
         // The same options on the from=scratch mount are accepted.
         let scratch_opts = Mount {

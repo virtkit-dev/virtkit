@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`RUN --mount=type=tmpfs` in builds.** A build step can now mount a fresh
+  RAM-backed scratch at the target for its duration (with an optional `size=`
+  cap); the contents are discarded afterwards and never enter the committed layer.
+
 ### Fixed
 
 - Guest DNS no longer breaks when the host's `resolv.conf` separates `nameserver`

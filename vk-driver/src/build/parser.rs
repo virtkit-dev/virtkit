@@ -90,6 +90,10 @@ pub struct Mount {
     pub uid: Option<String>,
     pub gid: Option<String>,
     pub mode: Option<String>,
+    /// `size=` for a `type=tmpfs` mount (a tmpfs `size=` value: `1g`, `512m`, a byte count).
+    /// Ignored on other mount types. Unset = the kernel default (½ RAM). Raw string,
+    /// interpolated like the other fields; parsed by the executor.
+    pub size: Option<String>,
 }
 
 /// Shell form (`RUN foo`) vs exec form (`RUN ["foo","bar"]`, a JSON array).
@@ -332,6 +336,7 @@ fn parse_mount(spec: &str) -> Mount {
             "uid" => m.uid = Some(v.trim().to_string()),
             "gid" => m.gid = Some(v.trim().to_string()),
             "mode" => m.mode = Some(v.trim().to_string()),
+            "size" => m.size = Some(v.trim().to_string()),
             _ => {}
         }
     }
@@ -563,6 +568,7 @@ mod tests {
                 uid: None,
                 gid: None,
                 mode: None,
+                size: None,
             }
         );
         assert_eq!(r.cmd, Cmdline::Shell("make".into()));
@@ -589,6 +595,7 @@ mod tests {
                 uid: Some("1000".into()),
                 gid: Some("1001".into()),
                 mode: Some("0700".into()),
+                size: None,
             }
         );
         // `readwrite` is an accepted spelling of `rw`.
@@ -597,6 +604,32 @@ mod tests {
             panic!()
         };
         assert!(r.mounts[0].rw);
+    }
+
+    #[test]
+    fn run_mount_tmpfs_captures_size() {
+        let df = parse("RUN --mount=type=tmpfs,target=/cache,size=1g build\n").unwrap();
+        let Instruction::Run(r) = &df.instructions[0] else {
+            panic!()
+        };
+        assert_eq!(
+            r.mounts[0],
+            Mount {
+                typ: "tmpfs".into(),
+                target: Some("/cache".into()),
+                size: Some("1g".into()),
+                ..Mount::default()
+            }
+        );
+        // Sizeless tmpfs: no size, no from/source.
+        let df = parse("RUN --mount=type=tmpfs,target=/t x\n").unwrap();
+        let Instruction::Run(r) = &df.instructions[0] else {
+            panic!()
+        };
+        assert_eq!(r.mounts[0].typ, "tmpfs");
+        assert_eq!(r.mounts[0].target.as_deref(), Some("/t"));
+        assert_eq!(r.mounts[0].size, None);
+        assert_eq!(r.mounts[0].from, None);
     }
 
     #[test]

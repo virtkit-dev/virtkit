@@ -176,6 +176,58 @@ pub fn mount_scratch(
     Ok(())
 }
 
+/// The tmpfs mount `data` string for an optional `size=` value, validating its shape.
+/// A tmpfs `size=` is a byte count with an optional `k`/`m`/`g` suffix, or a percentage of
+/// RAM. The value goes verbatim into the comma-separated mount options, so anything outside
+/// that shape is rejected — both to keep an extra option from being smuggled in past a comma
+/// and to fail with a clear message instead of the kernel's opaque `EINVAL`.
+fn tmpfs_mount_data(size: Option<&str>) -> Result<CString> {
+    let opts = match size {
+        Some(s) => {
+            let digits = if let Some(pct) = s.strip_suffix('%') {
+                pct
+            } else {
+                s.strip_suffix(|c: char| matches!(c, 'k' | 'K' | 'm' | 'M' | 'g' | 'G'))
+                    .unwrap_or(s)
+            };
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                bail!("mount --tmpfs: invalid size {s:?} (want NNN, NNN[k|m|g], or NNN%)");
+            }
+            format!("size={s}")
+        }
+        None => String::new(),
+    };
+    Ok(CString::new(opts).unwrap())
+}
+
+/// Mount a fresh RAM-backed tmpfs at `target` (creating it), for `RUN --mount=type=tmpfs`.
+/// Hardened (`MS_NOSUID | MS_NODEV`). `size` is an optional tmpfs `size=` value (`1g`,
+/// `512m`, `50%`, a byte count); unset leaves the kernel default (½ RAM). The mount is torn
+/// down after the RUN, so its contents never enter the committed layer; the default 1777
+/// mode lets a non-root RUN write to it.
+pub fn mount_tmpfs(target: &Path, size: Option<&str>) -> Result<()> {
+    create_dir_all_noting(target)
+        .with_context(|| format!("creating tmpfs mountpoint {}", target.display()))?;
+    let data = tmpfs_mount_data(size)?;
+    let tgt = CString::new(target.as_os_str().as_bytes()).context("mountpoint has a NUL")?;
+    let fstype = CString::new("tmpfs").unwrap();
+    // SAFETY: valid C strings; data is the (possibly empty) tmpfs option string.
+    let rc = unsafe {
+        libc::mount(
+            fstype.as_ptr(),
+            tgt.as_ptr(),
+            fstype.as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            data.as_ptr() as *const libc::c_void,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("mounting tmpfs at {}", target.display()));
+    }
+    Ok(())
+}
+
 /// Remove every entry under `dir` (files, dirs, symlinks) without following symlinks — used
 /// to hand a reused scratch device a fresh, empty root each mount.
 fn empty_dir(dir: &Path) -> std::io::Result<()> {
@@ -504,9 +556,12 @@ pub fn main(args: &[String]) -> i32 {
             [flag, src, target] if flag == "--bind" => {
                 mount_bind_ro(Path::new(src), Path::new(target))
             }
+            [flag, target, size] if flag == "--tmpfs" => {
+                mount_tmpfs(Path::new(target), (size != "-").then_some(size.as_str()))
+            }
             _ => {
                 return usage(
-                    "mount --ro <device> <mp> | mount --scratch <device> <mp> <uid|-> <gid|-> <mode|-> | mount --bind <src> <target>",
+                    "mount --ro <device> <mp> | mount --scratch <device> <mp> <uid|-> <gid|-> <mode|-> | mount --bind <src> <target> | mount --tmpfs <target> <size|->",
                 );
             }
         },
@@ -583,8 +638,33 @@ fn usage(msg: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::copy_spec;
+    use super::{copy_spec, tmpfs_mount_data};
     use vk_core::dockerignore::Ignore;
+
+    #[test]
+    fn tmpfs_mount_data_validates_size() {
+        // Unset size yields empty options (kernel default).
+        assert_eq!(tmpfs_mount_data(None).unwrap().to_str().unwrap(), "");
+        // A byte count, a k/m/g suffix (any case), and a percentage are all accepted.
+        for (input, opts) in [
+            ("1024", "size=1024"),
+            ("512m", "size=512m"),
+            ("1G", "size=1G"),
+            ("50%", "size=50%"),
+        ] {
+            assert_eq!(
+                tmpfs_mount_data(Some(input)).unwrap().to_str().unwrap(),
+                opts
+            );
+        }
+        // Junk, a bad unit, a doubled/misplaced suffix, or a smuggled extra option is rejected.
+        for bad in ["", "abc", "1z", "1g2m", "5%%", "1g,noexec", "%", "0x10"] {
+            assert!(
+                tmpfs_mount_data(Some(bad)).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
 
     #[test]
     fn copy_spec_dockerignore_negation() {
