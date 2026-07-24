@@ -91,7 +91,9 @@ pub trait Executor {
         state: &ShellState,
     ) -> Result<()>;
     /// Apply a `COPY` into `fs` (from the build context, or `from`'s committed rootfs).
-    fn copy(&mut self, fs: &Rootfs, op: &Copy, from: Option<&Rootfs>) -> Result<()>;
+    /// `workdir` is the active `WORKDIR`, against which a relative destination resolves
+    /// (Docker semantics).
+    fn copy(&mut self, fs: &Rootfs, op: &Copy, from: Option<&Rootfs>, workdir: &str) -> Result<()>;
 
     /// Declare a stage's inputs before its instructions run: the stages it will
     /// `COPY --from` / `RUN --mount=from` (their committed rootfs), and its build
@@ -222,12 +224,18 @@ impl Executor for DryRun {
         ));
         Ok(())
     }
-    fn copy(&mut self, _fs: &Rootfs, op: &Copy, from: Option<&Rootfs>) -> Result<()> {
+    fn copy(
+        &mut self,
+        _fs: &Rootfs,
+        op: &Copy,
+        from: Option<&Rootfs>,
+        workdir: &str,
+    ) -> Result<()> {
         self.transcript.push(format!(
             "copy from={} {:?} -> {}",
             from.map(|f| f.label.as_str()).unwrap_or("context"),
             op.sources,
-            op.dest
+            resolve_copy_dest(&op.dest, workdir)
         ));
         Ok(())
     }
@@ -316,7 +324,13 @@ impl Executor for Planner {
     ) -> Result<()> {
         bail!("Planner backend does not run instructions")
     }
-    fn copy(&mut self, _fs: &Rootfs, _op: &Copy, _from: Option<&Rootfs>) -> Result<()> {
+    fn copy(
+        &mut self,
+        _fs: &Rootfs,
+        _op: &Copy,
+        _from: Option<&Rootfs>,
+        _workdir: &str,
+    ) -> Result<()> {
         bail!("Planner backend does not run instructions")
     }
     fn export_ext4(&mut self, _fs: &Rootfs, _out: &Path) -> Result<()> {
@@ -1544,6 +1558,25 @@ fn scratch_mount_target(specs: &[&Mount]) -> Result<Option<String>> {
     }
 }
 
+/// Resolve a `COPY` destination against the active `WORKDIR`: an absolute dest is used
+/// verbatim, a relative one joins onto `workdir` (Docker semantics). `workdir` is expected
+/// absolute — a relative `WORKDIR` is stored verbatim (not stacked onto the previous one, a
+/// pre-existing limitation) and so yields a relative dest, which stays consistent with how
+/// `RUN` uses `WORKDIR` as its cwd from `/`.
+pub(crate) fn resolve_copy_dest(dest: &str, workdir: &str) -> String {
+    if dest.starts_with('/') {
+        return dest.to_string();
+    }
+    // "/" -> "" so joining never doubles the slash; any other workdir loses its trailing /.
+    let wd = workdir.trim_end_matches('/');
+    let rel = dest.strip_prefix("./").unwrap_or(dest);
+    if rel.is_empty() || rel == "." {
+        format!("{wd}/") // WORKDIR itself, as a directory target
+    } else {
+        format!("{wd}/{rel}")
+    }
+}
+
 impl Executor for MicroVm {
     fn from_image(&mut self, stage: &str, image: &str) -> Result<Rootfs> {
         std::fs::create_dir_all(&self.scratch)
@@ -1915,7 +1948,7 @@ impl Executor for MicroVm {
         }
         Ok(())
     }
-    fn copy(&mut self, fs: &Rootfs, op: &Copy, from: Option<&Rootfs>) -> Result<()> {
+    fn copy(&mut self, fs: &Rootfs, op: &Copy, from: Option<&Rootfs>, workdir: &str) -> Result<()> {
         let needed: Vec<&str> = from.map(|src| vec![src.label.as_str()]).unwrap_or_default();
         self.ensure_session_with(fs, &needed, false)?;
         // The source tree lives at `root` in the guest: a `--from` stage is mounted
@@ -1976,7 +2009,7 @@ impl Executor for MicroVm {
                 argv.push(format!("{root}/{rel}"));
             }
         }
-        argv.push(op.dest.clone());
+        argv.push(resolve_copy_dest(&op.dest, workdir));
         let code = block_on(session.exec(&argv, None, &self.output_sink))?;
         if let Some(mp) = mount {
             let _ = block_on(session.exec(
@@ -2475,7 +2508,7 @@ impl Executor for Host {
         self.context = Some(context.to_path_buf());
         Ok(())
     }
-    fn copy(&mut self, fs: &Rootfs, op: &Copy, from: Option<&Rootfs>) -> Result<()> {
+    fn copy(&mut self, fs: &Rootfs, op: &Copy, from: Option<&Rootfs>, workdir: &str) -> Result<()> {
         let src_root = match from {
             Some(r) => self.stage_dir(r)?,
             None => self
@@ -2484,10 +2517,11 @@ impl Executor for Host {
                 .context("internal: copy before stage_sources set the context")?,
         };
         let dest_root = self.stage_dir(fs)?;
-        // dest is relative to the rootfs root; a trailing '/' or multiple sources mean
-        // dest is a directory. (Simplified Docker COPY semantics — see module status.)
-        let dest = dest_root.join(op.dest.trim_start_matches('/'));
-        let dest_is_dir = op.dest.ends_with('/') || op.sources.len() > 1;
+        // A relative dest is resolved against the active WORKDIR (Docker semantics), then
+        // under the rootfs root; a trailing '/' or multiple sources mean dest is a directory.
+        let rdest = resolve_copy_dest(&op.dest, workdir);
+        let dest = dest_root.join(rdest.trim_start_matches('/'));
+        let dest_is_dir = rdest.ends_with('/') || op.sources.len() > 1;
         for s in &op.sources {
             // sources resolve under the source root like dest does under the rootfs
             // root — an absolute source (the COPY --from=<stage> idiom) must not
@@ -2628,6 +2662,25 @@ mod tests {
         // A set value is trimmed and passed through verbatim.
         assert_eq!(resolve_build_mem(Some(" 8G ")), "8G");
         assert_eq!(resolve_build_mem(Some("2048")), "2048");
+    }
+
+    #[test]
+    fn resolve_copy_dest_honours_workdir() {
+        // Absolute dest: used verbatim, whatever the workdir.
+        assert_eq!(resolve_copy_dest("/opt/app", "/w"), "/opt/app");
+        // Relative dest: resolved against WORKDIR (the reported bug — `.` landed at /).
+        assert_eq!(resolve_copy_dest(".", "/w"), "/w/");
+        assert_eq!(resolve_copy_dest("./s.sh", "/w"), "/w/s.sh");
+        assert_eq!(resolve_copy_dest("s.sh", "/w"), "/w/s.sh");
+        // A trailing slash (directory target) is preserved.
+        assert_eq!(resolve_copy_dest("sub/", "/w"), "/w/sub/");
+        // WORKDIR = / (or a trailing slash on it) must not double the separator.
+        assert_eq!(resolve_copy_dest("s.sh", "/"), "/s.sh");
+        assert_eq!(resolve_copy_dest(".", "/"), "/");
+        assert_eq!(resolve_copy_dest("s.sh", "/w/"), "/w/s.sh");
+        // A relative WORKDIR is stored verbatim (not stacked), so it yields a relative dest —
+        // consistent with RUN using WORKDIR as its cwd from /.
+        assert_eq!(resolve_copy_dest("s.sh", "w"), "w/s.sh");
     }
 
     #[test]
@@ -2843,7 +2896,7 @@ mod tests {
             chmod: None,
             link: false,
         };
-        h.copy(&app, &op, Some(&lib)).unwrap();
+        h.copy(&app, &op, Some(&lib), "/").unwrap();
         let copied = std::fs::read_to_string(h.stage_dir(&app).unwrap().join("t2")).unwrap();
         assert_eq!(copied, "tool");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2869,9 +2922,9 @@ mod tests {
             chmod: None,
             link: false,
         };
-        assert!(h.copy(&fs, &op, None).is_err());
+        assert!(h.copy(&fs, &op, None, "/").is_err());
         h.stage_sources(&[], &stage).unwrap();
-        h.copy(&fs, &op, None).unwrap();
+        h.copy(&fs, &op, None, "/").unwrap();
         let copied = std::fs::read_to_string(h.stage_dir(&fs).unwrap().join("f.txt")).unwrap();
         assert_eq!(copied, "from-stage");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2898,7 +2951,7 @@ mod tests {
             chmod: None,
             link: false,
         };
-        h.copy(&fs, &op, None).unwrap();
+        h.copy(&fs, &op, None, "/").unwrap();
         let out = tmp.join("out.ext4");
         h.export_ext4(&fs, &out).unwrap();
 

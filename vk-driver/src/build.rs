@@ -2524,7 +2524,7 @@ fn apply_fs(
                     None => Some(ex.pull(reference)?), // COPY --from=<external image>
                 },
             };
-            ex.copy(fs, c, from.as_ref())?;
+            ex.copy(fs, c, from.as_ref(), &state.workdir)?;
         }
         // only RUN/COPY reach here (the driver routes ENV/WORKDIR/USER to apply_meta).
         _ => {}
@@ -2887,8 +2887,14 @@ mod tests {
         ) -> Result<()> {
             self.inner.run(fs, cmd, mounts, state)
         }
-        fn copy(&mut self, fs: &Rootfs, op: &parser::Copy, from: Option<&Rootfs>) -> Result<()> {
-            self.inner.copy(fs, op, from)
+        fn copy(
+            &mut self,
+            fs: &Rootfs,
+            op: &parser::Copy,
+            from: Option<&Rootfs>,
+            workdir: &str,
+        ) -> Result<()> {
+            self.inner.copy(fs, op, from, workdir)
         }
         fn export_ext4(&mut self, fs: &Rootfs, out: &Path) -> Result<()> {
             self.inner.export_ext4(fs, out)

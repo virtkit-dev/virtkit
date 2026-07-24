@@ -16,6 +16,8 @@ All notable changes to virtkit will be documented in this file.
   from its address with a tab (or any whitespace) instead of a single space.
 - A `USER` given as `user:group`, `uid:gid`, a mixed name/id, or a bare numeric id
   now resolves like Docker's, instead of only the bare-name form working.
+- A `COPY` with a relative destination now lands under the active `WORKDIR`, as
+  Docker does, instead of at the image root.
 
 ## [0.28.0] - 2026-07-24
 
