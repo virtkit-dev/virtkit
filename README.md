@@ -145,6 +145,13 @@ The ones you'll actually type:
   (the CI-executor features only when named with `--feature`).
 - `gc` — reclaim the host image cache: evict image bases no VM is using and
   idle past the timeout, and drop unreferenced registry chunks.
+- `update` — replace this `vk` with a release build from GitHub: the latest, or a
+  version you name (an older one downgrades). It asks before replacing anything
+  (`--yes` to skip), verifies the download against the digest published with the
+  release so a corrupted or truncated transfer is never installed, and leaves
+  running VMs untouched. `--check` reports what is available and installs nothing,
+  exiting 1 when a newer release exists — enough for a cron or a login banner to
+  nag with.
 - `service up` / `service down` / `service status` — from inside the primary,
   control the run's compose services (build on demand + boot, stop, or query state).
 - `gitlab config` / `gitlab prepare` / `gitlab run` / `gitlab cleanup` — the

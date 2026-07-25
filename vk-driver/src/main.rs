@@ -56,6 +56,7 @@ mod sshconf;
 mod switch;
 mod timing;
 mod units;
+mod update;
 #[cfg(feature = "virtiofsd")]
 mod virtiofsd;
 mod vm;
@@ -834,6 +835,28 @@ enum Cmd {
         #[arg(long, default_value_t = 30)]
         timeout: u64,
     },
+    /// Replace this `vk` with a GitHub release build — the latest release, or the
+    /// VERSION given. Prints what it is about to install and asks before touching
+    /// anything; the download is checked against the digest published beside it and
+    /// must report its own version before it replaces the running binary. Needs
+    /// write access to the directory `vk` is installed in. VMs already running are
+    /// unaffected. `--check` only reports what is available, downloading nothing.
+    /// Exit: 0 up to date, installed, or declined at the prompt; 1 a newer release
+    /// is available (`--check`); 2 the update or check itself failed.
+    #[command(display_order = 9)]
+    Update {
+        /// release to install, `0.29.0` or `v0.29.0` (default: the latest release).
+        /// An older version downgrades, which `--check` does not report as an update
+        /// available.
+        version: Option<String>,
+        /// skip the confirmation prompt (for unattended use)
+        #[arg(short = 'y', long, conflicts_with = "check")]
+        yes: bool,
+        /// report whether a newer release is available and exit — download nothing,
+        /// install nothing (exit 1 when there is one)
+        #[arg(long)]
+        check: bool,
+    },
     /// Print each stage's build-cache key (its `stage_key`: the chained content key after
     /// the stage's last instruction) — the exact identity virtkit's instruction cache
     /// stores the stage's snapshot under. Prints `stage:key` lines. Resolves base
@@ -1312,6 +1335,30 @@ async fn cli_main() -> ExitCode {
     // before Config::load so it works from inside a guest that has none.
     if let Cmd::Service { cmd } = &cli.cmd {
         return service_cmd(cmd).await;
+    }
+    // `update` replaces the binary and reads nothing from the config — handle it before
+    // Config::load, so a config file that no longer parses cannot block the upgrade that
+    // fixes it.
+    if let Cmd::Update {
+        version,
+        yes,
+        check,
+    } = &cli.cmd
+    {
+        // Errors exit 2 throughout, leaving 1 to mean `--check` found a newer release —
+        // so a script can branch on "an update is available" without reading it as
+        // failure.
+        if *check {
+            return match update::check(version.as_deref()).await {
+                Ok(false) => ExitCode::SUCCESS,
+                Ok(true) => exit_code(1),
+                Err(e) => fail(&e, 2),
+            };
+        }
+        return match update::run(version.as_deref(), *yes).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 2),
+        };
     }
     // `vk config --example` prints the bundled annotated template — before Config::load,
     // so a broken config file on disk cannot keep the user from seeing a valid example.
@@ -2342,6 +2389,7 @@ async fn cli_main() -> ExitCode {
         | Cmd::Fingerprint { .. }
         | Cmd::List { .. }
         | Cmd::Stop { .. }
+        | Cmd::Update { .. }
         | Cmd::Service { .. } => {
             unreachable!()
         }
@@ -2643,6 +2691,40 @@ mod tests {
         assert!(Cli::try_parse_from(["vk", "exec", "ls", "-la"]).is_err());
     }
 
+    // `vk update` CLI shape: the version is an optional positional (absent = latest),
+    // `-y` is a flag rather than the version, and `--check` (which installs nothing)
+    // cannot be combined with the flag that skips the install prompt.
+    #[test]
+    fn update_cli_takes_optional_version_and_yes() {
+        let cli = Cli::try_parse_from(["vk", "update"]).unwrap();
+        let Cmd::Update {
+            version,
+            yes,
+            check,
+        } = cli.cmd
+        else {
+            panic!("expected Cmd::Update")
+        };
+        assert_eq!(version, None);
+        assert!(!yes && !check);
+
+        let cli = Cli::try_parse_from(["vk", "update", "-y", "v0.28.0"]).unwrap();
+        let Cmd::Update { version, yes, .. } = cli.cmd else {
+            panic!("expected Cmd::Update")
+        };
+        assert_eq!(version.as_deref(), Some("v0.28.0"));
+        assert!(yes);
+
+        let cli = Cli::try_parse_from(["vk", "update", "--check", "0.28.0"]).unwrap();
+        let Cmd::Update { version, check, .. } = cli.cmd else {
+            panic!("expected Cmd::Update")
+        };
+        assert_eq!(version.as_deref(), Some("0.28.0"));
+        assert!(check);
+
+        assert!(Cli::try_parse_from(["vk", "update", "--check", "--yes"]).is_err());
+    }
+
     #[test]
     fn exec_service_selects_named_sibling_and_rejects_raw_address() {
         let entry = vms::VmEntry {
@@ -2686,7 +2768,7 @@ mod tests {
         assert_eq!(
             sorted,
             [
-                "build", "check", "exec", "gc", "list", "run", "status", "stop"
+                "build", "check", "exec", "gc", "list", "run", "status", "stop", "update"
             ]
         );
     }

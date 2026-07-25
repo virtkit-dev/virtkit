@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk update`.** Upgrade `vk` in place from its GitHub releases — the latest by
+  default, or the version you name. It shows what it will install and asks first
+  (`--yes` for unattended use), and VMs already running keep going. `--check` reports
+  whether a newer release is available without installing it, exiting 1 when there is
+  one.
+
 ## [0.29.0] - 2026-07-24
 
 ### Added
