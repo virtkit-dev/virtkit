@@ -59,14 +59,16 @@ job's plain GitLab `image:` is read the same way):
 - `virtkit/<name>[:tag|@sha256:…]` — a bundle in the `[registry]` repo;
 - `docker/<name>[:tag|@sha256:…]` — an OCI image from the `[docker]` repo, booted
   directly (embedded kernel + agent);
-- `dockerfile:<path>[?context=<dir>&arg=NAME=VALUE][#<stage>]` — a **git-defined**
-  image: virtkit builds the Dockerfile from the job's own checkout (each `RUN` in
-  a microVM, no Docker involved) and boots the result, so the job image lives in
+- `dockerfile:<path>[?context=<dir>&buildcontext=NAME=DIR&arg=NAME=VALUE][#<stage>]` — a
+  **git-defined** image: virtkit builds the Dockerfile from the job's own checkout (each
+  `RUN` in a microVM, no Docker involved) and boots the result, so the job image lives in
   the repo instead of a registry. `<path>` is relative to the repo root; the build
   context defaults to the Dockerfile's directory (`?context=.` for the repo root),
-  `?arg=` supplies a `--build-arg` (repeatable), and `#<stage>` selects a stage.
-  Built images are cached and shared across jobs and runners. Requires
-  `[gitlab] host_checkout`;
+  `?arg=` supplies a `--build-arg` (repeatable), `?buildcontext=NAME=DIR` (repeatable)
+  declares an extra repo-root-relative directory a `COPY --from=NAME` or
+  `RUN --mount=…,from=NAME` may read, and `#<stage>` selects a stage. Every path stays
+  inside the checkout. Built images are cached and shared across
+  jobs and runners. Requires `[gitlab] host_checkout`;
 - `compose:<file>#<primary>` — a whole fleet from a compose file in the checkout:
   boots `<primary>` as the job VM and the other services (built or pulled the
   same way) as siblings on the job network. Same `host_checkout` requirement.

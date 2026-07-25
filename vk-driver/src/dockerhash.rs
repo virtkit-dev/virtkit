@@ -22,7 +22,9 @@ pub fn run(
     build_args: &[(String, String)],
     requested: &[String],
 ) -> Result<()> {
-    let keys = crate::build::stage_keys(dockerfiles, contexts, build_args)?;
+    // `vk docker-hash` has no way to declare a named context, so a `COPY --from=<name>` here
+    // keys as an external image ref — the key a build with that context declared would differ.
+    let keys = crate::build::stage_keys(dockerfiles, contexts, &[], build_args)?;
     if requested.is_empty() {
         for (name, key) in &keys {
             println!("{name}:{key}");

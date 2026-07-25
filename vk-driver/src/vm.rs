@@ -374,7 +374,8 @@ fn resolve_media(ctx: &JobCtx) -> Result<(Option<PathBuf>, Media, bool)> {
     }
 }
 
-/// The job's primary as a git-defined image (`MICROVM_IMAGE: dockerfile:<path>[?context=<dir>&arg=<N>=<V>][#<stage>]`):
+/// The job's primary as a git-defined image
+/// (`MICROVM_IMAGE: dockerfile:<path>[?context=<dir>&buildcontext=<N>=<dir>&arg=<N>=<V>][#<stage>]`):
 /// build it and return it as generic-disk boot media (embedded kernel, agent + config riding
 /// the preinit initramfs — the byte-clean model `vk build`/bundles use).
 fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<(Option<PathBuf>, Media, bool)> {
@@ -390,12 +391,15 @@ fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<(Option<PathBuf>,
     ))
 }
 
-/// Build a git-defined image `<path>[?context=<dir>&arg=<N>=<V>][#<stage>]` from the host-side checkout into
-/// the shared build tier and return its rootfs + captured runtime config. Shared by the job's
-/// primary (`resolve_dockerfile_form`) and its git-defined services (`plan_services`). Requires
-/// `[gitlab] host_checkout`: the Dockerfile + context are the checked-out sources. The context
-/// defaults to the Dockerfile's directory; `?context=<dir>` overrides it. `--build-arg`s come
-/// from `?arg=<NAME>=<VALUE>` parameters (repeatable).
+/// Build a git-defined image
+/// `<path>[?context=<dir>&buildcontext=<N>=<dir>&arg=<N>=<V>][#<stage>]` from the host-side
+/// checkout into the shared build tier and return its rootfs + captured runtime config. Shared
+/// by the job's primary (`resolve_dockerfile_form`) and its git-defined services
+/// (`plan_services`). Requires `[gitlab] host_checkout`: the Dockerfile + context are the
+/// checked-out sources. The context defaults to the Dockerfile's directory; `?context=<dir>`
+/// overrides it. `--build-arg`s come from `?arg=<NAME>=<VALUE>` parameters (repeatable), and
+/// `?buildcontext=<NAME>=<DIR>` (repeatable) names an extra context directory — every path
+/// confined to the checkout, since all of them are job-authored.
 fn build_git_image(
     ctx: &JobCtx,
     spec: &str,
@@ -422,12 +426,31 @@ fn build_git_image(
         .iter()
         .map(|(name, value)| (name.to_string(), value.to_string()))
         .collect();
-    let stage_key = crate::build::target_stage_key(&dockerfiles, &contexts, &build_args, stage)
-        .context("computing the git-defined image's stage fingerprint")?;
+    // Named contexts are job-controlled paths too: confine each to the checkout, exactly as
+    // the Dockerfile path and `context=` are, so a job cannot read outside its own checkout
+    // during the host-side build.
+    let build_contexts: Vec<(String, PathBuf)> = parsed
+        .build_contexts
+        .iter()
+        .map(|(name, dir)| {
+            let dir = confined_dockerfile(&checkout, dir)
+                .with_context(|| format!("resolving buildcontext {name}"))?;
+            Ok(((*name).to_string(), dir))
+        })
+        .collect::<Result<_>>()?;
+    let stage_key = crate::build::target_stage_key(
+        &dockerfiles,
+        &contexts,
+        &build_contexts,
+        &build_args,
+        stage,
+    )
+    .context("computing the git-defined image's stage fingerprint")?;
     let (net, audit) = effective_build_egress(cfg, ctx)?;
     let recipe = crate::ensure::BuildRecipe {
         dockerfiles,
         contexts,
+        build_contexts,
         build_args,
         kernel: cfg.build.kernel.clone(),
         cloud_hypervisor: Some(cfg.cloud_hypervisor().to_path_buf()),
@@ -461,8 +484,8 @@ fn build_git_image(
     Ok((rootfs, config))
 }
 
-/// Resolve the job-controlled Dockerfile path against the checkout root, refusing to escape
-/// it. Rejects an absolute path (`Path::join` would discard the base) and any `..`/root
+/// Resolve a job-controlled repo-relative path — the Dockerfile, a `context=`, a
+/// `buildcontext=` directory — against the checkout root, refusing to escape it. Rejects an absolute path (`Path::join` would discard the base) and any `..`/root
 /// component up front, then canonicalizes and re-checks the prefix so a symlink committed in
 /// the repo cannot redirect the read outside the checkout (`read_to_string` follows symlinks).
 /// A `dockerfile:` job fully controls its repo, so this is the boundary that keeps it inside its
@@ -538,15 +561,21 @@ struct DockerfileSpec<'a> {
     stage: Option<&'a str>,
     /// `arg=<NAME>=<VALUE>` (repeatable): `--build-arg`s for the build.
     build_args: Vec<(&'a str, &'a str)>,
+    /// `buildcontext=<NAME>=<DIR>` (repeatable): named build contexts, so a stage can
+    /// `COPY --from=<NAME>` files that live outside its own context — no staging copy into
+    /// the context. Each `<DIR>` is checkout-relative and confined like `context=`.
+    build_contexts: Vec<(&'a str, &'a str)>,
 }
 
 /// Parse a `dockerfile:` image spec's body into a [`DockerfileSpec`]. Query before fragment,
 /// URL-style: the `#` binds first, so a `?`-parameter placed after a `#` lands inside the stage
 /// rather than being parsed. `<params>` are `&`-separated `key=value`: `context=<dir>` overrides
-/// the build context (default: the Dockerfile's own directory) and `arg=<NAME>=<VALUE>`
-/// (repeatable) supplies a `--build-arg`. Anything else — an unknown parameter, an empty or
-/// repeated `context=`, or an `arg` missing its `=VALUE` — is rejected so a typo fails loudly
-/// rather than silently building the wrong thing. A build-arg `VALUE` may itself contain `=`, but
+/// the build context (default: the Dockerfile's own directory), `arg=<NAME>=<VALUE>`
+/// (repeatable) supplies a `--build-arg`, and `buildcontext=<NAME>=<DIR>` (repeatable) names an
+/// extra context directory a `COPY --from=<NAME>` or `RUN --mount=…,from=<NAME>` may read.
+/// Anything else — an unknown parameter, an empty or repeated `context=`, an `arg` missing its
+/// `=VALUE`, or a `buildcontext` that is not `NAME=DIR`, has an empty half, or repeats a name —
+/// is rejected so a typo fails loudly rather than silently building the wrong thing. A build-arg `VALUE` may itself contain `=`, but
 /// no value can contain `&` (the parameter separator) or `#` (the stage delimiter).
 fn parse_dockerfile_spec(spec: &str) -> Result<DockerfileSpec<'_>> {
     let (head, stage) = match spec.split_once('#') {
@@ -559,6 +588,7 @@ fn parse_dockerfile_spec(spec: &str) -> Result<DockerfileSpec<'_>> {
     };
     let mut context = None;
     let mut build_args = Vec::new();
+    let mut build_contexts: Vec<(&str, &str)> = Vec::new();
     for kv in query
         .into_iter()
         .flat_map(|q| q.split('&'))
@@ -580,8 +610,21 @@ fn parse_dockerfile_spec(spec: &str) -> Result<DockerfileSpec<'_>> {
                     .with_context(|| format!("dockerfile: arg must be NAME=VALUE: {v:?}"))?;
                 build_args.push(nv);
             }
+            Some(("buildcontext", v)) => {
+                let (name, dir) = v
+                    .split_once('=')
+                    .with_context(|| format!("dockerfile: buildcontext must be NAME=DIR: {v:?}"))?;
+                if name.is_empty() || dir.is_empty() {
+                    bail!("dockerfile: buildcontext NAME and DIR must both be set: {v:?}");
+                }
+                if build_contexts.iter().any(|(n, _)| *n == name) {
+                    bail!("dockerfile: buildcontext {name:?} specified more than once");
+                }
+                build_contexts.push((name, dir));
+            }
             _ => bail!(
-                "unknown dockerfile: parameter {kv:?} (expected context=<dir> or arg=NAME=VALUE)"
+                "unknown dockerfile: parameter {kv:?} (expected context=<dir>, \
+                 buildcontext=NAME=DIR or arg=NAME=VALUE)"
             ),
         }
     }
@@ -590,6 +633,7 @@ fn parse_dockerfile_spec(spec: &str) -> Result<DockerfileSpec<'_>> {
         context,
         stage,
         build_args,
+        build_contexts,
     })
 }
 
@@ -2163,6 +2207,28 @@ mod tests {
         assert_eq!(p.context, Some("a/ctx"));
         assert_eq!(p.stage, None);
         assert!(p.build_args.is_empty());
+
+        // Named contexts (repeatable), mixed with the other params and a stage: each is a
+        // NAME=DIR pair, distinct from the positional `context=`.
+        let p = parse_dockerfile_spec(
+            "docker/dev-container/Dockerfile?buildcontext=shared=shared&arg=X=y\
+             &buildcontext=tools=ci/tools#builder-ci",
+        )
+        .unwrap();
+        assert_eq!(p.path, "docker/dev-container/Dockerfile");
+        assert_eq!(p.context, None);
+        assert_eq!(p.stage, Some("builder-ci"));
+        assert_eq!(p.build_args, vec![("X", "y")]);
+        assert_eq!(
+            p.build_contexts,
+            vec![("shared", "shared"), ("tools", "ci/tools")]
+        );
+
+        // A malformed or duplicated named context is refused rather than half-honoured.
+        assert!(parse_dockerfile_spec("a/Dockerfile?buildcontext=shared").is_err());
+        assert!(parse_dockerfile_spec("a/Dockerfile?buildcontext==shared").is_err());
+        assert!(parse_dockerfile_spec("a/Dockerfile?buildcontext=shared=").is_err());
+        assert!(parse_dockerfile_spec("a/Dockerfile?buildcontext=p=a&buildcontext=p=b").is_err());
 
         // A param-only spec without a stage.
         let p = parse_dockerfile_spec("a/Dockerfile?arg=X=y").unwrap();

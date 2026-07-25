@@ -597,7 +597,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     let timings = Arc::new(Timings::new());
     let t_plan = Instant::now();
     let mut plan = Plan::from_dockerfiles(&inputs, &build_args)?;
-    plan.named_contexts = named_contexts(opts)?;
+    plan.named_contexts = named_context_map(&opts.build_contexts)?;
     let target = plan.resolve_target(opts.target.as_deref())?;
     let order = plan.build_order(target)?;
     // Reject a cross-stage source under /tmp up front: /tmp is ephemeral and never
@@ -900,7 +900,7 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
             .with_context(|| format!("build unit {:?}", unit.label))?;
             let mut plan = Plan::from_dockerfiles(&inputs, &build_args)
                 .with_context(|| format!("build unit {:?}", unit.label))?;
-            plan.named_contexts = named_contexts(opts)?;
+            plan.named_contexts = named_context_map(&opts.build_contexts)?;
             let targets: Vec<Tgt> = unit
                 .targets
                 .iter()
@@ -1346,11 +1346,13 @@ fn resolve_stages(
 pub fn stage_keys(
     dockerfiles: &[PathBuf],
     contexts: &[PathBuf],
+    build_contexts: &[(String, PathBuf)],
     build_args: &[(String, String)],
 ) -> Result<Vec<(String, String)>> {
     let inputs = load_inputs(dockerfiles, contexts)?;
     let ba: Vars = build_args.iter().cloned().collect();
-    let plan = Plan::from_dockerfiles(&inputs, &ba)?;
+    let mut plan = Plan::from_dockerfiles(&inputs, &ba)?;
+    plan.named_contexts = named_context_map(build_contexts)?;
     let order = plan.all_order()?;
     let mut ex = exec::Planner::new();
     // canonical keys: DOCKER_STAGE_HASH is excluded (its injected value never affects a
@@ -1425,12 +1427,14 @@ fn source_content_key(
 pub fn target_stage_key(
     dockerfiles: &[PathBuf],
     contexts: &[PathBuf],
+    build_contexts: &[(String, PathBuf)],
     build_args: &[(String, String)],
     target: Option<&str>,
 ) -> Result<String> {
     let inputs = load_inputs(dockerfiles, contexts)?;
     let ba: Vars = build_args.iter().cloned().collect();
-    let plan = Plan::from_dockerfiles(&inputs, &ba)?;
+    let mut plan = Plan::from_dockerfiles(&inputs, &ba)?;
+    plan.named_contexts = named_context_map(build_contexts)?;
     let t = plan.resolve_target(target)?;
     let order = plan.build_order(t)?;
     let mut ex = exec::Planner::new();
@@ -2251,17 +2255,19 @@ fn from_refs(instructions: &[Instruction]) -> Vec<&str> {
     refs
 }
 
-/// The `--build-context` values as the plan's name → directory map, each resolved to an
-/// absolute path like the positional contexts are: the directory is read host-side (packed
-/// into an ext4, and hashed into the cache key), so a cwd-relative value must not be left for
-/// something later to re-resolve.
-fn named_contexts(opts: &Options) -> Result<std::collections::BTreeMap<String, PathBuf>> {
+/// Declared named contexts — `--build-context <name>=<dir>`, or a CI job's `buildcontext=` —
+/// as the plan's name → directory map, each resolved to an absolute path like the positional
+/// contexts are: the directory is read host-side (packed into an ext4, and hashed into the cache
+/// key), so a cwd-relative value must not be left for something later to re-resolve.
+fn named_context_map(
+    build_contexts: &[(String, PathBuf)],
+) -> Result<std::collections::BTreeMap<String, PathBuf>> {
     let mut out = std::collections::BTreeMap::new();
-    for (name, dir) in &opts.build_contexts {
+    for (name, dir) in build_contexts {
         // `--from=scratch` always names the reserved empty base (see `Plan::check_reserved_names`),
         // so a context by that name could never be read from.
         if name == "scratch" {
-            bail!("--build-context scratch=…: the name \"scratch\" is reserved");
+            bail!("build context \"scratch\": the name is reserved");
         }
         let abs = std::path::absolute(dir)
             .with_context(|| format!("resolving build context {name} ({})", dir.display()))?;
@@ -2269,13 +2275,10 @@ fn named_contexts(opts: &Options) -> Result<std::collections::BTreeMap<String, P
         // packed for the guest, and a missing one hashes as empty — so a typo would key a build
         // as if the context held nothing, then fail mid-build (or not at all, when cached).
         if !abs.is_dir() {
-            bail!(
-                "--build-context {name}: {} is not a directory",
-                abs.display()
-            );
+            bail!("build context {name}: {} is not a directory", abs.display());
         }
         if out.insert(name.clone(), abs).is_some() {
-            bail!("--build-context {name} declared more than once");
+            bail!("build context {name} declared more than once");
         }
     }
     Ok(out)
@@ -3814,8 +3817,10 @@ mod tests {
         let files = [tmp.join("a/Dockerfile"), tmp.join("b/Dockerfile")];
 
         let keys = || {
-            let m: HashMap<String, String> =
-                stage_keys(&files, &[], &[]).unwrap().into_iter().collect();
+            let m: HashMap<String, String> = stage_keys(&files, &[], &[], &[])
+                .unwrap()
+                .into_iter()
+                .collect();
             (m["lib"].clone(), m["app"].clone())
         };
         let (lib1, app1) = keys();
@@ -4212,7 +4217,7 @@ ENTRYPOINT run me
         })
         .unwrap();
         // The stamped UUID must equal fingerprint([the target's stage key]).
-        let key = target_stage_key(&dockerfiles, &[], &[], None).unwrap();
+        let key = target_stage_key(&dockerfiles, &[], &[], &[], None).unwrap();
         let expected = crate::ensure::fingerprint(&[&key]);
         assert_eq!(
             crate::ext4::fs_uuid(&out).as_deref(),

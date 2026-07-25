@@ -95,11 +95,18 @@ fn build_recipe(
     build_args.extend(args.iter().cloned());
     // compose semantics: one context for all the service's files.
     let contexts = vec![context.clone(); dockerfiles.len()];
-    let key =
-        crate::build::target_stage_key(dockerfiles, &contexts, &build_args, target.as_deref())?;
+    let key = crate::build::target_stage_key(
+        dockerfiles,
+        &contexts,
+        &[],
+        &build_args,
+        target.as_deref(),
+    )?;
     let recipe = crate::ensure::BuildRecipe {
         dockerfiles: dockerfiles.clone(),
         contexts,
+        // compose `build:` units declare no named contexts
+        build_contexts: Vec::new(),
         build_args,
         kernel: build.map(|b| b.kernel.clone()),
         cloud_hypervisor: build.map(|b| b.cloud_hypervisor.clone()),

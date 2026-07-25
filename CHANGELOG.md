@@ -23,7 +23,8 @@ All notable changes to virtkit will be documented in this file.
   outside files in before every build. The directory is read-only to the build, and a build
   rereads it when the files it copies change. A name only takes effect when the Dockerfile
   has no stage of that name, so declaring one can never change what an existing Dockerfile
-  means.
+  means. A CI job gets the same thing from its `dockerfile:` image —
+  `?buildcontext=<name>=<dir>` names an extra directory from the job's own checkout.
 
 ### Fixed
 

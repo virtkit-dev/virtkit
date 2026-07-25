@@ -186,9 +186,9 @@ Exit codes follow the custom-executor contract: script failures exit with
   natively with content-defined chunk dedup (CDC + per-chunk zstd).
 - `docker/<name>[:tag|@sha256:…]` — an OCI image from the `[docker]` repo, pulled with
   the native OCI client and booted directly (embedded kernel + agent; see below).
-- `dockerfile:<path>[?context=<dir>&arg=NAME=VALUE][#<stage>]` — a git-defined image:
-  built from the job's host-side checkout (the `vk build` path, cached and shared
-  across jobs and runners) and booted. Requires `[gitlab] host_checkout`.
+- `dockerfile:<path>[?context=<dir>&buildcontext=NAME=DIR&arg=NAME=VALUE][#<stage>]` — a
+  git-defined image: built from the job's host-side checkout (the `vk build` path, cached
+  and shared across jobs and runners) and booted. Requires `[gitlab] host_checkout`.
 - `compose:<file>#<primary>` — a fleet from a compose file in the checkout: `<primary>`
   becomes the job VM, the rest boot as siblings. Same `host_checkout` requirement.
 

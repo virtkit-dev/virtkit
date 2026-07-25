@@ -132,6 +132,9 @@ fn freshness_of_recipe(r: &StaleRecipe) -> Freshness {
     let Ok(key) = crate::build::target_stage_key(
         &r.dockerfiles,
         &r.contexts,
+        // drift detection covers `vk run -f` and compose `build:` units, neither of which
+        // declares a named context
+        &[],
         &r.build_args,
         r.target.as_deref(),
     ) else {

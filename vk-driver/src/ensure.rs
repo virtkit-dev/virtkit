@@ -59,6 +59,11 @@ pub struct BuildRecipe {
     pub dockerfiles: Vec<PathBuf>,
     /// Build contexts, zipped positionally with `dockerfiles` (missing = the file's dir).
     pub contexts: Vec<PathBuf>,
+    /// Named build contexts (`--build-context <name>=<dir>`, or a job's `buildcontext=`): extra
+    /// directories a `COPY --from=<name>` or `RUN --mount=…,from=<name>` may read. Job-authored
+    /// values must already be confined to the checkout by the caller, like
+    /// `dockerfiles`/`contexts` are.
+    pub build_contexts: Vec<(String, PathBuf)>,
     pub build_args: Vec<(String, String)>,
     pub kernel: Option<PathBuf>,
     pub cloud_hypervisor: Option<PathBuf>,
@@ -103,7 +108,7 @@ pub fn ensure_unit_build(
         dockerfiles: recipe.dockerfiles.clone(),
         target: target.map(String::from),
         contexts: recipe.contexts.clone(),
-        build_contexts: Vec::new(),
+        build_contexts: recipe.build_contexts.clone(),
         out: Some(out.to_path_buf()),
         out_disk: None,
         print_plan: false,
@@ -210,6 +215,7 @@ mod tests {
         let recipe = BuildRecipe {
             dockerfiles: vec![tmp.join("no-such-Dockerfile")],
             contexts: vec![],
+            build_contexts: Vec::new(),
             build_args: vec![],
             kernel: None,
             cloud_hypervisor: None,
