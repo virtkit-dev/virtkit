@@ -21,13 +21,111 @@ use vk_core::dockerignore::Ignore;
 /// would not persist do not litter the artifact.
 const CREATED_REGISTRY: &str = "/run/.virtkit-created";
 
+/// The same record for the API-filesystem mountpoints, kept *in the image* instead of on
+/// tmpfs so it survives being snapshotted into the build cache and restored.
+///
+/// Those mountpoints have to exist on the stage disk for the whole build (`/proc` above
+/// all: the agent is reachable only as `/proc/self/exe`, since it lives nowhere in the
+/// rootfs), so a mid-stage snapshot inevitably contains them. Without this, restoring such
+/// a snapshot left them looking like part of the base — already present, so
+/// [`note_created`] never recorded them and `cleanup` never dropped them — and the empty
+/// `/proc`, `/sys`, `/dev`, `/run`, `/tmp` became a permanent part of every image built on
+/// top. Recording them here instead makes the judgement travel with the bytes it describes.
+/// `cleanup` removes this file along with the directories it names.
+const EPHEMERAL_REGISTRY: &str = "/.virtkit-ephemeral";
+
+/// The only paths the in-image registry may name — the API mountpoints
+/// [`crate::init`] mounts. Unlike [`CREATED_REGISTRY`], which lives on this boot's tmpfs and
+/// so can only ever hold what this agent wrote, that file ships inside the image: a base
+/// image (or a build whose `cleanup` was interrupted) can hand us an arbitrary one, and
+/// `cleanup` unmounts and deletes every path it names. Anything outside this set is ignored
+/// rather than trusted. Keep in step with the mount table in `init::mount_api_filesystems`.
+const EPHEMERAL_ALLOWED: &[&str] = &[
+    "/proc", "/sys", "/dev", "/dev/pts", "/dev/shm", "/run", "/tmp",
+];
+
+/// The in-image registry's lines, restricted to the paths it is allowed to name.
+fn ephemeral_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().filter(|l| EPHEMERAL_ALLOWED.contains(l))
+}
+
 /// Record `path` as agent-created (best-effort, one line appended).
 pub fn note_created(path: &Path) {
+    append_line(CREATED_REGISTRY, path);
+}
+
+/// Record `path` as an agent-created API mountpoint, in both registries: the tmpfs one that
+/// drives this boot's `cleanup`, and the in-image one that tells a later boot restored from
+/// a snapshot that this directory is still ours to drop.
+pub fn note_ephemeral(path: &Path) {
+    note_created(path);
+    append_line(EPHEMERAL_REGISTRY, path);
+}
+
+/// The in-image registry's contents, read once for a caller that consults it for several
+/// paths (see [`noted_ephemeral_in`]).
+pub(crate) fn ephemeral_registry() -> String {
+    fs::read_to_string(EPHEMERAL_REGISTRY).unwrap_or_default()
+}
+
+/// Whether `cleanup` will still change the image: a recorded path that is still there *and* is
+/// image content — its own directory entry lives on the root fs. A mountpoint the agent created
+/// on some other fs (`/dev/pts` and `/dev/shm` on the devtmpfs over `/dev`, a stub under the
+/// disk-backed `/tmp`) is dropped from that fs, not from the image, so it must not cost the host
+/// a re-push. Both registries matter — besides the API mountpoints, a `--mount` target's created
+/// parent and a file bind stub outlive their step's `umount` and are dropped only here, so the
+/// last step's snapshot differs from the export even on a base that ships `/proc`. A superset: a
+/// recorded directory that kept real content survives `remove_dir`, so the host may re-push
+/// bytes that did not change — idempotent, and far cheaper than answering "no" when the answer
+/// is "yes".
+pub fn cleanup_pending() -> bool {
+    // `cleanup` always drops this file, and it is image content — so its mere presence is a
+    // change, whatever it names. Keeps the answer true by construction rather than by the
+    // argument that everything written to it is a path this function counts anyway.
+    if Path::new(EPHEMERAL_REGISTRY).exists() {
+        return true;
+    }
+    let Ok(root) = fs::metadata("/") else {
+        return true; // cannot tell whose fs a path is on — answer the safe way
+    };
+    recorded_paths(
+        &fs::read_to_string(CREATED_REGISTRY).unwrap_or_default(),
+        &fs::read_to_string(EPHEMERAL_REGISTRY).unwrap_or_default(),
+    )
+    .iter()
+    .any(|p| is_live_image_content(p, root.dev()))
+}
+
+/// Whether `p` is image content that is still there: its own directory entry exists and lives
+/// on the root fs (`root_dev`). The *parent*'s device decides, not the path's own — a
+/// mountpoint's entry belongs to the fs holding the directory it sits in, whatever is mounted
+/// over it, so `/proc` counts while `/dev/pts` (an entry on the devtmpfs over `/dev`) does not.
+fn is_live_image_content(p: &Path, root_dev: u64) -> bool {
+    p.symlink_metadata().is_ok()
+        && p.parent()
+            .and_then(|d| fs::metadata(d).ok())
+            .is_some_and(|m| m.dev() == root_dev)
+}
+
+/// The exit code `cleanup-pending` reports: 0 when `cleanup` will still change the image, so the
+/// host's `matches!(…, Ok(0))` probe reads a shell-style "yes".
+fn pending_exit_code(pending: bool) -> i32 {
+    i32::from(!pending)
+}
+
+/// Whether `text` — the in-image registry's contents, from [`ephemeral_registry`] — records
+/// `path` as an ephemeral mountpoint: it is present only because a snapshot captured it
+/// mid-build, so this boot still owns it.
+pub(crate) fn noted_ephemeral_in(text: &str, path: &Path) -> bool {
+    ephemeral_lines(text).any(|l| Path::new(l) == path)
+}
+
+fn append_line(registry: &str, path: &Path) {
     use std::io::Write;
     if let Ok(mut f) = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(CREATED_REGISTRY)
+        .open(registry)
     {
         let _ = f.write_all(path.as_os_str().as_bytes());
         let _ = f.write_all(b"\n");
@@ -68,9 +166,15 @@ pub fn cleanup() -> Result<()> {
 /// litter the committed image. A directory that still holds real content survives
 /// (`remove_dir` fails on non-empty). Best-effort.
 fn remove_created() {
-    let list = fs::read_to_string(CREATED_REGISTRY).unwrap_or_default();
-    for line in list.lines().rev() {
-        let p = Path::new(line);
+    // Both registries: this boot's own record, plus whatever an earlier boot left in the
+    // image (a snapshot restored mid-build). Read in full before anything is removed, since
+    // detaching `/run` takes the tmpfs registry with it.
+    let recorded = recorded_paths(
+        &fs::read_to_string(CREATED_REGISTRY).unwrap_or_default(),
+        &fs::read_to_string(EPHEMERAL_REGISTRY).unwrap_or_default(),
+    );
+    for p in &recorded {
+        let p = p.as_path();
         if let Ok(c) = CString::new(p.as_os_str().as_bytes()) {
             // SAFETY: valid C string; MNT_DETACH unmounts even a busy mountpoint.
             unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
@@ -80,6 +184,30 @@ fn remove_created() {
         }
     }
     let _ = fs::remove_file(CREATED_REGISTRY);
+    // Last: the in-image list is itself ephemeral, and leaving it behind would litter the
+    // artifact it exists to keep clean.
+    let _ = fs::remove_file(EPHEMERAL_REGISTRY);
+}
+
+/// The recorded paths to drop, deepest first. The two registries are deduplicated — an API
+/// mountpoint is recorded in both — blank lines are ignored, so an absent or half-written
+/// registry contributes nothing, and the in-image one is held to [`EPHEMERAL_ALLOWED`] since
+/// it is base-image content.
+fn recorded_paths(tmpfs: &str, in_image: &str) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    for line in tmpfs.lines().chain(ephemeral_lines(in_image)) {
+        let p = std::path::PathBuf::from(line);
+        if !line.is_empty() && !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    // A child has to be removed before its parent, or `remove_dir` finds the parent non-empty
+    // and leaves both in the image. Each registry is appended to as directories are created, so
+    // reversing one orders it deepest-first — but the concatenation of two is not ordered at
+    // all: a parent recorded on tmpfs would precede a child recorded only in the image. Sort by
+    // depth so the invariant holds by construction.
+    out.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    out
 }
 
 /// Quiesce the root fs so the on-disk image is consistent. Freeze the root fs (FIFREEZE)
@@ -538,7 +666,8 @@ fn primary_gid(user: &str) -> Option<u32> {
     }
 }
 
-/// CLI entry for `vk-agent mount|umount|copy …`. Returns the process exit code.
+/// CLI entry for `vk-agent mount|umount|copy|cleanup|cleanup-pending …`. Returns the process
+/// exit code.
 pub fn main(args: &[String]) -> i32 {
     let result = match args.first().map(String::as_str) {
         Some("mount") => match &args[1..] {
@@ -571,7 +700,15 @@ pub fn main(args: &[String]) -> i32 {
         },
         Some("copy") => copy_cmd(&args[1..]),
         Some("cleanup") => cleanup(),
-        _ => return usage("mount|umount|copy|cleanup …"),
+        // Queried by the build host before it shuts a stage guest down: exit 0 when `cleanup`
+        // still has paths to drop from this image, so the host knows the snapshot it pushed
+        // mid-stage no longer describes what it will export. Asked while the guest is still
+        // up, because answering needs the agent at all.
+        Some("cleanup-pending") => match &args[1..] {
+            [] => return pending_exit_code(cleanup_pending()),
+            _ => return usage("cleanup-pending"),
+        },
+        _ => return usage("mount|umount|copy|cleanup|cleanup-pending …"),
     };
     match result {
         Ok(()) => 0,
@@ -638,7 +775,11 @@ fn usage(msg: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_spec, tmpfs_mount_data};
+    use super::{
+        copy_spec, is_live_image_content, noted_ephemeral_in, pending_exit_code, recorded_paths,
+        tmpfs_mount_data,
+    };
+    use std::path::Path;
     use vk_core::dockerignore::Ignore;
 
     #[test]
@@ -664,6 +805,107 @@ mod tests {
                 "expected {bad:?} to be rejected"
             );
         }
+    }
+
+    /// A child must never be preceded by its own parent, or `remove_dir` finds the parent
+    /// non-empty and leaves both in the image. Asserted as the invariant rather than an exact
+    /// order, since only the parent/child pairs matter.
+    fn assert_children_first(got: &[std::path::PathBuf]) {
+        for (i, p) in got.iter().enumerate() {
+            for later in &got[i + 1..] {
+                assert!(
+                    !later.starts_with(p),
+                    "{} precedes its child {}",
+                    p.display(),
+                    later.display()
+                );
+            }
+        }
+    }
+
+    // The removal order is what keeps a child from outliving its parent, and the two
+    // registries overlap: an API mountpoint is recorded in the in-image one *and* in this
+    // boot's tmpfs one, so a naive concatenation would try to remove it twice.
+    #[test]
+    fn recorded_paths_are_deepest_first_and_deduplicated() {
+        let tmpfs = "/proc\n/dev\n/dev/pts\n/mnt/src-build\n";
+        let in_image = "/proc\n/dev\n/dev/pts\n";
+        let got = recorded_paths(tmpfs, in_image);
+        let want: Vec<std::path::PathBuf> = ["/dev/pts", "/mnt/src-build", "/proc", "/dev"]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        assert_eq!(got, want, "deepest first, each path once");
+        assert_children_first(&got);
+        // A parent recorded on tmpfs must not precede a child recorded only in the image: the
+        // two registries are ordered individually, their concatenation is not.
+        let got = recorded_paths("/dev\n", "/dev\n/dev/pts\n");
+        assert_eq!(
+            got,
+            ["/dev/pts", "/dev"]
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect::<Vec<_>>()
+        );
+        assert_children_first(&got);
+        // Missing or blank registries contribute nothing rather than a bare "" path, which
+        // would resolve to the guest's own root.
+        assert!(recorded_paths("", "").is_empty());
+        assert!(recorded_paths("\n\n", "").is_empty());
+        assert_eq!(recorded_paths("", "/tmp\n").len(), 1);
+    }
+
+    // What decides whether the host pays for a re-push: only a path whose own entry is in the
+    // image counts. Getting this wrong either re-pushes every stage or none of them.
+    #[test]
+    fn only_a_live_entry_on_the_root_fs_is_image_content() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = std::env::temp_dir().join(format!("dm-content-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file = tmp.join("stub");
+        std::fs::write(&file, "").unwrap();
+        let dev = std::fs::metadata(&tmp).unwrap().dev();
+
+        assert!(is_live_image_content(&file, dev), "a stub in the image");
+        assert!(is_live_image_content(&tmp, dev), "a directory too");
+        // A path already gone changes nothing at cleanup...
+        assert!(!is_live_image_content(&tmp.join("absent"), dev));
+        // ...and neither does one whose entry lives on another fs, the way /dev/pts sits on the
+        // devtmpfs mounted over /dev rather than in the image.
+        assert!(!is_live_image_content(&file, dev.wrapping_add(1)));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // The host reads this exit code as a yes/no, and an inversion would silently mean "never
+    // re-push" — the bug this registry exists to fix, with every other test still green.
+    #[test]
+    fn pending_is_reported_as_exit_zero() {
+        assert_eq!(pending_exit_code(true), 0, "pending -> success");
+        assert_eq!(pending_exit_code(false), 1);
+    }
+
+    // The in-image registry ships inside the image, so a base image can hand the agent an
+    // arbitrary one — and `cleanup` unmounts and deletes every path it names. Only the API
+    // mountpoints may be named; anything else is ignored rather than removed from the image
+    // being built.
+    #[test]
+    fn the_in_image_registry_only_names_api_mountpoints() {
+        let hostile = "/etc/ssl/certs/ca-certificates.crt\n/usr/bin\n/\n../escape\n/proc\n";
+        assert_eq!(
+            recorded_paths("", hostile),
+            vec![std::path::PathBuf::from("/proc")],
+            "only the allowlisted mountpoint survives"
+        );
+        assert!(noted_ephemeral_in(hostile, Path::new("/proc")));
+        for rejected in ["/usr/bin", "/", "../escape"] {
+            assert!(
+                !noted_ephemeral_in(hostile, Path::new(rejected)),
+                "{rejected} must not count as agent-created"
+            );
+        }
+        // The tmpfs registry is written only by this agent, so it takes any path it records.
+        assert_eq!(recorded_paths("/mnt/src-build\n", "").len(), 1);
     }
 
     #[test]

@@ -12,6 +12,15 @@ All notable changes to virtkit will be documented in this file.
   whether a newer release is available without installing it, exiting 1 when there is
   one.
 
+### Fixed
+
+- **A cached build no longer keeps scratch mountpoints a cold build drops.** Building on a
+  base that ships no `/proc`, `/sys`, `/dev`, `/run` or `/tmp` — `FROM scratch` and the
+  minimal images — left those mountpoints in the artifact whenever a build reused the
+  cache, and they then persisted into everything built on top; the same went for a bind
+  target a build step created, on any base. Entries an earlier `vk` already cached keep
+  the old contents until the step is rebuilt.
+
 ## [0.29.0] - 2026-07-24
 
 ### Added

@@ -307,6 +307,8 @@ fn mount_api_filesystems() -> Result<()> {
     // registry lives on it). Pre-existing dirs (a normal debian/alpine base ships them) are
     // left untouched and kept.
     let mut created: Vec<&str> = Vec::new();
+    // What an earlier boot of this image already claimed, read once for the whole table.
+    let noted = crate::diskmount::ephemeral_registry();
     // (source, target, fstype, flags)
     let mounts: &[(&str, &str, &str, libc::c_ulong)] = &[
         ("proc", "/proc", "proc", 0),
@@ -325,7 +327,7 @@ fn mount_api_filesystems() -> Result<()> {
         ),
     ];
     for (src, target, fstype, flags) in mounts {
-        if !std::path::Path::new(target).exists() {
+        if is_ephemeral_mountpoint(&noted, target) {
             created.push(target);
         }
         let _ = std::fs::create_dir_all(target);
@@ -363,7 +365,7 @@ fn mount_api_filesystems() -> Result<()> {
     // it stays a fresh mount that leaks nothing into the image.
     let tmp_dev = tmp_dev_from_cmdline();
     for target in ["/run", "/tmp"] {
-        if !std::path::Path::new(target).exists() {
+        if is_ephemeral_mountpoint(&noted, target) {
             created.push(target);
         }
         let _ = std::fs::create_dir_all(target);
@@ -409,11 +411,30 @@ fn mount_api_filesystems() -> Result<()> {
         }
     }
     // Now that /run (the registry's tmpfs) is mounted, record the mountpoints we created
-    // so the pre-commit cleanup can remove them from a FROM scratch image.
+    // so the pre-commit cleanup can remove them from a FROM scratch image. A mountpoint that
+    // is itself image content is recorded in the image as well as on tmpfs, so a build that
+    // restores a mid-stage snapshot still knows the directory is the agent's and not the
+    // base's. /dev/pts and /dev/shm are not: their entries live on the devtmpfs mounted over
+    // /dev, so they never reach the image, and the next boot finds them missing again anyway.
+    // Recording them there would put the registry file into every image built — even on a base
+    // that ships every API mountpoint — and cost the host a re-push to take it back out.
     for target in created {
-        crate::diskmount::note_created(std::path::Path::new(target));
+        let p = std::path::Path::new(target);
+        if p.parent() == Some(std::path::Path::new("/")) {
+            crate::diskmount::note_ephemeral(p);
+        } else {
+            crate::diskmount::note_created(p);
+        }
     }
     Ok(())
+}
+
+/// Whether `target` is a mountpoint the agent owns rather than one the base image ships:
+/// either it is not there yet, or an earlier boot of this image already recorded it as ours
+/// in `noted` (the in-image registry) and a snapshot carried it here.
+fn is_ephemeral_mountpoint(noted: &str, target: &str) -> bool {
+    let p = std::path::Path::new(target);
+    !p.exists() || crate::diskmount::noted_ephemeral_in(noted, p)
 }
 
 /// The disk-backed `/tmp` scratch device a build's `boot_session` passes as

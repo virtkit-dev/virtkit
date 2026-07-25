@@ -1650,7 +1650,7 @@ fn build_stage(
         let fs = restore_into(ex, &name, key)?;
         timings.record(Phase::CachePull, &name, t_restore.elapsed());
         progress.restore_done(display);
-        ex.stage_end(&fs)?;
+        ex.stage_end(&fs, Some(key))?;
         return Ok(fs);
     }
     // Build-once across runners: take the lock on this stage's final content key (a no-op
@@ -1671,7 +1671,7 @@ fn build_stage(
                 let fs = restore_into(ex, &name, &final_key)?;
                 timings.record(Phase::CachePull, &name, t_restore.elapsed());
                 progress.restore_done(display);
-                ex.stage_end(&fs)?;
+                ex.stage_end(&fs, Some(&final_key))?;
                 return Ok(fs);
             }
             guard
@@ -1811,7 +1811,7 @@ fn build_stage(
     // last step's still-uploading cache push (no next RUN overlapped it), so show a spinner —
     // otherwise the dashboard sits frozen on the header through that upload.
     progress.stage_finishing_start(display, &name);
-    let r = ex.stage_end(&final_fs);
+    let r = ex.stage_end(&final_fs, steps.last().map(|s| s.key.as_str()));
     progress.stage_finishing_done(display);
     r?;
     Ok(final_fs)
@@ -2918,6 +2918,57 @@ mod tests {
             self.last_saved = Some(key.to_string());
             Ok(())
         }
+        fn stage_end(&mut self, fs: &Rootfs, final_key: Option<&str>) -> Result<()> {
+            self.inner.transcript.push(format!(
+                "stage-end {} key={}",
+                fs.label,
+                final_key.unwrap_or("-")
+            ));
+            Ok(())
+        }
+    }
+
+    /// Every `stage_end` is handed the key of that stage's own last cache push. The microVM
+    /// backend re-pushes exactly that key from the finished image, so a key belonging to another
+    /// stage — or one no step ever pushed — would publish this stage's bytes where they do not
+    /// belong.
+    #[test]
+    fn stage_end_receives_the_stage_final_key() {
+        let src =
+            "FROM alpine AS builder\nRUN one\n\nFROM alpine\nCOPY --from=builder /a /a\nRUN two\n";
+        let ba = Vars::new();
+        let plan = plan_one(src, &ba);
+        let t = plan.resolve_target(None).unwrap();
+        let order = plan.build_order(t).unwrap();
+        let mut ex = CachedDry::default();
+        drive(
+            &plan,
+            &order,
+            &ba,
+            &mut ex,
+            false,
+            BuildCache::Instructions,
+            &Progress::disabled(),
+            &Arc::new(Timings::new()),
+        )
+        .unwrap();
+        let mut last_save: Option<&str> = None;
+        let mut ends = 0;
+        for line in &ex.inner.transcript {
+            if let Some(k) = line.strip_prefix("cache-save ") {
+                last_save = Some(k);
+            }
+            if let Some(rest) = line.strip_prefix("stage-end ") {
+                let key = rest.split_once("key=").unwrap().1;
+                assert_eq!(
+                    Some(key),
+                    last_save,
+                    "stage_end got {key}, not this stage's last pushed key"
+                );
+                ends += 1;
+            }
+        }
+        assert_eq!(ends, 2, "one stage_end per stage");
     }
 
     #[test]
@@ -2960,12 +3011,19 @@ mod tests {
         )
         .unwrap();
         let t = &ex.inner.transcript;
-        assert_eq!(t.len(), 2, "{t:?}");
+        assert_eq!(t.len(), 3, "{t:?}");
         assert!(
             t[0].starts_with("cache-has ") && t[0].ends_with("-> true"),
             "{t:?}"
         );
         assert!(t[1].starts_with("cache-restore "), "{t:?}");
+        // The restore still ends the stage, under the very key it restored: that is the key the
+        // microVM backend would re-push from, and a restore ships its snapshot verbatim.
+        let key = t[0]
+            .strip_prefix("cache-has ")
+            .and_then(|l| l.split_whitespace().next())
+            .unwrap();
+        assert_eq!(t[2], format!("stage-end stage1 key={key}"), "{t:?}");
     }
 
     #[test]

@@ -182,7 +182,7 @@ fn main() {
     // ext4 read-only and runs `vk-agent mount|umount …` in the guest to read it.
     if matches!(
         std::env::args().nth(1).as_deref(),
-        Some("mount") | Some("umount") | Some("copy") | Some("cleanup")
+        Some("mount") | Some("umount") | Some("copy") | Some("cleanup") | Some("cleanup-pending")
     ) {
         let rest: Vec<String> = std::env::args().skip(1).collect();
         std::process::exit(vk_agent::diskmount::main(&rest));

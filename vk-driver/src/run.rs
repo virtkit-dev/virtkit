@@ -3075,8 +3075,18 @@ impl VmSession {
         // the image) and then quiesces — all native, so it works on a shell-less `FROM scratch`
         // stage. Fall back to a native fsfreeze, then a shell `sync`, if an older agent lacks
         // cleanup. The guest is killed right after, so no thaw is needed.
-        let quiesced = self.guest_ok(&[GUEST_AGENT, "cleanup"]).await
-            || self.guest_ok(&[GUEST_AGENT, "fsfreeze", "-f", "/"]).await;
+        let cleaned = self.guest_ok(&[GUEST_AGENT, "cleanup"]).await;
+        if !cleaned {
+            // `cleanup` is what drops the agent-created mountpoints and stubs, and the in-image
+            // record naming them, so an image committed from this guest can keep both — and a
+            // build on top of it would then read that record as its own. Silence here is what
+            // used to make that indistinguishable from a clean stage.
+            eprintln!(
+                "virtkit: the guest's cleanup step did not run — an image committed from this \
+                 guest may keep the agent's ephemeral mountpoints"
+            );
+        }
+        let quiesced = cleaned || self.guest_ok(&[GUEST_AGENT, "fsfreeze", "-f", "/"]).await;
         if !quiesced {
             let _ = crate::executor::exec_script(
                 &self.addr,

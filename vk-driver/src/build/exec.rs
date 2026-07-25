@@ -150,8 +150,10 @@ pub trait Executor {
 
     /// Finalize a stage once all its instructions have run (default: nothing). The
     /// microVM backend uses this to shut down the stage's long-lived guest, whose writes
-    /// are already persisted in the stage image (the booted disk).
-    fn stage_end(&mut self, _fs: &Rootfs) -> Result<()> {
+    /// are already persisted in the stage image (the booted disk). `final_key` is the
+    /// stage's last content key, so a backend that changes the image while shutting down
+    /// can re-cache it under the key a later build will restore — and under no other.
+    fn stage_end(&mut self, _fs: &Rootfs, _final_key: Option<&str>) -> Result<()> {
         Ok(())
     }
 
@@ -492,6 +494,9 @@ pub struct MicroVm {
     /// this the set would be per-VM-boot, and a checkpoint after a reboot would miss every write
     /// from before it.
     dirty_carry: HashMap<String, DirtySet>,
+    /// stage label → the last content key `cache_save` pushed for it. `stage_end` re-pushes
+    /// that key when the guest's shutdown changed the image, and refuses to touch any other.
+    last_saved_key: HashMap<String, String>,
 }
 
 /// What `cache_save` chunks + uploads in the background. The thread returns the pushed
@@ -926,6 +931,7 @@ impl MicroVm {
             cancel: None,
             stage_prev_extents: HashMap::new(),
             dirty_carry: HashMap::new(),
+            last_saved_key: HashMap::new(),
         }
     }
 
@@ -1003,6 +1009,7 @@ impl MicroVm {
             cancel: None,
             stage_prev_extents: HashMap::new(),
             dirty_carry: HashMap::new(),
+            last_saved_key: HashMap::new(),
         }
     }
 
@@ -2108,6 +2115,8 @@ impl Executor for MicroVm {
         let Some(rg) = self.cache.clone() else {
             return Ok(());
         };
+        self.last_saved_key
+            .insert(fs.label.clone(), key.to_string());
         let boot_kind =
             crate::image::boot_kind_tag(crate::image::BootKind::GenericDisk).to_string();
 
@@ -2349,7 +2358,38 @@ impl Executor for MicroVm {
         Ok(())
     }
 
-    fn stage_end(&mut self, fs: &Rootfs) -> Result<()> {
+    fn stage_end(&mut self, fs: &Rootfs, final_key: Option<&str>) -> Result<()> {
+        // Only the key the stage's last step actually pushed can be re-pushed below; without one
+        // (no cache, an uncacheable stage, a stage whose last step never saved) there is nothing
+        // to correct and no reason to bother the guest.
+        let repushable = final_key
+            .is_some_and(|k| self.last_saved_key.get(&fs.label).map(String::as_str) == Some(k));
+        // Whether the shutdown's `cleanup` will still change the image. Asked before the
+        // shutdown, because answering it needs the agent, which is reachable only as
+        // `/proc/self/exe` — i.e. only while `/proc` is still one of the mountpoints cleanup is
+        // about to drop. Exit 0 = yes, so the snapshot pushed mid-stage no longer describes the
+        // image this stage hands on.
+        let cleanup_changes_image = repushable
+            && match self.session.as_ref() {
+                None => false,
+                Some(session) => {
+                    let argv = [GUEST_AGENT.to_string(), "cleanup-pending".to_string()];
+                    match block_on(session.exec(&argv, None, &self.output_sink)) {
+                        Ok(code) => code == 0,
+                        Err(e) => {
+                            // Not knowing leaves the mid-stage snapshot published under this
+                            // stage's final key, so a later cached build would ship bytes the
+                            // export does not have. Say so rather than diverge silently.
+                            eprintln!(
+                                "virtkit: build: could not ask the guest whether its shutdown \
+                                 changes the image ({e:#}) — this stage's cache entry may not \
+                                 match the exported image"
+                            );
+                            false
+                        }
+                    }
+                }
+            };
         // The stage's last step always checkpoints (consuming its carry), but drop any remainder
         // so a fresh stage on this worker never inherits a stale carry.
         self.dirty_carry.remove(&fs.label);
@@ -2369,6 +2409,35 @@ impl Executor for MicroVm {
             block_on(session.finish())?;
             self.timings.probe("stage.finish", t_fin.elapsed());
         }
+        // The shutdown just dropped the ephemeral mountpoints and stubs from the image, so the
+        // snapshot pushed for the last step — captured mid-stage, while they still had to exist —
+        // no longer matches what this stage hands on. Re-push that key from the finished image:
+        // a fully-cached restore ships its snapshot verbatim without ever booting a guest that
+        // could clean it, so leaving the mid-stage one there is what made a cached build's
+        // artifact differ from a cold build's. `repushable` pinned this to the key the last step
+        // already saved, so this can never publish content under a key not meant to hold it.
+        if cleanup_changes_image && let Some(key) = final_key {
+            // The mid-stage push for this key may still be uploading; let it land first so its
+            // manifest cannot overwrite the one below.
+            self.join_pending(&fs.label);
+            // Diff against the snapshot being replaced rather than the previous step's, so the
+            // re-push is a near-empty delta: `join_pending` records that digest but, unlike
+            // `harvest_prev_push`, does not pin it as the parent. A failed push leaves none
+            // recorded, and the older pinned digest still yields a complete manifest.
+            let pushed = self
+                .stage_last_digest
+                .lock()
+                .unwrap()
+                .get(&fs.label)
+                .cloned();
+            if pushed.is_some() {
+                self.parent_digest = pushed;
+            }
+            // The guest is gone, so `cache_save` takes its static-image path: the whole stage
+            // image, deduped against the parent chain, pushed synchronously.
+            self.cache_save(fs, key)?;
+        }
+        self.last_saved_key.remove(&fs.label);
         if let Some(tmp) = self.tmp_disk.take() {
             let _ = std::fs::remove_file(tmp);
         }
