@@ -3796,11 +3796,21 @@ ENTRYPOINT run me
             std::fs::read(tmp.join("a.ext4")).unwrap(),
             std::fs::read(tmp.join("b.ext4")).unwrap(),
         );
-        // identical past the primary superblock, whose UUID is random per build.
-        // Relies on this fixture being a tiny single-group image: a larger one would
-        // carry UUID-bearing backup superblocks (one per sparse_super group, 128 MiB
-        // apart) past this offset — do not enlarge it without widening the compare.
-        assert_eq!(a[2048..], b[2048..]);
+        // Bit-identical, superblock included: the only identity an exported image carries
+        // is the UUID `stamp_stage_uuid` writes, and that is a fingerprint of the stage
+        // key rather than a random one — so neither which entry point ran nor when it ran
+        // can show up here. Compared by offset rather than with `assert_eq!` on the two
+        // buffers, which would print 128 MiB of bytes on failure instead of naming the
+        // one that moved.
+        assert_eq!(a.len(), b.len(), "image sizes differ");
+        if let Some((off, x, y)) = a
+            .iter()
+            .zip(&b)
+            .enumerate()
+            .find_map(|(i, (x, y))| (x != y).then_some((i, *x, *y)))
+        {
+            panic!("images differ at 0x{off:x}: {x:02x} != {y:02x}");
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

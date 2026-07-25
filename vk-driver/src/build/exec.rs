@@ -20,6 +20,7 @@
 //!     honoring `.dockerignore`.
 
 use std::collections::HashMap;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -2551,8 +2552,58 @@ impl Executor for Host {
     }
     fn export_ext4(&mut self, fs: &Rootfs, out: &Path) -> Result<()> {
         let dir = self.stage_dir(fs)?;
+        // The exported image has to be a function of the staged tree alone. `std::fs::copy`
+        // does not carry an mtime across and a freshly created directory carries the clock,
+        // so without this the wall-clock second of the build leaks into the image's inode
+        // timestamps (`build_from_dir` reads them from the tree) — making two builds of one
+        // tree differ whenever they fall either side of a tick.
+        stamp_epoch_tree(&dir)?;
         crate::ext4::build_from_dir(&dir, out)
     }
+}
+
+/// Set the atime and mtime of every entry in the tree at `path` — the root included — to
+/// the epoch, so the mtimes the ext4 builder reads out of the tree are a function of its
+/// shape and not of when the build ran.
+fn stamp_epoch_tree(path: &Path) -> Result<()> {
+    // `symlink_metadata` (not `metadata`) and `AT_SYMLINK_NOFOLLOW` keep both the walk and
+    // the stamp on the link itself: a symlink's own mtime is what the ext4 builder reads for
+    // it, and a staged tree can hold an absolute symlink copied verbatim out of the build
+    // context — following one would leave the scratch dir and zero a *host* file's mtime.
+    // Re-resolving the path per syscall is safe here only because nothing else writes the
+    // scratch stage dir while the export runs — `read_dir` would follow a symlink swapped in
+    // for a directory. `File::set_times` cannot do this job: there is no fd for a symlink.
+    if std::fs::symlink_metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .is_dir()
+    {
+        for entry in
+            std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))?
+        {
+            stamp_epoch_tree(&entry?.path())?;
+        }
+    }
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("{} has an interior NUL", path.display()))?;
+    let epoch = [libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    }; 2];
+    // SAFETY: `cpath` is a valid NUL-terminated path and `epoch` a 2-element timespec array,
+    // both alive across the call; utimensat returns 0 or -1 with errno set.
+    let rc = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            cpath.as_ptr(),
+            epoch.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("stamping {}", path.display()));
+    }
+    Ok(())
 }
 
 /// Recursively copy the *contents* of `src` into `dst` (files, dirs, symlinks).
@@ -2959,6 +3010,43 @@ mod tests {
         assert!(bytes.len() > 4096, "ext4 image should be non-trivial");
         // ext4 superblock magic 0xEF53 (LE) at byte offset 0x438.
         assert_eq!(&bytes[0x438..0x43a], &[0x53, 0xEF], "ext4 superblock magic");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stamp_epoch_tree_zeroes_the_tree_without_following_a_symlink() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = std::env::temp_dir().join(format!("vk-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let sub = tmp.join("tree/sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("f"), "x").unwrap();
+        // an absolute symlink out of the tree, as `copy_tree` recreates one from a context;
+        // it targets a *directory* so a walk that followed it would stamp host files
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), "keep").unwrap();
+        std::os::unix::fs::symlink(&outside, tmp.join("tree/link")).unwrap();
+
+        stamp_epoch_tree(&tmp.join("tree")).unwrap();
+
+        for p in [
+            tmp.join("tree"),
+            sub.clone(),
+            sub.join("f"),
+            tmp.join("tree/link"),
+        ] {
+            let mtime = std::fs::symlink_metadata(&p).unwrap().mtime();
+            assert_eq!(mtime, 0, "{} was not stamped", p.display());
+        }
+        // the link itself was stamped, never what it points at
+        assert_ne!(std::fs::symlink_metadata(&outside).unwrap().mtime(), 0);
+        assert_ne!(
+            std::fs::symlink_metadata(outside.join("keep"))
+                .unwrap()
+                .mtime(),
+            0
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
