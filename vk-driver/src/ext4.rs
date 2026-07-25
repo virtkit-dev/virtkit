@@ -260,10 +260,19 @@ pub fn fsck(image: &Path) -> FsckResult {
 }
 
 /// Zero the ext4 superblock's volatile bookkeeping — the write/mount/check timestamps and
-/// the lifetime "kbytes written" / mount counters — so an exported image is deterministic:
-/// a warm (cache-restored) build and a cold build produce byte-identical artifacts, and a
-/// rebuild is reproducible. These fields are informational (the kernel sets them on writes);
-/// zeroing them is fsck-clean. Only the primary superblock carries them.
+/// the lifetime "kbytes written" / mount counters — so a fully-cached restore of a stage
+/// exports the same bytes as the cold build that filled the cache. These fields are
+/// informational (the kernel sets them on writes); zeroing them is fsck-clean. Only the
+/// primary superblock carries them.
+///
+/// That cache guarantee is all this buys, and only the microVM export — its one caller —
+/// rests on it: an uncached rebuild of a stage a guest wrote to does not reproduce the bytes,
+/// and this pass does not try to. Each file the guest writes takes the wall clock into its own
+/// inode, and the guest need not put the same content in the same blocks twice — so the extent
+/// pointers and block bitmap can differ too. Settling the timestamps would be possible;
+/// settling the allocation would mean re-emitting the filesystem from its contents at export —
+/// which is what emitting from a staged tree ([`build_from_dir`], the tests-only host backend)
+/// gets for free and a guest-written image does not.
 pub fn normalize_superblock(image: &Path) -> Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .read(true)

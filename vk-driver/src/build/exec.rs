@@ -2049,8 +2049,9 @@ impl Executor for MicroVm {
         }
         self.images.lock().unwrap().remove(&fs.label);
         // Zero the superblock's volatile bookkeeping (write/mount/check times + the
-        // kbytes-written/mount counters) so the artifact is deterministic: a cache-restored
-        // (warm) build and a cold build are byte-identical, and rebuilds are reproducible.
+        // kbytes-written/mount counters), so a fully-cached restore exports the same bytes as
+        // the cold build that filled the cache. That is the whole guarantee: an uncached rebuild
+        // of this stage does not reproduce the bytes (see `normalize_superblock`).
         crate::ext4::normalize_superblock(out)?;
         // The build is journal-less (a journal is dead weight under the rw-overlay
         // runtime and churns every snapshot). Optionally add one to the exported
