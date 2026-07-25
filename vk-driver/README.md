@@ -48,6 +48,9 @@ services:
       context: ./api                  # default "." (relative to the compose file)
       dockerfile: api.Dockerfile      # default "Dockerfile"
       target: runtime                 # stage to build (default: the last)
+      additional_contexts:            # extra dirs a COPY --from=<name> may read
+        shared: ../shared             #   (relative to the compose file, like context;
+                                      #    also the `- shared=../shared` list form)
       args:
         VERSION: "1.2"
   app:

@@ -775,6 +775,9 @@ pub enum UnitInput {
         dockerfiles: Vec<PathBuf>,
         /// zipped positionally with `dockerfiles` (a file without one defaults to its dir)
         contexts: Vec<PathBuf>,
+        /// this unit's named build contexts: a compose service's `additional_contexts`, or
+        /// the build-wide `--build-context` values on the `-f` multi-target path
+        build_contexts: Vec<(String, PathBuf)>,
     },
     Image(String),
 }
@@ -894,13 +897,22 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
                 UnitInput::Build {
                     dockerfiles,
                     contexts,
+                    ..
                 } => load_inputs(dockerfiles, contexts),
                 UnitInput::Image(image) => Ok(vec![image_plan_input(image)?]),
             }
             .with_context(|| format!("build unit {:?}", unit.label))?;
             let mut plan = Plan::from_dockerfiles(&inputs, &build_args)
                 .with_context(|| format!("build unit {:?}", unit.label))?;
-            plan.named_contexts = named_context_map(&opts.build_contexts)?;
+            // Each unit's own named contexts: a compose service's `additional_contexts`, or the
+            // `--build-context` values the `-f` multi-target path copies into its single unit.
+            // There is never a build-wide set to merge under a compose unit: `vk build` refuses
+            // the flag with `--compose`, and a compose service build gets its options from
+            // `service_build_options`, which declares none. An `image:` unit's synthetic
+            // single-`FROM` plan has no COPY that could read one.
+            if let UnitInput::Build { build_contexts, .. } = &unit.input {
+                plan.named_contexts = named_context_map(build_contexts)?;
+            }
             let targets: Vec<Tgt> = unit
                 .targets
                 .iter()

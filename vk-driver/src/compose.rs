@@ -3,7 +3,8 @@
 //! `services:` block, which is a subset of it) migrates mechanically.
 //!
 //! Supported per service: `image` xor `build.{context, dockerfile (string or list —
-//! a vk extension merging the files into one stage namespace), target, args}`,
+//! a vk extension merging the files into one stage namespace), target, args,
+//! additional_contexts (directories only)}`,
 //! `environment`, `command`, `entrypoint`, `user`, `hostname`, `depends_on`
 //! (start-ordering only), `volumes` (bind mounts) and `profiles` (a profiled
 //! service stays down at start-up unless activated or depended on). **Any other
@@ -21,6 +22,8 @@
 //!       context: .                # shared by all the service's dockerfiles
 //!       dockerfile: [base.Dockerfile, app.Dockerfile]  # merged stage namespace
 //!       target: app               # any stage across the merged files
+//!       additional_contexts:      # extra dirs, read via COPY --from=<name>
+//!         shared: ../shared       #   (also the `- shared=../shared` list form)
 //!     depends_on: [db, redis]
 //! ```
 //!
@@ -76,6 +79,9 @@ pub enum Source {
         dockerfiles: Vec<PathBuf>,
         /// the build context, shared by all the service's files (compose semantics)
         context: PathBuf,
+        /// `build.additional_contexts`: extra named contexts this service's stages may read
+        /// with `COPY --from=<name>`, each already resolved against the compose file's dir.
+        build_contexts: Vec<(String, PathBuf)>,
         target: Option<String>,
         args: Vec<(String, String)>,
     },
@@ -526,9 +532,45 @@ fn map_build(build: serde_yaml_ng::Value, base: &Path) -> Result<Source> {
             fs.into_iter().map(|f| context.join(f)).collect()
         }
     };
+    let build_contexts = spec
+        .additional_contexts
+        .map(Env::into_pairs)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, value)| {
+            // A nameless context is unreachable — no `COPY --from=` can spell it — so the
+            // `COPY` it was meant for would resolve as an image ref and fail inside the build.
+            if name.is_empty() {
+                bail!("build.additional_contexts: an entry needs a name ({value:?})");
+            }
+            // Only a directory is a context here: compose's remote forms would silently be
+            // taken for a relative path and fail deep inside the build instead.
+            if value.contains("://")
+                || ["service:", "target:", "docker-image:", "oci-layout:"]
+                    .iter()
+                    .any(|p| value.starts_with(p))
+            {
+                bail!(
+                    "build.additional_contexts {name}: only a directory is supported, got {value:?}"
+                );
+            }
+            if value.is_empty() {
+                bail!("build.additional_contexts {name}: empty directory");
+            }
+            Ok((name, base.join(value)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // The list form can name one context twice, where the map form cannot. Caught here so it
+    // reports in compose's own vocabulary rather than as a bare build-context clash later.
+    for (i, (name, _)) in build_contexts.iter().enumerate() {
+        if build_contexts[..i].iter().any(|(seen, _)| seen == name) {
+            bail!("build.additional_contexts {name}: declared more than once");
+        }
+    }
     Ok(Source::Build {
         dockerfiles,
         context,
+        build_contexts,
         target: spec.target,
         args: spec.args.map(Env::into_pairs).unwrap_or_default(),
     })
@@ -731,6 +773,9 @@ struct BuildSpec {
     dockerfile: Option<OneOrMany>,
     target: Option<String>,
     args: Option<Env>,
+    /// compose `additional_contexts`: `name: dir` map or `name=dir` list. Only directories
+    /// are supported (not compose's `docker-image://` / `oci-layout://` / `service:` forms).
+    additional_contexts: Option<Env>,
 }
 
 #[derive(Deserialize)]
@@ -916,6 +961,72 @@ mod tests {
                 assert_eq!(args, &[("ver".to_string(), "9".to_string())]);
             }
             _ => panic!("expected a build source"),
+        }
+    }
+
+    #[test]
+    fn additional_contexts_parse_in_both_forms_and_anchor_on_the_compose_dir() {
+        let contexts_of = |yaml: &str| match &one(yaml).source {
+            Source::Build { build_contexts, .. } => build_contexts.clone(),
+            _ => panic!("expected a build source"),
+        };
+        // map form (`name: dir`), the compose spelling
+        assert_eq!(
+            contexts_of(
+                "services:\n  app:\n    build:\n      context: docker/dev\n\
+                 \x20     additional_contexts:\n        shared: shared\n"
+            ),
+            vec![("shared".to_string(), PathBuf::from("/base/shared"))]
+        );
+        // list form (`name=dir`), like build args
+        assert_eq!(
+            contexts_of(
+                "services:\n  app:\n    build:\n      context: .\n\
+                 \x20     additional_contexts:\n        - shared=shared\n        - tools=ci/tools\n"
+            ),
+            vec![
+                ("shared".to_string(), PathBuf::from("/base/shared")),
+                ("tools".to_string(), PathBuf::from("/base/ci/tools")),
+            ]
+        );
+        // absent = none
+        assert!(contexts_of("services:\n  app:\n    build: .\n").is_empty());
+        // compose's remote forms are refused rather than taken for a relative directory
+        for value in [
+            "docker-image://alpine",
+            "oci-layout:///l",
+            "service:other",
+            "target:other",
+        ] {
+            let err = parse(
+                &format!(
+                    "services:\n  app:\n    build:\n      context: .\n\
+                     \x20     additional_contexts:\n        x: {value}\n"
+                ),
+                Path::new("/base"),
+            )
+            .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("only a directory is supported"), "{msg}");
+        }
+        // A half-written entry names no directory, or nothing at all — both would otherwise
+        // register a context that no `COPY --from=` could ever reach.
+        for (entry, want) in [
+            ("        x:\n", "empty directory"),
+            ("        - shared\n", "empty directory"),
+            ("        - =shared\n", "needs a name"),
+            ("        - x=a\n        - x=b\n", "declared more than once"),
+        ] {
+            let err = parse(
+                &format!(
+                    "services:\n  app:\n    build:\n      context: .\n\
+                     \x20     additional_contexts:\n{entry}"
+                ),
+                Path::new("/base"),
+            )
+            .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains(want), "{entry:?} -> {msg}");
         }
     }
 

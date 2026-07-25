@@ -2034,6 +2034,7 @@ async fn cli_main() -> ExitCode {
                     input: build::UnitInput::Build {
                         dockerfiles: file.clone(),
                         contexts: context.clone(),
+                        build_contexts: opts.build_contexts.clone(),
                     },
                     build_args: opts.build_args.clone(),
                     targets,

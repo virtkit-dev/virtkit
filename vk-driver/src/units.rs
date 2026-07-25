@@ -85,6 +85,7 @@ fn build_recipe(
     let crate::compose::Source::Build {
         dockerfiles,
         context,
+        build_contexts,
         target,
         args,
     } = &unit.source
@@ -98,15 +99,14 @@ fn build_recipe(
     let key = crate::build::target_stage_key(
         dockerfiles,
         &contexts,
-        &[],
+        build_contexts,
         &build_args,
         target.as_deref(),
     )?;
     let recipe = crate::ensure::BuildRecipe {
         dockerfiles: dockerfiles.clone(),
         contexts,
-        // compose `build:` units declare no named contexts
-        build_contexts: Vec::new(),
+        build_contexts: build_contexts.clone(),
         build_args,
         kernel: build.map(|b| b.kernel.clone()),
         cloud_hypervisor: build.map(|b| b.cloud_hypervisor.clone()),

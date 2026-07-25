@@ -25,7 +25,9 @@ All notable changes to virtkit will be documented in this file.
   what a `COPY` from it takes, exactly as it does for the Dockerfile's own context. A name only
   takes effect when the Dockerfile has no stage of that name, so declaring one can never change
   what an existing Dockerfile means. A CI job gets the same thing from its `dockerfile:` image —
-  `?buildcontext=<name>=<dir>` names an extra directory from the job's own checkout.
+  `?buildcontext=<name>=<dir>` names an extra directory from the job's own checkout — and a
+  compose service declares its own with `build.additional_contexts` (directories, resolved
+  against the compose file like `build.context`; compose's remote forms are refused).
 
 ### Fixed
 

@@ -977,6 +977,7 @@ async fn build_and_boot(
                 crate::compose::Source::Build {
                     dockerfiles,
                     context,
+                    build_contexts,
                     target,
                     args: unit_args,
                 } => {
@@ -985,8 +986,7 @@ async fn build_and_boot(
                     Some(crate::vms::StaleRecipe {
                         dockerfiles: dockerfiles.clone(),
                         contexts: vec![context.clone(); dockerfiles.len()],
-                        // a compose `build:` unit declares no named contexts
-                        build_contexts: Vec::new(),
+                        build_contexts: build_contexts.clone(),
                         build_args,
                         target: target.clone(),
                         root_ext4: prov.ext4.clone(),
@@ -1347,6 +1347,7 @@ async fn build_and_boot(
                 if let crate::compose::Source::Build {
                     dockerfiles,
                     context,
+                    build_contexts,
                     target,
                     args: unit_args,
                 } = &compose_units[idx].source
@@ -1356,8 +1357,7 @@ async fn build_and_boot(
                     return Some(crate::vms::StaleRecipe {
                         dockerfiles: dockerfiles.clone(),
                         contexts: vec![context.clone(); dockerfiles.len()],
-                        // a compose `build:` unit declares no named contexts
-                        build_contexts: Vec::new(),
+                        build_contexts: build_contexts.clone(),
                         build_args,
                         target: target.clone(),
                         root_ext4: root.clone(),
@@ -1898,9 +1898,14 @@ pub(crate) fn compose_build_units(
     selected: &[usize],
     out_of: impl Fn(&crate::compose::Unit) -> Option<PathBuf>,
 ) -> Vec<crate::build::BuildUnit> {
-    // A build group's identity: (dockerfiles, contexts, resolved build args). Services with
-    // an equal signature share one plan, so they merge into one multi-target unit.
-    type BuildSig = (Vec<PathBuf>, Vec<PathBuf>, Vec<(String, String)>);
+    // A build group's identity: (dockerfiles, contexts, named contexts, resolved build args).
+    // Services with an equal signature share one plan, so they merge into one multi-target unit.
+    type BuildSig = (
+        Vec<PathBuf>,
+        Vec<PathBuf>,
+        Vec<(String, PathBuf)>,
+        Vec<(String, String)>,
+    );
     let mut result: Vec<crate::build::BuildUnit> = Vec::new();
     let mut groups: Vec<(BuildSig, usize)> = Vec::new(); // signature -> index into `result`
     for &i in selected {
@@ -1914,6 +1919,7 @@ pub(crate) fn compose_build_units(
             crate::compose::Source::Build {
                 dockerfiles,
                 context,
+                build_contexts,
                 target: stage,
                 args: unit_args,
             } => {
@@ -1921,9 +1927,17 @@ pub(crate) fn compose_build_units(
                 let contexts = vec![context.clone(); dockerfiles.len()];
                 let mut build_args = global_build_args.to_vec();
                 build_args.extend(unit_args.iter().cloned());
-                let sig = (dockerfiles.clone(), contexts.clone(), build_args.clone());
-                // Order-sensitive on build_args: two services with the same args in a
-                // different order won't merge (a missed optimization, not a bug).
+                // The named contexts are part of the identity: two services differing only in
+                // their `additional_contexts` must not be merged into one unit.
+                let sig = (
+                    dockerfiles.clone(),
+                    contexts.clone(),
+                    build_contexts.clone(),
+                    build_args.clone(),
+                );
+                // Order-sensitive on build_args and build_contexts: two services declaring the
+                // same ones in a different order won't merge, though they key identically (the
+                // plan holds the contexts in a map). A missed optimization, not a bug.
                 if let Some((_, ri)) = groups.iter().find(|(s, _)| *s == sig) {
                     result[*ri].targets.push(target(stage.clone()));
                 } else {
@@ -1933,6 +1947,7 @@ pub(crate) fn compose_build_units(
                         input: crate::build::UnitInput::Build {
                             dockerfiles: dockerfiles.clone(),
                             contexts,
+                            build_contexts: build_contexts.clone(),
                         },
                         build_args,
                         targets: vec![target(stage.clone())],
@@ -3147,16 +3162,19 @@ mod tests {
     fn compose_build_units_merge_services_sharing_a_dockerfile() {
         // a + b share one context/Dockerfile (differ only by target) → one multi-target
         // unit (their common stages build once); c's context differs, d is a pulled image →
-        // each its own unit.
+        // each its own unit. e matches a exactly but for a named context, which its plan reads
+        // and a's does not, so it must not join their unit.
         let yaml = "services:\n\
              \x20 a:\n    build:\n      context: ./ctx\n      target: sa\n\
              \x20 b:\n    build:\n      context: ./ctx\n      target: sb\n\
              \x20 c:\n    build:\n      context: ./other\n      target: sc\n\
-             \x20 d:\n    image: redis:7\n";
+             \x20 d:\n    image: redis:7\n\
+             \x20 e:\n    build:\n      context: ./ctx\n      target: sa\n\
+             \x20     additional_contexts:\n        tools: ./tools\n";
         let units = crate::compose::parse(yaml, Path::new("/base"), &|_| None).unwrap();
         let selected: Vec<usize> = (0..units.len()).collect();
         let built = compose_build_units(&[], &units, &selected, |_| None);
-        assert_eq!(built.len(), 3, "a+b merge; c and d stand alone");
+        assert_eq!(built.len(), 4, "a+b merge; c, d and e stand alone");
         // the merged unit carries both a and b as targets, by their stage selectors.
         let merged = built.iter().find(|u| u.targets.len() == 2).unwrap();
         let mut targets: Vec<(&str, &str)> = merged

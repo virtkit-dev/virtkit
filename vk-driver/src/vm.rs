@@ -719,12 +719,19 @@ fn load_compose_fleet(ctx: &JobCtx, spec: &str) -> Result<ComposeFleet> {
         if let crate::compose::Source::Build {
             context,
             dockerfiles,
+            build_contexts,
             ..
         } = &mut unit.source
         {
             *context = confine_under(&root, context)?;
             for df in dockerfiles.iter_mut() {
                 *df = confine_under(&root, df)?;
+            }
+            // `additional_contexts` are job-authored paths too, and they are read host-side
+            // during the build — confine each like the context and the Dockerfiles.
+            for (name, dir) in build_contexts.iter_mut() {
+                *dir = confine_under(&root, dir)
+                    .with_context(|| format!("compose additional_contexts {name}"))?;
             }
         }
     }
