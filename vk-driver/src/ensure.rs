@@ -103,6 +103,7 @@ pub fn ensure_unit_build(
         dockerfiles: recipe.dockerfiles.clone(),
         target: target.map(String::from),
         contexts: recipe.contexts.clone(),
+        build_contexts: Vec::new(),
         out: Some(out.to_path_buf()),
         out_disk: None,
         print_plan: false,

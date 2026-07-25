@@ -316,6 +316,18 @@ enum Cmd {
         /// default: each Dockerfile's own directory)
         #[arg(long)]
         context: Vec<PathBuf>,
+        /// an additional named context, `<name>=<dir>`, that `COPY --from=<name>` and
+        /// `RUN --mount=…,from=<name>` read (repeatable) — so a Dockerfile can reach files
+        /// outside its own context with no staging copy. Resolved after the Dockerfile's own
+        /// stages and before an image ref, so a name never shadows a stage. Not supported with
+        /// --compose: a compose service declares its own contexts, and `vk run --compose` would
+        /// otherwise rebuild what this built, under a different key.
+        #[arg(
+            long = "build-context",
+            value_name = "NAME=DIR",
+            conflicts_with = "compose"
+        )]
+        build_context: Vec<String>,
         /// ext4 output path
         #[arg(long)]
         out: Option<PathBuf>,
@@ -1793,6 +1805,7 @@ async fn cli_main() -> ExitCode {
         profile,
         primary,
         context,
+        build_context,
         out,
         tag,
         disk,
@@ -1823,6 +1836,22 @@ async fn cli_main() -> ExitCode {
                 None => (a.clone(), String::new()),
             })
             .collect();
+        // each --build-context is NAME=DIR; both halves are required (a nameless or
+        // directoryless context could only fail later, inside the build).
+        let mut build_contexts: Vec<(String, PathBuf)> = Vec::new();
+        for c in build_context {
+            match c.split_once('=') {
+                Some((n, d)) if !n.is_empty() && !d.is_empty() => {
+                    build_contexts.push((n.to_string(), PathBuf::from(d)))
+                }
+                _ => {
+                    return fail(
+                        &anyhow::anyhow!("--build-context expects NAME=DIR, got {c:?}"),
+                        2,
+                    );
+                }
+            }
+        }
         let net = match build::BuildNet::from_flags(build_net, build_allow_ip, build_allow_name) {
             Ok(n) => n,
             Err(e) => return fail(&e, 2),
@@ -1893,6 +1922,7 @@ async fn cli_main() -> ExitCode {
             // the single-image path uses this one (default: the last stage).
             target: target.first().cloned(),
             contexts: context.clone(),
+            build_contexts,
             out: tag_out.clone().or_else(|| out.clone()),
             out_disk,
             print_plan: *print_plan,

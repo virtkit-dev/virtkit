@@ -9,7 +9,7 @@
 //! frontend/dockerfile/dockerfile2llb: `toDispatchState` + stage resolution).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
@@ -67,6 +67,10 @@ pub struct Plan {
     /// interpolation and, when a stage re-declares `ARG <name>` with no default, to that
     /// stage.
     pub global_args: Vars,
+    /// Named build contexts (`--build-context <name>=<dir>`): a `--from=<name>` reference
+    /// resolves to this host directory, letting a stage read files outside its own build
+    /// context. Set from the build options after planning; empty by default.
+    pub named_contexts: BTreeMap<String, PathBuf>,
     by_name: BTreeMap<String, usize>,
 }
 
@@ -217,6 +221,7 @@ impl Plan {
         Ok(Plan {
             stages,
             global_args,
+            named_contexts: BTreeMap::new(),
             by_name: by_name.into_iter().map(|(k, (i, _))| (k, i)).collect(),
         })
     }
@@ -294,11 +299,11 @@ impl Plan {
     /// Reject a stage name the backend reserves. `--from=scratch` always names the reserved
     /// empty base a `RUN --mount` gets as an ephemeral writable disk, so it never resolves to a
     /// stage — meaning nothing could ever read from one by that name. A `/` is rejected too: it
-    /// is what keeps a stage's label out of the `image/<ref>` namespace an external `--from`
-    /// source is attached under (see `exec::image_source_label`), and Docker rejects it in a
-    /// stage name anyway. Both fail here, before any build work, rather than letting a
-    /// `COPY --from=…` silently read the wrong thing. Only the stages in `order` (the ones
-    /// actually built) are checked.
+    /// is what keeps a stage's label out of the `image/<ref>` and `context/<name>` namespaces
+    /// a non-stage `--from` source is attached under (see `exec::image_source_label` and
+    /// `exec::context_source_label`), and Docker rejects it in a stage name anyway. Both fail
+    /// here, before any build work, rather than letting a `COPY --from=…` silently read the
+    /// wrong thing. Only the stages in `order` (the ones actually built) are checked.
     pub fn check_reserved_names(&self, order: &[usize]) -> Result<()> {
         for &idx in order {
             let Some(name) = self.stages[idx].name.as_deref() else {
@@ -313,12 +318,22 @@ impl Plan {
             }
             if name.contains('/') {
                 bail!(
-                    "stage name {name:?} may not contain '/': an external `--from=<image>` source \
-                     is attached under `image/<ref>`, which such a name would shadow. Rename it."
+                    "stage name {name:?} may not contain '/': a `--from=` source that is not a \
+                     stage is attached under `image/<ref>` or `context/<name>`, which such a name \
+                     would shadow. Rename it."
                 );
             }
         }
         Ok(())
+    }
+
+    /// A `--from=<x>` reference naming a build context declared with `--build-context`.
+    /// Resolved *after* stages and *before* an external image, so declaring a context can
+    /// never change what an existing Dockerfile means: a stage of the same name still wins.
+    /// `${ARG}` is expanded as in [`Plan::stage_ref`].
+    pub(crate) fn named_context(&self, reference: &str) -> Option<&Path> {
+        let reference = interp::interpolate(reference, &self.global_args);
+        self.named_contexts.get(&reference).map(PathBuf::as_path)
     }
 
     /// Reject a `COPY --from=<stage>` / `RUN --mount=…,from=<stage>` whose source lives
@@ -483,6 +498,31 @@ mod tests {
         assert_eq!(p.stages[0].instructions.len(), 1); // RUN x only, no stray ARG
         assert_eq!(p.stages[1].base, Base::Image("debian:9".into()));
         assert!(two("FROM alpine\n", "RUN x\nFROM alpine\n").is_err());
+    }
+
+    #[test]
+    fn named_context_lookup_is_separate_from_stage_ref() {
+        let mut p = plan("FROM alpine AS base\nFROM alpine\nCOPY --from=base /a /a\n");
+        p.named_contexts
+            .insert("base".into(), PathBuf::from("/shadowed"));
+        p.named_contexts
+            .insert("shared".into(), PathBuf::from("/repo/shared"));
+        // A stage of the same name keeps its meaning: declaring a context cannot silently
+        // repoint an existing `--from=<stage>`. (What resolves first is decided by the callers
+        // that consult both — `non_stage_source` and `source_content_key`.)
+        assert_eq!(p.stage_ref("base"), Some(0));
+        // A declared name that is not a stage resolves to its directory...
+        assert_eq!(p.named_context("shared"), Some(Path::new("/repo/shared")));
+        // ...and an undeclared ref stays an external image (pulled, not read from disk).
+        assert_eq!(p.named_context("golang:1.22"), None);
+        // A `--from=<stage>` is a build edge...
+        assert_eq!(p.deps(1), vec![0]);
+        // ...while a `--from=<named context>` is not: there is nothing to build before it.
+        let mut ctx_only = plan("FROM alpine\nCOPY --from=shared /a /a\n");
+        ctx_only
+            .named_contexts
+            .insert("shared".into(), PathBuf::from("/repo/shared"));
+        assert!(ctx_only.deps(0).is_empty());
     }
 
     #[test]

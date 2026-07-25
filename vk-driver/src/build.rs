@@ -192,6 +192,10 @@ pub struct Options {
     /// Build-context roots, zipped positionally with `dockerfiles`; a file without one
     /// defaults to its own directory.
     pub contexts: Vec<PathBuf>,
+    /// `--build-context <name>=<dir>`: additional contexts a `COPY --from=<name>` /
+    /// `RUN --mount=…,from=<name>` can read, so a Dockerfile is not confined to the files
+    /// under its own context. Resolved after stage names and before image refs.
+    pub build_contexts: Vec<(String, PathBuf)>,
     /// ext4 output path (unused in `--print-plan`).
     pub out: Option<PathBuf>,
     /// `--disk <path>`: a caller-owned raw disk file attached read-write to the *target*
@@ -592,7 +596,8 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     // build finishes (see [`Timings::render`]). Started here so the plan phase is timed.
     let timings = Arc::new(Timings::new());
     let t_plan = Instant::now();
-    let plan = Plan::from_dockerfiles(&inputs, &build_args)?;
+    let mut plan = Plan::from_dockerfiles(&inputs, &build_args)?;
+    plan.named_contexts = named_contexts(opts)?;
     let target = plan.resolve_target(opts.target.as_deref())?;
     let order = plan.build_order(target)?;
     // Reject a cross-stage source under /tmp up front: /tmp is ephemeral and never
@@ -893,8 +898,9 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
                 UnitInput::Image(image) => Ok(vec![image_plan_input(image)?]),
             }
             .with_context(|| format!("build unit {:?}", unit.label))?;
-            let plan = Plan::from_dockerfiles(&inputs, &build_args)
+            let mut plan = Plan::from_dockerfiles(&inputs, &build_args)
                 .with_context(|| format!("build unit {:?}", unit.label))?;
+            plan.named_contexts = named_contexts(opts)?;
             let targets: Vec<Tgt> = unit
                 .targets
                 .iter()
@@ -1249,7 +1255,7 @@ fn resolve_stages(
             let content = match &instr {
                 Instruction::Copy(c) => match &c.from {
                     None => Some(context_files_hash(&stage.context, &c.sources)),
-                    Some(r) => source_content_key(plan, &out, r, ex),
+                    Some(r) => source_content_key(plan, &out, r, &c.sources, ex),
                 },
                 Instruction::Run(r) => {
                     // A --mount=from=<x> keys on that source; a bind mount from the context
@@ -1258,7 +1264,12 @@ fn resolve_stages(
                     let mut parts: Vec<String> = Vec::new();
                     for m in &r.mounts {
                         let part = match &m.from {
-                            Some(f) => source_content_key(plan, &out, f, ex),
+                            Some(f) => {
+                                // The mounted subpath is what a named context keys on, exactly
+                                // as a context bind below does.
+                                let src = m.source.clone().unwrap_or_else(|| "/".into());
+                                source_content_key(plan, &out, f, &[src], ex)
+                            }
                             None if m.typ == "bind" => {
                                 // Default source matches the executor's bind default (build/exec.rs);
                                 // copy_src_files resolves both "/" and "." to the context root.
@@ -1370,15 +1381,20 @@ fn source_stage_key(
     resolved.get(&s).map(|r| r.final_key.clone())
 }
 
-/// The content identity of whatever a `--from=<x>` names: a stage's final key, or an external
-/// image's resolved manifest digest — so a moved tag busts every consumer's key exactly as it
-/// busts a `FROM <image>` base's chain. `None` when neither resolves (no registry reachable, or
-/// an unresolvable `$VAR` ref); the reference text alone then keys the instruction, which is all
-/// there is to go on.
+/// The content identity of whatever a `--from=<x>` names, folded into the consuming
+/// instruction's key: a stage's final key, the sha256 of the `sources` a named build context
+/// holds, or an external image's resolved manifest digest — so editing those files, or moving
+/// that tag, busts every consumer's key exactly as a change in a source stage does. Resolved in
+/// that order, matching how the source itself is resolved, so what a reference means never
+/// depends on which of the three answered.
+///
+/// `None` when nothing resolves (no registry reachable, or an unresolvable `$VAR` ref); the
+/// reference text alone then keys the instruction, which is all there is to go on.
 fn source_content_key(
     plan: &Plan,
     resolved: &HashMap<usize, Resolved>,
     reference: &str,
+    sources: &[String],
     ex: &mut dyn Executor,
 ) -> Option<String> {
     // `scratch` is the reserved empty base a `RUN --mount` gets as writable scratch, not a
@@ -1387,10 +1403,19 @@ fn source_content_key(
     if reference == "scratch" {
         return None;
     }
-    source_stage_key(plan, resolved, reference).or_else(|| {
-        ex.resolve_base_digest(reference)
-            .map(|d| format!("{reference}@{d}"))
-    })
+    // A reference that names a stage *is* that stage, whether or not this build resolved it (a
+    // `--from=$ARG` outside the pruned order is not), so a named context can never answer for
+    // it — exactly as `non_stage_source` resolves the source itself.
+    if plan.stage_ref(reference).is_some() {
+        return source_stage_key(plan, resolved, reference);
+    }
+    // A named build context is host files like the stage's own context, so it keys on their
+    // content rather than on a snapshot key.
+    if let Some(dir) = plan.named_context(reference) {
+        return Some(context_files_hash(dir, sources));
+    }
+    ex.resolve_base_digest(reference)
+        .map(|d| format!("{reference}@{d}"))
 }
 
 /// The cache key (`stage_key`) of one target stage in the merged Dockerfiles — the
@@ -2226,13 +2251,53 @@ fn from_refs(instructions: &[Instruction]) -> Vec<&str> {
     refs
 }
 
+/// The `--build-context` values as the plan's name → directory map, each resolved to an
+/// absolute path like the positional contexts are: the directory is read host-side (packed
+/// into an ext4, and hashed into the cache key), so a cwd-relative value must not be left for
+/// something later to re-resolve.
+fn named_contexts(opts: &Options) -> Result<std::collections::BTreeMap<String, PathBuf>> {
+    let mut out = std::collections::BTreeMap::new();
+    for (name, dir) in &opts.build_contexts {
+        // `--from=scratch` always names the reserved empty base (see `Plan::check_reserved_names`),
+        // so a context by that name could never be read from.
+        if name == "scratch" {
+            bail!("--build-context scratch=…: the name \"scratch\" is reserved");
+        }
+        let abs = std::path::absolute(dir)
+            .with_context(|| format!("resolving build context {name} ({})", dir.display()))?;
+        // Checked before any build work: the directory is both hashed into the cache key and
+        // packed for the guest, and a missing one hashes as empty — so a typo would key a build
+        // as if the context held nothing, then fail mid-build (or not at all, when cached).
+        if !abs.is_dir() {
+            bail!(
+                "--build-context {name}: {} is not a directory",
+                abs.display()
+            );
+        }
+        if out.insert(name.clone(), abs).is_some() {
+            bail!("--build-context {name} declared more than once");
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve a `--from=<x>` that does not name a build stage: a named build context when one
+/// was declared under that name (`--build-context <x>=<dir>`), else an external image to pull.
+fn non_stage_source(plan: &Plan, ex: &mut dyn Executor, reference: &str) -> Result<Rootfs> {
+    match plan.named_context(reference) {
+        Some(dir) => ex.context_source(reference, dir),
+        None => ex.pull(reference),
+    }
+}
+
 /// The read-only sources a stage reads, in first-use order: its committed source stages
 /// (uncommitted ones are dropped — their consumers are fully cached, so no guest reads them)
-/// plus every external image it references, materialized here. Declared *before* the stage's
-/// guest boots, because a source that was not declared cannot be attached later.
+/// plus every named build context and external image it references, materialized here.
+/// Declared *before* the stage's guest boots, because a source that was not declared cannot
+/// be attached later.
 ///
-/// That ordering puts image materialization ahead of the per-step cache probes, so a stage with
-/// a cached prefix still pays the base-ext4 cache pull for an image only its cached steps read.
+/// That ordering puts materialization ahead of the per-step cache probes, so a stage with a
+/// cached prefix still pays the base-ext4 cache pull for an image only its cached steps read.
 /// A fully cached stage is cheaper: it returns before this runs and pulls nothing.
 fn stage_input_rootfs(
     plan: &Plan,
@@ -2247,8 +2312,9 @@ fn stage_input_rootfs(
                 Some(fs) => fs.clone(),
                 None => continue,
             },
-            // `--from=<image>`: pulled + flattened to a read-only ext4 (memoized per image).
-            None => ex.pull(r)?,
+            // a named build context (packed read-only), else `--from=<image>` (pulled +
+            // flattened); both memoized, so several references materialize once.
+            None => non_stage_source(plan, ex, r)?,
         };
         if !out.iter().any(|o| o.label == fs.label) {
             out.push(fs);
@@ -2539,7 +2605,7 @@ fn apply_fs(
                     match plan.stage_ref(from) {
                         Some(s) => resolved.push((mi, Some(s))),
                         None => {
-                            pulled.push(ex.pull(from)?);
+                            pulled.push(non_stage_source(plan, ex, from)?);
                             resolved.push((mi, None));
                         }
                     }
@@ -2579,7 +2645,8 @@ fn apply_fs(
                 None => None,
                 Some(reference) => match plan.stage_ref(reference) {
                     Some(s) => committed.get(&s).cloned(),
-                    None => Some(ex.pull(reference)?), // COPY --from=<external image>
+                    // COPY --from=<named context> / --from=<external image>
+                    None => Some(non_stage_source(plan, ex, reference)?),
                 },
             };
             ex.copy(fs, c, from.as_ref(), &state.workdir)?;
@@ -3538,6 +3605,62 @@ mod tests {
     }
 
     #[test]
+    fn named_context_copy_keys_on_the_referenced_files() {
+        // A COPY --from=<named context> reads a directory outside the stage's own context, so
+        // that directory's content must enter the key — and a stage of the same name must keep
+        // winning it, on the key path as well as the resolution path.
+        let tmp = std::env::temp_dir().join(format!("vk-ctxkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("ctx")).unwrap();
+        std::fs::create_dir_all(tmp.join("extra")).unwrap();
+        std::fs::write(tmp.join("extra/setup.sh"), "one").unwrap();
+        let ba = Vars::new();
+        let key = |src: &str, declared: bool| {
+            let mut plan = Plan::from_dockerfiles(
+                &[PlanInput {
+                    dockerfile: parser::parse(src).unwrap(),
+                    origin: "Dockerfile".into(),
+                    context: tmp.join("ctx"),
+                }],
+                &ba,
+            )
+            .unwrap();
+            if declared {
+                plan.named_contexts
+                    .insert("shared".into(), tmp.join("extra"));
+            }
+            let order = plan.all_order().unwrap();
+            let mut ex = DryRun::new();
+            let r = resolve_stages(&plan, &order, &ba, &mut ex, None).unwrap();
+            r[order.last().unwrap()].final_key.clone()
+        };
+        let df = "FROM scratch\nCOPY --from=shared setup.sh /setup.sh\n";
+        let before = key(df, true);
+        // editing the referenced file busts the key...
+        std::fs::write(tmp.join("extra/setup.sh"), "two").unwrap();
+        let after = key(df, true);
+        assert_ne!(
+            before, after,
+            "an edit to the copied file must bust the key"
+        );
+        // ...while an unreferenced file in the same directory does not.
+        std::fs::write(tmp.join("extra/unused.txt"), "x").unwrap();
+        assert_eq!(after, key(df, true), "only the referenced files are keyed");
+        // Declaring the context is what makes it a context: undeclared, the ref keys as an image.
+        assert_ne!(after, key(df, false));
+        // A stage of the same name wins, declared context or not — the key follows what the
+        // build actually reads.
+        let shadow =
+            "FROM scratch AS shared\nFROM scratch\nCOPY --from=shared setup.sh /setup.sh\n";
+        assert_eq!(
+            key(shadow, true),
+            key(shadow, false),
+            "a stage of that name must not be keyed on the context's files"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn run_bind_mount_keys_the_mounted_context_file() {
         // A `RUN --mount=type=bind` reads a file from the context but never copies it, so
         // its content must still enter the key — editing the mounted script busts the cache.
@@ -3944,6 +4067,7 @@ ENTRYPOINT run me
             dockerfiles: vec![tmp.join("Dockerfile")],
             target: None,
             contexts: vec![],
+            build_contexts: Vec::new(),
             out: Some(out),
             out_disk: None,
             print_plan: false,
@@ -4015,6 +4139,7 @@ ENTRYPOINT run me
             dockerfiles: vec![tmp.join("Dockerfile")],
             target: None,
             contexts: vec![],
+            build_contexts: Vec::new(),
             out: Some(out.clone()),
             out_disk: None,
             print_plan: false,
@@ -4064,6 +4189,7 @@ ENTRYPOINT run me
             dockerfiles: dockerfiles.clone(),
             target: None,
             contexts: vec![],
+            build_contexts: Vec::new(),
             out: Some(out.clone()),
             out_disk: None,
             print_plan: false,
@@ -4112,6 +4238,7 @@ ENTRYPOINT run me
             dockerfiles: vec![tmp.join("Dockerfile")],
             target: None,
             contexts: vec![],
+            build_contexts: Vec::new(),
             out: Some(out.clone()),
             out_disk: None,
             print_plan: false,
@@ -4323,6 +4450,7 @@ RUN ship
             dockerfiles: vec![],
             target: None,
             contexts: vec![],
+            build_contexts: Vec::new(),
             out: None,
             out_disk: None,
             print_plan: false,

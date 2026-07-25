@@ -83,6 +83,14 @@ pub trait Executor {
     /// Pull an external image as a read-only source for `COPY --from=<image>` /
     /// `RUN --mount=…,from=<image>` (not a build stage).
     fn pull(&mut self, image: &str) -> Result<Rootfs>;
+    /// Materialize the named build context `name` (`--build-context <name>=<dir>`) as a
+    /// read-only source labelled `context/<name>`, so `COPY --from=<name>` /
+    /// `RUN --mount=…,from=<name>` read the host directory `dir` — files outside the
+    /// stage's own build context. Unlike a context `COPY`, the directory's own
+    /// `.dockerignore` is not applied. Default: unsupported.
+    fn context_source(&mut self, _name: &str, _dir: &Path) -> Result<Rootfs> {
+        bail!("this backend does not support named build contexts")
+    }
     /// Execute a `RUN` over `fs` with the accumulated shell state and resolved mounts.
     fn run(
         &mut self,
@@ -206,6 +214,10 @@ impl Executor for DryRun {
     fn pull(&mut self, image: &str) -> Result<Rootfs> {
         let label = image_source_label(image);
         Ok(self.emit(format!("pull {image}"), &label))
+    }
+    fn context_source(&mut self, name: &str, dir: &Path) -> Result<Rootfs> {
+        let label = context_source_label(name);
+        Ok(self.emit(format!("context-source {name} ({})", dir.display()), &label))
     }
     fn run(
         &mut self,
@@ -844,6 +856,13 @@ fn select_source_batch(
 /// itself would otherwise accept.
 pub(crate) fn image_source_label(image: &str) -> String {
     format!("image/{image}")
+}
+
+/// The label a named build context is attached under, as a `--from=<name>` source. Collision-free
+/// against a stage label for the same reason [`image_source_label`] is, and against an image
+/// source because the two differ in their first path component.
+pub(crate) fn context_source_label(name: &str) -> String {
+    format!("context/{name}")
 }
 
 /// A filesystem-safe name for a rootfs label — path separators and `:` flattened to `_`, plus
@@ -1808,6 +1827,29 @@ impl Executor for MicroVm {
         self.images.lock().unwrap().insert(label.clone(), ext4);
         Ok(Rootfs { label })
     }
+    fn context_source(&mut self, name: &str, dir: &Path) -> Result<Rootfs> {
+        // Served like a source stage: the directory is packed into an ext4 and attached
+        // read-only. (The stage's own build context rides a virtiofs share, but a guest gets
+        // just the one, so every *extra* context becomes a disk.) Packed once per build.
+        let label = context_source_label(name);
+        // Serialized per context, for the reason `pull` is: two stages reading the same one run
+        // concurrently, and the loser of a race would repack the ext4 the winner has attached.
+        let lock = {
+            let mut locks = self.image_locks.lock().unwrap();
+            Arc::clone(locks.entry(label.clone()).or_default())
+        };
+        let _packing = lock.lock().unwrap();
+        if self.images.lock().unwrap().contains_key(&label) {
+            return Ok(Rootfs { label });
+        }
+        std::fs::create_dir_all(&self.scratch)
+            .with_context(|| format!("creating {}", self.scratch.display()))?;
+        let ext4 = self.image_path(&label);
+        crate::ext4::build_from_dir(dir, &ext4)
+            .with_context(|| format!("packing build context {name} ({})", dir.display()))?;
+        self.images.lock().unwrap().insert(label.clone(), ext4);
+        Ok(Rootfs { label })
+    }
     fn run(
         &mut self,
         fs: &Rootfs,
@@ -2628,6 +2670,13 @@ impl Executor for Host {
     fn pull(&mut self, image: &str) -> Result<Rootfs> {
         bail!("host PoC: `--from={image}` (external image) needs the OCI path")
     }
+    fn context_source(&mut self, name: &str, dir: &Path) -> Result<Rootfs> {
+        // No packing needed: this backend copies host-to-host, so the context directory
+        // *is* the source tree (registered under the same label the microVM backend uses).
+        let label = context_source_label(name);
+        self.dirs.insert(label.clone(), dir.to_path_buf());
+        Ok(Rootfs { label })
+    }
     fn run(
         &mut self,
         _fs: &Rootfs,
@@ -3113,6 +3162,66 @@ mod tests {
         h.copy(&fs, &op, None, "/").unwrap();
         let copied = std::fs::read_to_string(h.stage_dir(&fs).unwrap().join("f.txt")).unwrap();
         assert_eq!(copied, "from-stage");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn named_context_source_is_read_by_copy_from() {
+        // The case this exists for: a file that must stay outside the Dockerfile's own context is
+        // reached through `--build-context <name>=<dir>` + `COPY --from=<name>`, with no
+        // staging copy into the context.
+        let tmp = std::env::temp_dir().join(format!("vk-namedctx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let ctx = tmp.join("ctx");
+        let extra = tmp.join("shared");
+        std::fs::create_dir_all(&ctx).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(ctx.join("own.txt"), b"from the stage's own context").unwrap();
+        std::fs::write(extra.join("setup.sh"), b"#!/bin/sh\necho setup").unwrap();
+
+        let mut h = Host::new(tmp.join("scratch"));
+        let src = h.context_source("shared", &extra).unwrap();
+        assert_eq!(
+            src.label, "context/shared",
+            "labelled distinctly from a stage"
+        );
+        h.stage_sources(std::slice::from_ref(&src), &ctx).unwrap();
+        let fs = h.from_scratch("s").unwrap();
+
+        let copy = |sources: Vec<String>, dest: &str, from: Option<&str>| Copy {
+            sources,
+            dest: dest.into(),
+            from: from.map(str::to_string),
+            chown: None,
+            chmod: None,
+            link: false,
+        };
+        // A COPY from the named context reads that directory...
+        h.copy(
+            &fs,
+            &copy(vec!["setup.sh".into()], "/setup.sh", Some("shared")),
+            Some(&src),
+            "/",
+        )
+        .unwrap();
+        // ...while a plain COPY still reads the stage's own context.
+        h.copy(
+            &fs,
+            &copy(vec!["own.txt".into()], "/own.txt", None),
+            None,
+            "/",
+        )
+        .unwrap();
+
+        let dir = h.stage_dir(&fs).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("setup.sh")).unwrap(),
+            "#!/bin/sh\necho setup"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("own.txt")).unwrap(),
+            "from the stage's own context"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

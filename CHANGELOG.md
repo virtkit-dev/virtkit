@@ -17,6 +17,13 @@ All notable changes to virtkit will be documented in this file.
   build, and a build rereads it when the tag moves. A build stage may no longer be named
   `scratch`, since `--from=scratch` always means the empty base a writable `RUN --mount`
   gets — a stage by that name could never be read from.
+- **Extra build contexts.** `vk build --build-context <name>=<dir>` lets a build read files
+  from a directory outside the Dockerfile's own context: `COPY --from=<name>` or
+  `RUN --mount=…,from=<name>` reads that host directory, so a project no longer has to copy
+  outside files in before every build. The directory is read-only to the build, and a build
+  rereads it when the files it copies change. A name only takes effect when the Dockerfile
+  has no stage of that name, so declaring one can never change what an existing Dockerfile
+  means.
 
 ### Fixed
 
