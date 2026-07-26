@@ -74,6 +74,11 @@ pub struct ServiceEntry {
 pub struct StaleRecipe {
     pub dockerfiles: Vec<PathBuf>,
     pub contexts: Vec<PathBuf>,
+    /// Named build contexts, so editing a file in one is seen as drift like any other input.
+    /// Defaulted: an entry written before this field existed must still load, or the VM it
+    /// describes drops out of the registry (`load_all_in` skips what it cannot parse).
+    #[serde(default)]
+    pub build_contexts: Vec<(String, PathBuf)>,
     pub build_args: Vec<(String, String)>,
     pub target: Option<String>,
     /// The built root image whose ext4 UUID carries its stamped stage key.
@@ -132,9 +137,7 @@ fn freshness_of_recipe(r: &StaleRecipe) -> Freshness {
     let Ok(key) = crate::build::target_stage_key(
         &r.dockerfiles,
         &r.contexts,
-        // drift detection covers `vk run -f` and compose `build:` units, neither of which
-        // declares a named context
-        &[],
+        &r.build_contexts,
         &r.build_args,
         r.target.as_deref(),
     ) else {
@@ -815,6 +818,17 @@ mod tests {
                 .unwrap()
                 .contains("\"stale\":true")
         );
+    }
+
+    // An entry written before `build_contexts` existed has to keep loading: `load_all_in` skips
+    // whatever it cannot parse, so a required field would drop the whole VM out of the registry
+    // — `vk list` would lose it and `vk stop <dir>` would fail, with the VM still running.
+    #[test]
+    fn stale_recipe_loads_without_build_contexts() {
+        let json = r#"{"dockerfiles":["/p/Dockerfile"],"contexts":["/p"],
+            "build_args":[],"target":null,"root_ext4":"/p/root.ext4"}"#;
+        let r: StaleRecipe = serde_json::from_str(json).unwrap();
+        assert!(r.build_contexts.is_empty());
     }
 
     #[test]

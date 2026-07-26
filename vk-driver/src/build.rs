@@ -2255,6 +2255,23 @@ fn from_refs(instructions: &[Instruction]) -> Vec<&str> {
     refs
 }
 
+/// Parse one `--build-context NAME=DIR` value. Both halves are required: a nameless or
+/// directoryless context could only fail later, inside the build.
+pub fn parse_build_context(value: &str) -> Result<(String, PathBuf)> {
+    match value.split_once('=') {
+        Some((name, dir)) if !name.is_empty() && !dir.is_empty() => {
+            Ok((name.to_string(), PathBuf::from(dir)))
+        }
+        _ => bail!("--build-context expects NAME=DIR, got {value:?}"),
+    }
+}
+
+/// Every `--build-context NAME=DIR` value, in order. Shared by the flag's two front-ends
+/// (`vk build` and `vk run -f`) so a bad value is rejected the same way for both.
+pub fn parse_build_contexts(values: &[String]) -> Result<Vec<(String, PathBuf)>> {
+    values.iter().map(|v| parse_build_context(v)).collect()
+}
+
 /// Declared named contexts — `--build-context <name>=<dir>`, or a CI job's `buildcontext=` —
 /// as the plan's name → directory map, each resolved to an absolute path like the positional
 /// contexts are: the directory is read host-side (packed into an ext4, and hashed into the cache
@@ -2680,6 +2697,27 @@ mod tests {
     }
     fn build_inputs_host(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
         build_backend(inputs, opts, false)
+    }
+
+    #[test]
+    fn parse_build_context_requires_both_halves() {
+        assert_eq!(
+            parse_build_context("shared=shared").unwrap(),
+            ("shared".to_string(), PathBuf::from("shared"))
+        );
+        // An absolute dir, and a dir containing '=' (only the first '=' splits).
+        assert_eq!(
+            parse_build_context("repo=/srv/shared").unwrap(),
+            ("repo".to_string(), PathBuf::from("/srv/shared"))
+        );
+        assert_eq!(
+            parse_build_context("x=a=b").unwrap(),
+            ("x".to_string(), PathBuf::from("a=b"))
+        );
+        // Rejected rather than half-honoured: no '=', empty name, empty dir.
+        assert!(parse_build_context("shared").is_err());
+        assert!(parse_build_context("=shared").is_err());
+        assert!(parse_build_context("shared=").is_err());
     }
 
     #[test]
@@ -3604,6 +3642,39 @@ mod tests {
         let (a, b, c) = (tmp.join("a"), tmp.join("b"), tmp.join("c"));
         assert_ne!(key(&a), key(&b)); // different content -> different key
         assert_eq!(key(&a), key(&c)); // same content elsewhere -> same key
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The key `target_stage_key` computes must carry the named contexts it is given — this is
+    /// what lets drift detection notice a file changing inside one. Without them threaded
+    /// through, a `vk run` would recompute a key that never matches the one its build stamped.
+    #[test]
+    fn target_stage_key_tracks_a_named_context_file() {
+        let tmp = std::env::temp_dir().join(format!("vk-ctxdrift-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("ctx")).unwrap();
+        std::fs::create_dir_all(tmp.join("extra")).unwrap();
+        std::fs::write(tmp.join("extra/setup.sh"), "one").unwrap();
+        // `FROM scratch` so nothing is resolved over the network.
+        let df = tmp.join("ctx/Dockerfile");
+        std::fs::write(&df, "FROM scratch\nCOPY --from=extra setup.sh /setup.sh\n").unwrap();
+        let named = vec![("extra".to_string(), tmp.join("extra"))];
+        let key = || {
+            target_stage_key(
+                std::slice::from_ref(&df),
+                &[tmp.join("ctx")],
+                &named,
+                &[],
+                None,
+            )
+            .unwrap()
+        };
+        let before = key();
+        std::fs::write(tmp.join("extra/setup.sh"), "two").unwrap();
+        assert_ne!(before, key(), "an edit in the named context must be drift");
+        // (That an *undeclared* name keys differently is covered by
+        // `named_context_copy_keys_on_the_referenced_files`, which needs no registry:
+        // resolving the ref as an image here would reach one.)
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

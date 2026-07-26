@@ -104,6 +104,9 @@ pub struct RunArgs {
     /// Build-context roots, zipped positionally with `dockerfiles` (default: each
     /// Dockerfile's own directory).
     pub contexts: Vec<PathBuf>,
+    /// Named build contexts (`--build-context <name>=<dir>`): extra directories a
+    /// `COPY --from=<name>` may read, outside the Dockerfile's own context.
+    pub build_contexts: Vec<(String, PathBuf)>,
     /// Instruction cache for a Dockerfile boot: each stage's ext4 is pushed/pulled by
     /// its content key, so a repeat boot restores instead of rebuilding. A registry
     /// repo, an absolute store directory path, or `none` to disable; `None` = the
@@ -596,7 +599,7 @@ async fn build_and_boot(
             dockerfiles: args.dockerfiles.clone(),
             target: args.target.clone(),
             contexts: args.contexts.clone(),
-            build_contexts: Vec::new(),
+            build_contexts: args.build_contexts.clone(),
             out: Some(out.clone()),
             out_disk: None,
             print_plan: false,
@@ -982,6 +985,8 @@ async fn build_and_boot(
                     Some(crate::vms::StaleRecipe {
                         dockerfiles: dockerfiles.clone(),
                         contexts: vec![context.clone(); dockerfiles.len()],
+                        // a compose `build:` unit declares no named contexts
+                        build_contexts: Vec::new(),
                         build_args,
                         target: target.clone(),
                         root_ext4: prov.ext4.clone(),
@@ -1351,6 +1356,8 @@ async fn build_and_boot(
                     return Some(crate::vms::StaleRecipe {
                         dockerfiles: dockerfiles.clone(),
                         contexts: vec![context.clone(); dockerfiles.len()],
+                        // a compose `build:` unit declares no named contexts
+                        build_contexts: Vec::new(),
                         build_args,
                         target: target.clone(),
                         root_ext4: root.clone(),
@@ -1361,6 +1368,7 @@ async fn build_and_boot(
                 Some(crate::vms::StaleRecipe {
                     dockerfiles: args.dockerfiles.clone(),
                     contexts: args.contexts.clone(),
+                    build_contexts: args.build_contexts.clone(),
                     build_args: args.build_args.clone(),
                     target: args.target.clone(),
                     root_ext4: root.clone(),

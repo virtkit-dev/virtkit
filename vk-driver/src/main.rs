@@ -585,6 +585,17 @@ enum Cmd {
         /// with -f; default: each Dockerfile's own directory)
         #[arg(long)]
         context: Vec<PathBuf>,
+        /// an additional named context, `<name>=<dir>`, that `COPY --from=<name>` and
+        /// `RUN --mount=…,from=<name>` read (repeatable) — files outside the Dockerfile's
+        /// own context, with no staging copy. The --file build only: a compose service
+        /// declares its own contexts, and --compose would key the same service differently
+        #[arg(
+            long = "build-context",
+            value_name = "NAME=DIR",
+            requires = "file",
+            conflicts_with = "primary"
+        )]
+        build_context: Vec<String>,
         /// instruction cache for the --file build (push/pull each stage's ext4 by
         /// content key, so a repeat boot restores instead of rebuilding): a registry
         /// repo, an absolute store directory path, or `none` to disable. Default:
@@ -1454,6 +1465,7 @@ async fn cli_main() -> ExitCode {
         file,
         target,
         context,
+        build_context,
         cache_registry,
         cache_insecure,
         build_arg,
@@ -1598,11 +1610,16 @@ async fn cli_main() -> ExitCode {
         };
         // --disk HOST[:ro]: raw block devices attached after any rootfs disk.
         let extra_disks = parse_disks(disk);
+        let build_contexts = match build::parse_build_contexts(build_context) {
+            Ok(v) => v,
+            Err(e) => return fail(&e, 2),
+        };
         let args = run::RunArgs {
             image: image.clone().unwrap_or_default(),
             dockerfiles: file.clone(),
             target: target.clone(),
             contexts: context.clone(),
+            build_contexts,
             cache_registry: cache_registry.clone(),
             cache_insecure: *cache_insecure,
             build_args,
@@ -1836,22 +1853,10 @@ async fn cli_main() -> ExitCode {
                 None => (a.clone(), String::new()),
             })
             .collect();
-        // each --build-context is NAME=DIR; both halves are required (a nameless or
-        // directoryless context could only fail later, inside the build).
-        let mut build_contexts: Vec<(String, PathBuf)> = Vec::new();
-        for c in build_context {
-            match c.split_once('=') {
-                Some((n, d)) if !n.is_empty() && !d.is_empty() => {
-                    build_contexts.push((n.to_string(), PathBuf::from(d)))
-                }
-                _ => {
-                    return fail(
-                        &anyhow::anyhow!("--build-context expects NAME=DIR, got {c:?}"),
-                        2,
-                    );
-                }
-            }
-        }
+        let build_contexts = match build::parse_build_contexts(build_context) {
+            Ok(v) => v,
+            Err(e) => return fail(&e, 2),
+        };
         let net = match build::BuildNet::from_flags(build_net, build_allow_ip, build_allow_name) {
             Ok(n) => n,
             Err(e) => return fail(&e, 2),
