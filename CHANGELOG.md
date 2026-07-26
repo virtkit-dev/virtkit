@@ -21,9 +21,11 @@ All notable changes to virtkit will be documented in this file.
   from a directory outside the Dockerfile's own context: `COPY --from=<name>` or
   `RUN --mount=…,from=<name>` reads that host directory, so a project no longer has to copy
   outside files in before every build. The directory is read-only to the build, and a build
-  rereads it when the files it copies change. A name only takes effect when the Dockerfile
-  has no stage of that name, so declaring one can never change what an existing Dockerfile
-  means. A CI job gets the same thing from its `dockerfile:` image —
+  rereads it when the files it copies change. A `.dockerignore` in that directory decides what
+  a `COPY` from it takes, exactly as it does for the Dockerfile's own context. A name only
+  takes effect when the Dockerfile has no stage of that name, so declaring one can never
+  change what an existing Dockerfile means. A CI job gets the same thing from its
+  `dockerfile:` image —
   `?buildcontext=<name>=<dir>` names an extra directory from the job's own checkout.
 
 ### Fixed

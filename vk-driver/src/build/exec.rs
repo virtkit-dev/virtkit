@@ -86,8 +86,9 @@ pub trait Executor {
     /// Materialize the named build context `name` (`--build-context <name>=<dir>`) as a
     /// read-only source labelled `context/<name>`, so `COPY --from=<name>` /
     /// `RUN --mount=…,from=<name>` read the host directory `dir` — files outside the
-    /// stage's own build context. Unlike a context `COPY`, the directory's own
-    /// `.dockerignore` is not applied. Default: unsupported.
+    /// stage's own build context. Under the microVM backend a `COPY` from it honours the
+    /// directory's own `.dockerignore`, as a context COPY does; a `RUN --mount=type=bind` from
+    /// it sees the unfiltered tree, as it does for the stage's own context. Default: unsupported.
     fn context_source(&mut self, _name: &str, _dir: &Path) -> Result<Rootfs> {
         bail!("this backend does not support named build contexts")
     }
@@ -858,11 +859,22 @@ pub(crate) fn image_source_label(image: &str) -> String {
     format!("image/{image}")
 }
 
+/// Label prefix marking a source as a named build context, so a COPY from one can be told from
+/// a stage's (bare label) or an image's ([`image_source_label`]) — see [`is_context_source`].
+const CONTEXT_LABEL_PREFIX: &str = "context/";
+
 /// The label a named build context is attached under, as a `--from=<name>` source. Collision-free
 /// against a stage label for the same reason [`image_source_label`] is, and against an image
 /// source because the two differ in their first path component.
 pub(crate) fn context_source_label(name: &str) -> String {
-    format!("context/{name}")
+    format!("{CONTEXT_LABEL_PREFIX}{name}")
+}
+
+/// Is this source a named build context — a host directory attached read-only — rather than a
+/// build stage (bare label) or an external image? A COPY from one is a context COPY, so it
+/// honours the directory's `.dockerignore`.
+fn is_context_source(fs: &Rootfs) -> bool {
+    fs.label.starts_with(CONTEXT_LABEL_PREFIX)
 }
 
 /// A filesystem-safe name for a rootfs label — path separators and `:` flattened to `_`, plus
@@ -2100,8 +2112,12 @@ impl Executor for MicroVm {
         let session = self.session.as_ref().expect("session booted");
         // agent copy [--chown u:g] [--chmod OCTAL] [--ignore-root R] <root>/<src>... <dst>
         let mut argv = vec![GUEST_AGENT.to_string(), "copy".to_string()];
-        if from.is_none() {
-            // context COPY: apply the context's .dockerignore.
+        // context COPY: apply the context's .dockerignore — for the stage's own context and
+        // for a named build context alike (its directory is packed with its .dockerignore, and
+        // the cache key already hashes only the files it does *not* ignore, so the copy must
+        // match). A stage or image source is a committed rootfs, not a context: nothing is
+        // ignored there.
+        if from.is_none_or(is_context_source) {
             argv.push("--ignore-root".into());
             argv.push(root.clone());
         }
@@ -2815,6 +2831,24 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Which sources a COPY filters through a `.dockerignore` rides entirely on this predicate:
+    // read a stage or an image as a context and the copy would drop files the key counted, read
+    // a context as a stage and it would copy files the key never saw.
+    #[test]
+    fn is_context_source_only_matches_a_named_context_label() {
+        let fs = |label: &str| Rootfs {
+            label: label.to_string(),
+        };
+        assert!(is_context_source(&fs(&context_source_label("shared"))));
+        // A stage — bare, or prefixed by its build unit — is a committed rootfs, not a context.
+        assert!(!is_context_source(&fs("build")));
+        assert!(!is_context_source(&fs("web:build")));
+        // Nor is an external image, even one whose ref itself starts with `context/`.
+        assert!(!is_context_source(&fs(&image_source_label(
+            "context/shared:16"
+        ))));
+    }
 
     #[test]
     fn source_dev_shifts_to_vdc_with_out_disk() {
