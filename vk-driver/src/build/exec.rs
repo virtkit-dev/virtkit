@@ -1302,6 +1302,94 @@ impl MicroVm {
         self.scratch
             .join(format!("{}.qcow2", stage.replace(['/', '\\', ':'], "_")))
     }
+    /// Materialize `image` as an ext4 under `label`'s scratch path: restore the cached base
+    /// (keyed by the image's manifest digest) or pull + flatten the OCI image and populate the
+    /// cache. Returns the ext4, its base cache key, and the digest of the cached snapshot
+    /// (`None` when nothing was cached) — the lineage a stage's first diff push chunks against.
+    /// Kept free of the caller's own bookkeeping so anything that needs an image on disk, not
+    /// just a stage base, can ask for one.
+    fn materialize_image(
+        &mut self,
+        label: &str,
+        image: &str,
+    ) -> Result<(PathBuf, String, Option<String>)> {
+        std::fs::create_dir_all(&self.scratch)
+            .with_context(|| format!("creating {}", self.scratch.display()))?;
+        let ext4 = self.image_path(label);
+        // Base-image ext4 cache: the materialized base (OCI-flattened + free headroom) is keyed
+        // by the image's manifest digest (resolved + memoized by resolve_base_digest, falling
+        // back to the ref) and stored in the cache registry. A repeat build pulls it back
+        // instead of re-running the pull/flatten/ext4-build — and, because the base's chunks
+        // are now in the store, an instruction snapshot on a cold build dedups its unchanged
+        // base region against them, so only the RUN's diff is compressed and uploaded.
+        // Digest-keyed so a moved tag is not served a stale base (matching the chain-key seed).
+        let base_id = match self.resolve_base_digest(image) {
+            Some(d) => format!("{image}@{d}"),
+            None => image.to_string(),
+        };
+        let base_key = base_cache_key(&base_id);
+        if let Some(rg) = self.cache.clone()
+            && crate::registry::exists(&rg, CACHE_REPO, &base_key)
+            && let Some(digest) =
+                crate::registry::try_pull_ext4(&rg, CACHE_REPO, &base_key, &ext4, image)?
+        {
+            self.verify_ext4(&ext4, &format!("cached base image {image} (after load)"))?;
+            return Ok((ext4, base_key, Some(digest)));
+        }
+        // pull + flatten the OCI image to a rootfs tar (no docker), then build the ext4.
+        let tar = self
+            .scratch
+            .join(format!("{}.tar", label.replace(['/', '\\', ':'], "_")));
+        // Swallow the pull's status lines: the live build dashboard owns the terminal
+        // (a raw write would corrupt its cursor accounting) and already shows this
+        // stage's FROM step, so the "pulling …"/"flattened …" notes are redundant here.
+        block_on(crate::oci::pull_flatten(
+            image,
+            None,
+            None,
+            None,
+            false,
+            &tar,
+            &|_| {},
+        ))
+        .with_context(|| format!("pulling {image}"))?;
+        // Build the base ext4 with free space for the RUN steps to write into
+        // (a zero extra_free_blocks leaves none, which would ENOSPC on the first write). The agent
+        // is NOT injected: it boots from the initramfs and pivots into this rootfs, so the
+        // image stays clean (no agent binary baked in).
+        crate::ext4::build_from_tar_injecting(
+            &tar,
+            &[],
+            self.free_blocks,
+            // No journal: the runtime boots a rw overlay over this ext4 (read-only), so
+            // the journal is never used — during the build it is dead weight (a 4 MiB
+            // circular log rewritten every RUN, so it never dedups and churns every
+            // snapshot). Snapshots stay consistent via the fsfreeze quiesce.
+            &crate::ext4::FsId {
+                with_journal: false,
+                ..Default::default()
+            },
+            &ext4,
+        )?;
+        let _ = std::fs::remove_file(&tar);
+        // Populate the base cache (best-effort: a push failure must not fail the build).
+        let mut digest = None;
+        if let Some(rg) = self.cache.clone() {
+            let boot_kind = crate::image::boot_kind_tag(crate::image::BootKind::GenericDisk);
+            match crate::registry::push_ext4(&rg, CACHE_REPO, &base_key, &ext4, boot_kind) {
+                // pin the digest we just wrote, not the tag: another process may clobber
+                // base_key with its own (byte-different) base before our first diff push.
+                Ok(d) => digest = Some(d),
+                Err(e) => {
+                    eprintln!(
+                        "virtkit: build base cache push of {image} failed ({e:#}) — not cached"
+                    )
+                }
+            }
+        }
+        Ok((ext4, base_key, digest))
+    }
+
     /// Register a freshly built or pulled raw ext4 `base` as `stage`'s image by wrapping it
     /// in a rw qcow2 overlay — the stage's guest boots that overlay directly and its writes
     /// accumulate into it (no separate boot overlay, no commit). The raw stays as the
@@ -1587,90 +1675,12 @@ pub(crate) fn resolve_copy_dest(dest: &str, workdir: &str) -> String {
 
 impl Executor for MicroVm {
     fn from_image(&mut self, stage: &str, image: &str) -> Result<Rootfs> {
-        std::fs::create_dir_all(&self.scratch)
-            .with_context(|| format!("creating {}", self.scratch.display()))?;
-        let ext4 = self.image_path(stage);
-        // Base-image ext4 cache: the materialized base (OCI-flattened + agent injected
-        // + free headroom) is keyed by the image's manifest digest (resolved + memoized by
-        // resolve_base_digest, falling back to the ref) and stored in the cache registry.
-        // A repeat build pulls it back instead of re-running the pull/flatten/ext4-build
-        // — and, because the base's chunks are now in the store, an instruction snapshot
-        // on a cold build dedups its unchanged base region against them, so only the
-        // RUN's diff is compressed and uploaded. Digest-keyed so a moved tag is not served
-        // a stale base (matching the chain-key seed).
-        let base_id = match self.resolve_base_digest(image) {
-            Some(d) => format!("{image}@{d}"),
-            None => image.to_string(),
-        };
-        let base_key = base_cache_key(&base_id);
-        if let Some(rg) = self.cache.clone()
-            && crate::registry::exists(&rg, CACHE_REPO, &base_key)
-            && let Some(digest) =
-                crate::registry::try_pull_ext4(&rg, CACHE_REPO, &base_key, &ext4, image)?
-        {
-            self.verify_ext4(&ext4, &format!("cached base image {image} (after load)"))?;
-            self.wrap_base(stage, &ext4)?;
-            self.parent_key = Some(base_key);
-            self.parent_digest = Some(digest);
-            self.parent_layers = None;
-            return Ok(Rootfs {
-                label: stage.to_string(),
-            });
-        }
-        // pull + flatten the OCI image to a rootfs tar (no docker), then build a
-        // bootable ext4 with the agent injected as PID 1.
-        let tar = self
-            .scratch
-            .join(format!("{}.tar", stage.replace(['/', '\\', ':'], "_")));
-        // Swallow the pull's status lines: the live build dashboard owns the terminal
-        // (a raw write would corrupt its cursor accounting) and already shows this
-        // stage's FROM step, so the "pulling …"/"flattened …" notes are redundant here.
-        block_on(crate::oci::pull_flatten(
-            image,
-            None,
-            None,
-            None,
-            false,
-            &tar,
-            &|_| {},
-        ))
-        .with_context(|| format!("pulling {image}"))?;
-        // Build the base ext4 with free space for the RUN steps to write into
-        // (a zero extra_free_blocks leaves none, which would ENOSPC on the first write). The agent
-        // is NOT injected: it boots from the initramfs and pivots into this rootfs, so the
-        // image stays clean (no agent binary baked in).
-        crate::ext4::build_from_tar_injecting(
-            &tar,
-            &[],
-            self.free_blocks,
-            // No journal: the runtime boots a rw overlay over this ext4 (read-only), so
-            // the journal is never used — during the build it is dead weight (a 4 MiB
-            // circular log rewritten every RUN, so it never dedups and churns every
-            // snapshot). Snapshots stay consistent via the fsfreeze quiesce.
-            &crate::ext4::FsId {
-                with_journal: false,
-                ..Default::default()
-            },
-            &ext4,
-        )?;
-        let _ = std::fs::remove_file(&tar);
-        // Populate the base cache (best-effort: a push failure must not fail the build).
-        self.parent_digest = None;
-        if let Some(rg) = self.cache.clone() {
-            let boot_kind = crate::image::boot_kind_tag(crate::image::BootKind::GenericDisk);
-            match crate::registry::push_ext4(&rg, CACHE_REPO, &base_key, &ext4, boot_kind) {
-                // pin the digest we just wrote, not the tag: another process may clobber
-                // base_key with its own (byte-different) base before our first diff push.
-                Ok(digest) => self.parent_digest = Some(digest),
-                Err(e) => {
-                    eprintln!(
-                        "virtkit: build base cache push of {image} failed ({e:#}) — not cached"
-                    )
-                }
-            }
-        }
+        // The stage's writable working rootfs: a qcow2 overlay over the materialized base,
+        // whose cache key + digest seed this stage's snapshot lineage.
+        let (ext4, base_key, digest) = self.materialize_image(stage, image)?;
         self.wrap_base(stage, &ext4)?;
         self.parent_key = Some(base_key);
+        self.parent_digest = digest;
         self.parent_layers = None;
         Ok(Rootfs {
             label: stage.to_string(),
