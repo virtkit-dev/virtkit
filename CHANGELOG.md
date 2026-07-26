@@ -11,6 +11,12 @@ All notable changes to virtkit will be documented in this file.
   (`--yes` for unattended use), and VMs already running keep going. `--check` reports
   whether a newer release is available without installing it, exiting 1 when there is
   one.
+- **Build steps can read from an external image.** `COPY --from=<image>` and
+  `RUN --mount=…,from=<image>` now work in a build: a step reads files straight out of any
+  image you name, with no stage to declare for it. Each such image is fetched once per
+  build, and a build rereads it when the tag moves. A build stage may no longer be named
+  `scratch`, since `--from=scratch` always means the empty base a writable `RUN --mount`
+  gets — a stage by that name could never be read from.
 
 ### Fixed
 

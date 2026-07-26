@@ -291,6 +291,36 @@ impl Plan {
             .filter(|&i| i < self.stages.len())
     }
 
+    /// Reject a stage name the backend reserves. `--from=scratch` always names the reserved
+    /// empty base a `RUN --mount` gets as an ephemeral writable disk, so it never resolves to a
+    /// stage — meaning nothing could ever read from one by that name. A `/` is rejected too: it
+    /// is what keeps a stage's label out of the `image/<ref>` namespace an external `--from`
+    /// source is attached under (see `exec::image_source_label`), and Docker rejects it in a
+    /// stage name anyway. Both fail here, before any build work, rather than letting a
+    /// `COPY --from=…` silently read the wrong thing. Only the stages in `order` (the ones
+    /// actually built) are checked.
+    pub fn check_reserved_names(&self, order: &[usize]) -> Result<()> {
+        for &idx in order {
+            let Some(name) = self.stages[idx].name.as_deref() else {
+                continue;
+            };
+            if name == "scratch" {
+                bail!(
+                    "stage name \"scratch\" is reserved: `--from=scratch` always names the empty \
+                     base a `RUN --mount` uses as writable scratch, so nothing could read from \
+                     this stage. Rename it."
+                );
+            }
+            if name.contains('/') {
+                bail!(
+                    "stage name {name:?} may not contain '/': an external `--from=<image>` source \
+                     is attached under `image/<ref>`, which such a name would shadow. Rename it."
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Reject a `COPY --from=<stage>` / `RUN --mount=…,from=<stage>` whose source lives
     /// under `/tmp`. A build guest's `/tmp` is an ephemeral scratch disk that never enters
     /// the stage's committed image (see the microVM executor), so such a source is always
@@ -463,6 +493,34 @@ mod tests {
             p.global_args.get("ver").map(String::as_str),
             Some("bookworm")
         );
+    }
+
+    #[test]
+    fn a_stage_named_scratch_is_rejected() {
+        let order = |p: &Plan| p.build_order(p.resolve_target(None).unwrap()).unwrap();
+
+        // `--from=scratch` always means the reserved empty base, so nothing could read from a
+        // stage by that name — say so rather than let a COPY silently read the build context.
+        let bad = plan("FROM alpine AS scratch\nRUN x\nFROM alpine\nCOPY --from=scratch /a /a\n");
+        assert!(bad.check_reserved_names(&order(&bad)).is_err());
+
+        // A `/` in a stage name would put its label inside the `image/<ref>` namespace an
+        // external source is attached under, where it shadows one — here the second COPY would
+        // read the stage instead of the image. The Dockerfile parser takes an `AS` name
+        // verbatim, so nothing else stops this.
+        let shadow = plan(
+            "FROM alpine AS image/busybox:latest\nRUN x\n\
+             FROM alpine\nCOPY --from=image/busybox:latest /a /a\n\
+             COPY --from=busybox:latest /bin/sh /b\n",
+        );
+        assert!(shadow.check_reserved_names(&order(&shadow)).is_err());
+
+        // `FROM scratch` itself is the empty base, not a stage name — and unnamed stages are fine.
+        let good = plan("FROM scratch\nCOPY x /x\n");
+        assert!(good.check_reserved_names(&order(&good)).is_ok());
+        // A stage whose name merely contains it is fine.
+        let ok = plan("FROM alpine AS scratchpad\nRUN x\n");
+        assert!(ok.check_reserved_names(&order(&ok)).is_ok());
     }
 
     #[test]

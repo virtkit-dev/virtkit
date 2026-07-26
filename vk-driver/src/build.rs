@@ -596,7 +596,9 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     let target = plan.resolve_target(opts.target.as_deref())?;
     let order = plan.build_order(target)?;
     // Reject a cross-stage source under /tmp up front: /tmp is ephemeral and never
-    // committed, so it would fail late with a cryptic "No such file" from the guest.
+    // committed, so it would fail late with a cryptic "No such file" from the guest. Same for a
+    // stage by a reserved name, which nothing could read from.
+    plan.check_reserved_names(&order)?;
     plan.check_tmp_sources(&order)?;
     timings.record(Phase::Plan, "", t_plan.elapsed());
 
@@ -907,6 +909,7 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
                 .with_context(|| format!("build unit {:?}", unit.label))?;
             let target_idxs: Vec<usize> = targets.iter().map(|t| t.idx).collect();
             let order = plan.build_order_multi(&target_idxs)?;
+            plan.check_reserved_names(&order)?;
             plan.check_tmp_sources(&order)?;
             let resolved = resolve_all(&plan, &order, &build_args, &mut probe, &target_idxs)?;
             let (needed, cached_final) = compute_needed(
@@ -1238,25 +1241,24 @@ fn resolve_stages(
             //     editing a copied source busts the cache;
             //   - a RUN --mount=type=bind from the context keys on the sha256 of the
             //     mounted files, so editing a bind-mounted script busts the cache;
-            //   - a COPY --from=<stage> / RUN --mount=from=<stage> keys on the source
-            //     stage's final key, so a change anywhere in the source stage chains
-            //     into every consumer — without it, a consumer whose own instructions
-            //     did not change would restore a snapshot holding the *old* source
-            //     content. `--from=<image>` sources stay keyed by their reference text.
+            //   - a COPY --from=<x> / RUN --mount=from=<x> keys on the source's content
+            //     identity — a stage's final key, or an image's manifest digest — so a
+            //     change anywhere in the source chains into every consumer; without it, a
+            //     consumer whose own instructions did not change would restore a snapshot
+            //     holding the *old* source content.
             let content = match &instr {
                 Instruction::Copy(c) => match &c.from {
                     None => Some(context_files_hash(&stage.context, &c.sources)),
-                    Some(r) => source_stage_key(plan, &out, r),
+                    Some(r) => source_content_key(plan, &out, r, ex),
                 },
                 Instruction::Run(r) => {
-                    // A --mount=from=<stage> keys on the source stage; a bind mount
-                    // from the context keys on its files (source defaults to the whole
-                    // context). --from=<image> and non-bind mounts contribute nothing.
-                    let mut parts: Vec<String> = r
-                        .mounts
-                        .iter()
-                        .filter_map(|m| match &m.from {
-                            Some(f) => source_stage_key(plan, &out, f),
+                    // A --mount=from=<x> keys on that source; a bind mount from the context
+                    // keys on its files (source defaults to the whole context). Non-bind
+                    // mounts contribute nothing.
+                    let mut parts: Vec<String> = Vec::new();
+                    for m in &r.mounts {
+                        let part = match &m.from {
+                            Some(f) => source_content_key(plan, &out, f, ex),
                             None if m.typ == "bind" => {
                                 // Default source matches the executor's bind default (build/exec.rs);
                                 // copy_src_files resolves both "/" and "." to the context root.
@@ -1264,8 +1266,9 @@ fn resolve_stages(
                                 Some(context_files_hash(&stage.context, &[src]))
                             }
                             None => None,
-                        })
-                        .collect();
+                        };
+                        parts.extend(part);
+                    }
                     // The command is keyed raw via `canonical` (it executes verbatim). Fold
                     // in its interpolated form only when the in-scope vars actually change it
                     // — i.e. it references an ARG/ENV — so a change to a referenced value
@@ -1354,9 +1357,9 @@ pub fn stage_keys(
 }
 
 /// The final key of the stage a `--from=<x>` names — its content identity, folded into
-/// the consuming instruction's key. `None` when `x` is an external image (keyed by its
-/// reference text alone) or an unresolvable `$VAR` ref (the same known limitation as
-/// [`stage_source_refs`]). The source is always resolved first: it is a dependency, so
+/// the consuming instruction's key. `None` when `x` is not a stage of this plan (an external
+/// image — see [`source_content_key`]) or an unresolvable `$VAR` ref (the same known limitation
+/// as [`stage_source_refs`]). The source is always resolved first: it is a dependency, so
 /// the topological order places it earlier.
 fn source_stage_key(
     plan: &Plan,
@@ -1365,6 +1368,29 @@ fn source_stage_key(
 ) -> Option<String> {
     let s = plan.stage_ref(reference)?;
     resolved.get(&s).map(|r| r.final_key.clone())
+}
+
+/// The content identity of whatever a `--from=<x>` names: a stage's final key, or an external
+/// image's resolved manifest digest — so a moved tag busts every consumer's key exactly as it
+/// busts a `FROM <image>` base's chain. `None` when neither resolves (no registry reachable, or
+/// an unresolvable `$VAR` ref); the reference text alone then keys the instruction, which is all
+/// there is to go on.
+fn source_content_key(
+    plan: &Plan,
+    resolved: &HashMap<usize, Resolved>,
+    reference: &str,
+    ex: &mut dyn Executor,
+) -> Option<String> {
+    // `scratch` is the reserved empty base a `RUN --mount` gets as writable scratch, not a
+    // source: it has no content to key on, and asking a registry to resolve it would cost a
+    // round trip and a warning for an image that does not exist.
+    if reference == "scratch" {
+        return None;
+    }
+    source_stage_key(plan, resolved, reference).or_else(|| {
+        ex.resolve_base_digest(reference)
+            .map(|d| format!("{reference}@{d}"))
+    })
 }
 
 /// The cache key (`stage_key`) of one target stage in the merged Dockerfiles — the
@@ -1679,11 +1705,12 @@ fn build_stage(
         None => None,
     };
     // Declare the stage's inputs — the source stages it copies/mounts from, and its
-    // build context — so the backend can attach them before the guest boots.
-    ex.stage_sources(
-        &stage_source_rootfs(plan, &stage.instructions, committed),
-        &stage.context,
-    )?;
+    // build context — so the backend can attach them before the guest boots. Read off the
+    // resolved steps, not the raw plan: a `--from=$VAR` reaches the backend interpolated, so
+    // declaring the raw text would materialize the wrong ref under a label no step asks for.
+    let step_instrs: Vec<Instruction> = steps.iter().map(|s| s.instr.clone()).collect();
+    let inputs = stage_input_rootfs(plan, &step_instrs, committed, ex)?;
+    ex.stage_sources(&inputs, &stage.context)?;
     // `FROM --kernel=image`: this stage's RUNs boot on the base image's own kernel.
     ex.stage_kernel(stage.image_kernel);
     // Instruction-level cache + lazy base: every step carries the chained key; the base
@@ -2157,26 +2184,8 @@ fn mem_available_mib() -> Option<u64> {
 /// --mount=from` (distinct, in source order). Resolved on the raw `--from` text —
 /// literal stage names; a `--from=$VAR` would not be seen (a known limitation).
 fn stage_source_refs(plan: &Plan, instructions: &[Instruction]) -> Vec<usize> {
-    let mut refs: Vec<&str> = Vec::new();
-    for instr in instructions {
-        match instr {
-            Instruction::Copy(c) => {
-                if let Some(f) = &c.from {
-                    refs.push(f);
-                }
-            }
-            Instruction::Run(r) => {
-                for m in &r.mounts {
-                    if let Some(f) = &m.from {
-                        refs.push(f);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
     let mut seen: Vec<usize> = Vec::new();
-    for r in refs {
+    for r in from_refs(instructions) {
         if let Some(si) = plan.stage_ref(r)
             && !seen.contains(&si)
         {
@@ -2186,17 +2195,66 @@ fn stage_source_refs(plan: &Plan, instructions: &[Instruction]) -> Vec<usize> {
     seen
 }
 
-/// [`stage_source_refs`] resolved to committed rootfs (stages not committed are
-/// dropped — their consumers are fully cached, so no guest ever reads them).
-fn stage_source_rootfs(
+/// Every `--from=` reference an instruction list makes (distinct, in source order), whether
+/// it names a stage or an external image. `scratch` is excluded: it is the reserved empty
+/// base a backend serves as an ephemeral writable mount, not a source to resolve.
+fn from_refs(instructions: &[Instruction]) -> Vec<&str> {
+    /// Append `f` unless it is `scratch` or already collected.
+    fn note<'a>(refs: &mut Vec<&'a str>, f: &'a str) {
+        if f != "scratch" && !refs.contains(&f) {
+            refs.push(f);
+        }
+    }
+    let mut refs: Vec<&str> = Vec::new();
+    for instr in instructions {
+        match instr {
+            Instruction::Copy(c) => {
+                if let Some(f) = &c.from {
+                    note(&mut refs, f);
+                }
+            }
+            Instruction::Run(r) => {
+                for m in &r.mounts {
+                    if let Some(f) = &m.from {
+                        note(&mut refs, f);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    refs
+}
+
+/// The read-only sources a stage reads, in first-use order: its committed source stages
+/// (uncommitted ones are dropped — their consumers are fully cached, so no guest reads them)
+/// plus every external image it references, materialized here. Declared *before* the stage's
+/// guest boots, because a source that was not declared cannot be attached later.
+///
+/// That ordering puts image materialization ahead of the per-step cache probes, so a stage with
+/// a cached prefix still pays the base-ext4 cache pull for an image only its cached steps read.
+/// A fully cached stage is cheaper: it returns before this runs and pulls nothing.
+fn stage_input_rootfs(
     plan: &Plan,
     instructions: &[Instruction],
     committed: &HashMap<usize, Rootfs>,
-) -> Vec<Rootfs> {
-    stage_source_refs(plan, instructions)
-        .into_iter()
-        .filter_map(|si| committed.get(&si).cloned())
-        .collect()
+    ex: &mut dyn Executor,
+) -> Result<Vec<Rootfs>> {
+    let mut out: Vec<Rootfs> = Vec::new();
+    for r in from_refs(instructions) {
+        let fs = match plan.stage_ref(r) {
+            Some(si) => match committed.get(&si) {
+                Some(fs) => fs.clone(),
+                None => continue,
+            },
+            // `--from=<image>`: pulled + flattened to a read-only ext4 (memoized per image).
+            None => ex.pull(r)?,
+        };
+        if !out.iter().any(|o| o.label == fs.label) {
+            out.push(fs);
+        }
+    }
+    Ok(out)
 }
 
 /// sha256 hex of `s` — the base cache key.
@@ -2552,6 +2610,72 @@ mod tests {
     }
     fn build_inputs_host(inputs: Vec<PlanInput>, opts: &Options) -> Result<Built> {
         build_backend(inputs, opts, false)
+    }
+
+    #[test]
+    fn from_refs_collects_stage_and_image_sources_once() {
+        let df = parser::parse(
+            "FROM alpine AS base\n\
+             COPY --from=base /a /a\n\
+             COPY --from=golang:1.22 /usr/local/go /go\n\
+             RUN --mount=type=bind,from=golang:1.22,target=/g \
+                 --mount=type=bind,from=scratch,target=/s,rw \
+                 --mount=type=tmpfs,target=/t build\n\
+             COPY --from=base /b /b\n",
+        )
+        .unwrap();
+        // Distinct, in first-use order: a stage and an image ref each appear once, the
+        // reserved `scratch` base and a from-less tmpfs/bind mount are not sources.
+        assert_eq!(
+            from_refs(&df.instructions),
+            vec!["base", "golang:1.22"],
+            "refs must be deduped, ordered, and exclude scratch"
+        );
+    }
+
+    /// An external image reaches the guest as a *declared* source: named in the stage's source
+    /// declaration, which is the only way a real backend can attach it before the boot, and read
+    /// under its `image/<ref>` label rather than silently resolved against the build context.
+    #[test]
+    fn copy_from_external_image_is_declared_before_the_stage_runs() {
+        let t = transcript(
+            "FROM alpine AS app\nCOPY --from=busybox:latest /bin/sh /sh\n",
+            Some("app"),
+        );
+        assert!(
+            t.contains(&"stage-sources [\"image/busybox:latest\"]".to_string()),
+            "the image must be declared as a source, not pulled ad hoc: {t:#?}"
+        );
+        let pull = t
+            .iter()
+            .position(|l| l == "pull busybox:latest")
+            .unwrap_or_else(|| panic!("no pull in {t:#?}"));
+        let copy = t
+            .iter()
+            .position(|l| l.starts_with("copy from=image/busybox:latest "))
+            .unwrap_or_else(|| panic!("copy did not read the image in {t:#?}"));
+        assert!(pull < copy, "the image must be attached first: {t:#?}");
+    }
+
+    /// A `--from=$VAR` is declared under the text the step will ask for. The declaration reads
+    /// the resolved steps, not the plan's raw instructions where the ref is still `${GO}` —
+    /// otherwise the build materializes a ref that does not exist, under a label no instruction
+    /// can ever match.
+    #[test]
+    fn copy_from_an_interpolated_image_ref_is_declared_expanded() {
+        let t = transcript(
+            "ARG GO=1.22\nFROM alpine AS app\nARG GO\nCOPY --from=golang:${GO} /go /go\n",
+            Some("app"),
+        );
+        assert!(
+            t.contains(&"stage-sources [\"image/golang:1.22\"]".to_string()),
+            "the expanded ref must be the declared source: {t:#?}"
+        );
+        assert!(
+            t.iter()
+                .any(|l| l.starts_with("copy from=image/golang:1.22 ")),
+            "the copy must read the expanded label: {t:#?}"
+        );
     }
 
     /// Scratch is absolute even for a relative `--out`, so a stage qcow2's recorded backing
@@ -3722,8 +3846,9 @@ RUN ship
         let (lib2, app2) = keys(&a.replace("RUN one", "RUN two"));
         assert_ne!(lib1, lib2);
         assert_ne!(app1, app2);
-        // a COPY --from=<external image> folds no stage key (keyed by its text alone):
-        // the consumer's key is indifferent to unrelated stage edits.
+        // a COPY --from=<external image> folds in that image's identity, not a stage's, so the
+        // consumer's key is indifferent to unrelated stage edits. (No digest resolves under
+        // `DryRun`, so here the identity is the ref text; a real build folds in the digest.)
         let a = "FROM alpine AS lib\nRUN one\nFROM alpine AS app\n\
                  COPY --from=busybox:latest /bin/sh /sh\n";
         let (lib1, app1) = keys(a);

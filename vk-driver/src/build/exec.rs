@@ -204,7 +204,7 @@ impl Executor for DryRun {
         Ok(self.emit(format!("from-stage {stage} (<- {})", parent.label), stage))
     }
     fn pull(&mut self, image: &str) -> Result<Rootfs> {
-        let label = format!("image:{image}");
+        let label = image_source_label(image);
         Ok(self.emit(format!("pull {image}"), &label))
     }
     fn run(
@@ -242,7 +242,11 @@ impl Executor for DryRun {
         ));
         Ok(())
     }
-    fn stage_sources(&mut self, _sources: &[Rootfs], context: &Path) -> Result<()> {
+    fn stage_sources(&mut self, sources: &[Rootfs], context: &Path) -> Result<()> {
+        // The declaration itself, not just its effect: a real backend can only attach a source
+        // it was told about before the boot, so a test has to be able to see what was declared.
+        let labels: Vec<&str> = sources.iter().map(|s| s.label.as_str()).collect();
+        self.transcript.push(format!("stage-sources {labels:?}"));
         self.transcript
             .push(format!("stage-context {}", context.display()));
         Ok(())
@@ -341,13 +345,13 @@ impl Executor for Planner {
     }
 }
 
-/// The microVM backend: a stage is a bootable ext4 (the OCI base pulled + flattened
-/// with the agent injected), `RUN` boots it in a microVM guest with egress
+/// The microVM backend: a stage is a bootable ext4 (the OCI base pulled + flattened; the agent
+/// rides the initramfs and is never baked in), `RUN` boots it in a microVM guest with egress
 /// per the build's [`BuildNet`](crate::build::BuildNet) policy (a `vk switch`,
 /// unrestricted by default) and execs the command — changes persist and the exported ext4
-/// is left clean. `COPY` / `RUN --mount=from` are not wired yet, so it builds the
-/// `FROM <image>` + `RUN` (+ multi-stage fork) shape. Each stage's ext4 lives under
-/// `scratch`.
+/// is left clean. A `COPY` / `RUN --mount=from` source — another stage or an external image —
+/// is attached read-only as its own disk for the instructions that read it. Each stage's ext4
+/// lives under `scratch`.
 pub struct MicroVm {
     cloud_hypervisor: PathBuf,
     kernel: PathBuf,
@@ -371,6 +375,11 @@ pub struct MicroVm {
     /// (a fork / `COPY --from` reads a dep's committed image): the driver commits a
     /// stage before unblocking its dependents, so the write happens-before the read.
     images: Arc<Mutex<HashMap<String, PathBuf>>>,
+    /// Per-image-source materialization guard, shared across workers like `images`: `pull`'s
+    /// memo check and the pull/flatten that follows it write one scratch ext4 named by the
+    /// image, so two stages reading the same `--from=<image>` must not race — the loser would
+    /// rewrite an ext4 the winner already has attached to a booted guest.
+    image_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// the current stage's long-lived guest (booted on its first RUN, reused for the
     /// rest, committed + torn down by `stage_end`). `None` between stages.
     session: Option<crate::run::VmSession>,
@@ -771,7 +780,7 @@ fn select_source_batch(
     }
     if needed_unique.len() > max {
         bail!(
-            "stage {stage} needs {} source stages in a single instruction, but this VMM can attach at most {max} source stages per boot: {}",
+            "stage {stage} needs {} sources in a single instruction, but this VMM can attach at most {max} sources per boot: {}",
             needed_unique.len(),
             needed_unique.join(", ")
         );
@@ -826,6 +835,35 @@ fn select_source_batch(
         add(&mut subset, source);
     }
     Ok(subset)
+}
+
+/// The label an external image is attached under, as a `--from=<image>` source. The `image/`
+/// prefix shares the backend's label namespace with the build stages without colliding: a
+/// stage's label is `<stage>` or `<unit>:<stage>`, a compose service name is a DNS label, and
+/// `Plan::check_reserved_names` rejects a `/` in a Dockerfile `AS` name — which the parser
+/// itself would otherwise accept.
+pub(crate) fn image_source_label(image: &str) -> String {
+    format!("image/{image}")
+}
+
+/// A filesystem-safe name for a rootfs label — path separators and `:` flattened to `_`, plus
+/// a short digest of the original whenever that flattening was lossy. Every scratch file and
+/// guest mountpoint a label names goes through here, so the disambiguation has to be part of
+/// the slug rather than the caller's business: an image source's label carries a registry ref,
+/// and `image/a/b` and `image/a_b` would otherwise share one ext4 and one mountpoint.
+fn label_slug(label: &str) -> String {
+    let flat = label.replace(['/', '\\', ':'], "_");
+    if flat == label {
+        return flat;
+    }
+    // 48 bits of sha256(label) restores what the flattening lost. Hashed here rather than
+    // reusing a cache tag, so a change to that tag's format cannot rename every scratch file.
+    use sha2::{Digest, Sha256};
+    let mut short = String::new();
+    for b in Sha256::digest(label.as_bytes()).iter().take(6) {
+        short.push_str(&format!("{b:02x}"));
+    }
+    format!("{flat}-{short}")
 }
 
 /// Cache tag for a base image's materialized ext4 — `base-<sha256(image ref)>`, in the
@@ -902,6 +940,7 @@ impl MicroVm {
             free_blocks: 32u64 * 1024 * 1024 * 1024 / 4096,
             cache,
             images: Arc::new(Mutex::new(HashMap::new())),
+            image_locks: Arc::new(Mutex::new(HashMap::new())),
             session: None,
             stage_image_kernel: false,
             image_kernel_boot: None,
@@ -975,6 +1014,7 @@ impl MicroVm {
             free_blocks: self.free_blocks,
             cache: self.cache.clone(),
             images: Arc::clone(&self.images),
+            image_locks: Arc::clone(&self.image_locks),
             stage_last_key: Arc::clone(&self.stage_last_key),
             stage_last_digest: Arc::clone(&self.stage_last_digest),
             base_digests: Arc::clone(&self.base_digests),
@@ -1117,10 +1157,9 @@ impl MicroVm {
         // Extract it once (flatten the stage rootfs to raw so fullvm can read the ext4,
         // then fullvm::prepare) and reuse the (kernel, preinit initramfs) across reboots.
         if self.stage_image_kernel && self.image_kernel_boot.is_none() {
-            let work = self.scratch.join(format!(
-                "imgkernel-{}",
-                fs.label.replace(['/', '\\', ':'], "_")
-            ));
+            let work = self
+                .scratch
+                .join(format!("imgkernel-{}", label_slug(&fs.label)));
             std::fs::create_dir_all(&work)?;
             let raw = work.join("rootfs.raw");
             crate::qcow2::flatten_to_raw(&ext4, &raw).with_context(|| {
@@ -1287,8 +1326,7 @@ impl MicroVm {
         Ok(())
     }
     fn image_path(&self, stage: &str) -> PathBuf {
-        self.scratch
-            .join(format!("{}.ext4", stage.replace(['/', '\\', ':'], "_")))
+        self.scratch.join(format!("{}.ext4", label_slug(stage)))
     }
     fn stage_image(&self, fs: &Rootfs) -> Result<PathBuf> {
         self.images
@@ -1299,15 +1337,14 @@ impl MicroVm {
             .with_context(|| format!("no ext4 for stage {:?}", fs.label))
     }
     fn stage_overlay_path(&self, stage: &str) -> PathBuf {
-        self.scratch
-            .join(format!("{}.qcow2", stage.replace(['/', '\\', ':'], "_")))
+        self.scratch.join(format!("{}.qcow2", label_slug(stage)))
     }
     /// Materialize `image` as an ext4 under `label`'s scratch path: restore the cached base
     /// (keyed by the image's manifest digest) or pull + flatten the OCI image and populate the
     /// cache. Returns the ext4, its base cache key, and the digest of the cached snapshot
     /// (`None` when nothing was cached) — the lineage a stage's first diff push chunks against.
-    /// Kept free of the caller's own bookkeeping so anything that needs an image on disk, not
-    /// just a stage base, can ask for one.
+    /// Shared by `from_image`, which wraps it as the stage's writable rootfs, and `pull`, which
+    /// attaches it read-only as a `--from=<image>` source.
     fn materialize_image(
         &mut self,
         label: &str,
@@ -1333,13 +1370,11 @@ impl MicroVm {
             && let Some(digest) =
                 crate::registry::try_pull_ext4(&rg, CACHE_REPO, &base_key, &ext4, image)?
         {
-            self.verify_ext4(&ext4, &format!("cached base image {image} (after load)"))?;
+            self.verify_ext4(&ext4, &format!("cached image {image} (after load)"))?;
             return Ok((ext4, base_key, Some(digest)));
         }
         // pull + flatten the OCI image to a rootfs tar (no docker), then build the ext4.
-        let tar = self
-            .scratch
-            .join(format!("{}.tar", label.replace(['/', '\\', ':'], "_")));
+        let tar = self.scratch.join(format!("{}.tar", label_slug(label)));
         // Swallow the pull's status lines: the live build dashboard owns the terminal
         // (a raw write would corrupt its cursor accounting) and already shows this
         // stage's FROM step, so the "pulling …"/"flattened …" notes are redundant here.
@@ -1694,10 +1729,9 @@ impl Executor for MicroVm {
         std::fs::create_dir_all(&self.scratch)
             .with_context(|| format!("creating {}", self.scratch.display()))?;
         let ext4 = self.image_path(stage);
-        let empty_tar = self.scratch.join(format!(
-            "{}-empty.tar",
-            stage.replace(['/', '\\', ':'], "_")
-        ));
+        let empty_tar = self
+            .scratch
+            .join(format!("{}-empty.tar", label_slug(stage)));
         // A valid empty tar archive is the two 512-byte end-of-archive zero records.
         std::fs::write(&empty_tar, [0u8; 1024])
             .with_context(|| format!("writing {}", empty_tar.display()))?;
@@ -1751,7 +1785,28 @@ impl Executor for MicroVm {
         })
     }
     fn pull(&mut self, image: &str) -> Result<Rootfs> {
-        bail!("microVM backend: `--from={image}` (external image source) not yet wired")
+        // A `--from=<image>` source: the image's materialized ext4, attached read-only like a
+        // source stage's (the attach path detects the raw format), memoized so several
+        // instructions referencing the same image pull and flatten it once. The stage's own cache
+        // lineage (parent_key/parent_digest) is deliberately untouched: this is a source, not a
+        // base. It is materialized exactly like a base, free headroom and all — nothing here
+        // will write to it, but building it any other way would fork the base cache entry the
+        // same image shares with a `FROM` that uses it.
+        let label = image_source_label(image);
+        // Serialize on this image before consulting the memo: two stages reading the same one
+        // run concurrently, and the loser of a race would rewrite the ext4 the winner already
+        // has attached. Waiting here costs nothing the second stage was not going to spend.
+        let lock = {
+            let mut locks = self.image_locks.lock().unwrap();
+            Arc::clone(locks.entry(label.clone()).or_default())
+        };
+        let _materializing = lock.lock().unwrap();
+        if self.images.lock().unwrap().contains_key(&label) {
+            return Ok(Rootfs { label });
+        }
+        let (ext4, _, _) = self.materialize_image(&label, image)?;
+        self.images.lock().unwrap().insert(label.clone(), ext4);
+        Ok(Rootfs { label })
     }
     fn run(
         &mut self,
@@ -1819,7 +1874,7 @@ impl Executor for MicroVm {
                     let dev = self.source_dev.get(&src_fs.label).with_context(|| {
                         format!("RUN --mount from={}: source not attached", src_fs.label)
                     })?;
-                    let mp = format!("/mnt/m-{}-{i}", src_fs.label.replace(['/', '\\', ':'], "_"));
+                    let mp = format!("/mnt/m-{}-{i}", label_slug(&src_fs.label));
                     let bindsrc = format!("{mp}/{}", source.trim_start_matches('/'));
                     binds.push((Some((dev.clone(), mp)), bindsrc, target));
                 }
@@ -1984,7 +2039,7 @@ impl Executor for MicroVm {
                         )
                     })?
                     .clone();
-                let mp = format!("/mnt/src-{}", src.label.replace(['/', '\\', ':'], "_"));
+                let mp = format!("/mnt/src-{}", label_slug(&src.label));
                 let session = self.session.as_ref().expect("session booted");
                 let m = [
                     GUEST_AGENT.to_string(),
@@ -2544,7 +2599,7 @@ impl Host {
             .with_context(|| format!("no host dir for stage {:?}", fs.label))
     }
     fn fresh_dir(&mut self, stage: &str) -> Result<Rootfs> {
-        let dir = self.scratch.join(stage.replace(['/', '\\', ':'], "_"));
+        let dir = self.scratch.join(label_slug(stage));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         self.dirs.insert(stage.to_string(), dir);
@@ -3004,7 +3059,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains(&format!("at most {MAX_SOURCE_DISKS} source stages"))
+                .contains(&format!("at most {MAX_SOURCE_DISKS} sources"))
         );
     }
 
