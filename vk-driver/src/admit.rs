@@ -458,6 +458,51 @@ fn parse(text: &str) -> Vec<Sample> {
         .collect()
 }
 
+/// The line a job trace ends with when the host has seen this job before: what it has been
+/// using lately under the ceiling it is running at now, and — where the host reserves from
+/// history — what that makes the next run claim. `None` for a job with no history yet, which
+/// includes one whose ceiling has just changed.
+pub fn history_summary(
+    dir: &Path,
+    key: &Path,
+    declared_mib: u64,
+    from_history: bool,
+) -> Option<String> {
+    history_summary_at(dir, key, declared_mib, from_history, now_secs())
+}
+
+fn history_summary_at(
+    dir: &Path,
+    key: &Path,
+    declared_mib: u64,
+    from_history: bool,
+    now: u64,
+) -> Option<String> {
+    // Checked, like `expect_mib`'s: a declared size too large to express in bytes has no
+    // history that could match it, since every stored ceiling went through this conversion.
+    let (most, runs) = most_recent_at(dir, key, declared_mib.checked_mul(MIB)?, now)?;
+    let plural = if runs == 1 { "run" } else { "runs" };
+    let reserves = match from_history {
+        true => format!(
+            "; the next run reserves {}",
+            fmt_mib(reserve_mib(most / MIB, declared_mib))
+        ),
+        false => String::new(),
+    };
+    // "lately" rather than the window's own length: [`window_of`] floors at [`MIN_RUNS`], so a
+    // job too quiet to have a fortnight's runs is answered from its last few however old they
+    // are — and a line reading "37 runs in 14 days" would then be a statement of throughput
+    // that is simply untrue. The guide gives the exact rule.
+    let most = crate::usage::fmt_bytes(most);
+    Some(format!(
+        "virtkit: most this job has used lately: {most} over {runs} {plural}{reserves}"
+    ))
+}
+
+fn fmt_mib(mib: u64) -> String {
+    crate::usage::fmt_bytes(mib * MIB)
+}
+
 /// Drop a job's reservation at cleanup. Best-effort: a reservation left behind stops
 /// counting the moment its holders die, and the next admission removes the file.
 pub fn release(dir: &Path, job_id: &str) {
@@ -1127,6 +1172,57 @@ mod tests {
         let (most, _) = most_recent_at(&dir, key("moved"), bytes(2048), now)
             .expect("the earlier ceiling's runs survived the trim");
         assert_eq!(most / MIB, 900);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The line a job trace ends with: what a person reads to size the host by.
+    #[test]
+    fn the_trace_line_says_what_the_job_uses_and_what_it_will_reserve() {
+        let dir = tmpdir("summary");
+        let now = 1_700_000_000;
+        let day = 24 * 60 * 60;
+        // Read at the same `now` the samples are written at: reading against the wall clock
+        // would age every one of them out and answer from the MIN_RUNS floor instead, which
+        // gives the same numbers here and so would assert nothing about the window.
+        assert_eq!(history_summary_at(&dir, key("none"), 8192, true, now), None);
+
+        remember_at(&dir, key("job"), bytes(1600), bytes(CEIL), now);
+        let line = history_summary_at(&dir, key("job"), 8192, true, now).unwrap();
+        assert_eq!(
+            line,
+            "virtkit: most this job has used lately: 1.6 GiB over 1 run; \
+             the next run reserves 2.0 GiB"
+        );
+        // With the host still reserving declared sizes, the figure is worth showing — it is
+        // how an operator decides to turn that on — but there is no reservation to promise.
+        remember_at(&dir, key("job"), bytes(1600), bytes(CEIL), now);
+        let line = history_summary_at(&dir, key("job"), 8192, false, now).unwrap();
+        assert_eq!(
+            line,
+            "virtkit: most this job has used lately: 1.6 GiB over 2 runs"
+        );
+        // Read against the ceiling the job is running at now, so widening MICROVM_MEM leaves
+        // the same job with nothing to report until it has run there.
+        assert_eq!(history_summary_at(&dir, key("job"), 16384, true, now), None);
+
+        // The largest run in the window, not the one that just ended.
+        remember_at(&dir, key("peaky"), bytes(3000), bytes(CEIL), now - day);
+        remember_at(&dir, key("peaky"), bytes(900), bytes(CEIL), now);
+        assert_eq!(
+            history_summary_at(&dir, key("peaky"), 8192, false, now).unwrap(),
+            "virtkit: most this job has used lately: 2.9 GiB over 2 runs"
+        );
+
+        // Past MIN_RUNS the window really does decide: a spike a month old leaves both the
+        // figure and the count.
+        remember_at(&dir, key("aged"), bytes(8000), bytes(CEIL), now - 30 * day);
+        for age in [3 * day, 2 * day, day, day / 2, 60] {
+            remember_at(&dir, key("aged"), bytes(900), bytes(CEIL), now - age);
+        }
+        assert_eq!(
+            history_summary_at(&dir, key("aged"), 8192, false, now).unwrap(),
+            "virtkit: most this job has used lately: 900 MiB over 5 runs"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

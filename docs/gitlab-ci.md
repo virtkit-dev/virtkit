@@ -245,6 +245,18 @@ quiet to have anything inside the window keeps its **last five runs** however ol
 so a monthly release job is still estimated from what it did rather than from what it asks
 for. A spike therefore stops being believed by ageing out, not by being outvoted.
 
+Every job trace says where it stands, whether or not the host reserves this way — reading it
+is how you decide to:
+
+```
+virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB
+virtkit: most this job has used lately: 2.1 GiB over 37 runs; the next run reserves 2.6 GiB
+```
+
+The run count is what the estimate rests on: the runs of the last 14 days, or the last five
+however old for a job too quiet to have that many. The `; the next run reserves …` clause
+appears only where the host really does reserve that way.
+
 The VM is still *given* the memory it declares; only the reservation shrinks. That is the
 point: guest RAM is faulted in on use and handed back when freed, so a generous declared
 size costs nothing at runtime, while an honest reservation is what lets the host run more

@@ -442,7 +442,7 @@ fn fmt_cpu(d: Duration) -> String {
 }
 
 /// Memory as a sizing figure — `1.6 GiB`, `842 MiB` — never finer than a MiB.
-fn fmt_bytes(bytes: u64) -> String {
+pub(crate) fn fmt_bytes(bytes: u64) -> String {
     let mib = bytes as f64 / (1024.0 * 1024.0);
     // Rounded for the same reason as fmt_cpu: 1023.7 MiB reads "1.0 GiB", never "1024 MiB".
     if mib.round() >= 1024.0 {

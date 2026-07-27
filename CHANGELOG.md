@@ -25,8 +25,9 @@ All notable changes to virtkit will be documented in this file.
   `[schedule] from_history`, a job is admitted against what runs of that same job have
   actually been using instead of a declared size it almost never reaches, so a host holds far
   more jobs for the same memory. Changing a job's `MICROVM_MEM` starts its history again. The
-  guest still gets every byte it declares; only the host's bookkeeping changes. Off by
-  default.
+  guest still gets every byte it declares; only the host's bookkeeping changes, and only when
+  you turn it on. Every job trace now ends with what that job has been using and over how many
+  runs either way, so a host can be sized from it before deciding to reserve that way.
 
 - **Builds, runs and CI jobs report what they used.** A build and a `vk run` now end with the
   CPU time and the peak memory they cost the host, and a CI job trace ends with the same for

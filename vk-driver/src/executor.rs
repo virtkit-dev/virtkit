@@ -167,11 +167,12 @@ fn report_resource_usage(ctx: &JobCtx) {
         && let Some(usage) = crate::usage::tree(pid)
     {
         eprintln!("{}", usage.summary("job"));
-        // Recorded in the same bytes the line above prints, so one run never reads as two
-        // figures. Stamped with the ceiling it ran under, which is what makes a job whose
-        // MICROVM_MEM changed start again rather than be predicted from runs it can no longer
-        // repeat. A job whose declared size will not parse never booted, so there is nothing
-        // to remember.
+        // Recorded before it is summarised, so the line below counts this run too, and in the
+        // same bytes the line above prints, so one run never reads as two figures. Stamped
+        // with the ceiling it ran under, which is what makes a job whose MICROVM_MEM changed
+        // start again rather than be predicted from runs it can no longer repeat. A job whose
+        // declared size will not parse — or will not fit in bytes — never booted, so there is
+        // nothing to remember.
         if let Ok(ceiling_mib) = crate::vm::declared_mem_mib(ctx)
             && let Some(ceiling) = ceiling_mib.checked_mul(1024 * 1024)
         {
@@ -181,7 +182,26 @@ fn report_resource_usage(ctx: &JobCtx) {
                 usage.peak_rss,
                 ceiling,
             );
+            report_job_history(ctx, ceiling_mib);
         }
+    }
+}
+
+/// Follow the run's own figures with what runs of this job have been using lately — the
+/// number `[schedule] mem_budget` has to be sized against, and what a host reserving from
+/// history sizes the next run's reservation from. Printed whether or not the host reserves
+/// that way: seeing it is how an operator decides to.
+fn report_job_history(ctx: &JobCtx, declared_mib: u64) {
+    let schedule = &ctx.cfg.schedule;
+    if let Some(line) = crate::admit::history_summary(
+        &ctx.history_dir(),
+        &ctx.usage_key(),
+        declared_mib,
+        // The reserve clause only where there is a reservation to promise: `from_history`
+        // decides how a job is admitted, but without a budget nothing is admitted at all.
+        schedule.from_history && schedule.mem_budget.is_some(),
+    ) {
+        eprintln!("{line}");
     }
 }
 
