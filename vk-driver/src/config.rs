@@ -72,6 +72,10 @@ pub struct Config {
     /// Defaults for `vk build` so a runner need not pass them every invocation;
     /// see [`Build`]. A CLI flag always overrides the matching config value.
     pub build: Build,
+    /// How many CI jobs this host lets run at once, by the memory they boot; see
+    /// [`Schedule`]. Off by default — jobs are admitted the moment gitlab-runner hands
+    /// them over, exactly as before.
+    pub schedule: Schedule,
     /// The file this config was loaded from; None = built-in defaults (no file
     /// found). Set by [`Config::load`], not a config key.
     #[serde(skip)]
@@ -139,6 +143,24 @@ pub struct Build {
     /// intermediate snapshot is checkpointed. Unset = 20. Smaller = more snapshots (a late
     /// edit re-runs less), larger = fewer commits.
     pub cache_checkpoint_secs: Option<u64>,
+}
+
+/// Memory admission for CI jobs. A runner takes as many jobs as its `concurrent` limit
+/// allows, with no idea what they will boot; past the host's RAM the OOM killer decides
+/// which VM dies. With a budget set, a job reserves the guest RAM it is about to boot and
+/// waits for room, oldest request first, so the host stays inside what it can back.
+///
+/// The budget is guest RAM, not host RAM: leave the difference for the VMMs themselves, the
+/// page cache and everything else on the box.
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct Schedule {
+    /// Total guest RAM this host admits at once, e.g. `"48G"`. Unset = no admission gate.
+    pub mem_budget: Option<String>,
+    /// How long a job waits for room before giving up. It then exits a *system* failure,
+    /// which GitLab retries when the job asks it to (`retry: { when: runner_system_failure }`)
+    /// — set that on jobs you would rather see land on another runner than fail. Default 600.
+    pub wait_timeout_secs: Option<u64>,
 }
 
 /// Host credentials forwarded into job VMs. The SSH agent is relayed over a vsock

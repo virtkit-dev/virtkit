@@ -6,6 +6,15 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **A runner can cap the memory its jobs boot at once.** Set `[schedule] mem_budget` and each
+  CI job claims the guest RAM it needs before booting, waiting its turn when the host is full
+  instead of pushing it into the OOM killer — which until now picked a VM to kill and failed
+  that job mid-stage. Jobs go in oldest-first, a waiting job says so in its trace, and one that
+  waits past `wait_timeout_secs` fails as a system failure, so a job that asks to be retried
+  can land on another runner. A job asking for more memory than the whole budget is clamped to
+  it, as it already is to `[vm] max_mem`. Unset, nothing changes: every job starts as soon as
+  gitlab-runner hands it over.
+
 - **Builds, runs and CI jobs report what they used.** A build and a `vk run` now end with the
   CPU time and the peak memory they cost the host, and a CI job trace ends with the same for
   the microVM its stages ran in — a ceiling on each, to size `[build] mem`/`--mem`/`MICROVM_MEM`

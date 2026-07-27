@@ -139,6 +139,13 @@ impl JobCtx {
         root.join(&self.concurrent_id).join(&self.project_slug)
     }
 
+    /// The host-wide memory ledger (`[schedule] mem_budget`), shared by every job on this
+    /// host — including those of another runner sharing the state dir. Outside the job dir
+    /// on purpose: a job's own dir is wiped and recreated by its prepare.
+    pub fn admit_dir(&self) -> PathBuf {
+        self.cfg.state_dir().join("admit")
+    }
+
     pub fn overlay(&self) -> PathBuf {
         self.job_dir.join("overlay.qcow2")
     }

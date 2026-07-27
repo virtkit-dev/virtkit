@@ -102,6 +102,17 @@
 # mem = "8G"             # per-stage build guest RAM (default: 4G)
 # cache_checkpoint_secs = 20  # `auto` cache mode: seconds of run time before a checkpoint
 
+# [schedule]             # how many CI jobs run at once, by the memory they boot. Off by
+#                        # default: gitlab-runner's `concurrent` alone decides, and past
+#                        # the host's RAM the OOM killer picks which VM dies. With a budget
+#                        # set, a job claims its guest RAM before booting and waits for
+#                        # room, oldest request first. Jobs report what they actually used
+#                        # (see the end of a job trace) — size the budget from that.
+# mem_budget = "48G"     # total GUEST RAM admitted at once; leave the rest of the host's
+#                        # memory for the VMMs, the page cache and everything else
+# wait_timeout_secs = 600  # then the job fails as a *system* failure, which GitLab retries
+#                        # for jobs that ask (`retry: { when: runner_system_failure }`)
+
 # MICROVM_IMAGE is prefix-based (the prefix names the source): unset = local/default;
 # `local/<name>` = a bundle dir under [local] dir; `virtkit/<name>[:tag|@digest]` =
 # a [registry] bundle; `docker/<name>[:tag|@digest]` = an OCI image booted directly

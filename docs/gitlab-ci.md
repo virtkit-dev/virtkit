@@ -4,8 +4,8 @@ virtkit ships a GitLab [custom executor](https://docs.gitlab.com/runner/executor
 that runs each CI job in a throwaway microVM: a fresh guest per job, destroyed
 when the job ends, with its own kernel and no shared state between jobs.
 Concurrent jobs each get their own VM. This guide covers configuring the runner,
-selecting the job image, sizing the guest, controlling egress, and attaching
-services.
+selecting the job image, sizing the guest, keeping the host inside its memory,
+controlling egress, and attaching services.
 
 For the host-side setup mechanics (runner wiring, state layout, exit codes) see
 also the [driver README](../vk-driver/README.md#gitlab-ci-executor); the full
@@ -148,6 +148,60 @@ Build sizing is host configuration only — there are no `MICROVM_*` equivalents
 built images are cached and shared across jobs and runners, so no single job owns the
 build guest it happens to trigger. Raising `[build] mem` lowers the derived `jobs` count
 unless you also set it: per-stage headroom and stage concurrency trade against each other.
+
+### Keeping the host inside its memory
+
+gitlab-runner decides how many jobs to take with `concurrent`, a count that knows nothing
+about what those jobs boot. Past the host's RAM the OOM killer arbitrates — it takes a
+VMM, and that job dies mid-stage with no explanation in its trace.
+
+Set a **memory budget** and a job instead claims the guest RAM it is about to boot, and
+waits when the host is full:
+
+```toml
+[schedule]
+mem_budget = "48G"        # total guest RAM admitted at once; unset = no gate (the default)
+wait_timeout_secs = 600   # then the job gives up
+```
+
+A job that waits says so in its trace, and says so again when it gets in:
+
+```
+virtkit: waiting for 8192 MiB of the host's 49152 MiB memory budget (45056 MiB reserved, 1 job(s) asked first)
+virtkit: admitted after waiting 34s for memory
+```
+
+Claims are held for the job's whole life and released at cleanup — or by the kernel, if
+the job dies, so a crash frees its memory rather than leaking the budget. Jobs are
+admitted **oldest request first**, so a large job cannot be starved by a stream of small
+ones; the cost is that a small job may queue behind a large one it would have fit
+alongside. Several runner processes on one host share the ledger as long as they share a
+`state_dir` and run as the same user.
+
+A job that gives up waiting exits a **system** failure, which GitLab retries only for jobs
+that ask for it:
+
+```yaml
+heavy-job:
+  retry:
+    max: 2
+    when: runner_system_failure
+```
+
+A `MICROVM_MEM` above the whole budget is clamped to it, the same way `[vm] max_mem` clamps
+one: a job asking for more than the host can ever admit would otherwise fail every attempt.
+Keep `[vm] mem` itself at or under the budget, though — a *default* no job can fit in makes
+every job on the host fail admission.
+
+Some limits worth knowing. The budget counts what a job *declares* (`MICROVM_MEM`, or
+`[vm] mem`), not what it will use — and guests rarely touch their declared size, so a
+runner sized this way runs fewer jobs than it could; the usage reports above tell you how
+far apart the two are. The claim is taken at the start of prepare, so a job that builds its
+own image holds its full guest RAM across that build, and the build's own stage guests
+(`[build] mem` × `[build] jobs`) are outside the budget — a host has to leave room for both.
+And a waiting job has already been assigned by GitLab, so it holds a `concurrent` slot and
+its own timeout runs while it waits. Admission control keeps a host from overcommitting; it
+is not a substitute for setting `concurrent` to something the host can carry.
 
 ## Egress control
 

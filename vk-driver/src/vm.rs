@@ -163,6 +163,12 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     std::fs::create_dir_all(&ctx.job_dir)
         .with_context(|| format!("creating {}", ctx.job_dir.display()))?;
 
+    // Memory admission (`[schedule] mem_budget`): claim the guest RAM this job is about to
+    // boot before booting it, waiting for room on a full host. Held for the rest of prepare;
+    // the supervisor takes its own hold on the same reservation, so it never lapses between
+    // the two. After the stale-job teardown above, which frees a predecessor's claim.
+    let _reservation = admit_memory(ctx, &mem)?;
+
     // [gitlab] host_checkout: check the sources out on the host NOW — before resolving the
     // image (a `dockerfile:`/`compose:` image is built from these sources) and before the
     // guest boots — so supervise can share the tree in and the git token never enters the
@@ -877,6 +883,10 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // base out from under a running overlay. A shared advisory lock the kernel drops when
     // this process exits — held in this Vec until supervise returns (job teardown).
     let mut use_guards: Vec<crate::image::UseGuard> = Vec::new();
+    // The other half of the memory reservation prepare took (see admit): held here for the
+    // job's whole life, so what this job booted keeps counting against the host budget until
+    // the VM is gone. `None` when admission is off.
+    let _reservation = crate::admit::hold(&ctx.admit_dir(), &ctx.job_id);
     if let Some(g) = crate::image::acquire_use_lock_for(cfg.state_dir(), &media.rootfs)? {
         use_guards.push(g);
     }
@@ -1655,10 +1665,43 @@ fn vm_size(ctx: &JobCtx) -> Result<(u32, String)> {
                 Some(m) => parse_gib(m).context("invalid vm.max_mem")?,
                 None => parse_gib(&vm.mem).context("invalid vm.mem")?,
             };
+            // `[schedule] mem_budget` is a host ceiling like the others: a request above the
+            // whole budget could never be admitted, and failing prepare over it would be a
+            // *system* failure — the retryable class, which no retry could ever satisfy.
+            let max = match &ctx.cfg.schedule.mem_budget {
+                Some(b) => max.min(parse_gib(b).context("invalid [schedule] mem_budget")?),
+                None => max,
+            };
             format!("{}G", req.min(max))
         }
     };
     Ok((cpus, mem))
+}
+
+/// Reserve this job's guest RAM against the host's `[schedule] mem_budget`, blocking until
+/// there is room for it (see admit). `None` when no budget is configured — the host then
+/// admits every job the runner hands it, as it did before. A job that never gets room fails
+/// prepare, which exits `SYSTEM_FAILURE_EXIT_CODE`: a system failure, not the job's fault.
+fn admit_memory(ctx: &JobCtx, mem: &str) -> Result<Option<crate::admit::Reservation>> {
+    let Some(budget) = ctx.cfg.schedule.mem_budget.as_deref() else {
+        return Ok(None);
+    };
+    let budget_mib = parse_gib(budget)
+        .context("invalid [schedule] mem_budget")?
+        .checked_mul(1024)
+        .context("[schedule] mem_budget is absurdly large")?;
+    let timeout = Duration::from_secs(ctx.cfg.schedule.wait_timeout_secs.unwrap_or(600));
+    let reservation = crate::admit::acquire(
+        &ctx.admit_dir(),
+        &ctx.job_id,
+        parse_gib(mem)
+            .context("invalid guest memory size")?
+            .checked_mul(1024)
+            .context("guest memory size is absurdly large")?,
+        budget_mib,
+        timeout,
+    )?;
+    Ok(Some(reservation))
 }
 
 /// "<n>G" (GiB) — the only size format the sizing variables accept
@@ -1773,6 +1816,9 @@ fn wait_child_gone(child: &mut std::process::Child, timeout: Duration) -> bool {
 pub fn cleanup(ctx: &JobCtx) -> Result<()> {
     stop_supervisor(ctx);
     crate::net::release(ctx);
+    // After the supervisor is gone, so the freed budget is visible to the next job the
+    // moment its entry disappears rather than while its VM is still shutting down.
+    crate::admit::release(&ctx.admit_dir(), &ctx.job_id);
     match std::fs::remove_dir_all(&ctx.job_dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -2164,6 +2210,40 @@ mod tests {
         assert!(vm_size(&ctx(Some("0"), None)).is_err());
         assert!(vm_size(&ctx(None, Some("64"))).is_err());
         assert!(vm_size(&ctx(None, Some("4096M"))).is_err());
+    }
+
+    /// A memory budget is a host ceiling like `max_mem`: a request above the whole budget is
+    /// clamped to it rather than left to fail admission, which no retry could ever satisfy.
+    #[test]
+    fn sizing_clamps_to_the_memory_budget() {
+        let mut ctx = ctx(None, Some("64G"));
+        assert_eq!(vm_size(&ctx).unwrap().1, "64G", "max_mem alone");
+        ctx.cfg.schedule.mem_budget = Some("48G".into());
+        assert_eq!(vm_size(&ctx).unwrap().1, "48G");
+        // The lower of the two ceilings wins whichever it is.
+        ctx.cfg.schedule.mem_budget = Some("256G".into());
+        assert_eq!(vm_size(&ctx).unwrap().1, "64G");
+        // A job that asked for nothing keeps the configured default, budget or not.
+        let mut plain = self::ctx(None, None);
+        plain.cfg.schedule.mem_budget = Some("2G".into());
+        assert_eq!(vm_size(&plain).unwrap().1, "8G");
+    }
+
+    /// With no budget configured the gate is absent: nothing is claimed, and no ledger is
+    /// created under the state dir.
+    #[test]
+    fn admission_is_absent_without_a_budget() {
+        let dir = std::env::temp_dir().join(format!("vk-admit-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = Config {
+            state_dir: Some(dir.clone()),
+            ..Config::default()
+        };
+        let ctx = JobCtx::new_for_job(cfg, "42".into()).unwrap();
+        assert!(ctx.cfg.schedule.mem_budget.is_none());
+        assert!(admit_memory(&ctx, "8G").unwrap().is_none());
+        assert!(!ctx.admit_dir().exists(), "no ledger without a budget");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
