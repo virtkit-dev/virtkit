@@ -376,7 +376,8 @@ impl EgressGuard {
         }
     }
     /// Record an allowed external domain the guest resolved to the audit channel, for the
-    /// end-of-job "domains contacted" summary. No-op when audit is off.
+    /// end-of-job "domains contacted" summary and the standing list of names a job reaches
+    /// (see sites). No-op only where nothing reads the channel: a CI job always has one.
     fn record_contact(&self, name: &str) {
         if let Some(path) = &self.audit_log {
             crate::egress_report::append_contact(path, name);
@@ -384,7 +385,8 @@ impl EgressGuard {
     }
     /// Remember the A-record IPs the switch just handed `src` for an allowed name, so a
     /// connection from that VM to one of them is not re-logged as a direct-IP contact. No-op
-    /// when audit is off (the direct-IP audit is the only reader of this set).
+    /// where there is no channel. Bounded by the answers the switch handed out, so a job's
+    /// worth of resolutions, and paid by every CI job now that the channel is always open.
     fn record_dns_ips(&self, src: Ipv4Addr, ips: &[Ipv4Addr]) {
         if self.audit_log.is_none() {
             return;
@@ -395,7 +397,9 @@ impl EgressGuard {
     /// Record an allowed external `ip:port` that `src` dialed to the audit channel — but only
     /// when the switch never resolved that IP for that same VM, so the "IPs/ports contacted"
     /// summary shows exactly the direct-IP egress the "domains contacted" summary cannot
-    /// (dedup is on `(src, ip)`; DNS answers carry no port). No-op when audit is off.
+    /// (dedup is on `(src, ip)`; DNS answers carry no port). No-op where there is no channel.
+    /// A set lookup per outbound connection, which a CI job now always pays; the append
+    /// behind it is reached only by a guest that dials an address it never resolved.
     fn record_ip_contact(&self, src: Ipv4Addr, dst: SocketAddrV4) {
         let Some(path) = &self.audit_log else {
             return;
@@ -679,7 +683,6 @@ pub async fn run(
             tx: ret_tx,
         },
     );
-    let audit = audit_log.is_some();
     let per_source_count = per_source.len();
     let guard = Arc::new(
         EgressGuard::new(egress, gateway)
@@ -758,11 +761,12 @@ pub async fn run(
         sw.hosts.len(),
         sw.inner.lock().unwrap().reservations.len(),
         upstream,
-        match (restricted, audit) {
-            (true, true) => "allowlist + audit",
-            (true, false) => "allowlist",
-            (false, true) => "unrestricted + audit",
-            (false, false) => "unrestricted",
+        // The audit channel is open for every CI job now — the standing list of names reads
+        // it too — so its presence no longer says this job audits, and the log does not claim
+        // it does.
+        match restricted {
+            true => "allowlist",
+            false => "unrestricted",
         },
         if per_source_count > 0 {
             format!(" ({per_source_count} per-service override(s))")

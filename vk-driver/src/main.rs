@@ -51,6 +51,7 @@ mod run;
 mod schedule;
 mod scratch;
 mod services;
+mod sites;
 mod source;
 mod spawn;
 mod sshagent;

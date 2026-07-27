@@ -490,8 +490,10 @@ fn window_of(samples: &[Sample], now: u64) -> &[Sample] {
 /// `dir/key`, or `None` for a key that would not stay under `dir`. Every key comes from
 /// [`crate::jobctx::JobCtx::usage_key`], which builds it out of sanitised components — but
 /// `Path::join` drops the base entirely for an absolute key, so nothing here takes that on
-/// trust from a caller two modules away.
-fn under(dir: &Path, key: &Path) -> Option<PathBuf> {
+/// trust from a caller two modules away. Shared with [`crate::sites`], which keys its own
+/// per-job store the same way: one guard, so a fix to it cannot reach one store and not the
+/// other.
+pub(crate) fn under(dir: &Path, key: &Path) -> Option<PathBuf> {
     let mut parts = key.components().peekable();
     parts.peek()?; // an empty key would name the history root itself
     parts
@@ -820,7 +822,7 @@ fn locked(file: &File) -> bool {
 
 /// Take the directory's exclusive lock, held until the returned file drops. Blocking: the
 /// critical section is a directory scan, and a waiter is better than a spuriously refused job.
-fn lock_dir(dir: &Path) -> Result<File> {
+pub(crate) fn lock_dir(dir: &Path) -> Result<File> {
     let path = dir.join(LOCK);
     let file = File::options()
         .write(true)

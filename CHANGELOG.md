@@ -35,6 +35,15 @@ All notable changes to virtkit will be documented in this file.
   `MICROVM_MEM` and `[build] cpus`/`--cpus`/`MICROVM_CPUS` from what the work costs rather than
   by guess. Where several guests run at once — concurrent build stages, a compose fleet — the
   report gives both what they held together and the largest single process.
+- **Every CI job trace says what that job reaches out to.** A job reports the external names
+  its guests have resolved — not just this run's, but everything the job has contacted since
+  its egress policy was last changed, so a nightly step's host is on the list even in a
+  pipeline that did not run one. That list is the `[egress] allow_name` the job needs, without
+  turning anything on first; narrowing the allowlist starts it again, since names reached under
+  looser rules say nothing about the job under the new ones. Audit mode keeps its own job: the
+  per-run counts, and the IPs a job dialed with no name behind them. The list lives under the
+  runner's state dir, readable only by the user the runner runs as, and can be deleted at any
+  time — a job then starts collecting again.
 
 ## [0.30.0] - 2026-07-26
 

@@ -154,6 +154,14 @@ impl JobCtx {
         self.cfg.state_dir().join("history")
     }
 
+    /// Where this host remembers what each job contacts, keyed by [`JobCtx::usage_key`] like
+    /// the run history. Its own root rather than a file beside each history: what a job used
+    /// and what it reached are read by different callers, and a scan of one must not have to
+    /// step over the other.
+    pub fn sites_dir(&self) -> PathBuf {
+        self.cfg.state_dir().join("sites")
+    }
+
     /// What makes two runs the same job for the memory history: `<project>/<job name>`.
     ///
     /// Two components rather than one joined string, because both halves may contain the
@@ -251,7 +259,8 @@ impl JobCtx {
     }
     /// Audit channel: every allowed external domain the switch saw this job's guest
     /// resolve, appended one-per-line and drained into the end-of-job "domains contacted"
-    /// summary (see egress_report). Written only when audit is on.
+    /// summary (see egress_report). Written for every job, audit or not: the standing list of
+    /// names a job contacts is read from it too (see sites).
     pub fn egress_audit_log(&self) -> PathBuf {
         self.job_dir.join("egress-audit.log")
     }

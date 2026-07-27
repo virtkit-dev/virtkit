@@ -526,14 +526,38 @@ packets — so a service cannot borrow another VM's (looser) policy. Requests ar
 validated at job prepare, so a per-service value outside the host cap fails the job
 with a visible error before anything boots.
 
+### What a job contacts
+
+Every job trace names what that job is known to reach out to, just before what it cost:
+
+```
+virtkit: names this job has contacted under unrestricted egress: deb.debian.org, github.com
+```
+
+This is the standing list, not this run's: each run adds what its guests resolved in the
+**run phase** to what the job has resolved before, so a nightly step's host is on it even in
+a pipeline that did not run one. Write an `allow_name` from it and the job keeps working — bar
+any entry showing `?`, which is a name the guest sent outside the characters a hostname is
+spelled with, kept only to show that it happened. A
+`dockerfile:` build's own resolutions are not on it — those are the build phase's, and
+`[egress.build]` is a separate cap with its own audit.
+
+The list belongs to the **policy**, not to the job. Narrowing an allowlist starts it again
+and the line then names the policy the list was gathered under
+(`under egress policy a379a6f61c4b8e02`) — what a job reached while it could reach anything
+says nothing about the same job once an allowlist is in force, and those names would
+otherwise linger as if it still needed them. It is kept per job under `<state_dir>/sites/`,
+keyed exactly as the run history is, and capped: past a couple of hundred names the line
+says how many more it is not showing, because a list that long is no longer an allowlist
+anyone would paste.
+
 ### Audit mode
 
-Audit mode records every external domain a job resolves and prints a
-"domains contacted" summary — each domain with its contact count — where the job
-can see it (at the end of the job trace for the run phase, after the build for the
-build phase). It is independent of the allowlist, so it also works with
-unrestricted egress: leave the lists absent and turn audit on to discover the
-allowlist a job actually needs before locking it down.
+Audit mode adds the counts for **one run**: every resolution that run made, plus the
+external IPs it dialed without a resolution behind them, printed where the job can see it
+(at the end of the job trace for the run phase, after the build for the build phase). Turn
+it on when the standing list above is not enough — to see how often a name is reached, or
+to catch a step talking to a literal IP.
 
 ```toml
 [egress]

@@ -1450,7 +1450,10 @@ fn spawn_switch(
         registry_proxy,
         log: ctx.switch_log(),
         denied_log: Some(ctx.egress_denied_log()),
-        audit_log: ctx.egress_audit().then(|| ctx.egress_audit_log()),
+        // Not gated on audit mode: the names a job resolves are what its allowlist is
+        // written from, and a host that only records them once someone turns auditing on has
+        // them for the run after the question was asked. The audit *summary* stays opt-in.
+        audit_log: Some(ctx.egress_audit_log()),
         bytes_log: Some(ctx.net_bytes_log()),
     })
     .context("spawning the per-job switch")
@@ -1460,7 +1463,7 @@ fn spawn_switch(
 /// job's `MICROVM_EGRESS_ALLOW_IP` / `_ALLOW_NAME` requests, returned as `(allow_ip,
 /// allow_name, restrict)` for `switch::Spawn`. `restrict` is true when either dimension is
 /// configured, so an empty allowlist denies (see the switch's `--egress-restrict`).
-fn effective_run_egress(
+pub(crate) fn effective_run_egress(
     cfg: &crate::config::Config,
     ctx: &JobCtx,
 ) -> Result<(Vec<String>, Vec<String>, bool)> {

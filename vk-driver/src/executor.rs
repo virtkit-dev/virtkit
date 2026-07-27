@@ -58,8 +58,8 @@ impl OutputSink {
 
 /// gitlab-runner's final `run_exec` sub-stage, run unconditionally after every other stage
 /// (even after a failed script). Its output still lands in the job trace — unlike
-/// `cleanup_exec` — so it is where the once-per-job summaries are emitted: the egress audit
-/// and what the job cost the runner.
+/// `cleanup_exec` — so it is where the once-per-job summaries are emitted: the egress audit,
+/// the names the job reaches out to, and what it cost the runner.
 const FINAL_STAGE: &str = "cleanup_file_variables";
 
 pub async fn run_stage(ctx: &JobCtx, script_path: &Path, stage: Option<&str>) -> Result<CmdResult> {
@@ -82,10 +82,11 @@ pub async fn run_stage(ctx: &JobCtx, script_path: &Path, stage: Option<&str>) ->
     // whether the step passed or failed.
     report_egress_blocks(ctx);
     // On the last stage, print the once-per-job summaries — the "domains contacted" audit
-    // (a no-op unless audit is on) and what the job cost the runner — so they appear at the
-    // end of the trace.
+    // (a no-op unless audit is on), the job's standing list of names, and what the job cost
+    // the runner — so they appear at the end of the trace.
     if stage == Some(FINAL_STAGE) {
         report_egress_audit(ctx);
+        report_contacted_names(ctx);
         report_resource_usage(ctx);
     }
     result
@@ -136,9 +137,17 @@ fn report_egress_blocks(ctx: &JobCtx) {
 /// saw this job's guest resolve, then every external IP it dialed directly (without a matching
 /// resolution), each most-contacted first. In audit mode (`[egress] audit` or
 /// `MICROVM_EGRESS_AUDIT`) the switch records each contact to its audit channel (see
-/// egress_report); this drains the whole file once, at the end of the job. Best-effort: audit
-/// off (no channel) or nothing contacted is a silent no-op.
+/// egress_report); this reads the whole file at the end of the job and leaves it, which the
+/// standing list of names below depends on — it reads the same channel just after. The channel
+/// is there either way, so this stays gated on the audit setting rather than on the file.
+/// Best-effort: nothing contacted is a silent no-op.
 fn report_egress_audit(ctx: &JobCtx) {
+    // The channel is written whether or not this job audits (see the switch spawn), so what
+    // makes the per-run summary an audit feature is this: without it the trace gets the
+    // job's standing list of names, not every resolution of this one run.
+    if !ctx.egress_audit() {
+        return;
+    }
     if let Some(summary) = crate::egress_report::contacts_summary(
         &ctx.egress_audit_log(),
         "external domains contacted (audit)",
@@ -153,12 +162,39 @@ fn report_egress_audit(ctx: &JobCtx) {
     }
 }
 
+/// Print the names this job is known to reach out to — everything its guests have resolved
+/// across the runs it has had under the egress policy in force now, this run included (see
+/// sites). Unlike the audit summary above, which is one run's resolutions and opt-in, this is
+/// the standing list an `[egress] allow_name` is written from, and every job gets it.
+///
+/// Recorded before the resource lines so the trace ends with what the job cost, which is what
+/// most readers are after. Best-effort: a job whose policy will not resolve — one already
+/// failed for it — has nothing to stamp a list with, and says nothing.
+fn report_contacted_names(ctx: &JobCtx) {
+    let Ok((allow_ip, allow_name, restrict)) = crate::vm::effective_run_egress(&ctx.cfg, ctx)
+    else {
+        return;
+    };
+    let policy = crate::sites::fingerprint(&allow_ip, &allow_name, restrict);
+    let contacted: Vec<String> = crate::egress_report::read_contacts(&ctx.egress_audit_log())
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    if let Some(names) =
+        crate::sites::remember(&ctx.sites_dir(), &ctx.usage_key(), &policy, &contacted)
+        && let Some(summary) = crate::sites::summary(&names, &policy)
+    {
+        eprintln!("{summary}");
+    }
+}
+
 /// Print what the job cost the runner — the CPU time, peak memory, and disk and network
 /// traffic of its microVM and the host helpers around it (see usage) — into the job trace,
-/// so a job can be sized from what it actually used. Sampled here rather than at cleanup because this is the
-/// last stage whose output the trace still keeps, and the job's processes are all still alive
-/// to be read: it therefore covers everything but the guest's own shutdown. Best-effort: a
-/// job whose supervisor is already gone (the guest died) reports nothing.
+/// so a job can be sized from what it actually used. Sampled here rather than at cleanup
+/// because this is the last stage whose output the trace still keeps, and the job's processes
+/// are all still alive to be read: it therefore covers everything but the guest's own
+/// shutdown. Best-effort: a job whose supervisor is already gone (the guest died) reports
+/// nothing.
 ///
 /// The same figure is what the next run of this job is admitted against where the host
 /// reserves from history (`[schedule] from_history`), so it is recorded here too.
