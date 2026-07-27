@@ -65,6 +65,16 @@ in the repo itself (`image: dockerfile:…`). See the
 [GitLab CI guide](docs/gitlab-ci.md) for job variables, per-phase egress control,
 and services.
 
+Know what the work cost. A build, a `vk run`, and a CI job each end with the CPU
+time and the peak memory they cost the host, the guests' own execution included.
+Read each as a ceiling — the totals carry vk's own work and the host helpers
+alongside the guests — and size `--mem`/`--cpus` and their config equivalents
+from what the work costs rather than by guess. Where several guests run at once
+(concurrent build stages, a compose fleet) a build and a `vk run` also name the
+largest single process, which is the difference between giving each guest more
+memory and running fewer of them at a time. See the
+[GitLab CI guide](docs/gitlab-ci.md#resource-usage) for what each figure covers.
+
 Carry one file around. The hypervisor, the guest kernel, and the guest agent are
 all embedded in `vk`, so you can copy it to any Linux machine with `/dev/kvm`
 and boot images. virtkit can even rebuild itself inside one of its own microVMs
