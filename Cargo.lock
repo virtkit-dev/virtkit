@@ -4549,6 +4549,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vk-runnerctl"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "vm-fdt"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

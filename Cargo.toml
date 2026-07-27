@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["vk-core", "vk-driver", "vk-agent", "vk-registry", "bench"]
+members = ["vk-core", "vk-driver", "vk-agent", "vk-registry", "vk-runnerctl", "bench"]
 # third_party/libkrun is upstream libkrun's own cargo workspace, vendored and locally
 # patched (see third_party/libkrun/VENDOR.md). vk-driver will depend on its `libkrun`
 # crate by path; excluding it here keeps the two workspaces from merging.

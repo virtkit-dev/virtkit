@@ -1,0 +1,20 @@
+[package]
+name = "vk-runnerctl"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# The one virtkit component that runs as root. It exists to be small: everything that
+# decides *what* the runner's concurrency should be lives in unprivileged `vk`, and this
+# only carries out the write. Keep the dependency list to what the job needs — an operator
+# grants it privilege, and should be able to read all of it.
+[[bin]]
+name = "vk-runnerctl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+toml.workspace = true
+libc.workspace = true
