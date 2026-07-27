@@ -57,6 +57,7 @@ mod switch;
 mod timing;
 mod units;
 mod update;
+mod usage;
 #[cfg(feature = "virtiofsd")]
 mod virtiofsd;
 mod vm;
@@ -120,7 +121,7 @@ enum GitlabCmd {
     Run {
         script: PathBuf,
         /// Stage name (prepare_script, get_sources, build_script, ...). Used to emit the
-        /// egress audit summary once, on the final stage (see executor::run_stage).
+        /// once-per-job summaries on the final stage (see executor::run_stage).
         stage: Option<String>,
     },
     /// cleanup_exec: stop the VM and remove the job state (idempotent)

@@ -83,6 +83,36 @@ test-in-repo-image:
     MICROVM_IMAGE: dockerfile:ci/Dockerfile#test   # built from this checkout, then booted
 ```
 
+## Resource usage
+
+A job trace ends with what the job cost the runner:
+
+```
+virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB
+```
+
+`cpu` is the CPU time of the job's microVM and of the host processes around it (the
+switch, the virtio-fs daemons, any service VM), the guest's own execution included.
+Against the job's own duration it gives the parallelism the job reached, which is what
+`MICROVM_CPUS` has to allow — a ceiling, since `MICROVM_CPUS` sizes the job guest alone
+while the total also carries the host helpers and any service VM.
+
+`peak memory` sums the high-water mark of every process the job still had running at the
+end — an upper bound over those, not over the whole job. A mark rather than the memory left
+at the end: a guest hands freed RAM straight back to the host, so its live figure says
+little about the peak it passed through. Read as a ceiling here too: two processes that
+never peaked together both count, pages the VMM shares with its virtio-fs daemons count in
+each, and for a job with services the figure spans every service VM, not just the one the
+stages run in. A helper that peaked and exited earlier contributes its CPU time but no
+memory.
+
+Both cover the job's **run** phase: the VM the stages run in, from its boot to the last
+stage. Building a git-defined image (`image: dockerfile:…`) happens before that VM exists,
+in build VMs shared with other jobs, and is not counted here — with one exception: an image
+the run phase has to build itself, because the shared tier no longer held it, contributes
+that build's CPU time. The line is omitted altogether for a job whose guest died and took
+the supervisor with it, leaving nothing to read.
+
 ## Egress control
 
 A job's networking is governed by the host `[egress]` configuration. virtkit runs

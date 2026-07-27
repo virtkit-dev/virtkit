@@ -58,7 +58,8 @@ impl OutputSink {
 
 /// gitlab-runner's final `run_exec` sub-stage, run unconditionally after every other stage
 /// (even after a failed script). Its output still lands in the job trace — unlike
-/// `cleanup_exec` — so it is where the once-per-job egress audit summary is emitted.
+/// `cleanup_exec` — so it is where the once-per-job summaries are emitted: the egress audit
+/// and what the job cost the runner.
 const FINAL_STAGE: &str = "cleanup_file_variables";
 
 pub async fn run_stage(ctx: &JobCtx, script_path: &Path, stage: Option<&str>) -> Result<CmdResult> {
@@ -80,10 +81,12 @@ pub async fn run_stage(ctx: &JobCtx, script_path: &Path, stage: Option<&str>) ->
     // fails because it could not reach a host would otherwise get no hint why. Reported
     // whether the step passed or failed.
     report_egress_blocks(ctx);
-    // On the last stage, print the once-per-job "domains contacted" audit summary (a no-op
-    // unless audit is on), so it appears at the end of the trace.
+    // On the last stage, print the once-per-job summaries — the "domains contacted" audit
+    // (a no-op unless audit is on) and what the job cost the runner — so they appear at the
+    // end of the trace.
     if stage == Some(FINAL_STAGE) {
         report_egress_audit(ctx);
+        report_resource_usage(ctx);
     }
     result
 }
@@ -147,6 +150,20 @@ fn report_egress_audit(ctx: &JobCtx) {
         "external IPs/ports contacted (audit)",
     ) {
         eprintln!("{summary}");
+    }
+}
+
+/// Print what the job cost the runner — the CPU time and peak memory of its microVM and the
+/// host helpers around it (see usage) — into the job trace, so a job can be sized from what
+/// it actually used. Sampled here rather than at cleanup because this is the last stage whose
+/// output the trace still keeps, and the job's processes are all still alive to be read: it
+/// therefore covers everything but the guest's own shutdown. Best-effort: a job whose
+/// supervisor is already gone (the guest died) reports nothing.
+fn report_resource_usage(ctx: &JobCtx) {
+    if let Some(pid) = crate::vm::live_supervisor_pid(ctx)
+        && let Some(usage) = crate::usage::tree(pid)
+    {
+        eprintln!("{}", usage.summary());
     }
 }
 

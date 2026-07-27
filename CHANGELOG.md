@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A CI job reports what it used.** A job trace now ends with the CPU time and the peak
+  memory the job's microVM and its host helpers consumed on the runner — a ceiling on each, to
+  size `MICROVM_MEM` and `MICROVM_CPUS` from what a job costs rather than by guess.
+
 ## [0.30.0] - 2026-07-26
 
 ### Added
