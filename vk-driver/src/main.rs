@@ -48,6 +48,7 @@ mod qcow2;
 mod registry;
 mod regproxy;
 mod run;
+mod schedule;
 mod scratch;
 mod services;
 mod source;
@@ -256,6 +257,13 @@ enum Cmd {
         #[arg(long, conflicts_with = "example")]
         path: bool,
     },
+    /// Keep gitlab-runner's `concurrent` in step with what this host can hold: measure the
+    /// memory its jobs have committed and leave the concurrency that fits where the
+    /// root-side `vk-runnerctl` applies it. Run from a timer every half minute or so (see
+    /// the GitLab CI guide), so it is hidden from the everyday help like `vk gitlab`.
+    /// Needs `[schedule] mem_budget`.
+    #[command(hide = true)]
+    Tune,
     /// GitLab custom-executor lifecycle (config / prepare / run / cleanup)
     #[command(hide = true)]
     Gitlab {
@@ -2270,6 +2278,10 @@ async fn cli_main() -> ExitCode {
     };
 
     match cli.cmd {
+        Cmd::Tune => match schedule::tune(&ctx.cfg) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        },
         Cmd::Gitlab { cmd } => match cmd {
             GitlabCmd::Config => {
                 let info = serde_json::json!({

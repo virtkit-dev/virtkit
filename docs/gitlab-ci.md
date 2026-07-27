@@ -258,13 +258,80 @@ a step change. Leave it off until a few pipelines have been measured.
 ### What admission does not do
 
 A waiting job has already been assigned by GitLab: it holds a `concurrent` slot and its own
-timeout runs while it waits. Admission keeps a host from overcommitting; it is not a
-substitute for setting `concurrent` to something the host can carry.
+timeout runs while it waits. Admission keeps a host from overcommitting; it does not keep
+work out of the runner. For that, see below.
 
 Nor does it cover everything a job boots. The claim is taken at the start of prepare, so a
 job that builds its own image holds its full guest RAM across that build — and the build's
 own stage guests (`[build] mem` × `[build] jobs`) are outside the budget entirely. A host
 has to leave room for both.
+
+## Throttling a busy runner
+
+`concurrent` decides how many jobs gitlab-runner *accepts*. Sized by hand it is a guess
+that has to hold for the worst pipeline, so it is usually set low — and a job it turns away
+stays **pending in GitLab**, holding no slot, running no timeout, free to land on another
+runner. That is the one thing admission cannot do for a job already assigned.
+
+gitlab-runner re-reads `config.toml` when it changes, so `concurrent` can follow the host.
+Two pieces do that, split along the privilege line:
+
+| | Runs as | Does |
+| --- | --- | --- |
+| `vk tune` | the runner user | Reads the ledger, works out how many jobs fit, writes that one number to `<state_dir>/schedule/desired-concurrency` |
+| `vk-runnerctl` | root | Reads that number, clamps it into a range **it** configures, edits `concurrent`, puts the file back atomically |
+
+The split is the point: `config.toml` is root's, and granting `vk` the right to write it
+would grant root outright — `vk run` boots VMs with arbitrary mounts. `vk-runnerctl` instead
+takes **no arguments and no paths**; everything it touches is named in its own root-owned
+config. The worst an attacker who owns the runner user can do is ask for a concurrency an
+administrator already allowed.
+
+```toml
+# /etc/virtkit/runnerctl.toml — root-owned, 0644
+runner_config = "/etc/gitlab-runner/config.toml"
+desired_file  = "/var/lib/virtkit/schedule/desired-concurrency"
+min = 1
+max = 12                  # never exceeded, whatever is requested
+cooldown_secs = 60        # shortest interval between two writes
+stale_secs = 300          # a request older than this is treated as gone
+# reload_command = ["systemctl", "kill", "-s", "HUP", "gitlab-runner"]
+```
+
+Run the measuring half from a user timer every half minute (`vk tune`), and the privileged
+half either from a **root timer** — nothing is granted to anyone — or from the runner user
+through a sudoers rule that allows no arguments:
+
+```
+gitlab-runner ALL=(root) NOPASSWD: /usr/local/lib/vk/vk-runnerctl ""
+```
+
+What it does with the file is deliberately narrow: it rewrites the single `concurrent` line
+and proves the result differs from the original at that key alone before installing it, so
+comments, key order and registration tokens survive untouched, and the original is kept once
+as `config.toml.vk-orig`. Lowering the number never disturbs a running job — it only stops
+new ones being taken.
+
+The number itself is "the jobs running now, plus what the budget still has room for", at the
+size a job on this host typically reserves:
+
+```
+virtkit: runner concurrency 2 (6144 of 8192 MiB committed by 1 job(s), typical job 2048 MiB, 35% of host memory free)
+```
+
+It falls the moment the host fills and climbs back one step at a time, because a job that
+has just started has not yet reached its real size. A host whose free memory drops below
+15% takes on nothing beyond what it is already running, whatever the ledger says — the
+ledger cannot see the page cache or anything else on the box. One slot is always offered
+even then, since `concurrent = 0` is not a setting gitlab-runner has and a runner that
+accepted nothing at all would never pick up again. And if `vk tune` stops writing, the
+runner is not left throttled: `vk-runnerctl` walks `concurrent` back up to `max` a step at
+a time.
+
+Getting the number wrong is cheap on purpose. It decides what the runner *accepts*, never
+what is committed: too high and the extra jobs queue at the admission gate exactly as
+before, too low and the host idles until the next run. The gate is the guarantee; this is
+the throughput.
 
 ## Egress control
 

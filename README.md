@@ -87,7 +87,7 @@ and boot images. virtkit can even rebuild itself inside one of its own microVMs
 | `vk` | The host-side tool. Boots and manages VMs, builds and converts images, runs the GitLab executor, and provides the guest network. Self-contained: the guest kernel and `vk-agent` are embedded. |
 | `vk-agent` | Runs inside the guest as PID 1. Brings the system up (mounts, networking, hostname, shared folders, optional SSH) and lets the host run commands inside the VM. |
 | `vk-registry` | Optional central OCI-distribution server, shared by every runner: build-once dedup (a lease/heartbeat lock so an image is built once, not per runner), a pull-through cache for upstream registries (digest-addressed content only), and a backend for the `task` build cache. Not needed for local use — `vk` keeps its own on-disk store by default. |
-| `vk-runnerctl` | Optional, and the only piece that runs as root: it sets gitlab-runner's `concurrent` from what `vk` measures, so a busy host stops taking work instead of overcommitting. It decides nothing and takes no arguments — see the [GitLab CI guide](docs/gitlab-ci.md). |
+| `vk-runnerctl` | Optional, and the only piece that runs as root: it sets gitlab-runner's `concurrent` from what `vk` measures, so a busy host stops taking work instead of overcommitting. It decides nothing and takes no arguments — see the [GitLab CI guide](docs/gitlab-ci.md#throttling-a-busy-runner). |
 
 ## How it works
 

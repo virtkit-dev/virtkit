@@ -1726,7 +1726,7 @@ fn admit_memory(ctx: &JobCtx, mem: &str) -> Result<Option<crate::admit::Reservat
 }
 
 /// "<n>G" (GiB) — the only size format the sizing variables accept
-fn parse_gib(s: &str) -> Result<u64> {
+pub(crate) fn parse_gib(s: &str) -> Result<u64> {
     let n = s
         .strip_suffix('G')
         .ok_or_else(|| anyhow!("expected <n>G"))?

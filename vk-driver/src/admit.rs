@@ -364,6 +364,35 @@ pub fn expect_mib(dir: &Path, key: &Path, declared_mib: u64) -> Option<u64> {
     Some(reserve_mib(most / MIB, declared_mib))
 }
 
+/// What every job this host remembers would reserve if it ran now, each read against the
+/// ceiling it last ran under — the scheduler sizing a typical job, which knows no job's
+/// ceiling. Histories are two deep (`<project>/<job>`), and only directories are descended,
+/// so the root's own lock file is passed over.
+pub fn all_expected(root: &Path) -> Vec<u64> {
+    let Ok(projects) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut expected = Vec::new();
+    for project in projects.flatten().filter(|p| p.path().is_dir()) {
+        let Ok(jobs) = std::fs::read_dir(project.path()) else {
+            continue; // removed under us, or not ours to read
+        };
+        for job in jobs.flatten() {
+            let key = PathBuf::from(project.file_name()).join(job.file_name());
+            expected.extend(expect_last_mib(root, &key));
+        }
+    }
+    expected
+}
+
+/// The same for a caller that does not know a job's ceiling — the scheduler asking what a
+/// typical job on this host reserves. Read against the ceiling the job last ran under, which
+/// is the one it would run under now.
+pub fn expect_last_mib(dir: &Path, key: &Path) -> Option<u64> {
+    let ceiling = read(dir, key).last()?.ceiling;
+    expect_mib(dir, key, ceiling / MIB)
+}
+
 fn reserve_mib(most_mib: u64, declared_mib: u64) -> u64 {
     // Saturating: the headroom is applied to a figure read off disk, and a wrapped total
     // would reserve less than the run it came from. The cap makes the ceiling the real bound.
@@ -458,14 +487,54 @@ fn scan(
     asked: u128,
     anomalies: &mut Vec<String>,
 ) -> Result<(u64, usize)> {
-    let (mut used_mib, mut ahead): (u64, usize) = (0, 0);
+    let held = tally(dir, job_id, asked, anomalies)?;
+    Ok((held.granted_mib, held.ahead))
+}
+
+/// What the ledger is holding: the memory granted and how many jobs hold it, plus how many
+/// asked before `asked` and are still waiting. Ignores `job_id` (the caller's own entry).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Held {
+    pub granted_mib: u64,
+    pub granted: usize,
+    pub ahead: usize,
+}
+
+/// What this host has committed right now, for a caller with no entry of its own — the
+/// scheduler reading the ledger to decide how much work the runner should accept.
+///
+/// A ledger that is not there yet holds nothing — no job on this host has ever been admitted,
+/// which is the honest answer on a fresh host and not a failure. A ledger that exists and
+/// cannot be read is an error, though: a scheduler told nothing is committed would offer the
+/// whole budget again, which is the one answer that overcommits the host.
+pub fn committed(dir: &Path) -> Result<Held> {
+    // Not `Path::exists()`: that answers false for a stat that failed for any reason — a
+    // permission error on a parent included — which is exactly the reading this must refuse.
+    match std::fs::metadata(dir) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Held::default()),
+        Err(e) => return Err(e).with_context(|| format!("statting {}", dir.display())),
+    }
+    let mut anomalies = Vec::new();
+    let out = {
+        let _lock = lock_dir(dir)?;
+        tally(dir, "", u128::MAX, &mut anomalies)
+    };
+    report(&anomalies);
+    out
+}
+
+fn tally(dir: &Path, job_id: &str, asked: u128, anomalies: &mut Vec<String>) -> Result<Held> {
+    let mut out = Held::default();
     let entries = std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?;
     for entry in entries {
         let path = entry
             .with_context(|| format!("reading {}", dir.display()))?
             .path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name == LOCK || name == job_id {
+        // Compared as an OsStr, never defaulted to "": `committed` passes "" for "no entry of
+        // my own", and a name that is not UTF-8 must not match it and go uncounted.
+        let name = path.file_name().unwrap_or_default();
+        if name == std::ffi::OsStr::new(LOCK) || name == std::ffi::OsStr::new(job_id) {
             continue;
         }
         let file = match File::open(&path) {
@@ -492,12 +561,13 @@ fn scan(
         // Saturating: these are numbers parsed out of a file, and a wrapped total would read
         // as room where there is none.
         if entry.granted {
-            used_mib = used_mib.saturating_add(entry.want_mib);
+            out.granted_mib = out.granted_mib.saturating_add(entry.want_mib);
+            out.granted = out.granted.saturating_add(1);
         } else if entry.asked < asked {
-            ahead = ahead.saturating_add(1);
+            out.ahead = out.ahead.saturating_add(1);
         }
     }
-    Ok((used_mib, ahead))
+    Ok(out)
 }
 
 /// One ledger entry: what the job wants, when it first asked (its place in the queue), and
@@ -1171,6 +1241,49 @@ mod tests {
             most_recent_at(&dir, &real, bytes(CEIL), now),
             Some((bytes(1600), 1))
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The scheduler asks what a typical job reserves without knowing any job's ceiling, so
+    /// each history answers for the one it last ran under.
+    #[test]
+    fn a_job_is_read_against_the_ceiling_it_last_ran_under() {
+        let dir = tmpdir("last-ceiling");
+        let now = 1_700_000_000;
+        remember_at(&dir, key("job"), bytes(3900), bytes(4096), now - 120);
+        remember_at(&dir, key("job"), bytes(9000), bytes(16384), now - 60);
+        // The 16 GiB run is the current one, so the estimate follows it and is capped there.
+        assert_eq!(
+            expect_last_mib(&dir, key("job")),
+            Some(reserve_mib(9000, 16384))
+        );
+
+        // Nothing recorded, nothing to read against.
+        assert_eq!(expect_last_mib(&dir, key("never-run")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the scheduler reads off the ledger: how much is granted, by how many jobs, and
+    /// how many are still queued behind them.
+    #[test]
+    fn the_ledger_reports_what_it_currently_holds() {
+        let dir = tmpdir("committed");
+        // Nothing there yet — not even the directory. A ledger that has never existed holds
+        // nothing; only one that exists and cannot be read is an error.
+        let empty = committed(&dir.join("missing")).expect("a fresh host holds nothing");
+        assert_eq!((empty.granted_mib, empty.granted, empty.ahead), (0, 0, 0));
+
+        let _running = held(&dir, "one", 2048, 1, true);
+        let _also = held(&dir, "two", 1024, 2, true);
+        let _queued = held(&dir, "three", 4096, 3, false);
+        let now = committed(&dir).unwrap();
+        assert_eq!(now.granted_mib, 3072, "only the granted count against it");
+        assert_eq!(now.granted, 2);
+        assert_eq!(now.ahead, 1, "the waiter is counted but not charged");
+
+        // The lock file the directory keeps is not a project, so nothing is read out of it.
+        assert!(dir.join(LOCK).exists(), "committed took the lock");
+        assert!(all_expected(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -14,6 +14,13 @@ All notable changes to virtkit will be documented in this file.
   can land on another runner. A job asking for more memory than the whole budget is clamped to
   it, as it already is to `[vm] max_mem`. Unset, nothing changes: every job starts as soon as
   gitlab-runner hands it over.
+- **A busy runner can stop taking work instead of overcommitting.** `vk tune`, run from a
+  timer, works out how many jobs this host can hold and leaves the figure for `vk-runnerctl`
+  — a new, deliberately tiny binary, the only part of virtkit that runs as root — to write
+  into gitlab-runner's `concurrent`. Jobs beyond it stay pending in GitLab rather than
+  occupying a slot on a full host, and the runner's capacity follows the load instead of
+  being guessed once. `vk-runnerctl` takes no arguments and no paths, so granting it root
+  grants nothing else; see the GitLab CI guide for the timer and sudoers forms.
 - **A runner can schedule on what jobs really use, not what they ask for.** With
   `[schedule] from_history`, a job is admitted against what runs of that same job have
   actually been using instead of a declared size it almost never reaches, so a host holds far
