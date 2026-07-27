@@ -1219,6 +1219,9 @@ impl MicroVm {
             .image_kernel_boot
             .as_ref()
             .map(|b| (b.kernel.as_path(), b.initramfs.as_path()));
+        // The one channel every stage's switch appends to, beside the audit log in the
+        // scratch the workers share — which is where the build reads it back from.
+        let bytes_log = self.scratch.join(crate::run::NET_BYTES);
         let s = block_on(crate::run::boot_session(
             &self.cloud_hypervisor,
             &self.kernel,
@@ -1235,6 +1238,7 @@ impl MicroVm {
             image_kernel,
             self.out_disk.as_deref(),
             self.audit_log.as_deref(),
+            Some(&bytes_log),
             self.cancel.clone(),
             &self.timings,
         ))?;

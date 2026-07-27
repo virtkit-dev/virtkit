@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::task::{Context as TaskCtx, Poll};
 use std::time::{Duration, Instant};
 
@@ -250,6 +250,16 @@ struct EgressGuard {
     /// same IP. Tracked independently of `pinned` because audit runs even under `AllowAll`,
     /// where nothing is pinned. Empty when audit is off.
     dns_ips: Mutex<HashSet<(Ipv4Addr, Ipv4Addr)>>,
+    /// Where the bytes forwarded are written for the job trace to read. `None` = don't
+    /// count. Unlike the audit channel this is not opt-in: what a job moved over the network
+    /// is part of what it cost, and the counting is one relaxed add per copy buffer.
+    bytes_log: Option<PathBuf>,
+    /// Payload forwarded out of and into the guests, in bytes. Not wire bytes: headers,
+    /// retransmits and the vsock framing around them are the host's business, not the job's.
+    sent: AtomicU64,
+    received: AtomicU64,
+    /// What the last publish wrote out, so each one appends only what is new.
+    published: Mutex<(u64, u64)>,
 }
 
 impl EgressGuard {
@@ -263,6 +273,10 @@ impl EgressGuard {
             denied_log: None,
             audit_log: None,
             dns_ips: Mutex::new(HashSet::new()),
+            bytes_log: None,
+            sent: AtomicU64::new(0),
+            received: AtomicU64::new(0),
+            published: Mutex::new((0, 0)),
         }
     }
     fn with_per_source(mut self, per_source: HashMap<Ipv4Addr, Egress>) -> Self {
@@ -280,6 +294,79 @@ impl EgressGuard {
     fn with_audit_log(mut self, path: Option<PathBuf>) -> Self {
         self.audit_log = path;
         self
+    }
+    fn with_bytes_log(mut self, path: Option<PathBuf>) -> Self {
+        self.bytes_log = path;
+        self
+    }
+
+    /// Add what has just crossed to the running totals: once per copy buffer for TCP — 8 KiB
+    /// at a time, not per byte — and once per datagram for UDP.
+    fn count(&self, sent: u64, received: u64) {
+        // Only the half that moved. A copy is one direction at a time, and the two counters
+        // share a cache line, so adding zero to the other would contend it for nothing.
+        if sent > 0 {
+            self.sent.fetch_add(sent, Ordering::Relaxed);
+        }
+        if received > 0 {
+            self.received.fetch_add(received, Ordering::Relaxed);
+        }
+    }
+
+    /// Open the byte channel with a line of zeros, so its existence says a switch is
+    /// counting for this phase. Without it an absent file means both "nothing was
+    /// forwarded" and "nothing is watching", and a `net.mode = "tap"` job — whose traffic
+    /// is real and goes nowhere near here — would be reported as having moved none.
+    fn open_bytes(&self) {
+        let Some(path) = &self.bytes_log else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write;
+            let _ = file.write_all(b"0 0\n");
+        }
+    }
+
+    /// Publish what has been forwarded since the last time, appending it to the channel the
+    /// reader sums. A delta rather than a total, so several switches can share one file — a
+    /// build gives every stage guest its own LAN, and each would otherwise overwrite the
+    /// others' figure. Best-effort: a lost update costs a trace one number and the LAN
+    /// nothing.
+    fn publish_bytes(&self) {
+        let Some(path) = &self.bytes_log else {
+            return;
+        };
+        // Read and advanced under the one lock. The totals only rise, so serialising the
+        // whole read-modify-write is what keeps a delta positive: loading them outside it
+        // lets two publishers take the lock in the opposite order to their loads, and the
+        // one that arrives second subtracts a larger total from a smaller one.
+        let (d_sent, d_received) = {
+            let mut published = self.published.lock().unwrap_or_else(|e| e.into_inner());
+            let (sent, received) = (
+                self.sent.load(Ordering::Relaxed),
+                self.received.load(Ordering::Relaxed),
+            );
+            let delta = (sent - published.0, received - published.1);
+            *published = (sent, received);
+            delta
+        };
+        if d_sent == 0 && d_received == 0 {
+            return; // nothing moved; leave the channel alone
+        }
+        // One `write_all` of one line, as the audit channel does it: two switches appending
+        // at once interleave whole records rather than fragments of them.
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write;
+            let _ = file.write_all(format!("{d_sent} {d_received}\n").as_bytes());
+        }
     }
     /// Record a refused flow to the denial channel for the job trace to surface. Paired
     /// with the switch's own `eprintln!` operator log at each call site.
@@ -472,7 +559,18 @@ pub struct Spawn {
     /// Audit mode: where the switch appends every allowed external domain the guest
     /// resolves, for the end-of-job "domains contacted" summary. `None` = audit off.
     pub audit_log: Option<PathBuf>,
+    /// Where the switch publishes the bytes it has forwarded, for the end-of-job resource
+    /// line. `None` = don't count, which only the standalone `vk switch` reaches: every
+    /// switch a run or a build boots is given a channel.
+    pub bytes_log: Option<PathBuf>,
 }
+
+/// How often the switch publishes what it has forwarded. Short, because a reader that cannot
+/// stop the switch first is only ever as current as the last beat: a run and a build stop
+/// theirs and lose nothing, but a CI job's figure is read while the job is still running and
+/// its switch is killed with the supervisor, so this interval bounds the tail a job can miss.
+/// The cost is an append of two numbers, and only when something moved.
+const BYTES_PUBLISH: Duration = Duration::from_millis(500);
 
 /// Spawn the switch as a tied child of this process (this binary's `switch`
 /// subcommand). Every consumer — `run`, the gitlab job supervisor —
@@ -529,6 +627,9 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
     if let Some(audit) = &opts.audit_log {
         cmd.arg("--audit-log").arg(audit);
     }
+    if let Some(bytes) = &opts.bytes_log {
+        cmd.arg("--net-bytes").arg(bytes);
+    }
     cmd.stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -559,6 +660,7 @@ pub async fn run(
     registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
     denied_log: Option<PathBuf>,
     audit_log: Option<PathBuf>,
+    bytes_log: Option<PathBuf>,
 ) -> Result<()> {
     if listen.is_empty() {
         bail!("switch: at least one --listen is required");
@@ -584,10 +686,43 @@ pub async fn run(
             .with_per_source(per_source)
             .with_registry_proxy(registry_proxy)
             .with_denied_log(denied_log)
-            .with_audit_log(audit_log),
+            .with_audit_log(audit_log)
+            .with_bytes_log(bytes_log),
     );
     let restricted = guard.restricted();
+    guard.open_bytes();
     tokio::spawn(accept_loop(ip_stack, guard.clone()));
+    // The totals go out on a timer, so a reader that cannot stop the switch first — the job
+    // trace, read while the job is still running — is at most a beat behind.
+    tokio::spawn({
+        let guard = guard.clone();
+        async move {
+            loop {
+                tokio::time::sleep(BYTES_PUBLISH).await;
+                guard.publish_bytes();
+            }
+        }
+    });
+    // And once more on the way out, which is what makes a `vk run` figure whole: its last
+    // flow closes as the guest exits, too late for the beat before teardown. A reader that
+    // stops the switch and waits for it therefore has everything it carried.
+    tokio::spawn({
+        let guard = guard.clone();
+        async move {
+            if let Ok(mut term) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            {
+                term.recv().await;
+                // PDEATHSIG is SIGTERM (see spawn_tied), so handling it puts this process's
+                // death on the runtime where the default disposition needed nothing at all.
+                // SIGALRM's default action terminates, so a publish that wedges still goes.
+                // SAFETY: alarm(2) only arms this process's own timer.
+                unsafe { libc::alarm(5) };
+                guard.publish_bytes();
+                std::process::exit(0);
+            }
+        }
+    });
 
     let upstream = host_upstream();
     let sw = Arc::new(Switch {
@@ -896,12 +1031,71 @@ async fn proxy_tcp(mut guest: ipstack::IpStackTcpStream, egress: Arc<EgressGuard
         }
     };
     match connect_egress(target, CONNECT_TIMEOUT).await {
-        Ok(mut host) => {
+        Ok(host) => {
+            // Counted as the bytes pass rather than from what the copy returns: a flow torn
+            // down by either end — which is how most of them end — reports an error and no
+            // counts at all, and a job's traffic would read as zero.
+            let mut host = Counted {
+                inner: host,
+                egress: egress.clone(),
+            };
             let _ = tokio::io::copy_bidirectional(&mut guest, &mut host).await;
         }
         // Connect refused, failed, or timed out: return so the guest stream drops and
         // ipstack RSTs it, failing the guest's flow at once instead of leaving it hung.
         Err(e) => eprintln!("switch: tcp connect {target}: {e} — closing guest flow"),
+    }
+}
+
+/// The host side of a guest flow, with what crosses it added to the switch's totals. Wraps
+/// the host end rather than the guest end so what is counted is what actually left the box:
+/// a write to the host is the guest sending, a read from it the guest receiving.
+struct Counted<S> {
+    inner: S,
+    egress: Arc<EgressGuard>,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Counted<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &polled {
+            let read = buf.filled().len() - before;
+            self.egress.count(0, read as u64);
+        }
+        polled
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Counted<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(written)) = &polled {
+            self.egress.count(*written as u64, 0);
+        }
+        polled
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -947,10 +1141,19 @@ async fn proxy_udp(mut guest: ipstack::IpStackUdpStream, egress: Arc<EgressGuard
         tokio::select! {
             r = guest.read(&mut from_guest) => match r {
                 Ok(0) | Err(_) => return,
-                Ok(n) => { let _ = host.send(&from_guest[..n]).await; }
+                Ok(n) => {
+                    if host.send(&from_guest[..n]).await.is_ok() {
+                        egress.count(n as u64, 0);
+                    }
+                }
             },
             r = host.recv(&mut from_host) => match r {
-                Ok(n) => { if guest.write_all(&from_host[..n]).await.is_err() { return; } }
+                Ok(n) => {
+                    if guest.write_all(&from_host[..n]).await.is_err() {
+                        return;
+                    }
+                    egress.count(0, n as u64);
+                }
                 Err(_) => return,
             },
         }
@@ -1977,6 +2180,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await;
         });
@@ -2039,6 +2243,7 @@ mod tests {
                 HashMap::new(),
                 Egress::AllowAll,
                 HashMap::new(),
+                None,
                 None,
                 None,
                 None,
@@ -2256,5 +2461,84 @@ mod tests {
             alloc_lease(&mut inner, &cfg, [0xcc; 6]),
             Some(Ipv4Addr::new(192, 168, 127, 4))
         );
+    }
+
+    /// A scratch byte channel for the counter tests, where the rest of this module's tests
+    /// put theirs.
+    fn bytes_channel(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("vk-switch-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch dir");
+        dir.join(crate::run::NET_BYTES)
+    }
+
+    /// Every byte counted reaches the channel exactly once, however many publishers race.
+    /// The reader sums the deltas, so a publish that went backwards would both lose its own
+    /// figure and — the totals being unsigned — invent an astronomical one in its place,
+    /// which `admit` would then remember as this job's appetite for a fortnight.
+    #[test]
+    fn racing_publishers_sum_to_exactly_what_was_counted() {
+        const THREADS: u64 = 8;
+        const EACH: u64 = 2000;
+        const SENT: u64 = 8192;
+        const RECEIVED: u64 = 4096;
+
+        let path = bytes_channel("racing");
+        let guard = Arc::new(
+            EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
+                .with_bytes_log(Some(path.clone())),
+        );
+        guard.open_bytes();
+        let writers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let guard = Arc::clone(&guard);
+                std::thread::spawn(move || {
+                    for _ in 0..EACH {
+                        guard.count(SENT, RECEIVED);
+                        guard.publish_bytes();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().expect("a publishing thread panicked");
+        }
+        // Whatever the threads left unpublished goes out here, so the sum is the whole of it.
+        guard.publish_bytes();
+
+        assert_eq!(
+            crate::egress_report::read_net_bytes(&path),
+            Some((THREADS * EACH * SENT, THREADS * EACH * RECEIVED))
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The two directions are kept apart, and a channel nobody wrote to reads as nothing at
+    /// all rather than as a pair of zeros — the distinction the trace line rests on.
+    #[test]
+    fn each_direction_is_counted_on_its_own_side() {
+        let path = bytes_channel("directions");
+        let guard = EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
+            .with_bytes_log(Some(path.clone()));
+
+        assert_eq!(crate::egress_report::read_net_bytes(&path), None);
+        guard.open_bytes();
+        assert_eq!(crate::egress_report::read_net_bytes(&path), Some((0, 0)));
+
+        guard.count(1500, 0);
+        guard.count(0, 9000);
+        guard.publish_bytes();
+        assert_eq!(
+            crate::egress_report::read_net_bytes(&path),
+            Some((1500, 9000))
+        );
+
+        // Nothing moved since, so nothing is appended and the totals stand.
+        guard.publish_bytes();
+        assert_eq!(
+            crate::egress_report::read_net_bytes(&path),
+            Some((1500, 9000))
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

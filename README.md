@@ -66,14 +66,17 @@ in the repo itself (`image: dockerfile:…`). See the
 and services.
 
 Know what the work cost. A build, a `vk run`, and a CI job each end with the CPU
-time, the peak memory and the disk traffic they cost the host, the guests' own
-execution included. Read each as a ceiling — the totals carry vk's own work and
-the host helpers alongside the guests — and size `--mem`/`--cpus` and their
-config equivalents from what the work costs rather than by guess. Where several
-guests run at once (concurrent build stages, a compose fleet) a build and a
-`vk run` also name the largest single process, which is the difference between
-giving each guest more memory and running fewer of them at a time. See the
-[GitLab CI guide](docs/gitlab-ci.md#resource-usage) for what each figure covers.
+time, the peak memory, and the disk and network traffic they cost the host, the
+guests' own execution included. Read the CPU, memory and disk as a ceiling — those
+totals carry vk's own work and the host helpers alongside the guests — and the
+network as the guests' share alone, since vk's own image pulls never cross the
+switch that counts it. Size `--mem`/`--cpus` and their config equivalents from
+what the work costs rather than by guess.
+Where several guests run at once (concurrent build stages, a compose fleet) a
+build and a `vk run` also name the largest single process, which is the
+difference between giving each guest more memory and running fewer of them at a
+time. See the [GitLab CI guide](docs/gitlab-ci.md#resource-usage) for what each
+figure covers.
 
 Carry one file around. The hypervisor, the guest kernel, and the guest agent are
 all embedded in `vk`, so you can copy it to any Linux machine with `/dev/kvm`

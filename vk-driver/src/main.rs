@@ -574,6 +574,10 @@ enum Cmd {
         /// executor; see egress_report).
         #[arg(long = "audit-log", value_name = "PATH")]
         audit_log: Option<PathBuf>,
+        /// publish the bytes forwarded here, for the end-of-phase resource line (set
+        /// internally by `vk run`, `vk build` and the gitlab executor; see egress_report).
+        #[arg(long = "net-bytes", value_name = "PATH")]
+        net_bytes: Option<PathBuf>,
     },
     /// Run a docker/OCI image as a microVM — boot it from a native ext4 disk
     /// (or a cpio initramfs in RAM with --ram), virtkit-agent as PID 1 over vsock, and
@@ -2190,6 +2194,7 @@ async fn cli_main() -> ExitCode {
         registry_proxy,
         denied_log,
         audit_log,
+        net_bytes,
     } = &cli.cmd
     {
         let mut listen_bind = Vec::with_capacity(listen.len());
@@ -2265,6 +2270,7 @@ async fn cli_main() -> ExitCode {
             proxy,
             denied_log.clone(),
             audit_log.clone(),
+            net_bytes.clone(),
         )
         .await
         {

@@ -90,13 +90,13 @@ Each phase reports what it cost the runner. A job that builds its own image
 its timing breakdown — a job whose image is already built runs no build and reports none:
 
 ```
-virtkit: build resource usage: cpu 8m12s, peak memory 3.2 GiB (largest process 1.2 GiB), read 1.8 GiB, written 4.1 GiB
+virtkit: build resource usage: cpu 8m12s, peak memory 3.2 GiB (largest process 1.2 GiB), read 1.8 GiB, written 4.1 GiB, sent 12 MiB, received 2.7 GiB
 ```
 
 and the run figures come at the very end of the trace:
 
 ```
-virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB, read 3.4 GiB, written 812 MiB
+virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB, read 3.4 GiB, written 812 MiB, sent 3 MiB, received 941 MiB
 ```
 
 `cpu` is all the CPU time the phase burned on the host, the guests' own execution
@@ -145,11 +145,22 @@ discovering:
 - a job re-run on a warm host reads far less than the same job on a cold one, which is the
   cache doing its job rather than the measurement wavering.
 
+`sent` and `received` are what the phase's guests moved **in and out of the host**, counted
+by the switch that forwards it — payload from the guests' side, so the framing around it and
+any retransmit under it are the host's traffic rather than the job's. What the guests send
+each other is switched between them without ever being forwarded, so it is not in the figure.
+Each phase counts its own: what a `dockerfile:` build's `RUN` steps fetched is on the build
+line, the packages the job's steps installed and the artifacts they uploaded on the job line.
+Only what a guest pulled is in either: `vk` resolves and pulls a base image itself, on the
+host and outside the switch, so those layers are in neither figure. A job
+on `net.mode = "tap"` has no switch in its path, so it reports no network at all rather than
+zero.
+
 A measured zero is printed — `read 0 B` says this job touched no disk, which is a fact
 about the job. The clause is left off only where the figure could not be taken at all: a
-kernel built without `CONFIG_TASK_IO_ACCOUNTING`. The history keeps the two apart as well,
-so a host that cannot measure never leaves a job remembered as having moved nothing, and
-`vk check` says which of the two a host is:
+kernel built without `CONFIG_TASK_IO_ACCOUNTING`, or a network nothing counted. The history
+keeps the two apart as well, so a host that cannot measure never leaves a job remembered as
+having moved nothing, and `vk check` says whether this kernel accounts block I/O:
 
 ```
 ok   usage    block I/O accounted, process tree from the kernel's child lists
@@ -271,9 +282,13 @@ Every job trace says where it stands, whether or not the host reserves this way 
 is how you decide to:
 
 ```
-virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB, read 3.4 GiB, written 812 MiB
-virtkit: most this job has used lately: memory 2.1 GiB, read 12.0 GiB, written 3.1 GiB over 37 runs; the next run reserves 2.6 GiB
+virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB, read 3.4 GiB, written 812 MiB, sent 3 MiB, received 941 MiB
+virtkit: most this job has used lately: memory 2.1 GiB, read 12.0 GiB, written 3.1 GiB, sent 40 MiB, received 4.2 GiB over 37 runs; the next run reserves 2.6 GiB
 ```
+
+Only the memory is reserved against; the traffic rides along because a job that pulls 4 GiB
+in and out of the host every run is a fact about the host worth knowing. Each figure is its
+own maximum over the window, so they need not all come from the same run.
 
 The run count is what the estimate rests on: the runs of the last 14 days, or the last five
 however old for a job too quiet to have that many. The `; the next run reserves …` clause

@@ -238,6 +238,12 @@ impl JobCtx {
     pub fn switch_log(&self) -> PathBuf {
         self.job_dir.join("switch.log")
     }
+    /// Where the per-job switch publishes the bytes it has forwarded, for the end-of-job
+    /// resource line. Always written when there is a switch: what a job moved over the
+    /// network is part of what it cost, not something to opt into.
+    pub fn net_bytes_log(&self) -> PathBuf {
+        self.job_dir.join("net.bytes")
+    }
     /// Typed egress-denial records the switch appends and each `run` stage drains into the
     /// job trace (see egress_report). Separate from the human `switch.log`.
     pub fn egress_denied_log(&self) -> PathBuf {

@@ -74,6 +74,16 @@ const GUEST_AGENT: &str = "/proc/self/exe";
 /// Guest mountpoint of a `--workdir` host-dir share (the live tree the command runs in).
 const WORKDIR_MOUNT: &str = "/work";
 
+/// Where the switches of a run or build publish the bytes they forwarded, in the same work
+/// dir, for the resource line each phase ends with. Every switch of a build appends its own
+/// deltas, so the file is the whole phase's traffic.
+pub(crate) const NET_BYTES: &str = "net.bytes";
+
+/// How long a run waits for its switch to publish and exit at teardown. Long enough for a
+/// signal and one append, short enough that a wedged switch costs the run nothing anyone
+/// would notice.
+const SWITCH_STOP: Duration = Duration::from_millis(300);
+
 /// Audit-mode channel filename in a switch's work dir (or the build scratch): the switch
 /// appends every external domain the guest resolves, the caller prints the summary at the
 /// end (see egress_report). Same basename the gitlab executor uses in the job dir.
@@ -253,6 +263,11 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
             WorkDir::create(default_scratch_base()?.join(format!("launch-{}", std::process::id())))?
         }
     };
+    // The byte channel is a sum over everything appended to it, and a work dir can outlive the
+    // run that made it: `--state-dir` is created-or-reused and never removed, and a run killed
+    // by a signal leaves its `launch-<pid>` behind for a recycled pid to find. Cleared here so
+    // this run reports its own traffic rather than every earlier run's on top of it.
+    let _ = std::fs::remove_file(work.path.join(NET_BYTES));
     // Resolve the agent and kernel: an explicit flag wins, else the copy embedded
     // in `vk` (served from a memfd), else the on-disk default.
     // Held for the VM's lifetime: an embedded asset lives in a memfd whose
@@ -1051,6 +1066,7 @@ async fn build_and_boot(
             &planned.reservations,
             registry_proxy,
             args.audit_egress.then(|| work.join(AUDIT_LOG)),
+            Some(work.join(NET_BYTES)),
             // Dev `vk run` egress is unrestricted (no allowlist plumbed here).
             false,
         )
@@ -1516,9 +1532,13 @@ async fn build_and_boot(
         eprintln!("{summary}");
     }
     timings.render();
-    // Read after teardown: every guest and helper has been waited for, so their CPU is in.
+    // Read after teardown: every guest and helper has been waited for, so their CPU is in
+    // and the switch has published the last of what it carried.
     if let Some(usage) = meter.read() {
-        eprintln!("{}", usage.summary("run"));
+        eprintln!(
+            "{}",
+            usage.with_network(&work.join(NET_BYTES)).summary("run")
+        );
     }
     result
 }
@@ -1544,7 +1564,22 @@ fn teardown_run(
     if let Some(mgr) = manager {
         mgr.stop_all();
     }
-    for mut child in virtiofsds.drain(..).chain(switch.take()) {
+    for mut child in virtiofsds.drain(..) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    if let Some(child) = switch.take() {
+        stop_switch(child);
+    }
+}
+
+/// Stop a run's switch, giving it the moment it needs to publish the bytes it carried
+/// ([`NET_BYTES`]) before it goes. SIGKILLed like the rest, a run's last flow — which closes
+/// as the guest exits — would be missing from the figure the run reports. Bounded because
+/// nothing but a resource line depends on it: a switch that does not go on its own is killed.
+fn stop_switch(mut child: Child) {
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    if !crate::vm::wait_child_gone(&mut child, SWITCH_STOP) {
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -1793,6 +1828,7 @@ async fn compose_up(
         &planned.reservations,
         None,
         args.audit_egress.then(|| work.join(AUDIT_LOG)),
+        Some(work.join(NET_BYTES)),
         false,
     )
     .await?;
@@ -1832,8 +1868,7 @@ async fn compose_up(
     tokio::signal::ctrl_c().await.ok();
     println!("virtkit: stopping ...");
     mgr.stop_all();
-    let _ = switch.kill();
-    let _ = switch.wait();
+    stop_switch(switch);
     if let Some(summary) = crate::egress_report::contacts_summary(
         &work.join(AUDIT_LOG),
         "external domains contacted (audit)",
@@ -1848,7 +1883,10 @@ async fn compose_up(
     }
     // Read after stop_all: every service VM has been waited for, so their CPU is in.
     if let Some(usage) = meter.read() {
-        eprintln!("{}", usage.summary("run"));
+        eprintln!(
+            "{}",
+            usage.with_network(&work.join(NET_BYTES)).summary("run")
+        );
     }
     Ok(())
 }
@@ -2575,6 +2613,10 @@ async fn spawn_vm_switch(
     reservations: &[(String, String)],
     registry_proxy: Option<(std::net::Ipv4Addr, std::net::SocketAddr)>,
     audit_log: Option<PathBuf>,
+    // Where this switch publishes what it forwarded, for the phase's resource line. A build
+    // passes its shared scratch, so every stage's switch appends to the one file the build
+    // reads at the end; a run passes its own work dir.
+    bytes_log: Option<PathBuf>,
     // Force allowlist mode even with empty lists (deny-all) — the CI build phase sets this
     // for a restricted `[egress.build]`. Dev `vk run` passes `false` (unset = unrestricted).
     restrict: bool,
@@ -2605,6 +2647,9 @@ async fn spawn_vm_switch(
         // Audit mode (`--audit-egress` / `--build-audit-egress`) records every external
         // domain the guest resolves; the caller prints the summary when the run/build ends.
         audit_log,
+        // What the switch forwarded, for the phase's own resource line — into whichever
+        // channel the caller reads at the end.
+        bytes_log,
     })?;
     let frag = format!(
         " VIRTKIT_NET_PORT={net_port} VIRTKIT_VM_IP={guest_ip}/{prefix} \
@@ -2685,6 +2730,10 @@ pub(crate) async fn boot_session(
     // external domain a `RUN` step resolves here (a channel shared across the build's stages),
     // for the post-build "domains contacted" summary. `None` = no audit.
     audit_log: Option<&Path>,
+    // `Some(path)` → the build's byte channel (`<scratch>/net.bytes`), shared across its
+    // stages the way the audit channel is: each stage's switch appends what it forwarded, and
+    // the build sums them into its resource line. `None` = nothing reads it, so nothing counts.
+    bytes_log: Option<&Path>,
     cancel: Option<CancellationToken>,
     timings: &Timings,
 ) -> Result<VmSession> {
@@ -2836,6 +2885,7 @@ pub(crate) async fn boot_session(
             &[],
             None,
             audit_log.map(Path::to_path_buf),
+            bytes_log.map(Path::to_path_buf),
             // A restricted build policy (`BuildNet::Allow`, incl. empty = deny) forces
             // allowlist mode; `BuildNet::All` is unrestricted.
             matches!(net, crate::build::BuildNet::Allow { .. }),
@@ -3149,10 +3199,13 @@ impl VmSession {
         self.flush_disk();
         let _ = self.ch.kill();
         let _ = self.ch.wait();
-        for c in [self.switch.as_mut(), self.virtiofsd.as_mut()]
-            .into_iter()
-            .flatten()
-        {
+        // The switch is stopped rather than killed, for the same reason a run stops its own:
+        // a stage whose last act is a download has that download in the counters and not yet
+        // in the channel, and the build reads the channel after every stage has gone.
+        if let Some(c) = self.switch.take() {
+            stop_switch(c);
+        }
+        if let Some(c) = self.virtiofsd.as_mut() {
             let _ = c.kill();
             let _ = c.wait();
         }
@@ -3166,10 +3219,13 @@ impl Drop for VmSession {
         // a session dropped without finish() (e.g. a failed RUN) must not leak the VM.
         let _ = self.ch.kill();
         let _ = self.ch.wait();
-        for c in [self.switch.as_mut(), self.virtiofsd.as_mut()]
-            .into_iter()
-            .flatten()
-        {
+        // The switch is stopped rather than killed, for the same reason a run stops its own:
+        // a stage whose last act is a download has that download in the counters and not yet
+        // in the channel, and the build reads the channel after every stage has gone.
+        if let Some(c) = self.switch.take() {
+            stop_switch(c);
+        }
+        if let Some(c) = self.virtiofsd.as_mut() {
             let _ = c.kill();
             let _ = c.wait();
         }
@@ -3491,6 +3547,7 @@ mod tests {
                 None, // image_kernel (--kernel=image)
                 None, // out_disk (--disk)
                 None, // audit_log
+                None, // bytes_log
                 None, // cancel
                 &Timings::new(),
             )

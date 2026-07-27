@@ -153,9 +153,9 @@ fn report_egress_audit(ctx: &JobCtx) {
     }
 }
 
-/// Print what the job cost the runner — the CPU time, peak memory and disk traffic of its
-/// microVM and the host helpers around it (see usage) — into the job trace, so a job can be
-/// sized from what it actually used. Sampled here rather than at cleanup because this is the
+/// Print what the job cost the runner — the CPU time, peak memory, and disk and network
+/// traffic of its microVM and the host helpers around it (see usage) — into the job trace,
+/// so a job can be sized from what it actually used. Sampled here rather than at cleanup because this is the
 /// last stage whose output the trace still keeps, and the job's processes are all still alive
 /// to be read: it therefore covers everything but the guest's own shutdown. Best-effort: a
 /// job whose supervisor is already gone (the guest died) reports nothing.
@@ -164,7 +164,7 @@ fn report_egress_audit(ctx: &JobCtx) {
 /// reserves from history (`[schedule] from_history`), so it is recorded here too.
 fn report_resource_usage(ctx: &JobCtx) {
     if let Some(pid) = crate::vm::live_supervisor_pid(ctx)
-        && let Some(usage) = crate::usage::tree(pid)
+        && let Some(usage) = crate::usage::tree(pid).map(|u| u.with_network(&ctx.net_bytes_log()))
     {
         eprintln!("{}", usage.summary("job"));
         // Recorded before it is summarised, so the line below counts this run too, and in the
@@ -183,6 +183,7 @@ fn report_resource_usage(ctx: &JobCtx) {
                     peak: usage.peak_rss,
                     ceiling,
                     disk: usage.disk,
+                    network: usage.network,
                 },
             );
             report_job_history(ctx, ceiling_mib);

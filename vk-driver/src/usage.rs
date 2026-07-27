@@ -50,9 +50,28 @@ pub struct Usage {
     /// which [`io_accounted`] answers for). Not the same as a phase that moved none, and not
     /// to be recorded as if it were: one is a fact about the job, the other about the host.
     pub disk: Option<(u64, u64)>,
+    /// `(sent, received)` between the guests and the outside, payload only, as counted by
+    /// the userspace switch that forwards it — the only thing in a position to: the traffic
+    /// never touches a host interface, and no `/proc` counter has it. Guest-to-guest traffic
+    /// is switched at layer 2 and never proxied, so it is not in here.
+    ///
+    /// `None` where no switch reported, which a `net.mode = "tap"` phase is: its traffic is
+    /// real and uncounted, and calling that zero would be a lie about a job that pulled
+    /// gigabytes.
+    pub network: Option<(u64, u64)>,
 }
 
 impl Usage {
+    /// Fold in what the switch at `bytes_log` forwarded. Separate from the rest because the
+    /// egress is measured by another process entirely: neither `getrusage` nor `/proc` can
+    /// say what it carried, only the switch that carried it.
+    pub fn with_network(self, bytes_log: &std::path::Path) -> Usage {
+        Usage {
+            network: crate::egress_report::read_net_bytes(bytes_log),
+            ..self
+        }
+    }
+
     /// The trace line for `phase` (`job`, `build`, `run`):
     /// `virtkit: build resource usage: cpu 2m14s, peak memory 1.6 GiB (largest process 900 MiB)`.
     pub fn summary(&self, phase: &str) -> String {
@@ -71,8 +90,18 @@ impl Usage {
             }
             None => String::new(),
         };
+        // Same rule as the disk clause: a switch that carried nothing says so, and a phase
+        // with no switch to ask says nothing.
+        let net = match self.network {
+            Some((sent, received)) => format!(
+                ", sent {}, received {}",
+                fmt_bytes(sent),
+                fmt_bytes(received)
+            ),
+            None => String::new(),
+        };
         format!(
-            "virtkit: {phase} resource usage: cpu {}, peak memory {total}{largest}{disk}",
+            "virtkit: {phase} resource usage: cpu {}, peak memory {total}{largest}{disk}{net}",
             fmt_cpu(self.cpu),
         )
     }
@@ -217,6 +246,9 @@ impl Meter {
             let (read, written) = rusage_disk();
             Usage {
                 cpu: rusage_cpu().saturating_sub(self.cpu_before),
+                // Not this process's to measure: the switch counts the egress, and the caller
+                // that knows where it publishes folds it in with [`Usage::with_network`].
+                network: None,
                 peak_rss: peak,
                 largest_rss: Some(largest),
                 disk: io_accounted().then(|| {

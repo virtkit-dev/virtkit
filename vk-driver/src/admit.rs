@@ -211,9 +211,9 @@ const FLOOR_MIB: u64 = 512;
 const MIB: u64 = 1024 * 1024;
 
 /// One remembered run: when it ended, the peak it reached, the ceiling it ran under, and the
-/// disk it moved. The ceiling matters because a peak is only evidence of what a job needs
-/// while the job was free to need it — a run held to 4 GiB says nothing about the same job
-/// given 16.
+/// disk and network traffic it moved. The ceiling matters because a peak is only evidence of
+/// what a job needs while the job was free to need it — a run held to 4 GiB says nothing
+/// about the same job given 16.
 ///
 /// Every figure is in **bytes**. Memory alone would read fine in MiB — it is what the
 /// reservation arithmetic and `MICROVM_MEM` are in — but the traffic beside it routinely
@@ -229,6 +229,10 @@ struct Sample {
     /// the job, "nobody could tell" one about the host, and a maximum that mixed them would
     /// report the second as the first for a fortnight.
     disk: Option<(u64, u64)>,
+    /// What its guests sent and received between them and the outside, under the same rule:
+    /// `None` where no switch counted — a `net.mode = "tap"` run, whose traffic goes nowhere
+    /// near one.
+    network: Option<(u64, u64)>,
 }
 
 /// What one run of a job cost, as its history remembers it, in bytes.
@@ -238,25 +242,35 @@ pub struct Run {
     pub ceiling: u64,
     /// What it moved to and from the disk, or `None` where the host could not measure.
     pub disk: Option<(u64, u64)>,
+    /// What its guests sent and received outside, or `None` where nothing counted it.
+    pub network: Option<(u64, u64)>,
 }
 
 /// The most a job has needed lately, in bytes, and over how many runs. Memory is what a
-/// reservation is made of; the disk figures ride along because a job that reads 40 GiB every
-/// run is a fact about the host worth knowing, even though nothing reserves against it. Each
-/// figure is its own maximum over the window, so the three need not come from the same run.
+/// reservation is made of; the traffic figures ride along because a job that reads 40 GiB or
+/// pulls 8 GiB over the network every run is a fact about the host worth knowing, even though
+/// nothing reserves against either. Each figure is its own maximum over the window, so they
+/// need not come from the same run.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Recent {
     most: u64,
     /// The heaviest disk of the runs that measured it, or `None` where none did.
     most_disk: Option<(u64, u64)>,
+    /// The same for the network.
+    most_network: Option<(u64, u64)>,
     runs: usize,
 }
 
 /// Note what a job of this kind actually used, and the ceiling it used it under, for the
-/// next one to be admitted against. One `<unix seconds> <peak> <ceiling> <read> <written>`
-/// line per run, every figure in bytes, appended whole so runs finishing together cannot
-/// tear each other's; best-effort, since a lost sample only costs accuracy on the next
-/// admission.
+/// next one to be admitted against. One
+/// `<unix seconds> <peak> <ceiling> <read> <written> <sent> <received>` line per run, every
+/// figure in bytes and an unmeasured pair written `-`, appended whole so runs finishing
+/// together cannot tear each other's; best-effort, since a lost sample only costs accuracy
+/// on the next admission.
+///
+/// Widening the line retires the histories written before it: a run without the new fields
+/// is dropped rather than read short, since a reader loose enough to accept it could not
+/// tell a torn append from a whole one. A host loses a fortnight of estimates once.
 pub fn remember(dir: &Path, key: &Path, run: Run) {
     remember_at(dir, key, run, now_secs())
 }
@@ -307,6 +321,7 @@ fn remember_at(dir: &Path, key: &Path, run: Run, now: u64) {
                 peak: run.peak,
                 ceiling: run.ceiling,
                 disk: run.disk,
+                network: run.network,
             })
             .as_bytes(),
         );
@@ -379,18 +394,20 @@ fn most_recent_at(dir: &Path, key: &Path, ceiling: u64, now: u64) -> Option<Rece
         most: peak,
         // Only the runs that measured it vote: one that could not is left out rather than
         // dragging the maximum down to zero.
-        most_disk: {
-            let measured: Vec<(u64, u64)> = window.iter().filter_map(|s| s.disk).collect();
-            match (
-                measured.iter().map(|(r, _)| *r).max(),
-                measured.iter().map(|(_, w)| *w).max(),
-            ) {
-                (Some(read), Some(written)) => Some((read, written)),
-                _ => None,
-            }
-        },
+        most_disk: heaviest(window, |s| s.disk),
+        most_network: heaviest(window, |s| s.network),
         runs: window.len(),
     })
+}
+
+/// The largest each half of a pair reached, over the runs that measured it. `None` where
+/// none did: a window in which nobody could take the figure has no maximum to report, which
+/// is not the same as one whose runs all moved nothing.
+fn heaviest(window: &[Sample], of: fn(&Sample) -> Option<(u64, u64)>) -> Option<(u64, u64)> {
+    window
+        .iter()
+        .filter_map(of)
+        .reduce(|(a, b), (c, d)| (a.max(c), b.max(d)))
 }
 
 /// The runs taken under `ceiling` bytes, in order. A run held to a lower ceiling may have been
@@ -508,17 +525,22 @@ fn parse(text: &str) -> Vec<Sample> {
                     n => n.parse().ok().map(Some),
                 }
             };
-            let sample = Sample {
-                at_secs: fields.next()?.parse().ok()?,
-                peak: fields.next()?.parse().ok()?,
-                ceiling: fields.next()?.parse().ok()?,
-                disk: None,
+            let at_secs = fields.next()?.parse().ok()?;
+            let peak = fields.next()?.parse().ok()?;
+            let ceiling = fields.next()?.parse().ok()?;
+            // Both halves or neither: a pair with one figure missing reads as unmeasured,
+            // and a field that is neither a number nor `-` drops the line.
+            let mut pair = || -> Option<Option<(u64, u64)>> {
+                let one = unmeasurable_or(fields.next()?)?;
+                let other = unmeasurable_or(fields.next()?)?;
+                Some(one.zip(other))
             };
-            let read = unmeasurable_or(fields.next()?)?;
-            let written = unmeasurable_or(fields.next()?)?;
             Some(Sample {
-                disk: read.zip(written),
-                ..sample
+                at_secs,
+                peak,
+                ceiling,
+                disk: pair()?,
+                network: pair()?,
             })
         })
         .collect()
@@ -527,11 +549,18 @@ fn parse(text: &str) -> Vec<Sample> {
 /// One history line, the only place the on-disk shape is written. A figure nobody could take
 /// is written `-`, so reading it back cannot mistake it for zero.
 fn sample_line(s: &Sample) -> String {
-    let (read, written) = match s.disk {
-        Some((read, written)) => (read.to_string(), written.to_string()),
-        None => ("-".to_string(), "-".to_string()),
+    let pair = |p: Option<(u64, u64)>| match p {
+        Some((one, other)) => format!("{one} {other}"),
+        None => "- -".to_string(),
     };
-    format!("{} {} {} {read} {written}\n", s.at_secs, s.peak, s.ceiling)
+    format!(
+        "{} {} {} {} {}\n",
+        s.at_secs,
+        s.peak,
+        s.ceiling,
+        pair(s.disk),
+        pair(s.network)
+    )
 }
 
 /// The line a job trace ends with when the host has seen this job before: what it has been
@@ -571,9 +600,10 @@ fn history_summary_at(
     // are — and a line reading "37 runs in 14 days" would then be a statement of throughput
     // that is simply untrue. The guide gives the exact rule.
     let disk = moved("read", "written", recent.most_disk);
+    let net = moved("sent", "received", recent.most_network);
     let most = crate::usage::fmt_bytes(recent.most);
     Some(format!(
-        "virtkit: most this job has used lately: memory {most}{disk} \
+        "virtkit: most this job has used lately: memory {most}{disk}{net} \
          over {runs} {plural}{reserves}"
     ))
 }
@@ -1308,8 +1338,9 @@ mod tests {
             line,
             "virtkit: most this job has used lately: memory 1.6 GiB over 2 runs"
         );
-        // A run that moved disk puts it on the line beside the memory — as the two runs above,
-        // which moved none, left it off rather than reading as zero.
+        // A run that moved disk and pulled traffic puts both on the line beside the memory —
+        // as the two runs above, which measured neither, left them off rather than reading as
+        // zero.
         remember_at(
             &dir,
             key("job"),
@@ -1317,13 +1348,14 @@ mod tests {
                 peak: 1600 * MIB,
                 ceiling: ceiling(CEIL),
                 disk: Some((3482 * MIB, 812 * MIB)),
+                network: Some((3 * MIB, 941 * MIB)),
             },
             now,
         );
         assert_eq!(
             history_summary_at(&dir, key("job"), 8192, false, now).unwrap(),
             "virtkit: most this job has used lately: memory 1.6 GiB, read 3.4 GiB, \
-             written 812 MiB over 3 runs"
+             written 812 MiB, sent 3 MiB, received 941 MiB over 3 runs"
         );
 
         // Read against the ceiling the job is running at now, so widening MICROVM_MEM leaves
@@ -1339,6 +1371,7 @@ mod tests {
                 peak: 900 * MIB,
                 ceiling: ceiling(CEIL),
                 disk: Some((0, 0)),
+                network: None,
             },
             now,
         );
@@ -1525,6 +1558,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A figure the host could not take is remembered as unmeasurable and stays out of the
+    /// maximum, rather than being written as a zero that then reads as a fact about the job.
+    /// The two pairs are independent: a `net.mode = "tap"` job on a kernel that accounts
+    /// block I/O measures its disk and not its network.
+    #[test]
+    fn an_unmeasurable_figure_is_not_remembered_as_zero() {
+        let dir = tmpdir("unmeasurable");
+        let now = 1_700_000_000;
+        let ceil = ceiling(CEIL);
+        let measured = Run {
+            peak: 900 * MIB,
+            ceiling: ceil,
+            disk: Some((10 * MIB, 20 * MIB)),
+            network: None,
+        };
+        remember_at(&dir, key("job"), measured, now);
+        remember_at(
+            &dir,
+            key("job"),
+            Run {
+                peak: 800 * MIB,
+                disk: None,
+                ..measured
+            },
+            now,
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("job")).unwrap(),
+            format!(
+                "{now} {} {ceil} {} {} - -\n{now} {} {ceil} - - - -\n",
+                900 * MIB,
+                10 * MIB,
+                20 * MIB,
+                800 * MIB
+            ),
+            "an unmeasurable figure is written as one, not as zero"
+        );
+        assert_eq!(
+            most_recent_at(&dir, key("job"), ceil, now),
+            Some(Recent {
+                most: 900 * MIB,
+                // The run that could measure carries the disk; the network neither run saw
+                // has no maximum at all, which is what keeps it off the trace line.
+                most_disk: Some((10 * MIB, 20 * MIB)),
+                most_network: None,
+                runs: 2,
+            })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A torn or truncated append is dropped whole rather than read as a run that never
     /// happened.
     #[test]
@@ -1534,14 +1618,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let ceil = ceiling(CEIL);
         let (peak, read, written) = (900 * MIB, 10 * MIB, 20 * MIB);
+        let (sent, received) = (2 * MIB, 400 * MIB);
         let (torn, lesser) = (4000 * MIB, 700 * MIB);
         std::fs::write(
             dir.join("job"),
             format!(
-                "{now} {peak} {ceil} {read} {written}\n\
-                 {now} {torn} {ceil} 30\n\
+                "{now} {peak} {ceil} {read} {written} {sent} {received}\n\
+                 {now} {torn} {ceil} 30 30 30\n\
                  nonsense\n\
-                 {now} {lesser} {ceil} 5 5\n"
+                 {now} {lesser} {ceil} 5 5 5 5\n"
             ),
         )
         .unwrap();
@@ -1552,6 +1637,7 @@ mod tests {
             Some(Recent {
                 most: peak,
                 most_disk: Some((read, written)),
+                most_network: Some((sent, received)),
                 runs: 2,
             })
         );

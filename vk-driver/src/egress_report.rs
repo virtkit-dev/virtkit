@@ -169,6 +169,31 @@ pub fn ip_contacts_summary(path: &Path, header: &str) -> Option<String> {
     summary(&read_ip_contacts(path), header)
 }
 
+/// The bytes the switch has forwarded, as it last published them: `(sent, received)` from
+/// the guests' side. `None` when there is no file — no switch, or one that has not published
+/// yet. Payload only, and egress only: the framing around it, the retransmits under it and
+/// the vsock carrying it are the host's traffic, and what the guests send each other is
+/// switched at layer 2 without ever being proxied.
+pub fn read_net_bytes(path: &Path) -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    // Each line is one switch's traffic since it last wrote, so the total is their sum —
+    // over every publish, and over every switch that shared the channel (a build's stages
+    // each have their own LAN). One publish is one small `write_all` to an `O_APPEND` fd,
+    // which the kernel does not split, so a reader never sees half a record — and a line
+    // that does not hold two numbers is passed over rather than read as a figure.
+    let total = text.lines().fold((0u64, 0u64), |(sent, received), line| {
+        let mut fields = line.split_whitespace();
+        match (
+            fields.next().and_then(|f| f.parse::<u64>().ok()),
+            fields.next().and_then(|f| f.parse::<u64>().ok()),
+        ) {
+            (Some(s), Some(r)) => (sent.saturating_add(s), received.saturating_add(r)),
+            _ => (sent, received),
+        }
+    });
+    Some(total)
+}
+
 /// Read the denials appended to `path` since byte `offset`, returning them with the new
 /// offset to persist. Only whole lines are consumed — a partial trailing line (the writer
 /// mid-append) is left for next time, so a record is never torn. A file shorter than
@@ -212,6 +237,28 @@ pub fn read_since(path: &Path, offset: u64) -> (Vec<Denial>, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The byte channel is summed, not read: several switches append to one file, each
+    /// writing only what it forwarded since its last line.
+    #[test]
+    fn network_bytes_are_summed_across_writers() {
+        let dir = std::env::temp_dir().join(format!("vk-net-bytes-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("net.bytes");
+        let _ = std::fs::remove_file(&path);
+
+        // No channel: nothing forwarded, and nothing to say.
+        assert_eq!(read_net_bytes(&path), None);
+
+        // Two switches, publishing as they go.
+        std::fs::write(&path, "100 2000\n50 0\n0 3000\n").unwrap();
+        assert_eq!(read_net_bytes(&path), Some((150, 5000)));
+
+        // A line torn by a switch killed mid-write counts for nothing rather than wrongly.
+        std::fs::write(&path, "100 2000\n7").unwrap();
+        assert_eq!(read_net_bytes(&path), Some((100, 2000)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn round_trips_and_resumes_from_offset() {

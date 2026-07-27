@@ -744,6 +744,10 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     // so the figures are complete. After the dashboard froze, so it is safe to print. Silent
     // when the meter cannot attribute them to this build alone (see `usage`).
     if let Some(usage) = meter.and_then(|m| m.read()) {
+        // The egress figure comes from the stage switches, which publish into the scratch
+        // this reads before removing it — a build's guests are gone by now, and each was
+        // stopped rather than killed so nothing it carried went unpublished.
+        let usage = usage.with_network(&scratch.join(crate::run::NET_BYTES));
         eprintln!("{}", usage.summary("build"));
     }
     // `--build-audit-egress`: the domains the build's RUN steps contacted (read before the
@@ -1112,6 +1116,7 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
     drop(mv);
     // What the whole fleet build cost the host (see build_backend's counterpart).
     if let Some(usage) = meter.read() {
+        let usage = usage.with_network(&scratch.join(crate::run::NET_BYTES));
         eprintln!("{}", usage.summary("build"));
     }
     // `--build-audit-egress`: the domains the build's RUN steps contacted (read before the

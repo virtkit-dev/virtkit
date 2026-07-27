@@ -1451,6 +1451,7 @@ fn spawn_switch(
         log: ctx.switch_log(),
         denied_log: Some(ctx.egress_denied_log()),
         audit_log: ctx.egress_audit().then(|| ctx.egress_audit_log()),
+        bytes_log: Some(ctx.net_bytes_log()),
     })
     .context("spawning the per-job switch")
 }
@@ -1821,7 +1822,7 @@ fn graceful_vmm_stop(ctx: &JobCtx, child: &mut std::process::Child) {
 
 /// Poll the held child (exact — no /proc parsing, no pid-reuse race) until it
 /// exits or `timeout` passes.
-fn wait_child_gone(child: &mut std::process::Child, timeout: Duration) -> bool {
+pub(crate) fn wait_child_gone(child: &mut std::process::Child, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         if matches!(child.try_wait(), Ok(Some(_))) {
@@ -2272,6 +2273,7 @@ mod tests {
                 peak: 1000 * 1024 * 1024,
                 ceiling: ceiling_mib * 1024 * 1024,
                 disk: None,
+                network: None,
             },
         );
         // 1000 MiB + 25% headroom, under the 8 GiB it declares.
