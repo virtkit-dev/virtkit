@@ -163,7 +163,7 @@ fn report_resource_usage(ctx: &JobCtx) {
     if let Some(pid) = crate::vm::live_supervisor_pid(ctx)
         && let Some(usage) = crate::usage::tree(pid)
     {
-        eprintln!("{}", usage.summary());
+        eprintln!("{}", usage.summary("job"));
     }
 }
 

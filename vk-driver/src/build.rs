@@ -595,6 +595,11 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     // Timing breakdown, shared across the parallel stage workers and rendered once the
     // build finishes (see [`Timings::render`]). Started here so the plan phase is timed.
     let timings = Arc::new(Timings::new());
+    // What the build costs the host, reported next to the breakdown (see `usage`). Started
+    // alongside it, so the two cover the same work. Only for the microVM backend: the host
+    // backend runs no guest to account for, and is only ever reached from this file's tests,
+    // whose threads would otherwise meter the same process as `usage`'s own.
+    let meter = microvm.then(crate::usage::Meter::start);
     let t_plan = Instant::now();
     let mut plan = Plan::from_dockerfiles(&inputs, &build_args)?;
     plan.named_contexts = named_context_map(&opts.build_contexts)?;
@@ -734,6 +739,13 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     // Leave the final dashboard frame on screen (FINISHED/FAILED) before any teardown log.
     progress.finish(result.is_ok());
     timings.render();
+    // What the build cost the host, next to where its time went. Every stage guest is a
+    // child this process has already waited for (each stage ends by tearing its guest down),
+    // so the figures are complete. After the dashboard froze, so it is safe to print. Silent
+    // when the meter cannot attribute them to this build alone (see `usage`).
+    if let Some(usage) = meter.and_then(|m| m.read()) {
+        eprintln!("{}", usage.summary("build"));
+    }
     // `--build-audit-egress`: the domains the build's RUN steps contacted (read before the
     // scratch, which holds the audit channel, is removed). After the dashboard froze, so it is
     // safe to print. "during the build" distinguishes it from a `vk run` guest summary. A
@@ -823,6 +835,7 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
         return Ok(HashMap::new());
     }
     let timings = Arc::new(Timings::new());
+    let meter = crate::usage::Meter::start();
     let (kernel, agent) = resolve_kernel_agent(opts)?;
 
     // One scratch dir for the whole build, placed next to some target's output (any target
@@ -1093,6 +1106,14 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
     // Leave the final dashboard frame on screen before any teardown log.
     progress.finish(result.is_ok());
     timings.render();
+    // Dropped before the meter is read, so the terminal cache-push drain its worker pool
+    // joins is charged to the build like build_backend's is — there the pool goes out of
+    // scope with the closure. Nothing below needs it.
+    drop(mv);
+    // What the whole fleet build cost the host (see build_backend's counterpart).
+    if let Some(usage) = meter.read() {
+        eprintln!("{}", usage.summary("build"));
+    }
     // `--build-audit-egress`: the domains the build's RUN steps contacted (read before the
     // scratch, which holds the audit channel, is removed). After the dashboard froze, so it is
     // safe to print. "during the build" distinguishes it from a `vk run` guest summary. A

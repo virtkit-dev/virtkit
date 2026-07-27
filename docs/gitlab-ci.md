@@ -85,33 +85,69 @@ test-in-repo-image:
 
 ## Resource usage
 
-A job trace ends with what the job cost the runner:
+Each phase reports what it cost the runner. A job that builds its own image
+(`image: dockerfile:…` / `compose:…`) gets the build figures as the build ends, next to
+its timing breakdown — a job whose image is already built runs no build and reports none:
+
+```
+virtkit: build resource usage: cpu 8m12s, peak memory 3.2 GiB (largest process 1.2 GiB)
+```
+
+and the run figures come at the very end of the trace:
 
 ```
 virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB
 ```
 
-`cpu` is the CPU time of the job's microVM and of the host processes around it (the
-switch, the virtio-fs daemons, any service VM), the guest's own execution included.
-Against the job's own duration it gives the parallelism the job reached, which is what
-`MICROVM_CPUS` has to allow — a ceiling, since `MICROVM_CPUS` sizes the job guest alone
-while the total also carries the host helpers and any service VM.
+`cpu` is all the CPU time the phase burned on the host, the guests' own execution
+included — for the build, the stage guests plus vk's own work assembling and caching the
+image; for the run, the job's microVM plus the host processes around it (the switch, the
+virtio-fs daemons, any service VM). Against the phase's own duration it gives the
+parallelism it reached: a ceiling for sizing one guest's vCPUs, since the total also
+carries the host helpers and every sibling VM.
 
-`peak memory` sums the high-water mark of every process the job still had running at the
-end — an upper bound over those, not over the whole job. A mark rather than the memory left
-at the end: a guest hands freed RAM straight back to the host, so its live figure says
-little about the peak it passed through. Read as a ceiling here too: two processes that
-never peaked together both count, pages the VMM shares with its virtio-fs daemons count in
-each, and for a job with services the figure spans every service VM, not just the one the
-stages run in. A helper that peaked and exited earlier contributes its CPU time but no
-memory.
+`peak memory` is the most the phase held at one time, not the memory left at the end: a
+guest hands freed RAM straight back to the host, so its live figure says little about the
+peak it passed through. A build reports its largest single process as well, because the
+two size different knobs:
 
-Both cover the job's **run** phase: the VM the stages run in, from its boot to the last
-stage. Building a git-defined image (`image: dockerfile:…`) happens before that VM exists,
-in build VMs shared with other jobs, and is not counted here — with one exception: an image
-the run phase has to build itself, because the shared tier no longer held it, contributes
-that build's CPU time. The line is omitted altogether for a job whose guest died and took
-the supervisor with it, leaving nothing to read.
+- the **total** is what the host had to have free while the phase ran — for a build,
+  several stage guests at once, so lower it with `[build] jobs`; for a job, the run VM and
+  its helpers together, i.e. `MICROVM_MEM` plus the VMM's own overhead.
+- the **largest process** — a stage guest, or vk itself — is what `[build] mem` has to
+  cover for one stage.
+
+The two are measured as their processes allow, and err in opposite directions. A build's
+guests are gone by the time it reports, so both its memory figures are sampled while it
+runs — a spike shorter than a tenth of a second can be missed, and longer than that on a
+host where reading the process tree is expensive, since the sampler backs off from its own
+cost. Each sweep totals and ranks the same reads, so the total always covers the largest
+process reported beside it. A job's VM is read in one pass instead, summing the high-water
+mark of every process still running at the end: marks that never coincided both count, while
+a helper that peaked and exited earlier contributes its CPU time but no memory. Read either
+figure as a ceiling — pages the VMM shares with its virtio-fs daemons count in each — and for
+a job with services it spans every service VM, not just the one the stages run in.
+
+Either line is omitted rather than guessed at when the figures cannot be had: the run ones
+for a job whose guest died and took the supervisor with it, the build ones for a build that
+shared the host process with another (both would be charged for each other's guests) or that
+the host could spare no sampler thread for.
+
+### Sizing the two phases
+
+The phases are sized independently, and by different people: the run VM by the job, the
+build by the host.
+
+| | Run phase | Build phase |
+| --- | --- | --- |
+| vCPUs | `[vm] cpus`, per job `MICROVM_CPUS` (capped by `[vm] max_cpus`) | `[build] cpus`, per stage guest — unset = the host's CPU count, capped at 16 |
+| RAM | `[vm] mem`, per job `MICROVM_MEM` (capped by `[vm] max_mem`) | `[build] mem`, per stage guest — unset = `4G` |
+| Concurrency | one VM per job (the runner's own `concurrent`) | `[build] jobs` stages at once — unset = 80% of host `MemAvailable` divided by `[build] mem`, capped at 16 |
+
+Build sizing is host configuration only — there are no `MICROVM_*` equivalents, because
+built images are cached and shared across jobs and runners, so no single job owns the
+build guest it happens to trigger. Raising `[build] mem` lowers the derived `jobs` count
+unless you also set it: per-stage headroom and stage concurrency trade against each other.
 
 ## Egress control
 
