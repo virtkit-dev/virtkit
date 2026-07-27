@@ -6,12 +6,12 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
-- **Builds and CI jobs report what they used.** A build now ends with the CPU time and the peak
-  memory it cost the host, printed next to its timing breakdown, and a CI job trace ends with
-  the same for the microVM its stages ran in — a ceiling on each, to size `[build] mem`/
-  `MICROVM_MEM` and `[build] cpus`/`MICROVM_CPUS` from what the work costs rather than by guess.
-  A build also reports the largest single process it ran, which is what one stage's memory has
-  to cover.
+- **Builds, runs and CI jobs report what they used.** A build and a `vk run` now end with the
+  CPU time and the peak memory they cost the host, and a CI job trace ends with the same for
+  the microVM its stages ran in — a ceiling on each, to size `[build] mem`/`--mem`/`MICROVM_MEM`
+  and `[build] cpus`/`--cpus`/`MICROVM_CPUS` from what the work costs rather than by guess.
+  Where several guests run at once — concurrent build stages, a compose fleet — the report
+  gives both what they held together and the largest single process.
 
 ## [0.30.0] - 2026-07-26
 

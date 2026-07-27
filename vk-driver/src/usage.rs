@@ -8,11 +8,11 @@
 //!   from `/proc` while it runs. The supervisor is detached and no `run` stage waits for
 //!   it, so there is no `rusage` to collect; by the time it is reaped (cleanup) the job
 //!   trace is already closed.
-//! - a **build** ([`Meter`]) is the opposite: its stage guests are this process's own
-//!   children, and every one is gone before the build ends. Its CPU therefore comes from
-//!   `getrusage`, which has already added the reaped children up — but how much memory
-//!   several guests held *together* exists only while they are alive, so a sampler tracks
-//!   it as the build runs.
+//! - a **build**, and a **`vk run`** ([`Meter`]), are the opposite: their guests are this
+//!   process's own children, and every one is gone before the phase ends. Their CPU
+//!   therefore comes from `getrusage`, which has already added the reaped children up — but
+//!   how much memory several guests held *together* exists only while they are alive, so a
+//!   sampler tracks it as the phase runs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,14 +33,16 @@ pub struct Usage {
     pub peak_rss: u64,
     /// The most any one process in the work was seen to hold — the per-guest figure next to
     /// the whole-phase `peak_rss`, so a build says whether to raise the memory each stage
-    /// guest gets or to run fewer at once. A maximum over measurements rather than any single
-    /// process's own peak: one that peaked while a larger sibling was resident never shows.
-    /// `None` where nothing tracked it.
+    /// guest gets or to run fewer at once, and a compose run how much its heaviest single
+    /// service held. Over every process in the tree, the driver and its helpers included, so a
+    /// fleet of small services can be topped by something that is not a guest at all. A
+    /// maximum over measurements rather than any single process's own peak: one that peaked
+    /// while a larger sibling was resident never shows. `None` where nothing tracked it.
     pub largest_rss: Option<u64>,
 }
 
 impl Usage {
-    /// The trace line for `phase` (`job`, `build`):
+    /// The trace line for `phase` (`job`, `build`, `run`):
     /// `virtkit: build resource usage: cpu 2m14s, peak memory 1.6 GiB (largest process 900 MiB)`.
     pub fn summary(&self, phase: &str) -> String {
         let total = fmt_bytes(self.peak_rss);
@@ -74,8 +76,8 @@ static METERS: AtomicU64 = AtomicU64::new(0);
 const ONE_STARTED: u64 = 1 << 32;
 const RUNNING_MASK: u64 = u32::MAX as u64;
 
-/// Measures a phase this process runs in guests of its own — a build's stage guests.
-/// Started before the phase, read after it.
+/// Measures a phase this process runs in guests of its own — a build's stage guests, a
+/// `vk run`'s VM and its compose siblings. Started before the phase, read after it.
 pub struct Meter {
     cpu_before: Duration,
     /// This meter's place in the process's sequence of meters, and whether any other was

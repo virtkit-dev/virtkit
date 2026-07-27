@@ -630,6 +630,13 @@ async fn build_and_boot(
         Some(out)
     };
 
+    // What this run costs the host, reported with the breakdown below (see `usage`). Started
+    // here, after any `-f`/`--primary` build: that build reports its own line, and a window
+    // spanning it would nest the two meters — a nested pair is attributable to neither, so
+    // neither line would print. An eagerly started `build:` sibling below can still build
+    // inside this window, which withholds both lines for the same reason.
+    let meter = crate::usage::Meter::start();
+
     // Effective init/kernel axes for the boot. Precedence, per the uniform-axes model:
     //   1. a non-`Default` CLI `--init`/`--kernel` overrides every unit (a run-wide force);
     //   2. otherwise the --primary primary's own marker axes apply;
@@ -1509,6 +1516,10 @@ async fn build_and_boot(
         eprintln!("{summary}");
     }
     timings.render();
+    // Read after teardown: every guest and helper has been waited for, so their CPU is in.
+    if let Some(usage) = meter.read() {
+        eprintln!("{}", usage.summary("run"));
+    }
     result
 }
 
@@ -1756,6 +1767,14 @@ async fn compose_up(
     if units.is_empty() {
         bail!("{} declares no services", compose.display());
     }
+    // What the fleet costs the host while it is up (see `usage`). Opened before
+    // `plan_services`, which builds nothing but does resolve and materialize every `image:`
+    // service — work that falls inside the window in the run above, so metering it here too
+    // keeps the two call sites reporting the same span. As there, a `build:` service the
+    // shared tier is missing builds when it is started, inside this window, which withholds
+    // both lines rather than crossing them.
+    let meter = crate::usage::Meter::start();
+
     // compose-up has no primary — every unit is a sibling, so there is nothing to build up
     // front here (siblings resolve/build via plan_services + the manager).
     let planned = plan_services(args, cfg, state_dir, work, &units, None)?;
@@ -1826,6 +1845,10 @@ async fn compose_up(
         "external IPs/ports contacted (audit)",
     ) {
         eprintln!("{summary}");
+    }
+    // Read after stop_all: every service VM has been waited for, so their CPU is in.
+    if let Some(usage) = meter.read() {
+        eprintln!("{}", usage.summary("run"));
     }
     Ok(())
 }
