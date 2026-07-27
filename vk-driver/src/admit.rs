@@ -210,29 +210,58 @@ const FLOOR_MIB: u64 = 512;
 /// arithmetic in MiB — which is the unit the ledger, `[vm] mem` and `MICROVM_MEM` all use.
 const MIB: u64 = 1024 * 1024;
 
-/// One remembered run: when it ended, the peak it reached, and the ceiling it ran under.
-/// The ceiling matters because a peak is only evidence of what a job needs while the job was
-/// free to need it — a run held to 4 GiB says nothing about the same job given 16.
+/// One remembered run: when it ended, the peak it reached, the ceiling it ran under, and the
+/// disk it moved. The ceiling matters because a peak is only evidence of what a job needs
+/// while the job was free to need it — a run held to 4 GiB says nothing about the same job
+/// given 16.
 ///
-/// Both figures are in **bytes**, though the reservation they feed is in MiB: what a run
-/// used is a measurement, and rounding a measurement on the way to disk throws away detail
-/// that later figures kept beside it may need at full resolution.
+/// Every figure is in **bytes**. Memory alone would read fine in MiB — it is what the
+/// reservation arithmetic and `MICROVM_MEM` are in — but the traffic beside it routinely
+/// runs to hundreds of kilobytes, and a megabyte unit rounds a real fetch to nothing.
 #[derive(Clone, Copy)]
 struct Sample {
     at_secs: u64,
     peak: u64,
     ceiling: u64,
+    /// What the run moved to and from the disk. `None` where the figure was never
+    /// measurable — a kernel that accounts no block I/O, or a run remembered before it was
+    /// recorded. Kept apart from a measured zero on purpose: "moved nothing" is a fact about
+    /// the job, "nobody could tell" one about the host, and a maximum that mixed them would
+    /// report the second as the first for a fortnight.
+    disk: Option<(u64, u64)>,
+}
+
+/// What one run of a job cost, as its history remembers it, in bytes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Run {
+    pub peak: u64,
+    pub ceiling: u64,
+    /// What it moved to and from the disk, or `None` where the host could not measure.
+    pub disk: Option<(u64, u64)>,
+}
+
+/// The most a job has needed lately, in bytes, and over how many runs. Memory is what a
+/// reservation is made of; the disk figures ride along because a job that reads 40 GiB every
+/// run is a fact about the host worth knowing, even though nothing reserves against it. Each
+/// figure is its own maximum over the window, so the three need not come from the same run.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Recent {
+    most: u64,
+    /// The heaviest disk of the runs that measured it, or `None` where none did.
+    most_disk: Option<(u64, u64)>,
+    runs: usize,
 }
 
 /// Note what a job of this kind actually used, and the ceiling it used it under, for the
-/// next one to be admitted against. One `<unix seconds> <peak> <ceiling>` line per run, both
-/// in bytes, appended whole so runs finishing together cannot tear each other's;
-/// best-effort, since a lost sample only costs accuracy on the next admission.
-pub fn remember(dir: &Path, key: &Path, peak: u64, ceiling: u64) {
-    remember_at(dir, key, peak, ceiling, now_secs())
+/// next one to be admitted against. One `<unix seconds> <peak> <ceiling> <read> <written>`
+/// line per run, every figure in bytes, appended whole so runs finishing together cannot
+/// tear each other's; best-effort, since a lost sample only costs accuracy on the next
+/// admission.
+pub fn remember(dir: &Path, key: &Path, run: Run) {
+    remember_at(dir, key, run, now_secs())
 }
 
-fn remember_at(dir: &Path, key: &Path, peak: u64, ceiling: u64, now: u64) {
+fn remember_at(dir: &Path, key: &Path, run: Run, now: u64) {
     let Some(path) = under(dir, key) else {
         return; // a key that would write outside the history is no key at all
     };
@@ -272,7 +301,15 @@ fn remember_at(dir: &Path, key: &Path, peak: u64, ceiling: u64, now: u64) {
     {
         // Best-effort, as the doc says: a run that goes unrecorded costs the next admission
         // a little accuracy and nothing else.
-        let _ = file.write_all(format!("{now} {peak} {ceiling}\n").as_bytes());
+        let _ = file.write_all(
+            sample_line(&Sample {
+                at_secs: now,
+                peak: run.peak,
+                ceiling: run.ceiling,
+                disk: run.disk,
+            })
+            .as_bytes(),
+        );
     }
     // Keep the file from growing without bound: the newest runs, capped.
     if let Ok(text) = std::fs::read_to_string(&path) {
@@ -292,7 +329,7 @@ fn remember_at(dir: &Path, key: &Path, peak: u64, ceiling: u64, now: u64) {
         let keep = samples.len().min(TRIM_AT);
         let kept: String = samples[samples.len() - keep..]
             .iter()
-            .map(|s| format!("{} {} {}\n", s.at_secs, s.peak, s.ceiling))
+            .map(sample_line)
             .collect();
         // Swapped in whole rather than truncated in place: a reader takes no lock, and
         // truncate-then-write leaves it a prefix — the *oldest* runs, a smaller history that
@@ -323,22 +360,37 @@ fn remember_at(dir: &Path, key: &Path, peak: u64, ceiling: u64, now: u64) {
     }
 }
 
-/// The most a job of this kind has used lately under `ceiling` bytes, and over how many
-/// runs.
+/// The most a job of this kind has used lately under `ceiling` bytes, and over how many runs.
 /// `None` when it has none — a job whose ceiling has just changed is in the same position as
 /// one that has never run: what it did under the old ceiling is not evidence about the new.
 ///
 /// The largest of the window, not an average: a job that peaks 6 GiB one run in five needs
 /// 6 GiB reserved, and averaging would admit it into a host that cannot hold it.
-fn most_recent(dir: &Path, key: &Path, ceiling: u64) -> Option<(u64, usize)> {
+fn most_recent(dir: &Path, key: &Path, ceiling: u64) -> Option<Recent> {
     most_recent_at(dir, key, ceiling, now_secs())
 }
 
-fn most_recent_at(dir: &Path, key: &Path, ceiling: u64, now: u64) -> Option<(u64, usize)> {
+fn most_recent_at(dir: &Path, key: &Path, ceiling: u64, now: u64) -> Option<Recent> {
     let samples = under_ceiling(&read(dir, key), ceiling);
     let window = window_of(&samples, now);
-    let most = window.iter().map(|s| s.peak).max()?;
-    Some((most, window.len()))
+    // An empty window is a job with no history to answer from, so it is the whole answer.
+    let peak = window.iter().map(|s| s.peak).max()?;
+    Some(Recent {
+        most: peak,
+        // Only the runs that measured it vote: one that could not is left out rather than
+        // dragging the maximum down to zero.
+        most_disk: {
+            let measured: Vec<(u64, u64)> = window.iter().filter_map(|s| s.disk).collect();
+            match (
+                measured.iter().map(|(r, _)| *r).max(),
+                measured.iter().map(|(_, w)| *w).max(),
+            ) {
+                (Some(read), Some(written)) => Some((read, written)),
+                _ => None,
+            }
+        },
+        runs: window.len(),
+    })
 }
 
 /// The runs taken under `ceiling` bytes, in order. A run held to a lower ceiling may have been
@@ -360,8 +412,8 @@ fn under_ceiling(samples: &[Sample], ceiling: u64) -> Vec<Sample> {
 pub fn expect_mib(dir: &Path, key: &Path, declared_mib: u64) -> Option<u64> {
     // A declared size too large to express in bytes has no history to match it: the ceiling
     // every run was stamped with went through the same conversion.
-    let (most, _) = most_recent(dir, key, declared_mib.checked_mul(MIB)?)?;
-    Some(reserve_mib(most / MIB, declared_mib))
+    let recent = most_recent(dir, key, declared_mib.checked_mul(MIB)?)?;
+    Some(reserve_mib(recent.most / MIB, declared_mib))
 }
 
 /// What every job this host remembers would reserve if it ran now, each read against the
@@ -445,17 +497,41 @@ fn read(dir: &Path, key: &Path) -> Vec<Sample> {
 
 /// Read a history file, oldest first. A line that does not parse whole is dropped: a torn
 /// append costs the next admission one sample, where half-reading it would invent a run.
+/// `-` is a figure the host could not take, which is not a figure of zero.
 fn parse(text: &str) -> Vec<Sample> {
     text.lines()
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
-            Some(Sample {
+            let unmeasurable_or = |f: &str| -> Option<Option<u64>> {
+                match f {
+                    "-" => Some(None),
+                    n => n.parse().ok().map(Some),
+                }
+            };
+            let sample = Sample {
                 at_secs: fields.next()?.parse().ok()?,
                 peak: fields.next()?.parse().ok()?,
                 ceiling: fields.next()?.parse().ok()?,
+                disk: None,
+            };
+            let read = unmeasurable_or(fields.next()?)?;
+            let written = unmeasurable_or(fields.next()?)?;
+            Some(Sample {
+                disk: read.zip(written),
+                ..sample
             })
         })
         .collect()
+}
+
+/// One history line, the only place the on-disk shape is written. A figure nobody could take
+/// is written `-`, so reading it back cannot mistake it for zero.
+fn sample_line(s: &Sample) -> String {
+    let (read, written) = match s.disk {
+        Some((read, written)) => (read.to_string(), written.to_string()),
+        None => ("-".to_string(), "-".to_string()),
+    };
+    format!("{} {} {} {read} {written}\n", s.at_secs, s.peak, s.ceiling)
 }
 
 /// The line a job trace ends with when the host has seen this job before: what it has been
@@ -480,12 +556,13 @@ fn history_summary_at(
 ) -> Option<String> {
     // Checked, like `expect_mib`'s: a declared size too large to express in bytes has no
     // history that could match it, since every stored ceiling went through this conversion.
-    let (most, runs) = most_recent_at(dir, key, declared_mib.checked_mul(MIB)?, now)?;
+    let recent = most_recent_at(dir, key, declared_mib.checked_mul(MIB)?, now)?;
+    let runs = recent.runs;
     let plural = if runs == 1 { "run" } else { "runs" };
     let reserves = match from_history {
         true => format!(
             "; the next run reserves {}",
-            fmt_mib(reserve_mib(most / MIB, declared_mib))
+            fmt_mib(reserve_mib(recent.most / MIB, declared_mib))
         ),
         false => String::new(),
     };
@@ -493,14 +570,31 @@ fn history_summary_at(
     // job too quiet to have a fortnight's runs is answered from its last few however old they
     // are — and a line reading "37 runs in 14 days" would then be a statement of throughput
     // that is simply untrue. The guide gives the exact rule.
-    let most = crate::usage::fmt_bytes(most);
+    let disk = moved("read", "written", recent.most_disk);
+    let most = crate::usage::fmt_bytes(recent.most);
     Some(format!(
-        "virtkit: most this job has used lately: {most} over {runs} {plural}{reserves}"
+        "virtkit: most this job has used lately: memory {most}{disk} \
+         over {runs} {plural}{reserves}"
     ))
 }
 
 fn fmt_mib(mib: u64) -> String {
     crate::usage::fmt_bytes(mib * MIB)
+}
+
+/// A pair of figures for a trace line, or nothing at all where no run in the window could
+/// measure them. A measured zero is printed: "moved nothing" is a fact about the job worth
+/// stating, where the same row of zeros from a host that accounts no block I/O would state
+/// that fact falsely.
+fn moved(one: &str, other: &str, pair: Option<(u64, u64)>) -> String {
+    match pair {
+        Some((a, b)) => format!(
+            ", {one} {}, {other} {}",
+            crate::usage::fmt_bytes(a),
+            crate::usage::fmt_bytes(b)
+        ),
+        None => String::new(),
+    }
 }
 
 /// Drop a job's reservation at cleanup. Best-effort: a reservation left behind stops
@@ -789,6 +883,31 @@ mod tests {
         }
     }
 
+    /// One run of a job at `ceiling_mib`, for the tests that are not about disk. The history
+    /// is in bytes; these tests read better in the megabytes a person would say, so they
+    /// convert here.
+    fn run(peak_mib: u64, ceiling_mib: u64) -> Run {
+        Run {
+            peak: peak_mib * MIB,
+            ceiling: ceiling(ceiling_mib),
+            ..Run::default()
+        }
+    }
+
+    /// A ceiling as the history stores it, from the megabytes a test states it in.
+    fn ceiling(mib: u64) -> u64 {
+        mib * MIB
+    }
+
+    /// What a window of runs that moved no disk reads back as.
+    fn recent(most_mib: u64, runs: usize) -> Option<Recent> {
+        Some(Recent {
+            most: most_mib * MIB,
+            runs,
+            ..Recent::default()
+        })
+    }
+
     /// A history key. Real ones are `<project>/<job>`; a single component exercises the same
     /// paths and keeps the assertions readable.
     fn key(name: &str) -> &Path {
@@ -981,11 +1100,6 @@ mod tests {
     /// The ceiling every history test that is not about ceilings runs under.
     const CEIL: u64 = 8192;
 
-    /// A figure as the history stores it, from the megabytes a test states it in.
-    fn bytes(mib: u64) -> u64 {
-        mib * MIB
-    }
-
     #[test]
     fn a_reservation_follows_what_the_job_has_been_using() {
         let dir = tmpdir("history");
@@ -997,11 +1111,11 @@ mod tests {
         // The largest run in the window plus headroom, not the average — a job that peaks
         // once needs room for that run.
         for (age, peak) in [(3 * day, 1000), (2 * day, 4000), (day, 1200)] {
-            remember_at(&dir, key("proj-test"), bytes(peak), bytes(CEIL), now - age);
+            remember_at(&dir, key("proj-test"), run(peak, CEIL), now - age);
         }
         assert_eq!(
-            most_recent_at(&dir, key("proj-test"), bytes(CEIL), now),
-            Some((bytes(4000), 3))
+            most_recent_at(&dir, key("proj-test"), ceiling(CEIL), now),
+            recent(4000, 3)
         );
         assert_eq!(reserve_mib(4000, 8192), 5000);
 
@@ -1020,23 +1134,23 @@ mod tests {
         let now = 1_700_000_000;
         let day = 24 * 60 * 60;
 
-        remember_at(&dir, key("job"), bytes(8000), bytes(CEIL), now - 30 * day); // a month ago
+        remember_at(&dir, key("job"), run(8000, CEIL), now - 30 * day); // a month ago
         for age in [3 * day, 2 * day, day, day / 2, 60] {
-            remember_at(&dir, key("job"), bytes(900), bytes(CEIL), now - age);
+            remember_at(&dir, key("job"), run(900, CEIL), now - age);
         }
         // Six runs, but only the five inside the window count — the old spike is not one of
         // them, and MIN_RUNS is satisfied without it.
         assert_eq!(
-            most_recent_at(&dir, key("job"), bytes(CEIL), now),
-            Some((bytes(900), 5))
+            most_recent_at(&dir, key("job"), ceiling(CEIL), now),
+            recent(900, 5)
         );
 
         // While it was fresh, that same spike was the whole answer — age demoted it, not
         // the runs since.
-        remember_at(&dir, key("spike-only"), bytes(8000), bytes(CEIL), now - day);
+        remember_at(&dir, key("spike-only"), run(8000, CEIL), now - day);
         assert_eq!(
-            most_recent_at(&dir, key("spike-only"), bytes(CEIL), now),
-            Some((bytes(8000), 1))
+            most_recent_at(&dir, key("spike-only"), ceiling(CEIL), now),
+            recent(8000, 1)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1054,17 +1168,16 @@ mod tests {
             remember_at(
                 &dir,
                 key("release"),
-                bytes(2000 + months * 10),
-                bytes(CEIL),
+                run(2000 + months * 10, CEIL),
                 now - months * year / 12,
             );
         }
         // Nothing is inside the window, so the last MIN_RUNS carry the estimate: the largest
         // of those five (five months ago), not the heavier ones from further back.
-        let (most, runs) = most_recent_at(&dir, key("release"), bytes(CEIL), now).unwrap();
-        assert_eq!(runs, MIN_RUNS);
+        let recent = most_recent_at(&dir, key("release"), ceiling(CEIL), now).unwrap();
+        assert_eq!(recent.runs, MIN_RUNS);
         assert_eq!(
-            most / MIB,
+            recent.most / MIB,
             2050,
             "the largest of the last five, not of all eight"
         );
@@ -1078,7 +1191,7 @@ mod tests {
         let day = 24 * 60 * 60;
         // A job run more times in a fortnight than the cap allows: the cap bounds the file.
         for i in 0..=TRIM_AT as u64 {
-            remember_at(&dir, key("busy"), bytes(500), bytes(CEIL), now - day + i);
+            remember_at(&dir, key("busy"), run(500, CEIL), now - day + i);
         }
         let kept = std::fs::read_to_string(dir.join("busy")).unwrap();
         assert_eq!(kept.lines().count(), TRIM_AT);
@@ -1094,7 +1207,7 @@ mod tests {
         // to believe, per ceiling and at read time; trimming by age here would be blind to
         // the ceiling and would take a thousand runs down to MIN_RUNS on the strength of one
         // quiet fortnight — losing every other ceiling's runs with them.
-        remember_at(&dir, key("busy"), bytes(500), bytes(CEIL), now + 60 * day);
+        remember_at(&dir, key("busy"), run(500, CEIL), now + 60 * day);
         assert_eq!(
             std::fs::read_to_string(dir.join("busy"))
                 .unwrap()
@@ -1103,8 +1216,8 @@ mod tests {
             TRIM_AT
         );
         assert_eq!(
-            most_recent_at(&dir, key("busy"), bytes(CEIL), now + 60 * day),
-            Some((bytes(500), MIN_RUNS)),
+            most_recent_at(&dir, key("busy"), ceiling(CEIL), now + 60 * day),
+            recent(500, MIN_RUNS),
             "the read still narrows to what the window reaches"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1118,7 +1231,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vk-hist-mode-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // The two-component key production uses, so the project directory is made here too.
-        remember(&dir, key("42-proj/build-abc"), bytes(500), bytes(CEIL));
+        remember(&dir, key("42-proj/build-abc"), run(500, CEIL));
 
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&dir), 0o700, "history root");
@@ -1143,16 +1256,10 @@ mod tests {
         // Runs under 2G, then enough under 8G to push the file past the cap — but not so many
         // that the newest TRIM_AT are all 8G, which would evict the older ceiling fairly.
         for i in 0..300 {
-            remember_at(
-                &dir,
-                key("moved"),
-                bytes(900),
-                bytes(2048),
-                now - 40 * day + i,
-            );
+            remember_at(&dir, key("moved"), run(900, 2048), now - 40 * day + i);
         }
         for i in 0..800 {
-            remember_at(&dir, key("moved"), bytes(3000), bytes(8192), now - day + i);
+            remember_at(&dir, key("moved"), run(3000, 8192), now - day + i);
         }
         assert_eq!(
             std::fs::read_to_string(dir.join("moved"))
@@ -1164,14 +1271,14 @@ mod tests {
 
         // The newest ceiling answers from its own runs...
         assert_eq!(
-            most_recent_at(&dir, key("moved"), bytes(8192), now).map(|(m, _)| m / MIB),
+            most_recent_at(&dir, key("moved"), ceiling(8192), now).map(|r| r.most / MIB),
             Some(3000)
         );
         // ...and going back to the old one still finds runs there, rather than falling back
         // to the declared size as it would if the trim had dropped them.
-        let (most, _) = most_recent_at(&dir, key("moved"), bytes(2048), now)
+        let earlier = most_recent_at(&dir, key("moved"), ceiling(2048), now)
             .expect("the earlier ceiling's runs survived the trim");
-        assert_eq!(most / MIB, 900);
+        assert_eq!(earlier.most / MIB, 900);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1186,42 +1293,78 @@ mod tests {
         // gives the same numbers here and so would assert nothing about the window.
         assert_eq!(history_summary_at(&dir, key("none"), 8192, true, now), None);
 
-        remember_at(&dir, key("job"), bytes(1600), bytes(CEIL), now);
+        remember_at(&dir, key("job"), run(1600, CEIL), now);
         let line = history_summary_at(&dir, key("job"), 8192, true, now).unwrap();
         assert_eq!(
             line,
-            "virtkit: most this job has used lately: 1.6 GiB over 1 run; \
+            "virtkit: most this job has used lately: memory 1.6 GiB over 1 run; \
              the next run reserves 2.0 GiB"
         );
         // With the host still reserving declared sizes, the figure is worth showing — it is
         // how an operator decides to turn that on — but there is no reservation to promise.
-        remember_at(&dir, key("job"), bytes(1600), bytes(CEIL), now);
+        remember_at(&dir, key("job"), run(1600, CEIL), now);
         let line = history_summary_at(&dir, key("job"), 8192, false, now).unwrap();
         assert_eq!(
             line,
-            "virtkit: most this job has used lately: 1.6 GiB over 2 runs"
+            "virtkit: most this job has used lately: memory 1.6 GiB over 2 runs"
         );
+        // A run that moved disk puts it on the line beside the memory — as the two runs above,
+        // which moved none, left it off rather than reading as zero.
+        remember_at(
+            &dir,
+            key("job"),
+            Run {
+                peak: 1600 * MIB,
+                ceiling: ceiling(CEIL),
+                disk: Some((3482 * MIB, 812 * MIB)),
+            },
+            now,
+        );
+        assert_eq!(
+            history_summary_at(&dir, key("job"), 8192, false, now).unwrap(),
+            "virtkit: most this job has used lately: memory 1.6 GiB, read 3.4 GiB, \
+             written 812 MiB over 3 runs"
+        );
+
         // Read against the ceiling the job is running at now, so widening MICROVM_MEM leaves
         // the same job with nothing to report until it has run there.
         assert_eq!(history_summary_at(&dir, key("job"), 16384, true, now), None);
 
+        // A run that measured zero says so, exactly as the per-run line does — the clause goes
+        // missing only where nobody could take the figure at all.
+        remember_at(
+            &dir,
+            key("zero"),
+            Run {
+                peak: 900 * MIB,
+                ceiling: ceiling(CEIL),
+                disk: Some((0, 0)),
+            },
+            now,
+        );
+        assert_eq!(
+            history_summary_at(&dir, key("zero"), 8192, false, now).unwrap(),
+            "virtkit: most this job has used lately: memory 900 MiB, read 0 B, \
+             written 0 B over 1 run"
+        );
+
         // The largest run in the window, not the one that just ended.
-        remember_at(&dir, key("peaky"), bytes(3000), bytes(CEIL), now - day);
-        remember_at(&dir, key("peaky"), bytes(900), bytes(CEIL), now);
+        remember_at(&dir, key("peaky"), run(3000, CEIL), now - day);
+        remember_at(&dir, key("peaky"), run(900, CEIL), now);
         assert_eq!(
             history_summary_at(&dir, key("peaky"), 8192, false, now).unwrap(),
-            "virtkit: most this job has used lately: 2.9 GiB over 2 runs"
+            "virtkit: most this job has used lately: memory 2.9 GiB over 2 runs"
         );
 
         // Past MIN_RUNS the window really does decide: a spike a month old leaves both the
         // figure and the count.
-        remember_at(&dir, key("aged"), bytes(8000), bytes(CEIL), now - 30 * day);
+        remember_at(&dir, key("aged"), run(8000, CEIL), now - 30 * day);
         for age in [3 * day, 2 * day, day, day / 2, 60] {
-            remember_at(&dir, key("aged"), bytes(900), bytes(CEIL), now - age);
+            remember_at(&dir, key("aged"), run(900, CEIL), now - age);
         }
         assert_eq!(
             history_summary_at(&dir, key("aged"), 8192, false, now).unwrap(),
-            "virtkit: most this job has used lately: 900 MiB over 5 runs"
+            "virtkit: most this job has used lately: memory 900 MiB over 5 runs"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1231,30 +1374,30 @@ mod tests {
         let dir = tmpdir("ceiling");
         let now = 1_700_000_000;
         for peak in [3900, 4000, 3950] {
-            remember_at(&dir, key("job"), bytes(peak), bytes(4096), now - 60);
+            remember_at(&dir, key("job"), run(peak, 4096), now - 60);
         }
         assert_eq!(
-            most_recent_at(&dir, key("job"), bytes(4096), now),
-            Some((bytes(4000), 3))
+            most_recent_at(&dir, key("job"), ceiling(4096), now),
+            recent(4000, 3)
         );
 
         // Given four times the room, the job is unknown again rather than predicted from
         // runs that were pressed against the old ceiling.
-        assert_eq!(most_recent_at(&dir, key("job"), bytes(16384), now), None);
+        assert_eq!(most_recent_at(&dir, key("job"), ceiling(16384), now), None);
         assert_eq!(expect_mib(&dir, key("job"), 16384), None);
 
         // Its first run at the new ceiling is what it is then read against.
-        remember_at(&dir, key("job"), bytes(11000), bytes(16384), now);
+        remember_at(&dir, key("job"), run(11000, 16384), now);
         assert_eq!(
-            most_recent_at(&dir, key("job"), bytes(16384), now),
-            Some((bytes(11000), 1))
+            most_recent_at(&dir, key("job"), ceiling(16384), now),
+            recent(11000, 1)
         );
 
         // And putting the ceiling back finds the earlier runs still there — nothing was
         // thrown away, only set aside.
         assert_eq!(
-            most_recent_at(&dir, key("job"), bytes(4096), now),
-            Some((bytes(4000), 3))
+            most_recent_at(&dir, key("job"), ceiling(4096), now),
+            recent(4000, 3)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1281,8 +1424,7 @@ mod tests {
                         remember_at(
                             &dir,
                             key("shared"),
-                            bytes(1000 + t * EACH + i),
-                            bytes(CEIL),
+                            run(1000 + t * EACH + i, CEIL),
                             now - 60,
                         );
                     }
@@ -1332,10 +1474,10 @@ mod tests {
         // A real two-component key is written and read as usual.
         let real = Path::new("42-proj").join("build-abc123");
         assert_eq!(under(&dir, &real), Some(dir.join(&real)));
-        remember_at(&dir, &real, bytes(1600), bytes(CEIL), now);
+        remember_at(&dir, &real, run(1600, CEIL), now);
         assert_eq!(
-            most_recent_at(&dir, &real, bytes(CEIL), now),
-            Some((bytes(1600), 1))
+            most_recent_at(&dir, &real, ceiling(CEIL), now),
+            recent(1600, 1)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1346,8 +1488,8 @@ mod tests {
     fn a_job_is_read_against_the_ceiling_it_last_ran_under() {
         let dir = tmpdir("last-ceiling");
         let now = 1_700_000_000;
-        remember_at(&dir, key("job"), bytes(3900), bytes(4096), now - 120);
-        remember_at(&dir, key("job"), bytes(9000), bytes(16384), now - 60);
+        remember_at(&dir, key("job"), run(3900, 4096), now - 120);
+        remember_at(&dir, key("job"), run(9000, 16384), now - 60);
         // The 16 GiB run is the current one, so the estimate follows it and is capped there.
         assert_eq!(
             expect_last_mib(&dir, key("job")),
@@ -1390,15 +1532,29 @@ mod tests {
         let dir = tmpdir("torn");
         let now = 1_700_000_000;
         std::fs::create_dir_all(&dir).unwrap();
-        let ceil = bytes(CEIL);
-        let (peak, lesser) = (bytes(900), bytes(700));
+        let ceil = ceiling(CEIL);
+        let (peak, read, written) = (900 * MIB, 10 * MIB, 20 * MIB);
+        let (torn, lesser) = (4000 * MIB, 700 * MIB);
         std::fs::write(
             dir.join("job"),
-            format!("{now} {peak} {ceil}\n{now} 4000\nnonsense\n{now} {lesser} {ceil}\n"),
+            format!(
+                "{now} {peak} {ceil} {read} {written}\n\
+                 {now} {torn} {ceil} 30\n\
+                 nonsense\n\
+                 {now} {lesser} {ceil} 5 5\n"
+            ),
         )
         .unwrap();
-        // The two whole lines, neither the short one nor the unparseable one.
-        assert_eq!(most_recent_at(&dir, key("job"), ceil, now), Some((peak, 2)));
+        // The two whole lines, neither the one cut short mid-append nor the unparseable one —
+        // so the 4000 MiB peak and the 30 bytes it claims to have read are both left out.
+        assert_eq!(
+            most_recent_at(&dir, key("job"), ceil, now),
+            Some(Recent {
+                most: peak,
+                most_disk: Some((read, written)),
+                runs: 2,
+            })
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

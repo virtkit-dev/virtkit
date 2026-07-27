@@ -153,12 +153,12 @@ fn report_egress_audit(ctx: &JobCtx) {
     }
 }
 
-/// Print what the job cost the runner — the CPU time and peak memory of its microVM and the
-/// host helpers around it (see usage) — into the job trace, so a job can be sized from what
-/// it actually used. Sampled here rather than at cleanup because this is the last stage whose
-/// output the trace still keeps, and the job's processes are all still alive to be read: it
-/// therefore covers everything but the guest's own shutdown. Best-effort: a job whose
-/// supervisor is already gone (the guest died) reports nothing.
+/// Print what the job cost the runner — the CPU time, peak memory and disk traffic of its
+/// microVM and the host helpers around it (see usage) — into the job trace, so a job can be
+/// sized from what it actually used. Sampled here rather than at cleanup because this is the
+/// last stage whose output the trace still keeps, and the job's processes are all still alive
+/// to be read: it therefore covers everything but the guest's own shutdown. Best-effort: a
+/// job whose supervisor is already gone (the guest died) reports nothing.
 ///
 /// The same figure is what the next run of this job is admitted against where the host
 /// reserves from history (`[schedule] from_history`), so it is recorded here too.
@@ -179,8 +179,11 @@ fn report_resource_usage(ctx: &JobCtx) {
             crate::admit::remember(
                 &ctx.history_dir(),
                 &ctx.usage_key(),
-                usage.peak_rss,
-                ceiling,
+                crate::admit::Run {
+                    peak: usage.peak_rss,
+                    ceiling,
+                    disk: usage.disk,
+                },
             );
             report_job_history(ctx, ceiling_mib);
         }

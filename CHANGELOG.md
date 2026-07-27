@@ -28,13 +28,13 @@ All notable changes to virtkit will be documented in this file.
   guest still gets every byte it declares; only the host's bookkeeping changes, and only when
   you turn it on. Every job trace now ends with what that job has been using and over how many
   runs either way, so a host can be sized from it before deciding to reserve that way.
-
 - **Builds, runs and CI jobs report what they used.** A build and a `vk run` now end with the
-  CPU time and the peak memory they cost the host, and a CI job trace ends with the same for
-  the microVM its stages ran in — a ceiling on each, to size `[build] mem`/`--mem`/`MICROVM_MEM`
-  and `[build] cpus`/`--cpus`/`MICROVM_CPUS` from what the work costs rather than by guess.
-  Where several guests run at once — concurrent build stages, a compose fleet — the report
-  gives both what they held together and the largest single process.
+  CPU time, the peak memory and the disk traffic they cost the host, and a CI job trace ends
+  with the same for the microVM its stages ran in — a ceiling on each, to size
+  `[build] mem`/`--mem`/`MICROVM_MEM` and `[build] cpus`/`--cpus`/`MICROVM_CPUS` from what the
+  work costs rather than by guess. Where several guests run at once — concurrent build stages,
+  a compose fleet — the report gives both what they held together and the largest single
+  process.
 
 ## [0.30.0] - 2026-07-26
 

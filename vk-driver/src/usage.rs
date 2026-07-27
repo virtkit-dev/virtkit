@@ -1,5 +1,5 @@
-//! What work cost the host: the CPU time and peak memory it consumed, for the line each
-//! phase reports when it ends.
+//! What work cost the host: the CPU time, peak memory and disk traffic it consumed, for the
+//! line each phase reports when it ends.
 //!
 //! Each phase is measured the way its own processes allow:
 //!
@@ -9,8 +9,8 @@
 //!   it, so there is no `rusage` to collect; by the time it is reaped (cleanup) the job
 //!   trace is already closed.
 //! - a **build**, and a **`vk run`** ([`Meter`]), are the opposite: their guests are this
-//!   process's own children, and every one is gone before the phase ends. Their CPU
-//!   therefore comes from `getrusage`, which has already added the reaped children up — but
+//!   process's own children, and every one is gone before the phase ends. Their CPU and disk
+//!   therefore come from `getrusage`, which has already added the reaped children up — but
 //!   how much memory several guests held *together* exists only while they are alive, so a
 //!   sampler tracks it as the phase runs.
 
@@ -39,6 +39,17 @@ pub struct Usage {
     /// maximum over measurements rather than any single process's own peak: one that peaked
     /// while a larger sibling was resident never shows. `None` where nothing tracked it.
     pub largest_rss: Option<u64>,
+    /// `(read, written)` against the block layer, not bytes the programs asked for: a guest
+    /// re-reading what its own page cache already holds costs nothing here, and work a tmpfs
+    /// absorbs is absent for the same reason — those pages never reach a disk. The write half
+    /// is charged a step earlier than the read: the kernel counts a write when its pages are
+    /// dirtied rather than when they go out, so a file deleted before writeback still counts.
+    /// Near enough for sizing a host's storage, which is what it is for.
+    ///
+    /// `None` where the kernel accounts no block I/O at all (`CONFIG_TASK_IO_ACCOUNTING`,
+    /// which [`io_accounted`] answers for). Not the same as a phase that moved none, and not
+    /// to be recorded as if it were: one is a fact about the job, the other about the host.
+    pub disk: Option<(u64, u64)>,
 }
 
 impl Usage {
@@ -52,8 +63,16 @@ impl Usage {
             Some(one) if one != total => format!(" (largest process {one})"),
             _ => String::new(),
         };
+        // A measured zero is printed — it says this phase touched no disk, which is a fact
+        // about the phase. What is left out is the figure nobody could take.
+        let disk = match self.disk {
+            Some((read, written)) => {
+                format!(", read {}, written {}", fmt_bytes(read), fmt_bytes(written))
+            }
+            None => String::new(),
+        };
         format!(
-            "virtkit: {phase} resource usage: cpu {}, peak memory {total}{largest}",
+            "virtkit: {phase} resource usage: cpu {}, peak memory {total}{largest}{disk}",
             fmt_cpu(self.cpu),
         )
     }
@@ -80,6 +99,7 @@ const RUNNING_MASK: u64 = u32::MAX as u64;
 /// `vk run`'s VM and its compose siblings. Started before the phase, read after it.
 pub struct Meter {
     cpu_before: Duration,
+    disk_before: (u64, u64),
     /// This meter's place in the process's sequence of meters, and whether any other was
     /// already running when it began — together they say whether it had the process to
     /// itself for its whole life (see [`Meter::read`]).
@@ -154,6 +174,7 @@ impl Meter {
             .ok();
         Meter {
             cpu_before: rusage_cpu(),
+            disk_before: rusage_disk(),
             seq,
             alone_at_start,
             peak,
@@ -192,10 +213,19 @@ impl Meter {
         // reported as having held no memory. Gated on the mark read first: a largest above
         // zero already implies a total at least as big, where a nonzero total says nothing
         // about a largest read before it.
-        (alone && self.sampler.is_some() && largest > 0).then(|| Usage {
-            cpu: rusage_cpu().saturating_sub(self.cpu_before),
-            peak_rss: peak,
-            largest_rss: Some(largest),
+        (alone && self.sampler.is_some() && largest > 0).then(|| {
+            let (read, written) = rusage_disk();
+            Usage {
+                cpu: rusage_cpu().saturating_sub(self.cpu_before),
+                peak_rss: peak,
+                largest_rss: Some(largest),
+                disk: io_accounted().then(|| {
+                    (
+                        read.saturating_sub(self.disk_before.0),
+                        written.saturating_sub(self.disk_before.1),
+                    )
+                }),
+            }
         })
     }
 }
@@ -243,6 +273,25 @@ fn rusage_cpu() -> Duration {
         .sum()
 }
 
+/// The same for the disk: `(read, written)` in bytes, this process and every child it has
+/// reaped. The kernel counts these in 512-byte blocks, from the same accounting
+/// `/proc/<pid>/io` reports — so a phase whose guests are already gone still has its I/O,
+/// exactly as it still has their CPU.
+fn rusage_disk() -> (u64, u64) {
+    [libc::RUSAGE_SELF, libc::RUSAGE_CHILDREN]
+        .into_iter()
+        .filter_map(rusage)
+        .fold((0, 0), |(read, written), ru| {
+            // Saturating for the same reason the counters are read at all: nothing here is
+            // worth a panic in a release build or a wrapped figure in a debug one.
+            let bytes = |blocks: libc::c_long| (blocks.max(0) as u64).saturating_mul(512);
+            (
+                read.saturating_add(bytes(ru.ru_inblock)),
+                written.saturating_add(bytes(ru.ru_oublock)),
+            )
+        })
+}
+
 fn rusage(who: libc::c_int) -> Option<libc::rusage> {
     let mut ru = std::mem::MaybeUninit::<libc::rusage>::uninit();
     // SAFETY: getrusage fills the whole struct through the pointer, and only on success.
@@ -264,12 +313,25 @@ pub fn tree(root: i32) -> Option<Usage> {
         return None;
     }
     let hz = clock_ticks();
-    let mut usage = Usage::default();
+    let mut usage = Usage {
+        // Asked once for the tree, not per process: whether the kernel accounts block I/O is
+        // a property of the host, and a process that exits mid-walk must not read as the
+        // host having stopped accounting.
+        disk: io_accounted().then_some((0, 0)),
+        ..Usage::default()
+    };
     for pid in pids {
         if let Some((_, ticks)) = stat(pid) {
             usage.cpu += ticks_to_duration(ticks, hz);
         }
         usage.peak_rss += mem(pid).map_or(0, |(_, peak)| peak);
+        if let Some((read, written)) = usage.disk.as_mut() {
+            // A process gone since the walk began contributes nothing rather than unmeasuring
+            // the whole tree: the kernel accounts I/O, this one is simply over.
+            let (r, w) = disk(pid).unwrap_or((0, 0));
+            *read += r;
+            *written += w;
+        }
     }
     Some(usage)
 }
@@ -327,7 +389,7 @@ fn kernel_children(pid: i32) -> Vec<i32> {
 /// Whether this kernel publishes per-thread child lists (`CONFIG_PROC_CHILDREN`). Probed
 /// once: the answer cannot change while we run, and the fallback costs a scan of every
 /// process on the host.
-fn kernel_lists_children() -> bool {
+pub(crate) fn kernel_lists_children() -> bool {
     static PRESENT: OnceLock<bool> = OnceLock::new();
     *PRESENT.get_or_init(|| {
         std::fs::read_dir("/proc/self/task").is_ok_and(|mut threads| {
@@ -408,6 +470,35 @@ fn parse_mem(status: &str) -> Option<(u64, u64)> {
     (rss.is_some() || peak.is_some()).then(|| (rss.unwrap_or(0), peak.unwrap_or(0)))
 }
 
+/// Whether this kernel accounts the block I/O a process causes
+/// (`CONFIG_TASK_IO_ACCOUNTING`). Without it `/proc/<pid>/io` is not published and
+/// `getrusage`'s block counters stay at zero, so a phase's disk figures were never
+/// measurable — which is a different thing from a phase that touched no disk. Probed once:
+/// a kernel does not grow the option while we run.
+pub(crate) fn io_accounted() -> bool {
+    static ACCOUNTED: OnceLock<bool> = OnceLock::new();
+    *ACCOUNTED.get_or_init(|| std::path::Path::new("/proc/self/io").exists())
+}
+
+/// `(read, written)` for `pid` in bytes, the [`Usage`] fields of the same names: a read
+/// served from the page cache is not here, while a write is counted as it is dirtied.
+/// Children `pid` has reaped are in the figure, exactly as they are in its `cutime` — a live
+/// descendant has not been waited for, so summing one of these per process counts nothing
+/// twice. `None` for a process that reports none — it has gone, the kernel was built without
+/// task I/O accounting, or the file is not ours to read (a process that dropped its
+/// dumpable flag denies it even to its own owner).
+fn disk(pid: i32) -> Option<(u64, u64)> {
+    parse_disk(&std::fs::read_to_string(format!("/proc/{pid}/io")).ok()?)
+}
+
+fn parse_disk(io: &str) -> Option<(u64, u64)> {
+    let field = |name: &str| {
+        io.lines()
+            .find_map(|l| l.strip_prefix(name)?.trim().parse::<u64>().ok())
+    };
+    Some((field("read_bytes:")?, field("write_bytes:")?))
+}
+
 /// The kernel's CPU-time unit — `stat` counts in these. Falls back to the near-universal
 /// 100 Hz if the sysconf query fails, so a usage line is still roughly right.
 fn clock_ticks() -> u64 {
@@ -441,14 +532,21 @@ fn fmt_cpu(d: Duration) -> String {
     }
 }
 
-/// Memory as a sizing figure — `1.6 GiB`, `842 MiB` — never finer than a MiB.
+/// A sizing figure — `1.6 GiB`, `842 MiB`, `300 KiB`. Memory never reaches the smaller units,
+/// but disk traffic does: a job that fetched a few hundred kilobytes moved something, and
+/// rounding it to `0 MiB` would report it as having moved nothing.
 pub(crate) fn fmt_bytes(bytes: u64) -> String {
-    let mib = bytes as f64 / (1024.0 * 1024.0);
-    // Rounded for the same reason as fmt_cpu: 1023.7 MiB reads "1.0 GiB", never "1024 MiB".
-    if mib.round() >= 1024.0 {
-        format!("{:.1} GiB", mib / 1024.0)
-    } else {
-        format!("{mib:.0} MiB")
+    let (mib, kib) = (bytes as f64 / (1024.0 * 1024.0), bytes as f64 / 1024.0);
+    // Rounded at each boundary rather than truncated, for the same reason as fmt_cpu:
+    // branching on the untruncated value while printing the rounded one renders 1023.7 MiB as
+    // "1024 MiB" and 1048575 bytes as "1024 KiB". Each arm also branches on the figure it
+    // prints and not on a coarser one — `round` breaks a tie upwards where `{:.0}` breaks it to
+    // even, so choosing the MiB arm by the MiB value renders exactly 512 KiB as "0 MiB".
+    match bytes {
+        _ if mib.round() >= 1024.0 => format!("{:.1} GiB", mib / 1024.0),
+        _ if kib.round() >= 1024.0 => format!("{mib:.0} MiB"),
+        1024.. => format!("{kib:.0} KiB"),
+        _ => format!("{bytes} B"),
     }
 }
 
@@ -491,6 +589,41 @@ mod tests {
         }
     }
 
+    /// A scratch directory on whatever backs the build tree, rather than the temp dir: `/tmp`
+    /// is a tmpfs on many hosts, and the tests that use this are about traffic reaching a
+    /// block layer. Left behind if one of them panics, which a gitignored build dir can bear.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let leaf = format!("{name}-{}", std::process::id());
+        // Under `target/` by preference. A checkout that cannot be written falls back to the
+        // temp dir rather than failing the run: these tests already handle a host that charges
+        // them nothing, and a RAM-backed temp dir is that same case.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/usage-io")
+            .join(&leaf);
+        let _ = std::fs::remove_dir_all(&dir);
+        if std::fs::create_dir_all(&dir).is_ok() {
+            return dir;
+        }
+        let dir = std::env::temp_dir().join("vk-usage-io").join(&leaf);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch dir for the disk tests");
+        dir
+    }
+
+    /// Write `mib` to `path` from a child, so the bytes are charged to this process's
+    /// *children* rusage the way a build's stage guests are, and flush it so a filesystem
+    /// that defers the work has still done it by the time the caller measures.
+    fn write_blob(path: &std::path::Path, mib: usize) {
+        let status = std::process::Command::new("dd")
+            .arg("if=/dev/zero")
+            .arg(format!("of={}", path.display()))
+            .args(["bs=1M", &format!("count={mib}"), "conv=fsync"])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("running dd");
+        assert!(status.success(), "dd wrote {mib} MiB");
+    }
+
     #[test]
     fn parses_a_stat_line_whose_comm_holds_spaces_and_parens() {
         // A real line, with a process name that would break front-to-back field splitting.
@@ -516,6 +649,17 @@ mod tests {
             ticks_to_duration(u64::MAX / 2, 100).as_secs(),
             u64::MAX / 200
         );
+    }
+
+    #[test]
+    fn reads_the_two_io_fields_it_needs() {
+        let io = "rchar: 1015058199240\nwchar: 145316407580\nsyscr: 587512211\n\
+                  read_bytes: 45834027008\nwrite_bytes: 141635293184\n\
+                  cancelled_write_bytes: 7357886464\n";
+        // The block-layer figures, not the syscall ones: rchar counts a guest's page-cache
+        // hits and its socket traffic, which cost the disk nothing.
+        assert_eq!(parse_disk(io), Some((45834027008, 141635293184)));
+        assert_eq!(parse_disk("rchar: 1\n"), None);
     }
 
     #[test]
@@ -681,10 +825,10 @@ mod tests {
         // And a sweep has since totalled it up with this process, which is the whole point of
         // sampling a tree: no per-process reading gives what two held together. Both are tree
         // members and a mark never falls, so one sweep covering the pair is enough. (A sibling
-        // test's own hog can only carry the total further, never hold it back.)
-        // Recomputed each turn rather than frozen: the shell overshoots while it reads its
-        // string in and then falls back, so a target caught at that spike could sit above
-        // anything a later sweep sees.
+        // test's own hog can only carry the total further, never hold it back.) Recomputed each
+        // turn rather than frozen: the shell overshoots while it reads its string in and then
+        // falls back, so a target caught at that spike could sit above anything a later sweep
+        // sees.
         while read().peak_rss < mem(me).unwrap().0 + mem(child.pid()).unwrap().0 {
             assert!(
                 held.elapsed() < Duration::from_secs(60),
@@ -702,6 +846,112 @@ mod tests {
             after.peak_rss >= after.largest_rss.unwrap(),
             "a total can never be under the largest process in it: {after:?}"
         );
+    }
+
+    /// The disk half of a meter, end to end: a child's writes are charged to this process by
+    /// `getrusage` exactly as its CPU is. Where nothing reaches a disk — a RAM-backed build tree,
+    /// or a kernel
+    /// without task I/O accounting — the figure must stay put rather than invent traffic,
+    /// which is the case the usage line documents by leaving the clause off.
+    #[test]
+    fn meter_counts_the_disk_a_child_moved() {
+        let _alone = METER_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("meter");
+        let me = std::process::id() as i32;
+
+        // Establish which of the two the host is, by the other reader: `disk` reads
+        // `/proc/<pid>/io`, so this settles the question without asking `getrusage`, the
+        // thing under test. The calibration write happens before the meter starts, so its
+        // own bytes are not in what the meter goes on to report.
+        let before = disk(me);
+        write_blob(&dir.join("calibrate"), 32);
+        let block_backed = matches!((before, disk(me)), (Some((_, a)), Some((_, b))) if b > a);
+
+        let meter = Meter::start();
+        // A mark only ever rises, so once the first sweep has landed every later read reports;
+        // before it, a meter has nothing to attribute and says so.
+        let idle = first_reading(&meter);
+        let read = || meter.read().expect("the only meter in this process");
+        write_blob(&dir.join("blob"), 64);
+        let after = read();
+
+        // Unmeasured on a kernel with no block accounting, where there is no claim to make.
+        let (Some((_, after_written)), Some((_, idle_written))) = (after.disk, idle.disk) else {
+            return;
+        };
+        let written = after_written - idle_written;
+        match block_backed {
+            // Well under the 64 MiB asked for: a filesystem is free to charge less than a
+            // caller wrote. That it was charged at all is the claim.
+            true => assert!(
+                written >= 8 * 1024 * 1024,
+                "a 64 MiB child write must reach the meter: {after:?} vs {idle:?}"
+            ),
+            // Not exactly zero: the rest of the suite runs in this process and writes its
+            // own scratch files, which are charged here too. The claim is that the meter did
+            // not invent the 64 MiB that never reached a disk.
+            false => assert!(
+                written < 8 * 1024 * 1024,
+                "nothing reached a disk, so the meter may not report having moved any: {after:?}"
+            ),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sweep of a process tree picks up each member's I/O, from the same `/proc` pass that
+    /// takes its memory — so a job's figure covers its helpers, not just its VMM.
+    #[test]
+    fn a_sweep_counts_the_disk_of_every_process_in_the_tree() {
+        let dir = scratch("tree");
+        let me = std::process::id() as i32;
+
+        // Kept alive past the measurement on purpose: a child this process had already
+        // reaped would have its bytes folded into this process's own `/proc/<pid>/io`, and
+        // the sweep would pass without ever descending. Only a live one puts them where
+        // nothing but the walk can find them.
+        let (blob, done) = (dir.join("blob"), dir.join("done"));
+        let child = Reap(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "dd if=/dev/zero of={} bs=1M count=32 conv=fsync 2>/dev/null; \
+                     : > {}; while true; do sleep 1; done",
+                    blob.display(),
+                    done.display()
+                ))
+                .spawn()
+                .expect("spawning a writing child"),
+        );
+        let started = std::time::Instant::now();
+        while !done.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "child never wrote"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Read before the sweep, so the three are ordered: every counter only ever rises,
+        // and the child's are disjoint from this process's while it is still running.
+        let own = disk(me).map(|(_, written)| written);
+        let by_child = disk(child.pid()).map_or(0, |(_, written)| written);
+        let swept = tree(me)
+            .expect("this process is a tree")
+            .disk
+            .map_or(0, |(_, written)| written);
+
+        match own {
+            // On a RAM-backed build tree `by_child` is zero and this falls back to the
+            // weaker claim, which is all there is to make where nothing reached a disk.
+            Some(written) => assert!(
+                swept >= written + by_child,
+                "the sweep must carry the child's writes as well as its own: \
+                 {swept} vs {written} + {by_child}"
+            ),
+            None => assert_eq!(swept, 0, "no accounting, no figure"),
+        }
+        drop(child);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `getrusage` and the process tree are both process-wide, so two phases running at once
@@ -785,7 +1035,6 @@ mod tests {
         // The hour boundary rounds the same way, and never reads "59m60s".
         assert_eq!(fmt_cpu(Duration::from_millis(3_599_700)), "1h00m");
 
-        assert_eq!(fmt_bytes(0), "0 MiB");
         // The first byte count to take the GiB branch still reads as a whole GiB.
         assert_eq!(fmt_bytes(1023 * 1024 * 1024 + 512 * 1024), "1.0 GiB");
         assert_eq!(fmt_bytes(842 * 1024 * 1024), "842 MiB");
@@ -793,15 +1042,57 @@ mod tests {
         assert_eq!(fmt_bytes(1717986918), "1.6 GiB");
         // Just short of a GiB likewise, rather than printing "1024 MiB".
         assert_eq!(fmt_bytes(1024 * 1024 * 1024 - 1), "1.0 GiB");
+        // Below a MiB the smaller units carry it, so disk traffic too small to round to one
+        // still reads as the something it was — and just short of a MiB is not "1024 KiB".
+        assert_eq!(fmt_bytes(1024 * 1024), "1 MiB");
+        assert_eq!(fmt_bytes(1024 * 1024 - 1), "1 MiB");
+        assert_eq!(fmt_bytes(300 * 1024), "300 KiB");
+        // Exactly half a MiB: the arm that prints MiB has to agree with the arm that chose it,
+        // or a real 512 KiB transfer reads as having moved nothing.
+        assert_eq!(fmt_bytes(512 * 1024), "512 KiB");
+        assert_eq!(fmt_bytes(1023 * 1024), "1023 KiB");
+        assert_eq!(fmt_bytes(1023), "1023 B");
+        assert_eq!(fmt_bytes(0), "0 B");
 
         // A job reports one figure; a build adds the largest single process.
         let usage = Usage {
             cpu: Duration::from_secs(134),
             peak_rss: 1717986918,
             largest_rss: None,
+            ..Usage::default()
         };
         assert_eq!(
             usage.summary("job"),
+            "virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB"
+        );
+        // Disk joins the line where it was measured.
+        assert_eq!(
+            Usage {
+                disk: Some((3_650_722_201, 851_443_712)),
+                ..usage
+            }
+            .summary("job"),
+            "virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB, \
+             read 3.4 GiB, written 812 MiB"
+        );
+        // The distinction the figure exists to keep: a phase that moved nothing says so,
+        // one whose host could not measure says nothing at all. Reading the same for both
+        // is what this prevents — the first is a fact about the job, the second about the
+        // host.
+        assert_eq!(
+            Usage {
+                disk: Some((0, 0)),
+                ..usage
+            }
+            .summary("job"),
+            "virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB, read 0 B, written 0 B"
+        );
+        assert_eq!(
+            Usage {
+                disk: None,
+                ..usage
+            }
+            .summary("job"),
             "virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB"
         );
         assert_eq!(

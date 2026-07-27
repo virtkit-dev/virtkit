@@ -90,13 +90,13 @@ Each phase reports what it cost the runner. A job that builds its own image
 its timing breakdown — a job whose image is already built runs no build and reports none:
 
 ```
-virtkit: build resource usage: cpu 8m12s, peak memory 3.2 GiB (largest process 1.2 GiB)
+virtkit: build resource usage: cpu 8m12s, peak memory 3.2 GiB (largest process 1.2 GiB), read 1.8 GiB, written 4.1 GiB
 ```
 
 and the run figures come at the very end of the trace:
 
 ```
-virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB
+virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB, read 3.4 GiB, written 812 MiB
 ```
 
 `cpu` is all the CPU time the phase burned on the host, the guests' own execution
@@ -132,6 +132,28 @@ Either line is omitted rather than guessed at when the figures cannot be had: th
 for a job whose guest died and took the supervisor with it, the build ones for a build that
 shared the host process with another (both would be charged for each other's guests) or that
 the host could spare no sampler thread for.
+
+`read` and `written` are what the phase cost the runner's **storage**, not what its programs
+asked for: `read` is what was actually fetched from the block layer, so a guest re-reading a
+file it has already pulled into its own page cache costs nothing here, and `written` is what
+was handed over to be written out. Two consequences are worth expecting rather than
+discovering:
+
+- work that never reaches a disk is not counted, because there is nothing to count: a
+  `[gitlab] checkout_dir` pointed at the runner's builds tmpfs, or a guest write absorbed by
+  its overlay, is RAM, and a tmpfs page never reaches the block layer;
+- a job re-run on a warm host reads far less than the same job on a cold one, which is the
+  cache doing its job rather than the measurement wavering.
+
+A measured zero is printed — `read 0 B` says this job touched no disk, which is a fact
+about the job. The clause is left off only where the figure could not be taken at all: a
+kernel built without `CONFIG_TASK_IO_ACCOUNTING`. The history keeps the two apart as well,
+so a host that cannot measure never leaves a job remembered as having moved nothing, and
+`vk check` says which of the two a host is:
+
+```
+ok   usage    block I/O accounted, process tree from the kernel's child lists
+```
 
 ### Sizing the two phases
 
@@ -249,8 +271,8 @@ Every job trace says where it stands, whether or not the host reserves this way 
 is how you decide to:
 
 ```
-virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB
-virtkit: most this job has used lately: 2.1 GiB over 37 runs; the next run reserves 2.6 GiB
+virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB, read 3.4 GiB, written 812 MiB
+virtkit: most this job has used lately: memory 2.1 GiB, read 12.0 GiB, written 3.1 GiB over 37 runs; the next run reserves 2.6 GiB
 ```
 
 The run count is what the estimate rests on: the runs of the last 14 days, or the last five

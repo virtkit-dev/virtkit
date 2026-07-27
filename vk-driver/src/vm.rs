@@ -2268,8 +2268,11 @@ mod tests {
         crate::admit::remember(
             &ctx.history_dir(),
             &ctx.usage_key(),
-            1000 * 1024 * 1024,
-            ceiling_mib * 1024 * 1024,
+            crate::admit::Run {
+                peak: 1000 * 1024 * 1024,
+                ceiling: ceiling_mib * 1024 * 1024,
+                disk: None,
+            },
         );
         // 1000 MiB + 25% headroom, under the 8 GiB it declares.
         assert_eq!(

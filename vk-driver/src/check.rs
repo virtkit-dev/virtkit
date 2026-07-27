@@ -33,6 +33,8 @@ pub enum Feature {
     Share,
     /// [services]: the shared image cache CI services pull into is writable
     Services,
+    /// the kernel accounts what jobs use, so their traces can report it
+    Usage,
 }
 
 impl Feature {
@@ -55,6 +57,7 @@ impl Feature {
             Feature::Gitlab => "gitlab",
             Feature::Share => "share",
             Feature::Services => "services",
+            Feature::Usage => "usage",
         }
     }
 }
@@ -157,6 +160,26 @@ fn evaluate(cfg: &Config, feature: Feature) -> Outcome {
         Feature::Gitlab => gitlab(cfg),
         Feature::Share => share(cfg),
         Feature::Services => services(cfg),
+        Feature::Usage => usage(),
+    }
+}
+
+/// Whether this host can measure what its jobs use. Not a reason a job cannot run — which is
+/// why an unaccounted kernel skips rather than fails, and only fails when an operator names
+/// the feature and is told it does not hold. Reported because the alternative is a blank in
+/// every job trace with nothing to say why: a phase whose disk was never measurable and one
+/// that touched no disk print the same nothing.
+fn usage() -> Outcome {
+    let tree = match crate::usage::kernel_lists_children() {
+        true => "process tree from the kernel's child lists",
+        false => "process tree from a scan of every process (no CONFIG_PROC_CHILDREN)",
+    };
+    match crate::usage::io_accounted() {
+        true => ok(format!("block I/O accounted, {tree}")),
+        false => skip(format!(
+            "no block I/O accounting in this kernel (CONFIG_TASK_IO_ACCOUNTING) — a job's \
+             disk figures are reported as unmeasured; {tree}"
+        )),
     }
 }
 

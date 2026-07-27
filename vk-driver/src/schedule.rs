@@ -398,8 +398,11 @@ mod tests {
             crate::admit::remember(
                 &history,
                 &key(project, job),
-                peak * 1024 * 1024,
-                8192 * 1024 * 1024,
+                crate::admit::Run {
+                    peak: peak * 1024 * 1024,
+                    ceiling: 8192 * 1024 * 1024,
+                    ..Default::default()
+                },
             );
         }
         let typical = typical_job_mib(&cfg, 8192);
