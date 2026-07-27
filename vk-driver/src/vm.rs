@@ -1702,18 +1702,22 @@ fn prefix_to_netmask(prefix: u32) -> String {
     )
 }
 
+/// The pid of the job's supervisor, or `None` if the pidfile is absent or unparseable,
+/// or if its pid no longer belongs to this job (`pid_running`'s pid-reuse guard).
+pub fn live_supervisor_pid(ctx: &JobCtx) -> Option<i32> {
+    let pid = read_pidfile(&ctx.supervisor_pidfile())?;
+    pid_running(pid, &ctx.job_dir.to_string_lossy()).then_some(pid)
+}
+
 /// Signal the job's supervisor and wait for it to go — everything it owns (the
 /// switch, virtiofsds, forwards, the VMM after its graceful guest shutdown)
 /// follows, by its TERM handler or by PDEATHSIG. Idempotent: tolerates a missing
 /// or stale pidfile (the job-dir cmdline tag guards against pid reuse).
 pub fn stop_supervisor(ctx: &JobCtx) {
-    let Some(pid) = read_pidfile(&ctx.supervisor_pidfile()) else {
+    let Some(pid) = live_supervisor_pid(ctx) else {
         return;
     };
     let tag = ctx.job_dir.to_string_lossy().into_owned();
-    if !pid_running(pid, &tag) {
-        return;
-    }
     unsafe { libc::kill(pid, libc::SIGTERM) };
     // the supervisor's own teardown runs the graceful guest shutdown; give it
     // that budget plus margin before the hammer.
@@ -1904,6 +1908,38 @@ mod tests {
         ctx.cpus_req = cpus_req.map(String::from);
         ctx.mem_req = mem_req.map(String::from);
         ctx
+    }
+
+    #[test]
+    fn live_supervisor_pid_rejects_a_pid_that_is_no_longer_ours() {
+        let dir = std::env::temp_dir().join(format!("vk-live-pid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = Config {
+            state_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        let ctx = JobCtx::new_for_job(cfg, "42".into()).unwrap();
+        std::fs::create_dir_all(&ctx.job_dir).unwrap();
+
+        // No pidfile: nothing was ever recorded.
+        assert_eq!(live_supervisor_pid(&ctx), None);
+
+        // A live pid whose cmdline does not name the job dir is a reused pid, not ours
+        // — this test process itself stands in for one.
+        std::fs::write(ctx.supervisor_pidfile(), std::process::id().to_string()).unwrap();
+        assert_eq!(live_supervisor_pid(&ctx), None);
+
+        // Positive control for that guard: the same pid does match a tag its cmdline
+        // carries, so the None above is the tag mismatch and not an unreadable /proc.
+        let exe = std::env::current_exe().unwrap();
+        let exe_name = exe.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(pid_running(std::process::id() as i32, &exe_name));
+
+        // An unparseable pidfile yields None, like an absent one.
+        std::fs::write(ctx.supervisor_pidfile(), "not-a-pid").unwrap();
+        assert_eq!(live_supervisor_pid(&ctx), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
