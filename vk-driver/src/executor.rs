@@ -159,11 +159,29 @@ fn report_egress_audit(ctx: &JobCtx) {
 /// output the trace still keeps, and the job's processes are all still alive to be read: it
 /// therefore covers everything but the guest's own shutdown. Best-effort: a job whose
 /// supervisor is already gone (the guest died) reports nothing.
+///
+/// The same figure is what the next run of this job is admitted against where the host
+/// reserves from history (`[schedule] from_history`), so it is recorded here too.
 fn report_resource_usage(ctx: &JobCtx) {
     if let Some(pid) = crate::vm::live_supervisor_pid(ctx)
         && let Some(usage) = crate::usage::tree(pid)
     {
         eprintln!("{}", usage.summary("job"));
+        // Recorded in the same bytes the line above prints, so one run never reads as two
+        // figures. Stamped with the ceiling it ran under, which is what makes a job whose
+        // MICROVM_MEM changed start again rather than be predicted from runs it can no longer
+        // repeat. A job whose declared size will not parse never booted, so there is nothing
+        // to remember.
+        if let Ok(ceiling_mib) = crate::vm::declared_mem_mib(ctx)
+            && let Some(ceiling) = ceiling_mib.checked_mul(1024 * 1024)
+        {
+            crate::admit::remember(
+                &ctx.history_dir(),
+                &ctx.usage_key(),
+                usage.peak_rss,
+                ceiling,
+            );
+        }
     }
 }
 

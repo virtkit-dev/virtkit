@@ -55,6 +55,13 @@ pub struct JobCtx {
     /// CI_CONCURRENT_ID + CI_PROJECT_PATH_SLUG, keying the reused host checkout dir.
     concurrent_id: String,
     project_slug: String,
+    /// CI_JOB_NAME — with the project, what makes two runs "the same job" for the memory
+    /// history (`[schedule] from_history`). The job id cannot: it is unique per run.
+    job_name: Option<String>,
+    /// CI_PROJECT_ID — unique on the GitLab instance, where the slug beside it is not: it is
+    /// lower-cased, punctuation-folded and cut to 63 characters, so two projects can share
+    /// one. The id scopes the history; the slug only makes the directory readable.
+    project_id: Option<String>,
 }
 
 impl JobCtx {
@@ -117,6 +124,8 @@ impl JobCtx {
             // defensively so a surprising value can never escape the checkouts root.
             concurrent_id: safe_component(job_var("CI_CONCURRENT_ID"), "0"),
             project_slug: safe_component(job_var("CI_PROJECT_PATH_SLUG"), "repo"),
+            job_name: job_var("CI_JOB_NAME"),
+            project_id: job_var("CI_PROJECT_ID"),
         })
     }
 
@@ -137,6 +146,34 @@ impl JobCtx {
             None => self.cfg.state_dir().join("checkouts"),
         };
         root.join(&self.concurrent_id).join(&self.project_slug)
+    }
+
+    /// Where this host remembers what jobs used, keyed by [`JobCtx::usage_key`]. Shared by
+    /// every runner on the host, like the ledger beside it.
+    pub fn history_dir(&self) -> PathBuf {
+        self.cfg.state_dir().join("history")
+    }
+
+    /// What makes two runs the same job for the memory history: `<project>/<job name>`.
+    ///
+    /// Two components rather than one joined string, because both halves may contain the
+    /// separator — a GitLab slug is made of them (`group/sub/proj` slugs to `group-sub-proj`)
+    /// and job names are full of them too, so `acme-web` + `build` and `acme` + `web-build`
+    /// would be the same key and share one history. The project is scoped by its numeric id
+    /// where there is one, since the slug alone is not unique; a project renamed under the
+    /// same id starts a fresh history, which costs it one run at its declared size.
+    pub fn usage_key(&self) -> PathBuf {
+        // The id is joined to the slug with the separator both halves may contain, so it is
+        // used only when it is what GitLab documents it to be — a number. Anything else and
+        // the slug stands alone: `42-x` + `y` and `42` + `x-y` must not be one project.
+        let project = match &self.project_id {
+            Some(id) if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) => {
+                format!("{id}-{}", self.project_slug)
+            }
+            _ => self.project_slug.clone(),
+        };
+        PathBuf::from(path_component(&project, "repo"))
+            .join(job_component(self.job_name.as_deref().unwrap_or("job")))
     }
 
     /// The host-wide memory ledger (`[schedule] mem_budget`), shared by every job on this
@@ -232,6 +269,43 @@ impl JobCtx {
     }
 }
 
+/// A job's own component: its name reduced to a filename, followed by a short digest of the
+/// name as written. The digest is what makes two names that reduce to the same filename —
+/// `test:unit` and `test/unit`, or two long names sharing their first hundred characters —
+/// keep their own histories, while the readable part still says which job the directory is.
+fn job_component(raw: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(raw.as_bytes());
+    // Sixteen bytes. Eight would separate names that merely reduce alike, but its birthday
+    // bound is only 2^32 — within reach of anyone who can pick both names, and two names
+    // sharing a history is what the whole key scheme exists to prevent.
+    let short: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{}-{short}", path_component(raw, "job"))
+}
+
+/// One safe path component out of free text: a job name can be anything (`test:unit 1/3`),
+/// so everything outside a plain filename becomes `_`, leading dots go, and a long name is
+/// cut. Falls back to `default` when nothing usable is left — `..` must never come out of
+/// here as a component of its own.
+fn path_component(raw: &str, default: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(100)
+        .collect();
+    let cleaned = cleaned.trim_start_matches('.').to_string();
+    match cleaned.is_empty() {
+        true => default.to_string(),
+        false => cleaned,
+    }
+}
+
 /// A single safe path component from an optional env value: keep only alphanumerics, `-`, `_`
 /// and `.`, reject a leading dot / emptiness, and fall back to `default` otherwise. Guards the
 /// `host_checkout` cache path against a crafted CI_CONCURRENT_ID / CI_PROJECT_PATH_SLUG.
@@ -286,6 +360,7 @@ pub(crate) fn job_identity() -> String {
 mod tests {
     use super::*;
     use crate::config::Gitlab;
+    use std::path::Path;
 
     // A JobCtx with a fixed slot/project key, built directly so `host_checkout_dir` is
     // exercised without depending on the ambient CI_* env.
@@ -312,7 +387,85 @@ mod tests {
             ci_project_dir: None,
             concurrent_id: "0".into(),
             project_slug: "myproj".into(),
+            job_name: Some("test:unit 1/3".into()),
+            project_id: Some("42".into()),
         }
+    }
+
+    /// The history key is a filename, and a GitLab job name is free text — parallel matrix
+    /// jobs carry slashes and spaces, and a crafted one must not walk out of the directory.
+    #[test]
+    fn the_usage_key_scopes_a_job_to_its_project() {
+        let key = ctx(Config::default()).usage_key();
+        let job = key.file_name().unwrap().to_string_lossy();
+        assert_eq!(key.parent().unwrap(), Path::new("42-myproj"));
+        assert!(job.starts_with("test_unit_1_3-"), "{job}");
+
+        // Both halves may contain the separator a single string would join them with, so
+        // they are separate components: these two would otherwise share one history.
+        let mut a = ctx(Config::default());
+        a.project_slug = "acme-web".into();
+        a.job_name = Some("build".into());
+        let mut b = ctx(Config::default());
+        b.project_slug = "acme".into();
+        b.job_name = Some("web-build".into());
+        assert_ne!(a.usage_key(), b.usage_key());
+
+        // Slugs are not unique — lower-cased, punctuation-folded, cut at 63 characters — so
+        // the project's own id is what separates two that fold together.
+        let mut same_slug = ctx(Config::default());
+        same_slug.project_id = Some("77".into());
+        assert_ne!(same_slug.usage_key(), ctx(Config::default()).usage_key());
+    }
+
+    /// Names that reduce to the same filename are still different jobs, and the digest of
+    /// the name as written is what keeps them apart.
+    #[test]
+    fn job_names_that_reduce_alike_keep_their_own_history() {
+        let key = |name: &str| {
+            let mut c = ctx(Config::default());
+            c.job_name = Some(name.into());
+            c.usage_key()
+        };
+        // Same filename, different jobs.
+        assert_ne!(key("test:unit"), key("test/unit"));
+        // Same first hundred characters, different jobs.
+        assert_ne!(
+            key(&format!("{}a", "x".repeat(100))),
+            key(&format!("{}b", "x".repeat(100)))
+        );
+        // And the same name is always the same history, run after run.
+        assert_eq!(key("test:unit"), key("test:unit"));
+    }
+
+    /// A job name is free text and lands in a path: no component may escape the directory,
+    /// and none may be empty.
+    #[test]
+    fn the_usage_key_stays_inside_its_directory() {
+        let mut escaping = ctx(Config::default());
+        escaping.job_name = Some("../../etc/passwd".into());
+        let key = escaping.usage_key();
+        assert_eq!(key.components().count(), 2);
+        let job = key.file_name().unwrap().to_string_lossy();
+        assert!(job.starts_with("_.._etc_passwd-"), "{job}");
+
+        // A name that sanitizes away entirely must still leave a component behind.
+        let mut dots = ctx(Config::default());
+        dots.job_name = Some("..".into());
+        let key = dots.usage_key();
+        assert!(
+            key.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("job-"),
+            "{key:?}"
+        );
+
+        // A manual run outside gitlab-runner has neither id nor name.
+        let mut bare = ctx(Config::default());
+        bare.project_id = None;
+        bare.job_name = None;
+        assert_eq!(bare.usage_key().parent().unwrap(), Path::new("myproj"));
     }
 
     #[test]

@@ -157,6 +157,13 @@ pub struct Build {
 pub struct Schedule {
     /// Total guest RAM this host admits at once, e.g. `"48G"`. Unset = no admission gate.
     pub mem_budget: Option<String>,
+    /// Reserve what a job of this kind has actually been using rather than what it declares
+    /// — jobs rarely touch their whole `MICROVM_MEM`, so declared sizes leave a host running
+    /// far fewer of them than it could. Reservations then follow a job's recent peaks (with
+    /// headroom, never above what it declares), and its first ever run falls back to the
+    /// declared size. Default off: it trades a margin of safety for throughput, so turn it on
+    /// once a few pipelines have been measured.
+    pub from_history: bool,
     /// How long a job waits for room before giving up. It then exits a *system* failure,
     /// which GitLab retries when the job asks it to (`retry: { when: runner_system_failure }`)
     /// — set that on jobs you would rather see land on another runner than fail. Default 600.

@@ -110,6 +110,13 @@
 #                        # (see the end of a job trace) — size the budget from that.
 # mem_budget = "48G"     # total GUEST RAM admitted at once; leave the rest of the host's
 #                        # memory for the VMMs, the page cache and everything else
+# from_history = false   # reserve what a job of this kind has been using (its largest run
+#                        # of the last 14 days at its current MICROVM_MEM + headroom, capped
+#                        # by what it declares) instead of declared size, so a host runs as
+#                        # many jobs as it can really hold. The VM still gets the memory it
+#                        # declares. Off by default: a job that suddenly needs far more than
+#                        # it ever has is admitted on the old figure. Turn it on once a few
+#                        # pipelines have been measured.
 # wait_timeout_secs = 600  # then the job fails as a *system* failure, which GitLab retries
 #                        # for jobs that ask (`retry: { when: runner_system_failure }`)
 

@@ -1678,6 +1678,14 @@ fn vm_size(ctx: &JobCtx) -> Result<(u32, String)> {
     Ok((cpus, mem))
 }
 
+/// The guest RAM this job declares, in MiB: `MICROVM_MEM` clamped by the host ceilings, the
+/// figure a reservation is capped at and the job's history is read against.
+pub(crate) fn declared_mem_mib(ctx: &JobCtx) -> Result<u64> {
+    parse_gib(&vm_size(ctx)?.1)?
+        .checked_mul(1024)
+        .context("guest memory size is absurdly large")
+}
+
 /// Reserve this job's guest RAM against the host's `[schedule] mem_budget`, blocking until
 /// there is room for it (see admit). `None` when no budget is configured — the host then
 /// admits every job the runner hands it, as it did before. A job that never gets room fails
@@ -1691,16 +1699,29 @@ fn admit_memory(ctx: &JobCtx, mem: &str) -> Result<Option<crate::admit::Reservat
         .checked_mul(1024)
         .context("[schedule] mem_budget is absurdly large")?;
     let timeout = Duration::from_secs(ctx.cfg.schedule.wait_timeout_secs.unwrap_or(600));
-    let reservation = crate::admit::acquire(
-        &ctx.admit_dir(),
-        &ctx.job_id,
-        parse_gib(mem)
-            .context("invalid guest memory size")?
-            .checked_mul(1024)
-            .context("guest memory size is absurdly large")?,
-        budget_mib,
-        timeout,
-    )?;
+    let declared_mib = parse_gib(mem)
+        .context("invalid guest memory size")?
+        .checked_mul(1024)
+        .context("guest memory size is absurdly large")?;
+    // `[schedule] from_history`: reserve what this job has been using rather than what it
+    // declares. Announced, because it is the difference between a job waiting and not.
+    let want_mib = match ctx.cfg.schedule.from_history {
+        true => crate::admit::expect_mib(&ctx.history_dir(), &ctx.usage_key(), declared_mib)
+            .inspect(|mib| {
+                // Only worth saying when it changes the reservation: a job whose peak fills
+                // its ceiling would otherwise be told it reserves what it declares.
+                if *mib < declared_mib {
+                    println!(
+                        "virtkit: reserving {mib} MiB from what this job has been using \
+                         (it declares {declared_mib} MiB)"
+                    );
+                }
+            })
+            .unwrap_or(declared_mib),
+        false => declared_mib,
+    };
+    let reservation =
+        crate::admit::acquire(&ctx.admit_dir(), &ctx.job_id, want_mib, budget_mib, timeout)?;
     Ok(Some(reservation))
 }
 
@@ -2227,6 +2248,36 @@ mod tests {
         let mut plain = self::ctx(None, None);
         plain.cfg.schedule.mem_budget = Some("2G".into());
         assert_eq!(vm_size(&plain).unwrap().1, "8G");
+    }
+
+    /// The ceiling a finished run is stamped with and the ceiling the next admission looks it
+    /// up under are computed in two different processes. They agree only because both route
+    /// through `declared_mem_mib`, and `under_ceiling` matches on exact equality — so any drift
+    /// between them turns `from_history` into a permanent, silent fallback to declared sizes.
+    #[test]
+    fn a_remembered_run_is_what_the_next_admission_reserves() {
+        let dir = std::env::temp_dir().join(format!("vk-hist-seam-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ctx = ctx(None, Some("8G"));
+        ctx.cfg.state_dir = Some(dir.clone());
+        ctx.cfg.schedule.mem_budget = Some("48G".into());
+        ctx.cfg.schedule.from_history = true;
+
+        let ceiling_mib = declared_mem_mib(&ctx).unwrap();
+        assert_eq!(ceiling_mib, 8192, "the job declares what the test set");
+        crate::admit::remember(
+            &ctx.history_dir(),
+            &ctx.usage_key(),
+            1000 * 1024 * 1024,
+            ceiling_mib * 1024 * 1024,
+        );
+        // 1000 MiB + 25% headroom, under the 8 GiB it declares.
+        assert_eq!(
+            crate::admit::expect_mib(&ctx.history_dir(), &ctx.usage_key(), ceiling_mib),
+            Some(1250),
+            "the run just recorded is what the next admission reserves"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// With no budget configured the gate is absent: nothing is claimed, and no ledger is

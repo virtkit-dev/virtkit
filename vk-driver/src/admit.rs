@@ -23,7 +23,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -184,6 +184,249 @@ pub fn hold(dir: &Path, job_id: &str) -> Option<Reservation> {
             None
         }
     }
+}
+
+/// How far back a job's own runs are believed. Measured in days rather than runs, because
+/// what changes a job's appetite — a dependency, a fixture, the code — changes on calendar
+/// time, while the same count of runs can span half an hour on a busy merge queue and most
+/// of a year on a release job.
+const WINDOW: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+/// However quiet a job is, its last few runs always count: a job that runs monthly would
+/// otherwise have no history at all and be admitted on its declared size forever.
+const MIN_RUNS: usize = 5;
+/// The most lines a job's history keeps; past it the oldest fall off the front. The only bound
+/// on the file — the window narrows what a read believes, not what is stored — so this is what
+/// keeps a job running every few minutes from growing one without end. A thousand recent runs
+/// make as good a maximum as ten thousand.
+const TRIM_AT: usize = 1000;
+/// Headroom over what a job has been seen to use, as a percentage: the next run is not the
+/// last one, and a reservation that is a little too big only costs throughput.
+const HEADROOM_PCT: u64 = 25;
+/// No reservation smaller than this, however little a job has been seen to use — the page
+/// cache behind the rootfs is not in the measured peak, and a job that has only ever run
+/// trivially may not next time.
+const FLOOR_MIB: u64 = 512;
+/// Bytes to a MiB, for the boundary between a history in bytes and the reservation
+/// arithmetic in MiB — which is the unit the ledger, `[vm] mem` and `MICROVM_MEM` all use.
+const MIB: u64 = 1024 * 1024;
+
+/// One remembered run: when it ended, the peak it reached, and the ceiling it ran under.
+/// The ceiling matters because a peak is only evidence of what a job needs while the job was
+/// free to need it — a run held to 4 GiB says nothing about the same job given 16.
+///
+/// Both figures are in **bytes**, though the reservation they feed is in MiB: what a run
+/// used is a measurement, and rounding a measurement on the way to disk throws away detail
+/// that later figures kept beside it may need at full resolution.
+#[derive(Clone, Copy)]
+struct Sample {
+    at_secs: u64,
+    peak: u64,
+    ceiling: u64,
+}
+
+/// Note what a job of this kind actually used, and the ceiling it used it under, for the
+/// next one to be admitted against. One `<unix seconds> <peak> <ceiling>` line per run, both
+/// in bytes, appended whole so runs finishing together cannot tear each other's;
+/// best-effort, since a lost sample only costs accuracy on the next admission.
+pub fn remember(dir: &Path, key: &Path, peak: u64, ceiling: u64) {
+    remember_at(dir, key, peak, ceiling, now_secs())
+}
+
+fn remember_at(dir: &Path, key: &Path, peak: u64, ceiling: u64, now: u64) {
+    let Some(path) = under(dir, key) else {
+        return; // a key that would write outside the history is no key at all
+    };
+    // The key is `<project>/<job>`, so the project's own directory has to exist first — and
+    // making it makes the history root the lock below lives in. 0700 like the ledger's, on
+    // create and on reuse: what a job is admitted against decides how much of the host it is
+    // charged for, so an entry another local user could plant or edit would let one job's
+    // guest be reserved a fraction of what it boots.
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .is_err()
+    {
+        return;
+    }
+    for private in [dir, parent] {
+        if std::fs::set_permissions(private, std::fs::Permissions::from_mode(0o700)).is_err() {
+            return;
+        }
+    }
+    // Held across the append and the trim under it, the way the ledger holds its own: the
+    // trim rewrites the file whole, so a run appended between its read and its write would
+    // be erased rather than merely delayed. A history dir has its own lock, so this never
+    // contends with admission.
+    let Ok(_dir_lock) = lock_dir(dir) else {
+        return; // no lock, no safe write — a lost sample only costs the next admission
+    };
+    if let Ok(mut file) = File::options()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        // Best-effort, as the doc says: a run that goes unrecorded costs the next admission
+        // a little accuracy and nothing else.
+        let _ = file.write_all(format!("{now} {peak} {ceiling}\n").as_bytes());
+    }
+    // Keep the file from growing without bound: the newest runs, capped.
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if text.lines().count() <= TRIM_AT {
+            return;
+        }
+        // Written back from the samples rather than from the lines they came from: the two
+        // line up only while every line parses, so a line that does not is dropped here
+        // instead of being carried forever.
+        //
+        // Trimmed by count alone and never by age. The window already ignores what is too old
+        // to believe, at read time and per ceiling — deleting it here would instead take every
+        // other ceiling's runs with it, since the window is ceiling-blind and floors at
+        // [`MIN_RUNS`]: one run after an idle fortnight would cut a thousand-line history to
+        // five lines, and a job whose ceiling went back to what it was would find nothing.
+        let samples = parse(&text);
+        let keep = samples.len().min(TRIM_AT);
+        let kept: String = samples[samples.len() - keep..]
+            .iter()
+            .map(|s| format!("{} {} {}\n", s.at_secs, s.peak, s.ceiling))
+            .collect();
+        // Swapped in whole rather than truncated in place: a reader takes no lock, and
+        // truncate-then-write leaves it a prefix — the *oldest* runs, a smaller history that
+        // still parses, which is the unsafe way to be wrong. A failed write leaves the previous
+        // file untouched.
+        //
+        // The staged name appends to the whole filename rather than replacing an extension, so
+        // it stays one-to-one with the history it belongs to: `with_extension` would turn
+        // `my.job-<digest>` into `my.trim`, losing the digest and colliding with every other
+        // `my.*` job. Created 0600 like the append path's, since the rename makes this inode
+        // the history and so its mode the history's mode; `create_new` after removing any
+        // staged file a crashed trim left rejects a symlink planted in its place.
+        let mut staged = path.clone().into_os_string();
+        staged.push(".trim");
+        let staged = PathBuf::from(staged);
+        let _ = std::fs::remove_file(&staged);
+        let written = File::options()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&staged)
+            .and_then(|mut f| f.write_all(kept.as_bytes()));
+        if written.is_ok() {
+            let _ = std::fs::rename(&staged, &path);
+        } else {
+            let _ = std::fs::remove_file(&staged);
+        }
+    }
+}
+
+/// The most a job of this kind has used lately under `ceiling` bytes, and over how many
+/// runs.
+/// `None` when it has none — a job whose ceiling has just changed is in the same position as
+/// one that has never run: what it did under the old ceiling is not evidence about the new.
+///
+/// The largest of the window, not an average: a job that peaks 6 GiB one run in five needs
+/// 6 GiB reserved, and averaging would admit it into a host that cannot hold it.
+fn most_recent(dir: &Path, key: &Path, ceiling: u64) -> Option<(u64, usize)> {
+    most_recent_at(dir, key, ceiling, now_secs())
+}
+
+fn most_recent_at(dir: &Path, key: &Path, ceiling: u64, now: u64) -> Option<(u64, usize)> {
+    let samples = under_ceiling(&read(dir, key), ceiling);
+    let window = window_of(&samples, now);
+    let most = window.iter().map(|s| s.peak).max()?;
+    Some((most, window.len()))
+}
+
+/// The runs taken under `ceiling` bytes, in order. A run held to a lower ceiling may have been
+/// squeezed by it; one given a higher ceiling had room this job no longer has. Either way the
+/// number it reached says nothing about what it would reach now, so raising or lowering a
+/// job's `MICROVM_MEM` starts its history again — and putting it back finds the old runs still
+/// there, until [`TRIM_AT`] newer ones have pushed them off the front.
+fn under_ceiling(samples: &[Sample], ceiling: u64) -> Vec<Sample> {
+    samples
+        .iter()
+        .copied()
+        .filter(|s| s.ceiling == ceiling)
+        .collect()
+}
+
+/// What to reserve for a job of this kind: the most it has used lately plus headroom, never
+/// below the floor and never above what the job declares. `None` when it has no history —
+/// the first run of a job is admitted against its declared size.
+pub fn expect_mib(dir: &Path, key: &Path, declared_mib: u64) -> Option<u64> {
+    // A declared size too large to express in bytes has no history to match it: the ceiling
+    // every run was stamped with went through the same conversion.
+    let (most, _) = most_recent(dir, key, declared_mib.checked_mul(MIB)?)?;
+    Some(reserve_mib(most / MIB, declared_mib))
+}
+
+fn reserve_mib(most_mib: u64, declared_mib: u64) -> u64 {
+    // Saturating: the headroom is applied to a figure read off disk, and a wrapped total
+    // would reserve less than the run it came from. The cap makes the ceiling the real bound.
+    most_mib
+        .saturating_add(most_mib.saturating_mul(HEADROOM_PCT) / 100)
+        .max(FLOOR_MIB)
+        .min(declared_mib)
+}
+
+/// The runs the estimate rests on: those inside the window, and always at least the last
+/// [`MIN_RUNS`] however old they are.
+///
+/// Counted from the newest backwards, so a sample stamped out of order — a host whose clock
+/// stepped between two runs — ends the window early rather than reordering history. The
+/// minimum then covers what that dropped.
+fn window_of(samples: &[Sample], now: u64) -> &[Sample] {
+    let fresh = samples
+        .iter()
+        .rev()
+        .take_while(|s| now.saturating_sub(s.at_secs) <= WINDOW.as_secs())
+        .count();
+    let take = fresh.max(MIN_RUNS).min(samples.len());
+    &samples[samples.len() - take..]
+}
+
+/// `dir/key`, or `None` for a key that would not stay under `dir`. Every key comes from
+/// [`crate::jobctx::JobCtx::usage_key`], which builds it out of sanitised components — but
+/// `Path::join` drops the base entirely for an absolute key, so nothing here takes that on
+/// trust from a caller two modules away.
+fn under(dir: &Path, key: &Path) -> Option<PathBuf> {
+    let mut parts = key.components().peekable();
+    parts.peek()?; // an empty key would name the history root itself
+    parts
+        .all(|c| matches!(c, Component::Normal(_)))
+        .then(|| dir.join(key))
+}
+
+/// Read without the directory lock, unlike the ledger beside it: the trim swaps a whole file in
+/// by rename, so a reader sees one complete history or the one before it and never a prefix of
+/// either. Taking the lock on every read would serialise the scheduler against every job on the
+/// host finishing, to close a race the rename has already closed.
+fn read(dir: &Path, key: &Path) -> Vec<Sample> {
+    let Some(path) = under(dir, key) else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(path)
+        .map(|text| parse(&text))
+        .unwrap_or_default()
+}
+
+/// Read a history file, oldest first. A line that does not parse whole is dropped: a torn
+/// append costs the next admission one sample, where half-reading it would invent a run.
+fn parse(text: &str) -> Vec<Sample> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some(Sample {
+                at_secs: fields.next()?.parse().ok()?,
+                peak: fields.next()?.parse().ok()?,
+                ceiling: fields.next()?.parse().ok()?,
+            })
+        })
+        .collect()
 }
 
 /// Drop a job's reservation at cleanup. Best-effort: a reservation left behind stops
@@ -355,6 +598,15 @@ fn lock_dir(dir: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// Wall-clock seconds, for ageing a job's history: what makes a run old is calendar time,
+/// which outlives the boots the queue's monotonic clock is scoped to.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// A request's place in the queue: nanoseconds since boot. Monotonic rather than wall clock,
 /// which the whole oldest-first rule rests on — an NTP step backwards would otherwise stamp a
 /// request that arrived later with an earlier time and let it cut in front of one already
@@ -378,6 +630,7 @@ fn now_nanos() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -419,6 +672,12 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// A history key. Real ones are `<project>/<job>`; a single component exercises the same
+    /// paths and keeps the assertions readable.
+    fn key(name: &str) -> &Path {
+        Path::new(name)
     }
 
     /// A reservation held by this test, as another job's would be.
@@ -601,6 +860,336 @@ mod tests {
             "a scan caught an entry between its creation and its first write"
         );
         until_ledger_is(&dir, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ceiling every history test that is not about ceilings runs under.
+    const CEIL: u64 = 8192;
+
+    /// A figure as the history stores it, from the megabytes a test states it in.
+    fn bytes(mib: u64) -> u64 {
+        mib * MIB
+    }
+
+    #[test]
+    fn a_reservation_follows_what_the_job_has_been_using() {
+        let dir = tmpdir("history");
+        let now = 1_700_000_000;
+        let day = 24 * 60 * 60;
+        // No history: the caller falls back to the declared size.
+        assert_eq!(expect_mib(&dir, key("proj-test"), 8192), None);
+
+        // The largest run in the window plus headroom, not the average — a job that peaks
+        // once needs room for that run.
+        for (age, peak) in [(3 * day, 1000), (2 * day, 4000), (day, 1200)] {
+            remember_at(&dir, key("proj-test"), bytes(peak), bytes(CEIL), now - age);
+        }
+        assert_eq!(
+            most_recent_at(&dir, key("proj-test"), bytes(CEIL), now),
+            Some((bytes(4000), 3))
+        );
+        assert_eq!(reserve_mib(4000, 8192), 5000);
+
+        // Never above what the job declares: reserving memory it cannot use would only
+        // idle the host. And never under the floor, however light the job has been.
+        assert_eq!(reserve_mib(4000, 4096), 4096);
+        assert_eq!(reserve_mib(4, 8192), FLOOR_MIB);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The point of measuring the window in days: a spike stops being believed once it is
+    /// old, however few runs have happened since.
+    #[test]
+    fn an_old_spike_leaves_the_window_on_its_own() {
+        let dir = tmpdir("ages");
+        let now = 1_700_000_000;
+        let day = 24 * 60 * 60;
+
+        remember_at(&dir, key("job"), bytes(8000), bytes(CEIL), now - 30 * day); // a month ago
+        for age in [3 * day, 2 * day, day, day / 2, 60] {
+            remember_at(&dir, key("job"), bytes(900), bytes(CEIL), now - age);
+        }
+        // Six runs, but only the five inside the window count — the old spike is not one of
+        // them, and MIN_RUNS is satisfied without it.
+        assert_eq!(
+            most_recent_at(&dir, key("job"), bytes(CEIL), now),
+            Some((bytes(900), 5))
+        );
+
+        // While it was fresh, that same spike was the whole answer — age demoted it, not
+        // the runs since.
+        remember_at(&dir, key("spike-only"), bytes(8000), bytes(CEIL), now - day);
+        assert_eq!(
+            most_recent_at(&dir, key("spike-only"), bytes(CEIL), now),
+            Some((bytes(8000), 1))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job that runs monthly has nothing inside the window, and must still be estimated
+    /// from what it did rather than from its declared size.
+    #[test]
+    fn a_rare_job_keeps_its_last_few_runs_however_old() {
+        let dir = tmpdir("rare");
+        let now = 1_700_000_000;
+        let year = 365 * 24 * 60 * 60;
+        // Oldest first, as an append-only history has them: eight monthly runs, the earlier
+        // ones the heaviest.
+        for months in (1..=8).rev() {
+            remember_at(
+                &dir,
+                key("release"),
+                bytes(2000 + months * 10),
+                bytes(CEIL),
+                now - months * year / 12,
+            );
+        }
+        // Nothing is inside the window, so the last MIN_RUNS carry the estimate: the largest
+        // of those five (five months ago), not the heavier ones from further back.
+        let (most, runs) = most_recent_at(&dir, key("release"), bytes(CEIL), now).unwrap();
+        assert_eq!(runs, MIN_RUNS);
+        assert_eq!(
+            most / MIB,
+            2050,
+            "the largest of the last five, not of all eight"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_long_history_is_trimmed_to_the_cap_and_no_further() {
+        let dir = tmpdir("trim");
+        let now = 1_700_000_000;
+        let day = 24 * 60 * 60;
+        // A job run more times in a fortnight than the cap allows: the cap bounds the file.
+        for i in 0..=TRIM_AT as u64 {
+            remember_at(&dir, key("busy"), bytes(500), bytes(CEIL), now - day + i);
+        }
+        let kept = std::fs::read_to_string(dir.join("busy")).unwrap();
+        assert_eq!(kept.lines().count(), TRIM_AT);
+        // The trim swaps a new file in, so from here on it is the trim that decides the mode.
+        let mode = std::fs::metadata(dir.join("busy"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the trim kept the history private");
+
+        // Ageing out does not shrink it further. The window already ignores what is too old
+        // to believe, per ceiling and at read time; trimming by age here would be blind to
+        // the ceiling and would take a thousand runs down to MIN_RUNS on the strength of one
+        // quiet fortnight — losing every other ceiling's runs with them.
+        remember_at(&dir, key("busy"), bytes(500), bytes(CEIL), now + 60 * day);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("busy"))
+                .unwrap()
+                .lines()
+                .count(),
+            TRIM_AT
+        );
+        assert_eq!(
+            most_recent_at(&dir, key("busy"), bytes(CEIL), now + 60 * day),
+            Some((bytes(500), MIN_RUNS)),
+            "the read still narrows to what the window reaches"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a job is admitted against decides how much of the host it is charged for, so the
+    /// history is as private as the ledger: a planted or edited file would have a job's guest
+    /// reserved a fraction of what it boots.
+    #[test]
+    fn the_history_is_created_private() {
+        let dir = std::env::temp_dir().join(format!("vk-hist-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // The two-component key production uses, so the project directory is made here too.
+        remember(&dir, key("42-proj/build-abc"), bytes(500), bytes(CEIL));
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700, "history root");
+        assert_eq!(mode(&dir.join("42-proj")), 0o700, "the project's directory");
+        assert_eq!(
+            mode(&dir.join("42-proj/build-abc")),
+            0o600,
+            "a job's history"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reason the trim is by count and not by age: one file holds runs from every ceiling
+    /// the job has had, and a job that goes back to an earlier `MICROVM_MEM` has to find them —
+    /// for as long as the cap has not pushed them out behind the newer ceiling's runs, which is
+    /// the bound this test stays inside.
+    #[test]
+    fn a_trim_keeps_an_earlier_ceilings_runs_inside_the_cap() {
+        let dir = tmpdir("trim-ceilings");
+        let now = 1_700_000_000;
+        let day = 24 * 60 * 60;
+        // Runs under 2G, then enough under 8G to push the file past the cap — but not so many
+        // that the newest TRIM_AT are all 8G, which would evict the older ceiling fairly.
+        for i in 0..300 {
+            remember_at(
+                &dir,
+                key("moved"),
+                bytes(900),
+                bytes(2048),
+                now - 40 * day + i,
+            );
+        }
+        for i in 0..800 {
+            remember_at(&dir, key("moved"), bytes(3000), bytes(8192), now - day + i);
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("moved"))
+                .unwrap()
+                .lines()
+                .count(),
+            TRIM_AT
+        );
+
+        // The newest ceiling answers from its own runs...
+        assert_eq!(
+            most_recent_at(&dir, key("moved"), bytes(8192), now).map(|(m, _)| m / MIB),
+            Some(3000)
+        );
+        // ...and going back to the old one still finds runs there, rather than falling back
+        // to the declared size as it would if the trim had dropped them.
+        let (most, _) = most_recent_at(&dir, key("moved"), bytes(2048), now)
+            .expect("the earlier ceiling's runs survived the trim");
+        assert_eq!(most / MIB, 900);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_changed_ceiling_starts_the_history_again() {
+        let dir = tmpdir("ceiling");
+        let now = 1_700_000_000;
+        for peak in [3900, 4000, 3950] {
+            remember_at(&dir, key("job"), bytes(peak), bytes(4096), now - 60);
+        }
+        assert_eq!(
+            most_recent_at(&dir, key("job"), bytes(4096), now),
+            Some((bytes(4000), 3))
+        );
+
+        // Given four times the room, the job is unknown again rather than predicted from
+        // runs that were pressed against the old ceiling.
+        assert_eq!(most_recent_at(&dir, key("job"), bytes(16384), now), None);
+        assert_eq!(expect_mib(&dir, key("job"), 16384), None);
+
+        // Its first run at the new ceiling is what it is then read against.
+        remember_at(&dir, key("job"), bytes(11000), bytes(16384), now);
+        assert_eq!(
+            most_recent_at(&dir, key("job"), bytes(16384), now),
+            Some((bytes(11000), 1))
+        );
+
+        // And putting the ceiling back finds the earlier runs still there — nothing was
+        // thrown away, only set aside.
+        assert_eq!(
+            most_recent_at(&dir, key("job"), bytes(4096), now),
+            Some((bytes(4000), 3))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The history is written by every job on the host, and the trim rewrites the whole file
+    /// — so concurrent writers must not erase each other's runs.
+    #[test]
+    fn concurrent_writers_do_not_lose_each_others_runs() {
+        const THREADS: u64 = 4;
+        // Past TRIM_AT, but by less than one thread's share: the trim drops the oldest
+        // THREADS * EACH - TRIM_AT runs, so every thread's own last run — written no earlier
+        // than its EACH'th of the total — is still there however the threads interleaved.
+        const EACH: u64 = 300;
+        let dir = tmpdir("shared-history");
+        let now = 1_700_000_000;
+
+        let writers: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    for i in 0..EACH {
+                        // Distinct peaks, so a lost run is a missing value and not a
+                        // duplicate of someone else's.
+                        remember_at(
+                            &dir,
+                            key("shared"),
+                            bytes(1000 + t * EACH + i),
+                            bytes(CEIL),
+                            now - 60,
+                        );
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+
+        // Every line still parses, and the file is trimmed to the cap rather than to
+        // whatever one racing writer happened to hold in memory.
+        let text = std::fs::read_to_string(dir.join("shared")).unwrap();
+        let samples = parse(&text);
+        assert_eq!(samples.len(), text.lines().count(), "a torn line");
+        assert_eq!(samples.len(), TRIM_AT);
+
+        // Nothing was dropped but by the trim: each writer's last run is still there, where
+        // an unlocked rewrite would have erased whatever landed during its read.
+        let kept: HashSet<u64> = samples.iter().map(|s| s.peak / MIB).collect();
+        assert_eq!(kept.len(), samples.len(), "a run was written twice");
+        for t in 0..THREADS {
+            let last = 1000 + t * EACH + EACH - 1;
+            assert!(
+                kept.contains(&last),
+                "writer {t} lost its last run ({last})"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A key names a history inside the directory, or it names nothing. `usage_key` already
+    /// sanitises every component, but these functions take a bare path and `Path::join`
+    /// throws the base away for an absolute one, so the guard lives here too.
+    #[test]
+    fn a_key_that_would_leave_the_directory_is_refused() {
+        let dir = tmpdir("escape");
+        let now = 1_700_000_000;
+
+        // Put to `under` itself rather than to a write against one of these paths: it is the
+        // one place the guard lives, and asking it directly cannot touch a file outside `dir`
+        // however the code around it changes.
+        for escape in ["/etc/passwd", "../outside", "", "/"] {
+            assert_eq!(under(&dir, key(escape)), None, "{escape:?} was let through");
+        }
+
+        // A real two-component key is written and read as usual.
+        let real = Path::new("42-proj").join("build-abc123");
+        assert_eq!(under(&dir, &real), Some(dir.join(&real)));
+        remember_at(&dir, &real, bytes(1600), bytes(CEIL), now);
+        assert_eq!(
+            most_recent_at(&dir, &real, bytes(CEIL), now),
+            Some((bytes(1600), 1))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A torn or truncated append is dropped whole rather than read as a run that never
+    /// happened.
+    #[test]
+    fn a_half_written_run_is_not_read_as_a_run() {
+        let dir = tmpdir("torn");
+        let now = 1_700_000_000;
+        std::fs::create_dir_all(&dir).unwrap();
+        let ceil = bytes(CEIL);
+        let (peak, lesser) = (bytes(900), bytes(700));
+        std::fs::write(
+            dir.join("job"),
+            format!("{now} {peak} {ceil}\n{now} 4000\nnonsense\n{now} {lesser} {ceil}\n"),
+        )
+        .unwrap();
+        // The two whole lines, neither the short one nor the unparseable one.
+        assert_eq!(most_recent_at(&dir, key("job"), ceil, now), Some((peak, 2)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

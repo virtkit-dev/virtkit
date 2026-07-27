@@ -193,15 +193,78 @@ one: a job asking for more than the host can ever admit would otherwise fail eve
 Keep `[vm] mem` itself at or under the budget, though — a *default* no job can fit in makes
 every job on the host fail admission.
 
-Some limits worth knowing. The budget counts what a job *declares* (`MICROVM_MEM`, or
-`[vm] mem`), not what it will use — and guests rarely touch their declared size, so a
-runner sized this way runs fewer jobs than it could; the usage reports above tell you how
-far apart the two are. The claim is taken at the start of prepare, so a job that builds its
-own image holds its full guest RAM across that build, and the build's own stage guests
-(`[build] mem` × `[build] jobs`) are outside the budget — a host has to leave room for both.
-And a waiting job has already been assigned by GitLab, so it holds a `concurrent` slot and
-its own timeout runs while it waits. Admission control keeps a host from overcommitting; it
-is not a substitute for setting `concurrent` to something the host can carry.
+By default the budget counts what a job **declares** (`MICROVM_MEM`, or `[vm] mem`), which
+is nearly always far more than it uses — so a runner gated this way runs fewer jobs than it
+could.
+
+### Reserving what jobs actually use
+
+Turn on `from_history` and a job is instead admitted against its own recent peaks — the
+same figures its trace reports:
+
+```toml
+[schedule]
+mem_budget = "48G"
+from_history = true
+```
+
+```
+virtkit: reserving 531 MiB from what this job has been using (it declares 2048 MiB)
+```
+
+Runs are remembered per project and job name, under
+`<state_dir>/history/<project id>-<slug>/<job name>-<digest>`, so `test:unit` is predicted
+from `test:unit`, not from the heavy `build` beside it. The project's own id scopes it, since
+two projects can share a slug; the digest of the job's name as written keeps two names that
+reduce to the same filename — `test:unit` and `test/unit` — from sharing a history.
+
+Every job records its run, whether or not this setting is on, so turning it on has something
+to work from. Each file keeps at most its thousand most recent runs, but there is one file per
+job name a project has ever run and nothing prunes them, so the directory grows slowly with
+the job names a host has seen. It holds no state anything else depends on: delete it, or any
+file in it, whenever you like — the jobs it covered fall back to their declared size for one
+run and start again.
+
+A reservation is the **largest** run of the last **14 days** plus 25% — the largest, because
+a job that peaks one run in five needs room for that run — never below 512 MiB and never
+above what the job declares. A job with no history yet falls back to its declared size, as
+does a job whose name changed.
+
+A job's runs also count only while its **memory ceiling** is the one they ran under. Raise
+`MICROVM_MEM` from 4G to 16G and the job is treated as unknown again for one run: what it
+reached pressed against 4 GiB says nothing about what it reaches given 16, and predicting
+the new job from the old one is how a host ends up overcommitted the moment someone widens a
+job that needed it. Lowering the ceiling starts it again for the same reason, and putting a
+ceiling back finds the earlier runs still there — they are set aside, not discarded, for as long
+as the file's thousand-run cap has not pushed them out behind the newer ceiling's runs.
+
+The window is days rather than a count of runs, because what changes a job's appetite — a
+dependency, a fixture, the code — changes on calendar time, while the same number of runs
+spans half an hour on a busy merge queue and most of a year on a release job. A job too
+quiet to have anything inside the window keeps its **last five runs** however old they are,
+so a monthly release job is still estimated from what it did rather than from what it asks
+for. A spike therefore stops being believed by ageing out, not by being outvoted.
+
+The VM is still *given* the memory it declares; only the reservation shrinks. That is the
+point: guest RAM is faulted in on use and handed back when freed, so a generous declared
+size costs nothing at runtime, while an honest reservation is what lets the host run more
+than a handful of jobs.
+
+The trade is real, though: a job that suddenly needs much more than it ever has — a new
+dependency, a bigger fixture — is admitted against the old figure, and the host can be
+overcommitted for that one run. The 25% headroom and the fortnight window absorb drift, not
+a step change. Leave it off until a few pipelines have been measured.
+
+### What admission does not do
+
+A waiting job has already been assigned by GitLab: it holds a `concurrent` slot and its own
+timeout runs while it waits. Admission keeps a host from overcommitting; it is not a
+substitute for setting `concurrent` to something the host can carry.
+
+Nor does it cover everything a job boots. The claim is taken at the start of prepare, so a
+job that builds its own image holds its full guest RAM across that build — and the build's
+own stage guests (`[build] mem` × `[build] jobs`) are outside the budget entirely. A host
+has to leave room for both.
 
 ## Egress control
 
