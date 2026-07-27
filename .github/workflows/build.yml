@@ -42,7 +42,7 @@ jobs:
         if: inputs.build-kernel
         run: ./build-kernel.sh
 
-      - name: Build binaries (vk, vk-agent, vk-registry)
+      - name: Build binaries (vk, vk-agent, vk-registry, vk-runnerctl)
         run: ./build.sh
 
       - name: Upload binary artifacts
@@ -53,9 +53,11 @@ jobs:
             dist/vk
             dist/vk-agent
             dist/vk-registry
+            dist/vk-runnerctl
             dist/vk.sha256
             dist/vk-agent.sha256
             dist/vk-registry.sha256
+            dist/vk-runnerctl.sha256
             dist/build-info.txt
           retention-days: ${{ inputs.retention-days }}
 

@@ -5,8 +5,8 @@ This file provides guidance to AI coding assistants (Claude Code, Copilot, etc.)
 ## Project Overview
 
 virtkit — a rootless microVM toolkit shipped as static-musl binaries (`vk` + the
-embedded `vk-agent`, plus the optional `vk-registry` central server), with the
-VMM built in. It boots OCI/Docker images as fast microVMs on its embedded
+embedded `vk-agent`, plus the optional `vk-registry` central server and the
+`vk-runnerctl` runner throttle), with the VMM built in. It boots OCI/Docker images as fast microVMs on its embedded
 [libkrun](https://github.com/containers/libkrun) VMM ([Cloud Hypervisor](https://www.cloudhypervisor.org/)
 stays available as an external backend via `VIRTKIT_VMM=cloud-hypervisor`), gives
 them a shared LAN with egress over ordinary host sockets (no tap, no bridge, no
@@ -16,7 +16,7 @@ The same codebase powers local compose-service VMs and a GitLab custom executor.
 
 ## Architecture
 
-A Cargo workspace (`Cargo.toml`, edition 2024) with four crates:
+A Cargo workspace (`Cargo.toml`, edition 2024) with five crates:
 
 - **`vk-core/`** — the shared host↔guest library: the wire protocol (`messages`,
   `framing`, `addr`, `net`, `status`, `fleetctl`) plus the runtime helpers both sides
@@ -38,6 +38,10 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with four crates:
   serves the store over HTTP(S), fronts upstream registries as a pull-through cache
   (caching only digest-addressed content), coordinates build-once via a lease/heartbeat
   lock API (`/lock`), and is a backend for the `task` build cache. See its `DESIGN.md`.
+- **`vk-runnerctl/`** — the only component that runs as root, and deliberately the smallest:
+  it sets gitlab-runner's `concurrent` from a number unprivileged `vk` leaves in a file,
+  clamped into a range only root can configure. It takes no arguments and no paths from its
+  caller, so granting it `NOPASSWD` grants nothing else; all the policy lives in `vk`.
 
 libkrun is vendored (its own cargo workspace, locally patched) under
 `third_party/libkrun` — see its `VENDOR.md` for the patch list.

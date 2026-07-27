@@ -87,6 +87,7 @@ and boot images. virtkit can even rebuild itself inside one of its own microVMs
 | `vk` | The host-side tool. Boots and manages VMs, builds and converts images, runs the GitLab executor, and provides the guest network. Self-contained: the guest kernel and `vk-agent` are embedded. |
 | `vk-agent` | Runs inside the guest as PID 1. Brings the system up (mounts, networking, hostname, shared folders, optional SSH) and lets the host run commands inside the VM. |
 | `vk-registry` | Optional central OCI-distribution server, shared by every runner: build-once dedup (a lease/heartbeat lock so an image is built once, not per runner), a pull-through cache for upstream registries (digest-addressed content only), and a backend for the `task` build cache. Not needed for local use — `vk` keeps its own on-disk store by default. |
+| `vk-runnerctl` | Optional, and the only piece that runs as root: it sets gitlab-runner's `concurrent` from what `vk` measures, so a busy host stops taking work instead of overcommitting. It decides nothing and takes no arguments — see the [GitLab CI guide](docs/gitlab-ci.md). |
 
 ## How it works
 
@@ -115,7 +116,7 @@ pins.
 ## Build
 
 ```sh
-./build.sh         # -> dist/{vk, vk-agent, vk-registry, *.sha256, build-info.txt}
+./build.sh         # -> dist/{vk, vk-agent, vk-registry, vk-runnerctl, *.sha256, build-info.txt}
 ./build-kernel.sh  # -> dist/vmlinux (the guest kernel; rebuilt only on a pin bump)
 ```
 
@@ -229,6 +230,7 @@ vk-core/         shared host↔guest library (wire protocol + exec/pty/dockerign
 vk-driver/       host driver crate
 vk-agent/        guest agent crate (PID 1 + exec server)
 vk-registry/     optional central OCI-distribution server (build-once lock + pull-through cache)
+vk-runnerctl/    optional root-side setter for gitlab-runner's concurrent (see docs/gitlab-ci.md)
 third_party/     vendored libkrun (locally patched — see its VENDOR.md)
 kernel/          guest kernel build (Dockerfile + config fragment)
 build.sh         build the binaries -> dist/

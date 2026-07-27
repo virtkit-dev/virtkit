@@ -11,8 +11,9 @@ name: Release
 # build runs in parallel with quality (lint + audit); the kernel is built in the
 # same job as the binaries so the published vk has it embedded. release publishes
 # once both quality and build pass. Each binary ships with its own .sha256 sidecar
-# (vk.sha256, vk-agent.sha256, vk-registry.sha256, vmlinux.sha256) so users can verify
-# just the file they downloaded without fetching a combined manifest.
+# (vk.sha256, vk-agent.sha256, vk-registry.sha256, vk-runnerctl.sha256,
+# vmlinux.sha256) so users can verify just the file they downloaded without
+# fetching a combined manifest.
 
 on:
   push:
@@ -68,6 +69,8 @@ jobs:
             dist/vk-agent.sha256 \
             dist/vk-registry \
             dist/vk-registry.sha256 \
+            dist/vk-runnerctl \
+            dist/vk-runnerctl.sha256 \
             dist/vmlinux \
             dist/vmlinux.sha256 \
             dist/build-info.txt \
