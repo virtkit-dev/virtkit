@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Runner concurrency now follows host memory too.** `vk tune` limits new slots by what the
+  host still has available after keeping 15% of its RAM free, as well as by the guest memory
+  budget. A large RAM-backed repository checkout or a service sharing the box therefore lowers
+  concurrency by what it actually occupies, instead of needing a guessed fixed reserve inside
+  `[schedule] mem_budget`.
+
 ## [0.31.0] - 2026-07-30
 
 ### Added

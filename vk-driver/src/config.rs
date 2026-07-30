@@ -151,7 +151,7 @@ pub struct Build {
 /// waits for room, oldest request first, so the host stays inside what it can back.
 ///
 /// The budget is guest RAM, not host RAM: leave the difference for the VMMs themselves, the
-/// page cache and everything else on the box.
+/// tmpfs a `checkout_dir` may sit on, and everything else on the box.
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Schedule {

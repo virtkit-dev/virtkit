@@ -404,21 +404,27 @@ comments, key order and registration tokens survive untouched, and the original 
 as `config.toml.vk-orig`. Lowering the number never disturbs a running job — it only stops
 new ones being taken.
 
-The number itself is "the jobs running now, plus what the budget still has room for", at the
-size a job on this host typically reserves:
+The number itself is "the jobs running now, plus what both the budget and the host still have
+room for", at the size a job on this host typically reserves:
 
 ```
-virtkit: runner concurrency 2 (6144 of 8192 MiB committed by 1 job(s), typical job 2048 MiB, 35% of host memory free)
+virtkit: runner concurrency 2 (6144 of 8192 MiB committed by 1 job(s), typical job 2048 MiB, 23040 of 32768 MiB host memory available)
 ```
 
 It falls the moment the host fills and climbs back one step at a time, because a job that
-has just started has not yet reached its real size. A host whose free memory drops below
-15% takes on nothing beyond what it is already running, whatever the ledger says — the
-ledger cannot see the page cache or anything else on the box. One slot is always offered
-even then, since `concurrent = 0` is not a setting gitlab-runner has and a runner that
-accepted nothing at all would never pick up again. And if `vk tune` stops writing, the
-runner is not left throttled: `vk-runnerctl` walks `concurrent` back up to `max` a step at
+has just started has not yet reached its real size. Alongside the ledger, `MemAvailable`
+limits how many typical jobs fit after keeping 15% of physical RAM free. A tmpfs-backed
+repository checkout therefore lowers the offered slots by its actual allocated size, as does
+an unrelated service on the box, without a guessed per-repository reserve; reclaimable page
+cache does not, since `MemAvailable` already counts it as available. Below that 15% floor the
+runner takes nothing beyond what it is already running, whatever the ledger says. One slot is
+always offered even then, since `concurrent = 0` is not a setting gitlab-runner has and a
+runner that accepted nothing at all would never pick up again. And if `vk tune` stops writing,
+the runner is not left throttled: `vk-runnerctl` walks `concurrent` back up to `max` a step at
 a time.
+
+A host whose `/proc/meminfo` cannot be read reports `host memory unreadable` and schedules on
+the budget alone.
 
 Getting the number wrong is cheap on purpose. It decides what the runner *accepts*, never
 what is committed: too high and the extra jobs queue at the admission gate exactly as

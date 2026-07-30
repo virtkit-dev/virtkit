@@ -21,10 +21,9 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
 
-/// The share of the host's memory that has to stay free for the brake to stay off. Guest
-/// RAM is only part of what a runner's box holds — the page cache behind every rootfs, the
-/// VMMs themselves, whatever else the machine runs — so the ledger looking roomy is not on
-/// its own a reason to take more work.
+/// The share of `MemTotal` kept outside new work. Guest RAM is only part of what a runner's
+/// box holds — the VMMs themselves, a tmpfs-backed checkout, whatever else the machine runs —
+/// so the ledger looking roomy is not on its own a reason to take more work.
 const RESERVE_PCT: u64 = 15;
 
 /// Where `vk` leaves the concurrency it would like, for the root-side setter to pick up.
@@ -61,14 +60,14 @@ pub fn tune(cfg: &Config) -> Result<()> {
     let previous = std::fs::read_to_string(&path)
         .ok()
         .and_then(|t| t.trim().parse::<u32>().ok());
-    // Read once: the figure the decision rests on is the one reported below it.
-    let free_pct = free_memory_pct();
+    // Read once: the figures the decision rests on are the ones reported below it.
+    let host = host_memory();
     let want = concurrency(Inputs {
         budget_mib,
         granted_mib: held.granted_mib,
         running: held.granted as u64,
         typical_mib: typical,
-        free_pct,
+        host,
         previous,
     });
 
@@ -103,10 +102,25 @@ pub fn tune(cfg: &Config) -> Result<()> {
     std::fs::rename(&tmp, &path).with_context(|| format!("installing {}", path.display()))?;
     println!(
         "virtkit: runner concurrency {want} ({} of {budget_mib} MiB committed by {} job(s), \
-         typical job {typical} MiB, {free_pct}% of host memory free)",
-        held.granted_mib, held.granted,
+         typical job {typical} MiB, {})",
+        held.granted_mib,
+        held.granted,
+        match host {
+            Some(h) => format!(
+                "{} of {} MiB host memory available",
+                h.available_mib, h.total_mib
+            ),
+            None => "host memory unreadable".to_string(),
+        },
     );
     Ok(())
+}
+
+/// What this host's `/proc/meminfo` says, in MiB.
+#[derive(Clone, Copy)]
+pub struct HostMemory {
+    pub available_mib: u64,
+    pub total_mib: u64,
 }
 
 /// Everything the decision rests on, so the rule itself can be read — and tested — without
@@ -116,25 +130,35 @@ pub struct Inputs {
     pub granted_mib: u64,
     pub running: u64,
     pub typical_mib: u64,
-    pub free_pct: u64,
+    /// `None` when `/proc/meminfo` cannot be read: the host brake is then off and the ledger
+    /// is the only gate, which is what it was before this brake existed.
+    pub host: Option<HostMemory>,
     pub previous: Option<u32>,
 }
 
 /// How many jobs the runner should be accepting: the ones already running, plus as many
-/// more of a typical size as the budget still has room for.
+/// more of a typical size as the budget and the host still have room for.
 ///
 /// The movement is deliberately lopsided. Falling is immediate — the host is under pressure
 /// now, and a slot not taken costs nothing. Rising is one step per run, because every job
 /// that starts takes a while to reach its real size, and a controller that believed an empty
 /// ledger would let a whole pipeline in at once.
 pub fn concurrency(i: Inputs) -> u32 {
-    let headroom = i.budget_mib.saturating_sub(i.granted_mib);
-    let mut want = i.running + headroom / i.typical_mib.max(1);
-    // A host short of memory for reasons the ledger cannot see — the page cache, another
-    // service, a guest that outgrew its reservation — takes no new work until it recovers.
-    if i.free_pct < RESERVE_PCT {
-        want = want.min(i.running);
-    }
+    let budget_headroom = i.budget_mib.saturating_sub(i.granted_mib);
+    // `MemAvailable` discounts what the host cannot hand out — a tmpfs-backed checkout or
+    // build tree, a co-located service — none of which the guest ledger sees. Keep RESERVE_PCT
+    // of the physical host outside new work, then let whichever headroom is smaller, ledger or
+    // host, decide how many more typical jobs fit. That charges a large checkout its real
+    // allocated size instead of a guessed per-repository reserve. Reclaimable page cache is not
+    // charged at all, since `MemAvailable` already counts it as available.
+    let headroom = match i.host {
+        Some(h) => {
+            let reserve = h.total_mib.saturating_mul(RESERVE_PCT) / 100;
+            budget_headroom.min(h.available_mib.saturating_sub(reserve))
+        }
+        None => budget_headroom,
+    };
+    let want = i.running + headroom / i.typical_mib.max(1);
     // Never below one, even then: `concurrent = 0` is not a throttle gitlab-runner has, and a
     // runner that stops taking work entirely never recovers on its own. An idle host under
     // memory pressure therefore still offers the one slot.
@@ -162,14 +186,15 @@ fn typical_job_mib(cfg: &Config, declared_mib: u64) -> u64 {
     seen[seen.len() / 2]
 }
 
-/// The share of host memory still available, from `/proc/meminfo`. A host whose memory
-/// cannot be read is treated as roomy: the ledger is the real guard, and this is only the
-/// brake for what the ledger cannot see.
-fn free_memory_pct() -> u64 {
-    let Some((available, total)) = meminfo(Path::new("/proc/meminfo")) else {
-        return 100;
-    };
-    available * 100 / total.max(1)
+/// This host's memory, from `/proc/meminfo`. `None` — a host whose memory cannot be read — is
+/// treated as roomy: the ledger is the real guard, and this is only the brake for what the
+/// ledger cannot see.
+fn host_memory() -> Option<HostMemory> {
+    let (available_kib, total_kib) = meminfo(Path::new("/proc/meminfo"))?;
+    Some(HostMemory {
+        available_mib: available_kib / 1024,
+        total_mib: total_kib / 1024,
+    })
 }
 
 /// `(MemAvailable, MemTotal)` in kB.
@@ -197,9 +222,20 @@ mod tests {
             granted_mib: 0,
             running: 0,
             typical_mib: 4096,
-            free_pct: 100,
+            host: Some(HostMemory {
+                available_mib: 65536,
+                total_mib: 65536,
+            }),
             previous: None,
         }
+    }
+
+    /// An `available_mib` on a 64 GiB host, for a case whose subject is host pressure.
+    fn available(mib: u64) -> Option<HostMemory> {
+        Some(HostMemory {
+            available_mib: mib,
+            total_mib: 65536,
+        })
     }
 
     /// The file this writes is read by a *root* process, which accepts a regular file of at
@@ -326,22 +362,63 @@ mod tests {
 
     #[test]
     fn a_host_short_of_memory_takes_no_new_work() {
-        // The ledger says there is room; the host says there is not. The host wins, and the
-        // jobs already running are left alone.
+        // The ledger says there is room; the host has less available than the 15% it keeps in
+        // reserve. The host wins, and the jobs already running are left alone.
         let tight = Inputs {
-            free_pct: 4,
+            host: available(2621),
             running: 3,
+            // It was offering eight; a host-driven fall is immediate, not one step at a time.
+            previous: Some(8),
             ..inputs()
         };
         assert_eq!(concurrency(tight), 3);
         // Even with nothing running it keeps the floor of one rather than stalling the runner.
         assert_eq!(
             concurrency(Inputs {
-                free_pct: 4,
+                host: available(2621),
                 running: 0,
                 ..inputs()
             }),
             1
+        );
+    }
+
+    #[test]
+    fn host_memory_in_use_lowers_the_slots_before_the_reserve_is_gone() {
+        // The ledger has room for eight 4 GiB jobs. With only 24 GiB available on a 64 GiB
+        // host, keeping 15% (9.6 GiB) of it free leaves 14.4 GiB, so three more jobs fit. What
+        // holds the missing memory does not matter — a tmpfs checkout or a co-located service
+        // both leave `MemAvailable` this low.
+        assert_eq!(
+            concurrency(Inputs {
+                host: available(24576),
+                ..inputs()
+            }),
+            3
+        );
+    }
+
+    #[test]
+    fn an_unreadable_meminfo_leaves_the_ledger_as_the_only_gate() {
+        // The brake needs a measurement to apply. Without one the answer is the budget's alone,
+        // which is what it was before the host was consulted at all.
+        assert_eq!(
+            concurrency(Inputs {
+                host: None,
+                ..inputs()
+            }),
+            8
+        );
+        // And a host it cannot measure never blocks work the ledger has room for.
+        assert_eq!(
+            concurrency(Inputs {
+                host: None,
+                granted_mib: 16384,
+                running: 4,
+                previous: Some(8),
+                ..inputs()
+            }),
+            8
         );
     }
 
