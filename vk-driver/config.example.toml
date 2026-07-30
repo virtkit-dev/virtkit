@@ -108,6 +108,8 @@
 #                        # instead of letting the job clone them in the guest
 # checkout_dir = "/builds"  # where those clones live (default: <state_dir>/checkouts); a
 #                        # host tmpfs keeps the clone and the job's writes out of the disk
+# checkout_cache_idle_secs = 1800  # unused clones are reclaimed before a checkout and by
+#                        # `vk gc`; unset inherits image_cache_idle_secs
 # checkout_overlay = true  # build on a guest tmpfs overlay over the read-only host tree,
 #                        # so writes run at guest speed and the guest cannot touch the host
 

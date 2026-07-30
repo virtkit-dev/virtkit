@@ -204,6 +204,10 @@ pub struct Gitlab {
     /// `checkout_overlay = false`, every in-job write to the shared tree) stays in host RAM
     /// instead of hitting the state disk.
     pub checkout_dir: Option<PathBuf>,
+    /// How long a reusable host checkout may sit with no prepare or guest sharing it before it
+    /// is removed. Reclamation runs before each host checkout and from `vk gc`; unset inherits
+    /// the top-level `image_cache_idle_secs` (30 minutes by default).
+    pub checkout_cache_idle_secs: Option<u64>,
     /// Mount the `host_checkout` tree in the guest behind a tmpfs-backed overlayfs (default
     /// on). The share is then exported read-only — the guest can never touch the host tree —
     /// and every in-job write runs at guest-native speed instead of a 50–90µs synchronous
@@ -221,6 +225,7 @@ impl Default for Gitlab {
             dir: None,
             host_checkout: false,
             checkout_dir: None,
+            checkout_cache_idle_secs: None,
             checkout_overlay: true,
         }
     }
@@ -624,10 +629,33 @@ impl Config {
         }
     }
 
+    /// The GitLab host-checkout root: `[gitlab] checkout_dir` if set, else
+    /// `<state_dir>/checkouts`. Takes no state dir on purpose, unlike [`Config::local_dir_under`]
+    /// — checkouts are the executor's alone, so no caller can hand this the dev root `vk run`
+    /// caches under and leave the idle sweep walking a tree nothing checks out into.
+    pub fn checkout_root(&self) -> PathBuf {
+        match self.gitlab.as_ref().and_then(|g| g.checkout_dir.as_ref()) {
+            Some(dir) => dir.clone(),
+            None => self.state_dir().join("checkouts"),
+        }
+    }
+
     /// How long a materialized image base may sit idle (no live overlay) before the
     /// cache GC evicts it. Default 30 min.
     pub fn image_cache_idle(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.image_cache_idle_secs.unwrap_or(1800))
+    }
+
+    /// How long an unused GitLab host checkout stays cached. By default checkouts and
+    /// materialized images share one cache lifetime, while a runner with expensive clones may
+    /// keep checkouts longer without also pinning extracted image bases.
+    pub fn checkout_cache_idle(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.gitlab
+                .as_ref()
+                .and_then(|g| g.checkout_cache_idle_secs)
+                .unwrap_or_else(|| self.image_cache_idle().as_secs()),
+        )
     }
 
     pub fn cloud_hypervisor(&self) -> &Path {
@@ -792,15 +820,35 @@ mod tests {
             [gitlab]
             host_checkout = true
             checkout_dir = "/builds"
+            checkout_cache_idle_secs = 7200
             "#,
         )
         .unwrap();
         let g = cfg.gitlab.as_ref().unwrap();
         assert!(g.host_checkout);
         assert_eq!(g.checkout_dir.as_deref(), Some(Path::new("/builds")));
-        // absent = None: the on-disk `<state_dir>/checkouts` default is preserved
+        assert_eq!(cfg.checkout_root(), Path::new("/builds"));
+        assert_eq!(cfg.checkout_cache_idle().as_secs(), 7200);
+        // absent = None: the on-disk `<state_dir>/checkouts` default is preserved, and the
+        // checkout lifetime is the image cache's.
         let bare: Config = toml::from_str("[gitlab]\ndir = \"/x\"\n").unwrap();
         assert!(bare.gitlab.as_ref().unwrap().checkout_dir.is_none());
+        assert_eq!(
+            bare.checkout_root(),
+            Path::new("/var/lib/virtkit/checkouts"),
+            "the default root is the executor's state dir, which is what `vk gc` must sweep"
+        );
+        assert_eq!(bare.checkout_cache_idle(), bare.image_cache_idle());
+        // No `[gitlab]` at all still resolves a root, and a configured state dir moves it.
+        assert_eq!(
+            Config::default().checkout_root(),
+            Path::new("/var/lib/virtkit/checkouts")
+        );
+        let moved = Config {
+            state_dir: Some(PathBuf::from("/s")),
+            ..Config::default()
+        };
+        assert_eq!(moved.checkout_root(), Path::new("/s/checkouts"));
     }
 
     #[test]

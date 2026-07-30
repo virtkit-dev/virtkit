@@ -33,6 +33,30 @@ The executor reads its host configuration from the usual virtkit config file
 (`$VIRTKIT_CONFIG` or `/etc/virtkit/config.toml`). Everything below that a job
 controls is set through `.gitlab-ci.yml` **job variables**.
 
+### Host-side checkouts
+
+A host-side checkout — which `dockerfile:` and `compose:` job images need — clones the
+sources on the runner instead of in the guest. Point `checkout_dir` at the runner's builds
+tmpfs when the state disk is too slow:
+
+```toml
+[gitlab]
+host_checkout = true
+checkout_dir = "/builds"
+checkout_cache_idle_secs = 1800
+```
+
+A tree is reused by concurrent slot and project, so a second job on the same slot fetches
+rather than re-clones. Before each checkout, and during `vk gc`, trees unused for longer than
+this are removed — which is what keeps a tmpfs `checkout_dir` from filling with the
+repositories of jobs that have moved on. Unset, checkouts inherit `image_cache_idle_secs`
+(30 minutes by default). A tree a prepare or a running guest is using is never removed.
+
+Only trees virtkit created are eligible, so a `checkout_dir` shared with another GitLab
+executor is safe. Such a root must still be writable **only** by the runner user: virtkit
+keeps its own bookkeeping in a `.virtkit` directory there, and a root anyone else can write
+lets them decide which trees the sweep considers its own.
+
 ## Job variables
 
 Job variables are read once per job, at the job level. GitLab passes them to the

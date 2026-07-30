@@ -349,9 +349,12 @@ pub(crate) fn acquire_use_lock_for(
     if !cache_tiers(state_dir).iter().any(|t| dir.starts_with(t)) {
         return Ok(None);
     }
+    // Every resolve re-dates the marker (see `mark_used`), so a base's idle window runs from the
+    // most recent boot that wanted it.
     Ok(Some(crate::cachelock::acquire_shared(
         &dir.join(".inuse"),
         &dir.join(".used"),
+        crate::cachelock::IdleFrom::Acquire,
     )?))
 }
 

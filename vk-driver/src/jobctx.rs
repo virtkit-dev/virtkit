@@ -172,23 +172,21 @@ impl JobCtx {
         })
     }
 
-    /// The host directory the job's sources are checked out into for `[gitlab] host_checkout`,
-    /// keyed by the runner's concurrent slot + project so sequential jobs reuse it (a fetch, not
-    /// a re-clone) while concurrent jobs on the same runner stay isolated.
+    /// The root every `[gitlab] host_checkout` tree on this host lives under — the unit the idle
+    /// checkout sweep walks. `[gitlab] checkout_dir` (e.g. the RAM-backed /builds tmpfs) overrides
+    /// the on-disk default so the clone and the job's writes to the shared tree stay in host RAM.
+    pub fn host_checkout_root(&self) -> PathBuf {
+        self.cfg.checkout_root()
+    }
+
+    /// The host directory this job's sources are checked out into, keyed by the runner's
+    /// concurrent slot + project so sequential jobs reuse it (a fetch, not a re-clone) while
+    /// concurrent jobs on the same runner stay isolated.
     pub fn host_checkout_dir(&self) -> PathBuf {
-        // `[gitlab] checkout_dir` (e.g. the RAM-backed /builds tmpfs) overrides the on-disk
-        // default so the clone and the job's writes to the shared tree stay in host RAM. The
-        // slot/project key still comes from sanitized env, never a job-controlled absolute path.
-        let root = match self
-            .cfg
-            .gitlab
-            .as_ref()
-            .and_then(|g| g.checkout_dir.as_ref())
-        {
-            Some(dir) => dir.clone(),
-            None => self.cfg.state_dir().join("checkouts"),
-        };
-        root.join(&self.concurrent_id).join(&self.project_slug)
+        // The slot/project key comes from sanitized env, never a job-controlled absolute path.
+        self.host_checkout_root()
+            .join(&self.concurrent_id)
+            .join(&self.project_slug)
     }
 
     /// Where this host remembers what jobs used, keyed by [`JobCtx::usage_key`]. Shared by

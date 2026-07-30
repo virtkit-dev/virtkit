@@ -175,7 +175,9 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // guest (the job sets GIT_STRATEGY: none). Crisp errors here (the runner-visible prepare)
     // beat a supervisor-log pointer; like any prepare failure a checkout error exits
     // system_failure.
-    if cfg.gitlab.as_ref().is_some_and(|g| g.host_checkout) {
+    // Held to the end of prepare, which outlasts the supervisor taking its own hold below, so the
+    // tree is referenced continuously from the clone until the job's VM is gone.
+    let _checkout_use = if cfg.gitlab.as_ref().is_some_and(|g| g.host_checkout) {
         let url = ctx
             .ci_repo_url
             .as_deref()
@@ -185,10 +187,21 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             .as_deref()
             .context("host_checkout is set but CI_COMMIT_SHA is unset")?;
         let dest = ctx.host_checkout_dir();
+        let guard = crate::checkout::acquire_use_lock(&dest)
+            .with_context(|| format!("locking host checkout {}", dest.display()))?;
+        // Bound what abandoned checkouts cost the host before adding one more — on a tmpfs
+        // `checkout_dir` they hold RAM that `vk tune` charges against this runner's concurrency.
+        // Swept while already holding our own reference, so an idle window that has just
+        // elapsed cannot evict the tree this job is about to reuse and turn its fetch into a
+        // re-clone.
+        crate::checkout::gc_idle(&ctx.host_checkout_root(), cfg.checkout_cache_idle());
         println!("virtkit: host checkout of {sha} -> {}", dest.display());
         crate::checkout::ensure(url, ctx.ci_commit_ref.as_deref().unwrap_or(""), sha, &dest)
             .context("host checkout")?;
-    }
+        Some(guard)
+    } else {
+        None
+    };
 
     // Resolve (and, for a `dockerfile:` image, build) the boot media in the runner-visible process;
     // the supervisor re-resolves from the same env (a fingerprint hit for a build). A `None`
@@ -866,6 +879,19 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         .with_context(|| format!("writing {}", ctx.supervisor_pidfile().display()))?;
 
     let cfg = &ctx.cfg;
+    // Prepare still holds its own reference on the checkout — it does not return until this
+    // process has booted the VM it is polling for — so taking ours here leaves no window in
+    // which the tree is unreferenced. Taken before resolving any git-defined image out of it,
+    // and kept until the VM and its virtio-fs share are gone.
+    let _checkout_use = if cfg.gitlab.as_ref().is_some_and(|g| g.host_checkout) {
+        let dest = ctx.host_checkout_dir();
+        Some(
+            crate::checkout::acquire_use_lock(&dest)
+                .with_context(|| format!("locking host checkout {}", dest.display()))?,
+        )
+    } else {
+        None
+    };
     let (kernel_opt, media, generic) = resolve_media(ctx)?;
     let (cpus, mem) = vm_size(ctx)?;
     // The agent and kernel back each guest boot (they ride the boot media) and any

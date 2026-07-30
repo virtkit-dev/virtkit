@@ -234,14 +234,17 @@ enum Cmd {
         #[arg(long = "feature", value_enum, value_name = "FEATURE")]
         feature: Vec<check::Feature>,
     },
-    /// Reclaim the host image cache: evict materialized bases (`<state_dir>/{registry,
-    /// docker, build}`) no VM is using and that are idle past the threshold, and drop
-    /// unreferenced registry chunks. Reclaim otherwise happens on each pull, so this
-    /// is for a cron or manual sweep on an otherwise-idle runner.
+    /// Reclaim the host caches: evict materialized bases (`<state_dir>/{registry, docker,
+    /// build}`) no VM is using, remove GitLab host checkouts no job is using, and drop
+    /// unreferenced registry chunks — all of them idle past the threshold. Reclaim otherwise
+    /// happens as those caches are used, so this is for a cron or manual sweep on an
+    /// otherwise-idle runner.
     #[command(display_order = 4)]
     Gc {
-        /// Idle threshold in seconds; `0` reclaims every base no VM is currently using.
-        /// Default: the config's `image_cache_idle_secs` (30 min).
+        /// Idle threshold in seconds; `0` reclaims every cache entry not currently in use.
+        /// Applies to images and checkouts alike, overriding both of their settings.
+        /// Default: the config's `image_cache_idle_secs` and `checkout_cache_idle_secs`
+        /// (30 min each).
         #[arg(long)]
         idle_secs: Option<u64>,
     },
@@ -1332,18 +1335,14 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
             "  jobs dir      {} (per-job runtime state, removed at job cleanup)",
             exec_state.join("jobs").display()
         )?;
-        let (checkouts, checkouts_note) =
-            match cfg.gitlab.as_ref().and_then(|g| g.checkout_dir.clone()) {
-                Some(d) => (d, "`[gitlab] checkout_dir` in the config"),
-                None => (
-                    exec_state.join("checkouts"),
-                    "default: <executor state dir>/checkouts",
-                ),
-            };
+        let checkouts_note = match cfg.gitlab.as_ref().and_then(|g| g.checkout_dir.as_ref()) {
+            Some(_) => "`[gitlab] checkout_dir` in the config",
+            None => "default: <executor state dir>/checkouts",
+        };
         writeln!(
             out,
-            "  checkouts     {} ({checkouts_note}) — host_checkout clones, never reclaimed",
-            checkouts.display()
+            "  checkouts     {} ({checkouts_note}) — host_checkout clones, idle-reclaimed",
+            cfg.checkout_root().display()
         )?;
         match cfg.gitlab.as_ref().and_then(|g| g.dir.as_ref()) {
             Some(d) => writeln!(
@@ -1466,20 +1465,29 @@ async fn cli_main() -> ExitCode {
         };
     }
     if let Cmd::Gc { idle_secs } = &cli.cmd {
-        let idle = idle_secs
-            .map(std::time::Duration::from_secs)
-            .unwrap_or_else(|| cfg.image_cache_idle());
+        let override_idle = idle_secs.map(std::time::Duration::from_secs);
+        let image_idle = override_idle.unwrap_or_else(|| cfg.image_cache_idle());
+        let checkout_idle = override_idle.unwrap_or_else(|| cfg.checkout_cache_idle());
         // Sweep the same state dir `vk run`/the executor cache under.
         let state_dir = match effective_state_dir(&cfg) {
             Ok(d) => d,
             Err(e) => return fail(&e, 2),
         };
         let registry = state_dir.join("registry");
-        image::gc_idle(&registry, idle);
+        image::gc_idle(&registry, image_idle);
         image::sweep_chunks(&registry);
-        image::gc_idle(&state_dir.join("docker"), idle);
-        image::gc_idle(&state_dir.join("build"), idle);
-        println!("virtkit: gc done (idle threshold {}s)", idle.as_secs());
+        image::gc_idle(&state_dir.join("docker"), image_idle);
+        image::gc_idle(&state_dir.join("build"), image_idle);
+        // Checkouts are the executor's alone, and the executor roots its state at
+        // `Config::state_dir()` — never the dev default `vk run` caches under, which is what
+        // `effective_state_dir` may resolve to here. Sweeping that instead would walk a tree
+        // nothing ever checks out into and silently reclaim nothing.
+        checkout::gc_idle(&cfg.checkout_root(), checkout_idle);
+        println!(
+            "virtkit: gc done (idle threshold {}s for images, {}s for checkouts)",
+            image_idle.as_secs(),
+            checkout_idle.as_secs()
+        );
         return ExitCode::SUCCESS;
     }
     // `run` is a standalone dev path: no JobCtx (no CUSTOM_ENV_* job context).

@@ -9,6 +9,13 @@ All notable changes to virtkit will be documented in this file.
 - **A runner's memory budget can follow the size of the host.** `[schedule] mem_budget` now
   takes a percentage such as `"50%"` as well as an exact `"48G"`, so one configuration leaves
   the same proportional headroom on runners with different amounts of RAM.
+- **Unused GitLab host checkouts are reclaimed.** A checkout no job has wanted for the cache
+  window is removed before the next one is taken, and `vk gc` now sweeps checkouts alongside
+  image bases — so a RAM-backed `checkout_dir` no longer fills up with the repositories of
+  jobs that have moved on. A checkout a job is using is never removed, by either sweep, and
+  neither is anything another tool put in a shared checkout directory. Set
+  `[gitlab] checkout_cache_idle_secs` to keep checkouts longer than image bases where clones
+  are expensive.
 
 ### Changed
 

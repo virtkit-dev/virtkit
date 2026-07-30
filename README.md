@@ -157,8 +157,8 @@ The ones you'll actually type:
 - `check` — preflight the host for the current user: `/dev/kvm` access, the VMM
   backend, a guest kernel/agent, and the host side of each configured feature
   (the CI-executor features only when named with `--feature`).
-- `gc` — reclaim the host image cache: evict image bases no VM is using and
-  idle past the timeout, and drop unreferenced registry chunks.
+- `gc` — reclaim the host caches: evict image bases no VM is using, remove
+  GitLab host checkouts no job is using, and drop unreferenced registry chunks.
 - `update` — replace this `vk` with a release build from GitHub: the latest, or a
   version you name (an older one downgrades). It asks before replacing anything
   (`--yes` to skip), verifies the download against the digest published with the
