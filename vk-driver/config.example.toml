@@ -102,6 +102,15 @@
 # mem = "8G"             # per-stage build guest RAM (default: 4G)
 # cache_checkpoint_secs = 20  # `auto` cache mode: seconds of run time before a checkpoint
 
+# [gitlab]               # host-side pieces of the GitLab custom executor
+# dir = "/usr/local/lib/vk/ci-tools"  # static tools shared read-only into job VMs
+# host_checkout = true   # clone the sources on the host and share them at CI_PROJECT_DIR,
+#                        # instead of letting the job clone them in the guest
+# checkout_dir = "/builds"  # where those clones live (default: <state_dir>/checkouts); a
+#                        # host tmpfs keeps the clone and the job's writes out of the disk
+# checkout_overlay = true  # build on a guest tmpfs overlay over the read-only host tree,
+#                        # so writes run at guest speed and the guest cannot touch the host
+
 # [schedule]             # how many CI jobs run at once, by the memory they boot. Off by
 #                        # default: gitlab-runner's `concurrent` alone decides, and past
 #                        # the host's RAM the OOM killer picks which VM dies. With a budget
