@@ -66,15 +66,31 @@ pub struct JobCtx {
 
 impl JobCtx {
     pub fn new(cfg: Config) -> Result<JobCtx> {
-        // CI_JOB_ID is unique across the GitLab instance; VM_JOB_ID covers manual
-        // runs outside gitlab-runner.
-        let job_id = std::env::var("CUSTOM_ENV_CI_JOB_ID")
-            .or_else(|_| std::env::var("VM_JOB_ID"))
-            .unwrap_or_else(|_| "dev".into());
-        Self::new_for_job(cfg, job_id)
+        // The runner's own account of the job first; CI_JOB_ID is the same number where
+        // there is no job response to read, and VM_JOB_ID covers manual runs outside
+        // gitlab-runner.
+        // Read once and threaded down: two reads of the same path are two chances to get two
+        // different answers, and the job id and the project identity have to come from one.
+        let response = JobResponse::read();
+        let job_id = match &response {
+            Some(r) => r.id.to_string(),
+            None => std::env::var("CUSTOM_ENV_CI_JOB_ID")
+                .or_else(|_| std::env::var("VM_JOB_ID"))
+                .unwrap_or_else(|_| "dev".into()),
+        };
+        Self::with_response(cfg, job_id, response)
     }
 
+    /// A context for a named job id, reading whatever job response the environment offers.
+    /// Test-only since [`JobCtx::new`] threads its own single read down: two reads of the same
+    /// path are two chances to get two different answers.
+    #[cfg(test)]
     pub fn new_for_job(cfg: Config, job_id: String) -> Result<JobCtx> {
+        let response = JobResponse::read();
+        Self::with_response(cfg, job_id, response)
+    }
+
+    fn with_response(cfg: Config, job_id: String, response: Option<JobResponse>) -> Result<JobCtx> {
         // The id lands in a filesystem path: keep it to one sane path component.
         if job_id.is_empty()
             || !job_id
@@ -123,9 +139,26 @@ impl JobCtx {
             // Slug + concurrent id are safe path components by GitLab's own rules; sanitize
             // defensively so a surprising value can never escape the checkouts root.
             concurrent_id: safe_component(job_var("CI_CONCURRENT_ID"), "0"),
-            project_slug: safe_component(job_var("CI_PROJECT_PATH_SLUG"), "repo"),
-            job_name: job_var("CI_JOB_NAME"),
-            project_id: job_var("CI_PROJECT_ID"),
+            // Identity, unlike everything above it, is not the job's to choose: it keys what
+            // this host keeps about the job between runs. Taken from the runner's account of
+            // the job where there is one, and from the variables only where there is not —
+            // which is no job at all (`vk` run from an operator's shell, a manual run), since a
+            // job cannot stop the runner writing it.
+            project_slug: safe_component(
+                match &response {
+                    Some(r) => Some(r.job_info.project_slug()),
+                    None => job_var("CI_PROJECT_PATH_SLUG"),
+                },
+                "repo",
+            ),
+            job_name: match &response {
+                Some(r) => Some(r.job_info.name.clone()),
+                None => job_var("CI_JOB_NAME"),
+            },
+            project_id: match &response {
+                Some(r) => Some(r.job_info.project_id.to_string()),
+                None => job_var("CI_PROJECT_ID"),
+            },
         })
     }
 
@@ -321,6 +354,73 @@ fn path_component(raw: &str, default: &str) -> String {
     }
 }
 
+/// The runner's own account of the job. gitlab-runner writes it as JSON and names the path
+/// in `JOB_RESPONSE_FILE` — a bare name, where everything a job can set arrives prefixed
+/// `CUSTOM_ENV_`, so a job can neither shadow the variable nor choose what is inside the
+/// file. Its own documentation points here for "the trusted job context".
+///
+/// Only the fields that name the job are read. Everything a job is *meant* to decide —
+/// `MICROVM_*`, the egress requests — stays on the variables, where a job overriding a value
+/// is the feature and not a hole. The file also carries the job token, so it is parsed and
+/// dropped: never logged, never quoted into an error.
+#[derive(serde::Deserialize)]
+struct JobResponse {
+    id: u64,
+    job_info: JobInfo,
+}
+
+#[derive(serde::Deserialize)]
+struct JobInfo {
+    name: String,
+    project_id: u64,
+    project_full_path: String,
+}
+
+impl JobResponse {
+    /// `None` where there is no job response to read, which means no job: `vk` run from an
+    /// operator's shell, or a manual run outside gitlab-runner. A real job always
+    /// has one, so nothing a job does can take this path.
+    fn read() -> Option<JobResponse> {
+        // Errors are swallowed rather than reported: the text holds the job token, so nothing
+        // from it goes near a log, and the caller falls back to the variables. But falling back
+        // *inside a job* means keying that job's stored state on values the job itself can set,
+        // which is what this exists to stop — so say so once, where an operator will see it.
+        let parsed = std::env::var("JOB_RESPONSE_FILE")
+            .ok()
+            .and_then(|path| std::fs::read_to_string(&path).ok())
+            .and_then(|text| serde_json::from_str::<JobResponse>(&text).ok());
+        if parsed.is_none() && std::env::var_os("CUSTOM_ENV_CI_JOB_ID").is_some() {
+            eprintln!(
+                "virtkit: warning: no readable JOB_RESPONSE_FILE — keying this job's stored \
+                 state on its own CI_* variables (gitlab-runner 15.0 or newer writes one)"
+            );
+        }
+        parsed
+    }
+}
+
+impl JobInfo {
+    /// The project half of a key, spelled as GitLab spells `CI_PROJECT_PATH_SLUG`: the full
+    /// path lowercased, every character outside `a-z0-9` becoming a `-`, cut to 63 and the
+    /// dashes trimmed off either end. Runs are deliberately *not* folded, because GitLab does
+    /// not fold them — an operator reading a directory name should see the slug they know.
+    /// Derived here rather than read from the variable of that name, which a job can set to
+    /// anything it likes.
+    fn project_slug(&self) -> String {
+        let mapped: String = self
+            .project_full_path
+            .to_lowercase()
+            .chars()
+            .map(|c| match c {
+                'a'..='z' | '0'..='9' => c,
+                _ => '-',
+            })
+            .take(63)
+            .collect();
+        mapped.trim_matches('-').to_string()
+    }
+}
+
 /// A single safe path component from an optional env value: keep only alphanumerics, `-`, `_`
 /// and `.`, reject a leading dot / emptiness, and fall back to `default` otherwise. Guards the
 /// `host_checkout` cache path against a crafted CI_CONCURRENT_ID / CI_PROJECT_PATH_SLUG.
@@ -376,6 +476,78 @@ mod tests {
     use super::*;
     use crate::config::Gitlab;
     use std::path::Path;
+
+    /// The identity a job keys its stored state on comes from the runner's account of the
+    /// job, not from the variables beside it — which a job sets itself, as it sets the
+    /// `MICROVM_*` knobs. A forged `CI_PROJECT_ID` in the payload's own variable list must
+    /// therefore change nothing: it is what a job would use to read, and pollute, the
+    /// history of a project whose pipelines it cannot even see.
+    #[test]
+    fn identity_comes_from_the_job_response_not_the_variables() {
+        let json = r#"{
+            "id": 4242,
+            "token": "a-job-token-that-must-not-be-logged",
+            "job_info": {
+                "name": "test:unit",
+                "project_id": 42,
+                "project_full_path": "Acme  Corp/Web_Team/my.project"
+            },
+            "variables": [
+                {"key": "CI_PROJECT_ID", "value": "14", "public": true},
+                {"key": "CI_PROJECT_PATH_SLUG", "value": "acme-web", "public": true},
+                {"key": "CI_JOB_NAME", "value": "someone-elses-job", "public": true}
+            ]
+        }"#;
+        let r: JobResponse = serde_json::from_str(json).expect("a job response parses");
+        assert_eq!(r.id, 4242);
+        assert_eq!(r.job_info.project_id, 42, "not the 14 the variables claim");
+        assert_eq!(r.job_info.name, "test:unit");
+        // Spelled as GitLab spells the slug: lowercased, every other character a dash, runs
+        // left alone — `Acme  Corp` has two spaces and keeps both dashes.
+        assert_eq!(r.job_info.project_slug(), "acme--corp-web-team-my-project");
+
+        // And the context built from it keys on those, not on the variables of the same names —
+        // which is the whole property, and is not tested by reading the struct's own fields.
+        let ctx = JobCtx::with_response(Config::default(), "4242".into(), Some(r))
+            .expect("a context for a real job");
+        assert_eq!(ctx.project_id.as_deref(), Some("42"));
+        assert_eq!(ctx.job_name.as_deref(), Some("test:unit"));
+        assert_eq!(ctx.project_slug, "acme--corp-web-team-my-project");
+        assert!(
+            ctx.usage_key()
+                .starts_with("42-acme--corp-web-team-my-project"),
+            "{:?}",
+            ctx.usage_key()
+        );
+    }
+
+    /// The slug is a path component, so the edges matter: a leading or trailing run of
+    /// non-alphanumerics must not survive as dots or dashes around the name, and a very long
+    /// path is cut where GitLab cuts it.
+    #[test]
+    fn a_project_slug_is_a_safe_path_component() {
+        let slug = |path: &str| {
+            JobInfo {
+                name: String::new(),
+                project_id: 1,
+                project_full_path: path.to_string(),
+            }
+            .project_slug()
+        };
+
+        assert_eq!(slug("../../etc/passwd"), "etc-passwd");
+        assert_eq!(slug("...leading"), "leading");
+        assert_eq!(slug("trailing///"), "trailing");
+        // One dash per character outside `a-z0-9`, as GitLab's own gsub gives: the slash and
+        // each accented letter contribute their own.
+        assert_eq!(slug("Group/Ünïcode"), "group--n-code");
+        assert_eq!(slug(&"a".repeat(80)), "a".repeat(63));
+        // Whatever comes out still passes the component guard the key is built with.
+        for path in ["../../etc/passwd", "...leading", "trailing///"] {
+            let s = slug(path);
+            assert_eq!(safe_component(Some(s.clone()), "repo"), s, "{path}");
+        }
+    }
 
     // A JobCtx with a fixed slot/project key, built directly so `host_checkout_dir` is
     // exercised without depending on the ambient CI_* env.
