@@ -882,7 +882,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // service) for the whole life of `supervise`, so the cache's idle GC cannot evict a
     // base out from under a running overlay. A shared advisory lock the kernel drops when
     // this process exits — held in this Vec until supervise returns (job teardown).
-    let mut use_guards: Vec<crate::image::UseGuard> = Vec::new();
+    let mut use_guards: Vec<crate::cachelock::Guard> = Vec::new();
     // The other half of the memory reservation prepare took (see admit): held here for the
     // job's whole life, so what this job booted keeps counting against the host budget until
     // the VM is gone. `None` when admission is off.

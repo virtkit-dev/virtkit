@@ -27,7 +27,7 @@ struct UnitState {
     /// Reference on the shared-cache base this unit overlays (image tier or build tier),
     /// held while the unit runs so the idle GC never evicts a base under a live overlay.
     /// Acquired at boot, dropped on stop.
-    guard: Option<crate::image::UseGuard>,
+    guard: Option<crate::cachelock::Guard>,
 }
 
 /// The manager owns the declared service units. units::boot_unit is sync, so the

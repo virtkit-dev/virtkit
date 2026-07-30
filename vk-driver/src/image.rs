@@ -19,7 +19,6 @@
 use std::io::{Read, Write};
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -322,17 +321,7 @@ fn spawn_holder(lock: UnixListener) -> PullLock {
 /// `.used` idle marker to now, so the idle GC never reclaims a base the executor is about to
 /// overlay. Called on every resolve (hit or miss). Best-effort.
 pub(crate) fn mark_used(dir: &Path) {
-    let _ = std::fs::File::create(dir.join(".inuse"));
-    let _ = std::fs::File::create(dir.join(".used"));
-}
-
-/// A held reference to a materialized image base: a shared advisory lock on the base's
-/// `.inuse`, kept for the whole lifetime of the VM overlaying it. The kernel drops the lock
-/// when this process exits for any reason, so a crashed job never pins a base — and
-/// `gc_idle`, which needs a non-blocking *exclusive* lock to evict, can therefore never
-/// reclaim a base under a live overlay. Released on drop.
-pub(crate) struct UseGuard {
-    _file: std::fs::File,
+    crate::cachelock::stamp(&dir.join(".inuse"), &dir.join(".used"));
 }
 
 /// The managed cache tiers under `state_dir`: pulled registry bundles, pulled docker
@@ -349,68 +338,32 @@ pub(crate) fn cache_tiers(state_dir: &Path) -> [PathBuf; 3] {
 /// Take a shared-lock reference on the materialized base backing `rootfs`, iff it lives in
 /// a managed cache tier (see [`cache_tiers`]). Returns `None` for a baked `[local]` bundle
 /// or an ephemeral rootfs — nothing there is reference-counted or evicted. Hold the returned
-/// guard for the overlay's whole lifetime.
-pub(crate) fn acquire_use_lock_for(state_dir: &Path, rootfs: &Path) -> Result<Option<UseGuard>> {
+/// guard for the overlay's whole lifetime: a base under a live overlay is never reclaimed.
+pub(crate) fn acquire_use_lock_for(
+    state_dir: &Path,
+    rootfs: &Path,
+) -> Result<Option<crate::cachelock::Guard>> {
     let Some(dir) = rootfs.parent() else {
         return Ok(None);
     };
     if !cache_tiers(state_dir).iter().any(|t| dir.starts_with(t)) {
         return Ok(None);
     }
-    let path = dir.join(".inuse");
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    // SAFETY: the fd is owned by `file`, kept alive by the returned guard. LOCK_SH contends
-    // only with the GC's momentary exclusive lock.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("shared-locking {}", path.display()));
-    }
-    let _ = std::fs::File::create(dir.join(".used"));
-    Ok(Some(UseGuard { _file: file }))
+    Ok(Some(crate::cachelock::acquire_shared(
+        &dir.join(".inuse"),
+        &dir.join(".used"),
+    )?))
 }
 
 /// Evict every materialized base under `root` that no process is overlaying and that has
-/// been idle at least `idle`. A live overlay holds a shared lock on the base's `.inuse`, so
-/// the non-blocking exclusive lock here fails and that base is skipped — a running base is
-/// never reclaimed. A base whose `.used` marker is missing (still being set up) is left
-/// alone. Best-effort.
+/// been idle at least `idle`, on [`crate::cachelock`]'s protocol. Best-effort.
 pub(crate) fn gc_idle(root: &Path, idle: std::time::Duration) {
     let now = std::time::SystemTime::now();
     for base in base_dirs(root) {
-        let Ok(file) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(base.join(".inuse"))
-        else {
-            continue;
-        };
-        // A live overlay holds LOCK_SH; a non-blocking LOCK_EX then fails (EWOULDBLOCK).
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            continue;
-        }
-        let idle_ok = match std::fs::metadata(base.join(".used")).and_then(|m| m.modified()) {
-            // A `.used` timestamp can read microseconds *ahead* of `now`: the filesystem stamps
-            // mtime from a coarse clock while `now` is precise, so under load the marker can
-            // appear to be in the future. Treat that as "used just now" (zero elapsed) rather
-            // than "keep forever", so a zero idle window still reclaims an unreferenced base.
-            Ok(t) => now.duration_since(t).unwrap_or_default() >= idle,
-            Err(_) => false, // missing/unreadable marker: mid-materialize, leave alone
-        };
-        if !idle_ok {
-            continue;
-        }
-        // Hold the exclusive lock across removal: a would-be new consumer's shared lock
-        // blocks on it, then finds the base gone and re-materializes.
-        println!("virtkit: evicting idle image base {}", base.display());
-        let _ = std::fs::remove_dir_all(&base);
+        crate::cachelock::try_reclaim(&base.join(".inuse"), &base.join(".used"), idle, now, || {
+            println!("virtkit: evicting idle image base {}", base.display());
+            let _ = std::fs::remove_dir_all(&base);
+        });
     }
 }
 
@@ -593,27 +546,17 @@ mod tests {
         }
     }
 
-    /// Run `gc_idle` until `base` is evicted. `gc_idle`'s liveness probe is a non-blocking
-    /// exclusive `flock`; a *concurrent* test that spawns a subprocess (e.g. the qcow2 tests
-    /// run `qemu-img`) briefly leaks this test's `.inuse` lock fd into the forked child across
-    /// `fork()`, keeping the shared lock alive until the child `exec`s and drops it. That makes
-    /// a single-shot eviction check racy under parallel load, so retry — exactly as the periodic
-    /// production GC would. Converges once the transient inheriting child is gone.
+    /// Run `gc_idle` until `base` is evicted — retried for the reason
+    /// [`crate::cachelock::reclaimed_eventually`] documents.
     fn evict_eventually(root: &Path, base: &Path) {
-        use std::time::{Duration, Instant};
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            gc_idle(root, Duration::ZERO);
-            if !base.exists() {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "base {} was not reclaimed within the timeout",
-                base.display()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert!(
+            crate::cachelock::reclaimed_eventually(|| {
+                gc_idle(root, std::time::Duration::ZERO);
+                !base.exists()
+            }),
+            "base {} was not reclaimed within the timeout",
+            base.display()
+        );
     }
 
     #[test]
