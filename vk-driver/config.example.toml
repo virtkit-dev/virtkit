@@ -117,8 +117,9 @@
 #                        # set, a job claims its guest RAM before booting and waits for
 #                        # room, oldest request first. Jobs report what they actually used
 #                        # (see the end of a job trace) — size the budget from that.
-# mem_budget = "48G"     # total GUEST RAM admitted at once; leave the rest of the host's
-#                        # memory for the VMMs, the page cache and everything else
+# mem_budget = "50%"     # total GUEST RAM admitted at once: an exact "48G", or a share of
+#                        # this host's MemTotal rounded up to whole GiB. Leave the rest of
+#                        # the host's memory for the VMMs, host tmpfs and everything else
 # from_history = false   # reserve what a job of this kind has been using (its largest run
 #                        # of the last 14 days at its current MICROVM_MEM + headroom, capped
 #                        # by what it declares) instead of declared size, so a host runs as

@@ -1672,8 +1672,8 @@ fn vm_size(ctx: &JobCtx) -> Result<(u32, String)> {
             // `[schedule] mem_budget` is a host ceiling like the others: a request above the
             // whole budget could never be admitted, and failing prepare over it would be a
             // *system* failure — the retryable class, which no retry could ever satisfy.
-            let max = match &ctx.cfg.schedule.mem_budget {
-                Some(b) => max.min(parse_gib(b).context("invalid [schedule] mem_budget")?),
+            let max = match budget_mib(&ctx.cfg) {
+                Some(b) => max.min(b? / 1024),
                 None => max,
             };
             format!("{}G", req.min(max))
@@ -1695,13 +1695,10 @@ pub(crate) fn declared_mem_mib(ctx: &JobCtx) -> Result<u64> {
 /// admits every job the runner hands it, as it did before. A job that never gets room fails
 /// prepare, which exits `SYSTEM_FAILURE_EXIT_CODE`: a system failure, not the job's fault.
 fn admit_memory(ctx: &JobCtx, mem: &str) -> Result<Option<crate::admit::Reservation>> {
-    let Some(budget) = ctx.cfg.schedule.mem_budget.as_deref() else {
+    let Some(budget) = budget_mib(&ctx.cfg) else {
         return Ok(None);
     };
-    let budget_mib = parse_gib(budget)
-        .context("invalid [schedule] mem_budget")?
-        .checked_mul(1024)
-        .context("[schedule] mem_budget is absurdly large")?;
+    let budget_mib = budget?;
     let timeout = Duration::from_secs(ctx.cfg.schedule.wait_timeout_secs.unwrap_or(600));
     let declared_mib = parse_gib(mem)
         .context("invalid guest memory size")?
@@ -1729,21 +1726,57 @@ fn admit_memory(ctx: &JobCtx, mem: &str) -> Result<Option<crate::admit::Reservat
     Ok(Some(reservation))
 }
 
-/// The host's `[schedule] mem_budget` in MiB, for a report that says there is no budget rather
-/// than inventing one. `None` when no budget is set, `Some(Err(..))` when one is set that this
-/// host cannot read —
-/// which the report has to tell apart, since a budget it cannot parse is one every job's
-/// prepare is already failing on, not the absence of a budget.
+/// The host's `[schedule] mem_budget` in MiB, resolving a percentage against this host, for a
+/// report that says there is no budget rather than inventing one. `None` when no budget is set,
+/// `Some(Err(..))` when one is set that this host cannot resolve — it does not parse, or it is a
+/// percentage and `/proc/meminfo` is unreadable — which the report has to tell apart, since a
+/// budget it cannot resolve is one every job's prepare is already failing on, not the absence of
+/// a budget. The error names the setting, so callers add no context of their own.
 pub(crate) fn budget_mib(cfg: &crate::config::Config) -> Option<Result<u64>> {
     let raw = cfg.schedule.mem_budget.as_deref()?;
+    // Only a percentage needs the host measured, and a `<n>G` budget must keep working on a host
+    // whose `/proc/meminfo` cannot be read.
+    let host_total_mib = raw
+        .ends_with('%')
+        .then(crate::schedule::host_total_mib)
+        .flatten();
     Some(
-        parse_gib(raw)
-            .with_context(|| format!("invalid [schedule] mem_budget {raw:?}"))
-            .and_then(|gib| {
-                gib.checked_mul(1024)
-                    .context("[schedule] mem_budget is absurdly large")
-            }),
+        // "cannot resolve", not "invalid": a percentage is a valid setting on a host whose
+        // memory this process simply cannot read.
+        parse_budget_mib(raw, host_total_mib)
+            .with_context(|| format!("cannot resolve [schedule] mem_budget {raw:?}")),
     )
+}
+
+/// `"<n>G"` as an exact size, or `"<n>%"` as a share of `host_total_mib`.
+fn parse_budget_mib(raw: &str, host_total_mib: Option<u64>) -> Result<u64> {
+    let Some(percent) = raw.strip_suffix('%') else {
+        if !raw.ends_with('G') {
+            bail!("expected <n>G or <n>%");
+        }
+        return parse_gib(raw)
+            .context("expected <n>G or <n>%")?
+            .checked_mul(1024)
+            .context("size is absurdly large");
+    };
+    let percent: u64 = percent.parse().context("expected <n>%")?;
+    if !(1..=100).contains(&percent) {
+        bail!("a percentage budget must be between 1% and 100%");
+    }
+    let total_mib = host_total_mib
+        .context("cannot read MemTotal from /proc/meminfo to resolve a percentage")?;
+    // Guest sizes are whole GiB, so the share is one too. Round it *up*, so 50% of a nominal
+    // 32 GiB runner — whose MemTotal is always somewhat under 32 GiB — still admits the two 8G
+    // jobs the operator asked for rather than one; and cap it at the whole GiB the host really
+    // has, so 100% cannot round past the machine.
+    let gib = (total_mib.checked_mul(percent))
+        .context("size is absurdly large")?
+        .div_ceil(100 * 1024)
+        .min(total_mib / 1024);
+    if gib == 0 {
+        bail!("this host has under 1 GiB to give a percentage budget");
+    }
+    Ok(gib * 1024)
 }
 
 /// "<n>G" (GiB) — the only size format the sizing variables accept
@@ -2269,6 +2302,37 @@ mod tests {
         let mut plain = self::ctx(None, None);
         plain.cfg.schedule.mem_budget = Some("2G".into());
         assert_eq!(vm_size(&plain).unwrap().1, "8G");
+    }
+
+    #[test]
+    fn a_percentage_memory_budget_is_a_share_of_this_host() {
+        // MemTotal always reads somewhat under the machine's nominal size, so the share is
+        // rounded up to the whole-GiB unit job sizes come in — except at 100%, which never
+        // claims more whole GiB than the host reports.
+        let total = 30 * 1024 + 512;
+        assert_eq!(parse_budget_mib("50%", Some(total)).unwrap(), 16 * 1024);
+        assert_eq!(parse_budget_mib("60%", Some(total)).unwrap(), 19 * 1024);
+        assert_eq!(parse_budget_mib("100%", Some(total)).unwrap(), 30 * 1024);
+        // An exact size is unchanged, and needs no reading of the host.
+        assert_eq!(parse_budget_mib("20G", None).unwrap(), 20 * 1024);
+        for invalid in ["0%", "101%", "%", "50", "0G", "-1%", "5 %", "50g"] {
+            assert!(
+                parse_budget_mib(invalid, Some(total)).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+        // A percentage of a host that cannot be measured is refused, not silently taken as all
+        // of it: the budget is the one number that must never be guessed upwards.
+        assert!(
+            parse_budget_mib("50%", None)
+                .unwrap_err()
+                .to_string()
+                .contains("MemTotal")
+        );
+        // Rounding up means any percentage of a host with at least a GiB resolves to at least
+        // one whole GiB; only a host with under a GiB has no budget to give at all.
+        assert_eq!(parse_budget_mib("1%", Some(1024)).unwrap(), 1024);
+        assert!(parse_budget_mib("50%", Some(512)).is_err());
     }
 
     /// The ceiling a finished run is stamped with and the ceiling the next admission looks it

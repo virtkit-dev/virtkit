@@ -155,7 +155,8 @@ pub struct Build {
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Schedule {
-    /// Total guest RAM this host admits at once, e.g. `"48G"`. Unset = no admission gate.
+    /// Total guest RAM this host admits at once, as an exact size (`"48G"`) or a share of this
+    /// host's `MemTotal` rounded up to whole GiB (`"50%"`). Unset = no admission gate.
     pub mem_budget: Option<String>,
     /// Reserve what a job of this kind has actually been using rather than what it declares
     /// — jobs rarely touch their whole `MICROVM_MEM`, so declared sizes leave a host running

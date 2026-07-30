@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A runner's memory budget can follow the size of the host.** `[schedule] mem_budget` now
+  takes a percentage such as `"50%"` as well as an exact `"48G"`, so one configuration leaves
+  the same proportional headroom on runners with different amounts of RAM.
+
 ### Changed
 
 - **Runner concurrency now follows host memory too.** `vk tune` limits new slots by what the

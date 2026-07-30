@@ -194,9 +194,20 @@ waits when the host is full:
 
 ```toml
 [schedule]
-mem_budget = "48G"        # total guest RAM admitted at once; unset = no gate (the default)
+mem_budget = "50%"        # total guest RAM admitted at once; exact "48G" also works
 wait_timeout_secs = 600   # then the job gives up
 ```
+
+A percentage is resolved from this host's `MemTotal`, so one config scales across runners of
+different sizes. It is rounded **up** to the whole-GiB unit job sizes come in — a runner's
+`MemTotal` always reads somewhat under its nominal size, and rounding down there would cost a
+whole job's worth of budget — and any percentage is capped at the whole GiB the host actually
+reports, so `100%` cannot round past the machine. A
+host whose `/proc/meminfo` cannot be read fails a percentage budget rather than guessing one.
+
+The budget stays a **guest RAM** ceiling either way, not a host one: leave enough of the host
+outside it for the VMMs, a tmpfs-backed checkout, and anything else the box runs. Unset,
+admission is disabled (the default).
 
 A job that waits says so in its trace, and says so again when it gets in:
 
@@ -238,7 +249,7 @@ same figures its trace reports:
 
 ```toml
 [schedule]
-mem_budget = "48G"
+mem_budget = "50%"
 from_history = true
 ```
 

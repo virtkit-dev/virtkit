@@ -37,16 +37,13 @@ pub fn desired_file(cfg: &Config) -> PathBuf {
 /// half minute or so from a user timer; each run stands alone, reading its own previous
 /// answer back out of the file it writes.
 pub fn tune(cfg: &Config) -> Result<()> {
-    let Some(budget) = cfg.schedule.mem_budget.as_deref() else {
+    let Some(budget) = crate::vm::budget_mib(cfg) else {
         bail!(
             "[schedule] mem_budget is unset: there is no budget to schedule against \
              (see the GitLab CI guide)"
         );
     };
-    let budget_mib = crate::vm::parse_gib(budget)
-        .context("invalid [schedule] mem_budget")?
-        .checked_mul(1024)
-        .context("[schedule] mem_budget is absurdly large")?;
+    let budget_mib = budget?;
     // Propagated, not defaulted: a reading of "nothing committed" would offer the whole
     // budget again, which is the one answer that overcommits the host.
     let held = crate::admit::committed(&cfg.state_dir().join("admit"))?;
@@ -195,6 +192,12 @@ fn host_memory() -> Option<HostMemory> {
         available_mib: available_kib / 1024,
         total_mib: total_kib / 1024,
     })
+}
+
+/// This host's `MemTotal` in MiB — what a percentage `[schedule] mem_budget` is a share of.
+/// `None` on a host whose memory cannot be read, which is a percentage that cannot be resolved.
+pub(crate) fn host_total_mib() -> Option<u64> {
+    host_memory().map(|h| h.total_mib)
 }
 
 /// `(MemAvailable, MemTotal)` in kB.
