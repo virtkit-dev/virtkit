@@ -88,6 +88,7 @@ pub async fn run_stage(ctx: &JobCtx, script_path: &Path, stage: Option<&str>) ->
         report_egress_audit(ctx);
         report_contacted_names(ctx);
         report_resource_usage(ctx);
+        report_project_usage(ctx);
     }
     result
 }
@@ -242,6 +243,41 @@ fn report_job_history(ctx: &JobCtx, declared_mib: u64) {
         schedule.from_history && schedule.mem_budget.is_some(),
     ) {
         eprintln!("{line}");
+    }
+}
+
+/// `MICROVM_USAGE_REPORT`: end the trace with what every job of this project has been using,
+/// not just this one. A `when: manual` job carrying the variable is how an operator sizes a
+/// project from the GitLab UI, without a shell on the runner. Printed after this run has been
+/// recorded, so the job asking is counted in its own report.
+///
+/// This project exactly, never one whose directory name merely contains it: the job asking
+/// may have no sight of the other's pipelines at all. Which project that is comes from the
+/// runner's account of the job rather than the variables beside it (see jobctx), so it is
+/// not something a job can name for itself.
+fn report_project_usage(ctx: &JobCtx) {
+    if !ctx.usage_report_req {
+        return;
+    }
+    // This prints a whole project's history into a job's trace, so it goes out only where the
+    // project is the runner's word and not the job's. Without a readable job response the
+    // identity falls back to `CUSTOM_ENV_CI_PROJECT_*`, which a job sets for itself — and a job
+    // could then name another project and read its jobs, peaks and traffic out of its own log.
+    if !ctx.identity_from_runner {
+        eprintln!(
+            "virtkit: not reporting this project's usage: without a readable JOB_RESPONSE_FILE \
+             the project is only what this job's own variables claim"
+        );
+        return;
+    }
+    match crate::admit::own_project_report(
+        &ctx.history_dir(),
+        &ctx.usage_project(),
+        crate::vm::budget_mib(&ctx.cfg).map(|r| r.map_err(|e| format!("{e:#}"))),
+        ctx.cfg.schedule.from_history,
+    ) {
+        Some(report) => eprint!("{report}"),
+        None => eprintln!("virtkit: no job of this project has run on this host yet"),
     }
 }
 

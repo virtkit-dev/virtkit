@@ -37,6 +37,14 @@ pub struct JobCtx {
     pub egress_audit_req: bool,
     /// MICROVM_BUILD_EGRESS_AUDIT: the same, for the build phase (`[egress.build] audit`).
     pub egress_build_audit_req: bool,
+    /// Whether the identity above came from the runner's own account of the job rather than
+    /// from the variables beside it. Anything that hands a job data keyed on that identity has
+    /// to check it: the fallback is the job naming a project for itself.
+    pub identity_from_runner: bool,
+    /// MICROVM_USAGE_REPORT: end this job's trace with what every job of its project has
+    /// been using, not just this one. Meant for a `when: manual` job an operator runs to size
+    /// a project, without needing a shell on the runner.
+    pub usage_report_req: bool,
     /// Exit code telling gitlab-runner the *script* failed (job failure)
     pub build_failure: i32,
     /// Exit code telling gitlab-runner the *environment* failed (retryable)
@@ -130,6 +138,8 @@ impl JobCtx {
             egress_audit_req: job_var("MICROVM_EGRESS_AUDIT").is_some_and(|v| is_truthy(&v)),
             egress_build_audit_req: job_var("MICROVM_BUILD_EGRESS_AUDIT")
                 .is_some_and(|v| is_truthy(&v)),
+            identity_from_runner: response.is_some(),
+            usage_report_req: job_var("MICROVM_USAGE_REPORT").is_some_and(|v| is_truthy(&v)),
             build_failure: exit_code_env("BUILD_FAILURE_EXIT_CODE", 1),
             system_failure: exit_code_env("SYSTEM_FAILURE_EXIT_CODE", 2),
             ci_repo_url: job_var("CI_REPOSITORY_URL"),
@@ -187,6 +197,21 @@ impl JobCtx {
         self.cfg.state_dir().join("history")
     }
 
+    /// The project half of [`JobCtx::usage_key`]: what a report covering every job of this
+    /// job's project is keyed on.
+    pub fn usage_project(&self) -> String {
+        // The id is joined to the slug with the separator both halves may contain, so it is
+        // used only when it is what GitLab documents it to be — a number. Anything else and the
+        // slug stands alone: `42-x` + `y` and `42` + `x-y` must not be one project.
+        let project = match &self.project_id {
+            Some(id) if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) => {
+                format!("{id}-{}", self.project_slug)
+            }
+            _ => self.project_slug.clone(),
+        };
+        path_component(&project, "repo")
+    }
+
     /// Where this host remembers what each job contacts, keyed by [`JobCtx::usage_key`] like
     /// the run history. Its own root rather than a file beside each history: what a job used
     /// and what it reached are read by different callers, and a scan of one must not have to
@@ -204,16 +229,7 @@ impl JobCtx {
     /// where there is one, since the slug alone is not unique; a project renamed under the
     /// same id starts a fresh history, which costs it one run at its declared size.
     pub fn usage_key(&self) -> PathBuf {
-        // The id is joined to the slug with the separator both halves may contain, so it is
-        // used only when it is what GitLab documents it to be — a number. Anything else and
-        // the slug stands alone: `42-x` + `y` and `42` + `x-y` must not be one project.
-        let project = match &self.project_id {
-            Some(id) if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) => {
-                format!("{id}-{}", self.project_slug)
-            }
-            _ => self.project_slug.clone(),
-        };
-        PathBuf::from(path_component(&project, "repo"))
+        PathBuf::from(self.usage_project())
             .join(job_component(self.job_name.as_deref().unwrap_or("job")))
     }
 
@@ -327,9 +343,17 @@ fn job_component(raw: &str) -> String {
     // Sixteen bytes. Eight would separate names that merely reduce alike, but its birthday
     // bound is only 2^32 — within reach of anyone who can pick both names, and two names
     // sharing a history is what the whole key scheme exists to prevent.
-    let short: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    let short: String = digest[..JOB_DIGEST_HEX / 2]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     format!("{}-{short}", path_component(raw, "job"))
 }
+
+/// How many hex characters [`job_component`] appends. Named because the report that reads
+/// these directories back has to take the same number off again (see `admit::readable_job`),
+/// and a digest that grew without the reader knowing would print raw directory names.
+pub(crate) const JOB_DIGEST_HEX: usize = 32;
 
 /// One safe path component out of free text: a job name can be anything (`test:unit 1/3`),
 /// so everything outside a plain filename becomes `_`, leading dots go, and a long name is
@@ -549,6 +573,31 @@ mod tests {
         }
     }
 
+    /// The two ends of a job directory name. `job_component` writes `<readable>-<digest>` and
+    /// `admit::readable_job` takes the digest back off; only [`JOB_DIGEST_HEX`] ties them, so a
+    /// digest that changed on one side without the other would have the report printing raw
+    /// directory names — and a job whose own name ends in something digest-shaped must not be
+    /// split at the wrong dash.
+    #[test]
+    fn a_job_component_reads_back_as_its_name_and_digest() {
+        for name in [
+            "build",
+            "test:unit 1/3",
+            "..",
+            &"x".repeat(120),
+            "foo-0123456789abcdef0123456789abcdef",
+            "",
+        ] {
+            let component = job_component(name);
+            let (readable, digest) = crate::admit::readable_job(&component);
+            assert_eq!(digest.len(), JOB_DIGEST_HEX, "{component}");
+            assert_eq!(component, format!("{readable}-{digest}"), "{component}");
+            assert_eq!(readable, path_component(name, "job"), "{component}");
+        }
+        // Two names that reduce alike keep distinct components, which is what the digest is for.
+        assert_ne!(job_component("deploy:prod"), job_component("deploy prod"));
+    }
+
     // A JobCtx with a fixed slot/project key, built directly so `host_checkout_dir` is
     // exercised without depending on the ambient CI_* env.
     fn ctx(cfg: Config) -> JobCtx {
@@ -566,6 +615,8 @@ mod tests {
             egress_build_allow_name_req: None,
             egress_audit_req: false,
             egress_build_audit_req: false,
+            identity_from_runner: false,
+            usage_report_req: false,
             build_failure: 1,
             system_failure: 2,
             ci_repo_url: None,

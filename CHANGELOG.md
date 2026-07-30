@@ -35,6 +35,12 @@ All notable changes to virtkit will be documented in this file.
   `MICROVM_MEM` and `[build] cpus`/`--cpus`/`MICROVM_CPUS` from what the work costs rather than
   by guess. Where several guests run at once — concurrent build stages, a compose fleet — the
   report gives both what they held together and the largest single process.
+- **`vk gitlab usage` sizes a project.** One command lists every job this runner remembers for
+  a project — what each has been peaking at, the runs behind it, the disk and network it
+  moves, and what its next run would reserve — closing with what they would all reserve at
+  once against the host's `[schedule] mem_budget`. A job can print its own project's report
+  into its trace with `MICROVM_USAGE_REPORT: "1"`, so a project can be sized from the GitLab
+  UI without a shell on the runner.
 - **Every CI job trace says what that job reaches out to.** A job reports the external names
   its guests have resolved — not just this run's, but everything the job has contacted since
   its egress policy was last changed, so a nightly step's host is on the list even in a

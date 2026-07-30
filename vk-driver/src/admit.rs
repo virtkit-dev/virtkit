@@ -19,6 +19,7 @@
 //! its RAM in gradually, so a VM that just booted leaves `MemAvailable` looking roomy and
 //! the next job in would be admitted against memory the previous one has not touched yet.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -610,8 +611,306 @@ fn history_summary_at(
     ))
 }
 
+/// What every job of a project has been using, as a table for an operator sizing a host:
+/// one row per job, heaviest first, and a closing line saying what the lot would reserve if
+/// they all ran at once — the figure `[schedule] mem_budget` has to cover.
+///
+/// `project` narrows it to the projects whose directory (`<id>-<slug>`) contains it, so the
+/// slug alone will do; empty reports every project this host remembers. `None` when nothing
+/// matched, which the caller distinguishes from a host that has run nothing.
+pub fn project_report(
+    root: &Path,
+    project: &str,
+    budget_mib: Option<Result<u64, String>>,
+    from_history: bool,
+) -> Option<String> {
+    // An empty fragment is in every name, so the whole host reports without a special case.
+    report_where(root, budget_mib, from_history, |name| {
+        name.contains(project)
+    })
+}
+
+/// The report for one named project and no other, for the trace of a job that asked for it.
+/// Exact where [`project_report`] takes a fragment: a directory name is `<id>-<slug>`, so one
+/// project's whole name can sit inside another's — `4-acme` is a substring of `14-acme-web` —
+/// and a job must not be handed the history of a project whose pipelines it cannot even see.
+pub fn own_project_report(
+    root: &Path,
+    project: &str,
+    budget_mib: Option<Result<u64, String>>,
+    from_history: bool,
+) -> Option<String> {
+    report_where(root, budget_mib, from_history, |name| name == project)
+}
+
+/// One job's row in the report: what it has been using, and the ceiling it last ran under —
+/// which is the one it would run under now, and so what its next reservation is read against.
+struct JobUsage {
+    job: String,
+    /// The digest the directory name carries, kept so two jobs whose readable names collide
+    /// can still be told apart on the report (see [`label_rows`]).
+    digest: String,
+    recent: Recent,
+    ceiling_mib: u64,
+}
+
+impl JobUsage {
+    /// What this job's next run would reserve, in MiB — the figure the report is ordered by and
+    /// the one its closing total adds up. Which is the size it declares unless the host reserves
+    /// from history: the report has to say what *this* host does, not what another one would.
+    fn reserves(&self, from_history: bool) -> u64 {
+        match from_history {
+            true => reserve_mib(self.recent.most / MIB, self.ceiling_mib),
+            false => self.ceiling_mib,
+        }
+    }
+}
+
+fn report_where(
+    root: &Path,
+    budget_mib: Option<Result<u64, String>>,
+    from_history: bool,
+    keep: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return None; // nothing has run on this host yet, or the store is not ours to read
+    };
+    let mut projects: Vec<PathBuf> = entries
+        .flatten()
+        .map(|p| p.path())
+        .filter(|p| p.is_dir() && p.file_name().and_then(|n| n.to_str()).is_some_and(&keep))
+        .collect();
+    projects.sort();
+
+    let mut blocks: Vec<(String, Vec<JobUsage>)> = Vec::new();
+    for dir in projects {
+        let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let mut jobs = jobs_of(root, &dir, name);
+        if jobs.is_empty() {
+            continue; // a project directory with no history left under it to read
+        }
+        label_rows(&mut jobs);
+        // Ordered by what each would reserve, which is the column the budget line below
+        // totals — not by the peak behind it, since a job pressed against a low ceiling
+        // reserves less than a lighter one given room.
+        jobs.sort_by(|a, b| {
+            b.reserves(from_history)
+                .cmp(&a.reserves(from_history))
+                .then(a.job.cmp(&b.job))
+        });
+        blocks.push((name.to_string(), jobs));
+    }
+    if blocks.is_empty() {
+        return None;
+    }
+    // One set of column widths for the whole report, so a host's projects read as one table
+    // in several pieces rather than as several tables that happen to be printed together.
+    let rows: Vec<Cells> = blocks
+        .iter()
+        .flat_map(|(_, jobs)| jobs)
+        .map(|job| row(job, from_history))
+        .collect();
+    let widths = widths(&rows);
+    let mut report = String::new();
+    for (name, jobs) in &blocks {
+        if !report.is_empty() {
+            report.push('\n');
+        }
+        // "lately", not the window's own length: [`window_of`] floors at [`MIN_RUNS`], so a
+        // quiet job is answered from its last few runs however old they are — the same reason
+        // the per-job line says it that way.
+        report.push_str(&format!(
+            "virtkit: {name} — what its jobs have been using lately:\n"
+        ));
+        report.push_str(&line(&head(), &widths));
+        for job in jobs {
+            report.push_str(&line(&row(job, from_history), &widths));
+        }
+    }
+    // Set apart where it closes several projects, since it covers them all; kept tight
+    // against the table of a single one, which is what a job's own trace prints.
+    if blocks.len() > 1 {
+        report.push('\n');
+    }
+    let all: Vec<&JobUsage> = blocks.iter().flat_map(|(_, jobs)| jobs).collect();
+    report.push_str(&together(&all, budget_mib, from_history));
+    Some(report)
+}
+
+/// One report row, headings included: a fixed width so `head`, `row`, `widths` and `line`
+/// cannot drift apart into a table whose columns do not line up.
+const COLS: usize = 9;
+type Cells = [String; COLS];
+
+/// What the columns are called, in the order [`row`] fills them.
+fn head() -> Cells {
+    [
+        "job", "memory", "ceiling", "reserves", "runs", "read", "written", "sent", "received",
+    ]
+    .map(str::to_string)
+}
+
+/// One job's cells. A figure no run could measure is `-`, not a zero: the two mean different
+/// things, and a column of zeros would hide which host cannot measure.
+fn row(job: &JobUsage, from_history: bool) -> Cells {
+    let pair = |p: Option<(u64, u64)>| match p {
+        Some((a, b)) => [crate::usage::fmt_bytes(a), crate::usage::fmt_bytes(b)],
+        None => ["-".to_string(), "-".to_string()],
+    };
+    let [read, written] = pair(job.recent.most_disk);
+    let [sent, received] = pair(job.recent.most_network);
+    [
+        job.job.clone(),
+        crate::usage::fmt_bytes(job.recent.most),
+        fmt_mib(job.ceiling_mib),
+        fmt_mib(job.reserves(from_history)),
+        job.recent.runs.to_string(),
+        read,
+        written,
+        sent,
+        received,
+    ]
+}
+
+/// Each column wide enough for the widest cell in it, headings included.
+fn widths(rows: &[Cells]) -> [usize; COLS] {
+    let head = head();
+    std::array::from_fn(|col| {
+        rows.iter()
+            .map(|r| &r[col])
+            .chain([&head[col]])
+            .map(|cell| cell.chars().count())
+            .max()
+            .unwrap_or(0)
+    })
+}
+
+/// One rendered line. Names read down the left edge; figures line up on the right, where a
+/// column of mixed units (`812 MiB` over `3.4 GiB`) can be compared at a glance.
+fn line(cells: &Cells, widths: &[usize; COLS]) -> String {
+    let mut out = String::from("  ");
+    for (col, (cell, width)) in cells.iter().zip(widths).enumerate() {
+        match col {
+            0 => out.push_str(&format!("{cell:<width$}  ")),
+            _ => out.push_str(&format!("{cell:>width$}  ")),
+        }
+    }
+    // The padding after the last column is trailing whitespace nobody wants in a trace.
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out.push('\n');
+    out
+}
+
+/// The closing line: what the reported jobs would reserve if every one of them ran at once,
+/// against the budget the host admits within. That comparison is the report's point — a host
+/// whose jobs cannot all fit is not misconfigured, it is one where jobs queue.
+fn together(
+    jobs: &[&JobUsage],
+    budget_mib: Option<Result<u64, String>>,
+    from_history: bool,
+) -> String {
+    // Saturating, like `reserve_mib`'s own arithmetic: these are figures read off disk.
+    let total: u64 = jobs
+        .iter()
+        .map(|j| j.reserves(from_history))
+        .fold(0u64, u64::saturating_add);
+    let plural = if jobs.len() == 1 { "job" } else { "jobs" };
+    let budget = match budget_mib {
+        Some(Ok(mib)) => format!(", against a budget of {}", fmt_mib(mib)),
+        // A budget this host cannot read is not the absence of one: every job's prepare is
+        // already failing on it, and saying "no budget" would send the reader the wrong way.
+        Some(Err(why)) => {
+            format!(", against a [schedule] mem_budget this host cannot read ({why})")
+        }
+        // Nothing to compare against, and saying so beats an unqualified total: without
+        // `[schedule] mem_budget` nothing is held back whatever the figure says.
+        None => ", with no [schedule] mem_budget to hold them back".to_string(),
+    };
+    format!(
+        "virtkit: {} {plural}; all at once they would reserve {}{budget}\n",
+        jobs.len(),
+        fmt_mib(total),
+    )
+}
+
+/// Every job remembered under one project directory, each read against the ceiling it last
+/// ran under — and, as every reader of a history does, over its last few runs however old
+/// they are, so a job too quiet for the window is still reported rather than dropped. Left
+/// out only where there is no history left to read.
+fn jobs_of(root: &Path, dir: &Path, project: &str) -> Vec<JobUsage> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new(); // removed under us, or not ours to read
+    };
+    let mut jobs = Vec::new();
+    for entry in entries.flatten() {
+        let key = Path::new(project).join(entry.file_name());
+        // Named the way the project above it is: anything this host wrote is ASCII by
+        // construction, so a name that will not read back as one is not a history of ours.
+        let Some((name, digest)) = entry.file_name().to_str().map(readable_job) else {
+            continue;
+        };
+        let Some(ceiling) = read(root, &key).last().map(|s| s.ceiling) else {
+            continue;
+        };
+        let Some(recent) = most_recent(root, &key, ceiling) else {
+            continue;
+        };
+        jobs.push(JobUsage {
+            job: name,
+            digest,
+            recent,
+            ceiling_mib: ceiling / MIB,
+        });
+    }
+    jobs
+}
+
+/// A job directory's readable half and the digest that follows it: two job names can reduce
+/// to the same readable half — `deploy:prod` and `deploy prod` both key on `deploy_prod` —
+/// and it is the digest that keeps their histories apart, so a report showing one row per
+/// name has to be able to tell them apart too.
+pub(crate) fn readable_job(component: &str) -> (String, String) {
+    match component.rsplit_once('-') {
+        Some((name, digest))
+            if digest.len() == crate::jobctx::JOB_DIGEST_HEX
+                && digest.chars().all(|c| c.is_ascii_hexdigit()) =>
+        {
+            (name.to_string(), digest.to_string())
+        }
+        _ => (component.to_string(), String::new()),
+    }
+}
+
+/// Give every row a label of its own: a readable name that only one job in this block wears
+/// is that name, and one that two wear carries enough of each digest to be told from the
+/// other — the alternative is two rows labelled alike with different figures behind them.
+fn label_rows(jobs: &mut [JobUsage]) {
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for j in jobs.iter() {
+        *seen.entry(j.job.as_str()).or_default() += 1;
+    }
+    let repeated: HashSet<String> = seen
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(name, _)| name.to_string())
+        .collect();
+    for j in jobs.iter_mut() {
+        if repeated.contains(&j.job) && !j.digest.is_empty() {
+            // The whole digest, not a prefix: a prefix separates two entries only as well as
+            // its own length, and these are names someone chose to have read alike.
+            j.job = format!("{} ({})", j.job, j.digest);
+        }
+    }
+}
+
 fn fmt_mib(mib: u64) -> String {
-    crate::usage::fmt_bytes(mib * MIB)
+    // Saturating: a `[schedule] mem_budget` absurd enough to survive its own `checked_mul` is
+    // still a figure this has to print rather than wrap on.
+    crate::usage::fmt_bytes(mib.saturating_mul(MIB))
 }
 
 /// A pair of figures for a trace line, or nothing at all where no run in the window could
@@ -1560,6 +1859,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The report an operator sizes a host from: every job of a project, heaviest first, with
+    /// the figures lined up under one set of columns and a closing line saying what the lot
+    /// would reserve at once.
+    #[test]
+    fn a_project_report_lists_each_job_against_the_host_budget() {
+        let dir = tmpdir("report");
+        let now = 1_700_000_000;
+        let digest = "0123456789abcdef0123456789abcdef"; // as `job_component` appends one
+        let put = |project: &str, job: &str, run: Run| {
+            let key = Path::new(project).join(format!("{job}-{digest}"));
+            remember_at(&dir, &key, run, now);
+        };
+        put("42-acme", "build", run(6000, CEIL));
+        put(
+            "42-acme",
+            "test_unit",
+            Run {
+                peak: 500 * MIB,
+                ceiling: ceiling(2048),
+                disk: Some((10 * MIB, 20 * MIB)),
+                network: None,
+            },
+        );
+        put("77-other", "lint", run(300, 2048));
+
+        // Narrowed by any part of the directory name — the slug is what an operator knows.
+        let report = project_report(&dir, "acme", Some(Ok(16384)), true).expect("acme has run");
+        assert_eq!(
+            report,
+            "virtkit: 42-acme — what its jobs have been using lately:\n\
+             \x20 job         memory  ceiling  reserves  runs    read  written  sent  received\n\
+             \x20 build      5.9 GiB  8.0 GiB   7.3 GiB     1       -        -     -         -\n\
+             \x20 test_unit  500 MiB  2.0 GiB   625 MiB     1  10 MiB   20 MiB     -         -\n\
+             virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.0 GiB\n"
+        );
+        assert!(!report.contains(digest), "the digest is not for reading");
+
+        // No project named reports the whole host, one table's worth of columns throughout.
+        let all = project_report(&dir, "", None, true).expect("something has run");
+        assert!(all.contains("42-acme") && all.contains("77-other"), "{all}");
+        assert!(
+            all.ends_with(
+                "virtkit: 3 jobs; all at once they would reserve 8.4 GiB, \
+                 with no [schedule] mem_budget to hold them back\n"
+            ),
+            "{all}"
+        );
+        // And a project nothing answers to reports nothing, as does an empty history.
+        assert_eq!(project_report(&dir, "no-such-project", None, true), None);
+        assert_eq!(project_report(&dir.join("missing"), "", None, true), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A project's whole directory name can sit inside another's, so the report a job asks for
+    /// is matched exactly: it goes into a trace anyone who can see that job can read, and the
+    /// other project's pipelines may be none of their business.
+    #[test]
+    fn the_report_a_job_asks_for_covers_its_own_project_only() {
+        let dir = tmpdir("own");
+        let now = 1_700_000_000;
+        let put = |project: &str| {
+            remember_at(
+                &dir,
+                &Path::new(project).join("build-0123456789abcdef0123456789abcdef"),
+                run(1000, CEIL),
+                now,
+            );
+        };
+        put("4-acme");
+        put("14-acme-web");
+
+        let report = own_project_report(&dir, "4-acme", None, true).expect("4-acme has run");
+        assert!(report.contains("4-acme"), "{report}");
+        assert!(!report.contains("14-acme-web"), "{report}");
+        assert!(
+            report.contains("1 job;"),
+            "one project's jobs, not both: {report}"
+        );
+        // A job of a project this host has never run reports nothing at all.
+        assert_eq!(own_project_report(&dir, "9-elsewhere", None, true), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A figure the host could not take is remembered as unmeasurable and stays out of the
     /// maximum, rather than being written as a zero that then reads as a fact about the job.
     /// The two pairs are independent: a `net.mode = "tap"` job on a kernel that accounts
@@ -1608,6 +1990,46 @@ mod tests {
                 runs: 2,
             })
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two job names can reduce to the same readable half, and the digest is what keeps
+    /// their histories apart — so the report has to keep their rows apart too, or an
+    /// operator reads two different jobs as one.
+    #[test]
+    fn two_jobs_that_read_alike_get_rows_of_their_own() {
+        let dir = tmpdir("collide");
+        let now = 1_700_000_000;
+        // What `job_component` writes for two names that `path_component` reduces alike.
+        for digest in [
+            "0123456789abcdef0123456789abcdef",
+            "fedcba9876543210fedcba9876543210",
+        ] {
+            let key = Path::new("42-acme").join(format!("deploy_prod-{digest}"));
+            remember_at(&dir, &key, run(1000, CEIL), now);
+        }
+        let report = project_report(&dir, "acme", None, true).expect("acme has run");
+        assert_eq!(
+            report.matches("deploy_prod").count(),
+            2,
+            "both jobs are on the report: {report}"
+        );
+        // The whole digest, not a prefix: these are names chosen to read alike, so a prefix
+        // would separate them only as well as its own length.
+        assert!(
+            report.contains("deploy_prod (0123456789abcdef0123456789abcdef)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("deploy_prod (fedcba9876543210fedcba9876543210)"),
+            "{report}"
+        );
+
+        // A name only one job wears is left as it is — the suffix is for collisions alone.
+        let lone = Path::new("42-acme").join("lint-0123456789abcdef0123456789abcdef");
+        remember_at(&dir, &lone, run(500, CEIL), now);
+        let report = project_report(&dir, "acme", None, true).expect("acme has run");
+        assert!(report.contains(" lint "), "{report}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

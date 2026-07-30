@@ -1729,6 +1729,23 @@ fn admit_memory(ctx: &JobCtx, mem: &str) -> Result<Option<crate::admit::Reservat
     Ok(Some(reservation))
 }
 
+/// The host's `[schedule] mem_budget` in MiB, for a report that says there is no budget rather
+/// than inventing one. `None` when no budget is set, `Some(Err(..))` when one is set that this
+/// host cannot read —
+/// which the report has to tell apart, since a budget it cannot parse is one every job's
+/// prepare is already failing on, not the absence of a budget.
+pub(crate) fn budget_mib(cfg: &crate::config::Config) -> Option<Result<u64>> {
+    let raw = cfg.schedule.mem_budget.as_deref()?;
+    Some(
+        parse_gib(raw)
+            .with_context(|| format!("invalid [schedule] mem_budget {raw:?}"))
+            .and_then(|gib| {
+                gib.checked_mul(1024)
+                    .context("[schedule] mem_budget is absurdly large")
+            }),
+    )
+}
+
 /// "<n>G" (GiB) — the only size format the sizing variables accept
 pub(crate) fn parse_gib(s: &str) -> Result<u64> {
     let n = s

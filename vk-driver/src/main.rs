@@ -129,6 +129,13 @@ enum GitlabCmd {
     },
     /// cleanup_exec: stop the VM and remove the job state (idempotent)
     Cleanup,
+    /// What this runner's CI jobs have been using: per project, each job's recent peak, the
+    /// runs it rests on and what its next run would reserve. Give a project to narrow it —
+    /// any part of its `<id>-<slug>` directory name, so the slug alone will do.
+    Usage {
+        /// Report only projects whose directory name contains this. Omitted = every project.
+        project: Option<String>,
+    },
     /// internal: the detached per-job supervisor prepare spawns — owns the job's
     /// switch/virtiofsds/forwards/VMM as tied children until SIGTERM'd by cleanup
     #[command(hide = true)]
@@ -2331,6 +2338,31 @@ async fn cli_main() -> ExitCode {
                 // gitlab-runner only logs cleanup failures; report and don't mask
                 Err(e) => fail(&e, 1),
             },
+            GitlabCmd::Usage { project } => {
+                let history = ctx.history_dir();
+                // The parse error is carried into the report rather than failing the command:
+                // a host with an unreadable budget is exactly one an operator runs this to
+                // understand.
+                let budget = vm::budget_mib(&ctx.cfg).map(|r| r.map_err(|e| format!("{e:#}")));
+                match admit::project_report(
+                    &history,
+                    project.as_deref().unwrap_or(""),
+                    budget,
+                    ctx.cfg.schedule.from_history,
+                ) {
+                    Some(report) => print!("{report}"),
+                    // Not a failure either way, but say which: a runner that has run nothing
+                    // looks the same as a project named in a way no directory answers to.
+                    None => match &project {
+                        Some(p) => println!(
+                            "virtkit: no job history for a project matching {p:?} under {}",
+                            history.display()
+                        ),
+                        None => println!("virtkit: no job history under {}", history.display()),
+                    },
+                }
+                ExitCode::SUCCESS
+            }
         },
         // stdio↔socket splice for an SSH ProxyCommand; returns when either side closes.
         Cmd::Connect { addr } => match vk_core::forward::run_connect(&addr).await {

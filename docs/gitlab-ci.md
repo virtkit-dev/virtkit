@@ -48,6 +48,7 @@ does not override the host default.
 | `MICROVM_USER` | User to run the job as inside the guest. |
 | `MICROVM_EGRESS_ALLOW_IP` / `_ALLOW_NAME` / `_AUDIT` | Narrow the run-phase egress cap (see [Egress](#egress-control)). |
 | `MICROVM_BUILD_EGRESS_ALLOW_IP` / `_ALLOW_NAME` / `_AUDIT` | Narrow the build-phase egress cap. |
+| `MICROVM_USAGE_REPORT` | End this job's trace with what every job of its project has been using (see [Sizing a project](#sizing-a-project)). |
 
 ### Image selection
 
@@ -303,6 +304,48 @@ The trade is real, though: a job that suddenly needs much more than it ever has 
 dependency, a bigger fixture — is admitted against the old figure, and the host can be
 overcommitted for that one run. The 25% headroom and the fortnight window absorb drift, not
 a step change. Leave it off until a few pipelines have been measured.
+
+### Sizing a project
+
+One job's trace says what that job needs. `vk gitlab usage` says what a whole project does —
+every job this host remembers, heaviest first, with what its next run would reserve and what
+the lot would reserve if they all ran at once, which is the figure `[schedule] mem_budget` has
+to cover:
+
+```console
+$ vk gitlab usage acme
+virtkit: 42-acme — what its jobs have been using lately:
+  job         memory  ceiling  reserves  runs     read  written   sent  received
+  build      5.9 GiB  8.0 GiB   7.3 GiB    24  3.4 GiB  812 MiB  3 MiB   941 MiB
+  test_unit  500 MiB  2.0 GiB   625 MiB    37        -        -  2 MiB    88 MiB
+virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.0 GiB
+```
+
+The argument is any part of a project's `<id>-<slug>` directory name, so the slug alone will
+do; without one it reports every project on the host. `reserves` is what each job's next run
+would claim: its declared size, or — with `[schedule] from_history` on, as above — what its
+history says it needs. A `-` is a figure no run could measure
+— an unaudited kernel for the disk columns, a `net.mode = "tap"` job for the network ones —
+which is not the same as a job that moved nothing.
+
+A job can ask for its own project's report and get it in its trace, for an operator with the
+GitLab UI but no shell on the runner:
+
+```yaml
+project-sizing:
+  when: manual
+  variables:
+    MICROVM_USAGE_REPORT: "1"           # 1/true/yes/on
+  script:
+    - echo sizing
+```
+
+It reports that job's project and no other, whatever else this host has run — matched
+exactly, so a project whose directory name merely contains another's is not confused with
+it. Which project a job belongs to is taken from the runner's own account of the job, not
+from the `CI_*` variables beside it, so it is not something a job can name for itself — and on
+a runner old enough not to write that account, the report is refused rather than answered from
+what the job claims.
 
 ### What admission does not do
 
