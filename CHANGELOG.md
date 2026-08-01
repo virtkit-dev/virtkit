@@ -13,9 +13,11 @@ All notable changes to virtkit will be documented in this file.
   window is removed before the next one is taken, and `vk gc` now sweeps checkouts alongside
   image bases — so a RAM-backed `checkout_dir` no longer fills up with the repositories of
   jobs that have moved on. A checkout a job is using is never removed, by either sweep, and
-  neither is anything another tool put in a shared checkout directory. Set
-  `[gitlab] checkout_cache_idle_secs` to keep checkouts longer than image bases where clones
-  are expensive.
+  a `checkout_dir` shared with another executor keeps virtkit's trees in a directory of their
+  own, so the sweep never considers anything else there. Checkouts an earlier release left
+  directly in such a shared directory stay put for the operator to remove, and are cloned afresh
+  once. Set `[gitlab] checkout_cache_idle_secs` to keep checkouts longer than image bases where
+  clones are expensive.
 
 ### Changed
 

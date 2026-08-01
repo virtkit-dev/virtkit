@@ -198,11 +198,12 @@ pub struct Gitlab {
     /// (a security win), and the host has the tree available to build a git-defined image
     /// (`ci-boots-git-defined-images`). Off by default.
     pub host_checkout: bool,
-    /// Root directory the `host_checkout` trees are cloned into on the host, keyed under it by
-    /// the runner's concurrent slot + project. Unset = `<state_dir>/checkouts`. Point it at the
-    /// runner's RAM-backed builds tmpfs (e.g. `/builds`) so the clone (and, with
-    /// `checkout_overlay = false`, every in-job write to the shared tree) stays in host RAM
-    /// instead of hitting the state disk.
+    /// Host storage directory for `host_checkout`. Trees are keyed by concurrent slot + project
+    /// in its private `vk` subtree, so sibling content from another executor is outside the idle
+    /// sweep. Unset = `<state_dir>/checkouts` directly. Point it at the runner's
+    /// RAM-backed builds tmpfs (e.g. `/builds`) so the clone (and, with `checkout_overlay =
+    /// false`, every in-job write to the shared tree) stays in host RAM instead of hitting the
+    /// state disk.
     pub checkout_dir: Option<PathBuf>,
     /// How long a reusable host checkout may sit with no prepare or guest sharing it before it
     /// is removed. Reclamation runs before each host checkout and from `vk gc`; unset inherits
@@ -629,13 +630,17 @@ impl Config {
         }
     }
 
-    /// The GitLab host-checkout root: `[gitlab] checkout_dir` if set, else
-    /// `<state_dir>/checkouts`. Takes no state dir on purpose, unlike [`Config::local_dir_under`]
-    /// — checkouts are the executor's alone, so no caller can hand this the dev root `vk run`
+    /// The GitLab host-checkout root: a private `vk` subtree of `[gitlab] checkout_dir` if set,
+    /// else `<state_dir>/checkouts`. The namespace confines the sweep to virtkit's own trees, so
+    /// an explicit root such as `/builds` can stay shared with another executor. The default root
+    /// gets no such subtree: it is already virtkit's own directory, so
+    /// interposing one would strand the checkouts a runner has in it to buy a guarantee that
+    /// already holds. Takes no state dir on purpose, unlike [`Config::local_dir_under`] —
+    /// checkouts are the executor's alone, so no caller can hand this the dev root `vk run`
     /// caches under and leave the idle sweep walking a tree nothing checks out into.
     pub fn checkout_root(&self) -> PathBuf {
         match self.gitlab.as_ref().and_then(|g| g.checkout_dir.as_ref()) {
-            Some(dir) => dir.clone(),
+            Some(dir) => dir.join("vk"),
             None => self.state_dir().join("checkouts"),
         }
     }
@@ -827,7 +832,7 @@ mod tests {
         let g = cfg.gitlab.as_ref().unwrap();
         assert!(g.host_checkout);
         assert_eq!(g.checkout_dir.as_deref(), Some(Path::new("/builds")));
-        assert_eq!(cfg.checkout_root(), Path::new("/builds"));
+        assert_eq!(cfg.checkout_root(), Path::new("/builds/vk"));
         assert_eq!(cfg.checkout_cache_idle().as_secs(), 7200);
         // absent = None: the on-disk `<state_dir>/checkouts` default is preserved, and the
         // checkout lifetime is the image cache's.

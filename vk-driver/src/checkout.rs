@@ -28,8 +28,9 @@ use anyhow::{Context, Result, bail};
 pub(crate) fn acquire_use_lock(dest: &Path) -> Result<crate::cachelock::Guard> {
     let s = sidecars(dest)?;
     // The lock and marker name a private, token-bearing checkout, so create their directory
-    // 0700 from the start rather than chmod'ing it afterwards. Only this directory: a shared
-    // `checkout_dir` root, and the slot directories in it, may belong to another executor.
+    // 0700 from the start rather than chmod'ing it afterwards. An explicit `checkout_dir` may
+    // belong to another executor, but `Config::checkout_root` places both our slots and this
+    // metadata beneath a private subtree of it.
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -342,12 +343,18 @@ mod tests {
 
     #[test]
     fn gc_reclaims_only_idle_checkouts_that_are_ours() {
-        let root = root("gc");
+        let base = root("gc");
+        let root = base.join("vk");
         let ours = root.join("0").join("live-project");
-        // A tree another GitLab executor put in a shared `/builds` root: same shape, no marker.
-        let foreign = root.join("1").join("docker-project");
+        // Our own shape, inside the swept root, but with no marker: a tree virtkit never made is
+        // not a candidate even where the sweep is allowed to look.
+        let unmarked = root.join("1").join("docker-project");
+        // And a tree another GitLab executor put beside our private namespace in a shared
+        // `/builds`, which the sweep never even walks.
+        let sibling = base.join("2").join("docker-project");
         std::fs::create_dir_all(ours.join(".git")).unwrap();
-        std::fs::create_dir_all(foreign.join(".git")).unwrap();
+        std::fs::create_dir_all(unmarked.join(".git")).unwrap();
+        std::fs::create_dir_all(sibling.join(".git")).unwrap();
 
         // A held reference protects the tree even against a zero idle window.
         let guard = acquire_use_lock(&ours).unwrap();
@@ -360,9 +367,28 @@ mod tests {
         assert!(ours.exists(), "a just-released checkout stays cached");
         evict_eventually(&root, &ours);
         assert!(
-            foreign.exists(),
+            unmarked.exists(),
+            "a tree virtkit never made is not a candidate"
+        );
+        assert!(
+            sibling.exists(),
             "a shared checkout root may hold another executor's trees"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_lock_creates_the_private_root_0700() {
+        // In production the lock is taken before the clone creates any tree, so a root that
+        // does not exist yet — the private `vk` subtree of an explicit `checkout_dir` — is
+        // born 0700 from the metadata dir's recursive creation, never chmod'd after the fact.
+        let root = root("mode");
+        let guard = acquire_use_lock(&root.join("0").join("project")).unwrap();
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drop(guard);
         let _ = std::fs::remove_dir_all(&root);
     }
 

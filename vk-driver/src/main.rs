@@ -1336,7 +1336,7 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
             exec_state.join("jobs").display()
         )?;
         let checkouts_note = match cfg.gitlab.as_ref().and_then(|g| g.checkout_dir.as_ref()) {
-            Some(_) => "`[gitlab] checkout_dir` in the config",
+            Some(_) => "private subtree of `[gitlab] checkout_dir`",
             None => "default: <executor state dir>/checkouts",
         };
         writeln!(

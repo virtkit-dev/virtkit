@@ -52,10 +52,17 @@ this are removed — which is what keeps a tmpfs `checkout_dir` from filling wit
 repositories of jobs that have moved on. Unset, checkouts inherit `image_cache_idle_secs`
 (30 minutes by default). A tree a prepare or a running guest is using is never removed.
 
-Only trees virtkit created are eligible, so a `checkout_dir` shared with another GitLab
-executor is safe. Such a root must still be writable **only** by the runner user: virtkit
-keeps its own bookkeeping in a `.virtkit` directory there, and a root anyone else can write
-lets them decide which trees the sweep considers its own.
+Under an explicit `checkout_dir`, virtkit keeps its trees in
+`<checkout_dir>/vk/<slot>/<project>`, so the sweep walks only its own — a sibling tree from
+another GitLab executor is outside the root it reads, and only trees virtkit created are
+eligible within it. The configured root must still be writable **only** by the runner user:
+anyone who can replace the private subtree can interfere with the runner's checkouts.
+
+Releases up to 0.31.0 put their checkouts directly under an explicit `checkout_dir`, which
+leaves them outside the new root, so an upgrade neither migrates nor reclaims them: remove the
+old `<checkout_dir>/<slot>` directories once no runner from before the upgrade is using them.
+The first job per slot and project after the upgrade clones instead of fetching, since its tree
+has moved.
 
 ## Job variables
 

@@ -173,8 +173,9 @@ impl JobCtx {
     }
 
     /// The root every `[gitlab] host_checkout` tree on this host lives under — the unit the idle
-    /// checkout sweep walks. `[gitlab] checkout_dir` (e.g. the RAM-backed /builds tmpfs) overrides
-    /// the on-disk default so the clone and the job's writes to the shared tree stay in host RAM.
+    /// checkout sweep walks. `[gitlab] checkout_dir` (e.g. the RAM-backed /builds tmpfs) puts it
+    /// in a private subtree there, so the clone and the job's writes stay in host RAM without
+    /// bringing sibling trees from another executor into the sweep.
     pub fn host_checkout_root(&self) -> PathBuf {
         self.cfg.checkout_root()
     }
@@ -730,7 +731,7 @@ mod tests {
         // The override replaces the `<state_dir>/checkouts` root; the slot/project key is unchanged.
         assert_eq!(
             ctx(cfg).host_checkout_dir(),
-            PathBuf::from("/builds/0/myproj")
+            PathBuf::from("/builds/vk/0/myproj")
         );
     }
 }

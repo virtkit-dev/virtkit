@@ -106,8 +106,9 @@
 # dir = "/usr/local/lib/vk/ci-tools"  # static tools shared read-only into job VMs
 # host_checkout = true   # clone the sources on the host and share them at CI_PROJECT_DIR,
 #                        # instead of letting the job clone them in the guest
-# checkout_dir = "/builds"  # where those clones live (default: <state_dir>/checkouts); a
-#                        # host tmpfs keeps the clone and the job's writes out of the disk
+# checkout_dir = "/builds"  # host storage for the clones, in a private `vk` subtree of it
+#                        # (default: <state_dir>/checkouts); a host tmpfs keeps the clone and the
+#                        # job's writes in RAM instead of on the state disk
 # checkout_cache_idle_secs = 1800  # unused clones are reclaimed before a checkout and by
 #                        # `vk gc`; unset inherits image_cache_idle_secs
 # checkout_overlay = true  # build on a guest tmpfs overlay over the read-only host tree,
