@@ -76,11 +76,18 @@ pub fn to_units(services: Vec<Service>) -> Vec<crate::compose::Unit> {
 
 /// Parse the job's services from the environment. Empty/unset = no services.
 pub fn from_env() -> Result<Vec<Service>> {
-    let raw = match std::env::var("CUSTOM_ENV_CI_JOB_SERVICES") {
-        Ok(s) if !s.trim().is_empty() => s,
-        _ => return Ok(Vec::new()),
+    parse(std::env::var("CUSTOM_ENV_CI_JOB_SERVICES").ok().as_deref())
+}
+
+/// Parse the `CI_JOB_SERVICES` payload, taken as a value rather than read from the
+/// environment: a test that set the variable would be mutating process-wide state every other
+/// test in the binary shares. Absent or blank = no services, which is what a job with no
+/// `services:` sends.
+fn parse(raw: Option<&str>) -> Result<Vec<Service>> {
+    let Some(raw) = raw.filter(|s| !s.trim().is_empty()) else {
+        return Ok(Vec::new());
     };
-    let mut services: Vec<Service> = serde_json::from_str(&raw)
+    let mut services: Vec<Service> = serde_json::from_str(raw)
         .map_err(|e| anyhow::anyhow!("parsing CI_JOB_SERVICES ({e}): {raw}"))?;
     for s in &mut services {
         if s.alias.is_empty() {
@@ -128,16 +135,31 @@ mod tests {
     }
 
     #[test]
+    fn no_payload_is_no_services() {
+        // A job with no `services:` reaches the executor as an unset variable on one runner
+        // version and as an empty string on another; both mean the same thing.
+        assert!(parse(None).unwrap().is_empty());
+        assert!(parse(Some("")).unwrap().is_empty());
+        assert!(parse(Some(" \n")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_malformed_payload_is_an_error() {
+        // The error names the variable and carries the payload, which is what a job trace
+        // needs to show for the runner's own bug to be findable.
+        let err = parse(Some("not json")).unwrap_err().to_string();
+        assert!(err.contains("CI_JOB_SERVICES"), "{err}");
+        assert!(err.contains("not json"), "{err}");
+    }
+
+    #[test]
     fn parses_services_json_and_defaults_alias() {
         let json = r#"[
             {"name":"reg.example.com/team/db:1","alias":"srv_mysql",
              "entrypoint":["/bin/db","--init"],"command":["--port","3307"]},
             {"name":"reg.io/team/cache:2","variables":{"X":"y"}}
         ]"#;
-        // SAFETY: tests are single-threaded per process here; set + parse + clear
-        unsafe { std::env::set_var("CUSTOM_ENV_CI_JOB_SERVICES", json) };
-        let svcs = from_env().unwrap();
-        unsafe { std::env::remove_var("CUSTOM_ENV_CI_JOB_SERVICES") };
+        let svcs = parse(Some(json)).unwrap();
         assert_eq!(svcs.len(), 2);
         assert_eq!(svcs[0].alias, "srv_mysql");
         assert_eq!(svcs[0].entrypoint, ["/bin/db", "--init"]);
@@ -156,10 +178,7 @@ mod tests {
         let json = r#"[
             {"name":"reg.io/team/db:1","alias":null,"variables":null,"entrypoint":null,"command":null}
         ]"#;
-        // SAFETY: tests are single-threaded per process here; set + parse + clear
-        unsafe { std::env::set_var("CUSTOM_ENV_CI_JOB_SERVICES", json) };
-        let svcs = from_env().unwrap();
-        unsafe { std::env::remove_var("CUSTOM_ENV_CI_JOB_SERVICES") };
+        let svcs = parse(Some(json)).unwrap();
         assert_eq!(svcs.len(), 1);
         // alias:null -> empty -> derived from the image name
         assert_eq!(svcs[0].alias, "team__db");
