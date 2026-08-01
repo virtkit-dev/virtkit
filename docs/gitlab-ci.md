@@ -55,14 +55,18 @@ repositories of jobs that have moved on. Unset, checkouts inherit `image_cache_i
 Under an explicit `checkout_dir`, virtkit keeps its trees in
 `<checkout_dir>/vk/<slot>/<project>`, so the sweep walks only its own — a sibling tree from
 another GitLab executor is outside the root it reads, and only trees virtkit created are
-eligible within it. The configured root must still be writable **only** by the runner user:
-anyone who can replace the private subtree can interfere with the runner's checkouts.
+eligible within it. Each tree also records which directory it is, rechecked immediately before
+removal, so bookkeeping left behind by a tree removed from outside cannot stand in for whatever
+appears at that path next. The configured root must still be writable **only** by the runner
+user: anyone who can replace the private subtree can interfere with the runner's checkouts.
 
 Releases up to 0.31.0 put their checkouts directly under an explicit `checkout_dir`, which
 leaves them outside the new root, so an upgrade neither migrates nor reclaims them: remove the
 old `<checkout_dir>/<slot>` directories once no runner from before the upgrade is using them.
 The first job per slot and project after the upgrade clones instead of fetching, since its tree
-has moved.
+has moved. Under the default `<state_dir>/checkouts` root the trees keep their paths and are
+still fetched into, but carry no identity record until the same slot and project is checked out
+again, which is when they become reclaimable.
 
 ## Job variables
 

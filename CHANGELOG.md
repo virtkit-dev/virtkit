@@ -16,7 +16,8 @@ All notable changes to virtkit will be documented in this file.
   a `checkout_dir` shared with another executor keeps virtkit's trees in a directory of their
   own, so the sweep never considers anything else there. Checkouts an earlier release left
   directly in such a shared directory stay put for the operator to remove, and are cloned afresh
-  once. Set `[gitlab] checkout_cache_idle_secs` to keep checkouts longer than image bases where
+  once; those under the default root keep working and join the sweep once a job has used them
+  again. Set `[gitlab] checkout_cache_idle_secs` to keep checkouts longer than image bases where
   clones are expensive.
 
 ### Changed
