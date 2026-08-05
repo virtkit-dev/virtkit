@@ -46,7 +46,17 @@ pub struct Provisioned {
     /// against the host `[egress]` cap by the executor. See vm.rs `spawn_switch`.
     pub egress_allow_ip_req: Option<String>,
     pub egress_allow_name_req: Option<String>,
+    /// Guest vCPUs / RAM (its compose `x-virtkit.cpus`/`.mem`, possibly overridden by
+    /// the owner); `None` = [`DEFAULT_CPUS`]/[`DEFAULT_MEM`]. Clamped to the host
+    /// `[vm] max_*` ceilings by the executor before it reaches here.
+    pub cpus: Option<u32>,
+    pub mem: Option<String>,
 }
+
+/// What a service guest gets when its unit declares no size — the shape every
+/// service booted at before sizing existed. Also `vk run`'s primary default.
+pub const DEFAULT_CPUS: u32 = 2;
+pub const DEFAULT_MEM: &str = "1G";
 
 /// Read a service's egress override var from its `variables:` (`unit.environment`). Unlike a
 /// job-level variable, a *present but empty* value is meaningful — it denies that dimension
@@ -245,6 +255,8 @@ pub fn provisioned(
         kernel: unit.kernel.clone(),
         egress_allow_ip_req: service_egress_req(&unit.environment, "MICROVM_EGRESS_ALLOW_IP"),
         egress_allow_name_req: service_egress_req(&unit.environment, "MICROVM_EGRESS_ALLOW_NAME"),
+        cpus: unit.cpus,
+        mem: unit.mem.clone(),
     })
 }
 
@@ -473,8 +485,8 @@ pub fn boot_unit(
             vsock_cid: svc.cid,
             vsock_socket: vsock,
             vsock_ports,
-            cpus: 2,
-            mem: "1G".into(),
+            cpus: svc.cpus.unwrap_or(DEFAULT_CPUS),
+            mem: svc.mem.clone().unwrap_or_else(|| DEFAULT_MEM.into()),
             shared_mem,
             net: crate::vmm::Net::None,
             balloon: false,

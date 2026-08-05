@@ -52,7 +52,9 @@ host, and it doesn't need privileges.
 Run compose services as VMs. `vk run --compose compose.yml` boots the services
 (redis, mysql, and so on) on a shared network where each one resolves by name.
 You can run them alongside your command, as the primary itself (`--primary`,
-like `docker compose run`), or on their own (compose up, until ctrl-c). From
+like `docker compose run`), or on their own (compose up, until ctrl-c). A
+service sizes its own guest with `x-virtkit: { cpus:, mem: }` (default 2 vCPUs
+/ 1G), and `--service-cpus`/`--service-mem NAME=VALUE` override it per run. From
 inside the primary, `/run/vk/services/<name>/{state,ctl,log}` lets you read
 service state and start or stop services with plain shell writes. For a dev VM,
 `vk run --ssh` boots any image with SSH access, and VS Code Remote-SSH works

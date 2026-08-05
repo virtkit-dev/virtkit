@@ -1392,7 +1392,9 @@ fn plan_services(
         None => crate::services::to_units(crate::services::from_env()?),
     };
     let mut out = Vec::new();
-    for (slot, unit) in units.into_iter().enumerate() {
+    for (slot, mut unit) in units.into_iter().enumerate() {
+        // A compose service's declared sizing obeys the same host ceilings as the job's own.
+        clamp_service_size(&ctx.cfg, &mut unit)?;
         // A `dockerfile:` service (the CI_JOB_SERVICES form) builds from the checkout via the
         // tier; a compose `build:` unit and any plain image ref go through the shared provision
         // path (Build -> tier ext4, built up front by prepare's warm pass; Image -> resolve_ref).
@@ -1710,6 +1712,39 @@ fn vm_size(ctx: &JobCtx) -> Result<(u32, String)> {
         }
     };
     Ok((cpus, mem))
+}
+
+/// Clamp a service unit's declared sizing (its compose `x-virtkit.cpus`/`.mem`) to the
+/// same host ceilings a job's MICROVM_CPUS/MICROVM_MEM requests are clamped to
+/// (vm.max_cpus/max_mem, defaulting to the base values) — a committed compose file must
+/// not size a service past what the runner's config lets a job declare. Silent, like
+/// `vm_size`; an undeclared axis stays `None` (the service default), not the job base.
+fn clamp_service_size(cfg: &crate::config::Config, unit: &mut crate::compose::Unit) -> Result<()> {
+    let vm = &cfg.vm;
+    if let Some(n) = unit.cpus {
+        unit.cpus = Some(n.min(vm.max_cpus.unwrap_or(vm.cpus)));
+    }
+    if let Some(mem) = &unit.mem {
+        // parse validated at compose load; the context covers a unit built elsewhere.
+        let req_mib = crate::run::parse_mem_mib(mem)
+            .with_context(|| format!("service {:?}: invalid mem {mem:?}", unit.name))?;
+        let max_mib = match &vm.max_mem {
+            Some(m) => parse_gib(m).context("invalid vm.max_mem")?,
+            None => parse_gib(&vm.mem).context("invalid vm.mem")?,
+        }
+        .checked_mul(1024)
+        .context("guest memory ceiling is absurdly large")?;
+        // `[schedule] mem_budget` is a host ceiling like the others (see `vm_size`): a service
+        // sized above the whole budget could never boot healthily on this runner.
+        let max_mib = match budget_mib(cfg) {
+            Some(b) => max_mib.min(b?),
+            None => max_mib,
+        };
+        if req_mib > max_mib {
+            unit.mem = Some(format!("{max_mib}M"));
+        }
+    }
+    Ok(())
 }
 
 /// The guest RAM this job declares, in MiB: `MICROVM_MEM` clamped by the host ceilings, the
@@ -2332,6 +2367,45 @@ mod tests {
         let mut plain = self::ctx(None, None);
         plain.cfg.schedule.mem_budget = Some("2G".into());
         assert_eq!(vm_size(&plain).unwrap().1, "8G");
+    }
+
+    /// A compose service's declared sizing obeys the same `[vm] max_*` ceilings a job's
+    /// own MICROVM_CPUS/MICROVM_MEM requests are clamped to; an undeclared axis stays
+    /// `None` (the service default), never the job base size.
+    #[test]
+    fn service_sizing_clamps_to_the_host_ceilings() {
+        let ctx = ctx(None, None); // vm: 4 cpus / 8G, max: 16 / 64G
+        let service = |marker: &str| {
+            crate::compose::parse(
+                &format!("services:\n  db:\n    image: x\n{marker}"),
+                std::path::Path::new("/b"),
+                &|_| None,
+            )
+            .unwrap()
+            .pop()
+            .unwrap()
+        };
+        // over the ceilings: clamped to them
+        let mut unit = service("    x-virtkit: { cpus: 32, mem: 100G }\n");
+        clamp_service_size(&ctx.cfg, &mut unit).unwrap();
+        assert_eq!(unit.cpus, Some(16));
+        assert_eq!(unit.mem.as_deref(), Some("65536M"));
+        // a `[schedule] mem_budget` below `max_mem` is the effective ceiling: a service
+        // sized above the whole budget could never boot healthily.
+        let mut budgeted = self::ctx(None, None);
+        budgeted.cfg.schedule.mem_budget = Some("32G".into());
+        let mut unit = service("    x-virtkit: { cpus: 2, mem: 100G }\n");
+        clamp_service_size(&budgeted.cfg, &mut unit).unwrap();
+        assert_eq!(unit.mem.as_deref(), Some("32768M"));
+        // under them: kept verbatim
+        let mut unit = service("    x-virtkit: { cpus: 2, mem: 512M }\n");
+        clamp_service_size(&ctx.cfg, &mut unit).unwrap();
+        assert_eq!(unit.cpus, Some(2));
+        assert_eq!(unit.mem.as_deref(), Some("512M"));
+        // undeclared: untouched
+        let mut unit = service("");
+        clamp_service_size(&ctx.cfg, &mut unit).unwrap();
+        assert_eq!((unit.cpus, unit.mem), (None, None));
     }
 
     #[test]

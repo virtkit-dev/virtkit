@@ -147,8 +147,15 @@ pub struct RunArgs {
     pub username: Option<String>,
     pub password: Option<String>,
     pub insecure: bool,
-    pub cpus: u32,
-    pub mem: String,
+    /// Primary VM sizing (`--cpus`/`--mem`). `None` = a `--primary` service's own
+    /// `x-virtkit.cpus`/`.mem`, else [`crate::units::DEFAULT_CPUS`]/[`crate::units::DEFAULT_MEM`] —
+    /// an explicit flag overrides the service's declaration, like `--init`/`--kernel`.
+    pub cpus: Option<u32>,
+    pub mem: Option<String>,
+    /// Per-service sizing overrides (`--service-cpus`/`--service-mem NAME=VALUE`),
+    /// layered over each named compose service's `x-virtkit` declaration.
+    pub service_cpus: Vec<(String, u32)>,
+    pub service_mem: Vec<(String, String)>,
     pub boot_timeout_secs: u64,
     /// `--vm-name` template for the VMM process name, `{name}` expanding to the stage /
     /// image / service name (see [`crate::vmm::resolve_proc_name`]). Default `vk:{name}`.
@@ -550,10 +557,11 @@ async fn build_and_boot(
     // rendered when the run finishes. A `-f` Dockerfile build reports its own breakdown
     // separately (via the build pipeline).
     let timings = Timings::new();
-    let compose_units: Vec<crate::compose::Unit> = match &args.compose {
+    let mut compose_units: Vec<crate::compose::Unit> = match &args.compose {
         Some(p) => crate::compose::load(p)?,
         None => Vec::new(),
     };
+    apply_service_sizes(&mut compose_units, &args.service_cpus, &args.service_mem)?;
     let mut image_env: Vec<(String, String)> = Vec::new();
     // The image's entrypoint and workdir, applied to the guest command like `docker
     // run`: the entrypoint is prepended to a trailing command, the workdir is its cwd.
@@ -670,6 +678,21 @@ async fn build_and_boot(
     } else {
         marker_kernel
     };
+    // Effective primary sizing, same precedence as the axes: an explicit --cpus/--mem
+    // overrides the --primary service's own x-virtkit sizing (which already carries
+    // any --service-cpus/--service-mem override); absent both, the run defaults.
+    let (marker_cpus, marker_mem) = primary_idx
+        .map(|i| (compose_units[i].cpus, compose_units[i].mem.clone()))
+        .unwrap_or((None, None));
+    let cpus = args
+        .cpus
+        .or(marker_cpus)
+        .unwrap_or(crate::units::DEFAULT_CPUS);
+    let mem = args
+        .mem
+        .clone()
+        .or(marker_mem)
+        .unwrap_or_else(|| crate::units::DEFAULT_MEM.to_string());
     // The pinned/explicit kernel `fullvm::prepare` boots on for a non-image kernel axis
     // (Default or Path). A CLI `--kernel <path>` was already resolved into `kernel` by
     // `run()`; a marker `kernel: <path>` (when the CLI left kernel Default) is resolved
@@ -930,13 +953,13 @@ async fn build_and_boot(
             // (an empty-log "exited during boot"). Refuse up front instead.
             let initramfs_mib = std::fs::metadata(&cpio)?.len() >> 20;
             let need_mib = initramfs_mib * 3 + 384;
-            if let Some(mem_mib) = parse_mem_mib(&args.mem)
+            if let Some(mem_mib) = parse_mem_mib(&mem)
                 && mem_mib < need_mib
             {
                 bail!(
                     "the image unpacks to a {initramfs_mib} MiB initramfs, which does not fit \
                      in --mem {} — pass --mem {}G, or drop --ram to boot from a disk",
-                    args.mem,
+                    mem,
                     need_mib.div_ceil(1024),
                 );
             }
@@ -1233,12 +1256,7 @@ async fn build_and_boot(
     let console = work.join("console.log");
     let vmm = crate::vmm::selected(&args.cloud_hypervisor);
     let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
-    println!(
-        "virtkit: booting {} (cpus={}, mem={})",
-        vmm.name(),
-        args.cpus,
-        args.mem
-    );
+    println!("virtkit: booting {} (cpus={cpus}, mem={mem})", vmm.name());
     // exec channel always; the switch and ssh-agent bridges only when set up above.
     let mut vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
     if args.net {
@@ -1299,8 +1317,8 @@ async fn build_and_boot(
         vsock_cid: 3,
         vsock_socket: vsock.clone(),
         vsock_ports,
-        cpus: args.cpus,
-        mem: args.mem.clone(),
+        cpus,
+        mem: mem.clone(),
         shared_mem,
         net: crate::vmm::Net::None,
         balloon: false,
@@ -1644,6 +1662,37 @@ fn resolve_primary(units: &[crate::compose::Unit], name: &str) -> Result<usize> 
     })
 }
 
+/// Layer the CLI per-service sizing overrides (`--service-cpus`/`--service-mem
+/// NAME=VALUE`) over the loaded units' own `x-virtkit` sizing. A name matching no
+/// declared service is an error naming the declared set, like `--primary`.
+fn apply_service_sizes(
+    units: &mut [crate::compose::Unit],
+    cpus: &[(String, u32)],
+    mem: &[(String, String)],
+) -> Result<()> {
+    let find = |units: &[crate::compose::Unit], flag: &str, name: &str| -> Result<usize> {
+        units.iter().position(|u| u.name == name).with_context(|| {
+            format!(
+                "{flag} {name:?}: no such compose service (declared: {})",
+                units
+                    .iter()
+                    .map(|u| u.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+    };
+    for (name, n) in cpus {
+        let i = find(units, "--service-cpus", name)?;
+        units[i].cpus = Some(*n);
+    }
+    for (name, m) in mem {
+        let i = find(units, "--service-mem", name)?;
+        units[i].mem = Some(m.clone());
+    }
+    Ok(())
+}
+
 /// The compose service indices `vk build --compose` builds: exactly the set `vk run --compose`
 /// would boot for the same `--profile` / `--primary` selection — the enabled set (profiled-down
 /// services excluded) or, with `--primary`, that service plus its dependency closure — and every
@@ -1798,10 +1847,11 @@ async fn compose_up(
         .compose
         .as_ref()
         .expect("compose_up requires --compose");
-    let units = crate::compose::load(compose)?;
+    let mut units = crate::compose::load(compose)?;
     if units.is_empty() {
         bail!("{} declares no services", compose.display());
     }
+    apply_service_sizes(&mut units, &args.service_cpus, &args.service_mem)?;
     // What the fleet costs the host while it is up (see `usage`). Opened before
     // `plan_services`, which builds nothing but does resolve and materialize every `image:`
     // service — work that falls inside the window in the run above, so metering it here too
@@ -3236,6 +3286,35 @@ impl Drop for VmSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_size_overrides_layer_over_the_compose_declaration() {
+        let yaml = "services:\n\
+             \x20 db:\n    image: d\n    x-virtkit: { cpus: 2, mem: 512M }\n\
+             \x20 web:\n    image: w\n";
+        let mut units = crate::compose::parse(yaml, Path::new("/b"), &|_| None).unwrap();
+        // the flag wins over the marker where given, sets an unmarked service, and
+        // leaves everything unnamed alone
+        apply_service_sizes(
+            &mut units,
+            &[("web".into(), 4)],
+            &[("db".into(), "2G".into())],
+        )
+        .unwrap();
+        let by = |n: &str| units.iter().find(|u| u.name == n).unwrap();
+        assert_eq!(
+            (by("db").cpus, by("db").mem.as_deref()),
+            (Some(2), Some("2G"))
+        );
+        assert_eq!((by("web").cpus, by("web").mem.as_deref()), (Some(4), None));
+        // a name matching no declared service is an error naming the declared set
+        let err = apply_service_sizes(&mut units, &[("nope".into(), 1)], &[]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--service-cpus") && msg.contains("db, web"),
+            "{msg}"
+        );
+    }
 
     #[test]
     fn compose_build_units_merge_services_sharing_a_dockerfile() {

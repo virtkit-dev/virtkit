@@ -92,6 +92,34 @@ fn parse_cpus(s: &str) -> Result<u32, String> {
     }
 }
 
+/// clap value parser for `--service-cpus NAME=N`.
+fn parse_service_cpus(s: &str) -> Result<(String, u32), String> {
+    let (name, n) = s
+        .split_once('=')
+        .filter(|(name, _)| !name.is_empty())
+        .ok_or_else(|| format!("expected NAME=N, got {s:?}"))?;
+    let n: u32 = n
+        .parse()
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| format!("expected a positive vCPU count, got {n:?}"))?;
+    Ok((name.to_string(), n))
+}
+
+/// clap value parser for `--service-mem NAME=SIZE` (`<n>G`, `<n>M` or a MiB count).
+fn parse_service_mem(s: &str) -> Result<(String, String), String> {
+    let (name, size) = s
+        .split_once('=')
+        .filter(|(name, _)| !name.is_empty())
+        .ok_or_else(|| format!("expected NAME=SIZE, got {s:?}"))?;
+    match run::parse_mem_mib(size).filter(|mib| *mib > 0) {
+        Some(_) => Ok((name.to_string(), size.to_string())),
+        None => Err(format!(
+            "expected a non-zero <n>G, <n>M or MiB size, got {size:?}"
+        )),
+    }
+}
+
 #[derive(Parser)]
 #[command(
     version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("VK_GIT_HASH"), ")"),
@@ -688,11 +716,14 @@ enum Cmd {
         /// else `cloud-hypervisor` on PATH). Only used with VIRTKIT_VMM=cloud-hypervisor.
         #[arg(long)]
         cloud_hypervisor: Option<PathBuf>,
-        /// vCPUs: a number, or `host` for as many as the host has (its logical CPU count)
-        #[arg(long, default_value = "2", value_parser = parse_cpus)]
-        cpus: u32,
-        #[arg(long, default_value = "1G")]
-        mem: String,
+        /// vCPUs: a number, or `host` for as many as the host has (its logical CPU
+        /// count). Default 2, or the --primary service's own x-virtkit.cpus
+        #[arg(long, value_parser = parse_cpus)]
+        cpus: Option<u32>,
+        /// guest RAM (<n>G, <n>M, or a MiB count). Default 1G, or the --primary
+        /// service's own x-virtkit.mem
+        #[arg(long)]
+        mem: Option<String>,
         #[arg(long, default_value_t = 120)]
         boot_timeout: u64,
         /// Name for the VM's process (shown in `ps`/`top`): a template where `{name}`
@@ -754,6 +785,16 @@ enum Cmd {
         /// alongside. Requires --compose; replaces the image/-f
         #[arg(long, value_name = "NAME", requires = "compose")]
         primary: Option<String>,
+        /// override a compose service's vCPU count (repeatable), over its
+        /// x-virtkit.cpus declaration
+        #[arg(long = "service-cpus", value_name = "NAME=N", requires = "compose",
+              value_parser = parse_service_cpus)]
+        service_cpus: Vec<(String, u32)>,
+        /// override a compose service's guest RAM (repeatable, e.g. db=2G), over
+        /// its x-virtkit.mem declaration
+        #[arg(long = "service-mem", value_name = "NAME=SIZE", requires = "compose",
+              value_parser = parse_service_mem)]
+        service_mem: Vec<(String, String)>,
         /// Forward the host SSH agent ($SSH_AUTH_SOCK) into the guest, so ssh/git in the
         /// guest use the host's keys without the keys ever entering the guest
         #[arg(long = "ssh-agent")]
@@ -1529,6 +1570,8 @@ async fn cli_main() -> ExitCode {
         compose,
         profile,
         primary,
+        service_cpus,
+        service_mem,
         ssh_agent,
         ssh_host,
         ssh,
@@ -1671,6 +1714,8 @@ async fn cli_main() -> ExitCode {
             insecure: *insecure,
             cpus: *cpus,
             mem: mem.clone(),
+            service_cpus: service_cpus.clone(),
+            service_mem: service_mem.clone(),
             boot_timeout_secs: *boot_timeout,
             vm_name: vm_name.clone(),
             ram: *ram,

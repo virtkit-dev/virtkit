@@ -6,6 +6,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **Compose services can size their own guests.** A service declares its vCPUs and RAM with
+  `x-virtkit: { cpus:, mem: }` in the compose file (default 2 vCPUs / 1G as before), and
+  `vk run --service-cpus`/`--service-mem NAME=VALUE` override it per run. In CI, a
+  `compose:` fleet's services follow the same marker, clamped to the host `[vm]
+  max_cpus`/`max_mem` ceilings exactly like a job's own `MICROVM_CPUS`/`MICROVM_MEM`.
 - **A runner's memory budget can follow the size of the host.** `[schedule] mem_budget` now
   takes a percentage such as `"50%"` as well as an exact `"48G"`, so one configuration leaves
   the same proportional headroom on runners with different amounts of RAM.

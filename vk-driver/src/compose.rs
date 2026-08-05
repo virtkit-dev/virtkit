@@ -66,6 +66,12 @@ pub struct Unit {
     /// identically primary or sibling. `Default` = the pinned kernel; `Image` = the
     /// image's own kernel + modules; `Path` = an explicit kernel file.
     pub kernel: crate::run::KernelSource,
+    /// This unit's guest vCPU count (compose `x-virtkit.cpus`), applied identically
+    /// primary or sibling; `None` = the consumer's default.
+    pub cpus: Option<u32>,
+    /// This unit's guest RAM (compose `x-virtkit.mem`, `<n>G`/`<n>M`/MiB), applied
+    /// identically primary or sibling; `None` = the consumer's default.
+    pub mem: Option<String>,
 }
 
 /// Where a unit's image comes from.
@@ -485,13 +491,15 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
         Some(h) => h,
         None => name.to_string(),
     };
-    // The per-service init/kernel axes (compose `x-virtkit`): absent key/subkey =
-    // Default, so an unmarked service keeps today's agent-as-PID1 pinned-kernel boot.
-    let (init, kernel) = match svc.x_virtkit {
-        Some(x) => (x.init()?, x.kernel()?),
+    // The per-service axes (compose `x-virtkit`): absent key/subkey = the defaults,
+    // so an unmarked service keeps today's agent-as-PID1 pinned-kernel 2-vCPU/1G boot.
+    let (init, kernel, cpus, mem) = match svc.x_virtkit {
+        Some(x) => (x.init()?, x.kernel()?, x.cpus()?, x.mem()?),
         None => (
             crate::run::InitSource::Default,
             crate::run::KernelSource::Default,
+            None,
+            None,
         ),
     };
     Ok(Unit {
@@ -507,6 +515,8 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
         profiles: svc.profiles,
         init,
         kernel,
+        cpus,
+        mem,
     })
 }
 
@@ -732,8 +742,8 @@ struct ComposeService {
 }
 
 /// The `x-virtkit` per-service marker: the init/kernel axes as compose strings,
-/// parsed into [`crate::run::InitSource`] / [`crate::run::KernelSource`]. An absent
-/// subkey defaults to `Default`.
+/// parsed into [`crate::run::InitSource`] / [`crate::run::KernelSource`], plus the
+/// guest sizing (`cpus`/`mem`). An absent subkey defaults to `Default`/unset.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct XVirtkit {
@@ -741,6 +751,11 @@ struct XVirtkit {
     init: Option<String>,
     #[serde(default)]
     kernel: Option<String>,
+    /// scalar, not u32: a `${VAR}` reference interpolates into a YAML string
+    #[serde(default)]
+    cpus: Option<Scalar>,
+    #[serde(default)]
+    mem: Option<Scalar>,
 }
 
 impl XVirtkit {
@@ -763,6 +778,36 @@ impl XVirtkit {
             // Infallible parser: "default"/"image" map to those variants, else a Path.
             Some(s) => crate::run::KernelSource::parse(s).unwrap(),
         })
+    }
+
+    /// `cpus: <n>` → the guest vCPU count (absent = the consumer's default).
+    fn cpus(&self) -> Result<Option<u32>> {
+        self.cpus
+            .clone()
+            .map(|c| {
+                let s = c.into_string();
+                s.parse::<u32>().ok().filter(|n| *n > 0).with_context(|| {
+                    format!("x-virtkit.cpus: expected a positive count, got {s:?}")
+                })
+            })
+            .transpose()
+    }
+
+    /// `mem: <n>G|<n>M|<MiB>` → the guest RAM size (absent = the consumer's default).
+    /// Validated here so a typo fails the compose load, not a later boot.
+    fn mem(&self) -> Result<Option<String>> {
+        self.mem
+            .clone()
+            .map(|m| {
+                let s = m.into_string();
+                crate::run::parse_mem_mib(&s)
+                    .filter(|mib| *mib > 0)
+                    .with_context(|| {
+                        format!("x-virtkit.mem: expected a non-zero <n>G, <n>M or MiB, got {s:?}")
+                    })?;
+                Ok(s)
+            })
+            .transpose()
     }
 }
 
@@ -809,7 +854,7 @@ impl Env {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(untagged)]
 enum Scalar {
     Str(String),
@@ -1260,6 +1305,44 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn x_virtkit_sizing_parses_and_validates() {
+        // absent = None: the consumer's default sizing applies
+        let u = one("services:\n  s:\n    image: x\n");
+        assert_eq!((u.cpus, u.mem), (None, None));
+        // number and string scalars both work; mem takes G/M/MiB forms
+        let u = one("services:\n  s:\n    image: x\n    x-virtkit: { cpus: 4, mem: 512M }\n");
+        assert_eq!(u.cpus, Some(4));
+        assert_eq!(u.mem.as_deref(), Some("512M"));
+        let u = one("services:\n  s:\n    image: x\n    x-virtkit: { cpus: \"8\", mem: 2G }\n");
+        assert_eq!((u.cpus, u.mem.as_deref()), (Some(8), Some("2G")));
+        // sizing composes with the other axes under one marker
+        let u = one("services:\n  s:\n    image: x\n    x-virtkit: { init: image, mem: 2G }\n");
+        assert_eq!(u.init, crate::run::InitSource::Image);
+        assert_eq!((u.cpus, u.mem.as_deref()), (None, Some("2G")));
+        // a ${VAR} reference sizes a service from the environment
+        let u = super::parse(
+            "services:\n  s:\n    image: x\n    x-virtkit:\n      cpus: ${N}\n      mem: ${M}\n",
+            Path::new("/b"),
+            &vars(&[("N", "6"), ("M", "3G")]),
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        assert_eq!((u.cpus, u.mem.as_deref()), (Some(6), Some("3G")));
+        // zero and garbage fail the load, not a later boot
+        for marker in ["{ cpus: 0 }", "{ cpus: two }", "{ mem: 0 }", "{ mem: big }"] {
+            assert!(
+                parse(
+                    &format!("services:\n  s:\n    image: x\n    x-virtkit: {marker}\n"),
+                    Path::new("/b")
+                )
+                .is_err(),
+                "{marker} should be rejected"
+            );
+        }
     }
 
     #[test]

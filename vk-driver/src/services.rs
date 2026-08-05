@@ -66,10 +66,14 @@ pub fn to_units(services: Vec<Service>) -> Vec<crate::compose::Unit> {
             depends_on: Vec::new(),
             volumes: Vec::new(),
             profiles: Vec::new(),
-            // The GitLab `services:` model has no init/kernel axes: every executor
-            // service keeps the default agent-as-PID1 pinned-kernel boot.
+            // The GitLab `services:` model has no init/kernel/sizing axes: every
+            // executor service keeps the default agent-as-PID1 pinned-kernel boot
+            // at the default size. Declare a service in a compose fleet
+            // (`MICROVM_IMAGE: compose:...`) to size it.
             init: crate::run::InitSource::Default,
             kernel: crate::run::KernelSource::Default,
+            cpus: None,
+            mem: None,
         })
         .collect()
 }

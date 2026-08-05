@@ -108,6 +108,10 @@ job's plain GitLab `image:` is read the same way):
 - `compose:<file>#<primary>` — a whole fleet from a compose file in the checkout:
   boots `<primary>` as the job VM and the other services (built or pulled the
   same way) as siblings on the job network. Same `host_checkout` requirement.
+  A service sizes its own guest with an `x-virtkit: { cpus:, mem: }` marker
+  (default 2 vCPUs / 1G), clamped to the host `[vm] max_cpus`/`max_mem` ceilings
+  like the job's own `MICROVM_CPUS`/`MICROVM_MEM`; the primary keeps following
+  those job variables.
 
 ```yaml
 my-job:
