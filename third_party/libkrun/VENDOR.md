@@ -157,3 +157,12 @@ it, so KVM's vPMU backs in-guest `perf` hardware counters (cycles, instructions)
 Default remains off — host performance counters are a side-channel surface, so
 only trusted guests (dev VMs) should enable this, never untrusted CI jobs.
 Additive: without the call, behaviour is unchanged. Used by `vk run --pmu`.
+
+`src/vmm/src/resources.rs` + `src/vmm/src/builder.rs` + `src/libkrun/src/lib.rs` — make the
+virtio-balloon device opt-out: `krun_disable_balloon(ctx)` sets `VmResources.disable_balloon`,
+which `build_microvm` checks before attaching it. Upstream always attaches one, so a caller
+could not boot without free-page reporting or reclaim the virtio-pci slot it spends — and
+virtkit's own `VmSpec::balloon` axis was silently ignored on this backend while
+cloud-hypervisor honored it. Spelled as a disable (like `disable_implicit_console`) so the
+`Default` keeps attaching a balloon. Additive: without the call, behaviour is unchanged.
+Search for `disable_balloon`.

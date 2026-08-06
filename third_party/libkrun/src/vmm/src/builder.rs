@@ -1008,8 +1008,13 @@ pub fn build_microvm(
         setup_terminal_raw_mode(&mut vmm, Some(serial_tty), false);
     }
 
+    // virtkit: the balloon is opt-out (krun_disable_balloon, see VENDOR.md), so a caller
+    // that does not want freed guest pages reported back — or wants the PCI slot — can
+    // boot without one. Unset, a balloon is attached as before.
     #[cfg(not(feature = "tee"))]
-    attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
+    if !vm_resources.disable_balloon {
+        attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
+    }
     #[cfg(not(feature = "tee"))]
     attach_rng_device(&mut vmm, event_manager, intc.clone())?;
     let mut console_id = 0;

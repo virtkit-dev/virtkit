@@ -181,6 +181,9 @@ pub struct VmResources {
     pub nested_enabled: bool,
     /// Whether to expose the guest PMU (virtkit patch, see VENDOR.md).
     pub pmu_enabled: bool,
+    /// Do not create the virtio-balloon device (virtkit patch, see VENDOR.md).
+    /// Spelled as an opt-out so the default keeps attaching one.
+    pub disable_balloon: bool,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
     /// Do not create an implicit console device in the guest
@@ -437,6 +440,7 @@ mod tests {
             smbios_oem_strings: None,
             nested_enabled: false,
             pmu_enabled: false,
+            disable_balloon: false,
             split_irqchip: false,
             disable_implicit_console: false,
             serial_consoles: Vec::new(),

@@ -2010,6 +2010,20 @@ pub unsafe extern "C" fn krun_set_pmu(ctx_id: u32, enabled: bool) -> i32 {
     }
 }
 
+#[unsafe(no_mangle)]
+/// Boot without the virtio-balloon device (virtkit patch, see VENDOR.md). Called
+/// before `krun_start_enter`; without it a balloon is attached as usual, so the
+/// guest reports freed pages back to the host.
+pub extern "C" fn krun_disable_balloon(ctx_id: u32) -> i32 {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            ctx_cfg.get_mut().vmr.disable_balloon = true;
+            KRUN_SUCCESS
+        }
+        Entry::Vacant(_) => -libc::ENOENT,
+    }
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 pub unsafe extern "C" fn krun_set_nested_virt(ctx_id: u32, enabled: bool) -> i32 {
@@ -3170,6 +3184,28 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
 
             -libc::EINVAL
         }
+    }
+}
+
+#[cfg(all(test, not(feature = "tee")))]
+mod test_disable_balloon {
+    use super::*;
+
+    #[test]
+    fn test_disable_balloon_sets_resource_flag() {
+        let ctx = unsafe { krun_create_ctx() } as u32;
+        assert_eq!(krun_disable_balloon(ctx), KRUN_SUCCESS);
+        assert!(
+            CTX_MAP
+                .lock()
+                .unwrap()
+                .get(&ctx)
+                .unwrap()
+                .vmr
+                .disable_balloon
+        );
+        assert_eq!(krun_free_ctx(ctx), KRUN_SUCCESS);
+        assert_eq!(krun_disable_balloon(ctx), -libc::ENOENT);
     }
 }
 
