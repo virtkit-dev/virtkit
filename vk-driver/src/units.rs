@@ -489,7 +489,10 @@ pub fn boot_unit(
             mem: svc.mem.clone().unwrap_or_else(|| DEFAULT_MEM.into()),
             shared_mem,
             net: crate::vmm::Net::None,
-            balloon: false,
+            // Like the job VM: freed guest pages go back to the host, so a service
+            // that idles between jobs stops holding its peak RAM against the ones
+            // sharing the box.
+            balloon: true,
             serial_log: console.clone(),
             // an image (stock) kernel keeps serial via the VIRTKIT_KERNEL=image token.
             console_serial: false,

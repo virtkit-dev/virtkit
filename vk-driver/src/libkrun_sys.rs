@@ -24,7 +24,7 @@ use anyhow::{Context, Result, bail};
 // >= 0 on success, a negative errno on failure.
 use krun::{
     krun_add_disk2, krun_add_net_tap, krun_add_virtiofs4, krun_add_vsock_port2, krun_create_ctx,
-    krun_disable_implicit_init, krun_init_log, krun_set_block_dirty_socket,
+    krun_disable_balloon, krun_disable_implicit_init, krun_init_log, krun_set_block_dirty_socket,
     krun_set_console_output, krun_set_kernel, krun_set_pmu, krun_set_vm_config, krun_start_enter,
 };
 
@@ -147,6 +147,13 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         // counters. Off by default — see VmSpec::pmu.
         if spec.pmu {
             ck("krun_set_pmu", krun_set_pmu(ctx, true))?;
+        }
+
+        // virtio-balloon, the same axis CH spells `--balloon …,free_page_reporting=on`:
+        // libkrun attaches one by default, so only the opt-out needs a call (the
+        // vendored krun_disable_balloon patch).
+        if !spec.balloon {
+            ck("krun_disable_balloon", krun_disable_balloon(ctx))?;
         }
 
         // Guest console -> the serial-log file, matching CH's `--serial file=`; the

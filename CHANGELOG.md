@@ -33,6 +33,15 @@ All notable changes to virtkit will be documented in this file.
   concurrency by what it actually occupies, instead of needing a guessed fixed reserve inside
   `[schedule] mem_budget`.
 
+### Fixed
+
+- **Freed guest memory returns to the host from every VM, under either VMM.** `[vm] balloon =
+  false` was ignored by the default backend, and conversely under cloud-hypervisor only the CI
+  job VM had a balloon at all — compose service, build, and `vk run` VMs held their peak memory
+  until poweroff, so a service that had finished its busy phase still counted against the jobs
+  sharing the host. All of them now balloon, and the setting is honored whichever VMM is
+  configured.
+
 ## [0.31.0] - 2026-07-30
 
 ### Added

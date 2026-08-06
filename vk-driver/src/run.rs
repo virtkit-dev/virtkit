@@ -1321,7 +1321,7 @@ async fn build_and_boot(
         mem: mem.clone(),
         shared_mem,
         net: crate::vmm::Net::None,
-        balloon: false,
+        balloon: true,
         serial_log: console.clone(),
         console_serial: args.console_serial,
         pmu: args.pmu,
@@ -2965,7 +2965,10 @@ pub(crate) async fn boot_session(
         mem: mem.to_string(),
         shared_mem: context.is_some(),
         net: crate::vmm::Net::None,
-        balloon: false,
+        // A stage's RUN can free a lot at once (a package cache, an unpacked tree):
+        // report those pages back rather than hold the guest's peak until poweroff.
+        // The PCI slot this spends is already counted into MAX_SOURCE_DISKS.
+        balloon: true,
         serial_log: console.clone(),
         // build stages boot the pinned kernel (hvc0), never a BYO serial-only kernel.
         console_serial: false,

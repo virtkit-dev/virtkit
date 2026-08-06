@@ -215,6 +215,11 @@ pub struct VmSpec {
     pub mem: String,
     pub shared_mem: bool,
     pub net: Net,
+    /// virtio-balloon with free-page reporting: the guest hands pages it frees back to
+    /// the host mid-run, so concurrent VMs can overcommit safely. Honored by both
+    /// backends — cloud-hypervisor gates its `--balloon` argument on it, and the libkrun
+    /// backend, which attaches a balloon by default, opts out through the vendored
+    /// `krun_disable_balloon`. Costs one virtio-pci slot on libkrun.
     pub balloon: bool,
     /// Serial console log file (`--serial file=…`).
     pub serial_log: PathBuf,
@@ -506,8 +511,9 @@ mod tests {
         );
     }
 
-    /// A build session: agent initramfs + a rw qcow2 stage disk + a read-only raw
-    /// source disk (COPY --from), no API/net/balloon, unshared memory.
+    /// A minimal guest: agent initramfs + a rw qcow2 stage disk + a read-only raw
+    /// source disk (COPY --from style), with API/net/balloon off and unshared memory —
+    /// the balloon-off spelling `[vm] balloon = false` selects, gating `--balloon` away.
     #[test]
     fn build_session_initramfs_and_source_disks() {
         let ch = CloudHypervisor {
