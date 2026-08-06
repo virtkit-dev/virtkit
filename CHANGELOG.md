@@ -9,6 +9,9 @@ All notable changes to virtkit will be documented in this file.
 - **A raw disk image can be exported for VMware.** `vk export vmdk disk.raw` packages a
   bootable raw disk (e.g. a `vk build --disk` artifact) as a streamOptimized VMDK — the
   compressed subformat vSphere's OVF/OVA import streams — natively, with no qemu-img.
+  `vk export ova` wraps that VMDK in a one-file OVA appliance (OVF descriptor + SHA256
+  manifest) ESXi/vCenter import directly, with `--name`, `--cpus`, `--mem`, `--guest-os`
+  and `--firmware bios|efi` describing the VM — no ovftool, no vSphere in the build.
 - **Compose services can size their own guests.** A service declares its vCPUs and RAM with
   `x-virtkit: { cpus:, mem: }` in the compose file (default 2 vCPUs / 1G as before), and
   `vk run --service-cpus`/`--service-mem NAME=VALUE` override it per run. In CI, a

@@ -45,6 +45,7 @@ mod manager;
 mod mkoci;
 mod net;
 mod oci;
+mod ova;
 mod qcow2;
 mod registry;
 mod regproxy;
@@ -99,12 +100,16 @@ enum ExportFormat {
     /// streamOptimized VMDK — the compressed, stream-readable subformat
     /// vSphere's OVF/OVA import requires
     Vmdk,
+    /// OVA appliance — the VMDK wrapped in an OVF descriptor + SHA256
+    /// manifest, importable by ESXi/vCenter as one file
+    Ova,
 }
 
 impl ExportFormat {
     fn extension(self) -> &'static str {
         match self {
             ExportFormat::Vmdk => "vmdk",
+            ExportFormat::Ova => "ova",
         }
     }
 }
@@ -997,8 +1002,9 @@ enum Cmd {
         parts: Vec<String>,
     },
     /// Export a raw disk image (a `vk build --disk` artifact) as a VMware
-    /// artifact: `vmdk` packages it as a streamOptimized VMDK, the compressed
-    /// subformat vSphere's OVF/OVA import streams. Native, no qemu-img.
+    /// artifact: `vmdk` packages it as a streamOptimized VMDK (the compressed
+    /// subformat vSphere's OVF/OVA import streams); `ova` wraps that in an OVF
+    /// appliance descriptor + manifest. Native, no qemu-img or ovftool.
     Export {
         /// output format
         #[arg(value_enum)]
@@ -1007,6 +1013,22 @@ enum Cmd {
         disk: PathBuf,
         /// output path (default: the input with the format's extension)
         out: Option<PathBuf>,
+        /// (ova) appliance/VM name (default: the disk's file stem)
+        #[arg(long)]
+        name: Option<String>,
+        /// (ova) vCPUs the descriptor declares (default 2)
+        #[arg(long)]
+        cpus: Option<u32>,
+        /// (ova) memory the descriptor declares, <n>G/<n>M/MiB (default 4G)
+        #[arg(long)]
+        mem: Option<String>,
+        /// (ova) VMware guest-OS identifier (default debian11_64Guest)
+        #[arg(long = "guest-os", value_name = "OSTYPE")]
+        guest_os: Option<String>,
+        /// (ova) firmware the VM boots with: bios for a grub-pc/MBR disk
+        /// (default), efi for a disk carrying an ESP
+        #[arg(long, value_enum)]
+        firmware: Option<ova::Firmware>,
     },
     /// Dev: build an ext4 image from a directory tree (native, no mke2fs).
     #[command(hide = true)]
@@ -1803,7 +1825,17 @@ async fn cli_main() -> ExitCode {
             Err(e) => fail(&e, 1),
         };
     }
-    if let Cmd::Export { format, disk, out } = &cli.cmd {
+    if let Cmd::Export {
+        format,
+        disk,
+        out,
+        name,
+        cpus,
+        mem,
+        guest_os,
+        firmware,
+    } = &cli.cmd
+    {
         let out = out
             .clone()
             .unwrap_or_else(|| disk.with_extension(format.extension()));
@@ -1826,14 +1858,65 @@ async fn cli_main() -> ExitCode {
             );
         }
         let result = match format {
-            ExportFormat::Vmdk => vmdk::write_stream_optimized(disk, &out),
+            ExportFormat::Vmdk => {
+                if name.is_some()
+                    || cpus.is_some()
+                    || mem.is_some()
+                    || guest_os.is_some()
+                    || firmware.is_some()
+                {
+                    return fail(
+                        &anyhow::anyhow!(
+                            "--name/--cpus/--mem/--guest-os/--firmware describe an appliance — \
+                             they apply to `vk export ova`"
+                        ),
+                        2,
+                    );
+                }
+                vmdk::write_stream_optimized(disk, &out)
+            }
+            ExportFormat::Ova => {
+                // A zero either way is a usage error (exit 2), like an unparsable --mem;
+                // write_ova's own check only backstops non-CLI callers.
+                if *cpus == Some(0) {
+                    return fail(&anyhow::anyhow!("--cpus must be at least 1"), 2);
+                }
+                let mem_mib = match mem.as_deref() {
+                    None => 4096,
+                    Some(m) => match run::parse_mem_mib(m).filter(|mib| *mib > 0) {
+                        Some(mib) => mib,
+                        None => {
+                            return fail(
+                                &anyhow::anyhow!("invalid --mem {m:?} (want <n>G, <n>M or MiB)"),
+                                2,
+                            );
+                        }
+                    },
+                };
+                let spec = ova::OvaSpec {
+                    name: name.clone().unwrap_or_else(|| {
+                        disk.file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "appliance".to_string())
+                    }),
+                    cpus: cpus.unwrap_or(2),
+                    mem_mib,
+                    guest_os: guest_os
+                        .clone()
+                        .unwrap_or_else(|| "debian11_64Guest".to_string()),
+                    firmware: firmware.unwrap_or(ova::Firmware::Bios),
+                };
+                ova::write_ova(disk, &out, &spec)
+            }
         };
         return match result {
             Ok(info) => {
+                // the OVA wraps the VMDK, so the artifact's own size is the honest figure
+                let size = std::fs::metadata(&out).map_or(info.written, |m| m.len());
                 println!(
                     "virtkit: wrote {} ({} MiB for a {} MiB disk)",
                     out.display(),
-                    info.written.div_ceil(1 << 20),
+                    size.div_ceil(1 << 20),
                     info.capacity.div_ceil(1 << 20),
                 );
                 ExitCode::SUCCESS
