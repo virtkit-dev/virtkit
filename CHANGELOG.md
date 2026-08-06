@@ -12,6 +12,12 @@ All notable changes to virtkit will be documented in this file.
   `vk export ova` wraps that VMDK in a one-file OVA appliance (OVF descriptor + SHA256
   manifest) ESXi/vCenter import directly, with `--name`, `--cpus`, `--mem`, `--guest-os`
   and `--firmware bios|efi` describing the VM — no ovftool, no vSphere in the build.
+- **An auto-install ISO can be built natively.** `vk export iso` packages a staged
+  directory tree as a bootable ISO 9660 image — Rock Ridge names, an El Torito catalog
+  with BIOS and/or UEFI entries (`--bios-boot`/`--efi-boot`, boot info table included),
+  and an optional `--hybrid-mbr` making the same file USB-writable — the medium for an
+  unattended image-based installer, with no xorriso on the host. See
+  [the appliance guide](docs/appliance.md) for the recipe.
 - **Compose services can size their own guests.** A service declares its vCPUs and RAM with
   `x-virtkit: { cpus:, mem: }` in the compose file (default 2 vCPUs / 1G as before), and
   `vk run --service-cpus`/`--service-mem NAME=VALUE` override it per run. In CI, a

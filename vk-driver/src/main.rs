@@ -37,6 +37,7 @@ mod ext4_read;
 mod fullvm;
 mod image;
 mod initramfs;
+mod iso9660;
 mod jobctx;
 #[cfg(feature = "libkrun")]
 mod libkrun_sys;
@@ -103,6 +104,9 @@ enum ExportFormat {
     /// OVA appliance — the VMDK wrapped in an OVF descriptor + SHA256
     /// manifest, importable by ESXi/vCenter as one file
     Ova,
+    /// bootable ISO 9660 image built from a staged directory tree (an
+    /// auto-install medium: bootloader + kernel + installer + disk payload)
+    Iso,
 }
 
 impl ExportFormat {
@@ -110,6 +114,7 @@ impl ExportFormat {
         match self {
             ExportFormat::Vmdk => "vmdk",
             ExportFormat::Ova => "ova",
+            ExportFormat::Iso => "iso",
         }
     }
 }
@@ -1001,16 +1006,19 @@ enum Cmd {
         /// Parts to hash (pre-computed hashes or raw strings), joined by '\n'
         parts: Vec<String>,
     },
-    /// Export a raw disk image (a `vk build --disk` artifact) as a VMware
-    /// artifact: `vmdk` packages it as a streamOptimized VMDK (the compressed
-    /// subformat vSphere's OVF/OVA import streams); `ova` wraps that in an OVF
-    /// appliance descriptor + manifest. Native, no qemu-img or ovftool.
+    /// Export a built image as a distributable artifact: `vmdk` packages a raw
+    /// disk (a `vk build --disk` artifact) as a streamOptimized VMDK (the
+    /// compressed subformat vSphere's OVF/OVA import streams); `ova` wraps
+    /// that in an OVF appliance descriptor + manifest; `iso` builds a bootable
+    /// BIOS+UEFI ISO from a staged directory tree (see the appliance guide for
+    /// the auto-install recipe). Native — no qemu-img, ovftool or xorriso.
     Export {
         /// output format
         #[arg(value_enum)]
         format: ExportFormat,
-        /// the raw disk image to package (whole 512-byte sectors)
-        disk: PathBuf,
+        /// what to package: a raw disk image of whole 512-byte sectors
+        /// (vmdk/ova), or a staged directory tree (iso)
+        input: PathBuf,
         /// output path (default: the input with the format's extension)
         out: Option<PathBuf>,
         /// (ova) appliance/VM name (default: the disk's file stem)
@@ -1029,6 +1037,22 @@ enum Cmd {
         /// (default), efi for a disk carrying an ESP
         #[arg(long, value_enum)]
         firmware: Option<ova::Firmware>,
+        /// (iso) volume identifier, 1-32 chars of [A-Z0-9_] (default VKISO)
+        #[arg(long)]
+        volid: Option<String>,
+        /// (iso) BIOS El Torito boot image, as a path INSIDE the tree (e.g.
+        /// boot/grub/eltorito.img); gets the boot info table patched in
+        #[arg(long = "bios-boot", value_name = "TREE_PATH")]
+        bios_boot: Option<PathBuf>,
+        /// (iso) UEFI El Torito boot image — a FAT ESP carrying
+        /// EFI/BOOT/BOOTX64.EFI — as a path INSIDE the tree
+        #[arg(long = "efi-boot", value_name = "TREE_PATH")]
+        efi_boot: Option<PathBuf>,
+        /// (iso) make the ISO dd-able to a USB stick: a host file with x86 MBR
+        /// boot code (e.g. syslinux's isohdpfx.bin) laid into the system area,
+        /// with partitions mapping the ISO and the ESP
+        #[arg(long = "hybrid-mbr", value_name = "FILE")]
+        hybrid_mbr: Option<PathBuf>,
     },
     /// Dev: build an ext4 image from a directory tree (native, no mke2fs).
     #[command(hide = true)]
@@ -1827,25 +1851,29 @@ async fn cli_main() -> ExitCode {
     }
     if let Cmd::Export {
         format,
-        disk,
+        input,
         out,
         name,
         cpus,
         mem,
         guest_os,
         firmware,
+        volid,
+        bios_boot,
+        efi_boot,
+        hybrid_mbr,
     } = &cli.cmd
     {
         let out = out
             .clone()
-            .unwrap_or_else(|| disk.with_extension(format.extension()));
+            .unwrap_or_else(|| input.with_extension(format.extension()));
         // By identity, not path spelling: a symlink or `./`-prefixed alias of the input
         // would otherwise pass the check and be truncated while still being read.
         let same_file = {
             use std::os::unix::fs::MetadataExt;
-            match (std::fs::metadata(disk), std::fs::metadata(&out)) {
+            match (std::fs::metadata(input), std::fs::metadata(&out)) {
                 (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
-                _ => out == *disk,
+                _ => out == *input,
             }
         };
         if same_file {
@@ -1857,24 +1885,41 @@ async fn cli_main() -> ExitCode {
                 2,
             );
         }
-        let result = match format {
-            ExportFormat::Vmdk => {
-                if name.is_some()
-                    || cpus.is_some()
-                    || mem.is_some()
-                    || guest_os.is_some()
-                    || firmware.is_some()
-                {
-                    return fail(
-                        &anyhow::anyhow!(
-                            "--name/--cpus/--mem/--guest-os/--firmware describe an appliance — \
-                             they apply to `vk export ova`"
-                        ),
-                        2,
-                    );
-                }
-                vmdk::write_stream_optimized(disk, &out)
-            }
+        // Each format has its own knobs; a flag for another format is a mistake
+        // worth stopping on, not ignoring.
+        let appliance_flags = name.is_some()
+            || cpus.is_some()
+            || mem.is_some()
+            || guest_os.is_some()
+            || firmware.is_some();
+        let iso_flags =
+            volid.is_some() || bios_boot.is_some() || efi_boot.is_some() || hybrid_mbr.is_some();
+        if *format != ExportFormat::Ova && appliance_flags {
+            return fail(
+                &anyhow::anyhow!(
+                    "--name/--cpus/--mem/--guest-os/--firmware describe an appliance — \
+                     they apply to `vk export ova`"
+                ),
+                2,
+            );
+        }
+        if *format != ExportFormat::Iso && iso_flags {
+            return fail(
+                &anyhow::anyhow!(
+                    "--volid/--bios-boot/--efi-boot/--hybrid-mbr describe a boot medium — \
+                     they apply to `vk export iso`"
+                ),
+                2,
+            );
+        }
+        // (size to report, description of the input)
+        let result: anyhow::Result<(u64, String)> = match format {
+            ExportFormat::Vmdk => vmdk::write_stream_optimized(input, &out).map(|info| {
+                (
+                    info.written,
+                    format!("{} MiB disk", info.capacity.div_ceil(1 << 20)),
+                )
+            }),
             ExportFormat::Ova => {
                 // A zero either way is a usage error (exit 2), like an unparsable --mem;
                 // write_ova's own check only backstops non-CLI callers.
@@ -1895,7 +1940,8 @@ async fn cli_main() -> ExitCode {
                 };
                 let spec = ova::OvaSpec {
                     name: name.clone().unwrap_or_else(|| {
-                        disk.file_stem()
+                        input
+                            .file_stem()
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_else(|| "appliance".to_string())
                     }),
@@ -1906,18 +1952,31 @@ async fn cli_main() -> ExitCode {
                         .unwrap_or_else(|| "debian11_64Guest".to_string()),
                     firmware: firmware.unwrap_or(ova::Firmware::Bios),
                 };
-                ova::write_ova(disk, &out, &spec)
+                ova::write_ova(input, &out, &spec).map(|info| {
+                    // the OVA wraps the VMDK, so its own size is the honest figure
+                    let size = std::fs::metadata(&out).map_or(info.written, |m| m.len());
+                    (
+                        size,
+                        format!("{} MiB disk", info.capacity.div_ceil(1 << 20)),
+                    )
+                })
+            }
+            ExportFormat::Iso => {
+                let boot = iso9660::BootSpec {
+                    bios: bios_boot.clone(),
+                    efi: efi_boot.clone(),
+                    hybrid_mbr: hybrid_mbr.clone(),
+                };
+                iso9660::write_iso(input, &out, volid.as_deref().unwrap_or("VKISO"), &boot)
+                    .map(|info| (info.size, format!("tree of {} members", info.members)))
             }
         };
         return match result {
-            Ok(info) => {
-                // the OVA wraps the VMDK, so the artifact's own size is the honest figure
-                let size = std::fs::metadata(&out).map_or(info.written, |m| m.len());
+            Ok((size, what)) => {
                 println!(
-                    "virtkit: wrote {} ({} MiB for a {} MiB disk)",
+                    "virtkit: wrote {} ({} MiB for a {what})",
                     out.display(),
                     size.div_ceil(1 << 20),
-                    info.capacity.div_ceil(1 << 20),
                 );
                 ExitCode::SUCCESS
             }

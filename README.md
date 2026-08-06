@@ -60,11 +60,13 @@ service state and start or stop services with plain shell writes. For a dev VM,
 `vk run --ssh` boots any image with SSH access, and VS Code Remote-SSH works
 against it out of the box.
 
-Ship a built disk to VMware. A Dockerfile stage can partition and install a
-bootloader into a caller-owned raw disk (`vk build --disk`), and `vk export
-vmdk|ova` packages that disk as a streamOptimized VMDK or a full OVA appliance
-(OVF descriptor + manifest) that ESXi/vCenter import directly — all native, no
-qemu-img or ovftool.
+Ship a built disk as an appliance. A Dockerfile stage can partition and
+install a bootloader into a caller-owned raw disk (`vk build --disk`), and
+`vk export vmdk|ova` packages that disk as a streamOptimized VMDK or a full
+OVA appliance that ESXi/vCenter import directly, while `vk export iso` builds
+a bootable BIOS+UEFI (and USB-writable) ISO from a staged tree — the shape of
+an unattended image-based installer. All native — no qemu-img, ovftool or
+xorriso; see [the appliance guide](docs/appliance.md).
 
 Isolate GitLab CI jobs. The custom executor gives every job a fresh microVM and
 destroys it when the job ends. Concurrent jobs work, and Docker images from your
