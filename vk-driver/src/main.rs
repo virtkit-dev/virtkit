@@ -65,6 +65,7 @@ mod usage;
 #[cfg(feature = "virtiofsd")]
 mod virtiofsd;
 mod vm;
+mod vmdk;
 mod vmm;
 mod vms;
 
@@ -89,6 +90,22 @@ fn parse_cpus(s: &str) -> Result<u32, String> {
     } else {
         s.parse()
             .map_err(|_| format!("--cpus expects a number or \"host\", got {s:?}"))
+    }
+}
+
+/// What `vk export` can package a raw disk image as.
+#[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
+enum ExportFormat {
+    /// streamOptimized VMDK — the compressed, stream-readable subformat
+    /// vSphere's OVF/OVA import requires
+    Vmdk,
+}
+
+impl ExportFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            ExportFormat::Vmdk => "vmdk",
+        }
     }
 }
 
@@ -979,6 +996,18 @@ enum Cmd {
         /// Parts to hash (pre-computed hashes or raw strings), joined by '\n'
         parts: Vec<String>,
     },
+    /// Export a raw disk image (a `vk build --disk` artifact) as a VMware
+    /// artifact: `vmdk` packages it as a streamOptimized VMDK, the compressed
+    /// subformat vSphere's OVF/OVA import streams. Native, no qemu-img.
+    Export {
+        /// output format
+        #[arg(value_enum)]
+        format: ExportFormat,
+        /// the raw disk image to package (whole 512-byte sectors)
+        disk: PathBuf,
+        /// output path (default: the input with the format's extension)
+        out: Option<PathBuf>,
+    },
     /// Dev: build an ext4 image from a directory tree (native, no mke2fs).
     #[command(hide = true)]
     Mkext { src: PathBuf, out: PathBuf },
@@ -1774,6 +1803,44 @@ async fn cli_main() -> ExitCode {
             Err(e) => fail(&e, 1),
         };
     }
+    if let Cmd::Export { format, disk, out } = &cli.cmd {
+        let out = out
+            .clone()
+            .unwrap_or_else(|| disk.with_extension(format.extension()));
+        // By identity, not path spelling: a symlink or `./`-prefixed alias of the input
+        // would otherwise pass the check and be truncated while still being read.
+        let same_file = {
+            use std::os::unix::fs::MetadataExt;
+            match (std::fs::metadata(disk), std::fs::metadata(&out)) {
+                (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+                _ => out == *disk,
+            }
+        };
+        if same_file {
+            return fail(
+                &anyhow::anyhow!(
+                    "output {} would overwrite the input — pass an output path",
+                    out.display()
+                ),
+                2,
+            );
+        }
+        let result = match format {
+            ExportFormat::Vmdk => vmdk::write_stream_optimized(disk, &out),
+        };
+        return match result {
+            Ok(info) => {
+                println!(
+                    "virtkit: wrote {} ({} MiB for a {} MiB disk)",
+                    out.display(),
+                    info.written.div_ceil(1 << 20),
+                    info.capacity.div_ceil(1 << 20),
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e, 1),
+        };
+    }
     if let Cmd::Mkext { src, out } = &cli.cmd {
         return match ext4::build_from_dir(src, out) {
             Ok(()) => ExitCode::SUCCESS,
@@ -2522,6 +2589,7 @@ async fn cli_main() -> ExitCode {
         | Cmd::Registry { .. }
         | Cmd::Switch { .. }
         | Cmd::Run { .. }
+        | Cmd::Export { .. }
         | Cmd::Mkext { .. }
         | Cmd::Qcow2Verify { .. }
         | Cmd::MkextTar { .. }
@@ -2911,7 +2979,7 @@ mod tests {
         assert_eq!(
             sorted,
             [
-                "build", "check", "exec", "gc", "list", "run", "status", "stop", "update"
+                "build", "check", "exec", "export", "gc", "list", "run", "status", "stop", "update"
             ]
         );
     }
