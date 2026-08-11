@@ -8,13 +8,21 @@ All notable changes to virtkit will be documented in this file.
 
 - **A CI job now reports how full it filled its writable layer.** Where a job builds on an
   in-guest overlay above its checkout, everything it writes under `CI_PROJECT_DIR` is RAM
-  capped at half the VM's memory — a wall that fails the job for want of space while every disk
+  capped at that layer's size — a wall that fails the job for want of space while every disk
   on the host sits empty and the `written` figure beside it says it wrote nothing at all. The
   job's usage line, the "most this job has used lately" line and `vk gitlab usage` now carry
-  the high-water mark against that capacity (`overlay 9.7 GiB of 10.0 GiB`), so a job running
+  the high-water mark against that capacity (`overlay 15.9 GiB of 16.0 GiB`), so a job running
   out of room is visible before it fails and `MICROVM_MEM` can be raised on evidence rather
   than on a guess. A job whose checkout is mounted read-write has no such layer and reports
   none, as does one on a guest too old to be asked.
+- **The writable layer a CI job builds on is now sized by the runner, and larger by default.**
+  `[gitlab] checkout_overlay_size` says how much of a job's VM memory that layer may take —
+  `"80%"` by default, where the kernel's own tmpfs default left it at half. That older figure is
+  the one that protects a general-purpose machine's services from an unevictable tmpfs, which a
+  one-shot job guest has none of, and it fails builds the VM had the memory for. Raising it costs
+  nothing below the cap and reserves no extra host memory, so the jobs it changes are the ones
+  that were already running out of room. Set `"50%"` for the previous behaviour, or an absolute
+  `"12G"`.
 - **A raw disk image can be exported for VMware.** `vk export vmdk disk.raw` packages a
   bootable raw disk (e.g. a `vk build --disk` artifact) as a streamOptimized VMDK — the
   compressed subformat vSphere's OVF/OVA import streams — natively, with no qemu-img.

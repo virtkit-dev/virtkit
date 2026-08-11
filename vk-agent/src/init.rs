@@ -26,6 +26,9 @@
 //!                        write under the mountpoint runs at guest-native speed. A
 //!                        listed share that fails to overlay-mount fails the boot (no
 //!                        silent fallback to the far slower direct mount)
+//!   VIRTKIT_VIRTIOFS_OVERLAY_SIZE  how much of this VM's memory each overlay layer
+//!                        above may take, as a tmpfs size= (e.g. 80%, 12G). Unset
+//!                        leaves the kernel's own tmpfs default (half the RAM)
 //!   VIRTKIT_SYMLINKS     src:dest[,src:dest] — after virtiofs mounts, create each
 //!                        `dest` as a symlink pointing to `src`. Entries where `src`
 //!                        does not exist are silently skipped.
@@ -792,6 +795,7 @@ fn materialize_env(cfg: Option<&RunConfig>) {
 /// run the workload 15–50× slower.
 fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<()> {
     let mut overlay = overlay_tags(cmdline)?;
+    let size = overlay_size(cmdline)?;
     let Some(spec) = cmdline.get("VIRTKIT_VIRTIOFS") else {
         if !overlay.is_empty() {
             bail!(
@@ -809,7 +813,7 @@ fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<()> {
             continue;
         };
         if overlay.remove(tag) {
-            mount_share_overlay(tag, path)
+            mount_share_overlay(tag, path, size)
                 .with_context(|| format!("overlay-mounting virtiofs share {tag} at {path}"))?;
             overlaid.insert(tag.to_string());
             continue;
@@ -874,6 +878,29 @@ fn overlay_tags(cmdline: &HashMap<String, String>) -> Result<HashSet<String>> {
     Ok(tags)
 }
 
+/// How much of this VM's memory an overlay layer may take, from
+/// VIRTKIT_VIRTIOFS_OVERLAY_SIZE: a tmpfs `size=` value, either a percentage of the RAM
+/// (`80%`) or an absolute size (`12G`). `None` where the host named none, which leaves the
+/// kernel's own tmpfs default of half the RAM.
+///
+/// Validated here as well as host-side, because the value ends up inside a mount option list:
+/// a token carrying a comma would mount the layer with options nobody asked for, and one
+/// carrying nonsense would fail the mount long after the cause is visible. A boot with a size
+/// this agent cannot make sense of is refused rather than quietly given a different layer.
+fn overlay_size(cmdline: &HashMap<String, String>) -> Result<Option<&str>> {
+    let Some(spec) = cmdline.get("VIRTKIT_VIRTIOFS_OVERLAY_SIZE") else {
+        return Ok(None);
+    };
+    let split = spec
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(spec.len());
+    let (digits, unit) = spec.split_at(split);
+    if digits.is_empty() || !matches!(unit, "" | "%" | "k" | "K" | "m" | "M" | "g" | "G") {
+        bail!("VIRTKIT_VIRTIOFS_OVERLAY_SIZE {spec:?} is not a tmpfs size (e.g. 80%, 12G)");
+    }
+    Ok(Some(spec))
+}
+
 /// The tags of a set, sorted and comma-joined for a stable error message.
 fn sorted_join(tags: &HashSet<String>) -> String {
     let mut tags: Vec<&str> = tags.iter().map(String::as_str).collect();
@@ -913,11 +940,20 @@ fn overlay_data(lower: &str, upper: &str, work: &str) -> String {
     )
 }
 
+/// The overlay upper tmpfs's mount options. Without a `size=` the kernel caps it at half the
+/// RAM, which is its default for a general-purpose machine rather than a choice made here.
+fn overlay_tmpfs_data(size: Option<&str>) -> String {
+    match size {
+        Some(size) => format!("mode=0755,size={size}"),
+        None => "mode=0755".to_string(),
+    }
+}
+
 /// Mount the virtiofs share `tag` at `path` behind an overlayfs: the share is the
-/// read-only lower layer, upper/work live on a dedicated guest tmpfs. Only first-touch
-/// reads of lower files cross virtio-fs (and then stay in the guest page cache); the
-/// host never sees guest writes.
-fn mount_share_overlay(tag: &str, path: &str) -> Result<()> {
+/// read-only lower layer, upper/work live on a dedicated guest tmpfs of `size` (`None` =
+/// the kernel's own default). Only first-touch reads of lower files cross virtio-fs (and
+/// then stay in the guest page cache); the host never sees guest writes.
+fn mount_share_overlay(tag: &str, path: &str, size: Option<&str>) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let OverlayDirs {
         lower,
@@ -929,15 +965,16 @@ fn mount_share_overlay(tag: &str, path: &str) -> Result<()> {
     mount(tag, &lower, "virtiofs", libc::MS_RDONLY)
         .with_context(|| format!("mounting virtiofs {tag} (lower layer) at {lower}"))?;
     // A dedicated tmpfs (not the shared /run) keeps bulk build writes away from the
-    // agent's runtime dirs. No size= : the kernel default (half the guest RAM) is the
-    // cap, and the VM memory size is the lever when a job needs more.
+    // agent's runtime dirs. Its size is what a build tree has to fit under, so the host
+    // states it (`[gitlab] checkout_overlay_size`); told nothing, the kernel's own tmpfs
+    // default of half the RAM applies, and the VM memory size is the lever either way.
     std::fs::create_dir_all(&rw).with_context(|| format!("creating {rw}"))?;
     mount_data(
         "tmpfs",
         &rw,
         "tmpfs",
         libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOATIME,
-        "mode=0755",
+        &overlay_tmpfs_data(size),
     )
     .with_context(|| format!("mounting the overlay upper tmpfs at {rw}"))?;
     std::fs::create_dir(&upper).with_context(|| format!("creating {upper}"))?;
@@ -1952,6 +1989,25 @@ mod tests {
         )]);
         let err = mount_virtiofs(&m).unwrap_err().to_string();
         assert!(err.contains("cibuild, extra"), "{err}");
+    }
+
+    #[test]
+    fn the_overlay_layer_is_sized_by_the_host_or_left_to_the_kernel() {
+        // Told nothing, the layer keeps the kernel's own default (half the RAM) rather than a
+        // size this agent invents — the policy belongs to the host that knows the workload.
+        assert_eq!(overlay_tmpfs_data(None), "mode=0755");
+        assert_eq!(overlay_tmpfs_data(Some("80%")), "mode=0755,size=80%");
+        assert_eq!(overlay_size(&HashMap::new()).unwrap(), None);
+        let sized =
+            |v: &str| HashMap::from([("VIRTKIT_VIRTIOFS_OVERLAY_SIZE".to_string(), v.to_string())]);
+        assert_eq!(overlay_size(&sized("80%")).unwrap(), Some("80%"));
+        assert_eq!(overlay_size(&sized("12G")).unwrap(), Some("12G"));
+        // Checked again on this side of the cmdline: the value lands in a mount option list, so
+        // one carrying a separator would mount the layer with options nobody asked for. A boot
+        // is refused rather than given a silently different writable layer.
+        for bad in ["", "80%,mode=0777", "eighty", "80 %", "12GB"] {
+            assert!(overlay_size(&sized(bad)).is_err(), "accepted {bad:?}");
+        }
     }
 
     #[test]

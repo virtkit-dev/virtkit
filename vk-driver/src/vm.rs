@@ -128,13 +128,43 @@ const CIBUILD_TAG: &str = "cibuild";
 /// VIRTKIT_VIRTIOFS shares at boot (mkdir -p'ing the mount point); CI supervise sets no
 /// other share, so a plain assignment is safe. With `overlay`, VIRTKIT_VIRTIOFS_OVERLAY
 /// tells the agent to build the tree on a tmpfs-backed overlay above the (then read-only)
-/// share instead of mounting it directly.
-fn checkout_virtiofs_cmdline(mount: &str, overlay: bool) -> String {
+/// share instead of mounting it directly, and VIRTKIT_VIRTIOFS_OVERLAY_SIZE how much of the
+/// VM's memory that layer may take.
+fn checkout_virtiofs_cmdline(mount: &str, overlay: bool, size: &str) -> String {
     let mut s = format!(" VIRTKIT_VIRTIOFS={CIBUILD_TAG}:{mount}");
     if overlay {
         s.push_str(&format!(" VIRTKIT_VIRTIOFS_OVERLAY={CIBUILD_TAG}"));
+        s.push_str(&format!(" VIRTKIT_VIRTIOFS_OVERLAY_SIZE={size}"));
     }
     s
+}
+
+/// `[gitlab] checkout_overlay_size` as a tmpfs `size=` token: a percentage (`80%`) or an
+/// absolute size (`12G`), the units `mount` itself takes.
+///
+/// Rejected rather than passed on when it is anything else. The value is spliced into the
+/// kernel cmdline and then into the guest's mount options, where a stray space or comma would
+/// not fail but silently mount something other than what was asked for — and a layer sized
+/// wrong is discovered as a job dying for want of space.
+fn checkout_overlay_size(spec: &str) -> Result<&str> {
+    let (digits, unit) = spec.split_at(
+        spec.find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(spec.len()),
+    );
+    let sized = !digits.is_empty() && matches!(unit, "" | "%" | "k" | "K" | "m" | "M" | "g" | "G");
+    // A percentage of nothing and a zero-byte layer are both a checkout that cannot be written
+    // to at all, which is a misconfiguration rather than a policy anyone means.
+    if !sized || digits.trim_start_matches('0').is_empty() {
+        bail!(
+            "[gitlab] checkout_overlay_size {spec:?} is not a tmpfs size: \
+             want a percentage of the VM memory (e.g. \"80%\") or an absolute size (e.g. \"12G\")"
+        );
+    }
+    // A parse failure on all-digit input is u32 overflow, which is even more than 100%.
+    if unit == "%" && !digits.parse::<u32>().is_ok_and(|pct| pct <= 100) {
+        bail!("[gitlab] checkout_overlay_size {spec:?} is more than all of the VM's memory");
+    }
+    Ok(spec)
 }
 
 pub async fn prepare(ctx: &JobCtx) -> Result<()> {
@@ -150,6 +180,11 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // spawned later in the detached supervisor, whose log the job never sees. (The build
     // phase validates in build_git_image / build_compose_unit, also in prepare.)
     effective_run_egress(cfg, ctx)?;
+    // Same fail-fast rationale for the writable-layer size: it is pure config, and the
+    // authoritative check runs in the detached supervisor whose log the job never sees.
+    if let Some(gl) = &cfg.gitlab {
+        checkout_overlay_size(&gl.checkout_overlay_size)?;
+    }
 
     // A leftover job (failed cleanup, retried job id) must not leak: signal its
     // supervisor — everything it owns cascades by PDEATHSIG — and drop the state. Done before
@@ -1076,7 +1111,11 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             uid_map,
             gid_map,
         });
-        cmdline.push_str(&checkout_virtiofs_cmdline(mount, overlay));
+        cmdline.push_str(&checkout_virtiofs_cmdline(
+            mount,
+            overlay,
+            checkout_overlay_size(&gl.checkout_overlay_size)?,
+        ));
     }
 
     let mut net = crate::vmm::Net::None;
@@ -2235,13 +2274,46 @@ mod tests {
     #[test]
     fn checkout_virtiofs_cmdline_pins_the_agent_contract() {
         assert_eq!(
-            checkout_virtiofs_cmdline("/builds/grp/proj", false),
-            " VIRTKIT_VIRTIOFS=cibuild:/builds/grp/proj"
+            checkout_virtiofs_cmdline("/builds/grp/proj", false, "80%"),
+            " VIRTKIT_VIRTIOFS=cibuild:/builds/grp/proj",
+            "a read-write checkout has no layer to size"
         );
         assert_eq!(
-            checkout_virtiofs_cmdline("/builds/grp/proj", true),
-            " VIRTKIT_VIRTIOFS=cibuild:/builds/grp/proj VIRTKIT_VIRTIOFS_OVERLAY=cibuild"
+            checkout_virtiofs_cmdline("/builds/grp/proj", true, "80%"),
+            " VIRTKIT_VIRTIOFS=cibuild:/builds/grp/proj VIRTKIT_VIRTIOFS_OVERLAY=cibuild \
+             VIRTKIT_VIRTIOFS_OVERLAY_SIZE=80%"
         );
+    }
+
+    /// The size crosses into the guest's mount options, so what reaches the cmdline has to be a
+    /// tmpfs size and nothing else — a value carrying a separator would mount the job's writable
+    /// layer with options the operator never wrote.
+    #[test]
+    fn only_a_tmpfs_size_reaches_the_overlay_cmdline() {
+        for good in ["80%", "100%", "1%", "12G", "512M", "1024k", "2048"] {
+            assert_eq!(checkout_overlay_size(good).unwrap(), good);
+        }
+        for bad in [
+            "",
+            "80 %",
+            "80%,mode=0777",
+            "eighty",
+            "%80",
+            "12GB",
+            "12Gi",
+            "-1",
+            // All of the memory is a policy; more than all of it is a typo, and zero is a layer
+            // no job could write a byte to. A percentage that overflows a u32 is not a bypass.
+            "101%",
+            "4294967296%",
+            "0",
+            "0%",
+        ] {
+            assert!(
+                checkout_overlay_size(bad).is_err(),
+                "accepted {bad:?} as a tmpfs size"
+            );
+        }
     }
 
     #[test]

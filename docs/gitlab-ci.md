@@ -136,7 +136,7 @@ virtkit: build resource usage: cpu 8m12s, peak memory 3.2 GiB (largest process 1
 and the run figures come at the very end of the trace:
 
 ```
-virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB, overlay 1.2 GiB of 10.0 GiB, read 3.4 GiB, written 812 MiB, sent 3 MiB, received 941 MiB
+virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB, overlay 1.2 GiB of 16.0 GiB, read 3.4 GiB, written 812 MiB, sent 3 MiB, received 941 MiB
 ```
 
 `cpu` is all the CPU time the phase burned on the host, the guests' own execution
@@ -176,17 +176,40 @@ the host could spare no sampler thread for.
 `overlay` is how full the job filled its **writable layer**, against what that layer held.
 With `[gitlab] checkout_overlay` (the default) a job builds on an overlay above its checkout
 whose upper layer is a tmpfs inside the VM, so every write under `CI_PROJECT_DIR` — the build
-tree, a package cache pointed there, an unpacked archive — is guest RAM, capped at half the
-VM's memory. That cap is a wall a job can hit: it fails with `ENOSPC` while every disk on the
-host sits empty, and the `written` figure beside it says the job wrote nothing at all, because
-none of those pages ever reached a block device. Read the pair as the room the job had left —
-`1.2 GiB of 10.0 GiB` has plenty, `9.9 GiB of 10.0 GiB` is a job about to fail on space — and
-raise `MICROVM_MEM` when a build tree needs more, since the capacity follows it.
+tree, a package cache pointed there, an unpacked archive — is guest RAM, capped at
+`[gitlab] checkout_overlay_size` (80% of the VM's memory by default). That cap is a wall a job
+can hit: it fails with `ENOSPC` while every disk on the host sits empty, and the `written`
+figure beside it says the job wrote nothing at all, because none of those pages ever reached a
+block device. Read the pair as the room the job had left — `4.2 GiB of 16.0 GiB` has plenty,
+`15.9 GiB of 16.0 GiB` is a job about to fail on space — and raise `MICROVM_MEM` when a build
+tree needs more, since the capacity follows it.
 
 The figure is the high-water mark, not what the layer held at the end: a job that unpacks an
 archive and deletes it would otherwise read as having needed nothing. It comes from the guest,
 which is the only place a tmpfs can be seen from, so a job with no overlaid checkout reports
 none — as does one on a guest whose agent is older than the figure.
+
+### Sizing the writable layer
+
+`[gitlab] checkout_overlay_size` is where the two failures either side of that wall are traded
+off, and the mark above is what to size it from:
+
+- **too low** and a job dies for want of a partition on a VM that had the memory for it — the
+  build tree hits the cap while gigabytes of guest RAM sit unused;
+- **too near 100%** and the layer starves the job's own processes instead. Compilers spike late
+  (linking), so the failure lands as an OOM kill of whatever the kernel picks — far harder to
+  read than a filesystem reporting itself full.
+
+It costs nothing below the cap: tmpfs pages are allocated on use, so a job that never fills the
+layer is unaffected by how large it was allowed to grow. Nor does raising it commit host memory
+— `[schedule]` admission reserves `MICROVM_MEM` either way, so the host is already sized for a
+job that uses all of its VM.
+
+The default is 80% rather than the kernel's own 50% tmpfs default. That default exists to keep
+an unevictable tmpfs from starving the long-lived services of a general-purpose machine; a
+one-shot job guest has no such services, and the tree it is there to build is the legitimate
+main consumer of its memory. Set `"50%"` to restore the kernel's behaviour, or an absolute
+`"12G"` where every job on the runner is the same shape.
 
 `read` and `written` are what the phase cost the runner's **storage**, not what its programs
 asked for: `read` is what was actually fetched from the block layer, so a guest re-reading a
@@ -348,8 +371,8 @@ Every job trace says where it stands, whether or not the host reserves this way 
 is how you decide to:
 
 ```
-virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB, overlay 1.2 GiB of 10.0 GiB, read 3.4 GiB, written 812 MiB, sent 3 MiB, received 941 MiB
-virtkit: most this job has used lately: memory 2.1 GiB, overlay 1.9 GiB of 10.0 GiB, read 12.0 GiB, written 3.1 GiB, sent 40 MiB, received 4.2 GiB over 37 runs; the next run reserves 2.6 GiB
+virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB, overlay 1.2 GiB of 16.0 GiB, read 3.4 GiB, written 812 MiB, sent 3 MiB, received 941 MiB
+virtkit: most this job has used lately: memory 2.1 GiB, overlay 1.9 GiB of 16.0 GiB, read 12.0 GiB, written 3.1 GiB, sent 40 MiB, received 4.2 GiB over 37 runs; the next run reserves 2.6 GiB
 ```
 
 Only the memory is reserved against; the writable layer and the traffic ride along because a

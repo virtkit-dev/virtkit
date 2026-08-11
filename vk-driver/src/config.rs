@@ -212,13 +212,34 @@ pub struct Gitlab {
     /// Mount the `host_checkout` tree in the guest behind a tmpfs-backed overlayfs (default
     /// on). The share is then exported read-only — the guest can never touch the host tree —
     /// and every in-job write runs at guest-native speed instead of a 50–90µs synchronous
-    /// virtio-fs round-trip per op. Guest writes land in guest RAM (an overlay tmpfs capped
-    /// at half the VM memory; raise MICROVM_MEM if a job needs more) and are discarded with
+    /// virtio-fs round-trip per op. Guest writes land in guest RAM (an overlay tmpfs sized by
+    /// `checkout_overlay_size`; raise MICROVM_MEM if a job needs more) and are discarded with
     /// the VM, which prepare's re-clean of the checkout did anyway. `false` restores the
     /// direct read-write mount — a rw virtio-fs share into an untrusted job guest is added
     /// host-side attack surface.
     pub checkout_overlay: bool,
+    /// How much of the VM's memory the `checkout_overlay` layer may take, as a tmpfs `size=`:
+    /// a percentage (`"80%"`, the default) or an absolute `"12G"`/`"512M"`.
+    ///
+    /// The cap is what a build tree has to fit under, and a job that reaches it fails with
+    /// `ENOSPC` however empty the host's disks are — so the figure trades two failures against
+    /// each other. Set too low, a job the VM had memory for dies for want of a partition; set
+    /// near 100%, the layer can starve the job's own processes and the kernel reaches for the
+    /// OOM killer instead, which is far harder to read than a full filesystem. It costs nothing
+    /// until a job reaches it — tmpfs pages are allocated on use — and the reservation admission
+    /// takes out is `MICROVM_MEM` either way, so raising it commits no host memory that was not
+    /// already set aside.
+    ///
+    /// 80% rather than the kernel's own 50% tmpfs default: that default protects a
+    /// general-purpose machine's long-lived services from an unevictable tmpfs, and a one-shot
+    /// job guest has none to protect. `"50%"` restores it. Each job's usage line reports the
+    /// mark it reached against this capacity, which is what to size it from.
+    pub checkout_overlay_size: String,
 }
+
+/// The default `checkout_overlay_size`. Named because the guest applies the kernel's own tmpfs
+/// default when it is told nothing, so this is the policy and that is only the fallback.
+pub const CHECKOUT_OVERLAY_SIZE: &str = "80%";
 
 impl Default for Gitlab {
     fn default() -> Self {
@@ -228,6 +249,7 @@ impl Default for Gitlab {
             checkout_dir: None,
             checkout_cache_idle_secs: None,
             checkout_overlay: true,
+            checkout_overlay_size: CHECKOUT_OVERLAY_SIZE.to_string(),
         }
     }
 }
