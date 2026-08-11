@@ -59,6 +59,16 @@ pub struct Usage {
     /// real and uncounted, and calling that zero would be a lie about a job that pulled
     /// gigabytes.
     pub network: Option<(u64, u64)>,
+    /// `(the high-water mark, the capacity)` of the guest's writable layer, in bytes — the
+    /// tmpfs a job's writes land on where its checkout is built on an in-guest overlay
+    /// (`[gitlab] checkout_overlay`). The pair reads as "how close the build tree came to the
+    /// wall": the capacity is half the VM memory, so a job can fail with `ENOSPC` at a peak
+    /// well under the ceiling beside it while `disk` says it wrote nothing at all — those
+    /// pages are RAM, and no host counter is in a position to see them.
+    ///
+    /// `None` where there was no such layer to ask about: every phase but a job on an overlaid
+    /// checkout, and a guest whose agent is too old to answer.
+    pub overlay: Option<(u64, u64)>,
 }
 
 impl Usage {
@@ -72,6 +82,13 @@ impl Usage {
         }
     }
 
+    /// Fold in the guest's writable-layer mark, for the same reason [`Usage::with_network`]
+    /// is separate: it is measured inside the VM, by the only thing that can see a tmpfs.
+    /// The caller that knows how to ask hands it over.
+    pub fn with_overlay(self, overlay: Option<(u64, u64)>) -> Usage {
+        Usage { overlay, ..self }
+    }
+
     /// The trace line for `phase` (`job`, `build`, `run`):
     /// `virtkit: build resource usage: cpu 2m14s, peak memory 1.6 GiB (largest process 900 MiB)`.
     pub fn summary(&self, phase: &str) -> String {
@@ -81,6 +98,15 @@ impl Usage {
         let largest = match self.largest_rss.map(fmt_bytes) {
             Some(one) if one != total => format!(" (largest process {one})"),
             _ => String::new(),
+        };
+        // Beside the memory rather than the disk: the layer is guest RAM, so what it says is
+        // how much of the peak above went to the build tree rather than to processes — and,
+        // against its capacity, whether the job had any room left.
+        let overlay = match self.overlay {
+            Some((used, cap)) => {
+                format!(", overlay {} of {}", fmt_bytes(used), fmt_bytes(cap))
+            }
+            None => String::new(),
         };
         // A measured zero is printed — it says this phase touched no disk, which is a fact
         // about the phase. What is left out is the figure nobody could take.
@@ -101,7 +127,8 @@ impl Usage {
             None => String::new(),
         };
         format!(
-            "virtkit: {phase} resource usage: cpu {}, peak memory {total}{largest}{disk}{net}",
+            "virtkit: {phase} resource usage: cpu {}, peak memory \
+             {total}{largest}{overlay}{disk}{net}",
             fmt_cpu(self.cpu),
         )
     }
@@ -249,6 +276,9 @@ impl Meter {
                 // Not this process's to measure: the switch counts the egress, and the caller
                 // that knows where it publishes folds it in with [`Usage::with_network`].
                 network: None,
+                // A build or a `vk run` has no overlaid checkout to fill, so there is no layer
+                // here to have a mark; a job's is folded in by the executor that asks its guest.
+                overlay: None,
                 peak_rss: peak,
                 largest_rss: Some(largest),
                 disk: io_accounted().then(|| {
@@ -1144,6 +1174,27 @@ mod tests {
             }
             .summary("build"),
             "virtkit: build resource usage: cpu 2m14s, peak memory 1.6 GiB"
+        );
+        // The writable layer follows the memory it is part of, and against its capacity, so a
+        // job that died of ENOSPC with an empty disk can be read off the line it ends with.
+        assert_eq!(
+            Usage {
+                overlay: Some((10_431_037_440, 10_737_418_240)),
+                disk: Some((0, 0)),
+                ..usage
+            }
+            .summary("job"),
+            "virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB, \
+             overlay 9.7 GiB of 10.0 GiB, read 0 B, written 0 B"
+        );
+        // A phase with no overlaid checkout leaves it out rather than claiming an empty layer.
+        assert_eq!(
+            Usage {
+                overlay: None,
+                ..usage
+            }
+            .summary("job"),
+            "virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB"
         );
     }
 }

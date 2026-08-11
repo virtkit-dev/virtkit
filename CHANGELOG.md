@@ -6,6 +6,15 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **A CI job now reports how full it filled its writable layer.** Where a job builds on an
+  in-guest overlay above its checkout, everything it writes under `CI_PROJECT_DIR` is RAM
+  capped at half the VM's memory — a wall that fails the job for want of space while every disk
+  on the host sits empty and the `written` figure beside it says it wrote nothing at all. The
+  job's usage line, the "most this job has used lately" line and `vk gitlab usage` now carry
+  the high-water mark against that capacity (`overlay 9.7 GiB of 10.0 GiB`), so a job running
+  out of room is visible before it fails and `MICROVM_MEM` can be raised on evidence rather
+  than on a guess. A job whose checkout is mounted read-write has no such layer and reports
+  none, as does one on a guest too old to be asked.
 - **A raw disk image can be exported for VMware.** `vk export vmdk disk.raw` packages a
   bootable raw disk (e.g. a `vk build --disk` artifact) as a streamOptimized VMDK — the
   compressed subformat vSphere's OVF/OVA import streams — natively, with no qemu-img.

@@ -87,7 +87,7 @@ pub async fn run_stage(ctx: &JobCtx, script_path: &Path, stage: Option<&str>) ->
     if stage == Some(FINAL_STAGE) {
         report_egress_audit(ctx);
         report_contacted_names(ctx);
-        report_resource_usage(ctx);
+        report_resource_usage(ctx).await;
         report_project_usage(ctx);
     }
     result
@@ -189,19 +189,23 @@ fn report_contacted_names(ctx: &JobCtx) {
     }
 }
 
-/// Print what the job cost the runner — the CPU time, peak memory, and disk and network
-/// traffic of its microVM and the host helpers around it (see usage) — into the job trace,
-/// so a job can be sized from what it actually used. Sampled here rather than at cleanup
-/// because this is the last stage whose output the trace still keeps, and the job's processes
-/// are all still alive to be read: it therefore covers everything but the guest's own
-/// shutdown. Best-effort: a job whose supervisor is already gone (the guest died) reports
-/// nothing.
+/// Print what the job cost the runner — the CPU time, peak memory, the writable layer it
+/// filled, and the disk and network traffic of its microVM and the host helpers around it (see
+/// usage) — into the job trace, so a job can be sized from what it actually used. Sampled here
+/// rather than at cleanup because this is the last stage whose output the trace still keeps,
+/// and the job's processes are all still alive to be read: it therefore covers everything but
+/// the guest's own shutdown. Best-effort: a job whose supervisor is already gone (the guest
+/// died) reports nothing.
 ///
 /// The same figure is what the next run of this job is admitted against where the host
 /// reserves from history (`[schedule] from_history`), so it is recorded here too.
-fn report_resource_usage(ctx: &JobCtx) {
+async fn report_resource_usage(ctx: &JobCtx) {
+    // Asked of the guest before the tree is read, so the memory marks stay the last thing
+    // measured and cover as much of the job as they can.
+    let overlay = overlay_mark(ctx).await;
     if let Some(pid) = crate::vm::live_supervisor_pid(ctx)
-        && let Some(usage) = crate::usage::tree(pid).map(|u| u.with_network(&ctx.net_bytes_log()))
+        && let Some(usage) = crate::usage::tree(pid)
+            .map(|u| u.with_network(&ctx.net_bytes_log()).with_overlay(overlay))
     {
         eprintln!("{}", usage.summary("job"));
         // Recorded before it is summarised, so the line below counts this run too, and in the
@@ -221,11 +225,64 @@ fn report_resource_usage(ctx: &JobCtx) {
                     ceiling,
                     disk: usage.disk,
                     network: usage.network,
+                    overlay: usage.overlay,
                 },
             );
             report_job_history(ctx, ceiling_mib);
         }
     }
+}
+
+/// How full the guest's writable layer got, asked of the guest's own agent (`vk-agent fsmark`):
+/// with `[gitlab] checkout_overlay` the job's writes land on a tmpfs inside the VM, which is
+/// guest RAM and so invisible to every host counter — the agent is the only thing that can
+/// measure it, and it keeps the high-water mark rather than what happens to be left now.
+///
+/// `None` where there is no such layer to ask about, so a host that mounts the checkout
+/// read-write costs no round-trip at all. A guest whose agent predates the subcommand answers
+/// non-zero and reads the same way: unmeasured, which is not a layer that stayed empty.
+async fn overlay_mark(ctx: &JobCtx) -> Option<(u64, u64)> {
+    let gitlab = ctx.cfg.gitlab.as_ref()?;
+    if !(gitlab.host_checkout && gitlab.checkout_overlay) {
+        return None;
+    }
+    let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = {
+        let out = Arc::clone(&out);
+        OutputSink::Routed(Arc::new(move |fd, bytes: &[u8]| {
+            // stdout only: the subcommand explains itself on stderr when it has no layer to
+            // report, and that is prose, not a figure.
+            if matches!(fd, Fd::Stdout)
+                && let Ok(mut buf) = out.lock()
+            {
+                buf.extend_from_slice(bytes);
+            }
+        }))
+    };
+    let asked = exec_script(
+        &vsock_addr(ctx),
+        &[crate::run::GUEST_AGENT.to_string(), "fsmark".to_string()],
+        Vec::new(),
+        None,
+        &sink,
+        None,
+    )
+    .await;
+    if !matches!(asked, Ok(r) if r.code == Some(0)) {
+        return None;
+    }
+    parse_mark(&out.lock().ok()?)
+}
+
+/// The two figures `vk-agent fsmark` prints, `<used> <total>` in bytes. `None` for anything
+/// else: a mark read short — or read from a guest answering something else entirely — is no
+/// measurement, and reporting half of one as a whole one would understate the layer.
+fn parse_mark(out: &[u8]) -> Option<(u64, u64)> {
+    let text = std::str::from_utf8(out).ok()?;
+    let mut figures = text.split_whitespace();
+    let used = figures.next()?.parse().ok()?;
+    let total = figures.next()?.parse().ok()?;
+    Some((used, total))
 }
 
 /// Follow the run's own figures with what runs of this job have been using lately — the
@@ -401,4 +458,45 @@ async fn next(
         .next()
         .await
         .ok_or_else(|| anyhow!("connection to the VM lost"))??)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_mark;
+
+    #[test]
+    fn the_writable_layer_mark_is_the_two_figures_the_agent_prints() {
+        assert_eq!(
+            parse_mark(b"10431037440 10737418240\n"),
+            Some((10_431_037_440, 10_737_418_240))
+        );
+    }
+
+    #[test]
+    fn anything_but_two_figures_is_no_mark() {
+        // The guest is asked over the same channel that runs job scripts, so the reply has to
+        // be checked rather than trusted: an agent too old for the subcommand, a shell that
+        // wrote a diagnostic to stdout, or a reply cut short all mean "unmeasured" — and half a
+        // pair reported as a whole one would understate the layer a job was working in.
+        for out in [
+            &b""[..],
+            b"10431037440",
+            b"10431037440 \n",
+            b"nine 10737418240",
+            b"/proc/self/exe: not found\n",
+            b"-1 10737418240",
+        ] {
+            assert_eq!(
+                parse_mark(out),
+                None,
+                "accepted {:?}",
+                String::from_utf8_lossy(out)
+            );
+        }
+    }
+
+    #[test]
+    fn a_mark_that_is_not_utf8_is_no_mark() {
+        assert_eq!(parse_mark(&[0xff, 0xfe]), None);
+    }
 }

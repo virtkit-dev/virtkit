@@ -211,10 +211,10 @@ const FLOOR_MIB: u64 = 512;
 /// arithmetic in MiB — which is the unit the ledger, `[vm] mem` and `MICROVM_MEM` all use.
 const MIB: u64 = 1024 * 1024;
 
-/// One remembered run: when it ended, the peak it reached, the ceiling it ran under, and the
-/// disk and network traffic it moved. The ceiling matters because a peak is only evidence of
-/// what a job needs while the job was free to need it — a run held to 4 GiB says nothing
-/// about the same job given 16.
+/// One remembered run: when it ended, the peak it reached, the ceiling it ran under, how full
+/// it filled its writable layer, and the disk and network traffic it moved. The ceiling matters
+/// because a peak is only evidence of what a job needs while the job was free to need it — a
+/// run held to 4 GiB says nothing about the same job given 16.
 ///
 /// Every figure is in **bytes**. Memory alone would read fine in MiB — it is what the
 /// reservation arithmetic and `MICROVM_MEM` are in — but the traffic beside it routinely
@@ -234,6 +234,11 @@ struct Sample {
     /// `None` where no switch counted — a `net.mode = "tap"` run, whose traffic goes nowhere
     /// near one.
     network: Option<(u64, u64)>,
+    /// How full its writable layer got, as `(the high-water mark, the capacity)`, under the
+    /// same rule again: `None` where the run had no in-guest overlay to measure. The capacity
+    /// is remembered beside the mark because it follows the VM's memory rather than the
+    /// ceiling exactly, so the mark alone could not say how near the wall a run came.
+    overlay: Option<(u64, u64)>,
 }
 
 /// What one run of a job cost, as its history remembers it, in bytes.
@@ -245,6 +250,9 @@ pub struct Run {
     pub disk: Option<(u64, u64)>,
     /// What its guests sent and received outside, or `None` where nothing counted it.
     pub network: Option<(u64, u64)>,
+    /// How full it filled its writable layer and how much that layer held, or `None` where it
+    /// had no in-guest overlay to fill.
+    pub overlay: Option<(u64, u64)>,
 }
 
 /// The most a job has needed lately, in bytes, and over how many runs. Memory is what a
@@ -259,15 +267,19 @@ struct Recent {
     most_disk: Option<(u64, u64)>,
     /// The same for the network.
     most_network: Option<(u64, u64)>,
+    /// The fullest its writable layer got, and what that layer held, over the runs that had
+    /// one. Unlike the traffic beside it this is a ceiling a job can *fail* against, so it is
+    /// the figure to read when a job dies of `ENOSPC` with every host disk empty.
+    most_overlay: Option<(u64, u64)>,
     runs: usize,
 }
 
 /// Note what a job of this kind actually used, and the ceiling it used it under, for the
 /// next one to be admitted against. One
-/// `<unix seconds> <peak> <ceiling> <read> <written> <sent> <received>` line per run, every
-/// figure in bytes and an unmeasured pair written `-`, appended whole so runs finishing
-/// together cannot tear each other's; best-effort, since a lost sample only costs accuracy
-/// on the next admission.
+/// `<unix seconds> <peak> <ceiling> <read> <written> <sent> <received> <overlay> <capacity>`
+/// line per run, every figure in bytes and an unmeasured pair written `-`, appended whole so
+/// runs finishing together cannot tear each other's; best-effort, since a lost sample only
+/// costs accuracy on the next admission.
 ///
 /// Widening the line retires the histories written before it: a run without the new fields
 /// is dropped rather than read short, since a reader loose enough to accept it could not
@@ -323,6 +335,7 @@ fn remember_at(dir: &Path, key: &Path, run: Run, now: u64) {
                 ceiling: run.ceiling,
                 disk: run.disk,
                 network: run.network,
+                overlay: run.overlay,
             })
             .as_bytes(),
         );
@@ -397,6 +410,7 @@ fn most_recent_at(dir: &Path, key: &Path, ceiling: u64, now: u64) -> Option<Rece
         // dragging the maximum down to zero.
         most_disk: heaviest(window, |s| s.disk),
         most_network: heaviest(window, |s| s.network),
+        most_overlay: heaviest(window, |s| s.overlay),
         runs: window.len(),
     })
 }
@@ -544,6 +558,7 @@ fn parse(text: &str) -> Vec<Sample> {
                 ceiling,
                 disk: pair()?,
                 network: pair()?,
+                overlay: pair()?,
             })
         })
         .collect()
@@ -557,12 +572,13 @@ fn sample_line(s: &Sample) -> String {
         None => "- -".to_string(),
     };
     format!(
-        "{} {} {} {} {}\n",
+        "{} {} {} {} {} {}\n",
         s.at_secs,
         s.peak,
         s.ceiling,
         pair(s.disk),
-        pair(s.network)
+        pair(s.network),
+        pair(s.overlay)
     )
 }
 
@@ -602,11 +618,12 @@ fn history_summary_at(
     // job too quiet to have a fortnight's runs is answered from its last few however old they
     // are — and a line reading "37 runs in 14 days" would then be a statement of throughput
     // that is simply untrue. The guide gives the exact rule.
+    let overlay = filled(recent.most_overlay);
     let disk = moved("read", "written", recent.most_disk);
     let net = moved("sent", "received", recent.most_network);
     let most = crate::usage::fmt_bytes(recent.most);
     Some(format!(
-        "virtkit: most this job has used lately: memory {most}{disk}{net} \
+        "virtkit: most this job has used lately: memory {most}{overlay}{disk}{net} \
          over {runs} {plural}{reserves}"
     ))
 }
@@ -741,13 +758,14 @@ fn report_where(
 
 /// One report row, headings included: a fixed width so `head`, `row`, `widths` and `line`
 /// cannot drift apart into a table whose columns do not line up.
-const COLS: usize = 9;
+const COLS: usize = 10;
 type Cells = [String; COLS];
 
 /// What the columns are called, in the order [`row`] fills them.
 fn head() -> Cells {
     [
-        "job", "memory", "ceiling", "reserves", "runs", "read", "written", "sent", "received",
+        "job", "memory", "overlay", "ceiling", "reserves", "runs", "read", "written", "sent",
+        "received",
     ]
     .map(str::to_string)
 }
@@ -764,6 +782,10 @@ fn row(job: &JobUsage, from_history: bool) -> Cells {
     [
         job.job.clone(),
         crate::usage::fmt_bytes(job.recent.most),
+        // Both figures in one cell, where every other column holds one: the mark is only
+        // legible against the layer that held it, and a job pressed against its capacity is
+        // the row an operator is reading the table to find.
+        overlay_cell(job.recent.most_overlay),
         fmt_mib(job.ceiling_mib),
         fmt_mib(job.reserves(from_history)),
         job.recent.runs.to_string(),
@@ -772,6 +794,20 @@ fn row(job: &JobUsage, from_history: bool) -> Cells {
         sent,
         received,
     ]
+}
+
+/// The overlay column's cell: the mark and the capacity it was reached against, or `-` for a
+/// job with no writable layer to fill (one whose checkout is mounted read-write, or that never
+/// had a checkout at all).
+fn overlay_cell(overlay: Option<(u64, u64)>) -> String {
+    match overlay {
+        Some((used, cap)) => format!(
+            "{} / {}",
+            crate::usage::fmt_bytes(used),
+            crate::usage::fmt_bytes(cap)
+        ),
+        None => "-".to_string(),
+    }
 }
 
 /// Each column wide enough for the widest cell in it, headings included.
@@ -923,6 +959,20 @@ fn moved(one: &str, other: &str, pair: Option<(u64, u64)>) -> String {
             ", {one} {}, {other} {}",
             crate::usage::fmt_bytes(a),
             crate::usage::fmt_bytes(b)
+        ),
+        None => String::new(),
+    }
+}
+
+/// The writable layer for a trace line, the mark against what the layer held — the pair, not
+/// the mark alone, because a job reads this to learn whether it has room left. Nothing at all
+/// where no run in the window had a layer to fill.
+fn filled(overlay: Option<(u64, u64)>) -> String {
+    match overlay {
+        Some((used, cap)) => format!(
+            ", overlay {} of {}",
+            crate::usage::fmt_bytes(used),
+            crate::usage::fmt_bytes(cap)
         ),
         None => String::new(),
     }
@@ -1650,6 +1700,7 @@ mod tests {
                 ceiling: ceiling(CEIL),
                 disk: Some((3482 * MIB, 812 * MIB)),
                 network: Some((3 * MIB, 941 * MIB)),
+                ..Run::default()
             },
             now,
         );
@@ -1657,6 +1708,25 @@ mod tests {
             history_summary_at(&dir, key("job"), 8192, false, now).unwrap(),
             "virtkit: most this job has used lately: memory 1.6 GiB, read 3.4 GiB, \
              written 812 MiB, sent 3 MiB, received 941 MiB over 3 runs"
+        );
+
+        // The writable layer reads beside the memory and before the traffic, as the pair it is:
+        // the mark alone would not say this job came within a hair of failing on space.
+        remember_at(
+            &dir,
+            key("filled"),
+            Run {
+                peak: 15_800 * MIB,
+                ceiling: ceiling(CEIL),
+                overlay: Some((9_950 * MIB, 10_240 * MIB)),
+                ..Run::default()
+            },
+            now,
+        );
+        assert_eq!(
+            history_summary_at(&dir, key("filled"), 8192, false, now).unwrap(),
+            "virtkit: most this job has used lately: memory 15.4 GiB, \
+             overlay 9.7 GiB of 10.0 GiB over 1 run"
         );
 
         // Read against the ceiling the job is running at now, so widening MICROVM_MEM leaves
@@ -1672,7 +1742,7 @@ mod tests {
                 peak: 900 * MIB,
                 ceiling: ceiling(CEIL),
                 disk: Some((0, 0)),
-                network: None,
+                ..Run::default()
             },
             now,
         );
@@ -1879,21 +1949,26 @@ mod tests {
                 peak: 500 * MIB,
                 ceiling: ceiling(2048),
                 disk: Some((10 * MIB, 20 * MIB)),
-                network: None,
+                // An overlaid checkout it nearly filled, beside a job that had no layer at all:
+                // the column has to tell those two apart.
+                overlay: Some((900 * MIB, 1024 * MIB)),
+                ..Run::default()
             },
         );
         put("77-other", "lint", run(300, 2048));
 
         // Narrowed by any part of the directory name — the slug is what an operator knows.
         let report = project_report(&dir, "acme", Some(Ok(16384)), true).expect("acme has run");
-        assert_eq!(
-            report,
-            "virtkit: 42-acme — what its jobs have been using lately:\n\
-             \x20 job         memory  ceiling  reserves  runs    read  written  sent  received\n\
-             \x20 build      5.9 GiB  8.0 GiB   7.3 GiB     1       -        -     -         -\n\
-             \x20 test_unit  500 MiB  2.0 GiB   625 MiB     1  10 MiB   20 MiB     -         -\n\
-             virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.0 GiB\n"
-        );
+        // Written out at the left margin, as the table it is: a column that stops lining up is
+        // the whole failure, and an expectation wrapped to fit an indent could not show it.
+        let want = "\
+virtkit: 42-acme — what its jobs have been using lately:
+  job         memory            overlay  ceiling  reserves  runs    read  written  sent  received
+  build      5.9 GiB                  -  8.0 GiB   7.3 GiB     1       -        -     -         -
+  test_unit  500 MiB  900 MiB / 1.0 GiB  2.0 GiB   625 MiB     1  10 MiB   20 MiB     -         -
+virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.0 GiB
+";
+        assert_eq!(report, want);
         assert!(!report.contains(digest), "the digest is not for reading");
 
         // No project named reports the whole host, one table's worth of columns throughout.
@@ -1955,7 +2030,7 @@ mod tests {
             peak: 900 * MIB,
             ceiling: ceil,
             disk: Some((10 * MIB, 20 * MIB)),
-            network: None,
+            ..Run::default()
         };
         remember_at(&dir, key("job"), measured, now);
         remember_at(
@@ -1971,7 +2046,7 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("job")).unwrap(),
             format!(
-                "{now} {} {ceil} {} {} - -\n{now} {} {ceil} - - - -\n",
+                "{now} {} {ceil} {} {} - - - -\n{now} {} {ceil} - - - - - -\n",
                 900 * MIB,
                 10 * MIB,
                 20 * MIB,
@@ -1984,9 +2059,11 @@ mod tests {
             Some(Recent {
                 most: 900 * MIB,
                 // The run that could measure carries the disk; the network neither run saw
-                // has no maximum at all, which is what keeps it off the trace line.
+                // has no maximum at all, which is what keeps it off the trace line — as does
+                // the writable layer neither run had.
                 most_disk: Some((10 * MIB, 20 * MIB)),
                 most_network: None,
+                most_overlay: None,
                 runs: 2,
             })
         );
@@ -2043,14 +2120,15 @@ mod tests {
         let ceil = ceiling(CEIL);
         let (peak, read, written) = (900 * MIB, 10 * MIB, 20 * MIB);
         let (sent, received) = (2 * MIB, 400 * MIB);
+        let (mark, cap) = (600 * MIB, 1024 * MIB);
         let (torn, lesser) = (4000 * MIB, 700 * MIB);
         std::fs::write(
             dir.join("job"),
             format!(
-                "{now} {peak} {ceil} {read} {written} {sent} {received}\n\
+                "{now} {peak} {ceil} {read} {written} {sent} {received} {mark} {cap}\n\
                  {now} {torn} {ceil} 30 30 30\n\
                  nonsense\n\
-                 {now} {lesser} {ceil} 5 5 5 5\n"
+                 {now} {lesser} {ceil} 5 5 5 5 5 5\n"
             ),
         )
         .unwrap();
@@ -2062,6 +2140,7 @@ mod tests {
                 most: peak,
                 most_disk: Some((read, written)),
                 most_network: Some((sent, received)),
+                most_overlay: Some((mark, cap)),
                 runs: 2,
             })
         );

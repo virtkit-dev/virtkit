@@ -136,7 +136,7 @@ virtkit: build resource usage: cpu 8m12s, peak memory 3.2 GiB (largest process 1
 and the run figures come at the very end of the trace:
 
 ```
-virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB, read 3.4 GiB, written 812 MiB, sent 3 MiB, received 941 MiB
+virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB, overlay 1.2 GiB of 10.0 GiB, read 3.4 GiB, written 812 MiB, sent 3 MiB, received 941 MiB
 ```
 
 `cpu` is all the CPU time the phase burned on the host, the guests' own execution
@@ -172,6 +172,21 @@ Either line is omitted rather than guessed at when the figures cannot be had: th
 for a job whose guest died and took the supervisor with it, the build ones for a build that
 shared the host process with another (both would be charged for each other's guests) or that
 the host could spare no sampler thread for.
+
+`overlay` is how full the job filled its **writable layer**, against what that layer held.
+With `[gitlab] checkout_overlay` (the default) a job builds on an overlay above its checkout
+whose upper layer is a tmpfs inside the VM, so every write under `CI_PROJECT_DIR` — the build
+tree, a package cache pointed there, an unpacked archive — is guest RAM, capped at half the
+VM's memory. That cap is a wall a job can hit: it fails with `ENOSPC` while every disk on the
+host sits empty, and the `written` figure beside it says the job wrote nothing at all, because
+none of those pages ever reached a block device. Read the pair as the room the job had left —
+`1.2 GiB of 10.0 GiB` has plenty, `9.9 GiB of 10.0 GiB` is a job about to fail on space — and
+raise `MICROVM_MEM` when a build tree needs more, since the capacity follows it.
+
+The figure is the high-water mark, not what the layer held at the end: a job that unpacks an
+archive and deletes it would otherwise read as having needed nothing. It comes from the guest,
+which is the only place a tmpfs can be seen from, so a job with no overlaid checkout reports
+none — as does one on a guest whose agent is older than the figure.
 
 `read` and `written` are what the phase cost the runner's **storage**, not what its programs
 asked for: `read` is what was actually fetched from the block layer, so a guest re-reading a
@@ -333,13 +348,14 @@ Every job trace says where it stands, whether or not the host reserves this way 
 is how you decide to:
 
 ```
-virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB, read 3.4 GiB, written 812 MiB, sent 3 MiB, received 941 MiB
-virtkit: most this job has used lately: memory 2.1 GiB, read 12.0 GiB, written 3.1 GiB, sent 40 MiB, received 4.2 GiB over 37 runs; the next run reserves 2.6 GiB
+virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB, overlay 1.2 GiB of 10.0 GiB, read 3.4 GiB, written 812 MiB, sent 3 MiB, received 941 MiB
+virtkit: most this job has used lately: memory 2.1 GiB, overlay 1.9 GiB of 10.0 GiB, read 12.0 GiB, written 3.1 GiB, sent 40 MiB, received 4.2 GiB over 37 runs; the next run reserves 2.6 GiB
 ```
 
-Only the memory is reserved against; the traffic rides along because a job that pulls 4 GiB
-in and out of the host every run is a fact about the host worth knowing. Each figure is its
-own maximum over the window, so they need not all come from the same run.
+Only the memory is reserved against; the writable layer and the traffic ride along because a
+job that fills its overlay or pulls 4 GiB in and out of the host every run is a fact about the
+host worth knowing. Each figure is its own maximum over the window, so they need not all come
+from the same run.
 
 The run count is what the estimate rests on: the runs of the last 14 days, or the last five
 however old for a job too quiet to have that many. The `; the next run reserves …` clause
@@ -365,18 +381,20 @@ to cover:
 ```console
 $ vk gitlab usage acme
 virtkit: 42-acme — what its jobs have been using lately:
-  job         memory  ceiling  reserves  runs     read  written   sent  received
-  build      5.9 GiB  8.0 GiB   7.3 GiB    24  3.4 GiB  812 MiB  3 MiB   941 MiB
-  test_unit  500 MiB  2.0 GiB   625 MiB    37        -        -  2 MiB    88 MiB
+  job         memory            overlay  ceiling  reserves  runs     read  written   sent  received
+  build      5.9 GiB  3.9 GiB / 4.0 GiB  8.0 GiB   7.3 GiB    24  3.4 GiB  812 MiB  3 MiB   941 MiB
+  test_unit  500 MiB                  -  2.0 GiB   625 MiB    37        -        -  2 MiB    88 MiB
 virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.0 GiB
 ```
 
 The argument is any part of a project's `<id>-<slug>` directory name, so the slug alone will
 do; without one it reports every project on the host. `reserves` is what each job's next run
 would claim: its declared size, or — with `[schedule] from_history` on, as above — what its
-history says it needs. A `-` is a figure no run could measure
-— an unaudited kernel for the disk columns, a `net.mode = "tap"` job for the network ones —
-which is not the same as a job that moved nothing.
+history says it needs. `overlay` is the writable layer against its capacity, the one column
+holding a figure a job can *fail* against rather than merely be sized by: `build` above has
+150 MiB of room left. A `-` is a figure no run could measure
+— an unaudited kernel for the disk columns, a `net.mode = "tap"` job for the network ones, a
+job with no overlaid checkout for `overlay` — which is not the same as a job that moved nothing.
 
 A job can ask for its own project's report and get it in its trace, for an operator with the
 GitLab UI but no shell on the runner:

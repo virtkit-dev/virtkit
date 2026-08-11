@@ -65,11 +65,11 @@ const HOST_EXEC_PORT: u32 = 1100;
 /// The run LAN: gateway .1, the run VM .2, services from the top down.
 const RUN_SUBNET: &str = "192.168.127.0/24";
 
-/// How the host re-invokes the agent's native subcommands (`fsfreeze`, `mount`,
-/// `copy`) inside the guest. `/proc/self/exe` resolves, in the forked child, to the
+/// How the host re-invokes the agent's native subcommands (`fsfreeze`, `mount`, `copy`,
+/// `fsmark`) inside the guest. `/proc/self/exe` resolves, in the forked child, to the
 /// running agent binary — so this works whether the agent was injected into the rootfs
 /// (legacy) or booted from an initramfs and pivoted in (its on-disk path then gone).
-const GUEST_AGENT: &str = "/proc/self/exe";
+pub(crate) const GUEST_AGENT: &str = "/proc/self/exe";
 
 /// Guest mountpoint of a `--workdir` host-dir share (the live tree the command runs in).
 const WORKDIR_MOUNT: &str = "/work";

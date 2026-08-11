@@ -178,6 +178,13 @@ fn main() {
         let rest: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(vk_agent::fsfreeze::trim_main(&rest));
     }
+    // The writable layer's high-water mark (no socket): the host runs `vk-agent fsmark` in the
+    // guest at the end of a job to read how full the overlay tmpfs its writes land on ever got
+    // — guest RAM, which no host counter sees.
+    if std::env::args().nth(1).as_deref() == Some("fsmark") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(vk_agent::fsmark::main(&rest));
+    }
     // Local block-device mount/unmount (no socket): the host attaches a source stage's
     // ext4 read-only and runs `vk-agent mount|umount …` in the guest to read it.
     if matches!(

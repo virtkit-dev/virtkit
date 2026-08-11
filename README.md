@@ -85,8 +85,10 @@ what the work costs rather than by guess.
 Where several guests run at once (concurrent build stages, a compose fleet) a
 build and a `vk run` also name the largest single process, which is the
 difference between giving each guest more memory and running fewer of them at a
-time. See the [GitLab CI guide](docs/gitlab-ci.md#resource-usage) for what each
-figure covers.
+time. A CI job adds how full it filled the in-guest layer its writes land on,
+against what that layer holds — the wall behind an out-of-space failure no host
+disk can explain. See the [GitLab CI guide](docs/gitlab-ci.md#resource-usage)
+for what each figure covers.
 
 Carry one file around. The hypervisor, the guest kernel, and the guest agent are
 all embedded in `vk`, so you can copy it to any Linux machine with `/dev/kvm`

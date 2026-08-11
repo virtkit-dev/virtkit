@@ -2460,8 +2460,7 @@ mod tests {
             crate::admit::Run {
                 peak: 1000 * 1024 * 1024,
                 ceiling: ceiling_mib * 1024 * 1024,
-                disk: None,
-                network: None,
+                ..crate::admit::Run::default()
             },
         );
         // 1000 MiB + 25% headroom, under the 8 GiB it declares.

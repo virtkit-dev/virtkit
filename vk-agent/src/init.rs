@@ -145,6 +145,10 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     maybe_host_exec(&cmdline);
     maybe_ssh_agent(&cmdline);
     let serve = spawn_serve(socket, inactivity_timeout)?;
+    // After the last fork: the sampler is a thread, and forking with one running would leave a
+    // child holding a lock it can only drop by exec'ing. Nothing has run in the guest yet — the
+    // serve above only now begins accepting commands — so no writes go unwatched.
+    crate::fsmark::watch();
     install_term_handler();
     supervise(serve)
 }
@@ -845,7 +849,12 @@ fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<()> {
 }
 
 /// Root under which overlay-backed shares keep their private lower/upper/work mounts.
-const OVERLAY_ROOT: &str = "/run/virtkit-overlay";
+pub(crate) const OVERLAY_ROOT: &str = "/run/virtkit-overlay";
+
+/// The tmpfs holding one overlay's upper+work, under its private directory. Named here rather
+/// than spelled twice because [`crate::fsmark`] measures that layer from the outside and must
+/// not drift from where [`overlay_dirs`] mounts it.
+pub(crate) const OVERLAY_RW: &str = "rw";
 
 /// The share tags VIRTKIT_VIRTIOFS_OVERLAY marks for an in-guest overlay.
 ///
@@ -884,11 +893,12 @@ struct OverlayDirs {
 
 fn overlay_dirs(tag: &str) -> OverlayDirs {
     let base = format!("{OVERLAY_ROOT}/{tag}");
+    let rw = format!("{base}/{OVERLAY_RW}");
     OverlayDirs {
         lower: format!("{base}/lower"),
-        rw: format!("{base}/rw"),
-        upper: format!("{base}/rw/upper"),
-        work: format!("{base}/rw/work"),
+        upper: format!("{rw}/upper"),
+        work: format!("{rw}/work"),
+        rw,
     }
 }
 
