@@ -304,6 +304,7 @@ virtkit: 42137-acme-web-test_unit — what its guest did:
 
 (Wrapped here to fit the page — the real output is one line per label.)
 
+
 Totals cover every sample, including the first — a job's VM boot is part of what the job cost.
 A figure computed *over* an interval — the cpu percentages, the rate of context switching, the
 sparklines — leaves that first sample out, because it covers however long the guest had been up
@@ -314,6 +315,19 @@ still reported as one. `pressure` is the line to read when a job is slow for no
 visible reason: it is time the guest spent *waiting* for a processor, for memory or for its
 disk, which no total of what it used can show. A figure the kernel could not measure prints as
 `-`, never as a zero.
+
+`--json` writes the samples themselves, one object per line, for anything that would rather
+compute than read. The units are the log's own: pages, with their `pagesize` beside them;
+ticks, with their `hertz` beside them; 512-byte sectors; and KiB for a process's resident size
+(`rsize_kib`). A counter the guest's kernel does not have is `null` rather than a zero — as is
+a scale whose record a sample did not carry, so check `hertz` and `pagesize` before dividing by
+one. A log with no complete sample writes nothing and exits 0, where `--summary` reports that
+there is nothing to account yet:
+
+```sh
+vk gitlab atop 42137 --json | jq -c '{t: .epoch, user_sys: (.cpu.user + .cpu.system)}'
+vk gitlab atop 42137 --json | jq '.procs | max_by(.rsize_kib) | {name, rsize_kib}'
+```
 
 The format is the text `atop -P` prints, pinned to the field order of atop 2.8.1 (what Debian
 12 ships), so anything that already reads that — a parser, or plain `grep`/`awk` — reads these

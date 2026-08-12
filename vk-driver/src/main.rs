@@ -208,6 +208,11 @@ enum GitlabCmd {
         /// processes the time went to.
         #[arg(long)]
         summary: bool,
+        /// Write every sample as one line of JSON, so a pipeline can take the samples a
+        /// line at a time (`vk gitlab atop 42137 --json | jq …`). Not with `--summary`: one
+        /// accounts the job, the other hands over the figures to account it with.
+        #[arg(long, conflicts_with = "summary")]
+        json: bool,
     },
     /// internal: the detached per-job supervisor prepare spawns — owns the job's
     /// switch/virtiofsds/forwards/VMM as tied children until SIGTERM'd by cleanup
@@ -2622,12 +2627,40 @@ async fn cli_main() -> ExitCode {
                     Err(e) => fail(&e, ctx.system_failure),
                 }
             }
-            GitlabCmd::Atop { job, summary } => match atop::resolve(&ctx.cfg, &job) {
+            GitlabCmd::Atop { job, summary, json } => match atop::resolve(&ctx.cfg, &job) {
                 // Exit 2 for a job nothing answers to, like `vk status`/`list`/`stop` — a
                 // reader of the path must not be handed a success with no path.
                 Err(e) => fail(&e, 2),
                 Ok(path) if summary => match atop_report::summarize(&path) {
                     Ok(report) => write_report(&report),
+                    Err(e) => fail(&e, 1),
+                },
+                Ok(path) if json => match atoplog::read(&path) {
+                    Ok(text) => {
+                        use std::io::Write;
+                        let parsed = atoplog::parse(&text);
+                        // On stderr, never on stdout: stdout is the JSON stream, and a
+                        // pipeline must not total a log that lost records as a whole one.
+                        if parsed.dropped > 0 {
+                            eprintln!(
+                                "virtkit: warning: {} — {} record(s) did not carry their \
+                                 label's fields and were left out",
+                                path.display(),
+                                parsed.dropped
+                            );
+                        }
+                        let mut out = std::io::stdout().lock();
+                        match atoplog::write_json(&parsed.samples, &mut out)
+                            .and_then(|()| out.flush())
+                        {
+                            Ok(()) => ExitCode::SUCCESS,
+                            // A closed pipe (`| head`) is how a reader says it has seen enough.
+                            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                                ExitCode::SUCCESS
+                            }
+                            Err(e) => fail(&anyhow::anyhow!(e), 1),
+                        }
+                    }
                     Err(e) => fail(&e, 1),
                 },
                 // Just the path, so it composes with whatever the operator reads logs with.

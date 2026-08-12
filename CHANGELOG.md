@@ -26,6 +26,9 @@ All notable changes to virtkit will be documented in this file.
   resource, the shape of it over time, and which of its processes the time went to. A figure
   the guest's kernel could not measure reads as `-` rather than as zero, and a log torn off by
   a VM that died is reported as far as it goes.
+- **`vk gitlab atop --json` writes a recorded job's samples as JSON lines.** One object per
+  sample, in the log's own units, for anything that would rather compute over a job than read
+  it (`… --json | jq`). A figure the guest's kernel could not measure is `null`, never a zero.
 
 ## [0.32.0] - 2026-08-11
 

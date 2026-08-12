@@ -94,7 +94,7 @@ impl Parsed {
 }
 
 /// One interval of a guest's life, as the log records it.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize)]
 pub struct Sample {
     /// When the sample was taken (seconds since the epoch).
     pub epoch: i64,
@@ -119,7 +119,7 @@ pub struct Sample {
 }
 
 /// Processor time over the interval, in ticks of `hertz`.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize)]
 pub struct Cpu {
     /// Which processor, for a per-core record; `None` for the total across all of them.
     pub core: Option<u32>,
@@ -166,7 +166,7 @@ impl Cpu {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize)]
 pub struct Load {
     pub load1: f64,
     pub load5: f64,
@@ -176,7 +176,7 @@ pub struct Load {
 }
 
 /// Memory as it stood, in pages of `pagesize`.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize)]
 pub struct Mem {
     pub pagesize: u64,
     pub physmem: u64,
@@ -208,7 +208,7 @@ impl Mem {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize)]
 pub struct Swap {
     pub pagesize: u64,
     pub total: u64,
@@ -229,7 +229,7 @@ impl Swap {
 }
 
 /// The paging events that say a guest was short of memory, over the interval.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize)]
 pub struct Paging {
     /// Allocations that had to wait for the kernel to reclaim.
     pub allocstalls: u64,
@@ -241,14 +241,14 @@ pub struct Paging {
 
 /// One pressure-stall resource: the averages as they stood, and the microseconds stalled
 /// during the interval.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, serde::Serialize)]
 pub struct Stall {
     /// The share of the last ten seconds spent stalled, as the sample was taken.
     pub avg10: f64,
     pub total_us: u64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize)]
 pub struct Psi {
     /// Whether the guest kernel reports pressure at all (`psi=1` on its cmdline).
     pub supported: bool,
@@ -261,7 +261,7 @@ pub struct Psi {
 
 /// One disk over the interval. A device that did nothing has no record, so an absent disk
 /// moved nothing rather than being unknown.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize)]
 pub struct Disk {
     pub name: String,
     /// Milliseconds the device was busy over the interval.
@@ -275,14 +275,14 @@ pub struct Disk {
 pub const SECTOR: u64 = 512;
 
 /// The protocol layers: connections held as they stand, segments resent over the interval.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize)]
 pub struct Net {
     pub tcp_established: u64,
     pub tcp_retrans: u64,
 }
 
 /// One interface over the interval.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize)]
 pub struct Iface {
     pub name: String,
     pub bytes_in: u64,
@@ -290,7 +290,7 @@ pub struct Iface {
 }
 
 /// One process in one sample: identity as it stands, everything else over the interval.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize)]
 pub struct Proc {
     pub pid: i32,
     pub name: String,
@@ -301,7 +301,9 @@ pub struct Proc {
     pub hertz: u64,
     pub utime: u64,
     pub stime: u64,
-    /// Resident size as it stands, in KiB.
+    /// Resident size as it stands, in KiB. Named with its unit in the JSON: this figure is
+    /// the one field whose scale is fixed rather than carried beside it.
+    #[serde(rename = "rsize_kib")]
     pub rsize: u64,
     /// 512-byte sectors moved over the interval, and whether the kernel accounted them at
     /// all — without accounting the two counts are meaningless rather than zero.
@@ -370,6 +372,28 @@ pub fn parse(text: &str) -> Parsed {
     out
 }
 
+/// Write every sample as one JSON object per line, which is what a pipeline reads: `jq` and
+/// its like take a line at a time, and no JSON document is built for the whole log.
+///
+/// The objects carry the log's own units, so nothing is rounded on the way out: pages, with
+/// their `pagesize` beside them; ticks, with their `hertz` beside them; 512-byte sectors; and
+/// KiB for a process's resident size (`rsize_kib`). A counter the guest's kernel does not have
+/// is `null`, never a zero — as is a scale the sample did not carry a record for, which is why
+/// `hertz` and `pagesize` are worth checking before dividing by one.
+///
+/// These field names are the interface `--json` promises: renaming one breaks the scripts
+/// reading it.
+pub fn write_json(samples: &[Sample], out: &mut impl std::io::Write) -> std::io::Result<()> {
+    for sample in samples {
+        // Rendered whole before any of it is written, so a closed pipe cannot leave half an
+        // object on a reader's stdin.
+        let line = serde_json::to_string(sample).map_err(std::io::Error::other)?;
+        out.write_all(line.as_bytes())?;
+        out.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
 /// One record, read by field name rather than by a counted-out position.
 struct Record<'a> {
     label: &'static Label,
@@ -395,6 +419,18 @@ impl Record<'_> {
         match self.raw(field).parse::<i64>() {
             Ok(n) if n >= 0 => Some(n as u64),
             _ => None,
+        }
+    }
+
+    /// A real-valued field. A guest can write `nan` or `inf` and both parse: neither is a
+    /// number JSON can name (each would serialize as `null`, which this format reserves for a
+    /// counter the kernel does not have), and no average over one means anything — so a figure
+    /// that is not finite reads as zero.
+    fn real(&self, field: &str) -> f64 {
+        let v: f64 = self.num(field);
+        match v.is_finite() {
+            true => v,
+            false => 0.0,
         }
     }
 
@@ -475,9 +511,9 @@ impl Builder {
             }
             "CPL" => {
                 self.sample.load = Some(Load {
-                    load1: r.num("load1"),
-                    load5: r.num("load5"),
-                    load15: r.num("load15"),
+                    load1: r.real("load1"),
+                    load5: r.real("load5"),
+                    load15: r.real("load15"),
                     ctxsw: r.num("ctxsw"),
                 })
             }
@@ -591,7 +627,7 @@ fn cpu(r: &Record, core: Option<u32>) -> Cpu {
 
 fn stall(r: &Record, resource: &str) -> Stall {
     Stall {
-        avg10: r.num(&format!("{resource}-avg10")),
+        avg10: r.real(&format!("{resource}-avg10")),
         total_us: r.num(&format!("{resource}-total")),
     }
 }
@@ -755,6 +791,101 @@ SEP
         assert_eq!(p.dropped, 1);
         assert_eq!(parse("").samples.len(), 0);
         assert_eq!(parse("SEP\n").samples.len(), 0);
+    }
+
+    /// Every sample is one line of JSON, carrying the log's own units and the scales that
+    /// make sense of them, so a pipeline reads a sample at a time.
+    #[test]
+    fn samples_serialize_one_object_per_line() {
+        let parsed = parse(LOG);
+        let mut out: Vec<u8> = Vec::new();
+        write_json(&parsed.samples, &mut out).expect("writing to a Vec cannot fail");
+        let text = String::from_utf8(out).expect("json is text");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per sample");
+
+        let first: serde_json::Value = serde_json::from_str(lines[0]).expect("a JSON object");
+        assert_eq!(first["epoch"], 1000);
+        assert_eq!(first["interval"], 40);
+        assert_eq!(first["host"], "runner");
+        assert_eq!(first["boot"], true);
+        // the scale beside the figures it applies to
+        assert_eq!(first["cpu"]["hertz"], 100);
+        assert_eq!(first["cpu"]["user"], 10);
+        assert_eq!(first["mem"]["pagesize"], 4096);
+        assert_eq!(first["mem"]["physmem"], 250_000);
+        // a counter this kernel does not have is null, not zero
+        assert_eq!(first["paging"]["oomkills"], serde_json::Value::Null);
+        assert_eq!(first["psi"]["io_some"]["total_us"], 4000);
+        assert_eq!(first["disks"][0]["name"], "vda");
+        assert_eq!(first["ifaces"][0]["name"], "eth0");
+        assert_eq!(first["cores"].as_array().expect("two cores").len(), 2);
+        let procs = first["procs"].as_array().expect("processes");
+        assert_eq!(procs.len(), 2);
+        let sh = procs.iter().find(|p| p["pid"] == 412).expect("pid 412");
+        assert_eq!(sh["cmdline"], "sh -c make test");
+        assert_eq!(sh["utime"], 120);
+        assert_eq!(
+            sh["rsize_kib"], 8000,
+            "named with its unit: the one fixed scale"
+        );
+        assert_eq!(sh["io_stats"], true);
+
+        // A label a sample did not carry is null rather than missing, so every line has the
+        // same shape whatever the guest recorded.
+        let second: serde_json::Value = serde_json::from_str(lines[1]).expect("a JSON object");
+        assert_eq!(second["boot"], false);
+        assert_eq!(second["psi"], serde_json::Value::Null);
+    }
+
+    /// The log is text a hostile process chose: a command line can hold quotes, backslashes
+    /// and bytes that are not text, and one line of JSON has to survive all of them.
+    #[test]
+    fn a_hostile_command_line_still_yields_one_valid_line() {
+        let cmd = "sh -c echo \"a\\b\"\u{1}\u{fffd}\ttail";
+        let log = format!(
+            "PRG runner 1000 1970/01/01 00:16:40 40 412 (sh) S 1000 100 412 3 0 900 ({cmd}) \
+             1 1 2 0 1000 100 1000 100 1000 100 0 y 0 0 - N ()\nSEP\n"
+        );
+        let mut out: Vec<u8> = Vec::new();
+        write_json(&parse(&log).samples, &mut out).expect("writing to a Vec cannot fail");
+        let text = String::from_utf8(out).expect("json is text");
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "one line, whatever the command held"
+        );
+        let v: serde_json::Value = serde_json::from_str(text.trim_end()).expect("a JSON object");
+        assert_eq!(v["procs"][0]["cmdline"], cmd, "escaped, and back again");
+    }
+
+    /// `nan` and `inf` parse as floats but are numbers JSON cannot name — and `null` here
+    /// would read as a counter the guest's kernel does not have, which is a different thing.
+    #[test]
+    fn a_figure_that_is_not_finite_reads_as_zero() {
+        let parsed = parse("CPL runner 1000 1970/01/01 00:16:40 40 2 nan inf -inf 4242 909\nSEP\n");
+        let load = parsed.samples[0].load.as_ref().expect("a CPL record");
+        assert_eq!((load.load1, load.load5, load.load15), (0.0, 0.0, 0.0));
+        let mut out: Vec<u8> = Vec::new();
+        write_json(&parsed.samples, &mut out).expect("writing to a Vec cannot fail");
+        let text = String::from_utf8(out).expect("json is text");
+        let v: serde_json::Value = serde_json::from_str(text.trim_end()).expect("a JSON object");
+        assert_eq!(v["load"]["load1"], 0.0, "a number, not null");
+    }
+
+    /// A log with nothing complete in it writes nothing, so a pipeline reads an empty stream
+    /// rather than half an object.
+    #[test]
+    fn a_log_with_no_complete_sample_writes_nothing() {
+        for text in [
+            "",
+            "SEP\n",
+            "CPU runner 1000 1970/01/01 00:16:40 40 100 2 20 10 0 760 4 0 6 0 0 0 100 0 0\n",
+        ] {
+            let mut out: Vec<u8> = Vec::new();
+            write_json(&parse(text).samples, &mut out).expect("writing to a Vec cannot fail");
+            assert!(out.is_empty(), "{text:?} holds no complete sample");
+        }
     }
 
     /// A label this version does not know is skipped, not counted as damage: the guest may
