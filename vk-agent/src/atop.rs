@@ -151,10 +151,17 @@ fn run(dir: &Path, interval: Duration) -> Result<()> {
         );
     }
     let env = Env::probe();
+    // Registered before the first sample, so even the boot-covering one carries the tasks that
+    // came and went while the guest was starting.
+    let mut exits = Exits::open(&env);
     eprintln!(
-        "vk-agent atop: sampling every {}s -> {}",
+        "vk-agent atop: sampling every {}s -> {}{}",
         interval.as_secs(),
-        log.display()
+        log.display(),
+        match exits.listening() {
+            true => ", exited tasks included",
+            false => "",
+        }
     );
 
     let mut prev: Option<Sys> = None;
@@ -165,13 +172,15 @@ fn run(dir: &Path, interval: Duration) -> Result<()> {
     let mut next = Instant::now() + interval;
     loop {
         let cur = snapshot(&env);
+        // Everything that died since the last sample belongs to this one.
+        let exited = exits.take();
         let covered = match &prev {
             Some(p) => covered_secs(cur.epoch, p.epoch),
             None => uptime_secs().max(1),
         };
         // One buffer per sample: a VM torn down mid-write then truncates the tail of
         // one sample instead of interleaving two, and the file stays line-parseable.
-        let text = sample_text(&env, &cur, prev.as_ref(), covered);
+        let text = sample_text(&env, &cur, prev.as_ref(), &exited, covered);
         match file.write_all(text.as_bytes()) {
             // `prev` advances only for a sample that reached the log, so a write that failed
             // leaves its interval to be covered by the next one that lands — counters and
@@ -196,7 +205,7 @@ fn run(dir: &Path, interval: Duration) -> Result<()> {
         while next <= now {
             next += interval;
         }
-        wait_until(next);
+        wait_until(next, &mut exits);
     }
     if failures > 1 {
         eprintln!(
@@ -207,16 +216,98 @@ fn run(dir: &Path, interval: Duration) -> Result<()> {
     Ok(())
 }
 
+/// The exited tasks the kernel has reported since the last sample, and the socket they arrive
+/// on. A guest whose kernel will not report them (or a sampler the kernel will not register)
+/// keeps every other figure: the `/proc` sweep is unaffected, and only tasks that both start
+/// and end between two samples go unseen, as they did before.
+struct Exits {
+    listener: Option<crate::taskstats::Listener>,
+    seen: Vec<crate::taskstats::Exit>,
+    /// Whether the loss of records has been reported: it is worth saying once, not per sample.
+    said_dropped: bool,
+}
+
+impl Exits {
+    fn open(env: &Env) -> Exits {
+        match crate::taskstats::Listener::open(env.cpus) {
+            Ok(listener) => Exits {
+                listener: Some(listener),
+                seen: Vec::new(),
+                said_dropped: false,
+            },
+            Err(e) => {
+                eprintln!(
+                    "vk-agent atop: not recording exited tasks ({e}) — a task that starts and \
+                     ends between two samples will not appear"
+                );
+                Exits {
+                    listener: None,
+                    seen: Vec::new(),
+                    said_dropped: false,
+                }
+            }
+        }
+    }
+
+    fn listening(&self) -> bool {
+        self.listener.is_some()
+    }
+
+    /// Wait up to `left` for exit records, taking whatever arrives. Without a listener there is
+    /// nothing to wait on, so the time is simply slept.
+    fn wait(&mut self, left: Duration) {
+        let Some(listener) = self.listener.as_mut() else {
+            nap(left);
+            return;
+        };
+        let mut poll = libc::pollfd {
+            fd: listener.fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // At least a millisecond, so a rounded-down remainder cannot spin.
+        let timeout = left.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+        // SAFETY: one caller-owned pollfd, and the count matches.
+        let ready = unsafe { libc::poll(&mut poll, 1, timeout) };
+        if ready > 0 {
+            listener.drain(&mut self.seen);
+        }
+        if listener.drops() > 0 && !self.said_dropped {
+            self.said_dropped = true;
+            eprintln!(
+                "vk-agent atop: the guest is exiting tasks faster than they can be recorded — \
+                 some will be missing from the log"
+            );
+        }
+    }
+
+    /// The records since the last sample, and none of them twice.
+    fn take(&mut self) -> Vec<crate::taskstats::Exit> {
+        // A last look, so a task that died between the poll returning and the sample being
+        // taken lands in the sample that covers it rather than the one after.
+        if let Some(listener) = self.listener.as_mut() {
+            listener.drain(&mut self.seen);
+        }
+        std::mem::take(&mut self.seen)
+    }
+}
+
 /// One sample as it goes to the log: the `RESET` line when there is nothing to deviate
 /// from — its counters cover the guest's whole boot — the records themselves, then the
 /// `SEP` line that marks the sample complete.
-fn sample_text(env: &Env, cur: &Sys, prev: Option<&Sys>, covered: u64) -> String {
+fn sample_text(
+    env: &Env,
+    cur: &Sys,
+    prev: Option<&Sys>,
+    exited: &[crate::taskstats::Exit],
+    covered: u64,
+) -> String {
     let mut buf = String::with_capacity(64 * 1024);
     if prev.is_none() {
         buf.push_str(RESET);
         buf.push('\n');
     }
-    write_sample(&mut buf, env, &deviate(cur, prev), covered);
+    write_sample(&mut buf, env, &deviate(cur, prev, exited, env), covered);
     buf.push_str(SEP);
     buf.push('\n');
     buf
@@ -229,20 +320,22 @@ fn covered_secs(now: i64, before: i64) -> u64 {
     (now.saturating_sub(before).max(0) as u64).max(1)
 }
 
-/// How long one sleep runs before the stop flag is read again. SIGUSR2 that lands between
-/// the flag check and the sleep interrupts nothing — the handler has already run — so the
-/// wait is sliced, which bounds that miss to one slice instead of one whole interval. The
-/// host waits seconds for the final sample, so a slice this size is never noticed.
+/// How long one wait runs before the stop flag is read again. SIGUSR2 that lands between the
+/// flag check and the wait interrupts nothing — the handler has already run — so the wait is
+/// sliced, which bounds that miss to one slice instead of one whole interval. The host waits
+/// seconds for the final sample, so a slice this size is never noticed.
 const SLEEP_SLICE: Duration = Duration::from_millis(250);
 
-/// Sleep until `deadline`, returning early once SIGUSR2 has been seen.
-fn wait_until(deadline: Instant) {
+/// Wait until `deadline`, taking exit records as they arrive, and return early once SIGUSR2 has
+/// been seen. Waiting on the socket rather than sleeping through the interval is what keeps a
+/// burst of short-lived tasks from overflowing it.
+fn wait_until(deadline: Instant, exits: &mut Exits) {
     while !STOP.load(Ordering::Relaxed) {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return;
         }
-        nap(left.min(SLEEP_SLICE));
+        exits.wait(left.min(SLEEP_SLICE));
     }
 }
 
@@ -265,6 +358,8 @@ struct Env {
     host: String,
     hertz: u64,
     pagesize: u64,
+    /// How many processors this guest has, which is the mask the exit listener registers over.
+    cpus: usize,
     /// Whether `/proc/<pid>/io` can be read — atop's IOSTAT support flag, which the
     /// PRD label carries because its counters mean nothing without it.
     io_stats: bool,
@@ -281,6 +376,7 @@ impl Env {
                 .unwrap_or_else(|| "localhost".into()),
             hertz: sysconf(libc::_SC_CLK_TCK, 100),
             pagesize: sysconf(libc::_SC_PAGESIZE, 4096),
+            cpus: sysconf(libc::_SC_NPROCESSORS_ONLN, 1) as usize,
             io_stats: std::fs::read_to_string("/proc/self/io").is_ok(),
         }
     }
@@ -463,6 +559,11 @@ struct Proc {
     btime: i64,
     /// absent from the previous snapshot — atop's 'N' marker
     is_new: bool,
+    /// The exit status of a task that has ended, as `wait` reports it; 0 while it lives.
+    exitcode: u32,
+    /// How long a task that has ended lived, in clock ticks; 0 while it lives, which is what
+    /// atop reports for a task it can still see.
+    elapsed: u64,
     utime: u64,
     stime: u64,
     nice: i64,
@@ -1071,7 +1172,7 @@ fn parse_proc_io(text: &str, p: &mut Proc) {
 /// `cur - prev` where it reports a per-interval difference. Without a previous
 /// snapshot every counter already covers boot→now, which is the sample the `RESET`
 /// line announces.
-fn deviate(cur: &Sys, prev: Option<&Sys>) -> Sys {
+fn deviate(cur: &Sys, prev: Option<&Sys>, exited: &[crate::taskstats::Exit], env: &Env) -> Sys {
     let mut d = cur.clone();
     let Some(p) = prev else {
         for proc in &mut d.procs {
@@ -1079,6 +1180,7 @@ fn deviate(cur: &Sys, prev: Option<&Sys>) -> Sys {
             proc.vgrow = proc.vmem as i64;
             proc.rgrow = proc.rmem as i64;
         }
+        d.procs.extend(exited_procs(exited, None, env));
         return d;
     };
     d.cpu = cpu_delta(&cur.cpu, &p.cpu);
@@ -1191,7 +1293,86 @@ fn deviate(cur: &Sys, prev: Option<&Sys>) -> Sys {
             }
         }
     }
+    let exits = exited_procs(exited, prev, env);
+    // A task can be in both: alive when /proc was swept, gone by the time the kernel's record
+    // of it was taken. The record is the whole truth about it, so it replaces the sweep's.
+    d.procs
+        .retain(|live| !exits.iter().any(|dead| same_task(dead, live)));
+    d.procs.extend(exits);
     d
+}
+
+/// The tasks that exited during the interval, as the records this sample reports.
+///
+/// A record carries a whole life, so a task the previous sample already reported must have that
+/// much taken off — otherwise its processor time is counted twice, once by the sweeps that saw
+/// it alive and again by the record of its death. A task that both began and ended inside the
+/// interval was never swept, and carries all of itself.
+fn exited_procs(exited: &[crate::taskstats::Exit], prev: Option<&Sys>, env: &Env) -> Vec<Proc> {
+    let ticks = |us: u64| us.saturating_mul(env.hertz) / 1_000_000;
+    let sectors = |bytes: u64| bytes / 512;
+    let mut out = Vec::with_capacity(exited.len());
+    for e in exited {
+        let mut proc = Proc {
+            pid: e.pid,
+            tgid: e.tgid,
+            ppid: e.ppid,
+            // A dead task has no command line left to read, so the name the kernel keeps is
+            // what it is called — which is what atop reports for an exited task too.
+            name: e.comm.clone(),
+            state: 'E',
+            cmdline: e.comm.clone(),
+            uids: [e.uid; 4],
+            gids: [e.gid; 4],
+            nthr: 1,
+            btime: e.btime,
+            is_new: true,
+            exitcode: e.exitcode,
+            elapsed: ticks(e.etime_us),
+            utime: ticks(e.utime_us),
+            stime: ticks(e.stime_us),
+            nice: i64::from(e.nice),
+            // Nothing schedules a dead task: atop reports -1 for the processor it was on, and
+            // the rest of the scheduling columns have no value to carry.
+            curcpu: -1,
+            // The most it ever held, which is the only memory figure a record of a death has.
+            rmem: e.hiwater_rss_kb,
+            minflt: e.minflt,
+            majflt: e.majflt,
+            rio: e.read_syscalls,
+            rsz: sectors(e.read_bytes),
+            wio: e.write_syscalls,
+            wsz: sectors(e.write_bytes),
+            cwsz: sectors(e.cancelled_write_bytes),
+            ..Default::default()
+        };
+        if let Some(q) = prev
+            .into_iter()
+            .flat_map(|s| s.procs.iter())
+            .find(|q| same_task(&proc, q))
+        {
+            proc.is_new = false;
+            proc.utime = sub(proc.utime, q.utime);
+            proc.stime = sub(proc.stime, q.stime);
+            proc.minflt = sub(proc.minflt, q.minflt);
+            proc.majflt = sub(proc.majflt, q.majflt);
+            proc.rio = sub(proc.rio, q.rio);
+            proc.rsz = sub(proc.rsz, q.rsz);
+            proc.wio = sub(proc.wio, q.wio);
+            proc.wsz = sub(proc.wsz, q.wsz);
+            proc.cwsz = sub(proc.cwsz, q.cwsz);
+        }
+        out.push(proc);
+    }
+    out
+}
+
+/// Whether two records are the same task. The pid alone is not enough — a fork-heavy job reuses
+/// them within seconds — so the time it started decides, to within a couple of seconds: one
+/// figure is the kernel's own note of when the task began, the other is derived from the boot
+/// time plus a tick count, and both are truncated to whole seconds.
+fn same_task(a: &Proc, b: &Proc) -> bool {
+    a.pid == b.pid && a.btime.saturating_sub(b.btime).abs() <= 2
 }
 
 /// A counter difference. Saturating: a counter that was reset (an interface renewed,
@@ -1509,14 +1690,15 @@ fn print_net(out: &mut String, h: &str, s: &Sys) {
 /// the two OpenVZ ids, the container id, whether the task is new this interval, and
 /// its cgroup v2 path.
 ///
-/// A live task has no exit code and no elapsed time (0), and this sampler reports no
-/// OpenVZ ids (0), no container (`-`) and no cgroup path — all of them atop's own
-/// values where it has nothing to report.
+/// A live task has no exit code and no elapsed time (0); a task the kernel has reported the
+/// death of carries both, and its state is `E`. This sampler reports no OpenVZ ids (0), no
+/// container (`-`) and no cgroup path — all of them atop's own values where it has nothing to
+/// report.
 fn print_prg(out: &mut String, h: &str, s: &Sys) {
     for p in &s.procs {
         let _ = writeln!(
             out,
-            "{h} {} {} {} {} {} {} {} 0 {} {} {} {} {} {} {} {} {} {} {} {} 0 y 0 0 - {} ()",
+            "{h} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} y 0 0 - {} ()",
             p.pid,
             paren(&p.name),
             p.state,
@@ -1524,6 +1706,7 @@ fn print_prg(out: &mut String, h: &str, s: &Sys) {
             p.gids[0],
             p.tgid,
             p.nthr,
+            exit_status(p.exitcode),
             p.btime,
             paren(&p.cmdline),
             p.ppid,
@@ -1536,8 +1719,18 @@ fn print_prg(out: &mut String, h: &str, s: &Sys) {
             p.gids[2],
             p.uids[3],
             p.gids[3],
+            p.elapsed,
             if p.is_new { 'N' } else { '-' }
         );
+    }
+}
+
+/// atop's own encoding of an exit status: a task killed by a signal reports the signal number
+/// plus 256, and one that returned reports what it returned.
+fn exit_status(code: u32) -> u32 {
+    match code & 0xff {
+        0 => (code >> 8) & 0xff,
+        signal => (signal & 0x7f) + 256,
     }
 }
 
@@ -1636,6 +1829,7 @@ mod tests {
             host: "runner".into(),
             hertz: 100,
             pagesize: 4096,
+            cpus: 2,
             io_stats: true,
         }
     }
@@ -2354,6 +2548,8 @@ mod tests {
             wio: 4,
             wsz: 64,
             cwsz: 8,
+            exitcode: 0,
+            elapsed: 0,
         }
     }
 
@@ -2451,12 +2647,12 @@ mod tests {
             procs: vec![proc_fixture()],
             ..Default::default()
         };
-        let first = sample_text(&env(), &s, None, 30);
+        let first = sample_text(&env(), &s, None, &[], 30);
         assert!(first.starts_with("RESET\n"), "{first}");
         assert!(first.ends_with("SEP\n"));
         assert_eq!(first.matches("RESET\n").count(), 1);
 
-        let next = sample_text(&env(), &s, Some(&s), 30);
+        let next = sample_text(&env(), &s, Some(&s), &[], 30);
         assert!(
             !next.contains("RESET"),
             "only the first sample announces one"
@@ -2540,7 +2736,7 @@ mod tests {
             ..Default::default()
         };
         // Nothing to deviate from: the raw counters already cover boot→now.
-        let d = deviate(&first, None);
+        let d = deviate(&first, None, &[], &env());
         assert_eq!(d.cpu.utime, 100);
         assert_eq!(d.procs[0].utime, 120);
         assert!(d.procs[0].is_new);
@@ -2562,7 +2758,7 @@ mod tests {
         second.procs[0].vmem = 22_000;
         second.procs[0].rio = 15;
 
-        let d = deviate(&second, Some(&first));
+        let d = deviate(&second, Some(&first), &[], &env());
         assert_eq!(d.cpu.utime, 75);
         assert_eq!(d.csw, 600);
         assert_eq!(d.pag.pgins, 2);
@@ -2586,9 +2782,152 @@ mod tests {
         let mut reused = second.clone();
         reused.procs[0].btime += 5;
         reused.procs[0].utime = 20;
-        let d = deviate(&reused, Some(&first));
+        let d = deviate(&reused, Some(&first), &[], &env());
         assert!(d.procs[0].is_new);
         assert_eq!(d.procs[0].utime, 20);
+    }
+
+    /// One exit record as the kernel reports it, for the arithmetic below.
+    fn exit_record(pid: i32, comm: &str, us: u64, btime: i64) -> crate::taskstats::Exit {
+        crate::taskstats::Exit {
+            pid,
+            tgid: pid,
+            ppid: 1,
+            uid: 0,
+            gid: 0,
+            comm: comm.into(),
+            exitcode: 0,
+            nice: 0,
+            btime,
+            etime_us: us.saturating_mul(2),
+            utime_us: us,
+            stime_us: us / 2,
+            minflt: 100,
+            majflt: 1,
+            hiwater_rss_kb: 2_048,
+            read_syscalls: 6,
+            write_syscalls: 3,
+            read_bytes: 4_096,
+            write_bytes: 1_024,
+            cancelled_write_bytes: 512,
+        }
+    }
+
+    /// A task the kernel reports the death of is not counted twice: what earlier samples
+    /// already reported of it comes off, a task that lived and died between two samples carries
+    /// the whole of itself, and a pid that has been handed to a different task is a different
+    /// task.
+    #[test]
+    fn an_exited_task_is_counted_once() {
+        let env = env();
+        let live = |pid: i32, btime: i64, utime: u64| Proc {
+            pid,
+            tgid: pid,
+            name: "cc1".into(),
+            state: 'R',
+            btime,
+            utime,
+            stime: utime / 2,
+            minflt: 60,
+            rsz: 4,
+            ..Default::default()
+        };
+        // A sample that saw it alive with 90 ticks of user time already reported.
+        let before = Sys {
+            epoch: 1_000,
+            procs: vec![live(412, 900, 90)],
+            ..Default::default()
+        };
+
+        // 1. It exits having used 1.5s of user time in all: only the last interval is left.
+        let exit = exit_record(412, "cc1", 1_500_000, 900);
+        let after = Sys {
+            epoch: 1_030,
+            procs: Vec::new(),
+            ..Default::default()
+        };
+        let d = deviate(&after, Some(&before), std::slice::from_ref(&exit), &env);
+        assert_eq!(d.procs.len(), 1);
+        let dead = &d.procs[0];
+        assert_eq!(dead.state, 'E');
+        assert_eq!(dead.utime, 150 - 90, "the interval, not the whole life");
+        assert_eq!(dead.stime, 75 - 45);
+        assert_eq!(dead.minflt, 100 - 60);
+        assert!(!dead.is_new, "it was there before, so it is not new");
+        assert_eq!(dead.rmem, 2_048, "the most it ever held");
+        assert_eq!(dead.elapsed, 300, "3s of life, in ticks");
+        assert_eq!(dead.curcpu, -1, "nothing schedules a dead task");
+
+        // 2. Born and died inside the interval: nothing reported it before, so all of it.
+        let born = exit_record(999, "true", 40_000, 1_029);
+        let d = deviate(&after, Some(&before), std::slice::from_ref(&born), &env);
+        let dead = &d.procs[0];
+        assert_eq!(dead.utime, 4, "40ms of user time, in ticks");
+        assert!(dead.is_new);
+
+        // 3. The same pid, a different task: its predecessor's figures are not its own.
+        let reused = exit_record(412, "sh", 1_500_000, 1_020);
+        let d = deviate(&after, Some(&before), std::slice::from_ref(&reused), &env);
+        let dead = &d.procs[0];
+        assert_eq!(dead.utime, 150, "a task of its own, counted in full");
+        assert!(dead.is_new);
+
+        // A task still in /proc when it was swept and dead by the time the record arrived is
+        // reported once — as the record, which is the whole truth about it.
+        let still_there = Sys {
+            epoch: 1_030,
+            procs: vec![live(412, 900, 140)],
+            ..Default::default()
+        };
+        let d = deviate(
+            &still_there,
+            Some(&before),
+            std::slice::from_ref(&exit),
+            &env,
+        );
+        assert_eq!(d.procs.len(), 1, "not once alive and once dead");
+        assert_eq!(d.procs[0].state, 'E');
+
+        // Without a previous sample (the boot-covering one) an exit carries its whole life.
+        let d = deviate(&after, None, std::slice::from_ref(&exit), &env);
+        assert_eq!(d.procs[0].utime, 150);
+    }
+
+    /// The records of an exited task, which differ from a live one's exactly where atop's own
+    /// do: state `E`, the exit status, the life it lived, and `-1` for the processor.
+    #[test]
+    fn an_exited_task_prints_atops_own_form() {
+        let env = env();
+        // killed by SIGKILL (9), which atop reports as the signal plus 256
+        let mut exit = exit_record(412, "cc1plus", 1_000_000, 900);
+        exit.exitcode = 9;
+        let s = Sys {
+            procs: exited_procs(std::slice::from_ref(&exit), None, &env),
+            ..Default::default()
+        };
+        let mut out = String::new();
+        print_prg(&mut out, H, &s);
+        print_prc(&mut out, H, &env, &s);
+        print_prm(&mut out, H, &env, &s);
+        print_prd(&mut out, H, &env, &s);
+        assert_eq!(
+            out,
+            format!(
+                "{H} 412 (cc1plus) E 0 0 412 1 265 900 (cc1plus) 1 0 0 0 0 0 0 0 0 0 200 y 0 0 - N ()\n\
+                 {H} 412 (cc1plus) E 100 100 50 0 0 0 0 -1 0 412 y 0 () 0 -3 -3\n\
+                 {H} 412 (cc1plus) E 4096 0 2048 0 0 0 100 1 0 0 0 0 412 y 0 0 -3 -3 -3 -3\n\
+                 {H} 412 (cc1plus) E n y 6 8 3 2 1 412 n y\n"
+            )
+        );
+        // And the status encoding itself: a return code, and a signal.
+        assert_eq!(exit_status(0x0100), 1, "returned 1");
+        assert_eq!(exit_status(0), 0);
+        assert_eq!(exit_status(9), 265, "killed by SIGKILL");
+        assert_eq!(
+            exit_status(0x8009),
+            265,
+            "the core-dump bit is not the signal"
+        );
     }
 
     /// Per-processor counters are deviated against the same processor, by its number — a
@@ -2612,7 +2951,7 @@ mod tests {
             cpus: vec![cpu(0, 150), cpu(2, 340)],
             ..Default::default()
         };
-        let d = deviate(&after, Some(&before));
+        let d = deviate(&after, Some(&before), &[], &env());
         assert_eq!((d.cpus[0].id, d.cpus[0].utime), (0, 50));
         assert_eq!(
             (d.cpus[1].id, d.cpus[1].utime),
@@ -2625,7 +2964,7 @@ mod tests {
             cpus: vec![cpu(0, 160), cpu(1, 210), cpu(2, 350)],
             ..Default::default()
         };
-        let d = deviate(&back, Some(&after));
+        let d = deviate(&back, Some(&after), &[], &env());
         assert_eq!(
             (d.cpus[1].id, d.cpus[1].utime),
             (1, 0),
@@ -2646,14 +2985,28 @@ mod tests {
         assert!(s.mem.physmem > 0, "physical memory");
         assert!(!s.procs.is_empty(), "at least this test process");
         let mut out = String::new();
-        write_sample(&mut out, &env, &deviate(&s, None), 30);
+        write_sample(&mut out, &env, &deviate(&s, None, &[], &env), 30);
         let mut seen: Vec<&str> = Vec::new();
         for line in out.lines() {
             let cells = vk_core::atop::cells(line);
             let label = vk_core::atop::label_of(&cells)
                 .unwrap_or_else(|| panic!("no schema for this record: {line}"));
-            assert_eq!(cells.len(), label.arity(), "{line}");
             seen.push(label.name);
+            // A command line holding unbalanced parentheses of its own cannot be read back
+            // unambiguously — the format has no escape for it, and atop's own output has the
+            // same hole. What a reader gets in return is that the record does not have its
+            // label's arity, which is how it knows to leave it alone; this asserts the arity
+            // for every record whose strings do not spring that trap, and that a record which
+            // does is detectable rather than silently mis-read.
+            let balanced = line.matches('(').count() == line.matches(')').count();
+            match balanced {
+                true => assert_eq!(cells.len(), label.arity(), "{line}"),
+                false => assert_ne!(
+                    cells.len(),
+                    label.arity(),
+                    "an ambiguous record must not look whole: {line}"
+                ),
+            }
         }
         for label in vk_core::atop::LABELS {
             // DSK is the one label a sample may legitimately lack: a device that moved

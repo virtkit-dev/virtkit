@@ -301,6 +301,13 @@ pub struct Proc {
     pub pid: i32,
     pub name: String,
     pub cmdline: String,
+    /// What the task was doing: the states `/proc` reports for a live one, and `E` for one the
+    /// kernel reported the death of — which is the only way a task too short-lived to be swept
+    /// appears at all.
+    pub state: char,
+    /// The status it exited with, as atop encodes it (a signal is its number plus 256). Only
+    /// meaningful for an exited task; 0 while it lives.
+    pub exitcode: u32,
     /// When the process started (seconds since the epoch), which tells a reused pid from
     /// the process that held it before.
     pub started: i64,
@@ -319,6 +326,16 @@ pub struct Proc {
 }
 
 impl Proc {
+    /// Whether this record is the death of a task rather than a look at a living one.
+    pub fn exited(&self) -> bool {
+        self.state == 'E'
+    }
+
+    /// Whether an exited task ended badly — the reason to look at a burst of them at all.
+    pub fn failed(&self) -> bool {
+        self.exited() && self.exitcode != 0
+    }
+
     /// The processor time this sample charged to the process, in seconds.
     pub fn cpu_seconds(&self) -> f64 {
         match self.hertz {
@@ -452,6 +469,10 @@ impl Record<'_> {
     fn flag(&self, field: &str) -> bool {
         self.raw(field) == "y"
     }
+
+    fn char(&self, field: &str) -> char {
+        self.raw(field).chars().next().unwrap_or('?')
+    }
 }
 
 /// A sample under construction: records arrive one line at a time and the four process
@@ -580,10 +601,13 @@ impl Builder {
                 p.name = r.text("name");
                 p.cmdline = r.text("cmdline");
                 p.started = r.num("starttime");
+                p.state = r.char("state");
+                p.exitcode = r.num("exitcode");
             }
             "PRC" => {
                 let p = self.proc(r);
                 p.name = r.text("name");
+                p.state = r.char("state");
                 p.hertz = r.num("hertz");
                 p.utime = r.num("utime");
                 p.stime = r.num("stime");
@@ -797,6 +821,39 @@ SEP
         assert_eq!(p.dropped, 1);
         assert_eq!(parse("").samples.len(), 0);
         assert_eq!(parse("SEP\n").samples.len(), 0);
+    }
+
+    /// A task the kernel reported the death of: state `E`, an exit status, and the whole of
+    /// what it used — the only way a command too short-lived to be swept appears at all.
+    #[test]
+    fn an_exited_task_reads_back_as_one() {
+        let text = "\
+CPU runner 1000 1970/01/01 00:16:40 30 100 2 6 3 0 2991 0 0 0 0 0 0 100 0 0
+PRG runner 1000 1970/01/01 00:16:40 30 99 (cc1plus) E 0 0 99 1 265 990 (cc1plus) 412 0 0 0 0 0 0 0 0 0 40 y 0 0 - N ()
+PRC runner 1000 1970/01/01 00:16:40 30 99 (cc1plus) E 100 30 10 0 0 0 0 -1 0 99 y 0 () 0 -3 -3
+PRM runner 1000 1970/01/01 00:16:40 30 99 (cc1plus) E 4096 0 8192 0 0 0 120 3 0 0 0 0 99 y 0 0 -3 -3 -3 -3
+PRD runner 1000 1970/01/01 00:16:40 30 99 (cc1plus) E n y 6 16 3 8 0 99 n y
+PRG runner 1000 1970/01/01 00:16:40 30 412 (make) S 0 0 412 1 0 900 (make -j8) 1 1 0 0 0 0 0 0 0 0 0 y 0 0 - - ()
+SEP
+";
+        let p = parse(text);
+        assert_eq!(p.samples.len(), 1);
+        let procs = &p.samples[0].procs;
+        assert_eq!(procs.len(), 2);
+        let dead = procs.iter().find(|p| p.pid == 99).expect("the exited task");
+        assert!(dead.exited(), "state {}", dead.state);
+        assert!(dead.failed(), "it was killed, which is a failure");
+        assert_eq!(dead.exitcode, 265, "the signal that killed it, plus 256");
+        assert_eq!(dead.command(), "cc1plus", "a dead task has only its name");
+        assert_eq!(dead.cpu_seconds(), 0.4);
+        assert_eq!(dead.rsize, 8192, "the most it ever held");
+        assert_eq!((dead.sectors_read, dead.sectors_written), (16, 8));
+
+        let live = procs.iter().find(|p| p.pid == 412).expect("the live one");
+        assert!(!live.exited() && !live.failed());
+        assert_eq!(live.state, 'S');
+        assert_eq!(live.exitcode, 0);
+        assert_eq!(live.command(), "make -j8");
     }
 
     /// Every sample is one line of JSON, carrying the log's own units and the scales that

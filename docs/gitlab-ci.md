@@ -298,11 +298,17 @@ virtkit: 42137-acme-web-test_unit — what its guest did:
 
   what ran — the 10 of 61 that used the most cpu
   command                                   pid   cpu  peak rss    read  written
-  /init tsi_hijack                            1  0.3s    11 MiB   2 MiB   20 KiB
+  cc1plus ×1184 (2 failed)                    -  6m12s   184 MiB   1 GiB   96 MiB
+  /init tsi_hijack                            1  0.3s     11 MiB   2 MiB   20 KiB
   …
 ```
 
 (Wrapped here to fit the page — the real output is one line per label.)
+
+The commands a job ran over and over are one row each, with the number of runs and how many of
+them failed: a build that forks a thousand compilers is a thousand processes no sweep ever saw,
+and one row of `cc1plus ×1184` says what a thousand rows of one run each would bury. A process
+the sampler did watch keeps its own row, however many namesakes came and went around it.
 
 `--view` walks the recording a sample at a time in a full-screen panel — the guest's
 processors (each core its own bar), memory and swap, pressure, disks and interfaces, then the
@@ -317,13 +323,15 @@ psi   cpu  0.4%  mem  0.0%  mem-full  0.0%  io  0.0%  io-full  0.0%
 disk  vda read 0 B/s write 4 KiB/s busy 4ms
 net   eth0 in 0 B/s out 42 B/s   0 tcp connections, 0 resent
 
-    pid      >cpu     memory       disk  command
-     65      0.1s      1 MiB      8 KiB  sh
-      1      0.0s     11 MiB        0 B  /init tsi_hijack
+    pid  st      >cpu     memory       disk  command
+     65   S      0.1s      1 MiB      8 KiB  sh
+    700   E      0.0s    512 KiB      1 KiB  true
+      1   S      0.0s     11 MiB        0 B  /init tsi_hijack
 …
 ←/→ step  home/end jump  c/m/d sort by cpu  a whole job  / filter  q quit
 ```
 
+The `st` column is the state each task was in, `E` marking one that ended during the sample.
 `←`/`→` step through the samples and `Home`/`End` jump to either end; `c`, `m` and `d` order
 the processes by processor time, memory or disk; `a` swaps each process's activity in this
 sample for its whole-job totals; `/` filters the table to the commands matching what you type;
@@ -369,7 +377,9 @@ seconds the sample covers, then the label's own fields. A `SEP` line closes each
 carry per-interval differences; size labels carry the value as it stood.
 
 The system labels are `CPU`, `cpu` (per processor), `CPL`, `MEM`, `SWP`, `PAG`, `PSI`, `DSK` and
-`NET`; every process gets a `PRG`, `PRC`, `PRM` and `PRD` line. So the busiest samples of a job
+`NET`; every process gets a `PRG`, `PRC`, `PRM` and `PRD` line, and so does every task that
+*ended* during the interval — those carry state `E`, the status they exited with and how long
+they lived. So the busiest samples of a job
 are one sort away:
 
 ```sh
@@ -381,8 +391,14 @@ grep '^PRM ' atop.log | sort -k12 -n | tail   # largest processes (column 12 onl
 Worth knowing before reading a log:
 
 - it is the **job's own VM**, not the fleet: a `compose:` job's service VMs are not sampled;
-- a process that starts *and* exits between two samples is not in the log at all. Real atop
-  catches those through process accounting; a `/proc` sweep cannot;
+- a process that starts *and* exits between two samples is still recorded — the guest's kernel
+  reports every task as it dies, and those land in the sample covering the exit with state `E`,
+  their whole life on them. Two things follow: a dead process has no command line left to read,
+  so it appears under the name the kernel keeps (`cc1plus`, not the arguments it was given), and
+  a guest exiting tasks faster than the sampler can read them loses some — the log says so on
+  the guest console, and it takes extreme churn;
+- a *thread* exiting is not recorded on its own: its time is charged to the process it belongs
+  to, which is what the process's own record carries;
 - there are no per-process network figures (`PRN`), which real atop needs a kernel module for.
   What the job moved in and out of the host is already on its resource line above;
 - a disk that moved nothing in a sample gets no `DSK` line in it: the guest kernel carries

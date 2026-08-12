@@ -34,6 +34,13 @@ All notable changes to virtkit will be documented in this file.
   or disk, filtered to the commands you are looking for, and switchable between a sample's
   activity and each process's whole-job totals. `--follow` picks up samples as the running job's
   guest commits them and holds still whenever you step back to read one.
+- **A job's short-lived processes are now recorded too.** The guest asks its kernel to report
+  every task as it exits, so the commands a job forks in their thousands — a compiler per file, a
+  process per test — appear in the log with the whole of what each one used, where before they
+  came and went between two samples and were never seen at all. `--summary` folds them into one
+  row per command with the number of runs and how many failed (`cc1plus ×1184 (2 failed)`), and
+  the panel marks them `E`. A dead process has only the name its kernel kept, not the arguments
+  it was given, and a guest churning faster than the records can be read says so on its console.
 
 ## [0.32.0] - 2026-08-11
 

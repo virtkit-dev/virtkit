@@ -529,11 +529,23 @@ fn processes(samples: &[Sample]) -> String {
     let listed = totals.len().min(TOP_PROCS);
     let rows: Vec<Cells> = totals.iter().take(listed).map(Totals::row).collect();
     let widths = widths(&rows);
+    // How much of the job was commands too short-lived for a sweep to catch. A burst of them
+    // can be most of what a job did and still sort below the top of this table — a thousand
+    // processes that each ran for a millisecond — so the count is said whatever it ranks.
+    let churn: u64 = totals
+        .iter()
+        .filter(|t| t.burst)
+        .map(|t| t.runs)
+        .fold(0, u64::saturating_add);
     let mut out = format!(
-        "\n  what ran{}\n",
+        "\n  what ran{}{}\n",
         match totals.len() > listed {
             true => format!(" — the {listed} of {} that used the most cpu", totals.len()),
             false => String::new(),
+        },
+        match churn {
+            0 => String::new(),
+            n => format!("; {n} short-lived {} came and went", plural(n, "task")),
         }
     );
     out.push_str(&line(&head(), &widths));
@@ -554,6 +566,16 @@ pub(crate) struct Totals {
     written: u64,
     /// Whether any sample could account this process's disk traffic at all.
     io_stats: bool,
+    /// How many runs this row stands for: one, unless it is a command the job ran over and over
+    /// and the kernel reported each death (see [`Totals::over`]).
+    runs: u64,
+    /// The kernel reported this task's death, and no sweep ever saw it alive — the shape of a
+    /// command too short-lived for the sampler to catch any other way.
+    burst: bool,
+    /// The task ended while the job was recorded, however it was seen.
+    exited: bool,
+    /// How many of those runs ended with a non-zero status.
+    failures: u64,
 }
 
 impl Totals {
@@ -574,15 +596,24 @@ impl Totals {
                     .add(p);
             }
         }
-        by_proc.into_values().collect()
+        burst_rows(by_proc.into_values().collect())
     }
 
     pub(crate) fn pid(&self) -> i32 {
         self.pid
     }
 
-    pub(crate) fn command(&self) -> &str {
-        &self.command
+    /// What to call this row: the command, and how many runs of it there were where it stands
+    /// for a burst of them.
+    pub(crate) fn command(&self) -> String {
+        let mut out = self.command.clone();
+        if self.runs > 1 {
+            out.push_str(&format!(" ×{}", self.runs));
+        }
+        if self.failures > 0 {
+            out.push_str(&format!(" ({} failed)", self.failures));
+        }
+        out
     }
 
     /// The processor time the whole job charged to the process. A `Duration` rather than the
@@ -590,6 +621,15 @@ impl Totals {
     /// counted in, so the figure can be one no `Duration` names.
     pub(crate) fn cpu_time(&self) -> std::time::Duration {
         secs_of(self.cpu)
+    }
+
+    /// The state a panel shows for this row: `E` for a task that ended while the job ran, as
+    /// atop marks an exited one, and `-` for a process the recording only ever saw alive.
+    pub(crate) fn state(&self) -> char {
+        match self.exited {
+            true => 'E',
+            false => '-',
+        }
     }
 
     pub(crate) fn peak_rss_bytes(&self) -> u64 {
@@ -607,16 +647,29 @@ impl Totals {
     fn new(p: &Proc) -> Totals {
         Totals {
             pid: p.pid,
-            command: p.command().to_string(),
+            command: plain(p.command()),
             cpu: 0.0,
             rss_peak_kib: 0,
             read: 0,
             written: 0,
             io_stats: false,
+            runs: 1,
+            burst: p.exited(),
+            exited: p.exited(),
+            failures: 0,
         }
     }
 
     fn add(&mut self, p: &Proc) {
+        // A record of a death is the last word on a task; a sweep that saw it alive means this
+        // row is a process the sampler watched, not one it only ever heard about.
+        match p.exited() {
+            true => {
+                self.exited = true;
+                self.failures = self.failures.saturating_add(u64::from(p.failed()));
+            }
+            false => self.burst = false,
+        }
         self.cpu += p.cpu_seconds();
         self.rss_peak_kib = self.rss_peak_kib.max(p.rsize);
         self.read = self
@@ -629,7 +682,7 @@ impl Totals {
         // The command line is only in PRG, so a process first seen through another label
         // has its bare name until one arrives.
         if !p.cmdline.is_empty() || self.command.is_empty() {
-            self.command = p.command().to_string();
+            self.command = plain(p.command());
         }
     }
 
@@ -639,14 +692,58 @@ impl Totals {
             false => "-".to_string(),
         };
         [
-            truncated(&self.command, COMMAND_WIDTH),
-            self.pid.to_string(),
+            truncated(&self.command(), COMMAND_WIDTH),
+            match self.runs > 1 {
+                // A row standing for many runs has no one pid to name.
+                true => "-".to_string(),
+                false => self.pid.to_string(),
+            },
             fmt_cpu(self.cpu_time()),
             fmt_bytes(self.peak_rss_bytes()),
             disk(self.read),
             disk(self.written),
         ]
     }
+}
+
+/// Fold the commands a job ran over and over into one row each.
+///
+/// A task the sampler only ever heard the death of is one of a burst — a compile forking a
+/// thousand `cc1`, a test suite a process per case — and a thousand rows of one run each say
+/// far less than one row of a thousand runs. A process a sweep did see stays its own row: it
+/// ran long enough to be worth naming on its own, and merging it into its namesakes would hide
+/// how long.
+fn burst_rows(totals: Vec<Totals>) -> Vec<Totals> {
+    let mut out: Vec<Totals> = Vec::new();
+    // The row each burst command has folded into so far. A map rather than a scan over `out`:
+    // the commands are a guest's own, and one that writes thirty thousand distinct ones must
+    // not cost thirty thousand comparisons apiece. The order does not matter — the caller
+    // sorts.
+    let mut folded: HashMap<String, usize> = HashMap::new();
+    for t in totals {
+        let merged = t.burst
+            && folded
+                .get(&t.command)
+                .and_then(|at| out.get_mut(*at))
+                .map(|o| {
+                    o.runs = o.runs.saturating_add(1);
+                    o.exited = true;
+                    o.failures = o.failures.saturating_add(t.failures);
+                    o.cpu += t.cpu;
+                    o.rss_peak_kib = o.rss_peak_kib.max(t.rss_peak_kib);
+                    o.read = o.read.saturating_add(t.read);
+                    o.written = o.written.saturating_add(t.written);
+                    o.io_stats |= t.io_stats;
+                })
+                .is_some();
+        if !merged {
+            if t.burst {
+                folded.insert(t.command.clone(), out.len());
+            }
+            out.push(t);
+        }
+    }
+    out
 }
 
 /// One row of the process table, headings included: a fixed width so `head`, `row`, `widths`
@@ -656,6 +753,22 @@ type Cells = [String; COLS];
 
 fn head() -> Cells {
     ["command", "pid", "cpu", "peak rss", "read", "written"].map(str::to_string)
+}
+
+/// A guest's own text, as a report or a panel may write it: one cell per character, and nothing
+/// a terminal reads as an instruction. The log is written on a directory the job's guest had
+/// read-write (see [`crate::atop`]), so a command line can hold an escape sequence — and one
+/// drawn into a full-screen panel would move the cursor rather than name a process.
+///
+/// Applied where the text enters a row, not where the row is drawn: what this module adds
+/// afterwards (`×1184`, `(2 failed)`) is its own and must survive.
+pub(crate) fn plain(s: &str) -> String {
+    s.chars()
+        .map(|c| match c.is_ascii_graphic() || c == ' ' {
+            true => c,
+            false => '.',
+        })
+        .collect()
 }
 
 /// How wide the command column may get. A build's own command lines run to hundreds of
@@ -974,6 +1087,79 @@ mod tests {
         for line in &table {
             assert!(!line.ends_with(' '), "trailing whitespace: {line:?}");
         }
+    }
+
+    /// A burst of short-lived commands is one row of many runs, not many rows of one — which is
+    /// the whole reason the kernel's exit records are read at all. A process a sweep did see
+    /// keeps its own row, however many namesakes died around it.
+    #[test]
+    fn a_burst_of_short_commands_is_one_row() {
+        let mut text = log();
+        let sep = text.rfind("SEP\n").expect("a sample to add to");
+        let mut burst = String::new();
+        for pid in 500..515 {
+            let h = |label: &str| format!("{label} runner 1060 1970/01/01 00:17:40 30");
+            // twelve that returned, three that failed
+            let status = match pid % 5 {
+                0 => 2,
+                _ => 0,
+            };
+            burst.push_str(&format!(
+                "{} {pid} (cc1) E 0 0 {pid} 1 {status} 1059 (cc1) 412 0 0 0 0 0 0 0 0 0 10 y 0 0 - N ()\n",
+                h("PRG")
+            ));
+            burst.push_str(&format!(
+                "{} {pid} (cc1) E 100 10 5 0 0 0 0 -1 0 {pid} y 0 () 0 -3 -3\n",
+                h("PRC")
+            ));
+            burst.push_str(&format!(
+                "{} {pid} (cc1) E 4096 0 4096 0 0 0 30 0 0 0 0 0 {pid} y 0 0 -3 -3 -3 -3\n",
+                h("PRM")
+            ));
+            burst.push_str(&format!(
+                "{} {pid} (cc1) E n y 2 8 1 4 0 {pid} n y\n",
+                h("PRD")
+            ));
+        }
+        text.insert_str(sep, &burst);
+        let out = report(&text);
+        println!("{out}");
+
+        let row = out
+            .lines()
+            .find(|l| l.contains("cc1"))
+            .unwrap_or_default()
+            .to_string();
+        assert!(row.contains("cc1 ×15"), "one row for fifteen runs: {out}");
+        assert!(
+            out.contains("15 short-lived tasks came and went"),
+            "the churn is reported whatever it ranks: {out}"
+        );
+        assert!(
+            row.contains("(3 failed)"),
+            "and the ones that failed: {row}"
+        );
+        assert!(row.contains(" - "), "a burst has no one pid to name: {row}");
+        // fifteen runs of 15 ticks each at 100 Hz, and the peak of one of them
+        assert!(row.contains("2.2s"), "their cpu time together: {row}");
+        assert!(
+            row.contains("4 MiB"),
+            "the most any one of them held: {row}"
+        );
+        // fifteen runs of 8 sectors read and 4 written, at 512 bytes a sector
+        assert!(
+            row.contains("60 KiB") && row.contains("30 KiB"),
+            "what they moved: {row}"
+        );
+        // The long-lived process is still its own row, not folded into anything.
+        assert_eq!(
+            out.lines()
+                .filter(|l| l.contains("sh -c make test"))
+                .count(),
+            1,
+            "{out}"
+        );
+        assert!(out.lines().any(|l| l.contains("cc1 ×15")), "{out}");
     }
 
     /// A log torn off mid-sample still reports what it has, and says that it was torn.

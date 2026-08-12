@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::atop_report::{Totals, secs_of};
+use crate::atop_report::{Totals, plain, secs_of};
 use crate::atoplog::{SECTOR, Sample};
 use crate::usage::{fmt_bytes, fmt_cpu};
 
@@ -719,27 +719,31 @@ fn system_panel(s: &Sample, cols: usize) -> Vec<String> {
 fn process_table(state: &View, sample: &Sample, room: usize, cols: usize) -> Vec<String> {
     let filter = state.filter.to_lowercase();
     let matches = |command: &str| filter.is_empty() || command.to_lowercase().contains(&filter);
-    /// A row is a command with four figures, whichever set of samples they came from. Named
-    /// rather than a tuple: the three sorts below each pick a different one of them.
+    /// A row is a command with four figures and the state it was in, whichever set of samples
+    /// they came from. Named rather than a tuple: the three sorts below each pick a different
+    /// one of them.
     struct Row {
         cpu: Duration,
         mem: u64,
         /// `None` where the guest's kernel accounted no disk traffic for the process.
         disk: Option<u64>,
         pid: i32,
+        /// `E` for a task that ended while the job ran, as atop marks an exited one.
+        state: char,
         command: String,
     }
     let mut rows_out: Vec<Row> = match state.accumulate {
         true => state
             .totals
             .iter()
-            .filter(|t| matches(t.command()))
+            .filter(|t| matches(&t.command()))
             .map(|t| Row {
                 cpu: t.cpu_time(),
                 mem: t.peak_rss_bytes(),
                 disk: t.disk_bytes(),
                 pid: t.pid(),
-                command: plain(t.command()),
+                state: t.state(),
+                command: t.command(),
             })
             .collect(),
         false => sample
@@ -755,6 +759,7 @@ fn process_table(state: &View, sample: &Sample, room: usize, cols: usize) -> Vec
                         .saturating_mul(SECTOR)
                 }),
                 pid: p.pid,
+                state: p.state,
                 command: plain(p.command()),
             })
             .collect(),
@@ -770,7 +775,7 @@ fn process_table(state: &View, sample: &Sample, room: usize, cols: usize) -> Vec
     }
     let mut out = vec![clip(
         &format!(
-            "{:>7}  {:>8}  {:>9}  {:>9}  {}",
+            "{:>7}  st  {:>8}  {:>9}  {:>9}  {}",
             "pid",
             heading("cpu", state.sort == Sort::Cpu),
             heading("memory", state.sort == Sort::Memory),
@@ -785,8 +790,9 @@ fn process_table(state: &View, sample: &Sample, room: usize, cols: usize) -> Vec
     for row in rows_out.into_iter().take(room.saturating_sub(1)) {
         out.push(clip(
             &format!(
-                "{:>7}  {:>8}  {:>9}  {:>9}  {}",
+                "{:>7}  {:>2}  {:>8}  {:>9}  {:>9}  {}",
                 row.pid,
+                row.state,
                 fmt_cpu(row.cpu),
                 fmt_bytes(row.mem),
                 // Unaccounted traffic is not no traffic, and the report says `-` for it too.
@@ -800,19 +806,6 @@ fn process_table(state: &View, sample: &Sample, room: usize, cols: usize) -> Vec
         ));
     }
     out
-}
-
-/// A guest's own text, as a panel may write it: one cell per character, and nothing the
-/// terminal reads as an instruction. The log is written on a directory the job's guest had
-/// read-write, so a command line can hold an escape sequence — and one drawn into a
-/// full-screen panel would move the cursor rather than name a process.
-fn plain(s: &str) -> String {
-    s.chars()
-        .map(|c| match c.is_ascii_graphic() || c == ' ' {
-            true => c,
-            false => '.',
-        })
-        .collect()
 }
 
 /// The column a table is sorted on, marked so the keys that change it have somewhere to
@@ -959,6 +952,24 @@ mod tests {
             s.push_str(&format!("{} 412 (sh) S n y 1 8 1 8 0 412 n y\n", h("PRD")));
             s.push_str(&format!(
                 "{} 99 (dd) R n y 100 {sectors} 100 {sectors} 0 99 n y\n",
+                h("PRD")
+            ));
+            // a short-lived command the kernel reported the death of, which no sweep saw
+            s.push_str(&format!(
+                "{} 700 (true) E 0 0 700 1 0 {} (true) 412 0 0 0 0 0 0 0 0 0 2 y 0 0 - N ()\n",
+                h("PRG"),
+                epoch - 1
+            ));
+            s.push_str(&format!(
+                "{} 700 (true) E 100 1 1 0 0 0 0 -1 0 700 y 0 () 0 -3 -3\n",
+                h("PRC")
+            ));
+            s.push_str(&format!(
+                "{} 700 (true) E 4096 0 512 0 0 0 20 0 0 0 0 0 700 y 0 0 -3 -3 -3 -3\n",
+                h("PRM")
+            ));
+            s.push_str(&format!(
+                "{} 700 (true) E n y 1 2 0 0 0 700 n y\n",
                 h("PRD")
             ));
             s.push_str("SEP\n");
@@ -1162,6 +1173,37 @@ mod tests {
         );
     }
 
+    /// A task the kernel reported the death of reads as one in the panel: atop marks an exited
+    /// process, and a table that showed it like a running one would be lying about it.
+    #[test]
+    fn an_exited_task_is_marked_in_the_table() {
+        let state = view(false);
+        let sample = state.current().expect("a sample").clone();
+        let rows = process_table(&state, &sample, 24, 100);
+        assert!(rows[0].contains("st"), "a state column: {:?}", rows[0]);
+        let dead = rows
+            .iter()
+            .find(|r| r.contains("true"))
+            .expect("the exited task");
+        assert!(dead.contains(" E "), "marked as exited: {dead:?}");
+        let live = rows.iter().find(|r| r.contains(" sh")).expect("a live one");
+        assert!(live.contains(" S "), "still sleeping: {live:?}");
+
+        // Accumulated over the job, the same task reads as one that ended.
+        let mut state = state;
+        state.key(Press::Char('a'));
+        let rows = process_table(&state, &sample, 24, 100);
+        let dead = rows
+            .iter()
+            .find(|r| r.contains("true"))
+            .expect("the exited task");
+        assert!(dead.contains(" E "), "{dead:?}");
+        assert!(
+            dead.contains("×3"),
+            "three runs of it, one per sample: {dead:?}"
+        );
+    }
+
     /// A filter narrows the table to the commands it matches, and while it is being typed
     /// the letters go into it rather than being read as commands.
     #[test]
@@ -1192,7 +1234,8 @@ mod tests {
         state.key(Press::Backspace);
         state.key(Press::Escape);
         assert!(state.filter.is_empty());
-        assert_eq!(process_table(&state, &sample, 24, 100).len(), 3);
+        // a heading, the two live processes, and the task that exited
+        assert_eq!(process_table(&state, &sample, 24, 100).len(), 4);
     }
 
     /// The boot sample is marked: its counters cover the guest's whole boot, so its
