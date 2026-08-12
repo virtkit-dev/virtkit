@@ -131,10 +131,66 @@ async fn finalize_atop(ctx: &JobCtx) {
         ),
     )
     .await;
-    println!(
-        "virtkit: atop log: {}",
-        dir.join(vk_core::atop::LOG_NAME).display()
-    );
+    report_guest(ctx, &dir.join(vk_core::atop::LOG_NAME));
+}
+
+/// End the trace with what the job's guest did, folded away.
+///
+/// The log holds a few hundred lines per interval and the account of it is twenty; those twenty
+/// are worth a reader's attention at the end of every job, which is why they are here rather
+/// than only in `vk gitlab atop --summary`. They go in a collapsed section, so a reader who
+/// wants them opens them and everyone else sees one line.
+///
+/// Silent whenever there is nothing to say — recording off, a guest that died before it
+/// finished a sample, a log that will not read — because a job's trace is not the place to
+/// report that its accounting was unavailable.
+fn report_guest(ctx: &JobCtx, log: &std::path::Path) {
+    let Some(body) = crate::atop_report::trace_body(log) else {
+        return;
+    };
+    // The command that opens the same log again, so a reader who wants the samples behind the
+    // account knows where they are without a path to copy.
+    let header = format!("what the job's guest did (vk gitlab atop {})", ctx.job_id);
+    // One write: the markers and what they wrap have to reach the trace together, or a section
+    // that opens in one chunk and closes in another folds the wrong lines away.
+    eprint!("{}", section("vk_atop", &header, &body, now_secs()));
+}
+
+/// A GitLab trace section, collapsed: the markers it folds between are exact byte sequences
+/// (`\e[0K` before each, a carriage return between marker and text), and a section whose
+/// framing is off by one byte is a section GitLab does not fold — it prints the escapes into
+/// the log instead. Hence one place that writes them, and a test that reads them back.
+///
+/// `name` identifies the section to the web UI and may hold only letters, digits, `_`, `.` and
+/// `-`; anything else is replaced, since a name GitLab rejects would take the fold with it.
+fn section(name: &str, header: &str, body: &str, at: u64) -> String {
+    let name: String = name
+        .chars()
+        .map(
+            |c| match c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                true => c,
+                false => '_',
+            },
+        )
+        .collect();
+    let body = match body.ends_with('\n') {
+        true => body.to_string(),
+        false => format!("{body}\n"),
+    };
+    // Each marker is preceded by the erase-line escape and separated from the text after it by
+    // a carriage return: that is the shape GitLab matches on, and the reason this is one
+    // format string rather than a few pushes.
+    let start = format!("\x1b[0Ksection_start:{at}:{name}[collapsed=true]\r\x1b[0K");
+    let end = format!("\x1b[0Ksection_end:{at}:{name}\r\x1b[0K\n");
+    format!("{start}{header}\n{body}{end}")
+}
+
+/// Now, in seconds since the epoch — what the section markers are stamped with.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Forward the per-job switch's egress refusals into the job trace. The switch
@@ -506,7 +562,51 @@ async fn next(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_mark;
+    use super::{parse_mark, section};
+
+    /// The framing of a collapsed section, byte for byte. GitLab reads these markers with no
+    /// tolerance at all: an escape or a carriage return out of place and the section does not
+    /// fold — the trace shows the raw markers instead, on every job.
+    #[test]
+    fn a_section_is_framed_exactly_as_gitlab_reads_it() {
+        let out = section(
+            "vk_atop",
+            "what the job's guest did (vk gitlab atop 42137)",
+            "one\ntwo\n",
+            1_767_225_600,
+        );
+        assert_eq!(
+            out,
+            "\x1b[0Ksection_start:1767225600:vk_atop[collapsed=true]\r\x1b[0K\
+             what the job's guest did (vk gitlab atop 42137)\n\
+             one\ntwo\n\
+             \x1b[0Ksection_end:1767225600:vk_atop\r\x1b[0K\n"
+        );
+        // The markers open and close once each, and the body sits between them.
+        assert_eq!(out.matches("section_start:").count(), 1);
+        assert_eq!(out.matches("section_end:").count(), 1);
+        assert!(out.find("one").unwrap() > out.find("section_start:").unwrap());
+        assert!(out.find("two").unwrap() < out.find("section_end:").unwrap());
+        // Folded by default, and the same name at both ends or the fold never closes.
+        assert!(out.contains("[collapsed=true]"));
+        assert!(
+            out.ends_with('\n'),
+            "the next line of the trace starts clean"
+        );
+
+        // A body without its own trailing newline still gets one, or the closing marker would
+        // land on the end of the last line and be read as part of it.
+        let out = section("vk_atop", "head", "no newline", 1);
+        assert!(out.contains("no newline\n\x1b[0Ksection_end:"), "{out:?}");
+
+        // A name GitLab would reject takes the fold with it, so it cannot get out.
+        let out = section("vk atop/2", "head", "body\n", 7);
+        assert!(
+            out.contains("section_start:7:vk_atop_2[collapsed=true]"),
+            "{out:?}"
+        );
+        assert!(out.contains("section_end:7:vk_atop_2"), "{out:?}");
+    }
 
     #[test]
     fn the_writable_layer_mark_is_the_two_figures_the_agent_prints() {

@@ -8,11 +8,10 @@ All notable changes to virtkit will be documented in this file.
 
 - **Every CI job now records what happened inside its VM.** The job's guest samples its own
   CPUs, memory, paging, pressure, disks, network and processes every 10 seconds and leaves the
-  samples in `<state_dir>/atop/<date>/<job>/atop.log`, whose path the end of the job trace
-  names. It is the text format `atop -P` prints, so existing atop parsers — or plain
-  `grep`/`awk` — read it, and the account of a job survives the microVM that is destroyed when
-  the job ends. On by default; `[gitlab] atop = false` turns it off and
-  `atop_interval_secs` changes the resolution. See the
+  samples in `<state_dir>/atop/<date>/<job>/atop.log`. It is the text format `atop -P` prints,
+  so existing atop parsers — or plain `grep`/`awk` — read it, and the account of a job survives
+  the microVM that is destroyed when the job ends. On by default; `[gitlab] atop = false` turns
+  it off and `atop_interval_secs` changes the resolution. See the
   [GitLab CI guide](docs/gitlab-ci.md#resource-usage).
 - **A job's recorded statistics are kept for two weeks.** Each day of recordings older than
   `[gitlab] atop_retention_days` is dropped whole, so the archive stays bounded on a runner
@@ -41,6 +40,12 @@ All notable changes to virtkit will be documented in this file.
   row per command with the number of runs and how many failed (`cc1plus ×1184 (2 failed)`), and
   the panel marks them `E`. A dead process has only the name its kernel kept, not the arguments
   it was given, and a guest churning faster than the records can be read says so on its console.
+- **Every job's trace now ends with what its guest did.** The account that `vk gitlab atop
+  --summary` prints — the processor time and where it went, the memory held, the disks and
+  network, the pressure that held the guest up, and the processes the time went to — is written
+  into the trace itself, inside a section the GitLab UI shows folded. Reading a slow or failed
+  job no longer starts with finding the runner it ran on. Nothing to report means no section,
+  and it can be turned off with the recording (`[gitlab] atop = false`).
 
 ## [0.32.0] - 2026-08-11
 

@@ -51,9 +51,30 @@ pub fn summarize(path: &Path) -> Result<String> {
     })
 }
 
+/// The same account, without the line that says whose it is — for the job trace, where the
+/// section holding it is already headed with the job's name. `None` where there is nothing to
+/// account, which is a job whose guest died before it finished a sample.
+pub(crate) fn trace_body(path: &Path) -> Option<String> {
+    let text = crate::atoplog::read(path).ok()?;
+    body(&crate::atoplog::parse(&text))
+}
+
 /// The report for one recorded job, or `None` when the log holds no complete sample — a
 /// guest that died before finishing its first one.
 fn summary(path: &Path, parsed: &Parsed) -> Option<String> {
+    let job = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    Some(format!(
+        "virtkit: {job} — what its guest did:\n{}",
+        body(parsed)?
+    ))
+}
+
+/// The account itself: everything but the line naming the job it belongs to.
+fn body(parsed: &Parsed) -> Option<String> {
     let samples = parsed.samples.as_slice();
     let (first, last) = (samples.first()?, samples.last()?);
     // Rates come from the samples that cover one interval each; the boot sample covers
@@ -61,12 +82,6 @@ fn summary(path: &Path, parsed: &Parsed) -> Option<String> {
     let paced: Vec<&Sample> = samples.iter().filter(|s| !s.boot).collect();
 
     let mut out = String::new();
-    let job = path
-        .parent()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.display().to_string());
-    out.push_str(&format!("virtkit: {job} — what its guest did:\n"));
     out.push_str(&keyed(
         "recorded",
         &span(first, last, &paced, samples.len()),

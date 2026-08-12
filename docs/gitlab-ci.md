@@ -255,11 +255,17 @@ a sample to a log the host keeps after the VM is gone.
 <state_dir>/atop/2026-08-11/42137-acme-web-test_unit/atop.log
 ```
 
-The last line of the job's trace names the file:
+Every job's trace ends with the account of it, in a section GitLab's web UI shows folded — one
+line to open when a job is worth looking into, and out of the way when it is not:
 
 ```
-virtkit: atop log: /var/lib/virtkit/atop/2026-08-11/42137-acme-web-test_unit/atop.log
+▶ what the job's guest did (vk gitlab atop 42137)
 ```
+
+Opened, it holds exactly what `--summary` prints below. A raw trace (the artifact, `curl` of the
+trace API, a runner log) has no UI to fold it, so it shows the same lines unfolded between the
+section markers — which is what a reader piping a trace through `grep` wants anyway. A job whose
+guest recorded nothing gets no section at all rather than an empty one.
 
 On the runner, `vk gitlab atop` finds one again from a job id, or from any part of a recorded
 job's name — the newest run answering — printing just the path, so it composes with whatever
