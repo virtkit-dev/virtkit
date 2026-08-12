@@ -274,6 +274,47 @@ The name to give is the one in the directory, which is the job's name with anyth
 `[A-Za-z0-9._-]` replaced — a `test:unit` job is recorded as `test_unit`. A job id matches only
 the id a directory name leads with, so `42` never answers for job `42137`.
 
+`--summary` reads the log for you instead, accounting the whole job — what its guest did with
+its processors and memory, what it moved, where it was held up, and which of its processes the
+time went to:
+
+```
+$ vk gitlab atop 42137 --summary
+virtkit: 42137-acme-web-test_unit — what its guest did:
+  recorded         2026/08/12 07:21:49 → 07:21:59 UTC (10s), 11 samples at 1s, the first
+                   covering the guest's boot (counted in the totals, not the rates)
+  guest            runner on 2 cpus, 988 MiB memory, no swap
+  cpu              1.7s of cpu time — 0.2s user, 0.9s system, 0.6s stolen by the host; 0.1s
+                   waiting for disk; 16% busy at peak, 5% on average, cpu 1 busiest at 22%
+                   of its own time
+  load             0.00 at peak, 0.00 / 0.00 / 0.00 at the end (1m / 5m / 15m); 285 context
+                   switches a second at peak
+  memory           63 MiB held at peak (6% of the VM), 146 MiB of cache at peak
+  pressure         cpu 182ms, 0.9% at 07:21:51; io 50ms, 0.3% at 07:21:55
+  disk             2 MiB read, 92 KiB written — vda busiest, 96ms busy
+  network          eth0 received 42 B, sent 714 B
+  cpu over time    ▁▁▁▁▁▁▁▁▁▂  (peak 16%)
+  memory over time ▁▁▁▁▁▁▁▁▁▁  (peak 6%)
+
+  what ran — the 10 of 61 that used the most cpu
+  command                                   pid   cpu  peak rss    read  written
+  /init tsi_hijack                            1  0.3s    11 MiB   2 MiB   20 KiB
+  …
+```
+
+(Wrapped here to fit the page — the real output is one line per label.)
+
+Totals cover every sample, including the first — a job's VM boot is part of what the job cost.
+A figure computed *over* an interval — the cpu percentages, the rate of context switching, the
+sparklines — leaves that first sample out, because it covers however long the guest had been up
+rather than one interval, and averaging a boot into the picture flattens everything after it. A
+figure that was simply the reading at a moment — the load, the memory held, a pressure average
+— comes from every sample, the first included, so a peak the guest reached while booting is
+still reported as one. `pressure` is the line to read when a job is slow for no
+visible reason: it is time the guest spent *waiting* for a processor, for memory or for its
+disk, which no total of what it used can show. A figure the kernel could not measure prints as
+`-`, never as a zero.
+
 The format is the text `atop -P` prints, pinned to the field order of atop 2.8.1 (what Debian
 12 ships), so anything that already reads that — a parser, or plain `grep`/`awk` — reads these
 logs. Each line is one record: a label, this guest's name, the epoch, the date and time, the

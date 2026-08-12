@@ -20,6 +20,12 @@ All notable changes to virtkit will be documented in this file.
 - **`vk gitlab atop` finds a recorded job's log.** Give it a job id, or any part of a job's
   name, and get the newest run of it. It prints the path alone, so it composes with whatever
   reads logs (`less $(vk gitlab atop 42137)`).
+- **`vk gitlab atop --summary` accounts a recorded job.** Instead of a few hundred lines per
+  interval it prints the job: how long its guest ran, what it did with its processors and
+  memory, what it moved over its disks and network, where it was held up waiting for a
+  resource, the shape of it over time, and which of its processes the time went to. A figure
+  the guest's kernel could not measure reads as `-` rather than as zero, and a log torn off by
+  a VM that died is reported as far as it goes.
 
 ## [0.32.0] - 2026-08-11
 

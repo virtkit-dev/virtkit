@@ -581,7 +581,7 @@ fn ticks_to_duration(ticks: u64, hz: u64) -> Duration {
 }
 
 /// CPU time at job scale: `12.3s` under a minute, then `2m14s`, then `1h04m`.
-fn fmt_cpu(d: Duration) -> String {
+pub(crate) fn fmt_cpu(d: Duration) -> String {
     // Rounded, not truncated: branching on 59 while the sub-minute arm prints the rounded
     // 60.0 would render 59.97s as "60.0s" instead of "1m00s".
     let secs = d.as_secs_f64().round() as u64;

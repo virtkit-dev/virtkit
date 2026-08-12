@@ -48,6 +48,13 @@ pub const HEADER: &[&str] = &["label", "host", "epoch", "date", "time", "interva
 /// How many columns [`HEADER`] describes, i.e. where a label's own fields begin.
 pub const HEADER_COLS: usize = HEADER.len();
 
+/// Column of the recording guest's hostname.
+pub const COL_HOST: usize = 1;
+/// Column of the sample time, in seconds since the epoch.
+pub const COL_EPOCH: usize = 2;
+/// Column of the seconds the sample covers — at least 1, and the divisor of every rate.
+pub const COL_INTERVAL: usize = 5;
+
 /// The cmdline fragment asking a guest to record: the share to mount, where, and how
 /// often to sample. `psi=1` rides along because the guest kernel is built with pressure
 /// stall information available but off, and the PSI label is worth having.
@@ -596,6 +603,13 @@ mod tests {
     /// exactly the trap.
     #[test]
     fn every_label_names_its_fields_once() {
+        // The generic columns are read by position, so the constants and the header they
+        // describe must not drift apart.
+        assert_eq!(HEADER[COL_HOST], "host");
+        assert_eq!(HEADER[COL_EPOCH], "epoch");
+        assert_eq!(HEADER[COL_INTERVAL], "interval");
+        assert_eq!(HEADER_COLS, COL_INTERVAL + 1);
+
         for label in LABELS {
             for (i, field) in label.fields.iter().enumerate() {
                 assert!(!field.is_empty(), "{} has an empty field name", label.name);

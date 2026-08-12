@@ -18,6 +18,8 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 mod admit;
 mod atop;
+mod atop_report;
+mod atoplog;
 mod build;
 mod cachelock;
 mod check;
@@ -193,14 +195,19 @@ enum GitlabCmd {
         /// Report only projects whose directory name contains this. Omitted = every project.
         project: Option<String>,
     },
-    /// Print the path of a recorded job's guest statistics log, so a viewer can be
-    /// pointed straight at it: `less $(vk gitlab atop 42137)`.
+    /// Read what a job's guest recorded of itself: with no flag, print the log's path so a
+    /// viewer can be pointed at it (`less $(vk gitlab atop 42137)`).
     Atop {
         /// A job id, or any part of a recorded job's directory name (its project or job
         /// name, with anything outside [A-Za-z0-9._-] replaced) — the newest run matching
         /// answers. Anything holding a `/` is taken as a path, so the path a job's trace
         /// printed works too.
         job: String,
+        /// Account the whole job instead of printing a path: what its guest did with its
+        /// processors and memory, what it moved, where it stalled, and which of its
+        /// processes the time went to.
+        #[arg(long)]
+        summary: bool,
     },
     /// internal: the detached per-job supervisor prepare spawns — owns the job's
     /// switch/virtiofsds/forwards/VMM as tied children until SIGTERM'd by cleanup
@@ -2615,10 +2622,17 @@ async fn cli_main() -> ExitCode {
                     Err(e) => fail(&e, ctx.system_failure),
                 }
             }
-            // Just the path, so it composes with whatever the operator reads logs with.
-            GitlabCmd::Atop { job } => match atop::resolve(&ctx.cfg, &job) {
-                // The path in its own bytes, as prepare recorded it: what reads this is
-                // another program, and a lossy rendering would send it to nothing.
+            GitlabCmd::Atop { job, summary } => match atop::resolve(&ctx.cfg, &job) {
+                // Exit 2 for a job nothing answers to, like `vk status`/`list`/`stop` — a
+                // reader of the path must not be handed a success with no path.
+                Err(e) => fail(&e, 2),
+                Ok(path) if summary => match atop_report::summarize(&path) {
+                    Ok(report) => write_report(&report),
+                    Err(e) => fail(&e, 1),
+                },
+                // Just the path, so it composes with whatever the operator reads logs with.
+                // In its own bytes, as prepare recorded it: what reads this is another
+                // program, and a lossy rendering would send it to nothing.
                 Ok(path) => {
                     use std::io::Write;
                     use std::os::unix::ffi::OsStrExt;
@@ -2632,9 +2646,6 @@ async fn cli_main() -> ExitCode {
                         Err(e) => fail(&anyhow::anyhow!(e), 1),
                     }
                 }
-                // Exit 2 for a job nothing answers to, like `vk status`/`list`/`stop` — a
-                // reader of the path must not be handed a success with no path.
-                Err(e) => fail(&e, 2),
             },
             GitlabCmd::Supervise { job_dir } => match vm::supervise(&ctx, &job_dir).await {
                 Ok(()) => ExitCode::SUCCESS,
@@ -2796,6 +2807,23 @@ async fn cli_main() -> ExitCode {
 fn fail(e: &anyhow::Error, code: i32) -> ExitCode {
     eprintln!("virtkit: error: {e:#}");
     exit_code(code)
+}
+
+/// Write a report to stdout and flush it, treating a closed pipe as the reader having seen
+/// enough (`… | head`). `print!` panics there instead, and a report long enough to page is a
+/// report somebody will pipe.
+fn write_report(text: &str) -> ExitCode {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    match out
+        .write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .err()
+        .filter(|e| e.kind() != std::io::ErrorKind::BrokenPipe)
+    {
+        None => ExitCode::SUCCESS,
+        Some(e) => fail(&anyhow::anyhow!(e), 1),
+    }
 }
 
 /// True when `s` is a raw agent address (has a transport scheme) rather than a directory. Used
