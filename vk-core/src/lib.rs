@@ -1,9 +1,11 @@
 //! Shared host↔guest library: the wire protocol (`messages`, `framing`, `addr`, `net`,
-//! `status`, `fleetctl`) and the runtime helpers both the driver (`vk`) and the guest
-//! agent (`vk-agent`) build on (`exec`, `forward`, `pty`, `dockerignore`). Deliberately
-//! free of guest-only concerns (init/ssh/tap/…) so the host links none of that.
+//! `status`, `fleetctl`), the formats both sides speak (`atop`), and the runtime helpers
+//! both the driver (`vk`) and the guest agent (`vk-agent`) build on (`exec`, `forward`,
+//! `pty`, `dockerignore`). Deliberately free of guest-only concerns (init/ssh/tap/…) so
+//! the host links none of that.
 
 pub mod addr;
+pub mod atop;
 pub mod dockerignore;
 pub mod exec;
 pub mod fleetctl;

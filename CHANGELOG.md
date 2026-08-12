@@ -4,6 +4,17 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Every CI job now records what happened inside its VM.** The job's guest samples its own
+  CPUs, memory, paging, pressure, disks, network and processes every 10 seconds and leaves the
+  samples in `<state_dir>/atop/<date>/<job>/atop.log`, whose path the end of the job trace
+  names. It is the text format `atop -P` prints, so existing atop parsers — or plain
+  `grep`/`awk` — read it, and the account of a job survives the microVM that is destroyed when
+  the job ends. On by default; `[gitlab] atop = false` turns it off and
+  `atop_interval_secs` changes the resolution. See the
+  [GitLab CI guide](docs/gitlab-ci.md#resource-usage).
+
 ## [0.32.0] - 2026-08-11
 
 ### Added

@@ -36,6 +36,10 @@
 //!                        and link the CI tools it carries (git/git-lfs/…) onto
 //!                        the PATH, skipping any the image already provides
 //!   VIRTKIT_TMPFS        /path:size[,/path:size] RAM scratch dirs (e.g. CI /builds)
+//!   VIRTKIT_ATOP         tag:mountpoint:interval_secs — mount this virtio-fs share
+//!                        read-write and fork the guest statistics sampler on it: one
+//!                        atop-parseable sample of this guest's /proc per interval,
+//!                        appended to <mountpoint>/atop.log (see the `atop` module)
 //!   VIRTKIT_CTL=1        mount the compose control fs at /run/vk/services (a FUSE
 //!                        bridge to the host service manager over vsock)
 //!   VIRTKIT_HOST_EXEC_PORT  host command channel: present /run/vk/host.sock and
@@ -130,6 +134,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     mount_virtiofs(&cmdline)?;
     apply_symlinks(&cmdline);
     link_ci_tools(&cmdline); // host CI tools (git/git-lfs/…) onto PATH, if the image lacks them
+    maybe_atop(&cmdline); // record this guest's own stats, before anything else runs in it
     configure_network(&cmdline);
     write_resolv_conf(&cmdline); // DNS for every net mode (kernel `ip=` pool + static bridge)
     apply_tmpfs(&cmdline); // RAM scratch dirs (e.g. CI /builds) before the payload starts
@@ -1158,6 +1163,44 @@ fn link_ci_tools(cmdline: &HashMap<String, String>) {
             unsafe { std::env::set_var("GIT_SSL_CAINFO", ca) };
             info!("vk-agent init: GIT_SSL_CAINFO={ca}");
         }
+    }
+}
+
+/// `VIRTKIT_ATOP=tag:mountpoint:interval_secs`: mount the host's per-job statistics
+/// archive read-write and fork the sampler onto it, so the guest records what the job
+/// running in it does — every tick, page and byte belongs to that one job (see the
+/// `atop` module for the format). The sampler's pid is left in
+/// [`vk_core::atop::PID_FILE`] for the host to signal at the end of the job.
+///
+/// Best effort throughout: a job whose stats cannot be recorded still runs.
+fn maybe_atop(cmdline: &HashMap<String, String>) {
+    let Some(spec) = cmdline.get("VIRTKIT_ATOP") else {
+        return;
+    };
+    let Some((tag, mnt, interval)) = vk_core::atop::parse_knob(spec) else {
+        warn!("vk-agent init: bad VIRTKIT_ATOP {spec:?} (want tag:mountpoint:interval_secs)");
+        return;
+    };
+    // The same mountpoint handling as every other share (see mount_virtiofs): virtiofs
+    // itself is built into the pinned guest kernel, so there is nothing to load first.
+    if let Err(e) = create_mountpoint(Path::new(mnt)) {
+        warn!("vk-agent init: creating stats mountpoint {mnt} failed: {e}");
+        return;
+    }
+    if let Err(e) = mount(tag, mnt, "virtiofs", 0) {
+        warn!("vk-agent init: mount stats archive {tag} at {mnt} failed: {e}");
+        return;
+    }
+    // Written here rather than by the sampler: the pid is known the moment the fork
+    // returns, so the host never races a child that has not got round to it.
+    match fork_agent(&["atop".into(), mnt.into(), interval.to_string()]) {
+        Ok(pid) => {
+            if let Err(e) = std::fs::write(vk_core::atop::PID_FILE, pid.to_string()) {
+                warn!("vk-agent init: writing {}: {e}", vk_core::atop::PID_FILE);
+            }
+            info!("vk-agent init: stats sampler on {mnt} every {interval}s (pid {pid})");
+        }
+        Err(e) => warn!("vk-agent init: stats sampler failed to start: {e}"),
     }
 }
 

@@ -118,6 +118,15 @@
 #                        # with ENOSPC that the VM had the memory for, too near 100% starves
 #                        # the job's own processes into the OOM killer. Costs nothing until a
 #                        # job reaches it; each job trace reports the mark it reached against it
+# atop = true            # record what each job's guest did: the guest samples its own /proc
+#                        # and writes it in `atop -P` text format to
+#                        # <state_dir>/atop/<date>/<job>/atop.log, which any atop parser (or
+#                        # grep/awk) reads. On by default — a host-side monitor sees only one
+#                        # VMM process per job, and the VM is gone when the job ends. Costs the
+#                        # guest a read-write share of that one directory, and `psi=1` on its
+#                        # own kernel for the pressure figures
+# atop_interval_secs = 10  # seconds between samples (at least 1); fine enough that a job of
+#                        # a few minutes still shows its phases, at a few MiB per job-hour
 
 # [schedule]             # how many CI jobs run at once, by the memory they boot. Off by
 #                        # default: gitlab-runner's `concurrent` alone decides, and past

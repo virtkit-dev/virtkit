@@ -17,6 +17,7 @@
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 mod admit;
+mod atop;
 mod build;
 mod cachelock;
 mod check;
@@ -1459,6 +1460,15 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
             out,
             "  checkouts     {} ({checkouts_note}) — host_checkout clones, idle-reclaimed",
             cfg.checkout_root().display()
+        )?;
+        let stats_note = match atop::enabled(cfg) {
+            true => "per-job guest stats in `atop -P` format, one directory per day",
+            false => "off (`[gitlab] atop`)",
+        };
+        writeln!(
+            out,
+            "  atop archive  {} ({stats_note})",
+            atop::archive_root(cfg).display()
         )?;
         match cfg.gitlab.as_ref().and_then(|g| g.dir.as_ref()) {
             Some(d) => writeln!(

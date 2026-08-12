@@ -284,6 +284,32 @@ impl JobCtx {
     pub fn tools_vfsd_log(&self) -> PathBuf {
         self.job_dir.join("tools-vfsd.log")
     }
+    /// Where prepare records the archive directory this job's guest statistics go to
+    /// (`[gitlab] atop`), for the supervisor and the final stage — separate processes,
+    /// which must not each derive a date of their own around midnight.
+    pub fn atop_dir_file(&self) -> PathBuf {
+        self.job_dir.join("atop.dir")
+    }
+    /// Third virtiofsd, read-write, exporting this job's archive directory into the
+    /// guest so its sampler can append to the log there.
+    pub fn atop_vfsd_sock(&self) -> PathBuf {
+        self.job_dir.join("atop-vfsd.sock")
+    }
+    pub fn atop_vfsd_log(&self) -> PathBuf {
+        self.job_dir.join("atop-vfsd.log")
+    }
+    /// This job's directory inside a day of the statistics archive:
+    /// `<job id>-<project>-<job name>`. The id leads because it is unique per CI run — two
+    /// runs of the same pipeline job never share a directory — and reads first when the
+    /// archive is listed or a job is looked up by number.
+    pub fn atop_component(&self) -> String {
+        format!(
+            "{}-{}-{}",
+            self.job_id,
+            self.project_slug,
+            path_component(self.job_name.as_deref().unwrap_or("job"), "job")
+        )
+    }
     /// Host side of the SSH-agent forward (`vk forward` splicing to the runner's
     /// `$SSH_AUTH_SOCK`, a supervisor child).
     pub fn ssh_agent_forward_log(&self) -> PathBuf {
@@ -703,6 +729,29 @@ mod tests {
         bare.project_id = None;
         bare.job_name = None;
         assert_eq!(bare.usage_key().parent().unwrap(), Path::new("myproj"));
+    }
+
+    /// The archive directory name is a path component built from free text — a GitLab
+    /// job name carries slashes and spaces — so it must stay one readable component
+    /// that cannot walk out of the day's directory.
+    #[test]
+    fn the_atop_component_is_one_safe_path_component() {
+        assert_eq!(
+            ctx(Config::default()).atop_component(),
+            "job1-myproj-test_unit_1_3"
+        );
+
+        let mut escaping = ctx(Config::default());
+        escaping.job_name = Some("../../etc/passwd".into());
+        assert_eq!(escaping.atop_component(), "job1-myproj-_.._etc_passwd");
+
+        // A name that sanitizes away entirely still leaves the two halves that name the run.
+        let mut dots = ctx(Config::default());
+        dots.job_name = Some("..".into());
+        assert_eq!(dots.atop_component(), "job1-myproj-job");
+        let mut bare = ctx(Config::default());
+        bare.job_name = None;
+        assert_eq!(bare.atop_component(), "job1-myproj-job");
     }
 
     #[test]

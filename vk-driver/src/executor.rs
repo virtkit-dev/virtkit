@@ -89,8 +89,52 @@ pub async fn run_stage(ctx: &JobCtx, script_path: &Path, stage: Option<&str>) ->
         report_contacted_names(ctx);
         report_resource_usage(ctx).await;
         report_project_usage(ctx);
+        finalize_atop(ctx).await;
     }
     result
+}
+
+/// End this job's statistics log on a whole sample and say where it is (`[gitlab] atop`).
+///
+/// The guest sampler takes SIGUSR2 as "one last sample, then exit", so asking for that here —
+/// the last stage whose output the trace keeps, with the guest still alive — means the log
+/// covers the job to its very end instead of stopping at the last interval boundary before
+/// teardown. The agent does the asking (`vk-agent atop --stop`, like the writable-layer mark
+/// above), so the job's own image needs no shell and the pid it signals is confirmed to be
+/// the sampler rather than whatever the job left in that file.
+///
+/// Briefly bounded: nothing about this may hold a job up, and a log one interval short is a
+/// far smaller loss than a stage that hangs. Best effort throughout — a guest that is
+/// already gone just gets no signal.
+async fn finalize_atop(ctx: &JobCtx) {
+    let Some(dir) = crate::atop::job_archive_dir(ctx) else {
+        return;
+    };
+    // Output discarded: the guest side has nothing to say that belongs in a job's trace.
+    let quiet = OutputSink::Routed(Arc::new(|_fd, _msg| {}));
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        exec_script(
+            &vsock_addr(ctx),
+            &[
+                crate::run::GUEST_AGENT.to_string(),
+                "atop".to_string(),
+                "--stop".to_string(),
+            ],
+            Vec::new(),
+            // uid 0: the sampler is a child of the guest's PID 1, and a job running as the
+            // image's own user could not signal it. The number rather than the name, which
+            // an image without a `root` passwd entry would not resolve.
+            Some("0".into()),
+            &quiet,
+            None,
+        ),
+    )
+    .await;
+    println!(
+        "virtkit: atop log: {}",
+        dir.join(vk_core::atop::LOG_NAME).display()
+    );
 }
 
 /// Forward the per-job switch's egress refusals into the job trace. The switch

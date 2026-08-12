@@ -235,6 +235,22 @@ pub struct Gitlab {
     /// job guest has none to protect. `"50%"` restores it. Each job's usage line reports the
     /// mark it reached against this capacity, which is what to size it from.
     pub checkout_overlay_size: String,
+    /// Record what each job's guest does: the in-guest agent samples its own `/proc` every
+    /// `atop_interval_secs` and writes the samples to a per-job log under
+    /// `<state_dir>/atop/<date>/<job>/`, in the text format `atop -P` prints — so an existing
+    /// atop parser reads them. On by default: a host-side monitor sees one VMM process per job
+    /// with every concurrent job mixed into it, while the guest *is* the job, and the log is
+    /// the only account of what happened inside a VM that is destroyed when the job ends.
+    ///
+    /// What it costs, since it is on by default. The guest is given a read-write virtio-fs
+    /// share — one directory, its own, which it can write anything and any amount into and
+    /// leave symlinks in, so a reader of the log opens it without following them; and the
+    /// guest kernel is booted with `psi=1`, which the guest's own scheduler pays for in
+    /// exchange for the pressure figures. `false` gives up the recording and both.
+    pub atop: bool,
+    /// Seconds between samples. Must be at least 1. Default 30, matching the interval the
+    /// runner hosts' own atop uses, so the two logs read at the same resolution.
+    pub atop_interval_secs: u64,
 }
 
 /// The default `checkout_overlay_size`. Named because the guest applies the kernel's own tmpfs
@@ -250,6 +266,8 @@ impl Default for Gitlab {
             checkout_cache_idle_secs: None,
             checkout_overlay: true,
             checkout_overlay_size: CHECKOUT_OVERLAY_SIZE.to_string(),
+            atop: true,
+            atop_interval_secs: 10,
         }
     }
 }

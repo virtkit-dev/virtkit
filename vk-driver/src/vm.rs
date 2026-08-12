@@ -198,6 +198,22 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     std::fs::create_dir_all(&ctx.job_dir)
         .with_context(|| format!("creating {}", ctx.job_dir.display()))?;
 
+    // [gitlab] atop: give this job somewhere to record what its guest does, and remember
+    // where — the supervisor shares that directory into the guest, and the last stage
+    // reports the log's path. Validated here (a job-visible error names the setting) but
+    // never fatal beyond that: a host whose archive cannot be written still runs jobs,
+    // silently unrecorded but for the warning.
+    if crate::atop::enabled(cfg) {
+        let interval = crate::atop::interval_secs(cfg)?;
+        match crate::atop::prepare_archive(ctx) {
+            Ok(dir) => println!(
+                "virtkit: recording guest stats every {interval}s -> {}",
+                dir.join(vk_core::atop::LOG_NAME).display()
+            ),
+            Err(e) => eprintln!("virtkit: warning: not recording guest stats: {e:#}"),
+        }
+    }
+
     // Memory admission (`[schedule] mem_budget`): claim the guest RAM this job is about to
     // boot before booting it, waiting for room on a full host. Held for the rest of prepare;
     // the supervisor takes its own hold on the same reservation, so it never lapses between
@@ -1116,6 +1132,52 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             overlay,
             checkout_overlay_size(&gl.checkout_overlay_size)?,
         ));
+    }
+
+    // [gitlab] atop: this job's statistics archive (created by prepare), shared
+    // read-write — the guest's own sampler writes the log, so this is the one share a
+    // job guest must be able to write. Only its own directory is exported, and the
+    // knob on the cmdline is what starts the sampler at all.
+    if let Some(dir) = crate::atop::job_archive_dir(ctx) {
+        let sock = ctx.atop_vfsd_sock();
+        // Recording is optional and on by default, so a share that will not start costs the
+        // job its statistics and nothing else — it must never be the reason a job fails.
+        let mut recording = true;
+        if !crate::vmm::libkrun_selected() {
+            let mut vfsd = cfg.virtiofsd_command();
+            vfsd.arg(format!("--socket-path={}", sock.display()))
+                .arg(format!("--shared-dir={}", dir.display()))
+                .args(["--cache=auto", "--sandbox=none"]);
+            match spawn_tied_logged(vfsd, &ctx.atop_vfsd_log()) {
+                Ok(child) => children.push(child),
+                Err(e) => {
+                    eprintln!("virtkit: warning: not recording guest stats: {e:#}");
+                    recording = false;
+                }
+            }
+            if recording && let Err(e) = wait_for_socket(&sock, Duration::from_secs(5)) {
+                eprintln!(
+                    "virtkit: warning: not recording guest stats: the stats virtiofsd did not \
+                     create its socket: {e:#}"
+                );
+                recording = false;
+            }
+        }
+        // Both together or neither: the share with no knob mounts an archive nothing writes
+        // to, and the knob with no share starts a sampler with nowhere to write.
+        if recording {
+            shares.push(crate::vmm::FsShare {
+                tag: vk_core::atop::TAG.into(),
+                socket: sock,
+                host_dir: dir,
+                read_only: false,
+                uid_map: Vec::new(),
+                gid_map: Vec::new(),
+            });
+            cmdline.push_str(&vk_core::atop::cmdline_knob(crate::atop::interval_secs(
+                cfg,
+            )?));
+        }
     }
 
     let mut net = crate::vmm::Net::None;

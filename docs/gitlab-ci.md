@@ -244,6 +244,71 @@ having moved nothing, and `vk check` says whether this kernel accounts block I/O
 ok   usage    block I/O accounted, process tree from the kernel's child lists
 ```
 
+### What the job did, second by second
+
+The figures above are one number per phase. For the shape of a job over time — which step
+saturated the CPUs, when memory climbed, what process was running while nothing else moved —
+each job's guest also records itself: every 10 seconds it samples its own `/proc` and appends
+a sample to a log the host keeps after the VM is gone.
+
+```
+<state_dir>/atop/2026-08-11/42137-acme-web-test_unit/atop.log
+```
+
+The last line of the job's trace names the file:
+
+```
+virtkit: atop log: /var/lib/virtkit/atop/2026-08-11/42137-acme-web-test_unit/atop.log
+```
+
+The format is the text `atop -P` prints, pinned to the field order of atop 2.8.1 (what Debian
+12 ships), so anything that already reads that — a parser, or plain `grep`/`awk` — reads these
+logs. Each line is one record: a label, this guest's name, the epoch, the date and time, the
+seconds the sample covers, then the label's own fields. A `SEP` line closes each sample, and a
+`RESET` line opens the first one, whose counters cover the guest's whole boot. Counter labels
+carry per-interval differences; size labels carry the value as it stood.
+
+The system labels are `CPU`, `cpu` (per processor), `CPL`, `MEM`, `SWP`, `PAG`, `PSI`, `DSK` and
+`NET`; every process gets a `PRG`, `PRC`, `PRM` and `PRD` line. So the busiest samples of a job
+are one sort away:
+
+```sh
+awk '$1 == "CPU" { print $5, $9 + $10 }' atop.log | sort -k2 -n | tail   # time, busy ticks
+grep '^PRM ' atop.log | sort -k12 -n | tail   # largest processes (column 12 only while no
+                                              # process name holds a space — see below)
+```
+
+Worth knowing before reading a log:
+
+- it is the **job's own VM**, not the fleet: a `compose:` job's service VMs are not sampled;
+- a process that starts *and* exits between two samples is not in the log at all. Real atop
+  catches those through process accounting; a `/proc` sweep cannot;
+- there are no per-process network figures (`PRN`), which real atop needs a kernel module for.
+  What the job moved in and out of the host is already on its resource line above;
+- a disk that moved nothing in a sample gets no `DSK` line in it: the guest kernel carries
+  sixteen ramdisks and eight loop devices that never see a sector;
+- a field this guest cannot source carries the value atop itself prints when it has no answer
+  — CPU frequency, cgroup limits and the proportional set size are the ones to ignore rather
+  than read;
+- a process's name and command line are parenthesised and may hold spaces, so column numbers
+  shift on the `PR*` labels: `awk`/`sort -k` are safe on the system labels, and a `PRG`/`PRM`
+  line has to be split on its parentheses first;
+- the timestamps and the date directory are UTC.
+
+Recording is not free, and it is on by default. Each job's guest gets a read-write virtio-fs
+share of its own archive directory — the one directory it can write, and it can write anything
+and any amount into it until the job ends — and it boots with `psi=1`, which its own scheduler
+pays for in exchange for the `PSI` label. `atop = false` gives up all three.
+
+Set `[gitlab] atop_interval_secs` for a finer or coarser resolution, and `atop = false` to
+record nothing:
+
+```toml
+[gitlab]
+atop = true                # default
+atop_interval_secs = 10    # default; at least 1
+```
+
 ### Sizing the two phases
 
 The phases are sized independently, and by different people: the run VM by the job, the

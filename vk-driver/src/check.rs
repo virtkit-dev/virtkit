@@ -396,7 +396,22 @@ fn gitlab(cfg: &Config) -> Outcome {
             dir.display()
         ));
     }
-    ok(format!("jobs dir {} writable", jobs.display()))
+    // Guest statistics recording: whether jobs are recorded, and whether the archive they
+    // are recorded into can actually be written. A misconfigured interval fails the check
+    // rather than each job it would stop.
+    let stats = if crate::atop::enabled(cfg) {
+        let root = crate::atop::archive_root(cfg);
+        match crate::atop::interval_secs(cfg) {
+            Err(e) => return fail(format!("{e:#}")),
+            Ok(secs) => match dir_writable(&root) {
+                Err(e) => return fail(format!("{e} (guest stats are archived there)")),
+                Ok(()) => format!("guest stats every {secs}s -> {}", root.display()),
+            },
+        }
+    } else {
+        "guest stats off (`[gitlab] atop`)".to_string()
+    };
+    ok(format!("jobs dir {} writable, {stats}", jobs.display()))
 }
 
 fn share(cfg: &Config) -> Outcome {
@@ -483,6 +498,7 @@ fn dir_writable(dir: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Gitlab;
 
     // A feature the default config leaves unconfigured is a skip, so the default
     // sweep passes on hosts that don't use it; run() escalates it to a failure
@@ -526,6 +542,55 @@ mod tests {
         assert!(resolve_bin(Path::new("/bin/sh")).is_some());
         assert!(resolve_bin(Path::new("vk-no-such-binary")).is_none());
         assert!(resolve_bin(Path::new("./vk-no-such-binary")).is_none());
+    }
+
+    /// The executor check reports what the host will record and whether it can: a setting
+    /// that would stop every job on this host fails here, once, instead of there, each time.
+    #[test]
+    fn the_gitlab_check_reports_the_guest_statistics_archive() {
+        let root = std::env::temp_dir().join(format!("vk-check-atop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let with = |gl: Gitlab| Config {
+            source: Some(root.join("config.toml")),
+            state_dir: Some(root.clone()),
+            gitlab: Some(gl),
+            ..Default::default()
+        };
+
+        // On by default: the interval and where the days of recordings go.
+        let out = gitlab(&with(Gitlab::default()));
+        assert_eq!(out.status, Status::Ok, "{}", out.detail);
+        assert!(
+            out.detail.contains("guest stats every 10s"),
+            "{}",
+            out.detail
+        );
+        assert!(
+            out.detail
+                .contains(&root.join("atop").display().to_string()),
+            "{}",
+            out.detail
+        );
+        // The archive is created by the probe, so an operator sees the path that will fill.
+        assert!(root.join("atop").is_dir());
+
+        // Turned off, the check says so rather than going quiet about it.
+        let out = gitlab(&with(Gitlab {
+            atop: false,
+            ..Default::default()
+        }));
+        assert_eq!(out.status, Status::Ok, "{}", out.detail);
+        assert!(out.detail.contains("guest stats off"), "{}", out.detail);
+
+        // An interval no job could sample at fails the check, naming the setting.
+        let out = gitlab(&with(Gitlab {
+            atop_interval_secs: 0,
+            ..Default::default()
+        }));
+        assert_eq!(out.status, Status::Fail);
+        assert!(out.detail.contains("atop_interval_secs"), "{}", out.detail);
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

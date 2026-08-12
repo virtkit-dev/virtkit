@@ -185,6 +185,13 @@ fn main() {
         let rest: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(vk_agent::fsmark::main(&rest));
     }
+    // The guest statistics sampler (no socket): init forks `vk-agent atop <dir>
+    // <interval_secs>` at boot when the cmdline asks for it, and it appends atop-parseable
+    // samples of this guest's /proc to the host archive share until SIGUSR2.
+    if std::env::args().nth(1).as_deref() == Some("atop") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(vk_agent::atop::main(&rest));
+    }
     // Local block-device mount/unmount (no socket): the host attaches a source stage's
     // ext4 read-only and runs `vk-agent mount|umount …` in the guest to read it.
     if matches!(
