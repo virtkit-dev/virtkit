@@ -127,6 +127,10 @@
 #                        # own kernel for the pressure figures
 # atop_interval_secs = 10  # seconds between samples (at least 1); fine enough that a job of
 #                        # a few minutes still shows its phases, at a few MiB per job-hour
+# atop_retention_days = 14  # days back the archive keeps beside today's, in whole UTC days: a
+#                        # day past the window is dropped whole by the first job recorded the
+#                        # next day (0 = only today, and loses the log of a job still running
+#                        # from yesterday). Reclamation stops with `atop = false`
 
 # [schedule]             # how many CI jobs run at once, by the memory they boot. Off by
 #                        # default: gitlab-runner's `concurrent` alone decides, and past

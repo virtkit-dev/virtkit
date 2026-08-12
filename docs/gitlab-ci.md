@@ -307,7 +307,22 @@ record nothing:
 [gitlab]
 atop = true                # default
 atop_interval_secs = 10    # default; at least 1
+atop_retention_days = 14   # default; 0 keeps only today's jobs
 ```
+
+The archive is kept for `atop_retention_days` and then reclaimed: each day past the window is
+dropped whole by the first job recorded the following day — once a day, not once a job — so the
+directory stays bounded on a runner nobody visits. The window is counted in whole UTC days
+beside today's, so `14` leaves fifteen date directories. Only a directory whose name is a date
+in that `YYYY-MM-DD` form is ever dropped: a file, a symlink, or anything else an operator
+leaves in the archive is never touched, so a log worth keeping can simply be renamed.
+
+Two things to know before setting it. A day goes even if a guest is still recording into it, so
+a job that outlives the window has its log unlinked while it is still writing — the guest keeps
+appending to a file nobody can open again. With `0` that is any job running past midnight, and
+with a short window any job outliving it. And the reclamation belongs to the recording:
+`atop = false` stops both, so an archive already on disk stays at the size it reached and has to
+be removed by hand.
 
 ### Sizing the two phases
 

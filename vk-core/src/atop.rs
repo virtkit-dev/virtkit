@@ -520,8 +520,9 @@ pub fn date_time(epoch: i64) -> (String, String) {
     )
 }
 
-/// Whole days since 1970-01-01, UTC — what a day of the archive is keyed on.
-fn day_of(epoch: i64) -> i64 {
+/// Whole days since 1970-01-01, UTC — what a day of the archive is keyed on, and what the
+/// retention window is counted in.
+pub fn day_of(epoch: i64) -> i64 {
     epoch.div_euclid(86_400)
 }
 
@@ -534,6 +535,30 @@ pub fn date_dir(epoch: i64) -> String {
 fn date_dir_of_day(day: i64) -> String {
     let (y, m, d) = civil_from_days(day);
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// The day an archive directory name stands for, or `None` when the name is not one of the
+/// days this archive writes — so a sweep can leave everything else in it alone.
+///
+/// Only the canonical `YYYY-MM-DD` of a real date reads back, which the round trip through
+/// [`date_dir_of_day`] is what settles: `2026-02-31` names no day rather than March the 3rd,
+/// and the fixed-width fields keep a year out of the arithmetic below that it could not hold.
+pub fn parse_date_dir(name: &str) -> Option<i64> {
+    let field = |part: Option<&str>, width: usize| -> Option<i64> {
+        let s = part?;
+        (s.len() == width && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse().ok())
+            .flatten()
+    };
+    let mut parts = name.split('-');
+    let y = field(parts.next(), 4)?;
+    let m = field(parts.next(), 2)?;
+    let d = field(parts.next(), 2)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let day = days_from_civil(y, m, d);
+    (date_dir_of_day(day) == name).then_some(day)
 }
 
 /// The Gregorian date `days` after 1970-01-01. Counting from a March-based year puts the
@@ -549,6 +574,17 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     (era * 400 + yoe + i64::from(month <= 2), month, day)
+}
+
+/// The day number of a Gregorian date, the inverse of [`civil_from_days`].
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y }; // the March-based year the day falls in
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 }; // month, 0 = March
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 #[cfg(test)]
@@ -732,5 +768,46 @@ mod tests {
         assert!(now > 1_767_225_600, "the clock is set: {now}");
         assert_eq!(date_dir(now), date_dir_of_day(day_of(now)));
         assert_eq!(day_of(now) - day_of(now - 86_400), 1);
+    }
+
+    /// A day number and its directory name convert both ways, whatever the calendar does
+    /// around them: the retention sweep compares those numbers, so an edge getting them
+    /// wrong would drop a day early or keep one forever.
+    #[test]
+    fn a_date_directory_name_reads_back_as_its_day() {
+        for name in [
+            "1970-01-01",
+            "2024-02-29",
+            "2024-03-01",
+            "2026-08-11",
+            "2026-12-31",
+        ] {
+            let day = parse_date_dir(name).unwrap_or_else(|| panic!("{name} is a date"));
+            assert_eq!(date_dir_of_day(day), name);
+        }
+        assert_eq!(
+            parse_date_dir("2024-03-01").unwrap() - parse_date_dir("2024-02-29").unwrap(),
+            1
+        );
+        // Anything that is not a day of recordings has no day number, so a sweep leaves it
+        // where the operator put it — including names that are nearly one, since a name the
+        // archive would never write is a name somebody else chose.
+        for bad in [
+            "atop.log",
+            "2026-08",
+            "2026-08-11.bak",
+            "2026-13-01",
+            "2026-08-32",
+            "2026-02-31", // in range, but no such day
+            "2023-02-29", // a leap day of a common year
+            "2026-1-1",   // not the width the archive writes
+            "2026-08-011",
+            "+2026-01-01",
+            "9223372036854775807-01-01", // a year the day arithmetic could not hold
+            "yesterday",
+            "",
+        ] {
+            assert_eq!(parse_date_dir(bad), None, "{bad}");
+        }
     }
 }

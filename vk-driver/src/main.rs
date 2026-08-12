@@ -1462,8 +1462,11 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
             cfg.checkout_root().display()
         )?;
         let stats_note = match atop::enabled(cfg) {
-            true => "per-job guest stats in `atop -P` format, one directory per day",
-            false => "off (`[gitlab] atop`)",
+            true => format!(
+                "per-job guest stats in `atop -P` format, one directory per day, {}",
+                atop::retention_note(cfg)
+            ),
+            false => "off (`[gitlab] atop`)".to_string(),
         };
         writeln!(
             out,

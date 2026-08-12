@@ -14,6 +14,9 @@ All notable changes to virtkit will be documented in this file.
   the job ends. On by default; `[gitlab] atop = false` turns it off and
   `atop_interval_secs` changes the resolution. See the
   [GitLab CI guide](docs/gitlab-ci.md#resource-usage).
+- **A job's recorded statistics are kept for two weeks.** Each day of recordings older than
+  `[gitlab] atop_retention_days` is dropped whole, so the archive stays bounded on a runner
+  nobody visits. Anything else left in it by hand is never touched.
 
 ## [0.32.0] - 2026-08-11
 

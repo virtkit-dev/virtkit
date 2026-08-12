@@ -6,7 +6,8 @@
 //! lands, and how the guest is told to write it:
 //!
 //! * `prepare` creates this job's archive directory under `<state_dir>/atop/<date>/`
-//!   and records its path in the job dir;
+//!   and records its path in the job dir — and, on the day's first recorded job, drops
+//!   the days past the retention window;
 //! * `supervise` shares that directory into the guest read-write and puts
 //!   [`vk_core::atop::cmdline_knob`] on the guest cmdline, which names the share and the
 //!   interval.
@@ -18,10 +19,10 @@
 //! still runs.
 
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use vk_core::atop::{date_dir, now_epoch};
+use vk_core::atop::{date_dir, day_of, now_epoch, parse_date_dir};
 
 use crate::config::{Config, Gitlab};
 use crate::jobctx::JobCtx;
@@ -48,6 +49,26 @@ pub fn interval_secs(cfg: &Config) -> Result<u64> {
     Ok(secs)
 }
 
+/// How many days of recorded jobs the archive keeps (`[gitlab] atop_retention_days`).
+pub fn retention_days(cfg: &Config) -> u64 {
+    // A host with no [gitlab] table configured nothing, so it gets the default rather than a
+    // zero that would read as an explicit "keep only today".
+    cfg.gitlab.as_ref().map_or_else(
+        || Gitlab::default().atop_retention_days,
+        |g| g.atop_retention_days,
+    )
+}
+
+/// How the retention window reads in a report. `0` still keeps what is being recorded now, so
+/// it is not "kept 0 days" — and one day is not "1 days".
+pub fn retention_note(cfg: &Config) -> String {
+    match retention_days(cfg) {
+        0 => "today's only".to_string(),
+        1 => "kept 1 day back".to_string(),
+        d => format!("kept {d} days back"),
+    }
+}
+
 /// Every job's archive on this host, one directory per day inside it. Shared by every
 /// runner using this state dir, and outside the job dirs on purpose: a job's own dir is
 /// wiped by its prepare and removed at cleanup, while the log outlives the job.
@@ -56,7 +77,7 @@ pub fn archive_root(cfg: &Config) -> PathBuf {
 }
 
 /// Where this job's log goes: `<archive root>/<YYYY-MM-DD>/<job>`. The date groups a
-/// day's jobs into one directory, so the archive stays readable as it fills up.
+/// day's jobs into one directory, which is the unit the retention window drops.
 pub fn archive_dir(ctx: &JobCtx, date: &str) -> PathBuf {
     archive_root(&ctx.cfg).join(date).join(ctx.atop_component())
 }
@@ -95,6 +116,80 @@ pub fn job_archive_dir(ctx: &JobCtx) -> Option<PathBuf> {
     (!bytes.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
 }
 
+/// Sweep the archive once a day rather than once a job: the first job recorded today has no
+/// directory for today yet, and the sweep it runs is the one that day needs. A sweep per job
+/// would charge every job on a busy runner for a recursive removal of trees that earlier
+/// jobs' guests filled, on the path where the job is waiting to boot.
+///
+/// Tied to recording being on, so `[gitlab] atop = false` stops the reclamation with it: an
+/// archive already on disk then stays until it is removed by hand.
+pub fn prune_archive_daily(cfg: &Config) {
+    prune_archive_daily_as_of(cfg, now_epoch());
+}
+
+/// [`prune_archive_daily`] against a given clock, so both the trigger and the window are read
+/// from one instant — a test pins it, and a sweep never straddles midnight between the two.
+fn prune_archive_daily_as_of(cfg: &Config, now: i64) {
+    let root = archive_root(cfg);
+    if root.join(date_dir(now)).exists() {
+        return;
+    }
+    prune_archive_as_of(&root, retention_days(cfg), day_of(now));
+}
+
+/// Drop the days the retention window has passed, so a busy runner's archive stays
+/// bounded with nobody sweeping it. Each date directory is one day of recorded jobs and
+/// goes whole; a directory exactly `days` old is still inside the window and stays.
+///
+/// Only a directory whose name is one of the days this archive writes is considered, so a
+/// file, a symlink, or a directory named anything else is left where the operator put it.
+///
+/// Best effort: a day that will not go — a permission problem, or another runner's sweep
+/// already removing it — is left for the next sweep. No lock is taken for that reason: two
+/// runners sweeping the same root want the same outcome, and the loser of the race has
+/// nothing left to do.
+///
+/// A day goes whether or not a guest still holds its log open — unlinking one succeeds — so a
+/// job that outlives the window loses the recording it is in the middle of writing. The
+/// default window covers every job shorter than a fortnight; `atop_retention_days = 0` gives
+/// that up for any job running past midnight, and a short window for any job outliving it.
+///
+/// `today` is passed in rather than read here, so one sweep judges every day in the archive
+/// against one instant — and a test pins the window's boundary instead of racing the clock.
+fn prune_archive_as_of(root: &Path, days: u64, today: i64) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return; // unreadable or not there yet: nothing this sweep can reclaim
+    };
+    // The oldest day still inside the window; a day exactly `days` old is one of them. An
+    // absurd `days` saturates towards keeping everything, never towards dropping it.
+    let keep_from = today.saturating_sub_unsigned(days);
+    for entry in entries.flatten() {
+        // A real directory, whatever its name: a file or a symlink an operator parked in the
+        // archive is not a day of recordings and is not this sweep's to remove.
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(day) = name.to_str().and_then(parse_date_dir) else {
+            continue;
+        };
+        if day >= keep_from {
+            continue;
+        }
+        let dir = entry.path();
+        // Already gone is a concurrent runner's sweep having got there first, which is the
+        // outcome this one wanted.
+        if let Err(e) = std::fs::remove_dir_all(&dir)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "virtkit: warning: could not drop expired stats archive {}: {e}",
+                dir.display()
+            );
+        }
+    }
+}
+
 /// The archive directory name for the day a job recorded now lands in.
 fn today() -> String {
     date_dir(now_epoch())
@@ -111,6 +206,11 @@ mod tests {
         cfg.gitlab = Some(Gitlab::default());
         assert!(enabled(&cfg), "on by default once the executor is set up");
         assert_eq!(interval_secs(&cfg).unwrap(), 10);
+        assert_eq!(retention_days(&cfg), 14);
+        // Neither figure is read off a host that configured nothing: the default window, not
+        // a zero that would sweep everything but today.
+        assert_eq!(retention_days(&Config::default()), 14);
+        assert_eq!(interval_secs(&Config::default()).unwrap(), 10);
 
         cfg.gitlab = Some(Gitlab {
             atop: false,
@@ -127,8 +227,100 @@ mod tests {
         assert!(format!("{e:#}").contains("atop_interval_secs"), "{e:#}");
     }
 
+    /// The sweep drops whole days once they are past the window, keeps the day that is
+    /// exactly at it, and leaves everything that is not a day of recordings alone.
+    #[test]
+    fn pruning_drops_the_days_past_the_retention_window() {
+        let root = std::env::temp_dir().join(format!("vk-atop-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // One instant for the names and for the sweep, so the boundary is still the boundary
+        // when the test runs across midnight.
+        let now = now_epoch();
+        let day = |offset: i64| date_dir(now - offset * 86_400);
+        let today = day(0);
+        let boundary = day(14);
+        let expired = day(15);
+        let ancient = day(400);
+        for name in [&today, &boundary, &expired, &ancient] {
+            // a day holds one directory per job, each holding the job's log
+            let job = root.join(name).join("42-proj-build");
+            std::fs::create_dir_all(&job).unwrap();
+            std::fs::write(job.join(vk_core::atop::LOG_NAME), b"RESET\nSEP\n").unwrap();
+        }
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::write(root.join("README"), b"kept by hand").unwrap();
+        // Named like an expired day, but neither is a day of recordings: a file the sweep
+        // cannot remove as a directory, and a symlink whose target is not the sweep's to take.
+        std::fs::write(root.join(day(30)), b"not a directory").unwrap();
+        let outside = root.join("keep-me");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(day(31))).unwrap();
+
+        prune_archive_as_of(&root, 14, day_of(now));
+
+        assert!(root.join(&today).is_dir(), "today is being written");
+        assert!(root.join(&boundary).is_dir(), "the boundary day is inside");
+        assert!(!root.join(&expired).exists(), "a day past the window goes");
+        assert!(!root.join(&ancient).exists());
+        assert!(root.join("notes").is_dir(), "not a date, not swept");
+        assert!(root.join("README").is_file());
+        assert!(root.join(day(30)).is_file(), "a file is not a day of jobs");
+        assert!(
+            root.join(day(31)).symlink_metadata().is_ok(),
+            "a symlink is not a day of jobs"
+        );
+        assert!(outside.is_dir(), "and its target is untouched");
+
+        // A window of zero keeps only what is being recorded now.
+        prune_archive_as_of(&root, 0, day_of(now));
+        assert!(root.join(&today).is_dir());
+        assert!(!root.join(&boundary).exists());
+
+        // A window no archive could outlive keeps everything, rather than inverting.
+        prune_archive_as_of(&root, u64::MAX, day_of(now));
+        assert!(root.join(&today).is_dir());
+
+        // An archive that does not exist yet is not an error.
+        prune_archive_as_of(&root.join("nope"), 14, day_of(now));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The sweep runs once a day, not once a job: a runner that has already recorded a job
+    /// today has swept today, and every later job that day goes straight to booting.
+    #[test]
+    fn the_sweep_runs_for_the_first_recorded_job_of_the_day() {
+        let root = std::env::temp_dir().join(format!("vk-atop-daily-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cfg = Config {
+            state_dir: Some(root.clone()),
+            gitlab: Some(Gitlab::default()),
+            ..Default::default()
+        };
+        let archive = archive_root(&cfg);
+        // One instant for the trigger and the window, so neither call can straddle midnight.
+        let now = now_epoch();
+        let expired = archive.join(date_dir(now - 30 * 86_400));
+        std::fs::create_dir_all(&expired).unwrap();
+
+        // No directory for today yet: this is the day's first recorded job, so it sweeps.
+        prune_archive_daily_as_of(&cfg, now);
+        assert!(!expired.exists(), "the first job of the day reclaims");
+
+        // That job then records into today's directory, as prepare creates it. With today's
+        // directory standing, a later job leaves the archive alone — including a day that
+        // expired while the runner was busy.
+        std::fs::create_dir_all(archive.join(date_dir(now))).unwrap();
+        let stale = archive.join(date_dir(now - 31 * 86_400));
+        std::fs::create_dir_all(&stale).unwrap();
+        prune_archive_daily_as_of(&cfg, now);
+        assert!(stale.is_dir(), "swept once for the day, not once per job");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// The archive is one directory per day of the shared state dir, outside the job dirs
-    /// that are wiped when a job ends.
+    /// that are wiped when a job ends — and a day's name reads back as the day it is, which
+    /// is the only thing the sweep goes by.
     #[test]
     fn the_archive_is_a_dated_directory_under_the_state_dir() {
         let cfg = Config {

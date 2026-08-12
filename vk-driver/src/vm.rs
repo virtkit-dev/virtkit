@@ -205,6 +205,8 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // silently unrecorded but for the warning.
     if crate::atop::enabled(cfg) {
         let interval = crate::atop::interval_secs(cfg)?;
+        // Bound what the archive costs the host before adding a job to it.
+        crate::atop::prune_archive_daily(cfg);
         match crate::atop::prepare_archive(ctx) {
             Ok(dir) => println!(
                 "virtkit: recording guest stats every {interval}s -> {}",

@@ -405,7 +405,11 @@ fn gitlab(cfg: &Config) -> Outcome {
             Err(e) => return fail(format!("{e:#}")),
             Ok(secs) => match dir_writable(&root) {
                 Err(e) => return fail(format!("{e} (guest stats are archived there)")),
-                Ok(()) => format!("guest stats every {secs}s -> {}", root.display()),
+                Ok(()) => format!(
+                    "guest stats every {secs}s, {} -> {}",
+                    crate::atop::retention_note(cfg),
+                    root.display()
+                ),
             },
         }
     } else {
@@ -565,6 +569,8 @@ mod tests {
             "{}",
             out.detail
         );
+        // and how long what it records survives
+        assert!(out.detail.contains("kept 14 days back"), "{}", out.detail);
         assert!(
             out.detail
                 .contains(&root.join("atop").display().to_string()),

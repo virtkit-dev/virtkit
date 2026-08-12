@@ -251,6 +251,12 @@ pub struct Gitlab {
     /// Seconds between samples. Must be at least 1. Default 30, matching the interval the
     /// runner hosts' own atop uses, so the two logs read at the same resolution.
     pub atop_interval_secs: u64,
+    /// How many days back the archive keeps beside today's, counted in whole UTC days rather
+    /// than elapsed time. A day past the window is dropped whole, by the first job recorded
+    /// the following day. Default 14, as the runner hosts keep their own atop logs; `0` keeps
+    /// only jobs recorded today — and drops the log of a job still running from the day
+    /// before out from under it. Any job outliving the window loses its log the same way.
+    pub atop_retention_days: u64,
 }
 
 /// The default `checkout_overlay_size`. Named because the guest applies the kernel's own tmpfs
@@ -268,6 +274,7 @@ impl Default for Gitlab {
             checkout_overlay_size: CHECKOUT_OVERLAY_SIZE.to_string(),
             atop: true,
             atop_interval_secs: 10,
+            atop_retention_days: 14,
         }
     }
 }
