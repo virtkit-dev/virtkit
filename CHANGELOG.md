@@ -47,6 +47,14 @@ All notable changes to virtkit will be documented in this file.
   job no longer starts with finding the runner it ran on. Nothing to report means no section,
   and it can be turned off with the recording (`[gitlab] atop = false`).
 
+### Fixed
+
+- **A build log off a terminal now says how long each step took.** Every finished step
+  reported `0.0s` whenever the output was not a terminal — a git hook, a CI log, a streamed
+  service build — so the durations were missing from exactly the places they get read after
+  the fact, and a slow build gave no clue which step it was spent in. They now carry each
+  step's real run time, as the live dashboard already did.
+
 ## [0.32.0] - 2026-08-11
 
 ### Added

@@ -87,10 +87,6 @@ struct Tty {
     header: ProgressBar,
     /// running bars keyed by (stage, cell num); export uses [`export_key`].
     bars: Mutex<HashMap<(StageId, usize), ProgressBar>>,
-    /// a step's command run-time, frozen at [`Progress::step_committing`] so the emitted line
-    /// reports how long the RUN/COPY took — not that plus the snapshot + cache push that
-    /// `cache_save` folds in after it (which would inflate a trivial step to minutes).
-    ran: Mutex<HashMap<(StageId, usize), Duration>>,
     /// the most recently started cell's label, mirrored into the terminal title so a parallel
     /// build's title tracks the latest work item (empty until the first cell starts).
     activity: Mutex<String>,
@@ -140,6 +136,14 @@ pub struct Progress {
     line_buf: Mutex<HashMap<(StageId, u8), Vec<u8>>>,
     /// the cell num currently running per stage, for prefixing that stage's output.
     cur: Mutex<HashMap<StageId, usize>>,
+    /// when each in-flight cell started, keyed by (stage, cell num). Kept here rather than
+    /// read off the tty bar so a plain/routed build (a git hook, a CI log) reports real
+    /// durations too — that is precisely where the numbers are read after the fact.
+    cell_start: Mutex<HashMap<(StageId, usize), Instant>>,
+    /// a step's command run-time, frozen at [`Progress::step_committing`] so the emitted line
+    /// reports how long the RUN/COPY took — not that plus the snapshot + cache push that
+    /// `cache_save` folds in after it (which would inflate a trivial step to minutes).
+    cell_ran: Mutex<HashMap<(StageId, usize), Duration>>,
     /// cached cells counted per stage but not yet materialized — a cache hit resolves an
     /// instruction instantly, but its filesystem is in hand only once the stage's snapshot
     /// is restored. Held here until [`Progress::restore_done`] moves it into `done`, so the
@@ -204,6 +208,8 @@ impl Progress {
             total: AtomicUsize::new(0),
             line_buf: Mutex::new(HashMap::new()),
             cur: Mutex::new(HashMap::new()),
+            cell_start: Mutex::new(HashMap::new()),
+            cell_ran: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
         }
     }
@@ -279,12 +285,20 @@ impl Progress {
     /// state, so the dashboard keeps moving through the commit instead of appearing to stall
     /// on a step whose command is already done.
     pub fn step_committing(&self, stage: StageId, step: usize) {
-        if let Backend::Tty(tty) = &self.backend {
-            let num = step + 2;
-            if let Some(pb) = tty.bars.lock().unwrap().get(&(stage, num)) {
-                tty.ran.lock().unwrap().insert((stage, num), pb.elapsed());
-                pb.set_style(self.commit_style());
-            }
+        let num = step + 2;
+        // Copy the Instant out so cell_start and cell_ran are never held together
+        // (parallel stage workers would otherwise race the locks in opposite orders).
+        let started = self.cell_start.lock().unwrap().get(&(stage, num)).copied();
+        if let Some(started) = started {
+            self.cell_ran
+                .lock()
+                .unwrap()
+                .insert((stage, num), started.elapsed());
+        }
+        if let Backend::Tty(tty) = &self.backend
+            && let Some(pb) = tty.bars.lock().unwrap().get(&(stage, num))
+        {
+            pb.set_style(self.commit_style());
         }
     }
     pub fn step_done(&self, stage: StageId, step: usize, outcome: Outcome) {
@@ -298,6 +312,8 @@ impl Progress {
     pub fn step_failed(&self, stage: StageId, step: usize) {
         self.flush_partial(stage);
         let num = step + 2;
+        self.cell_start.lock().unwrap().remove(&(stage, num));
+        self.cell_ran.lock().unwrap().remove(&(stage, num));
         let Some(meta) = self.meta.get() else { return };
         let Some(sm) = meta.stages.get(&stage) else {
             return;
@@ -307,7 +323,6 @@ impl Progress {
                 if let Some(pb) = tty.bars.lock().unwrap().remove(&(stage, num)) {
                     pb.finish_and_clear();
                 }
-                tty.ran.lock().unwrap().remove(&(stage, num));
                 let head = format!(" => [{} {}/{}] {}", sm.name, num, sm.total, sm.label(num));
                 let line = self.paint(&right_align(&head, "FAILED"), "\x1b[31m");
                 let _ = tty.println(line);
@@ -515,6 +530,10 @@ impl Progress {
 
     fn start_cell(&self, stage: StageId, num: usize) {
         self.cur.lock().unwrap().insert(stage, num);
+        self.cell_start
+            .lock()
+            .unwrap()
+            .insert((stage, num), Instant::now());
         let Some(meta) = self.meta.get() else { return };
         let Some(sm) = meta.stages.get(&stage) else {
             return;
@@ -555,23 +574,17 @@ impl Progress {
                 *self.pending.lock().unwrap().entry(stage).or_default() += 1;
             }
         }
-        // reclaim the running bar's elapsed (if this cell had one — cache hits never start).
+        // reclaim this cell's elapsed (None if it never started — cache hits don't).
         // A step reports its frozen command time (see `step_committing`); the base has none
-        // frozen, so it falls back to the bar's full lifetime (its materialize time).
-        let elapsed = if let Backend::Tty(tty) = &self.backend {
-            tty.bars.lock().unwrap().remove(&(stage, num)).map(|pb| {
-                let e = tty
-                    .ran
-                    .lock()
-                    .unwrap()
-                    .remove(&(stage, num))
-                    .unwrap_or_else(|| pb.elapsed());
-                pb.finish_and_clear();
-                e
-            })
-        } else {
-            None
-        };
+        // frozen, so it falls back to the cell's full lifetime (its materialize time).
+        let started = self.cell_start.lock().unwrap().remove(&(stage, num));
+        let ran = self.cell_ran.lock().unwrap().remove(&(stage, num));
+        let elapsed = ran.or_else(|| started.map(|t| t.elapsed()));
+        if let Backend::Tty(tty) = &self.backend
+            && let Some(pb) = tty.bars.lock().unwrap().remove(&(stage, num))
+        {
+            pb.finish_and_clear();
+        }
         if let Some(meta) = self.meta.get()
             && let Some(sm) = meta.stages.get(&stage)
         {
@@ -796,7 +809,6 @@ impl Tty {
             sep,
             header,
             bars: Mutex::new(HashMap::new()),
-            ran: Mutex::new(HashMap::new()),
             activity: Mutex::new(String::new()),
             title: std::env::var_os("VIRTKIT_NO_TITLE").is_none(),
         };
@@ -1322,5 +1334,33 @@ mod tests {
         assert!(got.iter().any(|l| l.contains("FINISHED")));
         // routed guest output must carry through, not inherit stdout
         assert!(matches!(p.stage_sink(1), OutputSink::Routed(_)));
+    }
+
+    #[test]
+    fn plain_lines_report_the_step_run_time() {
+        // A non-tty build (a git hook, a CI log) is exactly where durations are read after
+        // the fact, so its `#N DONE <d>` must carry the step's real run time — not the 0.0s
+        // it printed while the elapsed was reclaimed off the (tty-only) progress bar.
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let lines = Arc::clone(&lines);
+            Arc::new(move |l: &str| lines.lock().unwrap().push(l.to_string()))
+                as Arc<dyn Fn(&str) + Send + Sync>
+        };
+        let p = Progress::routed(sink);
+        p.init(two_stages(), 0);
+        p.step_start(1, 0);
+        std::thread::sleep(Duration::from_millis(150));
+        p.step_committing(1, 0);
+        p.step_done(1, 0, Outcome::Ran);
+        let got = lines.lock().unwrap();
+        let done = got
+            .iter()
+            .find(|l| l.contains(" DONE "))
+            .expect("a ran step emits a DONE line");
+        assert!(
+            !done.ends_with(" 0.0s"),
+            "DONE line lost the run time: {done}"
+        );
     }
 }
