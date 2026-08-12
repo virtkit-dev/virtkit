@@ -49,6 +49,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A bundle can be published to a local store.** `vk registry push` and `vk build --tag`
+  failed outright whenever the configured registry was a store directory rather than a
+  server, complaining that the path was not a valid image reference — while builds could
+  already share their images through such a store. Both now write straight into the store.
 - **A build log off a terminal now says how long each step took.** Every finished step
   reported `0.0s` whenever the output was not a terminal — a git hook, a CI log, a streamed
   service build — so the durations were missing from exactly the places they get read after

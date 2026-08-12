@@ -96,6 +96,12 @@ pub fn push(cfg: &Config, dir: &Path, image_ref: &str) -> Result<String> {
             bail!("`registry push` needs a :tag, not an @digest ({image_ref:?})")
         }
     };
+    // A path repo is the in-process store, which speaks no HTTP and has no OCI reference
+    // to resolve — the same dispatch `push_ext4` makes. Without it a `[registry] repo` set
+    // to a store directory fails in `make_ref`, since a leading `/` is not a registry host.
+    if let Some(root) = rg.local_root() {
+        return local::push_bundle(&root, dir, &name, &tag);
+    }
     block_on(push_async(rg, dir, &name, &tag))
 }
 
@@ -1850,7 +1856,8 @@ mod local {
             f.seek(SeekFrom::Start(start))?;
             chunk_region_into(&store, f.take(len), start, ext4, &mut layers)?;
         }
-        put_bundle_manifest(&store, name, tag, layers, total_size, boot_kind)
+        let config = cache_config(&layers, total_size, boot_kind);
+        put_bundle_manifest(&store, name, tag, layers, config)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1921,7 +1928,8 @@ mod local {
             chunk_region_into(&store, reader, start, ext4, &mut layers)?;
         }
         let ret = layers.clone();
-        let digest = put_bundle_manifest(&store, name, tag, layers, total_size, boot_kind)?;
+        let config = cache_config(&layers, total_size, boot_kind);
+        let digest = put_bundle_manifest(&store, name, tag, layers, config)?;
         Ok((ret, total_size, digest))
     }
 
@@ -1958,6 +1966,72 @@ mod local {
         Ok(())
     }
 
+    /// Push a bundle directory (`runner.ext4` + `boot.kind`, optionally `vmlinuz` /
+    /// `initrd.img` / the `runner.ext4.json` config sidecar) into the local store — the
+    /// in-process counterpart of `push_async`, writing the identical on-disk state.
+    pub(super) fn push_bundle(root: &Path, dir: &Path, name: &str, tag: &str) -> Result<String> {
+        let store = Store::new(root.to_path_buf())?;
+        let _lock = store.lock_shared()?;
+        let ext4 = dir.join("runner.ext4");
+        let total_size = std::fs::metadata(&ext4)
+            .with_context(|| format!("stat {}", ext4.display()))?
+            .len();
+        let mut layers: Vec<OciDescriptor> = Vec::new();
+        for (start, len) in file_data_extents(&ext4, total_size)? {
+            let mut f = std::fs::File::open(&ext4)
+                .with_context(|| format!("opening {}", ext4.display()))?;
+            f.seek(SeekFrom::Start(start))?;
+            chunk_region_into(&store, f.take(len), start, &ext4, &mut layers)?;
+        }
+        // the ext4's chunks alone; the kernel/initrd blobs below are not chunk layers.
+        let chunk_count = layers.len();
+        let has_kernel = dir.join("vmlinuz").is_file();
+        let has_initrd = dir.join("initrd.img").is_file();
+        if has_kernel {
+            layers.push(put_file(&store, &dir.join("vmlinuz"), KERNEL_MEDIA_TYPE)?);
+        }
+        if has_initrd {
+            layers.push(put_file(
+                &store,
+                &dir.join("initrd.img"),
+                INITRD_MEDIA_TYPE,
+            )?);
+        }
+        let boot_kind = image::read_boot_kind(dir).with_context(|| {
+            format!(
+                "bundle {}: unsupported boot.kind marker — re-push it",
+                dir.display()
+            )
+        })?;
+        let run_config = std::fs::read(dir.join("runner.ext4.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        let config = BundleConfig {
+            total_size,
+            chunk_count,
+            boot_kind: image::boot_kind_tag(boot_kind).to_string(),
+            compression: "zstd".to_string(),
+            has_kernel,
+            has_initrd,
+            run_config,
+        };
+        put_bundle_manifest(&store, name, tag, layers, config)
+    }
+
+    /// Store a whole file (kernel/initrd) as one raw blob, returning its layer descriptor —
+    /// the local counterpart of `push_file`.
+    fn put_file(store: &Store, path: &Path, media_type: &str) -> Result<OciDescriptor> {
+        let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let size = data.len() as i64;
+        let digest = store.put_blob(&data)?;
+        Ok(OciDescriptor {
+            media_type: media_type.to_string(),
+            digest,
+            size,
+            ..Default::default()
+        })
+    }
+
     /// Store the config blob + the bundle manifest and tag it — the local counterpart
     /// of the config/manifest tail of `push_async`/`push_ext4_diff_async`, producing
     /// the identical manifest JSON. Returns the manifest digest.
@@ -1966,18 +2040,8 @@ mod local {
         name: &str,
         tag: &str,
         layers: Vec<OciDescriptor>,
-        total_size: u64,
-        boot_kind: &str,
+        config: BundleConfig,
     ) -> Result<String> {
-        let config = BundleConfig {
-            total_size,
-            chunk_count: layers.len(),
-            boot_kind: boot_kind.to_string(),
-            compression: "zstd".to_string(),
-            has_kernel: false,
-            has_initrd: false,
-            run_config: None,
-        };
         let config_json = serde_json::to_vec(&config).context("serializing the bundle config")?;
         let config_digest = store.put_blob(&config_json)?;
         let config_desc = OciDescriptor {
@@ -1997,6 +2061,20 @@ mod local {
         };
         let body = serde_json::to_vec(&manifest).context("serializing the bundle manifest")?;
         store.put_manifest(name, tag, OCI_IMAGE_MEDIA_TYPE, &body)
+    }
+
+    /// The bundle config a build-cache snapshot carries: chunk layers only, and none of
+    /// the bundle extras (`push_bundle` fills those in from the bundle dir).
+    fn cache_config(layers: &[OciDescriptor], total_size: u64, boot_kind: &str) -> BundleConfig {
+        BundleConfig {
+            total_size,
+            chunk_count: layers.len(),
+            boot_kind: boot_kind.to_string(),
+            compression: "zstd".to_string(),
+            has_kernel: false,
+            has_initrd: false,
+            run_config: None,
+        }
     }
 
     /// Resolve `<name>:<tag>` to its parsed manifest + bundle config, `None` when the
@@ -2363,6 +2441,79 @@ mod tests {
             std::fs::read(&base).unwrap(),
             "an untouched overlay's child must equal the base"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A bundle push through the PUBLIC dispatch (`push` with a store-path repo — the
+    /// fixed path) lands in the local store: kernel/initrd ride along as non-chunk
+    /// layers, the config records the extras (`has_kernel`/`has_initrd`/`run_config`,
+    /// `chunk_count` = chunk layers only), and the ext4 pull path skips the extras and
+    /// reassembles byte-exactly.
+    #[test]
+    fn local_bundle_push_records_extras_and_still_pulls() {
+        let root = std::env::temp_dir().join(format!("vk-localreg-bundle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let rg = local_registry(&root);
+        let cfg = crate::config::Config {
+            registry: Some(local_registry(&root)),
+            ..Default::default()
+        };
+        let dir = root.join("bundle");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ext4 = dir.join("runner.ext4");
+        std::fs::write(&ext4, pseudo_random(4 << 20, 0xfeed)).unwrap();
+        std::fs::write(dir.join("vmlinuz"), b"kernel-bytes").unwrap();
+        std::fs::write(dir.join("initrd.img"), b"initrd-bytes").unwrap();
+        std::fs::write(dir.join("boot.kind"), "generic-disk").unwrap();
+        let rc = vk_core::runcfg::RunConfig {
+            user: "app".into(),
+            ..Default::default()
+        };
+        std::fs::write(
+            dir.join("runner.ext4.json"),
+            serde_json::to_vec(&rc).unwrap(),
+        )
+        .unwrap();
+
+        let digest = push(&cfg, &dir, "img:v1").unwrap();
+        assert!(digest.starts_with("sha256:"));
+        assert!(exists(&rg, "img", "v1"));
+
+        let store = vk_registry::Store::new(rg.local_root().unwrap()).unwrap();
+        let (_digest, bytes, _ctype) = store.get_manifest("img", "v1").unwrap().unwrap();
+        let manifest: OciImageManifest = serde_json::from_slice(&bytes).unwrap();
+        let config = store
+            .get_blob(manifest.config.digest.trim_start_matches("sha256:"))
+            .unwrap()
+            .unwrap();
+        let config: BundleConfig = serde_json::from_slice(&config).unwrap();
+        assert!(config.has_kernel && config.has_initrd);
+        assert_eq!(config.run_config, Some(rc));
+        assert_eq!(config.total_size, 4 << 20);
+        let chunk_layers = manifest
+            .layers
+            .iter()
+            .filter(|l| {
+                matches!(
+                    l.media_type.as_str(),
+                    CHUNK_MEDIA_TYPE | CHUNK_MEDIA_TYPE_RAW
+                )
+            })
+            .count();
+        assert_eq!(
+            config.chunk_count, chunk_layers,
+            "kernel/initrd are not chunk layers"
+        );
+        assert_eq!(manifest.layers.len(), chunk_layers + 2);
+
+        // the bundle's kernel/initrd layers must be skipped by the ext4 pull
+        let dest = root.join("out.ext4");
+        assert!(
+            try_pull_ext4(&rg, "img", "v1", &dest, "img")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), std::fs::read(&ext4).unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 
