@@ -47,6 +47,15 @@ All notable changes to virtkit will be documented in this file.
   job no longer starts with finding the runner it ran on. Nothing to report means no section,
   and it can be turned off with the recording (`[gitlab] atop = false`).
 
+### Changed
+
+- **Caching a built stage is several times faster.** Storing an image — the tail of every
+  stage a build does not restore from cache, and of every publish — used a single core no
+  matter how many the host had. It now runs across all of them: on a 12-core host,
+  snapshotting a ~4.7 GiB image into the cache drops from about two minutes to under half
+  a minute. Nothing about the stored result changes, so existing caches keep deduplicating
+  against it.
+
 ### Fixed
 
 - **A bundle can be published to a local store.** `vk registry push` and `vk build --tag`

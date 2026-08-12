@@ -1850,12 +1850,14 @@ mod local {
             .len();
         let mut layers: Vec<OciDescriptor> = Vec::new();
         // hole-aware like the HTTP push: only the data extents are read and chunked.
-        for (start, len) in file_data_extents(ext4, total_size)? {
-            let mut f =
-                std::fs::File::open(ext4).with_context(|| format!("opening {}", ext4.display()))?;
-            f.seek(SeekFrom::Start(start))?;
-            chunk_region_into(&store, f.take(len), start, ext4, &mut layers)?;
-        }
+        let regions = file_data_extents(ext4, total_size)?;
+        chunk_regions_into(
+            &store,
+            &regions,
+            ext4,
+            |start, len| file_region(ext4, start, len),
+            &mut layers,
+        )?;
         let config = cache_config(&layers, total_size, boot_kind);
         put_bundle_manifest(&store, name, tag, layers, config)
     }
@@ -1922,46 +1924,207 @@ mod local {
             dirty_sorted.sort_unstable();
             subtract_extents(&dirty_sorted, &covered)
         };
-        for (start, len) in new_regions {
-            let reader =
-                crate::qcow2::RegionReader::new(crate::qcow2::Qcow2::open(ext4)?, start, len);
-            chunk_region_into(&store, reader, start, ext4, &mut layers)?;
-        }
+        chunk_regions_into(
+            &store,
+            &new_regions,
+            ext4,
+            |start, len| {
+                // a private qcow2 handle per region: the mapping cache is not shared, and a
+                // reader owns its position.
+                Ok(crate::qcow2::RegionReader::new(
+                    crate::qcow2::Qcow2::open(ext4)?,
+                    start,
+                    len,
+                ))
+            },
+            &mut layers,
+        )?;
         let ret = layers.clone();
         let config = cache_config(&layers, total_size, boot_kind);
         let digest = put_bundle_manifest(&store, name, tag, layers, config)?;
         Ok((ret, total_size, digest))
     }
 
-    /// FastCDC-chunk `reader` (a data region starting at `start`) into the store,
-    /// appending a raw-digest descriptor per non-zero chunk — the local counterpart
-    /// of `chunk_region` (the store handles compression and dedup).
+    /// A reader over `[start, start+len)` of a plain file — its own descriptor, so regions
+    /// can be read concurrently without sharing a file position.
+    fn file_region(path: &Path, start: u64, len: u64) -> Result<std::io::Take<std::fs::File>> {
+        let mut f =
+            std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        f.seek(SeekFrom::Start(start))?;
+        Ok(f.take(len))
+    }
+
+    /// The read-ahead window a region is chunked in. Must exceed [`CDC_MAX`] by enough
+    /// that a window holds several chunks: only a window's trailing partial chunk is ever
+    /// carried forward, so the carry memmove is paid per window rather than per chunk.
+    const CHUNK_WINDOW: usize = 64 << 20;
+
+    /// A region's index paired with its chunk descriptors, one entry per region.
+    type RegionChunks = Vec<(usize, Vec<OciDescriptor>)>;
+
+    /// FastCDC-chunk every region of `label` into the store, appending a raw-digest
+    /// descriptor per non-zero chunk — the local counterpart of `chunk_region` (the store
+    /// handles compression and dedup). `open` yields a reader positioned at a region.
+    ///
+    /// Regions are processed concurrently. Each is chunked independently, exactly as when
+    /// they were walked in sequence, so the cut points — and every resulting digest — are
+    /// identical whatever order or parallelism the workers end up with; only the wall time
+    /// changes. Descriptors are re-sorted into region order so the manifest is stable too.
+    fn chunk_regions_into<F, R>(
+        store: &Store,
+        regions: &[(u64, u64)],
+        label: &Path,
+        open: F,
+        layers: &mut Vec<OciDescriptor>,
+    ) -> Result<()>
+    where
+        F: Fn(u64, u64) -> Result<R> + Sync,
+        R: Read,
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        if regions.is_empty() {
+            return Ok(());
+        }
+        // each worker owns up to a CHUNK_WINDOW buffer; cap the fleet so a many-core
+        // host does not pin gigabytes of windows.
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(regions.len())
+            .min(16);
+        let cursor = AtomicUsize::new(0);
+        let cursor = &cursor;
+        let open = &open;
+        let groups: Vec<Result<RegionChunks>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    s.spawn(move || {
+                        // One window per worker, reused across the regions it claims: a
+                        // median region is a fraction of the window, so allocating per
+                        // region would dominate the work of chunking it.
+                        let mut buf: Vec<u8> = Vec::new();
+                        let mut acc = Vec::new();
+                        loop {
+                            let i = cursor.fetch_add(1, Relaxed);
+                            let Some(&(start, len)) = regions.get(i) else {
+                                break;
+                            };
+                            let mut region = Vec::new();
+                            chunk_region_into(
+                                store,
+                                open(start, len)?,
+                                start,
+                                len,
+                                label,
+                                &mut buf,
+                                CHUNK_WINDOW,
+                                &mut region,
+                            )?;
+                            acc.push((i, region));
+                        }
+                        Ok(acc)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("a chunk worker panicked"))
+                .collect()
+        });
+        let mut done: RegionChunks = Vec::new();
+        for group in groups {
+            done.extend(group?);
+        }
+        done.sort_unstable_by_key(|(i, _)| *i);
+        layers.extend(done.into_iter().flat_map(|(_, d)| d));
+        Ok(())
+    }
+
+    /// Chunk one region into `layers`, reading through `buf` (grown as needed and reused
+    /// across regions by the caller).
+    #[allow(clippy::too_many_arguments)]
     fn chunk_region_into(
         store: &Store,
-        reader: impl Read,
+        mut reader: impl Read,
         start: u64,
+        len: u64,
         label: &Path,
+        buf: &mut Vec<u8>,
+        window: usize,
         layers: &mut Vec<OciDescriptor>,
     ) -> Result<()> {
-        let chunker = fastcdc::v2020::StreamCDC::new(
-            std::io::BufReader::new(reader),
-            CDC_MIN,
-            CDC_AVG,
-            CDC_MAX,
-        );
-        for chunk in chunker {
-            let chunk = chunk.with_context(|| format!("chunking {}", label.display()))?;
-            if chunk.data.iter().all(|&b| b == 0) {
-                continue; // hole — leave a gap, the pull fills it with zeros
+        // Right-sized to the region: most regions are far smaller than the window, and
+        // zeroing a full window for each would cost more than chunking it.
+        let want = (len as usize).clamp(1, window);
+        if buf.len() < want {
+            buf.resize(want, 0);
+        }
+        let win = &mut buf[..want];
+        let mut filled = 0usize; // live bytes in win
+        let mut base = 0u64; // region offset of win[0]
+        let mut read = 0u64; // bytes taken from the reader so far
+        let mut eof = false;
+        loop {
+            while !eof && filled < win.len() {
+                let n = reader
+                    .read(&mut win[filled..])
+                    .with_context(|| format!("reading {}", label.display()))?;
+                if n == 0 {
+                    eof = true;
+                } else {
+                    filled += n;
+                    read += n as u64;
+                }
             }
-            let digest = store.put_blob(&chunk.data)?;
-            layers.push(chunk_descriptor(
-                CHUNK_MEDIA_TYPE_RAW,
-                &digest,
-                chunk.data.len() as i64,
-                start + chunk.offset,
-                chunk.length as u64,
-            ));
+            // The region is exhausted once `len` bytes have been taken, whether or not the
+            // reader was asked for one more and answered 0 — a window sized exactly to the
+            // region fills without ever seeing that short read, and treating it as "more to
+            // come" would defer (and, for a single-chunk region, discard) its last chunk.
+            if read >= len {
+                eof = true;
+            }
+            if filled == 0 {
+                break;
+            }
+            // Cut points over the window, zero-copy — no per-chunk allocation and no
+            // per-chunk carry of the unconsumed remainder. Unless the source is exhausted
+            // the window's last chunk may only look complete because the window ran out,
+            // so it is carried into the next window instead of being emitted short.
+            let cuts: Vec<(usize, usize)> =
+                fastcdc::v2020::FastCDC::new(&win[..filled], CDC_MIN, CDC_AVG, CDC_MAX)
+                    .map(|c| (c.offset, c.length))
+                    .collect();
+            let keep = if eof {
+                cuts.len()
+            } else {
+                cuts.len().saturating_sub(1)
+            };
+            let cuts = &cuts[..keep];
+            for &(off, cl) in cuts {
+                let data = &win[off..off + cl];
+                if data.iter().all(|&b| b == 0) {
+                    continue; // hole — the pull fills the gap with zeros
+                }
+                let digest = store.put_blob(data)?;
+                layers.push(chunk_descriptor(
+                    CHUNK_MEDIA_TYPE_RAW,
+                    &digest,
+                    cl as i64,
+                    start + base + off as u64,
+                    cl as u64,
+                ));
+            }
+            let consumed = cuts.last().map_or(0, |&(o, l)| o + l);
+            if consumed == 0 {
+                // Reachable only when a full window forces a single cut, i.e. the window
+                // does not exceed CDC_MAX — refuse rather than silently truncate the region.
+                bail!("chunk window {window} B does not exceed CDC_MAX");
+            }
+            win.copy_within(consumed..filled, 0);
+            base += consumed as u64;
+            filled -= consumed;
+            if eof && filled == 0 {
+                break;
+            }
         }
         Ok(())
     }
@@ -1977,12 +2140,14 @@ mod local {
             .with_context(|| format!("stat {}", ext4.display()))?
             .len();
         let mut layers: Vec<OciDescriptor> = Vec::new();
-        for (start, len) in file_data_extents(&ext4, total_size)? {
-            let mut f = std::fs::File::open(&ext4)
-                .with_context(|| format!("opening {}", ext4.display()))?;
-            f.seek(SeekFrom::Start(start))?;
-            chunk_region_into(&store, f.take(len), start, &ext4, &mut layers)?;
-        }
+        let regions = file_data_extents(&ext4, total_size)?;
+        chunk_regions_into(
+            &store,
+            &regions,
+            &ext4,
+            |start, len| file_region(&ext4, start, len),
+            &mut layers,
+        )?;
         // the ext4's chunks alone; the kernel/initrd blobs below are not chunk layers.
         let chunk_count = layers.len();
         let has_kernel = dir.join("vmlinuz").is_file();
@@ -2100,6 +2265,117 @@ mod local {
         let config: BundleConfig =
             serde_json::from_slice(&config).context("parsing the bundle config blob")?;
         Ok(Some((digest, manifest, config)))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Deterministic non-zero filler (a chunk of zeros is legitimately dropped as a
+        /// hole, which would mask data loss).
+        fn filler(len: usize, seed: u32) -> Vec<u8> {
+            let mut s = seed | 1;
+            (0..len)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 17;
+                    s ^= s << 5;
+                    (s >> 8) as u8 | 1
+                })
+                .collect()
+        }
+
+        /// Chunk a region and reassemble it from the stored blobs, exactly as a pull would.
+        /// Guards the whole chunker: a dropped, duplicated or misplaced chunk cannot survive
+        /// a byte-for-byte comparison the way it survives a plausible-looking digest.
+        fn roundtrip(len: usize, window: usize) {
+            let dir = std::env::temp_dir()
+                .join(format!("vk-chunk-{}-{len}-{window}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let store = Store::new(dir.join("store")).unwrap();
+            let data = filler(len, len as u32 + window as u32);
+            let mut layers = Vec::new();
+            let mut buf = Vec::new();
+            chunk_region_into(
+                &store,
+                &data[..],
+                0,
+                len as u64,
+                Path::new("test"),
+                &mut buf,
+                window,
+                &mut layers,
+            )
+            .unwrap();
+            let mut out = vec![0u8; len];
+            for l in &layers {
+                let (off, n) = chunk_placement(l).unwrap();
+                let hex = l.digest.strip_prefix("sha256:").unwrap();
+                let blob = store.get_blob(hex).unwrap().expect("chunk blob stored");
+                out[off as usize..(off + n) as usize].copy_from_slice(&blob);
+            }
+            assert_eq!(
+                out, data,
+                "reassembly differs for len={len} window={window}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn chunking_roundtrips_regions_around_the_cdc_bounds() {
+            let mib = 1 << 20;
+            // A region below CDC_MAX is a single chunk, and a window sized exactly to it
+            // fills without ever seeing a short read — the case that silently dropped the
+            // whole region when EOF was inferred from the reader alone.
+            roundtrip(14 * mib, CHUNK_WINDOW);
+            roundtrip(CDC_MIN, CHUNK_WINDOW);
+            roundtrip(CDC_MAX, CHUNK_WINDOW);
+            // Larger than its window, so the trailing partial chunk is carried forward.
+            roundtrip(40 * mib, 17 * mib);
+            roundtrip(35 * mib, 17 * mib);
+        }
+
+        /// The windowed slice chunker must cut exactly where `StreamCDC` — the HTTP push
+        /// path, and the producer of every pre-existing cache entry — cuts: dedup across
+        /// pushes rides on the digests, and therefore the cut points, staying identical.
+        #[test]
+        fn windowed_cuts_match_streamcdc() {
+            let mib = 1 << 20;
+            // spans several windows, so carried trailing chunks are exercised too.
+            let data = filler(40 * mib, 0xc75);
+            let dir = std::env::temp_dir().join(format!("vk-cuts-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let store = Store::new(dir.join("store")).unwrap();
+            let mut layers = Vec::new();
+            let mut buf = Vec::new();
+            chunk_region_into(
+                &store,
+                &data[..],
+                0,
+                data.len() as u64,
+                Path::new("test"),
+                &mut buf,
+                17 * mib,
+                &mut layers,
+            )
+            .unwrap();
+            let got: Vec<(u64, u64)> = layers.iter().map(|l| chunk_placement(l).unwrap()).collect();
+            let want: Vec<(u64, u64)> = fastcdc::v2020::StreamCDC::new(
+                std::io::Cursor::new(&data),
+                CDC_MIN,
+                CDC_AVG,
+                CDC_MAX,
+            )
+            .map(|c| {
+                let c = c.unwrap();
+                (c.offset, c.length as u64)
+            })
+            .collect();
+            assert_eq!(got, want, "windowed cut points diverge from StreamCDC");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
 
