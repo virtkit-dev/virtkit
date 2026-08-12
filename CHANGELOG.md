@@ -17,6 +17,9 @@ All notable changes to virtkit will be documented in this file.
 - **A job's recorded statistics are kept for two weeks.** Each day of recordings older than
   `[gitlab] atop_retention_days` is dropped whole, so the archive stays bounded on a runner
   nobody visits. Anything else left in it by hand is never touched.
+- **`vk gitlab atop` finds a recorded job's log.** Give it a job id, or any part of a job's
+  name, and get the newest run of it. It prints the path alone, so it composes with whatever
+  reads logs (`less $(vk gitlab atop 42137)`).
 
 ## [0.32.0] - 2026-08-11
 

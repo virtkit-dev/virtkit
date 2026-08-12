@@ -193,6 +193,15 @@ enum GitlabCmd {
         /// Report only projects whose directory name contains this. Omitted = every project.
         project: Option<String>,
     },
+    /// Print the path of a recorded job's guest statistics log, so a viewer can be
+    /// pointed straight at it: `less $(vk gitlab atop 42137)`.
+    Atop {
+        /// A job id, or any part of a recorded job's directory name (its project or job
+        /// name, with anything outside [A-Za-z0-9._-] replaced) — the newest run matching
+        /// answers. Anything holding a `/` is taken as a path, so the path a job's trace
+        /// printed works too.
+        job: String,
+    },
     /// internal: the detached per-job supervisor prepare spawns — owns the job's
     /// switch/virtiofsds/forwards/VMM as tied children until SIGTERM'd by cleanup
     #[command(hide = true)]
@@ -332,7 +341,8 @@ enum Cmd {
     /// Needs `[schedule] mem_budget`.
     #[command(hide = true)]
     Tune,
-    /// GitLab custom-executor lifecycle (config / prepare / run / cleanup)
+    /// GitLab custom executor: the lifecycle hooks (config / prepare / run / cleanup) and the
+    /// operator's views of what its jobs did (usage / atop)
     #[command(hide = true)]
     Gitlab {
         #[command(subcommand)]
@@ -2605,6 +2615,27 @@ async fn cli_main() -> ExitCode {
                     Err(e) => fail(&e, ctx.system_failure),
                 }
             }
+            // Just the path, so it composes with whatever the operator reads logs with.
+            GitlabCmd::Atop { job } => match atop::resolve(&ctx.cfg, &job) {
+                // The path in its own bytes, as prepare recorded it: what reads this is
+                // another program, and a lossy rendering would send it to nothing.
+                Ok(path) => {
+                    use std::io::Write;
+                    use std::os::unix::ffi::OsStrExt;
+                    let mut out = std::io::stdout().lock();
+                    match out
+                        .write_all(path.as_os_str().as_bytes())
+                        .and_then(|()| out.write_all(b"\n"))
+                        .and_then(|()| out.flush())
+                    {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(e) => fail(&anyhow::anyhow!(e), 1),
+                    }
+                }
+                // Exit 2 for a job nothing answers to, like `vk status`/`list`/`stop` — a
+                // reader of the path must not be handed a success with no path.
+                Err(e) => fail(&e, 2),
+            },
             GitlabCmd::Supervise { job_dir } => match vm::supervise(&ctx, &job_dir).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(&e, 1),

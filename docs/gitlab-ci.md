@@ -261,6 +261,19 @@ The last line of the job's trace names the file:
 virtkit: atop log: /var/lib/virtkit/atop/2026-08-11/42137-acme-web-test_unit/atop.log
 ```
 
+On the runner, `vk gitlab atop` finds one again from a job id, or from any part of a recorded
+job's name — the newest run answering — printing just the path, so it composes with whatever
+reads it. Nothing matching means an empty stdout and a non-zero exit:
+
+```sh
+vk gitlab atop 42137                # that run
+less $(vk gitlab atop test_unit)    # the last run of this job
+```
+
+The name to give is the one in the directory, which is the job's name with anything outside
+`[A-Za-z0-9._-]` replaced — a `test:unit` job is recorded as `test_unit`. A job id matches only
+the id a directory name leads with, so `42` never answers for job `42137`.
+
 The format is the text `atop -P` prints, pinned to the field order of atop 2.8.1 (what Debian
 12 ships), so anything that already reads that — a parser, or plain `grep`/`awk` — reads these
 logs. Each line is one record: a label, this guest's name, the epoch, the date and time, the

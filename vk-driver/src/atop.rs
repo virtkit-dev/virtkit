@@ -22,7 +22,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use vk_core::atop::{date_dir, day_of, now_epoch, parse_date_dir};
+use vk_core::atop::{LOG_NAME, date_dir, day_of, now_epoch, parse_date_dir};
 
 use crate::config::{Config, Gitlab};
 use crate::jobctx::JobCtx;
@@ -137,6 +137,148 @@ fn prune_archive_daily_as_of(cfg: &Config, now: i64) {
     prune_archive_as_of(&root, retention_days(cfg), day_of(now));
 }
 
+/// The log `target` names, for `vk gitlab atop` to print — so a viewer can be pointed
+/// straight at it (`less $(vk gitlab atop 42137)`).
+///
+/// A target carrying a path separator is that path (a log, or the directory holding one), so
+/// the path a job's trace printed can be handed straight back. Anything else selects from the
+/// recorded jobs: all digits is a job id, answering only for the id a directory name leads
+/// with, and anything else is a substring of a job's or project's name — the newest run
+/// answering, since the reason to name a job by its name rather than its id is to ask about
+/// the last run of it.
+pub fn resolve(cfg: &Config, target: &str) -> Result<PathBuf> {
+    let root = archive_root(cfg);
+    // A host that records nothing has no archive to search, which is worth saying plainly:
+    // the alternative is an ENOENT on a path the operator never configured.
+    if !root.exists() && !enabled(cfg) {
+        bail!("nothing recorded on this host (`[gitlab] atop` is off)");
+    }
+    resolve_in(&root, target)
+}
+
+/// A regular `atop.log` in `dir`, and when it was last written. A symlink — or anything else
+/// where the log goes — is not a recording this host wrote: guest root can reach its own
+/// archive directory (see the module docs), and the path printed here goes straight to a
+/// reader that would follow it.
+fn recorded_log(dir: &Path) -> Option<(std::time::SystemTime, PathBuf)> {
+    let log = dir.join(LOG_NAME);
+    let md = std::fs::symlink_metadata(&log).ok()?;
+    if !md.is_file() {
+        eprintln!(
+            "virtkit: warning: {} is not a regular file; not a recording",
+            log.display()
+        );
+        return None;
+    }
+    Some((md.modified().unwrap_or(std::time::UNIX_EPOCH), log))
+}
+
+/// Whether a job's directory name — `<id>-<project>-<job name>` — answers to `target`: the
+/// leading id exactly where the target is all digits, so job 42137 is not what `42` asked
+/// for, and a substring of the name otherwise.
+fn job_dir_answers(name: &std::ffi::OsStr, target: &str) -> bool {
+    // A name this host did not write is not one of its jobs; matching a lossy rendering of
+    // one would match on bytes that are not there.
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    match target.bytes().all(|b| b.is_ascii_digit()) {
+        true => name.split('-').next() == Some(target),
+        false => name.contains(target),
+    }
+}
+
+/// The job a run belongs to, as distinct from the run: the directory name without the id that
+/// leads it, so two runs of one job read as the same job and two different jobs do not.
+fn job_identity(name: &str) -> &str {
+    name.split_once('-').map_or(name, |(_, rest)| rest)
+}
+
+/// Say on stderr when a name fragment answered for more than one job. "The newest run" is the
+/// right answer for repeated runs of one job, which is what a fragment usually names; when it
+/// spans different jobs, the one chosen is an accident of which ran last. Stderr, so the path
+/// on stdout still composes with whatever reads it.
+fn note_other_jobs(
+    target: &str,
+    chosen: &std::ffi::OsStr,
+    matches: &[(std::time::SystemTime, std::ffi::OsString, PathBuf)],
+) {
+    let job_of = |name: &std::ffi::OsStr| name.to_str().map(|n| job_identity(n).to_string());
+    let Some(mine) = job_of(chosen) else {
+        return;
+    };
+    let mut others: Vec<String> = matches
+        .iter()
+        .filter_map(|(_, name, _)| job_of(name))
+        .filter(|job| *job != mine)
+        .collect();
+    others.sort();
+    others.dedup();
+    if !others.is_empty() {
+        eprintln!(
+            "virtkit: note: {target:?} also matches {} — answering for {mine}",
+            others.join(", ")
+        );
+    }
+}
+
+fn resolve_in(root: &Path, target: &str) -> Result<PathBuf> {
+    if target.is_empty() {
+        bail!("name a job: an id, or part of a recorded job's name");
+    }
+    // A separator makes it a path. A bare word is a job to look up in the archive — never
+    // whatever the operator's working directory happens to hold under that name.
+    if target.contains('/') {
+        let path = Path::new(target);
+        if path.is_file() {
+            return Ok(path.to_path_buf());
+        }
+        return recorded_log(path)
+            .map(|(_, log)| log)
+            .with_context(|| format!("no {LOG_NAME} under {}", path.display()));
+    }
+    // Newest day first, and inside a day the log written last: two runs of one job on one day
+    // differ by when they ran, which their ids order only numerically — as the names they
+    // lead, they are strings of different lengths.
+    let mut days: Vec<(i64, PathBuf)> = std::fs::read_dir(root)
+        .with_context(|| format!("reading the stats archive {}", root.display()))?
+        .flatten()
+        // A real directory, as the sweep requires: a file or a symlink named like a day is
+        // not a day of recordings, whoever parked it here.
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| {
+            let day = parse_date_dir(e.file_name().to_str()?)?;
+            Some((day, e.path()))
+        })
+        .collect();
+    days.sort_by_key(|(day, _)| std::cmp::Reverse(*day));
+    for (_, day) in &days {
+        // A day that cannot be read is not an older day's run: answering with a different job
+        // than the one asked for is worse than saying the archive could not be read.
+        let entries =
+            std::fs::read_dir(day).with_context(|| format!("reading {}", day.display()))?;
+        let mut matches: Vec<(std::time::SystemTime, std::ffi::OsString, PathBuf)> = entries
+            .flatten()
+            .filter(|e| job_dir_answers(&e.file_name(), target))
+            .filter_map(|e| recorded_log(&e.path()).map(|(at, log)| (at, e.file_name(), log)))
+            .collect();
+        if matches.is_empty() {
+            continue;
+        }
+        // Newest first, and the job id the name leads with settles a tie in the mtimes, so
+        // one archive always answers the same way.
+        matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        let (_, chosen, log) = &matches[0];
+        note_other_jobs(target, chosen, &matches);
+        return Ok(log.clone());
+    }
+    bail!(
+        "no recorded job matches {target:?} in {} (a job id, or part of a recorded job's \
+         directory name; the archive keeps only the last `[gitlab] atop_retention_days` days)",
+        root.display()
+    );
+}
+
 /// Drop the days the retention window has passed, so a busy runner's archive stays
 /// bounded with nobody sweeping it. Each date directory is one day of recorded jobs and
 /// goes whole; a directory exactly `days` old is still inside the window and stays.
@@ -197,6 +339,8 @@ fn today() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -225,6 +369,153 @@ mod tests {
         });
         let e = interval_secs(&cfg).expect_err("zero is rejected");
         assert!(format!("{e:#}").contains("atop_interval_secs"), "{e:#}");
+    }
+
+    /// A recorded job is found by its id or by any part of its name, the newest run
+    /// answering; and a path that already exists is taken as it is, so what a job trace
+    /// printed can be handed straight back.
+    #[test]
+    fn a_recorded_job_is_found_by_id_or_by_name() {
+        let state = std::env::temp_dir().join(format!("vk-atop-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        // The archive as a state dir holds it, so the lookup can be reached through a config
+        // as well as directly.
+        let root = state.join("atop");
+        let record = |date: &str, job: &str| {
+            let dir = root.join(date).join(job);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(LOG_NAME), b"RESET\nSEP\n").unwrap();
+            dir.join(LOG_NAME)
+        };
+        let old = record("2026-08-09", "41000-acme-web-test_unit");
+        let new = record("2026-08-11", "42137-acme-web-test_unit");
+        let other = record("2026-08-11", "42140-acme-api-build");
+        // A job whose guest died before writing anything is not an answer.
+        std::fs::create_dir_all(root.join("2026-08-12").join("42200-acme-web-test_unit")).unwrap();
+
+        // By job id, exactly this run.
+        assert_eq!(resolve_in(&root, "41000").unwrap(), old);
+        assert_eq!(resolve_in(&root, "42140").unwrap(), other);
+        // By name: the newest day that has a run of it, skipping the empty one.
+        assert_eq!(resolve_in(&root, "test_unit").unwrap(), new);
+        assert_eq!(resolve_in(&root, "acme-api").unwrap(), other);
+
+        // An existing log, and the directory holding one.
+        assert_eq!(resolve_in(&root, &old.to_string_lossy()).unwrap(), old);
+        assert_eq!(
+            resolve_in(&root, &old.parent().unwrap().to_string_lossy()).unwrap(),
+            old
+        );
+
+        // Nothing matching, an empty archive, and a directory with no log: each says so.
+        for bad in ["nosuchjob", "42200"] {
+            let e = resolve_in(&root, bad).expect_err(bad);
+            assert!(format!("{e:#}").contains("no recorded job"), "{e:#}");
+        }
+        let empty = root.join("2026-08-12").join("42200-acme-web-test_unit");
+        let e = resolve_in(&root, &empty.to_string_lossy()).expect_err("no log there");
+        assert!(format!("{e:#}").contains(LOG_NAME), "{e:#}");
+        // An archive that cannot be read is not "no such job": it names the path it tried.
+        let e = resolve_in(&root.join("nope"), "42137").expect_err("no archive there");
+        assert!(format!("{e:#}").contains("nope"), "{e:#}");
+        // A job id answers only for the id a directory name leads with: a piece of one is a
+        // different job, or none.
+        for piece in ["42", "137", "4213"] {
+            let e = resolve_in(&root, piece).expect_err(piece);
+            assert!(
+                format!("{e:#}").contains("no recorded job"),
+                "{piece}: {e:#}"
+            );
+        }
+        // Named with nothing at all, it asks rather than answering with the newest job here.
+        assert!(resolve_in(&root, "").is_err());
+        // The lookup is rooted at the archive under the state dir, not at the cwd.
+        let cfg = Config {
+            state_dir: Some(state.clone()),
+            gitlab: Some(Gitlab::default()),
+            ..Default::default()
+        };
+        assert_eq!(archive_root(&cfg), root);
+        assert_eq!(resolve(&cfg, "41000").unwrap(), old);
+        std::fs::remove_dir_all(&state).unwrap();
+    }
+
+    /// Which run of a job answers, when more than one could. The reason to name a job rather
+    /// than a run is to ask about the last one, so the log written last wins — and a name that
+    /// a guest replaced with a symlink is not a recording at all.
+    #[test]
+    fn the_newest_run_of_a_job_answers_and_a_planted_log_does_not() {
+        let root = std::env::temp_dir().join(format!("vk-atop-newest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let day = root.join("2026-08-11");
+        let record = |job: &str, written_at: std::time::SystemTime| {
+            let dir = day.join(job);
+            std::fs::create_dir_all(&dir).unwrap();
+            let log = dir.join(LOG_NAME);
+            std::fs::write(&log, b"RESET\nSEP\n").unwrap();
+            // Pinned rather than taken from the order they were created in: it is the log's
+            // own write time the lookup orders by, and a test that raced it would prove nothing.
+            std::fs::File::options()
+                .write(true)
+                .open(&log)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(written_at))
+                .unwrap();
+            log
+        };
+        let epoch = std::time::UNIX_EPOCH;
+        let first = record(
+            "42137-acme-web-test_unit",
+            epoch + Duration::from_secs(1000),
+        );
+        let second = record(
+            "42140-acme-web-test_unit",
+            epoch + Duration::from_secs(2000),
+        );
+
+        // Two runs of one job on one day: the one whose log was written last.
+        assert_eq!(resolve_in(&root, "test_unit").unwrap(), second);
+        // Either run still answers exactly to its own id.
+        assert_eq!(resolve_in(&root, "42137").unwrap(), first);
+
+        // A fragment spanning two different jobs still answers, by the same rule.
+        let integration = record(
+            "42150-acme-web-test_integration",
+            epoch + Duration::from_secs(3000),
+        );
+        assert_eq!(resolve_in(&root, "test_").unwrap(), integration);
+
+        // A log the guest replaced with a symlink is not a recording: the run is skipped and
+        // the next newest answers, rather than a reader being pointed at the target.
+        let planted = day.join("42160-acme-web-test_unit");
+        std::fs::create_dir_all(&planted).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", planted.join(LOG_NAME)).unwrap();
+        assert_eq!(resolve_in(&root, "test_unit").unwrap(), second);
+        let e = resolve_in(&root, "42160").expect_err("a planted log is not a recording");
+        assert!(format!("{e:#}").contains("no recorded job"), "{e:#}");
+
+        // A file and a symlink named like a day are not days of recordings, so neither is
+        // walked and neither can put the answer outside the archive.
+        std::fs::write(root.join("2026-08-12"), b"not a directory").unwrap();
+        let outside = root.join("elsewhere");
+        std::fs::create_dir_all(outside.join("42999-acme-web-test_unit")).unwrap();
+        std::fs::write(
+            outside.join("42999-acme-web-test_unit").join(LOG_NAME),
+            b"RESET\nSEP\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("2026-08-13")).unwrap();
+        assert_eq!(
+            resolve_in(&root, "test_unit").unwrap(),
+            second,
+            "the answer stays inside the archive"
+        );
+        assert!(
+            resolve_in(&root, "42999").is_err(),
+            "not a day of recordings"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// The sweep drops whole days once they are past the window, keeps the day that is
