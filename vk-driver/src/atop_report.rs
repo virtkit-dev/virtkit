@@ -35,7 +35,7 @@ const TOP_PROCS: usize = 10;
 /// Seconds as a duration, saturating. A guest writes both its tick counters and the `hertz`
 /// they are counted in, so the quotient can be a number no `Duration` names — and a report is
 /// not the place to panic over one.
-fn secs_of(v: f64) -> std::time::Duration {
+pub(crate) fn secs_of(v: f64) -> std::time::Duration {
     std::time::Duration::try_from_secs_f64(v).unwrap_or(std::time::Duration::MAX)
 }
 
@@ -515,31 +515,15 @@ fn network_line(samples: &[Sample]) -> Option<String> {
 /// The whole job's processes, the ones that used the most processor time first: a job's own
 /// account of where its time went, which nothing outside the guest can give.
 fn processes(samples: &[Sample]) -> String {
-    // Keyed on the pid *and* when it started: a guest that runs thousands of short commands
-    // reuses pids, and two processes sharing one must not merge. A start time has one-second
-    // resolution, so two that reused a pid inside the same second still do.
-    //
-    // A map rather than a scan: a long job holds tens of thousands of distinct processes, and
-    // finding each one linearly in every sample is quadratic in exactly the case the table
-    // exists for.
-    let mut by_proc: HashMap<(i32, i64), Totals> = HashMap::new();
-    for s in samples {
-        for p in &s.procs {
-            by_proc
-                .entry((p.pid, p.started))
-                .or_insert_with(|| Totals::new(p))
-                .add(p);
-        }
-    }
-    if by_proc.is_empty() {
+    let mut totals = Totals::over(samples);
+    if totals.is_empty() {
         return String::new();
     }
-    let mut totals: Vec<Totals> = by_proc.into_values().collect();
     // The pid last, so the order does not depend on how the map happened to iterate.
     totals.sort_by(|a, b| {
-        b.cpu_seconds
-            .total_cmp(&a.cpu_seconds)
-            .then(b.rsize_peak.cmp(&a.rsize_peak))
+        b.cpu
+            .total_cmp(&a.cpu)
+            .then(b.rss_peak_kib.cmp(&a.rss_peak_kib))
             .then(a.pid.cmp(&b.pid))
     });
     let listed = totals.len().min(TOP_PROCS);
@@ -559,12 +543,13 @@ fn processes(samples: &[Sample]) -> String {
     out
 }
 
-/// One process across every sample it appears in.
-struct Totals {
+/// One process across every sample it appears in — what the whole job charged to it. Shared
+/// with the panel, whose `a` key asks the same question of the samples it has read.
+pub(crate) struct Totals {
     pid: i32,
     command: String,
-    cpu_seconds: f64,
-    rsize_peak: u64,
+    cpu: f64,
+    rss_peak_kib: u64,
     read: u64,
     written: u64,
     /// Whether any sample could account this process's disk traffic at all.
@@ -572,12 +557,59 @@ struct Totals {
 }
 
 impl Totals {
+    /// Every process of a recording, one entry each. Keyed on the pid *and* when it started:
+    /// a guest that runs thousands of short commands reuses pids, and two processes that
+    /// shared one must not merge into a third that ran for as long as both.
+    pub(crate) fn over(samples: &[Sample]) -> Vec<Totals> {
+        // A map rather than a scan: a long job holds tens of thousands of distinct processes,
+        // and finding each one linearly in every sample is quadratic in exactly the case this
+        // exists for. A start time has one-second resolution, so two processes that reused a
+        // pid inside one second do still merge.
+        let mut by_proc: HashMap<(i32, i64), Totals> = HashMap::new();
+        for s in samples {
+            for p in &s.procs {
+                by_proc
+                    .entry((p.pid, p.started))
+                    .or_insert_with(|| Totals::new(p))
+                    .add(p);
+            }
+        }
+        by_proc.into_values().collect()
+    }
+
+    pub(crate) fn pid(&self) -> i32 {
+        self.pid
+    }
+
+    pub(crate) fn command(&self) -> &str {
+        &self.command
+    }
+
+    /// The processor time the whole job charged to the process. A `Duration` rather than the
+    /// quotient it came from: a guest writes both its tick counters and the `hertz` they are
+    /// counted in, so the figure can be one no `Duration` names.
+    pub(crate) fn cpu_time(&self) -> std::time::Duration {
+        secs_of(self.cpu)
+    }
+
+    pub(crate) fn peak_rss_bytes(&self) -> u64 {
+        self.rss_peak_kib.saturating_mul(1024)
+    }
+
+    /// Everything the process moved, read and written together — the panel sorts on one
+    /// figure where the report has room for both. `None` where no sample could account its
+    /// traffic at all, which is not the same as having moved nothing.
+    pub(crate) fn disk_bytes(&self) -> Option<u64> {
+        self.io_stats
+            .then(|| self.read.saturating_add(self.written))
+    }
+
     fn new(p: &Proc) -> Totals {
         Totals {
             pid: p.pid,
             command: p.command().to_string(),
-            cpu_seconds: 0.0,
-            rsize_peak: 0,
+            cpu: 0.0,
+            rss_peak_kib: 0,
             read: 0,
             written: 0,
             io_stats: false,
@@ -585,8 +617,8 @@ impl Totals {
     }
 
     fn add(&mut self, p: &Proc) {
-        self.cpu_seconds += p.cpu_seconds();
-        self.rsize_peak = self.rsize_peak.max(p.rsize);
+        self.cpu += p.cpu_seconds();
+        self.rss_peak_kib = self.rss_peak_kib.max(p.rsize);
         self.read = self
             .read
             .saturating_add(p.sectors_read.saturating_mul(SECTOR));
@@ -609,8 +641,8 @@ impl Totals {
         [
             truncated(&self.command, COMMAND_WIDTH),
             self.pid.to_string(),
-            fmt_cpu(secs_of(self.cpu_seconds)),
-            fmt_bytes(self.rsize_peak.saturating_mul(1024)),
+            fmt_cpu(self.cpu_time()),
+            fmt_bytes(self.peak_rss_bytes()),
             disk(self.read),
             disk(self.written),
         ]

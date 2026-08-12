@@ -29,6 +29,11 @@ All notable changes to virtkit will be documented in this file.
 - **`vk gitlab atop --json` writes a recorded job's samples as JSON lines.** One object per
   sample, in the log's own units, for anything that would rather compute over a job than read
   it (`… --json | jq`). A figure the guest's kernel could not measure is `null`, never a zero.
+- **`vk gitlab atop --view` walks a recorded job, and `--follow` watches one as it runs.** A
+  full-screen panel of one sample at a time, walked with the arrow keys, sorted by cpu, memory
+  or disk, filtered to the commands you are looking for, and switchable between a sample's
+  activity and each process's whole-job totals. `--follow` picks up samples as the running job's
+  guest commits them and holds still whenever you step back to read one.
 
 ## [0.32.0] - 2026-08-11
 

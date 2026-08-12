@@ -304,6 +304,38 @@ virtkit: 42137-acme-web-test_unit — what its guest did:
 
 (Wrapped here to fit the page — the real output is one line per label.)
 
+`--view` walks the recording a sample at a time in a full-screen panel — the guest's
+processors (each core its own bar), memory and swap, pressure, disks and interfaces, then the
+processes ordered by what they were using at that moment:
+
+```
+42137-acme-web-test_unit — sample 11/11 at 07:21:59 +1s
+cpu    16% [██          ]  user   3%  sys  10%  wait   0%  steal   3%  0.2s of cpu time
+cores 0:[▊       ]  10%  1:[█▊      ]  22%
+mem     6% [▊           ]  63 MiB of 988 MiB  cache 146 MiB  no swap
+psi   cpu  0.4%  mem  0.0%  mem-full  0.0%  io  0.0%  io-full  0.0%
+disk  vda read 0 B/s write 4 KiB/s busy 4ms
+net   eth0 in 0 B/s out 42 B/s   0 tcp connections, 0 resent
+
+    pid      >cpu     memory       disk  command
+     65      0.1s      1 MiB      8 KiB  sh
+      1      0.0s     11 MiB        0 B  /init tsi_hijack
+…
+←/→ step  home/end jump  c/m/d sort by cpu  a whole job  / filter  q quit
+```
+
+`←`/`→` step through the samples and `Home`/`End` jump to either end; `c`, `m` and `d` order
+the processes by processor time, memory or disk; `a` swaps each process's activity in this
+sample for its whole-job totals; `/` filters the table to the commands matching what you type;
+`q` leaves. The first sample is marked, because its counters cover the guest's boot rather than
+an interval. The filter matches on ASCII.
+
+`--follow` is the same panel over a job that is still running: samples appear as the guest
+commits them, and while the view sits on the last one it moves with them. Stepping back holds
+it still — the header says `[paused]` — until `End`, or stepping forward onto the last sample,
+takes the live tail up again. Both need a terminal on stdin and stdout; without one (a pipe, or
+`TERM=dumb`) they say so and point at `--summary`. A process's disk figures read `-` where the
+guest's kernel accounted none, as in the summary.
 
 Totals cover every sample, including the first — a job's VM boot is part of what the job cost.
 A figure computed *over* an interval — the cpu percentages, the rate of context switching, the

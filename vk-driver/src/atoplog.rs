@@ -28,18 +28,38 @@ use vk_core::atop::{self, Label};
 /// reading one is not worth an unbounded allocation.
 const MAX_LOG: u64 = 256 * 1024 * 1024;
 
-/// A log as text.
-///
-/// Opened without following symlinks, and read from that descriptor: the guest had this
-/// directory read-write and can leave anything where its log goes, so the path is resolved
-/// once, by the kernel, on the thing actually read — never checked as a path and then opened
-/// as another. A symlink to a FIFO would otherwise block a reader forever.
+/// A whole log as text, opened by [`open_log`] and capped at [`MAX_LOG`].
 ///
 /// Read lossily on purpose: the guest maps a command's own control bytes to spaces as it
 /// writes, so a byte that is not text means a damaged log — and reading what is still there is
 /// exactly what a reader of a possibly-torn file is for.
 pub fn read(path: &Path) -> Result<String> {
     use std::io::Read;
+    let (file, len) = open_log(path)?;
+    if len > MAX_LOG {
+        // Said out loud rather than silently reading a fraction of the job: anything totalled
+        // over what comes back would cover only the part that was read.
+        eprintln!(
+            "virtkit: warning: {} is {} — reading its first {}",
+            path.display(),
+            crate::usage::fmt_bytes(len),
+            crate::usage::fmt_bytes(MAX_LOG)
+        );
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_LOG)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// A recording, opened on the descriptor everything that reads it reads from, with its size.
+///
+/// Without following symlinks, and refusing anything but a regular file: the guest had this
+/// directory read-write and can leave anything where its log goes, so the path is resolved
+/// once, by the kernel, on the thing actually read — never checked as a path and then opened
+/// as another. A symlink to a FIFO would otherwise block a reader forever.
+pub fn open_log(path: &Path) -> Result<(std::fs::File, u64)> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -52,21 +72,7 @@ pub fn read(path: &Path) -> Result<String> {
     if !md.is_file() {
         bail!("{} is not a regular file; not a recording", path.display());
     }
-    if md.len() > MAX_LOG {
-        // Said out loud rather than silently reading a fraction of the job: anything totalled
-        // over what comes back would cover only the part that was read.
-        eprintln!(
-            "virtkit: warning: {} is {} — reading its first {}",
-            path.display(),
-            crate::usage::fmt_bytes(md.len()),
-            crate::usage::fmt_bytes(MAX_LOG)
-        );
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_LOG)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("reading {}", path.display()))?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok((file, md.len()))
 }
 
 /// Every complete sample of a log, and how far into the text they reach.

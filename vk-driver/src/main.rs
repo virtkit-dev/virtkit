@@ -19,6 +19,7 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 mod admit;
 mod atop;
 mod atop_report;
+mod atop_view;
 mod atoplog;
 mod build;
 mod cachelock;
@@ -209,10 +210,19 @@ enum GitlabCmd {
         #[arg(long)]
         summary: bool,
         /// Write every sample as one line of JSON, so a pipeline can take the samples a
-        /// line at a time (`vk gitlab atop 42137 --json | jq …`). Not with `--summary`: one
-        /// accounts the job, the other hands over the figures to account it with.
-        #[arg(long, conflicts_with = "summary")]
+        /// line at a time (`vk gitlab atop 42137 --json | jq …`). One of `--summary`,
+        /// `--json` and the panel: each is a different answer to "what did this job do".
+        #[arg(long, conflicts_with_all = ["summary", "view", "follow"])]
         json: bool,
+        /// Walk the recording sample by sample in a full-screen panel: what the guest's
+        /// processors, memory, pressure, disks and network were doing at each moment, and
+        /// which processes were using them.
+        #[arg(long)]
+        view: bool,
+        /// The panel, kept up to date while the job is still running — new samples appear as
+        /// the guest commits them, and stepping back holds the view still until End.
+        #[arg(long, conflicts_with = "view")]
+        follow: bool,
     },
     /// internal: the detached per-job supervisor prepare spawns — owns the job's
     /// switch/virtiofsds/forwards/VMM as tied children until SIGTERM'd by cleanup
@@ -2627,7 +2637,13 @@ async fn cli_main() -> ExitCode {
                     Err(e) => fail(&e, ctx.system_failure),
                 }
             }
-            GitlabCmd::Atop { job, summary, json } => match atop::resolve(&ctx.cfg, &job) {
+            GitlabCmd::Atop {
+                job,
+                summary,
+                json,
+                view,
+                follow,
+            } => match atop::resolve(&ctx.cfg, &job) {
                 // Exit 2 for a job nothing answers to, like `vk status`/`list`/`stop` — a
                 // reader of the path must not be handed a success with no path.
                 Err(e) => fail(&e, 2),
@@ -2661,6 +2677,10 @@ async fn cli_main() -> ExitCode {
                             Err(e) => fail(&anyhow::anyhow!(e), 1),
                         }
                     }
+                    Err(e) => fail(&e, 1),
+                },
+                Ok(path) if view || follow => match atop_view::view(&path, follow) {
+                    Ok(()) => ExitCode::SUCCESS,
                     Err(e) => fail(&e, 1),
                 },
                 // Just the path, so it composes with whatever the operator reads logs with.
