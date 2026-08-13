@@ -196,34 +196,6 @@ enum GitlabCmd {
         /// Report only projects whose directory name contains this. Omitted = every project.
         project: Option<String>,
     },
-    /// Read what a job's guest recorded of itself: with no flag, print the log's path so a
-    /// viewer can be pointed at it (`less $(vk gitlab atop 42137)`).
-    Atop {
-        /// A job id, or any part of a recorded job's directory name (its project or job
-        /// name, with anything outside [A-Za-z0-9._-] replaced) — the newest run matching
-        /// answers. Anything holding a `/` is taken as a path, so the path a job's trace
-        /// printed works too.
-        job: String,
-        /// Account the whole job instead of printing a path: what its guest did with its
-        /// processors and memory, what it moved, where it stalled, and which of its
-        /// processes the time went to.
-        #[arg(long)]
-        summary: bool,
-        /// Write every sample as one line of JSON, so a pipeline can take the samples a
-        /// line at a time (`vk gitlab atop 42137 --json | jq …`). One of `--summary`,
-        /// `--json` and the panel: each is a different answer to "what did this job do".
-        #[arg(long, conflicts_with_all = ["summary", "view", "follow"])]
-        json: bool,
-        /// Walk the recording sample by sample in a full-screen panel: what the guest's
-        /// processors, memory, pressure, disks and network were doing at each moment, and
-        /// which processes were using them.
-        #[arg(long)]
-        view: bool,
-        /// The panel, kept up to date while the job is still running — new samples appear as
-        /// the guest commits them, and stepping back holds the view still until End.
-        #[arg(long, conflicts_with = "view")]
-        follow: bool,
-    },
     /// internal: the detached per-job supervisor prepare spawns — owns the job's
     /// switch/virtiofsds/forwards/VMM as tied children until SIGTERM'd by cleanup
     #[command(hide = true)]
@@ -364,7 +336,7 @@ enum Cmd {
     #[command(hide = true)]
     Tune,
     /// GitLab custom executor: the lifecycle hooks (config / prepare / run / cleanup) and the
-    /// operator's views of what its jobs did (usage / atop)
+    /// operator's view of what its jobs have been using (usage)
     #[command(hide = true)]
     Gitlab {
         #[command(subcommand)]
@@ -599,6 +571,35 @@ enum Cmd {
         /// Command to run and its arguments, after `--` (e.g. `vk exec -- ls -la`)
         #[arg(last = true, required = true)]
         command: Vec<String>,
+    },
+    /// Read what a job's guest recorded of itself: with no flag, print the log's path so a
+    /// viewer can be pointed at it (`less $(vk atop 42137)`).
+    #[command(display_order = 10)]
+    Atop {
+        /// A job id, or any part of a recorded job's directory name (its project or job
+        /// name, with anything outside [A-Za-z0-9._-] replaced) — the newest run matching
+        /// answers. Anything holding a `/` is taken as a path, so the path a job's trace
+        /// printed works too.
+        job: String,
+        /// Account the whole job instead of printing a path: what its guest did with its
+        /// processors and memory, what it moved, where it stalled, and which of its
+        /// processes the time went to.
+        #[arg(long)]
+        summary: bool,
+        /// Write every sample as one line of JSON, so a pipeline can take the samples a
+        /// line at a time (`vk atop 42137 --json | jq …`). One of `--summary`,
+        /// `--json` and the panel: each is a different answer to "what did this job do".
+        #[arg(long, conflicts_with_all = ["summary", "view", "follow"])]
+        json: bool,
+        /// Walk the recording sample by sample in a full-screen panel: what the guest's
+        /// processors, memory, pressure, disks and network were doing at each moment, and
+        /// which processes were using them.
+        #[arg(long)]
+        view: bool,
+        /// The panel, kept up to date while the job is still running — new samples appear as
+        /// the guest commits them, and stepping back holds the view still until End.
+        #[arg(long, conflicts_with = "view")]
+        follow: bool,
     },
     /// Filtering ssh-agent proxy: serve the ssh-agent protocol on `--listen`, relaying to
     /// the real agent at `--upstream` but exposing only the keys in the `--allow` .pub
@@ -2637,69 +2638,6 @@ async fn cli_main() -> ExitCode {
                     Err(e) => fail(&e, ctx.system_failure),
                 }
             }
-            GitlabCmd::Atop {
-                job,
-                summary,
-                json,
-                view,
-                follow,
-            } => match atop::resolve(&ctx.cfg, &job) {
-                // Exit 2 for a job nothing answers to, like `vk status`/`list`/`stop` — a
-                // reader of the path must not be handed a success with no path.
-                Err(e) => fail(&e, 2),
-                Ok(path) if summary => match atop_report::summarize(&path) {
-                    Ok(report) => write_report(&report),
-                    Err(e) => fail(&e, 1),
-                },
-                Ok(path) if json => match atoplog::read(&path) {
-                    Ok(text) => {
-                        use std::io::Write;
-                        let parsed = atoplog::parse(&text);
-                        // On stderr, never on stdout: stdout is the JSON stream, and a
-                        // pipeline must not total a log that lost records as a whole one.
-                        if parsed.dropped > 0 {
-                            eprintln!(
-                                "virtkit: warning: {} — {} record(s) did not carry their \
-                                 label's fields and were left out",
-                                path.display(),
-                                parsed.dropped
-                            );
-                        }
-                        let mut out = std::io::stdout().lock();
-                        match atoplog::write_json(&parsed.samples, &mut out)
-                            .and_then(|()| out.flush())
-                        {
-                            Ok(()) => ExitCode::SUCCESS,
-                            // A closed pipe (`| head`) is how a reader says it has seen enough.
-                            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                                ExitCode::SUCCESS
-                            }
-                            Err(e) => fail(&anyhow::anyhow!(e), 1),
-                        }
-                    }
-                    Err(e) => fail(&e, 1),
-                },
-                Ok(path) if view || follow => match atop_view::view(&path, follow) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => fail(&e, 1),
-                },
-                // Just the path, so it composes with whatever the operator reads logs with.
-                // In its own bytes, as prepare recorded it: what reads this is another
-                // program, and a lossy rendering would send it to nothing.
-                Ok(path) => {
-                    use std::io::Write;
-                    use std::os::unix::ffi::OsStrExt;
-                    let mut out = std::io::stdout().lock();
-                    match out
-                        .write_all(path.as_os_str().as_bytes())
-                        .and_then(|()| out.write_all(b"\n"))
-                        .and_then(|()| out.flush())
-                    {
-                        Ok(()) => ExitCode::SUCCESS,
-                        Err(e) => fail(&anyhow::anyhow!(e), 1),
-                    }
-                }
-            },
             GitlabCmd::Supervise { job_dir } => match vm::supervise(&ctx, &job_dir).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(&e, 1),
@@ -2733,6 +2671,66 @@ async fn cli_main() -> ExitCode {
                     },
                 }
                 ExitCode::SUCCESS
+            }
+        },
+        Cmd::Atop {
+            job,
+            summary,
+            json,
+            view,
+            follow,
+        } => match atop::resolve(&ctx.cfg, &job) {
+            // Exit 2 for a job nothing answers to, like `vk status`/`list`/`stop` — a
+            // reader of the path must not be handed a success with no path.
+            Err(e) => fail(&e, 2),
+            Ok(path) if summary => match atop_report::summarize(&path) {
+                Ok(report) => write_report(&report),
+                Err(e) => fail(&e, 1),
+            },
+            Ok(path) if json => match atoplog::read(&path) {
+                Ok(text) => {
+                    use std::io::Write;
+                    let parsed = atoplog::parse(&text);
+                    // On stderr, never on stdout: stdout is the JSON stream, and a
+                    // pipeline must not total a log that lost records as a whole one.
+                    if parsed.dropped > 0 {
+                        eprintln!(
+                            "virtkit: warning: {} — {} record(s) did not carry their \
+                             label's fields and were left out",
+                            path.display(),
+                            parsed.dropped
+                        );
+                    }
+                    let mut out = std::io::stdout().lock();
+                    match atoplog::write_json(&parsed.samples, &mut out).and_then(|()| out.flush())
+                    {
+                        Ok(()) => ExitCode::SUCCESS,
+                        // A closed pipe (`| head`) is how a reader says it has seen enough.
+                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+                        Err(e) => fail(&anyhow::anyhow!(e), 1),
+                    }
+                }
+                Err(e) => fail(&e, 1),
+            },
+            Ok(path) if view || follow => match atop_view::view(&path, follow) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, 1),
+            },
+            // Just the path, so it composes with whatever the operator reads logs with.
+            // In its own bytes, as prepare recorded it: what reads this is another
+            // program, and a lossy rendering would send it to nothing.
+            Ok(path) => {
+                use std::io::Write;
+                use std::os::unix::ffi::OsStrExt;
+                let mut out = std::io::stdout().lock();
+                match out
+                    .write_all(path.as_os_str().as_bytes())
+                    .and_then(|()| out.write_all(b"\n"))
+                    .and_then(|()| out.flush())
+                {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => fail(&anyhow::anyhow!(e), 1),
+                }
             }
         },
         // stdio↔socket splice for an SSH ProxyCommand; returns when either side closes.
@@ -3246,7 +3244,8 @@ mod tests {
         assert_eq!(
             sorted,
             [
-                "build", "check", "exec", "export", "gc", "list", "run", "status", "stop", "update"
+                "atop", "build", "check", "exec", "export", "gc", "list", "run", "status", "stop",
+                "update"
             ]
         );
     }

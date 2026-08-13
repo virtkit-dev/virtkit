@@ -1,4 +1,4 @@
-//! Walking a recorded job sample by sample: the panel `vk gitlab atop --view` draws, and
+//! Walking a recorded job sample by sample: the panel `vk atop --view` draws, and
 //! `--follow` keeps up to date while the job is still running.
 //!
 //! The summary answers what a job did; this answers *when*. One sample fills the screen —
@@ -51,7 +51,7 @@ pub fn view(path: &Path, follow: bool) -> Result<()> {
     // missing is a terminal this cannot drive.
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         bail!(
-            "--view needs a terminal on both stdin and stdout — `vk gitlab atop {} --summary` \
+            "--view needs a terminal on both stdin and stdout — `vk atop {} --summary` \
              accounts the same log as text",
             path.display()
         );

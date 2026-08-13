@@ -144,8 +144,8 @@ fn is_path_target(target: &str) -> bool {
     target.contains('/')
 }
 
-/// The log `target` names, for `vk gitlab atop` to print — so a viewer can be pointed
-/// straight at it (`less $(vk gitlab atop 42137)`).
+/// The log `target` names, for `vk atop` to print — so a viewer can be pointed
+/// straight at it (`less $(vk atop 42137)`).
 ///
 /// A target carrying a path separator is that path (a log, or the directory holding one), so
 /// the path a job's trace printed can be handed straight back. Anything else selects from the

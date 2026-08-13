@@ -1,4 +1,4 @@
-//! What a recorded job did, from its samples: the report `vk gitlab atop --summary` prints.
+//! What a recorded job did, from its samples: the report `vk atop --summary` prints.
 //!
 //! A log is a few hundred lines per interval and nobody reads that; this is the account of
 //! it — how long the guest ran, what it did with its processors and memory, what it moved,

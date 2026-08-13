@@ -1,7 +1,7 @@
 //! Reading a recorded job back: the samples in a guest's `atop.log`.
 //!
 //! The guest writes what `atop -P` would print (the schema is `vk_core::atop`); this opens
-//! that log and turns its text back into samples, so `vk gitlab atop` can account a job that
+//! that log and turns its text back into samples, so `vk atop` can account a job that
 //! has already finished. What the format guarantees a reader, and what this therefore relies
 //! on:
 //!

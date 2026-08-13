@@ -16,20 +16,20 @@ All notable changes to virtkit will be documented in this file.
 - **A job's recorded statistics are kept for two weeks.** Each day of recordings older than
   `[gitlab] atop_retention_days` is dropped whole, so the archive stays bounded on a runner
   nobody visits. Anything else left in it by hand is never touched.
-- **`vk gitlab atop` finds a recorded job's log.** Give it a job id, or any part of a job's
-  name, and get the newest run of it — or hand it the path a job's trace printed, which reads
-  on any machine, runner or not. It prints the path alone, so it composes with whatever reads
-  logs (`less $(vk gitlab atop 42137)`).
-- **`vk gitlab atop --summary` accounts a recorded job.** Instead of a few hundred lines per
+- **`vk atop` finds a recorded job's log.** Give it a job id, or any part of a job's name, and
+  get the newest run of it — or hand it the path a job's trace printed, which reads on any
+  machine, runner or not. It prints the path alone, so it composes with whatever reads logs
+  (`less $(vk atop 42137)`).
+- **`vk atop --summary` accounts a recorded job.** Instead of a few hundred lines per
   interval it prints the job: how long its guest ran, what it did with its processors and
   memory, what it moved over its disks and network, where it was held up waiting for a
   resource, the shape of it over time, and which of its processes the time went to. A figure
   the guest's kernel could not measure reads as `-` rather than as zero, and a log torn off by
   a VM that died is reported as far as it goes.
-- **`vk gitlab atop --json` writes a recorded job's samples as JSON lines.** One object per
+- **`vk atop --json` writes a recorded job's samples as JSON lines.** One object per
   sample, in the log's own units, for anything that would rather compute over a job than read
   it (`… --json | jq`). A figure the guest's kernel could not measure is `null`, never a zero.
-- **`vk gitlab atop --view` walks a recorded job, and `--follow` watches one as it runs.** A
+- **`vk atop --view` walks a recorded job, and `--follow` watches one as it runs.** A
   full-screen panel of one sample at a time, walked with the arrow keys, sorted by cpu, memory
   or disk, filtered to the commands you are looking for, and switchable between a sample's
   activity and each process's whole-job totals. `--follow` picks up samples as the running job's
@@ -41,7 +41,7 @@ All notable changes to virtkit will be documented in this file.
   row per command with the number of runs and how many failed (`cc1plus ×1184 (2 failed)`), and
   the panel marks them `E`. A dead process has only the name its kernel kept, not the arguments
   it was given, and a guest churning faster than the records can be read says so on its console.
-- **Every job's trace now ends with what its guest did.** The account that `vk gitlab atop
+- **Every job's trace now ends with what its guest did.** The account that `vk atop
   --summary` prints — the processor time and where it went, the memory held, the disks and
   network, the pressure that held the guest up, and the processes the time went to — is written
   into the trace itself, inside a section the GitLab UI shows folded. Reading a slow or failed

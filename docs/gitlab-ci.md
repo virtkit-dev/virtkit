@@ -259,7 +259,7 @@ Every job's trace ends with the account of it, in a section GitLab's web UI show
 line to open when a job is worth looking into, and out of the way when it is not:
 
 ```
-▶ what the job's guest did (vk gitlab atop 42137)
+▶ what the job's guest did (vk atop 42137)
 ```
 
 Opened, it holds exactly what `--summary` prints below. A raw trace (the artifact, `curl` of the
@@ -267,13 +267,13 @@ trace API, a runner log) has no UI to fold it, so it shows the same lines unfold
 section markers — which is what a reader piping a trace through `grep` wants anyway. A job whose
 guest recorded nothing gets no section at all rather than an empty one.
 
-On the runner, `vk gitlab atop` finds one again from a job id, or from any part of a recorded
+On the runner, `vk atop` finds one again from a job id, or from any part of a recorded
 job's name — the newest run answering — printing just the path, so it composes with whatever
 reads it. Nothing matching means an empty stdout and a non-zero exit:
 
 ```sh
-vk gitlab atop 42137                # that run
-less $(vk gitlab atop test_unit)    # the last run of this job
+vk atop 42137                # that run
+less $(vk atop test_unit)    # the last run of this job
 ```
 
 The name to give is the one in the directory, which is the job's name with anything outside
@@ -285,7 +285,7 @@ its processors and memory, what it moved, where it was held up, and which of its
 time went to:
 
 ```
-$ vk gitlab atop 42137 --summary
+$ vk atop 42137 --summary
 virtkit: 42137-acme-web-test_unit — what its guest did:
   recorded         2026/08/12 07:21:49 → 07:21:59 UTC (10s), 11 samples at 1s, the first
                    covering the guest's boot (counted in the totals, not the rates)
@@ -371,8 +371,8 @@ one. A log with no complete sample writes nothing and exits 0, where `--summary`
 there is nothing to account yet:
 
 ```sh
-vk gitlab atop 42137 --json | jq -c '{t: .epoch, user_sys: (.cpu.user + .cpu.system)}'
-vk gitlab atop 42137 --json | jq '.procs | max_by(.rsize_kib) | {name, rsize_kib}'
+vk atop 42137 --json | jq -c '{t: .epoch, user_sys: (.cpu.user + .cpu.system)}'
+vk atop 42137 --json | jq '.procs | max_by(.rsize_kib) | {name, rsize_kib}'
 ```
 
 The format is the text `atop -P` prints, pinned to the field order of atop 2.8.1 (what Debian

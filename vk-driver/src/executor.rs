@@ -138,7 +138,7 @@ async fn finalize_atop(ctx: &JobCtx) {
 ///
 /// The log holds a few hundred lines per interval and the account of it is twenty; those twenty
 /// are worth a reader's attention at the end of every job, which is why they are here rather
-/// than only in `vk gitlab atop --summary`. They go in a collapsed section, so a reader who
+/// than only in `vk atop --summary`. They go in a collapsed section, so a reader who
 /// wants them opens them and everyone else sees one line.
 ///
 /// Silent whenever there is nothing to say — recording off, a guest that died before it
@@ -150,7 +150,7 @@ fn report_guest(ctx: &JobCtx, log: &std::path::Path) {
     };
     // The command that opens the same log again, so a reader who wants the samples behind the
     // account knows where they are without a path to copy.
-    let header = format!("what the job's guest did (vk gitlab atop {})", ctx.job_id);
+    let header = format!("what the job's guest did (vk atop {})", ctx.job_id);
     // One write: the markers and what they wrap have to reach the trace together, or a section
     // that opens in one chunk and closes in another folds the wrong lines away.
     eprint!("{}", section("vk_atop", &header, &body, now_secs()));
@@ -571,14 +571,14 @@ mod tests {
     fn a_section_is_framed_exactly_as_gitlab_reads_it() {
         let out = section(
             "vk_atop",
-            "what the job's guest did (vk gitlab atop 42137)",
+            "what the job's guest did (vk atop 42137)",
             "one\ntwo\n",
             1_767_225_600,
         );
         assert_eq!(
             out,
             "\x1b[0Ksection_start:1767225600:vk_atop[collapsed=true]\r\x1b[0K\
-             what the job's guest did (vk gitlab atop 42137)\n\
+             what the job's guest did (vk atop 42137)\n\
              one\ntwo\n\
              \x1b[0Ksection_end:1767225600:vk_atop\r\x1b[0K\n"
         );
