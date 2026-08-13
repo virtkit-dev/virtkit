@@ -77,6 +77,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A compose unit's image is reused again on hosts whose `blkid` is busybox's.** Its
+  freshness is decided by the filesystem UUID stamped in the image, but reading that back
+  went through `blkid`, which on a musl/busybox host answers in its own format and reports
+  success — so the UUID never matched, every unit rebuilt from scratch on each run, and no
+  build cache could help. The UUID is now read from the image itself.
 - **A corrupt run-config sidecar fails the push instead of vanishing.** A bundle whose
   `runner.ext4.json` no longer parsed was published without it, so the image booted
   without its `Env`/`User` and nothing pointed at why. Pushing such a bundle is now an

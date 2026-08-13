@@ -1964,31 +1964,37 @@ fn be32(buf: &mut [u8], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
 }
 
-/// The base ext4's filesystem UUID (blkid, fallback dumpe2fs), used to name the
-/// overlay so a rebuilt base never reuses a stale overlay, and (via ensure) as the
-/// content fingerprint that decides a rebuild.
+/// The base ext4's filesystem UUID, read from the superblock's `s_uuid` — the read
+/// counterpart of [`set_uuid`]. Used to name the overlay so a rebuilt base never reuses a
+/// stale overlay, and (via ensure) as the content fingerprint that decides a rebuild.
+///
+/// Read in-process rather than shelled out to `blkid`: busybox's `blkid` takes only a
+/// block device, ignores `-o value -s UUID`, prints its own `<path>: UUID="…" TYPE="…"`
+/// line, and still exits 0 — so asking it for a value yields that whole line, which then
+/// never equals the fingerprint it is compared against. The musl images this ships in carry
+/// exactly that `blkid` and no `dumpe2fs` to fall back to. Rendered like
+/// `ensure::fingerprint`, the value it is compared against.
 pub(crate) fn fs_uuid(ext4: &Path) -> Option<String> {
-    if let Ok(out) = Command::new("blkid")
-        .args(["-o", "value", "-s", "UUID"])
-        .arg(ext4)
-        .output()
-        && out.status.success()
-    {
-        let u = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !u.is_empty() {
-            return Some(u);
-        }
+    let mut f = std::fs::File::open(ext4).ok()?;
+    let mut sb = [0u8; 1024];
+    f.seek(SeekFrom::Start(1024)).ok()?;
+    f.read_exact(&mut sb).ok()?;
+    if rd16(&sb, 0x38) != 0xEF53 {
+        return None;
     }
-    let out = Command::new("dumpe2fs").arg("-h").arg(ext4).output().ok()?;
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if let Some(rest) = line.strip_prefix("Filesystem UUID:") {
-            let u = rest.trim().to_string();
-            if !u.is_empty() {
-                return Some(u);
-            }
-        }
+    // All-zero is an image nothing has stamped yet, not a UUID of zeros.
+    if sb[0x68..0x78] == [0u8; 16] {
+        return None;
     }
-    None
+    let hex: String = sb[0x68..0x78].iter().map(|b| format!("{b:02x}")).collect();
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
 }
 
 #[cfg(test)]
@@ -2177,6 +2183,43 @@ mod tests {
             content.contains("hello-ext4-multigroup"),
             "content readback: {content:?}"
         );
+    }
+
+    // fs_uuid reads back exactly what set_uuid wrote, in the canonical form the
+    // fingerprint it is compared against uses. A bare superblock is enough for both: they
+    // need the magic, s_uuid, and a zero block count (so set_uuid walks no backups).
+    #[test]
+    fn fs_uuid_round_trips_set_uuid_and_reports_nothing_otherwise() {
+        let base = std::env::temp_dir().join(format!("ext4-fsuuid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let img = base.join("bare.img");
+
+        let mut buf = vec![0u8; 2048];
+        assert_eq!(fs_uuid(&img), None, "a missing file has no UUID");
+        std::fs::write(&img, &buf).unwrap();
+        assert_eq!(fs_uuid(&img), None, "no ext4 magic -> no UUID");
+
+        le16(&mut buf[1024..], 0x38, 0xEF53);
+        std::fs::write(&img, &buf).unwrap();
+        assert_eq!(fs_uuid(&img), None, "an unstamped image reads as no UUID");
+
+        let uuid = [
+            0x03, 0x56, 0xa1, 0xda, 0xfc, 0x66, 0xc4, 0x87, 0x3b, 0x3a, 0xdc, 0x29, 0xd7, 0x60,
+            0xf2, 0x03,
+        ];
+        set_uuid(&img, &uuid).unwrap();
+        assert_eq!(
+            fs_uuid(&img).as_deref(),
+            Some("0356a1da-fc66-c487-3b3a-dc29d760f203")
+        );
+        // The whole point: it is directly comparable with a fingerprint, which is what
+        // `ensure::unit_fresh` does with it.
+        assert_eq!(
+            crate::ensure::parse_uuid(&fs_uuid(&img).unwrap()),
+            Some(uuid)
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // set_uuid stamps the primary superblock and every sparse_super backup, then
