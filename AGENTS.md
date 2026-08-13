@@ -55,12 +55,15 @@ The release artifacts are built reproducibly inside a pinned devcontainer image
 (`.devcontainer/Dockerfile`, `rust:<ver>-alpine`, digest- and apk-pinned). Alpine
 supplies a musl-native gcc for the C our deps vendor (ring, zstd, jemalloc); no
 system C libraries are linked.
-All build scripts wrap Docker, so the host needs only Docker — no local Rust setup.
+Release build scripts can use Docker or `vk`, so no local Rust setup is needed. The
+fast edit loop below is deliberately `vk`-only and never invokes Docker.
 
 ```bash
-./build-kernel.sh [--no-cache]      # guest kernel vmlinux -> dist/ (Docker; slow) — run first
-./build.sh                          # static-musl binaries -> dist/ (Docker)
+./build-kernel.sh [--no-cache]      # guest kernel vmlinux -> dist/ (vk or Docker; slow) — run first
+./build.sh                          # static-musl binaries -> dist/ (vk or Docker)
 ./build.sh --fast                   # same, but the debug profile -> much faster iteration
+./dev.sh check -p vk-core           # fast type/borrow checking for one affected crate
+./dev.sh test -p vk-core --lib …    # one module's unit tests (see below)
 ./audit.sh [--deny warnings]        # cargo-audit against the committed Cargo.lock
 ./sweep.sh [--time 15]              # cargo-sweep stale target/ artifacts (default --installed)
 ./update.sh                         # bump the pinned Rust toolchain + re-pin apk deps
@@ -77,17 +80,41 @@ against.
 Every local (non-release) build also gets line-tables-only debuginfo from `[profile.dev]`,
 which keeps `file:line` in panics and backtraces while dropping the bulky per-variable
 DWARF; dependencies get none at all. When you need a debugger, build with cargo's
-`--profile debugging`.
+`--profile debugging` (`./dev.sh check|test` accept it too) — `build.sh` offers only the
+release and dev profiles.
 
 Both `./build.sh` and `./build.sh --fast` embed `dist/vmlinux` and fail when it is absent,
 so `./build-kernel.sh` comes first in a fresh checkout; `--no-kernel` builds a `vk` without
 the embedded kernel instead (it then needs `--kernel` at runtime, and is not shippable).
 
+### Fast edit/check/test loop
+
+During iterative edits, do not run `cargo build`, release builds, or broad test commands
+such as `cargo test --workspace` / `cargo test --all`. Start with
+`./dev.sh check -p <affected-crate>` for type and borrow checking. Then run only the test
+target and module affected by the change, for example:
+
+```bash
+./dev.sh test -p vk-core --lib dockerignore::tests
+./dev.sh test -p vk-core --test exec disconnect_kills_remote_process
+./dev.sh test -p vk-driver --bin vk atop_view::tests
+```
+
+`dev.sh` is Docker-free: on first use it boots the pinned build image as a persistent
+`vk` development VM; later invocations use `vk exec`, avoiding another image build and
+boot. It reuses `target/`, links tests with mold, and rejects workspace-wide or optimized
+invocations. Run `./dev.sh stop` when the VM is no longer needed. A `vk` and a `flock` on
+`PATH` are required and there is deliberately no Docker fallback. `VK_DEV_CPUS` and
+`VK_DEV_MEM` size the VM. Use `./build.sh --fast` only when an executable is actually
+needed for runtime testing.
+
 ### Cargo commands (pinned toolchain)
 
 The toolchain is pinned in `rust-toolchain.toml` (1.96.1, musl target, clippy +
 rustfmt). Run cargo directly if you have it, or inside the devcontainer image to
-match CI exactly (clippy needs the static-FFI env — see `.github/workflows/quality.yml`):
+match CI exactly (clippy needs the static-FFI env — see `.github/workflows/quality.yml`).
+These are the CI-parity commands, run to verify a change; the edit loop above is what to
+use while iterating:
 
 ```bash
 cargo build --release --workspace
