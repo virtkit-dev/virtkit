@@ -520,21 +520,19 @@ async fn digest(client: &reqwest::Client, target: &Target) -> Result<[u8; 32]> {
 /// (a foreign architecture hashes fine and cannot exec). Runs before the rename, so
 /// a binary that fails this never becomes the installed `vk`.
 fn smoke_test(path: &Path, version: &str) -> Result<()> {
-    let out = std::process::Command::new(path)
-        .arg("--version")
-        .output()
-        .map_err(|e| {
-            // Which errno this is decides what went wrong, and the causes are nothing alike:
-            // a release built for another architecture (ENOEXEC), a file some process still
-            // holds open for writing (ETXTBSY), a host with no room left to fork (EAGAIN).
-            // Only the first is about the architecture, so only it says so — asserting it
-            // for the others buries the errno under a wrong answer.
-            let hint = match e.raw_os_error() {
-                Some(libc::ENOEXEC) => " (is the release built for this architecture?)",
-                _ => "",
-            };
-            anyhow::Error::new(e).context(format!("running {} --version{hint}", path.display()))
-        })?;
+    let out = run_version(path).map_err(|e| {
+        // Which errno this is decides what went wrong, and the causes are nothing alike:
+        // a release built for another architecture (ENOEXEC), a file some process still
+        // holds open for writing (ETXTBSY, and `run_version` has already waited it out),
+        // a host with no room left to fork (EAGAIN). Only the first two name a cause worth
+        // reporting — offering one for the rest buries the errno under a wrong answer.
+        let hint = match e.raw_os_error() {
+            Some(libc::ENOEXEC) => " (is the release built for this architecture?)",
+            Some(libc::ETXTBSY) => " (something is still holding the download open for writing)",
+            _ => "",
+        };
+        anyhow::Error::new(e).context(format!("running {} --version{hint}", path.display()))
+    })?;
     // Non-UTF-8 output is not a version string: fall through to the error below with
     // it empty rather than mangling the bytes to report them.
     let reported = std::str::from_utf8(&out.stdout).unwrap_or_default();
@@ -549,6 +547,28 @@ fn smoke_test(path: &Path, version: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Run `<path> --version`, waiting out a busy file rather than reporting it. Closing the
+/// download's write fd is not enough on its own: a `fork` anywhere else in the process
+/// inherits that open file, and the kernel counts the file open for writing — so `execve`
+/// answers ETXTBSY — until that child reaches its own `exec`. Nothing here can stop the
+/// fork, and the window it leaves is microseconds wide, so looking again beats failing a
+/// download that is fine. A file held open for real still ends in ETXTBSY, once the
+/// looking is done.
+fn run_version(path: &Path) -> std::io::Result<std::process::Output> {
+    // Ten looks 20ms apart — 180ms of waiting before a busy file is reported as busy.
+    const ATTEMPTS: u32 = 10;
+    const WAIT: Duration = Duration::from_millis(20);
+    let run = || std::process::Command::new(path).arg("--version").output();
+    for _ in 1..ATTEMPTS {
+        match run() {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => std::thread::sleep(WAIT),
+            r => return r,
+        }
+    }
+    // The last look is the verdict, whichever way it goes.
+    run()
 }
 
 /// Ask on stderr, read the answer on stdin. Anything but an explicit yes declines,
@@ -1010,6 +1030,42 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.starts_with(".vk-update."))
             .collect()
+    }
+
+    /// The smoke test execs a file this process just wrote, so it races every `fork` the
+    /// process makes: one landing while the download is still open inherits the write fd and
+    /// holds the file busy past the close, until that child execs. A write fd of our own
+    /// stands in for that inherited one — released while the smoke test is already looking
+    /// again, and the download is good, so the verdict must be that it passes.
+    #[test]
+    fn the_smoke_test_waits_out_a_binary_something_still_holds_open() {
+        let s = Scratch::new("busy", 0o755);
+        fs::write(&s.exe, FAKE_VK).unwrap();
+
+        let held = OpenOptions::new().write(true).open(&s.exe).unwrap();
+        // Released a long way inside the 180ms budget, and late enough that the first look
+        // is the one that finds the file busy.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(held);
+        });
+        let looking = std::time::Instant::now();
+        smoke_test(&s.exe, "0.30.0").unwrap();
+        assert!(
+            looking.elapsed() >= Duration::from_millis(20),
+            "the first look succeeded: nothing waited"
+        );
+
+        // Held for good: the wait is a budget, not a spin, so a file that never frees up
+        // still reports the errno it failed on.
+        let _held = OpenOptions::new().write(true).open(&s.exe).unwrap();
+        let err = smoke_test(&s.exe, "0.30.0").unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>()
+                .and_then(|e| e.raw_os_error()),
+            Some(libc::ETXTBSY),
+            "{err:#}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
