@@ -233,6 +233,10 @@ pub struct RunArgs {
     /// --disk`. The guest reads/writes them directly, so it can partition and install
     /// into a disk image (see the runner host-image build).
     pub extra_disks: Vec<(PathBuf, bool)>,
+    /// record what the guest does from boot, one sample of its /proc every this many
+    /// seconds (`vk run --atop[=SECS]`) — the same recording a CI job's guest makes,
+    /// landing in `<state dir>/atop/atop.log` for `vk atop` to read. `None` = off.
+    pub atop: Option<u64>,
     /// extra environment for the guest (`--env`/`--env-file`, flags last so they
     /// win), appended to the image env and persisted in-guest for login shells
     pub env: Vec<(String, String)>,
@@ -313,6 +317,9 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
     // No primary (no image, no -f, no --primary) + a compose file = compose up:
     // services only, held until ctrl-c.
     if args.image.is_empty() && args.dockerfiles.is_empty() && args.primary.is_none() {
+        if args.atop.is_some() {
+            bail!("--atop records the primary VM, and a services-only compose run boots none");
+        }
         return compose_up(args, cfg, &state_dir, &work.path, &agent.path, &kernel.path).await;
     }
     build_and_boot(args, cfg, &state_dir, &work.path, &agent.path, &kernel.path).await
@@ -520,11 +527,27 @@ async fn build_and_boot(
     if args.kernel == KernelSource::Image && args.ram {
         bail!("--kernel image is incompatible with --ram");
     }
+    // The recording outlives nothing without a state dir: an ephemeral run's work directory
+    // goes with the run, log and all, and the VM is never registered for `vk atop` to find.
+    if args.atop.is_some() && args.state_dir.is_none() {
+        bail!(
+            "--atop needs --state-dir: the recording lives in it, and `vk atop` finds the VM by it"
+        );
+    }
     // The image-init preinit applies the virtkit setup the image's own init won't do
     // (host volume mounts, symlinks, the ssh/exec serves, env, and an eth0 bridge the
     // image DHCPs on) before handing off to systemd. The host-exec channel, compose
     // and an interactive pty (--shell or -t) are not wired for image init yet — reject
     // them rather than silently ignore.
+    // Named on its own, because unlike the rest it has somewhere to send the operator: the
+    // image's init leaves no agent at PID 1 to fork the sampler, but the reparented agent
+    // still serves the exec channel, which is what an attach records over.
+    if args.init == InitSource::Image && args.atop.is_some() {
+        bail!(
+            "--init image does not support --atop — boot the VM, then record it with \
+             `vk atop <dir>`"
+        );
+    }
     if args.init == InitSource::Image {
         let unsupported = [
             (args.host_exec, "--host-exec"),
@@ -1229,6 +1252,69 @@ async fn build_and_boot(
             gid_map: Vec::new(),
         });
     }
+    // `--atop`: record what this guest does from boot, exactly as a CI job's guest is
+    // recorded. The archive directory rides its own share, kept out of VIRTKIT_VIRTIOFS
+    // on purpose: the cmdline knob names the tag, and the agent mounts it before
+    // anything else runs in the guest, so even the boot is covered.
+    // Held for as long as the VM runs: the exclusive lock `vk atop`'s attach takes before it
+    // records, so no attach can truncate this recording or start a second sampler beside it.
+    // The lock, not the registry entry, is what closes that door — the entry is written after
+    // the VMM starts, and an attach in the gap would find nothing to warn it off.
+    let _atop_lock;
+    let atop_log = match args.atop {
+        None => None,
+        Some(secs) => {
+            let dir = work.join("atop");
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            let log = dir.join(vk_core::atop::LOG_NAME);
+            // A fresh boot is a fresh recording: the guest appends, and a log left by a
+            // previous run of this state dir would read as two boots run together.
+            if let Err(e) = std::fs::remove_file(&log)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(e).with_context(|| format!("removing stale {}", log.display()));
+            }
+            // Created here rather than left to the guest, so the lock below is held from
+            // before the VM exists — the guest then appends to this same file.
+            let held = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                // As the guest would have created it: the guest appends to this file, and
+                // the share maps its writes onto this user.
+                .mode(0o644)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&log)
+                .with_context(|| format!("creating {}", log.display()))?;
+            // SAFETY: the fd is owned by `held`, which outlives the call; flock returns 0
+            // or -1. The lock goes when this process does, which is when the VM does.
+            use std::os::unix::io::AsRawFd as _;
+            if unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                bail!(
+                    "{} is already being recorded — stop the `vk run` or `vk atop` that owns it",
+                    log.display()
+                );
+            }
+            _atop_lock = held;
+            let sock = work.join("atop.fs.sock");
+            if !crate::vmm::libkrun_selected() {
+                virtiofsds.push(crate::spawn::spawn_virtiofsd(&sock, &dir, false, &[], &[])?);
+            }
+            shares.push(crate::vmm::FsShare {
+                tag: vk_core::atop::TAG.into(),
+                socket: sock,
+                host_dir: dir,
+                read_only: false,
+                uid_map: Vec::new(),
+                gid_map: Vec::new(),
+            });
+            cmdline.push_str(&vk_core::atop::cmdline_knob(secs));
+            println!(
+                "virtkit: recording guest stats every {secs}s -> {} (`vk atop` to watch)",
+                log.display()
+            );
+            Some(log)
+        }
+    };
     if !virtiofs.is_empty() {
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS={virtiofs}"));
     }
@@ -1418,8 +1504,14 @@ async fn build_and_boot(
                 None
             }
         });
+        let state_dir = std::fs::canonicalize(work).unwrap_or_else(|_| work.to_path_buf());
         crate::vms::register(crate::vms::VmEntry {
-            state_dir: std::fs::canonicalize(work).unwrap_or_else(|_| work.to_path_buf()),
+            // Off the canonical state dir, so a run launched with a relative `--state-dir`
+            // still names its recording to a `vk atop` reading from another directory.
+            atop_log: atop_log
+                .is_some()
+                .then(|| state_dir.join("atop").join(vk_core::atop::LOG_NAME)),
+            state_dir,
             project_dir: std::env::current_dir().ok(),
             pid: std::process::id(),
             label,

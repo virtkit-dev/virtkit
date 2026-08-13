@@ -155,7 +155,7 @@ The ones you'll actually type:
 - `run` — boot an image, a Dockerfile target (`-f`), or a compose file as
   microVM(s) and run a command or an interactive shell (`--shell`, `-t`).
   This is where most of the flags live: `--net`, `--workdir`, `--volume`,
-  `--ssh`, `--compose`, `--detach`, ...
+  `--ssh`, `--compose`, `--detach`, `--atop`, ...
 - `build` — build a Dockerfile into a bootable ext4 image, each stage's `RUN`s
   executing in a microVM, instruction snapshots cached (`--build-cache`).
   `--tag` publishes the result to the `[registry]` as a bootable bundle the CI
@@ -180,11 +180,14 @@ The ones you'll actually type:
   `exec`/`status`), it starts sampling that guest on the spot and opens the
   follow panel on the recording as it grows; `--summary` — or having no terminal
   to draw on — records until Ctrl-C instead, and `--interval` sets the cadence.
-  Given a job
-  id, part of a job's name, or the path a job's trace printed, it reads that
-  recording instead: the log's path on stdout so it composes with whatever reads
-  logs, `--summary` to account the whole job, `--json` for its samples a line at
-  a time, and `--view` / `--follow` to walk it in a full-screen panel.
+  A VM booted with `run --atop` is already recording itself, so its own recording
+  is read live rather than a second sampler started. Given a job id, part of a
+  job's name, or the path a job's trace printed, it reads that recording instead.
+  On either recording `--summary` accounts the whole thing, `--json` writes its
+  samples a line at a time, and `--view` / `--follow` walk it in a panel. With
+  no flag a finished recording's path is printed, so it composes with whatever
+  reads logs (`less $(vk atop 42137)`); a VM still recording itself opens the
+  live panel instead — or prints its path too, with no terminal to draw one.
 - `check` — preflight the host for the current user: `/dev/kvm` access, the VMM
   backend, a guest kernel/agent, and the host side of each configured feature
   (the CI-executor features only when named with `--feature`).

@@ -42,6 +42,12 @@ All notable changes to virtkit will be documented in this file.
   recording stays on the host afterwards, for `vk atop <path>` to read back with any of the
   flags above, and each new watch of a VM replaces the last one's. `--interval` sets the
   cadence (5 seconds by default).
+- **`vk run --atop` records a dev VM from boot.** The very recording a CI job's guest makes,
+  for a VM booted by hand: one sample every 5 seconds (`--atop=SECS` to change), covering the
+  boot itself and landing in the run's `--state-dir`, at a path printed as it boots. `vk atop`
+  beside that VM reads its own recording rather than starting a second one, and `--summary`,
+  `--json` and `--view` all work on it while the VM runs — or long after it stopped, handed
+  the path printed at boot.
 - **A job's short-lived processes are now recorded too.** The guest asks its kernel to report
   every task as it exits, so the commands a job forks in their thousands — a compiler per file, a
   process per test — appear in the log with the whole of what each one used, where before they

@@ -578,9 +578,11 @@ enum Cmd {
     /// A directory a running VM matches (default: the current directory) attaches to it:
     /// a sampler starts in its guest and the follow panel opens on the recording as it
     /// grows (`<state dir>/atop/atop.log`) — with --summary, or with no terminal to draw
-    /// the panel on, it records headless until Ctrl-C and then prints what it recorded.
-    /// Anything else reads a recorded job: with no flag, print the log's path so a viewer
-    /// can be pointed at it (`less $(vk atop 42137)`).
+    /// the panel on, it records headless until Ctrl-C and then prints what it recorded. A
+    /// VM booted with `vk run --atop` is already recording itself, so its own recording is
+    /// read live instead: the flags answer off that log as it stands, with no attach to
+    /// Ctrl-C. Anything else reads a recorded job: with no flag, print the log's path so a
+    /// viewer can be pointed at it (`less $(vk atop 42137)`).
     #[command(display_order = 10)]
     Atop {
         /// A running VM's directory (as `vk exec` selects one; default: the current
@@ -608,8 +610,9 @@ enum Cmd {
         /// the guest commits them, and stepping back holds the view still until End.
         #[arg(long, conflicts_with = "view")]
         follow: bool,
-        /// Sampling interval when attaching to a running VM, in seconds. A recorded job
-        /// was sampled at whatever cadence recorded it, so this says nothing about one.
+        /// Sampling interval when attaching to a running VM, in seconds. A recorded job —
+        /// or a VM recording itself, whose cadence `vk run --atop` set at boot — was
+        /// sampled at whatever cadence recorded it, so this says nothing about either.
         #[arg(
             long,
             value_name = "SECS",
@@ -922,6 +925,19 @@ enum Cmd {
         /// is not accepted here.
         #[arg(long = "disk", value_name = "HOST[:ro]")]
         disk: Vec<String>,
+        /// record what the guest does from boot — one atop-format sample of its /proc
+        /// per interval, landing in `<state dir>/atop/atop.log` for `vk atop` to read
+        /// (`vk atop` beside the running VM follows it live). `--atop` alone samples
+        /// every 5 seconds; `--atop=SECS` picks the cadence
+        #[arg(
+            long = "atop",
+            value_name = "SECS",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "5",
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        atop: Option<u64>,
         /// extra environment for the guest command and its login shells (repeatable);
         /// wins over the image env and any --env-file
         #[arg(long = "env", value_name = "KEY=VALUE")]
@@ -1719,6 +1735,7 @@ async fn cli_main() -> ExitCode {
         volume,
         symlink,
         disk,
+        atop,
         env,
         env_file,
         host_exec,
@@ -1878,6 +1895,7 @@ async fn cli_main() -> ExitCode {
             volumes,
             symlinks,
             extra_disks,
+            atop: *atop,
             env: extra_env,
             host_exec: *host_exec,
             host_exec_wrapper: host_exec_wrapper.clone(),
@@ -2703,11 +2721,27 @@ async fn cli_main() -> ExitCode {
             // for --summary. The two flags that only read a finished recording are
             // refused rather than silently attaching.
             Ok(atop_attach::Target::Live(entry)) => {
-                if json || view {
+                // A VM already recording itself (`vk run --atop`) is read, never attached
+                // to: a second sampler appending to the same share file would run two
+                // recordings together. Its log is a recording still growing, so every
+                // recorded-log flag works — only the default changes, to the live panel,
+                // because a running VM was pointed at.
+                // `is_file` then open is a check on a path the guest can write, which is
+                // safe only because every reader below opens it with O_NOFOLLOW and
+                // refuses anything but a regular file.
+                if let Some(log) = entry.atop_log.as_deref().filter(|l| l.is_file()) {
+                    // Named for the VM: the log sits in the run's archive directory, which
+                    // would otherwise head the account `atop`.
+                    read_recording(
+                        log,
+                        Some(&entry.label),
+                        ReadAs::of(summary, json, view, follow, atop_view::can_draw()),
+                    )
+                } else if json || view {
                     fail(
                         &anyhow::anyhow!(
-                            "{} ({}) is a running VM — attach to it (no flag, or --summary), \
-                             or give {} a recorded log's path",
+                            "{} ({}) is a running VM that is not recording itself — attach \
+                             to it (no flag, or --summary), or give {} a recorded log's path",
                             entry.label,
                             entry
                                 .project_dir
@@ -2748,44 +2782,11 @@ async fn cli_main() -> ExitCode {
                 // Exit 2 for a job nothing answers to, like `vk status`/`list`/`stop` — a
                 // reader of the path must not be handed a success with no path.
                 Err(e) => fail(&e, 2),
-                Ok(path) if summary => match atop_report::summarize(&path) {
-                    Ok(report) => write_report(&report),
-                    Err(e) => fail(&e, 1),
-                },
-                Ok(path) if json => match atoplog::read(&path) {
-                    Ok(text) => {
-                        use std::io::Write;
-                        let parsed = atoplog::parse(&text);
-                        // On stderr, never on stdout: stdout is the JSON stream, and a
-                        // pipeline must not total a log that lost records as a whole one.
-                        if parsed.dropped > 0 {
-                            eprintln!(
-                                "virtkit: warning: {} — {} record(s) did not carry their \
-                             label's fields and were left out",
-                                path.display(),
-                                parsed.dropped
-                            );
-                        }
-                        let mut out = std::io::stdout().lock();
-                        match atoplog::write_json(&parsed.samples, &mut out)
-                            .and_then(|()| out.flush())
-                        {
-                            Ok(()) => ExitCode::SUCCESS,
-                            // A closed pipe (`| head`) is how a reader says it has seen enough.
-                            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                                ExitCode::SUCCESS
-                            }
-                            Err(e) => fail(&anyhow::anyhow!(e), 1),
-                        }
-                    }
-                    Err(e) => fail(&e, 1),
-                },
-                Ok(path) if view || follow => match atop_view::view(&path, follow) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => fail(&e, 1),
-                },
-                // Just the path, so it composes with whatever the operator reads logs with.
-                Ok(path) => write_path(&path),
+                // A recorded job names itself: its log sits in the directory the run made,
+                // and it is finished, so no flag means its path rather than a panel.
+                Ok(path) => {
+                    read_recording(&path, None, ReadAs::of(summary, json, view, follow, false))
+                }
             },
         },
         // stdio↔socket splice for an SSH ProxyCommand; returns when either side closes.
@@ -2929,6 +2930,75 @@ fn write_report(text: &str) -> ExitCode {
     {
         None => ExitCode::SUCCESS,
         Some(e) => fail(&anyhow::anyhow!(e), 1),
+    }
+}
+
+/// Which read of a recording the `vk atop` flags ask for. `live` says the recording is still
+/// growing (a VM recording itself), which is the only thing that changes the no-flag answer:
+/// pointed at a running VM the panel is what "watch this" means, but only where one can be
+/// drawn — otherwise the path is still the answer, so a no-flag read composes as ever.
+#[derive(Debug, PartialEq)]
+enum ReadAs {
+    Summary,
+    Json,
+    Panel { follow: bool },
+    Path,
+}
+
+impl ReadAs {
+    fn of(summary: bool, json: bool, view: bool, follow: bool, live_panel: bool) -> ReadAs {
+        if summary {
+            ReadAs::Summary
+        } else if json {
+            ReadAs::Json
+        } else if view || follow {
+            ReadAs::Panel { follow }
+        } else if live_panel {
+            ReadAs::Panel { follow: true }
+        } else {
+            ReadAs::Path
+        }
+    }
+}
+
+/// Read one recording the way the `vk atop` flags ask: account it (`summary`), stream its
+/// samples as JSON lines (`json`), walk it in the panel (`view`/`follow`), or — with no
+/// flag — print its path, so it composes with whatever the operator reads logs with.
+fn read_recording(path: &Path, named: Option<&str>, read: ReadAs) -> ExitCode {
+    match read {
+        ReadAs::Summary => match atop_report::summarize_as(path, named) {
+            Ok(report) => write_report(&report),
+            Err(e) => fail(&e, 1),
+        },
+        ReadAs::Json => match atoplog::read(path) {
+            Ok(text) => {
+                use std::io::Write;
+                let parsed = atoplog::parse(&text);
+                // On stderr, never on stdout: stdout is the JSON stream, and a
+                // pipeline must not total a log that lost records as a whole one.
+                if parsed.dropped > 0 {
+                    eprintln!(
+                        "virtkit: warning: {} — {} record(s) did not carry their \
+                         label's fields and were left out",
+                        path.display(),
+                        parsed.dropped
+                    );
+                }
+                let mut out = std::io::stdout().lock();
+                match atoplog::write_json(&parsed.samples, &mut out).and_then(|()| out.flush()) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    // A closed pipe (`| head`) is how a reader says it has seen enough.
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+                    Err(e) => fail(&anyhow::anyhow!(e), 1),
+                }
+            }
+            Err(e) => fail(&e, 1),
+        },
+        ReadAs::Panel { follow } => match atop_view::view(path, follow) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        },
+        ReadAs::Path => write_path(path),
     }
 }
 
@@ -3284,6 +3354,59 @@ mod tests {
         assert_eq!(interval, 30);
     }
 
+    /// `--atop` alone records at the default cadence and `--atop=SECS` picks one; the
+    /// value only ever attaches with `=`, so `vk run --atop IMAGE` can never eat the
+    /// image as an interval.
+    #[test]
+    fn run_atop_flag_takes_an_equals_value_or_defaults() {
+        let atop_of = |argv: &[&str]| {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let Cmd::Run { atop, .. } = cli.cmd else {
+                panic!("expected Cmd::Run")
+            };
+            atop
+        };
+        assert_eq!(atop_of(&["vk", "run", "debian:12"]), None);
+        assert_eq!(atop_of(&["vk", "run", "--atop", "debian:12"]), Some(5));
+        assert_eq!(atop_of(&["vk", "run", "--atop=30", "debian:12"]), Some(30));
+        // Space-separated, the interval reads as a second image rather than a value.
+        assert!(Cli::try_parse_from(["vk", "run", "--atop", "30", "debian:12"]).is_err());
+        // A zero interval would have the guest sampling without pause.
+        assert!(Cli::try_parse_from(["vk", "run", "--atop=0", "debian:12"]).is_err());
+    }
+
+    /// Which read the `vk atop` flags ask for. The flags say the same thing about a finished
+    /// recording and one still growing; only the no-flag case differs, because pointing at a
+    /// VM that is recording itself is asking to watch it — but a panel needs a terminal, and
+    /// without one the path is still the answer, so `LOG=$(vk atop <dir>)` keeps working.
+    #[test]
+    fn the_atop_flags_choose_one_read() {
+        use ReadAs::*;
+        // No flag: a path for a finished recording, the live panel for a growing one.
+        assert_eq!(ReadAs::of(false, false, false, false, false), Path);
+        assert_eq!(
+            ReadAs::of(false, false, false, false, true),
+            Panel { follow: true }
+        );
+        // Every explicit flag means the same thing either way.
+        for live in [false, true] {
+            assert_eq!(ReadAs::of(true, false, false, false, live), Summary);
+            assert_eq!(ReadAs::of(false, true, false, false, live), Json);
+            assert_eq!(
+                ReadAs::of(false, false, true, false, live),
+                Panel { follow: false }
+            );
+            assert_eq!(
+                ReadAs::of(false, false, false, true, live),
+                Panel { follow: true }
+            );
+            // clap lets --summary through beside the panel flags; accounting wins, so a
+            // recording still growing is never left drawing a panel nobody asked for.
+            assert_eq!(ReadAs::of(true, false, false, true, live), Summary);
+            assert_eq!(ReadAs::of(true, false, true, false, live), Summary);
+        }
+    }
+
     #[test]
     fn exec_service_selects_named_sibling_and_rejects_raw_address() {
         let entry = vms::VmEntry {
@@ -3293,6 +3416,7 @@ mod tests {
             label: "app".into(),
             exec_addr: "vsock-auto:///state/app/vsock.sock:4444".into(),
             ssh_addr: None,
+            atop_log: None,
             created_secs: 0,
             stale_recipe: None,
             services: vec![vms::ServiceEntry {

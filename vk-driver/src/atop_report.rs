@@ -40,13 +40,10 @@ pub(crate) fn secs_of(v: f64) -> std::time::Duration {
 }
 
 /// Read a recorded log and account it: the whole of `--summary`.
-pub fn summarize(path: &Path) -> Result<String> {
-    summarize_as(path, None)
-}
-
-/// The same account, headed with `named` instead of the recording's directory — for a log
-/// whose directory is not a job's. A live attach lays one down in `<state dir>/atop/`, which
-/// names the archive rather than the VM the samples came from.
+///
+/// `named` heads the account instead of the recording's directory, for a log whose directory
+/// is not a job's: a VM's own recording sits in `<state dir>/atop/`, which names the archive
+/// rather than the VM the samples came from. `None` reads the name off the directory.
 pub fn summarize_as(path: &Path, named: Option<&str>) -> Result<String> {
     let text = crate::atoplog::read(path)?;
     let parsed = crate::atoplog::parse(&text);
@@ -1238,14 +1235,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("atop.log");
         std::fs::write(&path, log()).unwrap();
-        let out = summarize(&path).expect("a report for a recorded job");
+        let out = summarize_as(&path, None).expect("a report for a recorded job");
         assert!(out.contains("what its guest did"), "{out}");
 
         // A byte that is not text is damage, not a reason to refuse the whole account.
         let mut raw = log().into_bytes();
         raw.extend_from_slice(b"CPU runner 1090 1970/01/01 00:18:10 30 \xff\xfe 2 1\nSEP\n");
         std::fs::write(&path, &raw).unwrap();
-        assert!(summarize(&path).is_ok(), "a damaged log still reports");
+        assert!(
+            summarize_as(&path, None).is_ok(),
+            "a damaged log still reports"
+        );
 
         // A symlink where the log goes is not opened, however readable its target: the path
         // is resolved by the kernel on the descriptor, not checked and re-opened.
@@ -1253,13 +1253,13 @@ mod tests {
         std::fs::write(&elsewhere, log()).unwrap();
         let planted = dir.join("planted.log");
         std::os::unix::fs::symlink(&elsewhere, &planted).unwrap();
-        let e = summarize(&planted).expect_err("a symlink is not a recording");
+        let e = summarize_as(&planted, None).expect_err("a symlink is not a recording");
         assert!(
             format!("{e:#}").contains(&planted.display().to_string()),
             "{e:#}"
         );
         // A directory is not one either.
-        assert!(summarize(&dir).is_err());
+        assert!(summarize_as(&dir, None).is_err());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

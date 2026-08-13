@@ -39,6 +39,10 @@ pub struct VmEntry {
     /// SSH address (`…:2222`) when the run served SSH (`--ssh`), else `None`.
     #[serde(default)]
     pub ssh_addr: Option<String>,
+    /// The boot-time recording (`vk run --atop`) this VM's guest is writing, else `None`.
+    /// `vk atop` follows this log instead of attaching a second sampler.
+    #[serde(default)]
+    pub atop_log: Option<PathBuf>,
     /// Unix time (seconds) the entry was recorded — the VM's start, for an uptime column.
     pub created_secs: u64,
     /// Inputs to recompute the root image's build key against the working tree, so `vk list
@@ -625,6 +629,7 @@ mod tests {
             label: "devcontainer".into(),
             exec_addr: "vsock-auto:///tmp/x/vsock.sock:4444".into(),
             ssh_addr: None,
+            atop_log: None,
             created_secs: unix_now(),
             stale_recipe: None,
             services: Vec::new(),
@@ -826,6 +831,16 @@ mod tests {
                 .unwrap()
                 .contains("\"stale\":true")
         );
+    }
+
+    // An entry written before `atop_log` existed still loads: `load_all_in` skips what it
+    // cannot parse, so a required field would drop a live VM out of the registry.
+    #[test]
+    fn vm_entry_loads_without_atop_log() {
+        let json =
+            r#"{"state_dir":"/state/x","pid":1,"label":"x","exec_addr":"a","created_secs":0}"#;
+        let e: VmEntry = serde_json::from_str(json).unwrap();
+        assert!(e.atop_log.is_none());
     }
 
     // An entry written before `build_contexts` existed has to keep loading: `load_all_in` skips

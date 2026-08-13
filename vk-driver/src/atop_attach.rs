@@ -313,6 +313,7 @@ mod tests {
             label: label.into(),
             exec_addr: "vsock-auto:///state/vm/vsock.sock:4444".into(),
             ssh_addr: None,
+            atop_log: None,
             created_secs: 0,
             stale_recipe: None,
             services: Vec::new(),
