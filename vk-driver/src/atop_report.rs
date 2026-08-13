@@ -41,9 +41,16 @@ pub(crate) fn secs_of(v: f64) -> std::time::Duration {
 
 /// Read a recorded log and account it: the whole of `--summary`.
 pub fn summarize(path: &Path) -> Result<String> {
+    summarize_as(path, None)
+}
+
+/// The same account, headed with `named` instead of the recording's directory — for a log
+/// whose directory is not a job's. A live attach lays one down in `<state dir>/atop/`, which
+/// names the archive rather than the VM the samples came from.
+pub fn summarize_as(path: &Path, named: Option<&str>) -> Result<String> {
     let text = crate::atoplog::read(path)?;
     let parsed = crate::atoplog::parse(&text);
-    summary(path, &parsed).with_context(|| {
+    summary(path, named, &parsed).with_context(|| {
         format!(
             "{} holds no complete sample yet (a job records its first one an interval in)",
             path.display()
@@ -61,12 +68,13 @@ pub(crate) fn trace_body(path: &Path) -> Option<String> {
 
 /// The report for one recorded job, or `None` when the log holds no complete sample — a
 /// guest that died before finishing its first one.
-fn summary(path: &Path, parsed: &Parsed) -> Option<String> {
-    let job = path
-        .parent()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.display().to_string());
+fn summary(path: &Path, named: Option<&str>, parsed: &Parsed) -> Option<String> {
+    let job = named.map(str::to_string).unwrap_or_else(|| {
+        path.parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string())
+    });
     Some(format!(
         "virtkit: {job} — what its guest did:\n{}",
         body(parsed)?
@@ -993,6 +1001,7 @@ mod tests {
         let parsed = crate::atoplog::parse(text);
         summary(
             &PathBuf::from("/var/lib/virtkit/atop/2026-08-12/42137-acme-web-test_unit/atop.log"),
+            None,
             &parsed,
         )
         .expect("a report for a log with samples")
@@ -1217,7 +1226,7 @@ mod tests {
     fn a_log_with_no_whole_sample_has_no_report() {
         let text = "RESET\nCPU runner 1000 1970/01/01 00:16:40 40 100 2 1\n";
         let parsed = crate::atoplog::parse(text);
-        assert!(summary(&PathBuf::from("atop.log"), &parsed).is_none());
+        assert!(summary(&PathBuf::from("atop.log"), None, &parsed).is_none());
     }
 
     /// The whole of `--summary` against a file on disk — and against the two things a job's
@@ -1273,7 +1282,7 @@ mod tests {
              SEP\n"
         );
         let parsed = crate::atoplog::parse(&text);
-        let out = summary(&PathBuf::from("atop.log"), &parsed).expect("a report");
+        let out = summary(&PathBuf::from("atop.log"), None, &parsed).expect("a report");
         assert!(out.contains("of cpu time"), "{out}");
     }
 

@@ -334,18 +334,26 @@ fn matches_dir(entry: &VmEntry, filter: &Path) -> bool {
     }
 }
 
-/// Resolve the single running VM for a directory (default: the current directory) — the
-/// selector `vk status`/`vk stop <dir>` use. Errors when none match, or when more than one does
-/// (an ambiguous parent directory), so a by-directory command never acts on the wrong VM.
-pub fn resolve_one(dir: Option<&Path>) -> Result<VmEntry> {
+/// The running VMs a directory selects (default: the current directory), and the
+/// canonical directory that did the selecting — for callers that decide for themselves
+/// what zero or several matches mean, where [`resolve_one`] would refuse.
+pub fn matching(dir: Option<&Path>) -> Result<(PathBuf, Vec<VmEntry>)> {
     let target = match dir {
         Some(d) => canonical(d),
         None => std::env::current_dir().context("resolving the current directory")?,
     };
-    let mut matched: Vec<VmEntry> = running()
+    let matched = running()
         .into_iter()
         .filter(|e| matches_dir(e, &target))
         .collect();
+    Ok((target, matched))
+}
+
+/// Resolve the single running VM for a directory (default: the current directory) — the
+/// selector `vk status`/`vk stop <dir>` use. Errors when none match, or when more than one does
+/// (an ambiguous parent directory), so a by-directory command never acts on the wrong VM.
+pub fn resolve_one(dir: Option<&Path>) -> Result<VmEntry> {
+    let (target, mut matched) = matching(dir)?;
     match matched.len() {
         0 => bail!("no running vk VM for {}", target.display()),
         1 => Ok(matched.pop().unwrap()),

@@ -18,6 +18,7 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 mod admit;
 mod atop;
+mod atop_attach;
 mod atop_report;
 mod atop_view;
 mod atoplog;
@@ -572,15 +573,22 @@ enum Cmd {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
-    /// Read what a job's guest recorded of itself: with no flag, print the log's path so a
-    /// viewer can be pointed at it (`less $(vk atop 42137)`).
+    /// Watch a running VM's guest live, or read what a recorded one did.
+    ///
+    /// A directory a running VM matches (default: the current directory) attaches to it:
+    /// a sampler starts in its guest and the follow panel opens on the recording as it
+    /// grows (`<state dir>/atop/atop.log`) — with --summary, or with no terminal to draw
+    /// the panel on, it records headless until Ctrl-C and then prints what it recorded.
+    /// Anything else reads a recorded job: with no flag, print the log's path so a viewer
+    /// can be pointed at it (`less $(vk atop 42137)`).
     #[command(display_order = 10)]
     Atop {
-        /// A job id, or any part of a recorded job's directory name (its project or job
-        /// name, with anything outside [A-Za-z0-9._-] replaced) — the newest run matching
-        /// answers. Anything holding a `/` is taken as a path, so the path a job's trace
-        /// printed works too.
-        job: String,
+        /// A running VM's directory (as `vk exec` selects one; default: the current
+        /// directory) — or a recorded job: a job id, any part of a recorded job's
+        /// directory name (its project or job name, with anything outside
+        /// [A-Za-z0-9._-] replaced) with the newest run matching answering, or a path
+        /// holding a `/`, so the path a job's trace printed works too.
+        target: Option<String>,
         /// Account the whole job instead of printing a path: what its guest did with its
         /// processors and memory, what it moved, where it stalled, and which of its
         /// processes the time went to.
@@ -600,6 +608,15 @@ enum Cmd {
         /// the guest commits them, and stepping back holds the view still until End.
         #[arg(long, conflicts_with = "view")]
         follow: bool,
+        /// Sampling interval when attaching to a running VM, in seconds. A recorded job
+        /// was sampled at whatever cadence recorded it, so this says nothing about one.
+        #[arg(
+            long,
+            value_name = "SECS",
+            default_value_t = 5,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        interval: u64,
     },
     /// Filtering ssh-agent proxy: serve the ssh-agent protocol on `--listen`, relaying to
     /// the real agent at `--upstream` but exposing only the keys in the `--allow` .pub
@@ -2674,64 +2691,102 @@ async fn cli_main() -> ExitCode {
             }
         },
         Cmd::Atop {
-            job,
+            target,
             summary,
             json,
             view,
             follow,
-        } => match atop::resolve(&ctx.cfg, &job) {
-            // Exit 2 for a job nothing answers to, like `vk status`/`list`/`stop` — a
-            // reader of the path must not be handed a success with no path.
+            interval,
+        } => match atop_attach::classify(target.as_deref()) {
             Err(e) => fail(&e, 2),
-            Ok(path) if summary => match atop_report::summarize(&path) {
-                Ok(report) => write_report(&report),
-                Err(e) => fail(&e, 1),
-            },
-            Ok(path) if json => match atoplog::read(&path) {
-                Ok(text) => {
-                    use std::io::Write;
-                    let parsed = atoplog::parse(&text);
-                    // On stderr, never on stdout: stdout is the JSON stream, and a
-                    // pipeline must not total a log that lost records as a whole one.
-                    if parsed.dropped > 0 {
-                        eprintln!(
-                            "virtkit: warning: {} — {} record(s) did not carry their \
-                             label's fields and were left out",
-                            path.display(),
-                            parsed.dropped
-                        );
+            // A running VM: attach and record it — into the follow panel, or headless
+            // for --summary. The two flags that only read a finished recording are
+            // refused rather than silently attaching.
+            Ok(atop_attach::Target::Live(entry)) => {
+                if json || view {
+                    fail(
+                        &anyhow::anyhow!(
+                            "{} ({}) is a running VM — attach to it (no flag, or --summary), \
+                             or give {} a recorded log's path",
+                            entry.label,
+                            entry
+                                .project_dir
+                                .as_deref()
+                                .unwrap_or(&entry.state_dir)
+                                .display(),
+                            if json { "--json" } else { "--view" },
+                        ),
+                        2,
+                    )
+                } else {
+                    match atop_attach::attach(&entry, interval, summary).await {
+                        Err(e) => fail(&e, 1),
+                        // Named for the VM: the log sits in the archive directory, which
+                        // would otherwise head the account `atop`.
+                        Ok(log) if summary => {
+                            match atop_report::summarize_as(&log, Some(&entry.label)) {
+                                Ok(report) => {
+                                    eprintln!("virtkit: recorded -> {}", log.display());
+                                    write_report(&report)
+                                }
+                                Err(e) => fail(&e, 1),
+                            }
+                        }
+                        Ok(log) => {
+                            // The recording outlives the attach; say how to read it again,
+                            // off stdout so the path there still composes.
+                            eprintln!(
+                                "virtkit: recorded; read it back: vk atop {} --summary",
+                                log.display()
+                            );
+                            write_path(&log)
+                        }
                     }
-                    let mut out = std::io::stdout().lock();
-                    match atoplog::write_json(&parsed.samples, &mut out).and_then(|()| out.flush())
-                    {
-                        Ok(()) => ExitCode::SUCCESS,
-                        // A closed pipe (`| head`) is how a reader says it has seen enough.
-                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
-                        Err(e) => fail(&anyhow::anyhow!(e), 1),
-                    }
-                }
-                Err(e) => fail(&e, 1),
-            },
-            Ok(path) if view || follow => match atop_view::view(&path, follow) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => fail(&e, 1),
-            },
-            // Just the path, so it composes with whatever the operator reads logs with.
-            // In its own bytes, as prepare recorded it: what reads this is another
-            // program, and a lossy rendering would send it to nothing.
-            Ok(path) => {
-                use std::io::Write;
-                use std::os::unix::ffi::OsStrExt;
-                let mut out = std::io::stdout().lock();
-                match out
-                    .write_all(path.as_os_str().as_bytes())
-                    .and_then(|()| out.write_all(b"\n"))
-                    .and_then(|()| out.flush())
-                {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => fail(&anyhow::anyhow!(e), 1),
                 }
             }
+            Ok(atop_attach::Target::Recorded(job)) => match atop::resolve(&ctx.cfg, &job) {
+                // Exit 2 for a job nothing answers to, like `vk status`/`list`/`stop` — a
+                // reader of the path must not be handed a success with no path.
+                Err(e) => fail(&e, 2),
+                Ok(path) if summary => match atop_report::summarize(&path) {
+                    Ok(report) => write_report(&report),
+                    Err(e) => fail(&e, 1),
+                },
+                Ok(path) if json => match atoplog::read(&path) {
+                    Ok(text) => {
+                        use std::io::Write;
+                        let parsed = atoplog::parse(&text);
+                        // On stderr, never on stdout: stdout is the JSON stream, and a
+                        // pipeline must not total a log that lost records as a whole one.
+                        if parsed.dropped > 0 {
+                            eprintln!(
+                                "virtkit: warning: {} — {} record(s) did not carry their \
+                             label's fields and were left out",
+                                path.display(),
+                                parsed.dropped
+                            );
+                        }
+                        let mut out = std::io::stdout().lock();
+                        match atoplog::write_json(&parsed.samples, &mut out)
+                            .and_then(|()| out.flush())
+                        {
+                            Ok(()) => ExitCode::SUCCESS,
+                            // A closed pipe (`| head`) is how a reader says it has seen enough.
+                            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                                ExitCode::SUCCESS
+                            }
+                            Err(e) => fail(&anyhow::anyhow!(e), 1),
+                        }
+                    }
+                    Err(e) => fail(&e, 1),
+                },
+                Ok(path) if view || follow => match atop_view::view(&path, follow) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => fail(&e, 1),
+                },
+                // Just the path, so it composes with whatever the operator reads logs with.
+                Ok(path) => write_path(&path),
+            },
         },
         // stdio↔socket splice for an SSH ProxyCommand; returns when either side closes.
         Cmd::Connect { addr } => match vk_core::forward::run_connect(&addr).await {
@@ -2874,6 +2929,22 @@ fn write_report(text: &str) -> ExitCode {
     {
         None => ExitCode::SUCCESS,
         Some(e) => fail(&anyhow::anyhow!(e), 1),
+    }
+}
+
+/// Write a path to stdout for another program to read: in its own bytes, as it was
+/// recorded — a lossy rendering would send the reader to nothing.
+fn write_path(path: &Path) -> ExitCode {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = std::io::stdout().lock();
+    match out
+        .write_all(path.as_os_str().as_bytes())
+        .and_then(|()| out.write_all(b"\n"))
+        .and_then(|()| out.flush())
+    {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&anyhow::anyhow!(e), 1),
     }
 }
 
@@ -3199,6 +3270,18 @@ mod tests {
         assert!(check);
 
         assert!(Cli::try_parse_from(["vk", "update", "--check", "--yes"]).is_err());
+    }
+
+    /// An interval of zero would have the guest sampling without pause. Refused where every
+    /// other bad value on the command line is — before anything dials a VM.
+    #[test]
+    fn atop_refuses_an_interval_of_zero() {
+        assert!(Cli::try_parse_from(["vk", "atop", "--interval", "0"]).is_err());
+        let cli = Cli::try_parse_from(["vk", "atop", "--interval", "30"]).unwrap();
+        let Cmd::Atop { interval, .. } = cli.cmd else {
+            panic!("expected Cmd::Atop")
+        };
+        assert_eq!(interval, 30);
     }
 
     #[test]

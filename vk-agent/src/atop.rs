@@ -30,7 +30,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -51,15 +51,16 @@ extern "C" fn handle_usr2(_sig: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
-/// CLI entry for the sampler `init` forks (`vk-agent atop <dir> <interval_secs>`) and for
-/// the host's end-of-job request for a final sample (`vk-agent atop --stop`). Errors go to
-/// the console: a guest that cannot record stats still runs its job.
+/// CLI entry for the sampler `init` forks (`vk-agent atop <dir> <interval_secs>`), for a
+/// host attach streaming the samples out (`vk-agent atop - <interval_secs>`, over the exec
+/// channel), and for the host's end-of-job request for a final sample (`vk-agent atop
+/// --stop`). Errors go to the console: a guest that cannot record stats still runs its job.
 pub fn main(args: &[String]) -> i32 {
     if matches!(args, [flag] if flag == "--stop") {
         return stop();
     }
     let [dir, interval] = args else {
-        eprintln!("usage: vk-agent atop <dir> <interval_secs> | vk-agent atop --stop");
+        eprintln!("usage: vk-agent atop <dir>|- <interval_secs> | vk-agent atop --stop");
         return 2;
     };
     let Some(interval) = interval.parse::<u64>().ok().filter(|i| *i > 0) else {
@@ -74,9 +75,20 @@ pub fn main(args: &[String]) -> i32 {
         }
     };
     // The pid file is this sampler's liveness, so it goes when the sampler does: nothing
-    // left to signal, and no recycled pid to mistake for one that is still recording.
-    let _ = std::fs::remove_file(PID_FILE);
+    // left to signal, and no recycled pid to mistake for one that is still recording. An
+    // attach sampler never had one — and must not take down the file of a recording
+    // sampler running beside it.
+    if !streaming(Path::new(dir)) {
+        let _ = std::fs::remove_file(PID_FILE);
+    }
     code
+}
+
+/// The `<dir>` that asks for the samples on stdout rather than in an archive directory —
+/// the one spelling `main` and [`Sink::open`] both go by, so the pid-file guard and the
+/// sink can never disagree about which kind of sampler this is.
+fn streaming(dir: &Path) -> bool {
+    dir == Path::new("-")
 }
 
 /// How long `--stop` waits for the final sample, and how often it looks. The host is
@@ -134,21 +146,66 @@ fn is_sampler(pid: libc::pid_t) -> bool {
     argv.next() == Some(SELF_EXE.as_bytes()) && argv.next() == Some(SUBCOMMAND.as_bytes())
 }
 
-/// Sample `/proc` every `interval` and append each sample to `<dir>/atop.log` until
-/// SIGUSR2 asks for a final one.
+/// Where the samples go: the log in the archive share (the recording `init` forks at
+/// boot), or stdout (a host attach over the exec channel, which lays the log down on
+/// its own side). Each sample is written whole either way; stdout is flushed per
+/// sample so the attach sees a sample as the guest commits it, not when a buffer fills.
+enum Sink {
+    File { log: PathBuf, file: std::fs::File },
+    Stdout,
+}
+
+impl Sink {
+    fn open(dir: &Path) -> Result<Sink> {
+        if streaming(dir) {
+            return Ok(Sink::Stdout);
+        }
+        let log = dir.join(LOG_NAME);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .with_context(|| format!("opening {}", log.display()))?;
+        Ok(Sink::File { log, file })
+    }
+
+    fn write(&mut self, text: &str) -> std::io::Result<()> {
+        match self {
+            Sink::File { file, .. } => file.write_all(text.as_bytes()),
+            Sink::Stdout => {
+                let mut out = std::io::stdout().lock();
+                out.write_all(text.as_bytes())?;
+                out.flush()
+            }
+        }
+    }
+
+    /// The sink as an error or banner names it.
+    fn name(&self) -> String {
+        match self {
+            Sink::File { log, .. } => log.display().to_string(),
+            Sink::Stdout => "stdout".to_string(),
+        }
+    }
+}
+
+/// Sample `/proc` every `interval` and append each sample to `<dir>/atop.log` — or to
+/// stdout, for `-` — until SIGUSR2 (or, streaming, stdin closing) asks for a final one.
 fn run(dir: &Path, interval: Duration) -> Result<()> {
-    let log = dir.join(LOG_NAME);
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)
-        .with_context(|| format!("opening {}", log.display()))?;
+    let mut sink = Sink::open(dir)?;
     // SAFETY: the handler only stores into an atomic (async-signal-safe).
     unsafe {
         libc::signal(
             libc::SIGUSR2,
             handle_usr2 as *const () as libc::sighandler_t,
         );
+    }
+    // A streaming sampler belongs to the attach holding its stdin open: EOF there is the
+    // host hanging up or asking to stop, and means what SIGUSR2 means — one final sample,
+    // then exit. Only when streaming: the boot-forked recording sampler inherits the
+    // console (or /dev/null), where EOF means nothing.
+    if let Sink::Stdout = sink {
+        stop_on_stdin_eof();
     }
     let env = Env::probe();
     // Registered before the first sample, so even the boot-covering one carries the tasks that
@@ -157,7 +214,7 @@ fn run(dir: &Path, interval: Duration) -> Result<()> {
     eprintln!(
         "vk-agent atop: sampling every {}s -> {}{}",
         interval.as_secs(),
-        log.display(),
+        sink.name(),
         match exits.listening() {
             true => ", exited tasks included",
             false => "",
@@ -181,7 +238,7 @@ fn run(dir: &Path, interval: Duration) -> Result<()> {
         // One buffer per sample: a VM torn down mid-write then truncates the tail of
         // one sample instead of interleaving two, and the file stays line-parseable.
         let text = sample_text(&env, &cur, prev.as_ref(), &exited, covered);
-        match file.write_all(text.as_bytes()) {
+        match sink.write(&text) {
             // `prev` advances only for a sample that reached the log, so a write that failed
             // leaves its interval to be covered by the next one that lands — counters and
             // `interval` column together — rather than dropping it. It also keeps `RESET`
@@ -191,7 +248,7 @@ fn run(dir: &Path, interval: Duration) -> Result<()> {
                 // Reported once. A share that cannot be written stays that way, and a line
                 // per interval would crowd out the rest of a long job's console log.
                 if failures == 0 {
-                    eprintln!("vk-agent atop: writing {}: {e}", log.display());
+                    eprintln!("vk-agent atop: writing {}: {e}", sink.name());
                 }
                 failures += 1;
             }
@@ -210,10 +267,31 @@ fn run(dir: &Path, interval: Duration) -> Result<()> {
     if failures > 1 {
         eprintln!(
             "vk-agent atop: {failures} samples could not be written to {}",
-            log.display()
+            sink.name()
         );
     }
     Ok(())
+}
+
+/// Raise the stop flag once stdin reaches EOF, from a thread that spends its life in
+/// `read`. The flag is read within one `SLEEP_SLICE`, so the final sample follows the
+/// host's hang-up about as fast as it follows SIGUSR2.
+fn stop_on_stdin_eof() {
+    std::thread::spawn(|| {
+        use std::io::Read as _;
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = [0u8; 256];
+        loop {
+            match stdin.read(&mut buf) {
+                // Whatever the host writes is not a protocol; only the hang-up counts.
+                Ok(n) if n > 0 => {}
+                Ok(_) => break, // EOF
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        STOP.store(true, Ordering::Relaxed);
+    });
 }
 
 /// The exited tasks the kernel has reported since the last sample, and the socket they arrive
@@ -1819,6 +1897,39 @@ fn print_prd(out: &mut String, h: &str, env: &Env, s: &Sys) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `-` streams the samples to stdout for a host attach; anything else is the archive
+    /// directory a recording is laid down in — appended to, so a re-run of the sampler
+    /// never eats the log so far. The sink's name is what errors and the banner say.
+    #[test]
+    fn the_sink_is_stdout_for_a_dash_and_the_log_otherwise() {
+        let dir = std::env::temp_dir().join(format!("vk-atop-sink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join(LOG_NAME);
+        let mut sink = Sink::open(&dir).unwrap();
+        sink.write("RESET\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "RESET\n");
+        assert_eq!(sink.name(), log.display().to_string());
+        let mut sink = Sink::open(&dir).unwrap();
+        sink.write("SEP\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "RESET\nSEP\n");
+
+        assert!(matches!(Sink::open(Path::new("-")).unwrap(), Sink::Stdout));
+        assert_eq!(Sink::open(Path::new("-")).unwrap().name(), "stdout");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Which sampler this is, which is what the pid file hangs on: only a recording one
+    /// owns that file, so an attach ending must leave a boot-time recording's alone — the
+    /// two run side by side, and clearing it would strand a recording nothing can stop.
+    #[test]
+    fn a_dash_is_the_streaming_sampler_and_nothing_else_is() {
+        assert!(streaming(Path::new("-")));
+        assert!(!streaming(Path::new("/run/vk/atop")));
+        // A directory that merely ends in a dash is an archive like any other.
+        assert!(!streaming(Path::new("/run/vk/-")));
+    }
 
     /// A fixed header, so the golden lines below assert field order and values rather
     /// than the clock — atop builds the same six columns for every label.

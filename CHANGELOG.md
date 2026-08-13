@@ -34,6 +34,14 @@ All notable changes to virtkit will be documented in this file.
   or disk, filtered to the commands you are looking for, and switchable between a sample's
   activity and each process's whole-job totals. `--follow` picks up samples as the running job's
   guest commits them and holds still whenever you step back to read one.
+- **`vk atop` watches a running VM.** Run it beside a `vk run` VM (or name the VM's
+  directory) and its guest starts being sampled on the spot — nothing had to be asked for at
+  boot, and the VM carries on running. On a terminal the panel opens on the recording as it
+  grows; `--summary` records until Ctrl-C and then accounts what happened, and with no
+  terminal to draw a panel on it records the same way and says where the recording is. That
+  recording stays on the host afterwards, for `vk atop <path>` to read back with any of the
+  flags above, and each new watch of a VM replaces the last one's. `--interval` sets the
+  cadence (5 seconds by default).
 - **A job's short-lived processes are now recorded too.** The guest asks its kernel to report
   every task as it exits, so the commands a job forks in their thousands — a compiler per file, a
   process per test — appear in the log with the whole of what each one used, where before they

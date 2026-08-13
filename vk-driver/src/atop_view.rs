@@ -44,6 +44,15 @@ use crate::usage::{fmt_bytes, fmt_cpu};
 /// under the shortest interval a job can record at, so a new sample shows up as it lands.
 const POLL: Duration = Duration::from_millis(400);
 
+/// Whether this terminal can carry the panel at all — for a caller that has something else
+/// to do when it cannot (a live attach records headless), rather than a flag to refuse. The
+/// same conditions [`view`] refuses on, so the two cannot disagree.
+pub fn can_draw() -> bool {
+    std::io::stdout().is_terminal()
+        && std::io::stdin().is_terminal()
+        && std::env::var("TERM").map(|t| t != "dumb").unwrap_or(true)
+}
+
 /// Draw `path` as a panel and walk it. `follow` keeps reading the log while the job runs.
 pub fn view(path: &Path, follow: bool) -> Result<()> {
     // A panel is a terminal program; without a terminal there is a report that is not.

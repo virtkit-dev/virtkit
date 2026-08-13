@@ -551,7 +551,9 @@ pub async fn exec_script(
     Ok(result)
 }
 
-async fn next(
+/// The next message from the guest, with the connection falling silent reported as the
+/// error it is. Shared with the other exec-channel drivers (`atop_attach`).
+pub async fn next(
     stream: &mut (impl futures::Stream<Item = Result<Message, std::io::Error>> + Unpin),
 ) -> Result<Message> {
     Ok(stream

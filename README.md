@@ -175,11 +175,16 @@ The ones you'll actually type:
   protocol, addressed by launch directory like `list`/`stop`, or by a raw agent
   address for plumbing. With `--stale`, skip the probe and print a single
   `fresh` / `stale` / `unknown` word for the VM's root image instead.
-- `atop` — read what a job's guest recorded of itself, by job id, by part of a
-  job's name, or by the path its trace printed. It prints the log's path so it
-  composes with whatever reads logs; `--summary` accounts the whole job instead,
-  `--json` writes its samples a line at a time, and `--view` / `--follow` walk it
-  in a full-screen panel.
+- `atop` — watch a running VM's guest, or read what a recorded one did. Pointed
+  at a directory a running VM matches (default: the current one, addressed like
+  `exec`/`status`), it starts sampling that guest on the spot and opens the
+  follow panel on the recording as it grows; `--summary` — or having no terminal
+  to draw on — records until Ctrl-C instead, and `--interval` sets the cadence.
+  Given a job
+  id, part of a job's name, or the path a job's trace printed, it reads that
+  recording instead: the log's path on stdout so it composes with whatever reads
+  logs, `--summary` to account the whole job, `--json` for its samples a line at
+  a time, and `--view` / `--follow` to walk it in a full-screen panel.
 - `check` — preflight the host for the current user: `/dev/kvm` access, the VMM
   backend, a guest kernel/agent, and the host side of each configured feature
   (the CI-executor features only when named with `--feature`).
