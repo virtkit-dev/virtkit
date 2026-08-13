@@ -1421,7 +1421,7 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
     writeln!(out)?;
     // The instruction cache, `vk-registry serve` and `vk registry status`/`gc` all
     // default to this store. A `[registry] repo` does NOT move it — that only routes
-    // `vk registry push`/`pull`/`inspect` — so a local repo is reported separately.
+    // the bundle pushes — so a local repo is reported separately.
     let store = vk_registry::default_root()?;
     writeln!(
         out,
@@ -1469,7 +1469,7 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
     if let Some(repo) = cfg.registry.as_ref().and_then(|r| r.local_root()) {
         writeln!(
             out,
-            "bundle repo     {} (`[registry] repo`) — `vk registry push`/`pull`/`inspect` use it in-process",
+            "bundle repo     {} (`[registry] repo`) — `vk registry push` and `vk build --tag` use it in-process",
             repo.display()
         )?;
     }
