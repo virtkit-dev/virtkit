@@ -13,10 +13,16 @@
 # Output goes to ./dist as stripped, static-pie musl ELF binaries. Both backends
 # mount the repo at /work and pass identical flags, so the bytes match either way.
 #
+# Needs the guest kernel: `vk` embeds ./dist/vmlinux, so run ./build-kernel.sh first
+# (it changes rarely — one build serves every later build.sh run).
+#
+# --no-kernel: build a `vk` with no embedded kernel — the only way to build without a
+# dist/vmlinux. That vk takes --kernel at runtime, so it is not a shippable binary.
+#
 # --bootstrap-check: after the default Docker build, rebuild with the just-built vk
 # (the dogfood backend, on a clean copy of the tree in a tmp dir) and assert the binaries
 # are byte-for-byte identical — proof the microVM backend reproduces Docker, i.e. vk
-# can rebuild itself. Needs dist/vmlinux (run ./build-kernel.sh first).
+# can rebuild itself. It boots the vk it builds, so it cannot combine with --no-kernel.
 #
 # --vmm=libkrun|cloud-hypervisor: VMM for the dogfood/bootstrap microVM (default:
 # vk's built-in libkrun; cloud-hypervisor needs the external binary).
@@ -45,6 +51,7 @@ BOOTSTRAP_CHECK=""
 FORCE_DOCKER=""
 FAST=""              # --fast/--debug: build the debug profile (much faster to compile,
                      # unoptimized + unstripped) for iteration — NOT a release artifact
+NO_KERNEL=""         # --no-kernel: build vk without embedding dist/vmlinux
 VMM=libkrun          # dogfood VMM backend: libkrun (default) or cloud-hypervisor
 for arg in "$@"; do
   case "$arg" in
@@ -52,6 +59,7 @@ for arg in "$@"; do
     --bootstrap-check) BOOTSTRAP_CHECK=1 ;;
     --docker) FORCE_DOCKER=1 ;;
     --fast|--debug) FAST=1 ;;
+    --no-kernel) NO_KERNEL=1 ;;
     --vmm=libkrun|--vmm=cloud-hypervisor) VMM="${arg#*=}" ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
@@ -60,6 +68,12 @@ done
 # artifact nor reproducible — it cannot back the reproducibility check.
 if [ -n "$FAST" ] && [ -n "$BOOTSTRAP_CHECK" ]; then
   echo "--fast builds the debug profile; it cannot be combined with --bootstrap-check" >&2
+  exit 2
+fi
+# The rebuild boots a microVM on the vk this build produces, which takes its kernel from
+# the one embedded in it — so a kernel-less build cannot back the check either.
+if [ -n "$NO_KERNEL" ] && [ -n "$BOOTSTRAP_CHECK" ]; then
+  echo "--bootstrap-check boots the vk it builds; it cannot be combined with --no-kernel" >&2
   exit 2
 fi
 # Cargo profile flag + its target/ subdir, threaded through the embed env, build command,
@@ -150,13 +164,18 @@ fi
 # `vk` embeds the guest kernel and vk-agent, so the compile is two phases: build
 # vk-agent first, then build vk with VK_EMBED_* pointing at that agent and the
 # pinned vmlinux (both under /work, where the repo is mounted in either backend).
-# The kernel is optional here — without dist/vmlinux, vk builds without an embedded
-# kernel (it then needs --kernel at runtime); the release always has it.
+# A missing kernel is an error rather than a quietly non-self-contained vk: it is the
+# shippable binary's defining property, and the build that drops it is the one nobody
+# notices until the vk fails to boot anything. --no-kernel asks for that vk explicitly.
+# Checked here, before the image build and compile, so the fix comes back in seconds.
 EMBED_ENV="VK_EMBED_AGENT=/work/target/$TARGET/$PROFILE_DIR/vk-agent"
-if [ -e "$OUT/vmlinux" ]; then
+if [ -n "$NO_KERNEL" ]; then
+  echo "build.sh: --no-kernel — the vk built here has no embedded kernel and needs --kernel at runtime" >&2
+elif [ -e "$OUT/vmlinux" ]; then
   EMBED_ENV="$EMBED_ENV VK_EMBED_KERNEL=/work/$OUT/vmlinux"
 else
-  echo "warning: $OUT/vmlinux not found — building vk without an embedded kernel (run ./build-kernel.sh first)" >&2
+  echo "missing $OUT/vmlinux — run ./build-kernel.sh first (or --no-kernel to build a vk without an embedded kernel)" >&2
+  exit 1
 fi
 # vk-registry (the standalone central server) and vk-runnerctl (the root-side setter for
 # gitlab-runner's concurrent) embed nothing, so they build plainly (no EMBED_ENV) alongside vk.
@@ -238,8 +257,9 @@ done
 
 # Reproducibility manifest: the pinned inputs and the artifact hashes. Anyone can
 # rebuild from the same commit + inputs and confirm byte-for-byte:
-#   git checkout <git_commit> && ./build.sh && sha256sum -c dist/vk.sha256 dist/vk-agent.sha256 \
-#                                                              dist/vk-registry.sha256 dist/vk-runnerctl.sha256
+#   git checkout <git_commit> && ./build-kernel.sh && ./build.sh &&
+#     ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-runnerctl.sha256 )
+# The sidecars name the binaries bare, so the check runs from inside dist/.
 ( cd "$OUT" && sha256sum vk > vk.sha256 && sha256sum vk-agent > vk-agent.sha256 && sha256sum vk-registry > vk-registry.sha256 && sha256sum vk-runnerctl > vk-runnerctl.sha256 )
 base_image=$(sed -nE 's/^FROM (rust:[^ ]*).*$/\1/p' .devcontainer/Dockerfile)
 toolchain=$(sed -nE 's/^channel = "(.*)"$/\1/p' rust-toolchain.toml)
@@ -249,11 +269,17 @@ toolchain=$(sed -nE 's/^channel = "(.*)"$/\1/p' rust-toolchain.toml)
 # manifest so its hashes are never mistaken for a release artifact — the release "Verify"
 # recipe would rebuild the release profile and fail sha256sum -c against these debug bytes.
 if [ -n "$FAST" ]; then
-  manifest_header="# virtkit DEBUG build manifest (--fast) — NOT reproducible, not a release artifact
+  manifest_header="# virtkit DEBUG build manifest (--fast${NO_KERNEL:+ --no-kernel}) — NOT reproducible, not a release artifact
 profile:         debug"
+elif [ -n "$NO_KERNEL" ]; then
+  # Same trap as --fast, one step removed: the bytes are release-profile but kernel-less,
+  # so the release recipe — which embeds the kernel — rebuilds something else entirely.
+  manifest_header="# virtkit build manifest (--no-kernel) — no embedded kernel, not a release artifact
+# Verify: git checkout <git_commit> && ./build.sh --no-kernel && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-runnerctl.sha256 )
+profile:         release"
 else
   manifest_header="# virtkit reproducible build manifest
-# Verify: git checkout <git_commit> && ./build.sh && sha256sum -c dist/vk.sha256 dist/vk-agent.sha256 dist/vk-registry.sha256 dist/vk-runnerctl.sha256
+# Verify: git checkout <git_commit> && ./build-kernel.sh && ./build.sh && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-runnerctl.sha256 )
 profile:         release"
 fi
 cat > "$OUT/build-info.txt" <<EOF

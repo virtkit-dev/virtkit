@@ -134,9 +134,15 @@ pins.
 ## Build
 
 ```sh
+./build-kernel.sh  # -> dist/vmlinux (the guest kernel; run this first)
 ./build.sh         # -> dist/{vk, vk-agent, vk-registry, vk-runnerctl, *.sha256, build-info.txt}
-./build-kernel.sh  # -> dist/vmlinux (the guest kernel; rebuilt only on a pin bump)
 ```
+
+Build the kernel first: `vk` embeds `dist/vmlinux`, so a `vk` without it cannot
+boot anything on its own and `build.sh` stops with an error when it is missing (pass
+`--no-kernel` for a `vk` that takes `--kernel` at runtime instead). The kernel
+changes only on a pin bump, so one `./build-kernel.sh` serves every later
+`./build.sh`.
 
 Both run inside a pinned `rust:*-alpine` container (Docker required), so the
 artifacts come out byte-reproducible regardless of the host. `./update.sh` bumps

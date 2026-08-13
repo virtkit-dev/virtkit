@@ -42,8 +42,13 @@ jobs:
         if: inputs.build-kernel
         run: ./build-kernel.sh
 
+      # Without the kernel step above there is no dist/vmlinux to embed, which build.sh
+      # rejects unless the caller says it means it — so ordinary CI passes --no-kernel.
+      # These binaries are artifacts to grab from a commit, not releasable ones.
+      # '' has to stay the last operand: it is falsy, so swapping the arms would make
+      # `||` always fire and hand --no-kernel to the release build too.
       - name: Build binaries (vk, vk-agent, vk-registry, vk-runnerctl)
-        run: ./build.sh
+        run: ./build.sh ${{ !inputs.build-kernel && '--no-kernel' || '' }}
 
       - name: Upload binary artifacts
         uses: actions/upload-artifact@v7

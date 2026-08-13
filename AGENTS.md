@@ -58,9 +58,9 @@ system C libraries are linked.
 All build scripts wrap Docker, so the host needs only Docker — no local Rust setup.
 
 ```bash
+./build-kernel.sh [--no-cache]      # guest kernel vmlinux -> dist/ (Docker; slow) — run first
 ./build.sh                          # static-musl binaries -> dist/ (Docker)
 ./build.sh --fast                   # same, but the debug profile -> much faster iteration
-./build-kernel.sh [--no-cache]      # guest kernel vmlinux -> dist/ (Docker; slow)
 ./audit.sh [--deny warnings]        # cargo-audit against the committed Cargo.lock
 ./sweep.sh [--time 15]              # cargo-sweep stale target/ artifacts (default --installed)
 ./update.sh                         # bump the pinned Rust toolchain + re-pin apk deps
@@ -73,6 +73,10 @@ that still produces the same static-musl `vk` with the kernel + agent embedded. 
 output is not stripped and not reproducible, so it is for iterating only, never a
 release artifact (it cannot combine with `--bootstrap-check`). Use a plain `./build.sh`
 for anything you ship or compare bytes against.
+
+Both `./build.sh` and `./build.sh --fast` embed `dist/vmlinux` and fail when it is absent,
+so `./build-kernel.sh` comes first in a fresh checkout; `--no-kernel` builds a `vk` without
+the embedded kernel instead (it then needs `--kernel` at runtime, and is not shippable).
 
 ### Cargo commands (pinned toolchain)
 
