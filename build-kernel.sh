@@ -62,7 +62,8 @@ file "$OUT/vmlinux" 2>/dev/null || true
 # Reproducibility manifest for the kernel: the pinned inputs and the vmlinux hash.
 # Kept in its own file (build.sh owns build-info.txt and rewrites it whole), so the two
 # scripts stay run-order independent. Verify a fetched vmlinux against the same commit:
-#   git checkout <git_commit> && ./build-kernel.sh && sha256sum -c dist/vmlinux.sha256
+#   git checkout <git_commit> && ./build-kernel.sh && ( cd dist && sha256sum -c vmlinux.sha256 )
+# The sidecar names vmlinux bare, so the check runs from inside dist/.
 base_image=$(sed -nE 's/^FROM (rust:[^ ]*).*$/\1/p' .devcontainer/Dockerfile)
 kernel_version=$(sed -nE 's/^ARG KERNEL_VERSION=(.*)$/\1/p' kernel/Dockerfile)
 kernel_sha256=$(sed -nE 's/^ARG KERNEL_SHA256=(.*)$/\1/p' kernel/Dockerfile)
@@ -75,7 +76,7 @@ echo "recorded vmlinux in $OUT/vmlinux.sha256"
 
 cat > kernel-build-info.txt <<EOF
 # virtkit reproducible kernel build manifest
-# Verify: git checkout <git_commit> && ./build-kernel.sh && sha256sum -c dist/vmlinux.sha256
+# Verify: git checkout <git_commit> && ./build-kernel.sh && ( cd dist && sha256sum -c vmlinux.sha256 )
 git_commit:      ${commit}
 kernel_version:  ${kernel_version}
 kernel_sha256:   ${kernel_sha256}
