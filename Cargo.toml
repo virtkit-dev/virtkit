@@ -16,6 +16,25 @@ authors = [
 ]
 license = "Apache-2.0"
 
+# Fast local builds: keep file:line backtraces for workspace crates, but omit the
+# variable/type debuginfo that slows code generation and linking. Dependencies need no
+# debuginfo in the normal edit loop. Opt into the full-debug profile when debugging.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# `inherits` also carries the inherited profile's per-package overrides, so the dev
+# profile's `debug = false` for dependencies has to be undone explicitly here —
+# otherwise no dependency frame resolves in the one profile meant for debugging.
+[profile.debugging]
+inherits = "dev"
+debug = true
+
+[profile.debugging.package."*"]
+debug = true
+
 # Reproducible release builds: strip inside the toolchain (not the host strip).
 # Path-independence comes from --remap-path-prefix / -ffile-prefix-map applied at
 # build time (see build.sh), since trim-paths is not yet stabilized in this toolchain.

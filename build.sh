@@ -30,9 +30,9 @@
 # --fast (alias --debug): build the debug cargo profile instead of release — a much
 # faster compile for iteration, still static-musl and still embedding the kernel/agent,
 # but unoptimized + unstripped and NOT reproducible, so not a release artifact (cannot
-# combine with --bootstrap-check). Also links with mold and trims debuginfo to line
-# tables to cut the edit-rebuild loop further; both are --fast-only and never touch the
-# release build.
+# combine with --bootstrap-check). It also links with mold, while the dev profile trims
+# debuginfo to line tables, cutting the edit-rebuild loop further without touching the
+# release profile.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -153,14 +153,6 @@ BUILD_ENV=(
   "CFLAGS_x86_64_unknown_linux_musl=-ffile-prefix-map=/work=/src -ffile-prefix-map=/work/target/.cargo-home=/cargo"
   "VK_GIT_COMMIT=$commit"
 )
-# --fast: trim the dev profile's debuginfo to line tables — keeps file:line in panics/
-# backtraces but drops the bulky per-variable/type DWARF, so codegen and every relink are
-# faster. Overridden via the env so it stays --fast-only and needs no [profile.dev] in
-# Cargo.toml (which would slow a plain `cargo build` too).
-if [ -n "$FAST" ]; then
-  BUILD_ENV+=(CARGO_PROFILE_DEV_DEBUG=line-tables-only)
-fi
-
 # `vk` embeds the guest kernel and vk-agent, so the compile is two phases: build
 # vk-agent first, then build vk with VK_EMBED_* pointing at that agent and the
 # pinned vmlinux (both under /work, where the repo is mounted in either backend).

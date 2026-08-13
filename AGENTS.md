@@ -67,12 +67,17 @@ All build scripts wrap Docker, so the host needs only Docker — no local Rust s
 ./update-kernel.sh [--lts|--stable] # bump the pinned guest kernel (defaults to LTS)
 ```
 
-**For dev iteration, prefer `./build.sh --fast`** (alias `--debug`). It builds the unoptimized debug
-profile, links with mold, and trims debuginfo to line tables — a much faster compile
-that still produces the same static-musl `vk` with the kernel + agent embedded. The
-output is not stripped and not reproducible, so it is for iterating only, never a
-release artifact (it cannot combine with `--bootstrap-check`). Use a plain `./build.sh`
-for anything you ship or compare bytes against.
+**When you need a runnable binary, use `./build.sh --fast`** (alias `--debug`). It builds the
+unoptimized debug profile and links with mold — a much faster compile that still produces
+the same static-musl `vk` with the kernel + agent embedded. The output is not stripped and
+not reproducible, so it is for iterating only, never a release artifact (it cannot combine
+with `--bootstrap-check`). Use a plain `./build.sh` for anything you ship or compare bytes
+against.
+
+Every local (non-release) build also gets line-tables-only debuginfo from `[profile.dev]`,
+which keeps `file:line` in panics and backtraces while dropping the bulky per-variable
+DWARF; dependencies get none at all. When you need a debugger, build with cargo's
+`--profile debugging`.
 
 Both `./build.sh` and `./build.sh --fast` embed `dist/vmlinux` and fail when it is absent,
 so `./build-kernel.sh` comes first in a fresh checkout; `--no-kernel` builds a `vk` without
