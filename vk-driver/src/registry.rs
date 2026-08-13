@@ -264,8 +264,11 @@ async fn try_pull_ext4_async(
     let Ok(digest) = client.fetch_manifest_digest(&image, &auth).await else {
         return Ok(None);
     };
-    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
-    let bundle = parent.join(format!(".vkpull-{}", sanitize_component(name)));
+    let bundle = staging_bundle(dest, ".vkpull-");
+    // Unconditionally, and before `pull_into` takes the lock: the name identifies the
+    // artifact, not the digest, so a bundle left at this path by an earlier pull for a
+    // different digest would otherwise satisfy `pull_into`'s `bundle_present` short-circuit
+    // and be served as this pull's result.
     let _ = std::fs::remove_dir_all(&bundle);
     let dref = make_digest_ref(rg, name, &digest)?;
     pull_into(&client, &auth, &dref, name, &digest, &bundle, label).await?;
@@ -300,8 +303,7 @@ async fn push_ext4_async(
     ext4: &Path,
     boot_kind: &str,
 ) -> Result<String> {
-    let parent = ext4.parent().unwrap_or_else(|| Path::new("."));
-    let bundle = parent.join(format!(".vkpush-{}", sanitize_component(name)));
+    let bundle = staging_bundle(ext4, ".vkpush-");
     let _ = std::fs::remove_dir_all(&bundle);
     std::fs::create_dir_all(&bundle).with_context(|| format!("creating {}", bundle.display()))?;
     let runner = bundle.join("runner.ext4");
@@ -773,9 +775,47 @@ async fn chunk_region(
     results.into_iter().filter_map(Result::transpose).collect()
 }
 
-/// Flatten a name to a safe single path component for a scratch dir (no separators).
-fn sanitize_component(name: &str) -> String {
-    name.replace(['/', '\\'], "_")
+/// Where a pull or a push stages the bundle it is assembling for `artifact`: a sibling
+/// directory named after the artifact's file stem, so no two distinct stems share one. Every
+/// artifact staged here is one stage's `<slug>.ext4`, which makes that one bundle per
+/// artifact; a caller that ever stages two extensions of a single stem side by side would
+/// have to key this on the whole file name instead.
+///
+/// The name has to come from the artifact rather than from the repo it is pushed to or
+/// pulled from, because a build's stages all use the one cache repo and the one scratch dir:
+/// a repo-derived name is a single path every stage collides on. Pulls then serialize behind
+/// that one path's pull lock instead of restoring at once, and pushes — which take no such
+/// lock — wipe and re-link the directory under whichever push is still chunking
+/// `runner.ext4` by path, publishing one image's filesystem under another's cache key.
+fn staging_bundle(artifact: &Path, prefix: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let parent = artifact.parent().unwrap_or_else(|| Path::new("."));
+    // A file stem is a single component already; only the fallback for a path that has none
+    // (`/`, `..`) can carry separators, which flattening removes — and the prefix keeps the
+    // name from ever *being* `.` or `..`, so the bundle is always one dir below `parent`.
+    // Flattened over bytes rather than through a `str`, whose lossy conversion could map two
+    // stems onto one name — the very collision this function exists to avoid.
+    let stem = artifact.file_stem().unwrap_or(artifact.as_os_str());
+    let flat: Vec<u8> = stem
+        .as_bytes()
+        .iter()
+        .map(|&b| if b == b'/' || b == b'\\' { b'_' } else { b })
+        .collect();
+    let mut name = std::ffi::OsString::from(prefix);
+    name.push(std::ffi::OsStr::from_bytes(&flat));
+    parent.join(name)
+}
+
+/// The directory a pull assembles into before promoting it onto its [`staging_bundle`] by
+/// rename. Appended rather than `Path::with_extension`, which replaces everything after the
+/// last dot: a bundle name carries the artifact's stem, and stems do hold dots (a registry
+/// host inside an image-source name, a Dockerfile `AS node.20`), so replacing would map two
+/// bundles onto one directory — which neither one's pull lock, keyed on the bundle path,
+/// covers.
+fn staging_tmp(bundle: &Path) -> PathBuf {
+    let mut name = bundle.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
 }
 
 /// Drive a registry future to completion from a sync entry point. The executor's
@@ -1079,7 +1119,7 @@ async fn pull_into(
     let config: BundleConfig =
         serde_json::from_slice(&config).context("parsing the bundle config blob")?;
 
-    let tmp = dir.with_extension("tmp");
+    let tmp = staging_tmp(dir);
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
 
@@ -2412,6 +2452,49 @@ mod tests {
             err.to_string().contains("[registry]"),
             "expected a missing-[registry] error, got: {err}"
         );
+    }
+
+    #[test]
+    fn staging_bundles_of_one_scratch_dir_never_collide() {
+        // The stages of a build pull and push through one cache repo, into one scratch dir:
+        // what keeps their staging bundles apart is the artifact each is assembling. Two
+        // stages sharing a bundle serialize their pulls and clobber each other's pushes.
+        let scratch = Path::new("/tmp/vk-build-42-0");
+        let go = staging_bundle(&scratch.join("go-compiler.ext4"), ".vkpull-");
+        let rust = staging_bundle(&scratch.join("rust-compiler.ext4"), ".vkpull-");
+        assert_eq!(go, scratch.join(".vkpull-go-compiler"));
+        assert_ne!(go, rust);
+        // The pull and the push of one stage are distinct too (a push stages beside the
+        // very ext4 a pull would place there).
+        assert_ne!(
+            go,
+            staging_bundle(&scratch.join("go-compiler.ext4"), ".vkpush-")
+        );
+        // The directory a pull assembles into has to be as distinct as the bundle it is
+        // promoted onto. Two image sources from one registry differ only after a dot, and
+        // the pull locks are keyed on the bundle path — so a shared assembly directory is
+        // one nothing serializes, and both pulls reassemble into the same `runner.ext4`.
+        let a = staging_bundle(&scratch.join("image_ghcr.io_org_a_1-0011.ext4"), ".vkpull-");
+        let b = staging_bundle(&scratch.join("image_ghcr.io_org_b_1-2233.ext4"), ".vkpull-");
+        assert_ne!(a, b);
+        assert_ne!(staging_tmp(&a), staging_tmp(&b));
+        // A path with no stem to take the name from still yields one ordinary component:
+        // flattening removes any separator the fallback carries, and the prefix keeps the
+        // name from ever *being* `.` or `..` — so no artifact path, however degenerate,
+        // points the bundle outside its parent.
+        for degenerate in ["/", "..", "/a/..ext4"] {
+            let d = staging_bundle(Path::new(degenerate), ".vkpull-");
+            let name = d.file_name().expect("a staging bundle always names a dir");
+            let bytes = name.as_encoded_bytes();
+            assert!(
+                bytes.starts_with(b".vkpull-"),
+                "{degenerate} kept the prefix"
+            );
+            assert!(
+                !bytes.contains(&b'/'),
+                "{degenerate} stayed a single component: {name:?}"
+            );
+        }
     }
 
     #[test]

@@ -6,6 +6,13 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A build caching to a registry (`--cache-registry`) restores its cached stages all at
+  once.** They came back one at a time however many were ready, so a job that was entirely
+  cache hits took as long as its restores added up to.
+- **A base image can no longer be cached under another base image's name.** Two stages
+  fetching their base images at the same time could store one image's filesystem under the
+  other's cache key, so every later build starting from that image restored the wrong
+  filesystem. Only builds caching to a registry were affected.
 - **Two pulls fetching the same chunk at once no longer poison the image cache.** They could
   leave a partial chunk cached under its digest, and every later pull trusted it — so the
   image failed to unpack, or unpacked with corrupt bytes in it, on every run until that entry
