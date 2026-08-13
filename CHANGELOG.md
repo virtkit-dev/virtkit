@@ -58,6 +58,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A corrupt run-config sidecar fails the push instead of vanishing.** A bundle whose
+  `runner.ext4.json` no longer parsed was published without it, so the image booted
+  without its `Env`/`User` and nothing pointed at why. Pushing such a bundle is now an
+  error naming the sidecar; a bundle without one is unaffected.
 - **A bundle can be published to a local store.** `vk registry push` and `vk build --tag`
   failed outright whenever the configured registry was a store directory rather than a
   server, complaining that the path was not a valid image reference — while builds could

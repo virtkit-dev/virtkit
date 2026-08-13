@@ -102,9 +102,21 @@ fn bundle_config_from_dir(
     // The image's runtime config, if the bundle dir carries the `runner.ext4.json` sidecar
     // a `vk build` writes next to its ext4. Carried in the manifest so the guest applies it
     // at boot without baking anything into the (byte-clean, dedup-friendly) rootfs.
-    let run_config = std::fs::read(dir.join("runner.ext4.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok());
+    // An absent sidecar is an image with no run config; a present one that does not read
+    // or parse is corruption — refuse rather than publish an image that silently boots
+    // without its Env/User.
+    let sidecar = dir.join("runner.ext4.json");
+    let run_config = match std::fs::read(&sidecar) {
+        Ok(bytes) => Some(
+            serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing {} — rebuild the bundle", sidecar.display()))?,
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("reading {} — rebuild the bundle", sidecar.display()));
+        }
+    };
     Ok(BundleConfig {
         total_size,
         chunk_count,
@@ -2437,6 +2449,39 @@ mod tests {
         });
         let back: BundleConfig = serde_json::from_value(legacy).unwrap();
         assert_eq!(back.run_config, None);
+    }
+
+    /// An absent run-config sidecar is a bundle with no run config; a corrupt one must
+    /// fail the push rather than publish an image that silently boots without its
+    /// Env/User.
+    #[test]
+    fn bundle_config_rejects_corrupt_sidecar() {
+        let dir = std::env::temp_dir().join(format!("vk-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("boot.kind"), "generic-disk").unwrap();
+        let cfg = bundle_config_from_dir(&dir, 4096, 1, false, false).unwrap();
+        assert_eq!(cfg.run_config, None);
+        std::fs::write(dir.join("runner.ext4.json"), b"{not json").unwrap();
+        let Err(err) = bundle_config_from_dir(&dir, 4096, 1, false, false) else {
+            panic!("a corrupt sidecar must fail the push");
+        };
+        assert!(
+            err.to_string().contains("runner.ext4.json"),
+            "the error must name the sidecar: {err}"
+        );
+        // A sidecar that exists but cannot be read (here: it is a directory) must also
+        // fail the push, not degrade to an image with no run config.
+        std::fs::remove_file(dir.join("runner.ext4.json")).unwrap();
+        std::fs::create_dir(dir.join("runner.ext4.json")).unwrap();
+        let Err(err) = bundle_config_from_dir(&dir, 4096, 1, false, false) else {
+            panic!("an unreadable sidecar must fail the push");
+        };
+        assert!(
+            err.to_string().contains("runner.ext4.json"),
+            "the error must name the sidecar: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// High-entropy pseudo-random bytes (a splitmix64 stream) so the CDC gear-hash
