@@ -2226,7 +2226,7 @@ fn sweep_stale_scratch(dir: &Path, prefix: &str) {
 
 /// Whether `pid` is a live process. `kill(pid, 0)` sends no signal — it only reports
 /// whether the target exists (`ESRCH` = gone; `EPERM` = alive but not ours, so live).
-fn pid_alive(pid: u32) -> bool {
+pub(crate) fn pid_alive(pid: u32) -> bool {
     // SAFETY: signal 0 performs only the existence/permission check, delivering nothing.
     if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
         return true;

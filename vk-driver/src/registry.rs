@@ -1241,11 +1241,21 @@ async fn pull_chunk(
     }
     let bytes = pull_blob_bytes(client, image, layer).await?;
     std::fs::create_dir_all(cache).with_context(|| format!("creating {}", cache.display()))?;
-    // atomic-ish: write to a tmp sibling then rename, so a killed pull never leaves
-    // a truncated file under the digest name (which would then be trusted blindly).
-    let tmp = cache.join(format!("{hex}.tmp"));
-    std::fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    let _ = std::fs::rename(&tmp, &cached);
+    // atomic-ish: write to a tmp sibling then rename, so a killed pull never leaves a
+    // truncated file under the digest name (which would then be trusted blindly). The staging
+    // name is private to this writer — `image::staging_chunk_name` explains why two pulls of
+    // one chunk must not share it — and `image::sweep_chunks` reclaims one a dead pid left.
+    let tmp = cache.join(image::staging_chunk_name(hex));
+    if let Err(e) = std::fs::write(&tmp, &bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("writing {}", tmp.display()));
+    }
+    // Publishing is best-effort — the bytes are already in hand, so a failure costs only the
+    // cache entry — but the staging file goes either way: nothing else would ever reuse a name
+    // private to this writer, and the sweep can only reclaim it once this process is gone.
+    if std::fs::rename(&tmp, &cached).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
     fetched.fetch_add(1, Ordering::Relaxed);
     Ok(bytes)
 }

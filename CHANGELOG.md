@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Two pulls fetching the same chunk at once no longer poison the image cache.** They could
+  leave a partial chunk cached under its digest, and every later pull trusted it — so the
+  image failed to unpack, or unpacked with corrupt bytes in it, on every run until that entry
+  aged out. A cached chunk is now always the whole chunk, and one left behind by a killed pull
+  is reclaimed instead of occupying the cache for good.
+
 ## [0.33.0] - 2026-08-13
 
 ### Added

@@ -22,7 +22,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 
@@ -394,6 +394,33 @@ fn base_dirs(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// The name a pull stages a chunk under before renaming it onto its digest: the digest,
+/// then who is writing it. Two pulls of one chunk — concurrent stage restores within a
+/// build, or two jobs sharing the store — must not share the file. Both write the same
+/// bytes, since the name is the digest, so the hazard is not a mix but a truncation: one
+/// writer reopening the file empty under another's finished write lets that writer's rename
+/// publish a partial chunk. The pid separates processes, the counter the writes inside one.
+pub(crate) fn staging_chunk_name(hex: &str) -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{hex}.{}-{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Whether the pull that staged a [`staging_chunk_name`] in the chunk store is dead, so the
+/// file will never be renamed into place. A name that does not carry a pid is from an older
+/// `vk` (or is not ours at all) and is reported as still live — never reclaiming someone
+/// else's in-flight write is worth leaving the odd stale file behind.
+fn staging_writer_is_gone(name: &str) -> bool {
+    name.strip_suffix(".tmp")
+        .and_then(|rest| rest.rsplit_once('.'))
+        .and_then(|(_hex, owner)| owner.split_once('-'))
+        .and_then(|(pid, _seq)| pid.parse::<u32>().ok())
+        .is_some_and(|pid| !crate::build::pid_alive(pid))
+}
+
 /// Drop chunk blobs in `<registry_root>/chunks/` that no cached bundle references. Each
 /// pulled bundle records the chunk digests it was reassembled from in a `chunks.list`; the
 /// union over every still-present bundle is the live set. A chunk is only a re-pull
@@ -421,10 +448,18 @@ pub(crate) fn sweep_chunks(registry_root: &Path) {
         let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        // Skip a chunk being staged into the store right now (`pull_chunk` writes `<hex>.tmp`
-        // then renames). An in-flight *bundle* is instead kept live by its `chunks.list`,
-        // which `pull_into` writes into the staging dir before fetching any chunk.
-        if name.ends_with(".tmp") || live.contains(name) {
+        // A chunk being staged into the store right now (`pull_chunk` writes
+        // `<hex>.<pid>-<seq>.tmp` then renames) is left alone; one whose writer is gone is
+        // reclaimed, since nothing will ever rename it into place. An in-flight *bundle* is
+        // instead kept live by its `chunks.list`, which `pull_into` writes into the staging
+        // dir before fetching any chunk.
+        if name.ends_with(".tmp") {
+            if staging_writer_is_gone(name) && std::fs::remove_file(&p).is_ok() {
+                dropped += 1;
+            }
+            continue;
+        }
+        if live.contains(name) {
             continue;
         }
         if std::fs::remove_file(&p).is_ok() {
@@ -432,7 +467,7 @@ pub(crate) fn sweep_chunks(registry_root: &Path) {
         }
     }
     if dropped > 0 {
-        println!("virtkit: swept {dropped} unreferenced cache chunk(s)");
+        println!("virtkit: swept {dropped} unreferenced cache chunk file(s)");
     }
 }
 
@@ -671,10 +706,29 @@ mod tests {
         std::fs::create_dir_all(&bundle).unwrap();
         std::fs::write(bundle.join("runner.ext4"), b"x").unwrap();
         std::fs::write(bundle.join("chunks.list"), "aaa\n").unwrap();
-        // The chunk store: a referenced blob, an orphan, and an in-flight temp.
+        // The chunk store: a referenced blob, an orphan, and five staged temps. The live one
+        // is named by `staging_chunk_name` itself, so keeping it also proves the name's
+        // producer and its parser still agree; one is a dead writer's, to be reclaimed; the
+        // last three cover every way the parser can fail to name a writer at all, each of
+        // which must be read as live.
+        // A guaranteed-dead pid: spawn a child and reap it.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let live_tmp = staging_chunk_name("ccc");
+        let dead_tmp = format!("ddd.{dead}-0.tmp");
+        let no_seq_tmp = format!("fff.{dead}.tmp");
         let chunks = root.join("chunks");
         std::fs::create_dir_all(&chunks).unwrap();
-        for f in ["aaa", "bbb", "ccc.tmp"] {
+        for f in [
+            "aaa",
+            "bbb",
+            &live_tmp,
+            &dead_tmp,
+            "eee.tmp",
+            &no_seq_tmp,
+            "ggg.notapid-0.tmp",
+        ] {
             std::fs::write(chunks.join(f), b"z").unwrap();
         }
 
@@ -682,8 +736,24 @@ mod tests {
         assert!(chunks.join("aaa").exists(), "a referenced chunk is kept");
         assert!(!chunks.join("bbb").exists(), "an orphan chunk is dropped");
         assert!(
-            chunks.join("ccc.tmp").exists(),
+            chunks.join(&live_tmp).exists(),
             "an in-flight chunk is left alone"
+        );
+        assert!(
+            !chunks.join(&dead_tmp).exists(),
+            "a chunk staged by a dead pull is reclaimed"
+        );
+        assert!(
+            chunks.join("eee.tmp").exists(),
+            "a temp with no owner in its name is left alone"
+        );
+        assert!(
+            chunks.join(&no_seq_tmp).exists(),
+            "a temp naming no write counter is left alone"
+        );
+        assert!(
+            chunks.join("ggg.notapid-0.tmp").exists(),
+            "a temp whose owner is not a pid is left alone"
         );
 
         // Once the only bundle referencing "aaa" is evicted, "aaa" becomes reclaimable.
