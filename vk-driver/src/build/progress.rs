@@ -198,6 +198,21 @@ impl Progress {
         }
     }
 
+    /// Emit one free-form line into the build's log — a note from the driver rather than a
+    /// step event. Routed like every other line, because the tty backend's pinned block is
+    /// drawing (and steady-ticking) from the moment the reporter exists, so a raw write would
+    /// land inside it: the tty prints above that block with indicatif suspended, the plain
+    /// backend writes stdout, and a routed build streams the line to its consumer.
+    pub fn note(&self, line: &str) {
+        match &self.backend {
+            Backend::Tty(tty) => {
+                let _ = tty.println(self.dim(line));
+            }
+            Backend::Plain | Backend::Routed(_) => self.plain_line(format_args!("{line}")),
+            Backend::Disabled => {}
+        }
+    }
+
     fn new_backend(backend: Backend, color: bool) -> Self {
         Progress {
             backend,
@@ -1334,6 +1349,25 @@ mod tests {
         assert!(got.iter().any(|l| l.contains("FINISHED")));
         // routed guest output must carry through, not inherit stdout
         assert!(matches!(p.stage_sink(1), OutputSink::Routed(_)));
+    }
+
+    #[test]
+    fn note_streams_to_a_routed_builds_consumer() {
+        // A note is the driver's own line rather than a step event, and it travels the same
+        // transport: on a routed build the reader is the guest that asked for the build, which
+        // never sees the driver's stdout.
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let lines = Arc::clone(&lines);
+            Arc::new(move |l: &str| lines.lock().unwrap().push(l.to_string()))
+                as Arc<dyn Fn(&str) + Send + Sync>
+        };
+        let p = Progress::routed(sink);
+        p.note("virtkit: build: up to 4 stage(s) at once");
+        assert_eq!(
+            lines.lock().unwrap().as_slice(),
+            ["virtkit: build: up to 4 stage(s) at once"]
+        );
     }
 
     #[test]

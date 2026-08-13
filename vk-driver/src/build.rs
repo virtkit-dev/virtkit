@@ -677,6 +677,12 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
             let agent = agent.as_ref().expect("resolved under microvm");
             let mv = make_microvm(opts, &scratch, &kernel.path, &agent.path, &timings)?;
             let jobs = resolve_build_jobs(opts, mv.mem_mib());
+            progress.note(&concurrency_line(
+                jobs,
+                mv.cpus(),
+                mv.mem(),
+                opts.build_jobs.is_some(),
+            ));
             let (committed, states) = drive_microvm(
                 &plan,
                 &order,
@@ -882,6 +888,12 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
     };
 
     let progress = build_progress(opts);
+    progress.note(&concurrency_line(
+        jobs,
+        mv.cpus(),
+        mv.mem(),
+        opts.build_jobs.is_some(),
+    ));
     let result = (|| -> Result<HashMap<String, Built>> {
         /// One resolved target of a unit: its stage index and where it exports.
         struct Tgt {
@@ -2195,6 +2207,22 @@ fn resolve_build_jobs(opts: &Options, mem_mib: u64) -> usize {
     let avail = mem_available_mib().unwrap_or(8 * 1024);
     let usable = avail * 8 / 10;
     ((usable / mem_mib.max(1)) as usize).clamp(1, 16)
+}
+
+/// How wide the build may run, announced before any stage starts: the cap on stages built at
+/// once, where that number came from (`configured` = `--build-jobs` or `[build] jobs`), and
+/// the size of one stage guest. A build held to one stage at a time reads in a trace exactly
+/// like a build with nothing to parallelize, and the two want opposite things done about them
+/// — so the line names its source. It is a budget, not a prediction: a build with fewer
+/// stages than `jobs` never reaches the cap. Pure over its inputs, so the wording is testable
+/// without a guest.
+fn concurrency_line(jobs: usize, cpus: u32, mem: &str, configured: bool) -> String {
+    let source = if configured {
+        "configured"
+    } else {
+        "from host memory"
+    };
+    format!("virtkit: build: up to {jobs} stage(s) at once ({source}), each cpus={cpus}, mem={mem}")
 }
 
 /// Remove build scratch orphaned by earlier runs that were hard-killed (SIGKILL, OOM,
@@ -4591,5 +4619,23 @@ RUN ship
         // Auto is RAM-bounded and clamped to [1, 16].
         assert_eq!(resolve_build_jobs(&opts(None), u64::MAX / 2), 1);
         assert!((1..=16).contains(&resolve_build_jobs(&opts(None), 1)));
+    }
+
+    #[test]
+    fn concurrency_line_names_where_its_budget_came_from() {
+        // The whole point of announcing the budget: a build pinned to one stage on purpose
+        // must not read like one the host's free memory squeezed down to it.
+        let pinned = concurrency_line(1, 2, "4G", true);
+        assert!(pinned.starts_with("virtkit: build: "), "{pinned}");
+        assert!(
+            pinned.contains("up to 1 stage(s) at once (configured)"),
+            "{pinned}"
+        );
+        assert!(pinned.contains("each cpus=2, mem=4G"), "{pinned}");
+        let auto = concurrency_line(6, 2, "4G", false);
+        assert!(
+            auto.contains("up to 6 stage(s) at once (from host memory)"),
+            "{auto}"
+        );
     }
 }

@@ -1025,6 +1025,17 @@ impl MicroVm {
         crate::run::parse_mem_mib(&self.mem).unwrap_or(2048)
     }
 
+    /// Each stage guest's vCPUs.
+    pub fn cpus(&self) -> u32 {
+        self.cpus
+    }
+
+    /// Each stage guest's memory as passed to the VMM (`4G`) — [`Self::mem_mib`] is the
+    /// parsed MiB the job budget divides by.
+    pub fn mem(&self) -> &str {
+        &self.mem
+    }
+
     /// A fresh per-stage worker that shares this executor's cross-stage state (the
     /// `images` / `stage_last_key` / `base_digests` maps and the cache registry) but
     /// starts with an empty per-stage working set (no session, sources, or in-flight

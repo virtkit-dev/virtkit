@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A build says how wide it is allowed to run.** Before the first stage starts it reports
+  how many stages it may build at once, whether that came from your configuration or from
+  the host's free memory, and the size of one stage's guest — so a build squeezed onto a
+  loaded runner is told apart from one that simply had nothing to run in parallel.
+
 ### Fixed
 
 - **A build caching to a registry (`--cache-registry`) restores its cached stages all at
