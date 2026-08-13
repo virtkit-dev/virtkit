@@ -110,11 +110,11 @@ needed for runtime testing.
 
 ### Cargo commands (pinned toolchain)
 
-The toolchain is pinned in `rust-toolchain.toml` (1.96.1, musl target, clippy +
-rustfmt). Run cargo directly if you have it, or inside the devcontainer image to
-match CI exactly (clippy needs the static-FFI env — see `.github/workflows/quality.yml`).
-These are the CI-parity commands, run to verify a change; the edit loop above is what to
-use while iterating:
+The toolchain is pinned in `rust-toolchain.toml` (musl target, clippy + rustfmt). Run
+cargo directly if you have it, or inside the devcontainer image to match CI exactly
+(clippy needs the static-FFI env — see `.github/workflows/quality.yml`). These are the
+CI-parity commands, run to verify a change; the edit loop above is what to use while
+iterating:
 
 ```bash
 cargo build --release --workspace
