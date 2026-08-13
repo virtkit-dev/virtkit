@@ -523,11 +523,17 @@ fn smoke_test(path: &Path, version: &str) -> Result<()> {
     let out = std::process::Command::new(path)
         .arg("--version")
         .output()
-        .with_context(|| {
-            format!(
-                "running {} --version (is the release built for this architecture?)",
-                path.display()
-            )
+        .map_err(|e| {
+            // Which errno this is decides what went wrong, and the causes are nothing alike:
+            // a release built for another architecture (ENOEXEC), a file some process still
+            // holds open for writing (ETXTBSY), a host with no room left to fork (EAGAIN).
+            // Only the first is about the architecture, so only it says so — asserting it
+            // for the others buries the errno under a wrong answer.
+            let hint = match e.raw_os_error() {
+                Some(libc::ENOEXEC) => " (is the release built for this architecture?)",
+                _ => "",
+            };
+            anyhow::Error::new(e).context(format!("running {} --version{hint}", path.display()))
         })?;
     // Non-UTF-8 output is not a version string: fall through to the error below with
     // it empty rather than mangling the bytes to report them.
@@ -1076,10 +1082,12 @@ mod tests {
             .unwrap();
         let s = Scratch::new("gone", 0o755);
         fs::remove_file(&s.exe).unwrap();
-        let err = install(&client, &target, &s.exe, &s.dir)
-            .await
-            .expect_err("nothing to replace")
-            .to_string();
+        let err = format!(
+            "{:#}",
+            install(&client, &target, &s.exe, &s.dir)
+                .await
+                .expect_err("nothing to replace")
+        );
         assert!(err.contains("is gone"), "{err}");
         // refused before anything was downloaded, so there is nothing to clean up
         assert_eq!(leftovers(&s.dir), Vec::<String>::new());
@@ -1107,10 +1115,12 @@ mod tests {
         fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
 
-        let err = install(&client, &target, &exe, &s.dir)
-            .await
-            .expect_err("the rename must fail")
-            .to_string();
+        let err = format!(
+            "{:#}",
+            install(&client, &target, &exe, &s.dir)
+                .await
+                .expect_err("the rename must fail")
+        );
         assert!(err.contains("installing"), "{err}");
         assert_eq!(leftovers(&s.dir), Vec::<String>::new());
     }
@@ -1127,10 +1137,12 @@ mod tests {
         let tmp = s.dir.join(format!(".vk-update.{}", std::process::id()));
         fs::write(&tmp, b"a previous run's").unwrap();
 
-        let err = install(&client, &target, &s.exe, &s.dir)
-            .await
-            .expect_err("must not reuse it")
-            .to_string();
+        let err = format!(
+            "{:#}",
+            install(&client, &target, &s.exe, &s.dir)
+                .await
+                .expect_err("must not reuse it")
+        );
         assert!(err.contains("already exists"), "{err}");
         assert_eq!(fs::read(&tmp).unwrap(), b"a previous run's");
     }
@@ -1157,16 +1169,20 @@ mod tests {
     async fn resolve_separates_a_missing_release_from_a_rate_limit() {
         let client = test_client();
 
-        let err = resolve(&client, &release_api(Fault::None), Some("0.28.0"))
-            .await
-            .expect_err("no such tag")
-            .to_string();
+        let err = format!(
+            "{:#}",
+            resolve(&client, &release_api(Fault::None), Some("0.28.0"))
+                .await
+                .expect_err("no such tag")
+        );
         assert!(err.contains("no release v0.28.0"), "{err}");
 
-        let err = resolve(&client, &release_api(Fault::RateLimited), None)
-            .await
-            .expect_err("out of quota")
-            .to_string();
+        let err = format!(
+            "{:#}",
+            resolve(&client, &release_api(Fault::RateLimited), None)
+                .await
+                .expect_err("out of quota")
+        );
         assert!(err.contains("rate limit is exhausted"), "{err}");
     }
 }
