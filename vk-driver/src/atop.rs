@@ -238,7 +238,10 @@ fn resolve_in(root: &Path, target: &str) -> Result<PathBuf> {
     // whatever the operator's working directory happens to hold under that name.
     if is_path_target(target) {
         let path = Path::new(target);
-        if path.is_file() {
+        // A regular file and not a symlink to one, on the same footing [`recorded_log`]
+        // takes the archive on: a named path points into a directory a guest could write,
+        // and the path handed back goes straight to a reader that would follow it.
+        if std::fs::symlink_metadata(path).is_ok_and(|md| md.is_file()) {
             return Ok(path.to_path_buf());
         }
         return recorded_log(path)
@@ -489,6 +492,35 @@ mod tests {
         let e = resolve(&off, "42137").expect_err("a job lookup has no archive to search");
         assert!(format!("{e:#}").contains("nothing recorded"), "{e:#}");
         std::fs::remove_dir_all(&state).unwrap();
+    }
+
+    /// A named path is held to the same rule the archive lookup holds a log to: a symlink
+    /// where the recording should be is not a recording, whoever put it there. A guest can
+    /// write the directory its own log lives in, and the path this hands back goes to a
+    /// reader that would follow it — so the two branches must not disagree about symlinks.
+    #[test]
+    fn a_path_target_that_is_a_symlink_is_not_a_recording() {
+        let dir = std::env::temp_dir().join(format!("vk-atop-pathlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let elsewhere = dir.join("elsewhere");
+        std::fs::write(&elsewhere, b"RESET\nSEP\n").unwrap();
+        let planted = dir.join(LOG_NAME);
+        std::os::unix::fs::symlink(&elsewhere, &planted).unwrap();
+        let cfg = Config {
+            state_dir: Some(dir.clone()),
+            gitlab: None,
+            ..Default::default()
+        };
+        // Named directly, and found by naming the directory holding it: refused either way.
+        assert!(resolve(&cfg, &planted.to_string_lossy()).is_err());
+        assert!(resolve(&cfg, &dir.to_string_lossy()).is_err());
+        // The file it points at is a recording in its own right, named as itself.
+        assert_eq!(
+            resolve(&cfg, &elsewhere.to_string_lossy()).unwrap(),
+            elsewhere
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Which run of a job answers, when more than one could. The reason to name a job rather
