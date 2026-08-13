@@ -76,6 +76,7 @@ mod vmdk;
 mod vmm;
 mod vms;
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -98,6 +99,14 @@ fn parse_cpus(s: &str) -> Result<u32, String> {
         s.parse()
             .map_err(|_| format!("--cpus expects a number or \"host\", got {s:?}"))
     }
+}
+
+/// clap value parser for `--build-jobs`: how many stages may build at once, at least one.
+/// Parsing straight to `NonZeroUsize` would reject `0` on its own, but with std's wording
+/// ("number would be zero for non-zero type"); this says it in the CLI's own terms.
+fn parse_build_jobs(s: &str) -> Result<NonZeroUsize, String> {
+    s.parse()
+        .map_err(|_| format!("expected a positive stage count, got {s:?}"))
 }
 
 /// What `vk export` can package a raw disk image as.
@@ -488,8 +497,8 @@ enum Cmd {
         /// max stages built concurrently on the microVM backend (independent stages
         /// build in parallel over the dependency graph). Default: `[build] jobs`, else
         /// auto, bounded by host RAM. 1 forces a sequential build
-        #[arg(long = "build-jobs", value_name = "N")]
-        build_jobs: Option<usize>,
+        #[arg(long = "build-jobs", value_name = "N", value_parser = parse_build_jobs)]
+        build_jobs: Option<NonZeroUsize>,
         /// verify each stage snapshot with e2fsck as it crosses the instruction cache
         /// (after a load, before an upload) to catch a corrupt ext4 early. Best-effort
         /// (skipped if e2fsck is absent); adds an fsck per instruction
@@ -3367,6 +3376,22 @@ mod tests {
             panic!("expected Cmd::Atop")
         };
         assert_eq!(interval, 30);
+    }
+
+    /// A budget of no stages at all is not a build, so it is refused on the command line
+    /// before anything boots — and in the flag's own vocabulary, not std's non-zero-type
+    /// wording, which is the whole reason `parse_build_jobs` exists.
+    #[test]
+    fn build_jobs_refuses_zero() {
+        let Err(err) = Cli::try_parse_from(["vk", "build", "--build-jobs", "0"]) else {
+            panic!("--build-jobs 0 must be rejected")
+        };
+        assert!(err.to_string().contains("positive stage count"), "{err}");
+        let cli = Cli::try_parse_from(["vk", "build", "--build-jobs", "4"]).unwrap();
+        let Cmd::Build { build_jobs, .. } = cli.cmd else {
+            panic!("expected Cmd::Build")
+        };
+        assert_eq!(build_jobs, NonZeroUsize::new(4));
     }
 
     /// `--atop` alone records at the default cadence and `--atop=SECS` picks one; the

@@ -47,6 +47,7 @@ mod plan;
 mod progress;
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -246,12 +247,14 @@ pub struct Options {
     /// Max stages built concurrently (microVM backend). `Some` (the `--build-jobs` flag,
     /// or the config's `[build] jobs`) overrides the `None` = auto default (bounded by
     /// host RAM, each stage guest reserving a fixed slice). `1` forces the sequential
-    /// build. Ignored by the host backend.
+    /// build. Ignored by the host backend. Non-zero by type: a budget of no stages at all
+    /// is not a build, and silently reading it as `1` would have the announced concurrency
+    /// cite a configured number the build never used.
     ///
     /// The other build-guest tuning knobs — per-stage `cpus`/`mem` and the `auto`
     /// checkpoint threshold — are host-wide (no CLI flag), so they ride the process-global
     /// build tuning set once from `[build]` (see [`set_tuning`]), not this per-build struct.
-    pub build_jobs: Option<usize>,
+    pub build_jobs: Option<NonZeroUsize>,
     /// Verify every stage snapshot with `e2fsck` (best-effort) as it crosses the cache
     /// boundary — after a cache load, and before an upload — to catch a corrupt ext4
     /// early instead of letting it poison the cache or ship in the image. Off by default
@@ -2195,14 +2198,15 @@ fn drive_microvm(
     Ok((committed, final_states(&resolved)))
 }
 
-/// Resolve the parallel build's job count: explicit `--build-jobs`, else the
-/// `opts.build_jobs` (the `--build-jobs` flag or `[build] jobs`) when set, else RAM-auto —
-/// each stage guest reserves `mem_mib`, so cap concurrency at ~80% of available RAM
-/// divided by that, clamped to a sane ceiling. CPU is intentionally allowed to
-/// oversubscribe (the host scheduler time-slices); RAM overcommit would OOM.
+/// Resolve the parallel build's job count: the `opts.build_jobs` set from `--build-jobs` or
+/// `[build] jobs` when present — taken as given, since the type rules out the one value that
+/// would need correcting — else RAM-auto: each stage guest reserves `mem_mib`, so cap
+/// concurrency at ~80% of available RAM divided by that, clamped to a sane ceiling. CPU is
+/// intentionally allowed to oversubscribe (the host scheduler time-slices); RAM overcommit
+/// would OOM.
 fn resolve_build_jobs(opts: &Options, mem_mib: u64) -> usize {
     if let Some(j) = opts.build_jobs {
-        return j.max(1);
+        return j.get();
     }
     let avail = mem_available_mib().unwrap_or(8 * 1024);
     let usable = avail * 8 / 10;
@@ -4577,7 +4581,7 @@ RUN ship
 
     #[test]
     fn build_jobs_override_beats_auto() {
-        let opts = |j: Option<usize>| Options {
+        let opts = |j: Option<NonZeroUsize>| Options {
             dockerfiles: vec![],
             target: None,
             contexts: vec![],
@@ -4602,12 +4606,16 @@ RUN ship
             debug: false,
             progress_sink: None,
         };
-        // Explicit build_jobs (--build-jobs, or [build] jobs) wins and is floored to 1.
-        assert_eq!(resolve_build_jobs(&opts(Some(3)), 2048), 3);
-        assert_eq!(resolve_build_jobs(&opts(Some(0)), 2048), 1);
-        // Auto is RAM-bounded and clamped to [1, 16].
+        // Explicit build_jobs (--build-jobs, or [build] jobs) wins over the RAM-derived
+        // default, and is used as given — zero is unrepresentable, so nothing to floor.
+        assert_eq!(resolve_build_jobs(&opts(NonZeroUsize::new(3)), 2048), 3);
+        // Auto is RAM-bounded and clamped to [1, 16]: a stage guest the host cannot fit
+        // floors it, a 1 MiB one lets it run to the ceiling.
         assert_eq!(resolve_build_jobs(&opts(None), u64::MAX / 2), 1);
-        assert!((1..=16).contains(&resolve_build_jobs(&opts(None), 1)));
+        assert_eq!(resolve_build_jobs(&opts(None), 1), 16);
+        // Same 1 MiB stage guest, but an explicit 1: the override forces the sequential
+        // build that auto would have widened, which is what makes it an override.
+        assert_eq!(resolve_build_jobs(&opts(NonZeroUsize::new(1)), 1), 1);
     }
 
     #[test]

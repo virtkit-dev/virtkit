@@ -5,6 +5,7 @@
 //! minimal; no file at all yields the defaults (enough for `config`, not for
 //! `prepare`, which validates the image paths).
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -132,8 +133,9 @@ pub struct Build {
     pub tmp_tmpfs: bool,
     /// max stages built concurrently on the microVM backend (`--build-jobs` overrides).
     /// Unset = auto, bounded by host RAM (each stage guest reserves `mem`). `1` forces a
-    /// sequential build.
-    pub jobs: Option<usize>,
+    /// sequential build; `0` is refused when the config loads rather than read as a request
+    /// for a build that runs nothing.
+    pub jobs: Option<NonZeroUsize>,
     /// per-stage build guest vCPUs. Unset = the host's logical CPU count, clamped to 16.
     pub cpus: Option<u32>,
     /// per-stage build guest RAM, e.g. "8G". Unset = 4G. A larger value lowers the
@@ -1033,5 +1035,14 @@ mod tests {
             Config::default().build.build_cache,
             crate::build::BuildCache::Auto
         );
+    }
+
+    /// The stage budget is refused at load time, where the offending line is still on
+    /// screen, rather than reaching the build as a request to run nothing.
+    #[test]
+    fn build_jobs_refuses_zero() {
+        let cfg: Config = toml::from_str("[build]\njobs = 2\n").unwrap();
+        assert_eq!(cfg.build.jobs, NonZeroUsize::new(2));
+        assert!(toml::from_str::<Config>("[build]\njobs = 0\n").is_err());
     }
 }
