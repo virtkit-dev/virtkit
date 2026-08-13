@@ -229,9 +229,12 @@ mod tests {
         assert_eq!(published(&dir), Some((1_000, 10_000)));
     }
 
-    /// A private directory for one test, removed and recreated so a rerun starts clean.
+    /// A private directory for one test, named after the test and the pid so two suites on the
+    /// same host never share a path and pull each other's tree out mid-run. Removed first all
+    /// the same, so a recycled pid starts clean instead of on an older run's leftovers.
     fn tempdir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("vk-agent-fsmark-{name}"));
+        let dir =
+            std::env::temp_dir().join(format!("vk-agent-fsmark-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
