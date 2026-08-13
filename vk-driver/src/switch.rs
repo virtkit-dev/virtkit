@@ -465,10 +465,11 @@ impl EgressGuard {
         }
     }
 
-    /// If the SYN in `ip` opens a TCP connection its source's policy denies, return the RST
-    /// frame refusing it; otherwise `None`, so the packet egresses normally. Rejecting the
-    /// SYN (rather than letting ipstack complete the handshake and then drop the flow) makes
-    /// the guest's connect() fail at once with ECONNREFUSED instead of stalling until a read
+    /// If the SYN in `ip` opens a TCP connection this switch will not carry — its source's
+    /// policy denies it, or its destination is one no network routes — return the RST frame
+    /// refusing it; otherwise `None`, so the packet egresses normally. Rejecting the SYN
+    /// (rather than letting ipstack complete the handshake and then drop the flow) makes the
+    /// guest's connect() fail at once with ECONNREFUSED instead of stalling until a read
     /// timeout. The source IPv4 comes from the SYN itself, so the right per-source policy
     /// applies.
     fn reject_denied_syn(&self, ip: &[u8], client_mac: Mac) -> Option<Vec<u8>> {
@@ -480,13 +481,33 @@ impl EgressGuard {
         {
             return None;
         }
-        if self.allows(*syn.src.ip(), SocketAddr::V4(syn.dst)) {
-            return None;
+        if !self.allows(*syn.src.ip(), SocketAddr::V4(syn.dst)) {
+            eprintln!("switch: egress denied (tcp) {} — sent RST", syn.dst);
+            self.record_denial(crate::egress_report::Proto::Tcp, &syn.dst.to_string());
+            return tcp_rst_frame(&syn, client_mac);
         }
-        eprintln!("switch: egress denied (tcp) {} — sent RST", syn.dst);
-        self.record_denial(crate::egress_report::Proto::Tcp, &syn.dst.to_string());
-        tcp_rst_frame(&syn, client_mac)
+        if unroutable(*syn.dst.ip()) {
+            // Not a policy decision, so it is not recorded as a denial: the address itself
+            // goes nowhere, and the host would fail the dial too, just seconds later.
+            eprintln!("switch: unroutable destination {} — sent RST", syn.dst);
+            return tcp_rst_frame(&syn, client_mac);
+        }
+        None
     }
+}
+
+/// A destination no network carries, decided from the address alone: RFC 5737 documentation
+/// ranges, `0.0.0.0/8`, loopback, link-local, multicast and broadcast. Forwarding such a SYN
+/// only buys the guest a handshake ipstack completes locally and a host dial that fails a
+/// few seconds later — a connect that wrongly succeeds, where a real network refuses at once.
+/// Private ranges are deliberately absent: a guest reaching the host's LAN is ordinary.
+fn unroutable(dst: Ipv4Addr) -> bool {
+    dst.is_documentation()
+        || dst.is_unspecified()
+        || dst.is_loopback()
+        || dst.is_link_local()
+        || dst.is_multicast()
+        || dst.is_broadcast()
 }
 
 #[derive(Default)]
@@ -1869,6 +1890,25 @@ mod tests {
                 .is_none(),
             "sentinel is exempt"
         );
+    }
+
+    #[test]
+    fn unroutable_covers_reserved_space_but_not_the_lan() {
+        let u = |s: &str| unroutable(s.parse().unwrap());
+        // RFC 5737 documentation ranges — what a test dials when it wants nowhere.
+        assert!(u("192.0.2.1"));
+        assert!(u("198.51.100.1"));
+        assert!(u("203.0.113.1"));
+        assert!(u("0.0.0.0"));
+        assert!(u("127.0.0.1"));
+        assert!(u("169.254.1.1"));
+        assert!(u("224.0.0.1"));
+        assert!(u("255.255.255.255"));
+        // The LAN and the internet must keep working: a guest reaching either is the point.
+        assert!(!u("10.1.2.3"));
+        assert!(!u("192.168.1.254"));
+        assert!(!u("172.16.0.1"));
+        assert!(!u("1.1.1.1"));
     }
 
     #[tokio::test]

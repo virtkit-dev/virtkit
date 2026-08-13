@@ -77,6 +77,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A guest dialling an address the network cannot carry now fails at once.** A connection to
+  documentation, loopback, link-local, multicast or broadcast space appeared to connect and
+  then died on the first read seconds later, because the switch answered the guest before
+  trying the destination. Such a dial is now refused as it is opened, the way any unreachable
+  address behaves. Reaching the host's own LAN is unaffected.
 - **A compose unit's image is reused again on hosts whose `blkid` is busybox's.** Its
   freshness is decided by the filesystem UUID stamped in the image, but reading that back
   went through `blkid`, which on a musl/busybox host answers in its own format and reports
