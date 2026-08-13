@@ -2,6 +2,10 @@
 //! virtkit process dies (PR_SET_PDEATHSIG), so a crashed or kill -9'd owner
 //! never leaks a switch, virtiofsd, or VMM. Used by every foreground owner
 //! (`run` and the build path) and the CI job supervisor.
+//!
+//! What the kernel cannot tie down — a build scratch dir, a staged chunk file — is
+//! instead named after the pid that owns it and reclaimed once that pid is gone, so
+//! [`pid_alive`] lives here too.
 
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -121,4 +125,15 @@ pub(crate) fn spawn_virtiofsd(
         std::thread::sleep(Duration::from_millis(100));
     }
     bail!("virtiofsd socket {} never appeared", sock.display());
+}
+
+/// Whether `pid` is a live process. `kill(pid, 0)` sends no signal — it only reports
+/// whether the target exists (`ESRCH` = gone; `EPERM` = alive but not ours, so live).
+pub(crate) fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 performs only the existence/permission check, delivering nothing.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    // Read errno only on the failure branch: EPERM = alive but not ours; ESRCH = gone.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }

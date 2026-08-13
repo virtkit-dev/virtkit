@@ -418,7 +418,7 @@ fn staging_writer_is_gone(name: &str) -> bool {
         .and_then(|rest| rest.rsplit_once('.'))
         .and_then(|(_hex, owner)| owner.split_once('-'))
         .and_then(|(pid, _seq)| pid.parse::<u32>().ok())
-        .is_some_and(|pid| !crate::build::pid_alive(pid))
+        .is_some_and(|pid| !crate::spawn::pid_alive(pid))
 }
 
 /// Drop chunk blobs in `<registry_root>/chunks/` that no cached bundle references. Each

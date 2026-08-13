@@ -2246,21 +2246,10 @@ fn sweep_stale_scratch(dir: &Path, prefix: &str) {
         else {
             continue;
         };
-        if pid != me && !pid_alive(pid) {
+        if pid != me && !crate::spawn::pid_alive(pid) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
-}
-
-/// Whether `pid` is a live process. `kill(pid, 0)` sends no signal — it only reports
-/// whether the target exists (`ESRCH` = gone; `EPERM` = alive but not ours, so live).
-pub(crate) fn pid_alive(pid: u32) -> bool {
-    // SAFETY: signal 0 performs only the existence/permission check, delivering nothing.
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
-        return true;
-    }
-    // Read errno only on the failure branch: EPERM = alive but not ours; ESRCH = gone.
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Available host RAM in MiB, from `/proc/meminfo` `MemAvailable`. `None` if unreadable.
