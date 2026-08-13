@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# dev.sh — fast, crate-scoped type checking and targeted tests in a persistent vk
-# development VM. The dev profile, mold linker, and shared target/ directory match
-# build.sh --fast, so dependency artifacts are reused between the two workflows. The
-# VK_EMBED_* vars build.sh sets are deliberately absent here (they must name an already
-# built agent), so vk-driver's own build script reruns when you alternate the two.
+# dev.sh — fast, crate-scoped type checking and targeted tests in a shared vk development
+# VM that powers itself off once left idle. The dev profile, mold linker, and shared
+# target/ directory match build.sh --fast, so dependency artifacts are reused between the
+# two workflows. The VK_EMBED_* vars build.sh sets are deliberately absent here (they must
+# name an already built agent), so vk-driver's own build script reruns when you alternate
+# the two.
 #
 # Examples:
 #   ./dev.sh check -p vk-core
@@ -13,7 +14,8 @@
 #   ./dev.sh test -p vk-driver --bin vk atop_view::tests
 #   ./dev.sh stop
 #
-# VK_DEV_CPUS / VK_DEV_MEM size the VM (default: host cpus, 8G).
+# VK_DEV_CPUS / VK_DEV_MEM size the VM (default: host cpus, 8G). VK_DEV_IDLE_SECS sets how
+# long it survives without a cargo command (default: 1800, 0 = until ./dev.sh stop).
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=$PWD
@@ -27,8 +29,9 @@ usage: ./dev.sh check -p <package> [cargo check arguments]
 The fast loop is deliberately scoped: --workspace/--all and optimized profiles are
 rejected. For tests, select exactly one target with --lib, --bin NAME or --test NAME
 (--doc and --example NAME also count) and normally pass the changed module or test
-name as a filter. The first command boots a persistent vk development VM; stop it
-explicitly with ./dev.sh stop.
+name as a filter. The first command boots a vk development VM; by default it powers
+off after 1800 seconds without a cargo command. Set VK_DEV_IDLE_SECS to change the
+window, or to 0 to keep the VM until ./dev.sh stop.
 EOF
   exit 2
 }
@@ -38,7 +41,7 @@ command -v vk >/dev/null 2>&1 || {
   exit 1
 }
 command -v flock >/dev/null 2>&1 || {
-  echo "dev.sh: flock is required to coordinate the persistent development VM" >&2
+  echo "dev.sh: flock is required to coordinate the shared development VM" >&2
   exit 1
 }
 VK=$(command -v vk)
@@ -160,6 +163,12 @@ if [ "$MODE" = test ] && [ -z "$has_test_target" ]; then
   echo "dev.sh: select one test target with --lib, --bin NAME, or --test NAME" >&2
   exit 2
 fi
+# Checked on every invocation, not just the one that boots: a typo should surface before it
+# has waited for the VM lock. `:-` already substituted for an empty value.
+idle_secs=${VK_DEV_IDLE_SECS:-1800}
+case "$idle_secs" in
+  *[!0-9]*) reject "VK_DEV_IDLE_SECS must be a whole number of seconds (0 = no timeout)" ;;
+esac
 
 commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 [ -n "$(git status --porcelain 2>/dev/null)" ] && commit="$commit (dirty)"
@@ -196,7 +205,20 @@ if [ -n "$agent_up" ] && [ "$(cat "$stamp_file" 2>/dev/null)" != "$image_stamp" 
 fi
 
 if [ -z "$agent_up" ]; then
-  echo "dev.sh: starting the persistent development VM" >&2
+  echo "dev.sh: starting the development VM" >&2
+  # The timeout owns the VM's lifetime, so the startup command only has to succeed quietly —
+  # `true` says that outright instead of falling through to vk run's boot-info probe.
+  lifetime_args=(--inactivity-timeout "$idle_secs" -- true)
+  # Keep the source tree self-hosting across an upgrade: the vk already on PATH may predate
+  # --inactivity-timeout, and it must still be able to compile the vk that introduces it.
+  # Without the probe that vk fails on the unknown argument and the caller is sent chasing
+  # the stuck-lock advice below. Delete this branch once the released vk carries the flag.
+  if [[ $("$VK" run --help 2>&1 || true) != *"--inactivity-timeout"* ]]; then
+    echo "dev.sh: the vk on PATH predates --inactivity-timeout, so this VM ignores" >&2
+    echo "        VK_DEV_IDLE_SECS and lives until ./dev.sh stop; install a current vk" >&2
+    echo "        (./build.sh --fast, then install dist/vk) to get the idle timeout" >&2
+    lifetime_args=(-- sleep infinity)
+  fi
   # Launch from the state dir so the VM's registry entry points there and not at the
   # repo: `vk list`/`vk stop` select by launch directory or below, so a bare `vk stop`
   # in the checkout would otherwise sweep up this VM along with build.sh's.
@@ -213,10 +235,11 @@ if [ -z "$agent_up" ]; then
       --workdir "$ROOT" \
       --state-dir "$STATE_DIR" \
       --net --cpus "${VK_DEV_CPUS:-host}" --mem "${VK_DEV_MEM:-8G}" --detach \
-      -- sleep infinity
+      "${lifetime_args[@]}"
   ) 9>&- || {
     echo "dev.sh: the development VM did not start; if a previous one is stuck holding" >&2
-    echo "        $STATE_DIR, clear it with ./dev.sh stop and retry" >&2
+    echo "        $STATE_DIR — or one just expired and has not let go yet — clear it" >&2
+    echo "        with ./dev.sh stop and retry" >&2
     exit 1
   }
   printf '%s\n' "$image_stamp" >"$stamp_file"
@@ -230,5 +253,5 @@ if [ -t 0 ] && [ -t 1 ]; then
   exec_args+=(-t)
 fi
 for entry in "${DEV_ENV[@]}"; do exec_args+=(--env "$entry"); done
-echo "dev.sh: running cargo $MODE in the persistent development VM" >&2
+echo "dev.sh: running cargo $MODE in the development VM" >&2
 exec "$VK" exec "$STATE_DIR" "${exec_args[@]}" -- "${cargo_cmd[@]}"

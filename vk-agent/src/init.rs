@@ -52,6 +52,10 @@
 //!                        presents SSH_AUTH_SOCK and relays it over this vsock port to the
 //!                        host (which splices to the host's real agent). Only agent
 //!                        protocol bytes cross — private keys never enter the guest.
+//!   VIRTKIT_INACTIVITY_TIMEOUT  power off after this many seconds without an active
+//!                        exec command (status probes do not reset the clock). Honored in
+//!                        the default mode only: the service and full-VM paths arm no
+//!                        watchdog, and their exec server is not what powers the VM off.
 //!   VIRTKIT_MODE=service fork the boot config's entrypoint; the agent stays as PID 1
 //!                        and reaps orphans. A systemd image hands off via its entrypoint.
 //!   VIRTKIT_SERVE=1      (service) also start the vsock exec server (port 4444) for
@@ -98,6 +102,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     let _ = mount("proc", "/proc", "proc", 0);
 
     let cmdline = read_cmdline();
+    let inactivity_timeout = resolve_inactivity_timeout(inactivity_timeout, &cmdline);
 
     // A modular image kernel (`--kernel image`) ships its boot-critical modules on the
     // preinit initramfs with a `/virtkit-modules` load list — insmod them before any
@@ -637,6 +642,21 @@ fn read_cmdline() -> HashMap<String, String> {
         .filter_map(|tok| tok.split_once('='))
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()
+}
+
+/// An explicit `vk-agent init` argument wins; PID 1 normally has no usable argv, so
+/// `vk run` carries the same value on the kernel cmdline. Zero means no watchdog.
+fn resolve_inactivity_timeout(
+    explicit: Option<u64>,
+    cmdline: &HashMap<String, String>,
+) -> Option<u64> {
+    explicit
+        .or_else(|| {
+            cmdline
+                .get("VIRTKIT_INACTIVITY_TIMEOUT")
+                .and_then(|value| value.parse().ok())
+        })
+        .filter(|timeout| *timeout > 0)
 }
 
 /// Derive the serve agent's vsock listen socket from the kernel cmdline
@@ -1995,6 +2015,25 @@ mod tests {
         assert_eq!(m.get("VIRTKIT_HOSTNAME").unwrap(), "runner");
         assert_eq!(m.get("VIRTKIT_VM_DNS").unwrap(), "1.1.1.1,8.8.8.8");
         assert!(!m.contains_key("ro"));
+    }
+
+    #[test]
+    fn inactivity_timeout_comes_from_explicit_arg_or_cmdline() {
+        let cmdline =
+            HashMap::from([("VIRTKIT_INACTIVITY_TIMEOUT".to_string(), "1800".to_string())]);
+        assert_eq!(resolve_inactivity_timeout(None, &cmdline), Some(1800));
+        assert_eq!(resolve_inactivity_timeout(Some(60), &cmdline), Some(60));
+        assert_eq!(resolve_inactivity_timeout(Some(0), &cmdline), None);
+
+        let invalid = HashMap::from([(
+            "VIRTKIT_INACTIVITY_TIMEOUT".to_string(),
+            "invalid".to_string(),
+        )]);
+        assert_eq!(resolve_inactivity_timeout(None, &invalid), None);
+
+        // Zero disables the watchdog whichever side carries it.
+        let zero = HashMap::from([("VIRTKIT_INACTIVITY_TIMEOUT".to_string(), "0".to_string())]);
+        assert_eq!(resolve_inactivity_timeout(None, &zero), None);
     }
 
     #[test]

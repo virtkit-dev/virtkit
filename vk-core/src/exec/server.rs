@@ -19,7 +19,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::select;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
 use tokio::{task, time};
 
 #[derive(Clone)]
@@ -44,9 +43,12 @@ impl TaskState {
         self.running_tasks += 1;
     }
 
+    /// A finishing exec stamps the idle clock even while other connections are still open:
+    /// `inactive()` ignores the stamp until `running_tasks` reaches zero, so waiting for the
+    /// count to drop would only discard the exec's activity when a status request outlived it.
     fn dec(&mut self, update_last: bool) {
         self.running_tasks -= 1;
-        if self.running_tasks == 0 && update_last {
+        if update_last {
             self.last_activity = Some(Instant::now());
         }
     }
@@ -62,12 +64,27 @@ impl TaskState {
     }
 }
 
+/// How often the accept loop re-checks for inactivity. Short timeouts are checked at their
+/// own cadence; longer ones need no more than ten-second precision. Never zero — that would
+/// panic `time::interval` — and with no timeout the check is a formality, so it idles.
+fn inactivity_check_period(inactivity_timeout: Option<Duration>) -> Duration {
+    inactivity_timeout
+        .filter(|timeout| !timeout.is_zero())
+        .map_or(Duration::from_secs(3600), |timeout| {
+            timeout.min(Duration::from_secs(10))
+        })
+}
+
 pub async fn run_server(
     socket: &SocketAddr,
     inactivity_timeout: Option<Duration>,
     exec_wrapper: Option<PathBuf>,
     exec_wrapper_env: Vec<String>,
 ) -> Result<(), anyhow::Error> {
+    // Zero means no watchdog at all. Normalizing it away here keeps the rest of the function
+    // from reading it as a timeout that has always already elapsed, and hands a zero-timeout
+    // caller the fallback watchdog below like any other caller that asked for no timeout.
+    let inactivity_timeout = inactivity_timeout.filter(|timeout| !timeout.is_zero());
     let status = Status::default();
     // Force every exec through this program (like SSH's ForceCommand): it receives
     // the requested command line as its arguments and decides what to run.
@@ -85,15 +102,15 @@ pub async fn run_server(
         start_watchdog(status.clone(), socket.clone());
     }
 
-    let inactivity_delay_check = if inactivity_timeout.is_some() {
-        10
-    } else {
-        3600
-    };
+    // Keep one interval across accept iterations: recreating a sleep after every connection
+    // would let frequent status probes postpone the check even though they intentionally do
+    // not reset last_activity.
+    let mut inactivity_checks = time::interval(inactivity_check_period(inactivity_timeout));
+    inactivity_checks.tick().await; // consume interval's immediate first tick
 
     loop {
         select! {
-                () = sleep(Duration::from_secs(inactivity_delay_check)) => {
+                _ = inactivity_checks.tick() => {
                     if let Some(inactivity_timeout) = inactivity_timeout {
                         let lock = state.lock().unwrap();
                         if lock.inactive(inactivity_timeout) {
@@ -120,6 +137,8 @@ pub async fn run_server(
                     tokio::spawn(async move {
                         let mut update_last = true;
                         match do_handle_conn(&status, stream, sink, (*exec_wrapper).as_ref()).await {
+                            // A connection that failed before naming itself counts as activity:
+                            // only a completed status request is known not to be one.
                             Err(e) => info!("{e}"),
                             Ok(skip_update) => {
                                 if skip_update {
@@ -951,7 +970,8 @@ async fn writer_task(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecWrapper, TaskState, apply_user, glob_match, resolve_user, split_user_group, wrap_cmd,
+        ExecWrapper, TaskState, apply_user, glob_match, inactivity_check_period, resolve_user,
+        split_user_group, wrap_cmd,
     };
     use crate::messages::{CmdExec, RunMode};
     use std::path::PathBuf;
@@ -1090,5 +1110,49 @@ mod tests {
         state.inc();
         state.dec(false);
         assert!(state.inactive(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn status_finishing_after_exec_does_not_hide_its_activity() {
+        let mut state = TaskState::new();
+        // Age the initial timestamp well past the threshold asserted below, so the assert can
+        // only pass if the exec's own activity replaced it.
+        std::thread::sleep(Duration::from_millis(100));
+        state.inc(); // exec
+        state.inc(); // overlapping status probe
+        state.dec(true);
+        // The exec ended while the probe was still running, so its activity lands here.
+        state.dec(false);
+        assert!(!state.inactive(Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn an_exec_outliving_a_status_request_still_counts() {
+        // The mirror of the case above: the probe finishes first, so the exec is the last
+        // task to end. Neither order may lose the exec's activity.
+        let mut state = TaskState::new();
+        std::thread::sleep(Duration::from_millis(100));
+        state.inc(); // exec
+        state.inc(); // overlapping status probe
+        state.dec(false);
+        state.dec(true);
+        assert!(!state.inactive(Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn inactivity_check_period_is_bounded_and_never_zero() {
+        // A timeout shorter than the cap is checked at its own resolution.
+        assert_eq!(
+            inactivity_check_period(Some(Duration::from_secs(3))),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            inactivity_check_period(Some(Duration::from_secs(1800))),
+            Duration::from_secs(10)
+        );
+        // `time::interval` panics on a zero period, so neither no-timeout nor a zero one
+        // may reach it.
+        assert!(!inactivity_check_period(None).is_zero());
+        assert!(!inactivity_check_period(Some(Duration::ZERO)).is_zero());
     }
 }

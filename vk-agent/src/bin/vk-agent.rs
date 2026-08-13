@@ -236,8 +236,9 @@ fn init_main(socket: SocketAddr, inactivity_timeout: Option<u64>) {
         },
     )
     .ok();
-    let timeout = inactivity_timeout.filter(|t| *t > 0);
-    if let Err(e) = vk_agent::init::run_init(&socket, timeout) {
+    // Zero (no watchdog) is resolved inside run_init, together with the kernel-cmdline
+    // fallback it takes precedence over: filtering it here would instead let the cmdline win.
+    if let Err(e) = vk_agent::init::run_init(&socket, inactivity_timeout) {
         error!("init: {e:#}");
         std::process::exit(1);
     }
@@ -344,15 +345,8 @@ async fn async_main(socket: SocketAddr, command: Commands) {
                 },
             )
             .unwrap();
-            let duration: Option<Duration> = if let Some(timeout) = inactivity_timeout {
-                if timeout > 0 {
-                    Some(Duration::from_secs(timeout))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            // run_server reads a zero timeout as no timeout, so it needs no filtering here.
+            let duration = inactivity_timeout.map(Duration::from_secs);
             if let Err(e) = run_server(&socket, duration, exec_wrapper, exec_wrapper_env).await {
                 error!("run_server: {e}");
                 std::process::exit(1)

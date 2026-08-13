@@ -254,6 +254,10 @@ pub struct RunArgs {
     /// daemonize once the guest is ready (foreground build/boot, background after); see
     /// [`crate::detach`]. Set only via the CLI `--detach` fork path.
     pub detach: bool,
+    /// After the detached run's startup command, keep the VM alive until its exec server
+    /// has had no active command for this many seconds. `Some(0)` waits until an explicit
+    /// stop instead. The guest enforces the non-zero timeout and powers itself off.
+    pub inactivity_timeout_secs: Option<u64>,
     /// where a `--detach` run redirects its output after detaching (default: discard)
     pub detach_log: Option<PathBuf>,
     pub command: Vec<String>,
@@ -537,7 +541,8 @@ async fn build_and_boot(
     // The image-init preinit applies the virtkit setup the image's own init won't do
     // (host volume mounts, symlinks, the ssh/exec serves, env, and an eth0 bridge the
     // image DHCPs on) before handing off to systemd. The host-exec channel, compose
-    // and an interactive pty (--shell or -t) are not wired for image init yet — reject
+    // and an interactive pty (--shell or -t) are not wired for image init yet, and an idle
+    // watchdog has nothing to power the VM off once the image's init owns PID 1 — reject
     // them rather than silently ignore.
     // Named on its own, because unlike the rest it has somewhere to send the operator: the
     // image's init leaves no agent at PID 1 to fork the sampler, but the reparented agent
@@ -554,6 +559,10 @@ async fn build_and_boot(
             (args.compose.is_some(), "--compose"),
             (args.shell, "--shell"),
             (args.tty, "-t"),
+            (
+                args.inactivity_timeout_secs.is_some(),
+                "--inactivity-timeout",
+            ),
         ]
         .into_iter()
         .filter(|(set, _)| *set)
@@ -701,6 +710,12 @@ async fn build_and_boot(
     } else {
         marker_kernel
     };
+    // The CLI axis was rejected far above, before the build; this catches a --primary
+    // service whose own x-virtkit marker selects image init, checked on the merged axes
+    // just computed above (like the --ram guard a few lines below).
+    if args.inactivity_timeout_secs.is_some() && eff_init == InitSource::Image {
+        bail!("a service's x-virtkit image init is incompatible with --inactivity-timeout");
+    }
     // Effective primary sizing, same precedence as the axes: an explicit --cpus/--mem
     // overrides the --primary service's own x-virtkit sizing (which already carries
     // any --service-cpus/--service-mem override); absent both, the run defaults.
@@ -996,6 +1011,13 @@ async fn build_and_boot(
             )
         };
     timings.record(Phase::BootMedia, "", t_media.elapsed());
+
+    // The agent is PID 1 and receives no usable argv, so its exec-idle watchdog is
+    // configured through the kernel cmdline. Zero deliberately adds no watchdog while
+    // still making the host retain the detached VM after its startup command.
+    if let Some(timeout) = args.inactivity_timeout_secs.filter(|timeout| *timeout > 0) {
+        cmdline.push_str(&format!(" VIRTKIT_INACTIVITY_TIMEOUT={timeout}"));
+    }
 
     // SSH-agent forwarding: tell the guest agent to present SSH_AUTH_SOCK and relay it over
     // a vsock port, which the host side (started below) bridges to the host's real agent —
@@ -2454,6 +2476,18 @@ fn guest_command_body(
     }
 }
 
+/// How often an inactivity-managed detached run re-checks that its guest is still there:
+/// the guest watchdog's own resolution, capped at ten seconds so a self-poweroff is noticed
+/// promptly. A zero timeout arms no watchdog and so has no poweroff to catch — it polls
+/// slowly, just often enough to notice a guest that died some other way.
+fn status_poll_period(inactivity_timeout_secs: Option<u64>) -> Duration {
+    Duration::from_secs(
+        inactivity_timeout_secs
+            .filter(|secs| *secs > 0)
+            .map_or(60, |secs| secs.min(10)),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive(
     ch: &mut Child,
@@ -2549,9 +2583,36 @@ async fn drive(
     };
     timings.record(Phase::Exec, "", t_exec.elapsed());
     match result.code {
-        Some(0) | None => Ok(()),
+        Some(0) | None => {}
         Some(c) => bail!("guest command exited {c}"),
     }
+    // Ordinarily the startup command owns the run lifetime. An inactivity-managed detached
+    // run instead leaves the exec server available for later `vk exec` calls. Its status
+    // requests do not count as activity, so they can also detect the watchdog exiting and
+    // route through the normal host teardown. The VMM usually exits on guest poweroff, but
+    // not every libkrun version reports it promptly; accepting either signal avoids a leak.
+    if args.inactivity_timeout_secs.is_some() {
+        // Only the rare VMM that misses its guest's poweroff needs these probes at all —
+        // `try_wait` above catches the ordinary case within one poll — so they can afford to
+        // be slow, and a starved guest must not be mistaken for one that is gone and torn
+        // down under whatever `vk exec` is running. Probe failures do not decorrelate (the
+        // load causing them is still there a poll later), so insist on a long streak.
+        const PROBE_FAILURES_BEFORE_GONE: u32 = 6;
+        let status_poll = status_poll_period(args.inactivity_timeout_secs);
+        let mut failures = 0;
+        while ch.try_wait()?.is_none() {
+            if vk_core::status::get_status(addr).await.is_err() {
+                failures += 1;
+                if failures >= PROBE_FAILURES_BEFORE_GONE {
+                    break;
+                }
+            } else {
+                failures = 0;
+            }
+            tokio::time::sleep(status_poll).await;
+        }
+    }
+    Ok(())
 }
 
 /// Write the `--ssh-host` stanzas into the guest's `~/.ssh/config` (0600, dir 0700) so
@@ -3565,6 +3626,19 @@ mod tests {
             ]
             .map(OsString::from)
         );
+    }
+
+    #[test]
+    fn status_poll_period_tracks_the_timeout_up_to_its_cap() {
+        // A timeout shorter than the cap is polled at its own resolution, so the host does
+        // not outlast the guest's watchdog by several times the timeout.
+        assert_eq!(status_poll_period(Some(3)), Duration::from_secs(3));
+        // Longer ones settle at the cap. 0 arms no watchdog, so there is no self-poweroff to
+        // catch promptly and nothing bounds how late the host may notice; it polls slower.
+        assert_eq!(status_poll_period(Some(1800)), Duration::from_secs(10));
+        assert_eq!(status_poll_period(Some(0)), Duration::from_secs(60));
+        // Never zero: the loop sleeps this between probes, so it must make progress.
+        assert!(!status_poll_period(Some(0)).is_zero());
     }
 
     #[test]

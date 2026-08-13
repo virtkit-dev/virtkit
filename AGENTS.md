@@ -100,12 +100,14 @@ target and module affected by the change, for example:
 ./dev.sh test -p vk-driver --bin vk atop_view::tests
 ```
 
-`dev.sh` is Docker-free: on first use it boots the pinned build image as a persistent
+`dev.sh` is Docker-free: on first use it boots the pinned build image as a shared
 `vk` development VM; later invocations use `vk exec`, avoiding another image build and
 boot. It reuses `target/`, links tests with mold, and rejects workspace-wide or optimized
-invocations. Run `./dev.sh stop` when the VM is no longer needed. A `vk` and a `flock` on
-`PATH` are required and there is deliberately no Docker fallback. `VK_DEV_CPUS` and
-`VK_DEV_MEM` size the VM. Use `./build.sh --fast` only when an executable is actually
+invocations. The VM powers itself off after half an hour with no cargo command, so a
+forgotten one stops holding memory; `./dev.sh stop` ends it immediately. A `vk` and a
+`flock` on `PATH` are required and there is deliberately no Docker fallback. `VK_DEV_CPUS`
+and `VK_DEV_MEM` size the VM, `VK_DEV_IDLE_SECS` sets that idle window (`0` keeps the VM
+until it is stopped). Use `./build.sh --fast` only when an executable is actually
 needed for runtime testing.
 
 ### Cargo commands (pinned toolchain)

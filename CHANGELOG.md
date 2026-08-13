@@ -6,6 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **A detached VM can shut itself down when left unused.**
+  `vk run --detach --inactivity-timeout SECS` keeps accepting `vk exec` commands after its
+  startup command finishes, then powers off once none has run for the chosen interval (`0`
+  keeps it alive until stopped), so a VM left behind stops holding memory.
 - **Every CI job now records what happened inside its VM.** The job's guest samples its own
   CPUs, memory, paging, pressure, disks, network and processes every 10 seconds and leaves the
   samples in `<state_dir>/atop/<date>/<job>/atop.log`. It is the text format `atop -P` prints,

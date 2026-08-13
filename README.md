@@ -155,7 +155,7 @@ The ones you'll actually type:
 - `run` — boot an image, a Dockerfile target (`-f`), or a compose file as
   microVM(s) and run a command or an interactive shell (`--shell`, `-t`).
   This is where most of the flags live: `--net`, `--workdir`, `--volume`,
-  `--ssh`, `--compose`, `--detach`, `--atop`, ...
+  `--ssh`, `--compose`, `--detach`, `--inactivity-timeout`, `--atop`, ...
 - `build` — build a Dockerfile into a bootable ext4 image, each stage's `RUN`s
   executing in a microVM, instruction snapshots cached (`--build-cache`).
   `--tag` publishes the result to the `[registry]` as a bootable bundle the CI
@@ -272,7 +272,7 @@ third_party/     vendored libkrun (locally patched — see its VENDOR.md)
 kernel/          guest kernel build (Dockerfile + config fragment)
 build.sh         build the binaries -> dist/
 build-kernel.sh  build the guest kernel -> dist/vmlinux
-dev.sh           crate-scoped check/test in a persistent dev VM
+dev.sh           crate-scoped check/test in a dev VM that expires when idle
 update.sh        bump + re-pin toolchain / base image / apk versions
 ```
 

@@ -979,6 +979,17 @@ enum Cmd {
         /// running. Intended for a long-lived run (`--ssh`, or `-- sleep infinity`)
         #[arg(long = "detach")]
         detach: bool,
+        /// With --detach, keep the VM after its startup command and power it off after
+        /// this many seconds without an active vk exec command. Only exec counts: status
+        /// probes and --ssh sessions do not hold the VM up, and the startup command has
+        /// to finish for the window to start. 0 keeps it running until explicitly stopped
+        #[arg(
+            long = "inactivity-timeout",
+            value_name = "SECS",
+            requires = "detach",
+            conflicts_with = "shell"
+        )]
+        inactivity_timeout: Option<u64>,
         /// With --detach, redirect the backgrounded VM's output here after detaching
         /// (default: discard). The foreground build/boot still prints to the terminal
         #[arg(long = "detach-log", value_name = "PATH", requires = "detach")]
@@ -1743,6 +1754,7 @@ async fn cli_main() -> ExitCode {
         host_exec_env,
         require_cached,
         detach,
+        inactivity_timeout,
         detach_log,
         command,
     } = &cli.cmd
@@ -1768,13 +1780,15 @@ async fn cli_main() -> ExitCode {
                 || !symlink.is_empty()
                 || !env.is_empty()
                 || !env_file.is_empty()
-                || *host_exec)
+                || *host_exec
+                || inactivity_timeout.is_some())
         {
             return fail(
                 &anyhow::anyhow!(
                     "--compose without an image/-f/--primary is services-only (compose up) — \
                      there is no primary VM for a command, --shell, -t, --ssh, --workdir, \
-                     --volume, --symlink, --env, --env-file, or --host-exec"
+                     --volume, --symlink, --env, --env-file, --host-exec, or \
+                     --inactivity-timeout"
                 ),
                 2,
             );
@@ -1902,6 +1916,7 @@ async fn cli_main() -> ExitCode {
             host_exec_env: host_exec_env.clone(),
             require_cached: *require_cached,
             detach: *detach,
+            inactivity_timeout_secs: *inactivity_timeout,
             detach_log: detach_log.clone(),
             command: command.clone(),
         };
@@ -3373,6 +3388,48 @@ mod tests {
         assert!(Cli::try_parse_from(["vk", "run", "--atop", "30", "debian:12"]).is_err());
         // A zero interval would have the guest sampling without pause.
         assert!(Cli::try_parse_from(["vk", "run", "--atop=0", "debian:12"]).is_err());
+    }
+
+    #[test]
+    fn run_inactivity_timeout_needs_detach_refuses_shell_accepts_zero() {
+        assert!(
+            Cli::try_parse_from(["vk", "run", "--inactivity-timeout", "60", "debian:12"]).is_err()
+        );
+        // --shell returns before the keep-alive loop ever runs, so the flag would be
+        // silently ignored rather than honored.
+        assert!(
+            Cli::try_parse_from([
+                "vk",
+                "run",
+                "--detach",
+                "--shell",
+                "--inactivity-timeout",
+                "60",
+                "debian:12",
+            ])
+            .is_err()
+        );
+
+        let timeout_of = |value| {
+            let cli = Cli::try_parse_from([
+                "vk",
+                "run",
+                "--detach",
+                "--inactivity-timeout",
+                value,
+                "debian:12",
+            ])
+            .unwrap();
+            let Cmd::Run {
+                inactivity_timeout, ..
+            } = cli.cmd
+            else {
+                panic!("expected Cmd::Run")
+            };
+            inactivity_timeout
+        };
+        assert_eq!(timeout_of("60"), Some(60));
+        assert_eq!(timeout_of("0"), Some(0));
     }
 
     /// Which read the `vk atop` flags ask for. The flags say the same thing about a finished
