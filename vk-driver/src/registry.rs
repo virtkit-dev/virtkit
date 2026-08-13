@@ -82,6 +82,40 @@ struct BundleConfig {
     run_config: Option<vk_core::runcfg::RunConfig>,
 }
 
+/// The bundle config a bundle-dir push records, HTTP and local alike: the boot flavour
+/// from the `boot.kind` marker, plus the `runner.ext4.json` run-config sidecar when the
+/// bundle carries one. `has_kernel`/`has_initrd` come from the caller so the config
+/// always matches the layers it actually pushed.
+fn bundle_config_from_dir(
+    dir: &Path,
+    total_size: u64,
+    chunk_count: usize,
+    has_kernel: bool,
+    has_initrd: bool,
+) -> Result<BundleConfig> {
+    let boot_kind = image::read_boot_kind(dir).with_context(|| {
+        format!(
+            "bundle {}: unsupported boot.kind marker — re-push it",
+            dir.display()
+        )
+    })?;
+    // The image's runtime config, if the bundle dir carries the `runner.ext4.json` sidecar
+    // a `vk build` writes next to its ext4. Carried in the manifest so the guest applies it
+    // at boot without baking anything into the (byte-clean, dedup-friendly) rootfs.
+    let run_config = std::fs::read(dir.join("runner.ext4.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
+    Ok(BundleConfig {
+        total_size,
+        chunk_count,
+        boot_kind: image::boot_kind_tag(boot_kind).to_string(),
+        compression: "zstd".to_string(),
+        has_kernel,
+        has_initrd,
+        run_config,
+    })
+}
+
 /// Push a local bundle dir to `<registry.repo>/<name>:<tag>`. Returns the manifest
 /// digest. `image_ref` must be a tag (a registry push needs a writable tag).
 pub fn push(cfg: &Config, dir: &Path, image_ref: &str) -> Result<String> {
@@ -880,27 +914,7 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
         layers.push(push_file(&client, &image, &dir.join("initrd.img"), INITRD_MEDIA_TYPE).await?);
     }
 
-    let boot_kind = image::read_boot_kind(dir).with_context(|| {
-        format!(
-            "bundle {}: unsupported boot.kind marker — re-push it",
-            dir.display()
-        )
-    })?;
-    // The image's runtime config, if the bundle dir carries the `runner.ext4.json` sidecar
-    // a `vk build` writes next to its ext4. Carried in the manifest so the guest applies it
-    // at boot without baking anything into the (byte-clean, dedup-friendly) rootfs.
-    let run_config = std::fs::read(dir.join("runner.ext4.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok());
-    let config = BundleConfig {
-        total_size,
-        chunk_count,
-        boot_kind: image::boot_kind_tag(boot_kind).to_string(),
-        compression: "zstd".to_string(),
-        has_kernel,
-        has_initrd,
-        run_config,
-    };
+    let config = bundle_config_from_dir(dir, total_size, chunk_count, has_kernel, has_initrd)?;
     let config_json = serde_json::to_vec(&config).context("serializing the bundle config")?;
     let config_digest = sha256_hex(&config_json);
     let config_desc = OciDescriptor {
@@ -2162,24 +2176,7 @@ mod local {
                 INITRD_MEDIA_TYPE,
             )?);
         }
-        let boot_kind = image::read_boot_kind(dir).with_context(|| {
-            format!(
-                "bundle {}: unsupported boot.kind marker — re-push it",
-                dir.display()
-            )
-        })?;
-        let run_config = std::fs::read(dir.join("runner.ext4.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok());
-        let config = BundleConfig {
-            total_size,
-            chunk_count,
-            boot_kind: image::boot_kind_tag(boot_kind).to_string(),
-            compression: "zstd".to_string(),
-            has_kernel,
-            has_initrd,
-            run_config,
-        };
+        let config = bundle_config_from_dir(dir, total_size, chunk_count, has_kernel, has_initrd)?;
         put_bundle_manifest(&store, name, tag, layers, config)
     }
 
