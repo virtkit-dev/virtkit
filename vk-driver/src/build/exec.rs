@@ -2846,6 +2846,9 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Temp dirs are minted over in `build`'s tests, so the tags here share one namespace with
+    // the tags there — keep any tag added here distinct from both.
+    use crate::build::tests::tmpdir;
 
     // Which sources a COPY filters through a `.dockerignore` rides entirely on this predicate:
     // read a stage or an image as a context and the copy would drop files the key counted, read
@@ -3165,9 +3168,7 @@ mod tests {
     fn host_copy_from_stage_resolves_absolute_sources_in_the_stage() {
         // `COPY --from=<stage> /t /t2`: the absolute source is a path *in the source
         // stage*, never a host path.
-        let tmp = std::env::temp_dir().join(format!("vk-host-from-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = tmpdir("host-from");
         let mut h = Host::new(tmp.join("scratch"));
         let lib = h.from_scratch("lib").unwrap();
         std::fs::write(h.stage_dir(&lib).unwrap().join("t"), "tool").unwrap();
@@ -3190,8 +3191,7 @@ mod tests {
     fn host_copy_requires_and_reads_the_stage_context() {
         // A context COPY reads the context `stage_sources` declared for the stage —
         // and errors if it runs before any stage declared one.
-        let tmp = std::env::temp_dir().join(format!("vk-host-ctx-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = tmpdir("host-ctx");
         let stage = tmp.join("stage");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::write(stage.join("f.txt"), "from-stage").unwrap();
@@ -3219,8 +3219,7 @@ mod tests {
         // The case this exists for: a file that must stay outside the Dockerfile's own context is
         // reached through `--build-context <name>=<dir>` + `COPY --from=<name>`, with no
         // staging copy into the context.
-        let tmp = std::env::temp_dir().join(format!("vk-namedctx-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = tmpdir("namedctx");
         let ctx = tmp.join("ctx");
         let extra = tmp.join("shared");
         std::fs::create_dir_all(&ctx).unwrap();
@@ -3278,8 +3277,7 @@ mod tests {
     fn host_builds_a_real_ext4_from_scratch_and_copy() {
         // exercises the actual "Dockerfile → ext4 with only virtkit" path: a scratch
         // stage + a COPY, exported via crate::ext4. No docker/buildkit/mke2fs/VM.
-        let tmp = std::env::temp_dir().join(format!("vk-build-host-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = tmpdir("host");
         let ctx = tmp.join("ctx");
         std::fs::create_dir_all(&ctx).unwrap();
         std::fs::write(ctx.join("hello.txt"), b"hi from virtkit").unwrap();
@@ -3309,8 +3307,7 @@ mod tests {
     #[test]
     fn stamp_epoch_tree_zeroes_the_tree_without_following_a_symlink() {
         use std::os::unix::fs::MetadataExt;
-        let tmp = std::env::temp_dir().join(format!("vk-stamp-epoch-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = tmpdir("stamp-epoch");
         let sub = tmp.join("tree/sub");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("f"), "x").unwrap();
@@ -3360,8 +3357,7 @@ mod tests {
             eprintln!("skipping: qemu-img/qemu-io not available");
             return;
         }
-        let dir = std::env::temp_dir().join(format!("vk-content-diff-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = tmpdir("content-diff");
         let base = dir.join("base.raw");
         let prev = dir.join("prev.qcow2");
         let cur = dir.join("cur.qcow2");
@@ -3430,8 +3426,7 @@ mod tests {
             eprintln!("skipping: qemu-img/qemu-io not available");
             return;
         }
-        let dir = std::env::temp_dir().join(format!("vk-content-diff-full-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = tmpdir("content-diff-full");
         let base = dir.join("base.raw");
         let prev = dir.join("prev.qcow2");
         let cur = dir.join("cur.qcow2");

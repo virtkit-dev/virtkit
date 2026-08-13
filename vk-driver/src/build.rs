@@ -2748,6 +2748,19 @@ fn upsert(env: &mut Vec<(String, String)>, k: &str, v: &str) {
 mod tests {
     use super::*;
 
+    /// A private directory for one test, removed and recreated so a rerun starts clean.
+    /// Shared with the `exec` submodule's tests, so every temp dir the build tests take is
+    /// minted here: nothing else under `std::env::temp_dir()` takes the `vk-build-` prefix,
+    /// and the pid keeps a second suite on the same host off these paths. Keep `tag` unique
+    /// across both test modules — two tests sharing a tag pull each other's tree out
+    /// mid-run, as a hand-rolled pair once did.
+    pub(super) fn tmpdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vk-build-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     /// Host-backend `build` / `build_inputs` (FROM scratch + COPY, no VM) — the path tests
     /// use to drive the whole pipeline without KVM. Production always builds in microVMs.
     fn build_host(opts: &Options) -> Result<Built> {
@@ -2868,9 +2881,7 @@ mod tests {
     /// (nor this process's own, nor an unrelated dir).
     #[test]
     fn sweep_removes_only_dead_pid_scratch() {
-        let root = std::env::temp_dir().join(format!("vk-sweep-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = tmpdir("sweep");
         // A guaranteed-dead pid: spawn a child and reap it.
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let dead = child.id();
@@ -3645,8 +3656,7 @@ mod tests {
 
     #[test]
     fn context_files_hash_tracks_content_and_dockerignore() {
-        let dir = std::env::temp_dir().join(format!("vk-copyhash-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = tmpdir("copyhash");
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/a.rs"), "fn main() {}").unwrap();
         std::fs::write(dir.join("README.md"), "hi").unwrap();
@@ -3672,8 +3682,7 @@ mod tests {
     fn copy_keys_hash_the_stage_context() {
         // A context COPY's content hash reads the *stage's* recorded context — and the
         // context path itself never enters the key (same content in two places, same key).
-        let tmp = std::env::temp_dir().join(format!("vk-stagectx-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = tmpdir("stagectx");
         for d in ["a", "b", "c"] {
             std::fs::create_dir_all(tmp.join(d)).unwrap();
         }
@@ -3709,8 +3718,7 @@ mod tests {
     /// through, a `vk run` would recompute a key that never matches the one its build stamped.
     #[test]
     fn target_stage_key_tracks_a_named_context_file() {
-        let tmp = std::env::temp_dir().join(format!("vk-ctxdrift-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = tmpdir("ctxdrift");
         std::fs::create_dir_all(tmp.join("ctx")).unwrap();
         std::fs::create_dir_all(tmp.join("extra")).unwrap();
         std::fs::write(tmp.join("extra/setup.sh"), "one").unwrap();
@@ -3742,8 +3750,7 @@ mod tests {
         // A COPY --from=<named context> reads a directory outside the stage's own context, so
         // that directory's content must enter the key — and a stage of the same name must keep
         // winning it, on the key path as well as the resolution path.
-        let tmp = std::env::temp_dir().join(format!("vk-ctxkey-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = tmpdir("ctxkey");
         std::fs::create_dir_all(tmp.join("ctx")).unwrap();
         std::fs::create_dir_all(tmp.join("extra")).unwrap();
         std::fs::write(tmp.join("extra/setup.sh"), "one").unwrap();
@@ -3798,9 +3805,7 @@ mod tests {
         // A `RUN --mount=type=bind` reads a file from the context but never copies it, so
         // its content must still enter the key — editing the mounted script busts the cache.
         // A `--mount=type=cache`, by contrast, reads no context bytes and must not.
-        let tmp = std::env::temp_dir().join(format!("vk-runbind-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = tmpdir("runbind");
         std::fs::write(tmp.join("setup.sh"), "echo one\n").unwrap();
         let ba = Vars::new();
         let key = |dockerfile: &str| {
@@ -3878,8 +3883,7 @@ mod tests {
 
     #[test]
     fn load_inputs_zips_contexts_with_files() {
-        let tmp = std::env::temp_dir().join(format!("vk-loadinputs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = tmpdir("loadinputs");
         std::fs::create_dir_all(tmp.join("a")).unwrap();
         std::fs::create_dir_all(tmp.join("b")).unwrap();
         std::fs::write(tmp.join("a/Dockerfile"), "FROM scratch AS x\n").unwrap();
@@ -3931,8 +3935,7 @@ mod tests {
         // Two files, two contexts: the merged build hashes each stage's COPY against
         // its own file's context, and editing one context busts only that stage's key
         // (and its dependents' — the chain), not the other file's.
-        let tmp = std::env::temp_dir().join(format!("vk-crossctx-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = tmpdir("crossctx");
         for d in ["a", "b"] {
             std::fs::create_dir_all(tmp.join(d)).unwrap();
         }
@@ -4192,9 +4195,7 @@ ENTRYPOINT run me
     fn build_inputs_matches_the_file_path() {
         // an in-memory plan (the synthetic FROM plan `run --compose` uses for
         // image: services) builds the same artifact the file path would.
-        let tmp = std::env::temp_dir().join(format!("vk-buildinputs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = tmpdir("inputs");
         std::fs::write(tmp.join("f"), "x").unwrap();
         let src = "FROM scratch\nCOPY f /f\nENTRYPOINT [\"/f\"]\n";
         std::fs::write(tmp.join("Dockerfile"), src).unwrap();
@@ -4259,9 +4260,7 @@ ENTRYPOINT run me
     #[test]
     fn build_writes_the_runtime_config_sidecar() {
         // a Host (FROM scratch + COPY) build exports the ext4 plus its config sidecar.
-        let tmp = std::env::temp_dir().join(format!("vk-runcfg-sidecar-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = tmpdir("runcfg-sidecar");
         std::fs::write(tmp.join("f"), "x").unwrap();
         std::fs::write(
             tmp.join("Dockerfile"),
@@ -4313,9 +4312,7 @@ ENTRYPOINT run me
         // so `vk fingerprint` (and the dev-VM staleness check) matches a freshly built image.
         // The export tail (flatten + normalize_superblock) otherwise leaves the base UUID,
         // which never equals the fingerprint — the source of the perpetual "stale" prompt.
-        let tmp = std::env::temp_dir().join(format!("vk-fp-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = tmpdir("fp");
         std::fs::write(tmp.join("f"), "x").unwrap();
         std::fs::write(tmp.join("Dockerfile"), "FROM scratch\nCOPY f /f\n").unwrap();
         let out = tmp.join("img.ext4");
@@ -4364,9 +4361,7 @@ ENTRYPOINT run me
         // so pin that shared helper's contract directly: whatever UUID the export tail leaves
         // (here, an image built without any explicit stamp), stamping replaces it with
         // fingerprint([stage_key]) — the identity `vk fingerprint` expects.
-        let tmp = std::env::temp_dir().join(format!("vk-stamp-uuid-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = tmpdir("stamp-uuid");
         std::fs::write(tmp.join("Dockerfile"), "FROM scratch\nCOPY Dockerfile /d\n").unwrap();
         let out = tmp.join("img.ext4");
         build_host(&Options {
