@@ -17,8 +17,9 @@ All notable changes to virtkit will be documented in this file.
   `[gitlab] atop_retention_days` is dropped whole, so the archive stays bounded on a runner
   nobody visits. Anything else left in it by hand is never touched.
 - **`vk gitlab atop` finds a recorded job's log.** Give it a job id, or any part of a job's
-  name, and get the newest run of it. It prints the path alone, so it composes with whatever
-  reads logs (`less $(vk gitlab atop 42137)`).
+  name, and get the newest run of it — or hand it the path a job's trace printed, which reads
+  on any machine, runner or not. It prints the path alone, so it composes with whatever reads
+  logs (`less $(vk gitlab atop 42137)`).
 - **`vk gitlab atop --summary` accounts a recorded job.** Instead of a few hundred lines per
   interval it prints the job: how long its guest ran, what it did with its processors and
   memory, what it moved over its disks and network, where it was held up waiting for a

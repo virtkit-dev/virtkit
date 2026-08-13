@@ -137,6 +137,13 @@ fn prune_archive_daily_as_of(cfg: &Config, now: i64) {
     prune_archive_as_of(&root, retention_days(cfg), day_of(now));
 }
 
+/// A target carrying a path separator names a recording directly rather than selecting one
+/// from the archive — the one rule the guard below and the lookup itself go by, so neither
+/// can drift from the other and leave the guard refusing a path it would have resolved.
+fn is_path_target(target: &str) -> bool {
+    target.contains('/')
+}
+
 /// The log `target` names, for `vk gitlab atop` to print — so a viewer can be pointed
 /// straight at it (`less $(vk gitlab atop 42137)`).
 ///
@@ -149,8 +156,9 @@ fn prune_archive_daily_as_of(cfg: &Config, now: i64) {
 pub fn resolve(cfg: &Config, target: &str) -> Result<PathBuf> {
     let root = archive_root(cfg);
     // A host that records nothing has no archive to search, which is worth saying plainly:
-    // the alternative is an ENOENT on a path the operator never configured.
-    if !root.exists() && !enabled(cfg) {
+    // the alternative is an ENOENT on a path the operator never configured. A path target
+    // is exempt — it names its recording itself, wherever that host got it from.
+    if !is_path_target(target) && !root.exists() && !enabled(cfg) {
         bail!("nothing recorded on this host (`[gitlab] atop` is off)");
     }
     resolve_in(&root, target)
@@ -228,7 +236,7 @@ fn resolve_in(root: &Path, target: &str) -> Result<PathBuf> {
     }
     // A separator makes it a path. A bare word is a job to look up in the archive — never
     // whatever the operator's working directory happens to hold under that name.
-    if target.contains('/') {
+    if is_path_target(target) {
         let path = Path::new(target);
         if path.is_file() {
             return Ok(path.to_path_buf());
@@ -437,6 +445,49 @@ mod tests {
         };
         assert_eq!(archive_root(&cfg), root);
         assert_eq!(resolve(&cfg, "41000").unwrap(), old);
+        std::fs::remove_dir_all(&state).unwrap();
+    }
+
+    /// A path target answers on any host — a machine with no executor configured can still
+    /// be handed the path a run printed — while a job lookup on such a host still says
+    /// plainly that nothing is recorded here.
+    #[test]
+    fn a_path_target_answers_with_recording_off() {
+        let state = std::env::temp_dir().join(format!("vk-atop-nogitlab-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let dir = state.join("somewhere");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join(LOG_NAME);
+        std::fs::write(&log, b"RESET\nSEP\n").unwrap();
+        let cfg = Config {
+            state_dir: Some(state.clone()),
+            gitlab: None,
+            ..Default::default()
+        };
+        assert!(!enabled(&cfg), "no [gitlab] table: no recording here");
+        assert_eq!(resolve(&cfg, &log.to_string_lossy()).unwrap(), log);
+        assert_eq!(
+            resolve(&cfg, &dir.to_string_lossy()).unwrap(),
+            log,
+            "the directory holding the log answers too"
+        );
+        let e = resolve(&cfg, "42137").expect_err("a job lookup has no archive to search");
+        assert!(format!("{e:#}").contains("nothing recorded"), "{e:#}");
+
+        // The same on the other host the refusal names: one that has the table and turned
+        // recording off, which is the case its message actually describes.
+        let off = Config {
+            state_dir: Some(state.clone()),
+            gitlab: Some(Gitlab {
+                atop: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!enabled(&off));
+        assert_eq!(resolve(&off, &log.to_string_lossy()).unwrap(), log);
+        let e = resolve(&off, "42137").expect_err("a job lookup has no archive to search");
+        assert!(format!("{e:#}").contains("nothing recorded"), "{e:#}");
         std::fs::remove_dir_all(&state).unwrap();
     }
 
