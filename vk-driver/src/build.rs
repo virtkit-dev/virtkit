@@ -4259,7 +4259,7 @@ ENTRYPOINT run me
     #[test]
     fn build_writes_the_runtime_config_sidecar() {
         // a Host (FROM scratch + COPY) build exports the ext4 plus its config sidecar.
-        let tmp = std::env::temp_dir().join(format!("vk-sidecar-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("vk-runcfg-sidecar-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("f"), "x").unwrap();
@@ -4364,7 +4364,7 @@ ENTRYPOINT run me
         // so pin that shared helper's contract directly: whatever UUID the export tail leaves
         // (here, an image built without any explicit stamp), stamping replaces it with
         // fingerprint([stage_key]) — the identity `vk fingerprint` expects.
-        let tmp = std::env::temp_dir().join(format!("vk-stamp-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("vk-stamp-uuid-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("Dockerfile"), "FROM scratch\nCOPY Dockerfile /d\n").unwrap();

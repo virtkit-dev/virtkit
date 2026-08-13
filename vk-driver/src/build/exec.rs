@@ -3309,7 +3309,7 @@ mod tests {
     #[test]
     fn stamp_epoch_tree_zeroes_the_tree_without_following_a_symlink() {
         use std::os::unix::fs::MetadataExt;
-        let tmp = std::env::temp_dir().join(format!("vk-stamp-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("vk-stamp-epoch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let sub = tmp.join("tree/sub");
         std::fs::create_dir_all(&sub).unwrap();

@@ -2549,7 +2549,7 @@ mod tests {
     /// Env/User.
     #[test]
     fn bundle_config_rejects_corrupt_sidecar() {
-        let dir = std::env::temp_dir().join(format!("vk-sidecar-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vk-bundle-sidecar-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("boot.kind"), "generic-disk").unwrap();
