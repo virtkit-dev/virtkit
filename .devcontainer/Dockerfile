@@ -13,6 +13,8 @@ FROM rust:1.97.1-alpine3.21@sha256:7bae7c67364dad5ebbd4060923b34d734fbed66d7c1cf
 # above are what freeze the inputs; regenerate with ./update.sh):
 #   gcc + musl-dev          ring (rustls' crypto backend) compiles C; Alpine's gcc
 #                           is musl-native, so it is also the musl C compiler.
+#   mold                    the linker every build.sh and dev.sh link runs through,
+#                           release artifact included (see the RUSTFLAGS in build.sh).
 #   git, ca-certificates, file   dev/build basics.
 COPY apk-pins.txt /tmp/apk-pins.txt
 RUN apk add --no-cache $(grep -vE '^[[:space:]]*(#|$)' /tmp/apk-pins.txt)

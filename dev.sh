@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # dev.sh — fast, crate-scoped type checking and targeted tests in a shared vk development
-# VM that powers itself off once left idle. The dev profile, mold linker, and shared
-# target/ directory match build.sh --fast, so dependency artifacts are reused between the
-# two workflows. The VK_EMBED_* vars build.sh sets are deliberately absent here (they must
-# name an already built agent), so vk-driver's own build script reruns when you alternate
-# the two.
+# VM that powers itself off once left idle. The mold-linking RUSTFLAGS and shared target/
+# directory match every build.sh invocation, and the dev profile matches build.sh --fast,
+# so dependency artifacts are reused between the two workflows. The VK_EMBED_* vars
+# build.sh sets are deliberately absent here (they must name an already built agent), so
+# vk-driver's own build script reruns when you alternate the two.
 #
 # Examples:
 #   ./dev.sh check -p vk-core

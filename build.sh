@@ -30,9 +30,8 @@
 # --fast (alias --debug): build the debug cargo profile instead of release — a much
 # faster compile for iteration, still static-musl and still embedding the kernel/agent,
 # but unoptimized + unstripped and NOT reproducible, so not a release artifact (cannot
-# combine with --bootstrap-check). It also links with mold, while the dev profile trims
-# debuginfo to line tables, cutting the edit-rebuild loop further without touching the
-# release profile.
+# combine with --bootstrap-check). The dev profile also trims debuginfo to line tables,
+# cutting the edit-rebuild loop further without touching the release profile.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -128,11 +127,18 @@ fi
 # produce identical bytes. The repo is always mounted at /work, so these /work-relative
 # values hold for both backends. Stripping is done by the release profile, not the host
 # strip.
-RUSTFLAGS_VAL="--remap-path-prefix=/work=/src --remap-path-prefix=/work/target/.cargo-home=/cargo"
-# --fast: link with mold (in the build image via apk-pins.txt) instead of the default
-# linker — the link step dominates an incremental rebuild, so this is the biggest win.
-# Gated to --fast, so the reproducible release link is untouched.
-[ -n "$FAST" ] && RUSTFLAGS_VAL="$RUSTFLAGS_VAL -C link-arg=-fuse-ld=mold"
+# One linker for every build: mold, pinned in the build image via apk-pins.txt, instead of
+# the GNU ld gcc defaults to. It is deterministic, so the reproducible release link is
+# unaffected, and it keeps this string identical to dev.sh's RUSTFLAGS — the two share
+# target/, and any divergence silently stops them reusing each other's artifacts. The time
+# it saves is in the incremental link the edit loop is dominated by; thin LTO with one
+# codegen unit leaves the release link little to do either way.
+# Not the LLD the toolchain bundles: that copy is built without zlib support, and Alpine's
+# gcc compresses the debug sections of the C that ring, zstd and jemalloc-sys vendor.
+# Release and dev both leave dependencies debuginfo-free, but one RUSTFLAGS serves
+# --profile debugging too, where [profile.debugging.package."*"] turns that C debuginfo
+# back on and the compressed sections appear.
+RUSTFLAGS_VAL="--remap-path-prefix=/work=/src --remap-path-prefix=/work/target/.cargo-home=/cargo -C link-arg=-fuse-ld=mold"
 # Resolve the source commit on the host and thread it into the compile as VK_GIT_COMMIT,
 # so `vk --version` and dist/build-info.txt report the same value. The build sandbox can't
 # reliably run git itself (the dogfood guest runs as root against a host-owned /work, which

@@ -71,11 +71,10 @@ fast edit loop below is deliberately `vk`-only and never invokes Docker.
 ```
 
 **When you need a runnable binary, use `./build.sh --fast`** (alias `--debug`). It builds the
-unoptimized debug profile and links with mold — a much faster compile that still produces
-the same static-musl `vk` with the kernel + agent embedded. The output is not stripped and
-not reproducible, so it is for iterating only, never a release artifact (it cannot combine
-with `--bootstrap-check`). Use a plain `./build.sh` for anything you ship or compare bytes
-against.
+unoptimized debug profile — a much faster compile that still produces the same static-musl
+`vk` with the kernel + agent embedded. The output is not stripped and not reproducible, so it
+is for iterating only, never a release artifact (it cannot combine with `--bootstrap-check`).
+Use a plain `./build.sh` for anything you ship or compare bytes against.
 
 Every local (non-release) build also gets line-tables-only debuginfo from `[profile.dev]`,
 which keeps `file:line` in panics and backtraces while dropping the bulky per-variable
@@ -102,13 +101,14 @@ target and module affected by the change, for example:
 
 `dev.sh` is Docker-free: on first use it boots the pinned build image as a shared
 `vk` development VM; later invocations use `vk exec`, avoiding another image build and
-boot. It reuses `target/`, links tests with mold, and rejects workspace-wide or optimized
+boot. It reuses `target/` — its RUSTFLAGS match `build.sh`'s exactly, so it shares
+dependency artifacts with `./build.sh --fast` — and rejects workspace-wide or optimized
 invocations. The VM powers itself off after half an hour with no cargo command, so a
 forgotten one stops holding memory; `./dev.sh stop` ends it immediately. A `vk` and a
 `flock` on `PATH` are required and there is deliberately no Docker fallback. `VK_DEV_CPUS`
 and `VK_DEV_MEM` size the VM, `VK_DEV_IDLE_SECS` sets that idle window (`0` keeps the VM
-until it is stopped). Use `./build.sh --fast` only when an executable is actually
-needed for runtime testing.
+until it is stopped). Use `./build.sh --fast` only when an executable is actually needed
+for runtime testing.
 
 ### Cargo commands (pinned toolchain)
 
