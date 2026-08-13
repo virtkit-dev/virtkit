@@ -88,7 +88,7 @@ difference between giving each guest more memory and running fewer of them at a
 time. A CI job adds how full it filled the in-guest layer its writes land on,
 against what that layer holds — the wall behind an out-of-space failure no host
 disk can explain. A job's guest also records itself as it runs, a sample of its
-own CPU, memory, disk, network and processes every 30 seconds in the text format
+own CPU, memory, disk, network and processes every 10 seconds in the text format
 `atop -P` prints, so the shape of the job outlives the VM that is destroyed with
 it. See the [GitLab CI guide](docs/gitlab-ci.md#resource-usage) for what each
 figure covers.
