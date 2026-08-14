@@ -113,7 +113,8 @@ forgotten one stops holding memory; `./dev.sh stop` ends it immediately. A `vk` 
 `flock` on `PATH` are required and there is deliberately no Docker fallback. `VK_DEV_CPUS`
 and `VK_DEV_MEM` size the VM, `VK_DEV_IDLE_SECS` sets that idle window (`0` keeps the VM
 until it is stopped). Use `./build.sh --fast` only when an executable is actually needed
-for runtime testing.
+for runtime testing. To search the tree from inside the VM, reach for `ugrep` and `bfs`;
+the image's `grep` and `find` are busybox applets.
 
 ### Cargo commands (pinned toolchain)
 

@@ -8,14 +8,19 @@
 # tag the image `virtkit-build` via -t; the two namespaces are independent.
 FROM rust:1.97.1-alpine3.21@sha256:7bae7c67364dad5ebbd4060923b34d734fbed66d7c1cf3af72aa2f062af93eb6 AS virtkit-build
 
-# Build deps (one per line in apk-pins.txt, pinned to exact versions for byte-for-byte
+# Image packages (one per line in apk-pins.txt, pinned to exact versions for byte-for-byte
 # reproducibility — Alpine has no snapshot service, so the pins + the image digest
 # above are what freeze the inputs; regenerate with ./update.sh):
 #   gcc + musl-dev          ring (rustls' crypto backend) compiles C; Alpine's gcc
 #                           is musl-native, so it is also the musl C compiler.
+#   make                    jemalloc-sys builds the vendored jemalloc through it.
 #   mold                    the linker every build.sh and dev.sh link runs through,
 #                           release artifact included (see the RUSTFLAGS in build.sh).
 #   git, ca-certificates, file   dev/build basics.
+#   ugrep, bfs              source search for interactive work in the dev.sh VM, where
+#                           the tree is the virtiofs share and busybox grep/find are all
+#                           the base image otherwise offers. No build step links or runs
+#                           them, so the release artifacts are unaffected.
 COPY apk-pins.txt /tmp/apk-pins.txt
 RUN apk add --no-cache $(grep -vE '^[[:space:]]*(#|$)' /tmp/apk-pins.txt)
 
