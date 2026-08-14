@@ -35,6 +35,17 @@ pub struct ServerConfig {
     pub password_file: Option<PathBuf>,
 }
 
+/// What a config file states about the server it would start, as stated — see
+/// [`ServerConfig::file_view`].
+pub struct FileView {
+    /// the address it sets, if it sets one
+    pub addr: Option<SocketAddr>,
+    /// the store it names, if it names one
+    pub root: Option<PathBuf>,
+    /// whether it turns TLS on (both `tls_cert` and `tls_key`)
+    pub tls: bool,
+}
+
 /// One upstream, as declared in the config file (before its HTTP client is built).
 pub struct UpstreamSpec {
     pub prefix: String,
@@ -99,6 +110,27 @@ impl ServerConfig {
             return Ok(r);
         }
         crate::default_root()
+    }
+
+    /// What a `serve` config file states, for whoever has to describe the server it will
+    /// start without starting one — `install-service`, building a unit around it. `None`
+    /// where the file says nothing, so a caller can tell a setting it named from a default
+    /// standing in for it, which [`ServerConfig::load`] deliberately cannot.
+    ///
+    /// One read, so an address and a store taken from the same file are taken from the same
+    /// contents of it.
+    pub fn file_view(path: &Path) -> Result<FileView> {
+        let f = read_file(path)?;
+        Ok(FileView {
+            addr: f
+                .addr
+                .map(|a| a.parse().with_context(|| format!("parsing addr {a:?}")))
+                .transpose()?,
+            root: f.root,
+            // Both keys, the pair `build_tls` insists on: a half-configured one is `serve`'s
+            // error to raise, not this caller's.
+            tls: f.tls_cert.is_some() && f.tls_key.is_some(),
+        })
     }
 
     /// Load from a TOML file. The CLI `addr` and optional `root` override the file; the
@@ -292,6 +324,63 @@ fn load_key(path: &Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a config file states, for a unit built around it: the address and store it
+    /// names, and whether it turns TLS on. `None` where it says nothing, which is the part
+    /// `load` cannot report — it substitutes the shared default and the caller can no longer
+    /// tell the two apart.
+    #[test]
+    fn a_file_view_reports_what_the_file_states_and_what_it_leaves_open() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-view-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        let fallback: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        let tls = write(
+            "tls.toml",
+            "addr = \"0.0.0.0:443\"\ntls_cert = \"/c.pem\"\ntls_key = \"/k.pem\"\n",
+        );
+        let v = ServerConfig::file_view(&tls).unwrap();
+        assert_eq!(v.addr, Some("0.0.0.0:443".parse().unwrap()));
+        assert_eq!(v.root, None);
+        assert!(v.tls);
+        // and it agrees with the address `serve` itself will listen on
+        assert_eq!(
+            ServerConfig::load(&tls, fallback, None).unwrap().addr,
+            v.addr.unwrap()
+        );
+
+        // a file that states neither: the view says so, where `load` would hand back the
+        // fallback address and the shared default store as if the file had named them
+        let bare = write("bare.toml", "username = \"ci\"\n");
+        let v = ServerConfig::file_view(&bare).unwrap();
+        assert_eq!((v.addr, v.root, v.tls), (None, None, false));
+        assert_eq!(
+            ServerConfig::load(&bare, fallback, None).unwrap().addr,
+            fallback
+        );
+
+        // one TLS key without the other is not TLS here: `serve` is what refuses the pair,
+        // so describing a unit must not be the thing that fails on it
+        let half = write("half.toml", "tls_cert = \"/c.pem\"\n");
+        assert!(!ServerConfig::file_view(&half).unwrap().tls);
+        assert!(
+            ServerConfig::load(&half, fallback, None)
+                .unwrap()
+                .build_tls()
+                .is_err()
+        );
+
+        // an unreadable file is an error, not an empty view
+        assert!(ServerConfig::file_view(&dir.join("absent.toml")).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The store root `status`/`gc` resolve, in the order `serve` resolves it: an explicit
     /// `--root` first, then the config file's, then the shared default. The file is what

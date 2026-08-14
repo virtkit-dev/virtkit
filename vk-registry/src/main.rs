@@ -51,13 +51,20 @@ enum Cmd {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Install + start a `systemd --user` unit running `serve`, so the store is
-    /// always available (survives logout/reboot).
+    /// Install + start a `systemd --user` unit running `serve`, so the store comes back
+    /// with the session (and, after `loginctl enable-linger`, without one).
     InstallService {
-        #[arg(long, default_value = "127.0.0.1:5000")]
+        /// Listen address to bake into the unit; ignored in favour of --config's.
+        #[arg(long, default_value = "127.0.0.1:5000", conflicts_with = "config")]
         addr: SocketAddr,
-        #[arg(long)]
+        /// Store directory to bake into the unit [default:
+        /// $XDG_DATA_HOME/virtkit/registry].
+        #[arg(long, conflicts_with = "config")]
         root: Option<PathBuf>,
+        /// The `serve` config file the unit should read — it carries addr/root/TLS/auth, so
+        /// it replaces --addr/--root rather than joining them.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Report the store's usage and content: on-disk size, dedup savings, and a
     /// per-repository breakdown. Read-only — it creates no store.
@@ -166,8 +173,9 @@ async fn run(cli: Cli) -> Result<()> {
             };
             vk_registry::serve_config(cfg).await
         }
-        Cmd::InstallService { addr, root } => {
-            vk_registry::install_service(addr, &resolve_root(root)?)
+        Cmd::InstallService { addr, root, config } => {
+            let facts = vk_registry::UnitFacts::resolve(config.as_deref(), addr, root)?;
+            vk_registry::install_service(&facts)
         }
         // `--root` first, then the root the `serve` config file names, then the shared
         // default: the same order `serve` resolves them in, so these report on and sweep
@@ -311,6 +319,39 @@ mod tests {
         assert!(check);
 
         assert!(Cli::try_parse_from(["vk-registry", "update", "--check", "--yes"]).is_err());
+    }
+
+    // A config file replaces the address and store `install-service` would otherwise bake
+    // into the unit, so asking for both is refused rather than one of them being dropped
+    // from a unit that still claims to describe the other.
+    #[test]
+    fn install_service_refuses_a_config_beside_the_flags_it_replaces() {
+        let ok = |args: &[&str]| Cli::try_parse_from(args).is_ok();
+        assert!(ok(&["vk-registry", "install-service"]));
+        assert!(ok(&["vk-registry", "install-service", "--root", "/srv/s"]));
+        assert!(ok(&[
+            "vk-registry",
+            "install-service",
+            "--config",
+            "/etc/r.toml"
+        ]));
+
+        assert!(!ok(&[
+            "vk-registry",
+            "install-service",
+            "--config",
+            "/etc/r.toml",
+            "--root",
+            "/srv/s"
+        ]));
+        assert!(!ok(&[
+            "vk-registry",
+            "install-service",
+            "--config",
+            "/etc/r.toml",
+            "--addr",
+            "0.0.0.0:443"
+        ]));
     }
 
     // The unit is named only for the one code that says it is serving. A probe that came

@@ -695,11 +695,17 @@ fn banner(root: &Path, upstreams: usize, tls: bool, addr: SocketAddr) -> String 
         0 => "local".to_string(),
         n => format!("mirror ({n} upstream(s))"),
     };
-    let scheme = if tls { "https" } else { "http" };
     format!(
-        "vk-registry: serving {} [{mode}] on {scheme}://{addr}",
-        root.display()
+        "vk-registry: serving {} [{mode}] on {}://{addr}",
+        root.display(),
+        scheme(tls)
     )
+}
+
+/// The URL scheme a server with (or without) TLS is reached over. One place, because every
+/// line that prints a virtkit registry's own URL has to agree with the acceptor it has.
+fn scheme(tls: bool) -> &'static str {
+    if tls { "https" } else { "http" }
 }
 
 /// Serve on an already-bound listener (so the caller can pick an ephemeral port and
@@ -1485,9 +1491,102 @@ pub fn default_root() -> Result<PathBuf> {
 /// replaces the binary has to point at the same unit to have the new one served.
 pub const SERVICE_UNIT: &str = "virtkit-registry.service";
 
-/// Install + start a `systemd --user` unit running `registry serve` with this
-/// `addr`/`root`, so the shared store survives logout and reboots.
-pub fn install_service(addr: SocketAddr, root: &Path) -> Result<()> {
+/// What a unit needs to know to run `serve`: the arguments it will pass, and what they mean
+/// once the config file they may name has been read — read once, so the address a unit is
+/// built for and the store it is granted cannot come from two different reads of it.
+pub struct UnitFacts {
+    /// the config file the unit hands `serve`, which then carries addr/root/TLS/auth
+    config: Option<PathBuf>,
+    /// where the server will listen
+    addr: SocketAddr,
+    /// the store it will open — `None` when nothing named one, leaving the per-user default
+    /// that a machine-wide unit must not inherit
+    root: Option<PathBuf>,
+    /// whether the config file turns TLS on
+    tls: bool,
+}
+
+impl UnitFacts {
+    /// Resolve the arguments a unit will carry. A config file supersedes `--addr`/`--root`
+    /// rather than joining them — the file is what an operator edits afterwards, and a
+    /// baked-in flag would quietly outrank what they change in it — so the CLI refuses the
+    /// two together and only one of them is read here.
+    pub fn resolve(config: Option<&Path>, addr: SocketAddr, root: Option<PathBuf>) -> Result<Self> {
+        let Some(path) = config else {
+            return Ok(UnitFacts {
+                config: None,
+                addr,
+                root,
+                tls: false,
+            });
+        };
+        let v = ServerConfig::file_view(path)?;
+        Ok(UnitFacts {
+            config: Some(path.to_path_buf()),
+            // The file's address wins, as it does for `serve`: `--addr` carries a default,
+            // so an explicit one cannot be told from it.
+            addr: v.addr.unwrap_or(addr),
+            root: v.root,
+            tls: v.tls,
+        })
+    }
+
+    /// Where the server will listen.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Whether it will serve TLS, so a caller naming its URL names the right scheme.
+    pub fn tls(&self) -> bool {
+        self.tls
+    }
+
+    /// The store the server will open, the per-user default included — right for a `--user`
+    /// unit, which runs as the user whose default that is.
+    pub fn store(&self) -> Result<PathBuf> {
+        match &self.root {
+            Some(r) => Ok(r.clone()),
+            None => default_root(),
+        }
+    }
+
+    /// The `serve` arguments a unit's `ExecStart` passes.
+    fn exec_args(&self) -> Result<String> {
+        if let Some(cfg) = &self.config {
+            return Ok(format!("--config {}", unit_path("the config file", cfg)?));
+        }
+        Ok(format!(
+            "--addr {} --root {}",
+            self.addr,
+            unit_path("the store", &self.store()?)?
+        ))
+    }
+}
+
+/// A path as one quoted systemd argument. systemd splits `Exec*` and `ReadWritePaths=` on
+/// whitespace, unescapes `\` and expands `%` specifiers *inside* the quotes, so a path
+/// carrying any of those means something other than itself — and a `"` or a newline ends the
+/// argument early, which in a file installed as root is how a store path becomes an extra
+/// directive. None of it is worth escaping around: refuse, and say which path it was.
+fn unit_path(what: &str, p: &Path) -> Result<String> {
+    let s = p.to_string_lossy();
+    if let Some(c) = s
+        .chars()
+        .find(|c| matches!(c, '"' | '\\' | '%' | '\'' | '$') || c.is_control())
+    {
+        bail!(
+            "{what} {} contains {c:?}, which does not survive a systemd unit as itself",
+            p.display()
+        );
+    }
+    Ok(format!("\"{s}\""))
+}
+
+/// Install + start a `systemd --user` unit running `serve`, so the store comes back with
+/// the session — and, with `loginctl enable-linger`, without one.
+pub fn install_service(facts: &UnitFacts) -> Result<()> {
+    let addr = facts.addr();
+    let root = facts.store()?;
     let exe = std::env::current_exe().context("locating the virtkit binary")?;
     let cfg_home = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
         Some(c) => PathBuf::from(c),
@@ -1499,23 +1598,23 @@ pub fn install_service(addr: SocketAddr, root: &Path) -> Result<()> {
     let unit_dir = cfg_home.join("systemd/user");
     std::fs::create_dir_all(&unit_dir)
         .with_context(|| format!("creating {}", unit_dir.display()))?;
-    let unit_path = unit_dir.join(SERVICE_UNIT);
+    let unit_file = unit_dir.join(SERVICE_UNIT);
     let unit = format!(
         "[Unit]\n\
          Description=virtkit local OCI registry (shared microVM bundle store)\n\
          After=network.target\n\
          \n\
          [Service]\n\
-         ExecStart={exe} serve --addr {addr} --root {root}\n\
+         ExecStart={exe} serve {args}\n\
          Restart=on-failure\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
-        exe = exe.display(),
-        root = root.display(),
+        exe = unit_path("the binary", &exe)?,
+        args = facts.exec_args()?,
     );
-    std::fs::write(&unit_path, unit).with_context(|| format!("writing {}", unit_path.display()))?;
-    println!("virtkit: wrote {}", unit_path.display());
+    std::fs::write(&unit_file, unit).with_context(|| format!("writing {}", unit_file.display()))?;
+    println!("virtkit: wrote {}", unit_file.display());
 
     let run = |args: &[&str]| -> Result<()> {
         let status = std::process::Command::new("systemctl")
@@ -1530,13 +1629,23 @@ pub fn install_service(addr: SocketAddr, root: &Path) -> Result<()> {
     };
     run(&["daemon-reload"])?;
     run(&["enable", "--now", SERVICE_UNIT])?;
+    // The unit may now carry a config file, so the URL and the client snippet both follow
+    // whether that file turns TLS on — `insecure` says the registry is plain HTTP, which is
+    // the wrong advice, not just an untidy one, for a unit serving TLS.
+    let tls = facts.tls();
     println!(
-        "virtkit: {SERVICE_UNIT} enabled + started (http://{addr}, store {})",
+        "virtkit: {SERVICE_UNIT} enabled + started ({}://{addr}, store {})",
+        scheme(tls),
         root.display()
     );
+    let client_key = if tls {
+        "    # ca_file = \"…\"   # when the cert is from a private CA"
+    } else {
+        "    insecure = true"
+    };
     println!(
         "virtkit: point each worktree's [registry] at it:\n\
-         \n    [registry]\n    repo = \"{addr}/bundles\"\n    insecure = true\n\
+         \n    [registry]\n    repo = \"{addr}/bundles\"\n{client_key}\n\
          \nvirtkit: for it to run without an active login session: loginctl enable-linger $USER"
     );
     Ok(())
@@ -1571,6 +1680,36 @@ mod tests {
             banner(root, 2, false, addr),
             "vk-registry: serving /srv/vk-registry [mirror (2 upstream(s))] on http://0.0.0.0:443"
         );
+    }
+
+    /// What the unit runs: a config file supersedes the flags rather than joining them, so
+    /// a baked-in `--addr` cannot outrank the `addr` an operator later edits into the file.
+    /// Paths are quoted, since systemd splits `ExecStart` on whitespace.
+    #[test]
+    fn a_units_exec_args_follow_the_config_file_when_there_is_one() {
+        let flags = UnitFacts::resolve(
+            None,
+            "127.0.0.1:5000".parse().unwrap(),
+            Some(PathBuf::from("/srv/a store")),
+        )
+        .unwrap();
+        assert_eq!(
+            flags.exec_args().unwrap(),
+            "--addr 127.0.0.1:5000 --root \"/srv/a store\""
+        );
+
+        let dir = std::env::temp_dir().join(format!("vk-regserve-exec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.toml");
+        std::fs::write(&cfg, "root = \"/srv/store\"\n").unwrap();
+        let configured =
+            UnitFacts::resolve(Some(&cfg), "127.0.0.1:5000".parse().unwrap(), None).unwrap();
+        assert_eq!(
+            configured.exec_args().unwrap(),
+            format!("--config \"{}\"", cfg.display())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `status` and `gc` look at a store; they do not bring one into being. A root with no

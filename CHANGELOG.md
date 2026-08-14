@@ -12,6 +12,10 @@ All notable changes to virtkit will be documented in this file.
   already running keeps serving the build it started as, so the command names the restart
   that puts the new one in service. `--check` reports whether a newer release is available
   without installing it, exiting 1 when there is one.
+- **`vk-registry install-service --config`.** The unit it writes can now read the same
+  config file `serve` does, instead of carrying an address and store baked in at install
+  time — so editing that file is enough to move the server, and what the command reports
+  about the one it started follows the TLS the file turns on.
 
 ### Changed
 
