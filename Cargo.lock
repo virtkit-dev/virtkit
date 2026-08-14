@@ -4571,6 +4571,7 @@ dependencies = [
  "virtio-queue",
  "vk-core",
  "vk-registry",
+ "vk-selfupdate",
  "vm-memory 0.17.1",
  "vm-memory 0.18.0",
  "vmm-sys-util 0.15.0",
@@ -4610,6 +4611,26 @@ dependencies = [
  "libc",
  "serde",
  "toml",
+]
+
+[[package]]
+name = "vk-selfupdate"
+version = "0.34.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "indicatif",
+ "libc",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
 ]
 
 [[package]]

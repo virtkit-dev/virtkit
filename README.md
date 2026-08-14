@@ -268,6 +268,7 @@ vk-driver/       host driver crate
 vk-agent/        guest agent crate (PID 1 + exec server)
 vk-registry/     optional central OCI-distribution server (build-once lock + pull-through cache)
 vk-runnerctl/    optional root-side setter for gitlab-runner's concurrent (see docs/gitlab-ci.md)
+vk-selfupdate/   vk update: install a release build over the running binary
 third_party/     vendored libkrun (locally patched — see its VENDOR.md)
 kernel/          guest kernel build (Dockerfile + config fragment)
 build.sh         build the binaries -> dist/

@@ -1,6 +1,6 @@
 # Rust Coding Guidelines
 
-Applies to: `vk-core/**`, `vk-driver/**`, `vk-agent/**`.
+Applies to: every Rust crate in the workspace.
 
 See [`../coding-guidelines.md`](../coding-guidelines.md) for general conventions and formatting requirements that apply to all code.
 

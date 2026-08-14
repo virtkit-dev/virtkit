@@ -67,7 +67,6 @@ mod sshconf;
 mod switch;
 mod timing;
 mod units;
-mod update;
 mod usage;
 #[cfg(feature = "virtiofsd")]
 mod virtiofsd;
@@ -85,6 +84,13 @@ use vk_core::addr::SocketAddr;
 
 use crate::config::Config;
 use crate::jobctx::JobCtx;
+
+/// This binary as `vk update` replaces it: the release asset `vk` ships as, and the
+/// version this build was made from.
+const VK: vk_selfupdate::Tool = vk_selfupdate::Tool {
+    name: "vk",
+    version: env!("CARGO_PKG_VERSION"),
+};
 
 /// clap value parser for `--cpus`: a number, or `host` for the host's CPU count
 /// (`available_parallelism`, which honours cgroup/affinity limits). libkrun and
@@ -1609,13 +1615,13 @@ async fn cli_main() -> ExitCode {
         // so a script can branch on "an update is available" without reading it as
         // failure.
         if *check {
-            return match update::check(version.as_deref()).await {
+            return match VK.check(version.as_deref()).await {
                 Ok(false) => ExitCode::SUCCESS,
                 Ok(true) => exit_code(1),
                 Err(e) => fail(&e, 2),
             };
         }
-        return match update::run(version.as_deref(), *yes).await {
+        return match VK.update(version.as_deref(), *yes).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 2),
         };

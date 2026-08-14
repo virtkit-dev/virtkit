@@ -1,0 +1,32 @@
+[package]
+name = "vk-selfupdate"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# `<tool> update` for the binaries a user installs by hand: resolve a GitHub release, check
+# the download against the digest published beside it, smoke-test it, and rename it over the
+# running binary. Parameterized by tool so every one of them goes through the same two gates
+# — the code deciding what is allowed to replace a binary should exist once.
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+# the download's progress bar (already in the tree via vk-driver's build dashboard)
+indicatif.workspace = true
+libc.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+# The fake release server the gate tests aim `resolve` at: the same hyper stack the
+# vk-registry server is built on, needed only to build the tests.
+[dev-dependencies]
+bytes.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rustls.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
