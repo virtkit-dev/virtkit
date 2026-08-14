@@ -85,8 +85,8 @@ RUN export ARCH=x86_64 \
                   CONFIG_VIRTIO_NET CONFIG_VIRTIO_PCI CONFIG_VIRTIO_VSOCKETS \
                   CONFIG_VIRTIO_FS CONFIG_FUSE_FS CONFIG_IP_PNP CONFIG_OVERLAY_FS \
                   CONFIG_BLK_DEV_INITRD CONFIG_DEVTMPFS_MOUNT \
-                  CONFIG_KVM CONFIG_KVM_INTEL CONFIG_KVM_AMD CONFIG_DUMMY \
-                  CONFIG_IPV6 CONFIG_WIREGUARD; do \
+                  CONFIG_KVM CONFIG_KVM_INTEL CONFIG_KVM_AMD CONFIG_KVM_IOAPIC \
+                  CONFIG_DUMMY CONFIG_IPV6 CONFIG_WIREGUARD; do \
            grep -q "^${opt}=y" .config || { echo "missing ${opt}=y in .config"; exit 1; }; \
        done \
     && for opt in CONFIG_MLX5_CORE CONFIG_VFIO CONFIG_X86_SGX CONFIG_VIRTIO_PMEM \
