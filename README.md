@@ -192,7 +192,7 @@ The ones you'll actually type:
   backend, a guest kernel/agent, and the host side of each configured feature
   (the CI-executor features only when named with `--feature`).
 - `gc` — reclaim the host caches: evict image bases no VM is using, remove
-  GitLab host checkouts no job is using, and drop unreferenced registry chunks.
+  GitLab host checkouts no job is using, and drop unreferenced image-cache chunks.
 - `update` — replace this `vk` with a release build from GitHub: the latest, or a
   version you name (an older one downgrades). It asks before replacing anything
   (`--yes` to skip), verifies the download against the digest published with the
@@ -204,9 +204,14 @@ The ones you'll actually type:
   control the run's compose services (build on demand + boot, stop, or query state).
 - `gitlab config` / `gitlab prepare` / `gitlab run` / `gitlab cleanup` — the
   GitLab custom-executor lifecycle (see the [GitLab CI guide](docs/gitlab-ci.md)).
-- `registry push` / `registry pull` / `registry inspect` / `registry status` /
-  `registry gc` — manage guest bundles in an OCI store, with chunk-level
-  deduplication to keep transfers small.
+- `registry push` / `registry pull` / `registry inspect` — publish, fetch, and check
+  for guest bundles in an OCI store, with chunk-level deduplication to keep
+  transfers small.
+- `registry status` / `registry gc` — report on, and sweep, a store on this host:
+  the one `[build] cache_registry` puts the build cache in, or any other with
+  `--root` — required whenever that setting names a registry server, whose store
+  is on its host. Neither creates a store: a path with no store there is reported
+  as having none, not materialized.
 
 The rest is plumbing the commands above spawn for themselves, or development
 tooling — listed by `vk help-all`, each documented in `vk help <cmd>`:
@@ -259,6 +264,32 @@ variables are:
 | `VIRTKIT_TIMING=1` | per-phase build/boot timing breakdown |
 | `VIRTKIT_PROGRESS=plain` | plain build progress instead of the live dashboard (CI logs) |
 | `VIRTKIT_NO_TITLE` | suppress terminal-title updates (keeps the dashboard) |
+
+Two settings name a content-addressed store. They are not two kinds of store — one
+on-disk format, two destinations:
+
+| Setting | Holds | Typical value |
+| --- | --- | --- |
+| `[build] cache_registry` | build-cache stage and base snapshots, in a repo called `dfcache` | a path on this disk, or a registry shared by every runner |
+| `[registry] repo` | guest bundles, one repo per name | a registry others pull from, or a path on this disk |
+
+Either accepts a registry (`registry.example.com/team`, `127.0.0.1:5000` — a
+server, with its own TLS and credentials) or an absolute path / `file://` URL (a
+store on this disk, accessed in-process: no daemon, no port, no auth — though a
+bundle in one is pulled by name only through a `vk-registry` serving it);
+`cache_registry = "none"` turns the build cache off, leaving `status`/`gc` on the
+builtin store where what was cached before it still is. Nothing keeps them apart:
+when both are local, point them at the **same directory** and chunk deduplication
+spans build cache and bundles alike, one `vk registry gc` covers both (it expires
+tags idle past `--retention-days` in every repo, bundles included), and
+`vk registry status` lists `dfcache` beside your bundle repos. Two different paths
+just mean two stores to keep an eye on — `status`/`gc` then follow the build-cache
+one unless you pass `--root`; a `cache_registry` on a registry server keeps its
+store on that host, so they refuse until `--root` names one here. With no
+configuration at all there is a single store, `$XDG_DATA_HOME/virtkit/registry`,
+holding only the build cache — it shares that directory with the image cache's own
+`registry/` tier, whose layout is independent and which `vk gc` reclaims.
+`vk paths` names the store on this host each setting resolved to.
 
 ## Layout
 

@@ -89,7 +89,17 @@
 # cloud_hypervisor = "/usr/local/bin/cloud-hypervisor"  # default: top-level cloud_hypervisor
 # kernel = "/usr/local/lib/vk/vmlinux"             # build guest kernel
 # agent = "/usr/local/lib/vk/vk-agent"        # injected as PID 1
-# cache_registry = "127.0.0.1:5000"                     # shared instruction cache
+# cache_registry = "127.0.0.1:5000"
+#                        # shared instruction cache: any OCI registry (a `vk-registry` to
+#                        # share it across runners; the cache_* keys below carry its TLS and
+#                        # credentials), or an absolute path / file:// URL for a store on
+#                        # this disk, accessed in-process (default:
+#                        # $XDG_DATA_HOME/virtkit/registry). `none` disables caching.
+#                        # A path here is also the store `vk registry status`/`gc` report on
+#                        # and sweep with no --root; with a registry server (the value above)
+#                        # the store is on that host, so they refuse until given a --root.
+#                        # Same store format as [registry] repo — a local one may be that
+#                        # very directory; see [registry] below.
 # cache_insecure = true                                 # the cache registry is plain HTTP
 # cache_ca_file = "/etc/virtkit/registry-ca.crt"        # PEM CA for a TLS cache registry
 # cache_username = "ci-push"                            # HTTP Basic; empty = anonymous
@@ -165,7 +175,23 @@
 # [registry]             # native OCI bundle registry: push/pull guest bundles with
 #                        # content-defined chunk dedup (CDC + per-chunk zstd), no
 #                        # oras, no docker. Backs the virtkit/<name> MICROVM_IMAGE form.
-# repo = "registry.example.com/team"   # fixed host-side = the image allowlist
+# repo = "registry.example.com/team"   # fixed host-side = the image allowlist. An absolute
+#                        # path or file:// URL instead names a store on this disk that
+#                        # `vk registry push` and `vk build --tag` write in-process — no
+#                        # daemon, no port, and the auth/TLS keys below no longer apply.
+#                        # Pulling by name (`registry pull`/`inspect`, the virtkit/<name>
+#                        # form) still speaks HTTP, so serve that directory with a
+#                        # `vk-registry` for the hosts that consume the bundles.
+#                        #
+#                        # It is the same store format as [build] cache_registry, and the two
+#                        # occupy different repos inside one (`dfcache` for the build cache,
+#                        # one per bundle name), so when both are local the simplest setup is
+#                        # ONE directory for both: chunk dedup spans them, a single
+#                        # `vk registry gc` covers both, and `vk registry status` lists them
+#                        # together. That one gc expires idle tags in every repo, so its
+#                        # --retention-days applies to bundles others pull by name too.
+#                        # Two paths = two stores; status/gc then follow the build-cache
+#                        # one unless given --root.
 # ca_file = "/etc/virtkit/registry-ca.crt"  # PEM CA the registry TLS chains to
 # username = "ci-push"             # HTTP Basic; empty = anonymous (no auth)
 # password_file = "/etc/virtkit/registry-password"   # file holding the password
