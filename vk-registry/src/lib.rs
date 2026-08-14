@@ -686,19 +686,35 @@ pub async fn serve_config(cfg: ServerConfig) -> Result<()> {
     serve_on(listener, Arc::new(state)).await
 }
 
+/// The line a server announces itself with: the store it serves, whether it mirrors, and
+/// the URL to reach it at. Built as a string, and from the facts rather than the state, so
+/// a test can hold the scheme to whether there is TLS — this line is what an operator reads
+/// to confirm TLS came up, and naming the wrong scheme is worse than naming none.
+fn banner(root: &Path, upstreams: usize, tls: bool, addr: SocketAddr) -> String {
+    let mode = match upstreams {
+        0 => "local".to_string(),
+        n => format!("mirror ({n} upstream(s))"),
+    };
+    let scheme = if tls { "https" } else { "http" };
+    format!(
+        "vk-registry: serving {} [{mode}] on {scheme}://{addr}",
+        root.display()
+    )
+}
+
 /// Serve on an already-bound listener (so the caller can pick an ephemeral port and
 /// learn it first). The store is content-addressed and written atomically, so several
 /// servers may serve the same `root` concurrently.
 pub async fn serve_on(listener: TcpListener, state: Arc<ServerState>) -> Result<()> {
     if let Ok(addr) = listener.local_addr() {
-        let mode = if state.upstreams.is_empty() {
-            "local".to_string()
-        } else {
-            format!("mirror ({} upstream(s))", state.upstreams.len())
-        };
         eprintln!(
-            "vk-registry: serving {} [{mode}] on http://{addr}",
-            state.store.root.display()
+            "{}",
+            banner(
+                &state.store.root,
+                state.upstreams.len(),
+                state.tls.is_some(),
+                addr
+            )
         );
     }
     loop {
@@ -1529,6 +1545,33 @@ pub fn install_service(addr: SocketAddr, root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The URL a server prints is the URL that reaches it: a TLS-configured server says
+    /// `https`, a plain one `http`. The scheme is the only part of the line an operator
+    /// cannot check by reading the config, so it has to follow the acceptor rather than
+    /// be assumed.
+    #[test]
+    fn the_banner_names_the_scheme_the_server_actually_speaks() {
+        let addr: SocketAddr = "0.0.0.0:443".parse().unwrap();
+        let root = Path::new("/srv/vk-registry");
+        assert_eq!(
+            banner(root, 0, true, addr),
+            "vk-registry: serving /srv/vk-registry [local] on https://0.0.0.0:443"
+        );
+        assert_eq!(
+            banner(root, 0, false, addr),
+            "vk-registry: serving /srv/vk-registry [local] on http://0.0.0.0:443"
+        );
+        // and a relay says how many upstreams it fronts, either way
+        assert_eq!(
+            banner(root, 2, true, addr),
+            "vk-registry: serving /srv/vk-registry [mirror (2 upstream(s))] on https://0.0.0.0:443"
+        );
+        assert_eq!(
+            banner(root, 2, false, addr),
+            "vk-registry: serving /srv/vk-registry [mirror (2 upstream(s))] on http://0.0.0.0:443"
+        );
+    }
 
     /// `status` and `gc` look at a store; they do not bring one into being. A root with no
     /// store — a fresh host, or a `--root`/`root =` that names the wrong path — has to come

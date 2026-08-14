@@ -26,6 +26,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A `vk-registry` serving TLS says `https` when it starts.** It announced its own URL as
+  `http://` whichever scheme it was serving, so the line that confirms TLS came up reported
+  the opposite.
 - **Asking about a registry store no longer creates one.** `vk registry status` and
   `vk registry gc` (and `vk-registry status` / `vk-registry gc`) left a store directory tree
   behind at whatever path they were pointed at — including the default one, on hosts that
