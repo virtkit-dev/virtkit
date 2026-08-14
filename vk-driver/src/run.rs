@@ -138,6 +138,10 @@ pub struct RunArgs {
     /// Expose the guest PMU to the primary VM (`vk run --pmu`, trusted guests
     /// only). See [`crate::vmm::VmSpec::pmu`].
     pub pmu: bool,
+    /// Let the primary VM run microVMs of its own (`vk run --nested`). Applies to
+    /// the primary alone: build stages and compose services never nest.
+    /// See [`crate::vmm::VmSpec::nested`].
+    pub nested: bool,
     /// `None` uses the vk-agent embedded in `vk` (or the on-disk default).
     pub agent: Option<PathBuf>,
     pub cloud_hypervisor: PathBuf,
@@ -1433,6 +1437,7 @@ async fn build_and_boot(
         serial_log: console.clone(),
         console_serial: args.console_serial,
         pmu: args.pmu,
+        nested: args.nested,
         api_socket: None,
         pass_fds,
         proc_name: crate::vmm::resolve_proc_name(&unit_name),
@@ -2678,6 +2683,17 @@ async fn run_shell(addr: &SocketAddr) -> Result<()> {
 }
 
 pub(crate) fn spawn_vmm(vmm: &dyn Vmm, spec: &crate::vmm::VmSpec) -> Result<Child> {
+    // Every boot funnels through here, so this is where a nesting request meets the host,
+    // whichever spec asked and whichever backend serves it: libkrun would mask VMX/SVM
+    // back out and cloud-hypervisor cannot mask it at all, so either would otherwise hand
+    // the guest a /dev/kvm that never appears. `vk run` refuses earlier, before the pull,
+    // for its own flag.
+    if spec.nested && !crate::vmm::host_nesting_enabled() {
+        bail!(
+            "nested virtualization is not enabled on the host \
+             (kvm_intel.nested / kvm_amd.nested)"
+        );
+    }
     let log = std::fs::File::create(spec.serial_log.with_extension("vmm.log"))?;
     let mut cmd = vmm.command(spec);
     cmd.stdin(Stdio::null())
@@ -3126,6 +3142,7 @@ pub(crate) async fn boot_session(
         // build stages boot the pinned kernel (hvc0), never a BYO serial-only kernel.
         console_serial: false,
         pmu: false,
+        nested: false,
         api_socket: None,
         pass_fds,
         // `stem` is the stage ext4's name — the closest identity this build VM has.
@@ -3872,6 +3889,7 @@ mod tests {
             serial_log: dir.join("console.log"),
             console_serial: false,
             pmu: false,
+            nested: false,
             api_socket: None,
             pass_fds: vec![medium.fd()],
             proc_name: "vk:test".into(),

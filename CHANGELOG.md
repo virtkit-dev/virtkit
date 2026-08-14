@@ -6,6 +6,16 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **`vk run --nested`: microVMs inside a microVM.** The guest gets VMX/SVM and its own
+  `/dev/kvm`, so `vk` runs inside a `vk` guest — build and boot images from a VM instead of
+  only compiling them there. Needs nested virtualization enabled on the host
+  (`kvm_intel.nested` / `kvm_amd.nested`), which the flag checks before pulling or building
+  rather than leaving a guest whose `/dev/kvm` never appears. The guest kernel also carries
+  what KVM needs to give those VMs an in-kernel interrupt controller, so qemu and friends
+  boot in there too, not just `vk` inside `vk`. Off by default (nesting is for trusted
+  guests); on the cloud-hypervisor backend a guest nests whenever the host allows it, flag
+  or no flag.
+
 - **`vk-registry update`.** Upgrade the registry server in place from its GitHub releases —
   the latest by default, or the version you name — with the same checks `vk update` makes:
   it shows what it will install and asks first (`--yes` for unattended use). A server

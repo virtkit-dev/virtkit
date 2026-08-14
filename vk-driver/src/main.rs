@@ -793,6 +793,14 @@ enum Cmd {
         /// untrusted CI jobs. libkrun backend only; default off.
         #[arg(long)]
         pmu: bool,
+        /// expose VMX/SVM to the guest so it can boot microVMs of its own — `vk`
+        /// inside `vk`. Needs nested virtualization enabled on the host
+        /// (kvm_intel.nested / kvm_amd.nested). SECURITY: the guest reaches host
+        /// KVM's nested paths — for trusted guests only. Only the libkrun backend
+        /// gates this; cloud-hypervisor guests nest whenever the host allows it.
+        /// Default off.
+        #[arg(long)]
+        nested: bool,
         /// Where the rootfs comes from: oci (registry pull, no docker daemon), docker
         /// (docker export), or auto (registry, falling back to docker for an unpushed image)
         #[arg(long, value_enum, default_value = "auto")]
@@ -1770,6 +1778,7 @@ async fn cli_main() -> ExitCode {
         kernel,
         console_serial,
         pmu,
+        nested,
         source,
         ca,
         username,
@@ -1867,6 +1876,18 @@ async fn cli_main() -> ExitCode {
                 2,
             );
         }
+        // Before the pull or the build, not at boot: a guest the host will never give
+        // VMX/SVM to is not worth fetching an image for. `run::spawn_vmm` checks again at
+        // boot, so the refusal does not depend on a flag having asked.
+        if *nested && !vmm::host_nesting_enabled() {
+            return fail(
+                &anyhow::anyhow!(
+                    "--nested needs nested virtualization enabled on the host \
+                     (kvm_intel.nested / kvm_amd.nested)"
+                ),
+                2,
+            );
+        }
         let build_args: Vec<(String, String)> = build_arg
             .iter()
             .map(|a| {
@@ -1927,6 +1948,7 @@ async fn cli_main() -> ExitCode {
             kernel: kernel.clone(),
             console_serial: *console_serial,
             pmu: *pmu,
+            nested: *nested,
             agent: agent.clone(),
             // CLI flag wins; else the config's top-level cloud_hypervisor (bare
             // "cloud-hypervisor" when unset). vk run has no [build] tier to consult.

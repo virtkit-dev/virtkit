@@ -25,7 +25,8 @@ use anyhow::{Context, Result, bail};
 use krun::{
     krun_add_disk2, krun_add_net_tap, krun_add_virtiofs4, krun_add_vsock_port2, krun_create_ctx,
     krun_disable_balloon, krun_disable_implicit_init, krun_init_log, krun_set_block_dirty_socket,
-    krun_set_console_output, krun_set_kernel, krun_set_pmu, krun_set_vm_config, krun_start_enter,
+    krun_set_console_output, krun_set_kernel, krun_set_nested_virt, krun_set_pmu,
+    krun_set_vm_config, krun_start_enter,
 };
 
 use crate::vmm::{Disk, Net, VmSpec};
@@ -147,6 +148,14 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         // counters. Off by default — see VmSpec::pmu.
         if spec.pmu {
             ck("krun_set_pmu", krun_set_pmu(ctx, true))?;
+        }
+
+        // Nested virt (`vk run --nested`): libkrun masks the host's VMX/SVM CPUID bit
+        // unless asked, and without it the guest's kvm_intel/kvm_amd never registers
+        // /dev/kvm. The host is already known to allow nesting — `run::spawn_vmm`
+        // refused this spec otherwise, on either backend.
+        if spec.nested {
+            ck("krun_set_nested_virt", krun_set_nested_virt(ctx, true))?;
         }
 
         // virtio-balloon, the same axis CH spells `--balloon …,free_page_reporting=on`:

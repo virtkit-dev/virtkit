@@ -236,6 +236,15 @@ pub struct VmSpec {
     /// has no equivalent; that backend warns and boots without.
     #[serde(default)]
     pub pmu: bool,
+    /// Expose VMX/SVM to the guest (`vk run --nested`) so it can run KVM guests of
+    /// its own — `vk` inside `vk`. The libkrun backend keeps the host's CPUID bit
+    /// (`krun_set_nested_virt`), which it otherwise masks; cloud-hypervisor has no
+    /// such knob and passes the host's bit through whatever this says, so its guests
+    /// nest whenever the host allows it. Default off: nesting widens the guest's
+    /// attack surface on host KVM, and the host must allow it
+    /// ([`host_nesting_enabled`]).
+    #[serde(default)]
+    pub nested: bool,
     /// CH API socket for graceful shutdown (the detached CI VM). `None` = no API
     /// socket (the held-`Child` paths kill the process directly).
     pub api_socket: Option<PathBuf>,
@@ -398,6 +407,26 @@ pub fn libkrun_selected() -> bool {
     )
 }
 
+/// Whether the host lets a guest run guests of its own — `kvm_intel`/`kvm_amd`'s
+/// `nested` module parameter. Backend-agnostic on purpose: libkrun's own
+/// `krun_check_nested_virt` reads these same two files (and is compiled out of a
+/// cloud-hypervisor-only build), while cloud-hypervisor has no nesting knob at all —
+/// it passes the host's VMX/SVM CPUID bit through — so this is what decides nesting
+/// on either backend.
+pub fn host_nesting_enabled() -> bool {
+    nesting_enabled_in(Path::new("/sys/module"))
+}
+
+/// [`host_nesting_enabled`] against an arbitrary `/sys/module` root, so the parse is
+/// testable. Absent files mean no nesting: a module that is not loaded (or a host
+/// that is not x86) exposes no parameter to read.
+fn nesting_enabled_in(sys_module: &Path) -> bool {
+    ["kvm_intel", "kvm_amd"].iter().any(|module| {
+        std::fs::read_to_string(sys_module.join(module).join("parameters/nested"))
+            .is_ok_and(|enabled| matches!(enabled.trim(), "1" | "Y" | "y"))
+    })
+}
+
 /// The selected VMM backend for a boot.
 pub fn selected(cloud_hypervisor: &Path) -> Box<dyn Vmm> {
     #[cfg(feature = "libkrun")]
@@ -429,6 +458,37 @@ mod tests {
         cmd.get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn host_nesting_reads_either_module_parameter() {
+        let root = std::env::temp_dir().join(format!("vk-nested-{}", std::process::id()));
+        // A panicking earlier run leaks its tree, and a reused pid would then start from
+        // an enabled parameter — the first assertion below is exactly what that breaks.
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |module: &str, value: &str| {
+            let dir = root.join(module).join("parameters");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("nested"), value).unwrap();
+        };
+        // neither module present: nothing to read, so no nesting
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(!nesting_enabled_in(&root));
+        // "1" or "Y" (kvm_amd vs kvm_intel), matched case-insensitively as libkrun does,
+        // with the newline sysfs writes
+        for enabled in ["1", "Y\n", "y"] {
+            write("kvm_intel", enabled);
+            assert!(
+                nesting_enabled_in(&root),
+                "{enabled:?} should read as nested"
+            );
+        }
+        write("kvm_intel", "0\n");
+        assert!(!nesting_enabled_in(&root));
+        // either vendor's module is enough — only one matches the host CPU
+        write("kvm_amd", "1\n");
+        assert!(nesting_enabled_in(&root));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -476,6 +536,7 @@ mod tests {
             serial_log: "/job/console.log".into(),
             console_serial: false,
             pmu: false,
+            nested: false,
             api_socket: Some("/job/api.sock".into()),
             pass_fds: Vec::new(),
             proc_name: "vk:ci".into(),
@@ -544,6 +605,7 @@ mod tests {
             serial_log: "/w/console.log".into(),
             console_serial: false,
             pmu: false,
+            nested: false,
             api_socket: None,
             pass_fds: Vec::new(),
             proc_name: "vk:build".into(),

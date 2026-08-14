@@ -370,6 +370,21 @@ fn mount_api_filesystems() -> Result<()> {
             warn!("vk-agent init: symlink {link} -> {target} failed: {e}");
         }
     }
+    // /dev/kvm, when nested virtualization gave this guest one: devtmpfs creates it
+    // root-only and there is no udev here to widen it, so an unprivileged in-guest
+    // process (a `vk exec --user` shell, a CI job) could not boot a microVM of its own.
+    // Absent on a guest whose CPUID carries no VMX/SVM — its kvm module then registers
+    // no node, which is the NotFound below. Present even unasked on cloud-hypervisor,
+    // which cannot mask the host's bit; harmless, because the isolation boundary is the
+    // VM around this and no host access is handed out here.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions("/dev/kvm", std::fs::Permissions::from_mode(0o666))
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            warn!("vk-agent init: chmod /dev/kvm failed: {e}");
+        }
+    }
     // /run and /tmp as fresh tmpfs, but recreate the image's baked top-level dirs so
     // a service's runtime dir survives — e.g. /run/redis (owned by redis) that redis
     // binds its unix socket into. systemd-tmpfiles would recreate these; we have no

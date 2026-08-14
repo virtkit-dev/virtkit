@@ -1359,6 +1359,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         // the executor has no BYO-kernel flag, so nothing forces it otherwise.
         console_serial: false,
         pmu: false,
+        nested: false,
         // libkrun has no API socket (it is driven as a subprocess); cloud-hypervisor
         // uses one for graceful shutdown in graceful_vmm_stop.
         api_socket: (!crate::vmm::libkrun_selected()).then(|| ctx.api_sock()),
