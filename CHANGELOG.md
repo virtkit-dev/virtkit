@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-08-14
+
 ### Added
 
 - **`vk run --nested`: microVMs inside a microVM.** The guest gets VMX/SVM and its own
@@ -1559,7 +1561,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.34.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.35.0...HEAD
+[0.35.0]: https://github.com/virtkit-dev/virtkit/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/virtkit-dev/virtkit/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/virtkit-dev/virtkit/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/virtkit-dev/virtkit/compare/v0.31.0...v0.32.0

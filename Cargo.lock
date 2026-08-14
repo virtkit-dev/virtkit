@@ -1237,7 +1237,7 @@ dependencies = [
 
 [[package]]
 name = "fsbench"
-version = "0.34.0"
+version = "0.35.0"
 
 [[package]]
 name = "fuser"
@@ -4495,7 +4495,7 @@ checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 
 [[package]]
 name = "vk-agent"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4513,7 +4513,7 @@ dependencies = [
 
 [[package]]
 name = "vk-core"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -4532,7 +4532,7 @@ dependencies = [
 
 [[package]]
 name = "vk-driver"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4580,7 +4580,7 @@ dependencies = [
 
 [[package]]
 name = "vk-registry"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4606,7 +4606,7 @@ dependencies = [
 
 [[package]]
 name = "vk-runnerctl"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -4616,7 +4616,7 @@ dependencies = [
 
 [[package]]
 name = "vk-selfupdate"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "bytes",
