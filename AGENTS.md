@@ -115,10 +115,14 @@ shell, so a forgotten one stops holding memory; `./dev.sh stop` ends it immediat
 `VK_DEV_CPUS` and `VK_DEV_MEM` size the VM, `VK_DEV_IDLE_SECS` sets that idle window
 (`0` keeps the VM until it is stopped). Use `./build.sh --fast` only when an executable
 is actually needed for runtime testing. `./dev.sh shell` opens an interactive shell in
-that VM (same user, directory and environment as the cargo commands) and holds the VM
-for as long as the shell runs, for the odd cargo or toolchain command the scoped modes
-above refuse. To search the tree from inside the VM, reach for `ugrep` and `bfs`; the
-image's `grep` and `find` are busybox applets.
+that VM (same user, directory and cargo environment) and holds the VM for as long as
+the shell runs, for the odd cargo or toolchain command the scoped modes above refuse.
+That VM boots with nested virtualization where the host allows it and the `vk` on
+`PATH` can ask for it, so the shell can also *run* what it builds: `./dist/vk run …`
+works inside it, as does `./build.sh --fast --use-virtkit=./dist`, their images and
+boot scratch redirected under `/var/tmp/vk` on the guest's own disk rather than the
+RAM-backed `/tmp`. To search the tree from inside the VM, reach for `ugrep` and `bfs`;
+the image's `grep` and `find` are busybox applets.
 
 ### Cargo commands (pinned toolchain)
 

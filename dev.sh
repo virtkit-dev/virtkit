@@ -19,6 +19,10 @@
 # VK_DEV_CPUS / VK_DEV_MEM size the VM (default: host cpus, 8G). VK_DEV_IDLE_SECS sets how
 # long it survives with no cargo command or open shell (default: 1800, 0 = until
 # ./dev.sh stop).
+#
+# The VM boots with nested virtualization when the host allows it and the vk on PATH can ask
+# for it, so `./dev.sh shell` can run vk inside vk — build and boot microVMs, not just
+# compile them.
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=$PWD
@@ -33,11 +37,13 @@ usage: ./dev.sh check -p <package> [cargo check arguments]
 The fast loop is deliberately scoped: --workspace/--all and optimized profiles are
 rejected. For tests, select exactly one target with --lib, --bin NAME or --test NAME
 (--doc and --example NAME also count) and normally pass the changed module or test
-name as a filter. `shell` opens an interactive shell in the same VM under the same
-environment the cargo commands get, and holds the VM for as long as it runs. The
-first command boots a vk development VM; by default it powers off after 1800 seconds
-without a cargo command. Set VK_DEV_IDLE_SECS to change the window, or to 0 to keep
-the VM until ./dev.sh stop.
+name as a filter. `shell` opens an interactive shell in the same VM under the cargo
+commands' own environment, and holds the VM for as long as it runs; that VM nests
+where the host allows it and the vk on PATH can ask for it, so the shell can boot
+vk's own microVMs rather than only compile them, keeping their images and boot
+scratch on the guest's disk. The first command boots a vk development VM; by default
+it powers off after 1800 seconds without a cargo command. Set VK_DEV_IDLE_SECS to
+change the window, or to 0 to keep the VM until ./dev.sh stop.
 EOF
   exit 2
 }
@@ -199,9 +205,9 @@ esac
 
 commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 [ -n "$(git status --porcelain 2>/dev/null)" ] && commit="$commit (dirty)"
-# Kept byte-identical to build.sh's BUILD_ENV, mold-linking RUSTFLAGS included: any
-# divergence changes the unit fingerprints and silently stops the two workflows from
-# sharing target/. Change both together.
+# What the cargo modes pass is byte-identical to build.sh's BUILD_ENV, mold-linking
+# RUSTFLAGS included: any divergence changes the unit fingerprints and silently stops the
+# two workflows from sharing target/. Change both together.
 DEV_ENV=(
   HOME=/tmp
   CARGO_HOME=/work/target/.cargo-home
@@ -216,25 +222,60 @@ if [ "$MODE" = shell ]; then
   # which drops the image's cargo/rustup bin directory out of the interactive shell.
   guest_cmd=(/bin/sh)
   what="opening a shell"
+  # A vk run from the shell keeps its image cache and boot scratch on the guest's own
+  # disk. HOME=/tmp above (which vk would otherwise derive both from) is the tmpfs the
+  # agent mounts, capped at half the guest's RAM — an image conversion fills it. Added
+  # in this branch only, so cargo's environment stays byte-identical to build.sh's.
+  DEV_ENV+=(XDG_DATA_HOME=/var/tmp/vk/share XDG_CACHE_HOME=/var/tmp/vk/cache)
 else
   guest_cmd=(cargo "$MODE" "${args[@]}")
   what="running cargo $MODE"
 fi
 
-# Reboot only when the build image's inputs, or the toolchain its base tag tracks, change.
-# rust-toolchain.toml is never COPYed into the image, but update.sh keeps the pinned base
-# tag in sync with it, and the guest toolchain follows it. Source and Cargo manifest edits
-# are shared live at /work and never require a reboot.
-image_stamp=$(sha256sum \
+# Does the host let a guest run guests of its own? `vk run --nested` refuses when it does
+# not, and that must not take the whole dev loop down with it.
+host_nests() {
+  local path
+  for path in /sys/module/kvm_intel/parameters/nested /sys/module/kvm_amd/parameters/nested; do
+    case "$(cat "$path" 2>/dev/null)" in
+      1 | Y | y) return 0 ;;
+    esac
+  done
+  return 1
+}
+# vk inside vk: with --nested the VM gets VMX/SVM and so its own /dev/kvm, which is what
+# lets `./dev.sh shell` build and boot microVMs (./dist/vk run …, ./build.sh) rather than
+# only compile them. Probed rather than assumed: the vk on PATH may predate the flag, and
+# it must still be able to compile the vk that introduces it.
+run_help=$("$VK" run --help 2>&1 || true)
+nested_args=()
+if [[ $run_help == *"--nested"* ]] && host_nests; then
+  nested_args=(--nested)
+fi
+
+# Reboot only when the build image's inputs, the toolchain its base tag tracks, or whether
+# the VM nests, change — a resize (VK_DEV_CPUS/VK_DEV_MEM) deliberately waits for the next
+# boot instead. rust-toolchain.toml is never COPYed into the image, but
+# update.sh keeps the pinned base tag in sync with it, and the guest toolchain follows it.
+# Source and Cargo manifest edits are shared live at /work and never require a reboot.
+# The boot shape is in the stamp so installing a vk that can nest restarts the VM instead
+# of leaving the next shell without a /dev/kvm. It restarts on losing nesting too — the
+# rule is "the shape changed", which is simpler than ranking the two directions.
+image_inputs=$(sha256sum \
   .devcontainer/Dockerfile \
   .devcontainer/apk-pins.txt \
   rust-toolchain.toml | sha256sum | cut -d ' ' -f 1)
-stamp_file="$STATE_DIR/image.stamp"
+vm_stamp=$(printf '%s %s\n' "$image_inputs" "${nested_args[*]}" | sha256sum | cut -d ' ' -f 1)
+stamp_file="$STATE_DIR/vm.stamp"
 lock_state_dir
+# Retire the pre-rename stamp: a state dir is reused and never removed, so image.stamp
+# would otherwise sit beside vm.stamp forever. Delete this line once no dev VM predating
+# the rename can still be around.
+rm -f "$STATE_DIR/image.stamp"
 agent_up=""
 "$VK" status "$STATE_DIR" >/dev/null 2>&1 && agent_up=1
-if [ -n "$agent_up" ] && [ "$(cat "$stamp_file" 2>/dev/null)" != "$image_stamp" ]; then
-  echo "dev.sh: build image inputs changed; restarting the development VM" >&2
+if [ -n "$agent_up" ] && [ "$(cat "$stamp_file" 2>/dev/null)" != "$vm_stamp" ]; then
+  echo "dev.sh: development VM inputs changed; restarting it" >&2
   "$VK" stop "$STATE_DIR" || true
   agent_up=""
 fi
@@ -248,7 +289,7 @@ if [ -z "$agent_up" ]; then
   # --inactivity-timeout, and it must still be able to compile the vk that introduces it.
   # Without the probe that vk fails on the unknown argument and the caller is sent chasing
   # the stuck-lock advice below. Delete this branch once the released vk carries the flag.
-  if [[ $("$VK" run --help 2>&1 || true) != *"--inactivity-timeout"* ]]; then
+  if [[ $run_help != *"--inactivity-timeout"* ]]; then
     echo "dev.sh: the vk on PATH predates --inactivity-timeout, so this VM ignores" >&2
     echo "        VK_DEV_IDLE_SECS and lives until ./dev.sh stop; install a current vk" >&2
     echo "        (./build.sh --fast, then install dist/vk) to get the idle timeout" >&2
@@ -270,14 +311,14 @@ if [ -z "$agent_up" ]; then
       --workdir "$ROOT" \
       --state-dir "$STATE_DIR" \
       --net --cpus "${VK_DEV_CPUS:-host}" --mem "${VK_DEV_MEM:-8G}" --detach \
-      "${lifetime_args[@]}"
+      "${nested_args[@]}" "${lifetime_args[@]}"
   ) 9>&- || {
     echo "dev.sh: the development VM did not start; if a previous one is stuck holding" >&2
     echo "        $STATE_DIR — or one just expired and has not let go yet — clear it" >&2
     echo "        with ./dev.sh stop and retry" >&2
     exit 1
   }
-  printf '%s\n' "$image_stamp" >"$stamp_file"
+  printf '%s\n' "$vm_stamp" >"$stamp_file"
 fi
 exec 9>&-
 
