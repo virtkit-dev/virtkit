@@ -13,6 +13,14 @@ All notable changes to virtkit will be documented in this file.
   that puts the new one in service. `--check` reports whether a newer release is available
   without installing it, exiting 1 when there is one.
 
+### Fixed
+
+- **Asking about a registry store no longer creates one.** `vk registry status` and
+  `vk registry gc` (and `vk-registry status` / `vk-registry gc`) left a store directory tree
+  behind at whatever path they were pointed at — including the default one, on hosts that
+  had never used a registry. They now report an absent store as absent and write nothing,
+  so a mistyped `--root` is visible instead of silently materialized.
+
 ## [0.34.0] - 2026-08-14
 
 ### Added

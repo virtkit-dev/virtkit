@@ -98,16 +98,50 @@ pub struct Store {
 }
 
 impl Store {
+    /// The store at `root`, its layout created if this is the first use — for the write
+    /// paths, and for the in-process build cache, whose reads share the root it pushes to.
+    /// Looking at a store without bringing one into being is [`Store::open`].
     pub fn new(root: PathBuf) -> Result<Self> {
         for sub in ["blobs/sha256", "blobs/zstd", "uploads", "repos"] {
             let p = root.join(sub);
             std::fs::create_dir_all(&p).with_context(|| format!("creating {}", p.display()))?;
         }
-        Ok(Store {
+        Ok(Store::at(root))
+    }
+
+    /// The store at `root` if there is one, creating nothing — for [`status`] and [`gc`],
+    /// which look at a store rather than start one. Asking a host what it has cached must
+    /// not be what gives it a store: a directory tree conjured by a report is one nothing
+    /// will ever write to, under a path the user may only have mistyped. `Ok(None)` when
+    /// nothing is there, which the caller reports as the absence it is; a root that cannot
+    /// be read at all is an error, since reporting it as absent is the same silence.
+    ///
+    /// A store is recognized by `blobs/sha256/`, the first directory [`Store::new`] makes
+    /// and so one every store has — rather than by `root` being a directory, which any
+    /// mistyped `--root` also is, or by `blobs/` alone, which something else may happen to
+    /// carry. What the marker decides is whether this store's lockfile is dropped into a
+    /// directory that is not one.
+    pub fn open(root: &Path) -> Result<Option<Self>> {
+        let marker = root.join("blobs/sha256");
+        match std::fs::metadata(&marker) {
+            // There but not a directory is not a store either.
+            Ok(m) => Ok(m.is_dir().then(|| Store::at(root.to_path_buf()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => {
+                Err(e).with_context(|| format!("looking for a store at {}", marker.display()))
+            }
+        }
+    }
+
+    /// A handle on the store at `root`, whose layout is [`Store::new`]'s to create and
+    /// [`Store::open`]'s to have found.
+    fn at(root: PathBuf) -> Self {
+        Store {
             root,
             next_upload: AtomicU64::new(0),
-        })
+        }
     }
+
     /// Identity blob: the stored bytes ARE the canonical (digested) bytes.
     fn blob_path(&self, hex: &str) -> PathBuf {
         self.root.join("blobs/sha256").join(hex)
@@ -1316,7 +1350,13 @@ fn percent_decode(s: &str) -> String {
 /// `vk registry gc` — collect `root` and print a one-line summary; see
 /// [`Store::gc`] for the retention model.
 pub fn gc(root: PathBuf, retention: Duration, grace: Duration, dry_run: bool) -> Result<()> {
-    let store = Store::new(root)?;
+    let Some(store) = Store::open(&root)? else {
+        println!(
+            "vk registry: gc {}: no store here, nothing to collect",
+            root.display()
+        );
+        return Ok(());
+    };
     let r = store.gc(retention, grace, dry_run)?;
     println!(
         "vk registry: gc {}: {} {} tag(s), {} manifest(s), {} blob(s) ({:.1} MiB), {} upload(s)",
@@ -1335,7 +1375,13 @@ pub fn gc(root: PathBuf, retention: Duration, grace: Duration, dry_run: bool) ->
 /// `root`: on-disk size, dedup savings, and a per-repository breakdown; see
 /// [`Store::stats`].
 pub fn status(root: PathBuf) -> Result<()> {
-    let store = Store::new(root)?;
+    let Some(store) = Store::open(&root)? else {
+        // Not an error: a host that has cached nothing has an empty store by definition,
+        // and `--root` pointed at the wrong place reads as this too — which is why the
+        // path is named rather than the counts printed as zeroes.
+        println!("vk registry: {} — no store here", root.display());
+        return Ok(());
+    };
     let s = store.stats()?;
     let blobs = s.identity_blobs + s.zstd_blobs;
     let blob_bytes = s.identity_bytes + s.zstd_bytes;
@@ -1483,6 +1529,61 @@ pub fn install_service(addr: SocketAddr, root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `status` and `gc` look at a store; they do not bring one into being. A root with no
+    /// store — a fresh host, or a `--root`/`root =` that names the wrong path — has to come
+    /// back reported and still untouched: a tree conjured by a report is one nothing will
+    /// ever write to, and it hides the mistake that produced it. A directory that is not a
+    /// store counts as no store, down to not leaving the lockfile in it.
+    #[test]
+    fn reading_a_store_that_is_not_there_creates_nothing() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // The retention window is zero throughout: on an absent store neither entry point
+        // gets as far as collecting anything, and the one present-store leg is a dry run.
+        let zero = Duration::from_secs(0);
+
+        assert!(Store::open(&dir).unwrap().is_none());
+        status(dir.clone()).unwrap();
+        gc(dir.clone(), zero, zero, false).unwrap();
+        assert!(!dir.exists(), "{} was created by reading it", dir.display());
+
+        // Someone else's directory, named by a mistyped root: reported as no store, and
+        // left exactly as empty as it was.
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(Store::open(&dir).unwrap().is_none());
+        status(dir.clone()).unwrap();
+        gc(dir.clone(), zero, zero, false).unwrap();
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "{} was written to",
+            dir.display()
+        );
+
+        // A directory that carries a `blobs/` of its own is still not a store, and a marker
+        // that is not a directory is not one either.
+        std::fs::create_dir_all(dir.join("blobs")).unwrap();
+        assert!(Store::open(&dir).unwrap().is_none());
+        std::fs::write(dir.join("blobs/sha256"), b"not a store").unwrap();
+        assert!(Store::open(&dir).unwrap().is_none());
+        std::fs::remove_dir_all(dir.join("blobs")).unwrap();
+
+        // A root that cannot be read at all is an error, not one more absence: reporting it
+        // as "no store here" is the silence this distinction exists to remove.
+        std::fs::write(dir.join("a-file"), b"").unwrap();
+        assert!(Store::open(&dir.join("a-file")).is_err());
+        assert!(status(dir.join("a-file")).is_err());
+        std::fs::remove_file(dir.join("a-file")).unwrap();
+
+        // A store that is there is opened as usual — the report is skipped for absence,
+        // not for being empty.
+        let store = Store::new(dir.clone()).unwrap();
+        assert!(Store::open(&store.root).unwrap().is_some());
+        status(dir.clone()).unwrap();
+        gc(dir.clone(), zero, zero, true).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// finish_upload stores a compressible raw blob zstd-compressed (smaller, in the
     /// zstd store) and an incompressible one verbatim (identity store), and find_blob
