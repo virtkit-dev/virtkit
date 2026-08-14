@@ -1487,8 +1487,9 @@ pub fn default_root() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/share/virtkit/registry"))
 }
 
-/// The `systemd --user` unit [`install_service`] writes. Named here because whoever
-/// replaces the binary has to point at the same unit to have the new one served.
+/// The unit name both shapes use — the one [`install_service`] writes, and the one an admin
+/// installs [`system_unit`]'s output as. Named here because whoever replaces the binary has
+/// to point at the same unit to have the new one served, whichever shape it is.
 pub const SERVICE_UNIT: &str = "virtkit-registry.service";
 
 /// What a unit needs to know to run `serve`: the arguments it will pass, and what they mean
@@ -1541,6 +1542,11 @@ impl UnitFacts {
         self.tls
     }
 
+    /// The store something named, or `None` for the per-user default.
+    pub fn named_store(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
     /// The store the server will open, the per-user default included — right for a `--user`
     /// unit, which runs as the user whose default that is.
     pub fn store(&self) -> Result<PathBuf> {
@@ -1580,6 +1586,94 @@ fn unit_path(what: &str, p: &Path) -> Result<String> {
         );
     }
     Ok(format!("\"{s}\""))
+}
+
+/// A hardened **system** unit running `serve` as `account`, for the deployment a `--user`
+/// unit cannot express: machine-wide, started at boot before anyone logs in, and — when the
+/// port needs it — allowed to bind a privileged one.
+///
+/// Returned rather than installed: writing under `/etc` and owning the store are the
+/// admin's, and this binary stays free of any privileged step. The unit it hands back is
+/// the point — the server it starts holds one capability and can write one directory.
+/// `exe` is the installed `vk-registry` the unit should run — the caller's `current_exe`
+/// in practice, a parameter so the check below is exercisable.
+pub fn system_unit(facts: &UnitFacts, account: &str, exe: &Path) -> Result<String> {
+    // The per-user default store is not available to this shape at all: `ProtectHome=`
+    // below hides it, and the installer's home is not the service account's anyway. Ask
+    // for one rather than emitting a unit that cannot start.
+    let store = facts.named_store().context(
+        "a --system unit needs a store of its own: pass --root, or --config naming a file \
+         that sets `root`",
+    )?;
+    // Both paths are reached from inside the namespace `ProtectHome=` sets up, where these
+    // trees are gone — a binary under one fails to exec, and a store under one silently
+    // becomes an empty read-only mount that `Restart=on-failure` then loops on.
+    for (what, p) in [("the binary", exe), ("the store", store)] {
+        if ["/home/", "/root/", "/run/user/"]
+            .iter()
+            .any(|d| p.starts_with(d))
+        {
+            bail!(
+                "{what} is at {} — ProtectHome= puts that out of a system unit's reach; \
+                 install it outside /home, /root and /run/user",
+                p.display()
+            );
+        }
+    }
+    // Binding below 1024 is the one thing an ordinary account cannot do. Granting the
+    // capability only when the port actually needs it keeps the common case at none, and
+    // the bounding set stops any other from ever being acquired either way.
+    let privileged_port = if facts.addr().port() < 1024 {
+        "AmbientCapabilities=CAP_NET_BIND_SERVICE\n\
+         CapabilityBoundingSet=CAP_NET_BIND_SERVICE\n"
+    } else {
+        "CapabilityBoundingSet=\n"
+    };
+    Ok(format!(
+        "[Unit]\n\
+         Description=virtkit OCI registry (shared microVM bundle store)\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         ExecStart={exe} serve {args}\n\
+         Restart=on-failure\n\
+         RestartSec=2\n\
+         LimitNOFILE=1048576\n\
+         \n\
+         User={account}\n\
+         {privileged_port}\
+         NoNewPrivileges=yes\n\
+         \n\
+         ProtectSystem=strict\n\
+         ProtectHome=yes\n\
+         ReadWritePaths={store}\n\
+         PrivateTmp=yes\n\
+         PrivateDevices=yes\n\
+         ProtectClock=yes\n\
+         ProtectControlGroups=yes\n\
+         ProtectHostname=yes\n\
+         ProtectKernelLogs=yes\n\
+         ProtectKernelModules=yes\n\
+         ProtectKernelTunables=yes\n\
+         ProtectProc=invisible\n\
+         RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX\n\
+         RestrictNamespaces=yes\n\
+         RestrictRealtime=yes\n\
+         RestrictSUIDSGID=yes\n\
+         LockPersonality=yes\n\
+         MemoryDenyWriteExecute=yes\n\
+         SystemCallArchitectures=native\n\
+         SystemCallFilter=@system-service\n\
+         SystemCallErrorNumber=EPERM\n\
+         UMask=0077\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        exe = unit_path("the binary", exe)?,
+        args = facts.exec_args()?,
+        store = unit_path("the store", store)?,
+    ))
 }
 
 /// Install + start a `systemd --user` unit running `serve`, so the store comes back with
@@ -1680,6 +1774,147 @@ mod tests {
             banner(root, 2, false, addr),
             "vk-registry: serving /srv/vk-registry [mirror (2 upstream(s))] on http://0.0.0.0:443"
         );
+    }
+
+    /// A system unit runs the server as an account of its own, may write only the store,
+    /// and is allowed to bind a privileged port only when the port it was given is one —
+    /// the capability is what the `--user` unit could never grant, so it must not be
+    /// handed out by default either.
+    #[test]
+    fn a_system_unit_grants_the_port_capability_only_when_the_port_needs_it() {
+        let installed = Path::new("/usr/local/bin/vk-registry");
+        let facts = |addr: &str| {
+            UnitFacts::resolve(
+                None,
+                addr.parse().unwrap(),
+                Some(PathBuf::from("/srv/vk-registry")),
+            )
+            .unwrap()
+        };
+
+        let privileged = system_unit(&facts("0.0.0.0:443"), "vk-registry", installed).unwrap();
+        assert!(
+            privileged.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE\n")
+                && privileged.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE\n"),
+            "{privileged}"
+        );
+
+        // a high port needs none, and the bounding set is emptied rather than left default
+        let plain = system_unit(&facts("127.0.0.1:5000"), "vk-registry", installed).unwrap();
+        assert!(!plain.contains("Ambient"), "{plain}");
+        assert!(plain.contains("CapabilityBoundingSet=\n"), "{plain}");
+
+        // the account is the one asked for, and the store is the only writable path. No
+        // `Group=`: the account's own primary group is whatever `useradd` gave it.
+        let unit = system_unit(&facts("127.0.0.1:5000"), "registry-svc", installed).unwrap();
+        assert!(unit.contains("User=registry-svc\n"), "{unit}");
+        assert!(!unit.contains("Group="), "{unit}");
+        assert!(
+            unit.contains("ReadWritePaths=\"/srv/vk-registry\"\n")
+                && unit.contains("ProtectSystem=strict\n"),
+            "{unit}"
+        );
+        assert!(unit.contains("NoNewPrivileges=yes\n"), "{unit}");
+        // machine-wide, so it is up before anyone logs in
+        assert!(unit.contains("WantedBy=multi-user.target\n"), "{unit}");
+    }
+
+    /// The unit grants exactly the store the server it starts will open. These are two
+    /// separate resolutions, and a unit whose `ReadWritePaths` names anything else is one
+    /// whose store is read-only at runtime — a restart loop rather than an error.
+    #[test]
+    fn a_system_units_writable_path_is_the_store_its_own_exec_line_resolves() {
+        let installed = Path::new("/usr/local/bin/vk-registry");
+        let dir = std::env::temp_dir().join(format!("vk-regserve-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // the flags case: the root in `ExecStart` is the granted one
+        let flags = UnitFacts::resolve(None, "0.0.0.0:443".parse().unwrap(), Some("/srv/a".into()))
+            .unwrap();
+        let unit = system_unit(&flags, "vk-registry", installed).unwrap();
+        assert!(unit.contains("--root \"/srv/a\"\n"), "{unit}");
+        assert!(unit.contains("ReadWritePaths=\"/srv/a\"\n"), "{unit}");
+
+        // the config case: `ExecStart` names only the file, so the granted path has to be
+        // the one that file sets — and the port for the capability comes from it too
+        let cfg = dir.join("registry.toml");
+        std::fs::write(&cfg, "addr = \"0.0.0.0:443\"\nroot = \"/srv/from-file\"\n").unwrap();
+        let configured =
+            UnitFacts::resolve(Some(&cfg), "127.0.0.1:5000".parse().unwrap(), None).unwrap();
+        let unit = system_unit(&configured, "vk-registry", installed).unwrap();
+        assert!(
+            unit.contains(&format!("serve --config \"{}\"\n", cfg.display())),
+            "{unit}"
+        );
+        assert!(
+            unit.contains("ReadWritePaths=\"/srv/from-file\"\n"),
+            "{unit}"
+        );
+        assert!(
+            unit.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE\n"),
+            "{unit}"
+        );
+
+        // a file naming no store leaves the per-user default, which this shape refuses
+        let bare = dir.join("bare.toml");
+        std::fs::write(&bare, "addr = \"0.0.0.0:443\"\n").unwrap();
+        let bare_facts =
+            UnitFacts::resolve(Some(&bare), "127.0.0.1:5000".parse().unwrap(), None).unwrap();
+        let err = format!(
+            "{:#}",
+            system_unit(&bare_facts, "vk-registry", installed).unwrap_err()
+        );
+        assert!(err.contains("--root") && err.contains("`root`"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store or a binary under a home directory cannot be reached from inside the
+    /// namespace `ProtectHome=` sets up, and a path that systemd rewrites -- a `%`
+    /// specifier -- or that ends the argument early -- a quote -- is refused rather than
+    /// written into a file destined for /etc as root.
+    #[test]
+    fn a_system_unit_refuses_what_it_cannot_faithfully_describe() {
+        let installed = Path::new("/usr/local/bin/vk-registry");
+        let port: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let with_root = |r: &str| UnitFacts::resolve(None, port, Some(PathBuf::from(r))).unwrap();
+
+        for home in ["/home/vince/store", "/root/store", "/run/user/1000/store"] {
+            let err = format!(
+                "{:#}",
+                system_unit(&with_root(home), "vk-registry", installed).unwrap_err()
+            );
+            assert!(err.contains("ProtectHome"), "{home}: {err}");
+        }
+        // the binary too, not just the store
+        let err = format!(
+            "{:#}",
+            system_unit(
+                &with_root("/srv/store"),
+                "vk-registry",
+                Path::new("/home/vince/bin/vk-registry")
+            )
+            .unwrap_err()
+        );
+        assert!(
+            err.contains("the binary") && err.contains("ProtectHome"),
+            "{err}"
+        );
+
+        // and what a unit file would read as something other than the path given
+        for bad in [
+            "/srv/100%store",
+            "/srv/a\"b",
+            "/srv/back\\slash",
+            "/srv/it's",
+        ] {
+            let err = format!(
+                "{:#}",
+                system_unit(&with_root(bad), "vk-registry", installed).unwrap_err()
+            );
+            assert!(err.contains("systemd unit"), "{bad}: {err}");
+        }
     }
 
     /// What the unit runs: a config file supersedes the flags rather than joining them, so

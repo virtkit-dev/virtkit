@@ -16,6 +16,12 @@ All notable changes to virtkit will be documented in this file.
   config file `serve` does, instead of carrying an address and store baked in at install
   time — so editing that file is enough to move the server, and what the command reports
   about the one it started follows the TLS the file turns on.
+- **`vk-registry install-service --system` prints a machine-wide unit.** The unit it
+  installs is a `systemd --user` one, which runs as whoever installed it and cannot bind a
+  port below 1024. The printed unit is for a server shared by every runner: an unprivileged
+  account of its own, the store as its only writable path, and permission to bind a
+  privileged port only when the port it was given is one. Install it with your own `sudo`;
+  `vk-registry` itself still asks for no privilege anywhere.
 
 ### Changed
 

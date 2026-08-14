@@ -38,6 +38,9 @@ New workspace member `vk-registry/` = **lib + bin**.
   pull-through relay, and the lock/auth modules.
 - **bin** is a thin CLI (`serve`/`gc`/`status`/`install-service`) over the lib, plus
   `update` (over `vk-selfupdate`) so an operator can move it to a published release.
+  `install-service` covers both shapes it is deployed in: a `systemd --user` unit it
+  installs itself, and — with `--system` — a machine-wide one it prints for an admin to
+  install, running as an unprivileged account with only the store writable.
 
 `vk-driver` gains a path dep on the lib and deletes `regserve.rs`; its in-process
 build-cache backend (`registry.rs` `mod local`) uses only `vk_registry::Store`. One

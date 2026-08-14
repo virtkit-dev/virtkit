@@ -9,11 +9,11 @@
 //! `vk_registry` library, which `vk` also links for its in-process build cache.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use vk_selfupdate::{Outcome, Tool};
 
@@ -51,20 +51,31 @@ enum Cmd {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Install + start a `systemd --user` unit running `serve`, so the store comes back
-    /// with the session (and, after `loginctl enable-linger`, without one).
+    /// Write the unit that runs `serve`: install + start a `systemd --user` one, or with
+    /// `--system` print a machine-wide one for an admin to install. The `--user` unit runs
+    /// as you, on a port you can bind, and comes back with your session (or without one,
+    /// after `loginctl enable-linger`). The `--system` unit runs as an unprivileged account
+    /// of its own, may write only the store, and is allowed to bind a privileged port only
+    /// when the port is one — it is printed, not installed, because creating that account
+    /// and writing under /etc are the admin's step, so nothing here needs root.
     InstallService {
         /// Listen address to bake into the unit; ignored in favour of --config's.
         #[arg(long, default_value = "127.0.0.1:5000", conflicts_with = "config")]
         addr: SocketAddr,
-        /// Store directory to bake into the unit [default:
-        /// $XDG_DATA_HOME/virtkit/registry].
+        /// Store directory to bake into the unit [default: $XDG_DATA_HOME/virtkit/registry,
+        /// which a --system unit may not use].
         #[arg(long, conflicts_with = "config")]
         root: Option<PathBuf>,
         /// The `serve` config file the unit should read — it carries addr/root/TLS/auth, so
         /// it replaces --addr/--root rather than joining them.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Print a hardened machine-wide unit on stdout rather than installing a --user one.
+        #[arg(long)]
+        system: bool,
+        /// The account a --system unit runs as; it has to exist and own the store.
+        #[arg(long, default_value = "vk-registry", requires = "system")]
+        service_user: String,
     },
     /// Report the store's usage and content: on-disk size, dedup savings, and a
     /// per-repository breakdown. Read-only — it creates no store.
@@ -173,9 +184,42 @@ async fn run(cli: Cli) -> Result<()> {
             };
             vk_registry::serve_config(cfg).await
         }
-        Cmd::InstallService { addr, root, config } => {
+        Cmd::InstallService {
+            addr,
+            root,
+            config,
+            system,
+            service_user,
+        } => {
             let facts = vk_registry::UnitFacts::resolve(config.as_deref(), addr, root)?;
-            vk_registry::install_service(&facts)
+            if !system {
+                return vk_registry::install_service(&facts);
+            }
+            // The unit goes to stdout so it can be piped or reviewed; what to do with it
+            // goes to stderr, so a pipe carries only the unit.
+            let exe = std::env::current_exe().context("locating the vk-registry binary")?;
+            print!("{}", vk_registry::system_unit(&facts, &service_user, &exe)?);
+            let unit = vk_registry::SERVICE_UNIT;
+            // `install -d` rather than `chown -R`: on a fresh host there is nothing to own
+            // yet, and `ReadWritePaths=` on a path that does not exist fails the unit's
+            // namespace setup rather than reporting a missing directory. No `--shell`, since
+            // `nologin` is at a different place on each distribution and `--system` accounts
+            // get a non-login one anyway.
+            let store = facts.named_store().unwrap_or(Path::new("")).display();
+            eprintln!("vk-registry: the account it runs as has to exist and own the store:");
+            eprintln!("\n    sudo useradd --system --no-create-home {service_user}");
+            eprintln!("    sudo install -d -o {service_user} -m 0750 {store}");
+            eprintln!("\nvk-registry: then install the unit above as root:");
+            eprintln!(
+                "\n    vk-registry install-service --system{} | \\",
+                match &config {
+                    Some(c) => format!(" --config {}", c.display()),
+                    None => format!(" --root {store}"),
+                }
+            );
+            eprintln!("      sudo tee /etc/systemd/system/{unit}");
+            eprintln!("    sudo systemctl daemon-reload && sudo systemctl enable --now {unit}");
+            Ok(())
         }
         // `--root` first, then the root the `serve` config file names, then the shared
         // default: the same order `serve` resolves them in, so these report on and sweep
@@ -258,28 +302,46 @@ fn restart_hint() {
     // A probe, so systemctl's own diagnostics stay out of an update's output: asked without
     // a user bus to reach — under `sudo`, from cron, inside a container — it reports failing
     // to connect on stderr.
-    let asked = std::process::Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", unit])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    match serving(asked) {
-        // The unit runs the binary that installed it, which need not be the one just
-        // replaced — so name the restart without promising it picks this build up.
-        Serving::Unit => {
-            println!(
-                "vk-registry: {unit} is still serving the build it started as — restart it \
-                 if it runs this binary:"
-            );
-            println!("    systemctl --user restart {unit}");
+    let ask = |scope: &str| {
+        serving(
+            std::process::Command::new("systemctl")
+                .args([scope, "is-active", "--quiet", unit])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status(),
+        )
+    };
+    // Both scopes, because both shapes exist: `install-service --system` installs the unit
+    // machine-wide and the plain form installs it per-user, and the machine-wide one — the
+    // server every runner depends on — is the one an update most has to name.
+    let mut unanswered = false;
+    for (scope, restart) in [
+        ("--system", format!("sudo systemctl restart {unit}")),
+        ("--user", format!("systemctl --user restart {unit}")),
+    ] {
+        match ask(scope) {
+            // The unit runs the binary that installed it, which need not be the one just
+            // replaced — so name the restart without promising it picks this build up.
+            Serving::Unit => {
+                println!(
+                    "vk-registry: {unit} is still serving the build it started as — restart \
+                     it if it runs this binary:"
+                );
+                println!("    {restart}");
+                return;
+            }
+            Serving::Nothing => {}
+            Serving::Unknown => unanswered = true,
         }
-        Serving::Nothing => {}
-        // Nothing was answered, and a server may well be running under something else, so
-        // say what an update needs without naming a unit that was never checked.
-        Serving::Unknown => println!(
+    }
+    // Neither scope said a unit is serving, and at least one could not say anything at all —
+    // a server may well be running where systemd could not be asked about it, so say what an
+    // update needs without naming a unit that was never checked.
+    if unanswered {
+        println!(
             "vk-registry: a server already running keeps serving the previous build until it \
              is restarted"
-        ),
+        );
     }
 }
 
@@ -321,9 +383,10 @@ mod tests {
         assert!(Cli::try_parse_from(["vk-registry", "update", "--check", "--yes"]).is_err());
     }
 
-    // A config file replaces the address and store `install-service` would otherwise bake
-    // into the unit, so asking for both is refused rather than one of them being dropped
-    // from a unit that still claims to describe the other.
+    // `install-service`'s two shapes: a config file replaces the flags it would otherwise
+    // bake in, so asking for both is refused rather than one of them being dropped from a
+    // unit that still claims to describe the other; and the account only a system unit has
+    // cannot be named without asking for that shape.
     #[test]
     fn install_service_refuses_a_config_beside_the_flags_it_replaces() {
         let ok = |args: &[&str]| Cli::try_parse_from(args).is_ok();
@@ -335,7 +398,15 @@ mod tests {
             "--config",
             "/etc/r.toml"
         ]));
+        assert!(ok(&[
+            "vk-registry",
+            "install-service",
+            "--system",
+            "--root",
+            "/srv/s"
+        ]));
 
+        // a config file plus a flag it supersedes
         assert!(!ok(&[
             "vk-registry",
             "install-service",
@@ -351,6 +422,14 @@ mod tests {
             "/etc/r.toml",
             "--addr",
             "0.0.0.0:443"
+        ]));
+        // the service account is meaningless without --system, and a defaulted one does
+        // not trip the requirement
+        assert!(!ok(&[
+            "vk-registry",
+            "install-service",
+            "--service-user",
+            "svc"
         ]));
     }
 
