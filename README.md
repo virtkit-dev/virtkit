@@ -304,7 +304,7 @@ third_party/     vendored libkrun (locally patched — see its VENDOR.md)
 kernel/          guest kernel build (Dockerfile + config fragment)
 build.sh         build the binaries -> dist/
 build-kernel.sh  build the guest kernel -> dist/vmlinux
-dev.sh           crate-scoped check/test in a dev VM that expires when idle
+dev.sh           crate-scoped check/test plus a shell, in a dev VM that expires when idle
 update.sh        bump + re-pin toolchain / base image / apk versions
 ```
 

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# dev.sh — fast, crate-scoped type checking and targeted tests in a shared vk development
-# VM that powers itself off once left idle. The mold-linking RUSTFLAGS and shared target/
-# directory match every build.sh invocation, and the dev profile matches build.sh --fast,
-# so dependency artifacts are reused between the two workflows. The VK_EMBED_* vars
-# build.sh sets are deliberately absent here (they must name an already built agent), so
-# vk-driver's own build script reruns when you alternate the two.
+# dev.sh — fast, crate-scoped type checking, targeted tests and an interactive shell in a
+# shared vk development VM that powers itself off once left idle. The mold-linking
+# RUSTFLAGS and shared target/ directory match every build.sh invocation, and the dev
+# profile matches build.sh --fast, so dependency artifacts are reused between the two
+# workflows. The VK_EMBED_* vars build.sh sets are deliberately absent here (they must
+# name an already built agent), so vk-driver's own build script reruns when you alternate
+# the two.
 #
 # Examples:
 #   ./dev.sh check -p vk-core
@@ -12,10 +13,12 @@
 #   ./dev.sh test -p vk-core --lib dockerignore::tests
 #   ./dev.sh test -p vk-core --test exec disconnect_kills_remote_process
 #   ./dev.sh test -p vk-driver --bin vk atop_view::tests
+#   ./dev.sh shell
 #   ./dev.sh stop
 #
 # VK_DEV_CPUS / VK_DEV_MEM size the VM (default: host cpus, 8G). VK_DEV_IDLE_SECS sets how
-# long it survives without a cargo command (default: 1800, 0 = until ./dev.sh stop).
+# long it survives with no cargo command or open shell (default: 1800, 0 = until
+# ./dev.sh stop).
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=$PWD
@@ -24,14 +27,17 @@ usage() {
   cat >&2 <<'EOF'
 usage: ./dev.sh check -p <package> [cargo check arguments]
        ./dev.sh test  -p <package> <target> [test filter]
+       ./dev.sh shell
        ./dev.sh stop
 
 The fast loop is deliberately scoped: --workspace/--all and optimized profiles are
 rejected. For tests, select exactly one target with --lib, --bin NAME or --test NAME
 (--doc and --example NAME also count) and normally pass the changed module or test
-name as a filter. The first command boots a vk development VM; by default it powers
-off after 1800 seconds without a cargo command. Set VK_DEV_IDLE_SECS to change the
-window, or to 0 to keep the VM until ./dev.sh stop.
+name as a filter. `shell` opens an interactive shell in the same VM under the same
+environment the cargo commands get, and holds the VM for as long as it runs. The
+first command boots a vk development VM; by default it powers off after 1800 seconds
+without a cargo command. Set VK_DEV_IDLE_SECS to change the window, or to 0 to keep
+the VM until ./dev.sh stop.
 EOF
   exit 2
 }
@@ -65,7 +71,21 @@ lock_state_dir() {
 
 MODE=${1:-}
 case "$MODE" in
-  check|test) shift ;;
+  check | test)
+    shift
+    [ "$#" -gt 0 ] || usage
+    ;;
+  shell)
+    shift
+    [ "$#" -eq 0 ] || usage
+    # The remote pty needs -t, which vk exec only accepts with both local ends on a
+    # terminal; and a shell reading a redirected stdin would exit before the caller
+    # could type into it.
+    { [ -t 0 ] && [ -t 1 ]; } || {
+      echo "dev.sh: shell needs a terminal on stdin and stdout" >&2
+      exit 1
+    }
+    ;;
   stop)
     shift
     [ "$#" -eq 0 ] || usage
@@ -82,7 +102,6 @@ case "$MODE" in
     ;;
   *) usage ;;
 esac
-[ "$#" -gt 0 ] || usage
 args=("$@")
 
 # Keep accidental broad or optimized invocations out of the edit loop. CI and release
@@ -112,57 +131,65 @@ note_test_target() {
   has_test_target=1
 }
 
-for ((i = 0; i < ${#args[@]}; i++)); do
-  arg=${args[$i]}
-  # Everything past a bare `--` is the test binary's own argv, not cargo's: libtest
-  # has flags of its own (`--test`, `--lib`) that must not read as target selection.
-  if [ "$arg" = -- ]; then
-    break
+# Vets one cargo invocation's arguments and exits non-zero on anything out of scope; reads
+# $MODE for the test-only rules and accumulates into has_package/has_test_target, so it is
+# called once per run.
+check_cargo_args() {
+  local argv=("$@") i arg
+  for ((i = 0; i < ${#argv[@]}; i++)); do
+    arg=${argv[$i]}
+    # Everything past a bare `--` is the test binary's own argv, not cargo's: libtest
+    # has flags of its own (`--test`, `--lib`) that must not read as target selection.
+    if [ "$arg" = -- ]; then
+      break
+    fi
+    case "$arg" in
+      --workspace | --all)
+        reject "$arg is intentionally disabled; select an affected package with -p"
+        ;;
+      -r | --release)
+        reject "release builds are intentionally disabled; use ./build.sh when shipping"
+        ;;
+      --profile)
+        [ $((i + 1)) -lt ${#argv[@]} ] || usage
+        check_profile "${argv[$((i + 1))]}"
+        ;;
+      --profile=*) check_profile "${arg#--profile=}" ;;
+      -p | --package)
+        [ $((i + 1)) -lt ${#argv[@]} ] || usage
+        check_package_spec "${argv[$((i + 1))]}"
+        has_package=1
+        ;;
+      --package=*)
+        check_package_spec "${arg#--package=}"
+        has_package=1
+        ;;
+      # cargo's attached short form, e.g. -pvk-core.
+      -p?*)
+        check_package_spec "${arg#-p}"
+        has_package=1
+        ;;
+      --lib | --doc | --bin | --bin=* | --test | --test=* | --example | --example=*)
+        note_test_target
+        ;;
+      --all-targets | --bins | --tests | --benches | --examples)
+        if [ "$MODE" = test ]; then
+          reject "$arg is too broad for the edit loop; select one --lib, --bin or --test target"
+        fi
+        ;;
+    esac
+  done
+  [ -n "$has_package" ] || {
+    echo "dev.sh: select the affected package with -p/--package" >&2
+    exit 2
+  }
+  if [ "$MODE" = test ] && [ -z "$has_test_target" ]; then
+    echo "dev.sh: select one test target with --lib, --bin NAME, or --test NAME" >&2
+    exit 2
   fi
-  case "$arg" in
-    --workspace | --all)
-      reject "$arg is intentionally disabled; select an affected package with -p"
-      ;;
-    -r | --release)
-      reject "release builds are intentionally disabled; use ./build.sh when shipping"
-      ;;
-    --profile)
-      [ $((i + 1)) -lt ${#args[@]} ] || usage
-      check_profile "${args[$((i + 1))]}"
-      ;;
-    --profile=*) check_profile "${arg#--profile=}" ;;
-    -p | --package)
-      [ $((i + 1)) -lt ${#args[@]} ] || usage
-      check_package_spec "${args[$((i + 1))]}"
-      has_package=1
-      ;;
-    --package=*)
-      check_package_spec "${arg#--package=}"
-      has_package=1
-      ;;
-    # cargo's attached short form, e.g. -pvk-core.
-    -p?*)
-      check_package_spec "${arg#-p}"
-      has_package=1
-      ;;
-    --lib | --doc | --bin | --bin=* | --test | --test=* | --example | --example=*)
-      note_test_target
-      ;;
-    --all-targets | --bins | --tests | --benches | --examples)
-      if [ "$MODE" = test ]; then
-        reject "$arg is too broad for the edit loop; select one --lib, --bin or --test target"
-      fi
-      ;;
-  esac
-done
-[ -n "$has_package" ] || {
-  echo "dev.sh: select the affected package with -p/--package" >&2
-  exit 2
 }
-if [ "$MODE" = test ] && [ -z "$has_test_target" ]; then
-  echo "dev.sh: select one test target with --lib, --bin NAME, or --test NAME" >&2
-  exit 2
-fi
+# `shell` takes no cargo arguments to vet; every other mode is a cargo invocation.
+[ "$MODE" = shell ] || check_cargo_args "${args[@]}"
 # Checked on every invocation, not just the one that boots: a typo should surface before it
 # has waited for the VM lock. `:-` already substituted for an empty value.
 idle_secs=${VK_DEV_IDLE_SECS:-1800}
@@ -184,7 +211,15 @@ DEV_ENV=(
   "CFLAGS_x86_64_unknown_linux_musl=-ffile-prefix-map=/work=/src -ffile-prefix-map=/work/target/.cargo-home=/cargo"
   "VK_GIT_COMMIT=$commit"
 )
-cargo_cmd=(cargo "$MODE" "${args[@]}")
+if [ "$MODE" = shell ]; then
+  # Not a login shell: Alpine's /etc/profile overwrites PATH with the system default,
+  # which drops the image's cargo/rustup bin directory out of the interactive shell.
+  guest_cmd=(/bin/sh)
+  what="opening a shell"
+else
+  guest_cmd=(cargo "$MODE" "${args[@]}")
+  what="running cargo $MODE"
+fi
 
 # Reboot only when the build image's inputs, or the toolchain its base tag tracks, change.
 # rust-toolchain.toml is never COPYed into the image, but update.sh keeps the pinned base
@@ -246,12 +281,13 @@ if [ -z "$agent_up" ]; then
 fi
 exec 9>&-
 
-# -t keeps cargo's colour and progress rendering; vk exec requires both local stdin and
-# stdout to be terminals for it.
+# -t keeps cargo's colour and progress rendering, and is what makes the shell usable at
+# all; vk exec requires both local stdin and stdout to be terminals for it, which `shell`
+# has already insisted on.
 exec_args=(--user dev --dir /work)
 if [ -t 0 ] && [ -t 1 ]; then
   exec_args+=(-t)
 fi
 for entry in "${DEV_ENV[@]}"; do exec_args+=(--env "$entry"); done
-echo "dev.sh: running cargo $MODE in the development VM" >&2
-exec "$VK" exec "$STATE_DIR" "${exec_args[@]}" -- "${cargo_cmd[@]}"
+echo "dev.sh: $what in the development VM" >&2
+exec "$VK" exec "$STATE_DIR" "${exec_args[@]}" -- "${guest_cmd[@]}"
