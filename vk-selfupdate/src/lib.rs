@@ -67,6 +67,18 @@ pub struct Tool {
     pub version: &'static str,
 }
 
+/// What [`Tool::update`] did, for a caller with something to add afterwards: the binary on
+/// disk changing is not the same as the change taking effect.
+#[derive(Clone, Copy, Debug)]
+pub enum Outcome {
+    /// the release is the version already installed; nothing was written
+    AlreadyCurrent,
+    /// the user declined at the confirmation prompt; nothing was written
+    Declined,
+    /// the release build is now the binary on disk
+    Installed,
+}
+
 /// The subset of GitHub's release JSON we read.
 #[derive(serde::Deserialize)]
 struct ApiRelease {
@@ -128,8 +140,9 @@ struct Plan {
 
 impl Tool {
     /// Move this binary to `tag`'s release build, or to the latest release when no tag is
-    /// given. Prompts before replacing it unless `assume_yes`.
-    pub async fn update(&self, tag: Option<&str>, assume_yes: bool) -> Result<()> {
+    /// given. Prompts before replacing it unless `assume_yes`; the [`Outcome`] says whether
+    /// anything was written.
+    pub async fn update(&self, tag: Option<&str>, assume_yes: bool) -> Result<Outcome> {
         let plan = self.plan(API, tag).await?;
         if plan.step == Step::Same {
             println!(
@@ -138,7 +151,7 @@ impl Tool {
                 self.version,
                 plan.exe.display()
             );
-            return Ok(());
+            return Ok(Outcome::AlreadyCurrent);
         }
         // The download lands in the installed binary's own directory, so publishing it is
         // a rename on the same filesystem rather than a copy.
@@ -164,13 +177,13 @@ impl Tool {
         eprintln!("  replacing {}", plan.exe.display());
         if !assume_yes && !self.confirm()? {
             eprintln!("update cancelled");
-            return Ok(());
+            return Ok(Outcome::Declined);
         }
 
         self.install(&plan.client, &plan.target, &plan.exe, dir)
             .await?;
         println!("{} updated to {}", self.name, plan.target.tag);
-        Ok(())
+        Ok(Outcome::Installed)
     }
 
     /// Report how the release `tag` names — or the latest one when no tag is given —

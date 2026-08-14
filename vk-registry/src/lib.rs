@@ -1419,6 +1419,10 @@ pub fn default_root() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/share/virtkit/registry"))
 }
 
+/// The `systemd --user` unit [`install_service`] writes. Named here because whoever
+/// replaces the binary has to point at the same unit to have the new one served.
+pub const SERVICE_UNIT: &str = "virtkit-registry.service";
+
 /// Install + start a `systemd --user` unit running `registry serve` with this
 /// `addr`/`root`, so the shared store survives logout and reboots.
 pub fn install_service(addr: SocketAddr, root: &Path) -> Result<()> {
@@ -1433,7 +1437,7 @@ pub fn install_service(addr: SocketAddr, root: &Path) -> Result<()> {
     let unit_dir = cfg_home.join("systemd/user");
     std::fs::create_dir_all(&unit_dir)
         .with_context(|| format!("creating {}", unit_dir.display()))?;
-    let unit_path = unit_dir.join("virtkit-registry.service");
+    let unit_path = unit_dir.join(SERVICE_UNIT);
     let unit = format!(
         "[Unit]\n\
          Description=virtkit local OCI registry (shared microVM bundle store)\n\
@@ -1463,9 +1467,9 @@ pub fn install_service(addr: SocketAddr, root: &Path) -> Result<()> {
         Ok(())
     };
     run(&["daemon-reload"])?;
-    run(&["enable", "--now", "virtkit-registry.service"])?;
+    run(&["enable", "--now", SERVICE_UNIT])?;
     println!(
-        "virtkit: virtkit-registry.service enabled + started (http://{addr}, store {})",
+        "virtkit: {SERVICE_UNIT} enabled + started (http://{addr}, store {})",
         root.display()
     );
     println!(

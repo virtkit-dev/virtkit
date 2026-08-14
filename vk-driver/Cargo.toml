@@ -18,8 +18,7 @@ vk-core = { path = "../vk-core" }
 # the content-addressed OCI store + helpers, shared with the standalone vk-registry
 # daemon; vk links it for its in-process build cache (registry.rs `mod local`).
 vk-registry = { path = "../vk-registry" }
-# `vk update`: the release-install path, factored out so the vk-registry binary can reuse
-# the same gates.
+# `vk update`: the release-install path, shared with the vk-registry binary.
 vk-selfupdate = { path = "../vk-selfupdate" }
 # thread-pool: the virtiofsd daemon's optional request worker pool
 futures = { workspace = true, features = ["thread-pool"] }

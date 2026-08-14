@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk-registry update`.** Upgrade the registry server in place from its GitHub releases —
+  the latest by default, or the version you name — with the same checks `vk update` makes:
+  it shows what it will install and asks first (`--yes` for unattended use). A server
+  already running keeps serving the build it started as, so the command names the restart
+  that puts the new one in service. `--check` reports whether a newer release is available
+  without installing it, exiting 1 when there is one.
+
 ## [0.34.0] - 2026-08-14
 
 ### Added

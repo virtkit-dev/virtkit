@@ -10,11 +10,12 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{ExitCode, Stdio};
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use vk_selfupdate::{Outcome, Tool};
 
 // Match vk-driver: jemalloc under musl (the glibc allocator fragments on the
 // long-lived, many-small-allocation server workload).
@@ -81,7 +82,36 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Replace this `vk-registry` with a GitHub release build — the latest release, or
+    /// the VERSION given. Prints what it is about to install and asks before touching
+    /// anything; the download is checked against the digest published beside it and must
+    /// report its own version before it replaces the running binary. Needs write access
+    /// to the directory `vk-registry` is installed in. A server already running keeps
+    /// serving the build it started as, so restart its unit to pick this one up.
+    /// `--check` only reports what is available, downloading nothing. Exit: 0 up to date,
+    /// installed, or declined at the prompt; 1 a newer release is available (`--check`);
+    /// 2 the update or check itself failed.
+    Update {
+        /// release to install, `0.33.0` or `v0.33.0` (default: the latest release).
+        /// An older version downgrades, which `--check` does not report as an update
+        /// available.
+        version: Option<String>,
+        /// skip the confirmation prompt (for unattended use)
+        #[arg(short = 'y', long, conflicts_with = "check")]
+        yes: bool,
+        /// report whether a newer release is available and exit — download nothing,
+        /// install nothing (exit 1 when there is one)
+        #[arg(long)]
+        check: bool,
+    },
 }
+
+/// This binary as `update` replaces it: the release asset `vk-registry` ships as, and
+/// the version this build was made from.
+const TOOL: Tool = Tool {
+    name: "vk-registry",
+    version: env!("CARGO_PKG_VERSION"),
+};
 
 /// Resolve an optional `--root` to a store directory, defaulting to the shared
 /// virtkit store location.
@@ -91,17 +121,29 @@ fn resolve_root(root: Option<PathBuf>) -> Result<PathBuf> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    // Install the rustls crypto backend for the relay's HTTPS client (the workspace
-    // builds reqwest with rustls-no-provider), matching vk-driver.
+    // Install the rustls crypto backend both HTTPS clients here need — the relay's and
+    // `update`'s (the workspace builds reqwest with rustls-no-provider), matching vk-driver.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
+    // `update` reads no store and owns its own exit codes, so it is handled before the
+    // dispatch below rather than inside it.
+    if let Cmd::Update {
+        version,
+        yes,
+        check,
+    } = &cli.cmd
+    {
+        return update(version.as_deref(), *yes, *check).await;
+    }
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("vk-registry: {e:#}");
-            ExitCode::FAILURE
-        }
+        Err(e) => fail(&e, 1),
     }
+}
+
+fn fail(e: &anyhow::Error, code: u8) -> ExitCode {
+    eprintln!("vk-registry: {e:#}");
+    ExitCode::from(code)
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -131,5 +173,149 @@ async fn run(cli: Cli) -> Result<()> {
                 dry_run,
             )
         }
+        // handled in `main`, before this dispatch
+        Cmd::Update { .. } => unreachable!("update is handled in main"),
+    }
+}
+
+/// `vk-registry update`: install a release build over this binary, or report what is
+/// available with `--check`. Errors exit 2 throughout, leaving 1 to mean `--check` found
+/// a newer release — so a script can branch on "an update is available" without reading
+/// it as failure.
+async fn update(version: Option<&str>, yes: bool, check: bool) -> ExitCode {
+    if check {
+        return match TOOL.check(version).await {
+            Ok(false) => ExitCode::SUCCESS,
+            Ok(true) => ExitCode::from(1),
+            Err(e) => fail(&e, 2),
+        };
+    }
+    match TOOL.update(version, yes).await {
+        Ok(Outcome::Installed) => {
+            restart_hint();
+            ExitCode::SUCCESS
+        }
+        // Up to date or declined: nothing was written, so there is nothing to restart.
+        // Named rather than caught, so a fourth outcome has to be decided here too.
+        Ok(Outcome::AlreadyCurrent | Outcome::Declined) => ExitCode::SUCCESS,
+        Err(e) => fail(&e, 2),
+    }
+}
+
+/// What the probe below can come back with: the unit is serving, nothing is, or systemd
+/// could not be asked at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Serving {
+    Unit,
+    Nothing,
+    Unknown,
+}
+
+/// `systemctl --user is-active`'s verdict: 0 the unit is serving, 3 it is stopped, 4 there
+/// is no such unit — the last two are answers, and both mean there is nothing to restart.
+/// Anything else is not an answer: no systemd to ask, no `systemctl` to ask it with, or a
+/// probe killed before it replied.
+fn serving(asked: std::io::Result<std::process::ExitStatus>) -> Serving {
+    match asked.map(|s| s.code()) {
+        Ok(Some(0)) => Serving::Unit,
+        Ok(Some(3 | 4)) => Serving::Nothing,
+        _ => Serving::Unknown,
+    }
+}
+
+/// Name the restart a running server needs. The install is a rename, so a `serve` already
+/// under way holds the inode it started from and goes on answering from the old build —
+/// which is the point (an update never interrupts a pull), but leaves the operator with a
+/// step to take.
+fn restart_hint() {
+    let unit = vk_registry::SERVICE_UNIT;
+    // A probe, so systemctl's own diagnostics stay out of an update's output: asked without
+    // a user bus to reach — under `sudo`, from cron, inside a container — it reports failing
+    // to connect on stderr.
+    let asked = std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", unit])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match serving(asked) {
+        // The unit runs the binary that installed it, which need not be the one just
+        // replaced — so name the restart without promising it picks this build up.
+        Serving::Unit => {
+            println!(
+                "vk-registry: {unit} is still serving the build it started as — restart it \
+                 if it runs this binary:"
+            );
+            println!("    systemctl --user restart {unit}");
+        }
+        Serving::Nothing => {}
+        // Nothing was answered, and a server may well be running under something else, so
+        // say what an update needs without naming a unit that was never checked.
+        Serving::Unknown => println!(
+            "vk-registry: a server already running keeps serving the previous build until it \
+             is restarted"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `vk-registry update` CLI shape: the version is an optional positional (absent =
+    // latest), `-y` is a flag rather than the version, and `--check` (which installs
+    // nothing) cannot be combined with the flag that skips the install prompt.
+    #[test]
+    fn update_cli_takes_optional_version_and_yes() {
+        let cli = Cli::try_parse_from(["vk-registry", "update"]).unwrap();
+        let Cmd::Update {
+            version,
+            yes,
+            check,
+        } = cli.cmd
+        else {
+            panic!("expected Cmd::Update")
+        };
+        assert_eq!(version, None);
+        assert!(!yes && !check);
+
+        let cli = Cli::try_parse_from(["vk-registry", "update", "-y", "v0.33.0"]).unwrap();
+        let Cmd::Update { version, yes, .. } = cli.cmd else {
+            panic!("expected Cmd::Update")
+        };
+        assert_eq!(version.as_deref(), Some("v0.33.0"));
+        assert!(yes);
+
+        let cli = Cli::try_parse_from(["vk-registry", "update", "--check", "0.33.0"]).unwrap();
+        let Cmd::Update { version, check, .. } = cli.cmd else {
+            panic!("expected Cmd::Update")
+        };
+        assert_eq!(version.as_deref(), Some("0.33.0"));
+        assert!(check);
+
+        assert!(Cli::try_parse_from(["vk-registry", "update", "--check", "--yes"]).is_err());
+    }
+
+    // The unit is named only for the one code that says it is serving. A probe that came
+    // back with no answer at all must not be read as "nothing to restart": a server may be
+    // running where systemd could not be asked about it.
+    #[test]
+    fn only_a_unit_that_answers_that_it_runs_is_named() {
+        use std::os::unix::process::ExitStatusExt;
+        // `from_raw` takes a wait status, where the exit code is the second byte.
+        let exited = |code: i32| Ok(std::process::ExitStatus::from_raw(code << 8));
+        assert_eq!(serving(exited(0)), Serving::Unit);
+        // stopped, and no such unit: both answer that nothing is serving
+        assert_eq!(serving(exited(3)), Serving::Nothing);
+        assert_eq!(serving(exited(4)), Serving::Nothing);
+        // no user bus to ask over, killed mid-probe, and no `systemctl` to run at all
+        assert_eq!(serving(exited(1)), Serving::Unknown);
+        assert_eq!(
+            serving(Ok(std::process::ExitStatus::from_raw(libc::SIGKILL))),
+            Serving::Unknown
+        );
+        assert_eq!(
+            serving(Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+            Serving::Unknown
+        );
     }
 }

@@ -42,7 +42,7 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with six crates:
   GitHub release, check the download against the digest published beside it, smoke-test it,
   and rename it over the running binary. Parameterized by tool so every one of them passes
   the same gates; the caller supplies only which asset it is and what version it was built
-  as. `vk` is the caller today.
+  as. `vk` and the `vk-registry` binary are the callers.
 - **`vk-runnerctl/`** — the only component that runs as root, and deliberately the smallest:
   it sets gitlab-runner's `concurrent` from a number unprivileged `vk` leaves in a file,
   clamped into a range only root can configure. It takes no arguments and no paths from its

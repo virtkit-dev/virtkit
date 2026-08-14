@@ -4600,6 +4600,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "vk-selfupdate",
  "zstd",
 ]
 

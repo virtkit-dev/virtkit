@@ -1621,8 +1621,10 @@ async fn cli_main() -> ExitCode {
                 Err(e) => fail(&e, 2),
             };
         }
+        // Whichever way it went is already reported; `vk` has nothing to add, since the
+        // rename leaves running VMs on the binary they booted from.
         return match VK.update(version.as_deref(), *yes).await {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(_) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 2),
         };
     }

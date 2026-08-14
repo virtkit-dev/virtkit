@@ -36,7 +36,8 @@ New workspace member `vk-registry/` = **lib + bin**.
   `zstd_with_size`, `ZSTD_LEVEL`, `TRANSPARENT_ZSTD_HEADER`), moved out of
   `vk-driver/src/regserve.rs`, plus the hyper server, the OCI v2 route table, the
   pull-through relay, and the lock/auth modules.
-- **bin** is a thin CLI (`serve`/`gc`/`status`/`install-service`) over the lib.
+- **bin** is a thin CLI (`serve`/`gc`/`status`/`install-service`) over the lib, plus
+  `update` (over `vk-selfupdate`) so an operator can move it to a published release.
 
 `vk-driver` gains a path dep on the lib and deletes `regserve.rs`; its in-process
 build-cache backend (`registry.rs` `mod local`) uses only `vk_registry::Store`. One
