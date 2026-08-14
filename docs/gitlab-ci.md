@@ -111,7 +111,10 @@ job's plain GitLab `image:` is read the same way):
   A service sizes its own guest with an `x-virtkit: { cpus:, mem: }` marker
   (default 2 vCPUs / 1G), clamped to the host `[vm] max_cpus`/`max_mem` ceilings
   like the job's own `MICROVM_CPUS`/`MICROVM_MEM`; the primary keeps following
-  those job variables.
+  those job variables. `x-virtkit: { nested: true }` is refused when the fleet
+  loads, primary or sibling: nesting reaches host KVM, so it is the runner's
+  decision rather than a job's, the same way the executor never hands a job the
+  guest PMU.
 
 ```yaml
 my-job:

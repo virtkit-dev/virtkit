@@ -16,6 +16,13 @@ All notable changes to virtkit will be documented in this file.
   guests); on the cloud-hypervisor backend a guest nests whenever the host allows it, flag
   or no flag.
 
+- **A compose service can nest on its own.** `x-virtkit: { nested: true }` gives one service
+  its own `/dev/kvm`, so a fleet can hold a builder that nests beside ordinary services that
+  do not — honored the same whether the service runs as the `--primary` VM or as a
+  background sibling. A host that disallows nesting refuses the boot. CI fleets cannot ask
+  for it: a job-authored compose file reaching host KVM is the runner's decision, not a
+  job's.
+
 - **`vk-registry update`.** Upgrade the registry server in place from its GitHub releases —
   the latest by default, or the version you name — with the same checks `vk update` makes:
   it shows what it will install and asks first (`--yes` for unattended use). A server

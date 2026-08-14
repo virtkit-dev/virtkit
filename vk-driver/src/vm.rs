@@ -792,6 +792,7 @@ fn load_compose_fleet(ctx: &JobCtx, spec: &str) -> Result<ComposeFleet> {
                 unit.name
             );
         }
+        refuse_job_nesting(unit)?;
         if let crate::compose::Source::Build {
             context,
             dockerfiles,
@@ -1823,6 +1824,24 @@ fn vm_size(ctx: &JobCtx) -> Result<(u32, String)> {
 /// (vm.max_cpus/max_mem, defaulting to the base values) — a committed compose file must
 /// not size a service past what the runner's config lets a job declare. Silent, like
 /// `vm_size`; an undeclared axis stays `None` (the service default), not the job base.
+/// Nesting widens the guest's attack surface on host KVM (see `VmSpec::nested`), so it is the
+/// runner's call and not a job-authored compose file's — the same reason the executor never
+/// hands a job the PMU. Refused rather than quietly cleared: a fleet that asked for a nesting
+/// builder must not look like it got one, and on the cloud-hypervisor backend clearing the
+/// flag would not mask VMX/SVM anyway. Refused where the fleet loads, so it covers the
+/// primary as well as the siblings and the error reaches the job from `prepare` rather than
+/// only the supervisor's log.
+fn refuse_job_nesting(unit: &crate::compose::Unit) -> Result<()> {
+    if unit.nested {
+        bail!(
+            "compose service {:?}: x-virtkit.nested is not available on the GitLab executor — \
+             nesting is the runner's decision, not a job's",
+            unit.name
+        );
+    }
+    Ok(())
+}
+
 fn clamp_service_size(cfg: &crate::config::Config, unit: &mut crate::compose::Unit) -> Result<()> {
     let vm = &cfg.vm;
     if let Some(n) = unit.cpus {
@@ -2543,6 +2562,33 @@ mod tests {
         let mut unit = service("");
         clamp_service_size(&ctx.cfg, &mut unit).unwrap();
         assert_eq!((unit.cpus, unit.mem), (None, None));
+    }
+
+    /// A job-authored fleet cannot grant itself host KVM. Checked where the fleet loads, so
+    /// it covers the primary as well as the siblings — `compose_service_units` drops the
+    /// primary, so a later per-service pass would let `compose:file#builder` nest silently.
+    #[test]
+    fn a_job_authored_fleet_cannot_ask_to_nest() {
+        let service = |marker: &str| {
+            crate::compose::parse(
+                &format!("services:\n  db:\n    image: x\n{marker}"),
+                std::path::Path::new("/b"),
+                &|_| None,
+            )
+            .unwrap()
+            .pop()
+            .unwrap()
+        };
+        let err = refuse_job_nesting(&service("    x-virtkit: { nested: true }\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not available on the GitLab executor"),
+            "{err}"
+        );
+        // declaring it off is not a request, and neither is leaving it out
+        refuse_job_nesting(&service("    x-virtkit: { nested: false }\n")).unwrap();
+        refuse_job_nesting(&service("")).unwrap();
     }
 
     #[test]

@@ -51,6 +51,9 @@ pub struct Provisioned {
     /// `[vm] max_*` ceilings by the executor before it reaches here.
     pub cpus: Option<u32>,
     pub mem: Option<String>,
+    /// Whether this service's guest gets VMX/SVM and so a `/dev/kvm` of its own (its
+    /// compose `x-virtkit.nested`). Uniform with the primary path.
+    pub nested: bool,
 }
 
 /// What a service guest gets when its unit declares no size — the shape every
@@ -257,6 +260,7 @@ pub fn provisioned(
         egress_allow_name_req: service_egress_req(&unit.environment, "MICROVM_EGRESS_ALLOW_NAME"),
         cpus: unit.cpus,
         mem: unit.mem.clone(),
+        nested: unit.nested,
     })
 }
 
@@ -497,7 +501,9 @@ pub fn boot_unit(
             // an image (stock) kernel keeps serial via the VIRTKIT_KERNEL=image token.
             console_serial: false,
             pmu: false,
-            nested: false,
+            // This service's own `x-virtkit.nested` — a sibling that is itself a
+            // hypervisor gets VMX/SVM; every other one keeps it masked.
+            nested: svc.nested,
             api_socket: None,
             pass_fds: Vec::new(),
             proc_name: crate::vmm::resolve_proc_name(&svc.name),

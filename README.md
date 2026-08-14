@@ -49,6 +49,13 @@ Give a VM internet access with a flag. Pass `--net` and the VM can reach the
 network. There are no bridges, tap devices, or firewall rules to set up on the
 host, and it doesn't need privileges.
 
+Run microVMs inside a microVM. `vk run --nested` gives the guest its own
+`/dev/kvm`, so it can build and boot images instead of only compiling them. The
+host has to allow nesting (`kvm_intel.nested` / `kvm_amd.nested`), which the
+flag checks before pulling or building anything. Off by default and for trusted
+guests only — the guest reaches host KVM's nested paths. In compose, a service
+picks this per service with an `x-virtkit: { nested: true }` marker.
+
 Run compose services as VMs. `vk run --compose compose.yml` boots the services
 (redis, mysql, and so on) on a shared network where each one resolves by name.
 You can run them alongside your command, as the primary itself (`--primary`,

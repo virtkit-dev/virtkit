@@ -72,6 +72,10 @@ pub struct Unit {
     /// This unit's guest RAM (compose `x-virtkit.mem`, `<n>G`/`<n>M`/MiB), applied
     /// identically primary or sibling; `None` = the consumer's default.
     pub mem: Option<String>,
+    /// Whether this unit's guest runs microVMs of its own (compose `x-virtkit.nested`),
+    /// applied identically primary or sibling — a service that is itself a hypervisor
+    /// (a vk builder, a nested test runner). `false` = no nesting, the default.
+    pub nested: bool,
 }
 
 /// Where a unit's image comes from.
@@ -493,13 +497,14 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
     };
     // The per-service axes (compose `x-virtkit`): absent key/subkey = the defaults,
     // so an unmarked service keeps today's agent-as-PID1 pinned-kernel 2-vCPU/1G boot.
-    let (init, kernel, cpus, mem) = match svc.x_virtkit {
-        Some(x) => (x.init()?, x.kernel()?, x.cpus()?, x.mem()?),
+    let (init, kernel, cpus, mem, nested) = match svc.x_virtkit {
+        Some(x) => (x.init()?, x.kernel()?, x.cpus()?, x.mem()?, x.nested()?),
         None => (
             crate::run::InitSource::Default,
             crate::run::KernelSource::Default,
             None,
             None,
+            false,
         ),
     };
     Ok(Unit {
@@ -517,6 +522,7 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
         kernel,
         cpus,
         mem,
+        nested,
     })
 }
 
@@ -743,7 +749,8 @@ struct ComposeService {
 
 /// The `x-virtkit` per-service marker: the init/kernel axes as compose strings,
 /// parsed into [`crate::run::InitSource`] / [`crate::run::KernelSource`], plus the
-/// guest sizing (`cpus`/`mem`). An absent subkey defaults to `Default`/unset.
+/// guest sizing (`cpus`/`mem`) and nested virtualization (`nested`). An absent
+/// subkey defaults to `Default`/unset/off.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct XVirtkit {
@@ -756,6 +763,10 @@ struct XVirtkit {
     cpus: Option<Scalar>,
     #[serde(default)]
     mem: Option<Scalar>,
+    /// scalar, not bool: `nested: true` is a YAML bool but `${VAR}` interpolates
+    /// into a string, and both spellings must reach the same parse
+    #[serde(default)]
+    nested: Option<Scalar>,
 }
 
 impl XVirtkit {
@@ -808,6 +819,23 @@ impl XVirtkit {
                 Ok(s)
             })
             .transpose()
+    }
+
+    /// `nested: true|false` → whether the guest can run microVMs of its own
+    /// (absent = off). The host must allow nesting; that is checked at boot, where
+    /// the same failure reaches a `vk run --nested` guest.
+    fn nested(&self) -> Result<bool> {
+        match self.nested.clone().map(Scalar::into_string) {
+            None => Ok(false),
+            // `True`/`TRUE` are YAML bools that already normalise to "true" on the literal
+            // path, so fold case for the `${VAR}` and quoted spellings to accept the same
+            // set. `yes`, `on` and `1` stay rejected: YAML 1.2 reads none of them as bools.
+            Some(s) => match s.to_ascii_lowercase().as_str() {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => bail!("x-virtkit.nested: expected true or false, got {s:?}"),
+            },
+        }
     }
 }
 
@@ -1334,6 +1362,45 @@ mod tests {
         assert_eq!((u.cpus, u.mem.as_deref()), (Some(6), Some("3G")));
         // zero and garbage fail the load, not a later boot
         for marker in ["{ cpus: 0 }", "{ cpus: two }", "{ mem: 0 }", "{ mem: big }"] {
+            assert!(
+                parse(
+                    &format!("services:\n  s:\n    image: x\n    x-virtkit: {marker}\n"),
+                    Path::new("/b")
+                )
+                .is_err(),
+                "{marker} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn x_virtkit_nested_opts_one_service_in() {
+        // absent = off: an unmarked service keeps VMX/SVM masked
+        assert!(!one("services:\n  s:\n    image: x\n").nested);
+        assert!(!one("services:\n  s:\n    image: x\n    x-virtkit: { cpus: 2 }\n").nested);
+        // the YAML bool and the ${VAR} string spelling reach the same parse
+        assert!(one("services:\n  s:\n    image: x\n    x-virtkit: { nested: true }\n").nested);
+        assert!(!one("services:\n  s:\n    image: x\n    x-virtkit: { nested: false }\n").nested);
+        // every spelling YAML itself reads as a bool, plus the quoted string form
+        assert!(one("services:\n  s:\n    image: x\n    x-virtkit: { nested: True }\n").nested);
+        assert!(one("services:\n  s:\n    image: x\n    x-virtkit: { nested: TRUE }\n").nested);
+        assert!(one("services:\n  s:\n    image: x\n    x-virtkit: { nested: \"true\" }\n").nested);
+        // ${VAR} arrives as a string, so it must accept the same spellings
+        for value in ["true", "True"] {
+            let u = super::parse(
+                "services:\n  s:\n    image: x\n    x-virtkit:\n      nested: ${N}\n",
+                Path::new("/b"),
+                &vars(&[("N", value)]),
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+            assert!(u.nested, "${{N}}={value:?} should read as nested");
+        }
+        // a null value is an unset key, not a bad one: `Option` reads it as absent
+        assert!(!one("services:\n  s:\n    image: x\n    x-virtkit: { nested: }\n").nested);
+        // anything else fails the load, not a later boot
+        for marker in ["{ nested: yes }", "{ nested: 1 }", "{ nested: maybe }"] {
             assert!(
                 parse(
                     &format!("services:\n  s:\n    image: x\n    x-virtkit: {marker}\n"),
