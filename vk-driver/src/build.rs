@@ -374,18 +374,26 @@ fn run_config(st: &ShellState) -> vk_core::runcfg::RunConfig {
 
 /// Resolve the instruction-cache destination: an explicit registry/store wins; `none`
 /// disables; the default is the builtin local store — the same content-addressed root
-/// a `vk registry serve` shares, accessed in-process (no server, no port). A
-/// dot-relative path is rejected: only absolute paths and `file://` URLs select the
-/// in-process store, everything else is a registry host.
+/// a `vk registry serve` shares, accessed in-process (no server, no port). Only absolute
+/// paths and `file://` URLs select the in-process store, everything else is a registry
+/// host — so a spelling that names neither is refused rather than read as one of them.
 fn cache_repo(cache_registry: Option<&str>) -> Result<Option<String>> {
     Ok(match cache_registry {
         Some("none") => None,
-        // A hostname can't start with a dot, so this is a relative path — which
-        // Registry::local_root would silently treat as a registry host.
-        Some(repo) if repo.starts_with('.') => bail!(
-            "cache destination {repo:?} is a relative path; \
-             an in-process store needs an absolute path (or a file:// URL)"
-        ),
+        // A hostname can start with neither a dot nor nothing at all, and a `file://` URL
+        // that continues with anything but `/` is a path relative to wherever `vk` happens
+        // to be running — all three of which Registry::local_root_of would otherwise take
+        // for a registry host or for a store at a path nobody named.
+        Some(repo)
+            if repo.trim().is_empty()
+                || repo.starts_with('.')
+                || matches!(repo.strip_prefix("file://"), Some(p) if !p.starts_with('/')) =>
+        {
+            bail!(
+                "cache destination {repo:?} names no absolute store path; \
+                 an in-process store needs an absolute path (or a file:// URL)"
+            )
+        }
         Some(repo) => Some(repo.to_string()),
         None => Some(
             vk_registry::default_root()
@@ -393,6 +401,37 @@ fn cache_repo(cache_registry: Option<&str>) -> Result<Option<String>> {
                 .display()
                 .to_string(),
         ),
+    })
+}
+
+/// Where the instruction cache keeps what it caches, as [`cache_store`] answers it.
+/// `Server` is not a failure: the store is simply on that host, and the one thing the
+/// commands that operate on a store must not do is take the builtin one — which the cache
+/// never touches — for it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CacheStore {
+    /// a store in this filesystem
+    Dir(PathBuf),
+    /// a `vk-registry` repo: its store is on that host
+    Server(String),
+}
+
+/// The store the instruction cache is configured to use: what `vk registry status`/`gc`
+/// operate on, and what `vk paths` reports, when no `--root` names another store. It is
+/// [`cache_repo`]'s destination whenever that is a store in this filesystem, and the
+/// builtin store when caching is off — the store anything cached before it was turned off
+/// is still in.
+///
+/// `Err` keeps meaning what it means everywhere else: a `cache_registry` that names no
+/// store at all, or no place to put the builtin one.
+pub fn cache_store(cache_registry: Option<&str>) -> Result<CacheStore> {
+    let Some(repo) = cache_repo(cache_registry)? else {
+        let dir = vk_registry::default_root().context("resolving the builtin cache store dir")?;
+        return Ok(CacheStore::Dir(dir));
+    };
+    Ok(match crate::config::Registry::local_root_of(&repo) {
+        Some(dir) => CacheStore::Dir(dir),
+        None => CacheStore::Server(repo),
     })
 }
 
@@ -3583,6 +3622,39 @@ mod tests {
         assert!(default.starts_with('/'), "not absolute: {default}");
         // A relative path would be misread as a registry host; refuse it.
         assert!(cache_repo(Some("./cache")).is_err());
+    }
+
+    // Where `vk registry status`/`gc` and `vk paths` look when no `--root` says otherwise:
+    // the store the configured cache uses, not the builtin default it was pointed away
+    // from. A cache on a `vk-registry` server has no store here, and is reported as the
+    // server it is rather than as a failure to resolve one.
+    #[test]
+    fn cache_store_follows_the_configured_cache() {
+        let default = CacheStore::Dir(vk_registry::default_root().unwrap());
+        assert_eq!(cache_store(None).unwrap(), default);
+        assert_eq!(
+            cache_store(Some("/srv/vk-cache")).unwrap(),
+            CacheStore::Dir(PathBuf::from("/srv/vk-cache"))
+        );
+        assert_eq!(
+            cache_store(Some("file:///srv/vk-cache")).unwrap(),
+            CacheStore::Dir(PathBuf::from("/srv/vk-cache"))
+        );
+        // caching off: nothing names a store, so the builtin one — where anything cached
+        // before it was turned off still is — is what gets reported.
+        assert_eq!(cache_store(Some("none")).unwrap(), default);
+        // a server: its store is on that host, which is the answer rather than an error
+        assert_eq!(
+            cache_store(Some("127.0.0.1:5000")).unwrap(),
+            CacheStore::Server("127.0.0.1:5000".to_string())
+        );
+        // and a setting that names no store at all stays an error, not a phantom server or
+        // a store at a path relative to wherever `vk` was run from
+        assert!(cache_store(Some("./cache")).is_err());
+        assert!(cache_store(Some("")).is_err());
+        assert!(cache_store(Some("  ")).is_err());
+        assert!(cache_store(Some("file://")).is_err());
+        assert!(cache_store(Some("file://srv/vk-cache")).is_err());
     }
 
     #[test]

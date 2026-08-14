@@ -83,13 +83,28 @@ impl ServerConfig {
         }
     }
 
+    /// The store root alone, for the commands that operate on a store without serving it
+    /// (`status`, `gc`). The root is resolved in [`ServerConfig::load`]'s order — an
+    /// explicit `--root` first, then the config file's, then the shared default — so a
+    /// store configured for the server is the one they report on and sweep, instead of a
+    /// default store the server never touches. Only the root is taken: a file whose
+    /// `addr`/TLS/auth keys `serve` would reject still answers where the store is.
+    pub fn root_of(config: Option<&Path>, root: Option<PathBuf>) -> Result<PathBuf> {
+        if let Some(r) = root {
+            return Ok(r);
+        }
+        if let Some(path) = config
+            && let Some(r) = read_file(path)?.root
+        {
+            return Ok(r);
+        }
+        crate::default_root()
+    }
+
     /// Load from a TOML file. The CLI `addr` and optional `root` override the file; the
     /// store root falls back to the shared default when neither sets it.
     pub fn load(path: &Path, addr: SocketAddr, root: Option<PathBuf>) -> Result<Self> {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let f: FileConfig =
-            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let f = read_file(path)?;
         let addr = match f.addr {
             Some(a) => a.parse().with_context(|| format!("parsing addr {a:?}"))?,
             None => addr,
@@ -233,6 +248,15 @@ impl UpstreamSpec {
     }
 }
 
+/// Read + parse a config file, named in the error whichever way it fails. Shared by
+/// [`ServerConfig::load`] and [`ServerConfig::root_of`], so `serve` and the store commands
+/// read the same file the same way.
+fn read_file(path: &Path) -> Result<FileConfig> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
 fn load_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     let mut r =
         BufReader::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
@@ -263,4 +287,66 @@ fn load_key(path: &Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
     use rustls::pki_types::pem::PemObject;
     rustls::pki_types::PrivateKeyDer::from_pem_reader(&mut r)
         .with_context(|| format!("reading a private key from {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The store root `status`/`gc` resolve, in the order `serve` resolves it: an explicit
+    /// `--root` first, then the config file's, then the shared default. The file is what
+    /// used to be skipped — leaving those two commands on a default store the server never
+    /// touches.
+    #[test]
+    fn root_of_prefers_the_flag_then_the_file() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.toml");
+        std::fs::write(&path, "root = \"/srv/store\"\n").unwrap();
+
+        assert_eq!(
+            ServerConfig::root_of(Some(&path), Some(PathBuf::from("/flag"))).unwrap(),
+            PathBuf::from("/flag")
+        );
+        assert_eq!(
+            ServerConfig::root_of(Some(&path), None).unwrap(),
+            PathBuf::from("/srv/store")
+        );
+        // a file that sets no root falls through to the default, as it does for `serve`
+        let bare = dir.join("bare.toml");
+        std::fs::write(&bare, "addr = \"127.0.0.1:5001\"\n").unwrap();
+        assert_eq!(
+            ServerConfig::root_of(Some(&bare), None).unwrap(),
+            crate::default_root().unwrap()
+        );
+        assert_eq!(
+            ServerConfig::load(&bare, "127.0.0.1:5000".parse().unwrap(), None)
+                .unwrap()
+                .root,
+            ServerConfig::root_of(Some(&bare), None).unwrap()
+        );
+        assert_eq!(
+            ServerConfig::root_of(None, None).unwrap(),
+            crate::default_root().unwrap()
+        );
+        // and a config file that is not there is an error, not a silent default
+        assert!(ServerConfig::root_of(Some(&dir.join("absent.toml")), None).is_err());
+
+        // The same file resolves the same root through `serve`'s own loader, with and
+        // without the flag: the two must not drift into sweeping different stores.
+        let addr = "127.0.0.1:5000".parse().unwrap();
+        assert_eq!(
+            ServerConfig::load(&path, addr, None).unwrap().root,
+            ServerConfig::root_of(Some(&path), None).unwrap()
+        );
+        assert_eq!(
+            ServerConfig::load(&path, addr, Some(PathBuf::from("/flag")))
+                .unwrap()
+                .root,
+            ServerConfig::root_of(Some(&path), Some(PathBuf::from("/flag"))).unwrap()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

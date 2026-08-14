@@ -247,9 +247,10 @@ enum RegistryCmd {
     // `vk` accesses its local filesystem store in-process (registry.rs `mod local`).
     /// Report a registry store's usage and content: on-disk size (both storage
     /// forms), dedup savings, and a per-repository breakdown (tags, latest tag,
-    /// logical size). Read-only.
+    /// logical size). Read-only — it creates no store.
     Status {
-        /// Store directory [default: $XDG_DATA_HOME/virtkit/registry].
+        /// Store directory [default: the store the build cache uses —
+        /// `[build] cache_registry`, else $XDG_DATA_HOME/virtkit/registry].
         #[arg(long)]
         root: Option<PathBuf>,
     },
@@ -258,7 +259,8 @@ enum RegistryCmd {
     /// (both after a grace window). Takes the store lock exclusive, briefly
     /// blocking concurrent pushers.
     Gc {
-        /// Store directory [default: $XDG_DATA_HOME/virtkit/registry].
+        /// Store directory [default: the store the build cache uses —
+        /// `[build] cache_registry`, else $XDG_DATA_HOME/virtkit/registry].
         #[arg(long)]
         root: Option<PathBuf>,
         /// Drop tags unused for more than this many days.
@@ -1479,38 +1481,76 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
         "                idle ones. images/ is never reclaimed."
     )?;
     writeln!(out)?;
-    // The instruction cache, `vk-registry serve` and `vk registry status`/`gc` all
-    // default to this store. A `[registry] repo` does NOT move it — that only routes
-    // the bundle pushes — so a local repo is reported separately.
-    let store = vk_registry::default_root()?;
-    writeln!(
-        out,
-        "registry store  {} (default: $XDG_DATA_HOME/virtkit/registry)",
-        store.display()
-    )?;
-    writeln!(
-        out,
-        "                a separate content-addressed store: the build/instruction cache, and"
-    )?;
-    writeln!(
-        out,
-        "                what `vk-registry serve` serves; `vk registry status`/`gc` operate on it"
-    )?;
-    if store == state_dir.join("registry") {
-        writeln!(
-            out,
-            "                (it shares this directory with the image cache's registry/ tier;"
-        )?;
-        writeln!(
-            out,
-            "                the layouts are independent and each GC ignores the other's files)"
-        )?;
+    // The instruction cache and `vk registry status`/`gc` use this store, so it is
+    // resolved the way they resolve it: `[build] cache_registry` moves it when it names a
+    // store here. `vk-registry serve` is a resolution of its own (its `--root`/`--config`)
+    // and is not claimed here. A `[registry] repo` does not move it either — that only
+    // routes the bundle pushes — so a local repo is reported separately.
+    let configured = cfg.build.cache_registry.as_deref();
+    match crate::build::cache_store(configured)? {
+        crate::build::CacheStore::Dir(store) => {
+            let from = match configured {
+                // caching off: the builtin store is named because that is where whatever
+                // was cached before still is, not because a setting put it there
+                Some("none") => "`[build] cache_registry = \"none\"`: caching off",
+                // name the key that moved it, rather than calling it the default it is not
+                Some(_) => "`[build] cache_registry`",
+                None => "default: $XDG_DATA_HOME/virtkit/registry",
+            };
+            writeln!(out, "registry store  {} ({from})", store.display())?;
+            writeln!(
+                out,
+                "                a separate content-addressed store holding the build/instruction cache;"
+            )?;
+            writeln!(
+                out,
+                "                `vk registry status`/`gc` operate on it (a `vk-registry serve` takes its"
+            )?;
+            writeln!(
+                out,
+                "                root from its own `--root`/`--config`, which may differ)"
+            )?;
+            // Both spellings of one directory share it, so compare what they resolve to
+            // rather than how they were written; neither has to exist to be reported.
+            let shared = state_dir.join("registry");
+            let same = match (store.canonicalize(), shared.canonicalize()) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => store == shared,
+            };
+            if same {
+                writeln!(
+                    out,
+                    "                (it shares this directory with the image cache's registry/ tier;"
+                )?;
+                writeln!(
+                    out,
+                    "                the layouts are independent and each GC ignores the other's files)"
+                )?;
+            }
+            writeln!(
+                out,
+                "                override: `--cache-registry`/`[build] cache_registry` (instruction cache),"
+            )?;
+            writeln!(out, "                `--root` on `vk registry status`/`gc`")?;
+        }
+        // The cache is a `vk-registry` server: the store is on its host, so there is no
+        // path here to print — and naming the builtin one this vk is not using would be
+        // the bug `vk registry status` had.
+        crate::build::CacheStore::Server(repo) => {
+            writeln!(
+                out,
+                "registry store  on the host serving {repo} (`[build] cache_registry`)"
+            )?;
+            writeln!(
+                out,
+                "                the build/instruction cache lives there; `vk registry status`/`gc`"
+            )?;
+            writeln!(
+                out,
+                "                need `--root` to name a store in this filesystem"
+            )?;
+        }
     }
-    writeln!(
-        out,
-        "                override: `--cache-registry`/`[build] cache_registry` (instruction cache),"
-    )?;
-    writeln!(out, "                `--root` on `vk registry status`/`gc`")?;
     writeln!(out)?;
     let vms = vms::registry_dir()?;
     writeln!(
@@ -2530,11 +2570,7 @@ async fn cli_main() -> ExitCode {
                 Err(e) => fail(&e, 1),
             },
             RegistryCmd::Status { root } => {
-                let root = match root
-                    .clone()
-                    .map(Ok)
-                    .unwrap_or_else(vk_registry::default_root)
-                {
+                let root = match store_root(&cfg, root) {
                     Ok(r) => r,
                     Err(e) => return fail(&e, 2),
                 };
@@ -2549,11 +2585,7 @@ async fn cli_main() -> ExitCode {
                 grace_days,
                 dry_run,
             } => {
-                let root = match root
-                    .clone()
-                    .map(Ok)
-                    .unwrap_or_else(vk_registry::default_root)
-                {
+                let root = match store_root(&cfg, root) {
                     Ok(r) => r,
                     Err(e) => return fail(&e, 2),
                 };
@@ -2943,6 +2975,31 @@ async fn cli_main() -> ExitCode {
     }
 }
 
+/// The store `vk registry status`/`gc` work on: `--root` when given, else the one the
+/// configuration puts the instruction cache in — so they report on and sweep the store
+/// this `vk` is actually using, not the builtin default it may have been pointed away from.
+fn store_root(cfg: &Config, root: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(r) = root {
+        return Ok(r.clone());
+    }
+    match build::cache_store(cfg.build.cache_registry.as_deref())? {
+        build::CacheStore::Dir(dir) => Ok(dir),
+        // Which store a server keeps is the server's to know, not ours — but one on this
+        // host is the common setup, so name the store it serves when neither its `--root`
+        // nor its `--config` moved it. The hint never replaces the refusal: a default this
+        // host cannot resolve degrades to naming where it comes from.
+        build::CacheStore::Server(repo) => anyhow::bail!(
+            "the instruction cache is the registry {repo}, whose store is on that host — \
+             pass --root to name a store in this filesystem (a `vk-registry` on this host \
+             with no --root and no `root` in its --config serves {})",
+            vk_registry::default_root().map_or_else(
+                |_| "$XDG_DATA_HOME/virtkit/registry".to_string(),
+                |d| d.display().to_string()
+            )
+        ),
+    }
+}
+
 fn fail(e: &anyhow::Error, code: i32) -> ExitCode {
     eprintln!("virtkit: error: {e:#}");
     exit_code(code)
@@ -3301,6 +3358,60 @@ mod tests {
         let report = paths_report(&config::Config::default(), true).unwrap();
         let jobs_root = ctx.job_dir.parent().unwrap();
         assert!(report.contains(&format!("jobs dir      {}", jobs_root.display())));
+    }
+
+    // The registry-store section names the store the configuration puts the build cache in
+    // and which setting placed it there — and for a cache kept on a server, whose host it
+    // is on rather than a local path nothing here writes to. `vk registry status`/`gc`
+    // resolve the same store, so the report and the commands cannot disagree.
+    #[test]
+    fn paths_report_names_the_configured_registry_store() {
+        let mut cfg = config::Config::default();
+        let report = paths_report(&cfg, false).unwrap();
+        assert!(
+            report.contains(&format!(
+                "registry store  {} (default:",
+                vk_registry::default_root().unwrap().display()
+            )),
+            "{report}"
+        );
+        assert_eq!(
+            store_root(&cfg, &None).unwrap(),
+            vk_registry::default_root().unwrap()
+        );
+
+        cfg.build.cache_registry = Some("file:///srv/vk-cache".to_string());
+        let report = paths_report(&cfg, false).unwrap();
+        assert!(
+            report.contains("registry store  /srv/vk-cache (`[build] cache_registry`)"),
+            "{report}"
+        );
+        assert_eq!(
+            store_root(&cfg, &None).unwrap(),
+            PathBuf::from("/srv/vk-cache")
+        );
+        // `--root` still wins over the configured store
+        let named = Some(PathBuf::from("/other"));
+        assert_eq!(store_root(&cfg, &named).unwrap(), PathBuf::from("/other"));
+
+        // caching off: the builtin store, named as the disabled setting it came from
+        cfg.build.cache_registry = Some("none".to_string());
+        let report = paths_report(&cfg, false).unwrap();
+        assert!(report.contains("caching off"), "{report}");
+
+        // a cache on a server: no path here, and the commands say so instead of sweeping
+        // a local store the cache never writes to
+        cfg.build.cache_registry = Some("127.0.0.1:5000".to_string());
+        let report = paths_report(&cfg, false).unwrap();
+        assert!(
+            report.contains("registry store  on the host serving 127.0.0.1:5000"),
+            "{report}"
+        );
+        let err = format!("{:#}", store_root(&cfg, &None).unwrap_err());
+        assert!(
+            err.contains("127.0.0.1:5000") && err.contains("--root"),
+            "{err}"
+        );
     }
 
     // `vk exec` CLI shape: the optional target precedes `--`, the command trails it,

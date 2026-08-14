@@ -43,7 +43,8 @@ enum Cmd {
         /// Listen address.
         #[arg(long, default_value = "127.0.0.1:5000")]
         addr: SocketAddr,
-        /// Store directory [default: $XDG_DATA_HOME/virtkit/registry].
+        /// Store directory [default: the `root` in --config, else
+        /// $XDG_DATA_HOME/virtkit/registry].
         #[arg(long)]
         root: Option<PathBuf>,
         /// TOML config file with `[[upstream]]` relay entries (and optional addr/root).
@@ -59,18 +60,28 @@ enum Cmd {
         root: Option<PathBuf>,
     },
     /// Report the store's usage and content: on-disk size, dedup savings, and a
-    /// per-repository breakdown. Read-only.
+    /// per-repository breakdown. Read-only — it creates no store.
     Status {
-        /// Store directory [default: $XDG_DATA_HOME/virtkit/registry].
+        /// Store directory [default: the `root` in --config, else
+        /// $XDG_DATA_HOME/virtkit/registry].
         #[arg(long)]
         root: Option<PathBuf>,
+        /// The `serve` config file to take the store root from, so this reports on the
+        /// store the server uses.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Garbage-collect the store: drop tags idle past the retention window, then
     /// sweep unreferenced blobs and stale uploads (both after a grace window).
     Gc {
-        /// Store directory [default: $XDG_DATA_HOME/virtkit/registry].
+        /// Store directory [default: the `root` in --config, else
+        /// $XDG_DATA_HOME/virtkit/registry].
         #[arg(long)]
         root: Option<PathBuf>,
+        /// The `serve` config file to take the store root from, so this sweeps the store
+        /// the server uses.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Drop tags unused for more than this many days.
         #[arg(long, default_value_t = 30)]
         retention_days: u64,
@@ -158,16 +169,23 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::InstallService { addr, root } => {
             vk_registry::install_service(addr, &resolve_root(root)?)
         }
-        Cmd::Status { root } => vk_registry::status(resolve_root(root)?),
+        // `--root` first, then the root the `serve` config file names, then the shared
+        // default: the same order `serve` resolves them in, so these report on and sweep
+        // the store the server actually uses.
+        Cmd::Status { root, config } => {
+            let root = vk_registry::ServerConfig::root_of(config.as_deref(), root)?;
+            vk_registry::status(root)
+        }
         Cmd::Gc {
             root,
+            config,
             retention_days,
             grace_days,
             dry_run,
         } => {
             let days = |d: u64| Duration::from_secs(d * 86_400);
             vk_registry::gc(
-                resolve_root(root)?,
+                vk_registry::ServerConfig::root_of(config.as_deref(), root)?,
                 days(retention_days),
                 days(grace_days),
                 dry_run,
@@ -317,5 +335,28 @@ mod tests {
             serving(Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
             Serving::Unknown
         );
+    }
+
+    // `status`/`gc` take the same `--config` `serve` does: the store to report on is the
+    // one the server was configured with, and naming that file is how they are told.
+    #[test]
+    fn status_and_gc_take_the_serve_config() {
+        use std::path::Path;
+
+        let cli = Cli::try_parse_from(["vk-registry", "status", "--config", "/etc/reg.toml"])
+            .expect("status must accept --config");
+        let Cmd::Status { root, config } = cli.cmd else {
+            panic!("expected Cmd::Status")
+        };
+        assert_eq!(root, None);
+        assert_eq!(config.as_deref(), Some(Path::new("/etc/reg.toml")));
+
+        let cli = Cli::try_parse_from(["vk-registry", "gc", "--config", "/etc/reg.toml"])
+            .expect("gc must accept --config");
+        let Cmd::Gc { root, config, .. } = cli.cmd else {
+            panic!("expected Cmd::Gc")
+        };
+        assert_eq!(root, None);
+        assert_eq!(config.as_deref(), Some(Path::new("/etc/reg.toml")));
     }
 }

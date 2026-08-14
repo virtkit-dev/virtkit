@@ -13,6 +13,17 @@ All notable changes to virtkit will be documented in this file.
   that puts the new one in service. `--check` reports whether a newer release is available
   without installing it, exiting 1 when there is one.
 
+### Changed
+
+- **`vk registry status`/`gc` follow the store you configured.** They report on and sweep
+  the store your configuration puts the build cache in (`[build] cache_registry`) instead
+  of always the built-in default, so `gc` reclaims the store this host actually fills —
+  including one you moved to another disk. When the cache is kept on a `vk-registry`
+  server they refuse and ask for a `--root` in this filesystem, since the store is on that
+  host. `vk paths` names the same store and says which setting placed it there.
+  `vk-registry status`/`gc` take the same `--config` as the server, so they act on the
+  store it was configured with.
+
 ### Fixed
 
 - **Asking about a registry store no longer creates one.** `vk registry status` and

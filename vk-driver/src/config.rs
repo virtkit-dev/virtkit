@@ -516,12 +516,18 @@ impl Registry {
     /// no port, no auth; `ca_file`/`username`/`insecure`/`transparent_zstd` are
     /// all meaningless and ignored for such a repo.
     pub fn local_root(&self) -> Option<PathBuf> {
-        if let Some(p) = self.repo.strip_prefix("file://") {
+        Self::local_root_of(&self.repo)
+    }
+
+    /// [`Registry::local_root`]'s test applied to a repo string that is not (yet) a
+    /// configured registry — the instruction cache's destination, which reaches this from
+    /// `[build] cache_registry` or `--cache-registry` and is a store or a server by the
+    /// same rule.
+    pub fn local_root_of(repo: &str) -> Option<PathBuf> {
+        if let Some(p) = repo.strip_prefix("file://") {
             return Some(PathBuf::from(p));
         }
-        self.repo
-            .starts_with('/')
-            .then(|| PathBuf::from(&self.repo))
+        repo.starts_with('/').then(|| PathBuf::from(repo))
     }
 
     /// Build a `Registry` for the build-sharing path, from the CLI flags rather than a
