@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-08-18
+
 ### Added
 
 - **`[vm] nested`: CI jobs that boot microVMs of their own.** A GitLab job could not nest —
@@ -1615,7 +1617,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.35.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.36.0...HEAD
+[0.36.0]: https://github.com/virtkit-dev/virtkit/compare/v0.35.0...v0.36.0
 [0.35.0]: https://github.com/virtkit-dev/virtkit/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/virtkit-dev/virtkit/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/virtkit-dev/virtkit/compare/v0.32.0...v0.33.0
