@@ -33,6 +33,43 @@ The executor reads its host configuration from the usual virtkit config file
 (`$VIRTKIT_CONFIG` or `/etc/virtkit/config.toml`). Everything below that a job
 controls is set through `.gitlab-ci.yml` **job variables**.
 
+### Nested virtualization
+
+Job VMs mask VMX/SVM, so a job cannot boot microVMs of its own. A runner that
+hosts jobs which build or test virtkit itself grants them that:
+
+```toml
+[vm]
+nested = true
+```
+
+It applies to the job VM whatever `MICROVM_IMAGE` names. In a `compose:` fleet it
+also unlocks the per-service marker, so the nesting guest can be a sibling rather
+than the primary:
+
+```yaml
+services:
+  builder:
+    image: virtkit/build
+    x-virtkit: { nested: true }
+```
+
+Without the grant that marker is refused when the fleet loads rather than
+cleared — a fleet that asked for a nesting builder must not look like it got one.
+Nesting reaches host KVM's nested paths, so the grant is the host admin's to make
+and there is deliberately no job variable for it.
+
+The grant is per host and unconditional: every job VM this runner boots gets
+VMX/SVM, asked for or not. Set it on a runner dedicated to trusted pipelines, not
+one that also runs fork merge requests.
+
+The host must be loaded with `kvm_intel.nested=1` / `kvm_amd.nested=1`;
+`vk check --feature gitlab` reports when it is not, and `prepare` refuses the
+job rather than booting a guest that cannot nest — on either backend. The
+setting itself is the libkrun backend's: under `VIRTKIT_VMM=cloud-hypervisor`
+nothing masks VMX/SVM, so a job nests whenever the host allows it, setting or
+no setting.
+
 ### Host-side checkouts
 
 A host-side checkout — which `dockerfile:` and `compose:` job images need — clones the
@@ -111,10 +148,10 @@ job's plain GitLab `image:` is read the same way):
   A service sizes its own guest with an `x-virtkit: { cpus:, mem: }` marker
   (default 2 vCPUs / 1G), clamped to the host `[vm] max_cpus`/`max_mem` ceilings
   like the job's own `MICROVM_CPUS`/`MICROVM_MEM`; the primary keeps following
-  those job variables. `x-virtkit: { nested: true }` is refused when the fleet
-  loads, primary or sibling: nesting reaches host KVM, so it is the runner's
-  decision rather than a job's, the same way the executor never hands a job the
-  guest PMU.
+  those job variables. `x-virtkit: { nested: true }` needs the runner to have set
+  [`[vm] nested`](#nested-virtualization) and is refused when the fleet loads
+  otherwise: nesting reaches host KVM, so it is the runner's decision rather than
+  a job's, the same way the executor never hands a job the guest PMU.
 
 ```yaml
 my-job:

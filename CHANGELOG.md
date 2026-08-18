@@ -6,6 +6,18 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **`[vm] nested`: CI jobs that boot microVMs of their own.** A GitLab job could not nest —
+  the job VM masked VMX/SVM and a compose file asking to nest was refused, with nothing a
+  runner admin could turn on instead. The runner config now carries the switch, so a fleet
+  that builds or tests virtkit itself can run `vk` inside its job. Off by default, and it
+  is the grant that also unlocks a `compose:` fleet's `x-virtkit: { nested: true }`, so the
+  nesting guest can be a sibling rather than the primary; ungranted, that marker stays
+  refused and no job variable can ask for it. A runner that sets the grant on a host
+  without `kvm_intel.nested` / `kvm_amd.nested` is told so by `vk check --feature gitlab`
+  and again when a job prepares, rather than handing the job a guest that cannot nest. On
+  the cloud-hypervisor backend a job nests whenever the host allows it, setting or no
+  setting.
+
 - **`vk run --init entrypoint`: the image's own entrypoint as PID 1.** An image whose
   entrypoint prepares the machine and only then starts the real init now gets that step
   run: `--init image` hands PID 1 straight to `/sbin/init`, so the preparation was skipped

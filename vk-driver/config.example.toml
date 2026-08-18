@@ -18,6 +18,8 @@
 # balloon = true       # free_page_reporting: freed guest RAM returns to the host
 # max_cpus = 32        # ceilings for the per-job MICROVM_CPUS/MICROVM_MEM
 # max_mem = "128G"     # variables (unset = jobs cannot exceed cpus/mem above)
+# nested = false       # let jobs boot microVMs of their own (vk inside vk); needs
+#                      # kvm_intel/kvm_amd nested=1, and widens what a job can reach
 # cmdline_extra = ""
 # boot_timeout_secs = 120
 # shutdown_timeout_secs = 15

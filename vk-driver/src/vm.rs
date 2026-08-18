@@ -174,6 +174,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     if unsafe { libc::access(c"/dev/kvm".as_ptr(), libc::R_OK | libc::W_OK) } != 0 {
         bail!("no rw access to /dev/kvm (is the runner user in the kvm group?)");
     }
+    refuse_unsupported_nesting(cfg.vm.nested, crate::vmm::host_nesting_enabled())?;
     let (cpus, mem) = vm_size(ctx)?;
     // Validate the run-phase egress narrowing here so a MICROVM_EGRESS_ALLOW_* request
     // outside the `[egress]` cap fails with a crisp job-visible error — the switch itself is
@@ -792,7 +793,7 @@ fn load_compose_fleet(ctx: &JobCtx, spec: &str) -> Result<ComposeFleet> {
                 unit.name
             );
         }
-        refuse_job_nesting(unit)?;
+        refuse_job_nesting(ctx.cfg.vm.nested, unit)?;
         if let crate::compose::Source::Build {
             context,
             dockerfiles,
@@ -1360,7 +1361,8 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         // the executor has no BYO-kernel flag, so nothing forces it otherwise.
         console_serial: false,
         pmu: false,
-        nested: false,
+        // `[vm] nested`: the runner's grant, checked against the host in prepare.
+        nested: cfg.vm.nested,
         // libkrun has no API socket (it is driven as a subprocess); cloud-hypervisor
         // uses one for graceful shutdown in graceful_vmm_stop.
         api_socket: (!crate::vmm::libkrun_selected()).then(|| ctx.api_sock()),
@@ -1819,29 +1821,46 @@ fn vm_size(ctx: &JobCtx) -> Result<(u32, String)> {
     Ok((cpus, mem))
 }
 
-/// Clamp a service unit's declared sizing (its compose `x-virtkit.cpus`/`.mem`) to the
-/// same host ceilings a job's MICROVM_CPUS/MICROVM_MEM requests are clamped to
-/// (vm.max_cpus/max_mem, defaulting to the base values) — a committed compose file must
-/// not size a service past what the runner's config lets a job declare. Silent, like
-/// `vm_size`; an undeclared axis stays `None` (the service default), not the job base.
-/// Nesting widens the guest's attack surface on host KVM (see `VmSpec::nested`), so it is the
-/// runner's call and not a job-authored compose file's — the same reason the executor never
-/// hands a job the PMU. Refused rather than quietly cleared: a fleet that asked for a nesting
-/// builder must not look like it got one, and on the cloud-hypervisor backend clearing the
-/// flag would not mask VMX/SVM anyway. Refused where the fleet loads, so it covers the
-/// primary as well as the siblings and the error reaches the job from `prepare` rather than
-/// only the supervisor's log.
-fn refuse_job_nesting(unit: &crate::compose::Unit) -> Result<()> {
-    if unit.nested {
+/// A compose file may ask a service to nest only where the runner granted nesting
+/// (`[vm] nested`). Nesting widens the guest's attack surface on host KVM (see
+/// `VmSpec::nested`), so the grant is the host admin's and not a job-authored compose
+/// file's — the same reason the executor never hands a job the PMU. Once granted, the
+/// marker is honoured, so a fleet can put its nesting builder wherever it belongs instead
+/// of only in the primary. Ungranted it is refused rather than quietly cleared: a fleet
+/// that asked for a nesting builder must not look like it got one, and on the
+/// cloud-hypervisor backend clearing the flag would not mask VMX/SVM anyway. Checked where
+/// the fleet loads, so it covers the primary as well as the siblings and the error reaches
+/// the job from `prepare` rather than only the supervisor's log.
+fn refuse_job_nesting(granted: bool, unit: &crate::compose::Unit) -> Result<()> {
+    if unit.nested && !granted {
         bail!(
-            "compose service {:?}: x-virtkit.nested is not available on the GitLab executor — \
-             nesting is the runner's decision, not a job's",
+            "compose service {:?}: x-virtkit.nested needs a runner that allows nesting — it \
+             reaches host KVM, so `[vm] nested` is the host admin's grant to make, not a job's",
             unit.name
         );
     }
     Ok(())
 }
 
+/// `[vm] nested` on a host whose KVM will not nest boots a job guest that advertises VMX/SVM
+/// and cannot use it, so the jobs counting on it fail deep inside themselves instead of at
+/// the misconfiguration. Refused in `prepare`, whose error reaches the job trace, rather than
+/// in the detached supervisor's log.
+pub(crate) fn refuse_unsupported_nesting(requested: bool, host_nests: bool) -> Result<()> {
+    if requested && !host_nests {
+        bail!(
+            "[vm] nested is set but this host does not allow nesting — load kvm_intel or \
+             kvm_amd with nested=1, or unset it"
+        );
+    }
+    Ok(())
+}
+
+/// Clamp a service unit's declared sizing (its compose `x-virtkit.cpus`/`.mem`) to the
+/// same host ceilings a job's MICROVM_CPUS/MICROVM_MEM requests are clamped to
+/// (vm.max_cpus/max_mem, defaulting to the base values) — a committed compose file must
+/// not size a service past what the runner's config lets a job declare. Silent, like
+/// `vm_size`; an undeclared axis stays `None` (the service default), not the job base.
 fn clamp_service_size(cfg: &crate::config::Config, unit: &mut crate::compose::Unit) -> Result<()> {
     let vm = &cfg.vm;
     if let Some(n) = unit.cpus {
@@ -2568,7 +2587,7 @@ mod tests {
     /// it covers the primary as well as the siblings — `compose_service_units` drops the
     /// primary, so a later per-service pass would let `compose:file#builder` nest silently.
     #[test]
-    fn a_job_authored_fleet_cannot_ask_to_nest() {
+    fn a_fleet_may_ask_to_nest_only_where_the_runner_allows_it() {
         let service = |marker: &str| {
             crate::compose::parse(
                 &format!("services:\n  db:\n    image: x\n{marker}"),
@@ -2579,16 +2598,31 @@ mod tests {
             .pop()
             .unwrap()
         };
-        let err = refuse_job_nesting(&service("    x-virtkit: { nested: true }\n"))
+        let asks = service("    x-virtkit: { nested: true }\n");
+        // ungranted the request is refused, not cleared
+        let err = refuse_job_nesting(false, &asks).unwrap_err().to_string();
+        assert!(err.contains("needs a runner that allows nesting"), "{err}");
+        // granted, the same fleet loads
+        refuse_job_nesting(true, &asks).unwrap();
+        // declaring it off is not a request, and neither is leaving it out
+        for granted in [false, true] {
+            refuse_job_nesting(granted, &service("    x-virtkit: { nested: false }\n")).unwrap();
+            refuse_job_nesting(granted, &service("")).unwrap();
+        }
+    }
+
+    /// The runner may grant nesting, but only where host KVM will actually nest — asking
+    /// on a host that will not is a misconfiguration, not a guest that quietly lacks VMX.
+    #[test]
+    fn nesting_is_refused_on_a_host_that_will_not_nest() {
+        let err = refuse_unsupported_nesting(true, false)
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("not available on the GitLab executor"),
-            "{err}"
-        );
-        // declaring it off is not a request, and neither is leaving it out
-        refuse_job_nesting(&service("    x-virtkit: { nested: false }\n")).unwrap();
-        refuse_job_nesting(&service("")).unwrap();
+        assert!(err.contains("does not allow nesting"), "{err}");
+        // granted and supported, and every shape of not asking
+        refuse_unsupported_nesting(true, true).unwrap();
+        refuse_unsupported_nesting(false, false).unwrap();
+        refuse_unsupported_nesting(false, true).unwrap();
     }
 
     #[test]

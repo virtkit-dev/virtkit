@@ -347,6 +347,12 @@ pub struct Vm {
     /// jobs cannot request more than the cpus/mem defaults above
     pub max_cpus: Option<u32>,
     pub max_mem: Option<String>,
+    /// Expose VMX/SVM to the job's guest so it can boot microVMs of its own
+    /// (`vk` inside `vk`). Off by default: nesting reaches host KVM's nested
+    /// paths, so it widens what a job can attack. Deliberately runner-only —
+    /// there is no MICROVM_* variable and a job's compose file is still refused,
+    /// because the grant is the host admin's to make, not a job's.
+    pub nested: bool,
     /// Appended verbatim to the kernel command line
     pub cmdline_extra: String,
     /// prepare: max seconds from cloud-hypervisor spawn to a vk-agent status reply
@@ -365,6 +371,7 @@ impl Default for Vm {
             balloon: true,
             max_cpus: None,
             max_mem: None,
+            nested: false,
             cmdline_extra: String::new(),
             boot_timeout_secs: 120,
             shutdown_timeout_secs: 15,
@@ -839,6 +846,22 @@ mod tests {
             Some("reg.example.com/team")
         );
         assert_eq!(back.build.build_cache, crate::build::BuildCache::Layers);
+    }
+
+    /// `[vm] nested` is a host grant, so the default matters as much as the parse: a
+    /// serde name that drifted would reject every runner config that sets it
+    /// (`deny_unknown_fields`), and a default that drifted would grant it unasked.
+    #[test]
+    fn vm_nested_parses_and_defaults_off() {
+        assert!(!Config::default().vm.nested);
+        let cfg: Config = toml::from_str("[vm]\nnested = true\n").unwrap();
+        assert!(cfg.vm.nested);
+        assert!(
+            !toml::from_str::<Config>("[vm]\nnested = false\n")
+                .unwrap()
+                .vm
+                .nested
+        );
     }
 
     #[test]

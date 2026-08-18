@@ -27,7 +27,7 @@ pub enum Feature {
     Docker,
     /// [registry]: local store writable, or remote credential files readable
     Registry,
-    /// gitlab executor: per-job state dir writable, [gitlab] tools dir readable
+    /// gitlab executor: state and tools dirs usable, guest stats and nesting supported
     Gitlab,
     /// [share]: shared dir readable, a virtiofsd available when needed
     Share,
@@ -434,6 +434,14 @@ fn gitlab(cfg: &Config) -> Outcome {
             dir.display()
         ));
     }
+    // `[vm] nested` needs host KVM loaded with nested=1. vm::prepare refuses each job it
+    // would boot; failing here too catches the runner before any of them, as the atop
+    // interval below does.
+    if let Err(e) =
+        crate::vm::refuse_unsupported_nesting(cfg.vm.nested, crate::vmm::host_nesting_enabled())
+    {
+        return fail(format!("{e:#}"));
+    }
     // Guest statistics recording: whether jobs are recorded, and whether the archive they
     // are recorded into can actually be written. A misconfigured interval fails the check
     // rather than each job it would stop.
@@ -453,7 +461,15 @@ fn gitlab(cfg: &Config) -> Outcome {
     } else {
         "guest stats off (`[gitlab] atop`)".to_string()
     };
-    ok(format!("jobs dir {} writable, {stats}", jobs.display()))
+    let nesting = if cfg.vm.nested {
+        "job VMs may nest (`[vm] nested`)"
+    } else {
+        "no nesting"
+    };
+    ok(format!(
+        "jobs dir {} writable, {stats}, {nesting}",
+        jobs.display()
+    ))
 }
 
 fn share(cfg: &Config) -> Outcome {
@@ -636,6 +652,9 @@ mod tests {
         );
         // The archive is created by the probe, so an operator sees the path that will fill.
         assert!(root.join("atop").is_dir());
+        // The default config grants no nesting, and the check says so rather than leaving
+        // an operator to guess whether the grant took.
+        assert!(out.detail.contains("no nesting"), "{}", out.detail);
 
         // Turned off, the check says so rather than going quiet about it.
         let out = gitlab(&with(Gitlab {
