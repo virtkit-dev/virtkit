@@ -633,18 +633,25 @@ async fn resolve_source(args: &RunArgs) -> Result<Source> {
     }
 }
 
-/// Whether the primary VM nests: `--nested` or the `--primary` service's own
-/// `x-virtkit.nested`. Nesting is a capability, not a setting with a default to override,
-/// so the two are ORed rather than ranked the way the sizing and init/kernel axes are —
-/// which also means a `--primary` service declaring it nests with or without the flag.
-/// A nesting service that is not the primary is none of this function's business: it boots
-/// as a sibling through [`crate::units::boot_unit`] with its own marker.
-fn effective_nested(
-    flag: bool,
+/// Whether the VM booted as the primary nests: the caller's own request — `vk run --nested`,
+/// or the runner's `[vm] nested` on the CI executor — or the primary service's own
+/// `x-virtkit.nested`. Nesting is a capability, not a setting with a default to override, so
+/// the two are ORed rather than ranked the way the sizing and init/kernel axes are, which
+/// also means a primary service declaring it nests with or without the request. Shared with
+/// the executor (`crate::vm`) so one rule decides it on both paths.
+pub(crate) fn effective_nested(requested: bool, primary_marker: bool) -> bool {
+    requested || primary_marker
+}
+
+/// The `x-virtkit.nested` of the unit booting as the primary, or `false` when no unit is
+/// (`vk run --compose` with no `--primary`: compose up boots services only). A nesting
+/// service that is not the primary is none of this function's business — it boots as a
+/// sibling through [`crate::units::boot_unit`] with its own marker.
+fn primary_nested_marker(
     compose_units: &[crate::compose::Unit],
     primary_idx: Option<usize>,
 ) -> bool {
-    flag || primary_idx.is_some_and(|i| compose_units[i].nested)
+    primary_idx.is_some_and(|i| compose_units[i].nested)
 }
 
 async fn build_and_boot(
@@ -871,7 +878,10 @@ async fn build_and_boot(
         .clone()
         .or(marker_mem)
         .unwrap_or_else(|| crate::units::DEFAULT_MEM.to_string());
-    let nested = effective_nested(args.nested, &compose_units, primary_idx);
+    let nested = effective_nested(
+        args.nested,
+        primary_nested_marker(&compose_units, primary_idx),
+    );
     // The pinned/explicit kernel `fullvm::prepare` boots on for a non-image kernel axis
     // (Default or Path). A CLI `--kernel <path>` was already resolved into `kernel` by
     // `run()`; a marker `kernel: <path>` (when the CLI left kernel Default) is resolved
@@ -3742,7 +3752,7 @@ mod tests {
     }
 
     #[test]
-    fn nesting_ors_the_flag_with_the_primary_service_marker() {
+    fn nesting_ors_the_request_with_the_primary_service_marker() {
         let units = crate::compose::parse(
             "services:\n\
              \x20 builder:\n    image: b\n    x-virtkit: { nested: true }\n\
@@ -3752,14 +3762,16 @@ mod tests {
         )
         .unwrap();
         let idx = |n: &str| Some(units.iter().position(|u| u.name == n).unwrap());
+        let marker = |n: Option<usize>| primary_nested_marker(&units, n);
         // either side asking is enough, and neither asking leaves it off
-        assert!(!effective_nested(false, &units, idx("web")));
-        assert!(effective_nested(true, &units, idx("web")));
-        assert!(effective_nested(false, &units, idx("builder")));
-        assert!(effective_nested(true, &units, idx("builder")));
+        assert!(!effective_nested(false, marker(idx("web"))));
+        assert!(effective_nested(true, marker(idx("web"))));
+        assert!(effective_nested(false, marker(idx("builder"))));
+        assert!(effective_nested(true, marker(idx("builder"))));
         // no primary (compose up): a nesting sibling is its own boot's business, not the
         // primary spec's — this is the case a refactor is likeliest to conflate
-        assert!(!effective_nested(false, &units, None));
+        assert!(!marker(None));
+        assert!(!effective_nested(false, marker(None)));
     }
 
     #[test]

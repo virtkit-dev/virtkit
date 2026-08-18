@@ -31,6 +31,22 @@ impl Media {
     }
 }
 
+/// What MICROVM_IMAGE resolved to: the boot files plus the two facts about the boot that
+/// only the resolve step knows. A struct rather than a tuple because `generic` and `nested`
+/// are both bare bools — positional, they are one transposition away from a silent swap.
+struct BootPlan {
+    /// `None` = boot vk's embedded kernel.
+    kernel: Option<PathBuf>,
+    media: Media,
+    /// A generic boot: the embedded agent rides a preinit initramfs as `/init` and pivots,
+    /// rather than the image booting its own init.
+    generic: bool,
+    /// The compose primary's own `x-virtkit.nested`; the boot ORs it with the runner's
+    /// `[vm] nested` through [`crate::run::effective_nested`]. False for every non-compose
+    /// form: nothing else carries the marker.
+    nested: bool,
+}
+
 /// Resolve a `name`'s uid and primary gid from a `/etc/passwd` blob
 /// (`name:passwd:uid:gid:…` per line). A non-UTF-8 line, or a name-matching line whose uid/gid
 /// fields are absent or unparseable, is skipped and the scan continues. None if none resolves.
@@ -264,8 +280,8 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // Resolve (and, for a `dockerfile:` image, build) the boot media in the runner-visible process;
     // the supervisor re-resolves from the same env (a fingerprint hit for a build). A `None`
     // kernel boots vk's embedded copy — nothing to stat.
-    let (kernel, media, _generic) = resolve_media(ctx)?;
-    for p in media.files().into_iter().chain(kernel.as_deref()) {
+    let plan = resolve_media(ctx)?;
+    for p in plan.media.files().into_iter().chain(plan.kernel.as_deref()) {
         if !p.is_file() {
             bail!("image file missing: {}", p.display());
         }
@@ -417,13 +433,14 @@ async fn wait_for_services(ctx: &JobCtx, names: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Resolve MICROVM_IMAGE to the boot files: an optional kernel (`None` = boot vk's
-/// embedded kernel), the rootfs + optional initrd, and whether it is a generic boot.
+/// Resolve MICROVM_IMAGE to the [`BootPlan`] the job VM boots: its kernel and media, plus
+/// whether the boot is generic and whether a compose primary asked to nest.
 ///
 /// `MICROVM_IMAGE: dockerfile:<path>[#<stage>]` builds a **git-defined** image from the
-/// host-side checkout into the shared build tier and boots that; any other form resolves
+/// host-side checkout into the shared build tier and boots that; `compose:<file>#<primary>`
+/// takes the primary out of the fleet and resolves that unit; any other form resolves
 /// through the shared image cache (`resolve_ref`).
-fn resolve_media(ctx: &JobCtx) -> Result<(Option<PathBuf>, Media, bool)> {
+fn resolve_media(ctx: &JobCtx) -> Result<BootPlan> {
     let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
     if let Some(spec) = image_ref.strip_prefix("dockerfile:") {
         return resolve_dockerfile_form(ctx, spec);
@@ -439,15 +456,17 @@ fn resolve_media(ctx: &JobCtx) -> Result<(Option<PathBuf>, Media, bool)> {
             initrd,
             generic,
             config,
-        } => Ok((
+        } => Ok(BootPlan {
             kernel,
-            Media {
+            media: Media {
                 rootfs,
                 initrd,
                 config,
             },
             generic,
-        )),
+            // A plain image ref carries no compose marker; only `[vm] nested` can grant it.
+            nested: false,
+        }),
     }
 }
 
@@ -455,17 +474,18 @@ fn resolve_media(ctx: &JobCtx) -> Result<(Option<PathBuf>, Media, bool)> {
 /// (`MICROVM_IMAGE: dockerfile:<path>[?context=<dir>&buildcontext=<N>=<dir>&arg=<N>=<V>][#<stage>]`):
 /// build it and return it as generic-disk boot media (embedded kernel, agent + config riding
 /// the preinit initramfs — the byte-clean model `vk build`/bundles use).
-fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<(Option<PathBuf>, Media, bool)> {
+fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<BootPlan> {
     let (rootfs, config) = build_git_image(ctx, spec)?;
-    Ok((
-        None,
-        Media {
+    Ok(BootPlan {
+        kernel: None,
+        media: Media {
             rootfs,
             initrd: None,
             config,
         },
-        true,
-    ))
+        generic: true,
+        nested: false,
+    })
 }
 
 /// Build a git-defined image
@@ -833,22 +853,20 @@ fn compose_service_units(fleet: &ComposeFleet) -> Result<Vec<crate::compose::Uni
 /// Resolve one compose unit to boot media: a `build:` unit is built into the shared build tier
 /// (from the host checkout), an `image:` unit resolves through the shared image cache. Its
 /// compose `environment`/`user` overrides are merged into the boot config either way.
-fn compose_unit_media(
-    ctx: &JobCtx,
-    unit: &crate::compose::Unit,
-) -> Result<(Option<PathBuf>, Media, bool)> {
+fn compose_unit_media(ctx: &JobCtx, unit: &crate::compose::Unit) -> Result<BootPlan> {
     match &unit.source {
         crate::compose::Source::Build { .. } => {
             let (rootfs, config) = build_compose_unit(ctx, unit)?;
-            Ok((
-                None,
-                Media {
+            Ok(BootPlan {
+                kernel: None,
+                media: Media {
                     rootfs,
                     initrd: None,
                     config: Some(config),
                 },
-                true,
-            ))
+                generic: true,
+                nested: unit.nested,
+            })
         }
         crate::compose::Source::Image(image) => {
             let crate::image::ResolvedImage::Disk {
@@ -862,15 +880,16 @@ fn compose_unit_media(
                 &config.unwrap_or_default(),
                 unit,
             ));
-            Ok((
+            Ok(BootPlan {
                 kernel,
-                Media {
+                media: Media {
                     rootfs,
                     initrd,
                     config,
                 },
                 generic,
-            ))
+                nested: unit.nested,
+            })
         }
     }
 }
@@ -951,7 +970,12 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     } else {
         None
     };
-    let (kernel_opt, media, generic) = resolve_media(ctx)?;
+    let BootPlan {
+        kernel: kernel_opt,
+        media,
+        generic,
+        nested: primary_nested,
+    } = resolve_media(ctx)?;
     let (cpus, mem) = vm_size(ctx)?;
     // The agent and kernel back each guest boot (they ride the boot media) and any
     // service build; an embedded copy lives in a memfd whose path is valid only while
@@ -1361,8 +1385,11 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         // the executor has no BYO-kernel flag, so nothing forces it otherwise.
         console_serial: false,
         pmu: false,
-        // `[vm] nested`: the runner's grant, checked against the host in prepare.
-        nested: cfg.vm.nested,
+        // `[vm] nested`, the runner's grant (checked against the host in prepare), ORed
+        // with the compose primary's own marker exactly as `vk run` does it. The grant is
+        // what let that marker past `refuse_job_nesting`, so today the OR only ever agrees
+        // with the grant — it is here so the two paths cannot drift apart.
+        nested: crate::run::effective_nested(cfg.vm.nested, primary_nested),
         // libkrun has no API socket (it is driven as a subprocess); cloud-hypervisor
         // uses one for graceful shutdown in graceful_vmm_stop.
         api_socket: (!crate::vmm::libkrun_selected()).then(|| ctx.api_sock()),
