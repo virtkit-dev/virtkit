@@ -38,6 +38,14 @@ All notable changes to virtkit will be documented in this file.
   tell a VM about to come up from one wedged mid-build, nor to find it and stop it. The
   refusal now carries the owning process and how long it has been running.
 
+### Fixed
+
+- **A `vk-registry serve --addr` you pass is the address it listens on.** With a `--config`
+  file that set `addr`, the file won and the flag was ignored without a word — while
+  `--root` worked the other way round, so the same command line honoured one flag and
+  dropped the other. An address passed on the command line now wins, and the file supplies
+  it for the runs that pass none.
+
 ## [0.35.0] - 2026-08-14
 
 ### Added

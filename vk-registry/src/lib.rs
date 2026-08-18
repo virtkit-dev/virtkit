@@ -45,7 +45,7 @@ pub mod lock;
 pub mod relay;
 
 pub use client::{ClientAuth, Held, LockClient};
-pub use config::ServerConfig;
+pub use config::{DEFAULT_ADDR, ServerConfig};
 
 /// Everything a connection handler needs: the content-addressed store, the relay
 /// upstreams (empty ⇒ a plain local registry, no mirroring), the build-once lock
@@ -1524,8 +1524,8 @@ impl UnitFacts {
         let v = ServerConfig::file_view(path)?;
         Ok(UnitFacts {
             config: Some(path.to_path_buf()),
-            // The file's address wins, as it does for `serve`: `--addr` carries a default,
-            // so an explicit one cannot be told from it.
+            // `--addr` and `--config` are mutually exclusive, so the only address that can
+            // reach this arm is the file's; the default stands in when it names none.
             addr: v.addr.unwrap_or(addr),
             root: v.root,
             tls: v.tls,

@@ -38,9 +38,9 @@ enum Cmd {
     /// With no upstreams configured it is a plain local OCI server; configure `[[upstream]]` in
     /// the config file to make it a pull-through mirror.
     Serve {
-        /// Listen address
-        #[arg(long, default_value = "127.0.0.1:5000")]
-        addr: SocketAddr,
+        /// Listen address [default: the `addr` in --config, else 127.0.0.1:5000]
+        #[arg(long)]
+        addr: Option<SocketAddr>,
         /// Store directory [default: the `root` in --config, else the shared virtkit store]
         ///
         /// The shared store is $XDG_DATA_HOME/virtkit/registry.
@@ -63,7 +63,7 @@ enum Cmd {
         /// Listen address to bake into the unit
         ///
         /// A --config file is where a unit's addr belongs, so the two cannot be combined.
-        #[arg(long, default_value = "127.0.0.1:5000", conflicts_with = "config")]
+        #[arg(long, default_value_t = vk_registry::DEFAULT_ADDR, conflicts_with = "config")]
         addr: SocketAddr,
         /// Store directory to bake into the unit [default: the shared virtkit store]
         ///
@@ -203,7 +203,10 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Serve { addr, root, config } => {
             let cfg = match config {
                 Some(path) => vk_registry::ServerConfig::load(&path, addr, root)?,
-                None => vk_registry::ServerConfig::local(addr, resolve_root(root)?),
+                None => vk_registry::ServerConfig::local(
+                    addr.unwrap_or(vk_registry::DEFAULT_ADDR),
+                    resolve_root(root)?,
+                ),
             };
             vk_registry::serve_config(cfg).await
         }
@@ -501,6 +504,26 @@ mod tests {
         };
         assert_eq!(root, None);
         assert_eq!(config.as_deref(), Some(Path::new("/etc/reg.toml")));
+    }
+
+    // `--addr`'s `[default: …]` is prose, not clap's own line: with no clap default there
+    // is nothing keeping it in step with the address `serve` really falls back to.
+    #[test]
+    fn serve_addr_help_names_the_built_in_default() {
+        let cmd = <Cli as clap::CommandFactory>::command();
+        let help = cmd
+            .find_subcommand("serve")
+            .expect("serve must exist")
+            .get_arguments()
+            .find(|a| a.get_long() == Some("addr"))
+            .expect("serve must take --addr")
+            .get_help()
+            .expect("--addr must carry help")
+            .to_string();
+        assert!(
+            help.contains(&vk_registry::DEFAULT_ADDR.to_string()),
+            "{help}"
+        );
     }
 
     // `-h` is a summary: a short line per command, per flag and per possible value, with

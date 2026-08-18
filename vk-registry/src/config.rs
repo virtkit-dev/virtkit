@@ -3,12 +3,13 @@
 //!
 //! The listen address and store root usually come from the CLI; the TOML config file
 //! carries the relay `[[upstream]]` entries, the TLS cert/key, and the auth credentials
-//! (and may override addr/root). No upstreams ⇒ a plain local registry; no TLS ⇒ plain
-//! HTTP; no auth ⇒ open. A central, network-exposed deployment sets all three.
+//! (and may name addr/root, for the flags that were not passed). No upstreams ⇒ a plain
+//! local registry; no TLS ⇒ plain HTTP; no auth ⇒ open. A central, network-exposed
+//! deployment sets all three.
 
 use std::fs::File;
 use std::io::BufReader;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -79,6 +80,10 @@ struct FileUpstream {
     ca_file: Option<PathBuf>,
 }
 
+/// Where the server listens when neither a flag nor a config file names an address.
+/// Loopback: a store served to the world is a deliberate act, not a default.
+pub const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
+
 impl ServerConfig {
     /// A plain local registry: no upstreams, no TLS, no auth.
     pub fn local(addr: SocketAddr, root: PathBuf) -> Self {
@@ -122,10 +127,7 @@ impl ServerConfig {
     pub fn file_view(path: &Path) -> Result<FileView> {
         let f = read_file(path)?;
         Ok(FileView {
-            addr: f
-                .addr
-                .map(|a| a.parse().with_context(|| format!("parsing addr {a:?}")))
-                .transpose()?,
+            addr: parse_addr(f.addr)?,
             root: f.root,
             // Both keys, the pair `build_tls` insists on: a half-configured one is `serve`'s
             // error to raise, not this caller's.
@@ -133,14 +135,15 @@ impl ServerConfig {
         })
     }
 
-    /// Load from a TOML file. The CLI `addr` and optional `root` override the file; the
-    /// store root falls back to the shared default when neither sets it.
-    pub fn load(path: &Path, addr: SocketAddr, root: Option<PathBuf>) -> Result<Self> {
+    /// Load from a TOML file. An explicitly passed `addr`/`root` outranks the file's; the
+    /// address falls back to [`DEFAULT_ADDR`] and the store root to the shared default when
+    /// neither names one.
+    pub fn load(path: &Path, addr: Option<SocketAddr>, root: Option<PathBuf>) -> Result<Self> {
         let f = read_file(path)?;
-        let addr = match f.addr {
-            Some(a) => a.parse().with_context(|| format!("parsing addr {a:?}"))?,
-            None => addr,
-        };
+        // Parsed even when a flag outranks it: a typo in the key is worth an error rather
+        // than silence, and the caller may have passed no flag on the next run.
+        let file_addr = parse_addr(f.addr)?;
+        let addr = addr.or(file_addr).unwrap_or(DEFAULT_ADDR);
         let root = match root.or(f.root) {
             Some(r) => r,
             None => crate::default_root()?,
@@ -280,6 +283,13 @@ impl UpstreamSpec {
     }
 }
 
+/// The `addr` key of a config file, parsed. Shared by [`ServerConfig::load`] and
+/// [`ServerConfig::file_view`], so a bad address reads the same whichever asks.
+fn parse_addr(addr: Option<String>) -> Result<Option<SocketAddr>> {
+    addr.map(|a| a.parse().with_context(|| format!("parsing addr {a:?}")))
+        .transpose()
+}
+
 /// Read + parse a config file, named in the error whichever way it fails. Shared by
 /// [`ServerConfig::load`] and [`ServerConfig::root_of`], so `serve` and the store commands
 /// read the same file the same way.
@@ -339,7 +349,6 @@ mod tests {
             std::fs::write(&p, body).unwrap();
             p
         };
-        let fallback: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
         let tls = write(
             "tls.toml",
@@ -351,18 +360,18 @@ mod tests {
         assert!(v.tls);
         // and it agrees with the address `serve` itself will listen on
         assert_eq!(
-            ServerConfig::load(&tls, fallback, None).unwrap().addr,
+            ServerConfig::load(&tls, None, None).unwrap().addr,
             v.addr.unwrap()
         );
 
         // a file that states neither: the view says so, where `load` would hand back the
-        // fallback address and the shared default store as if the file had named them
+        // built-in address and the shared default store as if the file had named them
         let bare = write("bare.toml", "username = \"ci\"\n");
         let v = ServerConfig::file_view(&bare).unwrap();
         assert_eq!((v.addr, v.root, v.tls), (None, None, false));
         assert_eq!(
-            ServerConfig::load(&bare, fallback, None).unwrap().addr,
-            fallback
+            ServerConfig::load(&bare, None, None).unwrap().addr,
+            DEFAULT_ADDR
         );
 
         // one TLS key without the other is not TLS here: `serve` is what refuses the pair,
@@ -370,7 +379,7 @@ mod tests {
         let half = write("half.toml", "tls_cert = \"/c.pem\"\n");
         assert!(!ServerConfig::file_view(&half).unwrap().tls);
         assert!(
-            ServerConfig::load(&half, fallback, None)
+            ServerConfig::load(&half, None, None)
                 .unwrap()
                 .build_tls()
                 .is_err()
@@ -378,6 +387,48 @@ mod tests {
 
         // an unreadable file is an error, not an empty view
         assert!(ServerConfig::file_view(&dir.join("absent.toml")).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An address passed on the command line outranks the config file's, the order
+    /// `--root` already followed: the file is the standing configuration, a flag is this
+    /// run's override of it.
+    #[test]
+    fn an_explicit_addr_outranks_the_config_file() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-addr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        let flag: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+
+        let named = write("named.toml", "addr = \"0.0.0.0:443\"\n");
+        assert_eq!(
+            ServerConfig::load(&named, Some(flag), None).unwrap().addr,
+            flag
+        );
+        // and the file still supplies it for the run that passes no flag
+        assert_eq!(
+            ServerConfig::load(&named, None, None).unwrap().addr,
+            "0.0.0.0:443".parse::<SocketAddr>().unwrap()
+        );
+
+        // neither names one: the built-in default
+        let bare = write("bare.toml", "username = \"ci\"\n");
+        assert_eq!(
+            ServerConfig::load(&bare, None, None).unwrap().addr,
+            DEFAULT_ADDR
+        );
+
+        // an unparseable `addr` is an error even on the run whose flag outranks it, so a
+        // typo in the file surfaces instead of waiting for the run that relies on it
+        let bad = write("bad.toml", "addr = \"h:t:t:p\"\n");
+        assert!(ServerConfig::load(&bad, Some(flag), None).is_err());
+        assert!(ServerConfig::load(&bad, None, None).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -410,9 +461,7 @@ mod tests {
             crate::default_root().unwrap()
         );
         assert_eq!(
-            ServerConfig::load(&bare, "127.0.0.1:5000".parse().unwrap(), None)
-                .unwrap()
-                .root,
+            ServerConfig::load(&bare, None, None).unwrap().root,
             ServerConfig::root_of(Some(&bare), None).unwrap()
         );
         assert_eq!(
@@ -424,13 +473,12 @@ mod tests {
 
         // The same file resolves the same root through `serve`'s own loader, with and
         // without the flag: the two must not drift into sweeping different stores.
-        let addr = "127.0.0.1:5000".parse().unwrap();
         assert_eq!(
-            ServerConfig::load(&path, addr, None).unwrap().root,
+            ServerConfig::load(&path, None, None).unwrap().root,
             ServerConfig::root_of(Some(&path), None).unwrap()
         );
         assert_eq!(
-            ServerConfig::load(&path, addr, Some(PathBuf::from("/flag")))
+            ServerConfig::load(&path, None, Some(PathBuf::from("/flag")))
                 .unwrap()
                 .root,
             ServerConfig::root_of(Some(&path), Some(PathBuf::from("/flag"))).unwrap()
