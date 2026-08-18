@@ -28,6 +28,15 @@ pub enum InitSource {
     Image,
 }
 
+impl InitSource {
+    /// Does this hand PID 1 to the image? Every guard that rejects a flag the preinit
+    /// handoff cannot carry, and the boot-medium choice that selects that handoff, ask
+    /// exactly this.
+    pub fn is_image(self) -> bool {
+        matches!(self, InitSource::Image)
+    }
+}
+
 /// Which kernel the guest boots on. `Default` = virtkit's pinned/embedded kernel
 /// (virtio + ext4 built in); `Image` = the image's own `/boot/vmlinuz` + its modules,
 /// extracted host-side; `Path` = an explicit vmlinux/bzImage file.
@@ -600,7 +609,7 @@ async fn build_and_boot(
     // Both non-default axes boot the image from an ext4 (the modular image kernel
     // mounts /dev/vda; the image's init pivots into it), so they need an ext4 — a `-f`
     // build or a non-`--ram` image — never the pure-RAM cpio path.
-    if args.init == InitSource::Image && args.ram {
+    if args.init.is_image() && args.ram {
         bail!("--init image is incompatible with --ram");
     }
     if args.kernel == KernelSource::Image && args.ram {
@@ -622,13 +631,13 @@ async fn build_and_boot(
     // Named on its own, because unlike the rest it has somewhere to send the operator: the
     // image's init leaves no agent at PID 1 to fork the sampler, but the reparented agent
     // still serves the exec channel, which is what an attach records over.
-    if args.init == InitSource::Image && args.atop.is_some() {
+    if args.init.is_image() && args.atop.is_some() {
         bail!(
             "--init image does not support --atop — boot the VM, then record it with \
              `vk atop <dir>`"
         );
     }
-    if args.init == InitSource::Image {
+    if args.init.is_image() {
         let unsupported = [
             (args.host_exec, "--host-exec"),
             (args.compose.is_some(), "--compose"),
@@ -788,7 +797,7 @@ async fn build_and_boot(
     // The CLI axis was rejected far above, before the build; this catches a --primary
     // service whose own x-virtkit marker selects image init, checked on the merged axes
     // just computed above (like the --ram guard a few lines below).
-    if args.inactivity_timeout_secs.is_some() && eff_init == InitSource::Image {
+    if args.inactivity_timeout_secs.is_some() && eff_init.is_image() {
         bail!("a service's x-virtkit image init is incompatible with --inactivity-timeout");
     }
     // Effective primary sizing, same precedence as the axes: an explicit --cpus/--mem
@@ -819,7 +828,7 @@ async fn build_and_boot(
     // marker (not the CLI flag) selects an image axis also needs an ext4, never the cpio
     // path. `--primary` forces the ext4 disk path anyway, so this only ever fires if that
     // invariant is broken — a belt-and-braces check on the merged axes.
-    if args.ram && (eff_init == InitSource::Image || eff_kernel == KernelSource::Image) {
+    if args.ram && (eff_init.is_image() || eff_kernel == KernelSource::Image) {
         bail!("a service's x-virtkit image init/kernel is incompatible with --ram");
     }
 
@@ -914,7 +923,7 @@ async fn build_and_boot(
     // initramfs. A default/default run keeps the existing non-image branches below.
     // The axes are the merged effective values (CLI force > primary marker > default).
     let (disks, initramfs, mut cmdline): (Vec<crate::vmm::Disk>, Option<PathBuf>, String) =
-        if eff_init == InitSource::Image || eff_kernel == KernelSource::Image {
+        if eff_init.is_image() || eff_kernel == KernelSource::Image {
             // Boot via the preinit initramfs. First get the raw ext4: a `-f` build already
             // produced one (dockerfile_ext4), otherwise build root.ext4 from the image
             // source exactly as the disk path below does.

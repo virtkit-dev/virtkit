@@ -346,8 +346,7 @@ pub fn boot_unit(
     // path (`run::build_and_boot`). A non-default axis boots via the preinit
     // initramfs — the image's own init needs the agent-as-/init handoff, and a
     // modular image kernel needs the module initramfs — exactly like the primary.
-    let image_boot =
-        svc.init == crate::run::InitSource::Image || svc.kernel == crate::run::KernelSource::Image;
+    let image_boot = svc.init.is_image() || svc.kernel == crate::run::KernelSource::Image;
     // The boot medium + boot kernel. Default/Default: the agent-service medium (agent
     // + the unit's config as VIRTKIT_MODE=service). Otherwise: the preinit medium,
     // reading the unit's clean ext4 (the overlay's ro backing) to extract the image
