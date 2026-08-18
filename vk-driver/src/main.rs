@@ -118,14 +118,17 @@ fn parse_build_jobs(s: &str) -> Result<NonZeroUsize, String> {
 /// What `vk export` can package a raw disk image as.
 #[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
 enum ExportFormat {
-    /// streamOptimized VMDK — the compressed, stream-readable subformat
-    /// vSphere's OVF/OVA import requires
+    /// streamOptimized VMDK — the subformat vSphere's OVF/OVA import requires
+    ///
+    /// Compressed and stream-readable.
     Vmdk,
-    /// OVA appliance — the VMDK wrapped in an OVF descriptor + SHA256
-    /// manifest, importable by ESXi/vCenter as one file
+    /// OVA appliance — importable by ESXi/vCenter as one file
+    ///
+    /// The VMDK wrapped in an OVF descriptor and a SHA256 manifest.
     Ova,
-    /// bootable ISO 9660 image built from a staged directory tree (an
-    /// auto-install medium: bootloader + kernel + installer + disk payload)
+    /// bootable ISO 9660 image built from a staged directory tree
+    ///
+    /// An auto-install medium: bootloader + kernel + installer + disk payload.
     Iso,
 }
 
@@ -167,10 +170,10 @@ fn parse_service_mem(s: &str) -> Result<(String, String), String> {
     }
 }
 
+/// Boot OCI/Docker images as fast, rootless microVMs
 #[derive(Parser)]
 #[command(
     version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("VK_GIT_HASH"), ")"),
-    about,
     after_help = "\
 Examples:
   vk run alpine                          boot alpine:latest, interactive shell
@@ -179,12 +182,16 @@ Examples:
   vk run -f Dockerfile                   build the last stage and boot it
   vk check                               preflight this host
 
+Every command's -h is a one-line summary per flag; --help adds the full detail.
 Run 'vk help-all' to also list the advanced/plumbing commands."
 )]
 struct Cli {
-    /// Config file [default: the first of $VIRTKIT_CONFIG,
-    /// ~/.config/virtkit/config.toml, /etc/virtkit/config.toml]
-    #[arg(long, global = true, value_name = "PATH")]
+    /// Config file [default: $VIRTKIT_CONFIG, else the first standard path that exists]
+    ///
+    /// $VIRTKIT_CONFIG names the file outright, so a path that is not there is an error.
+    /// The standard paths are $XDG_CONFIG_HOME/virtkit/config.toml (else
+    /// ~/.config/virtkit/config.toml), then /etc/virtkit/config.toml.
+    #[arg(long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
@@ -198,22 +205,31 @@ enum GitlabCmd {
     Prepare,
     /// run_exec: run one stage script inside the VM
     Run {
+        /// the stage script gitlab-runner passes on the command line
         script: PathBuf,
-        /// Stage name (prepare_script, get_sources, build_script, ...). Used to emit the
-        /// once-per-job summaries on the final stage (see executor::run_stage).
+        /// stage name (prepare_script, get_sources, build_script, …)
+        ///
+        /// It names the final stage, where the once-per-job summaries are emitted
+        /// (see executor::run_stage).
         stage: Option<String>,
     },
     /// cleanup_exec: stop the VM and remove the job state (idempotent)
     Cleanup,
-    /// What this runner's CI jobs have been using: per project, each job's recent peak, the
-    /// runs it rests on and what its next run would reserve. Give a project to narrow it —
-    /// any part of its `<id>-<slug>` directory name, so the slug alone will do.
+    /// Report what this runner's CI jobs have been reserving, per project
+    ///
+    /// For each project: every job's recent peak, the runs that peak rests on, and what
+    /// its next run would reserve.
     Usage {
-        /// Report only projects whose directory name contains this. Omitted = every project.
+        /// report only projects whose directory name contains this
+        ///
+        /// Any part of the `<id>-<slug>` directory name matches, so the slug alone will
+        /// do. Omitted, every project is reported.
         project: Option<String>,
     },
-    /// internal: the detached per-job supervisor prepare spawns — owns the job's
-    /// switch/virtiofsds/forwards/VMM as tied children until SIGTERM'd by cleanup
+    /// internal: the detached per-job supervisor prepare spawns
+    ///
+    /// It owns the job's switch/virtiofsds/forwards/VMM as tied children until cleanup
+    /// SIGTERMs it.
     #[command(hide = true)]
     Supervise {
         /// the job dir (pid-reuse guard on the cmdline; must match the environment)
@@ -223,54 +239,64 @@ enum GitlabCmd {
 
 #[derive(Subcommand)]
 enum RegistryCmd {
-    /// Push a local bundle dir (runner.ext4 + boot.kind [+ vmlinuz + initrd.img])
-    /// to the [registry] repo at <name>:<tag>, with CDC+zstd chunk dedup.
+    /// Push a local bundle dir to the [registry] repo at <name>:<tag>
+    ///
+    /// The directory holds runner.ext4 + boot.kind [+ vmlinuz + initrd.img], and its
+    /// blobs are stored with CDC+zstd chunk dedup.
     Push {
         /// Local bundle directory
         dir: PathBuf,
         /// Target reference, <name>:<tag> (a :tag is required for a push)
         reference: String,
     },
-    /// Pull+cache a bundle from the [registry] repo and print its cache dir.
+    /// Pull+cache a bundle from the [registry] repo and print its cache dir
     Pull {
         /// Source reference, <name>[:tag|@sha256:…]
         reference: String,
     },
-    /// Check a bundle exists in the [registry] repo without pulling it: print its
-    /// manifest digest and exit 0, or exit non-zero if absent (the CI build's
-    /// already-built check, replacing `docker manifest inspect`).
+    /// Check a bundle exists in the [registry] repo without pulling it
+    ///
+    /// It prints the manifest digest and exits 0, or exits non-zero when the bundle is
+    /// absent — the CI build's already-built check, replacing `docker manifest inspect`.
     Inspect {
         /// Source reference, <name>[:tag|@sha256:…]
         reference: String,
     },
     // Serving a store over HTTP now lives in the standalone `vk-registry` daemon;
     // `vk` accesses its local filesystem store in-process (registry.rs `mod local`).
-    /// Report a registry store's usage and content: on-disk size (both storage
-    /// forms), dedup savings, and a per-repository breakdown (tags, latest tag,
-    /// logical size). Read-only — it creates no store.
+    /// Report a registry store's usage and content
+    ///
+    /// On-disk size (both storage forms), dedup savings, and a per-repository breakdown
+    /// (tags, latest tag, logical size). Read-only — it creates no store.
     Status {
-        /// Store directory [default: the store the build cache uses —
-        /// `[build] cache_registry`, else $XDG_DATA_HOME/virtkit/registry].
-        #[arg(long)]
+        /// store directory [default: the store the build cache uses]
+        ///
+        /// The build cache's store is `[build] cache_registry`, else
+        /// $XDG_DATA_HOME/virtkit/registry.
+        #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
     },
-    /// Garbage-collect a registry store: drop tags idle past the retention window,
-    /// then sweep the blobs no surviving manifest references and stale uploads
-    /// (both after a grace window). Takes the store lock exclusive, briefly
-    /// blocking concurrent pushers.
+    /// Garbage-collect a registry store
+    ///
+    /// It drops tags idle past the retention window, then sweeps the blobs no surviving
+    /// manifest references and the stale uploads (both after a grace window). It holds
+    /// the store lock exclusive, briefly blocking concurrent pushers.
     Gc {
-        /// Store directory [default: the store the build cache uses —
-        /// `[build] cache_registry`, else $XDG_DATA_HOME/virtkit/registry].
-        #[arg(long)]
+        /// store directory [default: the store the build cache uses]
+        ///
+        /// The build cache's store is `[build] cache_registry`, else
+        /// $XDG_DATA_HOME/virtkit/registry.
+        #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
-        /// Drop tags unused for more than this many days.
-        #[arg(long, default_value_t = 30)]
+        /// drop tags unused for more than this many days
+        #[arg(long, default_value_t = 30, value_name = "DAYS")]
         retention_days: u64,
-        /// Keep unreferenced blobs and stale uploads this many days past their
-        /// last use (protects in-flight multi-request pushes).
-        #[arg(long, default_value_t = 1)]
+        /// keep unreferenced blobs and stale uploads this many days past their last use
+        ///
+        /// The window protects in-flight multi-request pushes.
+        #[arg(long, default_value_t = 1, value_name = "DAYS")]
         grace_days: u64,
-        /// Report what would be removed without removing anything.
+        /// report what would be removed without removing anything
         #[arg(long)]
         dry_run: bool,
     },
@@ -278,18 +304,20 @@ enum RegistryCmd {
 
 #[derive(Subcommand)]
 enum ServiceCmd {
-    /// Bring a service up: build its image on first use (a profiled-down service — build
-    /// progress streams live), then boot it. A no-op if it is already running.
+    /// Bring a service up, building its image on first use
+    ///
+    /// The first-use build is a profiled-down service build and streams its progress
+    /// live. A no-op when the service is already running.
     Up {
         /// service name (as declared in the compose file)
         name: String,
     },
-    /// Stop a running service (a no-op if already stopped).
+    /// Stop a running service (a no-op if already stopped)
     Down {
         /// service name
         name: String,
     },
-    /// Print a service's state and address, or every declared service when no name is given.
+    /// Print a service's state and address, or every service when no name is given
     Status {
         /// service name; omit to list all services
         name: Option<String>,
@@ -299,45 +327,51 @@ enum ServiceCmd {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
-    /// Preflight: check this host is usable by the current user — /dev/kvm access,
-    /// the VMM backend, a guest kernel/agent, and the host side of each feature the
-    /// config enables (net.mode taps, [docker], [registry], ...). Checked only when
-    /// named with --feature: the CI-executor features (gitlab, services), and
-    /// `entrypoint`, which reports whether this build can hand PID 1 to an image's own
-    /// entrypoint. One line per check; exits non-zero if any fails.
+    /// Preflight this host: can the current user boot microVMs here?
+    ///
+    /// Checks /dev/kvm access, the VMM backend, a guest kernel/agent, and the host side
+    /// of each feature the config enables (net.mode taps, [docker], [registry], ...).
+    /// Checked only when named with --feature: the CI-executor features (gitlab,
+    /// services), and `entrypoint`, which reports whether this build can hand PID 1 to an
+    /// image's own entrypoint. One line per check; exits non-zero if any fails.
     #[command(display_order = 5)]
     Check {
-        /// check only these features, failing (instead of skipping) any that
-        /// turn out unconfigured (repeatable)
+        /// check only these features (repeatable)
+        ///
+        /// Any that turn out unconfigured fail instead of being skipped.
         #[arg(long = "feature", value_enum, value_name = "FEATURE")]
         feature: Vec<check::Feature>,
     },
-    /// Reclaim the host caches: evict materialized bases (`<state_dir>/{registry, docker,
-    /// build}`) no VM is using, remove GitLab host checkouts no job is using, and drop
-    /// unreferenced registry chunks — all of them idle past the threshold. Reclaim otherwise
-    /// happens as those caches are used, so this is for a cron or manual sweep on an
-    /// otherwise-idle runner.
+    /// Reclaim the host caches — a cron or manual sweep
+    ///
+    /// Evicts materialized bases (`<state_dir>/{registry, docker, build}`) no VM is using,
+    /// removes GitLab host checkouts no job is using, and drops unreferenced registry
+    /// chunks — all of them idle past the threshold. Reclaim otherwise happens as those
+    /// caches are used, so this is for an otherwise-idle runner.
     #[command(display_order = 4)]
     Gc {
-        /// Idle threshold in seconds; `0` reclaims every cache entry not currently in use.
-        /// Applies to images and checkouts alike, overriding both of their settings.
-        /// Default: the config's `image_cache_idle_secs` and `checkout_cache_idle_secs`
-        /// (30 min each).
-        #[arg(long)]
+        /// Idle threshold in seconds; `0` reclaims every entry not currently in use
+        ///
+        /// Applies to images and checkouts alike, overriding both of their settings. Default:
+        /// the config's `image_cache_idle_secs` and `checkout_cache_idle_secs` (30 min each).
+        #[arg(long, value_name = "SECS")]
         idle_secs: Option<u64>,
     },
-    /// Print the effective host paths — config file, state dir, image cache,
-    /// registry store — where each comes from, and how to override it.
+    /// Print the effective host paths and where each comes from
+    ///
+    /// The config file, state dir, image cache and registry store — with the override for each.
     #[command(hide = true)]
     Paths {
         /// also show the gitlab executor's paths (jobs dir, checkouts, tools dir)
         #[arg(long)]
         gitlab: bool,
     },
-    /// Print the effective configuration as TOML — the built-in defaults merged with
-    /// the loaded config file, with a header naming which file it came from. Use it to
-    /// see what a `vk` invocation actually sees. `--example` prints the annotated
-    /// template instead; `--path` prints just the resolved config file path.
+    /// Print the effective configuration as TOML
+    ///
+    /// The built-in defaults merged with the loaded config file, with a header naming which
+    /// file it came from. Use it to see what a `vk` invocation actually sees. `--example`
+    /// prints the annotated template instead; `--path` prints just the resolved config file
+    /// path.
     #[command(hide = true)]
     Config {
         /// print the annotated example config template instead of the effective config
@@ -347,177 +381,266 @@ enum Cmd {
         #[arg(long, conflicts_with = "example")]
         path: bool,
     },
-    /// Keep gitlab-runner's `concurrent` in step with what this host can hold: measure the
-    /// memory its jobs have committed and leave the concurrency that fits where the
-    /// root-side `vk-runnerctl` applies it. Run from a timer every half minute or so (see
-    /// the GitLab CI guide), so it is hidden from the everyday help like `vk gitlab`.
-    /// Needs `[schedule] mem_budget`.
+    /// Keep gitlab-runner's `concurrent` in step with what this host can hold
+    ///
+    /// Measures the memory its jobs have committed and leaves the concurrency that fits where
+    /// the root-side `vk-runnerctl` applies it. Run from a timer every half minute or so (see
+    /// the GitLab CI guide), so it is hidden from the everyday help like `vk gitlab`. Needs
+    /// `[schedule] mem_budget`.
     #[command(hide = true)]
     Tune,
-    /// GitLab custom executor: the lifecycle hooks (config / prepare / run / cleanup) and the
-    /// operator's view of what its jobs have been using (usage)
+    /// GitLab custom executor
+    ///
+    /// The lifecycle hooks (config / prepare / run / cleanup) and the operator's view of what
+    /// its jobs have been using (usage).
     #[command(hide = true)]
     Gitlab {
         #[command(subcommand)]
         cmd: GitlabCmd,
     },
-    /// Native OCI bundle registry: push/pull guest bundles with content-defined chunk
-    /// deduplication (CDC + per-chunk zstd), no oras, no docker.
+    /// Native OCI bundle registry
+    ///
+    /// Push/pull guest bundles with content-defined chunk deduplication (CDC + per-chunk zstd),
+    /// no oras, no docker.
     #[command(hide = true)]
     Registry {
         #[command(subcommand)]
         cmd: RegistryCmd,
     },
-    /// Control the run's compose services from inside the guest: bring one up (building its
-    /// image on demand, streaming build progress), take it down, or query state. Speaks the
-    /// vsock control plane to the host service manager, so it only works inside a vk VM.
+    /// Control the run's compose services from inside the guest
+    ///
+    /// Bring one up (building its image on demand, streaming build progress), take it down, or
+    /// query state. Speaks the vsock control plane to the host service manager, so it only
+    /// works inside a vk VM.
     #[command(hide = true)]
     Service {
         #[command(subcommand)]
         cmd: ServiceCmd,
     },
-    /// Build a Dockerfile target and export it as a bootable ext4 image — a from-scratch
-    /// builder (no docker, no buildkit). Each RUN executes in a microVM guest (the
-    /// embedded libkrun by default) and instruction snapshots are cached
+    /// Build a Dockerfile target into a bootable ext4 image
+    ///
+    /// A from-scratch builder (no docker, no buildkit): each RUN executes in a microVM
+    /// guest (the embedded libkrun by default) and instruction snapshots are cached
     /// (`--cache-registry`). `--print-plan` parses + plans + prints the build without
     /// running it.
     #[command(display_order = 2)]
     Build {
-        /// Dockerfile to build (repeatable: the files merge into one stage namespace,
-        /// so a FROM/COPY --from in one file can name a stage declared in another)
-        #[arg(short = 'f', long = "file", default_value = "Dockerfile")]
+        /// Dockerfile to build
+        ///
+        /// Repeatable: the files merge into one stage namespace, so a FROM/COPY --from in one
+        /// file can name a stage declared in another.
+        #[arg(
+            short = 'f',
+            long = "file",
+            default_value = "Dockerfile",
+            help_heading = "What to build"
+        )]
         file: Vec<PathBuf>,
-        /// target stage (AS name or index; default: the last stage). Repeatable: several
-        /// targets build together in one pass, sharing their common stages (built once) and
-        /// running the rest concurrently. With one --out they export to <out>/<target>.ext4;
-        /// with none they only warm the instruction cache
-        #[arg(long)]
+        /// target stage (AS name or index; default: the last stage)
+        ///
+        /// Repeatable: several targets build together in one pass, sharing their common stages
+        /// (built once) and running the rest concurrently. With one --out they export to
+        /// <out>/<target>.ext4; with none they only warm the instruction cache.
+        #[arg(long, value_name = "NAME|INDEX", help_heading = "What to build")]
         target: Vec<String>,
-        /// build the services `vk run --compose` would boot — the enabled set (profiled-down
-        /// services excluded) plus every image: service — in one pass, so a prebuild warms
-        /// exactly what a boot needs. Services sharing a Dockerfile build their common stages
-        /// once. Warms the cache; with --out each exports to <out>/<name>.ext4. Excludes -f/--target
-        #[arg(long)]
+        /// build the services `vk run --compose` would boot
+        ///
+        /// The enabled set (profiled-down services excluded) plus every image: service, in one
+        /// pass, so a prebuild warms exactly what a boot needs. Services sharing a Dockerfile
+        /// build their common stages once. Warms the cache; with --out each exports to
+        /// <out>/<name>.ext4. Excludes -f/--target.
+        #[arg(long, value_name = "FILE", help_heading = "What to build")]
         compose: Option<PathBuf>,
-        /// with --compose, also build the services this profile enables (repeatable) — the
-        /// same profiled services `vk run --compose --profile` would boot
+        /// with --compose, also build the services this profile enables (repeatable)
+        ///
+        /// The same profiled services `vk run --compose --profile` would boot.
         #[arg(
             long = "profile",
             value_name = "NAME",
             requires = "compose",
-            conflicts_with = "primary"
+            conflicts_with = "primary",
+            help_heading = "What to build"
         )]
         profile: Vec<String>,
-        /// with --compose, build the set `vk run --compose --primary <NAME>` would boot (this
-        /// service plus its dependency closure, and every image: service) rather than the
-        /// default profile-enabled set
-        #[arg(long, value_name = "NAME", requires = "compose")]
+        /// with --compose, build the set `vk run --compose --primary <NAME>` would boot
+        ///
+        /// That service plus its dependency closure, and every image: service, rather than the
+        /// default profile-enabled set.
+        #[arg(
+            long,
+            value_name = "NAME",
+            requires = "compose",
+            help_heading = "What to build"
+        )]
         primary: Option<String>,
-        /// build context for COPY (repeatable, zipped positionally with -f;
-        /// default: each Dockerfile's own directory)
-        #[arg(long)]
+        /// build context for COPY
+        ///
+        /// Repeatable, zipped positionally with -f; default: each Dockerfile's own directory.
+        #[arg(long, value_name = "DIR", help_heading = "What to build")]
         context: Vec<PathBuf>,
-        /// an additional named context, `<name>=<dir>`, that `COPY --from=<name>` and
-        /// `RUN --mount=…,from=<name>` read (repeatable) — so a Dockerfile can reach files
-        /// outside its own context with no staging copy. Resolved after the Dockerfile's own
-        /// stages and before an image ref, so a name never shadows a stage. Not supported with
-        /// --compose: a compose service declares its own contexts, and `vk run --compose` would
-        /// otherwise rebuild what this built, under a different key.
+        /// an additional named context, `<name>=<dir>`, for `COPY --from` and `RUN --mount`
+        ///
+        /// `COPY --from=<name>` and `RUN --mount=…,from=<name>` read it.
+        /// Repeatable, so a Dockerfile can reach files outside its own context with no staging
+        /// copy. Resolved after the Dockerfile's own stages and before an image ref, so a name
+        /// never shadows a stage. Not supported with --compose: a compose service declares its
+        /// own contexts, and `vk run --compose` would otherwise rebuild what this built, under
+        /// a different key.
         #[arg(
             long = "build-context",
             value_name = "NAME=DIR",
-            conflicts_with = "compose"
+            conflicts_with = "compose",
+            help_heading = "What to build"
         )]
         build_context: Vec<String>,
         /// ext4 output path
-        #[arg(long)]
+        #[arg(long, value_name = "PATH", help_heading = "Output")]
         out: Option<PathBuf>,
-        /// build the target and publish it to the `[registry]` repo as `<name>:<tag>`, a
-        /// bootable bundle the executor pulls with `MICROVM_IMAGE: virtkit/<name>:<tag>`.
-        /// The rootfs is byte-clean (its Env/User ride the bundle config), and its chunks
-        /// dedup against `--cache-registry`, so a co-located registry makes this a near
-        /// no-op (only the manifest is written).
-        #[arg(long = "tag", value_name = "NAME:TAG")]
+        /// build the target and publish it to the `[registry]` repo as `<name>:<tag>`
+        ///
+        /// A bootable bundle the executor pulls with `MICROVM_IMAGE: virtkit/<name>:<tag>`. The
+        /// rootfs is byte-clean (its Env/User ride the bundle config), and its chunks dedup
+        /// against `--cache-registry`, so a co-located registry makes this a near no-op (only
+        /// the manifest is written).
+        #[arg(long = "tag", value_name = "NAME:TAG", help_heading = "Output")]
         tag: Option<String>,
-        /// attach this caller-owned raw disk file read-write to the target stage's RUN
-        /// guests as /dev/vdb (sources shift to vdc+). Its writes are the artifact — a RUN
-        /// can partition it, mkfs and install a bootloader. Size + own the file yourself
-        /// (e.g. `qemu-img create -f raw disk.raw 12G`); vk never creates or removes it.
-        /// Pairs with `FROM --kernel=image` for a kernel that can drive the disk.
-        #[arg(long = "disk", value_name = "PATH")]
+        /// attach a caller-owned raw disk read-write to the target stage's RUN guests
+        ///
+        /// It appears as /dev/vdb and sources shift to vdc+. Only the target stage sees it,
+        /// so exactly one stage writes it. Its writes are the artifact — a RUN can partition
+        /// it, mkfs and install a bootloader. Size and own the file yourself (e.g. `qemu-img
+        /// create -f raw disk.raw 12G`); vk never creates or removes it. Pairs with
+        /// `FROM --kernel=image` for a kernel that can drive the disk.
+        #[arg(long = "disk", value_name = "PATH", help_heading = "Output")]
         disk: Option<PathBuf>,
         /// parse + plan + print the build order and primitives; build nothing
-        #[arg(long = "print-plan")]
+        #[arg(long = "print-plan", help_heading = "Output")]
         print_plan: bool,
-        /// cloud-hypervisor binary — only used when VIRTKIT_VMM=cloud-hypervisor selects
-        /// that backend; the default libkrun backend is embedded in `vk` and needs none
-        /// (kernel/agent likewise default to the copies embedded in `vk`)
-        #[arg(long = "cloud-hypervisor")]
+        /// cloud-hypervisor binary, used only with VIRTKIT_VMM=cloud-hypervisor
+        ///
+        /// The default libkrun backend is embedded in `vk` and needs none.
+        #[arg(
+            long = "cloud-hypervisor",
+            value_name = "PATH",
+            help_heading = "Build environment"
+        )]
         cloud_hypervisor: Option<PathBuf>,
-        #[arg(long)]
+        /// guest kernel the RUN steps boot
+        ///
+        /// Default: `[build] kernel`, else the one embedded in `vk`.
+        #[arg(long, value_name = "PATH", help_heading = "Build environment")]
         kernel: Option<PathBuf>,
-        #[arg(long)]
+        /// static (musl) vk-agent the RUN guests run as PID 1
+        ///
+        /// Default: `[build] agent`, else the copy embedded in `vk`.
+        #[arg(long, value_name = "PATH", help_heading = "Build environment")]
         agent: Option<PathBuf>,
-        /// instruction cache: a registry repo (e.g. 127.0.0.1:5000 of a `vk-registry`
-        /// server), an absolute store directory path (accessed in-process), or `none`
-        /// to disable. Default: the builtin local store `vk-registry` also uses.
-        #[arg(long = "cache-registry")]
+        /// instruction cache: a registry repo, a store directory path, or `none` to disable
+        ///
+        /// A registry repo is e.g. 127.0.0.1:5000 of a `vk-registry` server; an absolute store
+        /// directory path is accessed in-process. Default: the builtin local store
+        /// `vk-registry` also uses.
+        #[arg(
+            long = "cache-registry",
+            value_name = "REF|DIR|none",
+            help_heading = "Instruction cache"
+        )]
         cache_registry: Option<String>,
-        /// the cache registry speaks plain HTTP (a loopback vk-registry); registry
-        /// caches only — the builtin/path store has no transport
-        #[arg(long = "cache-insecure")]
+        /// the cache registry speaks plain HTTP (a loopback vk-registry)
+        ///
+        /// Registry caches only — the builtin/path store has no transport.
+        #[arg(long = "cache-insecure", help_heading = "Instruction cache")]
         cache_insecure: bool,
-        /// how aggressively to populate the instruction cache: `auto` (default;
-        /// checkpoints only past a work threshold), `layers` (one snapshot per stage,
-        /// no partial-prefix reuse), or `instructions` (one snapshot per RUN/COPY)
-        #[arg(long = "build-cache", value_name = "auto|layers|instructions")]
+        /// how aggressively to populate the instruction cache
+        ///
+        /// `auto` (default) checkpoints only past a work threshold, `layers` takes one snapshot
+        /// per stage with no partial-prefix reuse, `instructions` one snapshot per RUN/COPY.
+        #[arg(
+            long = "build-cache",
+            value_name = "auto|layers|instructions",
+            help_heading = "Instruction cache"
+        )]
         build_cache: Option<String>,
         /// add an ext4 journal to the exported image (the build stays journal-less)
-        #[arg(long)]
+        #[arg(long, help_heading = "Output")]
         journal: bool,
-        /// use a RAM tmpfs for each stage guest's `/tmp` instead of the default
-        /// disk-backed scratch (which bounds a bulk `/tmp` write, e.g. a large toolchain
-        /// unpack, by disk rather than ½·guest-RAM). Also settable as `tmp_tmpfs` in `[build]`
-        #[arg(long = "build-tmp-tmpfs")]
+        /// use a RAM tmpfs for each stage guest's `/tmp`
+        ///
+        /// Instead of the default disk-backed scratch, which bounds a bulk `/tmp` write (e.g. a
+        /// large toolchain unpack) by disk rather than ½·guest-RAM. Also settable as
+        /// `tmp_tmpfs` in `[build]`.
+        #[arg(long = "build-tmp-tmpfs", help_heading = "Build environment")]
         build_tmp_tmpfs: bool,
         /// override an ARG default: NAME=VALUE (repeatable)
-        #[arg(long = "build-arg", value_name = "NAME=VALUE")]
+        #[arg(
+            long = "build-arg",
+            value_name = "NAME=VALUE",
+            help_heading = "What to build"
+        )]
         build_arg: Vec<String>,
-        /// network for the microVM build's RUN steps: `all` (unrestricted) or `none`
-        #[arg(long = "build-net", default_value = "all", value_name = "all|none")]
+        /// network for the build's RUN steps: `all` (unrestricted) or `none`
+        #[arg(
+            long = "build-net",
+            default_value = "all",
+            value_name = "all|none",
+            help_heading = "Network (RUN steps)"
+        )]
         build_net: String,
-        /// restrict RUN egress to this destination IPv4 CIDR, optionally port-scoped
-        /// as CIDR:port (repeatable; any --build-allow-* flag turns filtering on)
-        #[arg(long = "build-allow-ip", value_name = "CIDR[:PORT]")]
+        /// restrict RUN egress to this destination IPv4 CIDR
+        ///
+        /// Optionally port-scoped as CIDR:port (repeatable; any --build-allow-* flag turns
+        /// filtering on).
+        #[arg(
+            long = "build-allow-ip",
+            value_name = "CIDR[:PORT]",
+            help_heading = "Network (RUN steps)"
+        )]
         build_allow_ip: Vec<String>,
-        /// restrict RUN egress to hosts at/under this DNS suffix, e.g. `crates.io`
-        /// (repeatable; any --build-allow-* flag turns filtering on)
-        #[arg(long = "build-allow-name", value_name = "SUFFIX")]
+        /// restrict RUN egress to hosts at or under this DNS suffix
+        ///
+        /// A suffix is e.g. `crates.io`. Repeatable; any --build-allow-* flag turns
+        /// filtering on.
+        #[arg(
+            long = "build-allow-name",
+            value_name = "SUFFIX",
+            help_heading = "Network (RUN steps)"
+        )]
         build_allow_name: Vec<String>,
-        /// audit egress: list every external domain the build's RUN steps contact (and how
-        /// many times) after the build. Observes only — it does not restrict egress
-        #[arg(long = "build-audit-egress")]
+        /// audit egress: which external domains the build's RUN steps contact
+        ///
+        /// Lists every one, and how many times, after the build. Observes only — it does not
+        /// restrict egress.
+        #[arg(long = "build-audit-egress", help_heading = "Network (RUN steps)")]
         build_audit_egress: bool,
-        /// restores from the instruction cache are allowed, but nothing may build:
-        /// a cache miss aborts with exit code 3, so scripts can branch
-        /// cached-vs-cold without paying for a build
-        #[arg(long = "require-cached")]
+        /// restores from the instruction cache are allowed, but nothing may build
+        ///
+        /// A cache miss aborts with exit code 3, so scripts can branch cached-vs-cold without
+        /// paying for a build.
+        #[arg(long = "require-cached", help_heading = "Instruction cache")]
         require_cached: bool,
-        /// max stages built concurrently on the microVM backend (independent stages
-        /// build in parallel over the dependency graph). Default: `[build] jobs`, else
-        /// auto, bounded by host RAM. 1 forces a sequential build
-        #[arg(long = "build-jobs", value_name = "N", value_parser = parse_build_jobs)]
+        /// max stages built concurrently on the microVM backend
+        ///
+        /// Independent stages build in parallel over the dependency graph. Default: `[build]
+        /// jobs`, else auto, bounded by host RAM. 1 forces a sequential build.
+        #[arg(
+            long = "build-jobs",
+            value_name = "N",
+            value_parser = parse_build_jobs,
+            help_heading = "Build environment"
+        )]
         build_jobs: Option<NonZeroUsize>,
         /// verify each stage snapshot with e2fsck as it crosses the instruction cache
-        /// (after a load, before an upload) to catch a corrupt ext4 early. Best-effort
-        /// (skipped if e2fsck is absent); adds an fsck per instruction
-        #[arg(long)]
+        ///
+        /// After a load and before an upload, to catch a corrupt ext4 early. Best-effort
+        /// (skipped if e2fsck is absent); adds an fsck per instruction.
+        #[arg(long, help_heading = "Instruction cache")]
         debug: bool,
     },
-    /// Host side of a forward (companion of `virtkit-agent forward`): accept on
-    /// `--listen` and splice each connection to `--to`, opaque to the protocol.
-    /// Long-running, spawned detached per job — e.g. the VMM's per-port vsock
-    /// unix socket -> a host-local service the guest must not reach directly.
+    /// Host side of a forward (companion of `vk-agent forward`)
+    ///
+    /// Accepts on `--listen` and splices each connection to `--to`, opaque to the protocol.
+    /// Long-running, spawned detached per job — e.g. the VMM's per-port vsock unix socket -> a
+    /// host-local service the guest must not reach directly.
     #[command(hide = true)]
     Forward {
         /// Local address to listen on (a unix socket path, tcp://host:port, ...)
@@ -527,46 +650,55 @@ enum Cmd {
         #[arg(long)]
         to: SocketAddr,
     },
-    /// plumbing: splice stdio to the target address — the SSH `ProxyCommand` shape. ssh
-    /// hands its protocol stream on stdio; we relay it to the guest's ssh-serve (`run --ssh`
-    /// prints the full invocation). Addresses: a unix path, vsock-mux://<path>:<port>,
-    /// vsock-auto://<path>:<port> (best path per backend),
-    /// tcp://host:port.
+    /// plumbing: splice stdio to the target address — the SSH `ProxyCommand` shape
+    ///
+    /// ssh hands its protocol stream on stdio; we relay it to the guest's ssh-serve (`run
+    /// --ssh` prints the full invocation). Addresses: a unix path, vsock-mux://<path>:<port>,
+    /// vsock-auto://<path>:<port> (best path per backend), tcp://host:port.
     #[command(hide = true)]
     Connect {
         /// Target address to dial
         addr: SocketAddr,
     },
-    /// Probe a running VM's guest agent and print its reply, or exit non-zero if it does not
-    /// answer — a liveness check that exercises the agent protocol, stronger than a socket stat.
-    /// Selects the VM launched from the current directory by default; pass a DIR to select by
-    /// launch directory. A raw agent address (`vsock-auto://DIR/vsock.sock:4444`) probes it
-    /// directly, for plumbing that already knows the socket.
+    /// Probe a running VM's guest agent
+    ///
+    /// Prints its reply, or exits non-zero if it does not answer — a liveness check that
+    /// exercises the agent protocol, stronger than a socket stat. Selects the VM launched
+    /// from the current directory by default; pass a DIR to select by launch directory. A
+    /// raw agent address (`vsock-auto://DIR/vsock.sock:4444`) probes it directly, for
+    /// plumbing that already knows the socket.
     #[command(display_order = 7)]
     Status {
-        /// which VM: a directory (default: the current directory), resolved via the VM registry
-        /// `vk list` uses — or a raw agent address (`scheme://…`) to dial directly
+        /// which VM: a directory, or a raw agent address
+        ///
+        /// A directory (default: the current directory) resolves via the VM registry `vk list`
+        /// uses; a raw agent address (`scheme://…`) is dialed directly.
         target: Option<String>,
-        /// print whether the VM's root image is `fresh`, `stale` (a fresh `vk run` would
-        /// rebuild it), or `unknown` — a single scriptable token. Skips the agent probe but
-        /// may resolve base image digests over the network; selects the VM by directory
-        /// (a raw address has no build recipe)
+        /// print whether the VM's root image is `fresh`, `stale` or `unknown`
+        ///
+        /// A single scriptable token; `stale` means a fresh `vk run` would rebuild it. Skips
+        /// the agent probe but may resolve base image digests over the network; selects the VM
+        /// by directory (a raw address has no build recipe).
         #[arg(long)]
         stale: bool,
     },
-    /// Run a command in a live guest over its agent exec channel — an interactive
-    /// shell or a one-shot command, as `--user` in `--dir`. Reuses the same client
-    /// the in-guest agent embeds, so a host reaches a running VM with `vk` alone,
-    /// no separate `vk-agent` binary. `vk` exits with the command's own status.
-    /// The command goes after `--`; the optional token before it selects the VM.
+    /// Run a command in a live guest, or open an interactive shell in it
+    ///
+    /// Goes over the guest's agent exec channel, as `--user` in `--dir`. Reuses the same
+    /// client the in-guest agent embeds, so a host reaches a running VM with `vk` alone,
+    /// no separate `vk-agent` binary. `vk` exits with the command's own status. The
+    /// command goes after `--`; the optional token before it selects the VM.
     #[command(arg_required_else_help = true, display_order = 3)]
     Exec {
-        /// which VM: a directory (default: the current directory), resolved via the VM registry
-        /// `vk list` uses — or a raw agent address (`scheme://…`) to dial directly
+        /// which VM: a directory, or a raw agent address
+        ///
+        /// A directory (default: the current directory) resolves via the VM registry `vk list`
+        /// uses; a raw agent address (`scheme://…`) is dialed directly.
         target: Option<String>,
-        /// run in this compose sibling service of the selected VM (by name, as `vk list` shows)
-        /// instead of the primary; the service must be running
-        #[arg(long)]
+        /// run in this compose sibling service instead of the primary
+        ///
+        /// By name, as `vk list` shows it; the service must be running.
+        #[arg(long, value_name = "NAME")]
         service: Option<String>,
         /// Background mode: no stdio, do not wait for the command to exit
         #[arg(short, long)]
@@ -575,23 +707,24 @@ enum Cmd {
         #[arg(long)]
         clear_env: bool,
         /// Add an environment variable, syntax KEY=value (repeatable)
-        #[arg(long)]
+        #[arg(long, value_name = "KEY=VALUE")]
         env: Vec<String>,
         /// Working directory for the remote process (default: the agent's own)
         #[arg(long)]
         dir: Option<String>,
-        /// Allocate a remote pty and run interactively (requires local stdin/stdout
-        /// to be a terminal; incompatible with --background)
+        /// Allocate a remote pty and run interactively
+        ///
+        /// Requires local stdin/stdout to be a terminal; incompatible with --background.
         #[arg(short = 't', long)]
         tty: bool,
         /// Run the remote process as this Unix user (drops uid/gid/groups)
-        #[arg(long)]
+        #[arg(long, value_name = "NAME")]
         user: Option<String>,
         /// Command to run and its arguments, after `--` (e.g. `vk exec -- ls -la`)
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
-    /// Watch a running VM's guest live, or read what a recorded one did.
+    /// Watch a running VM's guest live, or read what a recorded one did
     ///
     /// A directory a running VM matches (default: the current directory) attaches to it:
     /// a sampler starts in its guest and the follow panel opens on the recording as it
@@ -603,34 +736,43 @@ enum Cmd {
     /// viewer can be pointed at it (`less $(vk atop 42137)`).
     #[command(display_order = 10)]
     Atop {
-        /// A running VM's directory (as `vk exec` selects one; default: the current
-        /// directory) — or a recorded job: a job id, any part of a recorded job's
-        /// directory name (its project or job name, with anything outside
-        /// [A-Za-z0-9._-] replaced) with the newest run matching answering, or a path
-        /// holding a `/`, so the path a job's trace printed works too.
+        /// A running VM's directory, or a recorded job
+        ///
+        /// A directory selects a running VM as `vk exec` does (default: the current directory).
+        /// A recorded job is a job id, any part of a recorded job's directory name (its project
+        /// or job name, with anything outside [A-Za-z0-9._-] replaced) with the newest run
+        /// matching answering, or a path holding a `/`, so the path a job's trace printed works
+        /// too.
         target: Option<String>,
-        /// Account the whole job instead of printing a path: what its guest did with its
-        /// processors and memory, what it moved, where it stalled, and which of its
-        /// processes the time went to.
+        /// Account the whole job instead of printing a path
+        ///
+        /// What its guest did with its processors and memory, what it moved, where it stalled,
+        /// and which of its processes the time went to.
         #[arg(long)]
         summary: bool,
-        /// Write every sample as one line of JSON, so a pipeline can take the samples a
-        /// line at a time (`vk atop 42137 --json | jq …`). One of `--summary`,
-        /// `--json` and the panel: each is a different answer to "what did this job do".
+        /// Write every sample as one line of JSON
+        ///
+        /// A pipeline can then take the samples a line at a time
+        /// (`vk atop 42137 --json | jq …`). One of `--summary`, `--json` and the panel: each
+        /// is a different answer to "what did this job do".
         #[arg(long, conflicts_with_all = ["summary", "view", "follow"])]
         json: bool,
-        /// Walk the recording sample by sample in a full-screen panel: what the guest's
-        /// processors, memory, pressure, disks and network were doing at each moment, and
-        /// which processes were using them.
+        /// Walk the recording sample by sample in a full-screen panel
+        ///
+        /// What the guest's processors, memory, pressure, disks and network were doing at each
+        /// moment, and which processes were using them.
         #[arg(long)]
         view: bool,
-        /// The panel, kept up to date while the job is still running — new samples appear as
-        /// the guest commits them, and stepping back holds the view still until End.
+        /// The panel, kept up to date while the job is still running
+        ///
+        /// New samples appear as the guest commits them, and stepping back holds the view still
+        /// until End.
         #[arg(long, conflicts_with = "view")]
         follow: bool,
-        /// Sampling interval when attaching to a running VM, in seconds. A recorded job —
-        /// or a VM recording itself, whose cadence `vk run --atop` set at boot — was
-        /// sampled at whatever cadence recorded it, so this says nothing about either.
+        /// Sampling interval when attaching to a running VM, in seconds
+        ///
+        /// A recorded job — or a VM recording itself, whose cadence `vk run --atop` set at boot
+        /// — was sampled at whatever cadence recorded it, so this says nothing about either.
         #[arg(
             long,
             value_name = "SECS",
@@ -639,10 +781,11 @@ enum Cmd {
         )]
         interval: u64,
     },
-    /// Filtering ssh-agent proxy: serve the ssh-agent protocol on `--listen`, relaying to
-    /// the real agent at `--upstream` but exposing only the keys in the `--allow` .pub
-    /// files (refusing to sign with or list any other key). The host side of forwarding a
-    /// subset of the agent into a guest.
+    /// Filtering ssh-agent proxy: expose a subset of the host agent's keys
+    ///
+    /// Serves the ssh-agent protocol on `--listen`, relaying to the real agent at `--upstream`
+    /// but exposing only the keys in the `--allow` .pub files (refusing to sign with or list
+    /// any other key). The host side of forwarding a subset of the agent into a guest.
     #[command(hide = true)]
     SshAgentProxy {
         /// Unix socket to serve on (the VMM's per-port vsock socket)
@@ -655,382 +798,574 @@ enum Cmd {
         #[arg(long = "allow", value_name = "PUBKEY")]
         allow: Vec<PathBuf>,
     },
-    /// Userspace L2 network gateway for microVM(s). Accepts the
-    /// qemu vhost transport on each VM's hybrid-vsock guest-port socket, answers
-    /// ARP + serves DHCP, and proxies guest TCP/UDP out through the host's own
-    /// sockets — no host privileges, multi-VM on one LAN. Replaces gvproxy.
+    /// Userspace L2 network gateway for microVM(s) — replaces gvproxy
+    ///
+    /// Accepts the qemu vhost transport on each VM's hybrid-vsock guest-port socket, answers
+    /// ARP + serves DHCP, and proxies guest TCP/UDP out through the host's own sockets — no
+    /// host privileges, multi-VM on one LAN.
     #[command(hide = true)]
     Switch {
-        /// VM qemu socket to accept on, paired with the VM's assigned address as
-        /// `<vsock.sock>_<port>=<ip>` (Cloud Hypervisor's socket); repeatable — one per VM on
-        /// the shared LAN. The switch binds the address to the socket so the VM can only
-        /// source its own IP.
+        /// VM qemu socket to accept on, as `<vsock.sock>_<port>=<ip>`
+        ///
+        /// Cloud Hypervisor's socket, paired with the VM's assigned address; repeatable — one
+        /// per VM on the shared LAN. The switch binds the address to the socket so the VM can
+        /// only source its own IP.
         #[arg(long = "listen", required = true, value_name = "SOCKET=IP")]
         listen: Vec<String>,
-        /// Gateway IPv4 — also the DHCP server and DNS address.
+        /// Gateway IPv4 — also the DHCP server and DNS address
         #[arg(long, default_value = "192.168.127.1")]
         gateway: std::net::Ipv4Addr,
-        /// Subnet prefix length.
+        /// Subnet prefix length
         #[arg(long, default_value_t = 24)]
         prefix: u8,
         /// service name the gateway resolver answers locally: name=ip (repeatable)
         #[arg(long = "host")]
         host: Vec<String>,
-        /// per-MAC DHCP reservation: mac=ip (repeatable). A guest with this MAC gets
-        /// exactly this address instead of a pool lease.
+        /// per-MAC DHCP reservation: mac=ip (repeatable)
+        ///
+        /// A guest with this MAC gets exactly this address instead of a pool lease.
         #[arg(long = "reserve", value_name = "MAC=IP")]
         reserve: Vec<String>,
-        /// egress allowlist — destination IPv4 CIDR for direct (non-proxied) egress,
-        /// optionally port-scoped as CIDR:port (repeatable). With no
-        /// --allow-ip/--allow-name, egress is unrestricted.
+        /// egress allowlist — destination IPv4 CIDR for direct (non-proxied) egress
+        ///
+        /// Optionally port-scoped as CIDR:port (repeatable). With no --allow-ip/--allow-name,
+        /// egress is unrestricted.
         #[arg(long = "allow-ip", value_name = "CIDR[:PORT]")]
         allow_ip: Vec<String>,
-        /// egress allowlist — hostname suffix the http(s) proxy permits, e.g.
-        /// `corp.example.com` (repeatable).
+        /// egress allowlist — hostname suffix the http(s) proxy permits (repeatable)
+        ///
+        /// A suffix is e.g. `corp.example.com`.
         #[arg(long = "allow-name", value_name = "SUFFIX")]
         allow_name: Vec<String>,
-        /// force allowlist mode even with no --allow-ip/--allow-name, so an empty allowlist
-        /// denies everything instead of being unrestricted (set internally by the gitlab
-        /// executor when a job configures egress).
+        /// force allowlist mode even with no --allow-ip/--allow-name
+        ///
+        /// An empty allowlist then denies everything instead of leaving egress unrestricted
+        /// (set internally by the gitlab executor when a job configures egress).
         #[arg(long = "egress-restrict")]
         egress_restrict: bool,
-        /// per-source egress override `<src-ip>;<cidr,cidr>;<name,name>` (repeatable): flows
-        /// from that source use this restricted allowlist instead of the default; an empty
-        /// field is an empty (deny) list. Set internally by the gitlab executor for a service
-        /// that declared its own MICROVM_EGRESS_ALLOW_* in its `variables:`.
+        /// per-source egress override `<src-ip>;<cidr,cidr>;<name,name>` (repeatable)
+        ///
+        /// Flows from that source use this restricted allowlist instead of the default; an
+        /// empty field is an empty (deny) list. Set internally by the gitlab executor for a
+        /// service that declared its own MICROVM_EGRESS_ALLOW_* in its `variables:`.
         #[arg(long = "source-egress", value_name = "IP;CIDRS;NAMES")]
         source_egress: Vec<String>,
-        /// redirect guest flows to a sentinel address to a host-local registry proxy:
-        /// `<sentinel-ip>=<host:port>` (set internally by `vk run --registry-proxy`).
+        /// redirect guest flows aimed at a sentinel address to a host-local registry proxy
+        ///
+        /// The value is `<sentinel-ip>=<host:port>`, set internally by
+        /// `vk run --registry-proxy`.
         #[arg(long = "registry-proxy", value_name = "IP=ADDR")]
         registry_proxy: Option<String>,
-        /// append each egress denial as a typed record here for the job trace to surface
-        /// (set internally by the gitlab executor; see egress_report).
+        /// append each egress denial as a typed record here
+        ///
+        /// The job trace surfaces the records. Set internally by the gitlab executor; see
+        /// egress_report.
         #[arg(long = "denied-log", value_name = "PATH")]
         denied_log: Option<PathBuf>,
-        /// audit mode: append every allowed external domain the guest resolves here, for
-        /// the end-of-job "domains contacted" summary (set internally by the gitlab
-        /// executor; see egress_report).
+        /// audit mode: append every allowed external domain the guest resolves here
+        ///
+        /// The end-of-job "domains contacted" summary reads the log. Set internally by the
+        /// gitlab executor; see egress_report.
         #[arg(long = "audit-log", value_name = "PATH")]
         audit_log: Option<PathBuf>,
-        /// publish the bytes forwarded here, for the end-of-phase resource line (set
-        /// internally by `vk run`, `vk build` and the gitlab executor; see egress_report).
+        /// publish the bytes forwarded here
+        ///
+        /// The end-of-phase resource line reads the count. Set internally by `vk run`,
+        /// `vk build` and the gitlab executor; see egress_report.
         #[arg(long = "net-bytes", value_name = "PATH")]
         net_bytes: Option<PathBuf>,
     },
-    /// Run a docker/OCI image as a microVM — boot it from a native ext4 disk
-    /// (or a cpio initramfs in RAM with --ram), virtkit-agent as PID 1 over vsock, and
-    /// run a command or interactive shell.
+    /// Boot a docker/OCI image as a microVM and run a command in it
+    ///
+    /// The rootfs boots from a native ext4 disk (or a cpio initramfs in RAM with
+    /// `--ram`), vk-agent runs as PID 1 over vsock, and the trailing command — or an
+    /// interactive shell — runs in the guest.
     #[command(display_order = 1)]
     Run {
-        /// Image to boot (docker ref, or OCI reference with --source oci), e.g. alpine:3.20.
-        /// Omit when booting a Dockerfile target with --file.
+        /// Image to boot, e.g. `alpine:3.20`
+        ///
+        /// A docker ref, or an OCI reference with `--source oci`. Omit when booting a
+        /// Dockerfile target with `--file`.
         image: Option<String>,
-        /// Boot a Dockerfile target instead of an image: build (or cache-restore, with
-        /// --cache-registry) the target into an ext4 and boot it — no explicit ext4
-        /// file (repeatable: the files merge into one stage namespace)
-        #[arg(short = 'f', long = "file")]
+        /// Boot a Dockerfile target instead of an image
+        ///
+        /// Builds the target into an ext4 and boots it — no explicit ext4 file — or
+        /// cache-restores it with --cache-registry. Repeatable: the files merge into one stage
+        /// namespace.
+        #[arg(
+            short = 'f',
+            long = "file",
+            help_heading = "Build (with -f or --compose)"
+        )]
         file: Vec<PathBuf>,
         /// target stage to boot (AS name or index; default: the last stage), with --file
-        #[arg(long)]
+        #[arg(
+            long,
+            value_name = "NAME|INDEX",
+            help_heading = "Build (with -f or --compose)"
+        )]
         target: Option<String>,
-        /// build context for the Dockerfile's COPY (repeatable, zipped positionally
-        /// with -f; default: each Dockerfile's own directory)
-        #[arg(long)]
+        /// build context for the Dockerfile's COPY
+        ///
+        /// Repeatable, zipped positionally with -f; default: each Dockerfile's own directory.
+        #[arg(
+            long,
+            value_name = "DIR",
+            help_heading = "Build (with -f or --compose)"
+        )]
         context: Vec<PathBuf>,
-        /// an additional named context, `<name>=<dir>`, that `COPY --from=<name>` and
-        /// `RUN --mount=…,from=<name>` read (repeatable) — files outside the Dockerfile's
-        /// own context, with no staging copy. The --file build only: a compose service
-        /// declares its own contexts, and --compose would key the same service differently
+        /// an additional named context, `<name>=<dir>`, for `COPY --from` and `RUN --mount`
+        ///
+        /// `COPY --from=<name>` and `RUN --mount=…,from=<name>` read it.
+        /// Repeatable — files outside the Dockerfile's own context, with no staging copy. The
+        /// --file build only: a compose service declares its own contexts, and --compose would
+        /// key the same service differently.
         #[arg(
             long = "build-context",
             value_name = "NAME=DIR",
             requires = "file",
-            conflicts_with = "primary"
+            conflicts_with = "primary",
+            help_heading = "Build (with -f or --compose)"
         )]
         build_context: Vec<String>,
-        /// instruction cache for the --file build (push/pull each stage's ext4 by
-        /// content key, so a repeat boot restores instead of rebuilding): a registry
-        /// repo, an absolute store directory path, or `none` to disable. Default:
-        /// the builtin local store `vk-registry` also uses.
-        #[arg(long = "cache-registry")]
+        /// instruction cache for the --file build
+        ///
+        /// Pushes/pulls each stage's ext4 by content key, so a repeat boot restores instead of
+        /// rebuilding: a registry repo, an absolute store directory path, or `none` to disable.
+        /// Default: the builtin local store `vk-registry` also uses.
+        #[arg(
+            long = "cache-registry",
+            value_name = "REF|DIR|none",
+            help_heading = "Build (with -f or --compose)"
+        )]
         cache_registry: Option<String>,
-        /// the cache registry speaks plain HTTP (a loopback vk-registry); registry
-        /// caches only — the builtin/path store has no transport
-        #[arg(long = "cache-insecure")]
+        /// the cache registry speaks plain HTTP (a loopback vk-registry)
+        ///
+        /// Registry caches only — the builtin/path store has no transport.
+        #[arg(long = "cache-insecure", help_heading = "Build (with -f or --compose)")]
         cache_insecure: bool,
         /// override an ARG default for the --file build: NAME=VALUE (repeatable)
-        #[arg(long = "build-arg", value_name = "NAME=VALUE")]
+        #[arg(
+            long = "build-arg",
+            value_name = "NAME=VALUE",
+            help_heading = "Build (with -f or --compose)"
+        )]
         build_arg: Vec<String>,
-        /// network for the --file build's RUN steps: `all` (unrestricted) or `none`.
-        /// Independent of --net, which governs the booted guest.
-        #[arg(long = "build-net", default_value = "all", value_name = "all|none")]
+        /// network for the --file build's RUN steps: `all` (unrestricted) or `none`
+        ///
+        /// It is independent of --net, which governs the booted guest.
+        #[arg(
+            long = "build-net",
+            default_value = "all",
+            value_name = "all|none",
+            help_heading = "Build (with -f or --compose)"
+        )]
         build_net: String,
-        /// restrict the --file build's RUN egress to this destination IPv4 CIDR,
-        /// optionally port-scoped as CIDR:port (repeatable; any --build-allow-* flag
-        /// turns filtering on)
-        #[arg(long = "build-allow-ip", value_name = "CIDR[:PORT]")]
+        /// restrict the --file build's RUN egress to this destination IPv4 CIDR
+        ///
+        /// Optionally port-scoped as CIDR:port (repeatable; any --build-allow-* flag turns
+        /// filtering on).
+        #[arg(
+            long = "build-allow-ip",
+            value_name = "CIDR[:PORT]",
+            help_heading = "Build (with -f or --compose)"
+        )]
         build_allow_ip: Vec<String>,
-        /// restrict the --file build's RUN egress to hosts at/under this DNS suffix,
-        /// e.g. `crates.io` (repeatable; any --build-allow-* flag turns filtering on)
-        #[arg(long = "build-allow-name", value_name = "SUFFIX")]
+        /// restrict the --file build's RUN egress to hosts at or under this DNS suffix
+        ///
+        /// A suffix is e.g. `crates.io`. Repeatable; any --build-allow-* flag turns
+        /// filtering on.
+        #[arg(
+            long = "build-allow-name",
+            value_name = "SUFFIX",
+            help_heading = "Build (with -f or --compose)"
+        )]
         build_allow_name: Vec<String>,
-        /// share a host dir read-write into the guest (mounted at /work) and run the
-        /// command there, so its outputs land back on the host
-        #[arg(long, value_name = "DIR")]
-        workdir: Option<PathBuf>,
-        /// Kernel: `default` (virtkit's pinned kernel), `image` (the image's own
-        /// /boot/vmlinuz + modules), or a path to a vmlinux/bzImage.
-        #[arg(long, default_value = "default", value_parser = run::KernelSource::parse)]
+        /// Kernel: `default`, `image`, or a path to a vmlinux/bzImage
+        ///
+        /// `default` is virtkit's pinned kernel, `image` the image's own /boot/vmlinuz +
+        /// modules.
+        #[arg(
+            long,
+            default_value = "default",
+            value_parser = run::KernelSource::parse,
+            value_name = "default|image|PATH",
+            help_heading = "Guest"
+        )]
         kernel: run::KernelSource,
-        /// keep console=ttyS0 for a BYO stock kernel (`--kernel <path>`) whose
-        /// virtio-console (hvc0) is a module, so early boot output reaches the legacy
-        /// serial. Unneeded for the default or an image kernel.
-        #[arg(long = "console-serial")]
+        /// keep console=ttyS0 for a BYO stock kernel (`--kernel <path>`)
+        ///
+        /// For a kernel whose virtio-console (hvc0) is a module, so early boot output reaches
+        /// the legacy serial. Unneeded for the default or an image kernel.
+        #[arg(long = "console-serial", help_heading = "Guest")]
         console_serial: bool,
-        /// expose the guest PMU so in-guest `perf` gets hardware counters (cycles,
-        /// instructions) via KVM's vPMU. SECURITY: host performance counters are a
-        /// side-channel surface — enable only for trusted guests (a dev VM), never
-        /// untrusted CI jobs. libkrun backend only; default off.
-        #[arg(long)]
+        /// expose the guest PMU for in-guest `perf` — trusted guests only
+        ///
+        /// Cycles, instructions and the rest, via KVM's vPMU. SECURITY: host performance
+        /// counters are a side-channel surface — enable only for trusted guests (a dev VM),
+        /// never untrusted CI jobs. libkrun backend only; default off.
+        #[arg(long, help_heading = "Guest")]
         pmu: bool,
-        /// expose VMX/SVM to the guest so it can boot microVMs of its own — `vk`
-        /// inside `vk`. Needs nested virtualization enabled on the host
-        /// (kvm_intel.nested / kvm_amd.nested). SECURITY: the guest reaches host
-        /// KVM's nested paths — for trusted guests only. Only the libkrun backend
-        /// gates this; cloud-hypervisor guests nest whenever the host allows it.
-        /// Default off.
-        #[arg(long)]
+        /// expose VMX/SVM for `vk` inside `vk` — trusted guests only
+        ///
+        /// Needs nested virtualization enabled on the host (kvm_intel.nested / kvm_amd.nested).
+        /// SECURITY: the guest reaches host KVM's nested paths — for trusted guests only. Only
+        /// the libkrun backend gates this; cloud-hypervisor guests nest whenever the host
+        /// allows it. Default off.
+        #[arg(long, help_heading = "Guest")]
         nested: bool,
-        /// Where the rootfs comes from: oci (registry pull, no docker daemon), docker
-        /// (docker export), or auto (registry, falling back to docker for an unpushed image)
-        #[arg(long, value_enum, default_value = "auto")]
-        source: run::SourceMode,
-        /// PEM CA bundle the registry TLS cert chains to (oci/auto)
-        #[arg(long)]
-        ca: Option<PathBuf>,
-        #[arg(long)]
-        username: Option<String>,
-        #[arg(long)]
-        password: Option<String>,
-        /// plain HTTP registry (oci/auto)
-        #[arg(long)]
-        insecure: bool,
-        /// Static (musl) vk-agent injected as PID 1. Defaults to the copy embedded in `vk`.
-        #[arg(long = "agent")]
+        /// static (musl) vk-agent injected as PID 1
+        ///
+        /// Default: the copy embedded in `vk`.
+        #[arg(long = "agent", value_name = "PATH", help_heading = "Guest")]
         agent: Option<PathBuf>,
-        /// cloud-hypervisor binary (default: the config's top-level `cloud_hypervisor`,
-        /// else `cloud-hypervisor` on PATH). Only used with VIRTKIT_VMM=cloud-hypervisor.
-        #[arg(long)]
+        /// cloud-hypervisor binary, used only with VIRTKIT_VMM=cloud-hypervisor
+        ///
+        /// Default: the config's top-level `cloud_hypervisor`, else `cloud-hypervisor` on PATH.
+        #[arg(long, value_name = "PATH", help_heading = "Guest")]
         cloud_hypervisor: Option<PathBuf>,
-        /// vCPUs: a number, or `host` for as many as the host has (its logical CPU
-        /// count). Default 2, or the --primary service's own x-virtkit.cpus
-        #[arg(long, value_parser = parse_cpus)]
+        /// vCPUs: a number, or `host` for the host's logical CPU count
+        ///
+        /// Default 2, or the --primary service's own x-virtkit.cpus.
+        #[arg(
+            long,
+            value_parser = parse_cpus,
+            value_name = "N|host",
+            help_heading = "Guest"
+        )]
         cpus: Option<u32>,
-        /// guest RAM (<n>G, <n>M, or a MiB count). Default 1G, or the --primary
-        /// service's own x-virtkit.mem
-        #[arg(long)]
+        /// guest RAM (`<n>G`, `<n>M`, or a MiB count)
+        ///
+        /// Default 1G, or the --primary service's own x-virtkit.mem.
+        #[arg(long, value_name = "SIZE", help_heading = "Guest")]
         mem: Option<String>,
-        #[arg(long, default_value_t = 120)]
+        /// seconds to wait for the guest agent to answer before giving up on the boot
+        #[arg(
+            long,
+            default_value_t = 120,
+            value_name = "SECS",
+            help_heading = "Guest"
+        )]
         boot_timeout: u64,
-        /// Name for the VM's process (shown in `ps`/`top`): a template where `{name}`
-        /// expands to the Dockerfile stage, image, or compose service name
-        #[arg(long = "vm-name", default_value = "vk:{name}", value_name = "TEMPLATE")]
+        /// Name for the VM's process, as `ps`/`top` shows it
+        ///
+        /// A template where `{name}` expands to the Dockerfile stage, image, or compose service
+        /// name.
+        #[arg(
+            long = "vm-name",
+            default_value = "vk:{name}",
+            value_name = "TEMPLATE",
+            help_heading = "Guest"
+        )]
         vm_name: String,
-        /// Boot the rootfs as a cpio initramfs held entirely in RAM: zero host
-        /// scratch, but the guest needs --mem of roughly three times the image size
-        #[arg(long)]
+        /// Boot the rootfs as a cpio initramfs held entirely in RAM
+        ///
+        /// Zero host scratch, but the guest needs --mem of roughly three times the image size.
+        #[arg(long, help_heading = "Guest")]
         ram: bool,
-        /// Who runs as PID 1: `default` (vk-agent), `image` (the image's own
-        /// init/systemd) or `entrypoint` (the image's ENTRYPOINT+CMD, which may itself
-        /// exec the real init), the last two via the preinit handoff. Both need an
-        /// image or `-f` build and are incompatible with --ram.
-        #[arg(long, default_value = "default")]
+        /// Who runs as PID 1 in the guest
+        ///
+        /// `image` and `entrypoint` both go through the preinit handoff, so both need an
+        /// image or `-f` build and neither works with --ram.
+        #[arg(long, default_value = "default", help_heading = "Guest")]
         init: run::InitSource,
-        /// Drop into an interactive shell in the guest (requires a terminal);
-        /// ignores any trailing command
-        #[arg(long)]
+        /// share a host dir read-write into the guest at /work and run the command there
+        ///
+        /// The command's outputs then land back on the host.
+        #[arg(long, value_name = "DIR", help_heading = "Running the command")]
+        workdir: Option<PathBuf>,
+        /// Drop into an interactive shell in the guest
+        ///
+        /// Requires a terminal; ignores any trailing command.
+        #[arg(long, help_heading = "Running the command")]
         shell: bool,
-        /// Allocate a pty for the trailing command and wire it to the local terminal,
-        /// so it runs interactively (`docker run -t`; requires a terminal)
-        #[arg(short = 't', long = "tty", conflicts_with = "detach")]
+        /// Allocate a pty for the trailing command, so it runs interactively
+        ///
+        /// `docker run -t`, wired to the local terminal; requires a terminal.
+        #[arg(
+            short = 't',
+            long = "tty",
+            conflicts_with = "detach",
+            help_heading = "Running the command"
+        )]
         tty: bool,
         /// Give the guest network egress via a userspace `vk switch`
-        /// (DHCP + DNS + transparent proxy over vsock)
-        #[arg(long)]
+        ///
+        /// DHCP + DNS + transparent proxy over vsock.
+        #[arg(long, help_heading = "Network")]
         net: bool,
-        /// audit the booted guest's egress: list every external domain it contacts (and how
-        /// many times) when the run ends. Observes only — it does not restrict egress.
-        /// Requires --net (or --compose).
-        #[arg(long = "audit-egress")]
+        /// audit the booted guest's egress: which external domains it contacts
+        ///
+        /// Lists every one, and how many times, when the run ends. Observes only — it does not
+        /// restrict egress. Requires --net (or --compose).
+        #[arg(long = "audit-egress", help_heading = "Network")]
         audit_egress: bool,
-        /// audit the `-f`/`--compose` build's RUN egress (the build-phase counterpart of
-        /// --audit-egress, like --build-net to --net). Prints after the build; observes only.
-        #[arg(long = "build-audit-egress")]
+        /// audit the `-f`/`--compose` build's RUN egress
+        ///
+        /// The build-phase counterpart of --audit-egress, like --build-net to --net. Prints
+        /// after the build; observes only.
+        #[arg(
+            long = "build-audit-egress",
+            help_heading = "Build (with -f or --compose)"
+        )]
         build_audit_egress: bool,
-        /// Run a host-local credential-injecting registry proxy forwarding to this
-        /// upstream registry base URL (scheme://host); the guest reaches it
-        /// credential-free at `registry.vk`, injecting `--username`/`--password`/`--ca`.
+        /// Run a host-local credential-injecting proxy to this upstream registry
+        ///
+        /// Takes the upstream's base URL (scheme://host); the guest reaches the proxy
+        /// credential-free at `registry.vk`, which injects `--username`/`--password`/`--ca`.
         /// Needs `--net`. The job never sees the credentials.
-        #[arg(long = "registry-proxy", value_name = "URL")]
+        #[arg(long = "registry-proxy", value_name = "URL", help_heading = "Network")]
         registry_proxy: Option<String>,
-        /// boot this compose file's services as sibling microVMs on the run's LAN
-        /// (implies --net): the command reaches them by alias; everything is torn
-        /// down when the run exits. No readiness wait — retry the first connect.
-        /// Services declare `image:` or `build:` (`build.dockerfile` may be a
-        /// list: the files merge into one stage namespace, `target` picks any
-        /// stage across them). Alone (no image/-f/--primary) this is compose up:
-        /// services only, held until ctrl-c.
-        #[arg(long)]
+        /// boot this compose file's services as sibling microVMs (implies --net)
+        ///
+        /// They share the run's LAN, the command reaches them by alias, and everything is torn
+        /// down when the run exits. No readiness wait — retry the first connect. Services
+        /// declare `image:` or `build:` (`build.dockerfile` may be a list: the files merge into
+        /// one stage namespace, `target` picks any stage across them). Alone (no
+        /// image/-f/--primary) this is compose up: services only, held until ctrl-c.
+        #[arg(long, value_name = "FILE", help_heading = "Compose services")]
         compose: Option<PathBuf>,
-        /// activate a compose profile (repeatable): profiled services stay down
-        /// unless activated or depended on
-        #[arg(long = "profile", value_name = "NAME")]
+        /// activate a compose profile (repeatable)
+        ///
+        /// Profiled services stay down unless activated or depended on.
+        #[arg(
+            long = "profile",
+            value_name = "NAME",
+            help_heading = "Compose services"
+        )]
         profile: Vec<String>,
-        /// boot this compose service as the primary VM (like docker compose run):
-        /// its image is the rootfs, its config the command's env — with no trailing
-        /// command its entrypoint+cmd runs — and only its depends_on chain boots
-        /// alongside. Requires --compose; replaces the image/-f
-        #[arg(long, value_name = "NAME", requires = "compose")]
+        /// boot this compose service as the primary VM, like `docker compose run`
+        ///
+        /// Its image is the rootfs, its config the command's env — with no trailing command its
+        /// entrypoint+cmd runs — and only its depends_on chain boots alongside. Requires
+        /// --compose; replaces the image/-f.
+        #[arg(
+            long,
+            value_name = "NAME",
+            requires = "compose",
+            help_heading = "Compose services"
+        )]
         primary: Option<String>,
-        /// override a compose service's vCPU count (repeatable), over its
-        /// x-virtkit.cpus declaration
+        /// override a compose service's vCPU count (repeatable)
+        ///
+        /// Wins over its x-virtkit.cpus declaration.
         #[arg(long = "service-cpus", value_name = "NAME=N", requires = "compose",
-              value_parser = parse_service_cpus)]
+              value_parser = parse_service_cpus, help_heading = "Compose services")]
         service_cpus: Vec<(String, u32)>,
-        /// override a compose service's guest RAM (repeatable, e.g. db=2G), over
-        /// its x-virtkit.mem declaration
+        /// override a compose service's guest RAM (repeatable, e.g. `db=2G`)
+        ///
+        /// Wins over its x-virtkit.mem declaration.
         #[arg(long = "service-mem", value_name = "NAME=SIZE", requires = "compose",
-              value_parser = parse_service_mem)]
+              value_parser = parse_service_mem, help_heading = "Compose services")]
         service_mem: Vec<(String, String)>,
-        /// Forward the host SSH agent ($SSH_AUTH_SOCK) into the guest, so ssh/git in the
-        /// guest use the host's keys without the keys ever entering the guest
-        #[arg(long = "ssh-agent")]
+        /// Forward the host SSH agent ($SSH_AUTH_SOCK) into the guest
+        ///
+        /// ssh and git in the guest then use the host's keys, without the keys ever
+        /// entering the guest.
+        #[arg(long = "ssh-agent", help_heading = "SSH")]
         ssh_agent: bool,
-        /// Expose only these ~/.ssh/config Host aliases to the guest: a filtered agent
-        /// offers just their keys and their config stanzas are injected (repeatable).
+        /// Expose only these ~/.ssh/config Host aliases to the guest (repeatable)
+        ///
+        /// A filtered agent offers just their keys, and their config stanzas are injected.
         /// Implies --ssh-agent.
-        #[arg(long = "ssh-host", value_name = "ALIAS")]
+        #[arg(long = "ssh-host", value_name = "ALIAS", help_heading = "SSH")]
         ssh_host: Vec<String>,
-        /// Serve SSH into the guest (the agent's in-VM ssh-serve over vsock — no sshd
-        /// in the image): prints a ready-to-paste ssh command once booted. Sessions
-        /// run as --ssh-user (default root); the VM lives for the duration of the run command.
-        #[arg(long)]
+        /// Serve SSH into the guest — no sshd in the image
+        ///
+        /// The agent's in-VM ssh-serve over vsock: prints a ready-to-paste ssh command once
+        /// booted. Sessions run as --ssh-user (default root); the VM lives for the duration of
+        /// the run command.
+        #[arg(long, help_heading = "SSH")]
         ssh: bool,
-        /// public key authorised for --ssh (OpenSSH format, repeatable; implies --ssh).
-        /// Default: your standard ~/.ssh/id_*.pub keys
-        #[arg(long = "ssh-key", value_name = "PUBKEY")]
+        /// public key authorised for --ssh (OpenSSH format, repeatable)
+        ///
+        /// Implies --ssh. Default: your standard ~/.ssh/id_*.pub keys.
+        #[arg(long = "ssh-key", value_name = "PUBKEY", help_heading = "SSH")]
         ssh_key: Vec<String>,
-        /// user --ssh sessions log in as — root is the only user every image is
-        /// guaranteed to have, but a dev image's unprivileged user keeps
-        /// shared-tree ownership coherent
+        /// user --ssh sessions log in as
+        ///
+        /// root is the only user every image is guaranteed to have, but a dev image's
+        /// unprivileged user keeps shared-tree ownership coherent.
         #[arg(long = "ssh-user", value_name = "NAME", default_value = "root",
-              value_parser = run::parse_ssh_user)]
+              value_parser = run::parse_ssh_user, help_heading = "SSH")]
         ssh_user: String,
+        /// Where the rootfs comes from: oci, docker or auto
+        #[arg(
+            long,
+            value_enum,
+            default_value = "auto",
+            help_heading = "Image source"
+        )]
+        source: run::SourceMode,
+        /// PEM CA bundle the registry TLS cert chains to (oci/auto)
+        #[arg(long, value_name = "FILE", help_heading = "Image source")]
+        ca: Option<PathBuf>,
+        /// registry username (oci/auto)
+        #[arg(long, value_name = "NAME", help_heading = "Image source")]
+        username: Option<String>,
+        /// registry password (oci/auto)
+        #[arg(long, value_name = "SECRET", help_heading = "Image source")]
+        password: Option<String>,
+        /// plain HTTP registry (oci/auto)
+        #[arg(long, help_heading = "Image source")]
+        insecure: bool,
         /// pin the run's sockets, console log and build media to this directory
-        /// (created/reused, mode 0700, never removed) instead of a fresh temp dir,
-        /// so external tooling can attach to the running VM:
-        /// `vk-agent -s vsock-auto://DIR/vsock.sock:4444 exec …`
-        #[arg(long = "state-dir", value_name = "DIR")]
+        ///
+        /// Created/reused, mode 0700, never removed — instead of a fresh temp dir, so external
+        /// tooling can attach to the running VM: `vk-agent -s vsock-auto://DIR/vsock.sock:4444
+        /// exec …`.
+        #[arg(
+            long = "state-dir",
+            value_name = "DIR",
+            help_heading = "Mounts and disks"
+        )]
         state_dir: Option<PathBuf>,
-        /// bind-mount an extra host dir into the guest (repeatable), beyond --workdir
-        /// — e.g. persistent state a throwaway VM should keep on the host. `:ro`
-        /// shares read-only; `:overlay` shares read-only behind a tmpfs-backed overlay
-        /// (the guest reads the host tree but writes stay in guest RAM, never touching it)
-        #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|:overlay]")]
+        /// bind-mount an extra host dir into the guest (repeatable)
+        ///
+        /// Beyond --workdir — e.g. persistent state a throwaway VM should keep on the host.
+        /// `:ro` shares read-only; `:overlay` shares read-only behind a tmpfs-backed overlay
+        /// (the guest reads the host tree but writes stay in guest RAM, never touching it).
+        #[arg(
+            short = 'v',
+            long = "volume",
+            value_name = "HOST:GUEST[:ro|:overlay]",
+            help_heading = "Mounts and disks"
+        )]
         volume: Vec<String>,
-        /// create an in-guest symlink after the mounts (repeatable) — the single-file
-        /// share escape hatch (virtiofs shares directories only); a dangling SRC is
-        /// skipped
-        #[arg(long = "symlink", value_name = "SRC:DST")]
+        /// create an in-guest symlink after the mounts (repeatable)
+        ///
+        /// The single-file share escape hatch (virtiofs shares directories only); a dangling
+        /// SRC is skipped.
+        #[arg(
+            long = "symlink",
+            value_name = "SRC:DST",
+            help_heading = "Mounts and disks"
+        )]
         symlink: Vec<String>,
-        /// attach a raw host disk image as a block device (repeatable), ordered after
-        /// any rootfs disk (so typically /dev/vdb, vdc, …; but /dev/vda first under
-        /// --ram, which has no rootfs disk). The guest reads/writes it directly (no
-        /// virtiofs), so it can partition, mkfs and install into a disk image; append
-        /// `:ro` for read-only. HOST is a raw image file (qemu-img / truncate); qcow2
-        /// is not accepted here.
-        #[arg(long = "disk", value_name = "HOST[:ro]")]
+        /// attach a raw host disk image as a block device (repeatable)
+        ///
+        /// Ordered after any rootfs disk (so typically /dev/vdb, vdc, …; but /dev/vda first
+        /// under --ram, which has no rootfs disk). The guest reads/writes it directly (no
+        /// virtiofs), so it can partition, mkfs and install into a disk image; append `:ro` for
+        /// read-only. HOST is a raw image file (qemu-img / truncate); qcow2 is not accepted
+        /// here.
+        #[arg(
+            long = "disk",
+            value_name = "HOST[:ro]",
+            help_heading = "Mounts and disks"
+        )]
         disk: Vec<String>,
-        /// record what the guest does from boot — one atop-format sample of its /proc
-        /// per interval, landing in `<state dir>/atop/atop.log` for `vk atop` to read
-        /// (`vk atop` beside the running VM follows it live). `--atop` alone samples
-        /// every 5 seconds; `--atop=SECS` picks the cadence
+        /// record what the guest does from boot, for `vk atop` to read
+        ///
+        /// One atop-format sample of its /proc per interval, landing in `<state
+        /// dir>/atop/atop.log` (`vk atop` beside the running VM follows it live). `--atop`
+        /// alone samples every 5 seconds; `--atop=SECS` picks the cadence.
         #[arg(
             long = "atop",
             value_name = "SECS",
             num_args = 0..=1,
             require_equals = true,
             default_missing_value = "5",
-            value_parser = clap::value_parser!(u64).range(1..)
+            value_parser = clap::value_parser!(u64).range(1..),
+            help_heading = "Recording"
         )]
         atop: Option<u64>,
-        /// extra environment for the guest command and its login shells (repeatable);
-        /// wins over the image env and any --env-file
-        #[arg(long = "env", value_name = "KEY=VALUE")]
+        /// extra environment for the guest command and its login shells
+        ///
+        /// Repeatable; wins over the image env and any --env-file.
+        #[arg(
+            long = "env",
+            value_name = "KEY=VALUE",
+            help_heading = "Running the command"
+        )]
         env: Vec<String>,
-        /// KEY=VALUE lines of extra guest environment (`#` and blank lines skipped;
-        /// repeatable, later files win; --env flags win over every file)
-        #[arg(long = "env-file", value_name = "FILE")]
+        /// KEY=VALUE lines of extra guest environment
+        ///
+        /// `#` and blank lines skipped; repeatable, later files win; --env flags win over every
+        /// file.
+        #[arg(
+            long = "env-file",
+            value_name = "FILE",
+            help_heading = "Running the command"
+        )]
         env_file: Vec<PathBuf>,
-        /// serve host commands to the guest at /run/vk/host.sock (over vsock): guest
-        /// tooling runs `vk-agent -s /run/vk/host.sock exec -- CMD` on the host.
-        /// WITHOUT --host-exec-wrapper the guest can run ANY host command as the host
-        /// user (unrestricted); add --host-exec-wrapper to force every command through
-        /// an allowlist program
-        #[arg(long = "host-exec")]
+        /// serve host commands to the guest at /run/vk/host.sock — ANY command by default
+        ///
+        /// Guest tooling runs `vk-agent -s /run/vk/host.sock exec -- CMD` on the host, over
+        /// vsock. WITHOUT --host-exec-wrapper the guest can run ANY host command as the host
+        /// user (unrestricted); add --host-exec-wrapper to force every command through an
+        /// allowlist program.
+        #[arg(long = "host-exec", help_heading = "Host access from the guest")]
         host_exec: bool,
-        /// force every --host-exec command through this program (it receives the
-        /// requested command line as its arguments and decides what to run)
+        /// force every --host-exec command through this program
+        ///
+        /// It receives the requested command line as its arguments and decides what to run.
         #[arg(
             long = "host-exec-wrapper",
             value_name = "PROGRAM",
-            requires = "host_exec"
+            requires = "host_exec",
+            help_heading = "Host access from the guest"
         )]
         host_exec_wrapper: Option<PathBuf>,
-        /// client env vars passed through to the --host-exec-wrapper (repeatable;
-        /// shell-style globs, e.g. `LC_*`)
+        /// client env vars passed through to the --host-exec-wrapper
+        ///
+        /// Repeatable; shell-style globs, e.g. `LC_*`.
         #[arg(
             long = "host-exec-env",
             value_name = "GLOB",
-            requires = "host_exec_wrapper"
+            requires = "host_exec_wrapper",
+            help_heading = "Host access from the guest"
         )]
         host_exec_env: Vec<String>,
-        /// the -f/--primary/compose builds may restore from the instruction cache but
-        /// must not build: a cache miss aborts with exit code 3, so scripts can branch
-        /// cached-vs-cold without paying for a build
-        #[arg(long = "require-cached")]
+        /// the -f/--primary/compose builds may restore from cache but not build
+        ///
+        /// A cache miss aborts with exit code 3, so scripts can branch cached-vs-cold without
+        /// paying for a build.
+        #[arg(long = "require-cached", help_heading = "Build (with -f or --compose)")]
         require_cached: bool,
-        /// Daemonize once the guest is ready: run the build + boot in the foreground
-        /// (Ctrl-C aborts them), then detach so the terminal is freed while the VM keeps
-        /// running. Intended for a long-lived run (`--ssh`, or `-- sleep infinity`)
-        #[arg(long = "detach")]
+        /// Daemonize once the guest is ready
+        ///
+        /// The build + boot run in the foreground (Ctrl-C aborts them), then `vk` detaches so
+        /// the terminal is freed while the VM keeps running. Intended for a long-lived run
+        /// (`--ssh`, or `-- sleep infinity`).
+        #[arg(long = "detach", help_heading = "Detach")]
         detach: bool,
-        /// With --detach, keep the VM after its startup command and power it off after
-        /// this many seconds without an active vk exec command. Only exec counts: status
-        /// probes and --ssh sessions do not hold the VM up, and the startup command has
-        /// to finish for the window to start. 0 keeps it running until explicitly stopped
+        /// With --detach, power the VM off after this many idle seconds
+        ///
+        /// The VM outlives its startup command and goes down after this long without an active
+        /// vk exec command. Only exec counts: status probes and --ssh sessions do not hold the
+        /// VM up, and the startup command has to finish for the window to start. 0 keeps it
+        /// running until explicitly stopped.
         #[arg(
             long = "inactivity-timeout",
             value_name = "SECS",
             requires = "detach",
-            conflicts_with = "shell"
+            conflicts_with = "shell",
+            help_heading = "Detach"
         )]
         inactivity_timeout: Option<u64>,
-        /// With --detach, redirect the backgrounded VM's output here after detaching
-        /// (default: discard). The foreground build/boot still prints to the terminal
-        #[arg(long = "detach-log", value_name = "PATH", requires = "detach")]
+        /// With --detach, redirect the backgrounded VM's output here
+        ///
+        /// Default: discard. The foreground build/boot still prints to the terminal.
+        #[arg(
+            long = "detach-log",
+            value_name = "PATH",
+            requires = "detach",
+            help_heading = "Detach"
+        )]
         detach_log: Option<PathBuf>,
-        /// Command to run in the guest (default: a boot-info probe). Several
-        /// words are an argv, each passed as typed (like docker run — use
-        /// `sh -c '…'` for shell features); a single word is a shell one-liner
-        /// run verbatim
+        /// Command to run in the guest (default: a boot-info probe)
+        ///
+        /// Several words are an argv, each passed as typed (like docker run — use `sh -c '…'`
+        /// for shell features); a single word is a shell one-liner run verbatim.
         #[arg(last = true)]
         command: Vec<String>,
     },
-    /// List the running vk VMs (those started with `--state-dir`): their pid, uptime, name,
-    /// the directory each was launched from, and its exec-channel address. With a DIR
-    /// argument, only VMs launched from DIR or a subdirectory. `--json` for scripting.
+    /// List the running vk VMs
+    ///
+    /// The VMs started with `--state-dir`: their pid, uptime, name, the directory each was
+    /// launched from, and its exec-channel address. With a DIR argument, only VMs launched
+    /// from DIR or a subdirectory. `--json` for scripting.
     #[command(display_order = 6)]
     List {
         /// only VMs whose launch directory is DIR or below it (default: all)
@@ -1038,14 +1373,18 @@ enum Cmd {
         /// emit the entries as a JSON array instead of a table
         #[arg(long)]
         json: bool,
-        /// also report, per VM, whether a fresh `vk run` would rebuild its image (the working
-        /// tree drifted from what booted). Resolves base image digests, so it does network I/O.
+        /// also report, per VM, whether a fresh `vk run` would rebuild its image
+        ///
+        /// The report says whether the working tree drifted from what booted. It resolves
+        /// base image digests, so it does network I/O.
         #[arg(long)]
         stale: bool,
     },
-    /// Stop running vk VM(s): SIGTERM the managing `vk run` (which tears down the VM and any
-    /// compose siblings), then wait for it to exit. Selects the VM launched from the current
-    /// directory by default; pass a DIR to select by launch directory, or `--all`.
+    /// Stop running vk VM(s)
+    ///
+    /// SIGTERMs the managing `vk run` (which tears down the VM and any compose siblings),
+    /// then waits for it to exit. Selects the VM launched from the current directory by
+    /// default; pass a DIR to select by launch directory, or `--all`.
     #[command(display_order = 8)]
     Stop {
         /// stop the VM(s) launched from DIR or below it (default: the current directory)
@@ -1054,56 +1393,63 @@ enum Cmd {
         #[arg(long, conflicts_with = "dir")]
         all: bool,
         /// seconds to wait for each VM to go down before reporting it stuck
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 30, value_name = "SECS")]
         timeout: u64,
     },
-    /// Replace this `vk` with a GitHub release build — the latest release, or the
-    /// VERSION given. Prints what it is about to install and asks before touching
-    /// anything; the download is checked against the digest published beside it and
-    /// must report its own version before it replaces the running binary. Needs
-    /// write access to the directory `vk` is installed in. VMs already running are
-    /// unaffected. `--check` only reports what is available, downloading nothing.
-    /// Exit: 0 up to date, installed, or declined at the prompt; 1 a newer release
-    /// is available (`--check`); 2 the update or check itself failed.
+    /// Replace this `vk` with a GitHub release build
+    ///
+    /// Installs the latest release, or the VERSION given. Prints what it is about to
+    /// install and asks before touching anything; the download is checked against the
+    /// digest published beside it and must report its own version before it replaces the
+    /// running binary. Needs write access to the directory `vk` is installed in. VMs
+    /// already running are unaffected. `--check` only reports what is available,
+    /// downloading nothing. Exit: 0 up to date, installed, or declined at the prompt; 1 a
+    /// newer release is available (`--check`); 2 the update or check itself failed.
     #[command(display_order = 9)]
     Update {
-        /// release to install, `0.29.0` or `v0.29.0` (default: the latest release).
-        /// An older version downgrades, which `--check` does not report as an update
-        /// available.
+        /// release to install, `0.29.0` or `v0.29.0` (default: the latest release)
+        ///
+        /// An older version downgrades, which `--check` does not report as an update available.
         version: Option<String>,
         /// skip the confirmation prompt (for unattended use)
         #[arg(short = 'y', long, conflicts_with = "check")]
         yes: bool,
-        /// report whether a newer release is available and exit — download nothing,
-        /// install nothing (exit 1 when there is one)
+        /// report whether a newer release is available and exit
+        ///
+        /// Downloads nothing, installs nothing (exit 1 when there is one).
         #[arg(long)]
         check: bool,
     },
-    /// Print each stage's build-cache key (its `stage_key`: the chained content key after
-    /// the stage's last instruction) — the exact identity virtkit's instruction cache
-    /// stores the stage's snapshot under. Prints `stage:key` lines. Resolves base
-    /// digests + base image config over the network so the key matches a real build.
+    /// Print each stage's build-cache key, as `stage:key` lines
+    ///
+    /// The `stage_key` is the chained content key after the stage's last instruction — the
+    /// exact identity virtkit's instruction cache stores the stage's snapshot under. Resolves
+    /// base digests + base image config over the network so the key matches a real build.
     #[command(hide = true)]
     DockerHash {
-        /// Dockerfile to analyze (default: Dockerfile; repeatable: the files merge
-        /// into one stage namespace, exactly as `vk build` sees them)
+        /// Dockerfile to analyze (default: Dockerfile)
+        ///
+        /// Repeatable: the files merge into one stage namespace, exactly as `vk build` sees
+        /// them.
         #[arg(short = 'f', long = "file", default_value = "Dockerfile")]
         dockerfile: Vec<PathBuf>,
         /// Build arg affecting the key (KEY=VAL), repeatable
         #[arg(long = "build-arg")]
         build_arg: Vec<String>,
-        /// Build context for context `COPY` content hashing (repeatable, zipped
-        /// positionally with -f; default: each Dockerfile's own directory)
+        /// Build context for context `COPY` content hashing
+        ///
+        /// Repeatable, zipped positionally with -f; default: each Dockerfile's own directory.
         #[arg(long)]
         context: Vec<PathBuf>,
         /// Stages to print (default: all, in build order)
         stages: Vec<String>,
     },
-    /// Check whether an ext4 image is fresh given a list of content-fingerprint parts
-    /// (pre-hashed strings or raw values): computes sha256(parts joined by '\n')
-    /// formatted 8-4-4-4-12, reads the image's UUID, and exits 0 if they match (fresh)
-    /// or 1 if they differ or the image is missing (stale). Always prints the UUID on
-    /// stdout so the caller can pass it to `mkext-tar --uuid` on a stale build.
+    /// Check whether an ext4 image is fresh for a list of content-fingerprint parts
+    ///
+    /// The parts are pre-hashed strings or raw values: computes sha256(parts joined by '\n')
+    /// formatted 8-4-4-4-12, reads the image's UUID, and exits 0 if they match (fresh) or 1 if
+    /// they differ or the image is missing (stale). Always prints the UUID on stdout so the
+    /// caller can pass it to `mkext-tar --uuid` on a stale build.
     #[command(hide = true)]
     Fingerprint {
         /// ext4 image to check for freshness
@@ -1111,18 +1457,21 @@ enum Cmd {
         /// Parts to hash (pre-computed hashes or raw strings), joined by '\n'
         parts: Vec<String>,
     },
-    /// Export a built image as a distributable artifact: `vmdk` packages a raw
-    /// disk (a `vk build --disk` artifact) as a streamOptimized VMDK (the
-    /// compressed subformat vSphere's OVF/OVA import streams); `ova` wraps
-    /// that in an OVF appliance descriptor + manifest; `iso` builds a bootable
-    /// BIOS+UEFI ISO from a staged directory tree (see the appliance guide for
-    /// the auto-install recipe). Native — no qemu-img, ovftool or xorriso.
+    /// Export a built image as a VMDK, OVA or bootable ISO
+    ///
+    /// `vmdk` packages a raw disk (a `vk build --disk` artifact) as a streamOptimized
+    /// VMDK (the compressed subformat vSphere's OVF/OVA import streams); `ova` wraps that
+    /// in an OVF appliance descriptor + manifest; `iso` builds a bootable BIOS+UEFI ISO
+    /// from a staged directory tree (see the appliance guide for the auto-install
+    /// recipe). Native — no qemu-img, ovftool or xorriso.
     Export {
         /// output format
         #[arg(value_enum)]
         format: ExportFormat,
-        /// what to package: a raw disk image of whole 512-byte sectors
-        /// (vmdk/ova), or a staged directory tree (iso)
+        /// what to package
+        ///
+        /// A raw disk image of whole 512-byte sectors (vmdk/ova), or a staged directory tree
+        /// (iso).
         input: PathBuf,
         /// output path (default: the input with the format's extension)
         out: Option<PathBuf>,
@@ -1130,47 +1479,61 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
         /// (ova) vCPUs the descriptor declares (default 2)
-        #[arg(long)]
+        #[arg(long, value_name = "N")]
         cpus: Option<u32>,
         /// (ova) memory the descriptor declares, <n>G/<n>M/MiB (default 4G)
-        #[arg(long)]
+        #[arg(long, value_name = "SIZE")]
         mem: Option<String>,
         /// (ova) VMware guest-OS identifier (default debian11_64Guest)
         #[arg(long = "guest-os", value_name = "OSTYPE")]
         guest_os: Option<String>,
-        /// (ova) firmware the VM boots with: bios for a grub-pc/MBR disk
-        /// (default), efi for a disk carrying an ESP
+        /// (ova) firmware the VM boots with (default bios)
         #[arg(long, value_enum)]
         firmware: Option<ova::Firmware>,
         /// (iso) volume identifier, 1-32 chars of [A-Z0-9_] (default VKISO)
         #[arg(long)]
         volid: Option<String>,
-        /// (iso) BIOS El Torito boot image, as a path INSIDE the tree (e.g.
-        /// boot/grub/eltorito.img); gets the boot info table patched in
+        /// (iso) BIOS El Torito boot image, as a path INSIDE the tree
+        ///
+        /// A tree path is e.g. boot/grub/eltorito.img. It gets the boot info table
+        /// patched in.
         #[arg(long = "bios-boot", value_name = "TREE_PATH")]
         bios_boot: Option<PathBuf>,
-        /// (iso) UEFI El Torito boot image — a FAT ESP carrying
-        /// EFI/BOOT/BOOTX64.EFI — as a path INSIDE the tree
+        /// (iso) UEFI El Torito boot image, as a path INSIDE the tree
+        ///
+        /// A FAT ESP carrying EFI/BOOT/BOOTX64.EFI.
         #[arg(long = "efi-boot", value_name = "TREE_PATH")]
         efi_boot: Option<PathBuf>,
-        /// (iso) make the ISO dd-able to a USB stick: a host file with x86 MBR
-        /// boot code (e.g. syslinux's isohdpfx.bin) laid into the system area,
-        /// with partitions mapping the ISO and the ESP
+        /// (iso) make the ISO dd-able to a USB stick
+        ///
+        /// A host file with x86 MBR boot code (e.g. syslinux's isohdpfx.bin) laid into the
+        /// system area, with partitions mapping the ISO and the ESP.
         #[arg(long = "hybrid-mbr", value_name = "FILE")]
         hybrid_mbr: Option<PathBuf>,
     },
-    /// Dev: build an ext4 image from a directory tree (native, no mke2fs).
+    /// Dev: build an ext4 image from a directory tree (native, no mke2fs)
     #[command(hide = true)]
-    Mkext { src: PathBuf, out: PathBuf },
-    /// Dev: verify the native qcow2 reader against `qemu-img convert` for an image.
+    Mkext {
+        /// directory tree to pack
+        src: PathBuf,
+        /// ext4 image to write
+        out: PathBuf,
+    },
+    /// Dev: verify the native qcow2 reader against `qemu-img convert` for an image
     #[command(hide = true)]
-    Qcow2Verify { path: PathBuf },
-    /// Build an ext4 image from a rootfs tar (e.g. `docker export`), injecting
-    /// host files at guest paths. Native, no mke2fs, no root.
+    Qcow2Verify {
+        /// qcow2 image to read both ways and compare
+        path: PathBuf,
+    },
+    /// Build an ext4 image from a rootfs tar (e.g. `docker export`)
+    ///
+    /// Injects host files at guest paths. Native, no mke2fs, no root.
     #[command(hide = true)]
     MkextTar {
-        /// rootfs tar (ownership/mode from its headers), or "-" to STREAM stdin
-        /// (e.g. `docker export | … -`) — single pass, no intermediate tar
+        /// rootfs tar, or "-" to STREAM stdin
+        ///
+        /// Ownership and mode come from its headers. Streaming (e.g. `docker export | … -`) is
+        /// a single pass, with no intermediate tar.
         tar: PathBuf,
         /// output ext4 image
         out: PathBuf,
@@ -1180,29 +1543,35 @@ enum Cmd {
         /// spare free space (GiB) left in the filesystem for the guest to write
         #[arg(long, default_value_t = 0)]
         free_gib: u64,
-        /// streaming only (tar = "-"): upper-bound rootfs size in GiB (the image is
-        /// sparse, so over-estimating is free); required when streaming
+        /// streaming only (tar = "-"): upper-bound rootfs size in GiB
+        ///
+        /// Required when streaming; the image is sparse, so over-estimating is free.
         #[arg(long, default_value_t = 0)]
         size_gib: u64,
         /// streaming only: inode budget override (default: ~1 per 16 KiB)
         #[arg(long)]
         inodes: Option<u64>,
-        /// filesystem UUID to stamp (32 hex digits, dashes optional) — set it to a
-        /// content fingerprint to make the image's identity == what it was built from
+        /// filesystem UUID to stamp (32 hex digits, dashes optional)
+        ///
+        /// Set it to a content fingerprint to make the image's identity == what it was built
+        /// from.
         #[arg(long)]
         uuid: Option<String>,
         /// filesystem label to stamp (≤16 bytes; for blkid/lsblk)
         #[arg(long)]
         label: Option<String>,
     },
-    /// Build an ext4 image straight from a local OCI image archive (the tar
-    /// `buildctl --output type=oci` produces): flatten its layers AND extract the
-    /// image config (Env/User/Entrypoint/Cmd into /etc/virtkit/{env,user,cmd}),
-    /// no docker/podman. Replaces the podman load→create→export→mkext-tar chain.
+    /// Build an ext4 image straight from a local OCI image archive
+    ///
+    /// The tar `buildctl --output type=oci` produces: flattens its layers AND extracts the
+    /// image config (Env/User/Entrypoint/Cmd into /etc/virtkit/{env,user,cmd}), no
+    /// docker/podman. Replaces the podman load→create→export→mkext-tar chain.
     #[command(hide = true)]
     MkextOci {
-        /// OCI image archive (tar), or "-" to STREAM stdin (spooled to a temp
-        /// file first: OCI archives need random access, index.json is last)
+        /// OCI image archive (tar), or "-" to STREAM stdin
+        ///
+        /// Streaming is spooled to a temp file first: OCI archives need random access, and
+        /// index.json comes last.
         archive: PathBuf,
         /// output ext4 image
         out: PathBuf,
@@ -1212,28 +1581,34 @@ enum Cmd {
         /// spare free space (GiB) left in the filesystem for the guest to write
         #[arg(long, default_value_t = 0)]
         free_gib: u64,
-        /// filesystem UUID to stamp (32 hex digits, dashes optional) — set it to a
-        /// content fingerprint to make the image's identity == what it was built from
+        /// filesystem UUID to stamp (32 hex digits, dashes optional)
+        ///
+        /// Set it to a content fingerprint to make the image's identity == what it was built
+        /// from.
         #[arg(long)]
         uuid: Option<String>,
         /// filesystem label to stamp (≤16 bytes; for blkid/lsblk)
         #[arg(long)]
         label: Option<String>,
     },
-    /// List the advanced/plumbing commands `vk --help` hides, along with the
-    /// everyday ones. (`vk virtiofsd` dispatches on raw argv before this CLI
-    /// and appears in neither help; see the README.)
+    /// List the advanced/plumbing commands `vk --help` hides, with the everyday ones
+    ///
+    /// (`vk virtiofsd` dispatches on raw argv before this CLI and appears in neither help; see
+    /// the README.)
     #[command(hide = true)]
     HelpAll,
-    /// Dev: pull an OCI image from a registry (no docker) and flatten it to a
-    /// rootfs tar.
+    /// Dev: pull an OCI image from a registry (no docker) and flatten it to a rootfs tar
     #[command(hide = true)]
     OciPull {
+        /// image reference, <name>[:tag|@sha256:…]
         reference: String,
+        /// rootfs tar to write
         out: PathBuf,
-        #[arg(long)]
+        /// registry username
+        #[arg(long, value_name = "NAME")]
         username: Option<String>,
-        #[arg(long)]
+        /// registry password
+        #[arg(long, value_name = "SECRET")]
         password: Option<String>,
         /// PEM CA bundle the registry's TLS cert chains to
         #[arg(long)]
@@ -3679,6 +4054,71 @@ mod tests {
                 "atop", "build", "check", "exec", "export", "gc", "list", "run", "status", "stop",
                 "update"
             ]
+        );
+    }
+
+    // `-h` is a summary: a short line per command, per flag and per possible value, with
+    // the detail in the doc comment's second paragraph (which clap shows as `--help`). A
+    // one-paragraph doc comment is both, so it lands in `-h` in full — this is what
+    // catches that. It also catches the opposite slip, an entry with no help at all.
+    // Short is not the same as one rendered line: clap appends `[default: …]` and
+    // `[possible values: …]`, and lays wide groups out on a second line regardless.
+    #[test]
+    fn help_summaries_stay_short() {
+        // An 80-column terminal plus a little slack: the longest entry today is 81
+        // (`vk oci-pull`'s about), so this catches a paragraph that slipped in without
+        // failing on a summary that is merely close to the width.
+        const LIMIT: usize = 84;
+
+        // Every `-h` entry of `cmd` and, recursively, of its subcommands: the command's
+        // own about, each argument's help, and each possible value's help.
+        fn collect(path: &str, cmd: &clap::Command, out: &mut Vec<(String, Option<usize>)>) {
+            out.push((format!("{path} about"), summary_len(cmd.get_about())));
+            for arg in cmd.get_arguments() {
+                let name = match arg.get_long() {
+                    Some(long) => format!("--{long}"),
+                    None => format!("<{}>", arg.get_id()),
+                };
+                out.push((format!("{path} {name}"), summary_len(arg.get_help())));
+                // A bool flag carries synthetic true/false values clap never prints;
+                // only an arg that takes a value gets a `[possible values: …]` line.
+                let is_bool_flag = matches!(
+                    arg.get_action(),
+                    clap::ArgAction::SetTrue | clap::ArgAction::SetFalse
+                );
+                if !is_bool_flag {
+                    for value in arg.get_possible_values() {
+                        let what = format!("{path} {name}={}", value.get_name());
+                        out.push((what, summary_len(value.get_help())));
+                    }
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                collect(&format!("{path} {}", sub.get_name()), sub, out);
+            }
+        }
+        fn summary_len(text: Option<&clap::builder::StyledStr>) -> Option<usize> {
+            Some(text?.to_string().chars().count())
+        }
+
+        let mut entries = Vec::new();
+        collect(
+            "vk",
+            &<Cli as clap::CommandFactory>::command(),
+            &mut entries,
+        );
+        let bad: Vec<_> = entries
+            .into_iter()
+            .filter_map(|(what, len)| match len {
+                Some(len) if len > LIMIT => Some(format!("{what}: {len} chars")),
+                None => Some(format!("{what}: no help")),
+                Some(_) => None,
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "help entries over {LIMIT} chars or missing:\n  {}",
+            bad.join("\n  ")
         );
     }
 

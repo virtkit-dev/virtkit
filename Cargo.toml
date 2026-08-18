@@ -51,7 +51,10 @@ codegen-units = 1
 # `<dep>.workspace = true` and only add the per-crate features they need.
 [workspace.dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+# wrap_help wraps help text at the terminal width (adds only `terminal_size`; rustix is
+# already in the tree) — `vk run -h` lists 60 options and soft-wrapping them mid-word is
+# what makes it unreadable.
+clap = { version = "4", features = ["derive", "wrap_help"] }
 futures = "0"
 libc = "0"
 serde = { version = "1", features = ["derive"] }

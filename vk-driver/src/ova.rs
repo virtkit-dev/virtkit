@@ -18,7 +18,9 @@ use sha2::Digest;
 /// runner image); `Efi` is for a disk carrying an ESP + grub-efi.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Firmware {
+    /// a grub-pc/MBR disk, as the runner image is
     Bios,
+    /// a disk carrying an ESP + grub-efi
     Efi,
 }
 

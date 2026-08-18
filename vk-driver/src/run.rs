@@ -28,8 +28,14 @@ use crate::vmm::Vmm;
 /// PID 1, and a machine-preparing entrypoint (and any init it execs) needs root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum InitSource {
+    /// vk-agent, virtkit's own PID 1
     Default,
+    /// the image's own init (`/sbin/init`, e.g. systemd), via the preinit handoff
     Image,
+    /// the image's ENTRYPOINT+CMD, via that same handoff
+    ///
+    /// For an image whose entrypoint prepares the machine and only then execs the real
+    /// init — a step `image` skips.
     Entrypoint,
 }
 
@@ -142,12 +148,13 @@ pub(crate) const AUDIT_LOG: &str = "egress-audit.log";
 /// Where a `run <image>` rootfs comes from.
 #[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
 pub enum SourceMode {
-    /// Pull straight from a registry (no docker daemon).
+    /// pull straight from a registry (no docker daemon)
     Oci,
-    /// Export from the local docker daemon (`docker export`).
+    /// export from the local docker daemon (`docker export`)
     Docker,
-    /// Resolve over the registry, falling back to docker for an image that is not pushed
-    /// (a registry not-found); auth/network errors surface rather than silently fall back.
+    /// resolve over the registry, falling back to docker for an unpushed image
+    ///
+    /// Only a registry not-found falls back; auth and network errors surface instead.
     Auto,
 }
 

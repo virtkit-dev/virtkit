@@ -25,6 +25,13 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **The help reads as a summary.** Every command and flag now leads with a one-line
+  summary, so `vk --help` fits on a screen and `vk run -h` is a scannable list grouped
+  under headings (guest, network, compose, SSH, build, …) instead of a wall of paragraphs.
+  The detail moved to `--help`, so nothing is lost — and help now wraps at the terminal
+  width instead of breaking mid-word. A few flags that shipped with no help text at all
+  now have some.
+
 - **A refused `--state-dir` names the run holding it.** Starting a second `vk run` on a
   state directory a live run already owns reported only the path — and since that run
   prints its build and boot progress to the terminal that started it, there was no way to
