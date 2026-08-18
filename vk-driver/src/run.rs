@@ -428,11 +428,66 @@ fn lock_state_dir(dir: &Path) -> Result<std::fs::File> {
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let err = std::io::Error::last_os_error();
         if err.kind() == std::io::ErrorKind::WouldBlock {
-            bail!("state-dir {} is in use by a live run", dir.display());
+            // The owning run prints its progress to the terminal that started it, not
+            // here, so its pid is the only handle this caller gets on it.
+            let who = flock_holder(&f).map_or_else(String::new, |h| format!(" ({h})"));
+            bail!(
+                "state-dir {} is in use by a live run{who} — stop that run, or pass a different --state-dir",
+                dir.display()
+            );
         }
         return Err(err).with_context(|| format!("locking {}", dir.display()));
     }
     Ok(f)
+}
+
+/// Best-effort identity of whoever holds `f`'s `flock`, as `pid 1234, up 19m`.
+/// `/proc/locks` lists every FLOCK holder by pid and `<major>:<minor>:<inode>`
+/// (major/minor in hex), which pins the owner without scanning each process's fds.
+/// The VM registry would name it better, but a run records itself there only once its
+/// VMM is up, and the run this message is about may still be building — so procfs is
+/// the only source that covers the case, and `vk stop` has no entry to act on either.
+/// `None` when procfs names nobody: the holder can exit between the refused lock and
+/// this lookup, and on btrfs a subvolume's `st_dev` is not the superblock device
+/// `/proc/locks` prints, so the line never matches. A holder that exits and has its pid
+/// recycled before the age lookup is reported with the newcomer's age — which is why this
+/// only ever garnishes a message, and nothing acts on it.
+fn flock_holder(f: &std::fs::File) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let md = f.metadata().ok()?;
+    let want = format!(
+        "{:02x}:{:02x}:{}",
+        libc::major(md.dev()),
+        libc::minor(md.dev()),
+        md.ino()
+    );
+    let pid = holder_pid(&std::fs::read_to_string("/proc/locks").ok()?, &want)?;
+    Some(match crate::usage::proc_age(pid) {
+        Some(age) => format!("pid {pid}, up {}", crate::vms::fmt_uptime(age.as_secs())),
+        None => format!("pid {pid}"),
+    })
+}
+
+/// The pid holding an `FLOCK` on `want` (`<major>:<minor>:<inode>`), out of the text of
+/// `/proc/locks`. The first match is the holder: the kernel prints a lock ahead of any
+/// request blocked on it, and a blocked line carries `->` where this shape wants `FLOCK`,
+/// so a waiter can never be mistaken for the owner. `vk` only ever takes this lock
+/// `LOCK_EX`, so the one it contends with is the only one there is to name; a foreign
+/// shared `flock` on the same dir would leave the choice to line order.
+fn holder_pid(locks: &str, want: &str) -> Option<i32> {
+    locks.lines().find_map(|line| {
+        // `108: FLOCK  ADVISORY  WRITE 1909494 fc:01:22151305 0 EOF`
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        match fields.as_slice() {
+            // A lock held over NFS reports a negative pid, and one whose owner is outside
+            // this pid namespace reports 0; neither names a process to point the caller at.
+            [_, "FLOCK", _, _, pid, ino, ..] if *ino == want => {
+                pid.parse().ok().filter(|p: &i32| *p > 0)
+            }
+            _ => None,
+        }
+    })
 }
 
 impl Drop for WorkDir {
@@ -3937,5 +3992,88 @@ mod tests {
         let out = std::fs::read(spec.serial_log.with_extension("vmm.log")).unwrap();
         assert_eq!(out, b"boot medium");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refused_state_dir_names_the_run_holding_it() {
+        let dir = std::env::temp_dir().join(format!("vk-statelock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A second descriptor on the same directory, so the holder can be looked up the
+        // way the refusal path does — through the fd it already failed to lock.
+        let probe = std::fs::File::open(&dir).unwrap();
+        assert!(
+            flock_holder(&probe).is_none(),
+            "an unlocked dir has no holder"
+        );
+        let held = lock_state_dir(&dir).unwrap();
+
+        // flock keys on the open file description, so a second acquisition through a
+        // fresh fd is refused even from the process already holding it — which is what
+        // makes this testable without spawning a second vk.
+        let refusal = lock_state_dir(&dir).unwrap_err().to_string();
+        assert!(
+            refusal.contains(&dir.display().to_string())
+                && refusal.contains("pass a different --state-dir"),
+            "the refusal must name the dir and the way out: {refusal}"
+        );
+        // Naming the holder is best-effort: `/proc/locks` keys on the superblock device,
+        // which a btrfs subvolume's `st_dev` does not match, so a `TMPDIR` there resolves
+        // nobody. Where procfs does name one, it has to be this process. Matched on the
+        // pid alone — the age is recomputed per lookup, so a run straddling a second
+        // boundary between the two renders two different strings.
+        let pid = format!("pid {}", std::process::id());
+        match flock_holder(&probe) {
+            Some(who) => {
+                assert!(
+                    who.starts_with(&pid),
+                    "expected this process as the holder, got {who}"
+                );
+                assert!(
+                    refusal.contains(&pid),
+                    "the refusal must name the holder: {refusal}"
+                );
+            }
+            None => eprintln!("skipped: /proc/locks names no holder for {}", dir.display()),
+        }
+
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_the_flock_holder_out_of_proc_locks() {
+        let want = "fc:01:22151305";
+        let locks = "\
+1: POSIX  ADVISORY  WRITE 1111 fc:01:22151305 0 EOF
+2: FLOCK  ADVISORY  WRITE 2222 fc:01:22151305 0 EOF
+2: -> FLOCK  ADVISORY  WRITE 3333 fc:01:22151305 0 EOF
+3: FLOCK  ADVISORY  WRITE 4444 fc:01:99999999 0 EOF
+";
+        // The FLOCK holder, not the POSIX lock on the same inode, not a lock on another
+        // inode, and not the request blocked behind the holder.
+        assert_eq!(holder_pid(locks, want), Some(2222));
+        assert_eq!(holder_pid(locks, "00:00:1"), None);
+        // A request blocked behind a holder is never the holder, whatever its position in
+        // the file: the `->` the kernel prefixes it with lands where this shape wants
+        // `FLOCK`. Asserted on its own, since above it is also outranked by line order.
+        assert_eq!(
+            holder_pid(
+                "2: -> FLOCK  ADVISORY  WRITE 3333 fc:01:22151305 0 EOF\n",
+                want
+            ),
+            None
+        );
+        // A lock held over NFS, or by an owner outside this pid namespace, names no
+        // process this host can be pointed at.
+        for line in [
+            "5: FLOCK  ADVISORY  WRITE -1 fc:01:22151305 0 EOF\n",
+            "5: FLOCK  ADVISORY  WRITE 0 fc:01:22151305 0 EOF\n",
+        ] {
+            assert_eq!(holder_pid(line, want), None, "{line}");
+        }
+        // A truncated line yields nothing rather than a wrong pid.
+        assert_eq!(holder_pid("6: FLOCK  ADVISORY\n", want), None);
     }
 }

@@ -508,6 +508,36 @@ fn parse_stat(line: &str) -> Option<(i32, u64)> {
     Some((ppid, utime + stime + reaped(13) + reaped(14)))
 }
 
+/// How long `pid` has been alive, from its `starttime` in `/proc/<pid>/stat` against
+/// `/proc/uptime`. Both are boot-relative, so no wall-clock jump can skew the answer.
+/// `None` for a pid that is already gone, one procfs times against a boot it predates,
+/// or a procfs that does not answer.
+pub(crate) fn proc_age(pid: i32) -> Option<Duration> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let started = parse_starttime(&stat)?;
+    let uptime: f64 = std::fs::read_to_string("/proc/uptime")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    // clock_ticks never yields zero, and starttime is unsigned, so the only way this goes
+    // negative is a process older than the boot it is measured against — which
+    // try_from_secs_f64 rejects, leaving no age rather than a wrapped one.
+    Duration::try_from_secs_f64(uptime - started as f64 / clock_ticks() as f64).ok()
+}
+
+/// `starttime` — the clock ticks since boot at which the process started. Indexed from the
+/// last `)` for the same reason [`parse_stat`] is: the comm in between is free to contain
+/// spaces and parentheses.
+fn parse_starttime(line: &str) -> Option<u64> {
+    line.get(line.rfind(')')? + 1..)?
+        .split_whitespace()
+        .nth(19)? // starttime is field 22, i.e. the 20th after the comm
+        .parse()
+        .ok()
+}
+
 /// `(resident, peak resident)` for `pid` in bytes — what it holds now and its high-water
 /// mark. `None` for a process that reports neither (it has gone, or has no memory of its
 /// own); a process reporting only one of the two still counts for that one.
@@ -686,11 +716,14 @@ mod tests {
         assert!(status.success(), "dd wrote {mib} MiB");
     }
 
+    /// A real `/proc/<pid>/stat` line, with a process name that would break
+    /// front-to-back field splitting.
+    const STAT_LINE: &str = "42 (vk:my (odd) vm) S 7 42 42 0 -1 4194560 900 0 0 0 130 27 0 0 \
+                             20 0 9 0 123456 2 3 4";
+
     #[test]
     fn parses_a_stat_line_whose_comm_holds_spaces_and_parens() {
-        // A real line, with a process name that would break front-to-back field splitting.
-        let line = "42 (vk:my (odd) vm) S 7 42 42 0 -1 4194560 900 0 0 0 130 27 0 0 20 0 9 0 \
-                    123456 2 3 4";
+        let line = STAT_LINE;
         assert_eq!(parse_stat(line), Some((7, 157)));
         // Children this process reaped count too, or a helper that came and went before the
         // reading — a service's build microVMs, say — would go unbilled.
@@ -699,6 +732,17 @@ mod tests {
         // A truncated line yields nothing rather than a wrong figure.
         assert_eq!(parse_stat("42 (vk) S 7"), None);
         assert_eq!(parse_stat("no parens here"), None);
+    }
+
+    #[test]
+    fn reads_a_process_start_time_and_turns_it_into_an_age() {
+        assert_eq!(parse_starttime(STAT_LINE), Some(123_456));
+        // A line that stops before starttime yields nothing rather than a wrong age.
+        assert_eq!(parse_starttime("42 (vk) S 7"), None);
+        // This process started after the boot it is measured against, so it has an age;
+        // a pid that cannot exist has none.
+        assert!(proc_age(std::process::id() as i32).is_some());
+        assert!(proc_age(-1).is_none());
     }
 
     #[test]

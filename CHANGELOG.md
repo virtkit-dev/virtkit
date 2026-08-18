@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **A refused `--state-dir` names the run holding it.** Starting a second `vk run` on a
+  state directory a live run already owns reported only the path — and since that run
+  prints its build and boot progress to the terminal that started it, there was no way to
+  tell a VM about to come up from one wedged mid-build, nor to find it and stop it. The
+  refusal now carries the owning process and how long it has been running.
+
 ## [0.35.0] - 2026-08-14
 
 ### Added

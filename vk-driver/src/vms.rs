@@ -369,7 +369,13 @@ pub fn resolve_one(dir: Option<&Path>) -> Result<VmEntry> {
 }
 
 fn uptime(created_secs: u64) -> String {
-    let s = unix_now().saturating_sub(created_secs);
+    fmt_uptime(unix_now().saturating_sub(created_secs))
+}
+
+/// How long something has been up, as `vk list`'s UPTIME column renders it: `45s`, `19m`,
+/// `3h7m`, `2d4h`. Shared so a run named anywhere else — the refusal a second `vk run`
+/// on its state dir gets, say — reads the same as it does in the listing.
+pub(crate) fn fmt_uptime(s: u64) -> String {
     if s < 60 {
         format!("{s}s")
     } else if s < 3600 {
