@@ -16,6 +16,13 @@ All notable changes to virtkit will be documented in this file.
   service picks the axis per service with `x-virtkit: { init: entrypoint }`, and
   `--init image` is unchanged.
 
+- **`vk check --feature entrypoint`: ask a `vk` whether it can boot an image's entrypoint as
+  PID 1.** Reading `--init`'s help answered this only by eye; the probe answers with an exit
+  code, so a script can gate on it, and a `vk` too old to have the axis rejects the feature
+  name outright. It names every `--init` axis the build supports and reports the agent that
+  execs the entrypoint. Named-only — it says something about the build rather than the host,
+  so `vk check` on its own does not print it.
+
 ### Changed
 
 - **A refused `--state-dir` names the run holding it.** Starting a second `vk run` on a

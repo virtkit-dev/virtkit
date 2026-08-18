@@ -1,10 +1,10 @@
 //! `vk check`: host preflight. Verifies the current user can actually boot
 //! microVMs (/dev/kvm access, the selected VMM backend, a guest kernel + agent)
 //! and that each feature the config enables has its host side in place (net.mode
-//! taps, [docker] credentials, [registry] store/credentials, ...). The
-//! CI-executor features (gitlab, services) are checked only when named with
-//! `--feature`. Prints one line per check; the caller turns "any check failed"
-//! into the exit code.
+//! taps, [docker] credentials, [registry] store/credentials, ...). Some features
+//! are checked only when named with `--feature`: the CI-executor ones (gitlab,
+//! services), and the capability probes a script asks this build about (entrypoint).
+//! Prints one line per check; the caller turns "any check failed" into the exit code.
 
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
@@ -35,15 +35,21 @@ pub enum Feature {
     Services,
     /// the kernel accounts what jobs use, so their traces can report it
     Usage,
+    /// this build can hand PID 1 to the image's own entrypoint (`--init entrypoint`)
+    Entrypoint,
 }
 
 impl Feature {
-    /// CI-executor features (the gitlab runner and its sibling service VMs) are
-    /// checked only when named with `--feature`: their state dirs live under a
-    /// root-owned default path, so sweeping them would fail every host that just
-    /// boots VMs without running CI.
-    fn ci_executor_only(self) -> bool {
-        matches!(self, Feature::Gitlab | Feature::Services)
+    /// Features the default sweep leaves out, each for its own reason. The CI-executor
+    /// ones (the gitlab runner and its sibling service VMs) probe state dirs under a
+    /// root-owned default path, so sweeping them would fail every host that just boots
+    /// VMs without running CI. `Entrypoint` answers a question about this build rather
+    /// than about the host, so it belongs where a script asks for it and nowhere else.
+    fn on_request_only(self) -> bool {
+        matches!(
+            self,
+            Feature::Gitlab | Feature::Services | Feature::Entrypoint
+        )
     }
 
     fn name(self) -> &'static str {
@@ -58,6 +64,7 @@ impl Feature {
             Feature::Share => "share",
             Feature::Services => "services",
             Feature::Usage => "usage",
+            Feature::Entrypoint => "entrypoint",
         }
     }
 }
@@ -145,7 +152,7 @@ fn default_sweep() -> Vec<Feature> {
     <Feature as clap::ValueEnum>::value_variants()
         .iter()
         .copied()
-        .filter(|f| !f.ci_executor_only())
+        .filter(|f| !f.on_request_only())
         .collect()
 }
 
@@ -161,6 +168,33 @@ fn evaluate(cfg: &Config, feature: Feature) -> Outcome {
         Feature::Share => share(cfg),
         Feature::Services => services(cfg),
         Feature::Usage => usage(),
+        Feature::Entrypoint => entrypoint(),
+    }
+}
+
+/// Whether this `vk` can hand PID 1 to an image's own entrypoint (`--init entrypoint`, or a
+/// compose `x-virtkit: { init: entrypoint }`). Asked for by name and never swept, because it
+/// is a property of the binary: what it adds over reading `--init`'s help is an exit code, so
+/// a script asks this `vk` whether the axis is there instead of parsing prose — and a `vk`
+/// too old to have it rejects the feature name outright.
+///
+/// The host side is the agent. It rides the preinit initramfs as `/init` and is the thing
+/// that execs the image's ENTRYPOINT+CMD, so a `vk` with no agent to embed or find cannot do
+/// this whichever axis the operator names.
+fn entrypoint() -> Outcome {
+    use clap::ValueEnum;
+    let axes = <crate::run::InitSource as ValueEnum>::value_variants()
+        .iter()
+        .filter_map(|axis| axis.to_possible_value())
+        .map(|v| v.get_name().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    match asset_source(Asset::Agent) {
+        Some(src) => ok(format!("--init {axes}; agent {src} execs it as PID 1")),
+        None => fail(format!(
+            "--init {axes}, but no agent to exec it: nothing embedded and {} missing",
+            Asset::Agent.default_path()
+        )),
     }
 }
 
@@ -224,22 +258,26 @@ fn vmm(cfg: &Config) -> Outcome {
     }
 }
 
+/// Where an asset comes from — `embedded`, or the path it was found at — or `None` when it is
+/// neither embedded nor on disk.
+fn asset_source(asset: Asset) -> Option<String> {
+    if asset.embedded().is_some() {
+        return Some("embedded".to_string());
+    }
+    let p = Path::new(asset.default_path());
+    p.is_file().then(|| p.display().to_string())
+}
+
 fn kernel() -> Outcome {
     let mut have = Vec::new();
     let mut missing = Vec::new();
     for (name, asset) in [("kernel", Asset::Kernel), ("agent", Asset::Agent)] {
-        if asset.embedded().is_some() {
-            have.push(format!("{name} embedded"));
-            continue;
-        }
-        let p = Path::new(asset.default_path());
-        if p.is_file() {
-            have.push(format!("{name} {}", p.display()));
-        } else {
-            missing.push(format!(
+        match asset_source(asset) {
+            Some(src) => have.push(format!("{name} {src}")),
+            None => missing.push(format!(
                 "{name}: nothing embedded and {} missing",
-                p.display()
-            ));
+                asset.default_path()
+            )),
         }
     }
     if missing.is_empty() {
@@ -515,16 +553,35 @@ mod tests {
         }
     }
 
-    // The CI-executor features probe root-owned default state dirs, so they run
-    // only when named with --feature; the default sweep covers everything else.
+    // Named-only features run just when asked for: the CI-executor ones probe root-owned
+    // default state dirs, and `entrypoint` answers for the build, not the host. The default
+    // sweep covers everything else.
     #[test]
-    fn default_sweep_omits_ci_executor_features() {
+    fn default_sweep_omits_the_named_only_features() {
         let sweep = default_sweep();
         assert!(!sweep.contains(&Feature::Gitlab));
         assert!(!sweep.contains(&Feature::Services));
+        assert!(!sweep.contains(&Feature::Entrypoint));
         for f in <Feature as clap::ValueEnum>::value_variants() {
-            assert_eq!(sweep.contains(f), !f.ci_executor_only());
+            assert_eq!(sweep.contains(f), !f.on_request_only());
         }
+    }
+
+    // The capability probe names every axis this build has, which is the answer a script
+    // came for. Whether it then passes depends on the host having an agent to exec the
+    // entrypoint — a `cargo test` binary embeds none — but it never skips: a probe that
+    // declined to answer would be escalated to a failure by `run`, saying the opposite of
+    // what it means. A vk without the axis never reaches this: clap rejects the feature name
+    // first, which is the signal a script reads.
+    #[test]
+    fn the_entrypoint_probe_names_the_axes_this_build_supports() {
+        let outcome = evaluate(&Config::default(), Feature::Entrypoint);
+        assert!(
+            outcome.detail.contains("--init default, image, entrypoint"),
+            "{}",
+            outcome.detail
+        );
+        assert_ne!(outcome.status, Status::Skip);
     }
 
     // The default net.mode ("none") and "switch" need nothing from the host.
