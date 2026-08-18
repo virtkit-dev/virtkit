@@ -23,12 +23,9 @@ use vk_selfupdate::{Outcome, Tool};
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+/// Central OCI-distribution server: build-once dedup, pull-through relay, build lock
 #[derive(Parser)]
-#[command(
-    name = "vk-registry",
-    version,
-    about = "Central OCI-distribution server: build-once dedup, pull-through relay, and a build lock"
-)]
+#[command(name = "vk-registry", version)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -36,100 +33,126 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Serve the registry over HTTP, backed by a content-addressed store. With no
-    /// upstreams configured it is a plain local OCI server; configure `[[upstream]]`
-    /// in the config file to make it a pull-through mirror.
+    /// Serve the registry over HTTP, backed by a content-addressed store
+    ///
+    /// With no upstreams configured it is a plain local OCI server; configure `[[upstream]]` in
+    /// the config file to make it a pull-through mirror.
     Serve {
-        /// Listen address.
+        /// Listen address
         #[arg(long, default_value = "127.0.0.1:5000")]
         addr: SocketAddr,
-        /// Store directory [default: the `root` in --config, else
-        /// $XDG_DATA_HOME/virtkit/registry].
-        #[arg(long)]
+        /// Store directory [default: the `root` in --config, else the shared virtkit store]
+        ///
+        /// The shared store is $XDG_DATA_HOME/virtkit/registry.
+        #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
-        /// TOML config file with `[[upstream]]` relay entries (and optional addr/root).
-        #[arg(long)]
+        /// TOML config file with `[[upstream]]` relay entries, addr/root, TLS and auth
+        #[arg(long, value_name = "FILE")]
         config: Option<PathBuf>,
     },
-    /// Write the unit that runs `serve`: install + start a `systemd --user` one, or with
-    /// `--system` print a machine-wide one for an admin to install. The `--user` unit runs
-    /// as you, on a port you can bind, and comes back with your session (or without one,
-    /// after `loginctl enable-linger`). The `--system` unit runs as an unprivileged account
-    /// of its own, may write only the store, and is allowed to bind a privileged port only
-    /// when the port is one — it is printed, not installed, because creating that account
-    /// and writing under /etc are the admin's step, so nothing here needs root.
+    /// Write the unit that runs `serve`
+    ///
+    /// Installs and starts a `systemd --user` one, or with `--system` prints a machine-wide one
+    /// for an admin to install. The `--user` unit runs as you, on a port you can bind, and
+    /// comes back with your session (or without one, after `loginctl enable-linger`). The
+    /// `--system` unit runs as an unprivileged account of its own, may write only the store,
+    /// and is allowed to bind a privileged port only when the port is one — it is printed, not
+    /// installed, because creating that account and writing under /etc are the admin's step, so
+    /// nothing here needs root.
     InstallService {
-        /// Listen address to bake into the unit; ignored in favour of --config's.
+        /// Listen address to bake into the unit
+        ///
+        /// A --config file is where a unit's addr belongs, so the two cannot be combined.
         #[arg(long, default_value = "127.0.0.1:5000", conflicts_with = "config")]
         addr: SocketAddr,
-        /// Store directory to bake into the unit [default: $XDG_DATA_HOME/virtkit/registry,
-        /// which a --system unit may not use].
-        #[arg(long, conflicts_with = "config")]
+        /// Store directory to bake into the unit [default: the shared virtkit store]
+        ///
+        /// The shared store is $XDG_DATA_HOME/virtkit/registry, which a --system unit cannot
+        /// use — that shape needs this flag, or a --config that sets `root`.
+        #[arg(long, conflicts_with = "config", value_name = "DIR")]
         root: Option<PathBuf>,
-        /// The `serve` config file the unit should read — it carries addr/root/TLS/auth, so
-        /// it replaces --addr/--root rather than joining them.
-        #[arg(long)]
+        /// The `serve` config file the unit should read
+        ///
+        /// It carries addr/root/TLS/auth, so passing it together with --addr or --root is an
+        /// error.
+        #[arg(long, value_name = "FILE")]
         config: Option<PathBuf>,
-        /// Print a hardened machine-wide unit on stdout rather than installing a --user one.
+        /// Print a hardened machine-wide unit on stdout rather than installing a --user one
         #[arg(long)]
         system: bool,
-        /// The account a --system unit runs as; it has to exist and own the store.
-        #[arg(long, default_value = "vk-registry", requires = "system")]
+        /// The account a --system unit runs as; it has to exist and own the store
+        #[arg(
+            long,
+            default_value = "vk-registry",
+            requires = "system",
+            value_name = "NAME"
+        )]
         service_user: String,
     },
-    /// Report the store's usage and content: on-disk size, dedup savings, and a
-    /// per-repository breakdown. Read-only — it creates no store.
+    /// Report the store's usage and content
+    ///
+    /// On-disk size, dedup savings, and a per-repository breakdown. Read-only — it creates no
+    /// store.
     Status {
-        /// Store directory [default: the `root` in --config, else
-        /// $XDG_DATA_HOME/virtkit/registry].
-        #[arg(long)]
+        /// Store directory [default: the `root` in --config, else the shared virtkit store]
+        ///
+        /// The shared store is $XDG_DATA_HOME/virtkit/registry.
+        #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
-        /// The `serve` config file to take the store root from, so this reports on the
-        /// store the server uses.
-        #[arg(long)]
+        /// The `serve` config file to take the store root from
+        ///
+        /// Reporting then covers the store the server actually uses.
+        #[arg(long, value_name = "FILE")]
         config: Option<PathBuf>,
     },
-    /// Garbage-collect the store: drop tags idle past the retention window, then
-    /// sweep unreferenced blobs and stale uploads (both after a grace window).
+    /// Garbage-collect the store
+    ///
+    /// Drops tags idle past the retention window, then sweeps unreferenced blobs and stale
+    /// uploads (both after a grace window).
     Gc {
-        /// Store directory [default: the `root` in --config, else
-        /// $XDG_DATA_HOME/virtkit/registry].
-        #[arg(long)]
+        /// Store directory [default: the `root` in --config, else the shared virtkit store]
+        ///
+        /// The shared store is $XDG_DATA_HOME/virtkit/registry.
+        #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
-        /// The `serve` config file to take the store root from, so this sweeps the store
-        /// the server uses.
-        #[arg(long)]
+        /// The `serve` config file to take the store root from
+        ///
+        /// The sweep then covers the store the server actually uses.
+        #[arg(long, value_name = "FILE")]
         config: Option<PathBuf>,
-        /// Drop tags unused for more than this many days.
-        #[arg(long, default_value_t = 30)]
+        /// Drop tags unused for more than this many days
+        #[arg(long, default_value_t = 30, value_name = "DAYS")]
         retention_days: u64,
-        /// Keep unreferenced blobs and stale uploads this many days past their
-        /// last use (protects in-flight multi-request pushes).
-        #[arg(long, default_value_t = 1)]
+        /// Keep unreferenced blobs and stale uploads this many days past their last use
+        ///
+        /// The window protects in-flight multi-request pushes.
+        #[arg(long, default_value_t = 1, value_name = "DAYS")]
         grace_days: u64,
-        /// Report what would be removed without removing anything.
+        /// Report what would be removed without removing anything
         #[arg(long)]
         dry_run: bool,
     },
-    /// Replace this `vk-registry` with a GitHub release build — the latest release, or
-    /// the VERSION given. Prints what it is about to install and asks before touching
-    /// anything; the download is checked against the digest published beside it and must
-    /// report its own version before it replaces the running binary. Needs write access
-    /// to the directory `vk-registry` is installed in. A server already running keeps
-    /// serving the build it started as, so restart its unit to pick this one up.
+    /// Replace this `vk-registry` with a GitHub release build
+    ///
+    /// Installs the latest release, or the VERSION given. Prints what it is about to install
+    /// and asks before touching anything; the download is checked against the digest published
+    /// beside it and must report its own version before it replaces the running binary. Needs
+    /// write access to the directory `vk-registry` is installed in. A server already running
+    /// keeps serving the build it started as, so restart its unit to pick this one up.
     /// `--check` only reports what is available, downloading nothing. Exit: 0 up to date,
-    /// installed, or declined at the prompt; 1 a newer release is available (`--check`);
-    /// 2 the update or check itself failed.
+    /// installed, or declined at the prompt; 1 a newer release is available (`--check`); 2 the
+    /// update or check itself failed.
     Update {
-        /// release to install, `0.33.0` or `v0.33.0` (default: the latest release).
-        /// An older version downgrades, which `--check` does not report as an update
-        /// available.
+        /// release to install, `0.33.0` or `v0.33.0` (default: the latest release)
+        ///
+        /// An older version downgrades, which `--check` does not report as an update available.
         version: Option<String>,
         /// skip the confirmation prompt (for unattended use)
         #[arg(short = 'y', long, conflicts_with = "check")]
         yes: bool,
-        /// report whether a newer release is available and exit — download nothing,
-        /// install nothing (exit 1 when there is one)
+        /// report whether a newer release is available and exit
+        ///
+        /// Downloads nothing, installs nothing (exit 1 when a newer release exists).
         #[arg(long)]
         check: bool,
     },
@@ -478,5 +501,70 @@ mod tests {
         };
         assert_eq!(root, None);
         assert_eq!(config.as_deref(), Some(Path::new("/etc/reg.toml")));
+    }
+
+    // `-h` is a summary: a short line per command, per flag and per possible value, with
+    // the detail in the doc comment's second paragraph (which clap shows as `--help`). A
+    // one-paragraph doc comment is both, so it lands in `-h` in full — this is what
+    // catches that. It also catches the opposite slip, an entry with no help at all.
+    // Short is not the same as one rendered line: clap appends `[default: …]` and
+    // `[possible values: …]`, and lays wide groups out on a second line regardless.
+    // Mirrors `vk-driver`'s test of the same name.
+    #[test]
+    fn help_summaries_stay_short() {
+        // The same budget as `vk`'s copy of this test: an 80-column terminal plus a
+        // little slack (the longest entry here is 81).
+        const LIMIT: usize = 84;
+
+        // Every `-h` entry of `cmd` and, recursively, of its subcommands: the command's
+        // own about, each argument's help, and each possible value's help.
+        fn collect(path: &str, cmd: &clap::Command, out: &mut Vec<(String, Option<usize>)>) {
+            out.push((format!("{path} about"), summary_len(cmd.get_about())));
+            for arg in cmd.get_arguments() {
+                let name = match arg.get_long() {
+                    Some(long) => format!("--{long}"),
+                    None => format!("<{}>", arg.get_id()),
+                };
+                out.push((format!("{path} {name}"), summary_len(arg.get_help())));
+                // A bool flag carries synthetic true/false values clap never prints;
+                // only an arg that takes a value gets a `[possible values: …]` line.
+                let is_bool_flag = matches!(
+                    arg.get_action(),
+                    clap::ArgAction::SetTrue | clap::ArgAction::SetFalse
+                );
+                if !is_bool_flag {
+                    for value in arg.get_possible_values() {
+                        let what = format!("{path} {name}={}", value.get_name());
+                        out.push((what, summary_len(value.get_help())));
+                    }
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                collect(&format!("{path} {}", sub.get_name()), sub, out);
+            }
+        }
+        fn summary_len(text: Option<&clap::builder::StyledStr>) -> Option<usize> {
+            Some(text?.to_string().chars().count())
+        }
+
+        let mut entries = Vec::new();
+        collect(
+            "vk-registry",
+            &<Cli as clap::CommandFactory>::command(),
+            &mut entries,
+        );
+        let bad: Vec<_> = entries
+            .into_iter()
+            .filter_map(|(what, len)| match len {
+                Some(len) if len > LIMIT => Some(format!("{what}: {len} chars")),
+                None => Some(format!("{what}: no help")),
+                Some(_) => None,
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "help entries over {LIMIT} chars or missing:\n  {}",
+            bad.join("\n  ")
+        );
     }
 }

@@ -30,7 +30,7 @@ All notable changes to virtkit will be documented in this file.
   under headings (guest, network, compose, SSH, build, …) instead of a wall of paragraphs.
   The detail moved to `--help`, so nothing is lost — and help now wraps at the terminal
   width instead of breaking mid-word. A few flags that shipped with no help text at all
-  now have some.
+  now have some. `vk-registry` and `vk-agent` read the same way.
 
 - **A refused `--state-dir` names the run holding it.** Starting a second `vk run` on a
   state directory a live run already owns reported only the path — and since that run

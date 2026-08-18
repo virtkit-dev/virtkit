@@ -17,14 +17,18 @@ use vk_core::messages::{CmdExec, CmdResult, Tty};
 use vk_core::net::connect;
 use vk_core::status::get_status;
 
+/// Talk to, or be, the virtkit guest agent — exec, forward, network, PID 1
 #[derive(Debug, Parser)] // requires `derive` feature
 #[command(name = "vk-agent", version)]
-#[command(about = "send / execute commands through unix or vsock sockets", long_about = None)]
 struct Cli {
-    /// Socket address: a unix socket path, systemd:// (socket activation, serve
-    /// only), vsock://[cid:]port, or vsock-mux://path:port (hybrid vsock unix
-    /// socket of a Cloud Hypervisor / Firecracker VMM, connect only)
-    #[arg(short, long)]
+    /// Socket address: a unix socket path, or a systemd://, vsock*:// or tcp:// URL
+    ///
+    /// systemd:// is socket activation (serve only); vsock://[cid:]port; vsock-mux://path:port
+    /// is the hybrid vsock unix socket of a Cloud Hypervisor / Firecracker VMM, and
+    /// vsock-auto://path:port picks the best host→guest path to a guest port (both connect
+    /// only). tcp://host:port carries raw bytes only — a forward end, `connect`, `net` or
+    /// `ssh-serve` — and the agent protocol refuses it.
+    #[arg(short, long, value_name = "ADDR")]
     socket: SocketAddr,
 
     #[command(subcommand)]
@@ -33,102 +37,113 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Execute command
+    /// Run a command on the agent at --socket
     #[command(arg_required_else_help = true)]
     Exec {
-        /// Optional debug log
-        #[arg(long)]
+        /// Log this client's protocol activity to this file
+        #[arg(long, value_name = "PATH")]
         debug_log: Option<PathBuf>,
 
-        /// Backgound mode (no stdin/stdout/stderr, do not wait process end)
+        /// Background mode: no stdio, do not wait for the command to exit
         #[arg(short, long)]
         background: bool,
 
-        /// Start remote process with an empty environment
+        /// Start the remote process with an empty environment
         #[arg(long)]
         clear_env: bool,
 
-        /// Add environment variable, syntax KEY=value (can be used multiple times)
-        #[arg(long)]
+        /// Add an environment variable, syntax KEY=value (repeatable)
+        #[arg(long, value_name = "KEY=VALUE")]
         env: Vec<String>,
 
-        /// Working directory
-        /// If not set, the working directory is the same as the server
+        /// Working directory for the remote process (default: the agent's own)
         #[arg(long)]
         dir: Option<String>,
 
-        /// Allocate a pty on the remote side and run interactively (requires the
-        /// local stdin/stdout to be a terminal; incompatible with --background)
+        /// Allocate a pty on the remote side and run interactively
+        ///
+        /// Requires the local stdin/stdout to be a terminal; incompatible with --background.
         #[arg(short = 't', long)]
         tty: bool,
 
         /// Run the remote process as this Unix user (drops uid/gid/groups)
-        #[arg(long)]
+        #[arg(long, value_name = "NAME")]
         user: Option<String>,
 
         /// Command to run
         cmd: String,
 
-        /// Arguments
+        /// Arguments for the command
         args: Vec<String>,
     },
+    /// Serve the exec channel on --socket
     Serve {
+        /// Log at debug level instead of info
         #[arg(short, long)]
         debug: bool,
-        #[arg(short, long)]
+        /// Exit after this long without an exec; 0 = never
+        ///
+        /// The window runs from the last exec that finished, or from startup when none has.
+        /// A status probe does not reset it, and an exec still running holds it open.
+        #[arg(short, long, value_name = "SECS")]
         inactivity_timeout: Option<u64>,
-        /// Force every exec through this program (like SSH's ForceCommand): it
-        /// receives the requested command line as its arguments and decides what to
-        /// run. Use it to enforce an allowlist. Omitted = run commands directly.
-        #[arg(long)]
+        /// Force every exec through this program (like SSH's ForceCommand)
+        ///
+        /// It receives the requested command line as its arguments and decides what to run. Use
+        /// it to enforce an allowlist. Omitted = run commands directly.
+        #[arg(long, value_name = "PROGRAM")]
         exec_wrapper: Option<PathBuf>,
-        /// Allow these client-supplied environment variables through to the
-        /// --exec-wrapper (repeatable; shell-style `*`/`?` globs, e.g. `LC_*`).
-        /// LANG, LANGUAGE, LC_*, TZ are always allowed; everything else the client
-        /// sends is dropped so it cannot subvert the wrapper (e.g. LD_PRELOAD).
-        #[arg(long, requires = "exec_wrapper")]
+        /// Allow these client-supplied environment variables through to --exec-wrapper
+        ///
+        /// Repeatable; shell-style `*`/`?` globs, e.g. `LC_*`. LANG, LANGUAGE, LC_*, TZ are
+        /// always allowed; everything else the client sends is dropped so it cannot subvert the
+        /// wrapper (e.g. LD_PRELOAD).
+        #[arg(long, requires = "exec_wrapper", value_name = "GLOB")]
         exec_wrapper_env: Vec<String>,
     },
+    /// Probe the agent at --socket and print its status reply
     Status,
     /// Forward a local listener to the --socket target, splicing raw bytes
-    /// (opaque — no virtkit-agent protocol). E.g. expose a guest-local TCP port that
-    /// tunnels over vsock to a host-mediated service.
+    ///
+    /// Opaque — no virtkit-agent protocol. E.g. expose a guest-local TCP port that tunnels over
+    /// vsock to a host-mediated service.
     Forward {
-        /// Local address to listen on: tcp://host:port, a unix socket path, or
-        /// vsock://[cid:]port
-        #[arg(long)]
+        /// Local address to listen on: tcp://host:port, a unix path, or vsock://[cid:]port
+        #[arg(long, value_name = "ADDR")]
         listen: SocketAddr,
         /// For a unix `--listen`, give the bound socket to this `user[:group]`
-        /// (numeric id or a guest passwd/group name) so a non-root client can
-        /// open it. Ignored for tcp/vsock listeners.
-        #[arg(long)]
+        ///
+        /// A numeric id or a guest passwd/group name, so a non-root client can open it. Ignored
+        /// for tcp/vsock listeners.
+        #[arg(long, value_name = "USER[:GROUP]")]
         chown: Option<String>,
     },
-    /// Splice stdin/stdout to the --socket target, raw bytes (no virtkit-agent
-    /// protocol) — the stdio sibling of `forward`, meant to be an SSH
-    /// `ProxyCommand`. Tunnels ssh to a guest sshd reached over the hybrid
-    /// vsock-mux so VS Code Remote-SSH attaches to the microVM with no guest
-    /// network:
-    ///   ProxyCommand vk-agent -s vsock-mux://…/vsock.sock:2222 connect
+    /// Splice stdin/stdout to the --socket target, raw bytes — an SSH `ProxyCommand`
+    ///
+    /// The stdio sibling of `forward`, with no virtkit-agent protocol. Tunnels ssh to a guest
+    /// sshd reached over the hybrid vsock-mux, so VS Code Remote-SSH attaches to the microVM
+    /// with no guest network: `ProxyCommand vk-agent -s vsock-mux://…/vsock.sock:2222 connect`.
     Connect,
-    /// Bridge a guest tap NIC to a host network backend (gvproxy) over --socket,
-    /// using the qemu vhost framing (BE32 length + ethernet frame). The guest
-    /// gets a real L2 interface on the shared LAN with no host privileges:
-    /// the backend runs unprivileged on the host and egresses via host sockets.
-    /// Addressing (IP/route/DNS) is configured separately. E.g.:
-    ///   vk-agent -s vsock://1024 net --iface eth0
+    /// Bridge a guest tap NIC to a host network backend (gvproxy) over --socket
+    ///
+    /// Uses the qemu vhost framing (BE32 length + ethernet frame), so the guest gets a real L2
+    /// interface on the shared LAN with no host privileges: the backend runs unprivileged on
+    /// the host and egresses via host sockets. Addressing (IP/route/DNS) is configured
+    /// separately. E.g. `vk-agent -s vsock://1024 net --iface eth0`.
     Net {
         /// tap interface to create and bring up
         #[arg(long, default_value = "eth0")]
         iface: String,
-        /// hardware address to assign the tap (aa:bb:cc:dd:ee:ff). Lets the vk
-        /// switch match a per-MAC DHCP reservation; omit for a kernel-random MAC.
+        /// hardware address to assign the tap (aa:bb:cc:dd:ee:ff)
+        ///
+        /// Lets the vk switch match a per-MAC DHCP reservation; omit for a kernel-random MAC.
         #[arg(long)]
         mac: Option<String>,
     },
-    /// Run an SSH server (russh) on --socket — pubkey auth, pty/shell + exec — so
-    /// a stock ssh client (hence VS Code Remote-SSH) reaches the guest over vsock
-    /// with no sshd in the image. Pair with `connect` as the host ProxyCommand.
+    /// Run an SSH server (russh) on --socket, so the image needs no sshd
+    ///
+    /// Pubkey auth, pty/shell + exec, so a stock ssh client (hence VS Code Remote-SSH) reaches
+    /// the guest over vsock. Pair with `connect` as the host ProxyCommand.
     #[cfg(feature = "ssh")]
     SshServe {
         /// public key to accept (OpenSSH format: type base64 [comment]), repeatable
@@ -136,15 +151,16 @@ enum Commands {
         authorized_keys: Vec<String>,
 
         /// run sessions as this Unix user (default: the SSH login username)
-        #[arg(long)]
+        #[arg(long, value_name = "NAME")]
         user: Option<String>,
     },
-    /// PID 1 for systemd-less guests: set up the rootfs (API mounts, hostname,
-    /// DNS) then fork and supervise a `serve` agent on --socket. The guest's
-    /// IP/route comes from the kernel `ip=` cmdline param, not here.
+    /// PID 1 for systemd-less guests
+    ///
+    /// Sets up the rootfs (API mounts, hostname, DNS) then forks and supervises a `serve` agent
+    /// on --socket. The guest's IP/route comes from the kernel `ip=` cmdline param, not here.
     Init {
-        /// Idle seconds before the serve agent (hence the VM) exits; 0 = never.
-        #[arg(short, long)]
+        /// Idle seconds before the serve agent (hence the VM) exits; 0 = never
+        #[arg(short, long, value_name = "SECS")]
         inactivity_timeout: Option<u64>,
     },
 }
@@ -460,5 +476,75 @@ async fn execute(
         client_run_tty(stream, sink, exec).await
     } else {
         client_run_cmd(stream, sink, exec).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+
+    // `-h` is a summary: a short line per command, per flag and per possible value, with
+    // the detail in the doc comment's second paragraph (which clap shows as `--help`). A
+    // one-paragraph doc comment is both, so it lands in `-h` in full — this is what
+    // catches that. It also catches the opposite slip, an entry with no help at all.
+    // Short is not the same as one rendered line: clap appends `[default: …]` and
+    // `[possible values: …]`, and lays wide groups out on a second line regardless.
+    // Mirrors `vk-driver`'s test of the same name.
+    #[test]
+    fn help_summaries_stay_short() {
+        // The same budget as `vk`'s copy of this test: an 80-column terminal plus a
+        // little slack (the longest entry here is 79).
+        const LIMIT: usize = 84;
+
+        // Every `-h` entry of `cmd` and, recursively, of its subcommands: the command's
+        // own about, each argument's help, and each possible value's help.
+        fn collect(path: &str, cmd: &clap::Command, out: &mut Vec<(String, Option<usize>)>) {
+            out.push((format!("{path} about"), summary_len(cmd.get_about())));
+            for arg in cmd.get_arguments() {
+                let name = match arg.get_long() {
+                    Some(long) => format!("--{long}"),
+                    None => format!("<{}>", arg.get_id()),
+                };
+                out.push((format!("{path} {name}"), summary_len(arg.get_help())));
+                // A bool flag carries synthetic true/false values clap never prints;
+                // only an arg that takes a value gets a `[possible values: …]` line.
+                let is_bool_flag = matches!(
+                    arg.get_action(),
+                    clap::ArgAction::SetTrue | clap::ArgAction::SetFalse
+                );
+                if !is_bool_flag {
+                    for value in arg.get_possible_values() {
+                        let what = format!("{path} {name}={}", value.get_name());
+                        out.push((what, summary_len(value.get_help())));
+                    }
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                collect(&format!("{path} {}", sub.get_name()), sub, out);
+            }
+        }
+        fn summary_len(text: Option<&clap::builder::StyledStr>) -> Option<usize> {
+            Some(text?.to_string().chars().count())
+        }
+
+        let mut entries = Vec::new();
+        collect(
+            "vk-agent",
+            &<Cli as clap::CommandFactory>::command(),
+            &mut entries,
+        );
+        let bad: Vec<_> = entries
+            .into_iter()
+            .filter_map(|(what, len)| match len {
+                Some(len) if len > LIMIT => Some(format!("{what}: {len} chars")),
+                None => Some(format!("{what}: no help")),
+                Some(_) => None,
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "help entries over {LIMIT} chars or missing:\n  {}",
+            bad.join("\n  ")
+        );
     }
 }
