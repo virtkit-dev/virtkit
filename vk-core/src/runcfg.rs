@@ -13,6 +13,37 @@ use serde::{Deserialize, Serialize};
 /// real root (the pivot hides the initramfs).
 pub const INITRAMFS_PATH: &str = "virtkit-service.json";
 
+/// Who becomes PID 1 once the preinit hands the guest over, named on the guest kernel
+/// cmdline in `VIRTKIT_INIT`. The driver writes the token and the guest agent reads it
+/// back, both through this enum, so neither side spells a token of its own — a boot whose
+/// axis one of them silently did not recognize is then not expressible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageInit {
+    /// The image's own init: `VIRTKIT_HANDOFF` when the host named one, else `/sbin/init`.
+    Init,
+    /// The image's ENTRYPOINT+CMD, from its [`RunConfig`], exec'd as PID 1.
+    Entrypoint,
+}
+
+impl ImageInit {
+    /// Every axis, so a cmdline token can be resolved back to one. Keep it complete:
+    /// [`ImageInit::from_token`] resolves only what is listed here.
+    pub const ALL: [ImageInit; 2] = [ImageInit::Init, ImageInit::Entrypoint];
+
+    /// This axis's `VIRTKIT_INIT` token, which is also its `--init` / `x-virtkit.init` value.
+    pub fn token(self) -> &'static str {
+        match self {
+            ImageInit::Init => "image",
+            ImageInit::Entrypoint => "entrypoint",
+        }
+    }
+
+    /// The axis a `VIRTKIT_INIT` token names, or `None` when nothing does.
+    pub fn from_token(token: &str) -> Option<ImageInit> {
+        ImageInit::ALL.into_iter().find(|i| i.token() == token)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RunConfig {
     /// Environment, in declaration order (later keys override earlier ones).
@@ -59,6 +90,15 @@ impl RunConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_init_round_trips_through_its_cmdline_token() {
+        for axis in ImageInit::ALL {
+            assert_eq!(ImageInit::from_token(axis.token()), Some(axis));
+        }
+        assert_eq!(ImageInit::from_token("default"), None);
+        assert_eq!(ImageInit::from_token(""), None);
+    }
 
     #[test]
     fn argv_chains_entrypoint_and_cmd() {

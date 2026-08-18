@@ -1,13 +1,14 @@
 //! The preinit initramfs boot used whenever a `vk run` axis leaves the default:
-//! `--kernel image` (boot the image's OWN modular kernel) and/or `--init image`
-//! (hand PID 1 to the image's OWN init/systemd). This module reads the image's ext4
+//! `--kernel image` (boot the image's OWN modular kernel) and/or `--init
+//! image`/`--init entrypoint` (hand PID 1 to the image's OWN init/systemd, or to its OWN
+//! entrypoint). This module reads the image's ext4
 //! host-side (no mount, via [`crate::ext4_read::Ext4Reader`]) and, for the image
 //! kernel, extracts the two pieces libkrun needs: the raw kernel `vmlinuz` and the
 //! boot-critical kernel modules. It then assembles the preinit initramfs the agent
 //! boots from — the agent as `/init` plus any `.ko` files (decompressed from a distro's
 //! `.ko.xz`/`.ko.zst`/`.ko.gz`) and an ordered load list — so the preinit can `insmod`
-//! virtio/ext4 before mounting the real root and (for
-//! image init) exec'ing the image's `/sbin/init`. With `--kernel default` the pinned
+//! virtio/ext4 before mounting the real root and (for an image PID 1) exec'ing what that
+//! axis names. With `--kernel default` the pinned
 //! kernel has virtio/ext4 built in, so no extraction and no modules are needed.
 
 use std::path::{Path, PathBuf};

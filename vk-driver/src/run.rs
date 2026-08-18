@@ -21,19 +21,60 @@ use crate::timing::{Phase, Timings};
 use crate::vmm::Vmm;
 
 /// Who runs as PID 1 in the guest. `Default` = vk-agent (virtkit's default); `Image`
-/// = the image's own init (`/sbin/init`, e.g. systemd) via the preinit handoff.
+/// = the image's own init (`/sbin/init`, e.g. systemd) via the preinit handoff;
+/// `Entrypoint` = the image's ENTRYPOINT+CMD via that same handoff, for an image whose
+/// entrypoint prepares the machine and only then execs the real init — a step `Image`
+/// skips. The entrypoint runs as root, unlike `docker run`'s honoring of `USER`: it is
+/// PID 1, and a machine-preparing entrypoint (and any init it execs) needs root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum InitSource {
     Default,
     Image,
+    Entrypoint,
 }
 
 impl InitSource {
+    /// Which [`ImageInit`] axis the guest hands PID 1 to, or `None` for the agent.
+    /// Exhaustive on purpose: a new axis has to say here what PID 1 becomes, rather
+    /// than reaching the guest as a token nothing acts on.
+    pub fn image_init(self) -> Option<vk_core::runcfg::ImageInit> {
+        use vk_core::runcfg::ImageInit;
+        match self {
+            InitSource::Default => None,
+            InitSource::Image => Some(ImageInit::Init),
+            InitSource::Entrypoint => Some(ImageInit::Entrypoint),
+        }
+    }
+
     /// Does this hand PID 1 to the image? Every guard that rejects a flag the preinit
     /// handoff cannot carry, and the boot-medium choice that selects that handoff, ask
     /// exactly this.
     pub fn is_image(self) -> bool {
-        matches!(self, InitSource::Image)
+        self.image_init().is_some()
+    }
+
+    /// The cmdline fragment (leading space, empty for `Default`) telling the guest agent
+    /// what PID 1 becomes.
+    pub fn handoff_tokens(self) -> String {
+        use vk_core::runcfg::ImageInit;
+        let Some(axis) = self.image_init() else {
+            return String::new();
+        };
+        let mut tokens = format!(" VIRTKIT_INIT={}", axis.token());
+        // The image's own init needs its path spelled out. An entrypoint argv rides the
+        // boot config the agent already reads instead, so nothing with spaces in it has
+        // to survive the kernel cmdline.
+        if axis == ImageInit::Init {
+            tokens.push_str(" VIRTKIT_HANDOFF=/sbin/init");
+        }
+        tokens
+    }
+}
+
+/// The `--init` / `x-virtkit.init` value this axis is spelled as, for error messages.
+impl std::fmt::Display for InitSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.image_init().map_or("default", |axis| axis.token()))
     }
 }
 
@@ -178,9 +219,10 @@ pub struct RunArgs {
     /// boot the rootfs as a cpio initramfs held in RAM instead of the default
     /// native-ext4 disk (needs --mem of roughly three times the image size)
     pub ram: bool,
-    /// Who runs as PID 1 in the guest: vk-agent (`Default`) or the image's own
-    /// init/systemd (`Image`), the latter via the preinit handoff. `Image` requires
-    /// an ext4 (a `-f` build or a non-`--ram` image).
+    /// Who runs as PID 1 in the guest: vk-agent (`Default`), the image's own
+    /// init/systemd (`Image`), or the image's ENTRYPOINT+CMD (`Entrypoint`) — the
+    /// latter two via the preinit handoff, and both requiring an ext4 (a `-f` build
+    /// or a non-`--ram` image).
     pub init: InitSource,
     /// attach an interactive shell once the guest is up (needs a terminal)
     pub shell: bool,
@@ -610,7 +652,7 @@ async fn build_and_boot(
     // mounts /dev/vda; the image's init pivots into it), so they need an ext4 — a `-f`
     // build or a non-`--ram` image — never the pure-RAM cpio path.
     if args.init.is_image() && args.ram {
-        bail!("--init image is incompatible with --ram");
+        bail!("--init {} is incompatible with --ram", args.init);
     }
     if args.kernel == KernelSource::Image && args.ram {
         bail!("--kernel image is incompatible with --ram");
@@ -622,19 +664,20 @@ async fn build_and_boot(
             "--atop needs --state-dir: the recording lives in it, and `vk atop` finds the VM by it"
         );
     }
-    // The image-init preinit applies the virtkit setup the image's own init won't do
-    // (host volume mounts, symlinks, the ssh/exec serves, env, and an eth0 bridge the
-    // image DHCPs on) before handing off to systemd. The host-exec channel, compose
-    // and an interactive pty (--shell or -t) are not wired for image init yet, and an idle
-    // watchdog has nothing to power the VM off once the image's init owns PID 1 — reject
-    // them rather than silently ignore.
+    // The image-init preinit applies the virtkit setup the image's own init won't do (host
+    // volume mounts, symlinks, the ssh/exec serves, env, and an eth0 bridge the image DHCPs
+    // on) before it hands PID 1 over. The host-exec channel, compose and an interactive pty
+    // (--shell or -t) are not wired for an image PID 1 yet, and an idle watchdog has nothing
+    // to power the VM off once the image owns PID 1 — reject them rather than silently
+    // ignore.
     // Named on its own, because unlike the rest it has somewhere to send the operator: the
     // image's init leaves no agent at PID 1 to fork the sampler, but the reparented agent
     // still serves the exec channel, which is what an attach records over.
     if args.init.is_image() && args.atop.is_some() {
         bail!(
-            "--init image does not support --atop — boot the VM, then record it with \
-             `vk atop <dir>`"
+            "--init {} does not support --atop — boot the VM, then record it with \
+             `vk atop <dir>`",
+            args.init
         );
     }
     if args.init.is_image() {
@@ -654,7 +697,8 @@ async fn build_and_boot(
         .collect::<Vec<_>>();
         if !unsupported.is_empty() {
             bail!(
-                "--init image does not support {} yet",
+                "--init {} does not support {} yet",
+                args.init,
                 unsupported.join(", ")
             );
         }
@@ -679,9 +723,12 @@ async fn build_and_boot(
     };
     apply_service_sizes(&mut compose_units, &args.service_cpus, &args.service_mem)?;
     let mut image_env: Vec<(String, String)> = Vec::new();
-    // The image's entrypoint and workdir, applied to the guest command like `docker
-    // run`: the entrypoint is prepended to a trailing command, the workdir is its cwd.
+    // The image's entrypoint, cmd and workdir, applied to the guest command like
+    // `docker run`: the entrypoint is prepended to a trailing command, the workdir is
+    // its cwd. `--init entrypoint` boots entrypoint+cmd as PID 1, which is the only
+    // consumer of `image_cmd` — every other path takes its argv from the CLI.
     let mut image_entrypoint: Vec<String> = Vec::new();
+    let mut image_cmd: Vec<String> = Vec::new();
     let mut image_workdir = String::new();
     // The --primary primary's merged config: env for the command, argv as the
     // default command, hostname for the guest.
@@ -723,6 +770,7 @@ async fn build_and_boot(
         let cfg = crate::compose::merged_config(&built.config, unit);
         image_env = cfg.env.clone();
         image_entrypoint = cfg.entrypoint.clone();
+        image_cmd = cfg.cmd.clone();
         image_workdir = cfg.workdir.clone();
         primary_user = cfg.user.clone();
         primary_hostname = Some(unit.hostname.clone());
@@ -765,6 +813,7 @@ async fn build_and_boot(
         primary_user = built.config.user;
         image_env = built.config.env;
         image_entrypoint = built.config.entrypoint;
+        image_cmd = built.config.cmd;
         image_workdir = built.config.workdir;
         Some(out)
     };
@@ -795,10 +844,10 @@ async fn build_and_boot(
         marker_kernel
     };
     // The CLI axis was rejected far above, before the build; this catches a --primary
-    // service whose own x-virtkit marker selects image init, checked on the merged axes
+    // service whose own x-virtkit marker selects an image PID 1, checked on the merged axes
     // just computed above (like the --ram guard a few lines below).
     if args.inactivity_timeout_secs.is_some() && eff_init.is_image() {
-        bail!("a service's x-virtkit image init is incompatible with --inactivity-timeout");
+        bail!("a service's x-virtkit `init: {eff_init}` is incompatible with --inactivity-timeout");
     }
     // Effective primary sizing, same precedence as the axes: an explicit --cpus/--mem
     // overrides the --primary service's own x-virtkit sizing (which already carries
@@ -829,7 +878,17 @@ async fn build_and_boot(
     // path. `--primary` forces the ext4 disk path anyway, so this only ever fires if that
     // invariant is broken — a belt-and-braces check on the merged axes.
     if args.ram && (eff_init.is_image() || eff_kernel == KernelSource::Image) {
-        bail!("a service's x-virtkit image init/kernel is incompatible with --ram");
+        let mut axes = Vec::new();
+        if eff_init.is_image() {
+            axes.push(format!("`init: {eff_init}`"));
+        }
+        if eff_kernel == KernelSource::Image {
+            axes.push("`kernel: image`".to_string());
+        }
+        bail!(
+            "a service's x-virtkit {} is incompatible with --ram",
+            axes.join(" / ")
+        );
     }
 
     // 1. the rootfs source (docker export or registry pull) for an image boot, unless a
@@ -845,11 +904,29 @@ async fn build_and_boot(
             let cfg = source.run_config().await?;
             image_env = cfg.env;
             image_entrypoint = cfg.entrypoint;
+            image_cmd = cfg.cmd;
             image_workdir = cfg.workdir;
             Some(source)
         }
         Some(_) => None,
     };
+    // Every path that can carry an image config has now read one, so this is where the
+    // entrypoint axis can be checked: it has PID 1 exec the image's entrypoint, and an image
+    // naming none leaves it nothing to become — the guest would boot the init instead, the
+    // silent skip this axis exists to end. Refused here, where the operator reads it, rather
+    // than warned about on a guest console a successful run never prints. Read off the
+    // merged config, so a compose `entrypoint:`/`command:` counts as naming one.
+    if eff_init == InitSource::Entrypoint && image_entrypoint.is_empty() && image_cmd.is_empty() {
+        // The axis reaches here from the flag or from a --primary service's marker, never
+        // both: `--init entrypoint` with `--compose` was rejected far above, and --primary
+        // implies --compose. Name whichever one the operator actually wrote.
+        let axis = if args.init == InitSource::Entrypoint {
+            "--init entrypoint"
+        } else {
+            "a service's x-virtkit `init: entrypoint`"
+        };
+        bail!("{axis} needs an image with an ENTRYPOINT or CMD — this one declares neither");
+    }
     // --env/--env-file extras, upserted so they win over the image env — both in
     // `drive`'s exports and in the guest's own env (the media below carry the
     // merged list: the boot config for a clean -f/--primary image, an injected
@@ -955,11 +1032,17 @@ async fn build_and_boot(
                 rootfs
             };
             // Build the preinit initramfs (agent as /init that insmods any modules, pivots,
-            // and for --init image execs /sbin/init); with --kernel image also extract the
-            // image's kernel. The boot config carries the effective env, applied before handoff.
+            // then execs whatever the init axis names); with --kernel image also extract the
+            // image's kernel. The boot config carries what the agent needs before it hands
+            // PID 1 over: the effective env, and the image's entrypoint+cmd+workdir, which
+            // `--init entrypoint` execs as PID 1 (the other axes exec /sbin/init and ignore
+            // them).
             let boot_cfg = vk_core::runcfg::RunConfig {
                 env: image_env.clone(),
                 user: primary_user.clone(),
+                workdir: image_workdir.clone(),
+                entrypoint: image_entrypoint.clone(),
+                cmd: image_cmd.clone(),
                 ..Default::default()
             };
             let kernel_medium = medium("vmlinuz")?;
@@ -990,11 +1073,9 @@ async fn build_and_boot(
             if eff_kernel == KernelSource::Image {
                 kcmd.push_str(" VIRTKIT_KERNEL=image");
             }
-            // The image's own init takes PID 1 via the handoff. When init==default the agent
-            // stays PID 1 and pivots via the existing VIRTKIT_PIVOT path — no VIRTKIT_INIT.
-            if eff_init == InitSource::Image {
-                kcmd.push_str(" VIRTKIT_INIT=image VIRTKIT_HANDOFF=/sbin/init");
-            }
+            // Who takes PID 1 after the handoff. When init==default the agent stays PID 1
+            // and pivots via the existing VIRTKIT_PIVOT path — the fragment is then empty.
+            kcmd.push_str(&eff_init.handoff_tokens());
             (
                 vec![crate::vmm::Disk::overlay(overlay)],
                 Some(boot.initramfs),
@@ -1710,9 +1791,8 @@ async fn build_and_boot(
         }
     }
 
-    // With a --primary primary and no trailing command, the service's own
-    // entrypoint+cmd runs — `docker compose run <svc>` semantics.
-    let fallback_argv = primary.map(|c| c.argv()).unwrap_or_default();
+    let (cmd_entrypoint, fallback_argv) =
+        exec_channel_argv(eff_init, &image_entrypoint, primary.as_ref());
     let result = drive(
         &mut ch,
         &addr,
@@ -1720,7 +1800,7 @@ async fn build_and_boot(
         args,
         ssh_config.as_deref(),
         &image_env,
-        &image_entrypoint,
+        cmd_entrypoint,
         &image_workdir,
         &fallback_argv,
         &timings,
@@ -2521,6 +2601,27 @@ fn user_script(command: &[String]) -> String {
             .collect::<Vec<_>>()
             .join(" "),
     }
+}
+
+/// What the exec channel starts from: the entrypoint a trailing command is wrapped in, and
+/// the argv a run with no trailing command gets. Normally the image's entrypoint and — with
+/// a `--primary` primary — that service's own entrypoint+cmd, `docker compose run <svc>`
+/// semantics. Both are empty under `--init entrypoint`, where that argv is PID 1 already:
+/// running it again would repeat the machine preparation inside the machine it just
+/// prepared, so a trailing command runs on its own and a run without one gets the boot-info
+/// probe, which is what there is to look at.
+fn exec_channel_argv<'a>(
+    init: InitSource,
+    image_entrypoint: &'a [String],
+    primary: Option<&vk_core::runcfg::RunConfig>,
+) -> (&'a [String], Vec<String>) {
+    if init == InitSource::Entrypoint {
+        return (&[], Vec::new());
+    }
+    (
+        image_entrypoint,
+        primary.map(|c| c.argv()).unwrap_or_default(),
+    )
 }
 
 /// The shell body a run executes in the guest, `docker run`-style. With no trailing
@@ -3542,6 +3643,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_exec_channel_never_reruns_an_entrypoint_that_is_already_pid_1() {
+        let image_entrypoint = ["/prepare-machine.sh".to_string()];
+        let primary = vk_core::runcfg::RunConfig {
+            entrypoint: vec!["/prepare-machine.sh".into()],
+            cmd: vec!["serve".into()],
+            ..Default::default()
+        };
+        // the axes that keep the agent (or the image's init) at PID 1 wrap a trailing
+        // command in the image's entrypoint and fall back to a --primary service's own argv
+        for init in [InitSource::Default, InitSource::Image] {
+            let (entrypoint, fallback) = exec_channel_argv(init, &image_entrypoint, Some(&primary));
+            assert_eq!(entrypoint, image_entrypoint);
+            assert_eq!(fallback, ["/prepare-machine.sh", "serve"]);
+        }
+        // under `--init entrypoint` that argv is PID 1 already, so neither runs again
+        let (entrypoint, fallback) =
+            exec_channel_argv(InitSource::Entrypoint, &image_entrypoint, Some(&primary));
+        assert!(entrypoint.is_empty(), "a trailing command runs unwrapped");
+        assert!(
+            fallback.is_empty(),
+            "no command falls through to the boot-info probe"
+        );
+        // the `-f`/plain-image shape: no --primary config, so only the entrypoint differs
+        assert_eq!(
+            exec_channel_argv(InitSource::Image, &image_entrypoint, None),
+            (&image_entrypoint[..], Vec::new())
+        );
+        assert_eq!(
+            exec_channel_argv(InitSource::Entrypoint, &image_entrypoint, None),
+            (&[][..], Vec::new())
+        );
+    }
+
+    #[test]
+    fn handoff_tokens_name_the_axis_the_guest_agent_reads() {
+        // default: the agent keeps PID 1, so there is nothing to hand off
+        assert_eq!(InitSource::Default.handoff_tokens(), "");
+        // the image's own init needs its path spelled out on the cmdline
+        assert_eq!(
+            InitSource::Image.handoff_tokens(),
+            " VIRTKIT_INIT=image VIRTKIT_HANDOFF=/sbin/init"
+        );
+        // the entrypoint argv rides the boot config instead, so no handoff path here —
+        // one with spaces in it could not survive the kernel cmdline
+        assert_eq!(
+            InitSource::Entrypoint.handoff_tokens(),
+            " VIRTKIT_INIT=entrypoint"
+        );
+        // both image axes hand PID 1 over, so both take the preinit boot medium
+        assert!(InitSource::Image.is_image() && InitSource::Entrypoint.is_image());
+        assert!(!InitSource::Default.is_image());
+        // the axis names itself the way the user spelled it, for the guard messages
+        assert_eq!(
+            [
+                InitSource::Default.to_string(),
+                InitSource::Image.to_string(),
+                InitSource::Entrypoint.to_string()
+            ],
+            ["default", "image", "entrypoint"]
+        );
+    }
+
+    #[test]
     fn service_size_overrides_layer_over_the_compose_declaration() {
         let yaml = "services:\n\
              \x20 db:\n    image: d\n    x-virtkit: { cpus: 2, mem: 512M }\n\
@@ -3814,8 +3978,14 @@ mod tests {
             ),
             "cd '/app' && '/entry' 'serve'"
         );
-        // No command and no fallback: the boot-info probe.
+        // No command and no fallback: the boot-info probe. This is the `--init entrypoint`
+        // shape — the driver passes no entrypoint and no fallback there, since that argv is
+        // PID 1 already, so a trailing command runs unwrapped and none repeats it.
         assert!(guest_command_body(&[], &[], "", false, &[]).starts_with("echo PID1="));
+        assert_eq!(
+            guest_command_body(&s(&["sh", "-c", "id"]), &[], "/app", false, &[]),
+            "cd '/app' && 'sh' '-c' 'id'"
+        );
     }
 
     #[test]

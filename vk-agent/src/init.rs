@@ -56,6 +56,11 @@
 //!                        exec command (status probes do not reset the clock). Honored in
 //!                        the default mode only: the service and full-VM paths arm no
 //!                        watchdog, and their exec server is not what powers the VM off.
+//!   VIRTKIT_INIT         the image takes PID 1 through the preinit handoff, and this
+//!                        names what it becomes: `image` (the image's own init) or
+//!                        `entrypoint` (the boot config's entrypoint+cmd). Absent: the
+//!                        agent keeps PID 1 (the default and service modes below)
+//!   VIRTKIT_HANDOFF      which init `VIRTKIT_INIT=image` execs (default /sbin/init)
 //!   VIRTKIT_MODE=service fork the boot config's entrypoint; the agent stays as PID 1
 //!                        and reaps orphans. A systemd image hands off via its entrypoint.
 //!   VIRTKIT_SERVE=1      (service) also start the vsock exec server (port 4444) for
@@ -76,7 +81,7 @@ use anyhow::{Context, Result, bail};
 use log::{info, warn};
 
 use vk_core::addr::SocketAddr;
-use vk_core::runcfg::RunConfig;
+use vk_core::runcfg::{ImageInit, RunConfig};
 
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const SSH_VSOCK_PORT: u32 = 2222;
@@ -112,12 +117,19 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
         load_preinit_modules();
     }
 
-    // Image init (`vk run --init image`): the image runs its OWN init/systemd. Handled
+    // Image init (`vk run --init image|entrypoint`): the IMAGE takes PID 1. Handled
     // entirely by run_full_vm — pivot into the real root, fork a reparented serve, then
-    // exec the image's init so systemd (not this agent) becomes PID 1. Gated on the
-    // cmdline token so every default-init boot path stays unchanged.
-    if cmdline.get("VIRTKIT_INIT").map(String::as_str) == Some("image") {
-        return run_full_vm(socket, &cmdline, boot_config.as_ref());
+    // exec what the axis names (the image's init, or its entrypoint) so that, not this
+    // agent, becomes PID 1. Gated on the cmdline token so every default-init boot path
+    // stays unchanged.
+    if let Some(axis) = cmdline.get("VIRTKIT_INIT") {
+        match ImageInit::from_token(axis) {
+            Some(axis) => return run_full_vm(socket, &cmdline, boot_config.as_ref(), axis),
+            // Only this driver writes the token, so a value it does not name means the
+            // two have drifted apart: say so instead of quietly keeping PID 1 and
+            // serving a guest that never ran what the axis asked for.
+            None => warn!("vk-agent init: unknown VIRTKIT_INIT={axis} — keeping PID 1"),
+        }
     }
 
     // If booted from the agent-only initramfs (`VIRTKIT_PIVOT=<root dev>`), mount the
@@ -199,26 +211,32 @@ fn pivot_to_real_root() -> Result<bool> {
     Ok(true)
 }
 
-/// Image-init handoff (`vk run --init image`): pivot into the real root, apply the
-/// virtkit-provided setup the image's init won't do itself (host volume mounts,
-/// symlinks, the ssh and exec serves, image env), fork a reparented `vk-agent serve`,
-/// then exec the image's own init (systemd) so it becomes PID 1.
+/// Image-init handoff (`vk run --init image|entrypoint`): pivot into the real root,
+/// apply the virtkit-provided setup the image's init won't do itself (host volume
+/// mounts, symlinks, the ssh and exec serves, image env), fork a reparented `vk-agent
+/// serve`, then exec what `axis` names — the image's own init (systemd), or its
+/// entrypoint — so that becomes PID 1.
+///
+/// What is applied is that list and nothing more — whatever takes PID 1 next brings the
+/// rest of the machine up itself (/sys, /dev/pts, /run, loopback, hostname, resolv.conf,
+/// tmpfs scratch), the way an init does. An entrypoint that needs those *without* exec'ing
+/// an init belongs in `VIRTKIT_MODE=service`, which sets them up and forks it.
 ///
 /// Any modular image kernel's boot-critical modules are already loaded by the caller
 /// (`run_init`) before this runs — they must precede the pivot, which mounts the ext4
-/// rootfs at `/dev/vda`. The serves are forked just before the exec; once the exec
-/// makes systemd PID 1, they reparent to it and keep carrying the run's `-- <cmd>` /
-/// ssh over vsock. Only setup the image's init does not own is applied here —
-/// networking is left to the image (deferred).
+/// rootfs at `/dev/vda`. The serves are forked just before the exec; once the exec hands
+/// PID 1 over, they reparent to the new PID 1 and keep carrying the run's `-- <cmd>` /
+/// ssh over vsock. Networking is left to the image (deferred).
 fn run_full_vm(
     socket: &SocketAddr,
     cmdline: &HashMap<String, String>,
     cfg: Option<&RunConfig>,
+    axis: ImageInit,
 ) -> Result<()> {
-    // The pivot is mandatory here: the whole point is to hand off to the image's own
-    // /sbin/init, which only exists in the real root. Unlike the serve-mode path (which
-    // can keep serving in place), continuing without the pivot would just exec the
-    // initramfs's own tree — so fail loudly instead.
+    // The pivot is mandatory here: the whole point is to hand off to something in the
+    // image — its own /sbin/init, or its entrypoint — and neither exists anywhere but the
+    // real root. Unlike the serve-mode path (which can keep serving in place), continuing
+    // without the pivot would just exec the initramfs's own tree — so fail loudly instead.
     pivot_to_real_root().context("vk-agent image-init: pivot to real root")?;
     // Re-mount /proc and /dev in the pivoted root before the setup below: the
     // pivot's MS_MOVE hid the initramfs mounts, so the new root has neither. /proc
@@ -250,12 +268,72 @@ fn run_full_vm(
     maybe_ssh_agent(cmdline);
     let _serve = spawn_serve(socket, None)?;
 
-    let handoff = cmdline
-        .get("VIRTKIT_HANDOFF")
-        .cloned()
-        .unwrap_or_else(|| "/sbin/init".to_string());
-    info!("vk-agent image-init: exec {handoff} (systemd takes PID 1)");
-    exec_argv(&[handoff]); // never returns; this process becomes the image's init
+    // Only the entrypoint axis chdirs: /sbin/init neither has nor wants a workdir. It
+    // precedes the exec so a relative entrypoint (`./prepare.sh`) resolves there.
+    if let (ImageInit::Entrypoint, Some(cfg)) = (axis, cfg) {
+        chdir_workdir(cfg);
+    }
+    exec_first(&image_init_candidates(axis, cmdline, cfg)) // never returns
+}
+
+/// Become the first candidate that execs. `execvp` returns only when it failed, leaving
+/// this process untouched, so it is what decides whether the image can actually become a
+/// candidate — a probe here would have to predict PATH lookup, the execute bit, and a
+/// shebang's interpreter, and be wrong about all three between the check and the exec.
+/// Never returns: PID 1 exiting is a kernel panic, so the last candidate's failure is
+/// terminal and [`exec_argv`] reports it.
+fn exec_first(candidates: &[Vec<String>]) -> ! {
+    let (last, rest) = candidates
+        .split_last()
+        .expect("image_init_candidates always offers the image's init");
+    for argv in rest {
+        info!("vk-agent image-init: exec {argv:?} (it takes PID 1)");
+        let e = try_exec_argv(argv);
+        warn!("vk-agent image-init: exec {argv:?} failed: {e} — trying the next candidate");
+    }
+    info!("vk-agent image-init: exec {last:?} (it takes PID 1)");
+    exec_argv(last)
+}
+
+/// What PID 1 becomes after the handoff, as [`ImageInit`] names it — in preference order,
+/// since only the exec itself can tell whether the image really carries a candidate.
+///
+/// [`ImageInit::Init`] offers the image's own init alone: `VIRTKIT_HANDOFF` if the host
+/// named one, else `/sbin/init`. An image booted for its own init and missing it is broken,
+/// and looks it — the boot ends the way it did before any of this.
+///
+/// [`ImageInit::Entrypoint`] leads with the image's ENTRYPOINT+CMD (merged host-side with
+/// any compose override), exec'd — NOT forked as `VIRTKIT_MODE=service` does — so an
+/// entrypoint that sets the machine up and then execs systemd hands PID 1 straight on.
+/// Service mode cannot do that: systemd refuses to run anywhere but PID 1, which the agent
+/// holds there. It runs as root: it *is* PID 1, so the config's user is not applied the way
+/// service mode's `wrap_user` applies it. The image's init and then a shell follow it, so a
+/// mis-declared entrypoint reaches a debuggable guest rather than exiting 127 from PID 1
+/// and panicking the kernel — the same ladder [`service_argv`] climbs.
+fn image_init_candidates(
+    axis: ImageInit,
+    cmdline: &HashMap<String, String>,
+    cfg: Option<&RunConfig>,
+) -> Vec<Vec<String>> {
+    let init = vec![
+        cmdline
+            .get("VIRTKIT_HANDOFF")
+            .cloned()
+            .unwrap_or_else(|| "/sbin/init".to_string()),
+    ];
+    if axis == ImageInit::Init {
+        return vec![init];
+    }
+    let entrypoint = cfg.map(|c| c.argv()).unwrap_or_default();
+    let mut candidates = Vec::new();
+    if !entrypoint.is_empty() {
+        candidates.push(entrypoint);
+    } else {
+        warn!("vk-agent image-init: no entrypoint in the boot config — falling back to the init");
+    }
+    candidates.push(init);
+    candidates.push(vec!["/bin/sh".to_string()]);
+    candidates
 }
 
 /// Load the boot-critical modules listed (one absolute `.ko` path per line) in the
@@ -1629,13 +1707,7 @@ fn run_service(cmdline: &HashMap<String, String>, config: Option<&RunConfig>) ->
     let cfg = config.cloned().unwrap_or_default();
     let argv = service_argv(&cfg, Path::new("/sbin/init").exists());
     let argv = wrap_user(argv, &cfg.user);
-    if !cfg.workdir.is_empty() && cfg.workdir != "/" {
-        // children (the service, a VIRTKIT_SERVE exec server) inherit PID 1's cwd,
-        // so the service starts in its image WORKDIR like `docker run` would.
-        if let Err(e) = std::env::set_current_dir(&cfg.workdir) {
-            warn!("vk-agent init: chdir {} failed: {e}", cfg.workdir);
-        }
-    }
+    chdir_workdir(&cfg);
     info!(
         "vk-agent init: service as {}: {:?}",
         if cfg.user.is_empty() {
@@ -1807,6 +1879,18 @@ fn service_argv(cfg: &RunConfig, have_sbin_init: bool) -> Vec<String> {
     }
 }
 
+/// chdir into the config's WORKDIR, like `docker run` — so a relative argv resolves there,
+/// and so anything PID 1 goes on to start inherits it. Best effort: a directory the image
+/// does not have warns and leaves the cwd alone. `/` (or none) is already the cwd.
+fn chdir_workdir(cfg: &RunConfig) {
+    if cfg.workdir.is_empty() || cfg.workdir == "/" {
+        return;
+    }
+    if let Err(e) = std::env::set_current_dir(&cfg.workdir) {
+        warn!("vk-agent init: chdir {} failed: {e}", cfg.workdir);
+    }
+}
+
 /// Wrap argv to drop to `user` via setpriv (when non-root and setpriv is present).
 fn wrap_user(argv: Vec<String>, user: &str) -> Vec<String> {
     if !user.is_empty() && user != "root" && which("setpriv") {
@@ -1831,16 +1915,19 @@ fn wrap_user(argv: Vec<String>, user: &str) -> Vec<String> {
 
 /// execvp(argv) — replaces this process (PATH-searched). Never returns on success.
 fn exec_argv(argv: &[String]) -> ! {
+    let e = try_exec_argv(argv);
+    eprintln!("vk-agent init: exec {:?} failed: {e}", argv.first());
+    unsafe { libc::_exit(127) };
+}
+
+/// Try to become `argv`, handing back the error if that failed: `execvp` returns only on
+/// failure, and leaves this process able to try something else.
+fn try_exec_argv(argv: &[String]) -> io::Error {
     let c_argv: Vec<CString> = argv.iter().map(|a| cstr(a)).collect();
     let mut ptrs: Vec<*const libc::c_char> = c_argv.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
     unsafe { libc::execvp(c_argv[0].as_ptr(), ptrs.as_ptr()) };
-    eprintln!(
-        "vk-agent init: exec {:?} failed: {}",
-        argv.first(),
-        io::Error::last_os_error()
-    );
-    unsafe { libc::_exit(127) };
+    io::Error::last_os_error()
 }
 
 fn set_child_subreaper() {
@@ -2302,6 +2389,56 @@ mod tests {
             vec!["redis-server".to_string()]
         );
         assert_eq!(wrap_user(vec!["x".into()], ""), vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn image_init_candidates_lead_with_the_entrypoint_only_for_the_entrypoint_axis() {
+        let cfg = RunConfig {
+            entrypoint: vec!["/prepare-machine.sh".into()],
+            cmd: vec!["--log-level=info".into()],
+            ..Default::default()
+        };
+        let empty = HashMap::new();
+        let handoff = HashMap::from([(
+            "VIRTKIT_HANDOFF".to_string(),
+            "/lib/systemd/systemd".to_string(),
+        )]);
+
+        // the init axis offers the init and nothing else, exactly as it did before the
+        // entrypoint axis existed — the host's handoff where it named one
+        assert_eq!(
+            image_init_candidates(ImageInit::Init, &empty, Some(&cfg)),
+            [["/sbin/init"]]
+        );
+        assert_eq!(
+            image_init_candidates(ImageInit::Init, &handoff, Some(&cfg)),
+            [["/lib/systemd/systemd"]]
+        );
+
+        // the entrypoint axis leads with the config's entrypoint+cmd, verbatim: a bare name
+        // is left for execvp's PATH lookup rather than resolved here
+        assert_eq!(
+            image_init_candidates(ImageInit::Entrypoint, &empty, Some(&cfg)),
+            [
+                vec!["/prepare-machine.sh", "--log-level=info"],
+                vec!["/sbin/init"],
+                vec!["/bin/sh"]
+            ]
+        );
+        let bare = RunConfig {
+            entrypoint: vec!["prepare-machine.sh".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            image_init_candidates(ImageInit::Entrypoint, &empty, Some(&bare))[0],
+            ["prepare-machine.sh"]
+        );
+        // nothing to exec: straight to the init, then a shell — PID 1 always has a next
+        // candidate, since exiting from it panics the kernel
+        assert_eq!(
+            image_init_candidates(ImageInit::Entrypoint, &handoff, None),
+            [vec!["/lib/systemd/systemd"], vec!["/bin/sh"]]
+        );
     }
 
     #[test]

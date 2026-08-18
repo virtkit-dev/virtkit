@@ -60,7 +60,8 @@ pub struct Unit {
     pub profiles: Vec<String>,
     /// Who runs as PID 1 in this unit's guest (compose `x-virtkit.init`), applied
     /// identically whether the unit boots as the primary (`--primary`) or a sibling.
-    /// `Default` = vk-agent; `Image` = the image's own `/sbin/init`.
+    /// `Default` = vk-agent; `Image` = the image's own `/sbin/init`; `Entrypoint` =
+    /// the image's own ENTRYPOINT+CMD.
     pub init: crate::run::InitSource,
     /// Which kernel this unit's guest boots on (compose `x-virtkit.kernel`), applied
     /// identically primary or sibling. `Default` = the pinned kernel; `Image` = the
@@ -770,13 +771,17 @@ struct XVirtkit {
 }
 
 impl XVirtkit {
-    /// `init: default|image` → [`crate::run::InitSource`] (absent = Default).
+    /// `init: default|image|entrypoint` → [`crate::run::InitSource`] (absent = Default).
     fn init(&self) -> Result<crate::run::InitSource> {
         match self.init.as_deref() {
             None | Some("default") => Ok(crate::run::InitSource::Default),
             Some("image") => Ok(crate::run::InitSource::Image),
+            Some("entrypoint") => Ok(crate::run::InitSource::Entrypoint),
             Some(other) => {
-                bail!("x-virtkit.init: expected \"default\" or \"image\", got {other:?}")
+                bail!(
+                    "x-virtkit.init: expected \"default\", \"image\" or \"entrypoint\", \
+                     got {other:?}"
+                )
             }
         }
     }
@@ -1285,6 +1290,31 @@ mod tests {
     }
 
     #[test]
+    fn an_entrypoint_unit_boots_its_compose_override_as_pid_1() {
+        // `init: entrypoint` execs the unit's merged argv as PID 1 (see vk-agent's
+        // `image_init_candidates`), so a compose override has to reach that argv — the
+        // image's own ENTRYPOINT+CMD is only the default underneath it.
+        let unit = one(
+            "services:\n  s:\n    image: x\n    command: [--config, /etc/app.toml]\n\
+             \x20   x-virtkit: { init: entrypoint }\n",
+        );
+        assert_eq!(unit.init, crate::run::InitSource::Entrypoint);
+        let image = RunConfig {
+            entrypoint: vec!["/prepare-machine.sh".into()],
+            cmd: vec!["/sbin/init".into()],
+            workdir: "/srv".into(),
+            ..Default::default()
+        };
+        let cfg = merged_config(&image, &unit);
+        assert_eq!(
+            cfg.argv(),
+            ["/prepare-machine.sh", "--config", "/etc/app.toml"]
+        );
+        // the entrypoint's cwd, which the agent chdirs to before the exec
+        assert_eq!(cfg.workdir, "/srv");
+    }
+
+    #[test]
     fn x_virtkit_marker_sets_the_init_kernel_axes() {
         use crate::run::{InitSource, KernelSource};
         // no marker → Default/Default (today's behavior)
@@ -1304,6 +1334,10 @@ mod tests {
         let u = one("services:\n  s:\n    image: x\n    x-virtkit: { kernel: /boot/vmlinux }\n");
         assert_eq!(u.init, InitSource::Default);
         assert_eq!(u.kernel, KernelSource::Path("/boot/vmlinux".into()));
+        // entrypoint: PID 1 is the image's ENTRYPOINT, which may exec the real init
+        let u = one("services:\n  s:\n    image: x\n    x-virtkit: { init: entrypoint }\n");
+        assert_eq!(u.init, InitSource::Entrypoint);
+        assert!(u.init.is_image()); // boots through the preinit handoff, like image
         // explicit "default" is the same as absent
         let u = one(
             "services:\n  s:\n    image: x\n    x-virtkit: { init: default, kernel: default }\n",

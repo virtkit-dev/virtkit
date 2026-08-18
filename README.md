@@ -42,8 +42,11 @@ Boot an image on its own kernel and init. By default virtkit boots every image
 on its embedded kernel with `vk-agent` as PID 1, but `vk run --kernel image
 --init image` boots the image's own `/boot/vmlinuz` (with its modules) and hands
 PID 1 to the image's own init/systemd — so a stock distro image comes up as it
-would on real hardware. `--kernel <path>` boots a kernel you supply. In compose,
-a service picks this per service with an `x-virtkit: { init:, kernel: }` marker.
+would on real hardware. `--init entrypoint` hands PID 1 to the image's
+ENTRYPOINT+CMD instead, for an image whose entrypoint prepares the machine and
+only then execs the real init. `--kernel <path>` boots a kernel you supply. In
+compose, a service picks this per service with an `x-virtkit: { init:, kernel: }`
+marker.
 
 Give a VM internet access with a flag. Pass `--net` and the VM can reach the
 network. There are no bridges, tap devices, or firewall rules to set up on the

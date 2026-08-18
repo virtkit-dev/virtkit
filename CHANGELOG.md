@@ -4,6 +4,18 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk run --init entrypoint`: the image's own entrypoint as PID 1.** An image whose
+  entrypoint prepares the machine and only then starts the real init now gets that step
+  run: `--init image` hands PID 1 straight to `/sbin/init`, so the preparation was skipped
+  in silence and the guest came up with none of the services the entrypoint would have
+  assembled. The new axis execs the image's ENTRYPOINT+CMD as PID 1 instead, so the
+  entrypoint hands PID 1 on when it execs the real init. It runs as root, being PID 1, and a
+  trailing `-- <command>` runs on its own rather than wrapped in that entrypoint. A compose
+  service picks the axis per service with `x-virtkit: { init: entrypoint }`, and
+  `--init image` is unchanged.
+
 ### Changed
 
 - **A refused `--state-dir` names the run holding it.** Starting a second `vk run` on a

@@ -33,8 +33,9 @@ pub struct Provisioned {
     pub config: RunConfig,
     pub volumes: Vec<crate::compose::Volume>,
     /// Who runs as PID 1 in this unit's guest (its compose `x-virtkit.init`): the
-    /// vk-agent (`Default`, today's service medium) or the image's own `/sbin/init`
-    /// (`Image`, the preinit handoff). Uniform with the primary path.
+    /// vk-agent (`Default`, today's service medium), the image's own `/sbin/init`
+    /// (`Image`) or its ENTRYPOINT+CMD (`Entrypoint`) — the latter two via the preinit
+    /// handoff. Uniform with the primary path.
     pub init: crate::run::InitSource,
     /// Which kernel this unit boots on (its compose `x-virtkit.kernel`): the pinned
     /// kernel (`Default`), the image's own kernel + modules (`Image`), or an explicit
@@ -333,6 +334,17 @@ pub fn boot_unit(
     net_port: u32,
     gateway: Ipv4Addr,
 ) -> Result<(Child, Vec<Child>)> {
+    // Same refusal as the primary path (`run::build_and_boot`), before this touches
+    // anything: the axis has PID 1 exec this unit's entrypoint, so a unit naming none would
+    // boot the image's init instead — the silent skip the axis exists to end. `config` is
+    // the merged one, so a compose `entrypoint:`/`command:` counts.
+    if svc.init == crate::run::InitSource::Entrypoint && svc.config.argv().is_empty() {
+        bail!(
+            "service {}: x-virtkit `init: entrypoint` needs an ENTRYPOINT or CMD — its image \
+             declares neither, and no compose `entrypoint:`/`command:` supplies one",
+            svc.name
+        );
+    }
     let overlay = dir.join(format!("{}-overlay.qcow2", svc.name));
     let vsock = dir.join("vsock.sock");
     let console = dir.join("console.log");
@@ -366,14 +378,12 @@ pub fn boot_unit(
         )?;
         boot_kernel = boot.kernel;
         // Per-axis handoff tokens, mirroring the primary path: keep ttyS0 for a
-        // modular image kernel (no early hvc0), hand PID 1 to /sbin/init for image init.
+        // modular image kernel (no early hvc0), and name who takes PID 1.
         let mut frag = String::new();
         if svc.kernel == crate::run::KernelSource::Image {
             frag.push_str(" VIRTKIT_KERNEL=image");
         }
-        if svc.init == crate::run::InitSource::Image {
-            frag.push_str(" VIRTKIT_INIT=image VIRTKIT_HANDOFF=/sbin/init");
-        }
+        frag.push_str(&svc.init.handoff_tokens());
         handoff_frag = frag;
     } else {
         // The boot medium: agent + the unit's merged config, rebuilt on every start so
@@ -438,7 +448,8 @@ pub fn boot_unit(
         let mut cmdline = if image_boot {
             // Preinit boot, mirroring the primary path (`run::build_and_boot`): the
             // agent rides the initramfs as /init, pivots, then either stays PID 1
-            // (kernel=image only) or execs /sbin/init (init=image). VIRTKIT_VSOCK_PORT
+            // (kernel=image only) or execs what the init axis names — /sbin/init, or the
+            // unit's entrypoint+cmd from its boot config. VIRTKIT_VSOCK_PORT
             // gives the reparented `vk-agent serve` its port; the handoff tokens
             // (VIRTKIT_KERNEL/VIRTKIT_INIT) were computed above.
             format!(
