@@ -13,6 +13,9 @@ All notable changes to virtkit will be documented in this file.
   `vk`, though compose's own `env_file:` already strips a matching pair. Both now strip one
   matching leading/trailing `'`/`"` pair the same way; a bare `--env` flag is untouched since the
   shell already de-quoted it.
+- **A compose service's overlay volume now overlays.** Declaring `:overlay` on a
+  compose sibling service's volume silently mounted it as a plain virtiofs
+  share instead — only the primary's own volumes got the tmpfs-backed overlay.
 
 ## [0.37.0] - 2026-08-19
 

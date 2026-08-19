@@ -411,6 +411,11 @@ pub fn boot_unit(
     let mut aux: Vec<Child> = Vec::new();
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
     let mut virtiofs = String::new();
+    // Tags the agent should mount behind a tmpfs-backed overlay (`host:guest:overlay`),
+    // exactly as the primary's own `-v`/compose volumes do in `run::build_and_boot` — a
+    // sibling unit's `:overlay` volume was parsed into `vol.overlay` but never reached the
+    // guest, so it silently mounted as a plain (non-overlaid) virtiofs share instead.
+    let mut overlay_tags: Vec<String> = Vec::new();
     for (i, vol) in svc.volumes.iter().enumerate() {
         let tag = format!("vol{i}");
         let sock = dir.join(format!("vfsd-{tag}.sock"));
@@ -427,6 +432,9 @@ pub fn boot_unit(
             virtiofs.push(',');
         }
         virtiofs.push_str(&format!("{tag}:{}", vol.guest));
+        if vol.overlay {
+            overlay_tags.push(tag.clone());
+        }
         shares.push(crate::vmm::FsShare {
             tag,
             socket: sock,
@@ -493,6 +501,12 @@ pub fn boot_unit(
         }
         if !virtiofs.is_empty() {
             cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS={virtiofs}"));
+        }
+        if !overlay_tags.is_empty() {
+            cmdline.push_str(&format!(
+                " VIRTKIT_VIRTIOFS_OVERLAY={}",
+                overlay_tags.join(",")
+            ));
         }
 
         // The guest→host switch bridge, plus a host→guest exec channel: the agent
