@@ -1,20 +1,16 @@
 #!/usr/bin/env bash
 # =====================================================================================
-# TARGET TEST — NOT YET PASSING (the executable definition of "done").
+# The executable definition of "done" for `vk run --init image --kernel image`.
 # =====================================================================================
 # Boot a stock Debian Bookworm image — its OWN systemd under its OWN (modular) kernel —
 # on the libkrun backend, and confirm systemd took over PID 1 inside the microVM.
 #
-# Status today: FAILS. libkrun can LOAD a distro kernel (format sniffing), but reaching
-# userspace still needs:
-#   1. a preinit initramfs carrying vk-agent + the image's virtio_mmio/virtio_blk/ext4/
-#      virtio_vsock/virtio_net modules (a stock Debian kernel has these as modules, and
-#      libkrun already emits the `virtio_mmio.device=` cmdline params to discover them);
-#   2. a vk-agent preinit that modprobes those, mounts the rootfs, switch_roots, forks a
-#      persistent `vk-agent serve` (reparented to systemd), then execs /sbin/init.
+# What carries it: a preinit initramfs with vk-agent + the image's virtio_pci/virtio_blk/
+# ext4/vsock modules, and a vk-agent preinit that loads those, mounts the rootfs,
+# switch_roots, forks a persistent `vk-agent serve` (reparented to systemd), then execs
+# /sbin/init.
 #
-# The `--init image --kernel image` invocation below is the intended interface. What is
-# fixed is the OUTCOME asserted at the end. Run:  VK=./dist/vk tests/systemd-boot-e2e.sh
+# Run:  VK=./dist/vk tests/systemd-boot-e2e.sh
 # Needs: a `vk` with an embedded agent, KVM, and build tooling.
 set -euo pipefail
 
@@ -32,7 +28,7 @@ echo "== build the stock Debian+systemd+kernel image and boot it as a full VM in
 # virtkit extracts the image's /boot/vmlinuz, builds the preinit initramfs from its
 # /lib/modules, boots libkrun on that kernel, and hands off to systemd; the reparented
 # vk-agent serve carries this exec over vsock.
-out="$(
+if ! out="$(
   "$VK" run --init image --kernel image -f "$df" --context "$ctx" -- \
     sh -c '
       # The vk-agent serve becomes reachable the instant it forks — before the
@@ -49,14 +45,18 @@ out="$(
       cat /run/virtkit-systemd-up 2>/dev/null || echo NO-MARKER
     ' \
     2>&1
-)"
+)"; then
+  echo "$out"
+  echo "FAIL: the run itself failed — see the output above"
+  exit 1
+fi
 echo "$out"
 
 echo "== assertions =="
 # systemd reached a run state (running, or degraded if some unit failed — still PID 1).
-# `systemctl is-system-running` prints the state alone on a line, so match a whole line —
-# a substring test would spuriously accept the echoed `is-system-running` command itself.
-grep -Eq '^[[:space:]]*(running|degraded)[[:space:]]*$' <<<"$out" \
+# Anchored on the whole line the guest prints, so a state named anywhere else in the output
+# cannot satisfy it.
+grep -Eq '^system-state: (running|degraded)$' <<<"$out" \
   || { echo "FAIL: systemd did not reach a run state (did the preinit hand off to /sbin/init?)"; exit 1; }
 # our oneshot unit ran => systemd genuinely reached multi-user.target inside the VM.
 grep -q 'VIRTKIT_SYSTEMD_UP' <<<"$out" \

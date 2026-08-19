@@ -6,8 +6,8 @@
 #   /sbin/init            -> systemd (PID 1 after the preinit hands off)
 #   /boot/vmlinuz-<ver>   -> the Debian kernel (virtkit reads it host-side to boot)
 #   /lib/modules/<ver>/   -> the matching modules (virtkit seeds the preinit initramfs
-#                            with virtio_mmio/virtio_blk/ext4/virtio_vsock/virtio_net
-#                            from here, so the modular kernel can reach its rootfs+vsock)
+#                            with virtio_pci/virtio_blk/ext4/vsock from here, so the
+#                            modular kernel can reach its rootfs+vsock)
 FROM debian:bookworm
 
 RUN set -eux; \
