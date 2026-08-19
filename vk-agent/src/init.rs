@@ -200,6 +200,10 @@ fn pivot_to_real_root() -> Result<bool> {
     };
     let _ = std::fs::create_dir_all("/dev");
     let _ = mount("devtmpfs", "/dev", "devtmpfs", 0);
+    // devtmpfs alone leaves /dev/fd and friends absent, and the entrypoint this path
+    // hands PID 1 to is a shell script as often as not: a `<(…)` in it would fail on
+    // /dev/fd/<n> until the image's own init got around to creating the links.
+    link_dev_std_fds();
     std::fs::create_dir_all("/newroot")?;
     mount(&dev, "/newroot", "ext4", 0).with_context(|| format!("mounting real root {dev}"))?;
     std::env::set_current_dir("/newroot").context("chdir /newroot")?;
@@ -253,6 +257,11 @@ fn run_full_vm(
     let _ = mount("proc", "/proc", "proc", 0);
     let _ = std::fs::create_dir_all("/dev");
     let _ = mount("devtmpfs", "/dev", "devtmpfs", 0);
+    // Re-create the /dev/fd links directly rather than relying on the pre-pivot
+    // devtmpfs (which carries them across this remount only because devtmpfs is a
+    // single kernel-global instance, not a fresh tree per mount) — idempotent, and
+    // keeps this call site correct even if that pivot ever changes.
+    link_dev_std_fds();
     // /sys too: the interface state the setup below reads lives there
     // (/sys/class/net/<iface>), so without it the agent cannot see even the tap it
     // creates itself — it would look absent until the image's init mounted sysfs, long
@@ -523,6 +532,26 @@ fn insmod(path: &str) -> bool {
     }
 }
 
+/// The standard /dev file-descriptor symlinks. devtmpfs does not create these (a
+/// container runtime/udev normally would), but shells rely on them: bash process
+/// substitution `<(…)` opens /dev/fd/<n>, and scripts read /dev/stdin et al. Both init
+/// paths need them — the image-init one before it hands PID 1 to a script that may use
+/// either, since the init that would create them has not run yet.
+fn link_dev_std_fds() {
+    for (link, target) in [
+        ("/dev/fd", "/proc/self/fd"),
+        ("/dev/stdin", "/proc/self/fd/0"),
+        ("/dev/stdout", "/proc/self/fd/1"),
+        ("/dev/stderr", "/proc/self/fd/2"),
+    ] {
+        if !std::path::Path::new(link).exists()
+            && let Err(e) = std::os::unix::fs::symlink(target, link)
+        {
+            warn!("vk-agent init: symlink {link} -> {target} failed: {e}");
+        }
+    }
+}
+
 /// Mount the kernel API filesystems a from-scratch rootfs lacks. Best effort:
 /// each may already be mounted (the initrd/kernel set some up) — tolerate it.
 fn mount_api_filesystems() -> Result<()> {
@@ -563,21 +592,7 @@ fn mount_api_filesystems() -> Result<()> {
             warn!("vk-agent init: mount {fstype} on {target} failed: {e}");
         }
     }
-    // The standard /dev file-descriptor symlinks. devtmpfs does not create these (a
-    // container runtime/udev normally would), but shells rely on them: bash process
-    // substitution `<(…)` opens /dev/fd/<n>, and scripts read /dev/stdin et al.
-    for (link, target) in [
-        ("/dev/fd", "/proc/self/fd"),
-        ("/dev/stdin", "/proc/self/fd/0"),
-        ("/dev/stdout", "/proc/self/fd/1"),
-        ("/dev/stderr", "/proc/self/fd/2"),
-    ] {
-        if !std::path::Path::new(link).exists()
-            && let Err(e) = std::os::unix::fs::symlink(target, link)
-        {
-            warn!("vk-agent init: symlink {link} -> {target} failed: {e}");
-        }
-    }
+    link_dev_std_fds();
     // /dev/kvm, when nested virtualization gave this guest one: devtmpfs creates it
     // root-only and there is no udev here to widen it, so an unprivileged in-guest
     // process (a `vk exec --user` shell, a CI job) could not boot a microVM of its own.
