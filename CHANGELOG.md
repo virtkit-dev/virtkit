@@ -52,6 +52,15 @@ All notable changes to virtkit will be documented in this file.
   matching self-entry in `/etc/hosts` — is now in place before the image takes over; an
   image that ships its own `/etc/hostname` still wins.
 
+- **A build's base image is resolved once per invocation.** Every calculation of where a build
+  lands — addressing a service, building it, answering `vk list --stale` — asked the registry
+  again for the base image's digest: several anonymous requests, against the registries that
+  rate-limit exactly those. And because a lookup that failed was not treated like one that
+  answered, a single timeout could leave two calculations disagreeing about where a build
+  belonged — after which that service was rebuilt from scratch on every start and reported
+  stale for good, however untouched its sources. One lookup per base now, and every
+  calculation agrees on it.
+
 - **A CI service built from the repo boots that build's image, with its own settings.** A
   compose service the job builds came up with none of the environment, user or working
   directory its image declares: one declaring no `command:` ran a shell instead of its image's

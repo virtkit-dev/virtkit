@@ -19,10 +19,10 @@
 //!     `COPY` from the build context copies from the context shared over virtiofs,
 //!     honoring `.dockerignore`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result, bail};
 use tokio_util::sync::CancellationToken;
@@ -120,8 +120,9 @@ pub trait Executor {
         Ok(crate::oci::ImageConfig::default())
     }
     /// The base image's manifest digest, for the cache key so a moved tag busts the cache.
-    /// `None` (the default, and any resolve failure) keys by the image ref instead. The
-    /// microVM backend memoizes the result and reuses it for the base ext4 cache key.
+    /// `None` (the default, and any resolve failure) keys by the image ref instead. The real
+    /// backends share one process-wide memo ([`base_digest`]), so every key a process computes
+    /// resolves a given base once and agrees on the answer.
     fn resolve_base_digest(&mut self, _image: &str) -> Option<String> {
         None
     }
@@ -278,15 +279,70 @@ fn render_cmd(cmd: &Cmdline) -> String {
     }
 }
 
-/// A non-building backend that answers only the read-only queries the key/scope
-/// resolution needs — the base manifest digest and base image config, resolved over the
-/// network exactly as a real build does. It never materializes a rootfs, so it lets
+/// Base-image manifest digests this process has resolved. Process-wide rather than per
+/// executor because one `build:` unit is keyed several times over — addressed, built, and
+/// re-checked by `vk list --stale` — each through a fresh [`Planner`], and a tag-pinned base
+/// costs a live registry request every time. Consistency matters more than the requests: a
+/// failed resolve keys the stage by the bare ref instead (see `super::resolve_stages`), and
+/// `ensure::ensure_build_tier` names a tier dir from one computation's key while the build
+/// stamps the ext4 with its own — so two that disagreed about whether the registry answered
+/// leave an entry no freshness check can accept, rebuilt from scratch on every start.
+///
+/// A failure is therefore memoized like an answer, and that is what agreement costs: one
+/// unreachable registry keys everything by ref for the rest of the process, so
+/// `--require-cached` keeps refusing and a ref-keyed entry an earlier outage left behind is
+/// taken as fresh. A loud, consistent miss beats a split cache. `BTreeMap` because
+/// `HashMap::new` is not `const`, so it cannot initialize a `static`.
+static BASE_DIGESTS: Mutex<BTreeMap<String, Option<String>>> = Mutex::new(BTreeMap::new());
+
+/// The manifest digest for `image`, resolved once per process. `None` — including any resolve
+/// failure — means the caller keys by the bare image ref.
+fn base_digest(image: &str) -> Option<String> {
+    memoized_digest(image, || {
+        match block_on(crate::oci::resolve_digest(image)) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!("virtkit: digest resolve failed for {image} ({e:#}) — keying by ref");
+                None
+            }
+        }
+    })
+}
+
+/// [`base_digest`] without the registry: look `image` up in the memo and call `resolve` only
+/// on a miss. Split out so a test can prove the memoization — including that a failure is
+/// remembered — without a network.
+fn memoized_digest(image: &str, resolve: impl FnOnce() -> Option<String>) -> Option<String> {
+    // Recovering a poisoned guard rather than propagating: `resolve` runs outside the lock and
+    // is the only thing here that can panic, so a poisoned guard still hands back an intact map.
+    if let Some(d) = BASE_DIGESTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(image)
+        .cloned()
+    {
+        return d;
+    }
+    let d = resolve();
+    // Resolved outside the lock: `oci::resolve_digest` carries no timeout, and holding it would
+    // stall every other base in the process behind one unreachable registry. The first answer
+    // stored wins, so two threads racing the same base still return the same one.
+    BASE_DIGESTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(image.to_string())
+        .or_insert(d)
+        .clone()
+}
+
+/// A non-building backend that answers only the read-only queries the key/scope resolution
+/// needs — the base manifest digest and base image config, resolved over the network exactly
+/// as a real build does. It never materializes a rootfs, so it lets
 /// `docker-hash` compute each stage's cache key (via `resolve_stages`) without pulling,
-/// running, or copying anything. Memoizes both lookups so a base shared by several stages
-/// is fetched once.
+/// running, or copying anything. Memoizes the base config it pulls, so a base shared by
+/// several stages is fetched once; the digest memo behind [`base_digest`] outlives it.
 #[derive(Default)]
 pub struct Planner {
-    digests: HashMap<String, Option<String>>,
     configs: HashMap<String, crate::oci::ImageConfig>,
 }
 
@@ -300,20 +356,7 @@ impl Planner {
 // primitives are unreachable on this backend (it never builds), so they error.
 impl Executor for Planner {
     fn resolve_base_digest(&mut self, image: &str) -> Option<String> {
-        if let Some(d) = self.digests.get(image) {
-            return d.clone();
-        }
-        let d = match block_on(crate::oci::resolve_digest(image)) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                eprintln!(
-                    "virtkit: docker-hash: digest resolve failed for {image} ({e:#}) — keying by ref"
-                );
-                None
-            }
-        };
-        self.digests.insert(image.to_string(), d.clone());
-        d
+        base_digest(image)
     }
     fn base_config(&mut self, image: &str) -> Result<crate::oci::ImageConfig> {
         if let Some(c) = self.configs.get(image) {
@@ -491,10 +534,6 @@ pub struct MicroVm {
     /// the registry every push. `None` at a stage's first instruction (it fetches once) and
     /// after a full push. Reset at stage boundaries.
     parent_layers: Option<(Vec<oci_client::manifest::OciDescriptor>, u64)>,
-    /// resolved manifest digest per base image ref, memoized so the cache-key seed and the
-    /// base ext4 cache key share one lookup. `Some(None)` = a resolve that failed (key by ref).
-    /// Shared across workers: a pure memoization cache, safe to populate from any stage.
-    base_digests: Arc<Mutex<HashMap<String, Option<String>>>>,
     /// where this stage's guest command output goes — set per stage by the driver to the
     /// progress reporter's stage sink. `Inherit` (the default) writes straight to stdout.
     output_sink: crate::executor::OutputSink,
@@ -996,7 +1035,6 @@ impl MicroVm {
             stage_last_key: Arc::new(Mutex::new(HashMap::new())),
             stage_last_digest: Arc::new(Mutex::new(HashMap::new())),
             parent_layers: None,
-            base_digests: Arc::new(Mutex::new(HashMap::new())),
             output_sink: crate::executor::OutputSink::Inherit,
             cancel: None,
             stage_prev_extents: HashMap::new(),
@@ -1037,12 +1075,12 @@ impl MicroVm {
     }
 
     /// A fresh per-stage worker that shares this executor's cross-stage state (the
-    /// `images` / `stage_last_key` / `base_digests` maps and the cache registry) but
+    /// `images` / `stage_last_key` maps and the cache registry) but
     /// starts with an empty per-stage working set (no session, sources, or in-flight
     /// push). The parallel driver builds each concurrent stage on its own worker, so the
-    /// per-stage guest and cache-push bookkeeping never alias across threads; the shared
-    /// maps are the only synchronization point. Config (kernel/agent/net/…) is cheap to
-    /// clone per worker.
+    /// per-stage guest and cache-push bookkeeping never alias across threads; those maps and
+    /// the process-wide digest memo ([`base_digest`]) are the only synchronization points.
+    /// Config (kernel/agent/net/…) is cheap to clone per worker.
     pub fn worker(&self) -> MicroVm {
         MicroVm {
             cloud_hypervisor: self.cloud_hypervisor.clone(),
@@ -1059,7 +1097,6 @@ impl MicroVm {
             image_locks: Arc::clone(&self.image_locks),
             stage_last_key: Arc::clone(&self.stage_last_key),
             stage_last_digest: Arc::clone(&self.stage_last_digest),
-            base_digests: Arc::clone(&self.base_digests),
             journal: self.journal,
             timings: Arc::clone(&self.timings),
             net: self.net.clone(),
@@ -2466,23 +2503,7 @@ impl Executor for MicroVm {
     }
 
     fn resolve_base_digest(&mut self, image: &str) -> Option<String> {
-        if let Some(d) = self.base_digests.lock().unwrap().get(image) {
-            return d.clone();
-        }
-        let d = match block_on(crate::oci::resolve_digest(image)) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                eprintln!(
-                    "virtkit: build: digest resolve failed for {image} ({e:#}) — keying by ref"
-                );
-                None
-            }
-        };
-        self.base_digests
-            .lock()
-            .unwrap()
-            .insert(image.to_string(), d.clone());
-        d
+        base_digest(image)
     }
 
     fn stage_sources(&mut self, sources: &[Rootfs], context: &Path) -> Result<()> {
@@ -2849,6 +2870,31 @@ mod tests {
     // Temp dirs are minted over in `build`'s tests, so the tags here share one namespace with
     // the tags there — keep any tag added here distinct from both.
     use crate::build::tests::tmpdir;
+
+    #[test]
+    fn a_base_digest_is_resolved_once_per_process() {
+        // Every key computation over one `build:` unit — addressing it, building it, and
+        // `vk list --stale` re-checking it — goes through this memo, so each base costs one
+        // registry request per process. A failure is remembered too, and that is the part
+        // that matters: keying by the bare ref for one computation and by a digest for the
+        // next would give one set of sources two keys. Refs unique to this test, since the
+        // memo is process-wide and tests share it.
+        let hit = "vk-memo-test/hit:1";
+        assert_eq!(
+            memoized_digest(hit, || Some("sha256:aa".to_string())),
+            Some("sha256:aa".to_string())
+        );
+        assert_eq!(
+            memoized_digest(hit, || panic!("resolved a second time")),
+            Some("sha256:aa".to_string())
+        );
+        let miss = "vk-memo-test/miss:1";
+        assert_eq!(memoized_digest(miss, || None), None);
+        assert_eq!(
+            memoized_digest(miss, || panic!("re-resolved a failure")),
+            None
+        );
+    }
 
     // Which sources a COPY filters through a `.dockerignore` rides entirely on this predicate:
     // read a stage or an image as a context and the copy would drop files the key counted, read
