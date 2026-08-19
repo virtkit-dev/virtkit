@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Persistent volumes with full POSIX ownership.** A `host:guest:disk` volume (compose or
+  `vk run -v`) is a whole ext4 filesystem in a host file, attached as a real block device
+  instead of shared over virtiofs — so the guest gets full POSIX semantics (arbitrary `chown`,
+  device nodes, sockets) that virtiofs's host-side ownership mapping does not allow, and the
+  content survives across boots. The backing file is created and formatted the first time it
+  is used (sparse; `size=` sets its capacity, default 64 GiB) and reused as-is afterwards.
+
 ### Fixed
 
 - **An env-file value's quotes are stripped like docker compose's, not kept like docker's.**

@@ -29,6 +29,11 @@
 //!   VIRTKIT_VIRTIOFS_OVERLAY_SIZE  how much of this VM's memory each overlay layer
 //!                        above may take, as a tmpfs size= (e.g. 80%, 12G). Unset
 //!                        leaves the kernel's own tmpfs default (half the RAM)
+//!   VIRTKIT_DISKS        /dev/vdX:path[,/dev/vdX:path] — mount each already-formatted ext4
+//!                        raw disk (a compose/`-v` `disk` volume) read-write at path, creating
+//!                        it. Unlike a virtiofs share, this is a real block device: full POSIX
+//!                        semantics (arbitrary chown, mknod, sockets), and content that
+//!                        persists in the backing file across boots
 //!   VIRTKIT_SYMLINKS     src:dest[,src:dest] — after virtiofs mounts, create each
 //!                        `dest` as a symlink pointing to `src`. Entries where `src`
 //!                        does not exist are silently skipped.
@@ -151,6 +156,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     apply_boot_config(boot_config.as_ref()); // the boot config wins over any capture
     materialize_env(boot_config.as_ref()); // persist the merged env for login shells
     mount_virtiofs(&cmdline)?;
+    mount_disks(&cmdline)?;
     apply_symlinks(&cmdline);
     link_ci_tools(&cmdline); // host CI tools (git/git-lfs/…) onto PATH, if the image lacks them
     maybe_atop(&cmdline); // record this guest's own stats, before anything else runs in it
@@ -292,6 +298,7 @@ fn run_full_vm(
     materialize_env(cfg);
     claim_run_tmpfs(cmdline); // before the shares: a volume under /run must land on that tmpfs
     mount_virtiofs(cmdline)?;
+    mount_disks(cmdline)?;
     apply_symlinks(cmdline);
     configure_network_fullvm(cmdline);
 
@@ -1118,6 +1125,31 @@ fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<()> {
             "VIRTKIT_VIRTIOFS_OVERLAY names {} but VIRTKIT_VIRTIOFS declares no such share",
             sorted_join(&overlay)
         );
+    }
+    Ok(())
+}
+
+/// Mount each `VIRTKIT_DISKS=/dev/vdX:path[,/dev/vdX:path]` entry — a compose/`-v` `disk`
+/// volume's already-formatted ext4 raw disk — read-write at path, creating it. Unlike a
+/// virtiofs share, this is a real block device: no host-side ownership mapping, so the guest
+/// gets full POSIX semantics (arbitrary chown, mknod, sockets), and — being the host's own
+/// file, not a tmpfs layer — its content persists across boots. A disk that fails to mount
+/// fails the boot: the volume is why the service exists, so silently starting without it is
+/// worse than not starting.
+fn mount_disks(cmdline: &HashMap<String, String>) -> Result<()> {
+    let Some(spec) = cmdline.get("VIRTKIT_DISKS") else {
+        return Ok(());
+    };
+    for entry in spec.split(',').filter(|e| !e.is_empty()) {
+        let Some((device, path)) = entry.split_once(':') else {
+            bail!("bad VIRTKIT_DISKS entry {entry:?} (want /dev/vdX:path)");
+        };
+        let target = Path::new(path);
+        let created_parents = create_mountpoint(target)
+            .with_context(|| format!("creating disk mountpoint {}", target.display()))?;
+        mount(device, path, "ext4", libc::MS_NOSUID | libc::MS_NODEV)
+            .with_context(|| format!("mounting disk {device} at {}", target.display()))?;
+        chown_created_mount_parents(target, &created_parents);
     }
     Ok(())
 }
@@ -2472,6 +2504,18 @@ mod tests {
         )]);
         let err = mount_virtiofs(&m).unwrap_err().to_string();
         assert!(err.contains("cibuild, extra"), "{err}");
+    }
+
+    #[test]
+    fn mount_disks_is_a_noop_without_the_cmdline_key() {
+        mount_disks(&HashMap::new()).unwrap();
+    }
+
+    #[test]
+    fn mount_disks_rejects_a_malformed_entry() {
+        let m = HashMap::from([("VIRTKIT_DISKS".to_string(), "no-colon-here".to_string())]);
+        let err = mount_disks(&m).unwrap_err().to_string();
+        assert!(err.contains("no-colon-here"), "{err}");
     }
 
     #[test]

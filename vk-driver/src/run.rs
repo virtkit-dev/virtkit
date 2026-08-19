@@ -1026,7 +1026,7 @@ async fn build_and_boot(
     // needs the agent-as-/init handoff, and a modular image kernel needs the module
     // initramfs. A default/default run keeps the existing non-image branches below.
     // The axes are the merged effective values (CLI force > primary marker > default).
-    let (disks, initramfs, mut cmdline): (Vec<crate::vmm::Disk>, Option<PathBuf>, String) =
+    let (mut disks, initramfs, mut cmdline): (Vec<crate::vmm::Disk>, Option<PathBuf>, String) =
         if eff_init.is_image() || eff_kernel == KernelSource::Image {
             // Boot via the preinit initramfs. First get the raw ext4: a `-f` build already
             // produced one (dockerfile_ext4), otherwise build root.ext4 from the image
@@ -1429,7 +1429,21 @@ async fn build_and_boot(
     let mut file_bind_links: Vec<(String, String)> = Vec::new();
     // Tags the agent should mount behind a tmpfs-backed overlay (`-v host:guest:overlay`).
     let mut overlay_tags: Vec<String> = Vec::new();
+    // `disk` volumes: a raw virtio-blk device per volume (backing file created and formatted
+    // on first use), named to the guest over the cmdline — see [`crate::units`]'s identical
+    // handling for a compose sibling's own `disk` volumes.
+    let mut disk_devices = String::new();
     for (i, vol) in primary_volumes.iter().chain(&args.volumes).enumerate() {
+        if vol.disk {
+            crate::compose::ensure_disk_backing(vol)?;
+            let device = crate::build::vd_name(disks.len());
+            if !disk_devices.is_empty() {
+                disk_devices.push(',');
+            }
+            disk_devices.push_str(&format!("/dev/{device}:{}", vol.guest));
+            disks.push(crate::vmm::Disk::raw(vol.host.clone(), vol.read_only));
+            continue;
+        }
         let tag = format!("vol{i}");
         let sock = work.join(format!("vfsd-{tag}.sock"));
         // cloud-hypervisor serves each share through an external virtiofsd (libkrun serves in
@@ -1548,6 +1562,9 @@ async fn build_and_boot(
             overlay_tags.join(",")
         ));
     }
+    if !disk_devices.is_empty() {
+        cmdline.push_str(&format!(" VIRTKIT_DISKS={disk_devices}"));
+    }
     // In-guest symlinks, created by the agent after the mounts: explicit `--symlink`s plus one
     // per single-file bind (target -> the file inside its hidden single-file share mount). A
     // dangling source is skipped guest-side.
@@ -1608,11 +1625,10 @@ async fn build_and_boot(
             .unwrap_or(&args.image)
             .to_string()
     };
-    // --disk: raw host images appended after any rootfs disk (so vdb, vdc, … — vda
-    // first under --ram, which seeds no rootfs disk), so the guest can
+    // --disk: raw host images appended after any rootfs disk and `disk` volume (so vdb,
+    // vdc, … — vda first under --ram, which seeds no rootfs disk), so the guest can
     // partition/mkfs/install into a disk image directly. Paths are canonicalized so a
     // relative --disk resolves against the caller's cwd like the rootfs media do.
-    let mut disks = disks;
     for (path, readonly) in &args.extra_disks {
         let abs = std::fs::canonicalize(path)
             .with_context(|| format!("--disk {}: cannot access", path.display()))?;

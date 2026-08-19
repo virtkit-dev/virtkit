@@ -1224,12 +1224,17 @@ enum Cmd {
         /// bind-mount an extra host dir into the guest (repeatable)
         ///
         /// Beyond --workdir — e.g. persistent state a throwaway VM should keep on the host.
-        /// `:ro` shares read-only; `:overlay` shares read-only behind a tmpfs-backed overlay
-        /// (the guest reads the host tree but writes stay in guest RAM, never touching it).
+        /// `:ro` shares read-only, `:rw` (the default) read-write; `:overlay` shares
+        /// read-only behind a tmpfs-backed overlay (the guest reads the host tree but writes
+        /// stay in guest RAM, never touching it). `:disk[,size=SIZE]` instead attaches a whole
+        /// ext4 filesystem in a host file as a real block device — full POSIX semantics
+        /// (arbitrary chown, device nodes, sockets) and content that survives across boots,
+        /// for state a service needs to own outright; the file is created and formatted
+        /// (sparse, `size=` capacity, default 64G) the first time it is used.
         #[arg(
             short = 'v',
             long = "volume",
-            value_name = "HOST:GUEST[:ro|:overlay]",
+            value_name = "HOST:GUEST[:ro|:rw|:overlay|:disk[,size=SIZE]]",
             help_heading = "Mounts and disks"
         )]
         volume: Vec<String>,

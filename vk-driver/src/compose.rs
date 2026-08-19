@@ -33,6 +33,7 @@
 //! override never rebuilds an image.
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -98,7 +99,8 @@ pub enum Source {
     },
 }
 
-/// A bind mount (`host:guest[:ro|:overlay]`); named volumes are not supported.
+/// A bind mount (`host:guest[:ro|:rw|:overlay|:disk[,size=SIZE]]`); named volumes are not
+/// supported.
 #[derive(Debug, Clone)]
 pub struct Volume {
     pub host: PathBuf,
@@ -113,6 +115,18 @@ pub struct Volume {
     /// a directory, so this is served by a single-file fs (root = just this file) and linked
     /// into place in the guest, rather than mounted at `guest` directly.
     pub is_file: bool,
+    /// The host path is a whole ext4 filesystem in a file, attached as a raw virtio-blk device
+    /// and mounted at `guest` — not virtiofs-shared at all. Gives the guest full POSIX
+    /// semantics (arbitrary chown, mknod, sockets) that a virtiofs share's host-side ownership
+    /// mapping does not allow, and — unlike `overlay` — real persistence: the file, not a
+    /// tmpfs layer, so its content survives across boots. Created and formatted on first use
+    /// (the file does not exist yet); an existing file is trusted as-is, whatever a previous
+    /// boot left in it. Mutually exclusive with `overlay`/`is_file`.
+    pub disk: bool,
+    /// Formatted capacity for a freshly created `disk` volume, from its `size=` suffix.
+    /// Ignored once the backing file already exists — its own capacity applies, since this ext4
+    /// writer has no resize. `None` uses a generous built-in default.
+    pub disk_size_mib: Option<u64>,
 }
 
 /// The service's start-time config layered over the image's defaults, compose
@@ -597,16 +611,16 @@ fn map_build(build: serde_yaml_ng::Value, base: &Path) -> Result<Source> {
     })
 }
 
-/// A bind-mount `host:guest[:ro|rw|overlay]`. A source that is not a path (a compose
-/// named volume) is rejected — there is no volume manager here. Public: `run -v/--volume`
+/// A bind-mount `host:guest[:ro|rw|overlay|disk[,size=SIZE]]`. A source that is not a path (a
+/// compose named volume) is rejected — there is no volume manager here. Public: `run -v/--volume`
 /// parses the same syntax, anchored at the caller's cwd instead of the compose
 /// file's directory.
 pub fn parse_volume(spec: &str, base: &Path) -> Result<Volume> {
     let parts: Vec<&str> = spec.split(':').collect();
-    let (host, guest, mode) = match parts.as_slice() {
+    let (host, guest, mode_field) = match parts.as_slice() {
         [h, g] => (*h, *g, "rw"),
         [h, g, m] => (*h, *g, *m),
-        _ => bail!("bad volume {spec:?} (want host:guest[:ro|:overlay])"),
+        _ => bail!("bad volume {spec:?} (want host:guest[:ro|:rw|:overlay|:disk[,size=SIZE]])"),
     };
     if !(host.starts_with('/') || host.starts_with('.') || host.starts_with('~')) {
         bail!("volume {spec:?}: named volumes are not supported (bind-mount a path)");
@@ -614,25 +628,55 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Volume> {
     if host.starts_with('~') {
         bail!("volume {spec:?}: ~ expansion is not supported (use an absolute path)");
     }
-    // `overlay` exports the share read-only and mounts it as an overlayfs lower layer guest-side
-    // (writes go to a guest tmpfs, never back to the host tree).
-    let (read_only, overlay) = match mode {
-        "ro" => (true, false),
-        "rw" => (false, false),
-        "overlay" => (true, true),
-        other => bail!("volume {spec:?}: unsupported mode {other:?} (want ro, rw or overlay)"),
+    // The mode field is a keyword plus optional comma `key=value` refinements — mirroring
+    // `docker run --mount`'s style for the one case (disk's `size=`) where a bare flag isn't
+    // enough. `overlay` exports the share read-only and mounts it as an overlayfs lower layer
+    // guest-side (writes go to a guest tmpfs, never back to the host tree). `disk` skips
+    // virtiofs entirely — see [`Volume::disk`].
+    let mut mode_parts = mode_field.split(',');
+    let mode = mode_parts.next().unwrap_or("rw");
+    let (read_only, overlay, disk) = match mode {
+        "ro" => (true, false, false),
+        "rw" => (false, false, false),
+        "overlay" => (true, true, false),
+        // No `disk,ro` yet — a disk volume is always attached read-write.
+        "disk" => (false, false, true),
+        other => {
+            bail!("volume {spec:?}: unsupported mode {other:?} (want ro, rw, overlay or disk)")
+        }
     };
+    let mut disk_size_mib = None;
+    for opt in mode_parts {
+        if !disk {
+            bail!("volume {spec:?}: {opt:?} is only valid with disk mode");
+        }
+        let size = opt.strip_prefix("size=").with_context(|| {
+            format!("volume {spec:?}: unknown disk option {opt:?} (want size=SIZE)")
+        })?;
+        if disk_size_mib.is_some() {
+            bail!("volume {spec:?}: size= given more than once");
+        }
+        disk_size_mib = Some(crate::run::parse_mem_mib(size).with_context(|| {
+            format!("volume {spec:?}: bad disk size {size:?} (want e.g. 10G, 512M)")
+        })?);
+    }
     if !guest.starts_with('/') {
         bail!("volume {spec:?}: the guest path must be absolute");
     }
     let host = base.join(host);
     // A single-file bind when the source resolves to a regular file (a missing/dir source
-    // stays a directory share, the prior behavior).
-    let is_file = std::fs::metadata(&host)
-        .map(|m| m.is_file())
-        .unwrap_or(false);
+    // stays a directory share, the prior behavior). A disk volume's host path is its own
+    // backing file, not a single-file bind — never virtiofs-shared, so this stays false even
+    // once a previous boot's file is sitting there.
+    let is_file = !disk
+        && std::fs::metadata(&host)
+            .map(|m| m.is_file())
+            .unwrap_or(false);
     if overlay && is_file {
         bail!("volume {spec:?}: overlay mode needs a directory source, not a single file");
+    }
+    if disk && std::fs::metadata(&host).is_ok_and(|m| m.is_dir()) {
+        bail!("volume {spec:?}: disk mode needs a file source (or none yet), not a directory");
     }
     Ok(Volume {
         host,
@@ -640,7 +684,74 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Volume> {
         read_only,
         overlay,
         is_file,
+        disk,
+        disk_size_mib,
     })
+}
+
+/// Formatted capacity for a fresh `disk` volume with no explicit `size=` — generous because it
+/// is sparse (real host disk cost is only what gets written): double
+/// `run::SCRATCH_DISK_FREE_BLOCKS`'s 32 GiB, since a `disk` volume's content is meant to
+/// survive indefinitely rather than get discarded after one build.
+const DEFAULT_DISK_VOLUME_MIB: u64 = 65536; // 64 GiB
+
+/// Resolve a `disk` volume's backing file, creating and formatting it if this is the first
+/// use. An existing file is trusted as-is — whatever ext4 a previous boot left there — so the
+/// volume's content survives across runs; only a missing file gets sized (from
+/// `disk_size_mib`, else [`DEFAULT_DISK_VOLUME_MIB`]) and formatted. No-op, and no-ops safely,
+/// on a non-`disk` volume.
+///
+/// Built into a same-directory temp file first, then published with a hard link — which
+/// fails with `AlreadyExists` rather than silently overwriting a file a racing boot already
+/// published — instead of writing `vol.host` directly, so a crash mid-format can never leave
+/// a half-written file behind for a later boot to wrongly trust as-is. The temp file is opened
+/// `0600` at creation (`create_new`, so it also can't follow a pre-planted symlink at the temp
+/// path) rather than chmod'd after the fact, since the volume may end up holding whatever a
+/// service stores in it (e.g. a database's data directory); `ext4::build_empty`'s own
+/// `File::create` on that same path only truncates and rewrites it, leaving the mode as-is.
+pub fn ensure_disk_backing(vol: &Volume) -> Result<()> {
+    if !vol.disk || vol.host.exists() {
+        return Ok(());
+    }
+    let parent = vol
+        .host
+        .parent()
+        .with_context(|| format!("disk volume {}: no parent directory", vol.host.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+
+    let mib = vol.disk_size_mib.unwrap_or(DEFAULT_DISK_VOLUME_MIB);
+    // ext4.rs's writer works in fixed 4 KiB blocks.
+    let free_blocks = mib
+        .checked_mul(1024 * 1024 / 4096)
+        .with_context(|| format!("disk volume {}: size={mib}M overflows", vol.host.display()))?;
+
+    let file_name = vol
+        .host
+        .file_name()
+        .and_then(|n| n.to_str())
+        .with_context(|| format!("disk volume {}: bad file name", vol.host.display()))?;
+    let tmp = parent.join(format!(".{file_name}.vk-disk-tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let publish = (|| -> Result<()> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        crate::ext4::build_empty(&tmp, free_blocks)
+            .with_context(|| format!("formatting disk volume {}", vol.host.display()))?;
+        match std::fs::hard_link(&tmp, &vol.host) {
+            Ok(()) => Ok(()),
+            // A racing boot published it first; its file is as good as ours would have been.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => {
+                Err(e).with_context(|| format!("publishing disk volume {}", vol.host.display()))
+            }
+        }
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    publish
 }
 
 /// Parse a `--symlink SRC:DST` spec: two absolute guest paths, split at the first
@@ -972,6 +1083,8 @@ impl DependsOn {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     // Most tests need no interpolation: shadow `parse` with a no-vars variant so
@@ -1158,6 +1271,110 @@ mod tests {
         assert!(ov.read_only && ov.overlay);
         let bad = parse_volume("/src:/dst:rox", Path::new("/b")).unwrap_err();
         assert!(format!("{bad:#}").contains("unsupported mode"), "{bad:#}");
+    }
+
+    #[test]
+    fn volume_mode_disk() {
+        // A bare `disk`: read-write, no overlay/is_file, no explicit size.
+        let d = parse_volume("/data.ext4:/var/wab:disk", Path::new("/b")).unwrap();
+        assert!(d.disk && !d.read_only && !d.overlay && !d.is_file);
+        assert_eq!(d.disk_size_mib, None);
+
+        // `size=` is a comma refinement of the mode, parsed the same way `--mem` is.
+        let sized = parse_volume("/data.ext4:/var/wab:disk,size=10G", Path::new("/b")).unwrap();
+        assert!(sized.disk);
+        assert_eq!(sized.disk_size_mib, Some(10 * 1024));
+
+        // `size=` only makes sense alongside `disk`.
+        let err = parse_volume("/src:/dst:ro,size=10G", Path::new("/b")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("only valid with disk mode"),
+            "{err:#}"
+        );
+
+        // An unrecognized disk option is rejected rather than silently ignored.
+        let err = parse_volume("/data.ext4:/var/wab:disk,bogus=1", Path::new("/b")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unknown disk option"),
+            "{err:#}"
+        );
+
+        // A repeated `size=` is rejected rather than letting the last one silently win.
+        let err =
+            parse_volume("/data.ext4:/var/wab:disk,size=1G,size=2G", Path::new("/b")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("size= given more than once"),
+            "{err:#}"
+        );
+
+        // A directory source makes no sense for a disk's backing file.
+        let tmp = std::env::temp_dir().join(format!("vk-compose-diskdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let err =
+            parse_volume(&format!("{}:/var/wab:disk", tmp.display()), Path::new("/b")).unwrap_err();
+        assert!(format!("{err:#}").contains("not a directory"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ensure_disk_backing_creates_once_and_reuses() {
+        let dir = std::env::temp_dir().join(format!("vk-compose-diskfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let host = dir.join("nested/data.ext4");
+
+        let vol = parse_volume(
+            &format!("{}:/var/wab:disk", host.display()),
+            Path::new("/b"),
+        )
+        .unwrap();
+        assert!(!vol.host.exists(), "backing file must not exist yet");
+        ensure_disk_backing(&vol).unwrap();
+        assert!(vol.host.is_file(), "first call creates the backing file");
+        let created_len = std::fs::metadata(&vol.host).unwrap().len();
+        assert_eq!(
+            std::fs::metadata(&vol.host).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "a fresh backing file must not be group/other accessible"
+        );
+        assert!(
+            std::fs::read_dir(dir.join("nested"))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .all(|e| !e.file_name().to_string_lossy().contains("vk-disk-tmp")),
+            "the publish temp file must not be left behind"
+        );
+
+        // A second call (a later boot) must not reformat: write a marker byte and confirm it
+        // survives, which a reformat would wipe.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&vol.host)
+                .unwrap();
+            f.write_all(b"\xAB").unwrap();
+        }
+        ensure_disk_backing(&vol).unwrap();
+        let mut marker = [0u8; 1];
+        {
+            use std::io::Read;
+            std::fs::File::open(&vol.host)
+                .unwrap()
+                .read_exact(&mut marker)
+                .unwrap();
+        }
+        assert_eq!(
+            marker[0], 0xAB,
+            "an existing backing file must be reused as-is"
+        );
+        assert_eq!(
+            std::fs::metadata(&vol.host).unwrap().len(),
+            created_len,
+            "reusing must not resize"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

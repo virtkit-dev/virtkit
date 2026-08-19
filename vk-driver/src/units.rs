@@ -407,7 +407,8 @@ pub fn boot_unit(
         handoff_frag = String::new();
     }
 
-    // compose volumes: each bind mount is its own virtiofs share.
+    // compose volumes: each bind mount is its own virtiofs share, except `disk` ones (see
+    // below), which never touch virtiofs at all.
     let mut aux: Vec<Child> = Vec::new();
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
     let mut virtiofs = String::new();
@@ -422,7 +423,17 @@ pub fn boot_unit(
     // VIRTKIT_SYMLINKS below. Without this, a sibling's single-file volume mounted the
     // share directly at the guest path, turning what should be a file into a directory.
     let mut file_bind_links: Vec<(String, String)> = Vec::new();
+    // `disk` volumes: a raw virtio-blk device per volume (the backing file created and
+    // formatted on first use), attached after the unit's own overlay disk (vda) — so vdb,
+    // vdc, … in declaration order — and named to the guest over the cmdline the same way,
+    // mirroring `run::build_and_boot`'s handling of the primary's own `disk` volumes.
+    let mut disk_volumes: Vec<&crate::compose::Volume> = Vec::new();
     for (i, vol) in svc.volumes.iter().enumerate() {
+        if vol.disk {
+            crate::compose::ensure_disk_backing(vol)?;
+            disk_volumes.push(vol);
+            continue;
+        }
         let tag = format!("vol{i}");
         let sock = dir.join(format!("vfsd-{tag}.sock"));
         if !crate::vmm::libkrun_selected() {
@@ -465,6 +476,22 @@ pub fn boot_unit(
         });
     }
     let shared_mem = !shares.is_empty();
+    // vda is the unit's own overlay disk, pushed below — so a disk volume's device is its
+    // 1-based position here, exactly as `crate::build::vd_name`'s own Vec-position naming
+    // resolves it.
+    let disks: Vec<crate::vmm::Disk> = std::iter::once(crate::vmm::Disk::overlay(overlay))
+        .chain(
+            disk_volumes
+                .iter()
+                .map(|vol| crate::vmm::Disk::raw(vol.host.clone(), vol.read_only)),
+        )
+        .collect();
+    let disk_devices: String = disk_volumes
+        .iter()
+        .enumerate()
+        .map(|(i, vol)| format!("/dev/{}:{}", crate::build::vd_name(1 + i), vol.guest))
+        .collect::<Vec<_>>()
+        .join(",");
 
     // The sibling's deterministic MAC, derived from its run-assigned IP. Passed on
     // the cmdline so the agent sets the tap's hardware address to it, letting the
@@ -535,6 +562,9 @@ pub fn boot_unit(
                 .collect();
             cmdline.push_str(&format!(" VIRTKIT_SYMLINKS={}", symlink_specs.join(",")));
         }
+        if !disk_devices.is_empty() {
+            cmdline.push_str(&format!(" VIRTKIT_DISKS={disk_devices}"));
+        }
 
         // The guest→host switch bridge, plus a host→guest exec channel: the agent
         // serves it (a preinit boot's reparented serve, or the default boot's
@@ -548,7 +578,7 @@ pub fn boot_unit(
         let spec = crate::vmm::VmSpec {
             kernel: boot_kernel,
             cmdline,
-            disks: vec![crate::vmm::Disk::overlay(overlay)],
+            disks,
             initramfs: Some(cpio),
             shares,
             vsock_cid: svc.cid,
