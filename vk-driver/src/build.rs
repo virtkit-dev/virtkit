@@ -4114,6 +4114,87 @@ RUN --mount=type=bind,from=build,source=/src,target=/s /usr/bin/out --selftest
         );
     }
 
+    /// A [`DryRun`] that answers the base-digest lookup, standing in for a registry that
+    /// replied — `DryRun` itself takes the trait default (`None`, i.e. "resolve failed").
+    /// Forwards `DryRun`'s required primitives (none of which `resolve_stages` calls);
+    /// `context_source`/`stage_sources` are left on the trait default, so a test that drives a
+    /// whole build wants those forwarded too.
+    struct Answered {
+        inner: DryRun,
+        digest: Option<String>,
+    }
+
+    impl Executor for Answered {
+        fn resolve_base_digest(&mut self, _image: &str) -> Option<String> {
+            self.digest.clone()
+        }
+        fn from_image(&mut self, stage: &str, image: &str) -> Result<Rootfs> {
+            self.inner.from_image(stage, image)
+        }
+        fn from_scratch(&mut self, stage: &str) -> Result<Rootfs> {
+            self.inner.from_scratch(stage)
+        }
+        fn from_stage(&mut self, stage: &str, parent: &Rootfs) -> Result<Rootfs> {
+            self.inner.from_stage(stage, parent)
+        }
+        fn pull(&mut self, image: &str) -> Result<Rootfs> {
+            self.inner.pull(image)
+        }
+        fn copy(
+            &mut self,
+            fs: &Rootfs,
+            op: &parser::Copy,
+            from: Option<&Rootfs>,
+            workdir: &str,
+        ) -> Result<()> {
+            self.inner.copy(fs, op, from, workdir)
+        }
+        fn run(
+            &mut self,
+            fs: &Rootfs,
+            cmd: &parser::Cmdline,
+            mounts: &[ResolvedMount<'_>],
+            state: &ShellState,
+        ) -> Result<()> {
+            self.inner.run(fs, cmd, mounts, state)
+        }
+        fn export_ext4(&mut self, fs: &Rootfs, out: &Path) -> Result<()> {
+            self.inner.export_ext4(fs, out)
+        }
+    }
+
+    #[test]
+    fn a_base_digest_that_does_not_resolve_changes_the_stage_key() {
+        // The stage key is NOT a function of the sources alone: a `FROM <image>` folds in the
+        // base's resolved manifest digest, and keys by the bare ref when that lookup fails.
+        // For a tag-pinned base the lookup is a live anonymous registry request every time
+        // (`oci::resolve_digest`), so the same sources key two ways depending on whether the
+        // registry answered. Anything addressing a tier entry another process built must ask
+        // its build where it went rather than recompute this: one rate-limited request is
+        // enough to name an entry that process never wrote (see `vm::plan_services`).
+        let ba = Vars::new();
+        let key = |digest: Option<&str>| {
+            let plan = plan_one("FROM debian:bookworm\nRUN a\n", &ba);
+            let order = plan.all_order().unwrap();
+            let mut ex = Answered {
+                inner: DryRun::new(),
+                digest: digest.map(str::to_string),
+            };
+            resolve_stages(&plan, &order, &ba, &mut ex, None).unwrap()[&0]
+                .final_key
+                .clone()
+        };
+        let resolved = key(Some("sha256:aa"));
+        assert_ne!(
+            resolved,
+            key(None),
+            "a failed digest lookup must be visible in the key — it is why the key cannot be \
+             recomputed in another process"
+        );
+        // And it is the digest that carries, not merely "some digest": a moved tag re-keys.
+        assert_ne!(resolved, key(Some("sha256:bb")));
+    }
+
     #[test]
     fn resolve_stages_keys_are_stable_and_chained() {
         let src = "\

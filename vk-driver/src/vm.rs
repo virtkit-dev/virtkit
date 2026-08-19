@@ -1508,6 +1508,27 @@ async fn probe_guest_shell(ctx: &JobCtx, addr: &vk_core::addr::SocketAddr) {
     );
 }
 
+/// Where a CI service's image comes from — the three-way choice [`plan_services`] makes.
+#[derive(Debug, PartialEq, Eq)]
+enum ServiceMedia<'a> {
+    Git(&'a str),
+    Build,
+    Image,
+}
+
+/// [`ServiceMedia`] for one unit's source. Split out so the choice itself is testable:
+/// provisioning a service needs a job context, a checkout and a real build, but which of the
+/// three a unit takes is a function of its source alone.
+fn service_media(source: &crate::compose::Source) -> ServiceMedia<'_> {
+    match source {
+        crate::compose::Source::Image(image) => match image.strip_prefix("dockerfile:") {
+            Some(spec) => ServiceMedia::Git(spec),
+            None => ServiceMedia::Image,
+        },
+        crate::compose::Source::Build { .. } => ServiceMedia::Build,
+    }
+}
+
 /// Map the job's services onto provisioned units, assigning static addresses from the top of
 /// the job subnet and CIDs from the service range, and merging each unit's boot config. The
 /// services come from a `compose:<file>#<primary>` fleet (every enabled unit but the primary)
@@ -1529,20 +1550,27 @@ fn plan_services(
     for (slot, mut unit) in units.into_iter().enumerate() {
         // A compose service's declared sizing obeys the same host ceilings as the job's own.
         clamp_service_size(&ctx.cfg, &mut unit)?;
-        // A `dockerfile:` service (the CI_JOB_SERVICES form) builds from the checkout via the
-        // tier; a compose `build:` unit and any plain image ref go through the shared provision
-        // path (Build -> tier ext4, built up front by prepare's warm pass; Image -> resolve_ref).
-        let git_spec = match &unit.source {
-            crate::compose::Source::Image(image) => image.strip_prefix("dockerfile:"),
-            _ => None,
-        };
-        let prov = if let Some(spec) = git_spec {
-            let (ext4, config) =
-                build_git_image(ctx, spec).with_context(|| format!("service {}", unit.name))?;
-            let merged = crate::compose::merged_config(&config.unwrap_or_default(), &unit);
-            crate::units::provisioned(&unit, ext4, merged, gateway, prefix, slot as u32)?
-        } else {
-            crate::units::provision(
+        let prov = match service_media(&unit.source) {
+            ServiceMedia::Git(spec) => {
+                let (ext4, config) =
+                    build_git_image(ctx, spec).with_context(|| format!("service {}", unit.name))?;
+                let merged = crate::compose::merged_config(&config.unwrap_or_default(), &unit);
+                crate::units::provisioned(&unit, ext4, merged, gateway, prefix, slot as u32)?
+            }
+            // Ask the build where it put the image, as the primary does (`resolve_media` ->
+            // `compose_unit_media`), rather than predicting the address: normally a fingerprint
+            // hit on what prepare's warm pass built moments ago, and on a miss a rebuild inside
+            // prepare's readiness budget. Predicting would assume this process reaches the
+            // stage key prepare's build used, and that key is not a function of the sources
+            // alone (`build::tests::a_base_digest_that_does_not_resolve_changes_the_stage_key`).
+            // The build also reports the image's own config, already merged with the unit's
+            // compose overrides, which an address cannot carry — hence no `merged_config` here.
+            ServiceMedia::Build => {
+                let (ext4, config) = build_compose_unit(ctx, &unit)
+                    .with_context(|| format!("service {}", unit.name))?;
+                crate::units::provisioned(&unit, ext4, config, gateway, prefix, slot as u32)?
+            }
+            ServiceMedia::Image => crate::units::provision(
                 &ctx.cfg,
                 ctx.cfg.state_dir(),
                 &[],
@@ -1550,7 +1578,7 @@ fn plan_services(
                 gateway,
                 prefix,
                 slot as u32,
-            )?
+            )?,
         };
         out.push(prov);
     }
@@ -2920,5 +2948,34 @@ mod tests {
         assert!(confine_under(&canon_root, &root.join("ctx").join("../../..")).is_err());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_ci_service_takes_its_image_from_its_build_not_the_image_cache() {
+        use crate::compose::Source;
+        // A compose `build:` unit is built and then asked where it landed, rather than
+        // provisioned at a predicted address: this process need not reach the stage key
+        // prepare's build used, so the address it would compute can name an entry that was
+        // never written (see the branch in `plan_services`).
+        assert_eq!(
+            service_media(&Source::Build {
+                dockerfiles: vec![PathBuf::from("Dockerfile")],
+                context: PathBuf::from("."),
+                build_contexts: Vec::new(),
+                target: None,
+                args: Vec::new(),
+            }),
+            ServiceMedia::Build
+        );
+        // The other two are unchanged: a `dockerfile:` ref builds from the job's checkout,
+        // and a plain ref resolves through the shared image cache.
+        assert_eq!(
+            service_media(&Source::Image("dockerfile:svc/Dockerfile".into())),
+            ServiceMedia::Git("svc/Dockerfile")
+        );
+        assert_eq!(
+            service_media(&Source::Image("alpine:3.21".into())),
+            ServiceMedia::Image
+        );
     }
 }

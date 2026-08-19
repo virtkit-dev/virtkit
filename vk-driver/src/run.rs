@@ -2120,8 +2120,8 @@ fn plan_services(
     }
 
     // Resolve + address each service through the shared provisioning path (the same one the
-    // CI executor uses), then derive the switch's per-unit listen socket, resolver aliases and
-    // DHCP reservation from it.
+    // CI executor uses for its `image:` services), then derive the switch's per-unit listen
+    // socket, resolver aliases and DHCP reservation from it.
     for s in sited {
         let unit = &units[s.unit];
         let prov =

@@ -26,8 +26,9 @@ pub struct Provisioned {
     pub hostname: String,
     /// The unit's clean image. For a `build:` unit this is only the address its stage
     /// fingerprint predicts — the service manager replaces it with the entry the on-demand
-    /// build settles on at first start (`ensure_unit_build_sync`). The CI executor still
-    /// boots this predicted address, having warmed the stage up front in `prepare`.
+    /// build settles on at first start (`ensure_unit_build_sync`). The CI executor carries no
+    /// prediction here at all: it takes the entry from its build, because the stage key it
+    /// would recompute need not be the one prepare's build used (`vm::plan_services`).
     pub ext4: PathBuf,
     /// static address, `ip/prefix`
     pub ip: String,
@@ -196,13 +197,15 @@ pub fn ensure_unit_build_sync(
 }
 
 /// Provision one service unit at address `slot`: resolve its clean image to a cache path and
-/// merge its runtime config, shared by `vk run --compose` and the CI executor so both address
+/// merge its runtime config. Shared by `vk run --compose` and the CI executor, so both address
 /// services identically. An `image:` unit resolves through the shared image cache
 /// (`image::resolve_ref` — a services image must be generic-disk) and carries its real config.
 /// A `build:` unit addresses its shared build-tier ext4 (a pure function of the stage
 /// fingerprint) but is not built here — it gets the compose overrides alone as a placeholder
-/// until the owner materializes it on demand and adopts the entry it built, with that
-/// image's config.
+/// until the service manager materializes it on demand and adopts the entry it built, with
+/// that image's config. Only that owner provisions a `build:` unit, though: the CI executor
+/// asks its build for the address instead, because addressing it would have to reach a stage
+/// key another process computed (see `vm::plan_services`).
 pub fn provision(
     cfg: &Config,
     state_dir: &Path,

@@ -52,6 +52,14 @@ All notable changes to virtkit will be documented in this file.
   matching self-entry in `/etc/hosts` — is now in place before the image takes over; an
   image that ships its own `/etc/hostname` still wins.
 
+- **A CI service built from the repo boots that build's image, with its own settings.** A
+  compose service the job builds came up with none of the environment, user or working
+  directory its image declares: one declaring no `command:` ran a shell instead of its image's
+  command, and one asking for `init: entrypoint` was refused for declaring no entrypoint when
+  it had one. It could also boot a different build of the service than the one the job had just
+  made, or fail to find any, when a registry was slow to answer. Both the image and its
+  settings now come from the build the job ran.
+
 - **A service built on its first `vk service up` boots the image that build produced.** A
   service a profile excludes is built only when it is first brought up; if anything in its
   build context had changed since the run started, the boot still went looking for the image
