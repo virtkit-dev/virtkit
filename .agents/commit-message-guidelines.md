@@ -24,8 +24,13 @@ The same goes for the changelog: a commit with a user-visible change updates
 ```
 
 A single-line summary (no trailing period) is enough for most commits. Add a body only
-when the diff does not speak for itself — keep it to a short paragraph or a few bullets
-(~5 lines). The scope prefix is optional when a change is genuinely repo-wide.
+when the diff does not speak for itself, and cap it at **5 non-blank lines** — one short
+paragraph or a few bullets. Five is a hard cap, not a target: most bodies that earn one
+need two or three lines. A change that cannot be explained in five belongs in a code
+comment, or is really two commits. If a change seems to genuinely need a longer body,
+ask the user before writing one.
+
+The scope prefix is optional when a change is genuinely repo-wide.
 
 Examples (from this repo's history):
 
@@ -74,6 +79,10 @@ Body content rules:
   mechanics (algorithm choice, data-structure invariants, line-level rationale)
   belong in code comments next to the code, not the commit body. If the body
   reads like a file-by-file walkthrough of the diff, it is too detailed.
+- **Lead with the change, not the incident.** State what the commit does; give the
+  broken state at most one clause of setup. A body that opens by narrating the old
+  behavior and then argues its way to the fix is a post-mortem, and post-mortems
+  belong in an issue, not the git log.
 
 When in doubt, ship the shorter message.
 
