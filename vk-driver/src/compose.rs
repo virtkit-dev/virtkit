@@ -277,8 +277,9 @@ pub fn load_with_env(path: &Path, ambient: &dyn Fn(&str) -> Option<String>) -> R
 
 /// Load `KEY=VALUE` pairs from a `.env` beside the compose file — docker-compose's
 /// interpolation source. A missing file is not an error (no vars). Blank lines and
-/// `#` comments are skipped; the value is taken raw (same convention as `--env-file`),
-/// so no quoting or escaping is interpreted.
+/// `#` comments are skipped; the value is taken raw (same convention as
+/// `--env-file`) past one matching pair of quotes stripped by
+/// `crate::strip_env_quotes` — no escape sequences, no `$VAR` expansion.
 fn load_dotenv(dir: &Path) -> Result<Vec<(String, String)>> {
     let path = dir.join(".env");
     let text = match std::fs::read_to_string(&path) {
@@ -294,7 +295,10 @@ fn load_dotenv(dir: &Path) -> Result<Vec<(String, String)>> {
         }
         let line = line.strip_prefix("export ").unwrap_or(line);
         match line.split_once('=') {
-            Some((k, v)) => vars.push((k.trim().to_string(), v.to_string())),
+            Some((k, v)) => vars.push((
+                k.trim().to_string(),
+                crate::strip_env_quotes(v).into_owned(),
+            )),
             None => bail!(
                 "{}:{}: expected KEY=VALUE, got {line:?}",
                 path.display(),
@@ -1552,7 +1556,7 @@ mod tests {
         let _guard = TmpDir(dir.clone());
         std::fs::write(
             dir.join(".env"),
-            "# a comment\n\nexport A=1\nB = two words\nC=\n",
+            "# a comment\n\nexport A=1\nB = two words\nC=\nD='quoted'\n",
         )
         .unwrap();
         let v = load_dotenv(&dir).unwrap();
@@ -1560,6 +1564,8 @@ mod tests {
         // value is taken raw after the first '='; key is trimmed, `export ` stripped
         assert_eq!(v.iter().find(|(k, _)| k == "B").unwrap().1, " two words");
         assert_eq!(v.iter().find(|(k, _)| k == "C").unwrap().1, "");
+        // one matching pair of quotes is stripped (crate::strip_env_quotes)
+        assert_eq!(v.iter().find(|(k, _)| k == "D").unwrap().1, "quoted");
         // a missing .env is empty, not an error
         assert!(load_dotenv(Path::new("/no/such/dir")).unwrap().is_empty());
     }

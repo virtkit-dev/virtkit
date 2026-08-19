@@ -75,6 +75,7 @@ mod vmdk;
 mod vmm;
 mod vms;
 
+use std::borrow::Cow;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -3658,9 +3659,63 @@ fn parse_disks(specs: &[String]) -> Vec<(PathBuf, bool)> {
         .collect()
 }
 
+/// Strip one matching pair of leading/trailing quotes (`'` or `"`) docker-compose's
+/// env_file loader would strip — nothing past that: no escape-sequence decoding
+/// (`\n`, octal, …), no `$VAR` expansion. Shared with `compose::load_dotenv`, whose
+/// `.env` is the same convention.
+///
+/// The terminator is the first *unescaped* occurrence of the opening quote,
+/// scanned left to right — not just the value's last byte — so `'it\'s here'`
+/// round-trips to `it's here` (`\'`/`\"` unescape to a literal quote) instead of
+/// being cut short at the embedded one; a backslash before anything else is kept
+/// literal, same as compose's own scanner. A value with no opening quote,
+/// unterminated quoting, or content trailing the close (`'abc'def`) is returned
+/// unchanged — mismatched/malformed input is left as the raw string it always was,
+/// not a hard error.
+pub(crate) fn strip_env_quotes(v: &str) -> Cow<'_, str> {
+    let quote = match v.as_bytes().first() {
+        Some(&b @ (b'\'' | b'"')) => b as char,
+        _ => return Cow::Borrowed(v),
+    };
+
+    let mut out = String::new();
+    let mut escaped = false;
+    for (i, c) in v.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            if c == quote {
+                out.push(c);
+            } else {
+                out.push('\\');
+                out.push(c);
+            }
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
+        if c == quote {
+            return if i + c.len_utf8() == v.len() {
+                Cow::Owned(out) // the terminator is the value's last char
+            } else {
+                Cow::Borrowed(v) // trailing content after the close
+            };
+        }
+        out.push(c);
+    }
+    Cow::Borrowed(v) // unterminated
+}
+
 /// Collect the extra guest env from `--env-file`s (in order, later files win)
 /// then `--env` flags (they win over every file), upserted into one list — the
-/// same upsert the guest applies. `#` and blank lines in a file are skipped.
+/// same upsert the guest applies. `#` and blank lines in a file are skipped. A
+/// file value wrapped in one matching pair of quotes has them stripped
+/// (`strip_env_quotes`) — matching docker compose's `env_file:`, so a value that
+/// itself starts with `$` (a reference a consumer *inside* the guest is meant to
+/// expand, not vk) can be written `KEY='$OTHER'` without becoming a literal
+/// quote-wrapped string in the guest's environment. A `--env` flag is never
+/// quoted this way: the invoking shell already stripped any quoting from argv.
 fn collect_extra_env(files: &[PathBuf], flags: &[String]) -> anyhow::Result<Vec<(String, String)>> {
     let mut extra_env: Vec<(String, String)> = Vec::new();
     let mut env_upsert = |k: &str, v: &str| match extra_env.iter_mut().find(|(ek, _)| ek == k) {
@@ -3676,7 +3731,7 @@ fn collect_extra_env(files: &[PathBuf], flags: &[String]) -> anyhow::Result<Vec<
                 continue;
             }
             match line.split_once('=') {
-                Some((k, v)) => env_upsert(k, v),
+                Some((k, v)) => env_upsert(k, &strip_env_quotes(v)),
                 None => anyhow::bail!("bad line {line:?} in {} (want KEY=VALUE)", path.display()),
             }
         }
@@ -4171,6 +4226,69 @@ mod tests {
         let err = collect_extra_env(&[dir.join("missing.env")], &[]).unwrap_err();
         assert!(format!("{err:#}").contains("missing.env"), "{err:#}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A file value wrapped in one matching pair of quotes has them stripped, docker
+    // compose's env_file convention — so a `$VAR` a guest-side consumer means to expand
+    // itself, not vk, survives instead of becoming a literal quote-wrapped string with
+    // no leading `/` (TASK_TEMP_DIR='/workdir/.task/builder_$BUILDER_TAG' was landing as
+    // a relative path named `'` before this). A `--env` flag is never quote-stripped:
+    // the shell already handled its quoting before vk ever saw argv.
+    #[test]
+    fn extra_env_strips_one_matching_quote_pair_from_file_values() {
+        let dir =
+            std::env::temp_dir().join(format!("virtkit-envfile-quotes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("quoted.env");
+        std::fs::write(
+            &f,
+            "SINGLE='/workdir/.task/builder_$BUILDER_TAG'\n\
+             DOUBLE=\"two words\"\n\
+             MISMATCHED='oops\"\n\
+             LONE_QUOTE='\n\
+             UNQUOTED=plain\n",
+        )
+        .unwrap();
+        let env = collect_extra_env(
+            std::slice::from_ref(&f),
+            &["FLAG='kept-quoted'".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            env,
+            [
+                ("SINGLE", "/workdir/.task/builder_$BUILDER_TAG"),
+                ("DOUBLE", "two words"),
+                ("MISMATCHED", "'oops\""),
+                ("LONE_QUOTE", "'"),
+                ("UNQUOTED", "plain"),
+                ("FLAG", "'kept-quoted'"),
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The terminator is the first *unescaped* occurrence of the opening quote, not
+    // just the value's last byte — so an embedded, escaped delimiter (`\'`/`\"`)
+    // unescapes to a literal quote instead of ending the value early, matching
+    // compose-go's own scanner; a backslash before anything else round-trips as-is.
+    #[test]
+    fn strip_env_quotes_unescapes_an_embedded_delimiter() {
+        assert_eq!(strip_env_quotes(r"'it\'s here'").as_ref(), "it's here");
+        assert_eq!(strip_env_quotes(r#""say \"hi\"""#).as_ref(), r#"say "hi""#);
+        // a backslash not immediately before the quote char is kept literal
+        assert_eq!(
+            strip_env_quotes(r"'C:\Users\foo'").as_ref(),
+            r"C:\Users\foo"
+        );
+        // content trailing the close, or no terminator at all: left fully raw
+        assert_eq!(strip_env_quotes("'abc'def").as_ref(), "'abc'def");
+        assert_eq!(
+            strip_env_quotes(r"'unterminated\").as_ref(),
+            r"'unterminated\"
+        );
+        assert_eq!(strip_env_quotes("''").as_ref(), "");
     }
 
     // --disk parses HOST[:ro]: a trailing `:ro` marks the disk read-only, everything

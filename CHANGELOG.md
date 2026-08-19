@@ -4,6 +4,16 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **An env-file value's quotes are stripped like docker compose's, not kept like docker's.**
+  `--env-file` (`vk run`) and the compose `.env` both took a value fully raw, so a `.env`
+  written for both paths — e.g. `TASK_TEMP_DIR='/workdir/.task/builder_$BUILDER_TAG'`, deferring
+  `$VAR` expansion to a guest-side consumer — landed quote-wrapped and no longer absolute under
+  `vk`, though compose's own `env_file:` already strips a matching pair. Both now strip one
+  matching leading/trailing `'`/`"` pair the same way; a bare `--env` flag is untouched since the
+  shell already de-quoted it.
+
 ## [0.37.0] - 2026-08-19
 
 ### Added
