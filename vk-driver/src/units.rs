@@ -416,6 +416,12 @@ pub fn boot_unit(
     // sibling unit's `:overlay` volume was parsed into `vol.overlay` but never reached the
     // guest, so it silently mounted as a plain (non-overlaid) virtiofs share instead.
     let mut overlay_tags: Vec<String> = Vec::new();
+    // A single-file bind can't be mounted onto the guest file path (virtio-fs shares a
+    // directory), exactly as the primary path handles it: served by the single-file fs,
+    // mounted at a hidden dir, and symlinked into place — collected here and turned into
+    // VIRTKIT_SYMLINKS below. Without this, a sibling's single-file volume mounted the
+    // share directly at the guest path, turning what should be a file into a directory.
+    let mut file_bind_links: Vec<(String, String)> = Vec::new();
     for (i, vol) in svc.volumes.iter().enumerate() {
         let tag = format!("vol{i}");
         let sock = dir.join(format!("vfsd-{tag}.sock"));
@@ -428,10 +434,24 @@ pub fn boot_unit(
                 &[],
             )?);
         }
+        let mount_at = if vol.is_file {
+            let base = vol
+                .host
+                .file_name()
+                .and_then(|n| n.to_str())
+                .with_context(|| {
+                    format!("single-file bind {}: bad file name", vol.host.display())
+                })?;
+            let mp = format!("/run/vk/filebind-{i}");
+            file_bind_links.push((format!("{mp}/{base}"), vol.guest.clone()));
+            mp
+        } else {
+            vol.guest.clone()
+        };
         if !virtiofs.is_empty() {
             virtiofs.push(',');
         }
-        virtiofs.push_str(&format!("{tag}:{}", vol.guest));
+        virtiofs.push_str(&format!("{tag}:{mount_at}"));
         if vol.overlay {
             overlay_tags.push(tag.clone());
         }
@@ -507,6 +527,13 @@ pub fn boot_unit(
                 " VIRTKIT_VIRTIOFS_OVERLAY={}",
                 overlay_tags.join(",")
             ));
+        }
+        if !file_bind_links.is_empty() {
+            let symlink_specs: Vec<String> = file_bind_links
+                .iter()
+                .map(|(src, dest)| format!("{src}:{dest}"))
+                .collect();
+            cmdline.push_str(&format!(" VIRTKIT_SYMLINKS={}", symlink_specs.join(",")));
         }
 
         // The guest→host switch bridge, plus a host→guest exec channel: the agent

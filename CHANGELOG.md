@@ -16,6 +16,11 @@ All notable changes to virtkit will be documented in this file.
 - **A compose service's overlay volume now overlays.** Declaring `:overlay` on a
   compose sibling service's volume silently mounted it as a plain virtiofs
   share instead — only the primary's own volumes got the tmpfs-backed overlay.
+- **A compose sibling's single-file volume bind now lands as a file.** A
+  `host:guest` bind whose host side is a regular file mounted the share
+  directly at `guest` for a sibling unit, turning it into a directory instead
+  of the bound file — only the primary's own single-file binds got the hidden
+  mount + symlink that makes the guest path a real file.
 
 ## [0.37.0] - 2026-08-19
 
