@@ -39,6 +39,16 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A service built from a Dockerfile waits for its ports.** `EXPOSE` was recorded nowhere, so a
+  compose or CI service built from a Dockerfile counted as ready the moment its guest booted, and
+  a job could connect before it was listening — while the same image pulled from a registry
+  waited for the ports its config declares. A built image now carries the ports its Dockerfile
+  exposes, inherited from its base image and added to by each stage's own `EXPOSE`. A Dockerfile
+  exposing a port its service never listens on therefore never reports ready: a CI job fails to
+  prepare after `[vm] boot_timeout_secs`, and locally the service stays unreachable to `vk exec
+  --service` — exactly as a pulled image declaring the same already did. A service image already
+  built keeps the old behaviour until something makes it rebuild.
+
 - **A compose primary that is not root can drive its siblings.** `/run/vk/services/<svc>/ctl`
   was root's, so a primary running as the image's `USER` — which is now what `--init entrypoint`
   boots as, and what a served command runs as — got `permission denied` writing `start`/`stop`

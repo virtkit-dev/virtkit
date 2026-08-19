@@ -23,8 +23,9 @@ use oci_client::secrets::RegistryAuth;
 pub type Note<'a> = &'a (dyn Fn(&str) + Sync);
 
 /// The parts of an OCI image's config a build inherits into a stage: environment
-/// (notably `PATH`), default user and working directory, and the runtime
-/// entrypoint/cmd (carried through to the exported runtime-config sidecar).
+/// (notably `PATH`), default user and working directory, the runtime entrypoint/cmd,
+/// and the exposed ports a service gates its readiness on (all carried through to the
+/// exported runtime-config sidecar).
 #[derive(Default, Debug, Clone)]
 pub struct ImageConfig {
     pub env: Vec<(String, String)>,

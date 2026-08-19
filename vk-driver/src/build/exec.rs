@@ -38,7 +38,7 @@ pub struct Rootfs {
 }
 
 /// The mutable per-stage shell state that `ENV`/`WORKDIR`/`USER` (and, for the
-/// exported runtime config, `ENTRYPOINT`/`CMD`) accumulate and that each `RUN` — and
+/// exported runtime config, `ENTRYPOINT`/`CMD`/`EXPOSE`) accumulate and that each `RUN` — and
 /// the exported image's runtime-config sidecar — sees. Seeded from the base image's
 /// OCI config (or the parent stage's final state) so the values survive RUN-less
 /// stages exactly as they would in Docker.
@@ -51,6 +51,10 @@ pub struct ShellState {
     pub entrypoint: Vec<String>,
     /// Default arguments appended to the entrypoint.
     pub cmd: Vec<String>,
+    /// TCP ports the stage's `EXPOSE`s declare, on top of the ones its base image did — what a
+    /// service built from a Dockerfile gates its readiness on, as a pulled one gates on the
+    /// `ExposedPorts` of its OCI config.
+    pub exposed_ports: Vec<u16>,
     /// In-scope `ARG` values, exported into a `RUN`'s shell environment so `$VAR` resolves
     /// there (Docker leaves a RUN command to the shell). Build-time only — `ENV` already
     /// lives in `env`, and this is not part of the exported runtime config. Set per RUN

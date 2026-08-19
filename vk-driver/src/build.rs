@@ -365,10 +365,7 @@ fn run_config(st: &ShellState) -> vk_core::runcfg::RunConfig {
         workdir: st.workdir.clone(),
         entrypoint: st.entrypoint.clone(),
         cmd: st.cmd.clone(),
-        // EXPOSE is not tracked in ShellState, so a git-defined (dockerfile:) service
-        // gates readiness on the guest booting, not on its ports. Pulled images (the
-        // common services: case) carry ExposedPorts through the OCI config.
-        exposed_ports: Vec::new(),
+        exposed_ports: st.exposed_ports.clone(),
     }
 }
 
@@ -1281,6 +1278,7 @@ fn resolve_stages(
                     workdir: cfg.workdir.unwrap_or_else(|| "/".into()),
                     entrypoint: cfg.entrypoint,
                     cmd: cfg.cmd,
+                    exposed_ports: cfg.exposed_ports,
                     build_args: Vec::new(),
                 }
             }
@@ -2665,7 +2663,7 @@ fn restore_into(ex: &mut dyn Executor, name: &str, key: &str) -> Result<Rootfs> 
     Ok(fs)
 }
 
-/// Apply a non-filesystem instruction (ENV/WORKDIR/USER/ENTRYPOINT/CMD) — updates the
+/// Apply a non-filesystem instruction (ENV/WORKDIR/USER/ENTRYPOINT/CMD/EXPOSE) — updates the
 /// shell state only, so it needs no materialized rootfs.
 fn apply_meta(state: &mut ShellState, instr: &Instruction) {
     match instr {
@@ -2683,10 +2681,50 @@ fn apply_meta(state: &mut ShellState, instr: &Instruction) {
             state.cmd.clear();
         }
         Instruction::Cmd(c) => state.cmd = cmdline_argv(c),
-        // ARG/LABEL/Other: no effect here (ARG feeds interpolation upstream; LABEL
-        // would land in an exported image config).
+        // The one `Other` the exported runtime config models: the sidecar records these, so a
+        // service built from a Dockerfile gates readiness on its ports rather than on its guest
+        // merely booting. The parser upper-cases the keyword, so any spelling lands here.
+        Instruction::Other { name, args } if name == "EXPOSE" => {
+            state.exposed_ports.extend(exposed_tcp_ports(args));
+            state.exposed_ports.sort_unstable();
+            state.exposed_ports.dedup();
+        }
+        // ARG/LABEL/any other `Other`: no effect here (ARG feeds interpolation upstream;
+        // LABEL would land in an exported image config).
         _ => {}
     }
+}
+
+/// The TCP ports one `EXPOSE` declares: `<port>[/<proto>]` words and `<lo>-<hi>` ranges,
+/// expanded the way docker records them. udp is dropped — readiness is a TCP connect — and a
+/// word naming no protocol, or naming one in any case, is tcp, as docker lower-cases it before
+/// looking. Port 0 is dropped too: nothing listens there, and the guest's gate would wait for it
+/// forever. A word that does not parse as a port is ignored where docker would reject it: an
+/// instruction this builder does not model has never failed a build here, and a readiness gate
+/// is not worth making one that does.
+fn exposed_tcp_ports(args: &str) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for word in args.split_whitespace() {
+        let (spec, proto) = word.split_once('/').unwrap_or((word, "tcp"));
+        if !proto.is_empty() && !proto.eq_ignore_ascii_case("tcp") {
+            continue;
+        }
+        match spec.split_once('-') {
+            // an inverted range yields nothing, as an empty `lo..=hi` does
+            Some((lo, hi)) => {
+                if let (Ok(lo), Ok(hi)) = (lo.parse::<u16>(), hi.parse::<u16>()) {
+                    ports.extend(lo..=hi);
+                }
+            }
+            None => {
+                if let Ok(p) = spec.parse::<u16>() {
+                    ports.push(p);
+                }
+            }
+        }
+    }
+    ports.retain(|&p| p != 0);
+    ports
 }
 
 /// An ENTRYPOINT/CMD as argv: exec form verbatim, shell form wrapped `/bin/sh -c` —
@@ -3658,6 +3696,60 @@ mod tests {
     }
 
     #[test]
+    fn expose_ports_keeps_tcp_only_and_expands_ranges() {
+        // Docker's own spellings, since a Dockerfile in the wild uses all of them.
+        assert_eq!(exposed_tcp_ports("8080"), [8080]);
+        assert_eq!(exposed_tcp_ports("8080/tcp"), [8080]);
+        // docker lower-cases the protocol before it looks, so this is tcp — dropping it would
+        // leave the service gating on nothing.
+        assert_eq!(exposed_tcp_ports("8080/TCP"), [8080]);
+        assert_eq!(exposed_tcp_ports("8080/"), [8080]);
+        assert!(exposed_tcp_ports("53/udp").is_empty());
+        assert_eq!(exposed_tcp_ports("80 443"), [80, 443]);
+        assert_eq!(exposed_tcp_ports("9000-9002"), [9000, 9001, 9002]);
+        assert!(exposed_tcp_ports("9000-9002/udp").is_empty());
+        // an inverted range, junk, and a number no port can hold are ignored rather than
+        // failing a build that used to work; port 0 would make the guest's gate wait forever.
+        assert!(exposed_tcp_ports("9-7").is_empty());
+        assert!(exposed_tcp_ports("nope").is_empty());
+        assert!(exposed_tcp_ports("70000").is_empty());
+        assert!(exposed_tcp_ports("0").is_empty());
+        assert_eq!(exposed_tcp_ports("0-2"), [1, 2]);
+    }
+
+    #[test]
+    fn expose_folds_into_the_exported_runtime_config() {
+        // A pulled image's ports come from its OCI config; a built one's can only come from
+        // EXPOSE, and without them a service built from a Dockerfile counts as ready the moment
+        // its guest boots rather than when it is listening.
+        let expose = |args: &str| Instruction::Other {
+            name: "EXPOSE".into(),
+            args: args.into(),
+        };
+        let mut st = ShellState::default();
+        apply_meta(&mut st, &expose("8080"));
+        apply_meta(&mut st, &expose("443/tcp 53/udp"));
+        apply_meta(&mut st, &expose("9000-9002"));
+        apply_meta(&mut st, &expose("8080")); // a repeat is not a second port
+        apply_meta(
+            &mut st,
+            &Instruction::Other {
+                name: "STOPSIGNAL".into(),
+                args: "SIGTERM".into(),
+            },
+        );
+        assert_eq!(run_config(&st).exposed_ports, [443, 8080, 9000, 9001, 9002]);
+
+        // A base image's own ports are inherited, not replaced.
+        let mut inherited = ShellState {
+            exposed_ports: vec![5432],
+            ..Default::default()
+        };
+        apply_meta(&mut inherited, &expose("6379"));
+        assert_eq!(run_config(&inherited).exposed_ports, [5432, 6379]);
+    }
+
+    #[test]
     fn canonical_is_explicit_and_stable() {
         use parser::{Cmdline, Mount, Run};
         let run = |s: &str| {
@@ -4297,9 +4389,11 @@ RUN ship
         let src = "\
 FROM scratch AS base
 ENV A=1
+EXPOSE 5432
 ENTRYPOINT [\"/bin/app\"]
 CMD [\"--serve\"]
 FROM base AS child
+EXPOSE 6379
 FROM base AS override
 ENTRYPOINT run me
 ";
@@ -4310,6 +4404,7 @@ ENTRYPOINT run me
         let base = &r[&0].final_state;
         assert_eq!(base.entrypoint, ["/bin/app"]);
         assert_eq!(base.cmd, ["--serve"]);
+        assert_eq!(base.exposed_ports, [5432]);
         // ENTRYPOINT/CMD are stored verbatim (Docker image-config semantics): a
         // $VAR in them is the runtime shell's to expand — a compose environment
         // override must be able to reach it — never baked at build time.
@@ -4321,11 +4416,14 @@ ENTRYPOINT run me
         let mut ex2 = DryRun::new();
         let r2 = resolve_stages(&p2, &order2, &ba, &mut ex2, None).unwrap();
         assert_eq!(r2[&0].final_state.entrypoint, ["sh", "-c", "echo $A"]);
-        // an instruction-less child inherits everything
+        // a child inherits the base's ports and adds its own, as it does the rest of the state
         let child = &r[&1].final_state;
         assert_eq!(child.entrypoint, ["/bin/app"]);
         assert_eq!(child.cmd, ["--serve"]);
         assert_eq!(child.env, [("A".to_string(), "1".to_string())]);
+        assert_eq!(child.exposed_ports, [5432, 6379]);
+        // and a sibling that declares none keeps just the base's
+        assert_eq!(r[&2].final_state.exposed_ports, [5432]);
         // re-declaring ENTRYPOINT (shell form -> /bin/sh -c) resets the inherited CMD
         let ov = &r[&2].final_state;
         assert_eq!(ov.entrypoint, ["/bin/sh", "-c", "run me"]);
@@ -4418,6 +4516,7 @@ ENTRYPOINT run me
         std::fs::write(
             tmp.join("Dockerfile"),
             "FROM scratch\nCOPY f /f\nENV PORT=6379\nUSER svc\nWORKDIR /srv\n\
+             EXPOSE 6379/tcp 9000-9001\n\
              ENTRYPOINT [\"/bin/app\"]\nCMD [\"--port\", \"6379\"]\n",
         )
         .unwrap();
@@ -4456,6 +4555,8 @@ ENTRYPOINT run me
         assert_eq!(cfg.user, "svc");
         assert_eq!(cfg.workdir, "/srv");
         assert_eq!(cfg.argv(), ["/bin/app", "--port", "6379"]);
+        // the ports the Dockerfile exposes reach the sidecar, so the guest gates on them
+        assert_eq!(cfg.exposed_ports, [6379, 9000, 9001]);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
