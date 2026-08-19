@@ -496,6 +496,10 @@ fn mount_api_filesystems() -> Result<()> {
     // binds its unix socket into. systemd-tmpfiles would recreate these; we have no
     // systemd, and a bare tmpfs mount would hide them.
     //
+    // /run gets the mount an init would have given it (RUN_TMPFS_FLAGS/RUN_TMPFS_DATA)
+    // rather than the kernel tmpfs default: root's, as it is on any real system, and
+    // bounded. /tmp keeps that default, where 1777 is what it should be.
+    //
     // /tmp is the exception when a build hands us a disk-backed scratch device
     // (VIRTKIT_TMP_DEV): a build's RUN steps write bulk transient data (tar extractions,
     // ./configure) to /tmp, and a RAM tmpfs caps that at ½·guest-RAM. The device is a
@@ -525,6 +529,8 @@ fn mount_api_filesystems() -> Result<()> {
                     std::fs::Permissions::from_mode(0o1777),
                 )
             })
+        } else if target == "/run" {
+            mount_tmpfs_keep_dirs(target, RUN_TMPFS_FLAGS, RUN_TMPFS_DATA)
         } else {
             mount_tmpfs_keep_dirs(target, libc::MS_NOSUID | libc::MS_NODEV, "")
         };
@@ -1640,10 +1646,10 @@ fn maybe_ctlfs(cmdline: &HashMap<String, String>) {
 }
 
 // The flags and tmpfs options systemd's own `mount_setup` mounts /run with (`mode=0755` +
-// `TMPFS_LIMITS_RUN`, systemd v257), so a /run claimed by `claim_run_tmpfs` carries the same
-// mount options as the one the image's init would have made — rather than a kernel-default
-// tmpfs capped only at ½·guest-RAM with a 1777 world-writable root (see the /tmp note in
-// `mount_api_filesystems`).
+// `TMPFS_LIMITS_RUN`, systemd v257) — not the kernel tmpfs default, which is 1777 and capped
+// only at ½·guest-RAM. Both init paths mount /run this way: `mount_api_filesystems` for the
+// guest the agent keeps, `claim_run_tmpfs` for the one it hands to the image — which then
+// finds the /run it would have mounted itself, options and all.
 const RUN_TMPFS_FLAGS: libc::c_ulong = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_STRICTATIME;
 const RUN_TMPFS_DATA: &str = "mode=0755,size=20%,nr_inodes=800k";
 
@@ -2329,6 +2335,18 @@ mod tests {
         assert_eq!(dirs.rw, "/run/virtkit-overlay/cibuild/rw");
         assert_eq!(dirs.upper, "/run/virtkit-overlay/cibuild/rw/upper");
         assert_eq!(dirs.work, "/run/virtkit-overlay/cibuild/rw/work");
+    }
+
+    #[test]
+    fn run_is_mounted_with_an_init_s_own_options() {
+        // systemd's `mount_setup` row for /run, so an image's init finds the mount it would
+        // have made itself — and the guest the agent keeps gets the same bounded, root-owned
+        // /run rather than the kernel's 1777, half-the-RAM default.
+        assert_eq!(RUN_TMPFS_DATA, "mode=0755,size=20%,nr_inodes=800k");
+        assert_eq!(
+            RUN_TMPFS_FLAGS,
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_STRICTATIME
+        );
     }
 
     #[test]

@@ -14,6 +14,14 @@ All notable changes to virtkit will be documented in this file.
   handoff to the image's own init, and a full-VM primary drives its siblings with the same
   plain shell writes as any other primary.
 
+### Changed
+
+- **A guest's `/run` looks like a real system's.** It is root-owned and no longer
+  world-writable, and can no longer grow to half the VM's memory. A process running as a
+  non-root user that wrote a socket or pid file straight into `/run` — rather than into its
+  own directory there, which still works — now needs that directory, as it would on any
+  distribution.
+
 ### Fixed
 
 - **A VM that hands PID 1 to the image comes up on the network.** With `--net`, such a guest
