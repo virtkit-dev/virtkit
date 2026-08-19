@@ -16,6 +16,7 @@
 use anyhow::{Context, Result, bail};
 use log::{debug, info};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -227,6 +228,20 @@ async fn bridge(tap: OwnedFd, conn: RawConn) -> Result<()> {
     r
 }
 
+/// How long to wait before retrying a tap I/O the kernel refused with EIO — the link is
+/// administratively down, and readiness stays asserted, so a bare retry would spin a core.
+const LINK_DOWN_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Whether this error is the kernel saying "the link is down" rather than "the device is
+/// gone". A guest owns its interface state: `ifup`/`ifdown`, NetworkManager and a dhclient
+/// restart all take the link down and up again, and reads and writes fail with EIO in
+/// between. Treating that as terminal would end the bridge task, close the tap fd, and
+/// destroy the device — a NIC the guest can never bring back, since only its creator can
+/// make it. So the bridge waits the link out instead.
+fn link_is_down(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EIO)
+}
+
 /// Read one ethernet frame from the tap (async via readiness).
 async fn read_frame(tap: &AsyncFd<OwnedFd>, buf: &mut [u8]) -> Result<usize> {
     loop {
@@ -245,7 +260,12 @@ async fn read_frame(tap: &AsyncFd<OwnedFd>, buf: &mut [u8]) -> Result<usize> {
                 Ok(n as usize)
             }
         }) {
-            Ok(res) => return Ok(res?),
+            Ok(Ok(n)) => return Ok(n),
+            Ok(Err(e)) if link_is_down(&e) => {
+                debug!("net: tap read while the link is down, waiting for it to come back up");
+                tokio::time::sleep(LINK_DOWN_BACKOFF).await;
+            }
+            Ok(Err(e)) => return Err(e.into()),
             Err(_would_block) => continue,
         }
     }
@@ -269,11 +289,29 @@ async fn write_frame(tap: &AsyncFd<OwnedFd>, frame: &[u8]) -> Result<()> {
                 Ok(n as usize)
             }
         }) {
-            Ok(res) => {
-                res?;
+            Ok(Ok(_)) => return Ok(()),
+            // The frame is dropped: with the link down there is nothing in the guest to
+            // receive it, and an ethernet bridge may lose frames — a peer retransmits.
+            Ok(Err(e)) if link_is_down(&e) => {
+                debug!("net: dropping a frame while the tap link is down");
                 return Ok(());
             }
+            Ok(Err(e)) => return Err(e.into()),
             Err(_would_block) => continue,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_is_down_matches_only_eio() {
+        assert!(link_is_down(&std::io::Error::from_raw_os_error(libc::EIO)));
+        assert!(!link_is_down(&std::io::Error::from_raw_os_error(
+            libc::EAGAIN
+        )));
+        assert!(!link_is_down(&std::io::Error::other("no os error")));
     }
 }

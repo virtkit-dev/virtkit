@@ -75,6 +75,11 @@ All notable changes to virtkit will be documented in this file.
   the older sources would have produced — so it failed to find one, or came up on a stale
   image while the fresh build sat unused.
 
+- **A guest's network interface survives being taken down and back up.** Bringing the link
+  down from inside the guest — `ifdown`/`ifup`, NetworkManager, a DHCP client restart —
+  used to cost it the interface for the rest of the run; it now comes back on its own once
+  the link is back up.
+
 ## [0.36.0] - 2026-08-18
 
 ### Added
