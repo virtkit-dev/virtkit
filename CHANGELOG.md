@@ -16,6 +16,22 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **An image's entrypoint booted as PID 1 runs as the image's `USER`.** `--init entrypoint` ran
+  it as root while the same image booted as a compose service ran it as its declared user; one
+  image now comes up as the same user either way. An entrypoint that goes on to exec an init
+  still needs root, as does driving compose siblings through `/run/vk/services` — declare
+  `user: root` to keep it — and an image whose passwd has no entry for the USER, or no `setpriv`
+  that can make the drop (busybox's takes neither `--reuid` nor `--regid`), says so and stays
+  root rather than failing from PID 1. Note that a dropped
+  entrypoint spends the fallback to the image's init: PID 1 is `setpriv` by then, so an
+  entrypoint it cannot start is terminal.
+
+- **A command run against a guest booted from the image itself runs as the image's `USER`.**
+  Reading the USER for the entrypoint axis also gives a pulled image's `-- <command>` and its
+  ssh sessions the same user a converted image's already had, so a guest that boots the image's
+  own kernel or init (`--kernel image`, `--init image`, `--init entrypoint`) no longer runs it
+  as root where the default path would not.
+
 - **A guest's `/run` looks like a real system's.** It is root-owned and no longer
   world-writable, and can no longer grow to half the VM's memory. A process running as a
   non-root user that wrote a socket or pid file straight into `/run` — rather than into its

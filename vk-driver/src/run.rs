@@ -24,8 +24,9 @@ use crate::vmm::Vmm;
 /// = the image's own init (`/sbin/init`, e.g. systemd) via the preinit handoff;
 /// `Entrypoint` = the image's ENTRYPOINT+CMD via that same handoff, for an image whose
 /// entrypoint prepares the machine and only then execs the real init — a step `Image`
-/// skips. The entrypoint runs as root, unlike `docker run`'s honoring of `USER`: it is
-/// PID 1, and a machine-preparing entrypoint (and any init it execs) needs root.
+/// skips. The entrypoint runs as the image's `USER`, as a compose service of the same image
+/// does; an entrypoint that execs an init needs root, and an image declaring otherwise is
+/// broken under `docker run` too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum InitSource {
     /// vk-agent, virtkit's own PID 1
@@ -927,6 +928,9 @@ async fn build_and_boot(
             // workdir for the guest command, as `docker run` does.
             let cfg = source.run_config().await?;
             image_env = cfg.env;
+            // The USER too: it is what `--init entrypoint` hands the entrypoint over as, and
+            // the boot config below is its only carrier on the preinit path.
+            primary_user = cfg.user;
             image_entrypoint = cfg.entrypoint;
             image_cmd = cfg.cmd;
             image_workdir = cfg.workdir;

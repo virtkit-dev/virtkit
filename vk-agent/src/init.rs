@@ -301,7 +301,10 @@ fn run_full_vm(
     if let (ImageInit::Entrypoint, Some(cfg)) = (axis, cfg) {
         chdir_workdir(cfg);
     }
-    exec_first(&image_init_candidates(axis, cmdline, cfg)) // never returns
+    let drop_ids = (axis == ImageInit::Entrypoint)
+        .then(|| drop_ids_for_user(cfg.map_or("", |c| c.user.as_str())))
+        .flatten();
+    exec_first(&image_init_candidates(axis, cmdline, cfg, drop_ids)) // never returns
 }
 
 /// Become the first candidate that execs. `execvp` returns only when it failed, leaving
@@ -334,14 +337,22 @@ fn exec_first(candidates: &[Vec<String>]) -> ! {
 /// any compose override), exec'd — NOT forked as `VIRTKIT_MODE=service` does — so an
 /// entrypoint that sets the machine up and then execs systemd hands PID 1 straight on.
 /// Service mode cannot do that: systemd refuses to run anywhere but PID 1, which the agent
-/// holds there. It runs as root: it *is* PID 1, so the config's user is not applied the way
-/// service mode's `wrap_user` applies it. The image's init and then a shell follow it, so a
-/// mis-declared entrypoint reaches a debuggable guest rather than exiting 127 from PID 1
-/// and panicking the kernel — the same ladder [`service_argv`] climbs.
+/// holds there. It runs as the image's `USER`, as service mode's `wrap_user` does, so one
+/// image does not change hands between the two boot axes. An entrypoint that execs an init
+/// still needs root, and an image declaring otherwise is broken under `docker run` too. A
+/// host share carries no id map, so a non-root uid cannot create files in one.
+///
+/// The image's init and then a shell follow it, so an image with no entrypoint to exec — or
+/// one PID 1 cannot exec — reaches a debuggable guest rather than exiting 127 from PID 1 and
+/// panicking the kernel, the same ladder [`service_argv`] climbs. A drop spends that ladder:
+/// PID 1 becomes `setpriv`, which execs and only then reports, so anything it finds wrong is
+/// terminal. That is why [`drop_ids_for_user`] settles the drop before the exec and hands
+/// over ids it has already resolved.
 fn image_init_candidates(
     axis: ImageInit,
     cmdline: &HashMap<String, String>,
     cfg: Option<&RunConfig>,
+    drop_ids: Option<(u32, u32)>,
 ) -> Vec<Vec<String>> {
     let init = vec![
         cmdline
@@ -352,16 +363,107 @@ fn image_init_candidates(
     if axis == ImageInit::Init {
         return vec![init];
     }
-    let entrypoint = cfg.map(|c| c.argv()).unwrap_or_default();
     let mut candidates = Vec::new();
-    if !entrypoint.is_empty() {
-        candidates.push(entrypoint);
+    // ENTRYPOINT+CMD and the USER that owns them come from the same config.
+    if let Some((entrypoint, user)) = cfg
+        .map(|c| (c.argv(), c.user.as_str()))
+        .filter(|(argv, _)| !argv.is_empty())
+    {
+        // Only this candidate is dropped to the USER: the init below it must be root, and so
+        // must the debug shell that follows, or a mis-declared image would land somewhere it
+        // cannot work at all.
+        candidates.push(if let Some((uid, gid)) = drop_ids {
+            info!(
+                "vk-agent image-init: entrypoint runs as the image's USER {user} ({uid}:{gid}), \
+                 as `docker run` does — an entrypoint that execs an init needs root (declare \
+                 `user: root` to keep it)"
+            );
+            setpriv_wrap(entrypoint, &uid.to_string(), &gid.to_string())
+        } else {
+            entrypoint
+        });
     } else {
         warn!("vk-agent image-init: no entrypoint in the boot config — falling back to the init");
     }
     candidates.push(init);
     candidates.push(vec!["/bin/sh".to_string()]);
     candidates
+}
+
+/// The ids to hand the entrypoint over as, or `None` to keep root. Settled before the exec
+/// rather than discovered by it, because PID 1 becomes `setpriv`, which execs fine and only
+/// then reports that it cannot become the user — and PID 1 exiting panics the kernel, so
+/// [`exec_first`]'s ladder never gets its turn.
+///
+/// The USER has to have a passwd entry in the image: the ids come out of that entry, because
+/// `setpriv --init-groups` looks the uid up itself and fails on a `USER 1000` no passwd knows,
+/// and `--regid` given a name needs a group of that name, which a user's own primary group
+/// need not have. Handing over `pw_uid`/`pw_gid` asks neither question. The image also has to
+/// carry a `setpriv` that can make the drop, which is a question only the drop itself answers
+/// — busybox provides the name without `--reuid`. Any miss keeps the entrypoint at root, with
+/// the reason on the console.
+fn drop_ids_for_user(user: &str) -> Option<(u32, u32)> {
+    if user.is_empty() || user == "root" {
+        return None;
+    }
+    let (uid, gid) = match passwd_ids(user) {
+        // `USER 0` is root under another name; nothing to drop, and setpriv would be noise.
+        Some((0, _)) => return None,
+        Some(ids) => ids,
+        None => {
+            warn!(
+                "vk-agent image-init: USER {user} has no passwd entry in the image — keeping root"
+            );
+            return None;
+        }
+    };
+    if !setpriv_can_drop("setpriv", uid, gid) {
+        warn!(
+            "vk-agent image-init: no setpriv in the image that can drop to USER {user} \
+             ({uid}:{gid}) — keeping root"
+        );
+        return None;
+    }
+    Some((uid, gid))
+}
+
+/// Whether `prog` can actually drop to `uid`/`gid`, asked by making the drop in a child that
+/// does nothing but print a version. PID 1 cannot ask: it *becomes* `setpriv`, and a busybox
+/// one — the name without the flags — execs fine and then exits, which panics the kernel.
+/// Unlike the exec-time discovery [`exec_first`] relies on, a wrong answer here is safe: it
+/// only keeps the entrypoint at root.
+fn setpriv_can_drop(prog: &str, uid: u32, gid: u32) -> bool {
+    let (uid, gid) = (uid.to_string(), gid.to_string());
+    run_cmd(
+        prog,
+        &[
+            "--reuid",
+            &uid,
+            "--regid",
+            &gid,
+            "--init-groups",
+            "--",
+            "/proc/self/exe",
+            "--version",
+        ],
+    )
+}
+
+/// The image's own passwd entry for `user` — a name via `getpwnam`, a number via `getpwuid` —
+/// as (uid, gid). `None` when the image's passwd does not have it.
+fn passwd_ids(user: &str) -> Option<(u32, u32)> {
+    // SAFETY: getpwnam/getpwuid return a pointer into a static buffer (single-threaded,
+    // short-lived process); we read two fields before any further call.
+    unsafe {
+        let p = match user.parse::<u32>() {
+            Ok(uid) => libc::getpwuid(uid),
+            Err(_) => libc::getpwnam(CString::new(user).ok()?.as_ptr()),
+        };
+        if p.is_null() {
+            return None;
+        }
+        Some(((*p).pw_uid, (*p).pw_gid))
+    }
 }
 
 /// Load the boot-critical modules listed (one absolute `.ko` path per line) in the
@@ -2028,23 +2130,30 @@ fn chdir_workdir(cfg: &RunConfig) {
 /// Wrap argv to drop to `user` via setpriv (when non-root and setpriv is present).
 fn wrap_user(argv: Vec<String>, user: &str) -> Vec<String> {
     if !user.is_empty() && user != "root" && which("setpriv") {
-        let mut v: Vec<String> = [
-            "setpriv",
-            "--reuid",
-            user,
-            "--regid",
-            user,
-            "--init-groups",
-            "--",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        v.extend(argv);
-        v
+        setpriv_wrap(argv, user, user)
     } else {
         argv
     }
+}
+
+/// `argv` under `setpriv`, dropping to `reuid`/`regid` — the drop service mode and the
+/// entrypoint axis share. Either may be a name or a number, as `setpriv` takes both; the
+/// caller decides whether the drop is possible at all.
+fn setpriv_wrap(argv: Vec<String>, reuid: &str, regid: &str) -> Vec<String> {
+    let mut v: Vec<String> = [
+        "setpriv",
+        "--reuid",
+        reuid,
+        "--regid",
+        regid,
+        "--init-groups",
+        "--",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    v.extend(argv);
+    v
 }
 
 /// execvp(argv) — replaces this process (PATH-searched). Never returns on success.
@@ -2553,18 +2662,18 @@ mod tests {
         // the init axis offers the init and nothing else, exactly as it did before the
         // entrypoint axis existed — the host's handoff where it named one
         assert_eq!(
-            image_init_candidates(ImageInit::Init, &empty, Some(&cfg)),
+            image_init_candidates(ImageInit::Init, &empty, Some(&cfg), None),
             [["/sbin/init"]]
         );
         assert_eq!(
-            image_init_candidates(ImageInit::Init, &handoff, Some(&cfg)),
+            image_init_candidates(ImageInit::Init, &handoff, Some(&cfg), None),
             [["/lib/systemd/systemd"]]
         );
 
         // the entrypoint axis leads with the config's entrypoint+cmd, verbatim: a bare name
         // is left for execvp's PATH lookup rather than resolved here
         assert_eq!(
-            image_init_candidates(ImageInit::Entrypoint, &empty, Some(&cfg)),
+            image_init_candidates(ImageInit::Entrypoint, &empty, Some(&cfg), None),
             [
                 vec!["/prepare-machine.sh", "--log-level=info"],
                 vec!["/sbin/init"],
@@ -2576,15 +2685,89 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            image_init_candidates(ImageInit::Entrypoint, &empty, Some(&bare))[0],
+            image_init_candidates(ImageInit::Entrypoint, &empty, Some(&bare), None)[0],
             ["prepare-machine.sh"]
         );
+        // A guest that can drop to the image's USER hands the entrypoint over under setpriv, by
+        // the ids the image's passwd gave — a name would make setpriv resolve it again, and a
+        // group of that name need not exist. Only the entrypoint is dropped: the init below it
+        // and the debug shell below that stay root, for a guest that could not start the
+        // entrypoint at all.
+        let as_app = RunConfig {
+            entrypoint: vec!["/prepare-machine.sh".into()],
+            user: "app".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            image_init_candidates(
+                ImageInit::Entrypoint,
+                &empty,
+                Some(&as_app),
+                Some((1000, 100))
+            ),
+            [
+                vec![
+                    "setpriv",
+                    "--reuid",
+                    "1000",
+                    "--regid",
+                    "100",
+                    "--init-groups",
+                    "--",
+                    "/prepare-machine.sh"
+                ],
+                vec!["/sbin/init"],
+                vec!["/bin/sh"]
+            ]
+        );
+        // A guest that cannot (no setpriv, or a USER the image's passwd does not know) keeps
+        // root rather than exec'ing a setpriv that would exit from PID 1 and panic the kernel.
+        assert_eq!(
+            image_init_candidates(ImageInit::Entrypoint, &empty, Some(&as_app), None)[0],
+            ["/prepare-machine.sh"]
+        );
+        // Neither a missing USER nor an explicit root is ever a drop — nor is `USER 0`, which
+        // is root by number and needs no setpriv to become.
+        assert_eq!(drop_ids_for_user(""), None);
+        assert_eq!(drop_ids_for_user("root"), None);
+        assert_eq!(drop_ids_for_user("0"), None);
+        // The ids come out of the passwd entry, so a USER with none is not a drop.
+        assert_eq!(passwd_ids("nosuchuser-virtkit"), None);
+        assert_eq!(passwd_ids("4294967294"), None);
+        assert_eq!(passwd_ids("root"), Some((0, 0)));
+        assert_eq!(passwd_ids("0"), Some((0, 0)));
+
         // nothing to exec: straight to the init, then a shell — PID 1 always has a next
         // candidate, since exiting from it panics the kernel
         assert_eq!(
-            image_init_candidates(ImageInit::Entrypoint, &handoff, None),
+            image_init_candidates(ImageInit::Entrypoint, &handoff, None, None),
             [vec!["/lib/systemd/systemd"], vec!["/bin/sh"]]
         );
+    }
+
+    #[test]
+    fn a_setpriv_that_cannot_make_the_drop_is_not_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vk-setpriv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = |name: &str, code: u8| {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\nexit {code}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        // util-linux: takes the flags and makes the drop.
+        assert!(setpriv_can_drop(&fake("setpriv-ok", 0), 1000, 100));
+        // busybox: has the name, rejects --reuid — the case PID 1 must not discover by exec'ing
+        // it, since a setpriv that exits from PID 1 panics the kernel.
+        assert!(!setpriv_can_drop(&fake("setpriv-busybox", 1), 1000, 100));
+        // no setpriv at all.
+        assert!(!setpriv_can_drop(
+            &dir.join("setpriv-absent").to_string_lossy(),
+            1000,
+            100
+        ));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
