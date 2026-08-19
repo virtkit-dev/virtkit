@@ -927,15 +927,15 @@ fn build_compose_unit(
         net,
         audit,
     };
-    let ext4 = crate::units::build_unit_ext4(cfg.state_dir(), &build.build_args, unit)?;
-    let config = crate::units::ensure_unit_build_sync(
+    // The build reports the entry it materialized; addressing it separately would pin the
+    // fingerprint computed here rather than the one the build settled on.
+    crate::units::ensure_unit_build_sync(
         unit,
         cfg.state_dir(),
         cfg.image_cache_idle(),
         &build,
         None,
-    )?;
-    Ok((ext4, config))
+    )
 }
 
 /// The detached job supervisor (`vk gitlab supervise <job_dir>`, spawned by

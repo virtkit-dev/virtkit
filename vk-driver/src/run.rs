@@ -654,6 +654,14 @@ fn primary_nested_marker(
     primary_idx.is_some_and(|i| compose_units[i].nested)
 }
 
+/// The directory a run's VM-registry entry is filed under: its work dir, canonicalized so a
+/// run given a relative `--state-dir` and a reader arriving by another path agree on the key.
+/// Both the entry itself and the service-image correction the manager makes to it go through
+/// here, so the two cannot disagree about which file they mean.
+fn registry_key(work: &Path) -> PathBuf {
+    crate::vms::canonical(work)
+}
+
 async fn build_and_boot(
     args: &RunArgs,
     cfg: &crate::config::Config,
@@ -1241,8 +1249,12 @@ async fn build_and_boot(
     // ownership of `planned`: while running, each serves its agent at `<svc-dir>/vsock.sock` so
     // `vk exec --service` can reach it, and a `build:` service carries its recipe so `vk list
     // --stale` folds its image into the freshness check. Same context/build-arg derivation as
-    // `compose_build_units`, so a recomputed key matches the one the service booted with.
-    let service_entries: Vec<crate::vms::ServiceEntry> = planned
+    // `compose_build_units`. The recipe's image is the address provisioning predicted, which is
+    // all that is known at this point; every `build:` sibling materializes at its first start
+    // and adopts whatever entry its build settles on, so the address is taken from the manager
+    // below for the starts that have already run, and corrected by `vms::note_service_image`
+    // for the ones that come later over the control plane.
+    let mut service_entries: Vec<crate::vms::ServiceEntry> = planned
         .units
         .iter()
         .map(|(prov, dir, unit)| {
@@ -1349,7 +1361,12 @@ async fn build_and_boot(
             gw,
             agent.to_path_buf(),
             manager_build_opts(args, kernel, agent),
-            state_dir.to_path_buf(),
+            crate::manager::ManagerDirs {
+                cache: state_dir.to_path_buf(),
+                // Only a pinned run files a registry entry, so only a pinned run has one to
+                // correct — see the `register` call below.
+                run: args.state_dir.as_ref().map(|_| registry_key(work)),
+            },
             cfg.image_cache_idle(),
             planned.units,
         )))
@@ -1710,7 +1727,12 @@ async fn build_and_boot(
                 None
             }
         });
-        let state_dir = std::fs::canonicalize(work).unwrap_or_else(|_| work.to_path_buf());
+        let state_dir = registry_key(work);
+        // The eager starts above already adopted their built entries; take those addresses
+        // from the manager so what is filed names the image each service actually booted.
+        if let Some(mgr) = &manager {
+            mgr.refresh_service_images(&mut service_entries);
+        }
         crate::vms::register(crate::vms::VmEntry {
             // Off the canonical state dir, so a run launched with a relative `--state-dir`
             // still names its recording to a `vk atop` reading from another directory.
@@ -2044,8 +2066,8 @@ fn build_compose_images(
 /// (`image::resolve_ref`, the same digest-keyed cache the CI job + services use) and carries
 /// its real config. A `build:` sibling addresses its shared build-tier ext4 (a pure function
 /// of the stage fingerprint) but is not built yet — it gets the compose overrides alone as a
-/// placeholder until the manager builds it on demand at first start and adopts the real image
-/// config.
+/// placeholder until the manager builds it on demand at first start and adopts the entry it
+/// built, with that image's config.
 fn plan_services(
     args: &RunArgs,
     cfg: &crate::config::Config,
@@ -2188,7 +2210,11 @@ async fn compose_up(
         gw,
         agent.to_path_buf(),
         manager_build_opts(args, kernel, agent),
-        state_dir.to_path_buf(),
+        crate::manager::ManagerDirs {
+            cache: state_dir.to_path_buf(),
+            // A services-only run files no registry entry, so there is none to correct.
+            run: None,
+        },
         cfg.image_cache_idle(),
         planned.units,
     ));

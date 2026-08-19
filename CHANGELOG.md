@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A service built on its first `vk service up` boots the image that build produced.** A
+  service a profile excludes is built only when it is first brought up; if anything in its
+  build context had changed since the run started, the boot still went looking for the image
+  the older sources would have produced — so it failed to find one, or came up on a stale
+  image while the fresh build sat unused.
+
 ## [0.36.0] - 2026-08-18
 
 ### Added

@@ -24,6 +24,10 @@ use crate::config::Config;
 pub struct Provisioned {
     pub name: String,
     pub hostname: String,
+    /// The unit's clean image. For a `build:` unit this is only the address its stage
+    /// fingerprint predicts — the service manager replaces it with the entry the on-demand
+    /// build settles on at first start (`ensure_unit_build_sync`). The CI executor still
+    /// boots this predicted address, having warmed the stage up front in `prepare`.
     pub ext4: PathBuf,
     /// static address, `ip/prefix`
     pub ip: String,
@@ -153,18 +157,22 @@ pub fn build_unit_ext4(
 
 /// Ensure a `build:` unit is materialized in the shared build tier synchronously — the
 /// microVM build path never awaits — streaming its build progress to `sink` when set, and
-/// return its merged runtime config. This is the on-demand start path (the service manager
-/// builds a profiled-down `build:` service the first time it is brought up). Concurrent
-/// first-starts of the same stage serialize inside `ensure_build_tier` (a per-stage pull
-/// lock), and share the one tier entry. Errors for an `image:` unit: those need the async
-/// pull and are materialized up front, not on demand.
+/// return the ext4 it materialized along with its merged runtime config. The ext4 is part
+/// of the result because the stage fingerprint is settled here: a caller holding the
+/// address it predicted earlier (`build_unit_ext4` at provisioning) holds the fingerprint
+/// of the context as it stood then, and any edit since keys the build to another entry.
+/// This is the on-demand start path (the service manager builds a profiled-down `build:`
+/// service the first time it is brought up). Concurrent first-starts of the same stage
+/// serialize inside `ensure_build_tier` (a per-stage pull lock), and share the one tier
+/// entry. Errors for an `image:` unit: those need the async pull and are materialized up
+/// front, not on demand.
 pub fn ensure_unit_build_sync(
     unit: &crate::compose::Unit,
     state_dir: &Path,
     idle: std::time::Duration,
     build: &BuildOpts,
     sink: Option<crate::build::ProgressSink>,
-) -> Result<RunConfig> {
+) -> Result<(PathBuf, RunConfig)> {
     if let crate::compose::Source::Image(_) = &unit.source {
         anyhow::bail!(
             "on-demand start of the image: service {:?} is not supported — \
@@ -182,7 +190,9 @@ pub fn ensure_unit_build_sync(
         &unit.name,
         sink,
     )?;
-    read_merged_config(unit, &dir.join("runner.ext4"))
+    let ext4 = dir.join("runner.ext4");
+    let config = read_merged_config(unit, &ext4)?;
+    Ok((ext4, config))
 }
 
 /// Provision one service unit at address `slot`: resolve its clean image to a cache path and
@@ -191,7 +201,8 @@ pub fn ensure_unit_build_sync(
 /// (`image::resolve_ref` — a services image must be generic-disk) and carries its real config.
 /// A `build:` unit addresses its shared build-tier ext4 (a pure function of the stage
 /// fingerprint) but is not built here — it gets the compose overrides alone as a placeholder
-/// until the owner materializes it on demand and adopts the built config.
+/// until the owner materializes it on demand and adopts the entry it built, with that
+/// image's config.
 pub fn provision(
     cfg: &Config,
     state_dir: &Path,
@@ -548,6 +559,16 @@ fn create_overlay(ext4: &Path, overlay: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// A private directory for one test, removed and recreated so a rerun starts clean; the
+    /// `vk-units-` prefix and the pid keep concurrent test processes off each other's paths.
+    /// Keep `tag` unique within this module.
+    fn tmpdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vk-units-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn on_demand_build_rejects_an_image_service() {
         // `image:` services need the async pull and are materialized up front; the sync
@@ -583,6 +604,39 @@ mod tests {
             err.to_string().contains("materialized up front"),
             "expected an image-service rejection, got: {err:#}"
         );
+    }
+
+    #[test]
+    fn build_unit_ext4_re_addresses_an_edited_context() {
+        // The premise the start path's adoption rests on: this address is a pure function of
+        // the context, so two calls around an edit name different tier entries. It says
+        // nothing about the adoption itself — that needs a real build, and lives in
+        // `tests/service-ondemand-build-e2e.sh`.
+        let tmp = tmpdir("drift");
+        // `FROM scratch` so nothing is resolved over the network.
+        std::fs::write(
+            tmp.join("Dockerfile"),
+            "FROM scratch\nCOPY payload /payload\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.join("payload"), "one").unwrap();
+        let unit = crate::compose::parse(
+            "services:\n  s:\n    build:\n      context: .\n",
+            &tmp,
+            &|_| None,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+
+        let before = build_unit_ext4(Path::new("/state"), &[], &unit).unwrap();
+        std::fs::write(tmp.join("payload"), "two").unwrap();
+        let after = build_unit_ext4(Path::new("/state"), &[], &unit).unwrap();
+        assert_ne!(
+            before, after,
+            "editing the context must move the unit to another tier entry"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

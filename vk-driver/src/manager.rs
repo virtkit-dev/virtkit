@@ -30,6 +30,18 @@ struct UnitState {
     guard: Option<crate::cachelock::Guard>,
 }
 
+/// The two roots a [`Manager`] works from, named rather than positional: passing them the wrong
+/// way round would file a run's registry corrections under a cache root, which reads the same
+/// either way at the call site.
+pub struct ManagerDirs {
+    /// the shared cache root a `build:` unit materializes into
+    pub cache: PathBuf,
+    /// the run's own directory, the key its VM-registry entry is filed under — so a service
+    /// this manager builds on demand can correct the image that entry names (`vms`). `None`
+    /// for a run that files no entry: an unpinned run, or a services-only compose run.
+    pub run: Option<PathBuf>,
+}
+
 /// The manager owns the declared service units. units::boot_unit is sync, so the
 /// lock is held only around the sync boot/kill — never across an await.
 pub struct Manager {
@@ -43,9 +55,9 @@ pub struct Manager {
     /// the builder wiring (cache, build args, embedded kernel/agent) for building a
     /// profiled-down `build:` service on demand at its first start
     build: crate::units::BuildOpts,
-    /// the shared cache root a `build:` unit materializes into, and how long a base may sit
-    /// idle before the on-demand build path's GC evicts it
-    state_dir: PathBuf,
+    /// the roots this manager works from
+    dirs: ManagerDirs,
+    /// how long a base may sit idle before the on-demand build path's GC evicts it
     idle: std::time::Duration,
     units: Mutex<HashMap<String, UnitState>>,
 }
@@ -59,7 +71,7 @@ impl Manager {
         gateway: Ipv4Addr,
         agent: PathBuf,
         build: crate::units::BuildOpts,
-        state_dir: PathBuf,
+        dirs: ManagerDirs,
         idle: std::time::Duration,
         units: impl IntoIterator<Item = (crate::units::Provisioned, PathBuf, crate::compose::Unit)>,
     ) -> Manager {
@@ -70,7 +82,7 @@ impl Manager {
             gateway,
             agent,
             build,
-            state_dir,
+            dirs,
             idle,
             units: Mutex::new(
                 units
@@ -174,20 +186,27 @@ impl Manager {
 
         // A `build:` unit materializes into the shared build tier (lock released for the
         // build) — a fresh stage returns instantly; an `image:` unit was already pulled.
-        let built_config = if matches!(unit.source, crate::compose::Source::Build { .. }) {
+        let built_image = if matches!(unit.source, crate::compose::Source::Build { .. }) {
             match crate::units::ensure_unit_build_sync(
                 &unit,
-                &self.state_dir,
+                &self.dirs.cache,
                 self.idle,
                 &self.build,
                 sink,
             ) {
-                Ok(config) => Some(config),
+                Ok(built) => Some(built),
                 Err(e) => return Reply::err(format!("building {name}: {e:#}")),
             }
         } else {
             None
         };
+        // Still outside the units lock: the registry write fsyncs, and the whole point of
+        // releasing that lock for the build is that `list`/`status` never wait on file I/O.
+        // Recording the address before the boot adopts it is safe either way: the entry this
+        // build settled on is the one a boot of this unit uses from here on.
+        if let (Some((ext4, _)), Some(run)) = (&built_image, &self.dirs.run) {
+            crate::vms::note_service_image(run, name, ext4);
+        }
 
         // Re-take the lock for the boot; re-check running in case a concurrent start won.
         let mut u = self.units.lock().unwrap();
@@ -197,15 +216,17 @@ impl Manager {
         if state_of(st) == "running" {
             return Reply::ok(format!("{name} already running ({})", st.svc.ip));
         }
-        // A freshly-built image's own config (env/user/entrypoint) is known only after the
-        // build, so adopt it before booting — a profiled-down service had no config yet.
-        if let Some(config) = built_config {
+        // Boot the entry the build reports, with the config it carries: both are known only
+        // after the build, and the address provisioning predicted can key elsewhere (see
+        // `ensure_unit_build_sync`).
+        if let Some((ext4, config)) = built_image {
+            st.svc.ext4 = ext4;
             st.svc.config = config;
         }
         // Reference the shared-cache base for the unit's running lifetime, so the idle GC
         // never evicts a base under this live overlay. `None` for a rootfs outside the
         // managed tiers (nothing to reference-count there).
-        let guard = match crate::image::acquire_use_lock_for(&self.state_dir, &st.svc.ext4) {
+        let guard = match crate::image::acquire_use_lock_for(&self.dirs.cache, &st.svc.ext4) {
             Ok(guard) => guard,
             Err(e) => return Reply::err(format!("referencing {name} image: {e:#}")),
         };
@@ -226,6 +247,22 @@ impl Manager {
                 Reply::ok(format!("started {name} ({ip})"))
             }
             Err(e) => Reply::err(format!("starting {name}: {e:#}")),
+        }
+    }
+
+    /// Point each recorded service at the image it booted. The registry entry is filed after
+    /// the run's eager starts, and every `build:` sibling materializes at its first start
+    /// (`build_compose_images` builds only the primary) — so those adoptions happen before
+    /// there is an entry for [`crate::vms::note_service_image`] to correct, and are folded in
+    /// here instead. Later, control-plane starts go through that function.
+    pub fn refresh_service_images(&self, entries: &mut [crate::vms::ServiceEntry]) {
+        let units = self.units.lock().unwrap();
+        for e in entries {
+            if let Some(st) = units.get(&e.name)
+                && let Some(recipe) = e.stale_recipe.as_mut()
+            {
+                recipe.root_ext4 = st.svc.ext4.clone();
+            }
         }
     }
 
@@ -372,4 +409,96 @@ async fn stream_start(
         .await
         .unwrap_or_else(|e| Reply::err(format!("start task failed: {e}")));
     vk_core::fleetctl::write_msg(wr, &Frame::Done(reply)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A manager over one `build:` unit and one `image:` unit, provisioned as `plan_services`
+    /// would leave them: each addressed, neither built.
+    fn manager_over_two_units() -> Manager {
+        let compose = "services:\n  db:\n    build: ./db\n  cache:\n    image: redis:7\n";
+        let units = crate::compose::parse(compose, Path::new("/proj"), &|_| None).unwrap();
+        let gw: Ipv4Addr = "192.168.127.1".parse().unwrap();
+        let provisioned: Vec<_> = units
+            .iter()
+            .enumerate()
+            .map(|(slot, unit)| {
+                let svc = crate::units::provisioned(
+                    unit,
+                    PathBuf::from(format!("/tier/predicted-{}/runner.ext4", unit.name)),
+                    Default::default(),
+                    gw,
+                    24,
+                    slot as u32,
+                )
+                .unwrap();
+                (svc, PathBuf::from("/run/svc"), unit.clone())
+            })
+            .collect();
+        Manager::new(
+            "/nonexistent".into(),
+            "/nonexistent".into(),
+            1024,
+            gw,
+            "/nonexistent".into(),
+            crate::units::BuildOpts {
+                build_args: vec![],
+                kernel: "/nonexistent".into(),
+                cloud_hypervisor: "/nonexistent".into(),
+                agent: "/nonexistent".into(),
+                cache_registry: None,
+                cache_insecure: false,
+                cache_auth: Default::default(),
+                net: crate::build::BuildNet::All,
+                audit: false,
+            },
+            ManagerDirs {
+                cache: PathBuf::from("/cache"),
+                run: Some(PathBuf::from("/run/vm")),
+            },
+            std::time::Duration::from_secs(1800),
+            provisioned,
+        )
+    }
+
+    fn entry(name: &str, recipe: bool) -> crate::vms::ServiceEntry {
+        crate::vms::ServiceEntry {
+            name: name.to_string(),
+            exec_addr: format!("vsock-auto:///run/{name}/vsock.sock:4444"),
+            stale_recipe: recipe.then(|| crate::vms::StaleRecipe {
+                dockerfiles: vec![PathBuf::from("/proj/db/Dockerfile")],
+                contexts: vec![PathBuf::from("/proj/db")],
+                build_contexts: Vec::new(),
+                build_args: Vec::new(),
+                target: None,
+                root_ext4: PathBuf::from("/tier/predicted-db/runner.ext4"),
+            }),
+        }
+    }
+
+    #[test]
+    fn refreshing_records_the_entry_an_eager_start_adopted() {
+        // A run's eager starts happen before it files its registry entry, so the adoption in
+        // `start_streamed` has nothing to correct and this is what carries it instead. Without
+        // it the entry keeps the address provisioning predicted for the run's whole life, and
+        // `vk list --stale` weighs an image the service never booted.
+        let mgr = manager_over_two_units();
+        // What an eager start does once its build reports where it landed.
+        let adopted = PathBuf::from("/tier/built-db/runner.ext4");
+        mgr.units.lock().unwrap().get_mut("db").unwrap().svc.ext4 = adopted.clone();
+
+        let mut entries = vec![entry("db", true), entry("cache", false)];
+        mgr.refresh_service_images(&mut entries);
+
+        assert_eq!(
+            entries[0].stale_recipe.as_ref().unwrap().root_ext4,
+            adopted,
+            "the recorded image must follow the entry the build settled on"
+        );
+        // An `image:` service carries no recipe, and an unknown name must not panic.
+        assert!(entries[1].stale_recipe.is_none());
+        mgr.refresh_service_images(&mut [entry("absent", true)]);
+    }
 }

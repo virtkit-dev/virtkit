@@ -16,6 +16,7 @@ use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -310,6 +311,9 @@ impl Drop for Registration {
 /// only warns (the registry is a convenience, never a reason to fail a boot) and yields a
 /// no-op handle.
 pub fn register(entry: VmEntry) -> Registration {
+    // Serialized against a correction to the same entry (see `WRITES`); taken here rather than
+    // in `record_in`, which the correction calls while already holding it.
+    let _writes = WRITES.lock().unwrap_or_else(PoisonError::into_inner);
     match registry_dir().and_then(|dir| record_in(&dir, &entry)) {
         Ok(()) => Registration {
             state_dir: Some(entry.state_dir),
@@ -321,8 +325,74 @@ pub fn register(entry: VmEntry) -> Registration {
     }
 }
 
+/// Point a service's recorded build recipe at the image it actually booted. The entry is
+/// filed with the address provisioning predicted for a `build:` service, which is all that is
+/// known then; the service manager may go on to adopt a different tier entry when it builds
+/// that service on demand (`manager::Manager::start_streamed`), and `vk list --stale` would
+/// otherwise recompute freshness against an image the service never booted.
+///
+/// Best-effort, exactly like [`register`]: whether the registry can be written never decides
+/// whether a service starts, and a no-op when there is no entry to update. Several runs have
+/// none — an unpinned run (no `--state-dir`), and a services-only compose run, neither of
+/// which are recorded — and an exited run has already removed its own. This carries the starts
+/// that arrive over the control plane; `manager::Manager::refresh_service_images` enforces the
+/// ordering and folds in the adoptions that precede the entry.
+pub fn note_service_image(run_dir: &Path, service: &str, root_ext4: &Path) {
+    let done =
+        registry_dir().and_then(|dir| note_service_image_in(&dir, run_dir, service, root_ext4));
+    if let Err(e) = done {
+        eprintln!("virtkit: warning: could not update the VM registry: {e:#}");
+    }
+}
+
+/// Serializes writers of one run's entry. [`record_in`] stages every version through a single
+/// path keyed by the run, and the correction below is a read-modify-write, so unserialized
+/// callers both interleave into that staging file — publishing an entry no reader can parse,
+/// which drops the VM from `vk list` — and lose each other's updates. [`register`] takes it
+/// too: a leftover entry from a run that was killed makes a correction reachable before this
+/// run files its own, and an uncontended mutex costs nothing on the path that files it.
+/// Guards `()`, so a poisoning is nothing to propagate.
+static WRITES: Mutex<()> = Mutex::new(());
+
+fn note_service_image_in(
+    dir: &Path,
+    run_dir: &Path,
+    service: &str,
+    root_ext4: &Path,
+) -> Result<()> {
+    let _writes = WRITES.lock().unwrap_or_else(PoisonError::into_inner);
+    // The entry is filed under the canonicalized run dir (`run::registry_key`), so resolve the
+    // key the same way here rather than trusting every caller to: a raw or symlinked path would
+    // miss the file and correct nothing, silently.
+    let path = dir.join(format!("{}.json", slug(&canonical(run_dir))));
+    let json = match std::fs::read(&path) {
+        Ok(json) => json,
+        // Nothing filed under this run: recreating it here would leave an entry no run owns.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut entry: VmEntry =
+        serde_json::from_slice(&json).with_context(|| format!("parsing {}", path.display()))?;
+    // An `image:` service carries no recipe, and a prediction that held needs no rewrite —
+    // the common case, since only an edit between provisioning and the build moves the entry.
+    // Comparing the two paths as paths is enough here: both are one `build_tier_dir` off the
+    // same cache root, so they differ only where the stage key does, and the worst a spurious
+    // mismatch could cost is rewriting the entry with the value it already holds.
+    let Some(recipe) = entry
+        .services
+        .iter_mut()
+        .find(|s| s.name == service)
+        .and_then(|s| s.stale_recipe.as_mut())
+        .filter(|r| r.root_ext4 != root_ext4)
+    else {
+        return Ok(());
+    };
+    recipe.root_ext4 = root_ext4.to_path_buf();
+    record_in(dir, &entry)
+}
+
 /// Canonicalize a path for comparison, falling back to it as-given if it does not resolve.
-fn canonical(p: &Path) -> PathBuf {
+pub(crate) fn canonical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
@@ -663,6 +733,145 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].state_dir, b.state_dir);
 
+        std::fs::remove_dir_all(&reg).ok();
+    }
+
+    #[test]
+    fn a_service_image_correction_lands_on_the_recorded_entry() {
+        // The entry is filed with the address provisioning predicted; the manager corrects it
+        // to the tier entry an on-demand build actually settled on, so `--stale` judges the
+        // image that booted. Everything with nothing to correct stays a silent no-op.
+        let reg = tmpdir("reg-note");
+        // Filed under the canonicalized dir, as `run::registry_key` files it in production.
+        let state = canonical(&tmpdir("state-note"));
+        let mut e = entry(state.clone(), None);
+        e.services = vec![
+            ServiceEntry {
+                name: "db".into(),
+                exec_addr: "vsock-auto:///tmp/db/vsock.sock:4444".into(),
+                stale_recipe: Some(StaleRecipe {
+                    dockerfiles: vec![PathBuf::from("/ctx/Dockerfile")],
+                    contexts: vec![PathBuf::from("/ctx")],
+                    build_contexts: Vec::new(),
+                    build_args: Vec::new(),
+                    target: None,
+                    root_ext4: PathBuf::from("/tier/predicted/runner.ext4"),
+                }),
+            },
+            ServiceEntry {
+                name: "cache".into(),
+                exec_addr: "vsock-auto:///tmp/cache/vsock.sock:4444".into(),
+                stale_recipe: None, // an `image:` service — nothing is built, nothing to fix
+            },
+        ];
+        record_in(&reg, &e).unwrap();
+        let svc = |name: &str| {
+            let all = load_all_in(&reg);
+            assert_eq!(all.len(), 1, "the correction must not file a second entry");
+            all[0]
+                .services
+                .iter()
+                .find(|s| s.name == name)
+                .expect("service still recorded")
+                .clone()
+        };
+
+        let built = Path::new("/tier/built/runner.ext4");
+        note_service_image_in(&reg, &state, "db", built).unwrap();
+        assert_eq!(svc("db").stale_recipe.unwrap().root_ext4, built);
+
+        // An `image:` service, an unknown name, and a run with no entry filed (an unpinned
+        // run records none): each a no-op that neither errors nor creates anything.
+        note_service_image_in(&reg, &state, "cache", built).unwrap();
+        note_service_image_in(&reg, &state, "absent", built).unwrap();
+        note_service_image_in(&reg, &tmpdir("state-unpinned"), "db", built).unwrap();
+        assert!(svc("cache").stale_recipe.is_none());
+        assert_eq!(svc("db").stale_recipe.unwrap().root_ext4, built);
+
+        // The prediction that held — the common case — rewrites nothing at all. Compared by
+        // inode, not bytes: `record_in` republishes by rename, and every field round-trips
+        // byte-identically, so equal contents would not tell a no-op from a rewrite.
+        use std::os::unix::fs::MetadataExt as _;
+        let filed = reg.join(format!("{}.json", slug(&state)));
+        let before = std::fs::metadata(&filed).unwrap().ino();
+        note_service_image_in(&reg, &state, "db", built).unwrap();
+        assert_eq!(
+            before,
+            std::fs::metadata(&filed).unwrap().ino(),
+            "a correction to the filed value must not republish the entry"
+        );
+
+        // The entry is keyed by the canonicalized run dir, so a caller holding a symlink to it
+        // still corrects the right file: the one way this feature could silently do nothing.
+        let link = std::env::temp_dir().join(format!("vk-vms-link-{}", std::process::id()));
+        std::fs::remove_file(&link).ok();
+        std::os::unix::fs::symlink(&state, &link).unwrap();
+        let relinked = Path::new("/tier/relinked/runner.ext4");
+        note_service_image_in(&reg, &link, "db", relinked).unwrap();
+        assert_eq!(svc("db").stale_recipe.unwrap().root_ext4, relinked);
+        std::fs::remove_file(&link).ok();
+
+        // An entry that does not parse is reported, not skipped like `load_all_in` does and not
+        // a panic: the correction is best-effort, but a corrupt entry is worth saying out loud.
+        std::fs::write(reg.join(format!("{}.json", slug(&state))), b"{ not json").unwrap();
+        assert!(note_service_image_in(&reg, &state, "db", built).is_err());
+        std::fs::remove_dir_all(&reg).ok();
+    }
+
+    #[test]
+    fn concurrent_corrections_keep_the_entry_readable() {
+        // Two services brought up on demand at once arrive on their own threads, and every
+        // version of an entry is staged through one path keyed by the run — so unserialized
+        // writers interleave into it and publish something `load_all_in` then skips, taking
+        // the VM out of `vk list`. Both corrections must land, on one parseable entry.
+        let reg = tmpdir("reg-concurrent");
+        let state = canonical(&tmpdir("state-concurrent"));
+        let recipe = |ext4: &str| {
+            Some(StaleRecipe {
+                dockerfiles: vec![PathBuf::from("/ctx/Dockerfile")],
+                contexts: vec![PathBuf::from("/ctx")],
+                build_contexts: Vec::new(),
+                build_args: Vec::new(),
+                target: None,
+                root_ext4: PathBuf::from(ext4),
+            })
+        };
+        let names: Vec<String> = (0..8).map(|i| format!("svc{i}")).collect();
+        let mut e = entry(state.clone(), None);
+        e.services = names
+            .iter()
+            .map(|name| ServiceEntry {
+                name: name.clone(),
+                exec_addr: format!("vsock-auto:///tmp/{name}/vsock.sock:4444"),
+                stale_recipe: recipe("/tier/predicted/runner.ext4"),
+            })
+            .collect();
+        record_in(&reg, &e).unwrap();
+
+        std::thread::scope(|sc| {
+            for name in &names {
+                let (reg, state) = (reg.clone(), state.clone());
+                sc.spawn(move || {
+                    let built = PathBuf::from(format!("/tier/built-{name}/runner.ext4"));
+                    note_service_image_in(&reg, &state, name, &built).unwrap();
+                });
+            }
+        });
+
+        let all = load_all_in(&reg);
+        assert_eq!(
+            all.len(),
+            1,
+            "the entry must still parse, and stay the only one"
+        );
+        for name in &names {
+            let svc = all[0].services.iter().find(|s| &s.name == name).unwrap();
+            assert_eq!(
+                svc.stale_recipe.as_ref().unwrap().root_ext4,
+                PathBuf::from(format!("/tier/built-{name}/runner.ext4")),
+                "{name}'s correction was lost to a concurrent writer"
+            );
+        }
         std::fs::remove_dir_all(&reg).ok();
     }
 
