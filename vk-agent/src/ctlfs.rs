@@ -63,7 +63,7 @@ const NODES: [(Node, &str); 4] = [
 /// unit set is fixed for the owner's lifetime, so it is fetched once (with a
 /// grace retry — PID 1 forks us early in boot, the host side may still be
 /// binding its socket).
-pub fn run(mountpoint: &Path) -> Result<()> {
+pub fn run(mountpoint: &Path, owner: (u32, u32)) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -87,8 +87,9 @@ pub fn run(mountpoint: &Path) -> Result<()> {
         client: Mutex::new(client),
         units,
         errors: Mutex::new(HashMap::new()),
+        owner,
     };
-    // DefaultPermissions: the kernel enforces the modes (ctl is root-write-only);
+    // DefaultPermissions: the kernel enforces the modes (ctl is writable by its owner alone);
     // SessionACL::All (allow_other): every guest user may read states/logs.
     let mut opts = Config::default();
     opts.mount_options = vec![
@@ -118,6 +119,10 @@ struct CtlFs {
     units: Vec<String>,
     /// last failed ctl write per unit, served by its `error` file
     errors: Mutex<HashMap<usize, String>>,
+    /// uid:gid every node is attributed to — the run's own user (the image's `USER`), so a
+    /// primary that runs as that user can still drive its siblings through `ctl`, which is
+    /// writable by its owner alone. Root when the image declares none.
+    owner: (u32, u32),
 }
 
 impl CtlFs {
@@ -144,6 +149,8 @@ impl CtlFs {
             ROOT => (FileType::Directory, 0o555, 0),
             _ => match self.decode(ino)? {
                 (_, None) => (FileType::Directory, 0o555, 0),
+                // write-only, and to the owner alone: driving a sibling is the run's own
+                // business, not that of every user in the guest that may read the states.
                 (_, Some(Node::Ctl)) => (FileType::RegularFile, 0o200, 0),
                 // the kernel clamps reads at the attributed size even for
                 // direct-I/O opens, so a synthetic file must attribute its
@@ -167,8 +174,8 @@ impl CtlFs {
             kind,
             perm,
             nlink: if kind == FileType::Directory { 2 } else { 1 },
-            uid: 0,
-            gid: 0,
+            uid: self.owner.0,
+            gid: self.owner.1,
             rdev: 0,
             blksize: 4096,
             flags: 0,
@@ -397,5 +404,58 @@ impl Filesystem for CtlFs {
             }
         }
         reply.ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A server with no host behind it — enough for the attributes, which read no state. The
+    /// client connects lazily, so nothing here touches vsock; `state`/`log` would, so the
+    /// nodes exercised below are the dir, `ctl`, and `error` (served from the local map).
+    fn fs(owner: (u32, u32)) -> CtlFs {
+        CtlFs {
+            rt: tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+            client: Mutex::new(Client::new()),
+            units: vec!["db".into()],
+            errors: Mutex::new(HashMap::new()),
+            owner,
+        }
+    }
+
+    #[test]
+    fn the_control_nodes_are_the_run_user_s_and_ctl_is_write_only_to_it() {
+        // The run's user owns the tree, so a primary that is not root can write `ctl` — which is
+        // the owner's alone, while the states stay readable by everyone in the guest. The kernel
+        // enforces these against the numbers (`default_permissions`), so attributing them is the
+        // whole of the fix.
+        let f = fs((1500, 1500));
+        let ctl = FIRST + 1 + NODES.iter().position(|(n, _)| *n == Node::Ctl).unwrap() as u64;
+        let err = FIRST + 1 + NODES.iter().position(|(n, _)| *n == Node::Error).unwrap() as u64;
+
+        for ino in [ROOT, FIRST, ctl, err] {
+            let a = f.attr(ino).expect("a node of the declared unit");
+            assert_eq!(
+                (a.uid, a.gid),
+                (1500, 1500),
+                "ino {ino} is not the run user's"
+            );
+        }
+        assert_eq!(f.attr(ctl).unwrap().perm, 0o200);
+        assert_eq!(f.attr(err).unwrap().perm, 0o444);
+        assert_eq!(f.attr(ROOT).unwrap().perm, 0o555);
+        assert_eq!(f.attr(FIRST).unwrap().perm, 0o555);
+
+        // An image that declares no user leaves them root's, as they always were.
+        let r = fs((0, 0));
+        let a = r.attr(ctl).unwrap();
+        assert_eq!((a.uid, a.gid, a.perm), (0, 0, 0o200));
+
+        // Nothing is served for a unit that was never declared.
+        assert!(f.attr(FIRST + STRIDE).is_none());
     }
 }

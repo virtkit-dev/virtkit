@@ -19,10 +19,9 @@ All notable changes to virtkit will be documented in this file.
 - **An image's entrypoint booted as PID 1 runs as the image's `USER`.** `--init entrypoint` ran
   it as root while the same image booted as a compose service ran it as its declared user; one
   image now comes up as the same user either way. An entrypoint that goes on to exec an init
-  still needs root, as does driving compose siblings through `/run/vk/services` — declare
-  `user: root` to keep it — and an image whose passwd has no entry for the USER, or no `setpriv`
-  that can make the drop (busybox's takes neither `--reuid` nor `--regid`), says so and stays
-  root rather than failing from PID 1. Note that a dropped
+  still needs root — declare `user: root` to keep it — and an image whose passwd has no entry for
+  the USER, or no `setpriv` that can make the drop (busybox's takes neither `--reuid` nor
+  `--regid`), says so and stays root rather than failing from PID 1. Note that a dropped
   entrypoint spends the fallback to the image's init: PID 1 is `setpriv` by then, so an
   entrypoint it cannot start is terminal.
 
@@ -39,6 +38,13 @@ All notable changes to virtkit will be documented in this file.
   distribution.
 
 ### Fixed
+
+- **A compose primary that is not root can drive its siblings.** `/run/vk/services/<svc>/ctl`
+  was root's, so a primary running as the image's `USER` — which is now what `--init entrypoint`
+  boots as, and what a served command runs as — got `permission denied` writing `start`/`stop`
+  and could not control the group it was brought up with. The control nodes belong to the run's
+  own user now; `ctl` stays write-only to it, and the states and logs stay readable by everyone
+  in the guest.
 
 - **A VM that hands PID 1 to the image comes up on the network.** With `--net`, such a guest
   reached its own init or entrypoint with `eth0` unaddressed, so an appliance that configures

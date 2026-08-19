@@ -1752,13 +1752,54 @@ fn ctl_enabled(cmdline: &HashMap<String, String>) -> bool {
 /// VIRTKIT_CTL=1: fork the agent's `ctlfs` — the compose control plane mounted
 /// at /run/vk/services (each operation bridges to the host manager over vsock).
 /// Mounted one level down so /run/vk stays a plain directory with room for the
-/// run's other endpoints.
+/// run's other endpoints. Its nodes are attributed to the run's own user, so a
+/// primary that runs as the image's `USER` can drive its siblings — off the same
+/// `VIRTKIT_DEFAULT_RUN_USER` the exec server drops served commands by. The variable, not a
+/// `RunConfig`: the default path has none to read (a plain `vk run` carries no boot config),
+/// where only the `/etc/virtkit/user` capture names the user, and the run's other endpoints
+/// read it the same way.
 fn maybe_ctlfs(cmdline: &HashMap<String, String>) {
     if !ctl_enabled(cmdline) {
         return;
     }
-    if let Err(e) = fork_agent(&["ctlfs".into(), "/run/vk/services".into()]) {
+    let (uid, gid) = ctl_owner_ids(&std::env::var("VIRTKIT_DEFAULT_RUN_USER").unwrap_or_default());
+    if let Err(e) = fork_agent(&[
+        "ctlfs".into(),
+        "/run/vk/services".into(),
+        uid.to_string(),
+        gid.to_string(),
+    ]) {
         warn!("vk-agent init: control fs failed to start: {e}");
+    }
+}
+
+/// The ids the control fs attributes its nodes to. The run's own user owns them — writing a
+/// `ctl` file is the run's business, and a primary the image declares a `USER` for is not root
+/// once it drops (`--init entrypoint`) or once a served command does.
+///
+/// Resolved by the same [`vk_core::exec::server::resolve_user`] the served commands are dropped
+/// with, off the same `VIRTKIT_DEFAULT_RUN_USER` the exec server reads, so the owner is the uid
+/// those processes actually get: a `USER` the image's passwd does not list still resolves — as a
+/// bare uid with gid 0, the way `docker run --user <uid>` does — and a `user:group` spec takes
+/// its gid from the group half. `drop_ids_for_user` cannot share this: `setpriv --init-groups`
+/// needs a real passwd entry, where the kernel checking this mount needs only the number. So
+/// the two can disagree — an image with no usable `setpriv` keeps a root entrypoint while these
+/// nodes are the USER's; root writes them anyway (`CAP_DAC_OVERRIDE`), so the mismatch costs
+/// nothing and is not worth reconciling.
+///
+/// Root when the image declares no user, and when the spec does not resolve at all.
+fn ctl_owner_ids(user: &str) -> (u32, u32) {
+    if user.is_empty() || user == "root" {
+        return (0, 0);
+    }
+    match vk_core::exec::server::resolve_user(user) {
+        Ok(ru) => (ru.uid, ru.gid),
+        Err(e) => {
+            warn!(
+                "vk-agent init: USER {user} does not resolve ({e}) — the control fs stays root's"
+            );
+            (0, 0)
+        }
     }
 }
 
@@ -2459,6 +2500,34 @@ mod tests {
         assert_eq!(dirs.rw, "/run/virtkit-overlay/cibuild/rw");
         assert_eq!(dirs.upper, "/run/virtkit-overlay/cibuild/rw/upper");
         assert_eq!(dirs.work, "/run/virtkit-overlay/cibuild/rw/work");
+    }
+
+    #[test]
+    fn the_control_fs_belongs_to_the_run_s_own_user() {
+        // The run's user owns the control nodes, so a primary that is not root — an entrypoint
+        // that dropped to the image's USER, or a served stage that did — can still write `ctl`.
+        // An image that declares no USER leaves them root's, as does a *name* that resolves to
+        // nothing. A bare uid needs no passwd entry: the kernel compares the attributed number
+        // to the caller's fsuid (`default_permissions`).
+        assert_eq!(ctl_owner_ids(""), (0, 0));
+        assert_eq!(ctl_owner_ids("root"), (0, 0));
+        assert_eq!(ctl_owner_ids("0"), (0, 0));
+        // Only a spec that does not resolve at all falls back to root — an unknown *name*. A
+        // number always resolves, which is the point of the case below.
+        assert_eq!(ctl_owner_ids("nosuchuser-virtkit"), (0, 0));
+        // A uid the passwd does not list still owns them, as a bare uid with gid 0 — what the
+        // exec server drops such a `USER` to, and a distroless image's usual shape. Attributing
+        // the number is the whole job: the kernel checks this mount against it, not against a
+        // passwd entry.
+        assert_eq!(ctl_owner_ids("65532"), (65532, 0));
+        // A `user:group` spec takes its gid from the group half, as the drop does.
+        assert_eq!(ctl_owner_ids("65532:1500"), (65532, 1500));
+        // A name the image's passwd does have resolves to that entry's own ids.
+        if let Some((uid, gid)) = passwd_ids("daemon")
+            && uid != 0
+        {
+            assert_eq!(ctl_owner_ids("daemon"), (uid, gid));
+        }
     }
 
     #[test]

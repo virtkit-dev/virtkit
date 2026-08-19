@@ -168,12 +168,34 @@ enum Commands {
 fn main() {
     // The compose control filesystem (no --socket: it dials the manager over
     // vsock itself); handled before clap since init forks it with plain args.
-    let mut argv = std::env::args();
-    if argv.nth(1).as_deref() == Some("ctlfs") {
-        let mountpoint = std::env::args()
-            .nth(2)
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("ctlfs") {
+        let mountpoint = args
+            .get(2)
+            .cloned()
             .unwrap_or_else(|| "/run/vk/services".into());
-        if let Err(e) = vk_agent::ctlfs::run(std::path::Path::new(&mountpoint)) {
+        // uid:gid to attribute the nodes to, as init resolved them from the image's USER.
+        // Absent (both) means root — init always passes both, and a hand-run `ctlfs
+        // <mountpoint>` wants root. Anything else — unparsable, or only one of the pair —
+        // is a caller bug: defaulting it to root would hand back the very control plane
+        // the run cannot write.
+        let ids = match (args.get(3), args.get(4)) {
+            (None, None) => (0, 0),
+            (Some(uid), Some(gid)) => {
+                let parse = |s: &str| {
+                    s.parse::<u32>().unwrap_or_else(|_| {
+                        eprintln!("vk-agent ctlfs: {s:?} is not a uid/gid");
+                        std::process::exit(1);
+                    })
+                };
+                (parse(uid), parse(gid))
+            }
+            _ => {
+                eprintln!("vk-agent ctlfs: uid and gid must both be given, or neither");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = vk_agent::ctlfs::run(std::path::Path::new(&mountpoint), ids) {
             eprintln!("vk-agent ctlfs: {e:#}");
             std::process::exit(1);
         }
