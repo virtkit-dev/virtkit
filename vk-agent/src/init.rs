@@ -218,15 +218,16 @@ fn pivot_to_real_root() -> Result<bool> {
 /// entrypoint — so that becomes PID 1.
 ///
 /// What is applied is that list and nothing more — whatever takes PID 1 next brings the
-/// rest of the machine up itself (/sys, /dev/pts, /run, loopback, resolv.conf, tmpfs
-/// scratch), the way an init does. An entrypoint that needs those *without* exec'ing
+/// rest of the machine up itself (/dev/pts, /run, loopback, tmpfs scratch), the way an
+/// init does. An entrypoint that needs those *without* exec'ing
 /// an init belongs in `VIRTKIT_MODE=service`, which sets them up and forks it.
 ///
 /// Any modular image kernel's boot-critical modules are already loaded by the caller
 /// (`run_init`) before this runs — they must precede the pivot, which mounts the ext4
 /// rootfs at `/dev/vda`. The serves are forked just before the exec; once the exec hands
 /// PID 1 over, they reparent to the new PID 1 and keep carrying the run's `-- <cmd>` /
-/// ssh over vsock. Networking is left to the image (deferred).
+/// ssh over vsock. The guest's assigned address is applied before the handoff (see
+/// `configure_network_fullvm`); everything else about the network stays the image's.
 fn run_full_vm(
     socket: &SocketAddr,
     cmdline: &HashMap<String, String>,
@@ -242,12 +243,23 @@ fn run_full_vm(
     // pivot's MS_MOVE hid the initramfs mounts, so the new root has neither. /proc
     // is needed because `spawn_serve` execs `/proc/self/exe` (else exit 127); /dev
     // (devtmpfs) is needed for device nodes the setup opens, e.g. /dev/net/tun for
-    // the eth0 bridge. systemd re-mounts both after the handoff (already-mounted is
+    // the eth0 bridge. systemd re-mounts these after the handoff (already-mounted is
     // fine).
     let _ = std::fs::create_dir_all("/proc");
     let _ = mount("proc", "/proc", "proc", 0);
     let _ = std::fs::create_dir_all("/dev");
     let _ = mount("devtmpfs", "/dev", "devtmpfs", 0);
+    // /sys too: the interface state the setup below reads lives there
+    // (/sys/class/net/<iface>), so without it the agent cannot see even the tap it
+    // creates itself — it would look absent until the image's init mounted sysfs, long
+    // after the handoff. Worth a warning, unlike the two above: the only symptom of a
+    // missing /sys is an eth0 that never appears.
+    let _ = std::fs::create_dir_all("/sys");
+    if let Err(e) = mount("sysfs", "/sys", "sysfs", 0)
+        && e.raw_os_error() != Some(libc::EBUSY)
+    {
+        warn!("vk-agent image-init: mounting /sys failed: {e} — eth0 will look absent");
+    }
 
     // Apply only the virtkit-provided setup the image's own init won't do: the guest's name
     // (until the image's own init sets one), host volume mounts (`--volume`/`--workdir`),
@@ -1347,6 +1359,18 @@ fn net_args(port: &str, cmdline: &HashMap<String, String>) -> Vec<String> {
     args
 }
 
+/// The gateway to use when the run assigned an address but no `VIRTKIT_VM_GW` — the vk
+/// switch's own address in the default subnet. Every producer sets the param; this is the
+/// fallback both network paths share.
+const DEFAULT_GATEWAY: &str = "192.168.127.1";
+
+/// How long to wait for the switch to answer ARP for the gateway, in 100 ms tries. The ioctl
+/// sets the address instantly, but the forked bridge still has to dial the host switch before
+/// frames flow: a first DNS query dropped into a not-yet-forwarding bridge fails name
+/// resolution outright (getaddrinfo exhausts its retries). The switch itself answers ARP for
+/// the gateway, so the probe works under any egress policy.
+const GATEWAY_TRIES: u32 = 100;
+
 fn configure_network(cmdline: &HashMap<String, String>) {
     let Some(port) = cmdline.get("VIRTKIT_NET_PORT") else {
         return;
@@ -1369,38 +1393,40 @@ fn configure_network(cmdline: &HashMap<String, String>) {
     } else if let Some(ip) = cmdline.get("VIRTKIT_VM_IP") {
         let gw = cmdline
             .get("VIRTKIT_VM_GW")
-            .map_or("192.168.127.1", String::as_str);
+            .map_or(DEFAULT_GATEWAY, String::as_str);
         // ioctls, not `ip`: minimal glibc images (debian:*-slim) ship no iproute2, so
-        // shelling out left them with no address/route and a broken resolver.
+        // shelling out left them with no address/route and a broken resolver. The gateway
+        // wait is skipped when addressing failed — there is nothing to wait for.
         if let Err(e) = set_static_network(ip, gw) {
             warn!("vk-agent init: configuring eth0 {ip} via {gw} failed: {e:#}");
-        } else {
-            // The ioctl sets the address instantly, but the forked bridge still has to dial
-            // the host switch before frames flow. Block until the gateway answers ARP so the
-            // job's first DNS query isn't dropped into a not-yet-forwarding bridge (which
-            // fails name resolution outright — getaddrinfo exhausts its retries). The switch
-            // itself answers ARP for the gateway, so the probe works under any egress policy.
-            // Skipped when addressing failed above — there is nothing to wait for.
-            const GATEWAY_TRIES: u32 = 100;
-            if !wait_for_gateway(gw, GATEWAY_TRIES) {
-                warn!(
-                    "vk-agent init: gateway {gw} unreachable after {}s; continuing anyway",
-                    GATEWAY_TRIES / 10
-                );
-            }
+        } else if !wait_for_gateway(gw, GATEWAY_TRIES) {
+            warn!(
+                "vk-agent init: gateway {gw} unreachable after {}s; continuing anyway",
+                GATEWAY_TRIES / 10
+            );
         }
     }
     // DNS is written separately (write_resolv_conf) so it applies to the kernel `ip=`
     // pool net too, not just this vsock-bridge static path.
 }
 
-/// Full-VM networking: create the eth0 tap bridged to the vk switch over vsock and
-/// bring its link up, but leave *addressing* to the image's own DHCP client — so an
-/// image already set to DHCP eth0 needs no change. As a fallback for images not
-/// configured to DHCP, fork a child that waits a grace period and, if eth0 still has
-/// no address, runs `dhclient` itself. The bridge and the fallback child reparent to
-/// the image's init after the exec.
+/// Full-VM networking: create the eth0 tap bridged to the vk switch over vsock, bring
+/// its link up, and give it the address the run assigned this guest
+/// (`VIRTKIT_VM_IP`/`VIRTKIT_VM_GW`) — the same one the switch's DHCP would hand back,
+/// so applying it directly settles the address instead of waiting to see whether the
+/// image does. A run without an assigned address keeps the old behaviour: give the
+/// image's own client a grace period, then fall back to `dhclient`.
+///
+/// The assigned address is applied before the exec; only the DHCP fallback waits in a forked
+/// child, which reparents to the image's init after the exec — as the bridge itself does.
 fn configure_network_fullvm(cmdline: &HashMap<String, String>) {
+    // How long to wait for eth0 to appear, in 100 ms tries. The interface is the tap the
+    // agent creates itself, visible in /sys the moment the bridge helper makes it, so this
+    // is a guard against that helper failing to start — not a race to lose. The inline wait
+    // is paid before PID 1 is handed over, so it is the shorter of the two; the fallback
+    // child blocks nothing and keeps the 15 s it always waited.
+    const IFACE_TRIES: u32 = 100;
+    const IFACE_TRIES_FALLBACK: u32 = 150;
     let Some(port) = cmdline.get("VIRTKIT_NET_PORT") else {
         return;
     };
@@ -1408,29 +1434,67 @@ fn configure_network_fullvm(cmdline: &HashMap<String, String>) {
         warn!("vk-agent image-init: net bridge failed to start: {e}");
         return;
     }
-    // Fork a watcher rather than blocking here: the tap can take a moment to appear,
-    // and the image's own DHCP client races us. The watcher waits for eth0, gives the
-    // image a grace period to configure it, then falls back to dhclient. It reparents
-    // to the image's init after the exec below.
-    // SAFETY: single-threaded preinit (no tokio); the child only waits and runs a
-    // helper before _exit.
-    let pid = unsafe { libc::fork() };
-    if pid == 0 {
-        if !wait_for_iface("eth0", 150) {
-            warn!("vk-agent image-init: eth0 never appeared");
-            unsafe { libc::_exit(0) };
-        }
-        // Give the image's own DHCP client a head start; only step in if it didn't.
-        std::thread::sleep(Duration::from_secs(8));
-        if iface_configured("eth0") {
-            info!("vk-agent image-init: eth0 configured by the image");
+    if let Some(ip) = cmdline.get("VIRTKIT_VM_IP") {
+        let gw = cmdline
+            .get("VIRTKIT_VM_GW")
+            .map_or(DEFAULT_GATEWAY, String::as_str);
+        // Addressed here, before PID 1 is handed over: whatever runs next may need the
+        // network in its first seconds — an appliance that configures itself from the
+        // running interface does — and a child racing it cannot promise that. The tap is
+        // ours, so it appears as soon as the bridge helper above creates it.
+        //
+        // ioctls, not `ip`: minimal images ship no iproute2. An image client that DHCPs
+        // later lands on this same address — the switch's first pool lease is this guest's
+        // own index, and a sibling holds a per-MAC reservation — so this cannot disagree
+        // with what the image believes.
+        if !wait_for_iface("eth0", IFACE_TRIES) {
+            warn!("vk-agent image-init: eth0 never appeared — leaving it to the image");
+        } else if let Err(e) = set_static_network(ip, gw) {
+            warn!("vk-agent image-init: configuring eth0 {ip} via {gw} failed: {e:#}");
         } else {
-            info!("vk-agent image-init: image did not configure eth0 — running dhclient");
-            if !run_cmd("dhclient", &["-1", "eth0"]) {
-                warn!("vk-agent image-init: dhclient fallback failed (no dhcp client in image?)");
+            info!("vk-agent image-init: eth0 {ip} via {gw}");
+            // Wait for the gateway as the default path does: the address is instant, the
+            // forked bridge's dial to the switch is not, and what takes PID 1 next should
+            // not lose its first DNS query into a bridge that is not forwarding yet.
+            if !wait_for_gateway(gw, GATEWAY_TRIES) {
+                warn!(
+                    "vk-agent image-init: gateway {gw} unreachable after {}s; continuing anyway",
+                    GATEWAY_TRIES / 10
+                );
             }
         }
-        unsafe { libc::_exit(0) };
+    } else {
+        // No address assigned to this guest, so the image's own client owns addressing.
+        // Wait for it in a child (it may take a while, and nothing here should block the
+        // handoff on it), then step in with dhclient only if it did nothing.
+        // SAFETY: single-threaded preinit (no tokio); the child only waits and runs a
+        // helper before _exit.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            warn!(
+                "vk-agent image-init: fork for the dhclient fallback failed: {} — eth0 is \
+                 the image's alone",
+                io::Error::last_os_error()
+            );
+        } else if pid == 0 {
+            if !wait_for_iface("eth0", IFACE_TRIES_FALLBACK) {
+                warn!("vk-agent image-init: eth0 never appeared");
+                unsafe { libc::_exit(0) };
+            }
+            // Head start for the image's own client; step in only if it did nothing.
+            std::thread::sleep(Duration::from_secs(8));
+            if iface_configured("eth0") {
+                info!("vk-agent image-init: eth0 configured by the image");
+            } else {
+                info!("vk-agent image-init: image did not configure eth0 — running dhclient");
+                if !run_cmd("dhclient", &["-1", "eth0"]) {
+                    warn!(
+                        "vk-agent image-init: dhclient fallback failed (no dhcp client in image?)"
+                    );
+                }
+            }
+            unsafe { libc::_exit(0) };
+        }
     }
     // Seed /etc/resolv.conf with the switch's resolver so name resolution works even
     // on images that DHCP an address but don't wire up DNS (no systemd-resolved).

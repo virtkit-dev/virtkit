@@ -687,8 +687,8 @@ async fn build_and_boot(
         );
     }
     // The image-init preinit applies the virtkit setup the image's own init won't do (the
-    // guest's name, host volume mounts, symlinks, the ssh/exec serves, env, and an eth0
-    // bridge the image DHCPs on) before it hands PID 1 over. The host-exec channel, compose
+    // guest's name, host volume mounts, symlinks, the ssh/exec serves, env, and an eth0 bridge
+    // on the run-assigned address) before it hands PID 1 over. The host-exec channel, compose
     // and an interactive pty (--shell or -t) are not wired for an image PID 1 yet, and an idle
     // watchdog has nothing to power the VM off once the image owns PID 1 — reject them rather
     // than silently ignore.

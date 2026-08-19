@@ -15,6 +15,10 @@ echo "VIRTKIT_ENTRYPOINT_RAN pid=$$ args=$*" > /var/log/virtkit-entrypoint
 # /proc/sys/kernel/hostname rather than hostname(1): the preinit mounts /proc, and a
 # minimal image need not ship the binary.
 echo "VIRTKIT_ENTRYPOINT_HOSTNAME=$(cat /proc/sys/kernel/hostname)" >> /var/log/virtkit-entrypoint
+# And its address: virtkit applies the run-assigned one before the handoff, so an appliance
+# configuring itself from the running interface has something to read.
+echo "VIRTKIT_ENTRYPOINT_IPV4=$(ip -4 -o addr show eth0 | awk '{print $4}')" \
+  >> /var/log/virtkit-entrypoint
 
 # The preparation itself — a service that exists only because the entrypoint ran.
 cat > /etc/systemd/system/virtkit-assembled.service <<'UNIT'

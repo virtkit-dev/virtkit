@@ -6,6 +6,12 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A VM that hands PID 1 to the image comes up on the network.** With `--net`, such a guest
+  reached its own init or entrypoint with `eth0` unaddressed, so an appliance that configures
+  itself from the running interface had nothing to read and failed outright. The address the
+  run assigned is now in place before the image takes over; an image that runs its own DHCP
+  client later still lands on it.
+
 - **A VM that hands PID 1 to the image comes up with a name.** Such a guest booted nameless:
   an entrypoint that prepares the machine read the kernel's `(none)` where it expected the
   guest's name, and a declared `hostname:` never reached it at all. The name — and the

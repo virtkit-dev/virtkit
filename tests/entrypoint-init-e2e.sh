@@ -4,8 +4,8 @@
 # =====================================================================================
 # Boot an image whose ENTRYPOINT prepares the machine and only then execs the real init,
 # and confirm all three links of the chain: the entrypoint ran as PID 1, the service it
-# assembled at boot exists, and systemd took PID 1 over from it — plus the precondition
-# the first link needs, that the guest was named before the handoff.
+# assembled at boot exists, and systemd took PID 1 over from it — plus the preconditions
+# the first link needs, that the guest was named and addressed before the handoff.
 #
 # `--init image` fails the first two by construction: it hands PID 1 straight to
 # /sbin/init, so the preparation is skipped and only systemd itself comes up.
@@ -28,7 +28,7 @@ echo "== build the entrypoint-execs-systemd image and boot it as a full VM in on
 # config, not the kernel cmdline); `--kernel image` boots the image's own kernel, so this
 # is the same preinit path `--init image` takes and differs only in what it execs.
 if ! out="$(
-  "$VK" run --init entrypoint --kernel image -f "$df" --context "$ctx" -- \
+  "$VK" run --init entrypoint --kernel image --net -f "$df" --context "$ctx" -- \
     sh -c '
       # The vk-agent serve is reachable the instant it forks — before the entrypoint has
       # exec'"'"'d systemd, let alone before systemd finished booting. Poll for a run
@@ -71,5 +71,10 @@ grep -q 'VIRTKIT_ASSEMBLED_UNIT_RAN' <<<"$out" \
 #    kernel default `(none)`. `vm` is the name a run without a compose `hostname:` assigns.
 grep -q '^VIRTKIT_ENTRYPOINT_HOSTNAME=vm$' <<<"$out" \
   || { echo "FAIL: the entrypoint ran before the guest was named"; exit 1; }
+# 6. eth0 carried the run-assigned address before the handoff, so the entrypoint could
+#    configure itself from the running interface. .2/24 is what a `vk run --net` switch
+#    assigns the first guest in the default subnet.
+grep -q '^VIRTKIT_ENTRYPOINT_IPV4=192\.168\.127\.2/24$' <<<"$out" \
+  || { echo "FAIL: the entrypoint ran before eth0 was addressed"; exit 1; }
 
 echo "PASS: the image entrypoint ran as PID 1, prepared the machine, and handed off to systemd"
