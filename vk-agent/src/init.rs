@@ -41,7 +41,9 @@
 //!                        atop-parseable sample of this guest's /proc per interval,
 //!                        appended to <mountpoint>/atop.log (see the `atop` module)
 //!   VIRTKIT_CTL=1        mount the compose control fs at /run/vk/services (a FUSE
-//!                        bridge to the host service manager over vsock)
+//!                        bridge to the host service manager over vsock). Honored on
+//!                        the full-VM path too, which claims /run as a tmpfs first so
+//!                        the image's own init does not mount over the bridge
 //!   VIRTKIT_HOST_EXEC_PORT  host command channel: present /run/vk/host.sock and
 //!                        relay it over this vsock port to the host's `vk-agent
 //!                        serve` (whose --exec-wrapper enforces the allowlist)
@@ -218,9 +220,11 @@ fn pivot_to_real_root() -> Result<bool> {
 /// entrypoint — so that becomes PID 1.
 ///
 /// What is applied is that list and nothing more — whatever takes PID 1 next brings the
-/// rest of the machine up itself (/dev/pts, /run, loopback, tmpfs scratch), the way an
-/// init does. An entrypoint that needs those *without* exec'ing
-/// an init belongs in `VIRTKIT_MODE=service`, which sets them up and forks it.
+/// rest of the machine up itself (/dev/pts, /run, loopback, tmpfs scratch), the way an init
+/// does. An entrypoint that needs those *without* exec'ing an init belongs in
+/// `VIRTKIT_MODE=service`, which sets them up and forks it. /run is the one exception, and
+/// only under `--compose`: the control fs mounted in it has to outlive the handoff, so
+/// [`claim_run_tmpfs`] gets there first.
 ///
 /// Any modular image kernel's boot-critical modules are already loaded by the caller
 /// (`run_init`) before this runs — they must precede the pivot, which mounts the ext4
@@ -277,16 +281,19 @@ fn run_full_vm(
     load_image_env();
     apply_boot_config(cfg);
     materialize_env(cfg);
+    claim_run_tmpfs(cmdline); // before the shares: a volume under /run must land on that tmpfs
     mount_virtiofs(cmdline)?;
     apply_symlinks(cmdline);
     configure_network_fullvm(cmdline);
 
     // The vsock services the run exposes, forked before the exec so they reparent to
     // systemd and keep serving: ssh-serve (`--ssh`), the host-agent forwarder
-    // (`--ssh-agent`), and the exec channel that carries `-- <cmd>`. The first two are
-    // gated on their cmdline params.
+    // (`--ssh-agent`), the compose control fs at /run/vk/services (`--compose`), and the
+    // exec channel that carries `-- <cmd>`. All but the last are gated on their cmdline
+    // params.
     maybe_ssh_serve(cmdline);
     maybe_ssh_agent(cmdline);
+    maybe_ctlfs(cmdline);
     let _serve = spawn_serve(socket, None)?;
 
     // Only the entrypoint axis chdirs: /sbin/init neither has nor wants a workdir. It
@@ -519,7 +526,7 @@ fn mount_api_filesystems() -> Result<()> {
                 )
             })
         } else {
-            mount_tmpfs_keep_dirs(target, libc::MS_NOSUID | libc::MS_NODEV)
+            mount_tmpfs_keep_dirs(target, libc::MS_NOSUID | libc::MS_NODEV, "")
         };
         if let Err(e) = res
             && e.raw_os_error() != Some(libc::EBUSY)
@@ -578,10 +585,11 @@ fn tmp_dev_from_cmdline() -> Option<String> {
         .find_map(|t| t.strip_prefix("VIRTKIT_TMP_DEV=").map(str::to_string))
 }
 
-/// Mount a fresh tmpfs on `target`, first snapshotting its underlying top-level
-/// directories (name, mode, uid, gid) and recreating them on the new tmpfs — so a
-/// service's baked runtime dir (e.g. /run/redis owned by redis) isn't hidden.
-fn mount_tmpfs_keep_dirs(target: &str, flags: libc::c_ulong) -> io::Result<()> {
+/// Mount a fresh tmpfs on `target` with `data` as its tmpfs options (empty for the
+/// kernel defaults), first snapshotting its underlying top-level directories (name, mode,
+/// uid, gid) and recreating them on the new tmpfs — so a service's baked runtime dir
+/// (e.g. /run/redis owned by redis) isn't hidden.
+fn mount_tmpfs_keep_dirs(target: &str, flags: libc::c_ulong, data: &str) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let mut dirs: Vec<(std::ffi::OsString, u32, u32, u32)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(target) {
@@ -593,7 +601,7 @@ fn mount_tmpfs_keep_dirs(target: &str, flags: libc::c_ulong) -> io::Result<()> {
             }
         }
     }
-    mount("tmpfs", target, "tmpfs", flags)?;
+    mount_data("tmpfs", target, "tmpfs", flags, data)?;
     for (name, mode, uid, gid) in dirs {
         let path = std::path::Path::new(target).join(&name);
         if std::fs::create_dir(&path).is_ok() {
@@ -1610,16 +1618,63 @@ fn wait_for_iface(name: &str, tries: u32) -> bool {
     false
 }
 
+/// Whether the run manages compose services (`VIRTKIT_CTL=1`) — the one gate
+/// `claim_run_tmpfs` and `maybe_ctlfs` must agree on, since a claim without the control fs
+/// is a pointless tmpfs and a control fs without the claim is the mount an image's init
+/// hides.
+fn ctl_enabled(cmdline: &HashMap<String, String>) -> bool {
+    cmdline.get("VIRTKIT_CTL").map(String::as_str) == Some("1")
+}
+
 /// VIRTKIT_CTL=1: fork the agent's `ctlfs` — the compose control plane mounted
 /// at /run/vk/services (each operation bridges to the host manager over vsock).
 /// Mounted one level down so /run/vk stays a plain directory with room for the
 /// run's other endpoints.
 fn maybe_ctlfs(cmdline: &HashMap<String, String>) {
-    if cmdline.get("VIRTKIT_CTL").map(String::as_str) != Some("1") {
+    if !ctl_enabled(cmdline) {
         return;
     }
     if let Err(e) = fork_agent(&["ctlfs".into(), "/run/vk/services".into()]) {
         warn!("vk-agent init: control fs failed to start: {e}");
+    }
+}
+
+// The flags and tmpfs options systemd's own `mount_setup` mounts /run with (`mode=0755` +
+// `TMPFS_LIMITS_RUN`, systemd v257), so a /run claimed by `claim_run_tmpfs` carries the same
+// mount options as the one the image's init would have made — rather than a kernel-default
+// tmpfs capped only at ½·guest-RAM with a 1777 world-writable root (see the /tmp note in
+// `mount_api_filesystems`).
+const RUN_TMPFS_FLAGS: libc::c_ulong = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_STRICTATIME;
+const RUN_TMPFS_DATA: &str = "mode=0755,size=20%,nr_inodes=800k";
+
+/// VIRTKIT_CTL=1 in the full-VM path: claim /run as a tmpfs before the control fs is
+/// mounted under it. An init that finds nothing mounted on /run mounts its own tmpfs
+/// there — which would hide the FUSE mount underneath it, leaving /run/vk/services in
+/// /proc/self/mounts and unreachable — while one that finds /run already a mount point
+/// leaves it alone (systemd checks exactly that, in `mount_one`, for every API mount
+/// point it sets up). The image's baked /run dirs are recreated on the new tmpfs, so a
+/// service's runtime dir (e.g. /run/redis) survives the claim.
+///
+/// Should an init ever mount over a claimed /run anyway, the control fs goes back to being
+/// unreachable — what the full-VM path did before it was mounted at all — and nothing else
+/// about the boot changes.
+///
+/// The default path needs none of this: `mount_api_filesystems` already put /run on a
+/// tmpfs and no image init follows it.
+fn claim_run_tmpfs(cmdline: &HashMap<String, String>) {
+    if !ctl_enabled(cmdline) {
+        return;
+    }
+    // As `mount_api_filesystems` does: an image that ships no /run (FROM scratch) has
+    // nothing to mount on otherwise.
+    let _ = std::fs::create_dir_all("/run");
+    if let Err(e) = mount_tmpfs_keep_dirs("/run", RUN_TMPFS_FLAGS, RUN_TMPFS_DATA) {
+        // Mount the control fs anyway: an image whose init leaves /run alone still gets a
+        // working one, and one that does not is no worse off than before.
+        warn!(
+            "vk-agent image-init: mounting /run failed: {e} — the control fs may not \
+             survive the image's own init"
+        );
     }
 }
 

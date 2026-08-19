@@ -37,7 +37,8 @@ const WANTED_MODULES: &[&str] = &[
     "mbcache",
     "jbd2",
     "ext4",
-    // fuse + virtiofs so the preinit can mount --volume/--workdir host shares.
+    // fuse + virtiofs so the preinit can mount --volume/--workdir host shares and the
+    // compose control fs (--compose).
     "fuse",
     "virtiofs",
     // tun so the preinit can create the eth0 tap bridged to the vk switch (--net).

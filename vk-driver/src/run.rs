@@ -687,11 +687,11 @@ async fn build_and_boot(
         );
     }
     // The image-init preinit applies the virtkit setup the image's own init won't do (the
-    // guest's name, host volume mounts, symlinks, the ssh/exec serves, env, and an eth0 bridge
-    // on the run-assigned address) before it hands PID 1 over. The host-exec channel, compose
-    // and an interactive pty (--shell or -t) are not wired for an image PID 1 yet, and an idle
-    // watchdog has nothing to power the VM off once the image owns PID 1 — reject them rather
-    // than silently ignore.
+    // guest's name, host volume mounts, symlinks, the ssh/exec serves, the compose control fs,
+    // env, and an eth0 bridge on the run-assigned address) before it hands PID 1 over. The
+    // host-exec channel and an interactive pty (--shell or -t) are not wired for an image
+    // PID 1 yet, and an idle watchdog has nothing to power the VM off once the image owns
+    // PID 1 — reject them rather than silently ignore.
     // Named on its own, because unlike the rest it has somewhere to send the operator: the
     // image's init leaves no agent at PID 1 to fork the sampler, but the reparented agent
     // still serves the exec channel, which is what an attach records over.
@@ -705,7 +705,6 @@ async fn build_and_boot(
     if args.init.is_image() {
         let unsupported = [
             (args.host_exec, "--host-exec"),
-            (args.compose.is_some(), "--compose"),
             (args.shell, "--shell"),
             (args.tty, "-t"),
             (
@@ -942,9 +941,8 @@ async fn build_and_boot(
     // than warned about on a guest console a successful run never prints. Read off the
     // merged config, so a compose `entrypoint:`/`command:` counts as naming one.
     if eff_init == InitSource::Entrypoint && image_entrypoint.is_empty() && image_cmd.is_empty() {
-        // The axis reaches here from the flag or from a --primary service's marker, never
-        // both: `--init entrypoint` with `--compose` was rejected far above, and --primary
-        // implies --compose. Name whichever one the operator actually wrote.
+        // The axis can reach here from the flag or from a --primary service's marker, or
+        // both; the flag overrides every marker, so name it in preference.
         let axis = if args.init == InitSource::Entrypoint {
             "--init entrypoint"
         } else {

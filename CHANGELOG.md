@@ -4,6 +4,16 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A compose group whose primary is a full VM.** A primary that hands PID 1 to the image
+  itself — `--init image` / `--init entrypoint`, or the matching `x-virtkit: { init: … }`
+  marker — came up with no `/run/vk/services`, so nothing inside a systemd guest could read
+  a sibling service's state or start and stop one, and asking for the pair on the command
+  line was refused outright. Both now work: the control files are there, they outlive the
+  handoff to the image's own init, and a full-VM primary drives its siblings with the same
+  plain shell writes as any other primary.
+
 ### Fixed
 
 - **A VM that hands PID 1 to the image comes up on the network.** With `--net`, such a guest
