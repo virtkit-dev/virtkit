@@ -4,7 +4,8 @@
 # =====================================================================================
 # Boot an image whose ENTRYPOINT prepares the machine and only then execs the real init,
 # and confirm all three links of the chain: the entrypoint ran as PID 1, the service it
-# assembled at boot exists, and systemd took PID 1 over from it.
+# assembled at boot exists, and systemd took PID 1 over from it — plus the precondition
+# the first link needs, that the guest was named before the handoff.
 #
 # `--init image` fails the first two by construction: it hands PID 1 straight to
 # /sbin/init, so the preparation is skipped and only systemd itself comes up.
@@ -66,5 +67,9 @@ grep -Eq '^system-state: (running|degraded)$' <<<"$out" \
 # 4. the unit the entrypoint assembled at boot ran => the preparation reached systemd.
 grep -q 'VIRTKIT_ASSEMBLED_UNIT_RAN' <<<"$out" \
   || { echo "FAIL: the entrypoint-assembled unit did not run"; exit 1; }
+# 5. the guest was named before the handoff, so the entrypoint read a name and not the
+#    kernel default `(none)`. `vm` is the name a run without a compose `hostname:` assigns.
+grep -q '^VIRTKIT_ENTRYPOINT_HOSTNAME=vm$' <<<"$out" \
+  || { echo "FAIL: the entrypoint ran before the guest was named"; exit 1; }
 
 echo "PASS: the image entrypoint ran as PID 1, prepared the machine, and handed off to systemd"

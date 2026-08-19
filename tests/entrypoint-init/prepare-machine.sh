@@ -10,6 +10,11 @@ set -eu
 # The argv goes in too: it is the image's CMD, so recording it proves ENTRYPOINT+CMD
 # arrived whole rather than just the entrypoint.
 echo "VIRTKIT_ENTRYPOINT_RAN pid=$$ args=$*" > /var/log/virtkit-entrypoint
+# The guest's name as the entrypoint sees it — virtkit sets it before the handoff, so an
+# appliance preparing the machine reads a real name and not the kernel default `(none)`.
+# /proc/sys/kernel/hostname rather than hostname(1): the preinit mounts /proc, and a
+# minimal image need not ship the binary.
+echo "VIRTKIT_ENTRYPOINT_HOSTNAME=$(cat /proc/sys/kernel/hostname)" >> /var/log/virtkit-entrypoint
 
 # The preparation itself — a service that exists only because the entrypoint ran.
 cat > /etc/systemd/system/virtkit-assembled.service <<'UNIT'

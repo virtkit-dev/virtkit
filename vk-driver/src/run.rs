@@ -686,12 +686,12 @@ async fn build_and_boot(
             "--atop needs --state-dir: the recording lives in it, and `vk atop` finds the VM by it"
         );
     }
-    // The image-init preinit applies the virtkit setup the image's own init won't do (host
-    // volume mounts, symlinks, the ssh/exec serves, env, and an eth0 bridge the image DHCPs
-    // on) before it hands PID 1 over. The host-exec channel, compose and an interactive pty
-    // (--shell or -t) are not wired for an image PID 1 yet, and an idle watchdog has nothing
-    // to power the VM off once the image owns PID 1 — reject them rather than silently
-    // ignore.
+    // The image-init preinit applies the virtkit setup the image's own init won't do (the
+    // guest's name, host volume mounts, symlinks, the ssh/exec serves, env, and an eth0
+    // bridge the image DHCPs on) before it hands PID 1 over. The host-exec channel, compose
+    // and an interactive pty (--shell or -t) are not wired for an image PID 1 yet, and an idle
+    // watchdog has nothing to power the VM off once the image owns PID 1 — reject them rather
+    // than silently ignore.
     // Named on its own, because unlike the rest it has somewhere to send the operator: the
     // image's init leaves no agent at PID 1 to fork the sampler, but the reparented agent
     // still serves the exec channel, which is what an attach records over.

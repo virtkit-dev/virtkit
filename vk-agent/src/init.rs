@@ -212,14 +212,14 @@ fn pivot_to_real_root() -> Result<bool> {
 }
 
 /// Image-init handoff (`vk run --init image|entrypoint`): pivot into the real root,
-/// apply the virtkit-provided setup the image's init won't do itself (host volume
-/// mounts, symlinks, the ssh and exec serves, image env), fork a reparented `vk-agent
-/// serve`, then exec what `axis` names — the image's own init (systemd), or its
+/// apply the virtkit-provided setup the image's init won't do itself (the guest's name,
+/// host volume mounts, symlinks, the ssh and exec serves, image env), fork a reparented
+/// `vk-agent serve`, then exec what `axis` names — the image's own init (systemd), or its
 /// entrypoint — so that becomes PID 1.
 ///
 /// What is applied is that list and nothing more — whatever takes PID 1 next brings the
-/// rest of the machine up itself (/sys, /dev/pts, /run, loopback, hostname, resolv.conf,
-/// tmpfs scratch), the way an init does. An entrypoint that needs those *without* exec'ing
+/// rest of the machine up itself (/sys, /dev/pts, /run, loopback, resolv.conf, tmpfs
+/// scratch), the way an init does. An entrypoint that needs those *without* exec'ing
 /// an init belongs in `VIRTKIT_MODE=service`, which sets them up and forks it.
 ///
 /// Any modular image kernel's boot-critical modules are already loaded by the caller
@@ -249,10 +249,19 @@ fn run_full_vm(
     let _ = std::fs::create_dir_all("/dev");
     let _ = mount("devtmpfs", "/dev", "devtmpfs", 0);
 
-    // Apply only the virtkit-provided setup the image's own init won't do: host
-    // volume mounts (`--volume`/`--workdir`), symlinks, an eth0 bridge to the vk
-    // switch, and the run's env (so the served command and ssh sessions inherit it).
-    // Each is a no-op unless its cmdline param is set.
+    // Apply only the virtkit-provided setup the image's own init won't do: the guest's name
+    // (until the image's own init sets one), host volume mounts (`--volume`/`--workdir`),
+    // symlinks, an eth0 bridge to the vk switch, and the run's env (so the served command
+    // and ssh sessions inherit it). Each is a no-op unless its cmdline param is set.
+    //
+    // The name first, because what runs next reads it: an entrypoint that prepares the
+    // machine (an appliance assembling itself) asks for the hostname long before any init
+    // would set one, and without this it reads the kernel default `(none)` — which is not
+    // a valid hostname to pass on. An image that ships /etc/hostname renames the host once
+    // its own init applies that, leaving the /etc/hosts self-entry under the name set here —
+    // harmless (it never shadows a *.lan DNS answer), and what the default path already does.
+    set_hostname(cmdline);
+    write_self_hosts(cmdline);
     load_image_env();
     apply_boot_config(cfg);
     materialize_env(cfg);

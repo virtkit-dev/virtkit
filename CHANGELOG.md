@@ -6,6 +6,12 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A VM that hands PID 1 to the image comes up with a name.** Such a guest booted nameless:
+  an entrypoint that prepares the machine read the kernel's `(none)` where it expected the
+  guest's name, and a declared `hostname:` never reached it at all. The name — and the
+  matching self-entry in `/etc/hosts` — is now in place before the image takes over; an
+  image that ships its own `/etc/hostname` still wins.
+
 - **A service built on its first `vk service up` boots the image that build produced.** A
   service a profile excludes is built only when it is first brought up; if anything in its
   build context had changed since the run started, the boot still went looking for the image
