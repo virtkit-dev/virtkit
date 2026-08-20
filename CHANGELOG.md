@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-08-20
+
 ### Added
 
 - **Persistent volumes with full POSIX ownership.** A `host:guest:disk` volume (compose or
@@ -1738,7 +1740,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.37.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.38.0...HEAD
+[0.38.0]: https://github.com/virtkit-dev/virtkit/compare/v0.37.0...v0.38.0
 [0.37.0]: https://github.com/virtkit-dev/virtkit/compare/v0.36.0...v0.37.0
 [0.36.0]: https://github.com/virtkit-dev/virtkit/compare/v0.35.0...v0.36.0
 [0.35.0]: https://github.com/virtkit-dev/virtkit/compare/v0.34.0...v0.35.0
