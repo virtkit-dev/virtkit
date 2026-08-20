@@ -12,6 +12,8 @@ All notable changes to virtkit will be documented in this file.
   (a compose sibling service, say). No SSH, and no new port needs to be wired into the
   VM ahead of time.
 
+- **`vk check --feature publish` asks a `vk` whether it can run `vk publish`.**
+
 ### Fixed
 
 - **Cached build stages restore concurrently instead of one at a time.** Build concurrency

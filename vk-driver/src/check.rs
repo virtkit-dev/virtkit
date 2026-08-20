@@ -3,7 +3,8 @@
 //! and that each feature the config enables has its host side in place (net.mode
 //! taps, [docker] credentials, [registry] store/credentials, ...). Some features
 //! are checked only when named with `--feature`: the CI-executor ones (gitlab,
-//! services), and the capability probes a script asks this build about (entrypoint).
+//! services), and the capability probes a script asks this build about (entrypoint,
+//! publish).
 //! Prints one line per check; the caller turns "any check failed" into the exit code.
 
 use std::os::fd::AsRawFd;
@@ -37,18 +38,21 @@ pub enum Feature {
     Usage,
     /// this build can hand PID 1 to the image's own entrypoint (`--init entrypoint`)
     Entrypoint,
+    /// this build can relay a local connection into a guest's network (`vk publish`)
+    Publish,
 }
 
 impl Feature {
     /// Features the default sweep leaves out, each for its own reason. The CI-executor
     /// ones (the gitlab runner and its sibling service VMs) probe state dirs under a
     /// root-owned default path, so sweeping them would fail every host that just boots
-    /// VMs without running CI. `Entrypoint` answers a question about this build rather
-    /// than about the host, so it belongs where a script asks for it and nowhere else.
+    /// VMs without running CI. `Entrypoint` and `Publish` answer a question about this
+    /// build rather than about the host, so they belong where a script asks for them
+    /// and nowhere else.
     fn on_request_only(self) -> bool {
         matches!(
             self,
-            Feature::Gitlab | Feature::Services | Feature::Entrypoint
+            Feature::Gitlab | Feature::Services | Feature::Entrypoint | Feature::Publish
         )
     }
 
@@ -65,6 +69,7 @@ impl Feature {
             Feature::Services => "services",
             Feature::Usage => "usage",
             Feature::Entrypoint => "entrypoint",
+            Feature::Publish => "publish",
         }
     }
 }
@@ -169,6 +174,7 @@ fn evaluate(cfg: &Config, feature: Feature) -> Outcome {
         Feature::Services => services(cfg),
         Feature::Usage => usage(),
         Feature::Entrypoint => entrypoint(),
+        Feature::Publish => publish(),
     }
 }
 
@@ -193,6 +199,24 @@ fn entrypoint() -> Outcome {
         Some(src) => ok(format!("--init {axes}; agent {src} execs it as PID 1")),
         None => fail(format!(
             "--init {axes}, but no agent to exec it: nothing embedded and {} missing",
+            Asset::Agent.default_path()
+        )),
+    }
+}
+
+/// Whether this `vk` can run `vk publish`. Asked for by name and never swept, for the
+/// same reason as `entrypoint`: it is a property of the binary, not the host, and a
+/// `vk` too old to have the command rejects the feature name outright rather than
+/// reaching here.
+///
+/// The host side is the same agent asset `entrypoint`/`kernel` check for: `CmdConnect`
+/// rides the agent's own control channel, so a `vk` with no agent to embed or find has
+/// nothing to ask to dial out from a guest.
+fn publish() -> Outcome {
+    match asset_source(Asset::Agent) {
+        Some(src) => ok(format!("agent {src} understands `vk publish` (CmdConnect)")),
+        None => fail(format!(
+            "no agent to ask: nothing embedded and {} missing",
             Asset::Agent.default_path()
         )),
     }
@@ -570,14 +594,15 @@ mod tests {
     }
 
     // Named-only features run just when asked for: the CI-executor ones probe root-owned
-    // default state dirs, and `entrypoint` answers for the build, not the host. The default
-    // sweep covers everything else.
+    // default state dirs, and `entrypoint`/`publish` answer for the build, not the host.
+    // The default sweep covers everything else.
     #[test]
     fn default_sweep_omits_the_named_only_features() {
         let sweep = default_sweep();
         assert!(!sweep.contains(&Feature::Gitlab));
         assert!(!sweep.contains(&Feature::Services));
         assert!(!sweep.contains(&Feature::Entrypoint));
+        assert!(!sweep.contains(&Feature::Publish));
         for f in <Feature as clap::ValueEnum>::value_variants() {
             assert_eq!(sweep.contains(f), !f.on_request_only());
         }
@@ -597,6 +622,15 @@ mod tests {
             "{}",
             outcome.detail
         );
+        assert_ne!(outcome.status, Status::Skip);
+    }
+
+    // Same shape as the entrypoint probe: never skips (a `cargo test` binary embeds no
+    // agent, so this fails rather than declining to answer), and a `vk` without the
+    // command never reaches this — clap rejects the feature name first.
+    #[test]
+    fn the_publish_probe_never_skips() {
+        let outcome = evaluate(&Config::default(), Feature::Publish);
         assert_ne!(outcome.status, Status::Skip);
     }
 
