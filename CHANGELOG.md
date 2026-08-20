@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A restarted compose sibling became unreachable by its peers.** Its own reboot
+  deleted the network switch's routing socket to it along with its own stale
+  control sockets, and the switch never redials a path a sibling's restart erased.
+
 ## [0.39.0] - 2026-08-20
 
 ### Added

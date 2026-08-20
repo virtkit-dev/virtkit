@@ -365,11 +365,7 @@ pub fn boot_unit(
 
     let _ = std::fs::remove_file(&overlay);
     create_overlay(&svc.ext4, &overlay)?;
-    // Not just the base `vsock.sock`: a repeat `vk service up` after a `down` reuses
-    // this same `dir`, and a stale per-port file (`vsock.sock_4444`, …) left over from
-    // the previous boot makes libkrun's `krun_add_vsock_port2` fail (EEXIST) even
-    // though nothing is listening on it any more.
-    crate::run::remove_stale_sockets(dir)?;
+    remove_stale_exec_socket(&vsock);
 
     // The init/kernel axes are a uniform per-unit property (from the unit's compose
     // `x-virtkit` marker), applied identically here for a sibling and in the primary
@@ -624,6 +620,25 @@ pub fn boot_unit(
     }
 }
 
+/// Unlink `vsock` (the base hybrid-vsock socket) and its exec-port suffix
+/// (`vsock.sock_<VSOCK_PORT>`) before a boot rebinds them — a repeat `vk service up`
+/// after a `down` reuses the same `dir`, and a stale file left over from the
+/// previous boot makes libkrun's `krun_add_vsock_port2` fail (EEXIST) even though
+/// nothing is listening on it any more.
+///
+/// Deliberately narrower than `run::remove_stale_sockets`: it must NOT touch the
+/// bridge port (`vsock.sock_<net_port>`), because that one belongs to the switch —
+/// a long-lived peer of the whole compose run, not of this one unit — which dials
+/// it once and never redials. Removing it here would boot a unit whose own network
+/// interface configures fine while every peer sees "no route to host", because the
+/// switch is never coming back to redial a path this unit's own restart erased.
+fn remove_stale_exec_socket(vsock: &Path) {
+    // Best-effort: absent is the common case (first boot), and any file this fails
+    // to remove surfaces immediately as EEXIST from `krun_add_vsock_port2` on bind.
+    let _ = std::fs::remove_file(vsock);
+    let _ = std::fs::remove_file(vk_core::net::hybrid_socket(vsock, VSOCK_PORT));
+}
+
 /// Create a CoW qcow2 `overlay` over the ro raw `ext4` base. The backing reference is
 /// stored verbatim, so canonicalize the base to an absolute path — a relative one would
 /// be resolved against the overlay's directory and break.
@@ -739,5 +754,26 @@ mod tests {
         assert!(nth_static_ip(gw, 33, 0).is_err());
         assert!(nth_static_ip(gw, 32, 0).is_err());
         assert!(nth_static_ip(gw, 31, 0).is_err());
+    }
+
+    #[test]
+    fn remove_stale_exec_socket_spares_the_bridge_port() {
+        let dir = tmpdir("stale-exec-socket");
+        let vsock = dir.join("vsock.sock");
+        use std::os::unix::net::UnixListener;
+        let _base = UnixListener::bind(&vsock).unwrap();
+        let _exec = UnixListener::bind(vk_core::net::hybrid_socket(&vsock, VSOCK_PORT)).unwrap();
+        let bridge = vk_core::net::hybrid_socket(&vsock, 1024);
+        let _bridge = UnixListener::bind(&bridge).unwrap();
+
+        remove_stale_exec_socket(&vsock);
+
+        assert!(!vsock.exists());
+        assert!(!vk_core::net::hybrid_socket(&vsock, VSOCK_PORT).exists());
+        assert!(
+            bridge.exists(),
+            "the switch's own bridge socket must survive"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
