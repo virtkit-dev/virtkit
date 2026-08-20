@@ -2,6 +2,21 @@
 
 This file provides guidance to AI coding assistants (Claude Code, Copilot, etc.) when working with code in this repository.
 
+## Sourced Assertions
+
+Verify load-bearing factual claims — code, tooling, third-party behaviour — against the code, the
+repo docs, or a web search before stating them. Flag anything unverified, or a deduction.
+
+Badge in chat output only (never in commit messages, code comments, or committed files), inline
+right after the claim, with a `path:line` cite for code/doc:
+
+- `✅ code` / `✅ doc` `path:line` — verified in the code / repo docs
+- `✅ web` URL — verified online (bare URL, outside the code span; pin to a commit SHA, not a branch)
+- `💭 deduction` — inferred from verified facts
+- `⚠️ unverified` — unverifiable, or from training data
+
+Skip badges on restatements, tool output, and descriptions of your own next step.
+
 ## Project Overview
 
 virtkit — a rootless microVM toolkit shipped as static-musl binaries (`vk` + the
