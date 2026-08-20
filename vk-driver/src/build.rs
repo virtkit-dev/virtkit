@@ -1074,10 +1074,18 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
         };
 
         let cancel = CancellationToken::new();
+        // `jobs` caps concurrent guest builds (sized to host memory) via `build_permits`,
+        // not the DAG dispatch pool: a fully-cached stage never touches a guest, so it
+        // must not queue behind that cap just to restore from cache. Dispatch gets one
+        // thread per node so every cache hit can proceed the moment its deps are ready;
+        // total thread count (and any concurrent remote build-lock requests each node's
+        // uncached path makes) now scales with the DAG instead of `jobs`, which is fine
+        // since a node either restores instantly or waits on `build_permits` next.
+        let build_permits = Semaphore::new(jobs);
         let done = run_dag(
             &nodes,
             &deps,
-            jobs,
+            nodes.len(),
             Some(&cancel),
             |gid, done_global: &HashMap<usize, Rootfs>| {
                 let u = &resolved_units[unit_of(gid)];
@@ -1103,6 +1111,7 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
                     Some(&cancel),
                     &u.prefix,
                     gid,
+                    &build_permits,
                 )
             },
         )?;
@@ -1764,6 +1773,7 @@ fn build_stage(
     cancel: Option<&CancellationToken>,
     name_prefix: &str,
     display: progress::StageId,
+    build_permits: &Semaphore,
 ) -> Result<Rootfs> {
     // Abort before doing any work if an earlier stage already failed, and hand the token
     // to the backend so a RUN launched below is interrupted the moment a sibling fails.
@@ -1823,6 +1833,11 @@ fn build_stage(
         }
         None => None,
     };
+    // Past this point the stage needs a live guest (at minimum to probe/build its
+    // remaining steps), so it competes for the host-memory-derived build budget. Cache
+    // restores above never reach here, so they run at full DAG-dispatch concurrency
+    // instead of queuing behind real builds for one of these scarce permits.
+    let _permit = build_permits.acquire();
     // Declare the stage's inputs — the source stages it copies/mounts from, and its
     // build context — so the backend can attach them before the guest boots. Read off the
     // resolved steps, not the raw plan: a `--from=$VAR` reaches the backend interpolated, so
@@ -1992,6 +2007,9 @@ fn drive(
     let (needed, cached_final) =
         compute_needed(plan, order, &resolved, ex, require_cached, &targets)?;
     progress.init(stage_inits(plan, order, &resolved, &needed, 0, ""), 1);
+    // Sequential driver: one stage at a time on the single `ex`, so the permit count is
+    // irrelevant — it exists only to satisfy `build_stage`'s signature.
+    let build_permits = Semaphore::new(1);
     let mut committed: HashMap<usize, Rootfs> = HashMap::new();
     for &idx in order {
         if !needed.contains(&idx) {
@@ -2010,6 +2028,7 @@ fn drive(
             None,
             "",
             idx,
+            &build_permits,
         )?;
         committed.insert(idx, fs);
     }
@@ -2028,6 +2047,41 @@ struct Dag<R> {
     remaining: usize,
     /// first worker error; set once, then every worker drains and returns.
     error: Option<anyhow::Error>,
+}
+
+/// A counting semaphore: bounds how many callers hold a permit at once. Used to cap
+/// concurrent guest builds by host memory without also throttling the (cheap, I/O-bound)
+/// cache restores that share the same DAG worker pool — see `run_dag`.
+struct Semaphore {
+    permits: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl Semaphore {
+    fn new(permits: usize) -> Self {
+        Self {
+            permits: Mutex::new(permits),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> SemaphorePermit<'_> {
+        let mut n = self.permits.lock().unwrap();
+        while *n == 0 {
+            n = self.cv.wait(n).unwrap();
+        }
+        *n -= 1;
+        SemaphorePermit(self)
+    }
+}
+
+struct SemaphorePermit<'a>(&'a Semaphore);
+
+impl Drop for SemaphorePermit<'_> {
+    fn drop(&mut self) {
+        *self.0.permits.lock().unwrap() += 1;
+        self.0.cv.notify_one();
+    }
 }
 
 /// Run a DAG of tasks with bounded concurrency. `nodes` is the set to run; `deps[n]`
@@ -2206,32 +2260,47 @@ fn drive_microvm(
     // stage honors it, so a failure interrupts the RUN steps in flight on sibling guests
     // instead of letting them run to completion before the build bails.
     let cancel = CancellationToken::new();
-    let committed = run_dag(&needed_order, &deps, jobs, Some(&cancel), |idx, done| {
-        // A fresh per-stage worker: its own guest + cache-push state, sharing only the
-        // committed-image maps with `base`.
-        let mut ex = base.worker();
-        // `vk build --disk`: on the target stage's worker only, attach the caller's disk
-        // (so exactly one stage writes it — no concurrent rw sharing) and mark its
-        // instruction keys non-cacheable so its RUNs always run.
-        if idx == targets[0] {
-            ex.set_out_disk(out_disk.map(Path::to_path_buf));
-            ex.set_uncacheable(uncacheable.clone());
-        }
-        build_stage(
-            plan,
-            &resolved,
-            &cached_final,
-            done,
-            &mut ex,
-            idx,
-            cache,
-            progress,
-            timings,
-            Some(&cancel),
-            "",
-            idx,
-        )
-    })?;
+    // `jobs` caps concurrent guest builds (sized to host memory) via `build_permits`, not
+    // the DAG dispatch pool: a fully-cached stage never touches a guest, so it must not
+    // queue behind that cap just to restore from cache. Dispatch gets one thread per
+    // needed stage so every cache hit can proceed the moment its deps are ready; total
+    // thread count (and any concurrent remote build-lock requests each node's uncached
+    // path makes) now scales with the DAG instead of `jobs`, which is fine since a node
+    // either restores instantly or waits on `build_permits` next.
+    let build_permits = Semaphore::new(jobs);
+    let committed = run_dag(
+        &needed_order,
+        &deps,
+        needed_order.len(),
+        Some(&cancel),
+        |idx, done| {
+            // A fresh per-stage worker: its own guest + cache-push state, sharing only the
+            // committed-image maps with `base`.
+            let mut ex = base.worker();
+            // `vk build --disk`: on the target stage's worker only, attach the caller's disk
+            // (so exactly one stage writes it — no concurrent rw sharing) and mark its
+            // instruction keys non-cacheable so its RUNs always run.
+            if idx == targets[0] {
+                ex.set_out_disk(out_disk.map(Path::to_path_buf));
+                ex.set_uncacheable(uncacheable.clone());
+            }
+            build_stage(
+                plan,
+                &resolved,
+                &cached_final,
+                done,
+                &mut ex,
+                idx,
+                cache,
+                progress,
+                timings,
+                Some(&cancel),
+                "",
+                idx,
+                &build_permits,
+            )
+        },
+    )?;
     Ok((committed, final_states(&resolved)))
 }
 
@@ -3055,6 +3124,7 @@ mod tests {
             // Build every needed stage in dependency order; hand each one only its own
             // unit's committed rootfs, re-keyed to local indices (as build_units does).
             let mut committed_local: HashMap<usize, Rootfs> = HashMap::new();
+            let build_permits = Semaphore::new(1);
             for &idx in &order {
                 if !needed.contains(&idx) {
                     continue;
@@ -3072,6 +3142,7 @@ mod tests {
                     None,
                     &prefix,
                     base + idx,
+                    &build_permits,
                 )
                 .unwrap();
                 committed_local.insert(idx, fs.clone());
@@ -4826,6 +4897,78 @@ RUN ship
             "independent nodes should run concurrently (peak {})",
             max.load(SeqCst)
         );
+    }
+
+    #[test]
+    fn semaphore_blocks_beyond_capacity() {
+        let sem = Arc::new(Semaphore::new(1));
+        let held = sem.acquire();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let (sem2, entered2) = (Arc::clone(&sem), Arc::clone(&entered));
+        let waiter = std::thread::spawn(move || {
+            let _p = sem2.acquire();
+            entered2.store(1, SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            entered.load(SeqCst),
+            0,
+            "second acquire must block while the only permit is held"
+        );
+        drop(held);
+        waiter.join().unwrap();
+        assert_eq!(
+            entered.load(SeqCst),
+            1,
+            "second acquire should proceed once the permit is released"
+        );
+    }
+
+    // Regression test for the dispatch/build-cap decoupling: the fully-cached fast path
+    // must return before ever touching `build_permits`, so it has to complete even with
+    // the semaphore fully exhausted (0 permits) — a build-bound acquire here would block
+    // forever, so drive the call off-thread and assert it finishes instead of hanging.
+    #[test]
+    fn build_stage_cache_hit_skips_the_build_permit() {
+        let src = "FROM alpine\nRUN one\n";
+        let ba = Vars::new();
+        let mut ex = CachedDry::default();
+        let plan = plan_one(src, &ba);
+        let target = plan.resolve_target(None).unwrap();
+        let order = plan.build_order(target).unwrap();
+        let resolved = resolve_all(&plan, &order, &ba, &mut ex, &[target]).unwrap();
+        let key = resolved[&target].steps.last().unwrap().key.clone();
+        ex.cache.insert(key);
+        let (_needed, cached_final) =
+            compute_needed(&plan, &order, &resolved, &mut ex, false, &[target]).unwrap();
+        assert!(
+            cached_final.contains_key(&target),
+            "test setup: stage must be a full cache hit"
+        );
+        let build_permits = Semaphore::new(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = build_stage(
+                &plan,
+                &resolved,
+                &cached_final,
+                &HashMap::new(),
+                &mut ex,
+                target,
+                BuildCache::Instructions,
+                &Progress::disabled(),
+                &Arc::new(Timings::new()),
+                None,
+                "",
+                target,
+                &build_permits,
+            );
+            let _ = tx.send(result.is_ok());
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(ok) => assert!(ok, "cache-hit build_stage call returned an error"),
+            Err(_) => panic!("cache-hit stage blocked on an exhausted build permit"),
+        }
     }
 
     #[test]

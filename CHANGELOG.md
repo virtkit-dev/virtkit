@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Cached build stages restore concurrently instead of one at a time.** Build concurrency
+  is sized from host memory to bound concurrent guest builds, but that same cap also
+  throttled already-cached stages — serializing cheap cache restores to it and delaying the
+  real, memory-heavy builds queued up behind them.
+
 ## [0.38.0] - 2026-08-20
 
 ### Added
