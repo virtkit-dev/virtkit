@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// reordering a struct field, adding an enum variant, ...): rmp_serde encodes
 /// structs as fixed-length arrays, so such changes are not wire compatible
 /// across versions. A virtkit-agent predating this field decodes its `protocol` as 0.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub enum RunMode {
@@ -25,6 +25,16 @@ pub enum RunMode {
 pub enum Message {
     CmdExec(CmdExec),
     CmdStatus,
+    /// Dial `target` (an `addr::SocketAddr`, e.g. `tcp://192.168.127.252:443`) from the
+    /// guest and splice raw bytes to it, framed the same way a `CmdExec`'s stdio is:
+    /// `Data{Fd::Stdout}` for target->client, `Data{Fd::Stdin}` for client->target. Lets
+    /// a host reach any address the guest's own network can — a LAN peer included —
+    /// over the always-open agent control channel, with no dedicated vsock port to wire
+    /// up for it. A malformed `target` gets a `StartErr`, matching a `CmdExec` that
+    /// fails to spawn.
+    CmdConnect {
+        target: String,
+    },
     StartOK,
     StartErr {
         msg: String,

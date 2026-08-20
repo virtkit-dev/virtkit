@@ -1,7 +1,7 @@
 use crate::addr::SocketAddr;
 use crate::framing::{DeSink, SerStream};
 use crate::messages::{self, CmdExec, CmdResult, Message, RunMode, Status};
-use crate::net::listen;
+use crate::net::{listen, raw_connect};
 use crate::pty;
 use crate::status::get_status;
 use anyhow::anyhow;
@@ -310,6 +310,31 @@ async fn do_handle_conn(
                 })
                 .await;
             resp.map_err(std::convert::Into::into).and(Ok(true))
+        }
+        Message::CmdConnect { target } => {
+            // A wrapped channel is a restricted one (the host-exec allowlist a guest's
+            // requests are forced through): it has no notion of wrapping an arbitrary
+            // dial the way it wraps a command, so a raw connect on it would bypass the
+            // allowlist entirely instead of being subject to it. Refuse outright —
+            // CmdConnect is only for a channel the dialing side already trusts fully
+            // (the guest's own control port, as `vk exec`/`vk status` already use).
+            if exec_wrapper.is_some() {
+                let msg = "connect is refused on a wrapped (host-exec) channel".to_string();
+                let _ = sink.send(Message::StartErr { msg: msg.clone() }).await;
+                return Err(anyhow!(msg));
+            }
+            let req_id = REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let addr = match target.parse::<SocketAddr>() {
+                Ok(a) => a,
+                Err(e) => {
+                    let msg = format!("invalid connect target {target:?}: {e}");
+                    let _ = sink.send(Message::StartErr { msg: msg.clone() }).await;
+                    return Err(anyhow!("connect [{req_id}] {msg}"));
+                }
+            };
+            srv_run_connect(req_id, stream, sink, addr)
+                .await
+                .and(Ok(false))
         }
         _ => Err(anyhow!("invalid message")),
     }
@@ -878,6 +903,75 @@ async fn srv_run_cmd(
     drop(tx);
     writer.await?;
     info!("command [{req_id}] done ({status})");
+
+    Ok(())
+}
+
+/// `CmdConnect`: dial `target` and splice raw bytes to it, framed the same way a
+/// `CmdExec`'s stdio is (see [`Message::CmdConnect`]). Reuses the exec session's
+/// `reader_task`/`writer_task` pump against the dialed connection instead of a child
+/// process's stdio — one stream each way (Stdout out, Stdin in), no exit code.
+async fn srv_run_connect(
+    req_id: usize,
+    mut stream: impl Stream<Item = Result<Message, std::io::Error>>
+    + std::marker::Unpin
+    + Send
+    + 'static,
+    mut sink: impl Sink<Message, Error = std::io::Error> + Unpin + Send + 'static,
+    target: SocketAddr,
+) -> Result<(), anyhow::Error> {
+    info!("connect [{req_id}] {target}");
+    let conn = match raw_connect(&target).await {
+        Ok(c) => c,
+        Err(e) => {
+            sink.send(Message::StartErr { msg: e.to_string() }).await?;
+            return Err(anyhow!("connect [{req_id}] dialing {target}: {e:#}"));
+        }
+    };
+    sink.send(Message::StartOK).await?;
+
+    let (read_half, mut write_half) = tokio::io::split(conn);
+    let (tx, rx) = mpsc::channel(super::DATA_CHANNEL_CAPACITY);
+
+    let writer = tokio::spawn(async move {
+        writer_task(rx, sink, req_id).await;
+    });
+
+    let copy_out = tokio::spawn(async move {
+        reader_task(req_id, messages::Fd::Stdout, read_half, tx).await;
+    });
+
+    let client_stream_reader = tokio::spawn(async move {
+        loop {
+            match stream.next().await {
+                Some(Ok(Message::Data {
+                    fd: messages::Fd::Stdin,
+                    msg,
+                })) => {
+                    if write_half.write_all(&msg).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Close {
+                    fd: messages::Fd::Stdin,
+                    ..
+                })) => {
+                    let _ = write_half.shutdown().await;
+                }
+                Some(Ok(_)) => {}
+                None | Some(Err(_)) => break,
+            }
+        }
+    });
+
+    // The target closing (EOF on read_half) ends the session: reader_task has queued
+    // Close{Stdout} and dropped its tx by the time this returns, so the writer below
+    // sees the channel close on its own.
+    copy_out.await?;
+    client_stream_reader.abort();
+    drop(client_stream_reader);
+    writer.await?;
+    debug!("connect [{req_id}] done");
 
     Ok(())
 }

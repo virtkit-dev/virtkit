@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk publish` exposes a port on a guest's network to the host.** Accepts connections
+  and relays each one, over the same link `vk exec`/`vk status` already use, to an
+  address the target guest can reach — including a LAN peer with no agent of its own
+  (a compose sibling service, say). No SSH, and no new port needs to be wired into the
+  VM ahead of time.
+
 ### Fixed
 
 - **Cached build stages restore concurrently instead of one at a time.** Build concurrency

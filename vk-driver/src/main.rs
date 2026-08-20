@@ -52,6 +52,7 @@ mod mkoci;
 mod net;
 mod oci;
 mod ova;
+mod publish;
 mod qcow2;
 mod registry;
 mod regproxy;
@@ -724,6 +725,34 @@ enum Cmd {
         /// Command to run and its arguments, after `--` (e.g. `vk exec -- ls -la`)
         #[arg(last = true, required = true)]
         command: Vec<String>,
+    },
+    /// Publish a port on the guest's own network to the host — no SSH, no new vsock port
+    ///
+    /// Accepts connections on `--listen` and, for each one, asks the target VM's agent —
+    /// over the same exec control channel `vk exec`/`vk status` use — to dial `--to` and
+    /// splice raw bytes back. Nothing is wired up for this ahead of time: the control
+    /// channel is already open, so a fresh vsock port never needs to exist. The VM is
+    /// selected as `vk exec` selects it (a directory or a raw agent address, `--service`
+    /// for a compose sibling), and `--to` need not be that VM at all — any address its
+    /// own network reaches works, e.g. a LAN peer with no agent of its own:
+    /// `vk publish --service devcontainer --listen tcp://127.0.0.1:8443 --to tcp://runner:443`.
+    Publish {
+        /// which VM's agent to ask: a directory, or a raw agent address
+        ///
+        /// A directory (default: the current directory) resolves via the VM registry `vk list`
+        /// uses; a raw agent address (`scheme://…`) is dialed directly.
+        target: Option<String>,
+        /// ask this compose sibling's agent instead of the primary's
+        ///
+        /// By name, as `vk list` shows it; the service must be running.
+        #[arg(long, value_name = "NAME")]
+        service: Option<String>,
+        /// Local address to accept connections on (tcp://host:port, a unix path, ...)
+        #[arg(long)]
+        listen: SocketAddr,
+        /// Address the guest dials for each accepted connection (tcp://host:port, ...)
+        #[arg(long)]
+        to: SocketAddr,
     },
     /// Watch a running VM's guest live, or read what a recorded one did
     ///
@@ -3343,6 +3372,23 @@ async fn cli_main() -> ExitCode {
                 Err(e) => fail(&e, 1),
             }
         }
+        // publish::run only returns on a bind error, like Cmd::Forward; the target VM is
+        // selected the same way `vk exec` selects it.
+        Cmd::Publish {
+            target,
+            service,
+            listen,
+            to,
+        } => {
+            let addr = match resolve_exec_addr(target.as_deref(), service.as_deref()) {
+                Ok(a) => a,
+                Err(e) => return fail(&e, 2),
+            };
+            match publish::run(&addr, &listen, &to).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, 1),
+            }
+        }
         Cmd::SshAgentProxy {
             listen,
             upstream,
@@ -3540,9 +3586,10 @@ fn resolve_agent_addr(target: Option<&str>) -> anyhow::Result<SocketAddr> {
     }
 }
 
-/// Resolve `vk exec`'s target to the agent address to dial: the primary VM (as
-/// `resolve_agent_addr`), or — with `--service` — a named sibling service of the VM selected by
-/// directory. A raw agent address can't name a service (it isn't a registry entry).
+/// Resolve a target VM (shared by `vk exec` and `vk publish`) to the agent address
+/// to dial: the primary VM (as `resolve_agent_addr`), or — with `--service` — a
+/// named sibling service of the VM selected by directory. A raw agent address can't
+/// name a service (it isn't a registry entry).
 fn resolve_exec_addr(target: Option<&str>, service: Option<&str>) -> anyhow::Result<SocketAddr> {
     let Some(svc) = service else {
         return resolve_agent_addr(target);
@@ -4111,8 +4158,8 @@ mod tests {
         assert_eq!(
             sorted,
             [
-                "atop", "build", "check", "exec", "export", "gc", "list", "run", "status", "stop",
-                "update"
+                "atop", "build", "check", "exec", "export", "gc", "list", "publish", "run",
+                "status", "stop", "update"
             ]
         );
     }

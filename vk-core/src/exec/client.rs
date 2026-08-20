@@ -8,6 +8,7 @@ use crate::messages::CmdResult;
 use anyhow::anyhow;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use log::{debug, error, info};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 pub async fn client_run_cmd(
@@ -279,6 +280,79 @@ pub async fn client_run_tty(
     Ok(exit_code)
 }
 
+/// `CmdConnect`: ask the agent to dial `target` and splice `local`'s bytes to it.
+/// `local` is the host's own already-accepted end of the connection being published
+/// (see `vk publish`); this is the client-side counterpart of the agent's
+/// `srv_run_connect`, using the same `Data{Fd::Stdin/Stdout}` framing
+/// `client_run_cmd` uses for a command's stdio.
+pub async fn client_run_connect(
+    mut stream: impl Stream<Item = Result<Message, std::io::Error>> + Unpin,
+    mut sink: impl Sink<Message, Error = std::io::Error> + Unpin + Send + 'static,
+    target: String,
+    local: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+) -> Result<(), anyhow::Error> {
+    info!("connect: {target}");
+    sink.send(Message::CmdConnect { target }).await?;
+
+    let srv_msg = stream
+        .next()
+        .await
+        .ok_or(RunCmdError::StreamUnexpectedInterrupt)??;
+    match srv_msg {
+        Message::StartOK => {}
+        Message::StartErr { msg } => return Err(RunCmdError::ConnectFailed(msg).into()),
+        _ => return Err(RunCmdError::InvalidMessage(srv_msg).into()),
+    }
+
+    let (mut local_read, mut local_write) = tokio::io::split(local);
+    let upload = tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            match local_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let msg = Message::Data {
+                        fd: messages::Fd::Stdin,
+                        msg: buf[..n].to_vec(),
+                    };
+                    if sink.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = sink
+            .send(Message::Close {
+                fd: messages::Fd::Stdin,
+                error: None,
+            })
+            .await;
+    });
+
+    loop {
+        match stream.next().await {
+            Some(Ok(Message::Data {
+                fd: messages::Fd::Stdout,
+                msg,
+            })) => {
+                if local_write.write_all(&msg).await.is_err() {
+                    break;
+                }
+            }
+            Some(Ok(Message::Close {
+                fd: messages::Fd::Stdout,
+                ..
+            }))
+            | None
+            | Some(Err(_)) => break,
+            Some(Ok(_)) => {}
+        }
+    }
+    upload.abort();
+    debug!("connect: closed");
+    Ok(())
+}
+
 fn read_stdin(stdin_tx: &mpsc::Sender<Vec<u8>>) {
     use std::io::Read;
 
@@ -305,4 +379,6 @@ pub enum RunCmdError {
     InvalidMessage(Message),
     #[error("error starting remote process: {0}")]
     StartFailed(String),
+    #[error("error connecting: {0}")]
+    ConnectFailed(String),
 }

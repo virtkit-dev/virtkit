@@ -5,9 +5,10 @@
 use futures::{SinkExt, StreamExt};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixListener;
+use tokio::net::{TcpListener, TcpStream, UnixListener};
 use tokio::time::timeout;
 use vk_core::addr::SocketAddr;
+use vk_core::exec::client::client_run_connect;
 use vk_core::exec::server::run_server;
 use vk_core::framing::wrap_stream;
 use vk_core::messages::{CmdExec, Fd, Message, RunMode, Status, Tty};
@@ -34,6 +35,28 @@ async fn start_server(tag: &str) -> SocketAddr {
     while !path.exists() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    addr
+}
+
+/// A TCP echo server, standing in for an arbitrary "target on the guest's LAN" — the
+/// thing `CmdConnect` dials on the caller's behalf.
+async fn echo_server() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut conn, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                loop {
+                    match conn.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) if conn.write_all(&buf[..n]).await.is_err() => break,
+                        Ok(_) => {}
+                    }
+                }
+            });
+        }
+    });
     addr
 }
 
@@ -77,6 +100,158 @@ async fn unix_exec_roundtrip() {
 
     assert_eq!(code, Some(0));
     assert_eq!(stdout, b"hi\n");
+}
+
+/// `CmdConnect` end to end at the protocol level: dial an echo server through the
+/// agent and get bytes back framed as an exec session's Stdout would be.
+#[tokio::test]
+async fn connect_roundtrip_echoes_bytes() {
+    let addr = start_server("connect").await;
+    let echo_addr = echo_server().await;
+
+    let (mut stream, mut sink) = connect(&addr).await.unwrap();
+    sink.send(Message::CmdConnect {
+        target: format!("tcp://{echo_addr}"),
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        stream.next().await.unwrap().unwrap(),
+        Message::StartOK
+    ));
+
+    sink.send(Message::Data {
+        fd: Fd::Stdin,
+        msg: b"ping".to_vec(),
+    })
+    .await
+    .unwrap();
+
+    let echoed = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Message::Data {
+                fd: Fd::Stdout,
+                msg,
+            } = stream.next().await.unwrap().unwrap()
+            {
+                return msg;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(echoed, b"ping");
+
+    sink.send(Message::Close {
+        fd: Fd::Stdin,
+        error: None,
+    })
+    .await
+    .unwrap();
+}
+
+/// A target string that fails to parse as a `SocketAddr` (unlike a bare path, which
+/// always parses as `unix:`) is refused before ever dialing anything.
+#[tokio::test]
+async fn connect_with_unparseable_target_gets_start_err() {
+    let addr = start_server("connect-badaddr").await;
+    let (mut stream, mut sink) = connect(&addr).await.unwrap();
+    sink.send(Message::CmdConnect {
+        target: "vsock://not-a-port".into(),
+    })
+    .await
+    .unwrap();
+    match stream.next().await.unwrap().unwrap() {
+        Message::StartErr { msg } => assert!(msg.contains("invalid connect target"), "got: {msg}"),
+        other => panic!("expected StartErr, got {other:?}"),
+    }
+}
+
+/// A well-formed target nothing answers on fails at dial time, not parse time.
+#[tokio::test]
+async fn connect_to_missing_target_gets_start_err() {
+    let addr = start_server("connect-missing").await;
+    let (mut stream, mut sink) = connect(&addr).await.unwrap();
+    sink.send(Message::CmdConnect {
+        target: "/nonexistent/vk-connect-test.sock".into(),
+    })
+    .await
+    .unwrap();
+    match stream.next().await.unwrap().unwrap() {
+        Message::StartErr { msg } => assert!(msg.contains("nonexistent"), "got: {msg}"),
+        other => panic!("expected StartErr, got {other:?}"),
+    }
+}
+
+/// A wrapped channel (the host-exec allowlist a guest's requests are forced through)
+/// has no notion of wrapping an arbitrary dial, so it must refuse CmdConnect outright
+/// rather than let it bypass the allowlist.
+#[tokio::test]
+async fn connect_refused_on_wrapped_channel() {
+    let path = tmp_socket_path("connect-wrapped");
+    let _ = std::fs::remove_file(&path);
+    let addr = SocketAddr::Unix(path.clone());
+    let server_addr = addr.clone();
+    tokio::spawn(async move {
+        run_server(
+            &server_addr,
+            Some(Duration::from_secs(60)),
+            Some(std::path::PathBuf::from("/bin/true")),
+            vec![],
+        )
+        .await
+        .unwrap();
+    });
+    while !path.exists() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let (mut stream, mut sink) = connect(&addr).await.unwrap();
+    sink.send(Message::CmdConnect {
+        target: "tcp://127.0.0.1:1".into(),
+    })
+    .await
+    .unwrap();
+    match stream.next().await.unwrap().unwrap() {
+        Message::StartErr { msg } => assert!(msg.contains("wrapped"), "got: {msg}"),
+        other => panic!("expected StartErr, got {other:?}"),
+    }
+}
+
+/// `client_run_connect` end to end: a real local TCP connection (standing in for
+/// `vk publish`'s already-accepted host side) relayed through the agent to a real
+/// TCP target, exercising the same path `vk publish` will use.
+#[tokio::test]
+async fn client_run_connect_relays_between_local_and_target() {
+    let addr = start_server("connect-client").await;
+    let echo_addr = echo_server().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener_addr = listener.local_addr().unwrap();
+    let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+    let mut caller = TcpStream::connect(listener_addr).await.unwrap();
+    let local = accept.await.unwrap();
+
+    let (stream, sink) = connect(&addr).await.unwrap();
+    let relay = tokio::spawn(async move {
+        client_run_connect(stream, sink, format!("tcp://{echo_addr}"), local)
+            .await
+            .unwrap();
+    });
+
+    caller.write_all(b"hello").await.unwrap();
+    let mut buf = [0u8; 5];
+    timeout(Duration::from_secs(10), caller.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf, b"hello");
+
+    drop(caller);
+    timeout(Duration::from_secs(10), relay)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
