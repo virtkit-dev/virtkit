@@ -324,10 +324,10 @@ async fn do_handle_conn(
                 return Err(anyhow!(msg));
             }
             let req_id = REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let addr = match target.parse::<SocketAddr>() {
+            let addr = match crate::net::resolve_connect_target(&target).await {
                 Ok(a) => a,
                 Err(e) => {
-                    let msg = format!("invalid connect target {target:?}: {e}");
+                    let msg = format!("invalid connect target {target:?}: {e:#}");
                     let _ = sink.send(Message::StartErr { msg: msg.clone() }).await;
                     return Err(anyhow!("connect [{req_id}] {msg}"));
                 }

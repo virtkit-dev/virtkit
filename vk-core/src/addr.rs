@@ -73,6 +73,26 @@ fn parse_num(s: &str, what: &str) -> Result<u32, anyhow::Error> {
         .map_err(|_| anyhow!("invalid vsock {what} '{s}' (expected a number)"))
 }
 
+/// Splits a `tcp://host:port` value into `(host, port)`, rejecting an empty host.
+/// Returns `None` when `s` has no `tcp://` prefix. Shared by `parse_publish_to`
+/// (clap validation) and `resolve_connect_target` (async DNS resolution) so the
+/// two don't drift apart on what counts as a valid `tcp://` value.
+pub fn split_tcp_url(s: &str) -> Option<Result<(&str, u16), anyhow::Error>> {
+    let hostport = s.strip_prefix("tcp://")?;
+    Some((|| {
+        let (host, port) = hostport
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow!("tcp:// expects <host>:<port>, got {s:?}"))?;
+        if host.is_empty() {
+            return Err(anyhow!("tcp:// expects a non-empty host, got {s:?}"));
+        }
+        let port: u16 = port
+            .parse()
+            .map_err(|_| anyhow!("invalid port {port:?} in {s:?}"))?;
+        Ok((host, port))
+    })())
+}
+
 impl fmt::Display for SocketAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -96,10 +116,35 @@ impl fmt::Display for SocketAddr {
 
 #[cfg(test)]
 mod tests {
-    use super::SocketAddr;
+    use super::{SocketAddr, split_tcp_url};
 
     fn parse(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn split_tcp_url_returns_none_for_a_non_tcp_scheme() {
+        assert!(split_tcp_url("vsock://4444").is_none());
+    }
+
+    #[test]
+    fn split_tcp_url_splits_host_and_port() {
+        assert_eq!(
+            split_tcp_url("tcp://runner:443").unwrap().unwrap(),
+            ("runner", 443)
+        );
+    }
+
+    #[test]
+    fn split_tcp_url_rejects_an_empty_host() {
+        let err = split_tcp_url("tcp://:443").unwrap().unwrap_err();
+        assert!(err.to_string().contains("non-empty host"), "{err}");
+    }
+
+    #[test]
+    fn split_tcp_url_rejects_a_bad_port() {
+        let err = split_tcp_url("tcp://runner:notaport").unwrap().unwrap_err();
+        assert!(err.to_string().contains("invalid port"), "{err}");
     }
 
     #[test]

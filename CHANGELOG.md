@@ -7,10 +7,10 @@ All notable changes to virtkit will be documented in this file.
 ### Added
 
 - **`vk publish` exposes a port on a guest's network to the host.** Accepts connections
-  and relays each one, over the same link `vk exec`/`vk status` already use, to an
-  address the target guest can reach — including a LAN peer with no agent of its own
-  (a compose sibling service, say). No SSH, and no new port needs to be wired into the
-  VM ahead of time.
+  and relays each one, over the same control channel `vk exec`/`vk status` already
+  use, to an address the target guest can reach — a compose sibling's own hostname
+  included, resolved by that guest's own DNS. Works against whatever the VM is
+  already running.
 
 - **`vk check --feature publish` asks a `vk` whether it can run `vk publish`.**
 

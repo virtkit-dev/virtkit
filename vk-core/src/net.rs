@@ -295,6 +295,34 @@ impl AsyncWrite for RawConn {
     }
 }
 
+/// Resolve a `CmdConnect` target: a `SocketAddr` as-is, or — the one case
+/// `SocketAddr::from_str` can't parse — a `tcp://host:port` whose host is a name
+/// instead of an IP literal, resolved with this side's own DNS. `CmdConnect` carries
+/// its target as a raw string precisely so a caller can name a host only the far
+/// side's network (and DNS) can reach — a compose sibling's hostname, say — instead
+/// of forcing every caller to resolve it themselves before ever reaching that
+/// network. Only a `tcp://` target retries this way: any other scheme that fails to
+/// parse has no hostname notion to fall back to, so its original error stands.
+/// When a name resolves to multiple addresses, the first one `lookup_host` returns
+/// is used — good enough for a single compose sibling, which is the only producer
+/// of these targets today.
+pub async fn resolve_connect_target(target: &str) -> Result<SocketAddr, anyhow::Error> {
+    let parse_err = match target.parse::<SocketAddr>() {
+        Ok(addr) => return Ok(addr),
+        Err(e) => e,
+    };
+    let (host, port) = match crate::addr::split_tcp_url(target) {
+        Some(r) => r?,
+        None => return Err(parse_err),
+    };
+    let resolved = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("resolving {host:?}"))?
+        .next()
+        .ok_or_else(|| anyhow!("{host:?} resolved to no addresses"))?;
+    Ok(SocketAddr::Tcp(resolved))
+}
+
 /// Open a raw stream to `target`: tcp, unix, vsock, or hybrid vsock-mux (the
 /// CONNECT handshake runs, then the stream is raw). systemd:// is serve-only.
 pub async fn raw_connect(target: &SocketAddr) -> Result<RawConn, anyhow::Error> {
@@ -427,5 +455,54 @@ mod tests {
         conn.write_all(b"raw-bytes").await.unwrap();
         server.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_connect_target_passes_through_an_ip_literal() {
+        let addr = resolve_connect_target("tcp://127.0.0.1:4444")
+            .await
+            .unwrap();
+        assert_eq!(addr, "tcp://127.0.0.1:4444".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolve_connect_target_resolves_a_hostname() {
+        let addr = resolve_connect_target("tcp://localhost:4444")
+            .await
+            .unwrap();
+        let SocketAddr::Tcp(resolved) = addr else {
+            panic!("expected a resolved Tcp address, got {addr:?}");
+        };
+        assert_eq!(resolved.port(), 4444);
+        assert!(resolved.ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn resolve_connect_target_keeps_a_non_tcp_scheme_error() {
+        // vsock has no hostname notion to fall back to — the original parse error
+        // (not a DNS failure) must surface.
+        let err = resolve_connect_target("vsock://not-a-port")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("port"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_connect_target_rejects_an_unresolvable_host() {
+        // `.invalid` never resolves (RFC 2606), so this is deterministic, not flaky —
+        // it's the one test here that touches the network (DNS resolution failure).
+        let err = resolve_connect_target("tcp://this-host-does-not-exist.invalid:4444")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("this-host-does-not-exist"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_connect_target_rejects_an_empty_host() {
+        let err = resolve_connect_target("tcp://:4444").await.unwrap_err();
+        assert!(err.to_string().contains("non-empty host"), "{err}");
     }
 }

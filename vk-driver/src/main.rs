@@ -727,15 +727,15 @@ enum Cmd {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
-    /// Publish a port on the guest's own network to the host — no SSH, no new vsock port
+    /// Publish a port on the guest's own network to the host
     ///
     /// Accepts connections on `--listen` and, for each one, asks the target VM's agent —
     /// over the same exec control channel `vk exec`/`vk status` use — to dial `--to` and
-    /// splice raw bytes back. Nothing is wired up for this ahead of time: the control
-    /// channel is already open, so a fresh vsock port never needs to exist. The VM is
+    /// splice raw bytes back, reusing that already-open channel for the relay. The VM is
     /// selected as `vk exec` selects it (a directory or a raw agent address, `--service`
-    /// for a compose sibling), and `--to` need not be that VM at all — any address its
-    /// own network reaches works, e.g. a LAN peer with no agent of its own:
+    /// for a compose sibling), and `--to` can name any address that VM's own network
+    /// reaches — a LAN peer's own compose hostname included, resolved through that VM's
+    /// own DNS:
     /// `vk publish --service devcontainer --listen tcp://127.0.0.1:8443 --to tcp://runner:443`.
     Publish {
         /// which VM's agent to ask: a directory, or a raw agent address
@@ -752,8 +752,12 @@ enum Cmd {
         #[arg(long)]
         listen: SocketAddr,
         /// Address the guest dials for each accepted connection (tcp://host:port, ...)
-        #[arg(long)]
-        to: SocketAddr,
+        ///
+        /// A `tcp://` host may be a name instead of an IP literal — resolved by the
+        /// guest's own DNS (a compose sibling's hostname, say), not here, since only
+        /// the guest's network can resolve those.
+        #[arg(long, value_parser = parse_publish_to)]
+        to: String,
     },
     /// Watch a running VM's guest live, or read what a recorded one did
     ///
@@ -3602,6 +3606,23 @@ fn resolve_exec_addr(target: Option<&str>, service: Option<&str>) -> anyhow::Res
     resolve_service_addr(&entry, svc)
 }
 
+/// `vk publish --to`: a `SocketAddr` as-is, or — the one shape `SocketAddr::from_str`
+/// rejects — a `tcp://host:port` whose host is a name rather than an IP literal.
+/// Accepted here only so a typo is a clap usage error, not a live-connection
+/// failure; resolving that name happens agent-side (`resolve_connect_target`), the
+/// one place a compose sibling's hostname is actually reachable to resolve.
+fn parse_publish_to(s: &str) -> Result<String, String> {
+    let parse_err = match s.parse::<SocketAddr>() {
+        Ok(_) => return Ok(s.to_string()),
+        Err(e) => e,
+    };
+    match vk_core::addr::split_tcp_url(s) {
+        Some(Ok(_)) => Ok(s.to_string()),
+        Some(Err(e)) => Err(e.to_string()),
+        None => Err(parse_err.to_string()),
+    }
+}
+
 fn resolve_service_addr(entry: &vms::VmEntry, service: &str) -> anyhow::Result<SocketAddr> {
     let found = entry
         .services
@@ -3853,6 +3874,58 @@ mod tests {
         assert!(!b.allows_host("corp.com") && !b.contains_cidr("10.0.0.0/8").unwrap());
         // A bad source ip is rejected.
         assert!(parse_source_egress(&["nope;;".to_string()]).is_err());
+    }
+
+    #[test]
+    fn publish_to_accepts_a_socket_addr_as_is() {
+        assert_eq!(parse_publish_to("vsock://443").unwrap(), "vsock://443");
+    }
+
+    #[test]
+    fn publish_to_accepts_a_tcp_hostname() {
+        assert_eq!(
+            parse_publish_to("tcp://runner:443").unwrap(),
+            "tcp://runner:443"
+        );
+    }
+
+    #[test]
+    fn publish_to_rejects_tcp_with_no_port() {
+        assert!(
+            parse_publish_to("tcp://runner")
+                .unwrap_err()
+                .contains("<host>:<port>")
+        );
+    }
+
+    #[test]
+    fn publish_to_rejects_tcp_with_empty_host() {
+        assert!(
+            parse_publish_to("tcp://:443")
+                .unwrap_err()
+                .contains("non-empty host")
+        );
+    }
+
+    #[test]
+    fn publish_to_rejects_tcp_with_bad_port() {
+        assert!(
+            parse_publish_to("tcp://runner:notaport")
+                .unwrap_err()
+                .contains("invalid port")
+        );
+    }
+
+    #[test]
+    fn publish_to_keeps_a_non_tcp_scheme_error() {
+        // vsock has no hostname notion to fall back to — the original parse error
+        // (not a generic "invalid address") must surface, matching
+        // `resolve_connect_target_keeps_a_non_tcp_scheme_error` in vk-core.
+        assert!(
+            parse_publish_to("vsock://not-a-port")
+                .unwrap_err()
+                .contains("port")
+        );
     }
 
     // `vk paths --gitlab` must report the jobs root the executor actually uses:
