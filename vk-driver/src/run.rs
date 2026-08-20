@@ -561,8 +561,10 @@ impl Drop for WorkDir {
 /// virtiofsd sockets, …) from a reused `--state-dir`, one level deep (the
 /// per-service `svc-*` dirs hold their own). A stale unix socket file makes the
 /// next bind fail, so this must run before anything listens; everything else in
-/// the directory is left alone — it may be the caller's.
-fn remove_stale_sockets(dir: &Path) -> Result<()> {
+/// the directory is left alone — it may be the caller's. Also called directly on
+/// a single `svc-*` dir (`units::boot_unit`, a repeat `vk service up`), where the
+/// recursion into further `svc-*` subdirs is simply a no-op.
+pub(crate) fn remove_stale_sockets(dir: &Path) -> Result<()> {
     let mut walk = vec![dir.to_path_buf()];
     while let Some(d) = walk.pop() {
         let entries = match std::fs::read_dir(&d) {
@@ -4094,6 +4096,22 @@ mod tests {
         assert!(!svc.join("vsock.sock_4444").exists());
         assert!(deep.join("kept.sock").exists()); // non-svc dirs are not descended
         assert!(dir.join("vsock.sock.notes").exists()); // caller's file untouched
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_stale_sockets_cleans_a_leaf_svc_dir() {
+        // `units::boot_unit` calls this directly on a single `svc-*` dir (a repeat
+        // `vk service up`), not on the top-level state dir — the base and per-port
+        // socket files sit side by side there, with no nested `svc-*` to recurse into.
+        let dir = std::env::temp_dir().join(format!("virtkit-stale-leaf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::net::UnixListener;
+        let _a = UnixListener::bind(dir.join("vsock.sock")).unwrap();
+        let _b = UnixListener::bind(dir.join("vsock.sock_4444")).unwrap();
+        remove_stale_sockets(&dir).unwrap();
+        assert!(!dir.join("vsock.sock").exists());
+        assert!(!dir.join("vsock.sock_4444").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -365,7 +365,11 @@ pub fn boot_unit(
 
     let _ = std::fs::remove_file(&overlay);
     create_overlay(&svc.ext4, &overlay)?;
-    let _ = std::fs::remove_file(&vsock);
+    // Not just the base `vsock.sock`: a repeat `vk service up` after a `down` reuses
+    // this same `dir`, and a stale per-port file (`vsock.sock_4444`, …) left over from
+    // the previous boot makes libkrun's `krun_add_vsock_port2` fail (EEXIST) even
+    // though nothing is listening on it any more.
+    crate::run::remove_stale_sockets(dir)?;
 
     // The init/kernel axes are a uniform per-unit property (from the unit's compose
     // `x-virtkit` marker), applied identically here for a sibling and in the primary

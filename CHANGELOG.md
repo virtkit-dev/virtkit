@@ -16,6 +16,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A compose sibling started again after `vk service down`.** Its previous boot's
+  vsock control-socket files were left behind, so the next `vk service up` failed to
+  bind them — the guest itself booted fine, but `vk` never saw it come up, reporting
+  the service stopped indefinitely.
+
 - **Cached build stages restore concurrently instead of one at a time.** Build concurrency
   is sized from host memory to bound concurrent guest builds, but that same cap also
   throttled already-cached stages — serializing cheap cache restores to it and delaying the
