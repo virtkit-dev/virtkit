@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Guest disk reads and writes to the same image now run concurrently instead of
+  queuing one at a time.** A batch of up to 8 in-flight virtio-blk requests dispatches
+  across threads rather than serializing each one's full device latency, so a
+  disk-backed image no longer pays every request's latency back-to-back.
+
 ### Fixed
 
 - **A restarted compose sibling became unreachable by its peers.** Its own reboot

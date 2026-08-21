@@ -16,7 +16,7 @@ use std::os::linux::fs::MetadataExt;
 use std::os::macos::fs::MetadataExt;
 use std::path::PathBuf;
 use std::result;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 use imago::{
@@ -324,7 +324,7 @@ mod dirty_tests {
 /// Helper object for setting up all `Block` fields derived from its backing file.
 pub(crate) struct DiskProperties {
     cache_type: CacheType,
-    pub(crate) file: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
+    pub(crate) file: Arc<RwLock<FormatAccess<Box<dyn DynStorage>>>>,
     /// Set for read-only raw images; when present, reads are served from it instead of `file`.
     pub(crate) mmap: Option<Arc<DiskMmap>>,
     nsectors: u64,
@@ -336,13 +336,13 @@ pub(crate) struct DiskProperties {
 
 impl DiskProperties {
     pub fn new(
-        disk_image: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
+        disk_image: Arc<RwLock<FormatAccess<Box<dyn DynStorage>>>>,
         disk_image_id: Vec<u8>,
         cache_type: CacheType,
         mmap: Option<Arc<DiskMmap>>,
         dirty: Arc<Mutex<DirtyRanges>>,
     ) -> io::Result<Self> {
-        let disk_size = disk_image.lock().unwrap().size();
+        let disk_size = disk_image.read().unwrap().size();
 
         // We only support disk size, which uses the first two words of the configuration space.
         // If the image is not a multiple of the sector size, the tail bits are not exposed.
@@ -423,11 +423,11 @@ impl Drop for DiskProperties {
         match self.cache_type {
             CacheType::Writeback => {
                 // flush() first to force any cached data out.
-                if self.file.lock().unwrap().flush().is_err() {
+                if self.file.read().unwrap().flush().is_err() {
                     error!("Failed to flush block data on drop.");
                 }
                 // Sync data out to physical media on host.
-                if self.file.lock().unwrap().sync().is_err() {
+                if self.file.read().unwrap().sync().is_err() {
                     error!("Failed to sync block data on drop.")
                 }
             }
@@ -483,7 +483,7 @@ pub struct Block {
     // Host file and properties.
     disk: Option<DiskProperties>,
     cache_type: CacheType,
-    disk_image: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
+    disk_image: Arc<RwLock<FormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
     mmap: Option<Arc<DiskMmap>>,
     worker_thread: Option<JoinHandle<()>>,
@@ -577,7 +577,7 @@ impl Block {
             }
         };
 
-        let disk_image = Arc::new(Mutex::new(disk_image));
+        let disk_image = Arc::new(RwLock::new(disk_image));
 
         let dirty = Arc::new(Mutex::new(DirtyRanges::default()));
 
@@ -657,7 +657,7 @@ impl Block {
     /// (the build falls back correctly on the virtkit side).
     fn spawn_dirty_control(
         socket_path: String,
-        disk_image: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
+        disk_image: Arc<RwLock<FormatAccess<Box<dyn DynStorage>>>>,
         dirty: Arc<Mutex<DirtyRanges>>,
     ) {
         use std::os::unix::net::UnixListener;
@@ -690,7 +690,7 @@ impl Block {
                         // guest is frozen by the caller, so nothing races these two steps.
                         b'D' => {
                             let (written, discarded) = {
-                                let df = disk_image.lock().unwrap();
+                                let df = disk_image.read().unwrap();
                                 let size = df.size();
                                 if let Err(e) = flush_sync(&df) {
                                     error!("virtio-blk: dirty-control flush failed: {e}");
@@ -710,7 +710,7 @@ impl Block {
                         // later host read sees a complete image (replaces a graceful power-off).
                         // Reply one byte: 0 ok, 1 error.
                         b'F' => {
-                            let reply = match flush_sync(&disk_image.lock().unwrap()) {
+                            let reply = match flush_sync(&disk_image.read().unwrap()) {
                                 Ok(()) => 0u8,
                                 Err(e) => {
                                     error!("virtio-blk: dirty-control flush failed: {e}");
@@ -753,7 +753,7 @@ impl VmmExitObserver for Block {
         if self.cache_type != CacheType::Writeback {
             return;
         }
-        let disk = self.disk_image.lock().unwrap();
+        let disk = self.disk_image.read().unwrap();
         if let Err(e) = flush_sync(&disk) {
             error!("block: failed to flush image on VMM exit: {e}");
         }
@@ -880,7 +880,7 @@ mod tests {
         let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(ifile), false).unwrap();
         let fa = FormatAccess::new(raw);
         DiskProperties::new(
-            Arc::new(Mutex::new(fa)),
+            Arc::new(RwLock::new(fa)),
             vec![0u8; VIRTIO_BLK_ID_BYTES as usize],
             CacheType::Unsafe,
             Some(Arc::new(DiskMmap::open(&p).unwrap())),
@@ -1000,5 +1000,91 @@ mod tests {
 
         assert_eq!(n, want);
         assert_eq!(got.as_slice(), &bytes[4..4 + want]);
+    }
+
+    /// The block worker's whole parallelization scheme (see `worker::IO_PARALLELISM`) rests on
+    /// `readv`/`writev` needing only a shared `RwLock` read lock — concurrent requests against
+    /// the same image must neither deadlock nor step on each other's data. Drives real
+    /// concurrent I/O against a real file-backed image (bypassing the virtio ring entirely) and
+    /// checks every thread reads back exactly what it wrote, at a distinct, non-overlapping
+    /// offset.
+    #[test]
+    fn concurrent_readv_writev_do_not_corrupt_or_deadlock() {
+        use imago::io_buffers::{IoVector, IoVectorMut};
+        use std::io::{IoSlice, IoSliceMut};
+
+        const THREADS: u64 = 8;
+        const SLICE: u64 = 4096;
+
+        let dir = temp_dir("concurrent");
+        let path = dir.join("disk");
+        std::fs::write(&path, vec![0u8; (THREADS * SLICE) as usize]).unwrap();
+
+        let p = path.to_str().unwrap().to_string();
+        let ifile =
+            ImagoFile::open(StorageOpenOptions::new().write(true).filename(p.clone())).unwrap();
+        let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(ifile), true).unwrap();
+        let fa = Arc::new(RwLock::new(FormatAccess::new(raw)));
+
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let fa = Arc::clone(&fa);
+                scope.spawn(move || {
+                    let offset = t * SLICE;
+                    let pattern = t as u8 + 1;
+                    let write_buf = vec![pattern; SLICE as usize];
+                    fa.read()
+                        .unwrap()
+                        .writev(IoVector::from(vec![IoSlice::new(&write_buf)]), offset)
+                        .unwrap();
+
+                    let mut read_buf = vec![0u8; SLICE as usize];
+                    fa.read()
+                        .unwrap()
+                        .readv(
+                            IoVectorMut::from(vec![IoSliceMut::new(&mut read_buf)]),
+                            offset,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        read_buf, write_buf,
+                        "thread {t} must read back exactly what it wrote at offset {offset}"
+                    );
+                });
+            }
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the same locking scheme: `discard`/write-zeroes-with-unmap take the
+    /// image's write lock (see `worker::IO_PARALLELISM`) precisely so they exclude a concurrent
+    /// `writev`/`readv` (read lock) to the same region, rather than just avoiding a deadlock.
+    /// Proves that exclusion directly and deterministically — no data race, no timing tolerance
+    /// — by holding a write guard and checking `try_read()` is refused for as long as it's held,
+    /// then immediately granted once it's dropped.
+    #[test]
+    fn write_lock_excludes_a_concurrent_read_lock() {
+        let dir = temp_dir("lock-exclusion");
+        let path = dir.join("disk");
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+
+        let p = path.to_str().unwrap().to_string();
+        let ifile = ImagoFile::open(StorageOpenOptions::new().write(true).filename(p)).unwrap();
+        let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(ifile), true).unwrap();
+        let fa = RwLock::new(FormatAccess::new(raw));
+
+        let write_guard = fa.write().unwrap();
+        assert!(
+            fa.try_read().is_err(),
+            "a held write guard must refuse a concurrent read lock attempt"
+        );
+        drop(write_guard);
+        assert!(
+            fa.try_read().is_ok(),
+            "a read lock must be grantable once the write guard is dropped"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
