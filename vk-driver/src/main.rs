@@ -2166,6 +2166,8 @@ async fn cli_main() -> ExitCode {
         image::sweep_chunks(&registry);
         image::gc_idle(&state_dir.join("docker"), image_idle);
         image::gc_idle(&state_dir.join("build"), image_idle);
+        image::sweep_orphaned_build_tmp(&state_dir.join("docker"));
+        image::sweep_orphaned_build_tmp(&state_dir.join("build"));
         // Checkouts are the executor's alone, and the executor roots its state at
         // `Config::state_dir()` — never the dev default `vk run` caches under, which is what
         // `effective_state_dir` may resolve to here. Sweeping that instead would walk a tree

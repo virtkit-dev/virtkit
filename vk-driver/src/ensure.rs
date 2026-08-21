@@ -174,16 +174,26 @@ pub fn ensure_build_tier(
         crate::image::mark_used(&dir);
         return Ok(dir);
     }
+    // Reclaim scratch orphaned by earlier failed/killed builds of *other* stages before
+    // asking for more space ourselves — otherwise a tier stuck failing (e.g. ENOSPC) never
+    // gets a chance to recover, since the success path below is never reached.
+    crate::image::sweep_orphaned_build_tmp(&state_dir.join("build"));
     let tmp = dir.with_extension("tmp");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    // Wipe `tmp` the instant the build below fails (or panics) — don't leave that for a
+    // later sweep to notice. `ensure_unit_build`'s `?` runs this on the way out.
+    let cleanup = crate::image::TmpGuard::new(&tmp);
     // ensure_unit_build writes the ext4 + config sidecar and stamps the UUID at the out path.
     ensure_unit_build(recipe, target, stage_key, &tmp.join("runner.ext4"), sink)?;
+    cleanup.keep(); // built successfully: the rename below takes ownership of `tmp`.
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::rename(&tmp, &dir)
         .with_context(|| format!("promoting {} to {}", tmp.display(), dir.display()))?;
     crate::image::mark_used(&dir);
-    crate::image::gc_idle(&state_dir.join("build"), idle);
+    let build_root = state_dir.join("build");
+    crate::image::gc_idle(&build_root, idle);
+    crate::image::sweep_orphaned_build_tmp(&build_root);
     Ok(dir)
 }
 
@@ -238,6 +248,51 @@ mod tests {
         // a different stage key -> stale again.
         assert!(ensure_unit_build(&recipe, Some("svc"), "other", &out, None).is_err());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Regression test: before `TmpGuard`, a build failure left its `<fingerprint>.tmp`
+    // scratch on disk forever (nothing but a later rebuild of that exact key, or a manual
+    // `vk gc`, would ever touch it — see `image::sweep_orphaned_build_tmp`).
+    #[test]
+    fn ensure_build_tier_wipes_its_tmp_scratch_when_the_build_fails() {
+        let state_dir =
+            std::env::temp_dir().join(format!("vk-ensure-tier-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        // a recipe whose Dockerfile does not exist: the build always fails.
+        let recipe = BuildRecipe {
+            dockerfiles: vec![state_dir.join("no-such-Dockerfile")],
+            contexts: vec![],
+            build_contexts: Vec::new(),
+            build_args: vec![],
+            kernel: None,
+            cloud_hypervisor: None,
+            agent: None,
+            cache_registry: Some("none".into()),
+            cache_insecure: false,
+            cache_auth: Default::default(),
+            net: crate::build::BuildNet::All,
+            audit: false,
+        };
+        let key = "will-fail";
+        let result = ensure_build_tier(
+            &state_dir,
+            Duration::from_secs(3600),
+            &recipe,
+            Some("svc"),
+            key,
+            "svc",
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "test setup: the build must fail (missing Dockerfile)"
+        );
+        let tmp = build_tier_dir(&state_dir, key).with_extension("tmp");
+        assert!(
+            !tmp.exists(),
+            "a failed build must not leave its .tmp scratch behind"
+        );
+        let _ = std::fs::remove_dir_all(&state_dir);
     }
 
     #[test]

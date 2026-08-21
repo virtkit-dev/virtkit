@@ -372,7 +372,10 @@ pub(crate) fn gc_idle(root: &Path, idle: std::time::Duration) {
 
 /// Every materialized base under `root`: a directory directly holding a `runner.ext4`. The
 /// name between `root` and the digest can be multi-level (a `team/img` docker repo), so walk
-/// down, treating any dir with a `runner.ext4` as a base and not descending into it.
+/// down, treating any dir with a `runner.ext4` as a base and not descending into it. This
+/// also walks into a `.tmp` mid-build (it can already hold a `runner.ext4` before promotion)
+/// — harmless, since `gc_idle`'s `try_reclaim` bails out on that path's missing `.used`
+/// marker; a `.tmp`'s own cleanup is [`sweep_orphaned_build_tmp`]'s job, not this walk's.
 fn base_dirs(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -392,6 +395,100 @@ fn base_dirs(root: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// Removes its `path` on drop unless [`Self::keep`] consumed it first. Guarantees a tier's
+/// `.tmp` scratch (a build stage under `ensure::ensure_build_tier`, or a docker-tier pull
+/// under `dockerimg::build`) is wiped the instant its build/pull fails or panics — rather
+/// than depending on a later sweep to ever notice it (see [`sweep_orphaned_build_tmp`],
+/// which exists only to backstop the case nothing can run at all: a hard kill, SIGKILL, or
+/// OOM, where no destructor runs either).
+pub(crate) struct TmpGuard<'a> {
+    path: &'a Path,
+    keep: bool,
+}
+
+impl<'a> TmpGuard<'a> {
+    pub(crate) fn new(path: &'a Path) -> Self {
+        TmpGuard { path, keep: false }
+    }
+
+    /// Defuse: the caller has taken ownership of `path` (promoted/renamed it away), so
+    /// there is nothing left here to remove. Takes `self` by value rather than flipping a
+    /// flag through `&mut self`: the immediately-following implicit drop of this value is
+    /// what "defuses" it (it just finds `keep` already true and no-ops) — not
+    /// `mem::forget`/`ManuallyDrop`, the destructor still runs.
+    pub(crate) fn keep(mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for TmpGuard<'_> {
+    fn drop(&mut self) {
+        if !self.keep
+            && let Err(e) = std::fs::remove_dir_all(self.path)
+        {
+            eprintln!("virtkit: removing {}: {e}", self.path.display());
+        }
+    }
+}
+
+/// Reclaim orphaned `<name>.tmp` scratch anywhere under `root` (a build-tier or docker-tier
+/// cache dir): staging left behind by a build/pull that was killed or failed before it could
+/// promote (rename) into its final, fingerprinted dir (see `ensure::ensure_build_tier`,
+/// `dockerimg::build`). Such a `.tmp` never gets a `.used` marker (only the promoted dir gets
+/// one), so [`gc_idle`]'s idle-eviction never reaches it — it would otherwise sit forever.
+/// Safe to reclaim because the promoted dir's pull lock (`acquire_pull_lock`) is held for the
+/// *entire* window from before the `.tmp` is created to after promotion or failure: a
+/// non-blocking bind on that same abstract socket tells us whether a build is still in
+/// flight without waiting on it. Best-effort.
+///
+/// Walks like [`base_dirs`] (the name between `root` and the `.tmp`/digest can be
+/// multi-level, e.g. the docker tier's `<name>/<digest>.tmp`) rather than a flat `read_dir` —
+/// the build tier's fingerprint dirs happen to sit directly under `root`, but nothing else
+/// here assumes that.
+pub(crate) fn sweep_orphaned_build_tmp(root: &Path) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+                reclaim_orphaned_tmp(&path);
+                continue;
+            }
+            if path.join("runner.ext4").is_file() {
+                continue; // a promoted base — nothing to sweep inside it
+            }
+            stack.push(path); // an intermediate name component (e.g. docker's `<name>`)
+        }
+    }
+}
+
+/// Reclaim `path` (a `.tmp` scratch dir) iff nothing holds its build/pull lock — see
+/// [`sweep_orphaned_build_tmp`].
+fn reclaim_orphaned_tmp(path: &Path) {
+    let promoted = path.with_extension("");
+    let Ok(addr) = pull_lock_addr(pull_lock_hash(&promoted)) else {
+        return;
+    };
+    // Nobody holds the lock right now: the `.tmp` is an orphan, not a live build. If a
+    // build is actively holding it for this fingerprint, leave it alone.
+    if let Ok(_lock) = UnixListener::bind_addr(&addr) {
+        println!(
+            "virtkit: reclaiming orphaned build scratch {}",
+            path.display()
+        );
+        if let Err(e) = std::fs::remove_dir_all(path) {
+            eprintln!("virtkit: reclaiming {}: {e}", path.display());
+        }
+        // `_lock` drops here, releasing the socket.
+    }
 }
 
 /// The name a pull stages a chunk under before renaming it onto its digest: the digest,
@@ -552,6 +649,76 @@ mod tests {
                 Err(e) => panic!("rebinding the released lock addr failed: {e}"),
             }
         }
+    }
+
+    #[test]
+    fn sweep_orphaned_build_tmp_reclaims_unlocked_but_spares_a_live_build() {
+        let root =
+            std::env::temp_dir().join(format!("virtkit-test-sweep-tmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let orphan = root.join("orphan.tmp");
+        let live = root.join("live.tmp");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        // hold the live one's build lock, standing in for a build actually in flight.
+        let held = acquire_pull_lock(&root.join("live"), "build", "myimg", "sha256:x").unwrap();
+        sweep_orphaned_build_tmp(&root);
+        assert!(
+            !orphan.exists(),
+            "an unlocked .tmp orphan must be reclaimed"
+        );
+        assert!(
+            live.exists(),
+            "a .tmp still under a live build lock must be spared"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The docker tier nests a `.tmp` one level deeper than the build tier
+    // (`<name>/<digest>.tmp` vs. a fingerprint dir directly under `root`) — the sweep must
+    // walk down to find it, and must not descend into an already-promoted base looking for
+    // more (there is nothing to find there, and it would just be wasted work).
+    #[test]
+    fn sweep_orphaned_build_tmp_walks_nested_name_dirs_like_the_docker_tier() {
+        let root =
+            std::env::temp_dir().join(format!("virtkit-test-sweep-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let orphan = root.join("myimg").join("abc123.tmp");
+        let promoted = root.join("otherimg").join("def456");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::create_dir_all(&promoted).unwrap();
+        std::fs::write(promoted.join("runner.ext4"), b"").unwrap();
+        sweep_orphaned_build_tmp(&root);
+        assert!(
+            !orphan.exists(),
+            "a nested, unlocked .tmp orphan must be reclaimed"
+        );
+        assert!(
+            promoted.join("runner.ext4").is_file(),
+            "an already-promoted base must be left untouched"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tmp_guard_removes_on_drop_unless_kept() {
+        let dir =
+            std::env::temp_dir().join(format!("virtkit-test-tmpguard-{}", std::process::id()));
+        let removed = dir.join("removed");
+        std::fs::create_dir_all(&removed).unwrap();
+        drop(TmpGuard::new(&removed));
+        assert!(
+            !removed.exists(),
+            "an un-kept guard must remove its path on drop"
+        );
+
+        let kept = dir.join("kept");
+        std::fs::create_dir_all(&kept).unwrap();
+        TmpGuard::new(&kept).keep();
+        assert!(kept.exists(), "a kept guard must leave its path alone");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

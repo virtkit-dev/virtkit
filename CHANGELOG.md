@@ -11,6 +11,14 @@ All notable changes to virtkit will be documented in this file.
   parts a stage's steps actually read, so builds with many cached intermediate
   stages spend far less time on "restoring cached image."
 
+### Fixed
+
+- A `build:` unit's or docker-tier pull's `.tmp` scratch dir could leak
+  forever when it failed — nothing removed it, and idle GC never reclaimed
+  it either. A failed build/pull now cleans up its own scratch; `vk gc`
+  (and every later build/pull) also sweeps any `.tmp` orphan left over from
+  an older, hard-killed one.
+
 ## [0.40.0] - 2026-08-21
 
 ### Changed

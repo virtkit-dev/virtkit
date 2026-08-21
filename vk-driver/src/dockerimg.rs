@@ -163,6 +163,10 @@ fn resolve_full(
     if !dir.join("runner.ext4").is_file() {
         let _lock = image::acquire_pull_lock(&dir, "pull", name, &digest)?;
         if !dir.join("runner.ext4").is_file() {
+            // Reclaim scratch orphaned by earlier failed/killed pulls of *other* images
+            // before asking for more space ourselves — otherwise a tier stuck failing
+            // (e.g. ENOSPC) never gets a chance to recover.
+            image::sweep_orphaned_build_tmp(&state_dir.join("docker"));
             build(
                 &pinned,
                 creds.username.clone(),
@@ -171,7 +175,9 @@ fn resolve_full(
                 creds.insecure,
                 &dir,
             )?;
-            image::gc_idle(&state_dir.join("docker"), cfg.image_cache_idle());
+            let docker_root = state_dir.join("docker");
+            image::gc_idle(&docker_root, cfg.image_cache_idle());
+            image::sweep_orphaned_build_tmp(&docker_root);
         }
     }
     image::mark_used(&dir);
@@ -195,6 +201,10 @@ fn build(
     let tmp = dir.with_extension("tmp");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    // Wipe `tmp` the instant the pull below fails (or panics) — don't leave that for a
+    // later sweep to notice. `image::sweep_orphaned_build_tmp` backstops the case nothing
+    // can run at all (SIGKILL/OOM).
+    let cleanup = image::TmpGuard::new(&tmp);
     println!("virtkit: pulling {full} ...");
     // Flatten the image byte-clean (the agent rides the boot initramfs) and capture its
     // Config into the runner.ext4.json sidecar — the shared OCI-flatten core. A journalled
@@ -221,6 +231,7 @@ fn build(
     if !rootfs.is_file() {
         bail!("OCI direct build of {full} produced no rootfs");
     }
+    cleanup.keep(); // pulled successfully: the rename below takes ownership of `tmp`.
     let _ = std::fs::remove_dir_all(dir);
     std::fs::rename(&tmp, dir)
         .with_context(|| format!("promoting {} to {}", tmp.display(), dir.display()))
