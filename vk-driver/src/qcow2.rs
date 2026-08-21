@@ -758,6 +758,90 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// A lazy-restored base's flatten must reassemble byte-exactly even when its chunks
+    /// aren't cluster-aligned (content-defined chunking never aligns to the qcow2 cluster
+    /// size, unlike a hand-built test fixture that might accidentally do so): wrap a
+    /// `.vk_ro_img` (two chunks with a gap between them, like a real base image after
+    /// hole-skipping push) in an empty overlay exactly like `wrap_base` does for a lazy
+    /// cache restore, then flatten it exactly like the final `vk build --out` export does,
+    /// and check the bytes round-trip.
+    #[test]
+    fn flatten_matches_expected_over_lazy_backing() {
+        let dir =
+            std::env::temp_dir().join(format!("vk-qcow2-lazy-flatten-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache_dir = dir.join("chunks");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        fn hex(d: &[u8; 32]) -> String {
+            d.iter().map(|b| format!("{b:02x}")).collect()
+        }
+
+        // chunk_a spans several 64 KiB clusters and is NOT cluster-aligned in length;
+        // chunk_b likewise, at an offset that isn't cluster-aligned either — content-defined
+        // chunking (FastCDC) never aligns to the qcow2 cluster size.
+        let chunk_a: Vec<u8> = (0..70_003u32).map(|i| (i % 251) as u8).collect();
+        let chunk_b: Vec<u8> = (0..70_111u32).map(|i| ((i * 7) % 251) as u8).collect();
+        let digest_a = {
+            let mut d = [0u8; 32];
+            d[31] = 1;
+            d
+        };
+        let digest_b = {
+            let mut d = [0u8; 32];
+            d[31] = 2;
+            d
+        };
+        std::fs::write(cache_dir.join(hex(&digest_a)), &chunk_a).unwrap();
+        std::fs::write(cache_dir.join(hex(&digest_b)), &chunk_b).unwrap();
+
+        let chunk_b_offset: u64 = 150_007; // deliberately not cluster-aligned
+        let total_size: u64 = 300_000;
+        let chunks = vec![
+            crate::registry::LazyChunk {
+                offset: 0,
+                length: chunk_a.len() as u32,
+                codec: crate::registry::VK_RO_IMG_CODEC_RAW,
+                digest: digest_a,
+            },
+            crate::registry::LazyChunk {
+                offset: chunk_b_offset,
+                length: chunk_b.len() as u32,
+                codec: crate::registry::VK_RO_IMG_CODEC_RAW,
+                digest: digest_b,
+            },
+        ];
+        let manifest = dir.join("base.vk_ro_img");
+        crate::registry::write_vk_ro_img(
+            &manifest,
+            total_size,
+            crate::registry::VK_RO_IMG_LAYOUT_FLAT,
+            &cache_dir,
+            &chunks,
+        )
+        .unwrap();
+
+        // wrap in an empty overlay, exactly like `wrap_base` does for a lazy cache restore.
+        let overlay = dir.join("ovl.qcow2");
+        create_overlay(&overlay, &manifest).unwrap();
+
+        let out = dir.join("flat.raw");
+        flatten_to_raw(&overlay, &out).unwrap();
+
+        let mut want = vec![0u8; total_size as usize];
+        want[0..chunk_a.len()].copy_from_slice(&chunk_a);
+        want[chunk_b_offset as usize..chunk_b_offset as usize + chunk_b.len()]
+            .copy_from_slice(&chunk_b);
+
+        let got = std::fs::read(&out).unwrap();
+        assert_eq!(got.len(), want.len(), "flattened image has the wrong size");
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(g, w, "mismatch at byte offset {i}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // Build a raw backing + a qcow2 overlay that overwrites one cluster, then check the
     // native reader matches `qemu-img convert` byte-for-byte and reports the right extents.
     #[test]
