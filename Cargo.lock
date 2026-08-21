@@ -2101,11 +2101,13 @@ dependencies = [
  "libloading",
  "log",
  "lru",
+ "maybe-async",
  "nix 0.30.1",
  "rand 0.9.5",
  "virtio-bindings",
  "vm-fdt",
  "vm-memory 0.17.1",
+ "zstd",
 ]
 
 [[package]]

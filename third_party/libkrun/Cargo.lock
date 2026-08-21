@@ -665,6 +665,7 @@ dependencies = [
  "libloading",
  "log",
  "lru",
+ "maybe-async",
  "nix 0.30.1",
  "pipewire",
  "rand",
@@ -673,6 +674,7 @@ dependencies = [
  "vm-fdt",
  "vm-memory",
  "zerocopy",
+ "zstd",
 ]
 
 [[package]]

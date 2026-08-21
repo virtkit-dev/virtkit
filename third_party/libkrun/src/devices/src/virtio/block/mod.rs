@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod device;
+mod lazy_chunk_storage;
 mod worker;
 
 pub use self::device::{Block, CacheType};
@@ -41,6 +42,11 @@ pub enum ImageType {
     Raw,
     Qcow2,
     Vmdk,
+    /// A `.vk_ro_img` manifest: a read-only view over content-addressed, zstd-compressed
+    /// chunks (see [`super::lazy_chunk_storage`]), decompressed on demand as the guest
+    /// reads. Always read-only; never valid as a qcow2 data/backing-override target other
+    /// than via the implicit-backing-file sniff in `device.rs`.
+    VkLazyChunks,
 }
 
 impl TryFrom<u32> for ImageType {
@@ -51,6 +57,7 @@ impl TryFrom<u32> for ImageType {
             0 => Ok(ImageType::Raw),
             1 => Ok(ImageType::Qcow2),
             2 => Ok(ImageType::Vmdk),
+            3 => Ok(ImageType::VkLazyChunks),
             _ => {
                 // Do not continue if the user cannot specify a valid disk format
                 Err(())

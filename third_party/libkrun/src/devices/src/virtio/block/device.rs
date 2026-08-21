@@ -14,7 +14,7 @@ use std::os::fd::AsRawFd;
 use std::os::linux::fs::MetadataExt;
 #[cfg(target_os = "macos")]
 use std::os::macos::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::result;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -30,6 +30,7 @@ use virtio_bindings::{
 };
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
+use super::lazy_chunk_storage::LazyChunkStorage;
 use super::worker::BlockWorker;
 use super::{
     super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice, TYPE_BLOCK},
@@ -543,6 +544,10 @@ impl Block {
                 None
             };
 
+        // Captured before `disk_image_path` moves into `file_opts` below: the directory a
+        // relative qcow2 backing filename (possibly a `.vk_ro_img`, see below) resolves against.
+        let disk_dir = PathBuf::from(&disk_image_path).parent().map(PathBuf::from);
+
         let file_opts = StorageOpenOptions::new()
             .write(!is_disk_read_only)
             .filename(disk_image_path)
@@ -550,30 +555,74 @@ impl Block {
 
         #[cfg(target_os = "macos")]
         let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
-        let file = ImagoFile::open(file_opts)?;
-        let discard_alignment = file.discard_align();
 
-        let disk_image = match disk_image_format {
+        let (disk_image, discard_alignment) = match disk_image_format {
             ImageType::Qcow2 => {
+                let file = ImagoFile::open(file_opts)?;
+                let discard_alignment = file.discard_align();
                 let mut qcow2 =
                     Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image(
                         Box::new(file),
                         !is_disk_read_only,
                     )?;
+                // A `.vk_ro_img` backing file (a lazy, chunk-decompressing view of a cached
+                // build-stage image, see `lazy_chunk_storage`) isn't a format
+                // `open_implicit_dependencies` below can open on its own — it would try to
+                // sniff/open it as a plain raw or qcow2 file and fail. Detect it from the
+                // backing filename recorded in the header and build it explicitly instead;
+                // `set_backing` marks the backing dependency resolved, so the call below only
+                // handles the (unrelated) implicit data-file dependency.
+                let lazy_backing_name = qcow2
+                    .implicit_backing_file()
+                    .filter(|name| name.ends_with(".vk_ro_img"))
+                    .cloned();
+                if let Some(backing_name) = lazy_backing_name {
+                    // Mirrors `imago::file::File::resolve_relative_path`'s exact semantics
+                    // (absolute passthrough, else join onto the parent dir) rather than reusing
+                    // it directly: by this point `qcow2`'s metadata storage already owns
+                    // `disk_dir`'s underlying file handle, so re-deriving it here is intentional
+                    // duplication, not an oversight — keep the two in sync if either changes.
+                    let backing_path = if Path::new(&backing_name).is_absolute() {
+                        PathBuf::from(backing_name)
+                    } else {
+                        disk_dir
+                            .clone()
+                            .unwrap_or_else(|| PathBuf::from("."))
+                            .join(backing_name)
+                    };
+                    let lazy_opts = StorageOpenOptions::new()
+                        .write(false)
+                        .filename(backing_path);
+                    let lazy = LazyChunkStorage::open(lazy_opts)?;
+                    let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(lazy), false)?;
+                    qcow2.set_backing(Some(Arc::new(FormatAccess::new(raw))));
+                }
                 qcow2.open_implicit_dependencies()?;
-                FormatAccess::new(qcow2)
+                (FormatAccess::new(qcow2), discard_alignment)
             }
             ImageType::Raw => {
+                let file = ImagoFile::open(file_opts)?;
+                let discard_alignment = file.discard_align();
                 let raw =
                     Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), !is_disk_read_only)?;
-                FormatAccess::new(raw)
+                (FormatAccess::new(raw), discard_alignment)
             }
             ImageType::Vmdk => {
+                let file = ImagoFile::open(file_opts)?;
+                let discard_alignment = file.discard_align();
                 let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(
                     Box::new(file),
                 )
                 .open(PermissiveImplicitOpenGate::default())?;
-                FormatAccess::new(vmdk)
+                (FormatAccess::new(vmdk), discard_alignment)
+            }
+            ImageType::VkLazyChunks => {
+                // Always read-only (enforced right here, independent of `is_disk_read_only`),
+                // so discard/write-zeroes granularity is moot; the storage's own default (1) is
+                // fine, and there is no real host file to probe an alignment from anyway.
+                let lazy = LazyChunkStorage::open(file_opts)?;
+                let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(lazy), false)?;
+                (FormatAccess::new(raw), 1usize)
             }
         };
 
