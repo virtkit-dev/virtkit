@@ -42,7 +42,7 @@ arch = { package = "krun-arch", version = "=0.1.0-1.19.0", path = "../arch" }
 utils = { package = "krun-utils", version = "=0.1.0-1.19.0", path = "../utils" }
 polly = { package = "krun-polly", version = "=0.1.0-1.19.0", path = "../polly" }
 rutabaga_gfx = { package = "krun-rutabaga-gfx", version = "=0.1.0-1.19.0", path = "../rutabaga_gfx", features = ["virgl_renderer", "virgl_renderer_next"], optional = true }
-imago = { path = "../../../imago", features = ["sync-wrappers"] }
+imago = { path = "../../../imago", default-features = false, features = ["sync"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hvf = { package = "krun-hvf", version = "=0.1.0-1.19.0", path = "../hvf" }

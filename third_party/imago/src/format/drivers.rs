@@ -121,6 +121,7 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
     /// once. A driver with nothing to defer (the range was already fully, validly mapped, or this
     /// format has no notion of allocation at all) returns a no-op implementation.
     #[allow(clippy::needless_lifetimes)] // Elidable in sync, but async needs a named lifetime for the boxed future bound
+    #[allow(clippy::type_complexity)] // Only flagged under sync, where the elided-lifetime form above doesn't hide it
     async fn ensure_data_mapping<'a>(
         &'a self,
         offset: u64,

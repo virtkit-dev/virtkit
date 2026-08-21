@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use imago::{
-    file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk, DynStorage, FormatDriverBuilder,
-    PermissiveImplicitOpenGate, Storage, StorageOpenOptions, SyncFormatAccess,
+    file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk, DynStorage, FormatAccess,
+    FormatDriverBuilder, PermissiveImplicitOpenGate, Storage, StorageOpenOptions,
 };
 use log::{error, warn};
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
@@ -222,7 +222,7 @@ fn encode_dirty_reply(ranges: &[(u64, u64)]) -> Vec<u8> {
 /// Make the write-back cache durable on the host image file (flush, then sync). The one place
 /// that persists libkrun's cached writes to disk — shared by the DRAIN and FLUSH control commands
 /// and the on-VMM-exit observer, so the exact flush semantics can't drift between them.
-fn flush_sync(df: &SyncFormatAccess<Box<dyn DynStorage>>) -> io::Result<()> {
+fn flush_sync(df: &FormatAccess<Box<dyn DynStorage>>) -> io::Result<()> {
     df.flush().and_then(|()| df.sync())
 }
 
@@ -324,7 +324,7 @@ mod dirty_tests {
 /// Helper object for setting up all `Block` fields derived from its backing file.
 pub(crate) struct DiskProperties {
     cache_type: CacheType,
-    pub(crate) file: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    pub(crate) file: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
     /// Set for read-only raw images; when present, reads are served from it instead of `file`.
     pub(crate) mmap: Option<Arc<DiskMmap>>,
     nsectors: u64,
@@ -336,7 +336,7 @@ pub(crate) struct DiskProperties {
 
 impl DiskProperties {
     pub fn new(
-        disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+        disk_image: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
         disk_image_id: Vec<u8>,
         cache_type: CacheType,
         mmap: Option<Arc<DiskMmap>>,
@@ -483,7 +483,7 @@ pub struct Block {
     // Host file and properties.
     disk: Option<DiskProperties>,
     cache_type: CacheType,
-    disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    disk_image: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
     mmap: Option<Arc<DiskMmap>>,
     worker_thread: Option<JoinHandle<()>>,
@@ -550,32 +550,30 @@ impl Block {
 
         #[cfg(target_os = "macos")]
         let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
-        let file = ImagoFile::open_sync(file_opts)?;
+        let file = ImagoFile::open(file_opts)?;
         let discard_alignment = file.discard_align();
 
         let disk_image = match disk_image_format {
             ImageType::Qcow2 => {
                 let mut qcow2 =
-                    Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image_sync(
+                    Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image(
                         Box::new(file),
                         !is_disk_read_only,
                     )?;
-                qcow2.open_implicit_dependencies_sync()?;
-                SyncFormatAccess::new(qcow2)?
+                qcow2.open_implicit_dependencies()?;
+                FormatAccess::new(qcow2)
             }
             ImageType::Raw => {
-                let raw = Raw::<Box<dyn DynStorage>>::open_image_sync(
-                    Box::new(file),
-                    !is_disk_read_only,
-                )?;
-                SyncFormatAccess::new(raw)?
+                let raw =
+                    Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), !is_disk_read_only)?;
+                FormatAccess::new(raw)
             }
             ImageType::Vmdk => {
                 let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(
                     Box::new(file),
                 )
-                .open_sync(PermissiveImplicitOpenGate::default())?;
-                SyncFormatAccess::new(vmdk)?
+                .open(PermissiveImplicitOpenGate::default())?;
+                FormatAccess::new(vmdk)
             }
         };
 
@@ -659,7 +657,7 @@ impl Block {
     /// (the build falls back correctly on the virtkit side).
     fn spawn_dirty_control(
         socket_path: String,
-        disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+        disk_image: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
         dirty: Arc<Mutex<DirtyRanges>>,
     ) {
         use std::os::unix::net::UnixListener;
@@ -878,11 +876,11 @@ mod tests {
     /// the same wiring `Block::new` produces for a read-only raw image.
     fn mmap_disk(path: &std::path::Path) -> DiskProperties {
         let p = path.to_str().unwrap().to_string();
-        let ifile = ImagoFile::open_sync(StorageOpenOptions::new().filename(p.clone())).unwrap();
-        let raw = Raw::<Box<dyn DynStorage>>::open_image_sync(Box::new(ifile), false).unwrap();
-        let sfa = SyncFormatAccess::new(raw).unwrap();
+        let ifile = ImagoFile::open(StorageOpenOptions::new().filename(p.clone())).unwrap();
+        let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(ifile), false).unwrap();
+        let fa = FormatAccess::new(raw);
         DiskProperties::new(
-            Arc::new(Mutex::new(sfa)),
+            Arc::new(Mutex::new(fa)),
             vec![0u8; VIRTIO_BLK_ID_BYTES as usize],
             CacheType::Unsafe,
             Some(Arc::new(DiskMmap::open(&p).unwrap())),

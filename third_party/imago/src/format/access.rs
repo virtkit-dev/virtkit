@@ -1013,6 +1013,25 @@ mod writev_failure_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
+    /// Runs `$body` (a call to a `#[maybe_async]` test function) to completion: on a throwaway
+    /// current-thread runtime under the `async` feature, or directly under `sync` (where the
+    /// call already ran synchronously by the time this macro sees it).
+    macro_rules! block_on_test {
+        ($body:expr) => {{
+            #[cfg(feature = "async")]
+            {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on($body);
+            }
+            #[cfg(feature = "sync")]
+            {
+                $body;
+            }
+        }};
+    }
+
     /// `Null`-backed storage whose `pure_writev()` fails exactly once, for the request
     /// covering `fail_at`.
     #[derive(Debug)]
@@ -1073,42 +1092,42 @@ mod writev_failure_tests {
     /// not a regression test for the corruption fix itself (see the qcow2 test below for that);
     /// it only guards that routing every write through a pending commit/abort didn't change
     /// plain error propagation for a format that was never at risk.
-    fn a_failed_write_still_surfaces_its_error(parallel: bool) {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let size = 64 * 1024;
-                let fail_at = 4096;
-                let storage = FlakyStorage {
-                    inner: Null::new(size),
-                    fail_at,
-                    failed_once: AtomicBool::new(false),
-                };
+    #[maybe_async]
+    async fn a_failed_write_still_surfaces_its_error(parallel: bool) {
+        let size = 64 * 1024;
+        let fail_at = 4096;
+        let storage = FlakyStorage {
+            inner: Null::new(size),
+            fail_at,
+            failed_once: AtomicBool::new(false),
+        };
 
-                let raw = Raw::open_image(storage, true).await.unwrap();
-                let mut image = FormatAccess::new(raw);
-                if parallel {
-                    image.set_async_write_parallelization(4);
-                }
+        let raw = Raw::open_image(storage, true).await.unwrap();
+        #[allow(unused_mut)]
+        let mut image = FormatAccess::new(raw);
+        #[cfg(feature = "async")]
+        if parallel {
+            image.set_async_write_parallelization(4);
+        }
+        #[cfg(feature = "sync")]
+        let _ = parallel;
 
-                let buf = vec![0x42u8; 8192];
-                let err = image
-                    .write(buf.as_slice(), 0)
-                    .await
-                    .expect_err("the simulated write failure must surface");
-                assert_eq!(err.to_string(), "simulated write failure");
-            });
+        let buf = vec![0x42u8; 8192];
+        let err = image
+            .write(buf.as_slice(), 0)
+            .await
+            .expect_err("the simulated write failure must surface");
+        assert_eq!(err.to_string(), "simulated write failure");
     }
 
     #[test]
     fn a_failed_write_still_surfaces_its_error_serial() {
-        a_failed_write_still_surfaces_its_error(false);
+        block_on_test!(a_failed_write_still_surfaces_its_error(false));
     }
 
     #[test]
     fn a_failed_write_still_surfaces_its_error_parallel() {
-        a_failed_write_still_surfaces_its_error(true);
+        block_on_test!(a_failed_write_still_surfaces_its_error(true));
     }
 
     /// In-memory `Storage`: unlike `Null`, reads round-trip what was written, so it can back a
@@ -1209,73 +1228,153 @@ mod writev_failure_tests {
     /// `PendingDataMapping` is only committed after the write succeeds; on failure it is
     /// aborted instead, so the L2 table must come back out reading exactly as it did before —
     /// as if the write had never been attempted.
+    #[maybe_async]
+    async fn a_failed_fresh_allocation_never_becomes_a_visible_mapping_impl() {
+        let storage = MemStorage::new();
+
+        Qcow2::<MemStorage>::create_builder(storage.clone())
+            .size(4 << 20) // 4 MiB
+            .create()
+            .await
+            .unwrap();
+
+        let qcow2 = Qcow2::<MemStorage>::builder(storage.clone())
+            .write(true)
+            .open(crate::format::gate::PermissiveImplicitOpenGate())
+            .await
+            .unwrap();
+        let image = FormatAccess::new(qcow2);
+
+        // Warm-up write (no failure injected): establishes the L1/L2 table metadata
+        // covering this whole (small, single-L2-table) image, so the actual write below
+        // is the only thing that still needs to allocate — an L2 table entry write here
+        // would otherwise consume the injected failure before it ever reached the
+        // guest's own write.
+        image.write(vec![0u8; 65536].as_slice(), 0).await.unwrap();
+
+        let target_offset = 65536; // the next cluster over — untouched so far
+        let (before, _) = image.get_mapping(target_offset, 4096).await.unwrap();
+        assert!(
+            matches!(before, Mapping::Zero { explicit: false }),
+            "expected an untouched offset to start out unallocated, got {before:?}"
+        );
+
+        // A full, cluster-aligned cluster (the default qcow2 cluster size is 64 KiB):
+        // covering the whole cluster means no copy-on-write of surrounding data is
+        // needed, so the only write this triggers is the guest's own — precisely the
+        // one `fail_next_write` targets. A partial-cluster write would additionally
+        // trigger an internal zero-fill of the rest of the cluster first, which would
+        // consume the injected failure before it ever reached the guest's write.
+        storage.fail_next_write.store(true, Ordering::SeqCst);
+        let buf = vec![0x42u8; 65536];
+        let err = image
+            .write(buf.as_slice(), target_offset)
+            .await
+            .expect_err("the simulated write failure must surface");
+        assert_eq!(err.to_string(), "simulated write failure");
+
+        let (after, _) = image.get_mapping(target_offset, 4096).await.unwrap();
+        assert!(
+            matches!(after, Mapping::Zero { explicit: false }),
+            "a failed write must never leave a mapping behind — the aborted \
+             allocation must read exactly as it did before the write was attempted, \
+             not as valid, allocated storage holding undefined content; got {after:?}"
+        );
+
+        // The retry (no failure injected this time) must succeed cleanly, proving the
+        // aborted attempt didn't corrupt the image or leave it unwritable.
+        image.write(buf.as_slice(), target_offset).await.unwrap();
+        let mut readback = vec![0u8; 65536];
+        image
+            .read(readback.as_mut_slice(), target_offset)
+            .await
+            .unwrap();
+        assert_eq!(readback, buf);
+    }
+
+    /// Regression test for the deeper fix: a real qcow2 image, a guest write that allocates a
+    /// fresh cluster and then fails. Before this fix, the cluster would already have been
+    /// mapped into the L2 table by the time the write failed, so the failure would leave a
+    /// valid-looking mapping pointing at undefined content. Now, `ensure_data_mapping()`'s
+    /// `PendingDataMapping` is only committed after the write succeeds; on failure it is
+    /// aborted instead, so the L2 table must come back out reading exactly as it did before —
+    /// as if the write had never been attempted.
     #[test]
     fn a_failed_fresh_allocation_never_becomes_a_visible_mapping() {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let storage = MemStorage::new();
+        block_on_test!(a_failed_fresh_allocation_never_becomes_a_visible_mapping_impl());
+    }
 
-                Qcow2::<MemStorage>::create_builder(storage.clone())
-                    .size(4 << 20) // 4 MiB
-                    .create()
-                    .await
-                    .unwrap();
+    #[maybe_async]
+    async fn a_real_efbig_mid_write_never_becomes_a_visible_mapping_impl() {
+        use crate::file::File as ImagoFile;
+        use crate::format::gate::PermissiveImplicitOpenGate;
 
-                let qcow2 = Qcow2::<MemStorage>::builder(storage.clone())
-                    .write(true)
-                    .open(crate::format::gate::PermissiveImplicitOpenGate())
-                    .await
-                    .unwrap();
-                let image = FormatAccess::new(qcow2);
+        // EFBIG's default action is to kill the process; ignore it so the write
+        // returns an error instead.
+        unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
 
-                // Warm-up write (no failure injected): establishes the L1/L2 table metadata
-                // covering this whole (small, single-L2-table) image, so the actual write below
-                // is the only thing that still needs to allocate — an L2 table entry write here
-                // would otherwise consume the injected failure before it ever reached the
-                // guest's own write.
-                image.write(vec![0u8; 65536].as_slice(), 0).await.unwrap();
+        let path = std::env::temp_dir().join(format!("imago-efbig-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
 
-                let target_offset = 65536; // the next cluster over — untouched so far
-                let (before, _) = image.get_mapping(target_offset, 4096).await.unwrap();
-                assert!(
-                    matches!(before, Mapping::Zero { explicit: false }),
-                    "expected an untouched offset to start out unallocated, got {before:?}"
-                );
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        Qcow2::<ImagoFile>::create_builder(ImagoFile::try_from(f).unwrap())
+            .size(4 << 20)
+            .create()
+            .await
+            .unwrap();
 
-                // A full, cluster-aligned cluster (the default qcow2 cluster size is 64 KiB):
-                // covering the whole cluster means no copy-on-write of surrounding data is
-                // needed, so the only write this triggers is the guest's own — precisely the
-                // one `fail_next_write` targets. A partial-cluster write would additionally
-                // trigger an internal zero-fill of the rest of the cluster first, which would
-                // consume the injected failure before it ever reached the guest's write.
-                storage.fail_next_write.store(true, Ordering::SeqCst);
-                let buf = vec![0x42u8; 65536];
-                let err = image
-                    .write(buf.as_slice(), target_offset)
-                    .await
-                    .expect_err("the simulated write failure must surface");
-                assert_eq!(err.to_string(), "simulated write failure");
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let qcow2 = Qcow2::<ImagoFile>::builder(ImagoFile::try_from(f).unwrap())
+            .write(true)
+            .open(PermissiveImplicitOpenGate())
+            .await
+            .unwrap();
+        let image = FormatAccess::new(qcow2);
 
-                let (after, _) = image.get_mapping(target_offset, 4096).await.unwrap();
-                assert!(
-                    matches!(after, Mapping::Zero { explicit: false }),
-                    "a failed write must never leave a mapping behind — the aborted \
-                     allocation must read exactly as it did before the write was attempted, \
-                     not as valid, allocated storage holding undefined content; got {after:?}"
-                );
+        // Warm-up write: establishes L1/L2/refcount metadata so the write below only
+        // needs to allocate its own cluster.
+        image.write(vec![0u8; 65536].as_slice(), 0).await.unwrap();
+        let len_after_warmup = std::fs::metadata(&path).unwrap().len();
 
-                // The retry (no failure injected this time) must succeed cleanly, proving the
-                // aborted attempt didn't corrupt the image or leave it unwritable.
-                image.write(buf.as_slice(), target_offset).await.unwrap();
-                let mut readback = vec![0u8; 65536];
-                image
-                    .read(readback.as_mut_slice(), target_offset)
-                    .await
-                    .unwrap();
-                assert_eq!(readback, buf);
-            });
+        // Cap the file just past its current length, so the guest's next write (a
+        // fresh 64 KiB cluster) grows the file past the cap partway through.
+        let cap = len_after_warmup + 8192;
+        let rlimit = libc::rlimit {
+            rlim_cur: cap,
+            rlim_max: cap,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &rlimit) }, 0);
+
+        let target_offset = 65536u64;
+        let buf = vec![0x42u8; 65536];
+        let result = image.write(buf.as_slice(), target_offset).await;
+
+        let rlimit = libc::rlimit {
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &rlimit) };
+
+        result.expect_err("the write must fail with a real EFBIG");
+
+        let (after, _) = image.get_mapping(target_offset, 4096).await.unwrap();
+        assert!(
+            matches!(after, Mapping::Zero { explicit: false }),
+            "a real, partially-succeeded write must not leave a mapping behind; \
+             got {after:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Same regression as above, but against a real file and a real kernel write failure
@@ -1287,81 +1386,75 @@ mod writev_failure_tests {
     /// binary writes to a real file.
     #[test]
     fn a_real_efbig_mid_write_never_becomes_a_visible_mapping() {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(async {
-                use crate::file::File as ImagoFile;
-                use crate::format::gate::PermissiveImplicitOpenGate;
+        block_on_test!(a_real_efbig_mid_write_never_becomes_a_visible_mapping_impl());
+    }
 
-                // EFBIG's default action is to kill the process; ignore it so the write
-                // returns an error instead.
-                unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+    /// Regression test for a variant of the same bug the fix above addresses, but on the
+    /// opposite end: reusing an already-allocated cluster that is currently flagged zero (e.g.
+    /// via `write_zeroes()`, which keeps the allocation instead of discarding it), rather than
+    /// allocating a brand new one. `Qcow2::cow_cluster()` returns that case as
+    /// `ClusterAllocation::ReusedZero` (nothing to free on abort, correct), but committing it
+    /// must still map the cluster into the L2 table to clear its zero flag — unlike a cluster
+    /// that was already mapped as data, for which committing really is a no-op. Getting this wrong
+    /// leaves real, successfully written data physically on disk but with an L2 entry that still
+    /// says zero, so every subsequent read silently returns zeroes instead of what was written.
+    #[maybe_async]
+    async fn a_write_into_a_reused_zero_cluster_stays_visible_impl() {
+        let storage = MemStorage::new();
 
-                let path =
-                    std::env::temp_dir().join(format!("imago-efbig-test-{}", std::process::id()));
-                let _ = std::fs::remove_file(&path);
+        Qcow2::<MemStorage>::create_builder(storage.clone())
+            .size(4 << 20) // 4 MiB
+            .create()
+            .await
+            .unwrap();
 
-                let f = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&path)
-                    .unwrap();
-                Qcow2::<ImagoFile>::create_builder(ImagoFile::try_from(f).unwrap())
-                    .size(4 << 20)
-                    .create()
-                    .await
-                    .unwrap();
+        let qcow2 = Qcow2::<MemStorage>::builder(storage.clone())
+            .write(true)
+            .open(crate::format::gate::PermissiveImplicitOpenGate())
+            .await
+            .unwrap();
+        let image = FormatAccess::new(qcow2);
 
-                let f = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&path)
-                    .unwrap();
-                let qcow2 = Qcow2::<ImagoFile>::builder(ImagoFile::try_from(f).unwrap())
-                    .write(true)
-                    .open(PermissiveImplicitOpenGate())
-                    .await
-                    .unwrap();
-                let image = FormatAccess::new(qcow2);
+        // The default qcow2 cluster size is 64 KiB; a full, cluster-aligned write
+        // allocates it as an exclusively-owned data cluster (`copied: true`).
+        let target_offset = 65536;
+        let cluster_len = 65536;
+        image
+            .write(vec![0x11u8; cluster_len].as_slice(), target_offset)
+            .await
+            .unwrap();
 
-                // Warm-up write: establishes L1/L2/refcount metadata so the write below only
-                // needs to allocate its own cluster.
-                image.write(vec![0u8; 65536].as_slice(), 0).await.unwrap();
-                let len_after_warmup = std::fs::metadata(&path).unwrap().len();
+        // Zero it back out, but retaining the allocation (`write_zeroes()`, unlike
+        // `discard_to_zero()`, never discards) — the L2 entry becomes `Zero { host_cluster:
+        // Some(_), copied: true }`, i.e. exactly the case this fix's `ReusedZero` variant
+        // covers.
+        image
+            .write_zeroes(target_offset, cluster_len as u64)
+            .await
+            .unwrap();
+        let (zeroed, _) = image.get_mapping(target_offset, 4096).await.unwrap();
+        assert!(
+            matches!(zeroed, Mapping::Zero { explicit: true }),
+            "write_zeroes() must retain the allocation as an explicit zero mapping, \
+             got {zeroed:?}"
+        );
 
-                // Cap the file just past its current length, so the guest's next write (a
-                // fresh 64 KiB cluster) grows the file past the cap partway through.
-                let cap = len_after_warmup + 8192;
-                let rlimit = libc::rlimit {
-                    rlim_cur: cap,
-                    rlim_max: cap,
-                };
-                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &rlimit) }, 0);
+        // Write real data into that same cluster again: this reuses the still-allocated
+        // host cluster rather than allocating a fresh one, going through
+        // `ClusterAllocation::ReusedZero` instead of `Fresh`.
+        let buf = vec![0x22u8; cluster_len];
+        image.write(buf.as_slice(), target_offset).await.unwrap();
 
-                let target_offset = 65536u64;
-                let buf = vec![0x42u8; 65536];
-                let result = image.write(buf.as_slice(), target_offset).await;
-
-                let rlimit = libc::rlimit {
-                    rlim_cur: libc::RLIM_INFINITY,
-                    rlim_max: libc::RLIM_INFINITY,
-                };
-                unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &rlimit) };
-
-                result.expect_err("the write must fail with a real EFBIG");
-
-                let (after, _) = image.get_mapping(target_offset, 4096).await.unwrap();
-                assert!(
-                    matches!(after, Mapping::Zero { explicit: false }),
-                    "a real, partially-succeeded write must not leave a mapping behind; \
-                     got {after:?}"
-                );
-
-                let _ = std::fs::remove_file(&path);
-            });
+        let mut readback = vec![0u8; cluster_len];
+        image
+            .read(readback.as_mut_slice(), target_offset)
+            .await
+            .unwrap();
+        assert_eq!(
+            readback, buf,
+            "a write into a reused zero-flagged cluster must be visible on read, not \
+             silently swallowed by a stale zero L2 entry"
+        );
     }
 
     /// Regression test for a variant of the same bug the fix above addresses, but on the
@@ -1375,65 +1468,6 @@ mod writev_failure_tests {
     /// says zero, so every subsequent read silently returns zeroes instead of what was written.
     #[test]
     fn a_write_into_a_reused_zero_cluster_stays_visible() {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let storage = MemStorage::new();
-
-                Qcow2::<MemStorage>::create_builder(storage.clone())
-                    .size(4 << 20) // 4 MiB
-                    .create()
-                    .await
-                    .unwrap();
-
-                let qcow2 = Qcow2::<MemStorage>::builder(storage.clone())
-                    .write(true)
-                    .open(crate::format::gate::PermissiveImplicitOpenGate())
-                    .await
-                    .unwrap();
-                let image = FormatAccess::new(qcow2);
-
-                // The default qcow2 cluster size is 64 KiB; a full, cluster-aligned write
-                // allocates it as an exclusively-owned data cluster (`copied: true`).
-                let target_offset = 65536;
-                let cluster_len = 65536;
-                image
-                    .write(vec![0x11u8; cluster_len].as_slice(), target_offset)
-                    .await
-                    .unwrap();
-
-                // Zero it back out, but retaining the allocation (`write_zeroes()`, unlike
-                // `discard_to_zero()`, never discards) — the L2 entry becomes `Zero { host_cluster:
-                // Some(_), copied: true }`, i.e. exactly the case this fix's `ReusedZero` variant
-                // covers.
-                image
-                    .write_zeroes(target_offset, cluster_len as u64)
-                    .await
-                    .unwrap();
-                let (zeroed, _) = image.get_mapping(target_offset, 4096).await.unwrap();
-                assert!(
-                    matches!(zeroed, Mapping::Zero { explicit: true }),
-                    "write_zeroes() must retain the allocation as an explicit zero mapping, \
-                     got {zeroed:?}"
-                );
-
-                // Write real data into that same cluster again: this reuses the still-allocated
-                // host cluster rather than allocating a fresh one, going through
-                // `ClusterAllocation::ReusedZero` instead of `Fresh`.
-                let buf = vec![0x22u8; cluster_len];
-                image.write(buf.as_slice(), target_offset).await.unwrap();
-
-                let mut readback = vec![0u8; cluster_len];
-                image
-                    .read(readback.as_mut_slice(), target_offset)
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    readback, buf,
-                    "a write into a reused zero-flagged cluster must be visible on read, not \
-                     silently swallowed by a stale zero L2 entry"
-                );
-            });
+        block_on_test!(a_write_into_a_reused_zero_cluster_stays_visible_impl());
     }
 }
