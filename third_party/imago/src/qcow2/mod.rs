@@ -15,7 +15,7 @@ mod types;
 
 use crate::async_lru_cache::AsyncLruCache;
 use crate::format::builder::{FormatCreateBuilder, FormatDriverBuilder};
-use crate::format::drivers::FormatDriverInstance;
+use crate::format::drivers::{FormatDriverInstance, NoopPending, PendingDataMapping};
 use crate::format::gate::{ImplicitOpenGate, PermissiveImplicitOpenGate};
 use crate::format::wrapped::WrappedFormat;
 use crate::format::{Format, PreallocateMode};
@@ -505,17 +505,20 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         offset: u64,
         length: u64,
         overwrite: bool,
-    ) -> io::Result<(&'a S, u64, u64)> {
+    ) -> io::Result<(&'a S, u64, u64, Box<dyn PendingDataMapping + 'a>)> {
         self.check_disk_bounds(offset, length, "allocate")?;
 
         if length == 0 {
-            return Ok((self.storage(), 0, 0));
+            return Ok((self.storage(), 0, 0, Box::new(NoopPending)));
         }
 
         self.need_writable()?;
         let offset = GuestOffset(offset);
-        self.do_ensure_data_mapping(offset, length, overwrite, false)
-            .await
+        let (storage, host_offset, mapped_length, pending) = self
+            .do_ensure_data_mapping(offset, length, overwrite, false)
+            .await?;
+        let pending: Box<dyn PendingDataMapping + 'a> = Box::new(pending);
+        Ok((storage, host_offset, mapped_length, pending))
     }
 
     async fn ensure_zero_mapping(&self, offset: u64, length: u64) -> io::Result<(u64, u64)> {

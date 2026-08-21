@@ -114,13 +114,24 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
     /// mappings.  Making them unused, but retaining them as allocated so they can safely be
     /// written to (albeit with no effect) is OK; discarding them so that they may be reused for
     /// other mappings is not.
+    ///
+    /// The returned [`PendingDataMapping`] may still need establishing the mapping to be finished
+    /// (e.g. an allocation made visible): the caller must call exactly one of its `commit()` (once
+    /// its own write into the returned range has succeeded) or `abort()` (if it hasn't), exactly
+    /// once. A driver with nothing to defer (the range was already fully, validly mapped, or this
+    /// format has no notion of allocation at all) returns a no-op implementation.
     #[allow(clippy::needless_lifetimes)] // Elidable in sync, but async needs a named lifetime for the boxed future bound
     async fn ensure_data_mapping<'a>(
         &'a self,
         offset: u64,
         length: u64,
         overwrite: bool,
-    ) -> io::Result<(&'a Self::Storage, u64, u64)>;
+    ) -> io::Result<(
+        &'a Self::Storage,
+        u64,
+        u64,
+        Box<dyn PendingDataMapping + 'a>,
+    )>;
 
     /// Ensure that the given range is efficiently mapped as zeroes.
     ///
@@ -294,6 +305,52 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
     ///
     /// If the current size is already `new_size` or smaller, do nothing.
     async fn resize_shrink(&mut self, new_size: u64) -> io::Result<()>;
+}
+
+/// A data mapping [`FormatDriverInstance::ensure_data_mapping()`] established but that may not
+/// yet be safe to expose to anyone but the caller that is about to write into it.
+///
+/// Establishing a mapping (e.g. allocating or COW'ing a cluster) and a caller actually writing
+/// its data into the resulting range are two separate steps. If a driver made the mapping fully
+/// visible (e.g. to a later flush, or a concurrent reader) before that write has happened, a
+/// write that then fails would leave it looking like ordinary, valid, allocated storage — not a
+/// hole — while actually holding whatever undefined bytes happened to already be there. That is
+/// invisible both to the failed write's own caller (which only ever sees the one `io::Error`) and
+/// to a plain allocation-vs-write-tracking check, so it can be picked up as if it were real data
+/// far later, by an entirely unrelated operation.
+///
+/// The caller of `ensure_data_mapping()` must therefore call exactly one of [`commit()`] (once
+/// its own write into the returned range has actually succeeded) or [`abort()`] (if it hasn't),
+/// exactly once, before dropping this.
+///
+/// [`commit()`]: PendingDataMapping::commit
+/// [`abort()`]: PendingDataMapping::abort
+#[maybe_async(?Send)]
+pub trait PendingDataMapping {
+    /// Make the mapping fully visible: it may now be read back, or picked up by a flush, like
+    /// any other valid mapping.
+    async fn commit(self: Box<Self>) -> io::Result<()>;
+
+    /// Give up on this mapping. Whatever it allocated is freed (best-effort; there usually is no
+    /// better way to handle a failure to free than to leak, so this cannot itself fail); the
+    /// range must behave exactly as if `ensure_data_mapping()` had never been called.
+    async fn abort(self: Box<Self>);
+}
+
+/// A [`PendingDataMapping`] for a driver with nothing to defer: the mapping
+/// [`FormatDriverInstance::ensure_data_mapping()`] returned alongside this was already fully
+/// valid and visible the moment it was returned (there was nothing to allocate, or the format has
+/// no notion of allocation at all), so committing and aborting are both no-ops.
+#[derive(Debug, Default)]
+pub(crate) struct NoopPending;
+
+#[maybe_async(?Send)]
+impl PendingDataMapping for NoopPending {
+    async fn commit(self: Box<Self>) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn abort(self: Box<Self>) {}
 }
 
 /// Non-recursive mapping information.

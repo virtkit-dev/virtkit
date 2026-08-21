@@ -65,24 +65,38 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         }
 
         while offset < max_offset {
-            let (file, fofs, flen) = self
+            let (file, fofs, flen, pending) = self
                 .do_ensure_data_mapping(GuestOffset(offset), max_offset - offset, true, true)
                 .await?;
 
             // Data in metadata file: Allocate data areas as we go
             if self.storage.is_none() {
-                match storage_prealloc_mode {
-                    storage::PreallocateMode::None => (), // handled below
-                    storage::PreallocateMode::Zero => {
-                        file.write_zeroes(fofs, flen).await?;
-                    }
+                let result = match storage_prealloc_mode {
+                    // `PreallocateMode::None` explicitly promises nothing about the new
+                    // range's content ("may return random data"), so the freshly established
+                    // mapping can be committed as-is — there is no write to wait for here.
+                    storage::PreallocateMode::None => Ok(()),
+                    storage::PreallocateMode::Zero => file.write_zeroes(fofs, flen).await,
                     storage::PreallocateMode::Allocate => {
-                        file.write_allocated_zeroes(fofs, flen).await?;
+                        file.write_allocated_zeroes(fofs, flen).await
                     }
                     storage::PreallocateMode::WriteData => {
-                        write_full_zeroes(file, fofs, flen).await?;
+                        write_full_zeroes(file, fofs, flen).await
+                    }
+                };
+                // Only commit (map the fresh cluster into the L2 table) once its content is
+                // known to match what this mode promises; on failure, abort instead, freeing
+                // it — a mid-write failure must never leave a cluster mapped in with whatever
+                // undefined bytes happened to already be there. See `Qcow2Pending`.
+                match result {
+                    Ok(()) => pending.commit().await,
+                    Err(e) => {
+                        pending.abort().await;
+                        return Err(e);
                     }
                 }
+            } else {
+                pending.commit().await;
             }
 
             offset += flen;

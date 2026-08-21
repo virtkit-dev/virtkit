@@ -1,7 +1,7 @@
 //! VMDK implementation.
 
 use crate::format::builder::{FormatDriverBuilder, FormatDriverBuilderBase};
-use crate::format::drivers::FormatDriverInstance;
+use crate::format::drivers::{FormatDriverInstance, PendingDataMapping};
 use crate::format::gate::ImplicitOpenGate;
 use crate::format::wrapped::WrappedFormat;
 use crate::format::{Format, PreallocateMode};
@@ -665,7 +665,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatDriverInstance f
         _offset: u64,
         _length: u64,
         _overwrite: bool,
-    ) -> io::Result<(&'a S, u64, u64)> {
+    ) -> io::Result<(&'a S, u64, u64, Box<dyn PendingDataMapping + 'a>)> {
         Err(io::Error::other("Image is read-only"))
     }
 

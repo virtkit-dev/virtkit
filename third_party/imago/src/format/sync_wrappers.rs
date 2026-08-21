@@ -1,6 +1,6 @@
 //! Synchronous wrapper around [`FormatAccess`].
 
-use super::drivers::FormatDriverInstance;
+use super::drivers::{FormatDriverInstance, PendingDataMapping};
 use super::PreallocateMode;
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::{FormatAccess, Mapping, Storage};
@@ -103,7 +103,7 @@ impl<S: Storage + 'static> SyncFormatAccess<S> {
         offset: u64,
         length: u64,
         overwrite: bool,
-    ) -> io::Result<(&S, u64, u64)> {
+    ) -> io::Result<(&S, u64, u64, Box<dyn PendingDataMapping + '_>)> {
         self.runtime
             .block_on(self.inner.ensure_data_mapping(offset, length, overwrite))
     }

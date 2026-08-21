@@ -5,7 +5,7 @@
 use crate::format::builder::{
     FormatCreateBuilder, FormatCreateBuilderBase, FormatDriverBuilder, FormatDriverBuilderBase,
 };
-use crate::format::drivers::FormatDriverInstance;
+use crate::format::drivers::{FormatDriverInstance, NoopPending, PendingDataMapping};
 use crate::format::gate::ImplicitOpenGate;
 use crate::format::{Format, PreallocateMode};
 use crate::{
@@ -142,7 +142,7 @@ impl<S: Storage + 'static> FormatDriverInstance for Raw<S> {
         offset: u64,
         length: u64,
         _overwrite: bool,
-    ) -> io::Result<(&'a S, u64, u64)> {
+    ) -> io::Result<(&'a S, u64, u64, Box<dyn PendingDataMapping + 'a>)> {
         let Some(remaining) = self.size().checked_sub(offset) else {
             return Err(io::Error::other("Cannot allocate past the end of file"));
         };
@@ -150,7 +150,9 @@ impl<S: Storage + 'static> FormatDriverInstance for Raw<S> {
             return Err(io::Error::other("Cannot allocate past the end of file"));
         }
 
-        Ok((&self.inner, offset, length))
+        // A raw image has no notion of allocation: every offset is always already mapped
+        // directly to the storage object, so there is nothing to defer.
+        Ok((&self.inner, offset, length, Box::new(NoopPending)))
     }
 
     async fn ensure_zero_mapping(&self, offset: u64, length: u64) -> io::Result<(u64, u64)> {

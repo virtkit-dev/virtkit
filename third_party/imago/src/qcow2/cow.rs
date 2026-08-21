@@ -5,6 +5,43 @@
 use super::*;
 use crate::io_buffers::IoBuffer;
 
+/// The outcome of [`Qcow2::cow_cluster()`]: which host cluster a guest write may target, and
+/// whether mapping it into the L2 table is still pending.
+///
+/// Deliberately not [`Copy`]/[`Clone`]-derived-away-from: callers must route every value through
+/// exactly one of a commit (map it in, `MappedExisting` excepted) or an abort (free it, `Fresh`
+/// only) — see [`Qcow2Pending`](super::mappings::Qcow2Pending).
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ClusterAllocation {
+    /// Already validly mapped as a writable data cluster before this call. Committing it is a
+    /// no-op; it must never be freed — it may still be in use even if this particular write is
+    /// aborted.
+    MappedExisting(HostCluster),
+    /// An existing, already-referenced pre-allocated zero cluster being reused as-is: no new
+    /// physical allocation, so it must never be freed on abort. But its L2 entry still carries
+    /// the "zero" flag, so — unlike `MappedExisting` — committing it is not a no-op: it must
+    /// still be mapped in on commit to clear that flag, or a write that lands real data there
+    /// keeps reading back as zero forever.
+    ReusedZero(HostCluster),
+    /// Freshly claimed by this call, not yet mapped into the L2 table. Must be freed if it is
+    /// never committed, or it leaks; must not be exposed via the L2 table before the guest's
+    /// own write into it has actually succeeded, or an unwritten cluster becomes indistinguishable
+    /// from a valid one holding whatever bytes happened to already be there.
+    Fresh(HostCluster),
+}
+
+impl ClusterAllocation {
+    /// The host cluster a guest write into this allocation may target, regardless of which
+    /// variant this is.
+    pub(super) fn host_cluster(&self) -> HostCluster {
+        match *self {
+            ClusterAllocation::MappedExisting(hc)
+            | ClusterAllocation::ReusedZero(hc)
+            | ClusterAllocation::Fresh(hc) => hc,
+        }
+    }
+}
+
 #[maybe_async]
 impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     /// Do copy-on-write for the given guest cluster, if necessary.
@@ -21,7 +58,9 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     ///
     /// Return the new cluster, if any was allocated, or the old cluster in case it was already
     /// safe to write to.  I.e., the returned cluster is where data for `cluster` may be written
-    /// to.
+    /// to. Does NOT map a freshly allocated cluster into the L2 table — that is deferred to the
+    /// caller's [`Qcow2Pending`](super::mappings::Qcow2Pending), once the write into it (which
+    /// the caller performs after this returns) is known to have succeeded.
     ///
     /// `cluster` is the guest cluster to COW.
     ///
@@ -33,17 +72,13 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     /// immediately anyway, i.e. that need not be copied.
     ///
     /// `l2_table` is the L2 table for `offset`.
-    ///
-    /// If a previously existing allocation is replaced, the old one will be put into
-    /// `leaked_allocations`.  The caller must free it.
     pub(super) async fn cow_cluster(
         &self,
         cluster: GuestCluster,
         mandatory_host_cluster: Option<HostCluster>,
         partial_skip_cow: Option<Range<usize>>,
-        l2_table: &mut L2TableWriteGuard<'_>,
-        leaked_allocations: &mut Vec<(HostCluster, ClusterCount)>,
-    ) -> io::Result<Option<HostCluster>> {
+        l2_table: &L2TableWriteGuard<'_>,
+    ) -> io::Result<Option<ClusterAllocation>> {
         // No need to do COW when writing the full cluster
         let full_skip_cow = if let Some(skip) = partial_skip_cow.as_ref() {
             skip.start == 0 && skip.end == self.header.cluster_size()
@@ -62,10 +97,14 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                     return Ok(None);
                 }
             }
-            return Ok(Some(host_cluster));
+            return Ok(Some(ClusterAllocation::MappedExisting(host_cluster)));
         };
 
         self.need_writable()?;
+
+        // Whether `new_cluster` below is a fresh allocation (must be freed if never committed)
+        // or an existing, already-referenced one being reused as-is (must never be freed).
+        let mut fresh = false;
 
         let new_cluster = if let L2Mapping::Zero {
             host_cluster: Some(host_cluster),
@@ -77,6 +116,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                     Some(host_cluster)
                 } else {
                     // Discard existing mapping
+                    fresh = true;
                     self.allocate_data_cluster_at(cluster, Some(mandatory_host_cluster))
                         .await?
                 }
@@ -84,6 +124,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 Some(host_cluster)
             }
         } else {
+            fresh = true;
             self.allocate_data_cluster_at(cluster, mandatory_host_cluster)
                 .await?
         };
@@ -136,12 +177,14 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             }
         }
 
-        let l2i = cluster.l2_index(self.header.cluster_bits());
-        if let Some(leaked) = l2_table.map_cluster(l2i, new_cluster) {
-            leaked_allocations.push(leaked);
-        }
-
-        Ok(Some(new_cluster))
+        Ok(Some(if fresh {
+            ClusterAllocation::Fresh(new_cluster)
+        } else {
+            // Reused an existing pre-allocated zero cluster as-is (the `Some(host_cluster) =
+            // Some(new_cluster)` branches above): no new allocation, but the L2 entry's "zero"
+            // flag still needs clearing on commit.
+            ClusterAllocation::ReusedZero(new_cluster)
+        }))
     }
 
     /// Calculate what range of a cluster we need to COW.

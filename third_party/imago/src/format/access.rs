@@ -2,7 +2,7 @@
 //!
 //! Provides access to different image formats via `FormatAccess` objects.
 
-use super::drivers::{FormatDriverInstance, ShallowMapping};
+use super::drivers::{FormatDriverInstance, PendingDataMapping, ShallowMapping};
 use super::PreallocateMode;
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::storage::ext::write_full_zeroes;
@@ -329,14 +329,14 @@ impl<S: Storage + 'static> FormatAccess<S> {
         offset: u64,
         length: u64,
         overwrite: bool,
-    ) -> io::Result<(&S, u64, u64)> {
-        let (storage, mapped_offset, mapped_length) = self
+    ) -> io::Result<(&S, u64, u64, Box<dyn PendingDataMapping + '_>)> {
+        let (storage, mapped_offset, mapped_length, pending) = self
             .inner
             .ensure_data_mapping(offset, length, overwrite)
             .await?;
         let mapped_length = cmp::min(length, mapped_length);
         assert!(mapped_length > 0);
-        Ok((storage, mapped_offset, mapped_length))
+        Ok((storage, mapped_offset, mapped_length, pending))
     }
 
     /// Read data at `offset` into `bufv`.
@@ -418,7 +418,7 @@ impl<S: Storage + 'static> FormatAccess<S> {
         let mut workers = (self.write_parallelization > 1).then(FuturesUnordered::new);
 
         while !bufv.is_empty() {
-            let (storage, st_offset, st_length) =
+            let (storage, st_offset, st_length, pending) =
                 self.ensure_data_mapping(offset, bufv.len(), true).await?;
 
             #[cfg(feature = "async")]
@@ -432,14 +432,39 @@ impl<S: Storage + 'static> FormatAccess<S> {
             bufv = remainder;
             offset += st_length;
 
+            // `ensure_data_mapping` above may have allocated (or COW'd) a mapping that is not
+            // yet visible to anyone else — `pending` — precisely so that a write which then
+            // fails can still be undone instead of leaving that mapping allocated with
+            // whatever undefined bytes were already there (see `PendingDataMapping`). Commit
+            // it once the write below is known to have succeeded, or abort it if not.
             #[cfg(feature = "async")]
             if let Some(workers) = workers.as_mut() {
-                workers.push(storage.writev(chunk, st_offset));
+                workers.push(async move {
+                    match storage.writev(chunk, st_offset).await {
+                        Ok(()) => pending.commit().await,
+                        Err(e) => {
+                            pending.abort().await;
+                            Err(e)
+                        }
+                    }
+                });
             } else {
-                storage.writev(chunk, st_offset).await?;
+                match storage.writev(chunk, st_offset).await {
+                    Ok(()) => pending.commit().await?,
+                    Err(e) => {
+                        pending.abort().await;
+                        return Err(e);
+                    }
+                }
             }
             #[cfg(feature = "sync")]
-            storage.writev(chunk, st_offset)?;
+            match storage.writev(chunk, st_offset) {
+                Ok(()) => pending.commit()?,
+                Err(e) => {
+                    pending.abort();
+                    return Err(e);
+                }
+            }
         }
 
         #[cfg(feature = "async")]
@@ -588,13 +613,33 @@ impl<S: Storage + 'static> FormatAccess<S> {
                 ShallowMapping::Special { offset: _ } => None,
             };
 
-            let (file, mofs, mlen) = if let Some((file, mofs)) = mapping {
-                (file, mofs, mlen)
+            let (file, mofs, mlen, pending) = if let Some((file, mofs)) = mapping {
+                // Already a valid, writable mapping — nothing new was established, so there
+                // is nothing to commit or abort.
+                (file, mofs, mlen, None)
             } else {
-                self.ensure_data_mapping(offset, mlen, true).await?
+                let (file, mofs, mlen, pending) =
+                    self.ensure_data_mapping(offset, mlen, true).await?;
+                (file, mofs, mlen, Some(pending))
             };
 
-            write_full_zeroes(file, mofs, mlen).await?;
+            // `pending` (if any) is not yet visible to anyone else, precisely so that a write
+            // which then fails can still be undone instead of leaving it allocated with
+            // whatever undefined bytes were already there (see `PendingDataMapping`). Commit
+            // it once the write below is known to have succeeded, or abort it if not.
+            match write_full_zeroes(file, mofs, mlen).await {
+                Ok(()) => {
+                    if let Some(pending) = pending {
+                        pending.commit().await?;
+                    }
+                }
+                Err(e) => {
+                    if let Some(pending) = pending {
+                        pending.abort().await;
+                    }
+                    return Err(e);
+                }
+            }
             offset += mlen;
             length -= mlen;
         }
@@ -954,3 +999,441 @@ impl<S: Storage> std::future::AsyncDrop for FormatAccess<S> {
     }
 }
 */
+
+#[cfg(test)]
+mod writev_failure_tests {
+    use super::*;
+    use crate::format::builder::{FormatCreateBuilder, FormatDriverBuilder};
+    use crate::null::Null;
+    use crate::qcow2::Qcow2;
+    use crate::raw::Raw;
+    use crate::storage::drivers::CommonStorageHelper;
+    use crate::storage::PreallocateMode;
+    use maybe_async::maybe_async;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// `Null`-backed storage whose `pure_writev()` fails exactly once, for the request
+    /// covering `fail_at`.
+    #[derive(Debug)]
+    struct FlakyStorage {
+        inner: Null,
+        fail_at: u64,
+        failed_once: AtomicBool,
+    }
+
+    impl std::fmt::Display for FlakyStorage {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "flaky:{}", self.inner)
+        }
+    }
+
+    #[maybe_async(AFIT)]
+    impl Storage for FlakyStorage {
+        fn size(&self) -> io::Result<u64> {
+            self.inner.size()
+        }
+
+        async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
+            unsafe { self.inner.pure_readv(bufv, offset).await }
+        }
+
+        async unsafe fn pure_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
+            let end = offset + bufv.len();
+            if offset <= self.fail_at
+                && self.fail_at < end
+                && !self.failed_once.swap(true, Ordering::SeqCst)
+            {
+                return Err(io::Error::other("simulated write failure"));
+            }
+            unsafe { self.inner.pure_writev(bufv, offset).await }
+        }
+
+        async fn flush(&self) -> io::Result<()> {
+            self.inner.flush().await
+        }
+
+        async fn sync(&self) -> io::Result<()> {
+            self.inner.sync().await
+        }
+
+        async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+            unsafe { self.inner.invalidate_cache().await }
+        }
+
+        fn get_storage_helper(&self) -> &CommonStorageHelper {
+            self.inner.get_storage_helper()
+        }
+    }
+
+    /// Sanity check for the trivial case: `Raw` images have no notion of allocation (every
+    /// offset is already, always, a valid mapping — see `Raw::ensure_data_mapping()`), so
+    /// `ensure_data_mapping()` returns a no-op `PendingDataMapping` for them and a failed write
+    /// simply surfaces its error, exactly as a plain, unmediated write failure would. This is
+    /// not a regression test for the corruption fix itself (see the qcow2 test below for that);
+    /// it only guards that routing every write through a pending commit/abort didn't change
+    /// plain error propagation for a format that was never at risk.
+    fn a_failed_write_still_surfaces_its_error(parallel: bool) {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let size = 64 * 1024;
+                let fail_at = 4096;
+                let storage = FlakyStorage {
+                    inner: Null::new(size),
+                    fail_at,
+                    failed_once: AtomicBool::new(false),
+                };
+
+                let raw = Raw::open_image(storage, true).await.unwrap();
+                let mut image = FormatAccess::new(raw);
+                if parallel {
+                    image.set_async_write_parallelization(4);
+                }
+
+                let buf = vec![0x42u8; 8192];
+                let err = image
+                    .write(buf.as_slice(), 0)
+                    .await
+                    .expect_err("the simulated write failure must surface");
+                assert_eq!(err.to_string(), "simulated write failure");
+            });
+    }
+
+    #[test]
+    fn a_failed_write_still_surfaces_its_error_serial() {
+        a_failed_write_still_surfaces_its_error(false);
+    }
+
+    #[test]
+    fn a_failed_write_still_surfaces_its_error_parallel() {
+        a_failed_write_still_surfaces_its_error(true);
+    }
+
+    /// In-memory `Storage`: unlike `Null`, reads round-trip what was written, so it can back a
+    /// real qcow2 image's own metadata (header, L1/L2, refcount tables) as well as its data.
+    /// Cloning shares the same backing buffer (like reopening the same file), which is what lets
+    /// a qcow2 image be created through one handle and then opened through another.
+    #[derive(Debug, Clone)]
+    struct MemStorage {
+        data: Arc<Mutex<Vec<u8>>>,
+        /// If set, the next `pure_writev()` call fails once (any offset), simulating a
+        /// transient write failure into a cluster qcow2 may have just allocated.
+        fail_next_write: Arc<AtomicBool>,
+        storage_helper: Arc<CommonStorageHelper>,
+    }
+
+    impl MemStorage {
+        fn new() -> Self {
+            MemStorage {
+                data: Arc::new(Mutex::new(Vec::new())),
+                fail_next_write: Arc::new(AtomicBool::new(false)),
+                storage_helper: Arc::new(CommonStorageHelper::default()),
+            }
+        }
+    }
+
+    impl std::fmt::Display for MemStorage {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "mem:[{}B]", self.data.lock().unwrap().len())
+        }
+    }
+
+    #[maybe_async(AFIT)]
+    impl Storage for MemStorage {
+        fn size(&self) -> io::Result<u64> {
+            Ok(self.data.lock().unwrap().len() as u64)
+        }
+
+        async unsafe fn pure_readv(
+            &self,
+            mut bufv: IoVectorMut<'_>,
+            offset: u64,
+        ) -> io::Result<()> {
+            let data = self.data.lock().unwrap();
+            let start = offset as usize;
+            let want = bufv.len() as usize;
+            let mut buf = vec![0u8; want];
+            if start < data.len() {
+                let avail = &data[start..std::cmp::min(start + want, data.len())];
+                buf[..avail.len()].copy_from_slice(avail);
+            }
+            bufv.copy_from_slice(&buf);
+            Ok(())
+        }
+
+        async unsafe fn pure_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
+            if self.fail_next_write.swap(false, Ordering::SeqCst) {
+                return Err(io::Error::other("simulated write failure"));
+            }
+            let want = bufv.len() as usize;
+            let mut buf = vec![0u8; want];
+            bufv.copy_into_slice(&mut buf);
+            let start = offset as usize;
+            let end = start + want;
+            let mut data = self.data.lock().unwrap();
+            if end > data.len() {
+                data.resize(end, 0);
+            }
+            data[start..end].copy_from_slice(&buf);
+            Ok(())
+        }
+
+        async fn flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn sync(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn get_storage_helper(&self) -> &CommonStorageHelper {
+            &self.storage_helper
+        }
+
+        async fn resize(&self, new_size: u64, _prealloc_mode: PreallocateMode) -> io::Result<()> {
+            self.data.lock().unwrap().resize(new_size as usize, 0);
+            Ok(())
+        }
+    }
+
+    /// Regression test for the deeper fix: a real qcow2 image, a guest write that allocates a
+    /// fresh cluster and then fails. Before this fix, the cluster would already have been
+    /// mapped into the L2 table by the time the write failed, so the failure would leave a
+    /// valid-looking mapping pointing at undefined content. Now, `ensure_data_mapping()`'s
+    /// `PendingDataMapping` is only committed after the write succeeds; on failure it is
+    /// aborted instead, so the L2 table must come back out reading exactly as it did before —
+    /// as if the write had never been attempted.
+    #[test]
+    fn a_failed_fresh_allocation_never_becomes_a_visible_mapping() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let storage = MemStorage::new();
+
+                Qcow2::<MemStorage>::create_builder(storage.clone())
+                    .size(4 << 20) // 4 MiB
+                    .create()
+                    .await
+                    .unwrap();
+
+                let qcow2 = Qcow2::<MemStorage>::builder(storage.clone())
+                    .write(true)
+                    .open(crate::format::gate::PermissiveImplicitOpenGate())
+                    .await
+                    .unwrap();
+                let image = FormatAccess::new(qcow2);
+
+                // Warm-up write (no failure injected): establishes the L1/L2 table metadata
+                // covering this whole (small, single-L2-table) image, so the actual write below
+                // is the only thing that still needs to allocate — an L2 table entry write here
+                // would otherwise consume the injected failure before it ever reached the
+                // guest's own write.
+                image.write(vec![0u8; 65536].as_slice(), 0).await.unwrap();
+
+                let target_offset = 65536; // the next cluster over — untouched so far
+                let (before, _) = image.get_mapping(target_offset, 4096).await.unwrap();
+                assert!(
+                    matches!(before, Mapping::Zero { explicit: false }),
+                    "expected an untouched offset to start out unallocated, got {before:?}"
+                );
+
+                // A full, cluster-aligned cluster (the default qcow2 cluster size is 64 KiB):
+                // covering the whole cluster means no copy-on-write of surrounding data is
+                // needed, so the only write this triggers is the guest's own — precisely the
+                // one `fail_next_write` targets. A partial-cluster write would additionally
+                // trigger an internal zero-fill of the rest of the cluster first, which would
+                // consume the injected failure before it ever reached the guest's write.
+                storage.fail_next_write.store(true, Ordering::SeqCst);
+                let buf = vec![0x42u8; 65536];
+                let err = image
+                    .write(buf.as_slice(), target_offset)
+                    .await
+                    .expect_err("the simulated write failure must surface");
+                assert_eq!(err.to_string(), "simulated write failure");
+
+                let (after, _) = image.get_mapping(target_offset, 4096).await.unwrap();
+                assert!(
+                    matches!(after, Mapping::Zero { explicit: false }),
+                    "a failed write must never leave a mapping behind — the aborted \
+                     allocation must read exactly as it did before the write was attempted, \
+                     not as valid, allocated storage holding undefined content; got {after:?}"
+                );
+
+                // The retry (no failure injected this time) must succeed cleanly, proving the
+                // aborted attempt didn't corrupt the image or leave it unwritable.
+                image.write(buf.as_slice(), target_offset).await.unwrap();
+                let mut readback = vec![0u8; 65536];
+                image
+                    .read(readback.as_mut_slice(), target_offset)
+                    .await
+                    .unwrap();
+                assert_eq!(readback, buf);
+            });
+    }
+
+    /// Same regression as above, but against a real file and a real kernel write failure
+    /// (`RLIMIT_FSIZE` -> `EFBIG`) instead of a mock — this is what actually caught the bug
+    /// upstream: a real `pure_writev()` can genuinely partially succeed (some bytes land, then
+    /// a real error) and still must not get its whole cluster mapped in.
+    ///
+    /// `RLIMIT_FSIZE` is process-wide, so this only runs safely because no other test in this
+    /// binary writes to a real file.
+    #[test]
+    fn a_real_efbig_mid_write_never_becomes_a_visible_mapping() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use crate::file::File as ImagoFile;
+                use crate::format::gate::PermissiveImplicitOpenGate;
+
+                // EFBIG's default action is to kill the process; ignore it so the write
+                // returns an error instead.
+                unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+
+                let path =
+                    std::env::temp_dir().join(format!("imago-efbig-test-{}", std::process::id()));
+                let _ = std::fs::remove_file(&path);
+
+                let f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&path)
+                    .unwrap();
+                Qcow2::<ImagoFile>::create_builder(ImagoFile::try_from(f).unwrap())
+                    .size(4 << 20)
+                    .create()
+                    .await
+                    .unwrap();
+
+                let f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .unwrap();
+                let qcow2 = Qcow2::<ImagoFile>::builder(ImagoFile::try_from(f).unwrap())
+                    .write(true)
+                    .open(PermissiveImplicitOpenGate())
+                    .await
+                    .unwrap();
+                let image = FormatAccess::new(qcow2);
+
+                // Warm-up write: establishes L1/L2/refcount metadata so the write below only
+                // needs to allocate its own cluster.
+                image.write(vec![0u8; 65536].as_slice(), 0).await.unwrap();
+                let len_after_warmup = std::fs::metadata(&path).unwrap().len();
+
+                // Cap the file just past its current length, so the guest's next write (a
+                // fresh 64 KiB cluster) grows the file past the cap partway through.
+                let cap = len_after_warmup + 8192;
+                let rlimit = libc::rlimit {
+                    rlim_cur: cap,
+                    rlim_max: cap,
+                };
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &rlimit) }, 0);
+
+                let target_offset = 65536u64;
+                let buf = vec![0x42u8; 65536];
+                let result = image.write(buf.as_slice(), target_offset).await;
+
+                let rlimit = libc::rlimit {
+                    rlim_cur: libc::RLIM_INFINITY,
+                    rlim_max: libc::RLIM_INFINITY,
+                };
+                unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &rlimit) };
+
+                result.expect_err("the write must fail with a real EFBIG");
+
+                let (after, _) = image.get_mapping(target_offset, 4096).await.unwrap();
+                assert!(
+                    matches!(after, Mapping::Zero { explicit: false }),
+                    "a real, partially-succeeded write must not leave a mapping behind; \
+                     got {after:?}"
+                );
+
+                let _ = std::fs::remove_file(&path);
+            });
+    }
+
+    /// Regression test for a variant of the same bug the fix above addresses, but on the
+    /// opposite end: reusing an already-allocated cluster that is currently flagged zero (e.g.
+    /// via `write_zeroes()`, which keeps the allocation instead of discarding it), rather than
+    /// allocating a brand new one. `Qcow2::cow_cluster()` returns that case as
+    /// `ClusterAllocation::ReusedZero` (nothing to free on abort, correct), but committing it
+    /// must still map the cluster into the L2 table to clear its zero flag — unlike a cluster
+    /// that was already mapped as data, for which committing really is a no-op. Getting this wrong
+    /// leaves real, successfully written data physically on disk but with an L2 entry that still
+    /// says zero, so every subsequent read silently returns zeroes instead of what was written.
+    #[test]
+    fn a_write_into_a_reused_zero_cluster_stays_visible() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let storage = MemStorage::new();
+
+                Qcow2::<MemStorage>::create_builder(storage.clone())
+                    .size(4 << 20) // 4 MiB
+                    .create()
+                    .await
+                    .unwrap();
+
+                let qcow2 = Qcow2::<MemStorage>::builder(storage.clone())
+                    .write(true)
+                    .open(crate::format::gate::PermissiveImplicitOpenGate())
+                    .await
+                    .unwrap();
+                let image = FormatAccess::new(qcow2);
+
+                // The default qcow2 cluster size is 64 KiB; a full, cluster-aligned write
+                // allocates it as an exclusively-owned data cluster (`copied: true`).
+                let target_offset = 65536;
+                let cluster_len = 65536;
+                image
+                    .write(vec![0x11u8; cluster_len].as_slice(), target_offset)
+                    .await
+                    .unwrap();
+
+                // Zero it back out, but retaining the allocation (`write_zeroes()`, unlike
+                // `discard_to_zero()`, never discards) — the L2 entry becomes `Zero { host_cluster:
+                // Some(_), copied: true }`, i.e. exactly the case this fix's `ReusedZero` variant
+                // covers.
+                image
+                    .write_zeroes(target_offset, cluster_len as u64)
+                    .await
+                    .unwrap();
+                let (zeroed, _) = image.get_mapping(target_offset, 4096).await.unwrap();
+                assert!(
+                    matches!(zeroed, Mapping::Zero { explicit: true }),
+                    "write_zeroes() must retain the allocation as an explicit zero mapping, \
+                     got {zeroed:?}"
+                );
+
+                // Write real data into that same cluster again: this reuses the still-allocated
+                // host cluster rather than allocating a fresh one, going through
+                // `ClusterAllocation::ReusedZero` instead of `Fresh`.
+                let buf = vec![0x22u8; cluster_len];
+                image.write(buf.as_slice(), target_offset).await.unwrap();
+
+                let mut readback = vec![0u8; cluster_len];
+                image
+                    .read(readback.as_mut_slice(), target_offset)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    readback, buf,
+                    "a write into a reused zero-flagged cluster must be visible on read, not \
+                     silently swallowed by a stale zero L2 entry"
+                );
+            });
+    }
+}

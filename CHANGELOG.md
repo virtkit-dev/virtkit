@@ -10,6 +10,13 @@ All notable changes to virtkit will be documented in this file.
   deleted the network switch's routing socket to it along with its own stale
   control sockets, and the switch never redials a path a sibling's restart erased.
 
+- **A guest disk write that failed partway through could silently corrupt later,
+  unrelated reads.** A qcow2 write that allocated a new cluster but then failed to
+  write into it left that cluster looking like valid, allocated storage holding
+  whatever bytes happened to already be there — invisible to the guest until a
+  later read or checkpoint exposed it as unrelated corruption. Suspected root
+  cause of a corruption incident on a `vk build` guest.
+
 ## [0.39.0] - 2026-08-20
 
 ### Added

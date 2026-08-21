@@ -1,6 +1,8 @@
 //! Get and establish cluster mappings.
 
+use super::cow::ClusterAllocation;
 use super::*;
+use crate::format::drivers::PendingDataMapping;
 use crate::sync_primitives::RwLockWriteGuard;
 
 #[maybe_async]
@@ -113,7 +115,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         length: u64,
         skip_cow: bool,
         skip_cow_to_eof: bool,
-    ) -> io::Result<(&S, u64, u64)> {
+    ) -> io::Result<(&S, u64, u64, Qcow2Pending<'_, S, F>)> {
         let l2_table = self.ensure_l2(offset).await?;
 
         // Fast path for if everything is already allocated, which should be the common case at
@@ -132,12 +134,14 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         } = existing.0
         {
             if existing.1 >= length {
-                return Ok((storage, offset, existing.1));
+                // Already fully, validly mapped — nothing new was established, so there is
+                // nothing to commit or abort.
+                return Ok((storage, offset, existing.1, Qcow2Pending::empty(self)));
             }
         }
 
-        let l2_table = l2_table.lock_write().await;
-        let mut leaked_allocations = Vec::<(HostCluster, ClusterCount)>::new();
+        let l2_table_locked = l2_table.lock_write().await;
+        let mut pending_entries = Vec::<(u64, ClusterAllocation)>::new();
 
         let res = self
             .ensure_data_mapping_no_cleanup(
@@ -145,17 +149,28 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 length,
                 skip_cow,
                 skip_cow_to_eof,
-                l2_table,
-                &mut leaked_allocations,
+                l2_table_locked,
+                &mut pending_entries,
             )
             .await;
 
-        for alloc in leaked_allocations {
-            self.free_data_clusters(alloc.0, alloc.1).await;
-        }
-        let (host_offset, length) = res?;
+        let pending = Qcow2Pending {
+            qcow2: self,
+            l2_table: Some(l2_table),
+            entries: pending_entries,
+        };
 
-        Ok((self.storage(), host_offset, length))
+        let (host_offset, length) = match res {
+            Ok(ok) => ok,
+            Err(e) => {
+                // Nothing here will ever be committed — free whatever was freshly allocated
+                // before propagating the error, rather than leaking it.
+                pending.abort().await;
+                return Err(e);
+            }
+        };
+
+        Ok((self.storage(), host_offset, length, pending))
     }
 
     /// Make the given range be mapped by a fixed kind of clusters.
@@ -353,19 +368,26 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
     /// Inner implementation for [`Qcow2::do_ensure_data_mapping()`].
     ///
-    /// Does not do any clean-up: The L2 table will probably be modified, but not written to disk.
-    /// Any existing allocations that have been removed from it (and are thus leaked) are entered
-    /// into `leaked_allocations`, but not freed.
+    /// Does not map any freshly allocated cluster into the L2 table — every cluster this touches
+    /// (whether freshly allocated or an already-valid, reused mapping) is instead entered into
+    /// `pending_entries` as `(cluster's guest offset, allocation)`, for the caller to turn into a
+    /// [`Qcow2Pending`] once it knows whether the write it is about to perform into the returned
+    /// range actually succeeds. See [`Qcow2Pending`] for why: mapping a cluster in before that
+    /// write has happened would let a mid-write failure leave it allocated with whatever
+    /// undefined bytes happened to already be there, indistinguishable from valid data. Any
+    /// cluster a commit supersedes (discovered only then, since nothing is mapped in here yet) is
+    /// freed by the commit itself.
     ///
-    /// The caller must do both, ensuring it is done both in case of success and in case of error.
+    /// The caller must route `pending_entries` through a [`Qcow2Pending`], in both cases of
+    /// success and of error.
     async fn ensure_data_mapping_no_cleanup(
         &self,
         offset: GuestOffset,
         full_length: u64,
         skip_cow: bool,
         skip_cow_to_eof: bool,
-        mut l2_table: L2TableWriteGuard<'_>,
-        leaked_allocations: &mut Vec<(HostCluster, ClusterCount)>,
+        l2_table: L2TableWriteGuard<'_>,
+        pending_entries: &mut Vec<(u64, ClusterAllocation)>,
     ) -> io::Result<(u64, u64)> {
         let cb = self.header.cluster_bits();
 
@@ -382,17 +404,13 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         let mut current_guest_cluster = offset.cluster(cb);
 
         // Without a mandatory host offset, this should never return `Ok(None)`
-        let host_cluster = self
-            .cow_cluster(
-                current_guest_cluster,
-                None,
-                partial_skip_cow,
-                &mut l2_table,
-                leaked_allocations,
-            )
+        let allocation = self
+            .cow_cluster(current_guest_cluster, None, partial_skip_cow, &l2_table)
             .await?
             .ok_or_else(|| io::Error::other("Internal allocation error"))?;
+        pending_entries.push((current_guest_cluster.offset(cb).0, allocation));
 
+        let host_cluster = allocation.host_cluster();
         let host_offset_start = host_cluster.relative_offset(offset, cb);
         let mut allocated_length = offset.remaining_in_cluster(cb);
         let mut current_host_cluster = host_cluster;
@@ -411,21 +429,22 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             };
 
             let next_host_cluster = current_host_cluster + ClusterCount(1);
-            let host_cluster = self
+            let allocation = self
                 .cow_cluster(
                     current_guest_cluster,
                     Some(next_host_cluster),
                     partial_skip_cow,
-                    &mut l2_table,
-                    leaked_allocations,
+                    &l2_table,
                 )
                 .await?;
 
-            let Some(host_cluster) = host_cluster else {
+            let Some(allocation) = allocation else {
                 // Cannot continue continuous mapping range
                 break;
             };
+            let host_cluster = allocation.host_cluster();
             assert!(host_cluster == next_host_cluster);
+            pending_entries.push((current_guest_cluster.offset(cb).0, allocation));
             current_host_cluster = host_cluster;
 
             allocated_length += chunk_length as u64;
@@ -504,4 +523,97 @@ pub(super) enum FixedMapping {
     /// Note this breaks existing mapping information, which must be communicated somehow, for
     /// example by requiring mutable access to the `Qcow2` object.
     FullDiscard,
+}
+
+/// Clusters [`Qcow2::do_ensure_data_mapping()`] established but has not yet mapped into the L2
+/// table.
+///
+/// Establishing a mapping (allocating or COW'ing a cluster) and writing the caller's actual data
+/// into it are two separate steps, with the write happening only after this is returned. If the
+/// cluster were mapped in immediately, a write that then fails would leave it allocated with
+/// whatever undefined bytes happened to already be there — real, valid-looking storage, not a
+/// hole, indistinguishable from valid data to both the failed write's own caller (which only
+/// sees the one `io::Error`) and to a later reader or flush/checkpoint.
+///
+/// The caller must therefore call exactly one of [`commit()`](Self::commit) — once its write into
+/// the range this was returned alongside has actually succeeded — or [`abort()`](Self::abort) —
+/// if it hasn't — exactly once, before dropping this.  Neither can fail: mapping a cluster in is a
+/// plain, infallible in-memory L2 table update (the same one a direct, non-deferred write would
+/// have done), and freeing one on abort is already a best-effort operation crate-wide (see
+/// [`Qcow2::free_data_clusters()`]).  Dropping this without calling either leaks any freshly
+/// allocated cluster in it and leaves the L2 table unchanged — safe, but wasteful; there is no
+/// `Drop` impl enforcing the call because the async free it would need cannot run in one.
+#[must_use = "must be committed or aborted"]
+pub(super) struct Qcow2Pending<'a, S: Storage + 'static, F: WrappedFormat<S> + 'static> {
+    /// The image this pending batch's entries belong to, needed by both `commit()` (to lock the
+    /// L2 table) and `abort()` (to free any freshly allocated cluster).
+    qcow2: &'a Qcow2<S, F>,
+    /// The (single) L2 table every entry belongs to — `ensure_data_mapping_no_cleanup()`'s loop
+    /// never crosses an L2 table boundary, so one is always enough. `None` iff `entries` is
+    /// empty (nothing new was established, so there is no table to commit anything into).
+    l2_table: Option<Arc<L2Table>>,
+    /// `(guest offset of the cluster, its allocation)`, in the order established.
+    entries: Vec<(u64, ClusterAllocation)>,
+}
+
+#[maybe_async]
+impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2Pending<'_, S, F> {
+    /// A pending batch with nothing in it — for when nothing new was established at all (e.g.
+    /// the whole range was already validly mapped).
+    fn empty(qcow2: &Qcow2<S, F>) -> Qcow2Pending<'_, S, F> {
+        Qcow2Pending {
+            qcow2,
+            l2_table: None,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Map every freshly allocated or reused-zero cluster into the L2 table (clearing the
+    /// latter's "zero" flag), freeing whatever it superseded. Clusters already validly mapped
+    /// as data are left untouched (nothing to commit).
+    pub(super) async fn commit(self) {
+        let Some(l2_table) = self.l2_table else {
+            return;
+        };
+        let cb = self.qcow2.header.cluster_bits();
+        let mut l2_table = l2_table.lock_write().await;
+        for (guest_offset, allocation) in self.entries {
+            let new_cluster = match allocation {
+                ClusterAllocation::MappedExisting(_) => continue,
+                ClusterAllocation::ReusedZero(new_cluster)
+                | ClusterAllocation::Fresh(new_cluster) => new_cluster,
+            };
+            let l2i = GuestOffset(guest_offset).cluster(cb).l2_index(cb);
+            if let Some(leaked) = l2_table.map_cluster(l2i, new_cluster) {
+                self.qcow2.free_data_clusters(leaked.0, leaked.1).await;
+            }
+        }
+    }
+
+    /// Give up: free every freshly allocated cluster: the L2 table was never touched, so there
+    /// is nothing to undo there. Already-valid or reused-as-is mappings are left untouched —
+    /// they were never this call's to free.
+    pub(super) async fn abort(self) {
+        for (_, allocation) in self.entries {
+            if let ClusterAllocation::Fresh(new_cluster) = allocation {
+                self.qcow2
+                    .free_data_clusters(new_cluster, ClusterCount(1))
+                    .await;
+            }
+        }
+    }
+}
+
+#[maybe_async(?Send)]
+impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> PendingDataMapping
+    for Qcow2Pending<'_, S, F>
+{
+    async fn commit(self: Box<Self>) -> io::Result<()> {
+        Qcow2Pending::commit(*self).await;
+        Ok(())
+    }
+
+    async fn abort(self: Box<Self>) {
+        Qcow2Pending::abort(*self).await;
+    }
 }
