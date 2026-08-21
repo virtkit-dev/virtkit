@@ -30,6 +30,12 @@ All notable changes to virtkit will be documented in this file.
   (and every later build/pull) also sweeps any `.tmp` orphan left over from
   an older, hard-killed one.
 
+- **A build stage's cache could be corrupted by a concurrent build of the
+  same instruction.** A cache push could resolve its unchanged parent bytes
+  through a shared, mutable reference that a racing build had since
+  overwritten, silently splicing that other build's content in. A push now
+  only ever reuses bytes from the exact parent it started from.
+
 ## [0.40.0] - 2026-08-21
 
 ### Changed

@@ -469,16 +469,15 @@ pub struct MicroVm {
     /// `--disk` target stage's steps, whose disk output the cache does not capture. Empty
     /// for every normal stage. See [`MicroVm::set_uncacheable`].
     uncacheable_keys: std::collections::HashSet<String>,
-    /// cache key of the last snapshot saved/restored in this stage — the parent a diff
-    /// push re-chunks against (only its dirty clusters). Seeded from the base image on
-    /// `from_image`; `None` means a full push (no known parent chunks).
-    parent_key: Option<String>,
-    /// immutable manifest digest of the current parent's cached snapshot — the reference a
-    /// diff push fetches its reusable parent chunks by. Distinct from `parent_key` (the tag):
-    /// concurrent builds of the same instruction clobber the tag with byte-different but
-    /// equivalent content, so re-fetching parent chunks by tag can splice another build's
-    /// bytes onto this stage's actual backing and corrupt the reused (unchanged) regions.
-    /// Pinning the digest makes the fetch resolve exactly the parent this stage forked from.
+    /// immutable manifest digest of the current parent's cached snapshot — the *only*
+    /// reference a diff push fetches its reusable parent chunks by. Never fall back to
+    /// fetching by a mutable cache-key tag instead: concurrent builds of the same instruction
+    /// clobber the tag with byte-different but equivalent content, so re-fetching parent
+    /// chunks by tag can splice another build's bytes onto this stage's actual backing and
+    /// corrupt the reused (unchanged) regions. `None` means no known-safe parent (seeded on
+    /// `from_image` when the base wasn't itself pulled from cache, or after a push whose
+    /// digest we don't have) — `parent_for_push` then does a full re-chunk rather than risk a
+    /// tag-based lookup.
     parent_digest: Option<String>,
     /// shared timing collector: fine-grained phase probes (`VIRTKIT_TIMING`) from the
     /// guest lifecycle and cache-push path record here, surfacing in the end-of-run
@@ -532,15 +531,10 @@ pub struct MicroVm {
     /// monotonic counter for unique per-instruction snapshot filenames (several may exist
     /// at once: the live one plus the in-flight push's).
     push_seq: u64,
-    /// stage label → the cache key of its last pushed snapshot (its committed image). A
-    /// `FROM <stage>` fork starts from exactly that image, so its first instruction can
-    /// diff against this key instead of a full re-chunk of the whole image. Shared
-    /// across workers (same happens-before as `images`).
-    stage_last_key: Arc<Mutex<HashMap<String, String>>>,
     /// stage label → the immutable manifest digest of its last pushed snapshot (its committed
-    /// image), the digest counterpart of `stage_last_key`. A `FROM <stage>` fork pins this so
-    /// its first diff push reuses that stage's exact chunks regardless of concurrent tag
-    /// clobbering. Shared across workers (same happens-before as `stage_last_key`).
+    /// image). A `FROM <stage>` fork pins this so its first diff push reuses that stage's
+    /// exact chunks regardless of concurrent tag clobbering on the mutable cache-key tag.
+    /// Shared across workers (same happens-before as `images`).
     stage_last_digest: Arc<Mutex<HashMap<String, String>>>,
     /// the previous diff push's layer list (+ total size), kept in memory so the next
     /// instruction diffs against it without re-fetching+parsing the parent manifest from
@@ -589,8 +583,6 @@ struct PushInflight {
     /// the snapshot raw the push reads; freed after it is joined (and used as the next
     /// instruction's `content_diff` baseline).
     snap: PathBuf,
-    /// the instruction key this push caches (recorded as the stage's last key on success).
-    key: String,
 }
 
 /// Terminal cache pushes handed off at `stage_end` and awaiting their join, keyed by stage
@@ -1028,7 +1020,6 @@ impl MicroVm {
             image_kernel_boot: None,
             out_disk: None,
             uncacheable_keys: std::collections::HashSet::new(),
-            parent_key: None,
             parent_digest: None,
             timings,
             net,
@@ -1043,7 +1034,6 @@ impl MicroVm {
             pending: Arc::new(PushPool::default()),
             fork_parent: None,
             push_seq: 0,
-            stage_last_key: Arc::new(Mutex::new(HashMap::new())),
             stage_last_digest: Arc::new(Mutex::new(HashMap::new())),
             parent_layers: None,
             output_sink: crate::executor::OutputSink::Inherit,
@@ -1086,7 +1076,7 @@ impl MicroVm {
     }
 
     /// A fresh per-stage worker that shares this executor's cross-stage state (the
-    /// `images` / `stage_last_key` maps and the cache registry) but
+    /// `images` / `stage_last_digest` maps and the cache registry) but
     /// starts with an empty per-stage working set (no session, sources, or in-flight
     /// push). The parallel driver builds each concurrent stage on its own worker, so the
     /// per-stage guest and cache-push bookkeeping never alias across threads; those maps and
@@ -1106,7 +1096,6 @@ impl MicroVm {
             cache: self.cache.clone(),
             images: Arc::clone(&self.images),
             image_locks: Arc::clone(&self.image_locks),
-            stage_last_key: Arc::clone(&self.stage_last_key),
             stage_last_digest: Arc::clone(&self.stage_last_digest),
             timings: Arc::clone(&self.timings),
             net: self.net.clone(),
@@ -1118,7 +1107,6 @@ impl MicroVm {
             // `set_uncacheable`); a fresh worker inherits neither.
             out_disk: None,
             uncacheable_keys: std::collections::HashSet::new(),
-            parent_key: None,
             parent_digest: None,
             sources: Vec::new(),
             source_dev: HashMap::new(),
@@ -1451,11 +1439,7 @@ impl MicroVm {
     /// (`None` when nothing was cached) — the lineage a stage's first diff push chunks against.
     /// Shared by `from_image`, which wraps it as the stage's writable rootfs, and `pull`, which
     /// attaches it read-only as a `--from=<image>` source.
-    fn materialize_image(
-        &mut self,
-        label: &str,
-        image: &str,
-    ) -> Result<(PathBuf, String, Option<String>)> {
+    fn materialize_image(&mut self, label: &str, image: &str) -> Result<(PathBuf, Option<String>)> {
         std::fs::create_dir_all(&self.scratch)
             .with_context(|| format!("creating {}", self.scratch.display()))?;
         let ext4 = self.image_path(label);
@@ -1479,13 +1463,13 @@ impl MicroVm {
                 if let Some(digest) =
                     crate::registry::try_pull_ext4_lazy(&rg, CACHE_REPO, &base_key, &lazy, image)?
                 {
-                    return Ok((lazy, base_key, Some(digest)));
+                    return Ok((lazy, Some(digest)));
                 }
             } else if let Some(digest) =
                 crate::registry::try_pull_ext4(&rg, CACHE_REPO, &base_key, &ext4, image)?
             {
                 self.verify_ext4(&ext4, &format!("cached image {image} (after load)"))?;
-                return Ok((ext4, base_key, Some(digest)));
+                return Ok((ext4, Some(digest)));
             }
         }
         // pull + flatten the OCI image to a rootfs tar (no docker), then build the ext4.
@@ -1537,7 +1521,7 @@ impl MicroVm {
                 }
             }
         }
-        Ok((ext4, base_key, digest))
+        Ok((ext4, digest))
     }
 
     /// Register a freshly built or pulled raw ext4 `base` as `stage`'s image by wrapping it
@@ -1564,29 +1548,26 @@ impl MicroVm {
     ) -> (Vec<oci_client::manifest::OciDescriptor>, u64) {
         // A `FROM <stage>` fork's first push chains onto the parent's chunks: join the parent's
         // (possibly still-uploading) terminal push now, so its blobs are in the registry before
-        // the fetch below references them, and seed the parent key + pinned digest it forked
-        // from. Runs once — later pushes chain onto this stage's own in-memory `parent_layers`.
+        // the fetch below references them, and seed the pinned digest it forked from. Runs
+        // once — later pushes chain onto this stage's own in-memory `parent_layers`.
         if let Some(parent) = self.fork_parent.take() {
             self.join_pending(&parent);
-            self.parent_key = self.stage_last_key.lock().unwrap().get(&parent).cloned();
             self.parent_digest = self.stage_last_digest.lock().unwrap().get(&parent).cloned();
         }
         match self.parent_layers.take() {
             Some((l, t)) => (l, t),
-            // Resolve the parent by its pinned immutable digest, not the mutable tag
-            // (`parent_key`): under concurrent builds the tag may have been clobbered with a
+            // Resolve the parent ONLY by its pinned immutable digest — never by a mutable
+            // cache-key tag. Under concurrent builds the tag may have been clobbered with a
             // byte-different snapshot of the same instruction, and reusing those chunks over
-            // this stage's actual backing corrupts the unchanged regions. Fall back to the
-            // tag only when no digest was pinned (e.g. an earlier push failed).
-            None => match self
-                .parent_digest
-                .clone()
-                .or_else(|| self.parent_key.clone())
-                .and_then(|r| {
-                    crate::registry::fetch_chunks(rg, CACHE_REPO, &r)
-                        .ok()
-                        .flatten()
-                }) {
+            // this stage's actual backing would corrupt the unchanged regions (see
+            // `parent_digest`'s doc comment). No pinned digest (e.g. an earlier push failed, or
+            // the fork's parent never recorded one) means no known-safe parent: fall through to
+            // a full re-chunk rather than risk a tag lookup.
+            None => match self.parent_digest.clone().and_then(|r| {
+                crate::registry::fetch_chunks(rg, CACHE_REPO, &r)
+                    .ok()
+                    .flatten()
+            }) {
                 Some((l, t)) => (l, t),
                 None => (Vec::new(), total_size),
             },
@@ -1625,10 +1606,6 @@ impl MicroVm {
         ) {
             Ok((layers, total, digest)) => {
                 self.parent_layers = Some((layers, total));
-                self.stage_last_key
-                    .lock()
-                    .unwrap()
-                    .insert(fs.label.clone(), key.to_string());
                 self.stage_last_digest
                     .lock()
                     .unwrap()
@@ -1648,45 +1625,38 @@ impl MicroVm {
             }
             Err(e) => {
                 eprintln!("virtkit: build cache push of {key} failed ({e:#}) — not cached");
-                // Drop the pinned parent too: this push never wrote its tag, so the next diff
-                // must not reuse the *previous* stage's digest as its parent (that would splice
-                // stale bytes over what this instruction changed). Falling back to `parent_key`
-                // — this push's absent tag — forces a full re-chunk.
+                // Drop the pinned parent too: this push recorded no digest, so the next diff
+                // must not reuse the *previous* instruction's digest as its parent (that would
+                // splice stale bytes over what this instruction changed) — it has no known-safe
+                // parent left at all, so `parent_for_push` does a full re-chunk instead.
                 self.parent_layers = None;
                 self.parent_digest = None;
             }
         }
-        self.parent_key = Some(key.to_string());
         Ok(())
     }
 
     /// Join the previous in-flight push (if any) and adopt its result as the parent for the
-    /// next diff push: record the stage's last key, and on success pin its layers + digest as
-    /// the parent — on failure clear the pinned parent so the next diff falls back to
-    /// `parent_key` and re-chunks rather than splicing a stale digest's bytes over this
-    /// stage's backing. Frees the pushed snapshot. Called before spawning the next push.
+    /// next diff push: on success pin its layers + digest as the parent — on failure clear the
+    /// pinned parent so the next diff has no known-safe parent and re-chunks fully, rather than
+    /// splicing a stale digest's bytes over this stage's backing. Frees the pushed snapshot.
+    /// Called before spawning the next push.
     fn harvest_prev_push(&mut self, label: &str) {
         let Some(inf) = self.inflight.take() else {
             return;
         };
         match inf.handle.join().expect("cache push thread panicked") {
-            Ok(out) => {
-                self.stage_last_key
-                    .lock()
-                    .unwrap()
-                    .insert(label.to_string(), inf.key);
-                match out {
-                    Some((layers, digest)) => {
-                        self.parent_layers = Some(layers);
-                        self.stage_last_digest
-                            .lock()
-                            .unwrap()
-                            .insert(label.to_string(), digest.clone());
-                        self.parent_digest = Some(digest);
-                    }
-                    None => self.parent_layers = None,
+            Ok(out) => match out {
+                Some((layers, digest)) => {
+                    self.parent_layers = Some(layers);
+                    self.stage_last_digest
+                        .lock()
+                        .unwrap()
+                        .insert(label.to_string(), digest.clone());
+                    self.parent_digest = Some(digest);
                 }
-            }
+                None => self.parent_layers = None,
+            },
             Err(e) => {
                 eprintln!("virtkit: build async push failed ({e:#}) — not cached");
                 self.parent_layers = None;
@@ -1697,11 +1667,11 @@ impl MicroVm {
     }
 
     /// Adopt a stage's parked terminal push (parked at its `stage_end`) before a `FROM <stage>`
-    /// fork's first diff push chains onto it: join the upload and record the stage's last key +
-    /// immutable digest so `parent_for_push` can pin the parent's chunks. The fork must cross this
+    /// fork's first diff push chains onto it: join the upload and record the stage's immutable
+    /// digest so `parent_for_push` can pin the parent's chunks. The fork must cross this
     /// barrier — its first diff push fetches those chunks from the registry, so they must be
     /// uploaded first. Idempotent: a stage forked by several children joins once (later calls find
-    /// it gone but the recorded key/digest already in place). A failed push leaves no key, so the
+    /// it gone but the recorded digest already in place). A failed push leaves no digest, so the
     /// fork full-pushes.
     fn join_pending(&self, label: &str) {
         let Some(inf) = self.pending.take(label) else {
@@ -1709,10 +1679,6 @@ impl MicroVm {
         };
         match inf.handle.join().expect("cache push thread panicked") {
             Ok(out) => {
-                self.stage_last_key
-                    .lock()
-                    .unwrap()
-                    .insert(label.to_string(), inf.key);
                 if let Some((_, digest)) = out {
                     self.stage_last_digest
                         .lock()
@@ -1827,9 +1793,8 @@ impl Executor for MicroVm {
     fn from_image(&mut self, stage: &str, image: &str) -> Result<Rootfs> {
         // The stage's writable working rootfs: a qcow2 overlay over the materialized base,
         // whose cache key + digest seed this stage's snapshot lineage.
-        let (ext4, base_key, digest) = self.materialize_image(stage, image)?;
+        let (ext4, digest) = self.materialize_image(stage, image)?;
         self.wrap_base(stage, &ext4)?;
-        self.parent_key = Some(base_key);
         self.parent_digest = digest;
         self.parent_layers = None;
         Ok(Rootfs {
@@ -1867,7 +1832,6 @@ impl Executor for MicroVm {
         self.wrap_base(stage, &ext4)?;
         // No cached parent snapshot (the base is empty, built locally); the first COPY
         // here falls back to a full push if caching is enabled.
-        self.parent_key = None;
         self.parent_layers = None;
         Ok(Rootfs {
             label: stage.to_string(),
@@ -1892,7 +1856,6 @@ impl Executor for MicroVm {
         // the parent label and let the first `parent_for_push` join it, overlapping that upload
         // with this fork's first RUN rather than stalling the fork's start.
         self.fork_parent = Some(parent.label.clone());
-        self.parent_key = None;
         self.parent_digest = None;
         self.parent_layers = None;
         Ok(Rootfs {
@@ -1903,7 +1866,7 @@ impl Executor for MicroVm {
         // A `--from=<image>` source: the image's materialized ext4, attached read-only like a
         // source stage's (the attach path detects the raw format), memoized so several
         // instructions referencing the same image pull and flatten it once. The stage's own cache
-        // lineage (parent_key/parent_digest) is deliberately untouched: this is a source, not a
+        // lineage (`parent_digest`) is deliberately untouched: this is a source, not a
         // base. It is materialized exactly like a base, free headroom and all — nothing here
         // will write to it, but building it any other way would fork the base cache entry the
         // same image shares with a `FROM` that uses it.
@@ -1919,7 +1882,7 @@ impl Executor for MicroVm {
         if self.images.lock().unwrap().contains_key(&label) {
             return Ok(Rootfs { label });
         }
-        let (ext4, _, _) = self.materialize_image(&label, image)?;
+        let (ext4, _) = self.materialize_image(&label, image)?;
         self.images.lock().unwrap().insert(label.clone(), ext4);
         Ok(Rootfs { label })
     }
@@ -2331,7 +2294,6 @@ impl Executor for MicroVm {
         };
         self.wrap_base(&fs.label, &base)?;
         // the restored snapshot is the parent the next save diffs against — pin its digest.
-        self.parent_key = Some(key.to_string());
         self.parent_digest = Some(digest);
         Ok(())
     }
@@ -2467,12 +2429,7 @@ impl Executor for MicroVm {
                 timings.probe("cache.push", t.elapsed());
                 Ok(Some(((layers, total), digest)))
             });
-            self.inflight = Some(PushInflight {
-                handle,
-                snap,
-                key: key.to_string(),
-            });
-            self.parent_key = Some(key.to_string());
+            self.inflight = Some(PushInflight { handle, snap });
             return Ok(());
         }
 
@@ -2542,12 +2499,7 @@ impl Executor for MicroVm {
             timings.probe("cache.push", t.elapsed());
             Ok(Some(((layers, total), digest)))
         });
-        self.inflight = Some(PushInflight {
-            handle,
-            snap,
-            key: key.to_string(),
-        });
-        self.parent_key = Some(key.to_string());
+        self.inflight = Some(PushInflight { handle, snap });
         Ok(())
     }
 
@@ -2659,7 +2611,6 @@ impl Executor for MicroVm {
         }
         // the next stage starts a fresh cache lineage; clear its attached sources, its
         // context, and the in-memory parent layers.
-        self.parent_key = None;
         self.parent_layers = None;
         self.sources.clear();
         self.source_dev.clear();

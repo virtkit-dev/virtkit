@@ -3236,6 +3236,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Regression test for the tag-clobber bug `MicroVm::parent_for_push` used to be
+    /// exposed to: resolving a diff push's parent chunks by the mutable cache-key tag
+    /// silently follows whatever a concurrent build of the same instruction most recently
+    /// pushed under that tag — exactly the corruption this commit's fix (pin the parent by
+    /// its immutable manifest digest, never the tag) defends against. A digest-pinned
+    /// fetch must keep resolving to the original bundle no matter what the tag now points
+    /// at; a tag-based fetch does not have that property, which is the whole reason the
+    /// fix exists.
+    #[test]
+    fn fetch_chunks_by_digest_ignores_a_concurrent_tag_overwrite() {
+        let root = std::env::temp_dir().join(format!("vk-localreg-tagrace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let rg = local_registry(&root);
+        let dir = root.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Build A pushes under "shared-tag" and pins its own digest — standing in for
+        // `MicroVm` seeding `parent_digest` from its own push.
+        let a = dir.join("a.ext4");
+        std::fs::write(&a, pseudo_random(1 << 20, 0xAAAA)).unwrap();
+        let digest_a = push_ext4(&rg, "dfcache", "shared-tag", &a, "generic-disk").unwrap();
+        let (chunks_a, _) = fetch_chunks(&rg, "dfcache", "shared-tag").unwrap().unwrap();
+
+        // A concurrent build of the SAME instruction pushes byte-different content under
+        // that same tag — the clobber this fix defends against.
+        let b = dir.join("b.ext4");
+        std::fs::write(&b, pseudo_random(1 << 20, 0xBBBB)).unwrap();
+        let digest_b = push_ext4(&rg, "dfcache", "shared-tag", &b, "generic-disk").unwrap();
+        assert_ne!(digest_a, digest_b, "test setup: the two pushes must differ");
+
+        // Resolving by the now-clobbered tag follows the overwrite: this is exactly the
+        // wrong-parent hazard a `parent_key`-based lookup used to risk.
+        let digest_of = |chunks: &[oci_client::manifest::OciDescriptor]| -> Vec<String> {
+            chunks.iter().map(|l| l.digest.clone()).collect()
+        };
+        let (chunks_tag_now, _) = fetch_chunks(&rg, "dfcache", "shared-tag").unwrap().unwrap();
+        let (chunks_b, _) = fetch_chunks(&rg, "dfcache", &digest_b).unwrap().unwrap();
+        assert_eq!(
+            digest_of(&chunks_tag_now),
+            digest_of(&chunks_b),
+            "the tag must now resolve to build B's chunks, not build A's"
+        );
+
+        // But resolving by A's pinned digest still returns exactly A's own chunks,
+        // unaffected by the concurrent overwrite of the tag — the property the fix relies on.
+        let (chunks_pinned, _) = fetch_chunks(&rg, "dfcache", &digest_a).unwrap().unwrap();
+        assert_eq!(
+            digest_of(&chunks_pinned),
+            digest_of(&chunks_a),
+            "a pinned digest must not follow a concurrent tag clobber"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A bundle push through the PUBLIC dispatch (`push` with a store-path repo — the
     /// fixed path) lands in the local store: kernel/initrd ride along as non-chunk
     /// layers, the config records the extras (`has_kernel`/`has_initrd`/`run_config`,
