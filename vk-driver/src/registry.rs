@@ -1792,6 +1792,48 @@ impl Drop for BuildLock {
     }
 }
 
+// ---- build-failure memo (client of the vk-registry /lock/fail API) ----
+
+/// How long a recorded build failure blocks a re-attempt of the same key in the same
+/// pipeline. Generous — on the order of a slow pipeline's whole lifetime — since a new
+/// pipeline id always bypasses it regardless.
+const BUILD_FAIL_TTL: Duration = Duration::from_secs(6 * 3600);
+
+/// A lock client for `rg`'s failure-memo endpoints, or `None` when there is nothing to talk
+/// to: a local filesystem store (no lock server), or outside CI (no pipeline id — a local
+/// `vk build`/`vk run` always retries, never memoized). Shared setup for
+/// [`check_build_failure`]/[`report_build_failure`].
+fn fail_client(rg: &Registry) -> Option<(vk_registry::LockClient, String)> {
+    let pipeline = crate::jobctx::pipeline_identity()?;
+    let base = lock_base(rg)?;
+    let http = http_client(rg).ok()?;
+    let auth = cred(rg).map(|c| c.client_auth()).unwrap_or_default();
+    Some((vk_registry::LockClient::new(base, auth, http), pipeline))
+}
+
+/// Did `key` (a stage's final content hash) already fail to build earlier in this same
+/// pipeline? `None` (the common case) means proceed with the build as usual — including
+/// when there's nothing to ask (local store, or outside CI).
+pub fn check_build_failure(rg: &Registry, key: &str) -> Option<vk_registry::FailInfo> {
+    let (client, pipeline) = fail_client(rg)?;
+    block_on(async move { client.recent_failure(key, &pipeline).await })
+}
+
+/// Record that `key` just failed to build, so a peer in this same pipeline — another job
+/// needing the same content-key, or this job's own runner-level retry — fails fast instead
+/// of repeating the same doomed build. Best-effort no-op when there's nothing to tell (local
+/// store, or outside CI).
+pub fn report_build_failure(rg: &Registry, key: &str, reason: &str) {
+    let Some((client, pipeline)) = fail_client(rg) else {
+        return;
+    };
+    block_on(async move {
+        client
+            .record_failure(key, &pipeline, reason, BUILD_FAIL_TTL)
+            .await
+    });
+}
+
 /// Client credentials resolved from the registry config: a static bearer token
 /// (`token_file`) takes precedence over Basic (`username` + `password_file`), else none.
 /// One resolver for every client path (oci_client, raw HTTP, the lock API) so the driver

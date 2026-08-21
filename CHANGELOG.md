@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- A build stage that fails once now stays failed for the rest of the CI
+  pipeline: other jobs/retries needing the same content-key fail fast instead
+  of repeating the same build.
+
 ### Changed
 
 - **`vk build` restores cached stage images lazily instead of decompressing them

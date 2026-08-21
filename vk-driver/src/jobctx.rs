@@ -520,6 +520,17 @@ pub(crate) fn job_identity() -> String {
     format!("pid {}", std::process::id())
 }
 
+/// The current pipeline's identity, scoping a build-failure memo (see
+/// `registry::report_build_failure`/`check_build_failure`) to "this pipeline" — a restart
+/// always gets a new id, so a fresh attempt is never blocked by an earlier run's failure.
+/// `None` outside GitLab CI (no `CUSTOM_ENV_CI_PIPELINE_ID`), which keeps the whole feature
+/// inert for local `vk build`/`vk run`: every local invocation always retries.
+pub(crate) fn pipeline_identity() -> Option<String> {
+    std::env::var("CUSTOM_ENV_CI_PIPELINE_ID")
+        .ok()
+        .filter(|id| !id.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

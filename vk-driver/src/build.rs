@@ -1794,102 +1794,186 @@ fn build_stage(
         .get(&idx)
         .context("internal: stage not resolved")?
         .steps;
+    // The stage's final content key: used below both for the build-once lock and to check
+    // a remote vk-registry's build-failure memo (a no-op locally or outside CI) — if this
+    // exact key already failed to build earlier in this pipeline, fail fast instead of
+    // repeating a possibly expensive, doomed build (a runner-level retry of this job, or
+    // any other job/stage in the pipeline needing the same stage).
+    let final_key = steps.last().map(|s| s.key.clone());
     // Route this stage's guest output through the progress reporter (line-buffered +
     // stage-prefixed) so concurrent stages stay legible.
     ex.set_output_sink(progress.stage_sink(display));
-    // Fully cached: restore the final snapshot directly, nothing to probe or run.
-    if let Some(key) = cached_final.get(&idx) {
-        progress.stage_fully_cached(display);
-        progress.restore_start(display, &name);
-        let t_restore = Instant::now();
-        let fs = restore_into(ex, &name, key)?;
-        timings.record(Phase::CachePull, &name, t_restore.elapsed());
-        progress.restore_done(display);
-        ex.stage_end(&fs, Some(key))?;
-        return Ok(fs);
-    }
-    // Build-once across runners: take the lock on this stage's final content key (a no-op
-    // unless the cache is a remote vk-registry) so peers building the same stage don't
-    // duplicate it. After acquiring, re-check the cache — a peer may have finished while we
-    // waited — and restore instead of building. The guard is held for the whole stage
-    // (through the final `cache_save`) and releases on return.
-    let _build_lock = match steps.last().map(|s| s.key.clone()) {
-        Some(final_key) => {
-            // On contention the lock names its holder; show it under this stage until acquired.
-            let mut on_wait = |holder: &str| progress.wait_lock_start(display, &name, holder);
-            let guard = ex.build_lock(&final_key, &mut on_wait);
-            progress.wait_lock_done(display);
-            if guard.is_some() && ex.cache_has(&final_key) {
-                progress.stage_fully_cached(display);
-                progress.restore_start(display, &name);
-                let t_restore = Instant::now();
-                let fs = restore_into(ex, &name, &final_key)?;
-                timings.record(Phase::CachePull, &name, t_restore.elapsed());
-                progress.restore_done(display);
-                ex.stage_end(&fs, Some(&final_key))?;
-                return Ok(fs);
-            }
-            guard
+    // The actual build attempt, isolated in a closure so any error from here on is a
+    // candidate to memoize against `final_key` (just below) before it propagates — the
+    // memoization guard there filters out a cascaded cancellation or an environmental
+    // cause, so only this stage's own content failure actually poisons the key.
+    let result: Result<Rootfs> = (|| {
+        // Fully cached: restore the final snapshot directly, nothing to probe or run.
+        if let Some(key) = cached_final.get(&idx) {
+            progress.stage_fully_cached(display);
+            progress.restore_start(display, &name);
+            let t_restore = Instant::now();
+            let fs = restore_into(ex, &name, key)?;
+            timings.record(Phase::CachePull, &name, t_restore.elapsed());
+            progress.restore_done(display);
+            ex.stage_end(&fs, Some(key))?;
+            return Ok(fs);
         }
-        None => None,
-    };
-    // Past this point the stage needs a live guest (at minimum to probe/build its
-    // remaining steps), so it competes for the host-memory-derived build budget. Cache
-    // restores above never reach here, so they run at full DAG-dispatch concurrency
-    // instead of queuing behind real builds for one of these scarce permits.
-    let _permit = build_permits.acquire();
-    // Declare the stage's inputs — the source stages it copies/mounts from, and its
-    // build context — so the backend can attach them before the guest boots. Read off the
-    // resolved steps, not the raw plan: a `--from=$VAR` reaches the backend interpolated, so
-    // declaring the raw text would materialize the wrong ref under a label no step asks for.
-    let step_instrs: Vec<Instruction> = steps.iter().map(|s| s.instr.clone()).collect();
-    let inputs = stage_input_rootfs(plan, &step_instrs, committed, ex)?;
-    ex.stage_sources(&inputs, &stage.context)?;
-    // `FROM --kernel=image`: this stage's RUNs boot on the base image's own kernel.
-    ex.stage_kernel(stage.image_kernel);
-    // Instruction-level cache + lazy base: every step carries the chained key; the base
-    // rootfs is materialized only when something must actually run (the first cache
-    // miss). A fully-cached prefix never pulls/flattens the base. `fs` is None until
-    // materialized.
-    let mut fs: Option<Rootfs> = None;
-    let mut building = false;
-    // Whether the FROM (cell 1) line has been emitted. It is shown in order — before the
-    // step lines — so a cached prefix does not leave the FROM line trailing at the first
-    // miss; materialization of the base itself stays lazy (deferred to that first miss).
-    let mut base_shown = false;
-    let mut last_hit: Option<String> = None;
-    // `layers` never writes intermediate snapshots, so their keys can't hit — skip the
-    // per-step probe (a registry round-trip each) and build the whole stage from base.
-    // The fully-cached stage was already short-circuited above via `cached_final`.
-    let probe = !matches!(cache, BuildCache::Layers);
-    // `auto`: uncommitted run time accrued since the last checkpoint, and the threshold
-    // it must cross to force one. Reset on every commit.
-    let checkpoint = Duration::from_secs(checkpoint_secs());
-    let mut uncommitted = Duration::ZERO;
-    for (i, step) in steps.iter().enumerate() {
-        // Stop between steps if another stage has failed (covers the gap between a fast
-        // step finishing and the next boot; a long in-flight RUN is cut short in-guest).
-        if let Some(c) = cancel
-            && c.is_cancelled()
+        // Build-once across runners: take the lock on this stage's final content key (a no-op
+        // unless the cache is a remote vk-registry) so peers building the same stage don't
+        // duplicate it. After acquiring, re-check the cache — a peer may have finished while we
+        // waited — and restore instead of building. The guard is held for the whole stage
+        // (through the final `cache_save`) and releases on return.
+        let _build_lock = match &final_key {
+            Some(final_key) => {
+                // On contention the lock names its holder; show it under this stage until acquired.
+                let mut on_wait = |holder: &str| progress.wait_lock_start(display, &name, holder);
+                let guard = ex.build_lock(final_key, &mut on_wait);
+                progress.wait_lock_done(display);
+                if guard.is_some() && ex.cache_has(final_key) {
+                    progress.stage_fully_cached(display);
+                    progress.restore_start(display, &name);
+                    let t_restore = Instant::now();
+                    let fs = restore_into(ex, &name, final_key)?;
+                    timings.record(Phase::CachePull, &name, t_restore.elapsed());
+                    progress.restore_done(display);
+                    ex.stage_end(&fs, Some(final_key))?;
+                    return Ok(fs);
+                }
+                guard
+            }
+            None => None,
+        };
+        // Checked only now — after both cache short-circuits above — so a peer that
+        // finished (or a cache hit found only once we held the lock) always wins over a
+        // stale failure memo; consulting the memo any earlier could fail this build even
+        // though the content is now actually available.
+        if let Some(key) = &final_key
+            && let Some(fail) = ex.check_build_failure(key)
         {
-            bail!("build stopped after an earlier stage failed");
+            bail!(
+                "stage {name} recently failed to build in this pipeline ({}s ago: {}) — not \
+                 retrying automatically; restart the pipeline to retry",
+                fail.age.as_secs(),
+                fail.reason
+            );
         }
-        if probe && !building && ex.cache_has(&step.key) {
-            // A cached prefix restores the base as part of it, so the FROM line is CACHED;
-            // emit it before this step's line so it prints in order.
-            if !base_shown {
-                progress.base_done(display, Outcome::Cached);
-                base_shown = true;
+        // Past this point the stage needs a live guest (at minimum to probe/build its
+        // remaining steps), so it competes for the host-memory-derived build budget. Cache
+        // restores above never reach here, so they run at full DAG-dispatch concurrency
+        // instead of queuing behind real builds for one of these scarce permits.
+        let _permit = build_permits.acquire();
+        // Declare the stage's inputs — the source stages it copies/mounts from, and its
+        // build context — so the backend can attach them before the guest boots. Read off the
+        // resolved steps, not the raw plan: a `--from=$VAR` reaches the backend interpolated, so
+        // declaring the raw text would materialize the wrong ref under a label no step asks for.
+        let step_instrs: Vec<Instruction> = steps.iter().map(|s| s.instr.clone()).collect();
+        let inputs = stage_input_rootfs(plan, &step_instrs, committed, ex)?;
+        ex.stage_sources(&inputs, &stage.context)?;
+        // `FROM --kernel=image`: this stage's RUNs boot on the base image's own kernel.
+        ex.stage_kernel(stage.image_kernel);
+        // Instruction-level cache + lazy base: every step carries the chained key; the base
+        // rootfs is materialized only when something must actually run (the first cache
+        // miss). A fully-cached prefix never pulls/flattens the base. `fs` is None until
+        // materialized.
+        let mut fs: Option<Rootfs> = None;
+        let mut building = false;
+        // Whether the FROM (cell 1) line has been emitted. It is shown in order — before the
+        // step lines — so a cached prefix does not leave the FROM line trailing at the first
+        // miss; materialization of the base itself stays lazy (deferred to that first miss).
+        let mut base_shown = false;
+        let mut last_hit: Option<String> = None;
+        // `layers` never writes intermediate snapshots, so their keys can't hit — skip the
+        // per-step probe (a registry round-trip each) and build the whole stage from base.
+        // The fully-cached stage was already short-circuited above via `cached_final`.
+        let probe = !matches!(cache, BuildCache::Layers);
+        // `auto`: uncommitted run time accrued since the last checkpoint, and the threshold
+        // it must cross to force one. Reset on every commit.
+        let checkpoint = Duration::from_secs(checkpoint_secs());
+        let mut uncommitted = Duration::ZERO;
+        for (i, step) in steps.iter().enumerate() {
+            // Stop between steps if another stage has failed (covers the gap between a fast
+            // step finishing and the next boot; a long in-flight RUN is cut short in-guest).
+            if let Some(c) = cancel
+                && c.is_cancelled()
+            {
+                bail!("build stopped after an earlier stage failed");
             }
-            progress.step_done(display, i, Outcome::Cached);
-            last_hit = Some(step.key.clone());
-            continue;
+            if probe && !building && ex.cache_has(&step.key) {
+                // A cached prefix restores the base as part of it, so the FROM line is CACHED;
+                // emit it before this step's line so it prints in order.
+                if !base_shown {
+                    progress.base_done(display, Outcome::Cached);
+                    base_shown = true;
+                }
+                progress.step_done(display, i, Outcome::Cached);
+                last_hit = Some(step.key.clone());
+                continue;
+            }
+            // first miss: materialize the rootfs — restore the last cached snapshot if there
+            // was a cached prefix (the base folds into that restore, already shown above), else
+            // build the base from scratch/image/stage (shown here, in order, before this step).
+            if !building {
+                fs = Some(match &last_hit {
+                    Some(k) => {
+                        progress.restore_start(display, &name);
+                        let t_restore = Instant::now();
+                        let f = restore_into(ex, &name, k)?;
+                        timings.record(Phase::CachePull, &name, t_restore.elapsed());
+                        progress.restore_done(display);
+                        f
+                    }
+                    None => {
+                        progress.base_start(display);
+                        let t_base = Instant::now();
+                        let f = materialize_base(ex, &stage.base, &name, committed)?;
+                        timings.record(Phase::BasePull, &name, t_base.elapsed());
+                        progress.base_done(display, Outcome::Ran);
+                        base_shown = true;
+                        f
+                    }
+                });
+                building = true;
+            }
+            let f = fs.as_mut().expect("materialized on first miss");
+            progress.step_start(display, i);
+            let t0 = Instant::now();
+            apply_fs(plan, committed, ex, f, &step.state, &step.instr)
+                .inspect_err(|_| progress.step_failed(display, i))?;
+            let ran = t0.elapsed();
+            uncommitted += ran;
+            timings.record(Phase::Instructions, &name, ran);
+            // The stage's final step is always committed (so stage-level reuse and
+            // `COPY --from` hit); which intermediate steps are, depends on the mode:
+            // `instructions` commits every step, `layers` none, `auto` one once enough
+            // uncommitted run time has accrued (deferring is safe — the overlay is
+            // cumulative, so a later capture recovers the merged multi-step delta).
+            let last = i + 1 == steps.len();
+            let commit = match cache {
+                BuildCache::Instructions => true,
+                BuildCache::Layers => last,
+                BuildCache::Auto => last || uncommitted >= checkpoint,
+            };
+            if commit {
+                // The command is done; the snapshot + cache push that follow are commit
+                // overhead, not the step's runtime — freeze the reported time here so a
+                // trivial step isn't charged for the previous push's upload `cache_save` joins.
+                progress.step_committing(display, i);
+                let t_push = Instant::now();
+                ex.cache_save(f, &step.key)
+                    .inspect_err(|_| progress.step_failed(display, i))?;
+                timings.record(Phase::CachePush, &name, t_push.elapsed());
+                uncommitted = Duration::ZERO;
+            }
+            progress.step_done(display, i, Outcome::Ran);
         }
-        // first miss: materialize the rootfs — restore the last cached snapshot if there
-        // was a cached prefix (the base folds into that restore, already shown above), else
-        // build the base from scratch/image/stage (shown here, in order, before this step).
-        if !building {
-            fs = Some(match &last_hit {
+        // Nothing ran: the whole instruction run was cached → restore the final snapshot; or
+        // there were no fs-changing instructions → the stage is the base.
+        let final_fs = match fs {
+            Some(f) => f,
+            None => match &last_hit {
+                // Every step was a cache hit: the FROM line was already shown (CACHED) at the
+                // first hit in the loop, so just restore the final snapshot.
                 Some(k) => {
                     progress.restore_start(display, &name);
                     let t_restore = Instant::now();
@@ -1904,78 +1988,61 @@ fn build_stage(
                     let f = materialize_base(ex, &stage.base, &name, committed)?;
                     timings.record(Phase::BasePull, &name, t_base.elapsed());
                     progress.base_done(display, Outcome::Ran);
-                    base_shown = true;
                     f
                 }
-            });
-            building = true;
-        }
-        let f = fs.as_mut().expect("materialized on first miss");
-        progress.step_start(display, i);
-        let t0 = Instant::now();
-        apply_fs(plan, committed, ex, f, &step.state, &step.instr)
-            .inspect_err(|_| progress.step_failed(display, i))?;
-        let ran = t0.elapsed();
-        uncommitted += ran;
-        timings.record(Phase::Instructions, &name, ran);
-        // The stage's final step is always committed (so stage-level reuse and
-        // `COPY --from` hit); which intermediate steps are, depends on the mode:
-        // `instructions` commits every step, `layers` none, `auto` one once enough
-        // uncommitted run time has accrued (deferring is safe — the overlay is
-        // cumulative, so a later capture recovers the merged multi-step delta).
-        let last = i + 1 == steps.len();
-        let commit = match cache {
-            BuildCache::Instructions => true,
-            BuildCache::Layers => last,
-            BuildCache::Auto => last || uncommitted >= checkpoint,
+            },
         };
-        if commit {
-            // The command is done; the snapshot + cache push that follow are commit
-            // overhead, not the step's runtime — freeze the reported time here so a
-            // trivial step isn't charged for the previous push's upload `cache_save` joins.
-            progress.step_committing(display, i);
-            let t_push = Instant::now();
-            ex.cache_save(f, &step.key)
-                .inspect_err(|_| progress.step_failed(display, i))?;
-            timings.record(Phase::CachePush, &name, t_push.elapsed());
-            uncommitted = Duration::ZERO;
-        }
-        progress.step_done(display, i, Outcome::Ran);
+        // Finalize the stage: tear down its long-lived guest (if any) and commit its overlay
+        // back into the stage ext4 so forks / COPY --from / export see the writes. This joins the
+        // last step's still-uploading cache push (no next RUN overlapped it), so show a spinner —
+        // otherwise the dashboard sits frozen on the header through that upload.
+        progress.stage_finishing_start(display, &name);
+        let r = ex.stage_end(&final_fs, steps.last().map(|s| s.key.as_str()));
+        progress.stage_finishing_done(display);
+        r?;
+        Ok(final_fs)
+    })();
+    // Memoize a genuine failure against `final_key` so a peer in this pipeline fails fast
+    // instead of repeating it — but only a genuine one:
+    //  - a cascaded cancellation (a sibling stage failed; this one aborted mid-flight,
+    //    inside the closure's own step loop or via the backend cutting an in-flight RUN
+    //    short once `set_cancel` sees it) is not this key's fault, so re-check the token
+    //    here rather than trust the error text of whatever `bail!`/interruption surfaced;
+    //  - a failure whose root cause is environmental rather than content-related (out of
+    //    disk, a transient network hiccup pulling the base image) would otherwise poison
+    //    this key until the whole pipeline restarts, even though fixing the environment
+    //    (e.g. freeing disk) makes the very next retry succeed.
+    let cascaded = cancel.is_some_and(|c| c.is_cancelled());
+    if let (Err(e), Some(key)) = (&result, &final_key)
+        && !cascaded
+        && !is_environmental_failure(e)
+    {
+        ex.report_build_failure(key, &e.to_string());
     }
-    // Nothing ran: the whole instruction run was cached → restore the final snapshot; or
-    // there were no fs-changing instructions → the stage is the base.
-    let final_fs = match fs {
-        Some(f) => f,
-        None => match &last_hit {
-            // Every step was a cache hit: the FROM line was already shown (CACHED) at the
-            // first hit in the loop, so just restore the final snapshot.
-            Some(k) => {
-                progress.restore_start(display, &name);
-                let t_restore = Instant::now();
-                let f = restore_into(ex, &name, k)?;
-                timings.record(Phase::CachePull, &name, t_restore.elapsed());
-                progress.restore_done(display);
-                f
-            }
-            None => {
-                progress.base_start(display);
-                let t_base = Instant::now();
-                let f = materialize_base(ex, &stage.base, &name, committed)?;
-                timings.record(Phase::BasePull, &name, t_base.elapsed());
-                progress.base_done(display, Outcome::Ran);
-                f
-            }
-        },
-    };
-    // Finalize the stage: tear down its long-lived guest (if any) and commit its overlay
-    // back into the stage ext4 so forks / COPY --from / export see the writes. This joins the
-    // last step's still-uploading cache push (no next RUN overlapped it), so show a spinner —
-    // otherwise the dashboard sits frozen on the header through that upload.
-    progress.stage_finishing_start(display, &name);
-    let r = ex.stage_end(&final_fs, steps.last().map(|s| s.key.as_str()));
-    progress.stage_finishing_done(display);
-    r?;
-    Ok(final_fs)
+    result
+}
+
+/// Best-effort classification of an error chain as environmental (transient infrastructure
+/// trouble) rather than a genuine content/build failure — see `build_stage`'s memoization
+/// guard. Deliberately conservative: only a narrow, well-understood set of I/O error kinds
+/// qualifies; anything else (a failing RUN, a bad Dockerfile instruction, an unresolvable
+/// COPY source) is still memoized as this key's own fault.
+fn is_environmental_failure(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::StorageFull
+                    | std::io::ErrorKind::OutOfMemory
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            )
+        })
+    })
 }
 
 /// Each stage's final ENV/USER/WORKDIR, so a caller booting the exported image can run a
@@ -3313,6 +3380,25 @@ mod tests {
         /// key of the most recent `cache_save` — the target's final key after a cold
         /// run, so tests can evict it to simulate a partially cached rebuild.
         last_saved: Option<String>,
+        /// preset answer for `check_build_failure` — a test's stand-in for a remote
+        /// vk-registry's failure memo.
+        fail_check: Option<vk_registry::FailInfo>,
+        /// every `report_build_failure(key, reason)` call, in order — so a test can assert
+        /// a genuine build error got memoized (and a cascaded/short-circuited one did not).
+        fail_reports: Vec<(String, String)>,
+        /// force `cache_save` to fail, standing in for a genuine build error partway
+        /// through a stage.
+        fail_save: bool,
+        /// when `fail_save` also sets this, the synthetic failure wraps an `io::Error` of
+        /// this kind instead of a plain string — standing in for an environmental error
+        /// (e.g. `StorageFull`) instead of a genuine content/build one.
+        fail_save_io_kind: Option<std::io::ErrorKind>,
+        /// captured via `set_cancel`, exactly like the real backend — `cancel_after_run`
+        /// uses it to simulate a sibling stage failing while this one is still mid-flight.
+        cancel: Option<CancellationToken>,
+        /// if true, a successful `run` cancels the captured token as a side effect, so the
+        /// *next* step's between-steps check sees a cascaded cancellation.
+        cancel_after_run: bool,
     }
 
     impl Executor for CachedDry {
@@ -3335,7 +3421,17 @@ mod tests {
             mounts: &[ResolvedMount<'_>],
             state: &ShellState,
         ) -> Result<()> {
-            self.inner.run(fs, cmd, mounts, state)
+            let r = self.inner.run(fs, cmd, mounts, state);
+            if r.is_ok()
+                && self.cancel_after_run
+                && let Some(c) = &self.cancel
+            {
+                c.cancel();
+            }
+            r
+        }
+        fn set_cancel(&mut self, cancel: CancellationToken) {
+            self.cancel = Some(cancel);
         }
         fn copy(
             &mut self,
@@ -3363,6 +3459,12 @@ mod tests {
             Ok(())
         }
         fn cache_save(&mut self, _fs: &Rootfs, key: &str) -> Result<()> {
+            if self.fail_save {
+                if let Some(kind) = self.fail_save_io_kind {
+                    return Err(std::io::Error::from(kind)).context("synthetic cache_save failure");
+                }
+                bail!("synthetic cache_save failure");
+            }
             self.inner.transcript.push(format!("cache-save {key}"));
             self.cache.insert(key.to_string());
             self.last_saved = Some(key.to_string());
@@ -3375,6 +3477,13 @@ mod tests {
                 final_key.unwrap_or("-")
             ));
             Ok(())
+        }
+        fn check_build_failure(&mut self, _key: &str) -> Option<vk_registry::FailInfo> {
+            self.fail_check.clone()
+        }
+        fn report_build_failure(&mut self, key: &str, reason: &str) {
+            self.fail_reports
+                .push((key.to_string(), reason.to_string()));
         }
     }
 
@@ -3448,6 +3557,7 @@ mod tests {
             inner: DryRun::new(),
             cache: ex.cache,
             last_saved: None,
+            ..Default::default()
         };
         drive(
             &plan,
@@ -3543,6 +3653,7 @@ mod tests {
             inner: DryRun::new(),
             cache: ex.cache,
             last_saved: None,
+            ..Default::default()
         };
         drive(
             &plan,
@@ -3588,6 +3699,7 @@ mod tests {
             inner: DryRun::new(),
             cache,
             last_saved: None,
+            ..Default::default()
         };
         drive(
             &plan,
@@ -3697,6 +3809,7 @@ mod tests {
                 inner: DryRun::new(),
                 cache: cold.cache,
                 last_saved: None,
+                ..Default::default()
             };
             drive(
                 &plan,
@@ -4969,6 +5082,216 @@ RUN ship
             Ok(ok) => assert!(ok, "cache-hit build_stage call returned an error"),
             Err(_) => panic!("cache-hit stage blocked on an exhausted build permit"),
         }
+    }
+
+    // Regression test for the retry-storm fix: a stage whose content-key already has a
+    // memoized failure (from `Executor::check_build_failure`, backed by a remote
+    // vk-registry) must fail fast — never touching the build permit — instead of
+    // repeating the same doomed build. Run off-thread with the permit exhausted, exactly
+    // like the cache-hit test above, so a regression that reaches the real build path
+    // hangs the test instead of silently passing.
+    #[test]
+    fn build_stage_fails_fast_on_a_recent_failure_memo() {
+        let src = "FROM alpine\nRUN one\n";
+        let ba = Vars::new();
+        let mut ex = CachedDry::default();
+        let plan = plan_one(src, &ba);
+        let target = plan.resolve_target(None).unwrap();
+        let order = plan.build_order(target).unwrap();
+        let resolved = resolve_all(&plan, &order, &ba, &mut ex, &[target]).unwrap();
+        let (_needed, cached_final) =
+            compute_needed(&plan, &order, &resolved, &mut ex, false, &[target]).unwrap();
+        ex.fail_check = Some(vk_registry::FailInfo {
+            reason: "ENOSPC".into(),
+            age: Duration::from_secs(5),
+        });
+        let build_permits = Semaphore::new(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = build_stage(
+                &plan,
+                &resolved,
+                &cached_final,
+                &HashMap::new(),
+                &mut ex,
+                target,
+                BuildCache::Instructions,
+                &Progress::disabled(),
+                &Arc::new(Timings::new()),
+                None,
+                "",
+                target,
+                &build_permits,
+            );
+            let _ = tx.send(result.err().map(|e| e.to_string()));
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Some(msg)) => assert!(
+                msg.contains("ENOSPC"),
+                "error should surface the memoized failure's reason, got: {msg}"
+            ),
+            Ok(None) => panic!("a memoized failure must not let the build proceed"),
+            Err(_) => panic!("fail-fast stage blocked on an exhausted build permit"),
+        }
+    }
+
+    // Regression test for the retry-storm fix: a genuine build error must be memoized via
+    // `Executor::report_build_failure` against the stage's own final content key, so a
+    // peer in the same pipeline can fail fast instead of repeating it.
+    #[test]
+    fn build_stage_reports_a_genuine_failure_against_its_final_key() {
+        let src = "FROM alpine\nRUN one\n";
+        let ba = Vars::new();
+        let mut ex = CachedDry {
+            fail_save: true,
+            ..Default::default()
+        };
+        let plan = plan_one(src, &ba);
+        let target = plan.resolve_target(None).unwrap();
+        let order = plan.build_order(target).unwrap();
+        let resolved = resolve_all(&plan, &order, &ba, &mut ex, &[target]).unwrap();
+        let key = resolved[&target].steps.last().unwrap().key.clone();
+        let (_needed, cached_final) =
+            compute_needed(&plan, &order, &resolved, &mut ex, false, &[target]).unwrap();
+        let build_permits = Semaphore::new(1);
+        let result = build_stage(
+            &plan,
+            &resolved,
+            &cached_final,
+            &HashMap::new(),
+            &mut ex,
+            target,
+            BuildCache::Instructions,
+            &Progress::disabled(),
+            &Arc::new(Timings::new()),
+            None,
+            "",
+            target,
+            &build_permits,
+        );
+        assert!(
+            result.is_err(),
+            "the synthetic cache_save failure must propagate"
+        );
+        assert_eq!(
+            ex.fail_reports,
+            vec![(key, "synthetic cache_save failure".to_string())]
+        );
+    }
+
+    // Regression test: a cascaded cancellation (a sibling stage failed while this one was
+    // mid-flight, tripping the between-steps check) is not this stage's own fault and must
+    // not be memoized — otherwise the *next* pipeline run would fail fast on a key that
+    // never actually failed to build.
+    #[test]
+    fn build_stage_does_not_memoize_a_cascaded_cancellation() {
+        let src = "FROM alpine\nRUN one\nRUN two\n";
+        let ba = Vars::new();
+        let mut ex = CachedDry {
+            // `run` cancels the token right after step 0 succeeds, so the between-steps
+            // check ahead of step 1 sees a cascaded cancellation, exactly as a real sibling
+            // failure elsewhere in the DAG would trigger it.
+            cancel_after_run: true,
+            ..Default::default()
+        };
+        let plan = plan_one(src, &ba);
+        let target = plan.resolve_target(None).unwrap();
+        let order = plan.build_order(target).unwrap();
+        let resolved = resolve_all(&plan, &order, &ba, &mut ex, &[target]).unwrap();
+        let (_needed, cached_final) =
+            compute_needed(&plan, &order, &resolved, &mut ex, false, &[target]).unwrap();
+        let build_permits = Semaphore::new(1);
+        let cancel = CancellationToken::new();
+        let result = build_stage(
+            &plan,
+            &resolved,
+            &cached_final,
+            &HashMap::new(),
+            &mut ex,
+            target,
+            BuildCache::Instructions,
+            &Progress::disabled(),
+            &Arc::new(Timings::new()),
+            Some(&cancel),
+            "",
+            target,
+            &build_permits,
+        );
+        assert!(
+            result.is_err(),
+            "the between-steps cancellation check must still abort the stage"
+        );
+        assert!(
+            ex.fail_reports.is_empty(),
+            "a cascaded cancellation must not be memoized as this key's own failure, got: {:?}",
+            ex.fail_reports
+        );
+    }
+
+    // Regression test: an environmental failure (out of disk, a transient connection
+    // reset) is not this key's own content fault, and memoizing it would poison the key
+    // until the whole pipeline restarts — even though the very next retry could succeed
+    // once the environment recovers.
+    #[test]
+    fn build_stage_does_not_memoize_an_environmental_failure() {
+        let src = "FROM alpine\nRUN one\n";
+        let ba = Vars::new();
+        let mut ex = CachedDry {
+            fail_save: true,
+            fail_save_io_kind: Some(std::io::ErrorKind::StorageFull),
+            ..Default::default()
+        };
+        let plan = plan_one(src, &ba);
+        let target = plan.resolve_target(None).unwrap();
+        let order = plan.build_order(target).unwrap();
+        let resolved = resolve_all(&plan, &order, &ba, &mut ex, &[target]).unwrap();
+        let (_needed, cached_final) =
+            compute_needed(&plan, &order, &resolved, &mut ex, false, &[target]).unwrap();
+        let build_permits = Semaphore::new(1);
+        let result = build_stage(
+            &plan,
+            &resolved,
+            &cached_final,
+            &HashMap::new(),
+            &mut ex,
+            target,
+            BuildCache::Instructions,
+            &Progress::disabled(),
+            &Arc::new(Timings::new()),
+            None,
+            "",
+            target,
+            &build_permits,
+        );
+        assert!(
+            result.is_err(),
+            "the synthetic ENOSPC failure must propagate"
+        );
+        assert!(
+            ex.fail_reports.is_empty(),
+            "an environmental (StorageFull) failure must not be memoized, got: {:?}",
+            ex.fail_reports
+        );
+    }
+
+    #[test]
+    fn is_environmental_failure_matches_known_transient_io_kinds_only() {
+        let env = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        assert!(is_environmental_failure(&env));
+        let env = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+            .context("pulling the base image");
+        assert!(
+            is_environmental_failure(&env),
+            "an io::Error wrapped deeper in the chain (via .context()) must still be found"
+        );
+        let content = anyhow::anyhow!("RUN exited with status 1");
+        assert!(!is_environmental_failure(&content));
+        let other_io =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(
+            !is_environmental_failure(&other_io),
+            "only the curated transient-kind set should be treated as environmental"
+        );
     }
 
     #[test]

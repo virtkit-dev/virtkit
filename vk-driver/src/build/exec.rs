@@ -162,6 +162,17 @@ pub trait Executor {
         None
     }
 
+    /// Did `key` (a stage's final content hash) already fail to build earlier in this same
+    /// CI pipeline? A backend backed by a remote vk-registry checks its failure memo;
+    /// default: never (no memoized failure — local cache, no cache, or outside CI).
+    fn check_build_failure(&mut self, _key: &str) -> Option<vk_registry::FailInfo> {
+        None
+    }
+    /// Record that `key` just failed to build, so a peer in this same pipeline — another
+    /// job needing the same content-key, or this job's own runner-level retry — fails fast
+    /// instead of repeating the same doomed build. Default: nowhere to record it.
+    fn report_build_failure(&mut self, _key: &str, _reason: &str) {}
+
     /// Finalize a stage once all its instructions have run (default: nothing). The
     /// microVM backend uses this to shut down the stage's long-lived guest, whose writes
     /// are already persisted in the stage image (the booted disk). `final_key` is the
@@ -2287,6 +2298,14 @@ impl Executor for MicroVm {
             on_wait,
         )
     }
+    fn check_build_failure(&mut self, key: &str) -> Option<vk_registry::FailInfo> {
+        crate::registry::check_build_failure(self.cache.as_ref()?, &format!("{CACHE_REPO}/{key}"))
+    }
+    fn report_build_failure(&mut self, key: &str, reason: &str) {
+        if let Some(rg) = self.cache.as_ref() {
+            crate::registry::report_build_failure(rg, &format!("{CACHE_REPO}/{key}"), reason);
+        }
+    }
     fn cache_restore(&mut self, fs: &Rootfs, key: &str) -> Result<()> {
         let Some(rg) = self.cache.clone() else {
             bail!("cache_restore with no cache registry");
@@ -2909,6 +2928,20 @@ mod tests {
     // Temp dirs are minted over in `build`'s tests, so the tags here share one namespace with
     // the tags there — keep any tag added here distinct from both.
     use crate::build::tests::tmpdir;
+
+    // `DryRun` never overrides `check_build_failure`/`report_build_failure`, so it exercises
+    // the `Executor` trait's own defaults — a backend with no remote vk-registry (dry-run,
+    // planning, or a plain local build) must never see a memoized failure and must accept
+    // reporting one as a silent no-op, not an error.
+    #[test]
+    fn a_backend_without_a_remote_registry_never_memoizes_a_build_failure() {
+        let mut ex = DryRun::new();
+        assert!(
+            ex.check_build_failure("some-key").is_none(),
+            "the default check must never claim a memoized failure"
+        );
+        ex.report_build_failure("some-key", "boom"); // must not panic
+    }
 
     #[test]
     fn a_base_digest_is_resolved_once_per_process() {

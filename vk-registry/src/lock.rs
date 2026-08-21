@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use tokio::sync::Notify;
@@ -28,6 +28,18 @@ use tokio::sync::Notify;
 const DEFAULT_TTL: u64 = 30;
 /// Default contention wait if the client sends no `?wait=` (seconds).
 const DEFAULT_WAIT: u64 = 3600;
+/// Default failure-record ttl if the client sends no `?ttl=` on `/lock/fail` (seconds) —
+/// generous, on the order of a slow pipeline's whole lifetime.
+const DEFAULT_FAIL_TTL: u64 = 6 * 3600;
+/// Longest a client may ask a failure record to live for — a memo blocks every build of
+/// this key across the whole pipeline until it expires or the pipeline restarts, so unlike
+/// `/lock/acquire`'s lease (30s default, reclaimed fast on a miss), an unbounded `?ttl=`
+/// here has an outsized blast radius. Generous enough for any real pipeline, not a cap
+/// meant to bind tightly.
+const MAX_FAIL_TTL: u64 = 24 * 3600;
+/// `/lock/fail`'s reason body is free text for a log/error message, not a payload; cap it
+/// well above anything reasonable so a client can't park an unbounded buffer server-side.
+const MAX_FAIL_REASON: usize = 4096;
 
 /// Longest a single `acquire` call parks between contention re-checks — also the ceiling
 /// on how late a lapsed lease is reclaimed if a release notification is missed.
@@ -50,12 +62,31 @@ pub struct Blocker {
     pub holder: String,
 }
 
+/// A recorded build failure for one content-key, scoped to the pipeline that hit it — see
+/// [`LockManager::record_failure`].
+struct FailRecord {
+    pipeline: String,
+    reason: String,
+    recorded_at: Instant,
+    ttl: Duration,
+}
+
+/// A recent failure matching the querying pipeline, as reported to a caller.
+pub struct FailInfo {
+    pub reason: String,
+    pub age: Duration,
+}
+
 /// The name→holder table plus a notifier that wakes waiters on release.
 pub struct LockManager {
     held: Mutex<HashMap<String, Held>>,
     /// notified on every release so parked `acquire` calls re-check promptly
     freed: Notify,
     seq: AtomicU64,
+    /// build-failure memos, independent of `held` — a domain-specific negative cache, not a
+    /// mutual-exclusion primitive, so it never entangles with `task`'s reuse of `/lock/*` for
+    /// its own (unrelated) locking. See [`LockManager::record_failure`].
+    failed: Mutex<HashMap<String, FailRecord>>,
 }
 
 impl Default for LockManager {
@@ -70,7 +101,44 @@ impl LockManager {
             held: Mutex::new(HashMap::new()),
             freed: Notify::new(),
             seq: AtomicU64::new(0),
+            failed: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record that `name` (a build stage's content-key) just failed to build under
+    /// `pipeline`'s watch, so a peer — another job in the same pipeline needing the same
+    /// key, or this job's own runner-level retry — can fail fast instead of repeating a
+    /// doomed, expensive build. Scoped to `pipeline`: a different pipeline id (a restart)
+    /// always gets a fresh attempt, so there is no separate "clear" operation. Upserts (a
+    /// later failure replaces an earlier one) and prunes every lapsed record while it's at
+    /// it, so the table can't grow without bound.
+    pub fn record_failure(&self, name: &str, pipeline: &str, reason: &str, ttl: Duration) {
+        let mut map = self.failed.lock().unwrap();
+        let now = Instant::now();
+        map.retain(|_, r| now.duration_since(r.recorded_at) < r.ttl);
+        map.insert(
+            name.to_string(),
+            FailRecord {
+                pipeline: pipeline.to_string(),
+                reason: reason.to_string(),
+                recorded_at: now,
+                ttl,
+            },
+        );
+    }
+
+    /// A still-live failure record for `name` recorded under `pipeline`, `None` if there is
+    /// none, it was recorded under a different pipeline, or its ttl has lapsed.
+    pub fn recent_failure(&self, name: &str, pipeline: &str) -> Option<FailInfo> {
+        let now = Instant::now();
+        self.failed.lock().unwrap().get(name).and_then(|r| {
+            (r.pipeline == pipeline && now.duration_since(r.recorded_at) < r.ttl).then(|| {
+                FailInfo {
+                    reason: r.reason.clone(),
+                    age: now.duration_since(r.recorded_at),
+                }
+            })
+        })
     }
 
     /// Unique within this process — all the authority a single-process lock needs.
@@ -247,11 +315,19 @@ impl LockManager {
 /// - `POST /lock/renew?name=…&ttl=`         (`X-Vk-Lock-Owner`)  → `{renewed, of}`
 /// - `POST /lock/release?name=…`            (`X-Vk-Lock-Owner`)  → `{released}`
 /// - `POST /lock/status?name=…`                                  → `{holders:[{name, holder}]}`
+///
+/// A second, independent pair — a build-failure memo, not a mutual-exclusion primitive, so
+/// it never entangles with `task`'s reuse of the four locking endpoints above:
+///
+/// - `POST /lock/fail?name=…&ttl=` (`X-Vk-Lock-Pipeline`, body = reason text) → `{recorded:true}`
+/// - `POST /lock/fail-status?name=…` (`X-Vk-Lock-Pipeline`) → `{failed:false}` |
+///   `{failed:true, reason, age_secs}`
 pub async fn route(mgr: &LockManager, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
     let owner = header(&req, "x-vk-lock-owner");
     let holder = header(&req, "x-vk-lock-holder").unwrap_or_default();
+    let pipeline = header(&req, "x-vk-lock-pipeline");
 
     if req.method() != Method::POST {
         return Ok(json(
@@ -335,11 +411,83 @@ pub async fn route(mgr: &LockManager, req: Request<Incoming>) -> Result<Response
                 &serde_json::json!({"holders": holders}).to_string(),
             ))
         }
+        // record that `names` (usually one key) just failed to build under `pipeline`'s
+        // watch, so a peer sees it via `/lock/fail-status` and fails fast instead of
+        // repeating the same doomed build.
+        "/lock/fail" => {
+            let Some(pipeline) = pipeline.filter(|p| !p.is_empty()) else {
+                return Ok(json(
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":"missing X-Vk-Lock-Pipeline"}"#,
+                ));
+            };
+            let ttl = fail_ttl(&query);
+            let reason = match read_body_capped(req.into_body(), MAX_FAIL_REASON).await {
+                Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                Err(e) => {
+                    return Ok(json(
+                        StatusCode::BAD_REQUEST,
+                        &format!(r#"{{"error":"{e}"}}"#),
+                    ));
+                }
+            };
+            for name in &names {
+                mgr.record_failure(name, &pipeline, &reason, ttl);
+            }
+            Ok(json(StatusCode::OK, r#"{"recorded":true}"#))
+        }
+        // a still-live failure record for `names[0]` under `pipeline`? Single-name only —
+        // a batch has no natural all-or-nothing meaning for a query, so only the first
+        // requested name is checked.
+        "/lock/fail-status" => {
+            let Some(pipeline) = pipeline.filter(|p| !p.is_empty()) else {
+                return Ok(json(
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":"missing X-Vk-Lock-Pipeline"}"#,
+                ));
+            };
+            match mgr.recent_failure(&names[0], &pipeline) {
+                Some(f) => {
+                    let body = serde_json::json!({
+                        "failed": true, "reason": f.reason, "age_secs": f.age.as_secs(),
+                    });
+                    Ok(json(StatusCode::OK, &body.to_string()))
+                }
+                None => Ok(json(StatusCode::OK, r#"{"failed":false}"#)),
+            }
+        }
         _ => Ok(json(
             StatusCode::NOT_FOUND,
             r#"{"error":"unknown lock action"}"#,
         )),
     }
+}
+
+/// Read a body, capped at `cap` bytes (`/lock/fail`'s reason is a short log message, not a
+/// payload — reject anything abusively large instead of buffering it). Reads frame-by-frame
+/// and bails the moment the running total crosses `cap`, so an oversized body is never
+/// fully buffered server-side first, unlike a `collect()`-then-check. Generic over the body
+/// type (rather than `Request<Incoming>` directly) so a test can exercise it against a
+/// synthetic streaming body without a real connection.
+async fn read_body_capped<B>(mut body: B, cap: usize) -> Result<Bytes, &'static str>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
+    if body.size_hint().lower() > cap as u64 {
+        return Err("reason body too large");
+    }
+    let mut buf = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| "reading request body")?;
+        let Some(data) = frame.data_ref() else {
+            continue; // a trailers frame — no data to accumulate
+        };
+        if buf.len() + data.len() > cap {
+            return Err("reason body too large");
+        }
+        buf.extend_from_slice(data);
+    }
+    Ok(Bytes::from(buf))
 }
 
 /// Collect the repeated `?name=` query params (percent-decoded), de-duplicated while
@@ -402,6 +550,17 @@ fn qparam(query: &str, key: &str) -> Option<u64> {
         .filter_map(|p| p.split_once('='))
         .find(|(k, _)| *k == key)
         .and_then(|(_, v)| v.parse().ok())
+}
+
+/// `/lock/fail`'s effective ttl: the client's `?ttl=` (or [`DEFAULT_FAIL_TTL`]), clamped to
+/// [`MAX_FAIL_TTL`] — see that constant's doc for why this endpoint clamps where
+/// `/lock/acquire`'s lease does not.
+fn fail_ttl(query: &str) -> Duration {
+    Duration::from_secs(
+        qparam(query, "ttl")
+            .unwrap_or(DEFAULT_FAIL_TTL)
+            .min(MAX_FAIL_TTL),
+    )
 }
 
 fn json(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
@@ -631,5 +790,94 @@ mod tests {
         assert_eq!(m.holder("z"), None, "no partial acquisition of z");
         assert_eq!(m.holder("y").as_deref(), Some("holder"));
         assert!(m.release("y", &h));
+    }
+
+    #[test]
+    fn recent_failure_matches_only_the_recording_pipeline() {
+        let m = LockManager::new();
+        assert!(m.recent_failure("k", "pipeline-1").is_none());
+        m.record_failure("k", "pipeline-1", "ENOSPC", Duration::from_secs(60));
+        let f = m
+            .recent_failure("k", "pipeline-1")
+            .expect("recorded under pipeline-1");
+        assert_eq!(f.reason, "ENOSPC");
+        // a different pipeline (e.g. a restart) must never see the old failure.
+        assert!(m.recent_failure("k", "pipeline-2").is_none());
+        // an unrelated key is unaffected.
+        assert!(m.recent_failure("other", "pipeline-1").is_none());
+    }
+
+    #[test]
+    fn recent_failure_expires_past_its_ttl() {
+        let m = LockManager::new();
+        m.record_failure("k", "p", "boom", Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            m.recent_failure("k", "p").is_none(),
+            "a lapsed failure record must not block a retry"
+        );
+    }
+
+    #[test]
+    fn record_failure_overwrites_an_earlier_record_for_the_same_key() {
+        let m = LockManager::new();
+        m.record_failure("k", "p", "first reason", Duration::from_secs(60));
+        m.record_failure("k", "p", "second reason", Duration::from_secs(60));
+        assert_eq!(m.recent_failure("k", "p").unwrap().reason, "second reason");
+    }
+
+    #[test]
+    fn fail_ttl_defaults_and_clamps_but_never_shrinks_a_sane_value() {
+        assert_eq!(fail_ttl(""), Duration::from_secs(DEFAULT_FAIL_TTL));
+        assert_eq!(fail_ttl("ttl=60"), Duration::from_secs(60));
+        // an outsized client-requested ttl (a memo blocks every build of this key across
+        // the whole pipeline) must be clamped, not honored verbatim.
+        assert_eq!(
+            fail_ttl("ttl=999999999"),
+            Duration::from_secs(MAX_FAIL_TTL),
+            "an oversized ttl must be clamped to MAX_FAIL_TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_accepts_a_body_at_the_cap() {
+        let body = Full::new(Bytes::from(vec![b'x'; 8]));
+        let got = read_body_capped(body, 8).await.unwrap();
+        assert_eq!(got.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_rejects_a_body_over_the_cap() {
+        let body = Full::new(Bytes::from(vec![b'x'; 9]));
+        assert!(read_body_capped(body, 8).await.is_err());
+    }
+
+    // The whole point of reading frame-by-frame is to never fully buffer an oversized body
+    // server-side first. Feed a streaming body whose total size is far over the cap but
+    // whose individual frames are cap-sized, and assert the read stops as soon as the
+    // running total crosses the cap — not after draining every frame the client sent.
+    #[tokio::test]
+    async fn read_body_capped_stops_reading_once_over_cap_without_draining_the_rest() {
+        use futures::{StreamExt, stream};
+        use http_body_util::StreamBody;
+        use hyper::body::Frame;
+        let cap = 8usize;
+        let total_frames = 5usize; // 5 * cap is far over cap
+        let polled = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let counted = polled.clone();
+        let frames = stream::iter(0..total_frames).map(move |_| {
+            counted.set(counted.get() + 1);
+            Ok::<_, std::io::Error>(Frame::data(Bytes::from(vec![b'x'; cap])))
+        });
+        let body = StreamBody::new(frames);
+        let err = read_body_capped(body, cap)
+            .await
+            .expect_err("a body far over the cap must be rejected");
+        assert_eq!(err, "reason body too large");
+        assert!(
+            polled.get() < total_frames,
+            "must bail once over cap instead of draining every frame, polled {} of {total_frames}",
+            polled.get()
+        );
     }
 }

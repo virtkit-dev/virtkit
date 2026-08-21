@@ -36,6 +36,14 @@ pub struct Held {
     pub owner: String,
 }
 
+/// A recent build failure recorded for a content-key under the querying pipeline — see
+/// [`LockClient::recent_failure`].
+#[derive(Clone, Debug)]
+pub struct FailInfo {
+    pub reason: String,
+    pub age: Duration,
+}
+
 impl LockClient {
     pub fn new(base: impl Into<String>, auth: ClientAuth, client: reqwest::Client) -> Self {
         LockClient {
@@ -207,5 +215,53 @@ impl LockClient {
         self.release_all(std::slice::from_ref(&held.name), &held.owner)
             .await?;
         Ok(())
+    }
+
+    // ---- build-failure memo: independent of the lock above, see `crate::lock::route` ----
+
+    /// Record that `name` just failed to build under `pipeline`'s watch, so a peer sees it
+    /// via [`Self::recent_failure`] and fails fast instead of repeating the same doomed
+    /// build. Best-effort: a transport error is swallowed — a missed record only costs a
+    /// future re-attempt, never a correctness issue.
+    pub async fn record_failure(&self, name: &str, pipeline: &str, reason: &str, ttl: Duration) {
+        let ttl_s = ttl.as_secs().to_string();
+        let _ = self
+            .auth(self.client.post(self.url("fail")))
+            .query(&[("name", name), ("ttl", ttl_s.as_str())])
+            .header("x-vk-lock-pipeline", pipeline)
+            .body(reason.to_string())
+            .send()
+            .await;
+    }
+
+    /// A still-live failure record for `name` under `pipeline`. `None` for no record, a
+    /// record under a different pipeline, a lapsed ttl, or any transport/parse error —
+    /// treated alike so a registry hiccup never blocks a build that would otherwise
+    /// proceed.
+    pub async fn recent_failure(&self, name: &str, pipeline: &str) -> Option<FailInfo> {
+        let resp = self
+            .auth(self.client.post(self.url("fail-status")))
+            .query(&[("name", name)])
+            .header("x-vk-lock-pipeline", pipeline)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        #[derive(serde::Deserialize)]
+        struct Body {
+            failed: bool,
+            reason: Option<String>,
+            age_secs: Option<u64>,
+        }
+        let body: Body = resp.json().await.ok()?;
+        if !body.failed {
+            return None;
+        }
+        Some(FailInfo {
+            reason: body.reason.unwrap_or_default(),
+            age: Duration::from_secs(body.age_secs.unwrap_or(0)),
+        })
     }
 }
