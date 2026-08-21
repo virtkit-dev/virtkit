@@ -1793,8 +1793,6 @@ dependencies = [
 [[package]]
 name = "imago"
 version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "404f567d70cd6d288e43f95ea8f2d6e8fe6156dd07df7da955cb9b147c4ab2a5"
 dependencies = [
  "async-trait",
  "bincode",

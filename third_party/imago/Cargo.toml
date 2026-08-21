@@ -1,0 +1,76 @@
+[package]
+name = "imago"
+version = "0.2.4"
+edition = "2021"
+license = "MIT"
+description = "A library for accessing virtual machine disk images."
+repository = "https://gitlab.com/hreitz/imago"
+readme = "README.md"
+
+[dependencies]
+async-trait = { version = "0.1", optional = true }
+bincode = { version = "2", features = ["derive"], default-features = false }
+cfg-if = "1"
+futures = { version = "0.3", features = ["alloc"], default-features = false, optional = true }
+maybe-async = "0.2"
+miniz_oxide = { version = "0.8", features = ["std"] }
+nix = { version = "0.30", features = ["ioctl"] }
+page_size = "0.6"
+tokio = { version = "1", features = ["sync"], optional = true }
+tracing = { version = "0.1", features = ["attributes"] }
+vm-memory = { version = ">=0.16, <0.19", optional = true, default-features = false }
+
+# For build.rs
+[build-dependencies]
+rustc_version = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
+
+# Document all features for docs.rs
+[package.metadata.docs.rs]
+features = ["async", "sync-wrappers", "vm-memory"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[features]
+default = ["async"]
+# async-drop = []
+async = ["dep:tokio", "dep:async-trait", "dep:futures"]
+sync = ["maybe-async/is_sync"]
+sync-wrappers = ["async", "tokio/rt"]
+vm-memory = ["dep:vm-memory"]
+
+[lints.rust]
+# Occasionally, we may need to silence warnings and clippy lints that
+# were only introduced in newer Rust compiler versions.  Do not croak
+# in that case; the nightly clippy job disables this and ensures
+# that there are no misspelled allow() attributes.
+unknown_lints = "allow"
+
+# Prohibit code that is forbidden in Rust 2024
+unsafe_op_in_unsafe_fn = "deny"
+
+# The `sync` feature is built up across commits; allow cfg references before
+# it is defined in [features].
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("sync"))'] }
+
+warnings = "deny"
+
+[lints.rustdoc]
+private_intra_doc_links = "allow"
+broken_intra_doc_links = "deny"
+invalid_html_tags = "deny"
+invalid_rust_codeblocks = "deny"
+bare_urls = "deny"
+unescaped_backticks = "deny"
+redundant_explicit_links = "deny"
