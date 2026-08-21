@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-08-21
+
 ### Changed
 
 - **Guest disk reads and writes to the same image now run concurrently instead of
@@ -1784,7 +1786,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.39.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.40.0...HEAD
+[0.40.0]: https://github.com/virtkit-dev/virtkit/compare/v0.39.0...v0.40.0
 [0.39.0]: https://github.com/virtkit-dev/virtkit/compare/v0.38.0...v0.39.0
 [0.38.0]: https://github.com/virtkit-dev/virtkit/compare/v0.37.0...v0.38.0
 [0.37.0]: https://github.com/virtkit-dev/virtkit/compare/v0.36.0...v0.37.0
