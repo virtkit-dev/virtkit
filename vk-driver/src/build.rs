@@ -593,7 +593,6 @@ fn make_microvm(
         cpus,
         mem,
         cache,
-        opts.journal,
         opts.net.clone(),
         opts.debug,
         !opts.tmp_tmpfs,
@@ -773,6 +772,12 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
                 .final_key
                 .clone();
             stamp_stage_uuid(out, &key)?;
+            // Journal *after* the UUID stamp: `ext4::set_uuid` refuses an already-journaled
+            // image (the JBD2 superblock embeds the UUID at journal creation), so this must
+            // stay ordered after `stamp_stage_uuid` above, never before.
+            if opts.journal {
+                crate::ext4::add_journal(out)?;
+            }
             // The sidecar persists the config the image itself deliberately does not
             // carry (clean-image model: config is supplied at boot, never baked in).
             let sidecar = config_sidecar(out);
@@ -1143,6 +1148,11 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
                         .context("internal: target stage not resolved")?
                         .final_key;
                     stamp_stage_uuid(out, key)?;
+                    // Journal *after* the UUID stamp — see the single-target export path
+                    // above for why the order matters.
+                    if opts.journal {
+                        crate::ext4::add_journal(out)?;
+                    }
                     let sidecar = config_sidecar(out);
                     let st = u
                         .resolved
@@ -4836,6 +4846,65 @@ ENTRYPOINT run me
         assert_eq!(
             crate::ext4::fs_uuid(&out).as_deref(),
             Some(expected.as_str())
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Regression test: `ext4::set_uuid` (which `stamp_stage_uuid` calls) refuses an
+    // already-journaled image — the JBD2 superblock embeds the UUID at journal creation,
+    // so a restamp would desynchronize them. `Options.journal = true` must therefore land
+    // the journal *after* the UUID stamp in the export tail, not before; getting the order
+    // backwards would make every default (journaled) `vk build --out` fail right here.
+    #[test]
+    fn journaled_export_stamps_the_uuid_before_adding_the_journal() {
+        let tmp = tmpdir("journal-order");
+        std::fs::write(tmp.join("Dockerfile"), "FROM scratch\nCOPY Dockerfile /d\n").unwrap();
+        let out = tmp.join("img.ext4");
+        build_host(&Options {
+            dockerfiles: vec![tmp.join("Dockerfile")],
+            target: None,
+            contexts: vec![],
+            build_contexts: Vec::new(),
+            out: Some(out.clone()),
+            out_disk: None,
+            print_plan: false,
+            cloud_hypervisor: None,
+            kernel: None,
+            agent: None,
+            cache_registry: Some("none".into()),
+            cache_insecure: false,
+            cache_auth: Default::default(),
+            build_cache: BuildCache::default(),
+            journal: true,
+            tmp_tmpfs: false,
+            build_args: vec![],
+            net: BuildNet::None,
+            audit: false,
+            require_cached: false,
+            build_jobs: None,
+            debug: false,
+            progress_sink: None,
+        })
+        .expect("a journaled export must not fail stamping its own UUID");
+        let key = target_stage_key(&[tmp.join("Dockerfile")], &[], &[], &[], None).unwrap();
+        let expected = crate::ensure::fingerprint(&[&key]);
+        assert_eq!(
+            crate::ext4::fs_uuid(&out).as_deref(),
+            Some(expected.as_str()),
+            "the UUID must still be the one stamp_stage_uuid wrote, journal or not"
+        );
+        let mut sb = [0u8; 1024];
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = std::fs::File::open(&out).unwrap();
+            f.seek(SeekFrom::Start(1024)).unwrap();
+            f.read_exact(&mut sb).unwrap();
+        }
+        let feat_compat = u32::from_le_bytes(sb[0x5c..0x60].try_into().unwrap());
+        assert_eq!(
+            feat_compat & 0x0004,
+            0x0004,
+            "journal: true must actually leave a journal in the exported image"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

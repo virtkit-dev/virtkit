@@ -119,7 +119,13 @@ pub fn ensure_unit_build(
         cache_insecure: recipe.cache_insecure,
         cache_auth: recipe.cache_auth.clone(),
         build_cache: crate::build::BuildCache::default(),
-        journal: false,
+        // A `build:` unit's image lands in the shared, content-addressed, cross-restart
+        // build tier `vk build`'s own journal-by-default exists for — match that default
+        // here rather than leave this one path silently exempt. Every current boot of it
+        // goes through a throwaway CoW overlay (never a raw read-write attach), so this is
+        // precautionary consistency with the CLI default, not a fix for an unclean-shutdown
+        // failure mode actually reachable on this specific path today.
+        journal: true,
         tmp_tmpfs: false,
         build_args: recipe.build_args.clone(),
         // Build-phase egress: the CI job's effective `[egress.build]` policy (unrestricted

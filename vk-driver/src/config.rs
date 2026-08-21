@@ -125,8 +125,13 @@ pub struct Build {
     /// how aggressively the instruction cache is populated: `auto` (default), `layers`
     /// (one snapshot per stage), or `instructions` (one per RUN/COPY).
     pub build_cache: crate::build::BuildCache,
-    /// add an ext4 journal to the exported image (the build itself stays journal-less).
-    pub journal: bool,
+    /// Skip adding an ext4 journal to the exported image (the build's own intermediate
+    /// snapshots always stay journal-less regardless of this). A journal is added by
+    /// default: a build output commonly outlives the build that produced it (e.g. attached
+    /// read-write via `vk run --disk` across many later invocations), and a journal-less
+    /// image left unclean by a non-graceful shutdown has no way to recover — deleted-inode
+    /// references, `EUCLEAN`, `e2fsck` required by hand. Set this to opt back out.
+    pub no_journal: bool,
     /// use a RAM tmpfs for each stage guest's `/tmp` instead of the default disk-backed
     /// scratch. Disk-backed `/tmp` (the default) bounds bulk `/tmp` writes by disk rather
     /// than ½·guest-RAM; set this to trade that for a RAM tmpfs. Default off (disk-backed).
@@ -1056,7 +1061,7 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.build.kernel.as_deref(), Some(Path::new("/k/vmlinux")));
         assert_eq!(cfg.build.cache_registry.as_deref(), Some("127.0.0.1:5000"));
-        assert!(cfg.build.cache_insecure && !cfg.build.journal);
+        assert!(cfg.build.cache_insecure && !cfg.build.no_journal);
         assert_eq!(cfg.build.build_cache, crate::build::BuildCache::Layers);
         // absent [build] = all unset, cache mode defaults to auto
         assert!(Config::default().build.cache_registry.is_none());
@@ -1064,6 +1069,20 @@ mod tests {
             Config::default().build.build_cache,
             crate::build::BuildCache::Auto
         );
+    }
+
+    #[test]
+    fn build_no_journal_parses() {
+        let cfg: Config = toml::from_str("[build]\nno_journal = true\n").unwrap();
+        assert!(cfg.build.no_journal);
+    }
+
+    /// The renamed-away `journal` key (superseded by `no_journal` when the default
+    /// flipped) must be a hard parse error, not silently ignored — a config written
+    /// against the old key must not silently keep building journal-less images.
+    #[test]
+    fn build_rejects_the_renamed_away_journal_key() {
+        assert!(toml::from_str::<Config>("[build]\njournal = true\n").is_err());
     }
 
     /// The stage budget is refused at load time, where the offending line is still on

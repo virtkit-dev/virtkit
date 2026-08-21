@@ -480,8 +480,6 @@ pub struct MicroVm {
     /// bytes onto this stage's actual backing and corrupt the reused (unchanged) regions.
     /// Pinning the digest makes the fetch resolve exactly the parent this stage forked from.
     parent_digest: Option<String>,
-    /// add a journal to the exported image (the build itself stays journal-less).
-    journal: bool,
     /// shared timing collector: fine-grained phase probes (`VIRTKIT_TIMING`) from the
     /// guest lifecycle and cache-push path record here, surfacing in the end-of-run
     /// breakdown instead of printing mid-build over the live dashboard.
@@ -1003,7 +1001,6 @@ impl MicroVm {
         cpus: u32,
         mem: String,
         cache: Option<crate::config::Registry>,
-        journal: bool,
         net: crate::build::BuildNet,
         debug: bool,
         tmp_disk_enabled: bool,
@@ -1033,7 +1030,6 @@ impl MicroVm {
             uncacheable_keys: std::collections::HashSet::new(),
             parent_key: None,
             parent_digest: None,
-            journal,
             timings,
             net,
             audit_log,
@@ -1112,7 +1108,6 @@ impl MicroVm {
             image_locks: Arc::clone(&self.image_locks),
             stage_last_key: Arc::clone(&self.stage_last_key),
             stage_last_digest: Arc::clone(&self.stage_last_digest),
-            journal: self.journal,
             timings: Arc::clone(&self.timings),
             net: self.net.clone(),
             audit_log: self.audit_log.clone(),
@@ -2265,12 +2260,12 @@ impl Executor for MicroVm {
         // the cold build that filled the cache. That is the whole guarantee: an uncached rebuild
         // of this stage does not reproduce the bytes (see `normalize_superblock`).
         crate::ext4::normalize_superblock(out)?;
-        // The build is journal-less (a journal is dead weight under the rw-overlay
-        // runtime and churns every snapshot). Optionally add one to the exported
-        // artifact, natively, so a consumer that mounts it read-write directly recovers.
-        if self.journal {
-            crate::ext4::add_journal(out)?;
-        }
+        // Left journal-less here deliberately (a journal is dead weight under the
+        // rw-overlay build runtime and churns every snapshot): the caller stamps the
+        // content-freshness UUID next, and `ext4::set_uuid` refuses an already-journaled
+        // image (the JBD2 superblock embeds the UUID at journal creation), so `journal:
+        // true` in `Options` is applied by the caller, via `ext4::add_journal`, only after
+        // that stamp — never here.
         Ok(())
     }
 

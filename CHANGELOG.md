@@ -12,6 +12,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- `vk build` output now gets an ext4 journal by default, since it often
+  outlives the build (e.g. reattached via `vk run --disk`) and a journal-less
+  image can't recover from an unclean shutdown. The opt-out flag is renamed
+  from `--journal` to `--no-journal` (`[build] journal` to `[build] no_journal`).
+
 - **`vk build` restores cached stage images lazily instead of decompressing them
   upfront.** A cached base or instruction snapshot now decompresses only the
   parts a stage's steps actually read, so builds with many cached intermediate

@@ -564,9 +564,11 @@ enum Cmd {
             help_heading = "Instruction cache"
         )]
         build_cache: Option<String>,
-        /// add an ext4 journal to the exported image (the build stays journal-less)
+        /// opt out of the ext4 journal a build's exported image gets by default
+        ///
+        /// The build's own intermediate snapshots always stay journal-less regardless.
         #[arg(long, help_heading = "Output")]
-        journal: bool,
+        no_journal: bool,
         /// use a RAM tmpfs for each stage guest's `/tmp`
         ///
         /// Instead of the default disk-backed scratch, which bounds a bulk `/tmp` write (e.g. a
@@ -2045,6 +2047,14 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
     Ok(out)
 }
 
+/// Whether a build's exported image gets an ext4 journal: on by default, opted out by
+/// either the CLI's `--no-journal` or the config's `[build] no_journal` (either one suffices
+/// to opt out — the CLI can only push toward "skip it," never force a journal back on over
+/// a config-file opt-out, matching every other build bool flag's merge in this command).
+fn journal_enabled(cli_no_journal: bool, cfg_no_journal: bool) -> bool {
+    !(cli_no_journal || cfg_no_journal)
+}
+
 async fn cli_main() -> ExitCode {
     // reqwest/rustls are compiled with no built-in crypto provider (rustls-no-provider,
     // to keep aws-lc-rs out of the build); install ring — the backend russh already
@@ -2712,7 +2722,7 @@ async fn cli_main() -> ExitCode {
         cache_registry,
         cache_insecure,
         build_cache,
-        journal,
+        no_journal,
         build_tmp_tmpfs,
         build_arg,
         build_net,
@@ -2825,7 +2835,7 @@ async fn cli_main() -> ExitCode {
                 token_file: b.cache_token_file.clone(),
             },
             build_cache,
-            journal: *journal || b.journal,
+            journal: journal_enabled(*no_journal, b.no_journal),
             tmp_tmpfs: *build_tmp_tmpfs || b.tmp_tmpfs,
             build_args,
             net,
@@ -3859,6 +3869,17 @@ impl<R: std::io::Read> std::io::Read for ProgressReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_enabled_defaults_on_and_either_side_can_opt_out() {
+        assert!(journal_enabled(false, false), "journaled by default");
+        assert!(!journal_enabled(true, false), "--no-journal opts out");
+        assert!(!journal_enabled(false, true), "[build] no_journal opts out");
+        assert!(
+            !journal_enabled(true, true),
+            "both opting out still opts out"
+        );
+    }
 
     #[test]
     fn source_egress_specs_parse() {
