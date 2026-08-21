@@ -1303,6 +1303,13 @@ impl MicroVm {
         self.session = Some(s);
         Ok(())
     }
+    /// Whether a cache restore should write a lazy `.vk_ro_img` view instead of eagerly
+    /// decompressing the whole cached image to a raw ext4: only libkrun's virtio-blk knows
+    /// how to read one (`LazyChunkStorage` in `third_party/libkrun`), and `--debug` always
+    /// forces the eager path so `verify_ext4`'s `e2fsck` still has a real ext4 to check.
+    fn lazy_restore_enabled(&self) -> bool {
+        !self.debug && crate::vmm::libkrun_selected()
+    }
     /// `--debug`: run `e2fsck` on a raw ext4 as it crosses the cache boundary. A clean fs
     /// (or an inconclusive skip — e2fsck absent) passes; genuine corruption fails the build
     /// with `context` naming where it was caught, so a bad snapshot never silently becomes a
@@ -1415,6 +1422,12 @@ impl MicroVm {
     fn image_path(&self, stage: &str) -> PathBuf {
         self.scratch.join(format!("{}.ext4", label_slug(stage)))
     }
+    /// Where a lazy cache restore (see [`Self::lazy_restore_enabled`]) writes its
+    /// `.vk_ro_img` manifest instead of a fully reassembled ext4.
+    fn lazy_image_path(&self, stage: &str) -> PathBuf {
+        self.scratch
+            .join(format!("{}.vk_ro_img", label_slug(stage)))
+    }
     fn stage_image(&self, fs: &Rootfs) -> Result<PathBuf> {
         self.images
             .lock()
@@ -1454,11 +1467,20 @@ impl MicroVm {
         let base_key = base_cache_key(&base_id);
         if let Some(rg) = self.cache.clone()
             && crate::registry::exists(&rg, CACHE_REPO, &base_key)
-            && let Some(digest) =
-                crate::registry::try_pull_ext4(&rg, CACHE_REPO, &base_key, &ext4, image)?
         {
-            self.verify_ext4(&ext4, &format!("cached image {image} (after load)"))?;
-            return Ok((ext4, base_key, Some(digest)));
+            if self.lazy_restore_enabled() {
+                let lazy = self.lazy_image_path(label);
+                if let Some(digest) =
+                    crate::registry::try_pull_ext4_lazy(&rg, CACHE_REPO, &base_key, &lazy, image)?
+                {
+                    return Ok((lazy, base_key, Some(digest)));
+                }
+            } else if let Some(digest) =
+                crate::registry::try_pull_ext4(&rg, CACHE_REPO, &base_key, &ext4, image)?
+            {
+                self.verify_ext4(&ext4, &format!("cached image {image} (after load)"))?;
+                return Ok((ext4, base_key, Some(digest)));
+            }
         }
         // pull + flatten the OCI image to a rootfs tar (no docker), then build the ext4.
         let tar = self.scratch.join(format!("{}.tar", label_slug(label)));
@@ -2269,18 +2291,31 @@ impl Executor for MicroVm {
         let Some(rg) = self.cache.clone() else {
             bail!("cache_restore with no cache registry");
         };
-        // pull the snapshot's ext4 (chunk-cached, byte-exact), then wrap it in a rw qcow2 so
-        // any remaining instructions can boot it directly and write into the overlay.
-        let ext4 = self.image_path(&fs.label);
-        let Some(digest) = crate::registry::try_pull_ext4(&rg, CACHE_REPO, key, &ext4, &fs.label)?
-        else {
-            bail!("cached instruction {key} vanished from the registry");
+        // pull the snapshot's ext4 (chunk-cached, byte-exact) — or, when lazy restore
+        // applies, a `.vk_ro_img` view over it — then wrap it in a rw qcow2 so any remaining
+        // instructions can boot it directly and write into the overlay.
+        let (base, digest) = if self.lazy_restore_enabled() {
+            let lazy = self.lazy_image_path(&fs.label);
+            let Some(digest) =
+                crate::registry::try_pull_ext4_lazy(&rg, CACHE_REPO, key, &lazy, &fs.label)?
+            else {
+                bail!("cached instruction {key} vanished from the registry");
+            };
+            (lazy, digest)
+        } else {
+            let ext4 = self.image_path(&fs.label);
+            let Some(digest) =
+                crate::registry::try_pull_ext4(&rg, CACHE_REPO, key, &ext4, &fs.label)?
+            else {
+                bail!("cached instruction {key} vanished from the registry");
+            };
+            // `--debug`: a reassembled snapshot must be a clean ext4 before the build boots
+            // or forks it — else a corrupt cache entry (bad chunks / a poisoned push)
+            // silently becomes a corrupt image or an EUCLEAN mid-build.
+            self.verify_ext4(&ext4, &format!("cached instruction {key} (after load)"))?;
+            (ext4, digest)
         };
-        // `--debug`: a reassembled snapshot must be a clean ext4 before the build boots or
-        // forks it — else a corrupt cache entry (bad chunks / a poisoned push) silently
-        // becomes a corrupt image or an EUCLEAN mid-build.
-        self.verify_ext4(&ext4, &format!("cached instruction {key} (after load)"))?;
-        self.wrap_base(&fs.label, &ext4)?;
+        self.wrap_base(&fs.label, &base)?;
         // the restored snapshot is the parent the next save diffs against — pin its digest.
         self.parent_key = Some(key.to_string());
         self.parent_digest = Some(digest);

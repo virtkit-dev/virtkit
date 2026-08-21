@@ -39,6 +39,10 @@ enum Backing {
     /// a raw image: logical offset == file offset (reads past EOF are zero)
     Raw(File),
     Qcow2(Box<Qcow2>),
+    /// a `.vk_ro_img` lazy chunk view (see `VkRoImg`) — a cached base or instruction
+    /// snapshot restored without decompressing it, for a stage that never boots (or, once
+    /// it does, whose writes land in this layer instead — the lazy backing stays read-only).
+    Lazy(Box<VkRoImg>),
 }
 
 /// A read-only qcow2 image plus its backing chain.
@@ -180,6 +184,7 @@ impl Qcow2 {
                     }
                     // SAFETY of borrow: take the backing out to read it (no aliasing of self).
                     Backing::Qcow2(_) => self.read_backing_qcow2(l_off, dst)?,
+                    Backing::Lazy(_) => self.read_backing_lazy(l_off, dst)?,
                 },
             }
             done += n;
@@ -189,6 +194,13 @@ impl Qcow2 {
 
     fn read_backing_qcow2(&mut self, off: u64, dst: &mut [u8]) -> Result<()> {
         let Backing::Qcow2(b) = &mut self.backing else {
+            unreachable!()
+        };
+        b.read_at(off, dst)
+    }
+
+    fn read_backing_lazy(&mut self, off: u64, dst: &mut [u8]) -> Result<()> {
+        let Backing::Lazy(b) = &mut self.backing else {
             unreachable!()
         };
         b.read_at(off, dst)
@@ -226,6 +238,12 @@ impl Qcow2 {
             Backing::None => {}
             Backing::Qcow2(b) => all.extend(b.chain_data_extents()?),
             Backing::Raw(f) => all.extend(raw_data_extents(f)?),
+            // No sparse-hole tracking exposed here for a `.vk_ro_img` manifest (its chunks may
+            // have gaps that read as zero, but nothing separates a real hole from a chunk that
+            // happens to decompress to all zeros) — treat the whole range as potential data.
+            // Conservative: a flatten may write real zero bytes where the source was actually a
+            // hole, never drop data.
+            Backing::Lazy(b) => all.push((0, b.total_size)),
         }
         Ok(merge_extents(all))
     }
@@ -273,11 +291,18 @@ pub fn create_overlay(path: &Path, backing: &Path) -> Result<()> {
     const CS: u64 = 1 << CB; // 64 KiB cluster
     const L2_ENTRIES: u64 = CS / 8; // 8192 entries per L2 table
 
-    // backing format + the overlay's virtual size (= the backing's).
+    // backing format + the overlay's virtual size (= the backing's). Neither reader
+    // (`open_backing` here, `LazyChunkStorage` in libkrun) trusts the `backing_format`
+    // string written below to tell a `.vk_ro_img` apart from a raw image — both sniff the
+    // actual file — so `bfmt` only needs to be a value they'd resolve to the same place if
+    // they ever did fall back to it; the *size* must be the manifest's `total_size`, though,
+    // or the overlay would describe a virtual disk the size of the tiny manifest file.
     let (bfmt, size) = {
         let f = File::open(backing).with_context(|| format!("opening {}", backing.display()))?;
-        let mut magic = [0u8; 4];
-        if f.read_exact_at(&mut magic, 0).is_ok() && be32(&magic, 0) == MAGIC {
+        let mut magic8 = [0u8; 8];
+        if f.read_exact_at(&mut magic8, 0).is_ok() && &magic8 == crate::registry::VK_RO_IMG_MAGIC {
+            ("raw", VkRoImg::open(backing)?.total_size)
+        } else if be32(&magic8, 0) == MAGIC {
             ("qcow2", Qcow2::open(backing)?.virtual_size())
         } else {
             ("raw", f.metadata()?.len())
@@ -490,12 +515,193 @@ fn merge_extents(mut ext: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
 
 fn open_backing(path: &Path) -> Result<Backing> {
     let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut magic = [0u8; 4];
-    // a backing shorter than 4 bytes can't be qcow2; treat as raw
-    if f.read_exact_at(&mut magic, 0).is_ok() && be32(&magic, 0) == MAGIC {
+    let mut magic8 = [0u8; 8];
+    // A backing shorter than 8 bytes can't be qcow2 or a `.vk_ro_img`; treat as raw. Check
+    // the longer `.vk_ro_img` magic first — a qcow2 magic never collides with it (a
+    // `VkRoImg::open` on real qcow2 bytes would just fail its own magic check anyway).
+    if f.read_exact_at(&mut magic8, 0).is_ok() && &magic8 == crate::registry::VK_RO_IMG_MAGIC {
+        Ok(Backing::Lazy(Box::new(VkRoImg::open(path)?)))
+    } else if be32(&magic8, 0) == MAGIC {
         Ok(Backing::Qcow2(Box::new(Qcow2::open(path)?)))
     } else {
         Ok(Backing::Raw(f))
+    }
+}
+
+/// A parsed `.vk_ro_img` manifest (see `registry.rs`'s `write_vk_ro_img` for the exact byte
+/// layout — this is the second of two independent readers, alongside
+/// `third_party/libkrun`'s `LazyChunkStorage`, which the guest's virtio-blk uses instead).
+/// This one exists so a stage that never boots (or a diff-push instruction snapshot) can be
+/// exported/diffed straight from the host, without booting a guest just to decompress a
+/// chunk cache this process can read directly.
+pub struct VkRoImg {
+    total_size: u64,
+    layout: u8,
+    cache_dir: PathBuf,
+    chunks: Vec<VkRoChunk>,
+    /// Most recently decoded chunk, by index into `chunks` — `read_at` is driven by
+    /// `Qcow2::read_at`'s cluster-at-a-time loop, so consecutive calls usually land in the
+    /// same or the next chunk; without this, a single 16 MiB chunk would be re-decompressed
+    /// once per 64 KiB cluster.
+    last: Option<(usize, Vec<u8>)>,
+}
+
+struct VkRoChunk {
+    offset: u64,
+    length: u32,
+    codec: u8,
+    digest: [u8; 32],
+}
+
+impl VkRoImg {
+    fn open(path: &Path) -> Result<VkRoImg> {
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut p = 0usize;
+        let mut take = |n: usize| -> Result<&[u8]> {
+            let end = p
+                .checked_add(n)
+                .filter(|&e| e <= bytes.len())
+                .with_context(|| format!("{}: truncated .vk_ro_img", path.display()))?;
+            let s = &bytes[p..end];
+            p = end;
+            Ok(s)
+        };
+        if take(8)? != crate::registry::VK_RO_IMG_MAGIC.as_slice() {
+            bail!("{}: not a .vk_ro_img manifest", path.display());
+        }
+        let total_size = u64::from_le_bytes(take(8)?.try_into().unwrap());
+        let layout = take(1)?[0];
+        let cache_dir_len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+        let cache_dir = PathBuf::from(
+            std::str::from_utf8(take(cache_dir_len)?)
+                .with_context(|| format!("{}: cache dir not utf-8", path.display()))?,
+        );
+        let chunk_count = u64::from_le_bytes(take(8)?.try_into().unwrap()) as usize;
+        let mut chunks = Vec::with_capacity(chunk_count);
+        let mut expect_offset = 0u64;
+        for _ in 0..chunk_count {
+            let offset = u64::from_le_bytes(take(8)?.try_into().unwrap());
+            let length = u32::from_le_bytes(take(4)?.try_into().unwrap());
+            let codec = take(1)?[0];
+            let digest: [u8; 32] = take(32)?.try_into().unwrap();
+            // Chunks are offset-sorted and non-overlapping, but NOT necessarily contiguous: a
+            // diff push can drop a region that went fully back to zero since its parent
+            // instead of re-chunking it (`push_ext4_diff`) — a gap here reads as zero, exactly
+            // like the eager reassembly path leaves it an untouched hole.
+            if offset < expect_offset {
+                bail!("{}: overlapping chunk at offset {offset}", path.display());
+            }
+            expect_offset = offset
+                .checked_add(length as u64)
+                .with_context(|| format!("{}: chunk offset overflow", path.display()))?;
+            chunks.push(VkRoChunk {
+                offset,
+                length,
+                codec,
+                digest,
+            });
+        }
+        if expect_offset > total_size {
+            bail!(
+                "{}: chunks cover {expect_offset} bytes, expected at most {total_size}",
+                path.display()
+            );
+        }
+        Ok(VkRoImg {
+            total_size,
+            layout,
+            cache_dir,
+            chunks,
+            last: None,
+        })
+    }
+
+    fn chunk_path(&self, chunk: &VkRoChunk) -> PathBuf {
+        let hex: String = chunk.digest.iter().map(|b| format!("{b:02x}")).collect();
+        if self.layout == crate::registry::VK_RO_IMG_LAYOUT_STORE_ROOT {
+            let sub = if chunk.codec == crate::registry::VK_RO_IMG_CODEC_ZSTD {
+                "blobs/zstd"
+            } else {
+                "blobs/sha256"
+            };
+            self.cache_dir.join(sub).join(hex)
+        } else {
+            self.cache_dir.join(hex)
+        }
+    }
+
+    fn decode_chunk(&mut self, idx: usize) -> Result<&[u8]> {
+        if !matches!(&self.last, Some((i, _)) if *i == idx) {
+            let chunk = &self.chunks[idx];
+            let path = self.chunk_path(chunk);
+            let raw = std::fs::read(&path)
+                .with_context(|| format!("reading chunk {}", path.display()))?;
+            let data = if chunk.codec == crate::registry::VK_RO_IMG_CODEC_ZSTD {
+                zstd::decode_all(&raw[..])
+                    .with_context(|| format!("zstd-decompressing chunk {}", path.display()))?
+            } else {
+                raw
+            };
+            if data.len() != chunk.length as usize {
+                bail!(
+                    "chunk {}: decompressed to {} bytes, expected {}",
+                    path.display(),
+                    data.len(),
+                    chunk.length
+                );
+            }
+            self.last = Some((idx, data));
+        }
+        Ok(&self.last.as_ref().unwrap().1)
+    }
+
+    /// Index of the first chunk that could contain or come after byte `pos` — either the
+    /// chunk covering `pos`, or (if `pos` falls in a gap) the next chunk after the gap, or
+    /// `chunks.len()` if `pos` is at or past the last chunk's end (a trailing gap to EOF).
+    fn chunk_at(&self, pos: u64) -> usize {
+        self.chunks
+            .partition_point(|c| c.offset + c.length as u64 <= pos)
+    }
+
+    fn read_at(&mut self, offset: u64, dst: &mut [u8]) -> Result<()> {
+        let end = offset
+            .checked_add(dst.len() as u64)
+            .context("read offset overflow")?;
+        let mut pos = offset;
+        while pos < end {
+            if pos >= self.total_size {
+                dst[(pos - offset) as usize..].fill(0);
+                break;
+            }
+            let idx = self.chunk_at(pos);
+            let in_gap = idx >= self.chunks.len() || self.chunks[idx].offset > pos;
+            let copy_end = if in_gap {
+                // A gap (dropped by a diff push because it went back to zero) reads as
+                // zero, up to wherever the next chunk starts (or EOF).
+                let gap_end = self
+                    .chunks
+                    .get(idx)
+                    .map(|c| c.offset)
+                    .unwrap_or(self.total_size)
+                    .min(end);
+                dst[(pos - offset) as usize..(gap_end - offset) as usize].fill(0);
+                gap_end
+            } else {
+                let (chunk_offset, chunk_length) = {
+                    let c = &self.chunks[idx];
+                    (c.offset, c.length as u64)
+                };
+                let chunk_end = chunk_offset + chunk_length;
+                let copy_end = chunk_end.min(end);
+                let data = self.decode_chunk(idx)?;
+                let src = &data[(pos - chunk_offset) as usize..(copy_end - chunk_offset) as usize];
+                let dst_start = (pos - offset) as usize;
+                dst[dst_start..dst_start + src.len()].copy_from_slice(src);
+                copy_end
+            };
+            pos = copy_end;
+        }
+        Ok(())
     }
 }
 
@@ -962,6 +1168,146 @@ mod tests {
                 .success()
         );
         roundtrip(&dir, &qbase, 768 * 1024 * 1024, "qcow2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn fake_digest(n: u8) -> [u8; 32] {
+        let mut d = [0u8; 32];
+        d[31] = n;
+        d
+    }
+
+    fn digest_hex(digest: &[u8; 32]) -> String {
+        digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// `VkRoImg` (the host-side, non-guest reader of a `.vk_ro_img` manifest) must reassemble
+    /// the same bytes `LazyChunkStorage` would in the guest: two chunks with a gap between them
+    /// (reads as zero) and a trailing gap to EOF, one zstd- and one raw-encoded.
+    #[test]
+    fn vk_ro_img_reassembles_chunks_with_gaps() {
+        let dir = std::env::temp_dir().join(format!("vk-ro-img-gaps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let chunk_a: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+        let chunk_b: Vec<u8> = (0..2000u32).map(|i| ((i * 7) % 251) as u8).collect();
+        let digest_a = fake_digest(1);
+        let digest_b = fake_digest(2);
+        let compressed_a = zstd::encode_all(&chunk_a[..], 3).unwrap();
+        std::fs::write(dir.join(digest_hex(&digest_a)), &compressed_a).unwrap();
+        std::fs::write(dir.join(digest_hex(&digest_b)), &chunk_b).unwrap();
+
+        // total_size leaves a 1000-byte gap between the chunks and a 1000-byte gap after b.
+        let total_size = chunk_a.len() as u64 + 1000 + chunk_b.len() as u64 + 1000;
+        let manifest = dir.join("test.vk_ro_img");
+        crate::registry::write_vk_ro_img(
+            &manifest,
+            total_size,
+            crate::registry::VK_RO_IMG_LAYOUT_FLAT,
+            &dir,
+            &[
+                crate::registry::LazyChunk {
+                    offset: 0,
+                    length: chunk_a.len() as u32,
+                    codec: crate::registry::VK_RO_IMG_CODEC_ZSTD,
+                    digest: digest_a,
+                },
+                crate::registry::LazyChunk {
+                    offset: chunk_a.len() as u64 + 1000,
+                    length: chunk_b.len() as u32,
+                    codec: crate::registry::VK_RO_IMG_CODEC_RAW,
+                    digest: digest_b,
+                },
+            ],
+        )
+        .unwrap();
+
+        let mut img = VkRoImg::open(&manifest).unwrap();
+        assert_eq!(img.total_size, total_size);
+        let mut got = vec![0xFFu8; total_size as usize];
+        img.read_at(0, &mut got).unwrap();
+
+        let mut want = vec![0u8; total_size as usize];
+        want[0..chunk_a.len()].copy_from_slice(&chunk_a);
+        let b_off = chunk_a.len() + 1000;
+        want[b_off..b_off + chunk_b.len()].copy_from_slice(&chunk_b);
+        assert_eq!(
+            got, want,
+            "gaps must read as zero, chunks reassembled exactly"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `open_backing` must sniff a `.vk_ro_img` manifest (by magic, not extension) and hand
+    /// back a `Backing::Lazy`, not misread it as raw or fail as a bad qcow2 image.
+    #[test]
+    fn open_backing_detects_vk_ro_img_manifest() {
+        let dir = std::env::temp_dir().join(format!("vk-ro-img-sniff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("test.vk_ro_img");
+        crate::registry::write_vk_ro_img(
+            &manifest,
+            100,
+            crate::registry::VK_RO_IMG_LAYOUT_FLAT,
+            &dir,
+            &[],
+        )
+        .unwrap();
+        match open_backing(&manifest).unwrap() {
+            Backing::Lazy(img) => assert_eq!(img.total_size, 100),
+            _ => panic!("expected Backing::Lazy for a .vk_ro_img manifest"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end: a qcow2 overlay backed by a `.vk_ro_img` manifest (the shape `create_overlay`
+    /// produces for a stage restored lazily, see `build/exec.rs`) must read back through
+    /// `Qcow2::read_at`'s `Backing::Lazy` branch exactly like the flattened image would, and
+    /// `data_extents` must report the lazy backing's full range as backing-owned.
+    #[test]
+    fn qcow2_overlay_over_vk_ro_img_backing_reads_through() {
+        let dir = std::env::temp_dir().join(format!("vk-ro-img-overlay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let chunk: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
+        let digest = fake_digest(9);
+        std::fs::write(dir.join(digest_hex(&digest)), &chunk).unwrap();
+        let manifest = dir.join("base.vk_ro_img");
+        crate::registry::write_vk_ro_img(
+            &manifest,
+            chunk.len() as u64,
+            crate::registry::VK_RO_IMG_LAYOUT_FLAT,
+            &dir,
+            &[crate::registry::LazyChunk {
+                offset: 0,
+                length: chunk.len() as u32,
+                codec: crate::registry::VK_RO_IMG_CODEC_RAW,
+                digest,
+            }],
+        )
+        .unwrap();
+
+        let overlay = dir.join("ovl.qcow2");
+        create_overlay(&overlay, &manifest).unwrap();
+
+        let mut q = Qcow2::open(&overlay).unwrap();
+        assert_eq!(q.virtual_size(), chunk.len() as u64);
+        let mut got = vec![0u8; chunk.len()];
+        q.read_at(0, &mut got).unwrap();
+        assert_eq!(
+            got, chunk,
+            "overlay over a lazy backing must read the backing's bytes"
+        );
+        assert_eq!(
+            q.chain_data_extents().unwrap(),
+            vec![(0, chunk.len() as u64)],
+            "the chain's data extents must include the lazy backing's full range"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

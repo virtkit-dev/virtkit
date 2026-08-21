@@ -60,13 +60,25 @@ fn default_proc_name() -> String {
     resolve_proc_name("vm")
 }
 
+/// A virtio-blk disk image format. Drives `image_type=` and whether a backing chain is
+/// resolved.
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DiskFormat {
+    /// A raw base ext4 (or another plain block image).
+    Raw,
+    /// A CoW overlay or a forked build stage.
+    Qcow2,
+    /// A `.vk_ro_img` manifest: a read-only, on-demand-decompressing view over a cached
+    /// build-stage image's chunks (libkrun only — see `third_party/libkrun`'s
+    /// `lazy_chunk_storage`). Never valid under cloud-hypervisor.
+    VkLazyChunks,
+}
+
 /// A virtio-blk disk, attached in order (first = `/dev/vda`, then `vdb`, …).
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Disk {
     pub path: PathBuf,
-    /// `true` for a qcow2 (a CoW overlay or a forked build stage); `false` for a
-    /// raw base ext4. Drives `image_type=` and whether a backing chain is resolved.
-    pub qcow2: bool,
+    pub format: DiskFormat,
     pub readonly: bool,
     /// If set (libkrun build stages only), the VMM serves a dirty-drain control protocol
     /// on this Unix socket so a checkpoint captures only the delta. `None` = untracked.
@@ -79,7 +91,7 @@ impl Disk {
     pub fn overlay(path: PathBuf) -> Self {
         Disk {
             path,
-            qcow2: true,
+            format: DiskFormat::Qcow2,
             readonly: false,
             dirty_control_socket: None,
         }
@@ -92,7 +104,7 @@ impl Disk {
     pub fn raw(path: PathBuf, readonly: bool) -> Self {
         Disk {
             path,
-            qcow2: false,
+            format: DiskFormat::Raw,
             readonly,
             dirty_control_socket: None,
         }
@@ -106,13 +118,14 @@ impl Disk {
 
     /// cloud-hypervisor `--disk` value. qcow2 disks resolve their backing chain
     /// (overlays/forked stages); a raw disk omits both keys (CH defaults to raw).
+    /// `VkLazyChunks` never reaches here — it is only ever attached under libkrun.
     fn ch_value(&self) -> String {
         let mut v = format!(
             "path={},readonly={}",
             self.path.display(),
             if self.readonly { "on" } else { "off" }
         );
-        if self.qcow2 {
+        if self.format == DiskFormat::Qcow2 {
             v.push_str(",image_type=qcow2,backing_files=on");
         }
         v
@@ -587,7 +600,7 @@ mod tests {
                 Disk::overlay("/w/stage.qcow2".into()),
                 Disk {
                     path: "/w/source.ext4".into(),
-                    qcow2: false,
+                    format: DiskFormat::Raw,
                     readonly: true,
                     dirty_control_socket: None,
                 },

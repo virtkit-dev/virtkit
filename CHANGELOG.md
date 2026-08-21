@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **`vk build` restores cached stage images lazily instead of decompressing them
+  upfront.** A cached base or instruction snapshot now decompresses only the
+  parts a stage's steps actually read, so builds with many cached intermediate
+  stages spend far less time on "restoring cached image."
+
 ## [0.40.0] - 2026-08-21
 
 ### Changed

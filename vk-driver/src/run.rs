@@ -3125,12 +3125,13 @@ async fn spawn_vm_switch(
 }
 
 /// The qemu/cloud-hypervisor disk format of a stage image, by extension: forked stages
-/// are `.qcow2` (a copy-on-write overlay over their parent), bases are raw `.ext4`.
+/// are `.qcow2` (a copy-on-write overlay over their parent), bases are raw `.ext4`, and
+/// (libkrun, lazy restore) a cached base can be a `.vk_ro_img` chunk view.
 pub(crate) fn disk_format(path: &Path) -> &'static str {
-    if path.extension().and_then(|e| e.to_str()) == Some("qcow2") {
-        "qcow2"
-    } else {
-        "raw"
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("qcow2") => "qcow2",
+        Some("vk_ro_img") => "vk_lazy",
+        _ => "raw",
     }
 }
 
@@ -3256,11 +3257,16 @@ pub(crate) async fn boot_session(
     // Source stages for COPY --from / RUN --mount=from, attached read-only as the next
     // virtio-blk disks (vdb, vdc, … in order) for the guest to mount and read. A forked
     // source is a qcow2 over its parent (its backing chain is resolved); a base source is
-    // a plain raw ext4.
+    // a plain raw ext4, or (libkrun, lazy restore) a `.vk_ro_img` chunk view.
     for src in sources {
+        let format = match disk_format(src) {
+            "qcow2" => crate::vmm::DiskFormat::Qcow2,
+            "vk_lazy" => crate::vmm::DiskFormat::VkLazyChunks,
+            _ => crate::vmm::DiskFormat::Raw,
+        };
         disks.push(crate::vmm::Disk {
             path: src.clone(),
-            qcow2: disk_format(src) == "qcow2",
+            format,
             readonly: true,
             dirty_control_socket: None,
         });
@@ -3276,7 +3282,7 @@ pub(crate) async fn boot_session(
         let dev = crate::build::vd_name(disks.len());
         disks.push(crate::vmm::Disk {
             path: path.to_path_buf(),
-            qcow2: false,
+            format: crate::vmm::DiskFormat::Raw,
             readonly: false,
             dirty_control_socket: None,
         });
@@ -3290,7 +3296,7 @@ pub(crate) async fn boot_session(
         let dev = crate::build::vd_name(disks.len());
         disks.push(crate::vmm::Disk {
             path: path.to_path_buf(),
-            qcow2: false,
+            format: crate::vmm::DiskFormat::Raw,
             readonly: false,
             dirty_control_socket: None,
         });
@@ -4211,7 +4217,7 @@ mod tests {
             cmdline: String::new(),
             disks: vec![crate::vmm::Disk {
                 path: medium.path.clone(),
-                qcow2: false,
+                format: crate::vmm::DiskFormat::Raw,
                 readonly: true,
                 dirty_control_socket: None,
             }],

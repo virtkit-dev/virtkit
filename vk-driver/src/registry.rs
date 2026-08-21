@@ -21,6 +21,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,6 +61,83 @@ const INITRD_MEDIA_TYPE: &str = "application/vnd.wallix.microvm.initrd";
 // Descriptor annotation keys carrying the placement of a chunk inside runner.ext4.
 const ANN_OFFSET: &str = "vnd.wallix.microvm.chunk.offset";
 const ANN_LENGTH: &str = "vnd.wallix.microvm.chunk.length";
+
+// `.vk_ro_img` writer: a lazy, chunk-decompressing view of a cached image, restored instead
+// of a fully reassembled ext4 when the executor's backend supports it (libkrun, via
+// `LazyChunkStorage` in `third_party/libkrun`'s virtio-blk device — see its module doc for
+// the exact byte layout, which this mirrors independently; there is no crate shared between
+// the two workspaces, so a format change here must be mirrored there and vice versa).
+// `pub(crate)`: `qcow2.rs` reads the same manifests when a `.vk_ro_img` shows up as a
+// backing file during export/diff-push, so it shares these rather than redefining them.
+pub(crate) const VK_RO_IMG_MAGIC: &[u8; 8] = b"VKROIMG1";
+pub(crate) const VK_RO_IMG_CODEC_ZSTD: u8 = 0;
+pub(crate) const VK_RO_IMG_CODEC_RAW: u8 = 1;
+pub(crate) const VK_RO_IMG_LAYOUT_FLAT: u8 = 0;
+pub(crate) const VK_RO_IMG_LAYOUT_STORE_ROOT: u8 = 1;
+
+/// One chunk's placement + where to find it, as written into a `.vk_ro_img` manifest.
+pub(crate) struct LazyChunk {
+    pub(crate) offset: u64,
+    pub(crate) length: u32,
+    pub(crate) codec: u8,
+    /// Raw sha256 bytes (not hex) of the *stored* blob — the cache filename is its hex form.
+    pub(crate) digest: [u8; 32],
+}
+
+/// Parse `"sha256:<hex>"` into raw digest bytes for a `.vk_ro_img` chunk record.
+fn digest_bytes(digest: &str) -> Result<[u8; 32]> {
+    let hex = digest.trim_start_matches("sha256:");
+    if hex.len() != 64 {
+        bail!("bad digest {digest}: expected 64 hex chars");
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .with_context(|| format!("bad digest {digest}"))?;
+    }
+    Ok(out)
+}
+
+/// Write a `.vk_ro_img` manifest at `dest` (tmp-sibling + rename, so a failure never leaves
+/// a partial file a caller could boot): a lazy view over `chunks`, decompressed on demand
+/// from `cache_dir` (interpreted per `layout`) instead of eagerly reassembled.
+pub(crate) fn write_vk_ro_img(
+    dest: &Path,
+    total_size: u64,
+    layout: u8,
+    cache_dir: &Path,
+    chunks: &[LazyChunk],
+) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut buf = Vec::with_capacity(64 + chunks.len() * 45);
+    buf.extend_from_slice(VK_RO_IMG_MAGIC);
+    buf.extend_from_slice(&total_size.to_le_bytes());
+    buf.push(layout);
+    // `.vk_ro_img` readers (`LazyChunkStorage::parse` on the libkrun side) require this field
+    // to be valid UTF-8 — reject a non-UTF-8 `cache_dir` outright rather than mangling it via
+    // `to_string_lossy`, which would silently record a path that doesn't exist.
+    let cache_dir_bytes = cache_dir.as_os_str().as_bytes();
+    std::str::from_utf8(cache_dir_bytes)
+        .with_context(|| format!("cache dir {} is not valid UTF-8", cache_dir.display()))?;
+    buf.extend_from_slice(&(cache_dir_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(cache_dir_bytes);
+    buf.extend_from_slice(&(chunks.len() as u64).to_le_bytes());
+    for c in chunks {
+        buf.extend_from_slice(&c.offset.to_le_bytes());
+        buf.extend_from_slice(&c.length.to_le_bytes());
+        buf.push(c.codec);
+        buf.extend_from_slice(&c.digest);
+    }
+    let tmp = dest.with_extension("vk_ro_img.tmp");
+    std::fs::write(&tmp, &buf).with_context(|| format!("writing {}", tmp.display()))?;
+    let _ = std::fs::remove_file(dest);
+    std::fs::rename(&tmp, dest)
+        .with_context(|| format!("placing {} at {}", tmp.display(), dest.display()))?;
+    Ok(())
+}
 
 /// The config blob (`CONFIG_MEDIA_TYPE`): just enough to reassemble the bundle and
 /// pick a boot path without re-reading every layer's annotations.
@@ -277,6 +355,121 @@ async fn try_pull_ext4_async(
     std::fs::rename(&runner, dest)
         .with_context(|| format!("placing pulled ext4 at {}", dest.display()))?;
     let _ = std::fs::remove_dir_all(&bundle);
+    Ok(Some(digest))
+}
+
+/// Lazy counterpart of [`try_pull_ext4`]: ensure every chunk of the cached bundle is
+/// present in the local chunk cache (fetching over the network on a miss, exactly like a
+/// normal restore would), then write a `.vk_ro_img` manifest at `dest` instead of
+/// reassembling a raw ext4 — the decompress-and-write of each chunk's bytes happens lazily,
+/// only for the ranges a guest boot actually reads. Returns `None` if the tag is absent,
+/// exactly like `try_pull_ext4`.
+pub fn try_pull_ext4_lazy(
+    rg: &Registry,
+    name: &str,
+    tag: &str,
+    dest: &Path,
+    label: &str,
+) -> Result<Option<String>> {
+    if let Some(root) = rg.local_root() {
+        return local::try_pull_ext4_lazy(&root, name, tag, dest);
+    }
+    block_on(try_pull_ext4_lazy_async(rg, name, tag, dest, label))
+}
+
+async fn try_pull_ext4_lazy_async(
+    rg: &Registry,
+    name: &str,
+    tag: &str,
+    dest: &Path,
+    label: &str,
+) -> Result<Option<String>> {
+    let (client, auth) = client(rg)?;
+    let image = make_ref(rg, name, tag)?;
+    let Ok(digest) = client.fetch_manifest_digest(&image, &auth).await else {
+        return Ok(None);
+    };
+    let dref = make_digest_ref(rg, name, &digest)?;
+    let (manifest, _) = client
+        .pull_manifest(&dref, &auth)
+        .await
+        .with_context(|| format!("pulling the manifest of {name}@{digest}"))?;
+    let manifest = match manifest {
+        OciManifest::Image(m) => m,
+        OciManifest::ImageIndex(_) => bail!("{name}@{digest} is an image index, not a bundle"),
+    };
+    let config = pull_blob_bytes(&client, &dref, &manifest.config).await?;
+    let config: BundleConfig =
+        serde_json::from_slice(&config).context("parsing the bundle config blob")?;
+
+    let chunk_layers: Vec<OciDescriptor> = manifest
+        .layers
+        .iter()
+        .filter(|l| {
+            matches!(
+                l.media_type.as_str(),
+                CHUNK_MEDIA_TYPE | CHUNK_MEDIA_TYPE_RAW
+            )
+        })
+        .cloned()
+        .collect();
+
+    // The same shared local chunk cache `pull_into`'s eager path uses (same staging-bundle
+    // path shape, see `chunks_cache_dir`), so a lazy and an eager restore of the same image
+    // share one cache regardless of which ran first.
+    let bundle = staging_bundle(dest, ".vkpull-");
+    let chunks_cache = chunks_cache_dir(&bundle);
+
+    use futures::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const RESTORE_CONCURRENCY: usize = 16;
+    let fetched = AtomicUsize::new(0);
+    let reused = AtomicUsize::new(0);
+    let results: Vec<Result<LazyChunk>> = futures::stream::iter(chunk_layers)
+        .map(|layer| {
+            let (fetched, reused, chunks_cache) = (&fetched, &reused, &chunks_cache);
+            let client = &client;
+            let dref = &dref;
+            async move {
+                let (offset, length) = chunk_placement(&layer)?;
+                // Ensures the blob is in the local cache (network fetch on a miss) — the
+                // decompress-and-place step the eager path does next is what we skip.
+                pull_chunk(client, dref, &layer, chunks_cache, fetched, reused).await?;
+                let codec = if layer.media_type == CHUNK_MEDIA_TYPE {
+                    VK_RO_IMG_CODEC_ZSTD
+                } else {
+                    VK_RO_IMG_CODEC_RAW
+                };
+                Ok(LazyChunk {
+                    offset,
+                    length: length as u32,
+                    codec,
+                    digest: digest_bytes(&layer.digest)?,
+                })
+            }
+        })
+        .buffer_unordered(RESTORE_CONCURRENCY)
+        .collect()
+        .await;
+    let mut chunks: Vec<LazyChunk> = results.into_iter().collect::<Result<_>>()?;
+    chunks.sort_unstable_by_key(|c| c.offset);
+
+    write_vk_ro_img(
+        dest,
+        config.total_size,
+        VK_RO_IMG_LAYOUT_FLAT,
+        &chunks_cache,
+        &chunks,
+    )?;
+
+    let (fetched, reused) = (
+        fetched.load(Ordering::Relaxed),
+        reused.load(Ordering::Relaxed),
+    );
+    println!(
+        "virtkit: registry: {label}: {} ext4 chunks ({fetched} fetched, {reused} cached, lazy restore)",
+        fetched + reused
+    );
     Ok(Some(digest))
 }
 
@@ -1912,6 +2105,73 @@ mod local {
         Ok(Some(digest))
     }
 
+    /// Which of `Store`'s two blob directories actually holds `hex` — `put_blob` picks
+    /// adaptively per blob (whichever form is smaller), independent of the manifest layer's
+    /// `media_type` (this codebase's local pushes always tag `CHUNK_MEDIA_TYPE_RAW`, so the
+    /// media type alone can't tell us which directory a chunk landed in).
+    fn local_blob_codec(root: &Path, hex: &str) -> Result<u8> {
+        if root.join("blobs/zstd").join(hex).is_file() {
+            Ok(VK_RO_IMG_CODEC_ZSTD)
+        } else if root.join("blobs/sha256").join(hex).is_file() {
+            Ok(VK_RO_IMG_CODEC_RAW)
+        } else {
+            bail!("cached chunk sha256:{hex} missing from {}", root.display())
+        }
+    }
+
+    /// Lazy counterpart of [`try_pull_ext4`]: write a `.vk_ro_img` manifest over the store's
+    /// own blob directories instead of reassembling a raw ext4 — no decompression, no
+    /// full-size sparse file. `root` doubles as the `.vk_ro_img`'s `cache_dir` (layout
+    /// `store_root`), so no data is read or copied here at all, only the manifest is parsed.
+    pub(super) fn try_pull_ext4_lazy(
+        root: &Path,
+        name: &str,
+        tag: &str,
+        dest: &Path,
+    ) -> Result<Option<String>> {
+        let store = Store::new(root.to_path_buf())?;
+        let _lock = store.lock_shared()?;
+        let Some((digest, manifest, config)) = manifest_and_config(&store, name, tag)? else {
+            return Ok(None);
+        };
+        let mut chunks = Vec::with_capacity(manifest.layers.len());
+        for layer in &manifest.layers {
+            if !matches!(
+                layer.media_type.as_str(),
+                CHUNK_MEDIA_TYPE | CHUNK_MEDIA_TYPE_RAW
+            ) {
+                continue;
+            }
+            let (offset, length) = chunk_placement(layer)?;
+            let hex = layer.digest.trim_start_matches("sha256:");
+            // Presence + GC-retention mtime touch (this chunk is about to be read, like any
+            // other cache hit) — `local_blob_codec` then determines which directory it lives
+            // in, which `has_blob` alone can't tell us.
+            if !store.has_blob(hex) {
+                bail!(
+                    "cached chunk {} missing from {}",
+                    layer.digest,
+                    root.display()
+                );
+            }
+            chunks.push(LazyChunk {
+                offset,
+                length: length as u32,
+                codec: local_blob_codec(root, hex)?,
+                digest: digest_bytes(&layer.digest)?,
+            });
+        }
+        chunks.sort_unstable_by_key(|c| c.offset);
+        write_vk_ro_img(
+            dest,
+            config.total_size,
+            VK_RO_IMG_LAYOUT_STORE_ROOT,
+            root,
+            &chunks,
+        )?;
+        Ok(Some(digest))
+    }
+
     pub(super) fn push_ext4(
         root: &Path,
         name: &str,
@@ -2433,6 +2693,85 @@ mod local {
             })
             .collect();
             assert_eq!(got, want, "windowed cut points diverge from StreamCDC");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `try_pull_ext4_lazy`'s manifest must describe exactly the bytes a real (eager)
+        /// pull would reassemble: same total size, chunks offset-sorted and contiguous, and
+        /// each one's referenced blob — read the same way `LazyChunkStorage` on the libkrun
+        /// side would (probe `blobs/zstd` before falling back to `blobs/sha256`, matching
+        /// `local_blob_codec`) — decompresses back to the matching slice of the source data.
+        #[test]
+        fn lazy_manifest_describes_exactly_what_an_eager_pull_would_reassemble() {
+            let dir = std::env::temp_dir().join(format!("vk-lazy-manifest-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let root = dir.join("store");
+            let mib = 1 << 20;
+            let data = filler(10 * mib, 0xa5a5);
+            let ext4 = dir.join("runner.ext4");
+            std::fs::write(&ext4, &data).unwrap();
+
+            local::push_ext4(&root, "img", "t1", &ext4, "generic").unwrap();
+            let lazy = dir.join("runner.vk_ro_img");
+            let digest = local::try_pull_ext4_lazy(&root, "img", "t1", &lazy)
+                .unwrap()
+                .expect("tag present");
+            assert!(digest.starts_with("sha256:"));
+
+            let bytes = std::fs::read(&lazy).unwrap();
+            let mut p = 0usize;
+            let take = |p: &mut usize, n: usize| -> Vec<u8> {
+                let out = bytes[*p..*p + n].to_vec();
+                *p += n;
+                out
+            };
+            assert_eq!(&take(&mut p, 8), VK_RO_IMG_MAGIC);
+            let total_size = u64::from_le_bytes(take(&mut p, 8).try_into().unwrap());
+            assert_eq!(total_size, data.len() as u64);
+            let layout = take(&mut p, 1)[0];
+            assert_eq!(layout, VK_RO_IMG_LAYOUT_STORE_ROOT);
+            let cache_dir_len = u32::from_le_bytes(take(&mut p, 4).try_into().unwrap()) as usize;
+            let cache_dir = String::from_utf8(take(&mut p, cache_dir_len)).unwrap();
+            assert_eq!(Path::new(&cache_dir), root);
+            let chunk_count = u64::from_le_bytes(take(&mut p, 8).try_into().unwrap()) as usize;
+            assert!(
+                chunk_count >= 2,
+                "expected several chunks, got {chunk_count}"
+            );
+
+            let mut expect_offset = 0u64;
+            for _ in 0..chunk_count {
+                let offset = u64::from_le_bytes(take(&mut p, 8).try_into().unwrap());
+                let length = u32::from_le_bytes(take(&mut p, 4).try_into().unwrap());
+                let codec = take(&mut p, 1)[0];
+                let digest_raw = take(&mut p, 32);
+                let hex: String = digest_raw.iter().map(|b| format!("{b:02x}")).collect();
+
+                assert_eq!(offset, expect_offset, "chunks must be contiguous");
+                let sub = if codec == VK_RO_IMG_CODEC_ZSTD {
+                    "blobs/zstd"
+                } else {
+                    "blobs/sha256"
+                };
+                let stored = std::fs::read(root.join(sub).join(&hex))
+                    .unwrap_or_else(|e| panic!("chunk {hex} in {sub}: {e}"));
+                let raw = if codec == VK_RO_IMG_CODEC_ZSTD {
+                    zstd::decode_all(&stored[..]).unwrap()
+                } else {
+                    stored
+                };
+                assert_eq!(raw.len(), length as usize);
+                assert_eq!(
+                    raw,
+                    data[offset as usize..offset as usize + length as usize],
+                    "chunk at offset {offset} doesn't match the source data"
+                );
+                expect_offset += length as u64;
+            }
+            assert_eq!(expect_offset, total_size);
+            assert_eq!(p, bytes.len(), "trailing bytes after the last chunk record");
+
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

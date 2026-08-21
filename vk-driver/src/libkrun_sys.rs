@@ -41,6 +41,8 @@ const KRUN_KERNEL_FORMAT_IMAGE_GZ: u32 = 4;
 const KRUN_KERNEL_FORMAT_IMAGE_ZSTD: u32 = 5;
 const KRUN_DISK_FORMAT_RAW: u32 = 0;
 const KRUN_DISK_FORMAT_QCOW2: u32 = 1;
+/// Matches `ImageType::VkLazyChunks` in `third_party/libkrun`'s block device (`mod.rs`).
+const KRUN_DISK_FORMAT_VK_LAZY_CHUNKS: u32 = 3;
 
 /// Pick the `krun_set_kernel` format tag for `data` (a kernel image). A raw ELF `vmlinux` is
 /// `ELF`; anything else is treated as an "Image" whose payload libkrun decompresses then ELF-loads
@@ -287,10 +289,10 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
 unsafe fn add_disk(ctx: u32, index: usize, disk: &Disk) -> Result<()> {
     let block_id = cstr(&format!("vd{}", (b'a' + index as u8) as char));
     let path = cstr(&disk.path.to_string_lossy());
-    let format = if disk.qcow2 {
-        KRUN_DISK_FORMAT_QCOW2
-    } else {
-        KRUN_DISK_FORMAT_RAW
+    let format = match disk.format {
+        crate::vmm::DiskFormat::Raw => KRUN_DISK_FORMAT_RAW,
+        crate::vmm::DiskFormat::Qcow2 => KRUN_DISK_FORMAT_QCOW2,
+        crate::vmm::DiskFormat::VkLazyChunks => KRUN_DISK_FORMAT_VK_LAZY_CHUNKS,
     };
     ck("krun_add_disk2", unsafe {
         krun_add_disk2(ctx, block_id.as_ptr(), path.as_ptr(), format, disk.readonly)
