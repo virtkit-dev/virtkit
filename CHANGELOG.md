@@ -22,6 +22,12 @@ All notable changes to virtkit will be documented in this file.
   parts a stage's steps actually read, so builds with many cached intermediate
   stages spend far less time on "restoring cached image."
 
+- The instruction cache is now versioned: upgrading to a `vk` whose cache format
+  or semantics changed treats every entry from an older version as a miss
+  instead of restoring it, so a cache-affecting fix takes effect immediately.
+  No manual cache wipe needed — the next build on each cache-key just rebuilds
+  once, and the orphaned old entries are reclaimed by the existing idle GC.
+
 ### Fixed
 
 - A `build:` unit's or docker-tier pull's `.tmp` scratch dir could leak

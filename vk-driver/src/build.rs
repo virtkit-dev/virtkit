@@ -2585,10 +2585,22 @@ fn stage_input_rootfs(
     Ok(out)
 }
 
-/// sha256 hex of `s` — the base cache key.
+/// Bump whenever a change to instruction-cache semantics — chunking, restore, or a
+/// correctness fix in the cache-push path — means previously-cached content should no
+/// longer be trusted. Folded into every root cache key ([`hash_key`], `base_cache_key`
+/// in `exec.rs`); `chain_key` derives every other key from one of those roots, so this
+/// alone invalidates a whole cache generation. An old entry does not need deleting: it
+/// simply stops being looked up, and idle GC reclaims it like any other unused blob.
+const CACHE_KEY_VERSION: &str = "1";
+
+/// sha256 hex of `s`, salted with [`CACHE_KEY_VERSION`]. The root-key constructor (a
+/// stage's base, with no prior instruction to chain from) — but also reused wherever
+/// else a salted hash is needed, e.g. folding `image_kernel` into an already-chained key.
 fn hash_key(s: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
+    h.update(CACHE_KEY_VERSION.as_bytes());
+    h.update(b"\n");
     h.update(s.as_bytes());
     hex(&h.finalize())
 }
@@ -5418,5 +5430,20 @@ RUN ship
             auto.contains("up to 6 stage(s) at once (from host memory)"),
             "{auto}"
         );
+    }
+
+    /// `hash_key` must actually fold in `CACHE_KEY_VERSION`, not just carry it in a doc
+    /// comment: bumping the version is the whole invalidation mechanism, so a change that
+    /// silently stopped salting the hash would leave old, possibly-corrupt cache entries
+    /// resolving forever.
+    #[test]
+    fn hash_key_is_salted_by_the_cache_key_version() {
+        use sha2::{Digest, Sha256};
+        let unsalted = {
+            let mut h = Sha256::new();
+            h.update(b"FROM scratch");
+            hex(&h.finalize())
+        };
+        assert_ne!(hash_key("FROM scratch"), unsalted);
     }
 }

@@ -943,10 +943,13 @@ fn label_slug(label: &str) -> String {
 
 /// Cache tag for a base image's materialized ext4 — `base-<sha256(image ref)>`, in the
 /// same `CACHE_REPO` as the instruction snapshots (the `base-` prefix can't collide
-/// with the 64-hex chained instruction keys).
+/// with the 64-hex chained instruction keys). Salted with the same `CACHE_KEY_VERSION`
+/// as `build.rs`'s `hash_key`, so bumping it invalidates base entries too.
 fn base_cache_key(image: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
+    h.update(super::CACHE_KEY_VERSION.as_bytes());
+    h.update(b"\n");
     h.update(b"FROM image ");
     h.update(image.as_bytes());
     let mut s = String::from("base-");
@@ -2874,6 +2877,26 @@ mod tests {
     // Temp dirs are minted over in `build`'s tests, so the tags here share one namespace with
     // the tags there — keep any tag added here distinct from both.
     use crate::build::tests::tmpdir;
+
+    /// `base_cache_key` must actually fold in `CACHE_KEY_VERSION`, not just carry it in a
+    /// doc comment — mirrors `build::tests::hash_key_is_salted_by_the_cache_key_version`
+    /// for this crate's other root cache key: a change that silently stopped salting it
+    /// would leave old, possibly-corrupt base-image cache entries resolving forever.
+    #[test]
+    fn base_cache_key_is_salted_by_the_cache_key_version() {
+        use sha2::{Digest, Sha256};
+        let unsalted = {
+            let mut h = Sha256::new();
+            h.update(b"FROM image ");
+            h.update(b"alpine:3.20");
+            let mut s = String::from("base-");
+            for b in h.finalize() {
+                s.push_str(&format!("{b:02x}"));
+            }
+            s
+        };
+        assert_ne!(base_cache_key("alpine:3.20"), unsalted);
+    }
 
     // `DryRun` never overrides `check_build_failure`/`report_build_failure`, so it exercises
     // the `Executor` trait's own defaults — a backend with no remote vk-registry (dry-run,
