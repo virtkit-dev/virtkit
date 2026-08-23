@@ -49,6 +49,7 @@ pub(crate) mod keys;
 pub mod lock;
 pub mod oidc;
 pub mod relay;
+pub(crate) mod upload;
 
 pub use client::{ClientAuth, FailInfo, Held, LockClient};
 pub use config::{DEFAULT_ADDR, ServerConfig};
@@ -99,7 +100,7 @@ impl ServerState {
 }
 
 /// Default content type for a manifest whose Content-Type sidecar is missing.
-const DEFAULT_MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+pub(crate) const DEFAULT_MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
 /// Fixed zstd level: identical raw chunks must compress to identical bytes for a
 /// compressed-digest chunk to dedup. Shared by the client push path (registry.rs),
@@ -1121,6 +1122,15 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
         };
         return keys::route(db, p, state.cookies_are_secure(), req).await;
     }
+    if is_upload_path(&path) {
+        let (Authenticator::Accounts { db, .. }, Some(p)) = (&state.auth, &principal) else {
+            // Byte-identical to the catch-all 404, as its two siblings above are: in
+            // shared-secret mode this route does not exist, rather than existing and
+            // saying so to an unauthenticated caller.
+            return Ok(error_response(StatusCode::NOT_FOUND, "NOT_FOUND", &path));
+        };
+        return upload::route(&state.store, db, p, state.cookies_are_secure(), req).await;
+    }
 
     // The build-once lock API lives under `/lock/<action>` (all POST), outside the
     // `/v2/` OCI namespace; names are `?name=` params.
@@ -1679,7 +1689,7 @@ fn authorize_or_forbidden(
 /// there is sent to `/login` instead of getting the bare 401 `/v2/*`/`/lock/*` clients
 /// expect, and so shared-secret mode can refuse them outright.
 fn is_human_path(path: &str) -> bool {
-    is_browse_path(path) || is_settings_path(path)
+    is_browse_path(path) || is_settings_path(path) || is_upload_path(path)
 }
 
 fn is_browse_path(path: &str) -> bool {
@@ -1688,6 +1698,10 @@ fn is_browse_path(path: &str) -> bool {
 
 fn is_settings_path(path: &str) -> bool {
     path == "/settings/keys" || path.starts_with("/settings/keys/")
+}
+
+fn is_upload_path(path: &str) -> bool {
+    path == "/upload"
 }
 
 /// Send an unauthenticated browser to `/login`, remembering `target` so it lands back
@@ -2015,7 +2029,10 @@ pub(crate) fn valid_reference(r: &str) -> bool {
     valid_digest(r) || valid_tag(r)
 }
 
-fn valid_tag(t: &str) -> bool {
+/// Shared with `/upload`, whose tag field must be a tag, not a digest — a digest-shaped
+/// value there would silently skip the tag-pointer write ([`Store::put_manifest`]'s
+/// digest-reference rule) instead of erroring, which would confuse rather than help.
+pub(crate) fn valid_tag(t: &str) -> bool {
     !t.is_empty()
         && t != "."
         && t != ".."

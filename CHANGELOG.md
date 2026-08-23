@@ -33,6 +33,13 @@ All notable changes to virtkit will be documented in this file.
   can read every repository, and pushing needs an administrator — who is also the
   only one who can hand out a key that writes.
 
+- A file can be put into a registry from a browser: sign in, name a
+  repository and a tag, choose a file. It goes into the same store
+  everything else does, so it can be fetched back through the registry's
+  normal interface, and a file the registry already holds costs no extra
+  space however many names it is given. Up to just under 64 MiB, and uploading needs
+  an administrator, as pushing does.
+
 ### Changed
 
 - `vk-registry` now refuses to start on a config file it does not fully

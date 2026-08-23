@@ -346,7 +346,7 @@ what it excludes. `/settings/keys` (`keys.rs`) is a session-only, CSRF-protected
 UI; minting a **write**-scoped key needs an admin session, since a plain session cannot
 write and must not be able to mint itself a key that can. Granting admin is `set_admin`,
 with no HTTP route by design — an operator's job, from the `vk-registry accounts` CLI
-(step 4 below).
+(step 5 below).
 
 `/lock/*` stays authentication-only: a lock name is a build key, not a repository name,
 so there is nothing per-repo to check against. The consequence is that any principal,
@@ -520,13 +520,13 @@ what went wrong goes to the log.
 
 New routes alongside the existing `/v2/` and `/lock/` prefixes in `route()`:
 
-| Route                                  | Auth                              | Behavior                                        |
-|----------------------------------------|-----------------------------------|-------------------------------------------------|
-| `/browse`                              | any principal, scope-filtered     | list repos, via `Store::repo_names`/`list_tags` |
-| `/browse/<name>`                       | any principal, `Read` on `<name>` | list tags for one repo                          |
-| `/browse/<name>/manifests/<reference>` | any principal, `Read` on `<name>` | manifest detail: layers, digests, sizes, links  |
-| `/upload` (GET form, POST multipart)   | session                           | manual upload — not yet implemented             |
-| `/settings/keys`                       | session                           | the caller's API keys — not yet implemented     |
+| Route                                          | Auth                                | Behavior                                        |
+|------------------------------------------------|-------------------------------------|-------------------------------------------------|
+| `/browse`                                      | any principal, scope-filtered       | list repos, via `Store::repo_names`/`list_tags` |
+| `/browse/<name>`                               | any principal, `Read` on `<name>`   | list tags for one repo                          |
+| `/browse/<name>/manifests/<reference>`         | any principal, `Read` on `<name>`   | manifest detail: layers, digests, sizes, links  |
+| `/upload` (GET form, POST multipart)           | session, `Write` — i.e. admin | manual upload (see below), CSRF-protected       |
+| `/settings/keys`, `/settings/keys/<id>/revoke` | session                             | the caller's own API keys, CSRF-protected       |
 
 `/browse` exists **only in accounts mode**: it is the one surface that *enumerates*
 repository names (there is no `/v2/_catalog` here), so a shared-secret server — where an
@@ -548,15 +548,41 @@ rendered as inert text rather than linked — manifest JSON is pushed content, s
 it renders one person's identity over the store's inventory, and nothing on it loads a
 remote resource.
 
-**Manual upload shares the dedup store natively**: a file dropped through `/upload` is
-turned into one blob (`Store::put_blob`, digest = sha256 of the file) plus a small
-single-layer manifest (`Store::put_manifest`, a generic media type such as
-`application/vnd.virtkit.raw-file`) tagged with the given `name:tag` — exactly the shape a
-CI `push` produces. A human-uploaded artifact is therefore pullable by `vk registry pull`
-with no special-casing, and a duplicate upload of already-known bytes costs no new disk —
-this is the point of routing it through `Store` instead of a parallel raw-file tree like
-assetserver's (which stores every upload as its own file, no dedup, reject-on-name-clash
-instead of content-addressing).
+**Manual upload shares the dedup store natively**: a file dropped through `/upload`
+(`upload.rs`) is turned into one blob (`Store::put_blob`, digest = sha256 of the file)
+plus a small single-layer manifest (`Store::put_manifest`; the *layer's* media type is
+`application/vnd.virtkit.raw-file`, with the original filename — bounded, since it is
+client-supplied — as an `org.opencontainers.image.title` annotation) tagged with the
+given `name`/`tag`. The bytes come straight back over the ordinary OCI API:
+`GET /v2/<name>/manifests/<reference>` then `GET /v2/<name>/blobs/<digest>`.
+
+It is **not** a `vk` bundle: `vk registry pull` wants a `BundleConfig` and
+`CHUNK_MEDIA_TYPE` layers and refuses this shape. A raw file here is for fetching, not
+for booting — the point of routing it through `Store` is dedup and one storage path, not
+`vk` compatibility. A duplicate upload of already-known bytes costs no new disk (config,
+layer, *and* manifest all dedup when the file, filename and manifest shape are identical
+— a manifest carries no repo/tag of its own), where assetserver's parallel raw-file tree
+stores every upload as its own file, with no dedup and a reject-on-name-clash rule
+instead of content-addressing. Uploading to an existing tag repoints it, exactly as a
+`/v2/` push does.
+
+The file is held in memory to hash it, so the form caps an upload at just under 64 MiB
+(the cap covers the part's framing too); anything
+larger belongs in `vk registry push`, which streams. The multipart body is parsed as it
+arrives by a small hand-rolled scanner (`upload.rs`'s `Scanner`) rather than a crate:
+what is needed is "the next complete part", and the crates on offer carry a
+charset-transcoding dependency for a feature this never uses — the same reasoning behind
+the hand-rolled cookie and query parsing elsewhere in this crate. Parts are acted on in
+arrival order, and the form emits `csrf`, `name`, `tag` before `file`, so a caller who
+fails CSRF or the write check is refused after a few hundred bytes instead of after the
+whole upload; a body that puts `file` first is refused for that reason.
+
+Like `/settings/keys`, `/upload` is session-only — an API key already has a purpose-built
+path (`vk registry push`) — and CSRF-protected the same way (the session's `csrf_secret`
+as a hidden form field). Write still means `is_admin` (via the same `authorize()` every
+`/v2/*` branch uses), so today only an admin session can upload. Proven with real
+multipart POSTs over HTTP in `tests/upload_e2e.rs`, including the dedup claim, the
+readback over `/v2/*`, and each refusal.
 
 ### Implementation order
 
@@ -565,16 +591,16 @@ instead of content-addressing).
    `config.rs`/`lib.rs`.
 2. OIDC login/callback/logout (`oidc.rs`) + read-only `/browse`, gated by
    session-read-all.
-3. `authorize()` enforcement on every `/v2/*` branch (`lib.rs`'s
-   `authorize_or_forbidden`) and scope-filtering on `/browse`; API key CRUD
-   (`/settings/keys`) still to come. That enforcement presumes two things the write
-   path establishes first: a blob is stored only under a digest the server itself
-   hashed the bytes to, and an upload session can only be finished into the
-   repository it was opened in — otherwise a per-repo scope check on
-   `POST .../uploads/` says nothing about where the blob lands.
-4. `vk-registry accounts`, the CLI that grants admin and manages accounts and keys with
+3. API key CRUD (`keys.rs`, CSRF-protected) + `authorize()` enforcement on every
+   `/v2/*` branch (`lib.rs`'s `authorize_or_forbidden`) and scope-filtering on `/browse`.
+   That enforcement presumes two things the write path establishes first: a blob is
+   stored only under a digest the server itself hashed the bytes to, and an upload
+   session can only be finished into the repository it was opened in — otherwise a
+   per-repo scope check on `POST .../uploads/` says nothing about where the blob lands.
+4. `/upload` (`upload.rs`, session-authed + CSRF-protected, admin-only write, writes
+   through `Store` as a synthetic manifest+blob).
+5. `vk-registry accounts`, the CLI that grants admin and manages accounts and keys with
    no HTTP route to do it through.
-5. `/upload` (session-authed, writes through `Store` as a synthetic manifest+blob).
 6. Optional: a `request_log` table (who pushed/pulled what, when) for audit.
 
 ## Deferred

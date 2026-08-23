@@ -54,6 +54,7 @@ pub(crate) fn page(
             // token the control is omitted rather than rendered dead: a button whose only
             // possible outcome is a 403 is worse than no button.
             let links = "<a href=\"/browse\">browse</a> &middot; \
+                         <a href=\"/upload\">upload</a> &middot; \
                          <a href=\"/settings/keys\">keys</a>";
             match csrf {
                 Some(token) => format!(
@@ -215,8 +216,14 @@ mod tests {
             !keyed.contains("/settings/keys"),
             "a key cannot manage keys: {keyed}"
         );
-        assert!(signed_in.contains("/settings/keys"), "{signed_in}");
-        assert!(unarmed.contains("/settings/keys"), "{unarmed}");
+        for link in ["/browse", "/upload", "/settings/keys"] {
+            assert!(signed_in.contains(link), "{link}: {signed_in}");
+            assert!(unarmed.contains(link), "{link}: {unarmed}");
+            assert!(
+                !keyed.contains(link),
+                "{link}: a key browses nothing: {keyed}"
+            );
+        }
         assert!(
             !keyed.contains("s3cr3t"),
             "a key's page carries no session secret"

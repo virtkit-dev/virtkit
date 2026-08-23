@@ -1038,7 +1038,7 @@ async fn browse_belongs_to_accounts_mode_and_redirects_a_signed_out_browser() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    for p in ["/browse", "/browse/team-a", "/settings/keys"] {
+    for p in ["/browse", "/browse/team-a", "/settings/keys", "/upload"] {
         let r = http.get(format!("{url}{p}")).send().await.unwrap();
         assert_eq!(
             r.status().as_u16(),
