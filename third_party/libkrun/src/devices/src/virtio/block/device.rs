@@ -181,12 +181,17 @@ impl DirtyRanges {
     }
 }
 
-/// The whole clusters `[offset, offset+len)` spans (empty for a zero-length request).
-fn cluster_range(offset: u64, len: u64) -> std::ops::RangeInclusive<u64> {
+/// The whole clusters `[offset, offset+len)` spans, as a half-open cluster range, rounded
+/// outward — the mirror of [`DirtyRanges::record_discard`]'s inward rounding. The zero-length
+/// case needs the explicit guard: `div_ceil` alone would round an unaligned `offset` up to the
+/// next cluster and hand back a range spanning one, where a request touching no byte must span
+/// nothing. Expressing that empty is why this is not a `RangeInclusive`, whose only empty form
+/// is a reversed one.
+fn cluster_range(offset: u64, len: u64) -> std::ops::Range<u64> {
     if len == 0 {
-        return 1..=0; // empty
+        return 0..0;
     }
-    (offset / DIRTY_CLUSTER)..=((offset + len - 1) / DIRTY_CLUSTER)
+    (offset / DIRTY_CLUSTER)..(offset + len).div_ceil(DIRTY_CLUSTER)
 }
 
 /// Coalesce a cluster set into byte ranges clamped to `size`; adjacent clusters merge so the
@@ -283,6 +288,40 @@ mod dirty_tests {
         let (written, discarded) = d.take(10 * DIRTY_CLUSTER);
         assert!(written.is_empty());
         assert_eq!(discarded, vec![(DIRTY_CLUSTER, 2 * DIRTY_CLUSTER)]);
+    }
+
+    #[test]
+    fn a_zero_length_request_dirties_nothing() {
+        // The empty case `cluster_range` exists to express: a request touching no byte must
+        // dirty no cluster — not the one holding `offset`, which rounding an unaligned offset
+        // outward would hand back. `record_discard` rounds inward, so it lands there of its
+        // own accord; the discards below pin that it stays so.
+        let mut d = DirtyRanges::default();
+        d.record_write(0, 0);
+        d.record_write(5 * DIRTY_CLUSTER, 0);
+        d.record_write(DIRTY_CLUSTER / 2, 0);
+        d.record_discard(0, 0);
+        d.record_discard(DIRTY_CLUSTER / 2, 0);
+        assert_eq!(d.take(10 * DIRTY_CLUSTER), (vec![], vec![]));
+    }
+
+    #[test]
+    fn a_write_is_rounded_out_to_whole_clusters() {
+        // The other end of the same range: a write is rounded *outward*, so the last byte's
+        // cluster is included and one past it is not.
+        let mut d = DirtyRanges::default();
+        d.record_write(DIRTY_CLUSTER - 1, 2); // last byte of cluster 0, first of cluster 1
+        assert_eq!(
+            d.take(10 * DIRTY_CLUSTER),
+            (vec![(0, 2 * DIRTY_CLUSTER)], vec![])
+        );
+
+        let mut d = DirtyRanges::default();
+        d.record_write(0, DIRTY_CLUSTER); // exactly cluster 0 — cluster 1 stays clean
+        assert_eq!(
+            d.take(10 * DIRTY_CLUSTER),
+            (vec![(0, DIRTY_CLUSTER)], vec![])
+        );
     }
 
     #[test]
