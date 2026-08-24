@@ -595,7 +595,7 @@ vk-registry accounts grant-admin  <EMAIL> [--issuer URL]
 vk-registry accounts revoke-admin <EMAIL> [--issuer URL]
 vk-registry accounts list-keys  [--owner-email EMAIL] [--issuer URL]
 vk-registry accounts revoke-key <ID>
-vk-registry accounts create-key --owner-email EMAIL --name NAME --scope ACTION:PATTERN [--expires-days DAYS]
+vk-registry accounts create-key --name NAME --scope ACTION:PATTERN [--owner-email EMAIL] [--expires-days DAYS]
 ```
 
 Each takes the `--root`/`--config` store-selection flags `status`/`gc` already do, plus
@@ -617,15 +617,24 @@ unknown id from an already-revoked one and reports both the same way.
 
 This is deliberately **not** gated by `authorize()`: an operator who can run this CLI
 already has filesystem access to the accounts db, the same trust level `set_admin`
-(called with no HTTP route at all) already assumed. One consequence to know: a key's
-scopes are its own, so `create-key` can give a non-admin user a write-scoped key, and
-`revoke-admin` does not revoke it — `list-keys` prints each key's owner for that reason.
-Revoking the last admin is likewise allowed; this CLI is the way back. `create-key` still needs an
-existing `User` row to attach the key to (`--owner-email` resolves one via
-`find_users_by_email`) — that row only exists once its OIDC subject has logged in at
-least once, so this mints a key for a *known* user, not a key ahead of anyone's first
-login (a fully ownerless key is possible at the `Db::create_api_key` layer — it takes
-`owner_user_id: Option<&str>` — but nothing above that layer exposes it yet).
+(called with no HTTP route at all) already assumed. Two consequences to know. A key's
+scopes are its own, so `create-key` can give a non-admin user a write-scoped key and
+`revoke-admin` does not revoke it — which is why `list-keys` prints each key's owner. And
+revoking the last admin is allowed; this CLI is the way back.
+
+`create-key --owner-email` is optional: omit it for a **system key**, `owner_user_id:
+None` at the `Db::create_api_key` layer, which supported this from the start with nothing
+above it exposing it. This is the CI case: a key tied to a person keeps working with
+rights that person has since lost — `authorize()` for an `ApiKey` principal reads the
+key's own `scopes` and never the owner's `is_admin` — so tying a pipeline's credential to
+an individual buys nothing and misleads an audit. `list-keys` labels such a key's owner
+`(system)`.
+
+The trade is that an ownerless key has no owner to check a revoke against, so
+`/settings/keys` cannot reach it and `revoke_api_key_unchecked` — this CLI — is the only
+path. Revoking a leaked system key therefore means stopping the registry. A `write:*`
+system key is an unattended credential that may push to every repository; nothing stops
+an operator minting one, and nothing but this CLI takes it away again.
 
 ### Implementation order
 

@@ -655,8 +655,9 @@ impl Db {
         self.revoke(id, Some(owner_user_id))
     }
 
-    /// Revoke any key, ownerless ones included. For an admin or the `accounts` CLI, which
-    /// answer to the operator rather than to a key's owner.
+    /// Revoke any key, ownerless ones included — the operator's path, and the only one
+    /// that reaches a key with no owner to check against. Called by the `accounts` CLI;
+    /// the HTTP surface uses the owner-checked [`Db::revoke_api_key`].
     pub fn revoke_api_key_unchecked(&self, id: &str) -> Result<bool> {
         self.revoke(id, None)
     }

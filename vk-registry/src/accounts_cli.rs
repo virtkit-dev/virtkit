@@ -10,8 +10,11 @@
 //! same trust level `Db::set_admin` assumed when it had no route at all — so nothing here
 //! re-checks `authorize()`; that gate is for the HTTP surface, not this one. One
 //! consequence worth knowing: a key's scopes are its own, so `create-key` can hand a
-//! non-admin user a write-scoped key, and `revoke-admin` does not revoke it.
+//! non-admin user a write-scoped key, and `revoke-admin` does not revoke it. A key minted
+//! with no owner at all has nothing to check a revoke against, so `/settings/keys` cannot
+//! reach it and this CLI is the only way to take it back.
 
+use std::collections::HashMap;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
@@ -78,9 +81,10 @@ pub fn list_keys(db: &Db, owner_email: Option<&str>, issuer: Option<&str>) -> Re
         }
         return Ok(());
     }
+    let owners = owner_labels(db, &keys)?;
     let now = SystemTime::now();
     for k in &keys {
-        println!("{}", key_line(db, k, now));
+        println!("{}", key_line(k, &owners, now));
         println!(
             "    prefix {}…  created {}  last used {}",
             k.token_prefix,
@@ -98,6 +102,39 @@ pub fn list_keys(db: &Db, owner_email: Option<&str>, issuer: Option<&str>) -> Re
     Ok(())
 }
 
+/// `owner_user_id`'s email, if the key has an owner and that user still exists;
+/// `"system"` for an ownerless key (see [`create_key`]); `"<deleted user>"` if the
+/// owner id no longer resolves (there is no user-deletion path today, but nothing
+/// prevents editing the db directly, and this should not panic if that ever happens).
+/// Every user id in `keys`, resolved to a label once — one read of the users table
+/// instead of one per key, and resolved *before* any line is printed so a failure cannot
+/// truncate a listing halfway.
+///
+/// The labels for the two special cases are parenthesised, which no email is, so an
+/// owner's own email can never be mistaken for one of them.
+fn owner_labels(db: &Db, keys: &[ApiKey]) -> Result<HashMap<String, String>> {
+    let by_id: HashMap<String, User> = db
+        .list_users()?
+        .into_iter()
+        .map(|u| (u.id.clone(), u))
+        .collect();
+    Ok(keys
+        .iter()
+        .filter_map(|k| k.owner_user_id.clone())
+        .map(|id| {
+            let label = match by_id.get(&id) {
+                Some(u) => u
+                    .email
+                    .clone()
+                    .unwrap_or_else(|| format!("{} at {}", u.oidc_subject, u.oidc_issuer)),
+                // Nothing removes a user today; a hand-edited db could still leave this.
+                None => "(unknown user)".to_string(),
+            };
+            (id, label)
+        })
+        .collect())
+}
+
 pub fn revoke_key(db: &Db, id: &str) -> Result<()> {
     // The operator's revoke, not an owner's: `revoke_api_key_unchecked` is the one that
     // reaches an ownerless key, and an operator with the db is already past any
@@ -109,15 +146,21 @@ pub fn revoke_key(db: &Db, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// `owner_email`, when given, ties the key to that user (looked up via
+/// [`resolve_user`]); `None` mints a **system key** — owned by no one, so it
+/// keeps working if that person ever leaves or has their own admin status revoked.
+/// The right choice for CI.
 pub fn create_key(
     db: &Db,
-    owner_email: &str,
+    owner_email: Option<&str>,
     issuer: Option<&str>,
     name: &str,
     scopes: &[Scope],
     expires_days: Option<u64>,
 ) -> Result<()> {
-    let user = resolve_user(db, owner_email, issuer)?;
+    let owner = owner_email
+        .map(|email| resolve_user(db, email, issuer))
+        .transpose()?;
     // Checked: both the multiply and the addition are on operator input, and a silent
     // wrap would mint a credential that expires in hours rather than years.
     let expires_at = expires_days
@@ -135,13 +178,25 @@ pub fn create_key(
                 .with_context(|| format!("--expires-days {d} is too far in the future"))
         })
         .transpose()?;
-    let (key, token) = db.create_api_key(Some(&user.id), name, scopes, expires_at)?;
+    let (key, token) = db.create_api_key(
+        owner.as_ref().map(|u| u.id.as_str()),
+        name,
+        scopes,
+        expires_at,
+    )?;
     // The token alone on stdout, so `create-key > file` captures the credential and
     // nothing else; what to do with it goes to stderr, as `install-service` does.
-    eprintln!(
-        "vk-registry accounts: created key {} for {owner_email}",
-        key.id
-    );
+    match owner_email {
+        Some(email) => eprintln!("vk-registry accounts: created key {} for {email}", key.id),
+        // No owner: nothing to revoke it *by*, so say which path can.
+        // No owner means no owner-side revoke: `/settings/keys` cannot reach this key,
+        // so the only way back is this CLI, which needs the server stopped.
+        None => eprintln!(
+            "vk-registry accounts: created system key {} — it belongs to nobody, so \
+             revoking it means `accounts revoke-key {}` with the server stopped",
+            key.id, key.id
+        ),
+    }
     eprintln!("Copy this token now — it is not stored and will not be shown again.");
     println!("{token}");
     Ok(())
@@ -210,31 +265,32 @@ fn action_word(a: Action) -> &'static str {
 /// rather than only what the helpers behind it would return.
 ///
 /// The full id, because that is what `revoke-key` takes: it is `sha256(token)`, documented
-/// as safe to display, so there is nothing to truncate. The owner is resolved to a person
-/// rather than printed as `User::id` — that id is `issuer\x1fsubject`, so printing it would
-/// put a control byte mid-line and name somebody the operator cannot look up, which is
-/// exactly what this column is *for* (see the module doc on `create-key` for a non-admin).
-fn key_line(db: &Db, k: &ApiKey, now: SystemTime) -> String {
+/// as safe to display, so there is nothing to truncate. The owner is a label from
+/// [`owner_labels`] rather than `User::id` — that id is `issuer\x1fsubject`, so printing it
+/// would put a control byte mid-line and name somebody the operator cannot look up, which
+/// is exactly what this column is *for* (see the module doc on `create-key` for a
+/// non-admin).
+///
+/// An ownerless key is named by a marker of its own rather than a reserved `owner=` value.
+/// `owner=(system)` would be imitable: `email` is a provider-asserted claim that
+/// `clamp_claim` bounds but does not otherwise constrain, so a user whose provider says
+/// their address is `(system)` would render identically to a genuine unattended CI
+/// credential — in the one column an operator reads to decide whether an unattended
+/// `write:*` key is expected. `owner=-` is what a row with no email already shows in
+/// `list-users`, and the marker is what carries the meaning.
+fn key_line(k: &ApiKey, owners: &HashMap<String, String>, now: SystemTime) -> String {
+    let (owner, marker) = match k.owner_user_id.as_deref() {
+        None => ("-", "  [system key]"),
+        Some(id) => (owners.get(id).map_or("(unknown user)", String::as_str), ""),
+    };
     format!(
-        "{}  {}  owner={}  {}",
+        "{}  {}  owner={}  {}{}",
         k.id,
         k.name,
-        owner_of(db, k.owner_user_id.as_deref()),
+        owner,
         status_of(k, now),
+        marker,
     )
-}
-
-/// Who a key belongs to, as something an operator can act on: the owner's email, else the
-/// subject the identity provider knows them by. `-` for a key with no owner, or one whose
-/// user row cannot be read — a listing is worth printing even if one row will not resolve.
-fn owner_of(db: &Db, owner_user_id: Option<&str>) -> String {
-    let Some(id) = owner_user_id else {
-        return "-".to_string();
-    };
-    match db.get_user(id) {
-        Ok(Some(u)) => u.email.unwrap_or(u.oidc_subject),
-        Ok(None) | Err(_) => "-".to_string(),
-    }
 }
 
 fn status_of(k: &ApiKey, now: SystemTime) -> String {
@@ -336,7 +392,7 @@ mod tests {
         // 0 is the other end of the same typo: it mints a token already past its expiry
         for days in [0, u64::MAX, u64::MAX / 86_400, 200_000_000_000_000] {
             assert!(
-                create_key(&db, "a@example.com", None, "k", &scope, Some(days)).is_err(),
+                create_key(&db, Some("a@example.com"), None, "k", &scope, Some(days)).is_err(),
                 "{days} days must be refused"
             );
         }
@@ -358,7 +414,7 @@ mod tests {
                 .is_err()
         );
         assert!(
-            create_key(&db, "a@example.com", None, "k", &[bare_star], None).is_err(),
+            create_key(&db, Some("a@example.com"), None, "k", &[bare_star], None).is_err(),
             "the store must refuse it even if the CLI is called directly"
         );
         Ok(())
@@ -373,28 +429,63 @@ mod tests {
         let db = tmp.open()?;
         let u = db.upsert_user("https://issuer", "sub-1", Some("a@example.com"), None)?;
         db.create_api_key(Some(&u.id), "ci", &[], None)?;
-        let key = db.list_all_api_keys()?.remove(0);
-
-        // the rendered line, not just the helper behind it
-        let line = key_line(&db, &key, SystemTime::now());
-        assert!(line.contains("owner=a@example.com"), "{line}");
-        assert!(
-            !line.contains('\u{1f}'),
-            "no control byte reaches a listing"
-        );
-        assert!(
-            !line.contains("https://issuer"),
-            "not the raw user id: {line}"
-        );
-
         // no email on the row: the subject the provider knows them by, still not the id
         let v = db.upsert_user("https://issuer", "sub-2", None, None)?;
         db.create_api_key(Some(&v.id), "ci2", &[], None)?;
-        assert_eq!(owner_of(&db, Some(v.id.as_str())), "sub-2");
+        // and one with no owner at all
+        db.create_api_key(None, "system", &[], None)?;
 
-        // and an owner that cannot be resolved is a dash, not a panic and not the id
-        assert_eq!(owner_of(&db, Some("https://issuer\u{1f}gone")), "-");
-        assert_eq!(owner_of(&db, None), "-");
+        let keys = db.list_all_api_keys()?;
+        let owners = owner_labels(&db, &keys)?;
+        let now = SystemTime::now();
+        // the rendered lines, not just the helpers behind them
+        let lines: Vec<String> = keys.iter().map(|k| key_line(k, &owners, now)).collect();
+        let all = lines.join("\n");
+        assert!(!all.contains('\u{1f}'), "no control byte reaches a listing");
+
+        let line_of = |name: &str| {
+            lines
+                .iter()
+                .find(|l| l.contains(&format!("  {name}  owner=")))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert!(line_of("ci").contains("owner=a@example.com"), "{all}");
+        let no_email = line_of("ci2");
+        assert!(no_email.contains("sub-2"), "{no_email}");
+        assert!(
+            no_email.contains("owner=sub-2 at https://issuer"),
+            "the subject and its issuer, not the joined id: {no_email}"
+        );
+        // An ownerless key is marked, not labelled: `email` is a provider-asserted claim,
+        // so a reserved `owner=` value would be imitable by whoever controls it.
+        let sys = line_of("system");
+        assert!(
+            sys.contains("owner=-") && sys.contains("[system key]"),
+            "{sys}"
+        );
+        let spoof = db.upsert_user("https://issuer", "sub-3", Some("(system)"), None)?;
+        db.create_api_key(Some(&spoof.id), "spoof", &[], None)?;
+        let keys2 = db.list_all_api_keys()?;
+        let owners2 = owner_labels(&db, &keys2)?;
+        let spoofed = keys2
+            .iter()
+            .find(|k| k.name == "spoof")
+            .map(|k| key_line(k, &owners2, now))
+            .unwrap_or_default();
+        assert!(
+            !spoofed.contains("[system key]"),
+            "an email cannot pass for a system key: {spoofed}"
+        );
+
+        // a key whose user row cannot be found says so rather than showing the id
+        let orphan = ApiKey {
+            owner_user_id: Some("https://issuer\u{1f}gone".to_string()),
+            ..keys[0].clone()
+        };
+        let line = key_line(&orphan, &owners, now);
+        assert!(line.contains("owner=(unknown user)"), "{line}");
+        assert!(!line.contains('\u{1f}'), "{line}");
         Ok(())
     }
 
@@ -421,17 +512,42 @@ mod tests {
 
         create_key(
             &db,
-            "alice@example.com",
+            Some("alice@example.com"),
             None,
             "ci",
             &[parse_scope("write:team-a/*")?],
             Some(30),
         )?;
+        // A system key: no owner, so it is tied to nobody's admin status.
+        create_key(
+            &db,
+            None,
+            None,
+            "system-ci",
+            &[parse_scope("read:*")?],
+            None,
+        )?;
         list_keys(&db, Some("alice@example.com"), None)?;
-        list_keys(&db, None, None)?;
+        list_keys(&db, None, None)?; // renders an ownerless key with no user to name
         let keys = db.list_api_keys(&alice.id)?;
         assert_eq!(keys.len(), 1);
         assert!(keys[0].expires_at.is_some());
+
+        let all = db.list_all_api_keys()?;
+        assert_eq!(all.len(), 2);
+        let system_key = all
+            .iter()
+            .find(|k| k.name == "system-ci")
+            .expect("the system key is listed");
+        assert!(system_key.owner_user_id.is_none());
+        // Owners resolve once for the whole listing, and only owned keys contribute: the
+        // ownerless one is named by `key_line`, not by a label derived from a user row.
+        let labels = owner_labels(&db, &all)?;
+        assert_eq!(labels.len(), 1, "the ownerless key contributes no entry");
+        assert_eq!(
+            labels.get(keys[0].owner_user_id.as_deref().unwrap()),
+            Some(&"alice@example.com".to_string())
+        );
 
         revoke_key(&db, &keys[0].id)?;
         assert!(db.get_api_key(&keys[0].id)?.unwrap().revoked_at.is_some());
@@ -442,6 +558,17 @@ mod tests {
         set_admin(&db, "alice@example.com", None, false)?;
         let alice = db.find_users_by_email("alice@example.com")?.remove(0);
         assert!(!alice.is_admin);
+
+        // Only the operator path can revoke an ownerless key: there is no owner to check
+        // it against, so `revoke_key` — what the CLI tells the operator to run — is it.
+        let system = system_key.id.clone();
+        assert!(
+            !db.revoke_api_key(&alice.id, &system)?,
+            "an ownerless key is nobody's to revoke by ownership"
+        );
+        revoke_key(&db, &system)?;
+        assert!(db.get_api_key(&system)?.unwrap().revoked_at.is_some());
+
         Ok(())
     }
 

@@ -241,11 +241,16 @@ enum AccountsCmd {
     },
     /// Create a scoped API key, printed once
     CreateKey {
-        /// The key owner's email
+        /// The key owner's email [default: a system key, owned by no one]
+        ///
+        /// CI usually wants a system key rather than one tied to a person who may
+        /// leave or have their own admin status revoked later.
         #[arg(long, value_name = "EMAIL")]
-        owner_email: String,
+        owner_email: Option<String>,
         /// Which provider's user, when one email matches more than one
-        #[arg(long, value_name = "URL")]
+        ///
+        /// Only means anything alongside --owner-email, and is refused without it.
+        #[arg(long, value_name = "URL", requires = "owner_email")]
         issuer: Option<String>,
         /// A short label for the key
         #[arg(long)]
@@ -458,7 +463,7 @@ fn run_accounts(cmd: AccountsCmd) -> Result<()> {
             let (db, _) = open_accounts_db(&store)?;
             accounts_cli::create_key(
                 &db,
-                &owner_email,
+                owner_email.as_deref(),
                 issuer.as_deref(),
                 &name,
                 &scopes,
@@ -767,6 +772,51 @@ mod tests {
             Cmd::Accounts {
                 cmd: AccountsCmd::CreateKey { scopes, .. },
             } => assert_eq!(scopes, vec!["read:*", "write:team-a/*"]),
+            _ => panic!("expected accounts create-key"),
+        }
+
+        // --issuer narrows an email, so it means nothing without one
+        assert!(
+            parse(&[
+                "vk-registry",
+                "accounts",
+                "create-key",
+                "--issuer",
+                "https://idp",
+                "--name",
+                "ci",
+                "--scope",
+                "read:*"
+            ])
+            .is_err(),
+            "--issuer without --owner-email must be refused, not ignored"
+        );
+        assert!(
+            parse(&[
+                "vk-registry",
+                "accounts",
+                "list-keys",
+                "--issuer",
+                "https://idp"
+            ])
+            .is_err(),
+            "--issuer without --owner-email must be refused, not ignored"
+        );
+        // an ownerless key is what create-key mints with no --owner-email
+        let cli = parse(&[
+            "vk-registry",
+            "accounts",
+            "create-key",
+            "--name",
+            "system-ci",
+            "--scope",
+            "read:*",
+        ])
+        .expect("--owner-email is optional");
+        match cli.cmd {
+            Cmd::Accounts {
+                cmd: AccountsCmd::CreateKey { owner_email, .. },
+            } => assert_eq!(owner_email, None),
             _ => panic!("expected accounts create-key"),
         }
 

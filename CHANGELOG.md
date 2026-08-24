@@ -45,7 +45,12 @@ All notable changes to virtkit will be documented in this file.
   administrator or stop them being one, and list, create or revoke API keys.
   This is how the first administrator is appointed, since there is
   deliberately no way to do it over the network. The registry has to be
-  stopped while it runs — only one process can hold the accounts file.
+  stopped while it runs — only one process can hold the accounts file. A key
+  created this way can be left attached to nobody, which is what CI wants: a
+  key tied to a person keeps working with whatever it was given even after
+  that person's own access is taken away, so naming an owner buys nothing and
+  misleads anyone auditing later. The catch is that such a key can only be
+  revoked from this same command line, with the registry stopped.
 
 ### Changed
 
