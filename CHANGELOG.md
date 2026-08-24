@@ -9,11 +9,12 @@ All notable changes to virtkit will be documented in this file.
 - **A `vk build` stage could lose bytes the guest had already written.** Two
   writes landing close together in the same region of a stage's disk could
   race, and one of them was dropped — a file the guest wrote whole came back
-  with a hole in the middle of it. It surfaced later and at random: an
-  unreadable file in the built image, a stage that would not boot, a kernel or
+  with a hole in the middle of it. The same could happen between a write and the
+  zeroing of a neighbouring range of the disk. It surfaced later and at random:
+  an unreadable file in the built image, a stage that would not boot, a kernel or
   module the next stage could not load. Stages cached by an affected `vk` may
-  hold what it lost, so they are no longer used: the first build after
-  upgrading rebuilds them once.
+  hold what it lost, so they are no longer used: the first build after upgrading
+  rebuilds them once.
 
 - **A `vk build` stage built on top of a cached one could come out corrupted.** A
   stage restored from the build cache was read back correctly, but a stage built on

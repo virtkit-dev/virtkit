@@ -768,6 +768,28 @@ impl Block {
     }
 }
 
+/// Zero `length` bytes at `offset` in `image`, holding its **write** lock.
+///
+/// `FormatAccess::write_zeroes()` only needs `&self`, so this could share the lock with the rest
+/// of a batch (see `worker::IO_PARALLELISM`) — but it must not. Zeroing part of a cluster whose
+/// surrounding bytes read as zero is done by mapping the whole cluster to zero, and that decision
+/// is taken from the L2 table, which does not show a write that is concurrently allocating that
+/// same cluster (its claim is mapped in only once its data has landed). The two race, and the
+/// write can be the one that loses: the guest is told its bytes are on disk, and the cluster
+/// reads back as a hole. Excluding writes for the duration is what makes both land.
+///
+/// The whole range is zeroed under one hold, so a large `WRITE_ZEROES` stalls the rest of the
+/// batch for as long as it takes. Accepted as-is because such requests are rare; should it ever
+/// matter, the range can be split on cluster boundaries and zeroed under repeated short holds
+/// without reopening the race, since each cluster's decision falls entirely inside one chunk.
+pub(crate) fn write_zeroes_exclusive(
+    image: &RwLock<FormatAccess<Box<dyn DynStorage>>>,
+    offset: u64,
+    length: u64,
+) -> io::Result<()> {
+    image.write().unwrap().write_zeroes(offset, length)
+}
+
 impl VmmExitObserver for Block {
     /// Flush the write-back cache to the host image before the VMM terminates on a clean
     /// guest power-off. The VMM stops with `libc::_exit`, which skips `DiskProperties`'
@@ -1363,6 +1385,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Write-zeroes and a write can land in the same 64 KiB cluster in one batch (see
+    /// `worker::IO_PARALLELISM`), and zeroing part of a cluster whose surroundings read as zero
+    /// is done by mapping the whole cluster to zero — which erases a write that allocated that
+    /// cluster concurrently. Driving both the way the worker does (`write_zeroes_exclusive` for
+    /// the zeroes, a shared lock for the write) must leave both standing.
+    #[test]
+    fn write_zeroes_beside_a_concurrent_write_in_one_cluster() {
+        use imago::io_buffers::{IoVector, IoVectorMut};
+        use imago::FormatCreateBuilder;
+        use std::io::{IoSlice, IoSliceMut};
+
+        const CLUSTER: u64 = 64 * 1024;
+        const ZEROED: u64 = 4096;
+        // Many clusters, each raced separately: a single round loses the race only sometimes, and
+        // at 64 rounds a regression still slips through about half the time.
+        const CLUSTERS: u64 = 1024;
+
+        let dir = temp_dir("qcow2-zero-race");
+        let path = dir.join("img.qcow2");
+        let open_file = |writable: bool| {
+            ImagoFile::open(
+                StorageOpenOptions::new()
+                    .write(writable)
+                    .filename(path.to_str().unwrap().to_string()),
+            )
+            .unwrap()
+        };
+        std::fs::File::create(&path).unwrap();
+        Qcow2::<Box<dyn DynStorage>, Arc<FormatAccess<Box<dyn DynStorage>>>>::create_builder(
+            Box::new(open_file(true)),
+        )
+        .size(CLUSTER * CLUSTERS)
+        .create()
+        .unwrap();
+        let fa = Arc::new(RwLock::new(FormatAccess::new(
+            open_qcow2_chain(Box::new(open_file(true)), true).unwrap(),
+        )));
+
+        for c in 0..CLUSTERS {
+            std::thread::scope(|scope| {
+                // The write: the cluster's second half, under a shared lock, as `writev` runs.
+                let writer = Arc::clone(&fa);
+                scope.spawn(move || {
+                    let buf = vec![0xC5u8; (CLUSTER / 2) as usize];
+                    writer
+                        .read()
+                        .unwrap()
+                        .writev(
+                            IoVector::from(vec![IoSlice::new(&buf)]),
+                            c * CLUSTER + CLUSTER / 2,
+                        )
+                        .unwrap();
+                });
+                // The zeroes: the cluster's first slice, through the worker's own entry point.
+                let zeroer = Arc::clone(&fa);
+                scope.spawn(move || {
+                    write_zeroes_exclusive(&zeroer, c * CLUSTER, ZEROED).unwrap();
+                });
+            });
+        }
+        fa.read().unwrap().flush().unwrap();
+
+        for c in 0..CLUSTERS {
+            let mut got = vec![0u8; CLUSTER as usize];
+            fa.read()
+                .unwrap()
+                .readv(
+                    IoVectorMut::from(vec![IoSliceMut::new(&mut got)]),
+                    c * CLUSTER,
+                )
+                .unwrap();
+            assert_eq!(
+                &got[(CLUSTER / 2) as usize..],
+                vec![0xC5u8; (CLUSTER / 2) as usize],
+                "cluster {c}: the write did not survive the write-zeroes beside it"
+            );
+            // Wider than `ZEROED` on purpose: the rest of the half was never written, so it
+            // must read back zero too — and a lost claim would show up there as well.
+            assert_eq!(
+                &got[..(CLUSTER / 2) as usize],
+                vec![0u8; (CLUSTER / 2) as usize],
+                "cluster {c}: the write-zeroes did not survive the write beside it"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The same race one cluster over: a multi-cluster write extends its host allocation as a
     /// contiguous run, so for every cluster after the first it demands one specific host cluster.
     /// A claim already in flight for that guest cluster necessarily sits elsewhere, and the run
@@ -1452,9 +1562,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The other half of the same locking scheme: `discard`/write-zeroes-with-unmap take the
-    /// image's write lock (see `worker::IO_PARALLELISM`) precisely so they exclude a concurrent
-    /// `writev`/`readv` (read lock) to the same region, rather than just avoiding a deadlock.
+    /// The other half of the same locking scheme: `discard` and both forms of write-zeroes take
+    /// the image's write lock (see `worker::IO_PARALLELISM`) precisely so they exclude a
+    /// concurrent `writev`/`readv` (read lock) to the same region, rather than just avoiding a
+    /// deadlock.
     /// Proves that exclusion directly and deterministically — no data race, no timing tolerance
     /// — by holding a write guard and checking `try_read()` is refused for as long as it's held,
     /// then immediately granted once it's dropped.

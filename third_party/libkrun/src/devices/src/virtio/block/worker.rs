@@ -1,7 +1,7 @@
 use crate::virtio::descriptor_utils::{Reader, Writer};
 
 use super::super::DeviceQueue;
-use super::device::{CacheType, DiskProperties};
+use super::device::{write_zeroes_exclusive, CacheType, DiskProperties};
 
 use crate::virtio::{DescriptorChain, InterruptTransport};
 use std::io::{self, Write};
@@ -58,11 +58,13 @@ unsafe impl ByteValued for DiscardWriteData {}
 /// Guest requests dispatched to concurrent threads per batch. Real disk-backed images (SSD/NVMe)
 /// have per-request latency worth overlapping; a fixed small batch hides most of that latency
 /// without oversubscribing a single virtqueue's worth of work onto too many OS threads. `readv`/
-/// `writev`/`flush`/`sync`/`write_zeroes` take a shared `RwLock` read lock on the image (imago's
-/// own internal locking, not this one, is what actually serializes conflicting accesses), so
-/// batched requests genuinely run concurrently; `discard`/write-zeroes-with-unmap need a `&mut`
-/// borrow of the image and take the write lock instead, briefly serializing against the rest of
-/// the batch — correct, and rare enough not to matter.
+/// `writev`/`flush`/`sync` take a shared `RwLock` read lock on the image (imago's own internal
+/// locking, not this one, is what actually serializes conflicting accesses), so batched requests
+/// genuinely run concurrently; `discard` and both forms of write-zeroes take the write lock
+/// instead, briefly serializing against the rest of the batch — correct, and rare enough not to
+/// matter. (Discard and write-zeroes-with-unmap need a `&mut` borrow of the image anyway; plain
+/// write-zeroes does not, but must not run beside a write into the same cluster — see
+/// `device::write_zeroes_exclusive`.)
 ///
 /// Threads within one batch have no ordering between each other: a `FLUSH` and a write it is
 /// meant to make durable must never land in the same batch. This relies on the guest never
@@ -350,14 +352,14 @@ impl BlockWorker {
                         )
                         .map_err(RequestError::DiscardingToZero)?;
                 } else {
-                    disk.file
-                        .read()
-                        .unwrap()
-                        .write_zeroes(
-                            discard_write_data.sector * 512,
-                            discard_write_data.num_sectors as u64 * 512,
-                        )
-                        .map_err(RequestError::WritingZeroes)?;
+                    // Write lock like the unmap case above, for a different reason — see
+                    // `write_zeroes_exclusive`.
+                    write_zeroes_exclusive(
+                        &disk.file,
+                        discard_write_data.sector * 512,
+                        discard_write_data.num_sectors as u64 * 512,
+                    )
+                    .map_err(RequestError::WritingZeroes)?;
                 }
                 // Freed or zeroed either way — record as a discard so the checkpoint holes it.
                 disk.record_discard(
