@@ -1303,10 +1303,48 @@ impl MicroVm {
     }
     /// Whether a cache restore should write a lazy `.vk_ro_img` view instead of eagerly
     /// decompressing the whole cached image to a raw ext4: only libkrun's virtio-blk knows
-    /// how to read one (`LazyChunkStorage` in `third_party/libkrun`), and `--debug` always
-    /// forces the eager path so `verify_ext4`'s `e2fsck` still has a real ext4 to check.
+    /// how to read one (`LazyChunkStorage` in `third_party/libkrun`).
+    ///
+    /// `--debug` deliberately does *not* turn this off: it used to, which left the check looking
+    /// only at the eager path it substituted in. [`Self::verify_lazy_view`] materializes the view
+    /// instead, so the check covers what the build really restores.
     fn lazy_restore_enabled(&self) -> bool {
-        !self.debug && crate::vmm::libkrun_selected()
+        crate::vmm::libkrun_selected()
+    }
+    /// `--debug`: verify a lazily restored `.vk_ro_img` view — the chunks it names, reassembled
+    /// through the host-side reader — as [`Self::verify_ext4`] does for a raw restore. Writes a
+    /// throwaway raw (the whole point of the lazy path is not to, so this is `--debug`-only) and
+    /// discards it. No-op unless `--debug` is set.
+    ///
+    /// What it covers is the manifest and the chunks behind it, not libkrun's own reader of them
+    /// (`LazyChunkStorage`), which only a booted guest exercises. And with `--debug` no longer
+    /// forcing the eager path, the eager reassembly is checked by [`Self::verify_reassembly`]
+    /// and by a cloud-hypervisor build, rather than at this boundary.
+    fn verify_lazy_view(&self, view: &Path, context: &str) -> Result<()> {
+        if !self.debug {
+            return Ok(());
+        }
+        // Only ever called on what a lazy restore just wrote. Anything else — wrong name, or the
+        // right name over bytes that are not a manifest — would be copied through verbatim and
+        // reach `e2fsck` as "not an ext4", which is a skip, which is a pass. Check both.
+        let ext = crate::registry::VK_RO_IMG_EXT;
+        let named = view.extension() == Some(std::ffi::OsStr::new(ext));
+        let f = std::fs::File::open(view).with_context(|| format!("opening {}", view.display()))?;
+        if !named || crate::qcow2::sniff_kind(&f) != crate::qcow2::ImageKind::Lazy {
+            bail!("--debug: {} is not a .{ext} view", view.display());
+        }
+        drop(f);
+        let raw = view.with_extension("fsck-view.raw");
+        let materialized = crate::qcow2::materialize_to_raw(view, &raw)
+            .with_context(|| format!("reassembling {} for the --debug ext4 check", view.display()));
+        if materialized.is_err() {
+            // A partially-written raw may linger even on failure; do not leak it.
+            let _ = std::fs::remove_file(&raw);
+        }
+        materialized?;
+        let r = self.verify_ext4(&raw, context);
+        let _ = std::fs::remove_file(&raw); // best-effort: the raw is scratch for the check
+        r
     }
     /// `--debug`: run `e2fsck` on a raw ext4 as it crosses the cache boundary. A clean fs
     /// (or an inconclusive skip — e2fsck absent) passes; genuine corruption fails the build
@@ -1467,6 +1505,7 @@ impl MicroVm {
                 if let Some(digest) =
                     crate::registry::try_pull_ext4_lazy(&rg, CACHE_REPO, &base_key, &lazy, image)?
                 {
+                    self.verify_lazy_view(&lazy, &format!("cached image {image} (after load)"))?;
                     return Ok((lazy, Some(digest)));
                 }
             } else if let Some(digest) =
@@ -2282,6 +2321,8 @@ impl Executor for MicroVm {
             else {
                 bail!("cached instruction {key} vanished from the registry");
             };
+            // Same check the eager branch runs below, against the view the guest will read.
+            self.verify_lazy_view(&lazy, &format!("cached instruction {key} (after load)"))?;
             (lazy, digest)
         } else {
             let ext4 = self.image_path(&fs.label);

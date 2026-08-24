@@ -6,6 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- `vk build --debug` now checks the filesystem of the cached stages a build
+  actually loads. It used to check a separate copy unpacked just for the
+  check, so a fault in the form a normal build loads went unnoticed.
+
 - A `vk build` could have the files it was working on deleted by another `vk`
   starting up beside it, or refuse to start because it picked the same working
   directory as one already running — most often when the build runs inside a

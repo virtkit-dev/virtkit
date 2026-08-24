@@ -308,24 +308,23 @@ pub fn create_overlay(path: &Path, backing: &Path) -> Result<()> {
     // describe a virtual disk the size of the tiny manifest file.
     let (bfmt, size) = {
         let f = File::open(backing).with_context(|| format!("opening {}", backing.display()))?;
-        let mut magic8 = [0u8; 8];
-        if f.read_exact_at(&mut magic8, 0).is_ok() && &magic8 == crate::registry::VK_RO_IMG_MAGIC {
-            // Caught here rather than as garbage guest reads: libkrun resolves a manifest by
-            // extension only, so an overlay naming one under any other name would boot with
-            // the manifest's own bytes served as the disk.
-            let ext = crate::registry::VK_RO_IMG_EXT;
-            if backing.extension() != Some(OsStr::new(ext)) {
-                bail!(
-                    "{} is a .{ext} manifest but is not named `*.{ext}`; libkrun resolves a \
-                     manifest backing by extension and would read it as a raw image",
-                    backing.display()
-                );
+        match sniff_kind(&f) {
+            ImageKind::Lazy => {
+                // Caught here rather than as garbage guest reads: libkrun resolves a manifest by
+                // extension only, so an overlay naming one under any other name would boot with
+                // the manifest's own bytes served as the disk.
+                let ext = crate::registry::VK_RO_IMG_EXT;
+                if backing.extension() != Some(OsStr::new(ext)) {
+                    bail!(
+                        "{} is a .{ext} manifest but is not named `*.{ext}`; libkrun resolves a \
+                         manifest backing by extension and would read it as a raw image",
+                        backing.display()
+                    );
+                }
+                ("raw", VkRoImg::open(backing)?.total_size)
             }
-            ("raw", VkRoImg::open(backing)?.total_size)
-        } else if be32(&magic8, 0) == MAGIC {
-            ("qcow2", Qcow2::open(backing)?.virtual_size())
-        } else {
-            ("raw", f.metadata()?.len())
+            ImageKind::Qcow2 => ("qcow2", Qcow2::open(backing)?.virtual_size()),
+            ImageKind::Raw => ("raw", f.metadata()?.len()),
         }
     };
     let backing_name = backing
@@ -412,6 +411,41 @@ pub fn flatten_to_raw(src: &Path, out: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Write the image `view` stands for into a raw file at `out`: a `.vk_ro_img` manifest (a lazy
+/// chunk view of a cached stage) is wrapped in an empty overlay and flattened through the same
+/// reader an export uses, a qcow2 is flattened directly, and a raw image is copied. For a caller
+/// that needs a real filesystem where the build only has a view of one — `--debug`'s `e2fsck`
+/// check, which is otherwise blind to everything the lazy restore path produces.
+///
+/// For a manifest, `out` must be a sibling of `view` unless `view` is absolute: the overlay is
+/// written beside `out` and records its backing by the path given, which qcow2 resolves relative
+/// to the overlay's own directory.
+pub fn materialize_to_raw(view: &Path, out: &Path) -> Result<()> {
+    let mut f = File::open(view).with_context(|| format!("opening {}", view.display()))?;
+    match sniff_kind(&f) {
+        ImageKind::Lazy => {
+            // No reader takes a bare manifest as an image; an empty overlay over it is the
+            // shape a stage boots, so flatten that. Through the host reader (`VkRoImg`), not
+            // the guest's `LazyChunkStorage` — what this checks is the manifest and the chunks
+            // it names, not libkrun's own reader.
+            let wrap = out.with_extension("wrap.qcow2");
+            let created = create_overlay(&wrap, view);
+            let flattened = created.and_then(|()| flatten_to_raw(&wrap, out));
+            // The wrap is scratch either way, including after a half-written `create_overlay`.
+            let _ = std::fs::remove_file(&wrap);
+            flattened
+        }
+        ImageKind::Qcow2 => flatten_to_raw(view, out),
+        ImageKind::Raw => {
+            // Straight from the open fd, so the path is not resolved a second time.
+            let mut o = File::create(out).with_context(|| format!("creating {}", out.display()))?;
+            std::io::copy(&mut f, &mut o)
+                .with_context(|| format!("copying {} to {}", view.display(), out.display()))?;
+            Ok(())
+        }
+    }
 }
 
 /// Debug check (VIRTKIT_QCOW2_VERIFY): flatten `path` with `qemu-img convert` and compare
@@ -533,18 +567,41 @@ fn merge_extents(mut ext: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     out
 }
 
+/// What an image file's first bytes say it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageKind {
+    /// A `.vk_ro_img` manifest — a lazy chunk view of a cached stage, not an image itself.
+    Lazy,
+    /// A qcow2, to be read through its format layer.
+    Qcow2,
+    /// Anything else: the bytes are the image.
+    Raw,
+}
+
+/// Sniff `f`'s first eight bytes. A file shorter than that can be neither qcow2 nor a
+/// `.vk_ro_img`, so it reads as raw. The longer `.vk_ro_img` magic is checked first — a qcow2
+/// magic never collides with it (a `VkRoImg::open` on real qcow2 bytes would just fail its own
+/// magic check anyway).
+pub(crate) fn sniff_kind(f: &File) -> ImageKind {
+    let mut magic8 = [0u8; 8];
+    if f.read_exact_at(&mut magic8, 0).is_err() {
+        return ImageKind::Raw;
+    }
+    if &magic8 == crate::registry::VK_RO_IMG_MAGIC {
+        ImageKind::Lazy
+    } else if be32(&magic8, 0) == MAGIC {
+        ImageKind::Qcow2
+    } else {
+        ImageKind::Raw
+    }
+}
+
 fn open_backing(path: &Path) -> Result<Backing> {
     let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut magic8 = [0u8; 8];
-    // A backing shorter than 8 bytes can't be qcow2 or a `.vk_ro_img`; treat as raw. Check
-    // the longer `.vk_ro_img` magic first — a qcow2 magic never collides with it (a
-    // `VkRoImg::open` on real qcow2 bytes would just fail its own magic check anyway).
-    if f.read_exact_at(&mut magic8, 0).is_ok() && &magic8 == crate::registry::VK_RO_IMG_MAGIC {
-        Ok(Backing::Lazy(Box::new(VkRoImg::open(path)?)))
-    } else if be32(&magic8, 0) == MAGIC {
-        Ok(Backing::Qcow2(Box::new(Qcow2::open(path)?)))
-    } else {
-        Ok(Backing::Raw(f))
+    match sniff_kind(&f) {
+        ImageKind::Lazy => Ok(Backing::Lazy(Box::new(VkRoImg::open(path)?))),
+        ImageKind::Qcow2 => Ok(Backing::Qcow2(Box::new(Qcow2::open(path)?))),
+        ImageKind::Raw => Ok(Backing::Raw(f)),
     }
 }
 
@@ -1283,6 +1340,138 @@ mod tests {
 
     fn digest_hex(digest: &[u8; 32]) -> String {
         digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The point of materializing a view is that `e2fsck` can then check it, so check that end
+    /// to end: a real ext4, chunked into a manifest the way a cache restore writes one, must come
+    /// back through `materialize_to_raw` as a filesystem `e2fsck` accepts. Byte equality (the
+    /// test below) does not prove the manifest describes something mountable.
+    #[test]
+    fn a_materialized_view_is_a_filesystem_fsck_accepts() {
+        let dir = std::env::temp_dir().join(format!("vk-materialize-fs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let fs = dir.join("stage.ext4");
+        crate::ext4::build_empty(&fs, 1024).unwrap();
+        let image = std::fs::read(&fs).unwrap();
+
+        // Two chunks, one per codec, splitting the image on a block boundary.
+        let split = image.len() / 2 / 4096 * 4096;
+        let (head, tail) = image.split_at(split);
+        let (digest_head, digest_tail) = (fake_digest(21), fake_digest(22));
+        std::fs::write(
+            dir.join(digest_hex(&digest_head)),
+            zstd::encode_all(head, 3).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join(digest_hex(&digest_tail)), tail).unwrap();
+
+        let manifest = dir.join("stage.vk_ro_img");
+        crate::registry::write_vk_ro_img(
+            &manifest,
+            image.len() as u64,
+            crate::registry::VK_RO_IMG_LAYOUT_FLAT,
+            &dir,
+            &[
+                crate::registry::LazyChunk {
+                    offset: 0,
+                    length: head.len() as u32,
+                    codec: crate::registry::VK_RO_IMG_CODEC_ZSTD,
+                    digest: digest_head,
+                },
+                crate::registry::LazyChunk {
+                    offset: split as u64,
+                    length: tail.len() as u32,
+                    codec: crate::registry::VK_RO_IMG_CODEC_RAW,
+                    digest: digest_tail,
+                },
+            ],
+        )
+        .unwrap();
+
+        let out = dir.join("materialized.ext4");
+        materialize_to_raw(&manifest, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), image);
+        // `Skipped` is a pass in production too (no `e2fsck` on the host); only corruption fails.
+        match crate::ext4::fsck(&out) {
+            crate::ext4::FsckResult::Clean | crate::ext4::FsckResult::Skipped(_) => (),
+            crate::ext4::FsckResult::Corrupt(report) => {
+                panic!("a materialized view must be a clean ext4:\n{report}")
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `materialize_to_raw` must turn a `.vk_ro_img` into exactly the image it stands for —
+    /// that is what lets `--debug`'s `e2fsck` check a lazily restored stage instead of the
+    /// eager reassembly it used to substitute in. Covers the manifest path (via an overlay,
+    /// as a stage boots it) and the plain-raw passthrough.
+    #[test]
+    fn materialize_to_raw_reproduces_a_lazy_view() {
+        let dir = std::env::temp_dir().join(format!("vk-materialize-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Two chunks with a gap between them, as a diff push leaves one.
+        let chunk_a: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let chunk_b: Vec<u8> = (0..30_000u32).map(|i| ((i * 13 + 5) % 251) as u8).collect();
+        let digest_a = fake_digest(7);
+        let digest_b = fake_digest(8);
+        std::fs::write(
+            dir.join(digest_hex(&digest_a)),
+            zstd::encode_all(&chunk_a[..], 3).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join(digest_hex(&digest_b)), &chunk_b).unwrap();
+
+        let gap = 20_000u64;
+        let b_off = chunk_a.len() as u64 + gap;
+        let total_size = b_off + chunk_b.len() as u64 + 4096;
+        let manifest = dir.join("stage.vk_ro_img");
+        crate::registry::write_vk_ro_img(
+            &manifest,
+            total_size,
+            crate::registry::VK_RO_IMG_LAYOUT_FLAT,
+            &dir,
+            &[
+                crate::registry::LazyChunk {
+                    offset: 0,
+                    length: chunk_a.len() as u32,
+                    codec: crate::registry::VK_RO_IMG_CODEC_ZSTD,
+                    digest: digest_a,
+                },
+                crate::registry::LazyChunk {
+                    offset: b_off,
+                    length: chunk_b.len() as u32,
+                    codec: crate::registry::VK_RO_IMG_CODEC_RAW,
+                    digest: digest_b,
+                },
+            ],
+        )
+        .unwrap();
+
+        let mut want = vec![0u8; total_size as usize];
+        want[..chunk_a.len()].copy_from_slice(&chunk_a);
+        want[b_off as usize..b_off as usize + chunk_b.len()].copy_from_slice(&chunk_b);
+
+        let out = dir.join("materialized.raw");
+        materialize_to_raw(&manifest, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), want, "manifest -> raw");
+        assert!(
+            !out.with_extension("wrap.qcow2").exists(),
+            "the overlay used to read the manifest must not be left behind"
+        );
+
+        // A raw image is passed through unchanged.
+        let raw_in = dir.join("plain.raw");
+        std::fs::write(&raw_in, &want).unwrap();
+        let raw_out = dir.join("plain-copy.raw");
+        materialize_to_raw(&raw_in, &raw_out).unwrap();
+        assert_eq!(std::fs::read(&raw_out).unwrap(), want, "raw -> raw");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `VkRoImg` (the host-side, non-guest reader of a `.vk_ro_img` manifest) must reassemble
