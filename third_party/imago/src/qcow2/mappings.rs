@@ -142,6 +142,11 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
         let l2_table_locked = l2_table.lock_write().await;
         let mut pending_entries = Vec::<(u64, ClusterAllocation)>::new();
+        // Liveness token for the claims established below: it lives in the `Qcow2Pending`
+        // returned here, so a batch dropped without committing or aborting takes it with it and
+        // its claims stop being shareable once no other batch holds them (see
+        // `PendingAllocations`).
+        let owner = Arc::new(());
 
         let res = self
             .ensure_data_mapping_no_cleanup(
@@ -150,7 +155,10 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 skip_cow,
                 skip_cow_to_eof,
                 l2_table_locked,
-                &mut pending_entries,
+                PendingBatch {
+                    entries: &mut pending_entries,
+                    owner: &owner,
+                },
             )
             .await;
 
@@ -158,6 +166,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             qcow2: self,
             l2_table: Some(l2_table),
             entries: pending_entries,
+            _owner: Some(owner),
         };
 
         let (host_offset, length) = match res {
@@ -383,8 +392,8 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     /// cluster a commit supersedes (discovered only then, since nothing is mapped in here yet) is
     /// freed by the commit itself.
     ///
-    /// The caller must route `pending_entries` through a [`Qcow2Pending`], in both cases of
-    /// success and of error.
+    /// The caller must route `batch.entries` through a [`Qcow2Pending`], in both cases of success
+    /// and of error.
     async fn ensure_data_mapping_no_cleanup(
         &self,
         offset: GuestOffset,
@@ -392,8 +401,12 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         skip_cow: bool,
         skip_cow_to_eof: bool,
         l2_table: L2TableWriteGuard<'_>,
-        pending_entries: &mut Vec<(u64, ClusterAllocation)>,
+        batch: PendingBatch<'_>,
     ) -> io::Result<(u64, u64)> {
+        let PendingBatch {
+            entries: pending_entries,
+            owner,
+        } = batch;
         let cb = self.header.cluster_bits();
 
         let partial_skip_cow = skip_cow.then(|| {
@@ -410,7 +423,13 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
         // Without a mandatory host offset, this should never return `Ok(None)`
         let allocation = self
-            .cow_cluster(current_guest_cluster, None, partial_skip_cow, &l2_table)
+            .cow_cluster(
+                current_guest_cluster,
+                None,
+                partial_skip_cow,
+                &l2_table,
+                owner,
+            )
             .await?
             .ok_or_else(|| io::Error::other("Internal allocation error"))?;
         pending_entries.push((current_guest_cluster.offset(cb).0, allocation));
@@ -440,6 +459,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                     Some(next_host_cluster),
                     partial_skip_cow,
                     &l2_table,
+                    owner,
                 )
                 .await?;
 
@@ -530,6 +550,17 @@ pub(super) enum FixedMapping {
     FullDiscard,
 }
 
+/// The two batch-scoped things [`Qcow2::ensure_data_mapping_no_cleanup()`] fills in: where the
+/// claims it establishes are collected, and the token that says the batch collecting them is
+/// still alive. Both end up in the [`Qcow2Pending`] its caller builds, which is what makes them
+/// one parameter rather than two.
+pub(super) struct PendingBatch<'a> {
+    /// Where to record each cluster established, for the caller's [`Qcow2Pending`].
+    entries: &'a mut Vec<(u64, ClusterAllocation)>,
+    /// The batch's liveness token (see [`PendingAllocations`](super::cow::PendingAllocations)).
+    owner: &'a Arc<()>,
+}
+
 /// Clusters [`Qcow2::do_ensure_data_mapping()`] established but has not yet mapped into the L2
 /// table.
 ///
@@ -549,12 +580,17 @@ pub(super) enum FixedMapping {
 /// plain, infallible in-memory L2 table update (the same one a direct, non-deferred write would
 /// have done).
 ///
-/// Dropping this without calling either does not just leak the freshly allocated cluster: the
-/// claim on it stays registered as in flight for the lifetime of the image, so every later write
-/// into that guest cluster shares a host cluster that nobody will ever map in, and lands where no
-/// reader can see it.  That is silent corruption, not waste, so every path out of a `writev` must
-/// route its `Qcow2Pending`s through one of the two.  There is no `Drop` impl enforcing it because
-/// the async free it would need cannot run in one.
+/// Dropping this without calling either leaks the freshly allocated cluster.  The claim on it is
+/// reaped rather than left registered — the next write into that guest cluster finds this batch's
+/// token dead and claims a cluster of its own (see
+/// [`PendingAllocations`](super::cow::PendingAllocations)) — so what is left is waste, not the
+/// silent corruption it would otherwise be.  A write already sharing the claim when this went away
+/// still ends up with a cluster nobody covered the rest of, though, and the leak is real either
+/// way, so every path out of a `writev` must still route its `Qcow2Pending`s through one of the
+/// two.  (A write arriving *after* joins the claim only while some user still holds it; once the
+/// last one is gone it is reaped rather than handed out, because a user's token is dropped by its
+/// own `release()` and not left to die with its batch.)  There is no `Drop` impl enforcing it because the async free it would need cannot run in
+/// one.
 #[must_use = "must be committed or aborted"]
 pub(super) struct Qcow2Pending<'a, S: Storage + 'static, F: WrappedFormat<S> + 'static> {
     /// The image this pending batch's entries belong to, needed by both `commit()` (to lock the
@@ -566,6 +602,11 @@ pub(super) struct Qcow2Pending<'a, S: Storage + 'static, F: WrappedFormat<S> + '
     l2_table: Option<Arc<L2Table>>,
     /// `(guest offset of the cluster, its allocation)`, in the order established.
     entries: Vec<(u64, ClusterAllocation)>,
+    /// Liveness token for this batch's claims: held only here, so dropping this — including
+    /// without the commit or abort the contract asks for — is what lets a later write see those
+    /// claims as wreckage, once no other batch holding them is live either (see
+    /// [`PendingAllocations`](super::cow::PendingAllocations)).
+    _owner: Option<Arc<()>>,
 }
 
 #[maybe_async]
@@ -577,6 +618,8 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2Pending<'_, S, F>
             qcow2,
             l2_table: None,
             entries: Vec::new(),
+            // No claims, so no token to keep alive — and this is the fast path, so no allocation.
+            _owner: None,
         }
     }
 
@@ -591,6 +634,9 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2Pending<'_, S, F>
     /// than silently dropped. Everything not holed is still mapped in, and every claim is
     /// released either way.
     pub(super) async fn commit(self) -> io::Result<()> {
+        // Only `empty()` has no token, and it has no entries either, so the loop below never
+        // asks for one.
+        let owner = self._owner.as_ref();
         let Some(l2_table) = self.l2_table else {
             return Ok(());
         };
@@ -614,7 +660,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2Pending<'_, S, F>
                     .pending_allocs
                     .lock()
                     .await
-                    .release(guest_offset, true, claimant);
+                    .release(guest_offset, true, claimant, owner);
             if released.holed {
                 holed = true;
             } else {
@@ -642,6 +688,8 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2Pending<'_, S, F>
     /// free. Giving up while another write still shares a claim holes it: that cluster can no
     /// longer go live, and the sharer's `commit()` fails instead of exposing it.
     pub(super) async fn abort(self) {
+        // As in `commit()`: no token only where there is nothing to release.
+        let owner = self._owner.as_ref();
         for (guest_offset, allocation) in self.entries {
             if matches!(allocation, ClusterAllocation::MappedExisting(_)) {
                 continue;
@@ -650,12 +698,12 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2Pending<'_, S, F>
             // Freeing is the last user's call, and only if none of them mapped the cluster in:
             // a write sharing this claim may have landed and committed already. The registry
             // lock is dropped before the free, which takes the allocator's.
-            let released =
-                self.qcow2
-                    .pending_allocs
-                    .lock()
-                    .await
-                    .release(guest_offset, false, claimant);
+            let released = self.qcow2.pending_allocs.lock().await.release(
+                guest_offset,
+                false,
+                claimant,
+                owner,
+            );
             if let Some(orphan) = released.orphan {
                 self.qcow2.free_data_clusters(orphan, ClusterCount(1)).await;
             }

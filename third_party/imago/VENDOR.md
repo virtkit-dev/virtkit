@@ -96,10 +96,19 @@ user by `Qcow2Pending::commit()`/`abort()`.
   up holes nothing, and must not fail the claimant's successful write.
 - `format/access.rs`: `writev`'s `async` `write_parallelization > 1` path used to drop its
   `FuturesUnordered` on the first error — and on an `ensure_data_mapping()` error — dropping
-  uncommitted, unaborted `PendingDataMapping`s with it. That now leaves a claim registered as in
-  flight forever, so every later write into that cluster would land where no reader can see it; it
-  drains the workers instead (`drain()`). `readv`'s workers own no mappings and still return on
-  the first error.
+  uncommitted, unaborted `PendingDataMapping`s with it. That leaves a claim behind that nobody
+  will release; it drains the workers instead (`drain()`). `readv`'s workers own no mappings and
+  still return on the first error.
+- Liveness tokens: every batch holds an `Arc<()>` and each of its claims a `Weak<()>` of it, so a
+  claim that outlived every batch holding it is recognisable as wreckage and reaped by the next
+  `share()` rather than handed out — a host cluster nobody is going to map in, holding whatever
+  the abandoned write left. Per *user*, not per claimant: a claimant can abort (holing the claim)
+  and go away while a sharer is still going to commit, and reaping the entry then would let that
+  sharer release against a stranger's claim and map the holed cluster in. A user's token is
+  dropped by its own `release()`, not left to die with its batch, so the vector tracks the current
+  users: a claim whose remaining users have all abandoned it is reaped even while batches that
+  already released it linger. Dropping a batch without committing or aborting still leaks its
+  cluster, which is why `drain()` above stays.
 
 **Known gap.** One ordering is still not covered: a sharer commits (mapping the cluster in) and
 *then* the claimant's own write fails. The cluster is live by then, so no flag can hold it back,
@@ -134,8 +143,11 @@ started building `third_party/libkrun/src/devices` with it (see Feature selectio
 
 **Tests (shared claims):** `qcow2::cow::tests` covers the registry's decisions directly — that a
 claim elsewhere is not an unclaimed cluster, that only the last user of an unmapped fresh claim
-frees it, and that a user giving up holes a claim others still hold. Being plain unit tests they
-run in both feature modes and need no thread interleaving to be deterministic.
+frees it, and that a user giving up holes a claim others still hold. The liveness tokens add four:
+an abandoned claim is not shared with the next write, one a live sharer still holds is not reaped,
+one dead token among live ones does not reap either, and a token whose user already released stops
+keeping the claim alive. Being plain unit tests they run in both feature modes and need no thread
+interleaving to be deterministic.
 
 The end-to-end races live with the virtio-blk device that provokes them, in
 `third_party/libkrun/src/devices` (`block/device.rs`), since they need real threads writing
