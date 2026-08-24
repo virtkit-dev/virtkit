@@ -158,22 +158,23 @@ pub fn build_unit_ext4(
 
 /// Ensure a `build:` unit is materialized in the shared build tier synchronously — the
 /// microVM build path never awaits — streaming its build progress to `sink` when set, and
-/// return the ext4 it materialized along with its merged runtime config. The ext4 is part
-/// of the result because the stage fingerprint is settled here: a caller holding the
-/// address it predicted earlier (`build_unit_ext4` at provisioning) holds the fingerprint
-/// of the context as it stood then, and any edit since keys the build to another entry.
-/// This is the on-demand start path (the service manager builds a profiled-down `build:`
-/// service the first time it is brought up). Concurrent first-starts of the same stage
-/// serialize inside `ensure_build_tier` (a per-stage pull lock), and share the one tier
-/// entry. Errors for an `image:` unit: those need the async pull and are materialized up
-/// front, not on demand.
+/// return the ext4 it materialized along with its merged runtime config and a held reference
+/// on it — the guard [`crate::ensure::ensure_build_tier`] describes, with the same contract.
+/// The ext4 is part of the result because the stage fingerprint is settled here:
+/// a caller holding the address it predicted earlier (`build_unit_ext4` at provisioning)
+/// holds the fingerprint of the context as it stood then, and any edit since keys the build
+/// to another entry. This is the on-demand start path (the service manager builds a
+/// profiled-down `build:` service the first time it is brought up). Concurrent first-starts
+/// of the same stage serialize inside `ensure_build_tier` (a per-stage pull lock), and share
+/// the one tier entry. Errors for an `image:` unit: those need the async pull and are
+/// materialized up front, not on demand.
 pub fn ensure_unit_build_sync(
     unit: &crate::compose::Unit,
     state_dir: &Path,
     idle: std::time::Duration,
     build: &BuildOpts,
     sink: Option<crate::build::ProgressSink>,
-) -> Result<(PathBuf, RunConfig)> {
+) -> Result<(PathBuf, RunConfig, crate::cachelock::Guard)> {
     if let crate::compose::Source::Image(_) = &unit.source {
         anyhow::bail!(
             "on-demand start of the image: service {:?} is not supported — \
@@ -182,7 +183,7 @@ pub fn ensure_unit_build_sync(
         );
     }
     let (recipe, target, key) = build_recipe(unit, &build.build_args, Some(build))?;
-    let dir = crate::ensure::ensure_build_tier(
+    let (dir, guard) = crate::ensure::ensure_build_tier(
         state_dir,
         idle,
         &recipe,
@@ -193,7 +194,7 @@ pub fn ensure_unit_build_sync(
     )?;
     let ext4 = dir.join("runner.ext4");
     let config = read_merged_config(unit, &ext4)?;
-    Ok((ext4, config))
+    Ok((ext4, config, guard))
 }
 
 /// Provision one service unit at address `slot`: resolve its clean image to a cache path and

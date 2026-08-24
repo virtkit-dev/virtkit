@@ -338,7 +338,9 @@ pub(crate) fn cache_tiers(state_dir: &Path) -> [PathBuf; 3] {
 /// Take a shared-lock reference on the materialized base backing `rootfs`, iff it lives in
 /// a managed cache tier (see [`cache_tiers`]). Returns `None` for a baked `[local]` bundle
 /// or an ephemeral rootfs — nothing there is reference-counted or evicted. Hold the returned
-/// guard for the overlay's whole lifetime: a base under a live overlay is never reclaimed.
+/// guard for as long as anything depends on the base — a live overlay over it, but equally a
+/// caller that resolved it and only boots it later: a base is reclaimable the instant nobody
+/// holds a reference, whatever a freshness check last said.
 pub(crate) fn acquire_use_lock_for(
     state_dir: &Path,
     rootfs: &Path,
@@ -349,12 +351,12 @@ pub(crate) fn acquire_use_lock_for(
     if !cache_tiers(state_dir).iter().any(|t| dir.starts_with(t)) {
         return Ok(None);
     }
-    // Every resolve re-dates the marker (see `mark_used`), so a base's idle window runs from the
-    // most recent boot that wanted it.
+    // Date the entry from release, not from acquisition: these references are held for a whole
+    // job now (a build's source, a running service's base), and dating from the moment it was
+    // taken would leave a long job's base looking idle for the length of that job.
     Ok(Some(crate::cachelock::acquire_shared(
         &dir.join(".inuse"),
         &dir.join(".used"),
-        crate::cachelock::IdleFrom::Acquire,
     )?))
 }
 

@@ -37,9 +37,7 @@ pub(crate) fn acquire_use_lock(dest: &Path) -> Result<crate::cachelock::Guard> {
         .mode(0o700)
         .create(&s.dir)
         .with_context(|| format!("creating {}", s.dir.display()))?;
-    // A checkout is held for a whole job, so its idle window starts when the last prepare or
-    // supervisor lets go — not when a long-running job first took it.
-    crate::cachelock::acquire_shared(&s.lock, &s.used, crate::cachelock::IdleFrom::Release)
+    crate::cachelock::acquire_shared(&s.lock, &s.used)
 }
 
 /// Create the checkout directory and record the identity of what it created, while the caller

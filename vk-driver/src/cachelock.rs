@@ -19,50 +19,84 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 
-/// When an entry nobody holds starts ageing towards eviction.
-pub(crate) enum IdleFrom {
-    /// The last time a reference was taken. Fits an entry that every user re-dates as it
-    /// resolves it, so the window runs from the most recent job that wanted it.
-    Acquire,
-    /// The last time a reference went away. Fits an entry held for a whole job, which dating
-    /// from acquisition would leave looking idle for the length of that job.
-    Release,
-}
-
 /// A held reference to a cache entry: the shared lock lives exactly as long as this guard, so
-/// a reclaim can never remove the entry underneath its user. Released on drop.
+/// a reclaim can never remove the entry underneath its user. Released on drop, which re-dates
+/// the entry — every reference here is held for a whole job (a checkout, a base under a live
+/// overlay, a base a later phase still means to boot), so dating the idle window from
+/// acquisition instead would leave a long job's entry looking idle for the length of it.
+// `Debug` so a `Result` carrying a guard stays `unwrap_err`-able in tests.
+#[derive(Debug)]
 pub(crate) struct Guard {
     _file: std::fs::File,
-    release_marker: Option<PathBuf>,
+    used: PathBuf,
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        if let Some(used) = &self.release_marker {
-            let _ = std::fs::File::create(used);
-        }
+        // Best-effort, like every other stamp: an entry with no marker is one `try_reclaim`
+        // leaves alone. Runs before `_file`, so the shared lock still holds off a reclaim.
+        let _ = std::fs::File::create(&self.used);
     }
 }
 
-/// Take a shared reference on the entry named by `lock`/`used`, waiting only behind a
-/// reclaim's momentary exclusive lock, and date the entry to now — and again on release when
-/// `idle_from` says so. Stamping `used` is best-effort: an entry with no marker is one
-/// [`try_reclaim`] leaves alone, and the next acquisition stamps it again.
-pub(crate) fn acquire_shared(lock: &Path, used: &Path, idle_from: IdleFrom) -> Result<Guard> {
-    let file = open_lock(lock)?;
-    // SAFETY: `file` owns this fd and the returned guard keeps it open.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("shared-locking {}", lock.display()));
-    }
-    let _ = std::fs::File::create(used);
-    Ok(Guard {
-        _file: file,
-        release_marker: match idle_from {
-            IdleFrom::Acquire => None,
-            IdleFrom::Release => Some(used.to_path_buf()),
-        },
+/// How many times [`acquire_shared`] re-opens the lock file before giving up on ever seeing a
+/// stable entry. Only a rebuild that recreated the entry needs a retry at all — in the image
+/// tiers, whose reclaim takes the whole directory, the next open just fails instead — so a
+/// handful is already far past what a real sweep can produce.
+const ACQUIRE_ATTEMPTS: u32 = 3;
+
+/// Whether `e` is (or wraps) a "no such file or directory" — how an acquisition reports an
+/// entry a reclaim took away entirely, which the image tiers read as "rebuild it".
+pub(crate) fn is_not_found(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
     })
+}
+
+/// Take a shared reference on the entry named by `lock`/`used`, waiting only behind a
+/// reclaim's exclusive lock, and date the entry to now — and again on release. Stamping
+/// `used` is best-effort: an entry with no marker is one [`try_reclaim`] leaves alone, and
+/// the next acquisition stamps it again.
+pub(crate) fn acquire_shared(lock: &Path, used: &Path) -> Result<Guard> {
+    for _ in 0..ACQUIRE_ATTEMPTS {
+        let file = open_lock(lock)?;
+        // SAFETY: `file` owns this fd and the returned guard keeps it open.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("shared-locking {}", lock.display()));
+        }
+        // A reclaim removes the entry while holding the lock exclusively, so blocking behind
+        // one hands back a lock on a file that has since been unlinked — and if a rebuild
+        // recreated the entry meanwhile, the next sweep sees its *new* sidecar unheld and
+        // evicts an entry this guard claims to protect. Only a lock on the file the path
+        // still names is worth anything; anything else, take again.
+        if same_file(&file, lock)? {
+            let _ = std::fs::File::create(used);
+            return Ok(Guard {
+                _file: file,
+                used: used.to_path_buf(),
+            });
+        }
+    }
+    anyhow::bail!(
+        "{} was replaced under every attempt to reference it",
+        lock.display()
+    )
+}
+
+/// Whether the open `file` is still the file `path` names — `false` once a reclaim has
+/// unlinked it, or a rebuild has replaced it with a new one.
+fn same_file(file: &std::fs::File, path: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let held = file
+        .metadata()
+        .with_context(|| format!("stat-ing the held {}", path.display()))?;
+    match std::fs::metadata(path) {
+        Ok(named) => Ok((held.dev(), held.ino()) == (named.dev(), named.ino())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("stat-ing {}", path.display())),
+    }
 }
 
 /// Ensure the entry's lock sidecar exists and bump its `.used` marker to now, without taking
@@ -142,6 +176,8 @@ pub(crate) fn reclaimed_eventually(mut sweep: impl FnMut() -> bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::MetadataExt;
+
     use super::*;
 
     /// `(dir, lock, used)` under a fresh private directory; remove `dir` when done.
@@ -157,7 +193,7 @@ mod tests {
     #[test]
     fn a_held_entry_is_never_reclaimed() {
         let (dir, lock, used) = sidecars("held");
-        let guard = acquire_shared(&lock, &used, IdleFrom::Acquire).unwrap();
+        let guard = acquire_shared(&lock, &used).unwrap();
         let mut removed = false;
         assert!(!try_reclaim(
             &lock,
@@ -182,7 +218,7 @@ mod tests {
     #[test]
     fn an_entry_inside_its_idle_window_is_kept() {
         let (dir, lock, used) = sidecars("window");
-        drop(acquire_shared(&lock, &used, IdleFrom::Acquire).unwrap());
+        drop(acquire_shared(&lock, &used).unwrap());
         assert!(!try_reclaim(
             &lock,
             &used,
@@ -194,28 +230,48 @@ mod tests {
     }
 
     #[test]
-    fn release_dates_an_entry_from_the_last_reference_going_away() {
-        // The one thing the two caches differ on. `Release` rewrites the marker as the guard
-        // drops, so an entry held for a long job is not already at the far end of its idle
-        // window when the job ends; `Acquire` leaves the marker where acquisition put it.
+    fn an_entry_is_dated_from_the_last_reference_going_away() {
+        // The marker is rewritten as the guard drops, so an entry held for a long job is not
+        // already at the far end of its idle window by the time the job ends.
         let (dir, lock, used) = sidecars("release");
-        let guard = acquire_shared(&lock, &used, IdleFrom::Release).unwrap();
+        let guard = acquire_shared(&lock, &used).unwrap();
         let at_acquire = std::fs::metadata(&used).unwrap().modified().unwrap();
         std::thread::sleep(Duration::from_millis(20));
         drop(guard);
         assert!(std::fs::metadata(&used).unwrap().modified().unwrap() > at_acquire);
         let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        let (dir, lock, used) = sidecars("acquire");
-        let guard = acquire_shared(&lock, &used, IdleFrom::Acquire).unwrap();
-        let at_acquire = std::fs::metadata(&used).unwrap().modified().unwrap();
-        std::thread::sleep(Duration::from_millis(20));
-        drop(guard);
-        assert_eq!(
-            std::fs::metadata(&used).unwrap().modified().unwrap(),
-            at_acquire
+    #[test]
+    fn a_reference_is_only_ever_held_on_the_file_the_path_names() {
+        // What the retry in `acquire_shared` turns on. A reclaim unlinks the sidecar while
+        // holding it exclusively, so a lock taken from behind that reclaim can come back on an
+        // inode the path no longer names — worthless, because the next sweep sees the *new*
+        // sidecar unheld. Reproducing that interleaving needs the unlink to land while a caller
+        // is blocked in `flock`, which no test can force, so the predicate is what is pinned.
+        let (dir, lock, used) = sidecars("identity");
+        let stale = open_lock(&lock).unwrap();
+        assert!(same_file(&stale, &lock).unwrap());
+        std::fs::remove_file(&lock).unwrap();
+        assert!(
+            !same_file(&stale, &lock).unwrap(),
+            "an unlinked sidecar names nothing"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = open_lock(&lock).unwrap();
+        assert!(
+            !same_file(&stale, &lock).unwrap(),
+            "a recreated sidecar is a different file"
+        );
+        // And a reference taken across all that holds the file that is actually there.
+        let guard = acquire_shared(&lock, &used).unwrap();
+        let named = std::fs::metadata(&lock).unwrap();
+        let held = guard._file.metadata().unwrap();
+        assert_eq!((held.dev(), held.ino()), (named.dev(), named.ino()));
+        drop((stale, guard));
+
+        // The entry gone for good surfaces as a not-found, which callers read as "rebuild".
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(is_not_found(&acquire_shared(&lock, &used).unwrap_err()));
     }
 
     #[test]
@@ -238,7 +294,7 @@ mod tests {
         // precise `now`. That must mean "zero elapsed", not "keep forever": a non-zero idle
         // window keeps the entry, a zero window still reclaims it.
         let (dir, lock, used) = sidecars("skew");
-        drop(acquire_shared(&lock, &used, IdleFrom::Acquire).unwrap());
+        drop(acquire_shared(&lock, &used).unwrap());
         let earlier = SystemTime::now() - Duration::from_secs(60);
         assert!(!try_reclaim(
             &lock,

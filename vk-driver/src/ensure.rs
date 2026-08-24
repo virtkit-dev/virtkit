@@ -150,13 +150,54 @@ pub fn build_tier_dir(state_dir: &Path, stage_key: &str) -> PathBuf {
     state_dir.join("build").join(fingerprint(&[stage_key]))
 }
 
+/// A held reference on `dir` iff it is already fresh, `None` when it must be (re)built.
+///
+/// Check, acquire, re-check. The idle GC only backs off a base once something holds its
+/// `.inuse`, so the reference has to be taken before the answer is trusted — a peek that
+/// found the dir fresh says nothing about the moment the caller actually uses it. The
+/// re-check is what separates a reference worth having from one taken on a dir the GC
+/// removed, or a concurrent builder replaced, while this was blocked on the lock.
+fn reference_if_fresh(
+    state_dir: &Path,
+    dir: &Path,
+    expected: &str,
+) -> Result<Option<crate::cachelock::Guard>> {
+    let out = dir.join("runner.ext4");
+    if !unit_fresh(&out, expected) {
+        return Ok(None);
+    }
+    let guard = match crate::image::acquire_use_lock_for(state_dir, &out) {
+        Ok(Some(guard)) => guard,
+        // Unreachable: a build-tier dir is always `<state_dir>/build/…`, a managed tier. Were
+        // it not, the re-check below would answer `None` too, so every call would rebuild.
+        Ok(None) => return Ok(None),
+        // The GC removed the dir between the peek and the open, so there is nothing left to
+        // put a sidecar in: that is "not fresh", not a failure.
+        Err(e) if crate::cachelock::is_not_found(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if unit_fresh(&out, expected) {
+        Ok(Some(guard))
+    } else {
+        // The GC won the race between our first check and taking the lock (or a concurrent
+        // builder is mid-promotion): the guard is worthless, fall back to rebuilding.
+        Ok(None)
+    }
+}
+
 /// Ensure a `build:` stage is materialized in the shared build tier, returning its cache dir
-/// (holding `runner.ext4` + its config sidecar). On a fingerprint miss it builds under a
-/// pull lock into a tmp sibling, stamps the UUID, and promotes atomically — so a killed
-/// build never leaves a half-image a freshness check would trust, and concurrent identical
-/// builds serialize (the loser then finds it fresh). Marks the base used and runs idle GC on
-/// the tier. `label` names the stage (its compose service / git-defined image name) in the
-/// concurrent-build wait message. `sink` streams build progress when set.
+/// (holding `runner.ext4` + its config sidecar) together with a held reference on it. On a
+/// fingerprint miss it builds under a pull lock into a tmp sibling, stamps the UUID, and
+/// promotes atomically — so a killed build never leaves a half-image a freshness check would
+/// trust, and concurrent identical builds serialize (the loser then finds it fresh). Runs idle
+/// GC on the tier. `label` names the stage (its compose service / git-defined image name) in
+/// the concurrent-build wait message. `sink` streams build progress when set.
+///
+/// The caller MUST hold the returned guard for as long as it depends on the dir — the idle GC
+/// removes a build-tier entry the instant nobody holds its `.inuse`, regardless of how recently
+/// `unit_fresh` last found it good. This very function sweeps the tier after every build, so a
+/// caller that resolves one stage and builds the next has already given the sweep that can
+/// evict the first a chance to run.
 pub fn ensure_build_tier(
     state_dir: &Path,
     idle: Duration,
@@ -165,20 +206,18 @@ pub fn ensure_build_tier(
     stage_key: &str,
     label: &str,
     sink: Option<crate::build::ProgressSink>,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, crate::cachelock::Guard)> {
     let dir = build_tier_dir(state_dir, stage_key);
     let expected = fingerprint(&[stage_key]);
-    if unit_fresh(&dir.join("runner.ext4"), &expected) {
-        crate::image::mark_used(&dir);
-        return Ok(dir);
+    if let Some(guard) = reference_if_fresh(state_dir, &dir, &expected)? {
+        return Ok((dir, guard));
     }
     // `label` (the service / git-defined image name) names the stage in the concurrent-build
     // wait message; the fingerprint is the cache identity.
     let _lock = crate::image::acquire_pull_lock(&dir, "build", label, &expected)?;
     // Re-check under the lock: a concurrent build of the same stage may have just promoted it.
-    if unit_fresh(&dir.join("runner.ext4"), &expected) {
-        crate::image::mark_used(&dir);
-        return Ok(dir);
+    if let Some(guard) = reference_if_fresh(state_dir, &dir, &expected)? {
+        return Ok((dir, guard));
     }
     // Reclaim scratch orphaned by earlier failed/killed builds of *other* stages before
     // asking for more space ourselves — otherwise a tier stuck failing (e.g. ENOSPC) never
@@ -193,14 +232,22 @@ pub fn ensure_build_tier(
     // ensure_unit_build writes the ext4 + config sidecar and stamps the UUID at the out path.
     ensure_unit_build(recipe, target, stage_key, &tmp.join("runner.ext4"), sink)?;
     cleanup.keep(); // built successfully: the rename below takes ownership of `tmp`.
+    // The one removal that ignores references — but by construction nobody holds one: a
+    // holder found the entry fresh, and so would the two `reference_if_fresh` checks above,
+    // which would have returned long before here.
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::rename(&tmp, &dir)
         .with_context(|| format!("promoting {} to {}", tmp.display(), dir.display()))?;
-    crate::image::mark_used(&dir);
+    // Take the reference right away, still under the pull lock (still `_lock`-held) and with
+    // no `.used` marker yet on the freshly promoted dir — so there is no instant, before this
+    // returns, in which the idle GC could see the promoted dir as a reclaimable, unreferenced
+    // entry.
+    let guard = crate::image::acquire_use_lock_for(state_dir, &dir.join("runner.ext4"))?
+        .context("internal invariant: the build tier is one of the managed cache tiers")?;
     let build_root = state_dir.join("build");
     crate::image::gc_idle(&build_root, idle);
     crate::image::sweep_orphaned_build_tmp(&build_root);
-    Ok(dir)
+    Ok((dir, guard))
 }
 
 #[cfg(test)]
@@ -298,6 +345,118 @@ mod tests {
             !tmp.exists(),
             "a failed build must not leave its .tmp scratch behind"
         );
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    // Regression test: `ensure_build_tier`'s fast (already-fresh) path used to return a bare
+    // path with only a point-in-time `.used` stamp — no reference the idle GC had to respect —
+    // so a `vk gc` racing a caller that resolved the dir and kept it around a while (rather
+    // than booting it immediately) could remove the dir out from under that later use.
+    #[test]
+    fn ensure_build_tier_fast_path_holds_a_guard_the_idle_gc_must_respect() {
+        let state_dir =
+            std::env::temp_dir().join(format!("vk-ensure-tier-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let key = "already-fresh";
+        let dir = build_tier_dir(&state_dir, key);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("runner.ext4");
+        let tree = state_dir.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        crate::ext4::build_from_dir(&tree, &out).unwrap();
+        let expected = fingerprint(&[key]);
+        crate::ext4::set_uuid(&out, &parse_uuid(&expected).unwrap()).unwrap();
+        std::fs::write(crate::build::config_sidecar(&out), "{}").unwrap();
+
+        // A recipe whose Dockerfile does not exist: any attempt to actually build errors, so
+        // returning `Ok` here is only possible via the already-fresh fast path.
+        let recipe = BuildRecipe {
+            dockerfiles: vec![state_dir.join("no-such-Dockerfile")],
+            contexts: vec![],
+            build_contexts: Vec::new(),
+            build_args: vec![],
+            kernel: None,
+            cloud_hypervisor: None,
+            agent: None,
+            cache_registry: Some("none".into()),
+            cache_insecure: false,
+            cache_auth: Default::default(),
+            net: crate::build::BuildNet::All,
+            audit: false,
+        };
+        let (got_dir, guard) = ensure_build_tier(
+            &state_dir,
+            Duration::from_secs(3600),
+            &recipe,
+            Some("svc"),
+            key,
+            "svc",
+            None,
+        )
+        .unwrap();
+        assert_eq!(got_dir, dir);
+
+        let build_root = state_dir.join("build");
+        // A zero idle window would otherwise reclaim any base nothing holds a reference on.
+        crate::image::gc_idle(&build_root, Duration::ZERO);
+        assert!(
+            dir.exists(),
+            "a base the caller holds a guard on must never be evicted"
+        );
+
+        drop(guard);
+        assert!(
+            crate::cachelock::reclaimed_eventually(|| {
+                crate::image::gc_idle(&build_root, Duration::ZERO);
+                !dir.exists()
+            }),
+            "the base must become reclaimable once the guard is released"
+        );
+
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    // `reference_if_fresh`'s three deterministic answers. The fourth — acquired, then the
+    // re-check fails because the GC or a concurrent promotion landed in between — needs two
+    // processes racing on the same entry and is covered by the guard test above instead.
+    #[test]
+    fn reference_if_fresh_answers_none_for_a_missing_or_stale_dir() {
+        let state_dir = std::env::temp_dir().join(format!("vk-ensure-ref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let key = "reference-if-fresh";
+        let expected = fingerprint(&[key]);
+        let dir = build_tier_dir(&state_dir, key);
+
+        // Nothing on disk at all: not fresh, and no error for the absent sidecar.
+        assert!(
+            reference_if_fresh(&state_dir, &dir, &expected)
+                .unwrap()
+                .is_none()
+        );
+
+        // Present but stamped with another stage's fingerprint: still not fresh.
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("runner.ext4");
+        let tree = state_dir.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        crate::ext4::build_from_dir(&tree, &out).unwrap();
+        crate::ext4::set_uuid(&out, &parse_uuid(&fingerprint(&["other"])).unwrap()).unwrap();
+        std::fs::write(crate::build::config_sidecar(&out), "{}").unwrap();
+        assert!(
+            reference_if_fresh(&state_dir, &dir, &expected)
+                .unwrap()
+                .is_none()
+        );
+
+        // Right fingerprint: a reference the idle GC has to respect.
+        crate::ext4::set_uuid(&out, &parse_uuid(&expected).unwrap()).unwrap();
+        let guard = reference_if_fresh(&state_dir, &dir, &expected)
+            .unwrap()
+            .expect("a fresh dir hands back a reference");
+        crate::image::gc_idle(&state_dir.join("build"), Duration::ZERO);
+        assert!(dir.exists(), "a referenced base must not be evicted");
+        drop(guard);
+
         let _ = std::fs::remove_dir_all(&state_dir);
     }
 

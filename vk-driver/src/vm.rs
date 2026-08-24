@@ -21,6 +21,13 @@ struct Media {
     rootfs: PathBuf,
     initrd: Option<PathBuf>,
     config: Option<vk_core::runcfg::RunConfig>,
+    /// A held reference on `rootfs`, for a base freshly resolved from the shared build tier
+    /// (a `dockerfile:`/compose `build:` unit) — `None` for anything resolved through
+    /// `image::resolve_ref`, which takes no reference of its own. Whoever ends up with this
+    /// `Media` must hold this guard (fold it into whatever it already keeps `media.rootfs`'s
+    /// own reference in) for as long as it keeps referring to `rootfs`, and take one itself
+    /// when this is `None` — nothing else protects a resolved base from the idle GC.
+    use_guard: Option<crate::cachelock::Guard>,
 }
 
 impl Media {
@@ -280,7 +287,23 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // Resolve (and, for a `dockerfile:` image, build) the boot media in the runner-visible process;
     // the supervisor re-resolves from the same env (a fingerprint hit for a build). A `None`
     // kernel boots vk's embedded copy — nothing to stat.
-    let plan = resolve_media(ctx)?;
+    let mut plan = resolve_media(ctx)?;
+    // Every base this phase resolves or builds, held until prepare returns — same rationale as
+    // `_checkout_use` above: nothing else protects a resolved base from the idle GC, and this
+    // (possibly long, sequential) phase warms every service image before the supervisor, in
+    // another process, takes its own references. A `vk gc` landing in between would otherwise
+    // evict one this phase, or the supervisor moments later, still means to use. The primary
+    // contributes the guard its build already took, or a fresh one when it came from
+    // `image::resolve_ref`.
+    let mut warm_guards: Vec<crate::cachelock::Guard> = match plan.media.use_guard.take() {
+        Some(g) => vec![g],
+        None => crate::image::acquire_use_lock_for(cfg.state_dir(), &plan.media.rootfs)?
+            .into_iter()
+            .collect(),
+    };
+    // Referenced first, then checked, so nothing can be evicted between the two. A base
+    // already gone before this runs now reports itself from the acquisition rather than from
+    // the check below, which is the cost of closing that window.
     for p in plan.media.files().into_iter().chain(plan.kernel.as_deref()) {
         if !p.is_file() {
             bail!("image file missing: {}", p.display());
@@ -297,7 +320,9 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         for unit in compose_service_units(&load_compose_fleet(ctx, spec)?)? {
             validate_service_egress(cfg, &unit)?;
             if matches!(unit.source, crate::compose::Source::Build { .. }) {
-                build_compose_unit(ctx, &unit).with_context(|| format!("service {}", unit.name))?;
+                let (_, _, guard) = build_compose_unit(ctx, &unit)
+                    .with_context(|| format!("service {}", unit.name))?;
+                warm_guards.push(guard);
             }
             service_names.push(unit.name);
         }
@@ -307,7 +332,9 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             if let crate::compose::Source::Image(image) = &unit.source
                 && let Some(spec) = image.strip_prefix("dockerfile:")
             {
-                build_git_image(ctx, spec).with_context(|| format!("service {}", unit.name))?;
+                let (_, _, guard) =
+                    build_git_image(ctx, spec).with_context(|| format!("service {}", unit.name))?;
+                warm_guards.push(guard);
             }
             service_names.push(unit.name);
         }
@@ -371,6 +398,10 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
                 // they boot concurrently in the supervisor and the job script runs the moment
                 // this stage exits.
                 wait_for_services(ctx, &service_names).await?;
+                // The supervisor holds its own references now: this phase is done depending
+                // on the bases it warmed. Explicit so a later edit cannot shorten the hold
+                // without noticing.
+                drop(warm_guards);
                 return Ok(());
             }
             Err(e) => {
@@ -462,6 +493,7 @@ fn resolve_media(ctx: &JobCtx) -> Result<BootPlan> {
                 rootfs,
                 initrd,
                 config,
+                use_guard: None,
             },
             generic,
             // A plain image ref carries no compose marker; only `[vm] nested` can grant it.
@@ -475,13 +507,14 @@ fn resolve_media(ctx: &JobCtx) -> Result<BootPlan> {
 /// build it and return it as generic-disk boot media (embedded kernel, agent + config riding
 /// the preinit initramfs — the byte-clean model `vk build`/bundles use).
 fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<BootPlan> {
-    let (rootfs, config) = build_git_image(ctx, spec)?;
+    let (rootfs, config, guard) = build_git_image(ctx, spec)?;
     Ok(BootPlan {
         kernel: None,
         media: Media {
             rootfs,
             initrd: None,
             config,
+            use_guard: Some(guard),
         },
         generic: true,
         nested: false,
@@ -490,7 +523,8 @@ fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<BootPlan> {
 
 /// Build a git-defined image
 /// `<path>[?context=<dir>&buildcontext=<N>=<dir>&arg=<N>=<V>][#<stage>]` from the host-side
-/// checkout into the shared build tier and return its rootfs + captured runtime config. Shared
+/// checkout into the shared build tier and return its rootfs, captured runtime config, and a
+/// held reference on the entry (see [`crate::ensure::ensure_build_tier`]). Shared
 /// by the job's primary (`resolve_dockerfile_form`) and its git-defined services
 /// (`plan_services`). Requires `[gitlab] host_checkout`: the Dockerfile + context are the
 /// checked-out sources. The context defaults to the Dockerfile's directory; `?context=<dir>`
@@ -500,7 +534,11 @@ fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<BootPlan> {
 fn build_git_image(
     ctx: &JobCtx,
     spec: &str,
-) -> Result<(PathBuf, Option<vk_core::runcfg::RunConfig>)> {
+) -> Result<(
+    PathBuf,
+    Option<vk_core::runcfg::RunConfig>,
+    crate::cachelock::Guard,
+)> {
     let cfg = &ctx.cfg;
     if !cfg.gitlab.as_ref().is_some_and(|g| g.host_checkout) {
         bail!(
@@ -563,7 +601,7 @@ fn build_git_image(
         net,
         audit,
     };
-    let dir = crate::ensure::ensure_build_tier(
+    let (dir, guard) = crate::ensure::ensure_build_tier(
         cfg.state_dir(),
         cfg.image_cache_idle(),
         &recipe,
@@ -578,7 +616,7 @@ fn build_git_image(
     let config = std::fs::read_to_string(crate::build::config_sidecar(&rootfs))
         .ok()
         .and_then(|s| vk_core::runcfg::RunConfig::from_json(&s).ok());
-    Ok((rootfs, config))
+    Ok((rootfs, config, guard))
 }
 
 /// Resolve a job-controlled repo-relative path — the Dockerfile, a `context=`, a
@@ -856,13 +894,14 @@ fn compose_service_units(fleet: &ComposeFleet) -> Result<Vec<crate::compose::Uni
 fn compose_unit_media(ctx: &JobCtx, unit: &crate::compose::Unit) -> Result<BootPlan> {
     match &unit.source {
         crate::compose::Source::Build { .. } => {
-            let (rootfs, config) = build_compose_unit(ctx, unit)?;
+            let (rootfs, config, guard) = build_compose_unit(ctx, unit)?;
             Ok(BootPlan {
                 kernel: None,
                 media: Media {
                     rootfs,
                     initrd: None,
                     config: Some(config),
+                    use_guard: Some(guard),
                 },
                 generic: true,
                 nested: unit.nested,
@@ -886,6 +925,7 @@ fn compose_unit_media(ctx: &JobCtx, unit: &crate::compose::Unit) -> Result<BootP
                     rootfs,
                     initrd,
                     config,
+                    use_guard: None,
                 },
                 generic,
                 nested: unit.nested,
@@ -895,12 +935,13 @@ fn compose_unit_media(ctx: &JobCtx, unit: &crate::compose::Unit) -> Result<BootP
 }
 
 /// Build a compose `build:` unit into the shared build tier (from the host checkout) and return
-/// its rootfs + merged runtime config. The build wiring comes from `[build]` (embedded kernel/
+/// its rootfs, merged runtime config, and a held reference on the entry (see
+/// [`crate::ensure::ensure_build_tier`]). The build wiring comes from `[build]` (embedded kernel/
 /// agent by default); `--build-arg`s are the unit's own (from the compose file / its `.env`).
 fn build_compose_unit(
     ctx: &JobCtx,
     unit: &crate::compose::Unit,
-) -> Result<(PathBuf, vk_core::runcfg::RunConfig)> {
+) -> Result<(PathBuf, vk_core::runcfg::RunConfig, crate::cachelock::Guard)> {
     let cfg = &ctx.cfg;
     // Held across the build: an embedded asset lives in a memfd whose /proc/self/fd path is
     // valid only while the handle is open, and the build is synchronous.
@@ -972,7 +1013,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     };
     let BootPlan {
         kernel: kernel_opt,
-        media,
+        mut media,
         generic,
         nested: primary_nested,
     } = resolve_media(ctx)?;
@@ -996,7 +1037,12 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // job's whole life, so what this job booted keeps counting against the host budget until
     // the VM is gone. `None` when admission is off.
     let _reservation = crate::admit::hold(&ctx.admit_dir(), &ctx.job_id);
-    if let Some(g) = crate::image::acquire_use_lock_for(cfg.state_dir(), &media.rootfs)? {
+    // A build-tier base already carries its own reference straight from the build that
+    // promoted it (see `Media::use_guard`) — no gap to close here. Anything resolved through
+    // `image::resolve_ref` instead takes its reference fresh, now.
+    if let Some(g) = media.use_guard.take() {
+        use_guards.push(g);
+    } else if let Some(g) = crate::image::acquire_use_lock_for(cfg.state_dir(), &media.rootfs)? {
         use_guards.push(g);
     }
     // Every guest gets a throwaway CoW overlay over the ro base rootfs.
@@ -1251,13 +1297,10 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             // before the guest dials it; then point the agent at it. The same
             // shared LAN/egress core `run --compose` uses.
             let (gateway, prefix, guest_ip) = crate::net::switch_addrs(&cfg.net.subnet)?;
-            let services = plan_services(ctx, gateway, prefix)?;
-            // Reference each service's shared base for the job's life, like the primary above.
-            for svc in &services {
-                if let Some(g) = crate::image::acquire_use_lock_for(cfg.state_dir(), &svc.ext4)? {
-                    use_guards.push(g);
-                }
-            }
+            // Every service's guard lands directly in `use_guards` inside `plan_services`: a
+            // git-defined/`build:` service's the moment its build promotes it, an `image:`
+            // service's fresh off `image::resolve_ref` — no gap either way.
+            let services = plan_services(ctx, gateway, prefix, &mut use_guards)?;
             // the switch binds each service's vsock socket at startup: the
             // runtime dirs must exist before it spawns.
             for svc in &services {
@@ -1540,6 +1583,7 @@ fn plan_services(
     ctx: &JobCtx,
     gateway: Ipv4Addr,
     prefix: u8,
+    guards: &mut Vec<crate::cachelock::Guard>,
 ) -> Result<Vec<crate::units::Provisioned>> {
     let image_ref = ctx.image_ref.as_deref().unwrap_or("local/default");
     let units = match image_ref.strip_prefix("compose:") {
@@ -1552,8 +1596,9 @@ fn plan_services(
         clamp_service_size(&ctx.cfg, &mut unit)?;
         let prov = match service_media(&unit.source) {
             ServiceMedia::Git(spec) => {
-                let (ext4, config) =
+                let (ext4, config, guard) =
                     build_git_image(ctx, spec).with_context(|| format!("service {}", unit.name))?;
+                guards.push(guard);
                 let merged = crate::compose::merged_config(&config.unwrap_or_default(), &unit);
                 crate::units::provisioned(&unit, ext4, merged, gateway, prefix, slot as u32)?
             }
@@ -1566,19 +1611,28 @@ fn plan_services(
             // The build also reports the image's own config, already merged with the unit's
             // compose overrides, which an address cannot carry — hence no `merged_config` here.
             ServiceMedia::Build => {
-                let (ext4, config) = build_compose_unit(ctx, &unit)
+                let (ext4, config, guard) = build_compose_unit(ctx, &unit)
                     .with_context(|| format!("service {}", unit.name))?;
+                guards.push(guard);
                 crate::units::provisioned(&unit, ext4, config, gateway, prefix, slot as u32)?
             }
-            ServiceMedia::Image => crate::units::provision(
-                &ctx.cfg,
-                ctx.cfg.state_dir(),
-                &[],
-                &unit,
-                gateway,
-                prefix,
-                slot as u32,
-            )?,
+            ServiceMedia::Image => {
+                let prov = crate::units::provision(
+                    &ctx.cfg,
+                    ctx.cfg.state_dir(),
+                    &[],
+                    &unit,
+                    gateway,
+                    prefix,
+                    slot as u32,
+                )?;
+                if let Some(g) =
+                    crate::image::acquire_use_lock_for(ctx.cfg.state_dir(), &prov.ext4)?
+                {
+                    guards.push(g);
+                }
+                prov
+            }
         };
         out.push(prov);
     }

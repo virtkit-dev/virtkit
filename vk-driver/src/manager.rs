@@ -204,7 +204,7 @@ impl Manager {
         // releasing that lock for the build is that `list`/`status` never wait on file I/O.
         // Recording the address before the boot adopts it is safe either way: the entry this
         // build settled on is the one a boot of this unit uses from here on.
-        if let (Some((ext4, _)), Some(run)) = (&built_image, &self.dirs.run) {
+        if let (Some((ext4, _, _)), Some(run)) = (&built_image, &self.dirs.run) {
             crate::vms::note_service_image(run, name, ext4);
         }
 
@@ -214,21 +214,30 @@ impl Manager {
             return Reply::err(format!("no such unit {name:?}"));
         };
         if state_of(st) == "running" {
+            // A concurrent start won: dropping `built_image` here releases the reference this
+            // one took, which is right — the winner holds its own on the same entry.
             return Reply::ok(format!("{name} already running ({})", st.svc.ip));
         }
-        // Boot the entry the build reports, with the config it carries: both are known only
-        // after the build, and the address provisioning predicted can key elsewhere (see
-        // `ensure_unit_build_sync`).
-        if let Some((ext4, config)) = built_image {
+        // Reference the shared-cache base for the unit's running lifetime, so the idle GC
+        // never evicts a base under this live overlay. A `build:` unit carries its guard
+        // straight from the build that just promoted its entry (see `ensure_unit_build_sync`)
+        // — there is no gap, between that promotion and here, in which the entry sat
+        // unreferenced. An `image:` unit (never built here) takes its reference fresh; `None`
+        // for a rootfs outside the managed tiers (nothing to reference-count there). That
+        // acquisition blocks behind a reclaim of the same entry, which is the one way this
+        // path can hold the units lock across file I/O — bounded by that sweep's `remove`.
+        let guard = if let Some((ext4, config, guard)) = built_image {
+            // Boot the entry the build reports, with the config it carries: both are known
+            // only after the build, and the address provisioning predicted can key elsewhere
+            // (see `ensure_unit_build_sync`).
             st.svc.ext4 = ext4;
             st.svc.config = config;
-        }
-        // Reference the shared-cache base for the unit's running lifetime, so the idle GC
-        // never evicts a base under this live overlay. `None` for a rootfs outside the
-        // managed tiers (nothing to reference-count there).
-        let guard = match crate::image::acquire_use_lock_for(&self.dirs.cache, &st.svc.ext4) {
-            Ok(guard) => guard,
-            Err(e) => return Reply::err(format!("referencing {name} image: {e:#}")),
+            Some(guard)
+        } else {
+            match crate::image::acquire_use_lock_for(&self.dirs.cache, &st.svc.ext4) {
+                Ok(guard) => guard,
+                Err(e) => return Reply::err(format!("referencing {name} image: {e:#}")),
+            }
         };
         match crate::units::boot_unit(
             &st.svc,

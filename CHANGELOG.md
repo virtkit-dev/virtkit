@@ -10,6 +10,11 @@ All notable changes to virtkit will be documented in this file.
   running alive inside the guest, still holding the connection open. A step
   now always closes off the guest's input on its way out, however it ends.
 
+- A cached build stage could be removed by `vk gc` while a job that had
+  already resolved it — a later service build, or a service already running
+  from it — was still using it, failing the job. It now stays in place for as
+  long as the job is using it.
+
 ## [0.41.0] - 2026-08-22
 
 ### Added
