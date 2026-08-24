@@ -458,6 +458,27 @@ pub fn guest_shell(ctx: &JobCtx) -> Vec<String> {
     }
 }
 
+/// A [`tokio::spawn`]ed task aborted when its handle goes out of scope.
+///
+/// [`exec_script`]'s stdin feeder owns the connection's write half, so an early `?`
+/// that merely dropped the handle would leave the task pumping into a socket nobody
+/// closes: the guest never sees stdin EOF, the remote process keeps running, and the
+/// fd plus the whole script buffer leak. Aborting on drop makes every exit path —
+/// including the error ones — tear it down.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> AbortOnDrop<T> {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Run `script` (piped to `command`, e.g. bash) as `user` and relay its output,
 /// returning the command result. Shared by the gitlab-runner stages (run_stage)
 /// and the in-prepare services bring-up (which runs as root).
@@ -501,7 +522,7 @@ pub async fn exec_script(
     // The guest interleaves stdin consumption with output: pump the script in
     // concurrently with the output loop, or a chatty script would deadlock both
     // sides on full buffers.
-    let feed_stdin = tokio::spawn(async move {
+    let feed_stdin = AbortOnDrop(tokio::spawn(async move {
         for chunk in script.chunks(STDIN_CHUNK) {
             sink.send(Message::Data {
                 fd: Fd::Stdin,
@@ -515,7 +536,7 @@ pub async fn exec_script(
         })
         .await?;
         Ok::<_, std::io::Error>(())
-    });
+    }));
 
     let result = loop {
         let msg = match cancel {
@@ -524,7 +545,6 @@ pub async fn exec_script(
             Some(c) => tokio::select! {
                 biased;
                 () = c.cancelled() => {
-                    feed_stdin.abort();
                     bail!("guest command aborted: build stopped after an earlier stage failed");
                 }
                 m = next(&mut stream) => m?,
@@ -547,7 +567,6 @@ pub async fn exec_script(
             other => bail!("unexpected message: {other:?}"),
         }
     };
-    feed_stdin.abort();
     Ok(result)
 }
 

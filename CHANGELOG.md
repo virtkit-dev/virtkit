@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- A CI job step that failed part-way through could leave the command it was
+  running alive inside the guest, still holding the connection open. A step
+  now always closes off the guest's input on its way out, however it ends.
+
 ## [0.41.0] - 2026-08-22
 
 ### Added
