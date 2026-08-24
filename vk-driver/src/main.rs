@@ -22,6 +22,7 @@ mod atop_attach;
 mod atop_report;
 mod atop_view;
 mod atoplog;
+mod blockrt;
 mod build;
 mod cachelock;
 mod check;

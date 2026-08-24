@@ -35,6 +35,7 @@ use oci_client::secrets::RegistryAuth;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::blockrt::block_on;
 use crate::config::{Config, Registry};
 use crate::image::{self, Reference, ResolvedImage};
 // The content-addressed store lives in the standalone vk-registry crate; the client
@@ -1009,29 +1010,6 @@ fn staging_tmp(bundle: &Path) -> PathBuf {
     let mut name = bundle.as_os_str().to_os_string();
     name.push(".tmp");
     PathBuf::from(name)
-}
-
-/// Drive a registry future to completion from a sync entry point. The executor's
-/// prepare/run path (and `main`) already run inside a tokio runtime, so this runs
-/// the future on a dedicated OS thread with its own runtime — a nested
-/// `Runtime::block_on` on the calling thread would panic. A multi-thread runtime
-/// (+ its blocking pool) lets the push fan out chunk compression and uploads.
-pub(crate) fn block_on<F>(fut: F) -> F::Output
-where
-    F: std::future::Future + Send,
-    F::Output: Send,
-{
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("building the registry tokio runtime")
-                .block_on(fut)
-        })
-        .join()
-        .expect("the registry runtime thread panicked")
-    })
 }
 
 /// Build an oci-client `Client` + `RegistryAuth` from a `[registry]` section, the same

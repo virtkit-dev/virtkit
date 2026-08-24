@@ -28,6 +28,7 @@ use anyhow::{Context, Result, bail};
 use tokio_util::sync::CancellationToken;
 
 use super::parser::{Cmdline, Copy, Mount};
+use crate::blockrt::block_on;
 use crate::timing::Timings;
 
 /// An opaque handle to a stage's working filesystem (a host dir, an overlay, a VM
@@ -2646,28 +2647,6 @@ impl Executor for MicroVm {
 /// Single-quote a value for a `/bin/sh` script (wrap in `'…'`, escaping embedded `'`).
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// Drive an async future to completion from a sync context, even when already inside a
-/// tokio runtime (the CLI's async main): run it on a dedicated thread with its own
-/// runtime — a nested `block_on` on the calling thread would panic. Mirrors
-/// `registry::block_on`.
-fn block_on<F>(fut: F) -> F::Output
-where
-    F: std::future::Future + Send,
-    F::Output: Send,
-{
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("building the build tokio runtime")
-                .block_on(fut)
-        })
-        .join()
-        .expect("the build runtime thread panicked")
-    })
 }
 
 /// Host backend for the no-`RUN` subset (`FROM scratch` + `COPY`): each stage is a

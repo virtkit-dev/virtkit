@@ -20,6 +20,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
+use crate::blockrt::block_on;
 use crate::config::{Config, Docker};
 use crate::image::{self, BootKind, Reference, ResolvedImage};
 
@@ -142,7 +143,7 @@ fn resolve_full(
     full: &str,
     creds: &Creds,
 ) -> Result<ResolvedImage> {
-    let digest = crate::registry::block_on(crate::oci::resolve_digest_auth(
+    let digest = block_on(crate::oci::resolve_digest_auth(
         full,
         creds.username.as_deref(),
         creds.password.as_deref(),
@@ -210,7 +211,7 @@ fn build(
     // Config into the runner.ext4.json sidecar — the shared OCI-flatten core. A journalled
     // fs and no freshness UUID: the digest-keyed cache dir is this image's identity.
     let rootfs = tmp.join("runner.ext4");
-    crate::registry::block_on(crate::source::oci_flatten(
+    block_on(crate::source::oci_flatten(
         full,
         username.as_deref(),
         password.as_deref(),

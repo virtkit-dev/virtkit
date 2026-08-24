@@ -1,8 +1,8 @@
 //! Client for the vk-registry build-once lock — the counterpart to the server in
 //! [`crate::lock`], used by runners to coordinate "who builds this content-key". POSTs to
 //! the `/lock/{acquire,renew,release}` actions (names as `?name=` params); a single lock
-//! is just a one-name batch. Async; callers on a sync path drive it through their own
-//! runtime (vk-driver's `registry::block_on`), with a heartbeat renewing the lease.
+//! is just a one-name batch. Async; callers on a sync path drive it through vk-driver's
+//! shared `blockrt::block_on`, with a heartbeat renewing the lease.
 
 use std::time::Duration;
 
