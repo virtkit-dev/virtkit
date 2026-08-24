@@ -673,11 +673,14 @@ impl Block {
     /// - `b'D'` (DRAIN) flushes the disk image to its backing file and replies with the clusters
     ///   mutated since the previous drain as two back-to-back blocks — written clusters, then
     ///   discarded ones — each encoded as `u32 count` then `count × (u64 offset, u64 len)`
-    ///   little-endian. The caller freezes the guest fs first, so the flush + take is a
-    ///   consistent point-in-time delta.
+    ///   little-endian. The caller freezes the guest fs first — that is what makes the delta a
+    ///   consistent point-in-time one; the image's write lock taken here backstops it, keeping
+    ///   a guest write from landing between the flush and the take.
     /// - `b'F'` (FLUSH) makes the write-back cache durable on the host image (flush + sync)
     ///   without draining, and replies one byte (0 ok / 1 error). The caller flushes before it
-    ///   kills the VMM, so a later host read sees a complete image without a graceful power-off.
+    ///   kills the VMM, so a later host read sees a complete image without a graceful power-off
+    ///   — and this takes the write lock too, so the kill cannot land on a write left in flight
+    ///   beside the flush.
     ///
     /// Errors are logged and the listener keeps serving; a dead socket just means no checkpoints
     /// (the build falls back correctly on the virtkit side).
@@ -712,11 +715,16 @@ impl Block {
                         continue;
                     }
                     match cmd[0] {
-                        // DRAIN: persist all writes to the backing file, then take the delta. The
-                        // guest is frozen by the caller, so nothing races these two steps.
+                        // DRAIN: persist all writes to the backing file, then take the delta,
+                        // both under the image's write lock. The caller freezes the guest, and
+                        // the lock backstops that here: a write landing in imago's cache after
+                        // the flush but recorded before the take would be reported as a delta
+                        // the image on disk does not hold. Only a backstop — `record_write`
+                        // runs after the image lock is released, so the freeze is still what
+                        // makes the delta complete.
                         b'D' => {
                             let (written, discarded) = {
-                                let df = disk_image.read().unwrap();
+                                let df = disk_image.write().unwrap();
                                 let size = df.size();
                                 if let Err(e) = flush_sync(&df) {
                                     error!("virtio-blk: dirty-control flush failed: {e}");
@@ -736,13 +744,18 @@ impl Block {
                         // later host read sees a complete image (replaces a graceful power-off).
                         // Reply one byte: 0 ok, 1 error.
                         b'F' => {
-                            let reply = match flush_sync(&disk_image.read().unwrap()) {
+                            // Write lock: a write in flight beside the flush is one the kill
+                            // that follows would lose. The caller has normally quiesced the
+                            // guest by then, so this waits on nothing.
+                            let df = disk_image.write().unwrap();
+                            let reply = match flush_sync(&df) {
                                 Ok(()) => 0u8,
                                 Err(e) => {
                                     error!("virtio-blk: dirty-control flush failed: {e}");
                                     1u8
                                 }
                             };
+                            drop(df);
                             let _ = conn.write_all(&[reply]);
                         }
                         _ => continue,
@@ -797,11 +810,15 @@ impl VmmExitObserver for Block {
     /// power-off can leave imago's cached metadata/data unwritten and truncate the image (an
     /// L2 entry left pointing past EOF, which a later native read then rejects). A no-op for
     /// `Unsafe` caching, where guest flushes are advisory.
+    ///
+    /// Takes the write lock, like the dirty-control FLUSH it mirrors: this is the last flush
+    /// before the process exits, so a write still in flight beside it is one nothing will write
+    /// again. A power-off means the guest has stopped issuing I/O, so it waits on nothing.
     fn on_vmm_exit(&mut self) {
         if self.cache_type != CacheType::Writeback {
             return;
         }
-        let disk = self.disk_image.read().unwrap();
+        let disk = self.disk_image.write().unwrap();
         if let Err(e) = flush_sync(&disk) {
             error!("block: failed to flush image on VMM exit: {e}");
         }
@@ -1562,10 +1579,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The other half of the same locking scheme: `discard` and both forms of write-zeroes take
-    /// the image's write lock (see `worker::IO_PARALLELISM`) precisely so they exclude a
-    /// concurrent `writev`/`readv` (read lock) to the same region, rather than just avoiding a
-    /// deadlock.
+    /// The other half of the same locking scheme: `discard`, both forms of write-zeroes, the
+    /// dirty-control DRAIN/FLUSH and the VMM-exit flush take the image's write lock (see
+    /// `worker::IO_PARALLELISM`) precisely so they exclude a concurrent `writev`/`readv` (read
+    /// lock) to the same region, rather than just avoiding a deadlock.
     /// Proves that exclusion directly and deterministically — no data race, no timing tolerance
     /// — by holding a write guard and checking `try_read()` is refused for as long as it's held,
     /// then immediately granted once it's dropped.
