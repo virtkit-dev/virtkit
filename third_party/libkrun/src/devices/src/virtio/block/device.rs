@@ -14,14 +14,14 @@ use std::os::fd::AsRawFd;
 use std::os::linux::fs::MetadataExt;
 #[cfg(target_os = "macos")]
 use std::os::macos::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::result;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 use imago::{
     file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk, DynStorage, FormatAccess,
-    FormatDriverBuilder, PermissiveImplicitOpenGate, Storage, StorageOpenOptions,
+    FormatDriverBuilder, Storage, StorageOpenOptions,
 };
 use log::{error, warn};
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
@@ -30,7 +30,7 @@ use virtio_bindings::{
 };
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
-use super::lazy_chunk_storage::LazyChunkStorage;
+use super::lazy_chunk_storage::{LazyAwareOpenGate, LazyChunkStorage};
 use super::worker::BlockWorker;
 use super::{
     super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice, TYPE_BLOCK},
@@ -479,6 +479,24 @@ struct VirtioBlkConfig {
 // Safe because it only has data and has no implicit padding.
 unsafe impl ByteValued for VirtioBlkConfig {}
 
+/// A qcow2 image and its backing chain, both opened over boxed dynamic storage.
+type BoxedQcow2 = Qcow2<Box<dyn DynStorage>, Arc<FormatAccess<Box<dyn DynStorage>>>>;
+
+/// Open `metadata` as a qcow2, resolving its backing chain through [`LazyAwareOpenGate`].
+///
+/// The gate is what makes a `.vk_ro_img` backing file (a lazy, chunk-decompressing view of a
+/// cached build-stage image, see `lazy_chunk_storage`) readable: it is not a format imago can
+/// open on its own, so left to imago the manifest would be opened as a plain raw file and the
+/// guest would read the manifest's own bytes instead of the image. Going through the gate
+/// rather than resolving the top image's backing file by hand covers a manifest at any depth
+/// of the chain — a stage forked from a restored one is a qcow2 over a qcow2 over the
+/// manifest.
+fn open_qcow2_chain(metadata: Box<dyn DynStorage>, writable: bool) -> io::Result<BoxedQcow2> {
+    let mut qcow2 = BoxedQcow2::open_image(metadata, writable)?;
+    qcow2.open_implicit_dependencies_gated(LazyAwareOpenGate)?;
+    Ok(qcow2)
+}
+
 /// Virtio device for exposing block level read/write operations on a host file.
 pub struct Block {
     // Host file and properties.
@@ -544,10 +562,6 @@ impl Block {
                 None
             };
 
-        // Captured before `disk_image_path` moves into `file_opts` below: the directory a
-        // relative qcow2 backing filename (possibly a `.vk_ro_img`, see below) resolves against.
-        let disk_dir = PathBuf::from(&disk_image_path).parent().map(PathBuf::from);
-
         let file_opts = StorageOpenOptions::new()
             .write(!is_disk_read_only)
             .filename(disk_image_path)
@@ -560,44 +574,7 @@ impl Block {
             ImageType::Qcow2 => {
                 let file = ImagoFile::open(file_opts)?;
                 let discard_alignment = file.discard_align();
-                let mut qcow2 =
-                    Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image(
-                        Box::new(file),
-                        !is_disk_read_only,
-                    )?;
-                // A `.vk_ro_img` backing file (a lazy, chunk-decompressing view of a cached
-                // build-stage image, see `lazy_chunk_storage`) isn't a format
-                // `open_implicit_dependencies` below can open on its own — it would try to
-                // sniff/open it as a plain raw or qcow2 file and fail. Detect it from the
-                // backing filename recorded in the header and build it explicitly instead;
-                // `set_backing` marks the backing dependency resolved, so the call below only
-                // handles the (unrelated) implicit data-file dependency.
-                let lazy_backing_name = qcow2
-                    .implicit_backing_file()
-                    .filter(|name| name.ends_with(".vk_ro_img"))
-                    .cloned();
-                if let Some(backing_name) = lazy_backing_name {
-                    // Mirrors `imago::file::File::resolve_relative_path`'s exact semantics
-                    // (absolute passthrough, else join onto the parent dir) rather than reusing
-                    // it directly: by this point `qcow2`'s metadata storage already owns
-                    // `disk_dir`'s underlying file handle, so re-deriving it here is intentional
-                    // duplication, not an oversight — keep the two in sync if either changes.
-                    let backing_path = if Path::new(&backing_name).is_absolute() {
-                        PathBuf::from(backing_name)
-                    } else {
-                        disk_dir
-                            .clone()
-                            .unwrap_or_else(|| PathBuf::from("."))
-                            .join(backing_name)
-                    };
-                    let lazy_opts = StorageOpenOptions::new()
-                        .write(false)
-                        .filename(backing_path);
-                    let lazy = LazyChunkStorage::open(lazy_opts)?;
-                    let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(lazy), false)?;
-                    qcow2.set_backing(Some(Arc::new(FormatAccess::new(raw))));
-                }
-                qcow2.open_implicit_dependencies()?;
+                let qcow2 = open_qcow2_chain(Box::new(file), !is_disk_read_only)?;
                 (FormatAccess::new(qcow2), discard_alignment)
             }
             ImageType::Raw => {
@@ -613,7 +590,7 @@ impl Block {
                 let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(
                     Box::new(file),
                 )
-                .open(PermissiveImplicitOpenGate::default())?;
+                .open(LazyAwareOpenGate)?;
                 (FormatAccess::new(vmdk), discard_alignment)
             }
             ImageType::VkLazyChunks => {
@@ -1104,6 +1081,204 @@ mod tests {
         });
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty qcow2 overlay of `size` bytes over `backing`, its format recorded as `fmt` —
+    /// the same header shape vk-driver's `qcow2::create_overlay` writes for a build stage.
+    fn make_overlay(path: &std::path::Path, size: u64, backing: &std::path::Path, fmt: &str) {
+        use imago::FormatCreateBuilder;
+
+        std::fs::File::create(path).unwrap();
+        let file = ImagoFile::open(StorageOpenOptions::new().write(true).filename(path)).unwrap();
+        BoxedQcow2::create_builder(Box::new(file))
+            .size(size)
+            .backing(backing.to_str().unwrap().to_string(), fmt.to_string())
+            .create()
+            .unwrap();
+    }
+
+    /// Read `len` bytes at offset 0 of `image`, resolving its backing chain the way `Block::new`
+    /// does. `writable` is passed straight through so a read-only chain can be asserted to need
+    /// no write access, which is what production does for a `COPY --from` source.
+    fn read_chain(image: &std::path::Path, len: usize, writable: bool) -> Vec<u8> {
+        use imago::io_buffers::IoVectorMut;
+        use std::io::IoSliceMut;
+
+        let file =
+            ImagoFile::open(StorageOpenOptions::new().write(writable).filename(image)).unwrap();
+        let fa = FormatAccess::new(open_qcow2_chain(Box::new(file), writable).unwrap());
+        let mut got = vec![0u8; len];
+        fa.readv(IoVectorMut::from(vec![IoSliceMut::new(&mut got)]), 0)
+            .unwrap();
+        got
+    }
+
+    /// A cached build-stage image restored as a `.vk_ro_img` manifest sits at the BOTTOM of a
+    /// backing chain — a stage that forks it is a qcow2 over the restored stage's own qcow2 over
+    /// the manifest — so resolving the manifest only when it is the top image's direct backing
+    /// file leaves every deeper level to imago, which opens it as a plain raw file: the guest
+    /// then reads the manifest's own bytes (and zeroes past them) instead of the image, which
+    /// looks like wholesale corruption rather than an error. Every depth must read back the
+    /// chunks' actual bytes, including the zero gap between two non-contiguous chunks.
+    #[test]
+    fn a_vk_ro_img_backing_resolves_at_every_depth_of_the_chain() {
+        use super::super::lazy_chunk_storage::test_support::{
+            blob_name, fake_digest, write_manifest, Fixture, CODEC_RAW, CODEC_ZSTD, LAYOUT_FLAT,
+        };
+
+        const CHUNK: usize = 64 * 1024;
+        let fx = Fixture::new("backing-chain");
+
+        // Two chunks at offsets 0 and 128 KiB of a 192 KiB image, stored the way a
+        // remote-registry restore lays its cache out (flat layout, digest-hex filenames): one
+        // zstd-compressed, one raw. The 64 KiB hole between them must read as zero.
+        let chunk_a: Vec<u8> = (0..CHUNK).map(|i| (i % 251) as u8).collect();
+        let chunk_c: Vec<u8> = (0..CHUNK).map(|i| ((i * 7 + 3) % 251) as u8).collect();
+        let (digest_a, digest_c) = (fake_digest(1), fake_digest(2));
+        std::fs::write(
+            fx.dir.join(blob_name(&digest_a)),
+            zstd::encode_all(&chunk_a[..], 3).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(fx.dir.join(blob_name(&digest_c)), &chunk_c).unwrap();
+
+        let mut want = chunk_a.clone();
+        want.extend_from_slice(&vec![0u8; CHUNK]);
+        want.extend_from_slice(&chunk_c);
+        let size = want.len() as u64;
+
+        let manifest = fx.dir.join("cached.vk_ro_img");
+        write_manifest(
+            &manifest,
+            size,
+            LAYOUT_FLAT,
+            &fx.dir,
+            &[
+                (0, CHUNK as u32, CODEC_ZSTD, digest_a),
+                (2 * CHUNK as u64, CHUNK as u32, CODEC_RAW, digest_c),
+            ],
+        );
+
+        // `restored` is the cached stage as vk-driver attaches it; each further overlay is a
+        // stage forked from the one below, so the manifest sinks one level deeper each time.
+        let restored = fx.dir.join("restored.qcow2");
+        let forked = fx.dir.join("forked.qcow2");
+        let deep = fx.dir.join("deep.qcow2");
+        make_overlay(&restored, size, &manifest, "raw");
+        make_overlay(&forked, size, &restored, "qcow2");
+        make_overlay(&deep, size, &forked, "qcow2");
+
+        for (depth, image) in [(1, &restored), (2, &forked), (3, &deep)] {
+            assert_eq!(
+                read_chain(image, want.len(), false),
+                want,
+                "a .vk_ro_img {depth} level(s) down the backing chain must read as its chunks"
+            );
+        }
+    }
+
+    /// A cluster the guest writes into an overlay must win over the manifest underneath it —
+    /// the gate must not shadow the qcow2 layer it sits below. Written over a chunk and over
+    /// the manifest's zero gap, since those take different paths through the reader.
+    #[test]
+    fn an_overlay_write_takes_precedence_over_the_manifest_beneath_it() {
+        use super::super::lazy_chunk_storage::test_support::{
+            blob_name, fake_digest, write_manifest, Fixture, CODEC_RAW, LAYOUT_FLAT,
+        };
+        use imago::io_buffers::IoVector;
+        use std::io::IoSlice;
+
+        const CHUNK: usize = 64 * 1024;
+        let fx = Fixture::new("overlay-precedence");
+
+        let chunk_a: Vec<u8> = (0..CHUNK).map(|i| (i % 251) as u8).collect();
+        let digest_a = fake_digest(1);
+        std::fs::write(fx.dir.join(blob_name(&digest_a)), &chunk_a).unwrap();
+
+        // 128 KiB: one raw chunk at 0, a zero gap at 64 KiB.
+        let size = 2 * CHUNK as u64;
+        let manifest = fx.dir.join("cached.vk_ro_img");
+        write_manifest(
+            &manifest,
+            size,
+            LAYOUT_FLAT,
+            &fx.dir,
+            &[(0, CHUNK as u32, CODEC_RAW, digest_a)],
+        );
+        let overlay = fx.dir.join("stage.qcow2");
+        make_overlay(&overlay, size, &manifest, "raw");
+
+        let written = vec![0x5au8; CHUNK];
+        {
+            let file =
+                ImagoFile::open(StorageOpenOptions::new().write(true).filename(&overlay)).unwrap();
+            let fa = FormatAccess::new(open_qcow2_chain(Box::new(file), true).unwrap());
+            // Over the chunk, then over the gap.
+            fa.writev(IoVector::from(vec![IoSlice::new(&written)]), 0)
+                .unwrap();
+            fa.writev(IoVector::from(vec![IoSlice::new(&written)]), CHUNK as u64)
+                .unwrap();
+            fa.flush().unwrap();
+        }
+
+        let mut want = written.clone();
+        want.extend_from_slice(&written);
+        assert_eq!(
+            read_chain(&overlay, want.len(), false),
+            want,
+            "the overlay's own clusters must shadow both a manifest chunk and its zero gap"
+        );
+    }
+
+    /// The gate also handles every *ordinary* qcow2 disk in the product — a stage overlay over a
+    /// raw `.ext4` base, a `COPY --from` source, `vk run --disk` — since it replaced the
+    /// backing-resolution path for all of them. A backing file without the `.vk_ro_img`
+    /// extension must still be read as a plain raw file, and must NOT be promoted to a
+    /// manifest even when its bytes are a valid one: the extension (host-chosen, never
+    /// guest-written) is the only thing that selects the lazy reader, which is what keeps a
+    /// guest-writable image from naming an arbitrary host directory as its chunk cache.
+    #[test]
+    fn a_backing_file_without_the_extension_is_read_as_a_plain_raw_file() {
+        use super::super::lazy_chunk_storage::test_support::{
+            blob_name, fake_digest, write_manifest, Fixture, CODEC_RAW, LAYOUT_FLAT,
+        };
+
+        const CHUNK: usize = 64 * 1024;
+        let fx = Fixture::new("plain-backing");
+
+        // A plain raw base, the common case: read back through the gate unchanged.
+        let base_bytes: Vec<u8> = (0..CHUNK).map(|i| ((i * 11 + 5) % 251) as u8).collect();
+        let base = fx.dir.join("base.ext4");
+        std::fs::write(&base, &base_bytes).unwrap();
+        let plain = fx.dir.join("plain.qcow2");
+        make_overlay(&plain, CHUNK as u64, &base, "raw");
+        assert_eq!(
+            read_chain(&plain, base_bytes.len(), false),
+            base_bytes,
+            "a raw backing file must read as its own bytes through the gate"
+        );
+
+        // The negative case: identical manifest bytes under a name lacking the extension must
+        // be served verbatim, not decoded into the chunks they describe.
+        let chunk = vec![0x77u8; CHUNK];
+        let digest = fake_digest(1);
+        std::fs::write(fx.dir.join(blob_name(&digest)), &chunk).unwrap();
+        let disguised = fx.dir.join("disguised.img");
+        write_manifest(
+            &disguised,
+            CHUNK as u64,
+            LAYOUT_FLAT,
+            &fx.dir,
+            &[(0, CHUNK as u32, CODEC_RAW, digest)],
+        );
+        let raw_bytes = std::fs::read(&disguised).unwrap();
+        let over_disguised = fx.dir.join("over-disguised.qcow2");
+        make_overlay(&over_disguised, raw_bytes.len() as u64, &disguised, "raw");
+        assert_eq!(
+            read_chain(&over_disguised, raw_bytes.len(), false),
+            raw_bytes,
+            "manifest bytes under a non-.vk_ro_img name must not be promoted to a lazy manifest"
+        );
     }
 
     /// The other half of the same locking scheme: `discard`/write-zeroes-with-unmap take the

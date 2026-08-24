@@ -166,3 +166,23 @@ virtkit's own `VmSpec::balloon` axis was silently ignored on this backend while
 cloud-hypervisor honored it. Spelled as a disable (like `disable_implicit_console`) so the
 `Default` keeps attaching a balloon. Additive: without the call, behaviour is unchanged.
 Search for `disable_balloon`.
+
+`src/devices/src/virtio/block/{lazy_chunk_storage.rs (new),device.rs,mod.rs}` +
+`src/devices/Cargo.toml` — read a cached build-stage image lazily out of its compressed chunks
+instead of a reassembled raw file. A `.vk_ro_img` manifest (written by vk-driver,
+`registry.rs`; byte layout documented on the module) lists the content-addressed chunks tiling
+an image plus the local cache directory holding them;
+`LazyChunkStorage` is a read-only `imago::Storage` that decompresses each chunk the first time
+a guest read touches it, so a cache restore costs only the parts a stage's steps actually read.
+Attached directly as `ImageType::VkLazyChunks`, and — since a stage forked from a restored one
+is a qcow2 over a qcow2 over the manifest — resolved as a *backing* file at any depth of a
+chain by `LazyAwareOpenGate`, an `ImplicitOpenGate` that swaps in the lazy storage for any
+implicitly opened file named `*.vk_ro_img` (imago still picks the format layer from the
+parent's recorded `backing_format`, which must be `raw`). Keying on the host-chosen extension
+rather than sniffing the magic is deliberate: it keeps a guest-writable image from ever being
+promoted into a manifest and thereby naming an arbitrary host directory as its chunk cache.
+Local-disk-only (`std::fs::read` + zstd decode), so no network or async runtime enters
+libkrun; the crate gains `zstd`, `lru` and `maybe-async` for it. Additive — no upstream
+behaviour changes for a disk that is not a manifest and has none in its chain. Covered by
+`block::lazy_chunk_storage::tests` and the backing-chain tests in `block::device::tests`.
+Search for `LazyChunkStorage`.

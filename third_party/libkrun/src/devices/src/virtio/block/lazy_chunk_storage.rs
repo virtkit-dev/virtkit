@@ -18,7 +18,11 @@
 //!
 //! Both this reader and vk-driver's writer (`vk-driver/src/registry.rs`) hand-encode this
 //! layout independently — there is no shared crate between the two workspaces — so a change
-//! here must be mirrored there and vice versa.
+//! here must be mirrored there and vice versa. The `.vk_ro_img` *file extension* is part of
+//! that same cross-workspace contract, not just the bytes: it is what
+//! [`LazyAwareOpenGate`] keys on to resolve a manifest. vk-driver hardcodes it when it names
+//! one (`build/exec.rs`, `registry.rs`), requires it when it writes a qcow2 overlay over one
+//! (`qcow2.rs::create_overlay`), and matches on it to pick a disk's format (`run.rs`).
 //!
 //! ```text
 //! magic:          [u8; 8]   = b"VKROIMG1"
@@ -45,9 +49,14 @@
 //!   `cache_dir/blobs/sha256/<hex>` depending on `codec` — `Store` adaptively picks whichever
 //!   form is smaller per blob, so the two live in sibling directories under one root.
 
+use imago::file::File as ImagoFile;
+use imago::format::gate::ImplicitOpenGate;
 use imago::io_buffers::{IoVector, IoVectorMut};
 use imago::storage::drivers::CommonStorageHelper;
-use imago::{Storage, StorageCreateOptions, StorageOpenOptions};
+use imago::{
+    DynStorage, FormatAccess, FormatDriverBuilder, Storage, StorageCreateOptions,
+    StorageOpenOptions,
+};
 use maybe_async::maybe_async;
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, Read};
@@ -392,25 +401,91 @@ impl Storage for LazyChunkStorage {
     }
 }
 
+/// The extension vk-driver gives a `.vk_ro_img` manifest, in [`std::path::Path::extension`]
+/// form (no leading dot), and the only thing that marks one as a backing file: the name is
+/// chosen by the host driver, never by a guest, so keying on it (rather than sniffing the
+/// file's magic) keeps a guest-writable image from ever being promoted into a manifest —
+/// which would let it name any host directory as its chunk cache. Part of the
+/// cross-workspace contract described in this module's header.
+const VK_RO_IMG_EXT: &str = "vk_ro_img";
+
+/// Opens implicit qcow2 dependencies, resolving a `.vk_ro_img` backing file (see
+/// [`LazyChunkStorage`]) at *any* depth of the chain instead of letting imago read the
+/// manifest file's own bytes as the image.
+///
+/// A build stage's disk is a qcow2 whose backing is the stage it forked from, so a cached
+/// stage restored as a manifest sits at the bottom of a chain that can be arbitrarily deep:
+/// `stage.qcow2` → `parent.qcow2` → `cached.vk_ro_img`. The gate hands a fresh copy of itself
+/// to every nested open, so each level along the way keeps that behaviour.
+///
+/// The gate supplies only the *storage*; imago still picks the format layer wrapped around it
+/// from the parent's recorded `backing_format`, so a manifest must be recorded as `raw` (what
+/// vk-driver's `create_overlay` writes) — `qcow2` would parse the decompressed image as a
+/// qcow2 and fail. Every non-manifest open is exactly what imago's own
+/// `PermissiveImplicitOpenGate` would have done, which is what this replaced.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LazyAwareOpenGate;
+
+#[maybe_async(AFIT)]
+impl ImplicitOpenGate<Box<dyn DynStorage>> for LazyAwareOpenGate {
+    async fn open_format<F: FormatDriverBuilder<Box<dyn DynStorage>>>(
+        &mut self,
+        builder: F,
+    ) -> io::Result<FormatAccess<Box<dyn DynStorage>>> {
+        // `maybe-async`'s `is_sync` is pinned on for this crate (see its Cargo.toml), so this
+        // is a plain call — no `Box::pin` recursion dance like imago's own
+        // `PermissiveImplicitOpenGate` needs for its async build.
+        Ok(FormatAccess::new(builder.open(*self)?))
+    }
+
+    async fn open_storage(
+        &mut self,
+        options: StorageOpenOptions,
+    ) -> io::Result<Box<dyn DynStorage>> {
+        let is_manifest = options
+            .get_filename()
+            .is_some_and(|f| f.extension().is_some_and(|e| e == VK_RO_IMG_EXT));
+        if is_manifest {
+            // A manifest is a view over immutable, content-addressed chunks and
+            // `LazyChunkStorage` has no write path at all, so it is opened read-only whatever
+            // the caller asked for. `StorageOpenOptions` exposes no `write` getter, so
+            // `LazyChunkStorage::open` cannot observe the flag either way — this call states
+            // the intent for a reader, it does not enforce anything.
+            //
+            // Note the gate cannot tell a backing-file open (imago asks for `write(false)`)
+            // from an external-data-file one (`write(true)`): a `.vk_ro_img` named as a
+            // qcow2 data file would be accepted here and then fail late with `Unsupported` on
+            // the guest's first write. vk-driver never writes such a header.
+            Ok(Box::new(LazyChunkStorage::open(options.write(false))?))
+        } else {
+            Ok(Box::new(ImagoFile::open(options)?))
+        }
+    }
+}
+
+/// Test support shared with `device.rs`'s tests, which exercise this reader through a qcow2
+/// backing chain. It lives here, next to `parse`, so the hand-encoded manifest layout has
+/// exactly one test-side copy to keep in sync with the reader.
 #[cfg(test)]
-mod tests {
+pub(super) mod test_support {
     use super::*;
 
     /// Digest bytes derived from a small counter so each test chunk gets a distinct,
     /// deterministic "hash" without pulling in a real sha256 dependency just for tests.
-    fn fake_digest(n: u8) -> [u8; 32] {
+    /// The values are arbitrary: nothing in this reader verifies a chunk against its digest,
+    /// it only uses the hex form as the cache filename.
+    pub fn fake_digest(n: u8) -> [u8; 32] {
         let mut d = [0u8; 32];
         d[31] = n;
         d
     }
 
-    /// Build a `.vk_ro_img` manifest by hand (mirroring `LazyChunkStorage::parse`'s
-    /// expected byte layout) plus the chunk blob files it references, and open it.
-    struct Fixture {
-        dir: std::path::PathBuf,
+    /// A temp directory removed on drop, so a failing assert does not leak it.
+    pub struct Fixture {
+        pub dir: std::path::PathBuf,
     }
     impl Fixture {
-        fn new(name: &str) -> Self {
+        pub fn new(name: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "vk-lazy-chunk-storage-{name}-{}",
                 std::process::id()
@@ -426,7 +501,9 @@ mod tests {
         }
     }
 
-    fn write_manifest(
+    /// Build a `.vk_ro_img` manifest by hand, mirroring `LazyChunkStorage::parse`'s expected
+    /// byte layout.
+    pub fn write_manifest(
         path: &std::path::Path,
         total_size: u64,
         layout: u8,
@@ -449,6 +526,25 @@ mod tests {
         }
         std::fs::write(path, buf).unwrap();
     }
+
+    /// The cache filename a chunk's digest maps to. Delegates to the reader's own
+    /// `digest_hex` so a test writes its blobs under exactly the name the reader looks for
+    /// (a `pub use` cannot re-export it — it is private to this module).
+    pub fn blob_name(digest: &[u8; 32]) -> String {
+        digest_hex(digest)
+    }
+
+    /// The format constants a caller outside this module needs to describe a chunk. Aliases
+    /// rather than `pub use` for the same reason as `blob_name`.
+    pub const LAYOUT_FLAT: u8 = super::LAYOUT_FLAT;
+    pub const CODEC_ZSTD: u8 = super::CODEC_ZSTD;
+    pub const CODEC_RAW: u8 = super::CODEC_RAW;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{fake_digest, write_manifest, Fixture};
+    use super::*;
 
     /// Two chunks — one zstd, one raw — laid out flat (remote-registry style): reads
     /// spanning both, exactly at the boundary, and fully within one, all reassemble the

@@ -44,8 +44,9 @@ pub enum ImageType {
     Vmdk,
     /// A `.vk_ro_img` manifest: a read-only view over content-addressed, zstd-compressed
     /// chunks (see [`super::lazy_chunk_storage`]), decompressed on demand as the guest
-    /// reads. Always read-only; never valid as a qcow2 data/backing-override target other
-    /// than via the implicit-backing-file sniff in `device.rs`.
+    /// reads. Always read-only. As a qcow2 *backing* file it is not named by this variant at
+    /// all: `lazy_chunk_storage::LazyAwareOpenGate` resolves it from the `.vk_ro_img`
+    /// extension whenever imago implicitly opens a chain member, at any depth.
     VkLazyChunks,
 }
 

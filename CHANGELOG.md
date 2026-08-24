@@ -6,6 +6,14 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A `vk build` stage built on top of a cached one could come out corrupted.** A
+  stage restored from the build cache was read back correctly, but a stage built on
+  top of that restored stage saw the parts it had not rewritten itself as garbage or
+  zeroes — filesystem errors and unreadable files in the built image, or a stage with
+  no filesystem at all. Stages cached by an affected `vk` may hold corrupted content,
+  so they are no longer used: the first build after upgrading rebuilds them once, no
+  manual cache wipe needed.
+
 - A CI job step that failed part-way through could leave the command it was
   running alive inside the guest, still holding the connection open. A step
   now always closes off the guest's input on its way out, however it ends.

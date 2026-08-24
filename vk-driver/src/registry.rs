@@ -71,6 +71,11 @@ const ANN_LENGTH: &str = "vnd.wallix.microvm.chunk.length";
 // `pub(crate)`: `qcow2.rs` reads the same manifests when a `.vk_ro_img` shows up as a
 // backing file during export/diff-push, so it shares these rather than redefining them.
 pub(crate) const VK_RO_IMG_MAGIC: &[u8; 8] = b"VKROIMG1";
+/// The file extension a manifest must carry, without the leading dot. Part of the same
+/// cross-workspace contract as the byte layout above, and just as load-bearing: libkrun's
+/// `LazyAwareOpenGate` resolves a manifest backing file by this extension alone (never by
+/// sniffing its magic, so a guest-writable image can't be promoted into one).
+pub(crate) const VK_RO_IMG_EXT: &str = "vk_ro_img";
 pub(crate) const VK_RO_IMG_CODEC_ZSTD: u8 = 0;
 pub(crate) const VK_RO_IMG_CODEC_RAW: u8 = 1;
 pub(crate) const VK_RO_IMG_LAYOUT_FLAT: u8 = 0;
@@ -132,7 +137,7 @@ pub(crate) fn write_vk_ro_img(
         buf.push(c.codec);
         buf.extend_from_slice(&c.digest);
     }
-    let tmp = dest.with_extension("vk_ro_img.tmp");
+    let tmp = dest.with_extension(format!("{VK_RO_IMG_EXT}.tmp"));
     std::fs::write(&tmp, &buf).with_context(|| format!("writing {}", tmp.display()))?;
     let _ = std::fs::remove_file(dest);
     std::fs::rename(&tmp, dest)

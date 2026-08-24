@@ -10,6 +10,7 @@
 //! mis-read. Overlay creation is native too (`create_overlay`) — no `qemu-img` at runtime.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -291,16 +292,35 @@ pub fn create_overlay(path: &Path, backing: &Path) -> Result<()> {
     const CS: u64 = 1 << CB; // 64 KiB cluster
     const L2_ENTRIES: u64 = CS / 8; // 8192 entries per L2 table
 
-    // backing format + the overlay's virtual size (= the backing's). Neither reader
-    // (`open_backing` here, `LazyChunkStorage` in libkrun) trusts the `backing_format`
-    // string written below to tell a `.vk_ro_img` apart from a raw image — both sniff the
-    // actual file — so `bfmt` only needs to be a value they'd resolve to the same place if
-    // they ever did fall back to it; the *size* must be the manifest's `total_size`, though,
-    // or the overlay would describe a virtual disk the size of the tiny manifest file.
+    // backing format + the overlay's virtual size (= the backing's). Neither reader uses the
+    // `backing_format` string written below to tell a `.vk_ro_img` apart from a raw image:
+    // `open_backing` here sniffs the file's magic, and libkrun's `LazyAwareOpenGate` keys on
+    // the `.vk_ro_img` extension of the backing name (host-chosen, never guest-written, so a
+    // guest can't dress its own image up as a manifest).
+    //
+    // `bfmt` is load-bearing all the same, and not merely a fallback: the gate supplies only
+    // the storage, and libkrun's imago then wraps the format layer this string names around it
+    // ("qcow2" → qcow2, "raw"/"file" → raw, anything else → a hard error). A manifest must
+    // therefore be recorded as `raw`, or the decompressed image gets parsed as a qcow2 and the
+    // guest's disk fails to open. Two more invariants for a manifest backing: the *name* must
+    // keep its `.vk_ro_img` extension — the only thing that selects the lazy reader, asserted
+    // below — and the *size* must be the manifest's `total_size`, or the overlay would
+    // describe a virtual disk the size of the tiny manifest file.
     let (bfmt, size) = {
         let f = File::open(backing).with_context(|| format!("opening {}", backing.display()))?;
         let mut magic8 = [0u8; 8];
         if f.read_exact_at(&mut magic8, 0).is_ok() && &magic8 == crate::registry::VK_RO_IMG_MAGIC {
+            // Caught here rather than as garbage guest reads: libkrun resolves a manifest by
+            // extension only, so an overlay naming one under any other name would boot with
+            // the manifest's own bytes served as the disk.
+            let ext = crate::registry::VK_RO_IMG_EXT;
+            if backing.extension() != Some(OsStr::new(ext)) {
+                bail!(
+                    "{} is a .{ext} manifest but is not named `*.{ext}`; libkrun resolves a \
+                     manifest backing by extension and would read it as a raw image",
+                    backing.display()
+                );
+            }
             ("raw", VkRoImg::open(backing)?.total_size)
         } else if be32(&magic8, 0) == MAGIC {
             ("qcow2", Qcow2::open(backing)?.virtual_size())
@@ -1390,6 +1410,58 @@ mod tests {
             q.chain_data_extents().unwrap(),
             vec![(0, chunk.len() as u64)],
             "the chain's data extents must include the lazy backing's full range"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// libkrun resolves a manifest backing by its `.vk_ro_img` extension alone, so an overlay
+    /// naming one under any other extension boots with the manifest's own bytes served as the
+    /// guest's disk — silent corruption, not an error. `create_overlay` has already sniffed the
+    /// magic by then, so it must refuse instead of writing that header.
+    #[test]
+    fn create_overlay_refuses_a_manifest_backing_without_the_vk_ro_img_extension() {
+        let dir = std::env::temp_dir().join(format!("vk-ro-img-badext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let chunk = vec![7u8; 4096];
+        let digest = fake_digest(3);
+        std::fs::write(dir.join(digest_hex(&digest)), &chunk).unwrap();
+        let chunks = [crate::registry::LazyChunk {
+            offset: 0,
+            length: chunk.len() as u32,
+            codec: crate::registry::VK_RO_IMG_CODEC_RAW,
+            digest,
+        }];
+
+        // Byte-identical manifests, one correctly named and one not.
+        let good = dir.join("base.vk_ro_img");
+        let bad = dir.join("base.img");
+        for dest in [&good, &bad] {
+            crate::registry::write_vk_ro_img(
+                dest,
+                chunk.len() as u64,
+                crate::registry::VK_RO_IMG_LAYOUT_FLAT,
+                &dir,
+                &chunks,
+            )
+            .unwrap();
+        }
+
+        create_overlay(&dir.join("ok.qcow2"), &good)
+            .expect("a correctly named manifest backing is accepted");
+
+        let err = create_overlay(&dir.join("bad.qcow2"), &bad)
+            .expect_err("a manifest backing without the extension must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("vk_ro_img") && msg.contains("base.img"),
+            "the error must name the offending file and the required extension: {msg}"
+        );
+        assert!(
+            !dir.join("bad.qcow2").exists() || Qcow2::open(&dir.join("bad.qcow2")).is_err(),
+            "no usable overlay may be left behind for a rejected backing"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
