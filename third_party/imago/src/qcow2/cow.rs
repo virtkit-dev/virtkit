@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::io_buffers::IoBuffer;
+use std::collections::HashMap;
 
 /// The outcome of [`Qcow2::cow_cluster()`]: which host cluster a guest write may target, and
 /// whether mapping it into the L2 table is still pending.
@@ -23,11 +24,19 @@ pub(super) enum ClusterAllocation {
     /// still be mapped in on commit to clear that flag, or a write that lands real data there
     /// keeps reading back as zero forever.
     ReusedZero(HostCluster),
-    /// Freshly claimed by this call, not yet mapped into the L2 table. Must be freed if it is
-    /// never committed, or it leaks; must not be exposed via the L2 table before the guest's
+    /// Freshly claimed by this call, not yet mapped into the L2 table. Must be freed if nothing
+    /// ever commits it, or it leaks; must not be exposed via the L2 table before the guest's
     /// own write into it has actually succeeded, or an unwritten cluster becomes indistinguishable
-    /// from a valid one holding whatever bytes happened to already be there.
+    /// from a valid one holding whatever bytes happened to already be there. A concurrent write
+    /// into the same cluster may share it, which is what makes freeing it the last user's call
+    /// rather than this one's (see [`PendingAllocations`]).
     Fresh(HostCluster),
+    /// Claimed by a write that is still in flight (see
+    /// [`PendingAllocations`]) and shared with it: its copy-on-write
+    /// is already done, so this call adds none of its own. Committing it maps it in like the
+    /// claim it shares; freeing it is never this call's to do — the last user standing decides
+    /// that.
+    SharedPending(HostCluster),
 }
 
 impl ClusterAllocation {
@@ -37,7 +46,149 @@ impl ClusterAllocation {
         match *self {
             ClusterAllocation::MappedExisting(hc)
             | ClusterAllocation::ReusedZero(hc)
-            | ClusterAllocation::Fresh(hc) => hc,
+            | ClusterAllocation::Fresh(hc)
+            | ClusterAllocation::SharedPending(hc) => hc,
+        }
+    }
+}
+
+/// Allocations in flight, so that concurrent writes into one guest cluster share the host
+/// cluster claimed for it instead of each claiming one of their own.
+///
+/// A freshly claimed host cluster is deliberately not mapped into the L2 table until the write
+/// into it has succeeded (see [`Qcow2Pending`](super::mappings::Qcow2Pending)), so the L2 table
+/// alone cannot tell a second writer that a first one is already working on that cluster: both
+/// would claim a cluster, both would write their own part of it, and whichever committed last
+/// would map its own cluster in and free the other's — dropping bytes the guest had written and
+/// been told were on disk. Every claim is registered here for the length of that window instead,
+/// so the second writer finds the first one's cluster (its copy-on-write already done, under the
+/// same L2 table write guard) and writes into it.
+///
+/// Every registered claim is released exactly once per user, by that user's commit or abort.
+#[derive(Debug, Default)]
+pub(super) struct PendingAllocations {
+    /// Guest cluster offset → the claim in flight for it.
+    in_flight: HashMap<u64, PendingAllocation>,
+}
+
+/// One entry of [`PendingAllocations`].
+#[derive(Debug)]
+struct PendingAllocation {
+    /// The host cluster claimed for this guest cluster.
+    host_cluster: HostCluster,
+    /// How many writes are using it, i.e. how many claims are yet to be released.
+    users: usize,
+    /// Whether any of them has mapped it into the L2 table. Once one has, the cluster is live
+    /// and the last release must not free it, however the other writes ended.
+    mapped: bool,
+    /// Whether the claim was a fresh allocation (as opposed to an existing zero cluster being
+    /// reused), i.e. whether the last release has anything to free at all.
+    fresh: bool,
+    /// Whether the claimant gave up while others were still holding the claim. The claimant skips
+    /// the copy-on-write for the range it is about to write (that is the point of
+    /// `partial_skip_cow`), so if that write never lands, the range keeps whatever bytes the host
+    /// cluster happened to already have. That is exactly what deferred mapping exists to keep out
+    /// of the L2 table, so the cluster can never go live: the remaining users fail their writes
+    /// instead of exposing it. A sharer giving up holes nothing — it does no copy-on-write of its
+    /// own precisely because the claimant's already covers every byte outside the claimant's own
+    /// range.
+    holed: bool,
+}
+
+/// What [`PendingAllocations::share()`] found for a caller wanting to write into a guest cluster.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum SharedClaim {
+    /// No write is in flight into this cluster; the caller must claim a host cluster itself.
+    Unclaimed,
+    /// A write is in flight, and the caller now shares the host cluster it claimed.
+    Shared(HostCluster),
+    /// A write is in flight, but it claimed a host cluster other than the one the caller must
+    /// have — exactly like an existing mapping that does not match, so the caller gives up on
+    /// this cluster rather than claiming a second one.
+    Elsewhere,
+}
+
+/// What one [`PendingAllocations::release()`] leaves its caller to do.
+#[derive(Debug, Default)]
+pub(super) struct Released {
+    /// The host cluster to free: the last user is gone, none of them mapped it in, and it was a
+    /// fresh allocation.
+    pub(super) orphan: Option<HostCluster>,
+    /// The claim is holed (see [`PendingAllocation::holed`]), so the caller must not map the
+    /// cluster into the L2 table, and must fail its write instead of reporting bytes it cannot
+    /// make visible.
+    pub(super) holed: bool,
+}
+
+impl PendingAllocations {
+    /// Take a share of the claim already in flight for `guest_offset`, if there is one, counting
+    /// the caller as one of its users. `mandatory_host_cluster` (a caller extending a contiguous
+    /// run) rejects a claim that sits elsewhere.
+    pub(super) fn share(
+        &mut self,
+        guest_offset: u64,
+        mandatory_host_cluster: Option<HostCluster>,
+    ) -> SharedClaim {
+        let Some(entry) = self.in_flight.get_mut(&guest_offset) else {
+            return SharedClaim::Unclaimed;
+        };
+        if mandatory_host_cluster.is_some_and(|mandatory| mandatory != entry.host_cluster) {
+            return SharedClaim::Elsewhere;
+        }
+        entry.users += 1;
+        SharedClaim::Shared(entry.host_cluster)
+    }
+
+    /// Register a claim just made for `guest_offset`, with the caller as its first user. Only
+    /// ever reached when [`share()`](Self::share) just found no claim for it, under the same L2
+    /// table write guard, so it never overwrites a live one.
+    pub(super) fn claim(&mut self, guest_offset: u64, host_cluster: HostCluster, fresh: bool) {
+        let previous = self.in_flight.insert(
+            guest_offset,
+            PendingAllocation {
+                host_cluster,
+                users: 1,
+                mapped: false,
+                fresh,
+                holed: false,
+            },
+        );
+        debug_assert!(
+            previous.is_none(),
+            "claim over a live registration for guest offset {guest_offset}"
+        );
+    }
+
+    /// Release one user's claim on `guest_offset`. `mapped` tells whether it is mapping the
+    /// cluster into the L2 table (i.e. committing) or giving up (aborting); `claimant` whether it
+    /// is the call that made the claim, as opposed to one that shared it — only the claimant can
+    /// leave a hole behind (see [`PendingAllocation::holed`]).
+    pub(super) fn release(&mut self, guest_offset: u64, mapped: bool, claimant: bool) -> Released {
+        let Some(entry) = self.in_flight.get_mut(&guest_offset) else {
+            return Released::default();
+        };
+        if mapped {
+            // A holed claim must not go live, so a commit on one maps nothing in.
+            entry.mapped |= !entry.holed;
+        } else if claimant && entry.users > 1 {
+            entry.holed = true;
+        }
+        let holed = entry.holed;
+        debug_assert!(entry.users > 0, "claim released more often than taken");
+        entry.users = entry.users.saturating_sub(1);
+        if entry.users > 0 {
+            return Released {
+                orphan: None,
+                holed,
+            };
+        }
+        let entry = self
+            .in_flight
+            .remove(&guest_offset)
+            .expect("just looked it up");
+        Released {
+            orphan: (!entry.mapped && entry.fresh).then_some(entry.host_cluster),
+            holed,
         }
     }
 }
@@ -101,6 +252,28 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         };
 
         self.need_writable()?;
+
+        let guest_offset = cluster.offset(self.header.cluster_bits()).0;
+
+        // A write already in flight into this cluster has claimed a host cluster for it that the
+        // L2 table cannot show yet (see `PendingAllocations`) — write into that one rather than
+        // claim a second, and skip the copy-on-write it has already done. Only reachable once its
+        // claimant has dropped this L2 table's write guard, so that COW is complete by now.
+        let shared = {
+            let mut pending_allocs = self.pending_allocs.lock().await;
+            pending_allocs.share(guest_offset, mandatory_host_cluster)
+        };
+        match shared {
+            SharedClaim::Shared(host_cluster) => {
+                return Ok(Some(ClusterAllocation::SharedPending(host_cluster)));
+            }
+            // Claimed, but not where this caller needs it: give up on continuing the contiguous
+            // run here, exactly as a mismatching existing mapping does above. Claiming a second
+            // cluster for the same guest cluster instead would supersede the one in flight, which
+            // is the very race this registry exists to close.
+            SharedClaim::Elsewhere => return Ok(None),
+            SharedClaim::Unclaimed => (),
+        }
 
         // Whether `new_cluster` below is a fresh allocation (must be freed if never committed)
         // or an existing, already-referenced one being reused as-is (must never be freed).
@@ -176,6 +349,13 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 }
             }
         }
+
+        // Register the claim for as long as the write into it is in flight, so a concurrent
+        // write into the same cluster shares it instead of superseding it.
+        self.pending_allocs
+            .lock()
+            .await
+            .claim(guest_offset, new_cluster, fresh);
 
         Ok(Some(if fresh {
             ClusterAllocation::Fresh(new_cluster)
@@ -335,5 +515,127 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         to.write(&buf, to_offset.0).await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HostCluster, PendingAllocations, SharedClaim};
+
+    /// `share()` must distinguish "nothing in flight" (claim your own) from "in flight, but
+    /// elsewhere" (give up): conflating them lets a caller extending a contiguous run claim a
+    /// second host cluster for a guest cluster that already has one in flight, whose claim it
+    /// then overwrites — the very race the registry closes.
+    #[test]
+    fn a_claim_elsewhere_is_not_an_unclaimed_cluster() {
+        let (here, elsewhere) = (HostCluster(1), HostCluster(2));
+        let mut pending = PendingAllocations::default();
+
+        assert!(matches!(
+            pending.share(0, Some(here)),
+            SharedClaim::Unclaimed
+        ));
+        pending.claim(0, here, true);
+
+        assert!(matches!(pending.share(0, None), SharedClaim::Shared(hc) if hc == here));
+        assert!(matches!(pending.share(0, Some(here)), SharedClaim::Shared(hc) if hc == here));
+        assert!(matches!(
+            pending.share(0, Some(elsewhere)),
+            SharedClaim::Elsewhere
+        ));
+    }
+
+    /// A fresh claim is freed once, by whichever user is last, and only if none of them mapped
+    /// it into the L2 table — a cluster another write has already made live must survive this
+    /// one's failure.
+    #[test]
+    fn only_the_last_user_of_an_unmapped_fresh_claim_frees_it() {
+        let hc = HostCluster(1);
+
+        // Everyone gives up: the last one out frees it.
+        let mut pending = PendingAllocations::default();
+        pending.claim(0, hc, true);
+        assert!(matches!(pending.share(0, None), SharedClaim::Shared(_)));
+        assert_eq!(pending.release(0, false, true).orphan, None);
+        assert_eq!(pending.release(0, false, true).orphan, Some(hc));
+
+        // One of them mapped it in: it is live, and nobody frees it.
+        let mut pending = PendingAllocations::default();
+        pending.claim(0, hc, true);
+        assert!(matches!(pending.share(0, None), SharedClaim::Shared(_)));
+        assert_eq!(pending.release(0, true, true).orphan, None);
+        assert_eq!(pending.release(0, false, true).orphan, None);
+
+        // A reused zero cluster was never this registry's to free, however it ends.
+        let mut pending = PendingAllocations::default();
+        pending.claim(0, hc, false);
+        assert_eq!(pending.release(0, false, true).orphan, None);
+    }
+
+    /// The claimant skips the copy-on-write for the range it is about to write, so if it gives up
+    /// while others still hold the claim, that range keeps whatever bytes were already there and
+    /// nothing will fill it. The cluster must never go live: the remaining users' commits fail
+    /// instead, and it is freed rather than mapped in.
+    #[test]
+    fn a_claimant_giving_up_holes_a_claim_others_still_hold() {
+        let hc = HostCluster(1);
+        let mut pending = PendingAllocations::default();
+        pending.claim(0, hc, true);
+        assert!(matches!(pending.share(0, None), SharedClaim::Shared(_)));
+
+        let aborted = pending.release(0, false, true);
+        assert!(aborted.holed);
+        assert_eq!(aborted.orphan, None);
+
+        let committed = pending.release(0, true, false);
+        assert!(committed.holed, "a holed claim must not go live");
+        assert_eq!(
+            committed.orphan,
+            Some(hc),
+            "a claim nobody may map in is an orphan, not a live cluster"
+        );
+    }
+
+    /// A sharer, though, holes nothing when it gives up: it does no copy-on-write of its own
+    /// precisely because the claimant's already covers every byte outside the claimant's range.
+    /// Failing the claimant's own successful write over it would be a write lost for nothing.
+    #[test]
+    fn a_sharer_giving_up_holes_nothing() {
+        let hc = HostCluster(1);
+        let mut pending = PendingAllocations::default();
+        pending.claim(0, hc, true);
+        assert!(matches!(pending.share(0, None), SharedClaim::Shared(_)));
+
+        let aborted = pending.release(0, false, false);
+        assert!(!aborted.holed);
+        assert_eq!(aborted.orphan, None);
+
+        let committed = pending.release(0, true, true);
+        assert!(!committed.holed, "the claimant's write must still stand");
+        assert_eq!(
+            committed.orphan, None,
+            "a cluster mapped in is live, not an orphan"
+        );
+    }
+
+    /// The last user giving up alone leaves no hole behind — there is nobody left to expose the
+    /// cluster to, and it is freed whole.
+    #[test]
+    fn a_lone_user_giving_up_holes_nothing() {
+        let mut pending = PendingAllocations::default();
+        pending.claim(0, HostCluster(1), true);
+        let released = pending.release(0, false, true);
+        assert!(!released.holed);
+        assert_eq!(released.orphan, Some(HostCluster(1)));
+    }
+
+    /// Releasing a claim that is gone (its last user already released it) is a no-op, not a
+    /// panic: a `MappedExisting` allocation never registers one in the first place.
+    #[test]
+    fn releasing_an_unregistered_cluster_does_nothing() {
+        let mut pending = PendingAllocations::default();
+        let released = pending.release(0, true, true);
+        assert!(!released.holed);
+        assert_eq!(released.orphan, None);
     }
 }

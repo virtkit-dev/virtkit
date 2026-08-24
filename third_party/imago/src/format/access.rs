@@ -13,6 +13,21 @@ use maybe_async::maybe_async;
 use std::fmt::{self, Display, Formatter};
 use std::{cmp, io, ptr};
 
+/// Run every remaining write worker out, returning `first` (the error that ended the write).
+///
+/// Each worker owns a [`PendingDataMapping`] that only it can commit or abort, so dropping the
+/// set on the first error would leave those mappings neither — see [`PendingDataMapping`] for why
+/// that is silent corruption rather than a leak. Later errors are swallowed: the caller only ever
+/// reports one, and `first` is the one that describes what actually went wrong.
+#[cfg(feature = "async")]
+async fn drain<F: std::future::Future<Output = io::Result<()>>>(
+    workers: &mut FuturesUnordered<F>,
+    first: io::Error,
+) -> io::Error {
+    while workers.next().await.is_some() {}
+    first
+}
+
 /// Provides access to a disk image.
 #[derive(Debug)]
 pub struct FormatAccess<S: Storage + 'static> {
@@ -418,13 +433,30 @@ impl<S: Storage + 'static> FormatAccess<S> {
         let mut workers = (self.write_parallelization > 1).then(FuturesUnordered::new);
 
         while !bufv.is_empty() {
-            let (storage, st_offset, st_length, pending) =
-                self.ensure_data_mapping(offset, bufv.len(), true).await?;
+            // Not `?`: returning here would drop the worker set, and with it every mapping its
+            // workers still own (see `drain`).
+            let mapped = self.ensure_data_mapping(offset, bufv.len(), true).await;
+            #[cfg(feature = "async")]
+            let mapped = match (mapped, workers.as_mut()) {
+                (Err(e), Some(workers)) => Err(drain(workers, e).await),
+                (mapped, _) => mapped,
+            };
+            let (storage, st_offset, st_length, pending) = mapped?;
 
             #[cfg(feature = "async")]
             if let Some(workers) = workers.as_mut() {
                 while workers.len() >= self.write_parallelization {
-                    workers.next().await.unwrap()?;
+                    if let Err(e) = workers.next().await.unwrap() {
+                        // Every in-flight worker owns a `PendingDataMapping` that only it can
+                        // commit or abort, and `pending` here is one more. Dropping them instead
+                        // of running them out would leave their claims registered as in flight
+                        // for good, and every later write into those clusters would land where
+                        // no reader can ever see it (see `PendingDataMapping`). Drain before
+                        // aborting `pending`: a worker sharing its claim must get to land first.
+                        let e = drain(workers, e).await;
+                        pending.abort().await;
+                        return Err(e);
+                    }
                 }
             }
 
@@ -469,7 +501,13 @@ impl<S: Storage + 'static> FormatAccess<S> {
 
         #[cfg(feature = "async")]
         if let Some(mut workers) = workers {
-            while workers.next().await.transpose()?.is_some() {}
+            // Run every worker out, whatever the first error was, so none is dropped still owning
+            // an uncommitted, unaborted mapping (see `drain`).
+            while let Some(result) = workers.next().await {
+                if let Err(e) = result {
+                    return Err(drain(&mut workers, e).await);
+                }
+            }
         }
 
         Ok(())

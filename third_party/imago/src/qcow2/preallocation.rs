@@ -89,14 +89,14 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
                 // it — a mid-write failure must never leave a cluster mapped in with whatever
                 // undefined bytes happened to already be there. See `Qcow2Pending`.
                 match result {
-                    Ok(()) => pending.commit().await,
+                    Ok(()) => pending.commit().await?,
                     Err(e) => {
                         pending.abort().await;
                         return Err(e);
                     }
                 }
             } else {
-                pending.commit().await;
+                pending.commit().await?;
             }
 
             offset += flen;

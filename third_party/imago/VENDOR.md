@@ -64,11 +64,54 @@ expose is now transactional; a failed write never gets exposed.
 - `qcow2/preallocation.rs`: `preallocate()` commits on success / aborts on failure through the
   same mechanism.
 
-Commit/abort can't fail: commit is an infallible in-memory L2 update; abort's free is already
-best-effort crate-wide (see `Qcow2::free_data_clusters()`).
+Abort can't fail: its free is already best-effort crate-wide (see
+`Qcow2::free_data_clusters()`). Commit is otherwise an infallible in-memory L2 update, and fails
+only for a holed claim (see the second patch below).
 
-**Tests:** `format::access::writev_failure_tests`, all three fail if `abort()` is swapped for
-`commit()`:
+**Bug:** deferring the mapping also hides it from a *concurrent* writer. Two guest writes into the
+same qcow2 cluster (the virtio-blk worker pool dispatches them to different threads, see
+`block/worker.rs`) each found the cluster unmapped, each claimed a host cluster of its own, and
+whichever committed last mapped its own in and freed the other's — dropping bytes the guest had
+been told were on disk. A hole inside a region the guest wrote whole, surfacing later and at
+random: an unreadable file in a built image, a stage that would not boot.
+
+**Fix:** `qcow2/cow.rs` gains `PendingAllocations`, a registry of the claims in flight keyed by
+guest cluster offset, held in `Qcow2::pending_allocs`. `cow_cluster()` consults it before
+allocating and registers its own claim before returning; each claim is released exactly once per
+user by `Qcow2Pending::commit()`/`abort()`.
+
+- `ClusterAllocation::SharedPending` is the fourth variant: this call is writing into a claim
+  another write in flight made, whose copy-on-write is already done (it happened under the same L2
+  table write guard), so this call adds none of its own.
+- `share()` is three-valued. "In flight, but at another host cluster" is *not* "unclaimed": a
+  caller extending a contiguous run demands one specific host cluster, and must break the run
+  there rather than claim a second cluster for a guest cluster that already has one in flight —
+  claiming one would supersede the claim in flight, which is the very loss being fixed.
+- Freeing a fresh claim is the last user's call, and only if none of them mapped it in.
+- Holed claims: the *claimant* skips the copy-on-write for the range it is about to write, so if
+  it gives up while others still hold the claim, that range keeps whatever bytes the host cluster
+  already had — exactly what deferred mapping exists to keep out of the L2 table. Such a claim can
+  never go live: the remaining users' `commit()`s fail (so the guest is told its write failed,
+  rather than being handed a cluster with a hole in it) and the cluster is freed. A sharer giving
+  up holes nothing, and must not fail the claimant's successful write.
+- `format/access.rs`: `writev`'s `async` `write_parallelization > 1` path used to drop its
+  `FuturesUnordered` on the first error — and on an `ensure_data_mapping()` error — dropping
+  uncommitted, unaborted `PendingDataMapping`s with it. That now leaves a claim registered as in
+  flight forever, so every later write into that cluster would land where no reader can see it; it
+  drains the workers instead (`drain()`). `readv`'s workers own no mappings and still return on
+  the first error.
+
+**Known gap.** One ordering is still not covered: a sharer commits (mapping the cluster in) and
+*then* the claimant's own write fails. The cluster is live by then, so no flag can hold it back,
+and its claimant's skipped range keeps stale bytes. Closing it properly means never sharing a
+cluster that is not already valid — i.e. dropping the `partial_skip_cow`/`full_skip_cow`
+optimisation for any claim that gets registered, which costs a full cluster copy on every
+first write to a backed cluster. Deliberately not taken here: the window needs a genuine storage
+failure (`ENOSPC`/`EIO`) racing a second write into the same cluster, and the unpatched code
+loses data on that second write alone, with no failure required.
+
+**Tests (deferred mapping):** `format::access::writev_failure_tests`, all three fail if `abort()`
+is swapped for `commit()`:
 - `a_failed_fresh_allocation_never_becomes_a_visible_mapping` — mock (`MemStorage`) write
   failure; `Null` can't stand in, it doesn't round-trip writes, so it can't back qcow2's own
   metadata.
@@ -88,6 +131,19 @@ sync` too, not just the crate's default `async` build. They weren't originally: 
 imago's pre-existing test suite is `async`-only (an unconditional `tokio` dev-dependency, tests
 built on raw `tokio::runtime::Builder::block_on`), so nothing here exercised `sync` before we
 started building `third_party/libkrun/src/devices` with it (see Feature selection above).
+
+**Tests (shared claims):** `qcow2::cow::tests` covers the registry's decisions directly — that a
+claim elsewhere is not an unclaimed cluster, that only the last user of an unmapped fresh claim
+frees it, and that a user giving up holes a claim others still hold. Being plain unit tests they
+run in both feature modes and need no thread interleaving to be deterministic.
+
+The end-to-end races live with the virtio-blk device that provokes them, in
+`third_party/libkrun/src/devices` (`block/device.rs`), since they need real threads writing
+through a shared `FormatAccess` and only that crate builds imago with `sync`:
+`concurrent_writes_into_one_qcow2_cluster_all_land` (two writes into one cluster) and
+`a_write_extending_its_run_never_supersedes_a_claim_in_flight` (a multi-cluster write's contiguous
+run meeting a claim in flight). Both fail against the unpatched `qcow2/cow.rs`. They are
+probabilistic by nature, so both loop over many rounds rather than racing once.
 
 Suspected (not confirmed upstream) root cause of a `vk build` corruption incident: real
 `Input/output error`s from ext4 on unrelated later operations touching the same region. Image is

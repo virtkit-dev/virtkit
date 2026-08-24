@@ -74,6 +74,11 @@ pub struct Qcow2<S: Storage + 'static, F: WrappedFormat<S> + 'static = FormatAcc
     ///
     /// Is `None` for read-only images.
     allocator: Option<Mutex<Allocator<S>>>,
+
+    /// Host clusters allocated for a guest cluster but not yet mapped into its L2 entry, i.e.
+    /// the window between [`Qcow2::cow_cluster()`] claiming one and the write into it being
+    /// committed. See [`PendingAllocations`](cow::PendingAllocations).
+    pending_allocs: Mutex<cow::PendingAllocations>,
 }
 
 #[maybe_async]
@@ -143,6 +148,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
             caches,
             allocator,
+            pending_allocs: Default::default(),
         })
     }
 

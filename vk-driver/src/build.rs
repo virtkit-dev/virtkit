@@ -2591,7 +2591,7 @@ fn stage_input_rootfs(
 /// in `exec.rs`); `chain_key` derives every other key from one of those roots, so this
 /// alone invalidates a whole cache generation. An old entry does not need deleting: it
 /// simply stops being looked up, and idle GC reclaims it like any other unused blob.
-const CACHE_KEY_VERSION: &str = "2";
+const CACHE_KEY_VERSION: &str = "3";
 
 /// sha256 hex of `s`, salted with [`CACHE_KEY_VERSION`]. The root-key constructor (a
 /// stage's base, with no prior instruction to chain from) — but also reused wherever

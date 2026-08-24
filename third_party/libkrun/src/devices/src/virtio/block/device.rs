@@ -1281,6 +1281,177 @@ mod tests {
         );
     }
 
+    /// Guest writes that fall in the same 64 KiB qcow2 cluster can be dispatched to different
+    /// worker threads (see `worker::IO_PARALLELISM`), which makes them allocate that cluster
+    /// concurrently. A freshly allocated cluster is mapped into the L2 table only once the
+    /// write into it has succeeded, so neither writer sees the other's allocation: both
+    /// allocate a host cluster of their own, and whichever commits last wins — the loser's
+    /// bytes are dropped, leaving a hole inside a region the guest wrote whole. Every byte
+    /// written must read back.
+    #[test]
+    fn concurrent_writes_into_one_qcow2_cluster_all_land() {
+        use imago::io_buffers::{IoVector, IoVectorMut};
+        use imago::FormatCreateBuilder;
+        use std::io::{IoSlice, IoSliceMut};
+
+        const CLUSTER: u64 = 64 * 1024;
+        const SLICE: u64 = 4096;
+        const THREADS: u64 = CLUSTER / SLICE;
+        // Several clusters, each written by a fresh concurrent burst: one round can get lucky.
+        const CLUSTERS: u64 = 8;
+
+        let dir = temp_dir("qcow2-cluster-race");
+        let path = dir.join("img.qcow2");
+        let open_file = |writable: bool| {
+            ImagoFile::open(
+                StorageOpenOptions::new()
+                    .write(writable)
+                    .filename(path.to_str().unwrap().to_string()),
+            )
+            .unwrap()
+        };
+        std::fs::File::create(&path).unwrap();
+        Qcow2::<Box<dyn DynStorage>, Arc<FormatAccess<Box<dyn DynStorage>>>>::create_builder(
+            Box::new(open_file(true)),
+        )
+        .size(CLUSTER * (CLUSTERS + 1))
+        .create()
+        .unwrap();
+
+        let fa = Arc::new(RwLock::new(FormatAccess::new(
+            open_qcow2_chain(Box::new(open_file(true)), true).unwrap(),
+        )));
+        let pattern = |c: u64, t: u64| ((c * THREADS + t) % 251 + 1) as u8;
+
+        for c in 0..CLUSTERS {
+            std::thread::scope(|scope| {
+                for t in 0..THREADS {
+                    let fa = Arc::clone(&fa);
+                    scope.spawn(move || {
+                        let buf = vec![pattern(c, t); SLICE as usize];
+                        fa.read()
+                            .unwrap()
+                            .writev(
+                                IoVector::from(vec![IoSlice::new(&buf)]),
+                                c * CLUSTER + t * SLICE,
+                            )
+                            .unwrap();
+                    });
+                }
+            });
+        }
+        fa.read().unwrap().flush().unwrap();
+
+        for c in 0..CLUSTERS {
+            for t in 0..THREADS {
+                let mut got = vec![0u8; SLICE as usize];
+                fa.read()
+                    .unwrap()
+                    .readv(
+                        IoVectorMut::from(vec![IoSliceMut::new(&mut got)]),
+                        c * CLUSTER + t * SLICE,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    got,
+                    vec![pattern(c, t); SLICE as usize],
+                    "cluster {c}, slice {t} did not survive its concurrent neighbours"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same race one cluster over: a multi-cluster write extends its host allocation as a
+    /// contiguous run, so for every cluster after the first it demands one specific host cluster.
+    /// A claim already in flight for that guest cluster necessarily sits elsewhere, and the run
+    /// must break there rather than claim a second cluster for it — claiming one would supersede
+    /// the claim in flight, which is exactly the loss the registry exists to prevent. The two
+    /// writes here are byte-disjoint but cluster-overlapping, so both must survive.
+    #[test]
+    fn a_write_extending_its_run_never_supersedes_a_claim_in_flight() {
+        use imago::io_buffers::{IoVector, IoVectorMut};
+        use imago::FormatCreateBuilder;
+        use std::io::{IoSlice, IoSliceMut};
+
+        const CLUSTER: u64 = 64 * 1024;
+        const TAIL: u64 = 4096;
+        // Several rounds, each on its own pair of clusters: one round can get lucky.
+        const ROUNDS: u64 = 64;
+
+        let dir = temp_dir("qcow2-run-vs-claim");
+        let path = dir.join("img.qcow2");
+        let open_file = |writable: bool| {
+            ImagoFile::open(
+                StorageOpenOptions::new()
+                    .write(writable)
+                    .filename(path.to_str().unwrap().to_string()),
+            )
+            .unwrap()
+        };
+        std::fs::File::create(&path).unwrap();
+        Qcow2::<Box<dyn DynStorage>, Arc<FormatAccess<Box<dyn DynStorage>>>>::create_builder(
+            Box::new(open_file(true)),
+        )
+        .size(CLUSTER * (2 * ROUNDS + 2))
+        .create()
+        .unwrap();
+
+        let fa = Arc::new(RwLock::new(FormatAccess::new(
+            open_qcow2_chain(Box::new(open_file(true)), true).unwrap(),
+        )));
+
+        for round in 0..ROUNDS {
+            // `head` is written in full plus the leading bytes of `tail`'s cluster (so its
+            // allocation runs across the boundary); the other write takes `tail`'s last bytes.
+            let head = round * 2 * CLUSTER;
+            let tail = head + 2 * CLUSTER - TAIL;
+            let (head_byte, tail_byte) = ((round % 251 + 1) as u8, (round % 241 + 5) as u8);
+
+            std::thread::scope(|scope| {
+                for (offset, len, byte) in [
+                    (head, 2 * CLUSTER - TAIL, head_byte),
+                    (tail, TAIL, tail_byte),
+                ] {
+                    let fa = Arc::clone(&fa);
+                    scope.spawn(move || {
+                        let buf = vec![byte; len as usize];
+                        fa.read()
+                            .unwrap()
+                            .writev(IoVector::from(vec![IoSlice::new(&buf)]), offset)
+                            .unwrap();
+                    });
+                }
+            });
+
+            let mut got = vec![0u8; TAIL as usize];
+            fa.read()
+                .unwrap()
+                .readv(IoVectorMut::from(vec![IoSliceMut::new(&mut got)]), tail)
+                .unwrap();
+            assert_eq!(
+                got,
+                vec![tail_byte; TAIL as usize],
+                "round {round}: the tail write was superseded by its neighbour's run"
+            );
+
+            let mut got = vec![0u8; TAIL as usize];
+            let head_end = head + 2 * CLUSTER - 2 * TAIL;
+            fa.read()
+                .unwrap()
+                .readv(IoVectorMut::from(vec![IoSliceMut::new(&mut got)]), head_end)
+                .unwrap();
+            assert_eq!(
+                got,
+                vec![head_byte; TAIL as usize],
+                "round {round}: the head write lost its last cluster"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The other half of the same locking scheme: `discard`/write-zeroes-with-unmap take the
     /// image's write lock (see `worker::IO_PARALLELISM`) precisely so they exclude a concurrent
     /// `writev`/`readv` (read lock) to the same region, rather than just avoiding a deadlock.

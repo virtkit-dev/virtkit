@@ -178,6 +178,11 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     /// Allows zeroing or discarding clusters.  `mapping` says which kind of mapping to create.
     ///
     /// Return the offset of the first affected cluster, and the byte length affected (may be 0).
+    ///
+    /// Does not consult [`PendingAllocations`](super::cow::PendingAllocations), so a concurrent
+    /// write's later commit can still map its own cluster over what this establishes. Only the
+    /// write-zeroes-without-unmap path gets here under a mere read lock, so this is unchanged
+    /// pre-existing behaviour; the registry now makes it visible enough to fix, should it matter.
     pub(super) async fn ensure_fixed_mapping(
         &self,
         offset: GuestOffset,
@@ -537,12 +542,19 @@ pub(super) enum FixedMapping {
 ///
 /// The caller must therefore call exactly one of [`commit()`](Self::commit) — once its write into
 /// the range this was returned alongside has actually succeeded — or [`abort()`](Self::abort) —
-/// if it hasn't — exactly once, before dropping this.  Neither can fail: mapping a cluster in is a
+/// if it hasn't — exactly once, before dropping this.  `abort()` cannot fail: freeing a cluster is
+/// already a best-effort operation crate-wide (see [`Qcow2::free_data_clusters()`]).  `commit()`
+/// can, but only for a claim a concurrent write holed (see
+/// [`PendingAllocations`](super::cow::PendingAllocations)); mapping a cluster in is otherwise a
 /// plain, infallible in-memory L2 table update (the same one a direct, non-deferred write would
-/// have done), and freeing one on abort is already a best-effort operation crate-wide (see
-/// [`Qcow2::free_data_clusters()`]).  Dropping this without calling either leaks any freshly
-/// allocated cluster in it and leaves the L2 table unchanged — safe, but wasteful; there is no
-/// `Drop` impl enforcing the call because the async free it would need cannot run in one.
+/// have done).
+///
+/// Dropping this without calling either does not just leak the freshly allocated cluster: the
+/// claim on it stays registered as in flight for the lifetime of the image, so every later write
+/// into that guest cluster shares a host cluster that nobody will ever map in, and lands where no
+/// reader can see it.  That is silent corruption, not waste, so every path out of a `writev` must
+/// route its `Qcow2Pending`s through one of the two.  There is no `Drop` impl enforcing it because
+/// the async free it would need cannot run in one.
 #[must_use = "must be committed or aborted"]
 pub(super) struct Qcow2Pending<'a, S: Storage + 'static, F: WrappedFormat<S> + 'static> {
     /// The image this pending batch's entries belong to, needed by both `commit()` (to lock the
@@ -571,34 +583,81 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2Pending<'_, S, F>
     /// Map every freshly allocated or reused-zero cluster into the L2 table (clearing the
     /// latter's "zero" flag), freeing whatever it superseded. Clusters already validly mapped
     /// as data are left untouched (nothing to commit).
-    pub(super) async fn commit(self) {
+    ///
+    /// Fails if a concurrent write sharing one of these claims gave up before its own write
+    /// landed, which leaves a hole in the cluster it never filled in (see
+    /// [`PendingAllocations`](super::cow::PendingAllocations)): that cluster must not go live,
+    /// so this write's bytes cannot be made visible and it must be reported as failed rather
+    /// than silently dropped. Everything not holed is still mapped in, and every claim is
+    /// released either way.
+    pub(super) async fn commit(self) -> io::Result<()> {
         let Some(l2_table) = self.l2_table else {
-            return;
+            return Ok(());
         };
         let cb = self.qcow2.header.cluster_bits();
         let mut l2_table = l2_table.lock_write().await;
+        let mut holed = false;
         for (guest_offset, allocation) in self.entries {
             let new_cluster = match allocation {
                 ClusterAllocation::MappedExisting(_) => continue,
                 ClusterAllocation::ReusedZero(new_cluster)
-                | ClusterAllocation::Fresh(new_cluster) => new_cluster,
+                | ClusterAllocation::Fresh(new_cluster)
+                | ClusterAllocation::SharedPending(new_cluster) => new_cluster,
             };
-            let l2i = GuestOffset(guest_offset).cluster(cb).l2_index(cb);
-            if let Some(leaked) = l2_table.map_cluster(l2i, new_cluster) {
-                self.qcow2.free_data_clusters(leaked.0, leaked.1).await;
+            let claimant = !matches!(allocation, ClusterAllocation::SharedPending(_));
+            // Release first: mapping in is this claim's to do only if no other user of it has
+            // already given up on filling the cluster. Releasing also tells a concurrent write
+            // that shares the claim and then fails that the cluster is live now and must not be
+            // freed.
+            let released =
+                self.qcow2
+                    .pending_allocs
+                    .lock()
+                    .await
+                    .release(guest_offset, true, claimant);
+            if released.holed {
+                holed = true;
+            } else {
+                let l2i = GuestOffset(guest_offset).cluster(cb).l2_index(cb);
+                if let Some(leaked) = l2_table.map_cluster(l2i, new_cluster) {
+                    self.qcow2.free_data_clusters(leaked.0, leaked.1).await;
+                }
+            }
+            if let Some(orphan) = released.orphan {
+                self.qcow2.free_data_clusters(orphan, ClusterCount(1)).await;
             }
         }
+        if holed {
+            return Err(io::Error::other(
+                "Concurrent write into the same cluster failed; this write cannot be made visible",
+            ));
+        }
+        Ok(())
     }
 
-    /// Give up: free every freshly allocated cluster: the L2 table was never touched, so there
-    /// is nothing to undo there. Already-valid or reused-as-is mappings are left untouched —
-    /// they were never this call's to free.
+    /// Give up: free every freshly allocated cluster this call is the last user of, and that
+    /// nobody mapped in (a concurrent write may have shared the claim and landed — see
+    /// [`PendingAllocations`](super::cow::PendingAllocations)). The L2 table was never touched,
+    /// so there is nothing to undo there, and already-valid mappings were never this call's to
+    /// free. Giving up while another write still shares a claim holes it: that cluster can no
+    /// longer go live, and the sharer's `commit()` fails instead of exposing it.
     pub(super) async fn abort(self) {
-        for (_, allocation) in self.entries {
-            if let ClusterAllocation::Fresh(new_cluster) = allocation {
+        for (guest_offset, allocation) in self.entries {
+            if matches!(allocation, ClusterAllocation::MappedExisting(_)) {
+                continue;
+            }
+            let claimant = !matches!(allocation, ClusterAllocation::SharedPending(_));
+            // Freeing is the last user's call, and only if none of them mapped the cluster in:
+            // a write sharing this claim may have landed and committed already. The registry
+            // lock is dropped before the free, which takes the allocator's.
+            let released =
                 self.qcow2
-                    .free_data_clusters(new_cluster, ClusterCount(1))
-                    .await;
+                    .pending_allocs
+                    .lock()
+                    .await
+                    .release(guest_offset, false, claimant);
+            if let Some(orphan) = released.orphan {
+                self.qcow2.free_data_clusters(orphan, ClusterCount(1)).await;
             }
         }
     }
@@ -609,8 +668,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> PendingDataMapping
     for Qcow2Pending<'_, S, F>
 {
     async fn commit(self: Box<Self>) -> io::Result<()> {
-        Qcow2Pending::commit(*self).await;
-        Ok(())
+        Qcow2Pending::commit(*self).await
     }
 
     async fn abort(self: Box<Self>) {
