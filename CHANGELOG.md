@@ -6,6 +6,12 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- A `vk build` could have the files it was working on deleted by another `vk`
+  starting up beside it, or refuse to start because it picked the same working
+  directory as one already running — most often when the build runs inside a
+  container writing to a shared output directory. Concurrent builds now keep
+  out of each other's way there whether or not they can see each other.
+
 - **A `vk build` stage could lose bytes the guest had already written.** Two
   writes landing close together in the same region of a stage's disk could
   race, and one of them was dropped — a file the guest wrote whole came back

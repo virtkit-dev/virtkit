@@ -506,25 +506,134 @@ pub fn build(opts: &Options) -> Result<Built> {
     build_inputs(inputs, opts)
 }
 
-/// Filename prefix for a build's scratch dir, named `<prefix><pid>-<seq>`. The embedded
-/// pid lets a later run reclaim scratch orphaned by a hard-killed build (see
-/// [`sweep_stale_scratch`]).
+/// Filename prefix for a build's scratch dir, named `<prefix><pid>-<seq>-<nonce>`. The three
+/// fields only keep concurrent builds off each other's dir; what marks one live is the lock
+/// its owner holds on it (see [`claim_scratch`]), not anything in its name. The pid stays
+/// first so a sweep can recognise this process's own dirs, and for the diagnostic value of
+/// knowing which process left one behind.
 const SCRATCH_PREFIX: &str = ".build-";
 
-/// The scratch dir for a build writing to `out`, unique per run (`<prefix><pid>-<seq>`).
+/// 64 random bits in hex, for a scratch dir name.
+///
+/// Pid and counter alone are not unique where a pid is not: a build in its own PID namespace
+/// (a container sharing the output directory) starts its counter at 0 like everybody else, so
+/// host pid 42 and container pid 42 name the same dir — and the loser of that collision fails
+/// with "in use by another build" rather than getting on with it. Two builds on different
+/// hosts sharing an output directory over a network filesystem collide the same way, which no
+/// namespace-derived identifier would fix either.
+///
+/// Unlike `ext4`'s UUID this is not a hint, so there is no falling back to a constant: that
+/// would put the collision straight back. A `/dev/urandom` that cannot be read is an error.
+fn scratch_nonce() -> Result<String> {
+    use std::io::Read;
+
+    let mut bytes = [0u8; 8];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .context("reading /dev/urandom for a unique build scratch dir name")?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// The scratch dir for a build writing to `out`, unique per run
+/// (`<prefix><pid>-<seq>-<nonce>`, see [`scratch_nonce`]).
 /// Placed next to `out` so stage ext4s land on the real filesystem the caller chose, not
 /// a small/RAM-backed tmpfs — but always made absolute: stage qcow2 overlays record their
 /// backing image by path, and qcow2 resolves a *relative* backing against the overlay's
 /// own directory, so a cwd-relative scratch (from a relative `--out`) would apply the
 /// prefix twice and fail to open the backing.
 fn build_scratch(out: &Path, seq: u64) -> Result<PathBuf> {
-    let rel = out
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!("{SCRATCH_PREFIX}{}-{seq}", std::process::id()));
+    let rel = out.parent().unwrap_or_else(|| Path::new(".")).join(format!(
+        "{SCRATCH_PREFIX}{}-{seq}-{}",
+        std::process::id(),
+        scratch_nonce()?
+    ));
     // Must be absolute (see above); the relative fallback would reintroduce the exact
     // backing-path bug, so surface the error instead of silently using it.
     std::path::absolute(&rel).context("resolving the build scratch dir to an absolute path")
+}
+
+/// How long [`claim_scratch`] keeps retrying a scratch dir it cannot take. Contention is a
+/// sweep removing the dir we just created — no other build computes this name (see
+/// [`scratch_nonce`]) — which resolves as soon as that removal finishes. But a scratch dir
+/// holds whole stage images, so "as soon as" is not instant and a tight spin would fail a
+/// build that only had to wait. Long enough to outlast any real removal, short enough that a
+/// dir stuck locked is reported rather than waited on forever.
+const CLAIM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long [`claim_scratch`] waits between attempts. Same backoff `cachelock` uses when it
+/// waits for a reclaim to finish.
+const CLAIM_RETRY: Duration = Duration::from_millis(20);
+
+/// Create `scratch` and claim it for the life of the returned handle: an exclusive,
+/// non-blocking `flock` on the directory itself, which the kernel drops when the process
+/// exits however it exits. [`sweep_stale_scratch`] reclaims a scratch dir only when it can
+/// take that lock itself, i.e. when no live process holds it. The same scheme `vk run` uses
+/// for its state dir (`run::lock_state_dir`, `vms::alive`).
+///
+/// This is what the pid in the dir name cannot do: a build running in its own PID namespace
+/// (a container sharing the output directory over a bind mount) has a pid that means nothing
+/// to a sweeper outside it, which would then read a live build as dead and delete its
+/// scratch mid-run. A file lock is namespace-independent — it is the open file description
+/// that holds it, not a pid the sweeper has to interpret. It does need the filesystem to
+/// carry `flock` to the host, which a bind mount and NFS do but virtio-fs does not, so a
+/// build inside a *microVM* writing to a share is no better off than before.
+///
+/// Locking the directory rather than a file inside it is what makes a sweep safe to race:
+/// `remove_dir_all` empties the directory before removing it, and the directory inode — and
+/// so the sweeper's lock on it — outlives that whole walk. A build cannot end up inside a
+/// removal in progress; it either waits it out or claims the fresh directory afterwards.
+fn claim_scratch(scratch: &Path) -> Result<std::fs::File> {
+    claim_scratch_until(scratch, Instant::now() + CLAIM_TIMEOUT)
+}
+
+/// [`claim_scratch`] with the retry deadline spelled out, so a test can ask for a single
+/// attempt (`Instant::now()`) instead of waiting the real one out.
+fn claim_scratch_until(scratch: &Path, deadline: Instant) -> Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+
+    loop {
+        std::fs::create_dir_all(scratch)
+            .with_context(|| format!("creating the build scratch dir {}", scratch.display()))?;
+        let dir = match std::fs::File::open(scratch) {
+            Ok(dir) => Some(dir),
+            // Swept between our create and our open — we had nothing to lock yet, so a sweep
+            // was right to take it. Same answer as a `same_file` mismatch below: try again.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e).with_context(|| format!("opening {}", scratch.display())),
+        };
+        if let Some(dir) = dir {
+            // SAFETY: the fd is owned by `dir`, which the caller keeps alive; flock returns
+            // 0 or -1 and does not block under `LOCK_NB`.
+            if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                // Only a lock on the directory the path still names is worth anything: a
+                // sweep can have removed the one we opened before we locked it (see
+                // `cachelock::acquire_shared` for the same reasoning about a file). If it
+                // did, the next attempt creates one of our own.
+                if crate::cachelock::same_file(&dir, scratch)? {
+                    return Ok(dir);
+                }
+            } else {
+                // A build must know it owns its scratch, so unlike the sweep — which reads
+                // an unlockable dir as live and moves on — anything other than contention is
+                // fatal here, including a filesystem that cannot `flock` at all.
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::WouldBlock {
+                    return Err(err).with_context(|| format!("locking {}", scratch.display()));
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            // Names carry a nonce, so no other build computes this one: whoever holds it is a
+            // sweep that has been reclaiming it for the whole deadline.
+            bail!(
+                "the build scratch dir {} stayed locked by a reclaim for {}s — retry, or \
+                 build with a different --out directory",
+                scratch.display(),
+                CLAIM_TIMEOUT.as_secs()
+            );
+        }
+        std::thread::sleep(CLAIM_RETRY);
+    }
 }
 
 /// Resolve the microVM's kernel + agent and hold them for the whole build: an embedded
@@ -681,16 +790,16 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     let anchor = out
         .or(opts.out_disk.as_deref())
         .context("build needs --out <file> or --disk <file> (or --print-plan)")?;
-    // Scratch placement + naming: see [`build_scratch`]. Keyed by pid + an in-process
-    // counter, so two builds in one process (e.g. `run --compose` materializing several
-    // services, or parallel tests) never share — the first one's cleanup would otherwise
-    // delete the second's scratch.
+    // Scratch placement + naming: see [`build_scratch`]. Keyed by an in-process counter (so
+    // two builds in one process — `run --compose` materializing several services, or parallel
+    // tests — never share, the first one's cleanup would otherwise delete the second's) plus a
+    // nonce, which is what keeps builds that cannot see each other's pids apart.
     static BUILD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let scratch = build_scratch(anchor, seq)?;
     // Self-heal: a build normally removes its scratch on exit (even on error), but a hard
     // kill (SIGKILL/OOM/Ctrl-C/panic) orphans it. Before starting, drop any sibling
-    // scratch whose owning process is gone, so crashed runs don't accumulate.
+    // scratch nobody is holding, so crashed runs don't accumulate.
     if let Some(parent) = scratch.parent() {
         sweep_stale_scratch(parent, SCRATCH_PREFIX);
     }
@@ -702,6 +811,10 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     } else {
         (None, None)
     };
+    // Claim ours for the length of the build, so a concurrent sweep (another build starting
+    // beside us) can tell it is live without having to interpret our pid. After the resolve
+    // above, so its failure leaves no scratch dir behind.
+    let _scratch_owner = claim_scratch(&scratch)?;
     // Live build overview (Docker/buildkit-style): a dashboard in a terminal, plain `#N`
     // lines otherwise. The drivers populate it (which stages/steps run) once they know the
     // needed set, and route each stage's guest output through it.
@@ -914,6 +1027,8 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
     if let Some(parent) = scratch.parent() {
         sweep_stale_scratch(parent, SCRATCH_PREFIX);
     }
+    // As in `build_backend`: hold the scratch's own lock for the whole build.
+    let _scratch_owner = claim_scratch(&scratch)?;
     let mut mv = make_microvm(opts, &scratch, &kernel.path, &agent.path, &timings)?;
     // One job budget for every unit's stages combined (not per unit), so concurrent work
     // stays within host RAM instead of multiplying live guests.
@@ -2413,11 +2528,13 @@ fn concurrency_line(jobs: usize, cpus: u32, mem: &str, configured: bool) -> Stri
 }
 
 /// Remove build scratch orphaned by earlier runs that were hard-killed (SIGKILL, OOM,
-/// Ctrl-C, panic) before their normal on-exit cleanup could run. Scratch dirs in `dir`
-/// are named `<prefix><pid>-<seq>`; one whose owning `pid` is no longer a live process is
-/// stale and removed. A dir owned by this process (a concurrent in-process build) or by a
-/// live pid is left untouched — worst case an orphan survives, never a live build's
-/// scratch deleted. Best-effort: any error (unreadable dir, racing removal) is ignored.
+/// Ctrl-C, panic) before their normal on-exit cleanup could run. Scratch dirs in `dir` are
+/// named `<prefix><pid>-<seq>-<nonce>` and a live one holds an exclusive lock on itself
+/// ([`claim_scratch`]): a dir is stale only if this process can take that lock, whatever its
+/// name says about a pid. Anything else is left untouched — worst case an orphan survives,
+/// never the scratch of a build that takes the lock (a `vk` from before this scheme takes
+/// none, so a mixed-version host can still lose one). Best-effort: any error (unreadable
+/// dir, racing removal) is ignored.
 fn sweep_stale_scratch(dir: &Path, prefix: &str) {
     let me = std::process::id();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -2433,10 +2550,40 @@ fn sweep_stale_scratch(dir: &Path, prefix: &str) {
         else {
             continue;
         };
-        if pid != me && !crate::spawn::pid_alive(pid) {
-            let _ = std::fs::remove_dir_all(entry.path());
+        // Ours: a sibling in-process build may be between creating its dir and locking it.
+        if pid == me {
+            continue;
         }
+        let path = entry.path();
+        // Hold the claim across the removal: dropping it first would let a build claim the
+        // dir in the window and have its files deleted from under it.
+        let Some(_owner) = claim_if_abandoned(&path) else {
+            continue;
+        };
+        let _ = std::fs::remove_dir_all(&path);
     }
+}
+
+/// Claim the scratch dir at `path` if it belongs to no live build, returning the handle
+/// whose lock the caller must hold for as long as it acts on the dir. It is abandoned when
+/// its directory can be locked exclusively — the owner is gone and the kernel released the
+/// lock. A dir that cannot be locked has a live owner, including one in another PID
+/// namespace, which is exactly what a pid cannot tell us. Anything unexpected (an unreadable
+/// dir, a filesystem without `flock`) reads as live, so a sweep never removes what it does
+/// not understand.
+fn claim_if_abandoned(path: &Path) -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+
+    let dir = std::fs::File::open(path).ok()?;
+    // SAFETY: the fd is owned by `dir`, which the caller keeps alive; flock returns 0 or -1
+    // and does not block under `LOCK_NB`.
+    if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return None;
+    }
+    // A build recreating this dir between our open and our lock would hold a different
+    // inode; removing what we opened would then delete nothing it owns, but reporting it
+    // swept would be a lie. Only act on the dir the path still names.
+    crate::cachelock::same_file(&dir, path).ok()?.then_some(dir)
 }
 
 /// Available host RAM in MiB, from `/proc/meminfo` `MemAvailable`. `None` if unreadable.
@@ -3093,6 +3240,27 @@ mod tests {
         );
     }
 
+    /// Two builds that cannot tell each other's pids apart — one in a container sharing the
+    /// output directory, or one on another host across a network filesystem — would otherwise
+    /// compute the same `<pid>-<seq>` name and one of them would fail to claim it. The nonce
+    /// makes the name unique without asking who anyone is, so same pid and same seq still means
+    /// a different dir.
+    #[test]
+    fn two_builds_never_compute_the_same_scratch_name() {
+        let out = Path::new("./test.ext4");
+        let a = build_scratch(out, 0).unwrap();
+        let b = build_scratch(out, 0).unwrap();
+        assert_ne!(a, b, "same pid and seq must still yield distinct scratch");
+
+        // The sweep still reads the pid out of the longer name, so it can tell its own dirs.
+        let name = a.file_name().unwrap().to_str().unwrap();
+        let pid = name
+            .strip_prefix(SCRATCH_PREFIX)
+            .and_then(|rest| rest.split_once('-'))
+            .and_then(|(pid, _)| pid.parse::<u32>().ok());
+        assert_eq!(pid, Some(std::process::id()), "unparseable name {name}");
+    }
+
     /// Scratch is absolute even for a relative `--out`, so a stage qcow2's recorded backing
     /// path resolves against the overlay's own dir without doubling the scratch prefix.
     #[test]
@@ -3112,30 +3280,274 @@ mod tests {
         );
     }
 
-    /// The startup sweep removes scratch owned by a dead process but never a live pid's
-    /// (nor this process's own, nor an unrelated dir).
-    #[test]
-    fn sweep_removes_only_dead_pid_scratch() {
-        let root = tmpdir("sweep");
-        // A guaranteed-dead pid: spawn a child and reap it.
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        let dead = child.id();
-        child.wait().unwrap();
+    /// Sweep `root` until `dir` is gone. A single shot is racy under parallel test load: a
+    /// concurrent test's `Command::spawn` forks with this test's lock fd still open, holding
+    /// the lock alive until the child `exec`s — the same hazard `cachelock` documents for its
+    /// own sweeps. Converges once the transient inheriting child is gone.
+    fn swept_eventually(root: &Path, dir: &Path) -> bool {
+        crate::cachelock::reclaimed_eventually(|| {
+            sweep_stale_scratch(root, SCRATCH_PREFIX);
+            !dir.exists()
+        })
+    }
 
-        let dead_dir = root.join(format!("{SCRATCH_PREFIX}{dead}-0"));
+    /// A pid that has certainly been reaped, so a dir named after it never looks live on
+    /// its name alone.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// The startup sweep removes scratch nobody holds, keeps a dir this process is building
+    /// in, and leaves anything that is not scratch alone.
+    #[test]
+    fn sweep_removes_only_unheld_scratch() {
+        let root = tmpdir("sweep");
+        let orphan = root.join(format!("{SCRATCH_PREFIX}{}-0", dead_pid()));
         let own_dir = root.join(format!("{SCRATCH_PREFIX}{}-3", std::process::id()));
-        let live_dir = root.join(format!("{SCRATCH_PREFIX}1-0")); // pid 1 (init) always alive
         let unrelated = root.join("not-scratch");
-        for d in [&dead_dir, &own_dir, &live_dir, &unrelated] {
+        for d in [&orphan, &own_dir, &unrelated] {
             std::fs::create_dir_all(d).unwrap();
         }
 
-        sweep_stale_scratch(&root, SCRATCH_PREFIX);
-
-        assert!(!dead_dir.exists(), "dead-pid scratch should be swept");
+        assert!(
+            swept_eventually(&root, &orphan),
+            "scratch nobody holds should be swept"
+        );
         assert!(own_dir.exists(), "this process's own scratch must be kept");
-        assert!(live_dir.exists(), "a live pid's scratch must be kept");
         assert!(unrelated.exists(), "a non-scratch dir must be untouched");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A build's lock on its own scratch is what marks it live — not the pid in the name,
+    /// which means nothing to a sweeper in another PID namespace (a build in a container
+    /// sharing the output dir). A locked dir must survive a sweep even when its pid reads as
+    /// dead here; releasing the lock makes it collectable.
+    #[test]
+    fn sweep_keeps_a_locked_scratch_whatever_its_pid_says() {
+        let root = tmpdir("sweep-lock");
+        let dead = dead_pid();
+
+        let claimed = root.join(format!("{SCRATCH_PREFIX}{dead}-0"));
+        let owner = claim_scratch(&claimed).unwrap();
+
+        sweep_stale_scratch(&root, SCRATCH_PREFIX);
+        assert!(
+            claimed.exists(),
+            "a scratch dir whose owner lock is held must survive the sweep"
+        );
+
+        // The owner goes away (the process exited, the kernel dropped its lock).
+        drop(owner);
+        assert!(
+            swept_eventually(&root, &claimed),
+            "once nobody holds the lock the scratch is collectable"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Claiming a scratch dir twice must fail rather than let two builds share one.
+    #[test]
+    fn a_second_claim_on_one_scratch_dir_is_refused() {
+        let root = tmpdir("sweep-double-claim");
+        let dir = root.join(format!("{SCRATCH_PREFIX}{}-0", std::process::id()));
+        let _first = claim_scratch(&dir).unwrap();
+        assert!(
+            claim_scratch_until(&dir, Instant::now()).is_err(),
+            "a scratch dir already claimed must not be handed out twice"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// How libtest addresses [`scratch_claim_holder`], for the re-exec below.
+    const SCRATCH_HOLDER: &str = "build::tests::scratch_claim_holder";
+
+    /// A child killed however its test ends. The holder below blocks forever by design, so
+    /// a panicking assertion between spawning and killing it would otherwise leak a process
+    /// still holding a lock under `$TMPDIR`.
+    struct Reaped(std::process::Child);
+
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Not a test in its own right: the subprocess half of
+    /// [`sweep_reclaims_a_scratch_whose_owner_was_killed`]. Claims the scratch dir named by
+    /// `VK_TEST_SCRATCH_CLAIM`, reports itself ready, and blocks until killed. `#[ignore]`
+    /// keeps it out of ordinary runs; the parent re-runs this binary to reach it.
+    #[test]
+    #[ignore]
+    fn scratch_claim_holder() {
+        let (Ok(dir), Ok(ready)) = (
+            std::env::var("VK_TEST_SCRATCH_CLAIM"),
+            std::env::var("VK_TEST_SCRATCH_READY"),
+        ) else {
+            return;
+        };
+        let _owner = claim_scratch(Path::new(&dir)).unwrap();
+        std::fs::write(&ready, b"claimed").unwrap();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
+
+    /// What the lock actually buys is that a *hard-killed* build stops holding its
+    /// scratch: the kernel drops the lock with the process, and no in-process `drop` can
+    /// stand in for that. Drive it for real — a subprocess claims the dir and blocks, the
+    /// sweep must keep it, then `SIGKILL` must make it collectable.
+    #[test]
+    fn sweep_reclaims_a_scratch_whose_owner_was_killed() {
+        let root = tmpdir("sweep-killed-owner");
+        // Named after a dead pid, so only the subprocess's lock keeps it from the sweep.
+        let claimed = root.join(format!("{SCRATCH_PREFIX}{}-0", dead_pid()));
+        let ready = root.join("ready");
+
+        let mut holder = Reaped(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "--ignored", SCRATCH_HOLDER])
+                .env("VK_TEST_SCRATCH_CLAIM", &claimed)
+                .env("VK_TEST_SCRATCH_READY", &ready)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the holder never claimed {}",
+                claimed.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        sweep_stale_scratch(&root, SCRATCH_PREFIX);
+        assert!(
+            claimed.exists(),
+            "a scratch dir a live process holds must survive the sweep"
+        );
+
+        holder.0.kill().unwrap();
+        let died = holder.0.wait().unwrap();
+        // Killed, not already gone — otherwise the sweep above proved nothing.
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&died),
+            Some(libc::SIGKILL),
+            "the holder was meant to still be blocking on its claim"
+        );
+        assert!(
+            swept_eventually(&root, &claimed),
+            "a killed owner's lock dies with it, making its scratch collectable"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The pid misleads in the other direction too: a scratch dir nobody owns, whose pid has
+    /// since been reused by an unrelated live process, read as live and was never collected.
+    /// That the lock is free settles it, whatever the pid says.
+    #[test]
+    fn sweep_reclaims_an_unclaimed_scratch_whose_pid_is_live() {
+        let root = tmpdir("sweep-pid-reuse");
+        // pid 1 is always alive, so only the free lock can make this collectable.
+        let stale = root.join(format!("{SCRATCH_PREFIX}1-0"));
+        drop(claim_scratch(&stale).unwrap());
+
+        assert!(
+            swept_eventually(&root, &stale),
+            "a free lock means nobody owns the dir, whatever its pid"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A sweep must hold the claim it decided on for as long as it is deleting: releasing it
+    /// first leaves a window where a build claims the dir and then has its files removed.
+    /// The lock is on the directory, which `remove_dir_all` empties before removing it, so
+    /// it covers the whole walk — including, as here, the part where the dir has already
+    /// lost its contents but still exists under the name a build would claim.
+    #[test]
+    fn a_sweep_holds_its_claim_across_the_whole_removal() {
+        let root = tmpdir("sweep-holds-claim");
+        let dir = root.join(format!("{SCRATCH_PREFIX}{}-0", dead_pid()));
+        drop(claim_scratch(&dir).unwrap());
+        std::fs::write(dir.join("stage.ext4"), b"a stage half-removed").unwrap();
+
+        let owner = claim_if_abandoned(&dir).expect("an unlocked scratch dir is abandoned");
+        // Mid-walk: contents gone, the dir itself still to come.
+        std::fs::remove_file(dir.join("stage.ext4")).unwrap();
+        assert!(
+            dir.exists(),
+            "the removal has not reached the dir itself yet"
+        );
+        assert!(
+            claim_scratch_until(&dir, Instant::now()).is_err(),
+            "a build must not claim a dir a sweep is part-way through removing"
+        );
+        drop(owner);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// And the other side of that window: a claim landing after a sweep removed the dir must
+    /// come back holding the directory the path now names, not the removed one it may have
+    /// opened first — otherwise the build writes into nothing.
+    #[test]
+    fn a_claim_recreates_a_scratch_dir_a_sweep_removed() {
+        let root = tmpdir("claim-after-sweep");
+        let dir = root.join(format!("{SCRATCH_PREFIX}{}-0", dead_pid()));
+        drop(claim_scratch(&dir).unwrap());
+        assert!(
+            swept_eventually(&root, &dir),
+            "an unlocked scratch dir is swept"
+        );
+
+        let owner = claim_scratch(&dir).unwrap();
+        assert!(
+            crate::cachelock::same_file(&owner, &dir).unwrap(),
+            "a claim must hold the dir its path names"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A claim landing *while* a sweep removes the dir waits that removal out rather than
+    /// failing or joining it, and comes back holding a directory of its own — never the one
+    /// the sweep emptied.
+    #[test]
+    fn a_claim_racing_a_sweep_waits_for_a_dir_of_its_own() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tmpdir("claim-vs-sweep");
+        let dir = root.join(format!("{SCRATCH_PREFIX}{}-0", dead_pid()));
+        drop(claim_scratch(&dir).unwrap());
+
+        let sweeping = claim_if_abandoned(&dir).expect("an unlocked scratch dir is abandoned");
+        let held = std::fs::metadata(&dir).unwrap();
+
+        // The sweep finishes only once the build is already waiting behind it.
+        let removing = std::thread::spawn({
+            let dir = dir.clone();
+            move || {
+                std::thread::sleep(CLAIM_RETRY * 3);
+                std::fs::remove_dir_all(&dir).unwrap();
+                drop(sweeping);
+            }
+        });
+
+        let owner = claim_scratch(&dir).unwrap();
+        removing.join().unwrap();
+
+        let fresh = owner.metadata().unwrap();
+        assert_ne!(
+            (held.dev(), held.ino()),
+            (fresh.dev(), fresh.ino()),
+            "a build must get a fresh dir, not the one the sweep emptied"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

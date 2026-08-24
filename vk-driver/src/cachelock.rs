@@ -86,8 +86,10 @@ pub(crate) fn acquire_shared(lock: &Path, used: &Path) -> Result<Guard> {
 }
 
 /// Whether the open `file` is still the file `path` names — `false` once a reclaim has
-/// unlinked it, or a rebuild has replaced it with a new one.
-fn same_file(file: &std::fs::File, path: &Path) -> Result<bool> {
+/// unlinked it, or a rebuild has replaced it with a new one. Works on a directory just as
+/// well as a file: `build::claim_scratch` uses it to check the scratch dir it locked is
+/// still the one its path names.
+pub(crate) fn same_file(file: &std::fs::File, path: &Path) -> Result<bool> {
     use std::os::unix::fs::MetadataExt;
     let held = file
         .metadata()
