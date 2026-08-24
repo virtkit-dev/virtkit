@@ -2,6 +2,7 @@
 /target
 /dist
 /third_party/libkrun/target/
+/third_party/imago/target/
 
 # Editor / OS cruft
 *.swp
