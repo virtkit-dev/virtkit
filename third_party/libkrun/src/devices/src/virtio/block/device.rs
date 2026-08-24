@@ -521,6 +521,10 @@ unsafe impl ByteValued for VirtioBlkConfig {}
 /// A qcow2 image and its backing chain, both opened over boxed dynamic storage.
 type BoxedQcow2 = Qcow2<Box<dyn DynStorage>, Arc<FormatAccess<Box<dyn DynStorage>>>>;
 
+/// An opened image shared across threads, as the worker pool holds it.
+#[cfg(test)]
+type SharedImage = Arc<RwLock<FormatAccess<Box<dyn DynStorage>>>>;
+
 /// Open `metadata` as a qcow2, resolving its backing chain through [`LazyAwareOpenGate`].
 ///
 /// The gate is what makes a `.vk_ro_img` backing file (a lazy, chunk-decompressing view of a
@@ -976,6 +980,27 @@ mod tests {
         dir
     }
 
+    /// A writable qcow2 disk of `size` bytes, backing-less, under its own temp dir: `(dir,
+    /// image)`, the caller removing `dir` when done. The race tests below each drive their own
+    /// concurrent workload through one of these; `size` is the bytes that workload addresses.
+    fn race_image(tag: &str, size: u64) -> (PathBuf, SharedImage) {
+        use imago::FormatCreateBuilder;
+
+        let dir = temp_dir(tag);
+        let path = dir.join("img.qcow2");
+        let open_file =
+            || ImagoFile::open(StorageOpenOptions::new().write(true).filename(&path)).unwrap();
+        std::fs::File::create(&path).unwrap();
+        BoxedQcow2::create_builder(Box::new(open_file()))
+            .size(size)
+            .create()
+            .unwrap();
+        let image = Arc::new(RwLock::new(FormatAccess::new(
+            open_qcow2_chain(Box::new(open_file()), true).unwrap(),
+        )));
+        (dir, image)
+    }
+
     /// A read-only raw [`DiskProperties`] backed by `path`, with the mmap read path enabled —
     /// the same wiring `Block::new` produces for a read-only raw image.
     fn mmap_disk(path: &std::path::Path) -> DiskProperties {
@@ -1369,7 +1394,6 @@ mod tests {
     #[test]
     fn concurrent_writes_into_one_qcow2_cluster_all_land() {
         use imago::io_buffers::{IoVector, IoVectorMut};
-        use imago::FormatCreateBuilder;
         use std::io::{IoSlice, IoSliceMut};
 
         const CLUSTER: u64 = 64 * 1024;
@@ -1378,27 +1402,7 @@ mod tests {
         // Several clusters, each written by a fresh concurrent burst: one round can get lucky.
         const CLUSTERS: u64 = 8;
 
-        let dir = temp_dir("qcow2-cluster-race");
-        let path = dir.join("img.qcow2");
-        let open_file = |writable: bool| {
-            ImagoFile::open(
-                StorageOpenOptions::new()
-                    .write(writable)
-                    .filename(path.to_str().unwrap().to_string()),
-            )
-            .unwrap()
-        };
-        std::fs::File::create(&path).unwrap();
-        Qcow2::<Box<dyn DynStorage>, Arc<FormatAccess<Box<dyn DynStorage>>>>::create_builder(
-            Box::new(open_file(true)),
-        )
-        .size(CLUSTER * (CLUSTERS + 1))
-        .create()
-        .unwrap();
-
-        let fa = Arc::new(RwLock::new(FormatAccess::new(
-            open_qcow2_chain(Box::new(open_file(true)), true).unwrap(),
-        )));
+        let (dir, fa) = race_image("qcow2-cluster-race", CLUSTER * CLUSTERS);
         let pattern = |c: u64, t: u64| ((c * THREADS + t) % 251 + 1) as u8;
 
         for c in 0..CLUSTERS {
@@ -1449,7 +1453,6 @@ mod tests {
     #[test]
     fn write_zeroes_beside_a_concurrent_write_in_one_cluster() {
         use imago::io_buffers::{IoVector, IoVectorMut};
-        use imago::FormatCreateBuilder;
         use std::io::{IoSlice, IoSliceMut};
 
         const CLUSTER: u64 = 64 * 1024;
@@ -1458,26 +1461,7 @@ mod tests {
         // at 64 rounds a regression still slips through about half the time.
         const CLUSTERS: u64 = 1024;
 
-        let dir = temp_dir("qcow2-zero-race");
-        let path = dir.join("img.qcow2");
-        let open_file = |writable: bool| {
-            ImagoFile::open(
-                StorageOpenOptions::new()
-                    .write(writable)
-                    .filename(path.to_str().unwrap().to_string()),
-            )
-            .unwrap()
-        };
-        std::fs::File::create(&path).unwrap();
-        Qcow2::<Box<dyn DynStorage>, Arc<FormatAccess<Box<dyn DynStorage>>>>::create_builder(
-            Box::new(open_file(true)),
-        )
-        .size(CLUSTER * CLUSTERS)
-        .create()
-        .unwrap();
-        let fa = Arc::new(RwLock::new(FormatAccess::new(
-            open_qcow2_chain(Box::new(open_file(true)), true).unwrap(),
-        )));
+        let (dir, fa) = race_image("qcow2-zero-race", CLUSTER * CLUSTERS);
 
         for c in 0..CLUSTERS {
             std::thread::scope(|scope| {
@@ -1538,7 +1522,6 @@ mod tests {
     #[test]
     fn a_write_extending_its_run_never_supersedes_a_claim_in_flight() {
         use imago::io_buffers::{IoVector, IoVectorMut};
-        use imago::FormatCreateBuilder;
         use std::io::{IoSlice, IoSliceMut};
 
         const CLUSTER: u64 = 64 * 1024;
@@ -1546,27 +1529,7 @@ mod tests {
         // Several rounds, each on its own pair of clusters: one round can get lucky.
         const ROUNDS: u64 = 64;
 
-        let dir = temp_dir("qcow2-run-vs-claim");
-        let path = dir.join("img.qcow2");
-        let open_file = |writable: bool| {
-            ImagoFile::open(
-                StorageOpenOptions::new()
-                    .write(writable)
-                    .filename(path.to_str().unwrap().to_string()),
-            )
-            .unwrap()
-        };
-        std::fs::File::create(&path).unwrap();
-        Qcow2::<Box<dyn DynStorage>, Arc<FormatAccess<Box<dyn DynStorage>>>>::create_builder(
-            Box::new(open_file(true)),
-        )
-        .size(CLUSTER * (2 * ROUNDS + 2))
-        .create()
-        .unwrap();
-
-        let fa = Arc::new(RwLock::new(FormatAccess::new(
-            open_qcow2_chain(Box::new(open_file(true)), true).unwrap(),
-        )));
+        let (dir, fa) = race_image("qcow2-run-vs-claim", CLUSTER * 2 * ROUNDS);
 
         for round in 0..ROUNDS {
             // `head` is written in full plus the leading bytes of `tail`'s cluster (so its
