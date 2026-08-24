@@ -17,6 +17,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use vk_selfupdate::{Outcome, Tool};
 
+/// The `accounts` subcommand's implementation. A module of this binary rather than
+/// of the library: its whole contract is printing operator prose on stdout, which is no
+/// part of the store API `vk-driver` links.
+mod accounts_cli;
+
 // Match vk-driver: jemalloc under musl (the glibc allocator fragments on the
 // long-lived, many-small-allocation server workload).
 #[cfg(target_env = "musl")]
@@ -156,6 +161,130 @@ enum Cmd {
         #[arg(long)]
         check: bool,
     },
+    /// Manage users and API keys in `mode = "accounts"` (see DESIGN.md)
+    ///
+    /// Works on the accounts db directly, so the server must be stopped: only one
+    /// process can hold that file at a time. Granting admin has no HTTP route at all,
+    /// by design — an operator with the db is the trust level it assumes.
+    Accounts {
+        #[command(subcommand)]
+        cmd: AccountsCmd,
+    },
+}
+
+/// Where the accounts db is: an explicit `--accounts-db`, else the `serve` config's
+/// (`--config`), else `<root>/accounts/accounts.db` under the resolved store root. Shared
+/// by every `accounts` subcommand.
+#[derive(clap::Args)]
+struct StoreArgs {
+    /// Store directory [default: the `root` in --config, else the shared virtkit store]
+    #[arg(long, value_name = "DIR")]
+    root: Option<PathBuf>,
+    /// The `serve` config file to take root/accounts_db from
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+    /// Accounts db file [default: --config's accounts_db, else <root>/accounts/accounts.db]
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["root", "config"])]
+    accounts_db: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum AccountsCmd {
+    /// List every known user
+    ListUsers {
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Grant a user admin (write access to every repo)
+    GrantAdmin {
+        /// The user's OIDC email claim
+        email: String,
+        /// Which provider's user, when one email matches more than one
+        #[arg(long, value_name = "URL")]
+        issuer: Option<String>,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Revoke a user's admin
+    RevokeAdmin {
+        /// The user's OIDC email claim
+        email: String,
+        /// Which provider's user, when one email matches more than one
+        #[arg(long, value_name = "URL")]
+        issuer: Option<String>,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// List API keys — every key, or one user's
+    ListKeys {
+        /// Only this user's keys
+        #[arg(long, value_name = "EMAIL")]
+        owner_email: Option<String>,
+        /// Which provider's user, when one email matches more than one
+        ///
+        /// Only means anything alongside --owner-email, and is refused without it: on its
+        /// own it reads as a filter and would silently list every key instead.
+        #[arg(long, value_name = "URL", requires = "owner_email")]
+        issuer: Option<String>,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Revoke an API key by id (see `list-keys`)
+    ///
+    /// Reports failure for an id that is unknown *or* already revoked — it does not
+    /// distinguish the two.
+    RevokeKey {
+        /// The key's id, as `list-keys` prints it
+        id: String,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Create a scoped API key, printed once
+    CreateKey {
+        /// The key owner's email
+        #[arg(long, value_name = "EMAIL")]
+        owner_email: String,
+        /// Which provider's user, when one email matches more than one
+        #[arg(long, value_name = "URL")]
+        issuer: Option<String>,
+        /// A short label for the key
+        #[arg(long)]
+        name: String,
+        /// ACTION:repo_pattern, e.g. write:team-a/* — repeat for more than one
+        #[arg(long = "scope", value_name = "ACTION:PATTERN", required = true)]
+        scopes: Vec<String>,
+        /// Expire the key after this many days [default: never]
+        #[arg(long, value_name = "DAYS")]
+        expires_days: Option<u64>,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+}
+
+/// The accounts db a `StoreArgs` resolves to, opened only if it is already there.
+///
+/// Never creates one: a mistyped `--root` would otherwise leave an empty db behind and
+/// every subcommand would then report truthfully about the wrong file — "no users yet"
+/// for a registry that has plenty. `serve` is what brings an accounts db into being.
+fn open_accounts_db(store: &StoreArgs) -> Result<(vk_registry::accounts::Db, PathBuf)> {
+    let path = vk_registry::ServerConfig::accounts_db_of(
+        store.config.as_deref(),
+        store.root.clone(),
+        store.accounts_db.clone(),
+    )?;
+    // Advisory only, and deliberately so: this resolves the path a second time, but it is
+    // a usability guard (do not leave an empty db behind a mistyped `--root`), not a
+    // security one. `Db::open` is the gate — it opens `O_NOFOLLOW` and judges the mode off
+    // the descriptor, so a symlink or a file swapped in after this check is still refused.
+    if !path.is_file() {
+        anyhow::bail!(
+            "no accounts db at {} — check --root/--config/--accounts-db, or start the \
+             server once in mode = \"accounts\" to create it",
+            path.display()
+        );
+    }
+    let db = vk_registry::accounts::Db::open(&path)?;
+    Ok((db, path))
 }
 
 /// This binary as `update` replaces it: the release asset `vk-registry` ships as, and
@@ -271,6 +400,71 @@ async fn run(cli: Cli) -> Result<()> {
         }
         // handled in `main`, before this dispatch
         Cmd::Update { .. } => unreachable!("update is handled in main"),
+        Cmd::Accounts { cmd } => run_accounts(cmd),
+    }
+}
+
+fn run_accounts(cmd: AccountsCmd) -> Result<()> {
+    match cmd {
+        AccountsCmd::ListUsers { store } => {
+            let (db, path) = open_accounts_db(&store)?;
+            accounts_cli::list_users(&db, &path)
+        }
+        AccountsCmd::GrantAdmin {
+            email,
+            issuer,
+            store,
+        } => {
+            let (db, _) = open_accounts_db(&store)?;
+            accounts_cli::set_admin(&db, &email, issuer.as_deref(), true)
+        }
+        AccountsCmd::RevokeAdmin {
+            email,
+            issuer,
+            store,
+        } => {
+            let (db, _) = open_accounts_db(&store)?;
+            accounts_cli::set_admin(&db, &email, issuer.as_deref(), false)
+        }
+        AccountsCmd::ListKeys {
+            owner_email,
+            issuer,
+            store,
+        } => {
+            let (db, _) = open_accounts_db(&store)?;
+            accounts_cli::list_keys(&db, owner_email.as_deref(), issuer.as_deref())
+        }
+        AccountsCmd::RevokeKey { id, store } => {
+            let (db, _) = open_accounts_db(&store)?;
+            accounts_cli::revoke_key(&db, &id)
+        }
+        AccountsCmd::CreateKey {
+            owner_email,
+            issuer,
+            name,
+            scopes,
+            expires_days,
+            store,
+        } => {
+            // Parsed and validated before the db is touched, so a mistyped --scope or
+            // --name is a usage error rather than something that surfaces after a lock is
+            // taken. `validate_key_input` is the whole of what the store will check, so
+            // nothing is left to fail late.
+            let scopes = scopes
+                .iter()
+                .map(|s| accounts_cli::parse_scope(s))
+                .collect::<Result<Vec<_>>>()?;
+            vk_registry::accounts::validate_key_input(&name, &scopes)?;
+            let (db, _) = open_accounts_db(&store)?;
+            accounts_cli::create_key(
+                &db,
+                &owner_email,
+                issuer.as_deref(),
+                &name,
+                &scopes,
+                expires_days,
+            )
+        }
     }
 }
 
@@ -485,6 +679,113 @@ mod tests {
 
     // `status`/`gc` take the same `--config` `serve` does: the store to report on is the
     // one the server was configured with, and naming that file is how they are told.
+    /// The `accounts` subcommands' shape: a store selector on each, `--scope` required
+    /// and repeatable, and `--accounts-db` refusing to sit beside the flags it replaces.
+    #[test]
+    fn accounts_subcommands_take_a_store_and_require_a_scope() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+
+        let cli = parse(&[
+            "vk-registry",
+            "accounts",
+            "grant-admin",
+            "a@b.c",
+            "--root",
+            "/srv/store",
+        ])
+        .expect("grant-admin takes an email and a store");
+        match cli.cmd {
+            Cmd::Accounts {
+                cmd: AccountsCmd::GrantAdmin { email, store, .. },
+            } => {
+                assert_eq!(email, "a@b.c");
+                assert_eq!(store.root.as_deref(), Some(Path::new("/srv/store")));
+            }
+            _ => panic!("expected accounts grant-admin"),
+        }
+
+        // `--issuer` narrows `--owner-email`; on its own it would read as a filter and
+        // silently list every key, so clap refuses the combination outright
+        assert!(
+            parse(&[
+                "vk-registry",
+                "accounts",
+                "list-keys",
+                "--issuer",
+                "https://idp",
+                "--root",
+                "/srv/store",
+            ])
+            .is_err(),
+            "--issuer without --owner-email must be a usage error"
+        );
+        assert!(
+            parse(&[
+                "vk-registry",
+                "accounts",
+                "list-keys",
+                "--owner-email",
+                "a@b.c",
+                "--issuer",
+                "https://idp",
+                "--root",
+                "/srv/store",
+            ])
+            .is_ok(),
+            "together they are the disambiguating pair"
+        );
+
+        // --scope is required, and repeats
+        assert!(
+            parse(&[
+                "vk-registry",
+                "accounts",
+                "create-key",
+                "--owner-email",
+                "a@b.c",
+                "--name",
+                "ci"
+            ])
+            .is_err(),
+            "create-key without --scope must not parse"
+        );
+        let cli = parse(&[
+            "vk-registry",
+            "accounts",
+            "create-key",
+            "--owner-email",
+            "a@b.c",
+            "--name",
+            "ci",
+            "--scope",
+            "read:*",
+            "--scope",
+            "write:team-a/*",
+        ])
+        .expect("--scope repeats");
+        match cli.cmd {
+            Cmd::Accounts {
+                cmd: AccountsCmd::CreateKey { scopes, .. },
+            } => assert_eq!(scopes, vec!["read:*", "write:team-a/*"]),
+            _ => panic!("expected accounts create-key"),
+        }
+
+        // and the db selector is not combined with the flags it supersedes
+        assert!(
+            parse(&[
+                "vk-registry",
+                "accounts",
+                "list-users",
+                "--accounts-db",
+                "/srv/a.db",
+                "--root",
+                "/srv/store"
+            ])
+            .is_err(),
+            "--accounts-db beside --root must be refused, not silently preferred"
+        );
+    }
+
     #[test]
     fn status_and_gc_take_the_serve_config() {
         use std::path::Path;

@@ -140,6 +140,8 @@ mod tests {
             email: None,
             display_name: Some("Alice".to_string()),
             is_admin: false,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            last_login_at: std::time::SystemTime::UNIX_EPOCH,
         })
     }
 

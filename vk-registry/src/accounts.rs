@@ -120,6 +120,10 @@ pub struct User {
     pub email: Option<String>,
     pub display_name: Option<String>,
     pub is_admin: bool,
+    /// When this row was first created, and when it was last signed in on. `SystemTime`,
+    /// like [`ApiKey`]'s stamps — the raw epoch seconds stay inside the row type.
+    pub created_at: SystemTime,
+    pub last_login_at: SystemTime,
 }
 
 /// A scoped, revocable CI credential. `id` is `sha256(token)`, hex — already
@@ -267,13 +271,13 @@ impl Db {
                 return Err(e).with_context(|| format!("creating {}", path.display()));
             }
         };
-        // redb holds an exclusive `flock` for the life of the process, so a second
-        // `vk-registry serve` on the same root fails here; say so, rather than leaving the
-        // operator with redb's bare "database already open".
+        // redb holds an exclusive `flock` for the life of the process, so a second opener
+        // — another `serve`, or the `accounts` CLI beside a running one — fails here. Say
+        // which, rather than leaving the caller with redb's bare "database already open".
         let db = Database::builder().create_file(file).with_context(|| {
             format!(
-                "opening the accounts db at {} (one server at a time per store: the \
-                 accounts db is single-writer)",
+                "opening the accounts db at {}: only one process may hold it, so stop \
+                 the running vk-registry first",
                 path.display()
             )
         })?;
@@ -387,6 +391,46 @@ impl Db {
             .map(|g| decode::<UserRow>(g.value()))
             .transpose()?
             .map(|row| user_from_row(id.to_string(), row)))
+    }
+
+    /// Every user, oldest first — the `vk-registry accounts` CLI's `list-users`. A
+    /// linear scan, same rationale as [`Db::list_api_keys`]: this data's scale is one
+    /// team/org, not a hot path.
+    pub fn list_users(&self) -> Result<Vec<User>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let table = txn.open_table(USERS)?;
+        let mut users = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            users.push(user_from_row(k.value().to_string(), decode(v.value())?));
+        }
+        // Oldest first: the order an operator reads a roster in, and the reason `User`
+        // carries `created_at`. Ties break on the stable key so the listing is stable.
+        users.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(users)
+    }
+
+    /// Users whose claimed email matches (ASCII-case-insensitively), across every OIDC
+    /// issuer this server has seen a login from. More than one means the CLI's
+    /// `--issuer` is needed to say which: the same address can legitimately belong to
+    /// different accounts at different providers, and an email is an unverified,
+    /// provider-controlled, mutable claim — never an identity on its own.
+    pub fn find_users_by_email(&self, email: &str) -> Result<Vec<User>> {
+        Ok(self
+            .list_users()?
+            .into_iter()
+            // ASCII-case-insensitive: providers differ on how they normalise the local
+            // part, and an operator typing `Alice@example.com` means the same person.
+            .filter(|u| {
+                u.email
+                    .as_deref()
+                    .is_some_and(|e| e.eq_ignore_ascii_case(email))
+            })
+            .collect())
     }
 
     /// Start a session for the user identified by `user_id` (a [`User::id`]), valid for
@@ -647,15 +691,25 @@ impl Db {
     /// fails the whole listing rather than being silently dropped, so a key never goes
     /// missing from the page its owner revokes it from.
     pub fn list_api_keys(&self, owner_user_id: &str) -> Result<Vec<ApiKey>> {
+        Ok(self
+            .list_all_api_keys()?
+            .into_iter()
+            .filter(|k| k.owner_user_id.as_deref() == Some(owner_user_id))
+            .collect())
+    }
+
+    /// Every API key regardless of owner, newest first — the `vk-registry accounts`
+    /// CLI's `list-keys`. An operator with filesystem access to the accounts db is
+    /// already as trusted as this data gets; `/settings/keys` is what owner-scopes the
+    /// listing for an ordinary session.
+    pub fn list_all_api_keys(&self) -> Result<Vec<ApiKey>> {
         let txn = self.db.begin_read().context("starting a read")?;
         let table = txn.open_table(API_KEYS)?;
         let mut keys = Vec::new();
         for entry in table.iter()? {
             let (k, v) = entry?;
             let row = decode::<ApiKeyRow>(v.value())?;
-            if row.owner_user_key.as_deref() == Some(owner_user_id) {
-                keys.push(api_key_from_row(k.value().to_string(), &row));
-            }
+            keys.push(api_key_from_row(k.value().to_string(), &row));
         }
         keys.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
         Ok(keys)
@@ -876,10 +930,15 @@ fn clamp_claim(s: &str) -> String {
         .collect()
 }
 
-/// `pub(crate)` so a route can ask "is this input acceptable" *before* calling
-/// [`Db::create_api_key`], and so tell a bad form apart from a failed write — the first is
-/// the caller's to fix and worth showing them, the second is this server's and is not.
-pub(crate) fn validate_key_input(name: &str, scopes: &[Scope]) -> Result<()> {
+/// Public so a caller can ask "is this input acceptable" *before* calling
+/// [`Db::create_api_key`], and so tell a bad request apart from a failed write — the first
+/// is the caller's to fix and worth showing them, the second is not.
+///
+/// `pub` rather than `pub(crate)`: the `vk-registry accounts` CLI lives in the binary,
+/// which is out of crate, and pre-checks with this so a mistyped `--name` or `--scope` is
+/// a usage error rather than a failure after the db lock is taken. It looks over-wide from
+/// inside the library — it is not.
+pub fn validate_key_input(name: &str, scopes: &[Scope]) -> Result<()> {
     if name.is_empty() {
         bail!("an API key needs a name");
     }
@@ -937,6 +996,8 @@ fn user_from_row(id: String, row: UserRow) -> User {
         email: row.email,
         display_name: row.display_name,
         is_admin: row.is_admin,
+        created_at: from_secs(row.created_at),
+        last_login_at: from_secs(row.last_login_at),
     }
 }
 
@@ -1073,6 +1134,8 @@ mod tests {
             email: None,
             display_name: None,
             is_admin: false,
+            created_at: SystemTime::UNIX_EPOCH,
+            last_login_at: SystemTime::UNIX_EPOCH,
         };
         let admin = User {
             is_admin: true,

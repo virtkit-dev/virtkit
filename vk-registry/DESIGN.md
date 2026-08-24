@@ -344,9 +344,9 @@ in `route()`, and filters `/browse`: a principal is shown only the repositories 
 read, and one it may not read answers 404 rather than 403, so a listing does not confirm
 what it excludes. `/settings/keys` (`keys.rs`) is a session-only, CSRF-protected API-key
 UI; minting a **write**-scoped key needs an admin session, since a plain session cannot
-write and must not be able to mint itself a key that can. Granting admin is `set_admin`,
-with no HTTP route by design — an operator's job, from the `vk-registry accounts` CLI
-(step 5 below).
+write and must not be able to mint itself a key that can. Granting admin has no HTTP route
+at all: it is `set_admin`, and the `vk-registry accounts` CLI (step 5 below) is how an
+operator reaches it.
 
 `/lock/*` stays authentication-only: a lock name is a build key, not a repository name,
 so there is nothing per-repo to check against. The consequence is that any principal,
@@ -583,6 +583,49 @@ as a hidden form field). Write still means `is_admin` (via the same `authorize()
 `/v2/*` branch uses), so today only an admin session can upload. Proven with real
 multipart POSTs over HTTP in `tests/upload_e2e.rs`, including the dedup claim, the
 readback over `/v2/*`, and each refusal.
+
+### `vk-registry accounts` — the operator CLI
+
+Grants and API-key management that intentionally have no HTTP route (`set_admin`) live in
+`accounts_cli.rs`, under `vk-registry accounts <subcommand>`:
+
+```
+vk-registry accounts list-users
+vk-registry accounts grant-admin  <EMAIL> [--issuer URL]
+vk-registry accounts revoke-admin <EMAIL> [--issuer URL]
+vk-registry accounts list-keys  [--owner-email EMAIL] [--issuer URL]
+vk-registry accounts revoke-key <ID>
+vk-registry accounts create-key --owner-email EMAIL --name NAME --scope ACTION:PATTERN [--expires-days DAYS]
+```
+
+Each takes the `--root`/`--config` store-selection flags `status`/`gc` already do, plus
+an `--accounts-db` that replaces them and may not be combined with them
+(`ServerConfig::accounts_db_of`, mirroring
+`root_of`). It opens the same db a server would, which means **the server has to be
+stopped**: redb holds an exclusive `flock` for the life of the process, so a running
+`serve` locks out even `list-users`. The CLI also never *creates* a db — a mistyped
+`--root` is an error naming the path, not an empty db and a truthful-looking "no users
+yet".
+
+Users are selected by their OIDC `email` claim, matched case-insensitively over ASCII. An
+email is
+an unverified, provider-controlled claim, and two providers can assert the same one, so
+when it matches more than one account the CLI refuses and prints the `--issuer` that
+would narrow it — it never guesses. A key is selected by the id `list-keys` prints in
+full (its token hash — see `accounts.rs`'s `ApiKey::id`); `revoke-key` cannot tell an
+unknown id from an already-revoked one and reports both the same way.
+
+This is deliberately **not** gated by `authorize()`: an operator who can run this CLI
+already has filesystem access to the accounts db, the same trust level `set_admin`
+(called with no HTTP route at all) already assumed. One consequence to know: a key's
+scopes are its own, so `create-key` can give a non-admin user a write-scoped key, and
+`revoke-admin` does not revoke it — `list-keys` prints each key's owner for that reason.
+Revoking the last admin is likewise allowed; this CLI is the way back. `create-key` still needs an
+existing `User` row to attach the key to (`--owner-email` resolves one via
+`find_users_by_email`) — that row only exists once its OIDC subject has logged in at
+least once, so this mints a key for a *known* user, not a key ahead of anyone's first
+login (a fully ownerless key is possible at the `Db::create_api_key` layer — it takes
+`owner_user_id: Option<&str>` — but nothing above that layer exposes it yet).
 
 ### Implementation order
 

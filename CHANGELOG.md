@@ -40,6 +40,13 @@ All notable changes to virtkit will be documented in this file.
   space however many names it is given. Up to just under 64 MiB, and uploading needs
   an administrator, as pushing does.
 
+- A registry in accounts mode can be administered from the command line, on
+  the machine that holds it: see who has signed in, make someone an
+  administrator or stop them being one, and list, create or revoke API keys.
+  This is how the first administrator is appointed, since there is
+  deliberately no way to do it over the network. The registry has to be
+  stopped while it runs — only one process can hold the accounts file.
+
 ### Changed
 
 - `vk-registry` now refuses to start on a config file it does not fully

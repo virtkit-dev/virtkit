@@ -140,6 +140,18 @@ struct FileUpstream {
 /// against the bytes on disk, before the value is trimmed.
 const MAX_CLIENT_SECRET_LEN: u64 = 4096;
 
+/// The accounts db under a store root, when no `accounts_db` names one. A directory of
+/// its own rather than the root itself: `Db::open` creates that one at 0700 whatever the
+/// umask, whereas `Store::new` makes the root with `create_dir_all` and so leaves its mode
+/// to the ambient umask — and a root a group member can write to lets them rename the db
+/// aside and plant one naming themselves admin, `0600` on the file notwithstanding.
+///
+/// The single source of the default: `into_state` opens the db here, and the `vk-registry
+/// accounts` CLI finds it here, so the two cannot drift onto different files.
+pub fn default_accounts_db(root: &Path) -> PathBuf {
+    root.join("accounts").join("accounts.db")
+}
+
 /// Where the server listens when neither a flag nor a config file names an address.
 /// Loopback: a store served to the world is a deliberate act, not a default.
 pub const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
@@ -178,6 +190,27 @@ impl ServerConfig {
             return Ok(r);
         }
         crate::default_root()
+    }
+
+    /// Where the accounts db lives, resolved the same way [`ServerConfig::into_state`]
+    /// would: an explicit `--accounts-db` first, then the config file's, else
+    /// [`default_accounts_db`] under the resolved store root. For the `vk-registry
+    /// accounts` CLI, which reads that db directly rather than through a running
+    /// server — this is how it finds the same one `serve` would open.
+    pub fn accounts_db_of(
+        config: Option<&Path>,
+        root: Option<PathBuf>,
+        accounts_db: Option<PathBuf>,
+    ) -> Result<PathBuf> {
+        if let Some(p) = accounts_db {
+            return Ok(p);
+        }
+        if let Some(path) = config
+            && let Some(p) = read_file(path)?.accounts_db
+        {
+            return Ok(p);
+        }
+        Ok(default_accounts_db(&Self::root_of(config, root)?))
     }
 
     /// What a `serve` config file states, for whoever has to describe the server it will
@@ -440,16 +473,10 @@ impl ServerConfig {
         // `Store::new` first: the store owns the root, so it is the one that gets to
         // create it — `Db::open` would otherwise bring it into being as a side effect of
         // making room for the db file under it.
-        //
-        // A directory of its own, not the root itself: `Store::new` creates the root with
-        // `create_dir_all`, so its mode is the ambient umask's to decide, and on the common
-        // 002 that leaves it group-writable — which lets a group member rename the db aside
-        // and plant one naming themselves admin, `0600` on the file notwithstanding. The
-        // subdirectory is one `Db::open` creates itself, at 0700 whatever the umask.
         let db_path = self
             .accounts_db
             .clone()
-            .unwrap_or_else(|| self.root.join("accounts").join("accounts.db"));
+            .unwrap_or_else(|| default_accounts_db(&self.root));
         let store = Arc::new(Store::new(self.root)?);
         // `resolve_oidc` yields `Some` exactly in accounts mode, so it selects the arm as
         // well as supplying the provider.
@@ -666,6 +693,71 @@ mod tests {
         let bad = write("bad.toml", "addr = \"h:t:t:p\"\n");
         assert!(ServerConfig::load(&bad, Some(flag), None).is_err());
         assert!(ServerConfig::load(&bad, None, None).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `vk-registry accounts` CLI opens whatever this resolves, so it has to resolve
+    /// what `into_state` opens — otherwise the CLI reports truthfully about a file the
+    /// server never touches. Same flag-then-file-then-default order as `root_of`.
+    #[test]
+    fn accounts_db_of_resolves_the_db_a_server_would_open() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-adb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // an explicit path wins over everything
+        let path = dir.join("registry.toml");
+        std::fs::write(
+            &path,
+            "root = \"/srv/store\"\naccounts_db = \"/srv/file.db\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ServerConfig::accounts_db_of(
+                Some(&path),
+                Some(PathBuf::from("/flag")),
+                Some(PathBuf::from("/explicit.db"))
+            )
+            .unwrap(),
+            PathBuf::from("/explicit.db")
+        );
+        // then the file's
+        assert_eq!(
+            ServerConfig::accounts_db_of(Some(&path), None, None).unwrap(),
+            PathBuf::from("/srv/file.db")
+        );
+        // then the default under the resolved root, which is what `into_state` opens
+        let bare = dir.join("bare.toml");
+        std::fs::write(&bare, "root = \"/srv/store\"\n").unwrap();
+        assert_eq!(
+            ServerConfig::accounts_db_of(Some(&bare), None, None).unwrap(),
+            default_accounts_db(Path::new("/srv/store"))
+        );
+        assert_eq!(
+            ServerConfig::accounts_db_of(None, Some(dir.join("s")), None).unwrap(),
+            default_accounts_db(&dir.join("s"))
+        );
+
+        // and it agrees with the path a real `into_state` opens, not just with itself
+        let secret = dir.join("oidc-secret");
+        std::fs::write(&secret, "s3cr3t\n").unwrap();
+        let root = dir.join("store");
+        let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), root.clone());
+        cfg.mode = AuthMode::Accounts;
+        cfg.oidc = Some(OidcSpec {
+            issuer: "https://login.example.com".to_string(),
+            client_id: "vk-registry".to_string(),
+            client_secret_file: secret,
+            public_url: "https://registry.internal".to_string(),
+        });
+        drop(cfg.into_state().expect("a valid accounts config starts"));
+        let resolved = ServerConfig::accounts_db_of(None, Some(root), None).unwrap();
+        assert!(
+            resolved.is_file(),
+            "the CLI must find the db `serve` created: {}",
+            resolved.display()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
