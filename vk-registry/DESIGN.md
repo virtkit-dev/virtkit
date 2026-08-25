@@ -490,19 +490,33 @@ what went wrong goes to the log.
 
 New routes alongside the existing `/v2/` and `/lock/` prefixes in `route()`:
 
-| Route                                | Auth    | Behavior                                                               |
-|--------------------------------------|---------|------------------------------------------------------------------------|
-| `/browse`                            | session | list repos — walks `repos/` (mirrors `Store::repo_dirs`)               |
-| `/browse/<repo>`                     | session | list tags/manifests for one repo, filtered to what the caller can read |
-| `/browse/<repo>/<ref>`               | session | manifest detail: layers, digests, sizes, download links                |
-| `/upload` (GET form, POST multipart) | session | manual upload (see below)                                              |
-| `/settings/keys`                     | session | list/create/revoke the caller's API keys                               |
+| Route                                   | Auth          | Behavior                                                |
+|-----------------------------------------|---------------|---------------------------------------------------------|
+| `/browse`                               | any principal | list repos, via `Store::repo_names`/`list_tags`         |
+| `/browse/<name>`                        | any principal | list tags for one repo, via `Store::list_tags`          |
+| `/browse/<name>/manifests/<reference>`  | any principal | manifest detail: layers, digests, sizes, download links |
+| `/upload` (GET form, POST multipart)    | session       | manual upload (see below) — not yet implemented         |
+| `/settings/keys`                        | session       | the caller's API keys — not yet implemented             |
 
-Actual bytes are **not** re-served by new code: browse/download links point at the
-existing `/v2/<name>/blobs/<digest>` and `/v2/<name>/manifests/<ref>` GETs, now gated by
-`authorize()` instead of the global secret. `/browse` listings filter out repos the caller
-can't read rather than 403ing the whole page (the one assetserver pattern worth copying
-directly — `RegisterDirEndpoints` in `assetserver.go`).
+`/browse` exists **only in accounts mode**: it is the one surface that *enumerates*
+repository names (there is no `/v2/_catalog` here), so a shared-secret server — where an
+open `Auth::None` is an ordinary local configuration — 404s it rather than handing out the
+store's inventory. An unauthenticated browser in accounts mode is redirected to
+`/login?target=<path>` (not the bare 401 an OCI/CI client gets on `/v2/*`); scope
+filtering of *what* a session may see lands with `authorize()`.
+
+Reference disambiguation reuses the OCI API's own marker instead of inventing one:
+`<name>/manifests/<reference>` is the exact split `route()`'s `/v2/` handling already does
+(`rest.rfind("/manifests/")`), so a name containing slashes (`bundles/appbuilder`) reads
+the same on both surfaces — a repository whose own name ends in `manifests` is the one
+case that stays ambiguous, on `/v2/` equally. Actual bytes are **not** re-served by
+`browse.rs`: its download links point at the existing `/v2/<name>/blobs/<digest>` GET,
+authenticated by the same session cookie, and a descriptor digest that is not a digest is
+rendered as inert text rather than linked — manifest JSON is pushed content, so a
+`../../../v2/other/blobs/…` in it must not become a link. Every page is
+`Cache-Control: no-store` with `nosniff`, `no-referrer`, and a `default-src 'none'` CSP:
+it renders one person's identity over the store's inventory, and nothing on it loads a
+remote resource.
 
 **Manual upload shares the dedup store natively**: a file dropped through `/upload` is
 turned into one blob (`Store::put_blob`, digest = sha256 of the file) plus a small

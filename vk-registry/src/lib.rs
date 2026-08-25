@@ -40,6 +40,7 @@ use tokio::net::TcpListener;
 
 pub mod accounts;
 pub mod auth;
+pub(crate) mod browse;
 pub mod client;
 pub mod config;
 pub mod lock;
@@ -331,9 +332,11 @@ impl Store {
         Ok(Some((digest, data, ctype)))
     }
 
-    /// Every tag under `repos/<name>/tags`, sorted. Best-effort: an invalid name, an
-    /// absent repo, an unreadable directory and a non-UTF-8 entry all just yield fewer
-    /// tags. Tag listing is off the pull path (see `route`), so it never fails a caller.
+    /// Every tag under `repos/<name>/tags`, sorted — shared by the OCI `tags/list`
+    /// handler and both `/browse` pages (the repo list calls it once per repository).
+    /// Best-effort: an invalid name, an absent repo, an unreadable directory and a
+    /// non-UTF-8 entry all just yield fewer tags. No caller is on the pull path, so this
+    /// never fails one.
     pub(crate) fn list_tags(&self, name: &str) -> Vec<String> {
         if !valid_name(name) {
             return Vec::new();
@@ -347,6 +350,24 @@ impl Store {
             .collect();
         tags.sort();
         tags
+    }
+
+    /// Every repository that has a `tags` directory, as its `/`-joined name. The cheap
+    /// half of what [`Store::stats`] computes: no blob walk, no manifest parsing — what a
+    /// listing needs.
+    ///
+    /// Filtered through [`valid_name`]: only a name this store could have written itself
+    /// is a repository. A directory left in `repos/` by anything else is not one, and
+    /// `/browse` renders these, so they do not get to be a row with a link.
+    pub(crate) fn repo_names(&self) -> Vec<String> {
+        let repos = self.root.join("repos");
+        self.repo_dirs("tags")
+            .0
+            .iter()
+            .filter_map(|d| d.parent()?.strip_prefix(&repos).ok()?.to_str())
+            .filter(|n| valid_name(n))
+            .map(str::to_string)
+            .collect()
     }
 
     /// Take the store lock shared — held by every writer/reader across its whole
@@ -620,14 +641,16 @@ impl Store {
     /// the layout and is not supported by the gc.
     ///
     /// The descent is `lstat`-based (`DirEntry::file_type`, not `Path::is_dir`), so a
-    /// symlink is never followed — it could point back up its own tree — and
-    /// depth-bounded by [`MAX_NAME_SEGMENTS`], the same bound `valid_name` puts on a name,
-    /// so no name this store accepted is out of reach.
+    /// symlink is never followed — it could point back up its own tree, and `/browse`
+    /// reaches this once per page load — and depth-bounded by [`MAX_NAME_SEGMENTS`], the
+    /// same bound `valid_name` puts on a name, so no name this store accepted is out of
+    /// reach.
     ///
     /// The second return is the first path the walk could *not* see through — a symlink,
     /// an unreadable directory, or a subtree past the depth bound — or `None` if it saw all
     /// of `repos/`. [`Store::gc`] *deletes* on the strength of this walk, so for it an
-    /// incomplete answer is as fatal as a parse failure; `stats` only under-reports.
+    /// incomplete answer is as fatal as a parse failure; the listing and `stats` callers
+    /// only under-report.
     fn repo_dirs(&self, kind: &str) -> (Vec<PathBuf>, Option<PathBuf>) {
         let mut out = Vec::new();
         let mut unseen: Option<PathBuf> = None;
@@ -724,8 +747,8 @@ pub struct RepoStat {
 
 /// A manifest's referenced descriptors, in order: its config (if any) then each layer,
 /// as `(label, descriptor)`. Structural, so it needs no OCI types and tolerates media
-/// types it does not know — the one walk [`manifest_blob_sizes`] reads the referenced
-/// blobs out of.
+/// types it does not know — the one walk [`manifest_blob_sizes`] and `/browse`'s detail
+/// page both read the referenced blobs out of.
 pub(crate) fn manifest_descriptors(
     manifest: &serde_json::Value,
 ) -> Vec<(&'static str, &serde_json::Value)> {
@@ -942,17 +965,84 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
     // Accounts mode resolves a `Principal` instead: any valid session or `vkr_…` API key
     // is accepted for now, with per-scope enforcement arriving in the order DESIGN.md's
     // "Accounts, OIDC, and scoped API keys" sets out.
-    match &state.auth {
+    let is_browse = path == "/browse" || path.starts_with("/browse/");
+    let principal = match &state.auth {
         Authenticator::Accounts { db, .. } => {
-            if accounts::resolve_principal(db, &req, state.cookies_are_secure())?.is_none() {
+            let resolved = accounts::resolve_principal(db, &req, state.cookies_are_secure())?;
+            if resolved.is_none() {
+                // A browser on a human-facing page is sent to sign in and back to where
+                // it started; an API path (`/v2/*`, `/lock/*`) gets the 401 an OCI/CI
+                // client already knows how to react to.
+                if is_browse {
+                    return Ok(redirect_to_login(&path));
+                }
                 return Ok(accounts::challenge());
             }
+            resolved
         }
         Authenticator::Shared(auth) => {
             if auth.enabled() && !auth.allows(&req) {
                 return Ok(auth.challenge());
             }
+            None
         }
+    };
+
+    if is_browse {
+        // `/browse` is part of accounts mode and nothing else. It is the only surface
+        // that *enumerates* repository names (there is no `/v2/_catalog` here), so
+        // serving it in shared-secret mode — where `Auth::None` is an ordinary local
+        // configuration — would hand the store's inventory to anyone who can reach the
+        // port. In that mode the route does not exist at all, rather than existing
+        // unauthenticated.
+        let (Authenticator::Accounts { db, .. }, Some(principal)) = (&state.auth, &principal)
+        else {
+            // Says nothing about why: in shared-secret mode this is an unauthenticated
+            // caller, and which auth model a server runs is not something to confirm to
+            // one.
+            return Ok(error_response(
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                "not a v2 path",
+            ));
+        };
+        // Read-only pages: they answer the two methods a browser reads with and nothing
+        // else, like every other route here. A page that carries a session's CSRF secret
+        // has no business also answering the verbs that change state.
+        if !matches!(req.method(), &Method::GET | &Method::HEAD) {
+            return Ok(error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "UNSUPPORTED",
+                &path,
+            ));
+        }
+        // The session's CSRF secret, for the sign-out control the page renders. It is
+        // session state rather than user state, so it travels beside the principal
+        // instead of inside it.
+        let csrf = match principal {
+            accounts::Principal::Session(_) => {
+                let secure = state.cookies_are_secure();
+                accounts::session_cookie(req.headers(), secure).and_then(|id| {
+                    match db.session_csrf(&id) {
+                        Ok(v) => v,
+                        // Not worth a 500 on a page that renders fine without it: the
+                        // sign-out control is simply left unarmed, and it says so in the
+                        // log.
+                        Err(e) => {
+                            eprintln!("vk-registry: reading a session's CSRF secret: {e:#}");
+                            None
+                        }
+                    }
+                })
+            }
+            accounts::Principal::ApiKey(_) => None,
+        };
+        // The prefix `is_browse` matched, stripped once here rather than re-derived there.
+        let rest = path
+            .strip_prefix("/browse")
+            .unwrap_or_default()
+            .trim_start_matches('/');
+        return browse::route(&state.store, rest, principal, csrf.as_deref());
     }
 
     // The build-once lock API lives under `/lock/<action>` (all POST), outside the
@@ -1392,6 +1482,25 @@ pub(crate) fn unauthorized(challenge: &'static str, message: &str) -> Response<F
     response
 }
 
+/// Send an unauthenticated browser to `/login`, remembering `target` so it lands back
+/// where it started once signed in (`oidc::login`'s `?target=` handling).
+///
+/// The path only, never its query: `oidc::is_safe_redirect_target` is a charset allowlist
+/// a `?a=b` would fail anyway, so carrying one through would only produce a target
+/// silently replaced by the default. Nothing under `/browse` reads a query; the day one
+/// does, both ends move together. Same reason a `/browse/a..b` — which `valid_name`
+/// permits and that allowlist does not — lands on `/browse` rather than the page asked
+/// for: fail closed, and keep the allowlist the narrower of the two.
+fn redirect_to_login(target: &str) -> Response<Full<Bytes>> {
+    let url = format!("/login?target={}", percent_encode(target));
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(hyper::header::LOCATION, url)
+        .header(hyper::header::CACHE_CONTROL, "no-store")
+        .body(Full::new(Bytes::new()))
+        .expect("building a login redirect")
+}
+
 /// Collect a request body fully into memory. Bodies here are bounded by the
 /// client's chunk size (≤ one FastCDC chunk, ≤16 MiB) plus small manifests.
 async fn collect(req: Request<Incoming>) -> Result<Bytes> {
@@ -1410,9 +1519,12 @@ pub(crate) async fn collect_capped(req: Request<Incoming>, cap: usize) -> Result
         .map_err(|_| anyhow::anyhow!("request body is over the {cap}-byte cap"))
 }
 
-/// Escape the five HTML-significant characters. Every value the browser-facing routes
-/// interpolate goes through this: what an identity provider says reaches a page as text,
-/// never as markup.
+/// Escape the five HTML-significant characters. Every *string* a browser-facing page
+/// interpolates goes through this, unconditionally — some of them (repo and tag names) are
+/// already restricted by `valid_name`/`valid_reference`, others (manifest JSON fields,
+/// identity-provider claims) are not restricted at all, and a page is not the place to be
+/// keeping track of which is which. Counts and sizes are rendered as the integers they
+/// are.
 pub(crate) fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -1571,7 +1683,9 @@ const MAX_NAME_SEGMENTS: usize = 16;
 
 /// A repository name: one to [`MAX_NAME_SEGMENTS`] `/`-separated path components, each a
 /// non-empty run of `[A-Za-z0-9._-]` and not `.`/`..` — so it never escapes the store dir.
-fn valid_name(name: &str) -> bool {
+/// Shared with `/browse`, whose repo segment is just as untrusted as the OCI API's
+/// `<name>`.
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.split('/').count() <= MAX_NAME_SEGMENTS
         && name.split('/').all(|seg| {
@@ -1590,8 +1704,9 @@ fn valid_digest(d: &str) -> bool {
         .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// A manifest reference: a digest, or a single safe tag component.
-fn valid_reference(r: &str) -> bool {
+/// A manifest reference: a digest, or a single safe tag component. Shared with
+/// `/browse`'s manifest-detail page.
+pub(crate) fn valid_reference(r: &str) -> bool {
     valid_digest(r) || valid_tag(r)
 }
 
@@ -1621,8 +1736,8 @@ pub(crate) fn query_param(query: &str, key: &str) -> Option<String> {
 
 /// Percent-encode a string for use as one query-parameter value: everything but the
 /// unreserved set (`A-Za-z0-9-._~`) becomes `%XX`. Its callers build URLs — the OIDC
-/// endpoints — never HTML, so this needs no HTML-escaping counterpart; that is
-/// [`html_escape`].
+/// endpoints and the `?target=` on a login redirect — never HTML, so this needs no
+/// HTML-escaping counterpart; that is [`html_escape`].
 pub(crate) fn percent_encode(s: &str) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(s.len());
@@ -1760,8 +1875,9 @@ pub fn status(root: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// A byte count in binary units (`B`, `KiB`, ... `PiB`), one decimal past `B`.
-fn human_bytes(n: u64) -> String {
+/// A byte count in binary units (`B`, `KiB`, ... `PiB`), one decimal past `B`. Shared
+/// with `/browse`'s pages.
+pub(crate) fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     let mut v = n as f64;
     let mut u = 0;

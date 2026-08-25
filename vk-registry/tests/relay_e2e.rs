@@ -43,6 +43,33 @@ fn spawn(state: Arc<ServerState>) -> String {
     format!("http://{addr}")
 }
 
+/// Accounts-mode state built the way `serve` builds it: the store, the accounts db and
+/// the OIDC provider all come out of one `ServerConfig`, so a test cannot assemble a
+/// combination `into_state` would refuse. Discovery is deferred to the first login, so
+/// naming a provider here costs no network.
+fn accounts_state(dir: &std::path::Path) -> Arc<ServerState> {
+    std::fs::create_dir_all(dir).unwrap();
+    let secret = dir.join("oidc-secret");
+    std::fs::write(&secret, "s3cr3t\n").unwrap();
+    let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), dir.join("store"));
+    cfg.mode = AuthMode::Accounts;
+    cfg.oidc = Some(OidcSpec {
+        issuer: "https://login.example.com".to_string(),
+        client_id: "vk-registry".to_string(),
+        client_secret_file: secret,
+        public_url: "https://registry.internal".to_string(),
+    });
+    Arc::new(cfg.into_state().expect("a valid accounts config starts"))
+}
+
+/// The accounts db that server opened, for seeding users and keys into.
+fn accounts_db(state: &ServerState) -> &vk_registry::accounts::Db {
+    match &state.auth {
+        vk_registry::Authenticator::Accounts { db, .. } => db,
+        _ => panic!("not accounts mode"),
+    }
+}
+
 const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -779,28 +806,8 @@ async fn lock_api_build_once_over_http() {
 async fn accounts_auth_gates_everything_including_the_probe() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = tmp("accounts");
-    std::fs::create_dir_all(&dir).unwrap();
-    let secret = dir.join("oidc-secret");
-    std::fs::write(&secret, "s3cr3t\n").unwrap();
-
-    // Built through `into_state`, not a `ServerState` literal: accounts mode's store and
-    // its OIDC provider come from the config together, and this is the wiring a real
-    // `serve` uses. Discovery is deferred to the first login, so naming a provider here
-    // costs no network.
-    let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), dir.join("store"));
-    cfg.mode = AuthMode::Accounts;
-    cfg.oidc = Some(OidcSpec {
-        issuer: "https://login.example.com".to_string(),
-        client_id: "vk-registry".to_string(),
-        client_secret_file: secret,
-        public_url: "https://registry.internal".to_string(),
-    });
-    let state = Arc::new(cfg.into_state().unwrap());
-
-    // seed through the db the server itself opened
-    let vk_registry::Authenticator::Accounts { db, .. } = &state.auth else {
-        panic!("accounts mode was configured");
-    };
+    let state = accounts_state(&dir);
+    let db = accounts_db(&state);
     let user = db
         .upsert_user("https://issuer", "sub-1", Some("a@example.com"), None)
         .unwrap();
@@ -813,7 +820,7 @@ async fn accounts_auth_gates_everything_including_the_probe() {
         .unwrap();
     assert!(db.revoke_api_key(&user.id, &old.id).unwrap());
 
-    let url = spawn(state.clone());
+    let url = spawn(state);
     let http = reqwest::Client::new();
 
     // no credential: the probe challenges, and it says how — an OCI client that gets a
@@ -968,4 +975,130 @@ async fn accounts_auth_gates_everything_including_the_probe() {
     assert_eq!(r.bytes().await.unwrap().as_ref(), body);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `/browse` is part of accounts mode and nothing else: it enumerates repository names,
+/// which no other route does, so a shared-secret server must not serve it — and in
+/// accounts mode a browser without a session is sent to sign in rather than handed a 401
+/// it cannot act on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browse_belongs_to_accounts_mode_and_redirects_a_signed_out_browser() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // shared-secret mode, wide open: /v2/ answers, /browse does not exist
+    let open_dir = tmp("browse-open");
+    let open = Arc::new(ServerState {
+        store: Arc::new(Store::new(open_dir.clone()).unwrap()),
+        upstreams: vec![],
+        locks: LockManager::new(),
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
+        tls: None,
+    });
+    let open_url = spawn(open);
+    let url = open_url.clone();
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    assert!(
+        http.get(format!("{url}/v2/"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    for p in ["/browse", "/browse/team-a"] {
+        let r = http.get(format!("{url}{p}")).send().await.unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            404,
+            "{p} must not enumerate a shared-secret store"
+        );
+    }
+
+    // accounts mode: no session -> a redirect to sign in, carrying where to come back to
+    let acc_dir = tmp("browse-accounts");
+    let acc = accounts_state(&acc_dir);
+    let db = accounts_db(&acc);
+    let user = db
+        .upsert_user("https://issuer", "sub-1", None, None)
+        .unwrap();
+    let session = db
+        .create_session(&user.id, std::time::Duration::from_secs(3600))
+        .unwrap();
+    let (_, key_token) = db.create_api_key(Some(&user.id), "ci", &[], None).unwrap();
+    let url = spawn(acc);
+
+    let r = http
+        .get(format!("{url}/browse/team-a"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 302);
+    assert_eq!(
+        r.headers().get("location").and_then(|v| v.to_str().ok()),
+        Some("/login?target=%2Fbrowse%2Fteam-a")
+    );
+
+    // read-only: it answers the methods a browser reads with and refuses the rest, so the
+    // one page carrying a session CSRF secret is not also a state-changing endpoint
+    for method in [
+        reqwest::Method::POST,
+        reqwest::Method::PUT,
+        reqwest::Method::DELETE,
+    ] {
+        let r = http
+            .request(method.clone(), format!("{url}/browse"))
+            .header("cookie", format!("__Host-vk_session={session}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 405, "{method} /browse");
+    }
+
+    // with a session it renders, and it is not cacheable
+    let r = http
+        .get(format!("{url}/browse"))
+        .header("cookie", format!("__Host-vk_session={session}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "got {}", r.status());
+    assert_eq!(
+        r.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    assert!(
+        r.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/html"))
+    );
+
+    // an API key is a principal too, so it reaches the page — with no sign-out control,
+    // because there is no session behind it to end
+    let body = http
+        .get(format!("{url}/browse"))
+        .bearer_auth(&key_token)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("API key ci"), "{body}");
+    assert!(!body.contains("action=\"/logout\""), "{body}");
+
+    // the auth routes belong to accounts mode too: a shared-secret server 404s them
+    // rather than 500ing on a provider it has none of
+    for p in ["/login", "/auth/callback"] {
+        let r = http.get(format!("{open_url}{p}")).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 404, "{p}");
+    }
+
+    let _ = std::fs::remove_dir_all(&open_dir);
+    let _ = std::fs::remove_dir_all(&acc_dir);
 }

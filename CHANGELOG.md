@@ -18,6 +18,12 @@ All notable changes to virtkit will be documented in this file.
   the sign-in itself, so nobody is handed a shared token to keep. There is no
   separate account to create — the first sign-in makes one.
 
+- A registry in accounts mode has pages to look at: what it holds, each
+  repository's tags, and what one image is made of, with links to download the
+  parts. Read-only, and only for a signed-in person or a machine holding an API
+  key — a registry left on the older shared-secret setting does not serve them
+  at all.
+
 ### Changed
 
 - `vk-registry` now refuses to start on a config file it does not fully
