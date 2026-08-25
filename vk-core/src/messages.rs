@@ -70,8 +70,9 @@ pub struct CmdExec {
     /// and stderr merge into the single terminal stream (sent as Fd::Stdout)
     pub tty: Option<Tty>,
     /// Drop to this Unix user before exec (None = run as the virtkit-agent user,
-    /// or the VIRTKIT_DEFAULT_RUN_USER fallback). Sets uid/gid/supplementary
-    /// groups and HOME/USER/LOGNAME.
+    /// or the VIRTKIT_DEFAULT_RUN_USER fallback; Some("") = explicitly keep the
+    /// current user, skipping that fallback). Sets uid/gid/supplementary groups
+    /// and HOME/USER/LOGNAME.
     #[serde(default)]
     pub user: Option<String>,
 }

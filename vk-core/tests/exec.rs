@@ -38,6 +38,14 @@ async fn start_server(tag: &str) -> SocketAddr {
     addr
 }
 
+/// Run the command as whoever the test process is. `build_command` falls back to
+/// `VIRTKIT_DEFAULT_RUN_USER` when a request names no user, and these tests run inside a
+/// microVM whose agent exports it — so an unset user would make every spawn try to drop
+/// privileges and fail with EPERM. An empty one is already `Some`, so it wins over the
+/// fallback and is then dropped as empty, pinning the tests to the ambient user wherever
+/// they run.
+const AMBIENT_USER: Option<String> = Some(String::new());
+
 /// A TCP echo server, standing in for an arbitrary "target on the guest's LAN" — the
 /// thing `CmdConnect` dials on the caller's behalf.
 async fn echo_server() -> std::net::SocketAddr {
@@ -73,7 +81,7 @@ async fn unix_exec_roundtrip() {
         mode: RunMode::Interactive,
         tty: None,
         dir: None,
-        user: None,
+        user: AMBIENT_USER,
     }))
     .await
     .unwrap();
@@ -318,7 +326,7 @@ async fn large_output_roundtrip() {
         mode: RunMode::Interactive,
         tty: None,
         dir: None,
-        user: None,
+        user: AMBIENT_USER,
     }))
     .await
     .unwrap();
@@ -377,7 +385,7 @@ async fn disconnect_kills_remote_process() {
         mode: RunMode::Interactive,
         tty: None,
         dir: None,
-        user: None,
+        user: AMBIENT_USER,
     }))
     .await
     .unwrap();
@@ -429,7 +437,7 @@ async fn run_tty(addr: &SocketAddr, script: &str, rows: u16, cols: u16) -> (Stri
             cols,
         }),
         dir: None,
-        user: None,
+        user: AMBIENT_USER,
     }))
     .await
     .unwrap();
