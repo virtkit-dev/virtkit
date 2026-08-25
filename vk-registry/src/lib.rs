@@ -43,6 +43,7 @@ pub mod auth;
 pub mod client;
 pub mod config;
 pub mod lock;
+pub mod oidc;
 pub mod relay;
 
 pub use client::{ClientAuth, FailInfo, Held, LockClient};
@@ -56,7 +57,13 @@ pub enum Authenticator {
     /// none at all.
     Shared(auth::Auth),
     /// Per-user sessions and scoped API keys — see [`accounts::resolve_principal`].
-    Accounts(Arc<accounts::Db>),
+    /// The OIDC provider comes with the store rather than beside it: it is accounts mode's
+    /// only login path, so [`config::ServerConfig::into_state`] can never produce one
+    /// without the other.
+    Accounts {
+        db: Arc<accounts::Db>,
+        oidc: Arc<oidc::OidcClient>,
+    },
 }
 
 /// Everything a connection handler needs: the content-addressed store, the relay
@@ -69,6 +76,22 @@ pub struct ServerState {
     pub locks: lock::LockManager,
     pub auth: Authenticator,
     pub tls: Option<tokio_rustls::TlsAcceptor>,
+}
+
+impl ServerState {
+    /// Whether a browser reaches this server over TLS — terminated here, or at a proxy,
+    /// which is what the configured `public_url` says. It decides `Secure`, and with it
+    /// the cookie names: a `__Host-` prefix is honoured only alongside `Secure`, so this
+    /// is what both the writer and the reader of a cookie have to agree on. A deployment
+    /// constant, deliberately: it must not vary per request, or a cookie set under one
+    /// name would be read under the other.
+    pub(crate) fn cookies_are_secure(&self) -> bool {
+        self.tls.is_some()
+            || matches!(
+                &self.auth,
+                Authenticator::Accounts { oidc, .. } if oidc.public_url().starts_with("https://")
+            )
+    }
 }
 
 /// Default content type for a manifest whose Content-Type sidecar is missing.
@@ -810,8 +833,17 @@ async fn handle(
 }
 
 async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
-    // Client auth on every path, including the `/v2/` version probe. Returning 401 +
-    // WWW-Authenticate on `/v2/` is exactly how OCI clients discover they must
+    let path = req.uri().path().to_string();
+
+    // OIDC login/callback/logout must be reachable without a principal — gating the
+    // sign-in page on being signed in already would make it unreachable. Exempt from
+    // the auth gate below, the same way `/lock/` is exempt from `/v2/` routing.
+    if matches!(path.as_str(), "/login" | "/auth/callback" | "/logout") {
+        return oidc::route(&state, req).await;
+    }
+
+    // Client auth on every other path, including the `/v2/` version probe. Returning
+    // 401 + WWW-Authenticate on `/v2/` is exactly how OCI clients discover they must
     // authenticate (oci_client's store_auth_if_needed probes `/v2/`): leaving it open
     // (200) makes the client assume no auth is needed and then 401 on the real blob
     // requests. Capability detection (transparent-zstd) authenticates its own `/v2/` probe.
@@ -820,8 +852,8 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
     // is accepted for now, with per-scope enforcement arriving in the order DESIGN.md's
     // "Accounts, OIDC, and scoped API keys" sets out.
     match &state.auth {
-        Authenticator::Accounts(db) => {
-            if accounts::resolve_principal(db, &req)?.is_none() {
+        Authenticator::Accounts { db, .. } => {
+            if accounts::resolve_principal(db, &req, state.cookies_are_secure())?.is_none() {
                 return Ok(accounts::challenge());
             }
         }
@@ -834,12 +866,11 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
 
     // The build-once lock API lives under `/lock/<action>` (all POST), outside the
     // `/v2/` OCI namespace; names are `?name=` params.
-    if req.uri().path().starts_with("/lock/") {
+    if path.starts_with("/lock/") {
         return lock::route(&state.locks, req).await;
     }
     let store = state.store.clone();
     let method = req.method().clone();
-    let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
     // transparent-zstd negotiation: a PUT body may already be a zstd frame
     // (`Content-Encoding: zstd`), and a GET may accept the stored frame verbatim
@@ -1276,6 +1307,36 @@ async fn collect(req: Request<Incoming>) -> Result<Bytes> {
     Ok(req.into_body().collect().await?.to_bytes())
 }
 
+/// Collect a body that has a small, known ceiling — a browser form, not a blob. The cap
+/// is enforced *while* reading, not after: a `Transfer-Encoding: chunked` request
+/// declares no length, so a check on the size hint alone would buffer the whole thing
+/// first and cap nothing.
+pub(crate) async fn collect_capped(req: Request<Incoming>, cap: usize) -> Result<Bytes> {
+    http_body_util::Limited::new(req.into_body(), cap)
+        .collect()
+        .await
+        .map(|b| b.to_bytes())
+        .map_err(|_| anyhow::anyhow!("request body is over the {cap}-byte cap"))
+}
+
+/// Escape the five HTML-significant characters. Every value the browser-facing routes
+/// interpolate goes through this: what an identity provider says reaches a page as text,
+/// never as markup.
+pub(crate) fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// True if request header `name` lists `needle` (e.g. `Accept-Encoding: zstd`).
 /// Substring match — fine for the single token we negotiate.
 fn header_has(req: &Request<Incoming>, name: hyper::header::HeaderName, needle: &str) -> bool {
@@ -1452,11 +1513,29 @@ fn valid_upload_id(id: &str) -> bool {
 
 /// Look up a query parameter (percent-decoding the value, since the client encodes
 /// the `sha256:` digest's colon as `%3A`).
-fn query_param(query: &str, key: &str) -> Option<String> {
+pub(crate) fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
         (k == key).then(|| percent_decode(v))
     })
+}
+
+/// Percent-encode a string for use as one query-parameter value: everything but the
+/// unreserved set (`A-Za-z0-9-._~`) becomes `%XX`. Its callers build URLs — the OIDC
+/// endpoints — never HTML, so this needs no HTML-escaping counterpart; that is
+/// [`html_escape`].
+pub(crate) fn percent_encode(s: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => write!(out, "%{b:02X}").expect("writing to a String cannot fail"),
+        }
+    }
+    out
 }
 
 /// Minimal application/x-www-form-urlencoded decode: `%XX` hex escapes and `+`.

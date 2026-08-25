@@ -9,7 +9,7 @@
 //! three.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,6 +21,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::accounts;
 use crate::auth::Auth;
 use crate::lock::LockManager;
+use crate::oidc::{OidcClient, OidcConfig};
 use crate::relay::Upstream;
 use crate::{ServerState, Store};
 
@@ -52,6 +53,18 @@ pub struct ServerConfig {
     /// Where the accounts db lives, in `mode = "accounts"`. Defaults to
     /// `<root>/accounts/accounts.db` when unset.
     pub accounts_db: Option<PathBuf>,
+    /// `[oidc]`, required in `mode = "accounts"` — it is the only login path that mode
+    /// has.
+    pub oidc: Option<OidcSpec>,
+}
+
+/// The `[oidc]` config table, as declared (before its client secret is read and checked
+/// by [`ServerConfig::resolve_oidc`]).
+pub struct OidcSpec {
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret_file: PathBuf,
+    pub public_url: String,
 }
 
 /// What a config file states about the server it would start, as stated — see
@@ -92,8 +105,20 @@ struct FileConfig {
     /// credentials it chooses between.
     mode: Option<String>,
     accounts_db: Option<PathBuf>,
+    oidc: Option<FileOidc>,
     #[serde(default)]
     upstream: Vec<FileUpstream>,
+}
+
+/// `deny_unknown_fields` for the same reason `FileConfig` has it: this table configures
+/// who may sign in, and a key silently dropped for a typo is not a diagnostic anyone gets.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileOidc {
+    issuer: String,
+    client_id: String,
+    client_secret_file: PathBuf,
+    public_url: String,
 }
 
 /// `deny_unknown_fields` here for the same reason as on [`FileConfig`], applied to the
@@ -110,6 +135,10 @@ struct FileUpstream {
     password_file: Option<PathBuf>,
     ca_file: Option<PathBuf>,
 }
+
+/// Ceiling on the `[oidc]` client-secret file, trailing newline included — it is checked
+/// against the bytes on disk, before the value is trimmed.
+const MAX_CLIENT_SECRET_LEN: u64 = 4096;
 
 /// Where the server listens when neither a flag nor a config file names an address.
 /// Loopback: a store served to the world is a deliberate act, not a default.
@@ -129,6 +158,7 @@ impl ServerConfig {
             password_file: None,
             mode: AuthMode::SharedSecret,
             accounts_db: None,
+            oidc: None,
         }
     }
 
@@ -217,6 +247,12 @@ impl ServerConfig {
             password_file: f.password_file,
             mode,
             accounts_db: f.accounts_db,
+            oidc: f.oidc.map(|o| OidcSpec {
+                issuer: o.issuer,
+                client_id: o.client_id,
+                client_secret_file: o.client_secret_file,
+                public_url: o.public_url,
+            }),
         })
     }
 
@@ -236,6 +272,99 @@ impl ServerConfig {
             .context("building the TLS server config")?;
         sc.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(Some(TlsAcceptor::from(Arc::new(sc))))
+    }
+
+    /// The `[oidc]` table, resolved and checked, or `None` in shared-secret mode. Every
+    /// endpoint the login flow uses comes out of the provider's discovery document, and
+    /// the issuer is what says which document to trust — so it is checked here, before
+    /// anything is opened or created.
+    fn resolve_oidc(&self) -> Result<Option<OidcConfig>> {
+        if self.mode == AuthMode::SharedSecret {
+            // The mirror image of `build_auth`'s refusal: silently ignoring a table the
+            // operator wrote is how a server ends up in the mode they meant to replace.
+            if self.oidc.is_some() {
+                bail!("an [oidc] table needs mode = \"accounts\"; it is ignored otherwise");
+            }
+            return Ok(None);
+        }
+        let spec = self
+            .oidc
+            .as_ref()
+            .context("mode = \"accounts\" requires an [oidc] table naming the login provider")?;
+        for (what, url) in [("issuer", &spec.issuer), ("public_url", &spec.public_url)] {
+            // Both end up in a URL this server fetches or hands a browser as a `Location`,
+            // and the issuer is also the identity namespace `validate_identity` refuses
+            // control characters in — so they are refused here, at startup, rather than
+            // as a 502 at the first login. `oidc::is_usable_endpoint` holds the endpoints
+            // a discovery document names to the same two conditions.
+            if url.chars().any(char::is_control) {
+                bail!("[oidc] {what} may not contain control characters: {url:?}");
+            }
+            if !url.starts_with("https://") && !is_local_url(url) {
+                bail!(
+                    "[oidc] {what} must be https (or a loopback address): {url:?} would put \
+                     the client secret and the session cookie on the wire in cleartext"
+                );
+            }
+            if url.contains('?') || url.contains('#') {
+                bail!("[oidc] {what} is a base URL, with no query or fragment: {url:?}");
+            }
+        }
+        if spec.client_id.is_empty() {
+            bail!("[oidc] client_id may not be empty");
+        }
+        // Open once, then check the mode of *that* descriptor: `warn_if_mode` would
+        // resolve the path a second time, so the file it reported on need not be the one
+        // read below. `O_NOFOLLOW` for the same reason `accounts::Db::open` uses it — a
+        // credential is not read through someone else's symlink.
+        let secret_file = {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.custom_flags(libc::O_NOFOLLOW);
+            }
+            opts.open(&spec.client_secret_file)
+                .with_context(|| format!("opening {}", spec.client_secret_file.display()))?
+        };
+        crate::warn_if_file_mode(
+            &secret_file,
+            &spec.client_secret_file,
+            0o077,
+            "OIDC client secret",
+            "it is group/world-accessible — restrict it to 0600",
+        );
+        // Bounded: a client secret is tens of bytes, and a `client_secret_file` that is
+        // not one at all (a device, a log) must not be read into memory unbounded. One
+        // byte over the cap is an error rather than a silent truncation, which would
+        // otherwise show up as an unexplained rejection at the token endpoint. Read as
+        // bytes and length-checked before the UTF-8 decode, so an oversize file is
+        // reported as oversize rather than as a decode failure at a cut codepoint.
+        let mut raw = Vec::new();
+        secret_file
+            .take(MAX_CLIENT_SECRET_LEN + 1)
+            .read_to_end(&mut raw)
+            .with_context(|| format!("reading {}", spec.client_secret_file.display()))?;
+        if raw.len() as u64 > MAX_CLIENT_SECRET_LEN {
+            bail!(
+                "{} is over {MAX_CLIENT_SECRET_LEN} bytes; that is not a client secret",
+                spec.client_secret_file.display()
+            );
+        }
+        let client_secret = std::str::from_utf8(&raw)
+            .with_context(|| format!("{} is not text", spec.client_secret_file.display()))?
+            .trim()
+            .to_string();
+        if client_secret.is_empty() {
+            bail!("{} is empty", spec.client_secret_file.display());
+        }
+        Ok(Some(OidcConfig {
+            issuer: spec.issuer.trim_end_matches('/').to_string(),
+            client_id: spec.client_id.clone(),
+            client_secret,
+            public_url: spec.public_url.trim_end_matches('/').to_string(),
+        }))
     }
 
     /// The client-auth scheme: a bearer token file takes precedence, else Basic from a
@@ -286,7 +415,12 @@ impl ServerConfig {
 
     /// Build the shared runtime state: open the store, build each upstream's HTTP client
     /// (reading its password file), the lock manager, and the auth scheme (or the
-    /// accounts db, in `mode = "accounts"`). TLS is set separately by the serve path.
+    /// accounts db + the OIDC client, in `mode = "accounts"`). TLS is set separately by
+    /// the serve path.
+    ///
+    /// Nothing here touches the network: the OIDC provider is discovered lazily, at the
+    /// first login, so a provider that is briefly unreachable cannot stop a server whose
+    /// `/v2/` clients never touch OIDC from starting at all.
     pub fn into_state(self) -> Result<ServerState> {
         let auth = self.build_auth()?;
         // Auth over plain HTTP on a routable address would put the bearer token / Basic
@@ -300,6 +434,9 @@ impl ServerConfig {
                 self.addr
             );
         }
+        // Everything the config can be wrong about is settled before anything is created:
+        // a server that is going to refuse to start should not leave a db file behind.
+        let oidc_cfg = self.resolve_oidc()?;
         // `Store::new` first: the store owns the root, so it is the one that gets to
         // create it — `Db::open` would otherwise bring it into being as a side effect of
         // making room for the db file under it.
@@ -314,11 +451,14 @@ impl ServerConfig {
             .clone()
             .unwrap_or_else(|| self.root.join("accounts").join("accounts.db"));
         let store = Arc::new(Store::new(self.root)?);
-        let auth = match self.mode {
-            AuthMode::SharedSecret => crate::Authenticator::Shared(auth),
-            AuthMode::Accounts => {
-                crate::Authenticator::Accounts(Arc::new(accounts::Db::open(&db_path)?))
-            }
+        // `resolve_oidc` yields `Some` exactly in accounts mode, so it selects the arm as
+        // well as supplying the provider.
+        let auth = match oidc_cfg {
+            None => crate::Authenticator::Shared(auth),
+            Some(cfg) => crate::Authenticator::Accounts {
+                db: Arc::new(accounts::Db::open(&db_path)?),
+                oidc: Arc::new(OidcClient::new(cfg)),
+            },
         };
         let upstreams = self
             .upstreams
@@ -378,6 +518,30 @@ fn read_file(path: &Path) -> Result<FileConfig> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// True for an `http://` URL whose host is loopback: plain HTTP does not leave the
+/// machine there, so it is the one case this config accepts without TLS.
+pub(crate) fn is_local_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // `http://[::1]@evil.example/` has host `evil.example`, not `::1`: a guard that can be
+    // fooled by its own parsing is worse than none, so userinfo is simply refused.
+    if authority.contains('@') {
+        return false;
+    }
+    // A bracketed IPv6 literal keeps its colons; everything else splits on the port's.
+    let host = match authority.strip_prefix('[') {
+        // …and it must actually end at the bracket, with only a port after it.
+        Some(v6) => match v6.split_once(']') {
+            Some((host, after)) if after.is_empty() || after.starts_with(':') => host,
+            _ => return false,
+        },
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 fn load_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
@@ -654,33 +818,180 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Accounts mode replaces the shared secret rather than layering on it, and it carries
-    /// credentials, so the two guards that mode implies have to hold.
+    /// Plain HTTP is a leak everywhere but loopback, and the loopback test has to cope
+    /// with a bracketed IPv6 literal as well as a port. A guard that can be fooled by its
+    /// own parsing is worse than none, so the URLs whose *real* host is not the one a
+    /// naive split sees are in here too.
     #[test]
-    fn accounts_mode_refuses_a_shared_secret_beside_it_and_cleartext_under_it() {
-        let dir = std::env::temp_dir().join(format!("vk-regserve-amode-{}", std::process::id()));
+    fn only_loopback_counts_as_a_local_url() {
+        for ok in [
+            "http://localhost",
+            "http://localhost:5000",
+            "http://127.0.0.1",
+            "http://127.0.0.1:5000/path",
+            "http://[::1]",
+            "http://[::1]:5000",
+            "http://[::1]:5000/path",
+        ] {
+            assert!(is_local_url(ok), "{ok}");
+        }
+        for bad in [
+            "http://login.example.com",
+            "http://127.0.0.1.evil.example",
+            "http://[::2]:5000",
+            "https://localhost",
+            "localhost",
+            "",
+            // userinfo: the host is whatever follows the `@`
+            "http://127.0.0.1@evil.example/",
+            "http://[::1]@evil.example/",
+            "http://localhost:x@evil.example/",
+            // a bracketed literal has to end at its bracket
+            "http://[::1]evil.example",
+            "http://[::1",
+        ] {
+            assert!(!is_local_url(bad), "{bad}");
+        }
+    }
+
+    /// A temp dir of its own (two tests must not share one: the accounts db is
+    /// single-writer and they run in parallel) holding a valid client-secret file, plus
+    /// the fixtures every accounts-mode case needs.
+    fn accounts_fixture(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("oidc-secret");
+        std::fs::write(&secret, "s3cr3t\n").unwrap();
+        (dir, secret)
+    }
 
-        let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), dir.join("store"));
-        cfg.mode = AuthMode::Accounts;
+    fn oidc_spec(secret: &Path) -> OidcSpec {
+        OidcSpec {
+            issuer: "https://login.example.com".to_string(),
+            client_id: "vk-registry".to_string(),
+            client_secret_file: secret.to_path_buf(),
+            public_url: "https://registry.internal".to_string(),
+        }
+    }
+
+    fn accounts_cfg(addr: &str, root: PathBuf) -> ServerConfig {
+        let mut c = ServerConfig::local(addr.parse().unwrap(), root);
+        c.mode = AuthMode::Accounts;
+        c
+    }
+
+    fn err_of(c: ServerConfig) -> String {
+        c.into_state().map(|_| ()).unwrap_err().to_string()
+    }
+
+    /// `[oidc]` is the only login path accounts mode has, so a table that would put a
+    /// credential on the wire, name something that is not a base URL, or authenticate as
+    /// nobody is refused at startup rather than at the first login.
+    #[test]
+    fn a_bad_oidc_table_is_refused_at_startup() {
+        let (dir, secret) = accounts_fixture("oidcbad");
+        let root = dir.join("store");
+        let spec = || oidc_spec(&secret);
+        let with = |o: OidcSpec| {
+            let mut cfg = accounts_cfg("127.0.0.1:5000", root.clone());
+            cfg.oidc = Some(o);
+            err_of(cfg)
+        };
+
+        // an IdP reached over plain HTTP off-loopback: the client secret and the session
+        // cookie would both go out in the clear
+        let err = with(OidcSpec {
+            issuer: "http://login.example.com".to_string(),
+            ..spec()
+        });
+        assert!(err.contains("must be https"), "{err}");
+
+        // a base URL carrying a query or fragment: every endpoint is built by appending
+        // to it, so it has to be a base and nothing more
+        for bad in [
+            "https://login.example.com/?tenant=a",
+            "https://login.example.com/#x",
+        ] {
+            let err = with(OidcSpec {
+                issuer: bad.to_string(),
+                ..spec()
+            });
+            assert!(err.contains("base URL"), "{bad}: {err}");
+        }
+
+        // control characters: a `Location` header would refuse them at the first login,
+        // and the issuer is also the identity namespace
+        let err = with(OidcSpec {
+            public_url: "https://registry.internal\r\nX: y".to_string(),
+            ..spec()
+        });
+        assert!(err.contains("control characters"), "{err}");
+
+        // no client_id to authenticate as
+        let err = with(OidcSpec {
+            client_id: String::new(),
+            ..spec()
+        });
+        assert!(err.contains("client_id"), "{err}");
+
+        // an empty secret file, and one far too large to be a secret at all
+        std::fs::write(&secret, "\n").unwrap();
+        let err = with(spec());
+        assert!(err.contains("is empty"), "{err}");
+        std::fs::write(&secret, "x".repeat(MAX_CLIENT_SECRET_LEN as usize + 1)).unwrap();
+        let err = with(spec());
+        assert!(err.contains("not a client secret"), "{err}");
+
+        // and none of the refusals created the store
+        assert!(!root.exists(), "a config that cannot start creates nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Accounts mode replaces the shared secret rather than layering on it, it carries
+    /// credentials, and it needs an IdP to issue them — so every guard that mode implies
+    /// has to hold, and none of them may leave a half-built store behind.
+    #[test]
+    fn accounts_mode_refuses_a_shared_secret_cleartext_and_a_bad_idp() {
+        let (dir, secret) = accounts_fixture("amode");
+        let spec = || oidc_spec(&secret);
+
+        // a shared secret beside it
+        let mut cfg = accounts_cfg("127.0.0.1:5000", dir.join("store"));
         cfg.token_file = Some(PathBuf::from("/etc/vk-registry/token"));
         let err = cfg.build_auth().map(|_| ()).unwrap_err().to_string();
         assert!(err.contains("mutually exclusive"), "{err}");
 
-        let mut cfg = ServerConfig::local("0.0.0.0:5000".parse().unwrap(), dir.join("store"));
-        cfg.mode = AuthMode::Accounts;
-        let err = cfg.into_state().map(|_| ()).unwrap_err().to_string();
+        // credentials in cleartext on a routable address
+        let mut cfg = accounts_cfg("0.0.0.0:5000", dir.join("store"));
+        cfg.oidc = Some(spec());
+        let err = err_of(cfg);
         assert!(err.contains("cleartext"), "{err}");
 
-        // on loopback it is allowed, and the db lands in a directory of its own under the
-        // store — one `Db::open` makes at 0700 rather than the umask-dependent root
+        // no IdP at all — and the refusal leaves nothing behind
         let root = dir.join("store");
+        let err = err_of(accounts_cfg("127.0.0.1:5000", root.clone()));
+        assert!(err.contains("[oidc]"), "{err}");
+        assert!(
+            !root.exists(),
+            "a config that cannot start must not create the store"
+        );
+
+        // an [oidc] table under the mode that cannot use it
         let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), root.clone());
-        cfg.mode = AuthMode::Accounts;
-        let state = cfg.into_state().unwrap();
-        assert!(matches!(state.auth, crate::Authenticator::Accounts(_)));
+        cfg.oidc = Some(spec());
+        let err = err_of(cfg);
+        assert!(err.contains("needs mode"), "{err}");
+
+        // and configured correctly it starts, with the db in a directory of its own under
+        // the store — no network, because discovery is deferred to the first login
+        let mut cfg = accounts_cfg("127.0.0.1:5000", root.clone());
+        cfg.oidc = Some(spec());
+        let state = cfg.into_state().expect("a valid accounts config starts");
+        assert!(matches!(state.auth, crate::Authenticator::Accounts { .. }));
         assert!(root.join("accounts").join("accounts.db").exists());
+        // that directory is `Db::open`'s to make, at 0700 whatever the umask, rather than
+        // the store root whose mode the umask decides
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -694,10 +1005,13 @@ mod tests {
 
         // and a configured path is honoured instead
         let elsewhere = dir.join("elsewhere").join("ours.db");
-        let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), dir.join("store-two"));
-        cfg.mode = AuthMode::Accounts;
+        let mut cfg = accounts_cfg("127.0.0.1:5000", dir.join("store-two"));
+        cfg.oidc = Some(spec());
         cfg.accounts_db = Some(elsewhere.clone());
-        drop(cfg.into_state().unwrap());
+        drop(
+            cfg.into_state()
+                .expect("a configured accounts_db is honoured"),
+        );
         assert!(elsewhere.exists());
 
         let _ = std::fs::remove_dir_all(&dir);

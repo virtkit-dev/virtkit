@@ -66,7 +66,7 @@ fn authorization(req: &Request<Incoming>) -> Option<&str> {
 
 /// Length-checked byte comparison that does not short-circuit on the first differing
 /// byte — a cheap constant-time-ish guard for secret comparison.
-fn constant_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

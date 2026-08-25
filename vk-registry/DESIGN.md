@@ -343,39 +343,148 @@ abandoned is not, and a periodic sweep is deferred.
 then an accounts-mode server accepts any resolved principal for anything, the same coarse
 shape as the shared-secret mode it replaces.
 
-`mode` is a top-level config key, like the credentials it chooses between, and an
-unrecognized key in the file is an error — a mistyped or misplaced `mode` must not start
-the server in the auth model the operator meant to replace. The existing shared-secret
-`Auth` stays as `mode = "shared-secret"` (the default), mutually exclusive with
-`mode = "accounts"` — cheap to keep, and useful for solo/dev use and for
-bootstrapping the first admin before OIDC is reachable.
+`mode` is a top-level config key, like the credentials it chooses between. An
+unrecognized key anywhere in the file, `[oidc]` included, is an error: a mistyped or
+misplaced `mode` must not start the server in the auth model the operator meant to
+replace. The existing shared-secret `Auth` stays as `mode = "shared-secret"` (the
+default), mutually exclusive with `mode = "accounts"` — cheap to keep, and useful for
+solo/dev use and for bootstrapping the first admin before OIDC is reachable.
 
 ### OIDC login
 
-`openidconnect` (pure Rust, pluggable HTTP client — reuses the existing `reqwest`+`rustls`
-stack already linked for TLS and the relay). Routes, config shape, and the
-state-nonce/target-passthrough flow mirror idaas's `assetserver` (`auth.go`), with three
-deliberate fixes over that implementation:
+Hand-rolled against the Authorization Code flow (`vk-registry/src/oidc.rs`) — no OIDC
+crate, deliberately: it keeps this on the crate's existing `reqwest`+rustls TLS backend
+instead of risking a second TLS stack (openssl/aws-lc-rs) pulled in by an OIDC crate's own
+HTTP-client feature flags (see `Cargo.toml`'s comments on why that dependency shape is
+worth protecting), and the flow itself is short enough not to need one: discover, redirect,
+exchange a code for a token, then call UserInfo for claims — the same shape idaas's
+`assetserver` uses (`auth.go`), and enough for a confidential client (this server holds a
+`client_secret`) without also parsing/verifying the id_token's JWT locally — that
+verification is what a full OIDC crate would buy back, and it is not needed for
+correctness here because the code→token exchange is itself an authenticated,
+server-to-server, TLS request.
 
-- session cookie is `Secure` + `HttpOnly` + `SameSite=Lax` (assetserver sets none of the
-  last two);
-- a real per-session CSRF token guards state-changing forms — upload, key create/revoke
-  (assetserver wires a CSRF key through config but never uses it);
-- session expiry is decided once, at creation, and is not extended by use — assetserver's
-  `LastUpdate` is set once and never renewed either, but there it is a bug rather than a
-  choice; here a bounded absolute lifetime is the point, and it costs no per-request write.
+What the flow relies on, and what it deliberately does not:
+
+- the login `state` is **bound to the browser that started the login**: `/login` puts it
+  in an `HttpOnly` cookie as well as in a server-side map, and the callback requires the
+  two to agree. Single-use and a 5-minute TTL are replay protection; the cookie is what
+  makes `state` CSRF protection. Without it, an attacker who completes a login at the
+  provider can hand a victim the callback URL and log the victim in **as the attacker** —
+  which, once `/upload` and `/settings/keys` land, means the victim pushing into the
+  attacker's account. `assetserver` has this same gap;
+- **PKCE (S256)** is sent even though this is a confidential client. The secret protects
+  the exchange but not against code *injection* — a code that leaks through a
+  provider-side open redirect, a `Referer`, or a proxy log is otherwise redeemable
+  against a victim's callback. RFC 9700 asks for PKCE here for exactly that;
+- the **id_token's JWT is not parsed or verified**, and does not need to be: claims come
+  from UserInfo over a bearer token this server obtained itself in a TLS request it
+  authenticated, and the identity namespace is the *configured* issuer, never one the
+  provider asserts. What verification would add — binding the token to this client and
+  this exchange — PKCE and the cookie-bound state already cover;
+- the **discovery document is checked against the configured issuer**, and both `issuer`
+  and `public_url` must be `https` unless loopback: every endpoint the flow uses comes out
+  of that document, so whoever can substitute it chooses who logs in;
+- the session and login cookies are `HttpOnly` + `SameSite=Lax` + `Secure` whenever the
+  browser's connection is HTTPS — TLS terminated here *or* at a proxy, which is what
+  `public_url` says (`accounts::set_cookie_header`). Unconditional `Secure` would silently
+  break the loopback-plaintext deployment `ServerConfig` allows; `assetserver` sets neither
+  of the first two attributes;
+- wherever `Secure` is possible, both cookies are **`__Host-` prefixed**
+  (`__Host-vk_session`, `__Host-vk_login`). Without the prefix, any host that can set a
+  cookie for a parent or sibling domain — a neighbouring app under the same registrable
+  domain, a plaintext sibling with a network attacker in front of it — can *toss* a cookie
+  in, which is session fixation on one and, on the other, the very thing the browser
+  binding above exists to stop. The prefix costs the login cookie its `/auth/callback`
+  path scoping (it mandates `Path=/`), which is the lesser property. On the
+  loopback-plaintext deployment the prefix is impossible, so the bare names are used and
+  that protection is simply absent — one more reason that deployment is loopback-only.
+  Reading is **strict**, which is where the protection actually lives: a request is
+  searched for only the name this deployment would have *written*, never both. A bare
+  cookie on a TLS deployment can only be one another host tossed in, so accepting it as a
+  fallback would hand the prefix straight back. The price is that turning TLS on or off
+  invalidates every live session and in-flight login, since the names change with it;
+- **only the discovery document's origin is authenticated by the issuer comparison, not
+  the URLs inside it**, so every endpoint it names is separately required to be `https`
+  (or loopback `http`) and free of anything a header would refuse. A `Location` this
+  server hands a browser, and a request carrying the client secret, both come from there;
+  an `end_session_endpoint` that fails the check is dropped, leaving logout local-only,
+  rather than failing discovery and with it every login;
+- in-flight logins are **capped, and at the cap the oldest are evicted** rather than the
+  new login refused: `/login` needs no credential, so refusing would let one flood close
+  sign-in for everybody until the TTL ran out;
+- `email_verified` is **not consulted**, and identity is `(issuer, sub)` — never the
+  email, which is display-only. Anything that later authorizes on an email address has to
+  revisit that;
+- `?target=` (where to land back after login) is an **allowlist**: a `/browse` path made
+  of `[A-Za-z0-9._:/-]`, nothing else. A denylist would have to anticipate every form a
+  browser reads as off-origin (`//host`, `/\host`, a tab or newline before either);
+- **`/logout` is a POST carrying the session's CSRF secret**, which `/browse` renders as
+  a form once it lands. A link would let any page on the internet end a visitor's session
+  with an `<img src>` — and, chained with a forced login, swap it for someone else's. A
+  request with no session cookie — which is every cross-site POST, the cookie being
+  `SameSite=Lax` — is answered with a bare redirect and no `Set-Cookie`, so it cannot
+  force a re-login either;
+- login **supersedes the browser's previous session** (the old row is deleted), so a
+  re-login does not leave a second live credential behind for up to `SESSION_TTL`;
+- the provider is **discovered lazily, at the first login**, and cached. Discovery at
+  startup would mean a briefly unreachable IdP stopping a server whose `/v2/` clients
+  never touch OIDC from starting at all.
+
+Tested against an in-process fake IdP (`oidc.rs`'s tests — the same "spin up a real server
+on an ephemeral port" pattern `tests/relay_e2e.rs` uses for its fake upstream), covering
+discovery (including a document that states somebody else's issuer, and one naming a
+cleartext endpoint), the authorization-URL shape, both client-authentication methods, the
+cookie-binding refusals, the state TTL and the eviction at the cap, and the
+code→token→claims exchange — without a live external IdP. The cookie naming, the
+`/logout` CSRF comparison and the redirect-target allowlist are unit-tested directly,
+and `tests/relay_e2e.rs` covers the session cookie end to end through a real server.
+
+The claims kept from a login (`email`, `name`) are bounded and stripped of control
+characters where they enter the store (`accounts::upsert_user`), not at the login handler,
+so the `accounts` CLI and any later caller get the same treatment. An identity's two
+halves are refused rather than truncated: they are a key.
+
+Three limits worth knowing before this faces a real IdP:
+
+- **any identity the provider authenticates gets a session**, with the coarse read/write
+  every resolved principal has until the per-scope commits land. There is no
+  email-domain, group, or audience restriction in `[oidc]`, so pointing it at a
+  multi-tenant issuer (`login.microsoftonline.com/common`, say) means every account at
+  that issuer, not every account in the org. Point it at a tenant-specific issuer.
+- **the OIDC client trusts the platform roots only.** Unlike a relay `[[upstream]]`, which
+  takes a `ca_file`, an IdP behind a private CA is not configurable here — and it fails at
+  the first login, not at startup, because discovery is lazy.
+- **the discovery document is fetched once and cached for the process's life**, so a
+  provider that moves an endpoint needs a restart.
+
+A login's two db writes (upsert the user, mint the session) run inline on the hyper
+worker, as `resolve_principal` does — human-scale volume, so not worth a `spawn_blocking`
+yet. Revisit together, if the accounts store ever moves off the request thread.
+
+One deliberate divergence from the original plan: **session lifetime is a fixed 8-hour
+absolute TTL (`accounts::SESSION_TTL`), not sliding.** A sliding expiry needs a write on
+every authenticated request just to bump a timestamp; a bounded absolute lifetime gets
+"a stolen cookie has a bounded shelf life" for free and is what actually shipped.
+Revisit if 8 hours of forced daily re-login turns out to be the wrong trade.
 
 ```toml
 [oidc]
-issuer        = "https://login.example.com/app/…"
-client_id     = "vk-registry"
-client_secret_file = "/etc/vk-registry/oidc-secret"
-public_url    = "https://registry.internal"
+issuer              = "https://login.example.com/app/…"
+client_id           = "vk-registry"
+client_secret_file  = "/etc/vk-registry/oidc-secret"
+public_url          = "https://registry.internal"
 ```
 
-Routes: `/login`, `/auth/callback`, `/logout` (RP-initiated, same `end_session_endpoint`
-discovery trick as assetserver). Identity is claims-based (`sub`, `email`) — a `users` row
-is upserted on first login, not pre-provisioned.
+Routes: `GET /login` (redirects to the provider, `?target=` says where to land back),
+`GET /auth/callback`, `POST /logout` (RP-initiated if the provider advertises
+`end_session_endpoint`, local-only otherwise — either way the session is deleted).
+Identity is claims-based (`sub`, `email`, `name`, each bounded on the way in) — a `users`
+row is upserted on first login, not pre-provisioned. All three routes are exempt from the
+accounts-mode auth gate in `route()` (a login page gated on already being logged in would
+be unreachable) and 404 if accounts mode/`[oidc]` isn't configured. They answer a browser
+with HTML, not the OCI JSON error envelope, and never reflect the internal error chain:
+what went wrong goes to the log.
 
 ### HTTP surface: browse, download, manual upload
 
@@ -410,7 +519,8 @@ instead of content-addressing).
 1. `redb`-backed `users`/`sessions`/`api_keys` + `Principal` resolution, behaviour-neutral
    until `mode = "accounts"` is set. `vk-registry/src/accounts.rs`, wired in
    `config.rs`/`lib.rs`.
-2. OIDC login/callback/logout + read-only `/browse`, gated by session-read-all.
+2. OIDC login/callback/logout (`oidc.rs`) + read-only `/browse`, gated by
+   session-read-all (no per-scope filtering yet).
 3. API key CRUD (`/settings/keys`) + `authorize()` enforcement on `/v2/*` write paths.
 4. `/upload` (session-authed, writes through `Store` as a synthetic manifest+blob).
 5. Optional: a `request_log` table (who pushed/pulled what, when) for audit.

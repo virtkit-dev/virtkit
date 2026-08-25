@@ -5,9 +5,10 @@
 
 use std::sync::Arc;
 
+use vk_registry::config::{AuthMode, OidcSpec};
 use vk_registry::lock::LockManager;
 use vk_registry::relay::Upstream;
-use vk_registry::{ServerState, Store, accounts};
+use vk_registry::{ServerConfig, ServerState, Store};
 
 fn tmp(tag: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!(
@@ -778,9 +779,28 @@ async fn lock_api_build_once_over_http() {
 async fn accounts_auth_gates_everything_including_the_probe() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = tmp("accounts");
-    // `Store::new` first, then the db under it, exactly as `into_state` does it
-    let store = Arc::new(Store::new(dir.clone()).unwrap());
-    let db = accounts::Db::open(&dir.join("accounts").join("accounts.db")).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let secret = dir.join("oidc-secret");
+    std::fs::write(&secret, "s3cr3t\n").unwrap();
+
+    // Built through `into_state`, not a `ServerState` literal: accounts mode's store and
+    // its OIDC provider come from the config together, and this is the wiring a real
+    // `serve` uses. Discovery is deferred to the first login, so naming a provider here
+    // costs no network.
+    let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), dir.join("store"));
+    cfg.mode = AuthMode::Accounts;
+    cfg.oidc = Some(OidcSpec {
+        issuer: "https://login.example.com".to_string(),
+        client_id: "vk-registry".to_string(),
+        client_secret_file: secret,
+        public_url: "https://registry.internal".to_string(),
+    });
+    let state = Arc::new(cfg.into_state().unwrap());
+
+    // seed through the db the server itself opened
+    let vk_registry::Authenticator::Accounts { db, .. } = &state.auth else {
+        panic!("accounts mode was configured");
+    };
     let user = db
         .upsert_user("https://issuer", "sub-1", Some("a@example.com"), None)
         .unwrap();
@@ -793,14 +813,7 @@ async fn accounts_auth_gates_everything_including_the_probe() {
         .unwrap();
     assert!(db.revoke_api_key(&user.id, &old.id).unwrap());
 
-    let state = Arc::new(ServerState {
-        store,
-        upstreams: vec![],
-        locks: LockManager::new(),
-        auth: vk_registry::Authenticator::Accounts(Arc::new(db)),
-        tls: None,
-    });
-    let url = spawn(state);
+    let url = spawn(state.clone());
     let http = reqwest::Client::new();
 
     // no credential: the probe challenges, and it says how — an OCI client that gets a
@@ -830,14 +843,64 @@ async fn accounts_auth_gates_everything_including_the_probe() {
         .unwrap();
     assert_eq!(r.status().as_u16(), 404);
 
-    // so does a session cookie, the browser half of the same gate
+    // so does a session cookie, the browser half of the same gate. Under the name this
+    // deployment writes: `public_url` is https, so the cookie is `__Host-` prefixed, and
+    // the bare name is one only another host could have set.
+    let r = http
+        .get(format!("{url}/v2/"))
+        .header("cookie", format!("__Host-vk_session={session}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "got {}", r.status());
     let r = http
         .get(format!("{url}/v2/"))
         .header("cookie", format!("vk_session={session}"))
         .send()
         .await
         .unwrap();
-    assert!(r.status().is_success(), "got {}", r.status());
+    assert_eq!(
+        r.status().as_u16(),
+        401,
+        "a cookie under the name this server never sets is not a credential"
+    );
+
+    // A cross-site sign-out cannot force a re-login: a `SameSite=Lax` cookie is sent with
+    // no cross-site POST, so /logout sees no session — and must then answer with a bare
+    // redirect, never a cookie-clearing `Set-Cookie`, or any page on the internet could
+    // sign a visitor out.
+    // its own client: the default one follows the 302, and /browse behind the accounts
+    // gate would answer 401, hiding the response actually under test
+    let no_follow = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let r = no_follow
+        .post(format!("{url}/logout"))
+        .body("csrf=whatever")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status().as_u16(),
+        302,
+        "a browser answer, not a JSON error"
+    );
+    assert!(
+        r.headers().get("set-cookie").is_none(),
+        "a request that presented no session cookie must not have one cleared: {:?}",
+        r.headers().get("set-cookie")
+    );
+
+    // and one presenting a session it does not own the CSRF secret for is refused
+    let r = no_follow
+        .post(format!("{url}/logout"))
+        .header("cookie", format!("__Host-vk_session={session}"))
+        .body("csrf=wrong")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 403, "the CSRF guard holds");
 
     // the shared secret is not a credential here, and neither is a made-up or revoked key
     for bad in ["s3cret", "vkr_deadbeef", revoked_token.as_str()] {

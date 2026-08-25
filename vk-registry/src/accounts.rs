@@ -66,6 +66,11 @@ const MAX_REPO_PATTERN_LEN: usize = 256;
 /// Both halves of a user key are IdP-supplied, and the pair becomes a redb key.
 const MAX_IDENTITY_LEN: usize = 512;
 
+/// Cap on an IdP-supplied display claim (`email`, `name`). Like a key's name, these are
+/// stored and rendered back into a page, so the bound belongs here — at the store, so
+/// every caller gets it and not just the login handler.
+const MAX_CLAIM_LEN: usize = 256;
+
 // The three row types are the on-disk format. A decode failure is not recoverable — it
 // fails the lookup, and `list_api_keys` fails the whole listing — so a field added to any
 // of them later must be `Option` or `#[serde(default)]`, never a bare required field, or
@@ -86,9 +91,9 @@ struct SessionRow {
     user_key: String,
     csrf_secret: String,
     created_at: i64,
-    /// Absolute, not sliding: a session dies `ttl` after it was minted however much it is
-    /// used, so a stolen cookie has a bounded shelf life and no request has to write in
-    /// order to keep one alive.
+    /// Absolute, not sliding: a session dies `SESSION_TTL` after it was minted however
+    /// much it is used, so a stolen cookie has a bounded shelf life and no request has to
+    /// write to keep one alive. See `DESIGN.md`'s "OIDC login".
     expires_at: i64,
 }
 
@@ -311,8 +316,17 @@ impl Db {
             let row = UserRow {
                 oidc_issuer: issuer.to_string(),
                 oidc_subject: subject.to_string(),
-                email: email.map(str::to_string).or(prior_email),
-                display_name: display_name.map(str::to_string).or(prior_name),
+                // `filter`, because clamping can empty a claim entirely (a `name` of
+                // nothing but control characters), and an empty one must not overwrite a
+                // good stored value any more than an absent one does.
+                email: email
+                    .map(clamp_claim)
+                    .filter(|s| !s.is_empty())
+                    .or(prior_email),
+                display_name: display_name
+                    .map(clamp_claim)
+                    .filter(|s| !s.is_empty())
+                    .or(prior_name),
                 is_admin,
                 created_at,
                 last_login_at: now,
@@ -593,13 +607,17 @@ impl Db {
 /// Resolve the request's principal: a `vkr_…` bearer token, else a session cookie.
 /// Mutually exclusive — a bearer header present means the cookie is not even inspected,
 /// matching the shared-secret path's precedent of one credential per request.
-pub fn resolve_principal(db: &Db, req: &Request<Incoming>) -> Result<Option<Principal>> {
-    resolve_headers(db, req.headers())
+pub fn resolve_principal(
+    db: &Db,
+    req: &Request<Incoming>,
+    secure: bool,
+) -> Result<Option<Principal>> {
+    resolve_headers(db, req.headers(), secure)
 }
 
 /// [`resolve_principal`]'s body, over the headers alone — a `Request<Incoming>` can only
 /// be built by a live connection, so this is the testable half.
-fn resolve_headers(db: &Db, headers: &HeaderMap) -> Result<Option<Principal>> {
+fn resolve_headers(db: &Db, headers: &HeaderMap, secure: bool) -> Result<Option<Principal>> {
     // An `Authorization` header is a claim to be authenticated by it, so one that does not
     // carry a `vkr_…` key is a failed authentication rather than a reason to fall back to
     // the cookie — otherwise a stale shared-secret client would silently authenticate as
@@ -610,7 +628,7 @@ fn resolve_headers(db: &Db, headers: &HeaderMap) -> Result<Option<Principal>> {
         };
         return Ok(db.get_api_key_by_token(&token)?.map(Principal::ApiKey));
     }
-    if let Some(session_id) = session_cookie(headers) {
+    if let Some(session_id) = session_cookie(headers, secure) {
         return Ok(db.get_session_user(&session_id)?.map(Principal::Session));
     }
     Ok(None)
@@ -663,10 +681,39 @@ fn credential<'h>(headers: &'h HeaderMap, scheme: &str) -> Option<&'h str> {
         .then(|| credential.trim_start())
 }
 
-/// The `vk_session` cookie's value, hand-parsed (no cookie crate in the tree) out of a
-/// `Cookie: a=b; vk_session=…; c=d` header. A client may split its cookies over several
-/// headers, so all of them are scanned.
-fn session_cookie(headers: &HeaderMap) -> Option<String> {
+/// The session cookie's name in its `__Host-`-prefixed form — accepted by a browser only
+/// with `Secure` and `Path=/`, and, the point, writable by no other host: without the
+/// prefix a sibling or parent host on the same registrable domain can plant a session
+/// cookie (fixation) or a login state of its own.
+pub(crate) const SESSION_COOKIE_HOST: &str = "__Host-vk_session";
+
+/// The same cookie without the prefix, for the loopback-plaintext deployment
+/// `ServerConfig` allows: `__Host-` requires `Secure`, which a browser will not store
+/// over plain HTTP.
+pub(crate) const SESSION_COOKIE: &str = "vk_session";
+
+/// How long a session lasts after login — an absolute lifetime, not sliding, so a
+/// stolen cookie has a bounded shelf life regardless of continued use.
+pub(crate) const SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
+
+/// The session cookie's value, hand-parsed (no cookie crate in the tree) out of a
+/// `Cookie: a=b; __Host-vk_session=…; c=d` header — under *only* the name
+/// [`set_cookie_header`] would have written on this deployment (see
+/// [`crate::ServerState::cookies_are_secure`]).
+///
+/// Reading both names would give the `__Host-` prefix away: on a TLS deployment the
+/// server never sets the bare name, so a bare cookie can only be one some *other* host
+/// wrote — precisely the tossed cookie the prefix exists to reject. Accepting it as a
+/// fallback would restore session fixation.
+///
+/// `pub(crate)` — the login/logout handlers (`oidc.rs`) need it too.
+pub(crate) fn session_cookie(headers: &HeaderMap, secure: bool) -> Option<String> {
+    cookie(headers, session_cookie_name(secure))
+}
+
+/// One named cookie's value, hand-parsed (no cookie crate in the tree). A client may
+/// split its cookies over several `Cookie` headers, so all of them are scanned.
+pub(crate) fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all(hyper::header::COOKIE)
         .iter()
@@ -674,8 +721,40 @@ fn session_cookie(headers: &HeaderMap) -> Option<String> {
         .flat_map(|header| header.split(';'))
         .find_map(|pair| {
             let (k, v) = pair.trim().split_once('=')?;
-            (k == "vk_session").then(|| v.to_string())
+            (k == name).then(|| v.to_string())
         })
+}
+
+/// The `Set-Cookie` header value that logs a session in. `secure` should be true iff
+/// this connection is TLS — marking a cookie `Secure` over plain HTTP would just make
+/// the browser silently refuse to store it, breaking the loopback-plaintext deployment
+/// `ServerConfig` otherwise allows. That is also what decides the name: `__Host-` is
+/// only accepted alongside `Secure`, so the plaintext deployment gets the bare name and,
+/// with it, no protection against a sibling host writing the cookie.
+pub(crate) fn set_cookie_header(session_id: &str, secure: bool) -> String {
+    let name = session_cookie_name(secure);
+    let max_age = SESSION_TTL.as_secs();
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!("{name}={session_id}; Path=/; HttpOnly{secure_attr}; SameSite=Lax; Max-Age={max_age}")
+}
+
+/// Which of the two names [`set_cookie_header`] writes on this deployment — and so the
+/// only one [`session_cookie`] reads.
+fn session_cookie_name(secure: bool) -> &'static str {
+    if secure {
+        SESSION_COOKIE_HOST
+    } else {
+        SESSION_COOKIE
+    }
+}
+
+/// The `Set-Cookie` header value that logs a session out (an immediately expiring
+/// cookie with the same attributes as [`set_cookie_header`], so the browser matches and
+/// clears the one it holds).
+pub(crate) fn clear_cookie_header(secure: bool) -> String {
+    let name = session_cookie_name(secure);
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!("{name}=; Path=/; HttpOnly{secure_attr}; SameSite=Lax; Max-Age=0")
 }
 
 /// The stable primary key for a user row: OIDC identity is `(issuer, subject)`, joined by
@@ -701,6 +780,16 @@ fn validate_identity(issuer: &str, subject: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Bound a display claim and drop its control characters. Truncating rather than
+/// refusing is deliberate: an over-long `name` is the IdP's business, not a reason to
+/// refuse the person a login — unlike an identity, which is a key and must be exact.
+fn clamp_claim(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_CLAIM_LEN)
+        .collect()
 }
 
 fn validate_key_input(name: &str, scopes: &[Scope]) -> Result<()> {
@@ -817,8 +906,9 @@ fn from_secs(secs: i64) -> SystemTime {
 }
 
 /// `n` cryptographically random bytes, hex-encoded — the one token-generation primitive
-/// shared by session ids, csrf secrets, and API key secrets.
-fn random_token(n: usize) -> String {
+/// shared by session ids, csrf secrets, API key secrets, and `oidc.rs`'s login state and
+/// PKCE verifier.
+pub(crate) fn random_token(n: usize) -> String {
     let mut buf = vec![0u8; n];
     rand::rng().fill_bytes(&mut buf);
     hex_of(&buf)
@@ -883,6 +973,42 @@ mod tests {
         Ok(())
     }
 
+    /// Display claims are whatever an IdP chose to send, and they are stored and rendered
+    /// back into a page — so the bound and the control-character strip are applied here,
+    /// at the store, and not left to whichever caller happens to be signing someone in.
+    #[test]
+    fn upsert_bounds_the_claims_an_idp_supplies() -> Result<()> {
+        let db = Db::open_memory()?;
+        let long = "e".repeat(MAX_CLAIM_LEN + 50);
+        let u = db.upsert_user(
+            "https://issuer",
+            "sub-1",
+            Some(&long),
+            Some("A\nvk-registry: not a log line\r\tB"),
+        )?;
+        assert_eq!(u.email.as_deref().map(str::len), Some(MAX_CLAIM_LEN));
+        assert_eq!(
+            u.display_name.as_deref(),
+            Some("Avk-registry: not a log lineB"),
+            "control characters do not survive into a stored claim"
+        );
+        // a claim that clamps away to nothing must not blank a good stored one, any more
+        // than an absent claim does
+        let again = db.upsert_user("https://issuer", "sub-1", Some("\u{7f}"), Some("\u{7f}"))?;
+        assert_eq!(again.email.as_deref().map(str::len), Some(MAX_CLAIM_LEN));
+        assert_eq!(
+            again.display_name.as_deref(),
+            Some("Avk-registry: not a log lineB")
+        );
+
+        // an identity, unlike a claim, is a key: it is refused rather than truncated
+        assert!(
+            db.upsert_user("https://issuer", "sub\n1", None, None)
+                .is_err()
+        );
+        Ok(())
+    }
+
     /// A provider that stops sending an optional claim must not blank the profile, and a
     /// re-login must not demote an admin.
     #[test]
@@ -931,14 +1057,14 @@ mod tests {
             format!("vk_session={session_id}").parse().unwrap(),
         );
         assert_eq!(
-            resolve_headers(&db, &headers)?,
+            resolve_headers(&db, &headers, false)?,
             Some(Principal::Session(user))
         );
 
         db.delete_session(&session_id)?;
         assert_eq!(db.get_session_user(&session_id)?, None);
         assert_eq!(db.session_csrf(&session_id)?, None);
-        assert_eq!(resolve_headers(&db, &headers)?, None);
+        assert_eq!(resolve_headers(&db, &headers, false)?, None);
         Ok(())
     }
 
@@ -1168,7 +1294,7 @@ mod tests {
             hyper::header::COOKIE,
             format!("vk_session={session_id}").parse().unwrap(),
         );
-        match resolve_headers(&db, &headers)? {
+        match resolve_headers(&db, &headers, false)? {
             Some(Principal::ApiKey(k)) => assert_eq!(k.id, key.id),
             other => panic!("expected the API key to win, got {other:?}"),
         }
@@ -1178,7 +1304,7 @@ mod tests {
             hyper::header::AUTHORIZATION,
             "Bearer some-shared-secret".parse().unwrap(),
         );
-        assert_eq!(resolve_headers(&db, &headers)?, None);
+        assert_eq!(resolve_headers(&db, &headers, false)?, None);
         Ok(())
     }
 
@@ -1227,7 +1353,10 @@ mod tests {
             "a=b; vk_session=deadbeef; c=d".parse().unwrap(),
         );
         assert_eq!(api_key_token(&cookie_only), None);
-        assert_eq!(session_cookie(&cookie_only), Some("deadbeef".to_string()));
+        assert_eq!(
+            session_cookie(&cookie_only, false),
+            Some("deadbeef".to_string())
+        );
 
         // a client is free to split its cookies over several headers
         let mut split = HeaderMap::new();
@@ -1236,8 +1365,70 @@ mod tests {
             hyper::header::COOKIE,
             "vk_session=beefdead".parse().unwrap(),
         );
-        assert_eq!(session_cookie(&split), Some("beefdead".to_string()));
-        assert_eq!(session_cookie(&HeaderMap::new()), None);
+        assert_eq!(session_cookie(&split, false), Some("beefdead".to_string()));
+        assert_eq!(session_cookie(&HeaderMap::new(), false), None);
+    }
+
+    /// Only the name this deployment would have *written* is read. On a TLS deployment
+    /// the server never sets the bare `vk_session`, so a bare cookie can only be one
+    /// another host tossed in — reading it as a fallback would restore session fixation,
+    /// which is the whole reason for the `__Host-` prefix.
+    #[test]
+    fn a_session_cookie_under_the_other_name_is_not_read() {
+        let headers = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(hyper::header::COOKIE, v.parse().unwrap());
+            h
+        };
+        assert_eq!(
+            session_cookie(&headers("__Host-vk_session=ours"), true),
+            Some("ours".to_string())
+        );
+        assert_eq!(
+            session_cookie(&headers("vk_session=tossed; __Host-vk_session=ours"), true),
+            Some("ours".to_string()),
+            "the tossed one does not win"
+        );
+        assert_eq!(
+            session_cookie(&headers("vk_session=tossed"), true),
+            None,
+            "and it is not a fallback either"
+        );
+        assert_eq!(
+            session_cookie(&headers("__Host-vk_session=other"), false),
+            None,
+            "nor the other way round"
+        );
+    }
+
+    /// The cookie is `__Host-` prefixed wherever `Secure` is possible — the prefix is what
+    /// stops a sibling or parent host from writing a session cookie of its own (fixation),
+    /// and a browser honours it only alongside `Secure` and `Path=/` with no `Domain`. On
+    /// plain HTTP `Secure` is impossible, so the bare name is used and that protection is
+    /// absent; clearing must reuse whichever name was set, or the browser keeps the cookie.
+    #[test]
+    fn the_session_cookie_is_host_prefixed_wherever_secure_is_possible() {
+        let set = set_cookie_header("sess-1", true);
+        assert!(set.starts_with("__Host-vk_session=sess-1;"), "{set}");
+        assert!(set.contains("; Secure"), "{set}");
+        assert!(set.contains("HttpOnly"), "{set}");
+        assert!(set.contains("Path=/"), "{set}");
+        assert!(!set.contains("Domain="), "{set}");
+        assert!(set.contains("SameSite=Lax"), "{set}");
+
+        let plain = set_cookie_header("sess-1", false);
+        assert!(plain.starts_with("vk_session=sess-1;"), "{plain}");
+        assert!(!plain.contains("Secure"), "{plain}");
+
+        for secure in [true, false] {
+            let cleared = clear_cookie_header(secure);
+            assert!(cleared.contains("Max-Age=0"), "{cleared}");
+            assert_eq!(
+                cleared.split('=').next(),
+                set_cookie_header("sess-1", secure).split('=').next(),
+                "the same name, or the browser keeps the one it holds"
+            );
+        }
     }
 
     #[test]

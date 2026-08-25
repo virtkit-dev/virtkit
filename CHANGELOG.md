@@ -13,6 +13,11 @@ All notable changes to virtkit will be documented in this file.
   elsewhere); the file holds no password and no usable copy of any key or
   session.
 
+- People sign in to a registry in accounts mode through the same identity
+  provider they use everywhere else: point `[oidc]` at it and `vk-registry` runs
+  the sign-in itself, so nobody is handed a shared token to keep. There is no
+  separate account to create — the first sign-in makes one.
+
 ### Changed
 
 - `vk-registry` now refuses to start on a config file it does not fully
