@@ -833,7 +833,7 @@ fn upstream_failure(what: &str, e: &anyhow::Error) -> Response<Full<Bytes>> {
 /// before either, an embedded scheme. Enumerating what is allowed does not — so a page
 /// added later has to be added here too, or it is simply not a landing target.
 fn is_safe_redirect_target(t: &str) -> bool {
-    let known = t == DEFAULT_TARGET || t.starts_with("/browse/");
+    let known = t == DEFAULT_TARGET || t.starts_with("/browse/") || t == "/settings/keys";
     known
         && t.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b':'))
@@ -872,6 +872,12 @@ mod tests {
     #[test]
     fn redirect_target_safety() {
         assert!(is_safe_redirect_target("/browse"));
+        assert!(is_safe_redirect_target("/settings/keys"));
+        // only the page itself: the revoke sub-path is POST-only, so landing a browser
+        // there after login would land it on a 404
+        assert!(!is_safe_redirect_target("/settings/keys/abc/revoke"));
+        assert!(!is_safe_redirect_target("/settings/keysevil"));
+        assert!(!is_safe_redirect_target("/settings"));
         assert!(is_safe_redirect_target("/browse/team-a"));
         assert!(is_safe_redirect_target(
             "/browse/team-a/app/manifests/sha256:abc"

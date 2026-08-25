@@ -342,8 +342,11 @@ abandoned is not, and a periodic sweep is deferred.
 `blobs/<digest>`, `manifests/<reference>`, `tags/list`) through `authorize_or_forbidden`
 in `route()`, and filters `/browse`: a principal is shown only the repositories it may
 read, and one it may not read answers 404 rather than 403, so a listing does not confirm
-what it excludes. Granting admin is `set_admin`, with no HTTP route by
-design — an operator's job, from the `vk-registry accounts` CLI (step 4 below).
+what it excludes. `/settings/keys` (`keys.rs`) is a session-only, CSRF-protected API-key
+UI; minting a **write**-scoped key needs an admin session, since a plain session cannot
+write and must not be able to mint itself a key that can. Granting admin is `set_admin`,
+with no HTTP route by design — an operator's job, from the `vk-registry accounts` CLI
+(step 4 below).
 
 `/lock/*` stays authentication-only: a lock name is a build key, not a repository name,
 so there is nothing per-repo to check against. The consequence is that any principal,
@@ -359,10 +362,12 @@ every repository:
   fetch it through any repository it may read. Manifests and tags are what scoping
   protects, and they are where digests come from — so this matters only against a caller
   who obtains a digest another way. Per-repo blob membership is deferred.
-- **A key's scopes are not bounded by its creator's rights.** `create_api_key` takes the
-  scopes it is given, so once `/settings/keys` exists a non-admin session — which may only
-  read — must not be allowed to mint a `Write` key, or it escalates past itself. Nothing
-  can reach `create_api_key` over HTTP yet; the bound belongs with that route.
+- **A key's scopes are bounded at the route, not in the store.** `create_api_key` takes
+  the scopes it is given, so it is `/settings/keys` that refuses a plain session a
+  `Write` key — without that check a session which may only read could mint itself one
+  that writes. Any later caller of `create_api_key` owes the same check. The bound is at
+  creation time only: revoking someone's admin with `set_admin` leaves the write-scoped
+  keys they already minted live, so demoting an admin means revoking their keys too.
 - **Writes cannot claim a digest they did not produce.** `finish_upload` hashes the bytes
   and refuses a mismatch, and an upload session records the repository it was opened for,
   so a caller cannot start an upload where it may write and finish it where it may not.

@@ -45,6 +45,7 @@ pub(crate) mod browse;
 pub mod client;
 pub mod config;
 pub(crate) mod html;
+pub(crate) mod keys;
 pub mod lock;
 pub mod oidc;
 pub mod relay;
@@ -1002,13 +1003,17 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
     // they know the repo name and whether the request reads or writes (see DESIGN.md's
     // "Accounts, OIDC, and scoped API keys").
     let is_browse = is_browse_path(&path);
+    // Both browser-facing families, for the answers that differ by *audience* rather than
+    // by route: an HTML page and a login redirect for a person, the JSON envelope and a
+    // bare 401 for an OCI/CI client.
+    let is_human = is_human_path(&path);
     let principal = match &state.auth {
         Authenticator::Accounts { db, .. } => {
             let resolved = match accounts::resolve_principal(db, &req, state.cookies_are_secure()) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("vk-registry: resolving a credential: {e:#}");
-                    return Ok(if is_browse {
+                    return Ok(if is_human {
                         html::error(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             None,
@@ -1029,7 +1034,7 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
                 // A browser on a human-facing page is sent to sign in and back to where
                 // it started; an API path (`/v2/*`, `/lock/*`) gets the 401 an OCI/CI
                 // client already knows how to react to.
-                if is_browse {
+                if is_human {
                     return Ok(redirect_to_login(&path));
                 }
                 return Ok(accounts::challenge());
@@ -1106,6 +1111,15 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
             .unwrap_or_default()
             .trim_start_matches('/');
         return browse::route(&state.store, rest, principal, csrf.as_deref());
+    }
+    if is_settings_path(&path) {
+        let (Authenticator::Accounts { db, .. }, Some(p)) = (&state.auth, &principal) else {
+            // Byte-identical to the catch-all 404, for the reason the `/browse` branch
+            // above gives: in shared-secret mode this route does not exist, rather than
+            // existing and saying so.
+            return Ok(error_response(StatusCode::NOT_FOUND, "NOT_FOUND", &path));
+        };
+        return keys::route(db, p, state.cookies_are_secure(), req).await;
     }
 
     // The build-once lock API lives under `/lock/<action>` (all POST), outside the
@@ -1664,8 +1678,16 @@ fn authorize_or_forbidden(
 /// The paths a browser hits rather than an OCI/CI client — so an unauthenticated request
 /// there is sent to `/login` instead of getting the bare 401 `/v2/*`/`/lock/*` clients
 /// expect, and so shared-secret mode can refuse them outright.
+fn is_human_path(path: &str) -> bool {
+    is_browse_path(path) || is_settings_path(path)
+}
+
 fn is_browse_path(path: &str) -> bool {
     path == "/browse" || path.starts_with("/browse/")
+}
+
+fn is_settings_path(path: &str) -> bool {
+    path == "/settings/keys" || path.starts_with("/settings/keys/")
 }
 
 /// Send an unauthenticated browser to `/login`, remembering `target` so it lands back

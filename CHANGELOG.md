@@ -27,9 +27,11 @@ All notable changes to virtkit will be documented in this file.
 - An API key now reaches only the repositories it was given. Each key names what
   it may do and where — read or write, one repository, or everything under a
   prefix — and a request outside that is refused, over the registry API and on
-  the pages alike; the pages simply do not show what a key cannot reach. What a
-  person may do stays deliberately coarse for now: anyone the identity provider
-  will sign in can read every repository, and pushing needs an administrator.
+  the pages alike; the pages simply do not show what a key cannot reach. People
+  create and revoke their own keys from a page in the registry. What a person may
+  do stays deliberately coarse for now: anyone the identity provider will sign in
+  can read every repository, and pushing needs an administrator — who is also the
+  only one who can hand out a key that writes.
 
 ### Changed
 

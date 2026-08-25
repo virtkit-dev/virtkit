@@ -564,6 +564,23 @@ impl Db {
         Ok(Some(key))
     }
 
+    /// Look up an API key by its [`ApiKey::id`] (its token hash), without the plaintext
+    /// bearer string. Returns a revoked or expired key too — the caller decides what that
+    /// means; only [`Db::get_api_key_by_token`] treats those as absent, because it is
+    /// answering "is this a live credential" rather than "what is this row".
+    ///
+    /// `pub` rather than `pub(crate)`: its only caller is `tests/accounts_e2e.rs`, which
+    /// is out of crate. It looks unused from inside — it is not.
+    pub fn get_api_key(&self, id: &str) -> Result<Option<ApiKey>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let table = txn.open_table(API_KEYS)?;
+        Ok(table
+            .get(id)?
+            .map(|g| decode::<ApiKeyRow>(g.value()))
+            .transpose()?
+            .map(|row| api_key_from_row(id.to_string(), &row)))
+    }
+
     /// Record that a key was just used. Committed with `Durability::Eventual`: losing the
     /// most recent bump to a crash costs nothing, and an fsync per authenticated request
     /// would be felt on every chunk of a push.
@@ -859,7 +876,10 @@ fn clamp_claim(s: &str) -> String {
         .collect()
 }
 
-fn validate_key_input(name: &str, scopes: &[Scope]) -> Result<()> {
+/// `pub(crate)` so a route can ask "is this input acceptable" *before* calling
+/// [`Db::create_api_key`], and so tell a bad form apart from a failed write — the first is
+/// the caller's to fix and worth showing them, the second is this server's and is not.
+pub(crate) fn validate_key_input(name: &str, scopes: &[Scope]) -> Result<()> {
     if name.is_empty() {
         bail!("an API key needs a name");
     }

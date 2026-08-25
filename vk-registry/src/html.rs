@@ -53,15 +53,17 @@ pub(crate) fn page(
             // token — a link would let any page on the internet end this session. With no
             // token the control is omitted rather than rendered dead: a button whose only
             // possible outcome is a 403 is worse than no button.
+            let links = "<a href=\"/browse\">browse</a> &middot; \
+                         <a href=\"/settings/keys\">keys</a>";
             match csrf {
                 Some(token) => format!(
-                    "signed in as {who} &middot; <a href=\"/browse\">browse</a> &middot; \
+                    "signed in as {who} &middot; {links} &middot; \
                      <form method=\"post\" action=\"/logout\">\
                      <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
                      <button type=\"submit\">log out</button></form>",
                     html_escape(token)
                 ),
-                None => format!("signed in as {who} &middot; <a href=\"/browse\">browse</a>"),
+                None => format!("signed in as {who} &middot; {links}"),
             }
         }
         accounts::Principal::ApiKey(k) => {
@@ -93,8 +95,9 @@ fn shell(title: &str, nav: &str, body: &str) -> String {
          td,th{{padding:.25rem .75rem;text-align:left;border-bottom:1px solid #ddd}}\n\
          a{{color:#0645ad;text-decoration:none}} a:hover{{text-decoration:underline}}\n\
          nav{{float:right;color:#555;font-size:.9rem}}\n\
-         nav form{{display:inline}}\n\
-         code{{font-size:.9rem}}\n\
+         nav form{{display:inline}} label{{display:block;margin:.4rem 0}}\n\
+         .error{{color:#b00020}}\n\
+         code,pre{{font-size:.9rem}}\n\
          </style></head><body>\n\
          <nav>{nav}</nav>\n\
          {body}\n\
@@ -208,6 +211,12 @@ mod tests {
         assert!(keyed.contains("API key ci"), "{keyed}");
         assert!(!keyed.contains("<form"), "{keyed}");
         assert!(!keyed.contains("/logout"), "{keyed}");
+        assert!(
+            !keyed.contains("/settings/keys"),
+            "a key cannot manage keys: {keyed}"
+        );
+        assert!(signed_in.contains("/settings/keys"), "{signed_in}");
+        assert!(unarmed.contains("/settings/keys"), "{unarmed}");
         assert!(
             !keyed.contains("s3cr3t"),
             "a key's page carries no session secret"
