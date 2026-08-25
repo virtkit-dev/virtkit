@@ -3594,7 +3594,7 @@ impl VmSession {
             conn.read_exact(&mut buf)
                 .with_context(|| format!("dirty-control: read {label} ranges"))?;
             let mut ranges = Vec::with_capacity(count);
-            for c in buf.chunks_exact(16) {
+            for c in buf.as_chunks::<16>().0 {
                 let off = u64::from_le_bytes(c[..8].try_into().unwrap());
                 let len = u64::from_le_bytes(c[8..16].try_into().unwrap());
                 ranges.push((off, len));

@@ -105,7 +105,8 @@ impl Qcow2 {
         let mut l1_raw = vec![0u8; l1_size * 8];
         file.read_exact_at(&mut l1_raw, l1_offset)
             .with_context(|| format!("reading L1 table of {}", path.display()))?;
-        let l1: Vec<u64> = l1_raw.chunks_exact(8).map(|c| be64(c, 0)).collect();
+        let (l1_entries, _) = l1_raw.as_chunks::<8>();
+        let l1: Vec<u64> = l1_entries.iter().map(|c| be64(c, 0)).collect();
 
         // backing file: a path string at backing_file_offset, resolved relative to this image.
         let backing_off = be64(&h, 8);
@@ -275,7 +276,8 @@ impl Qcow2 {
             self.file
                 .read_exact_at(&mut raw, l2_off)
                 .context("reading qcow2 L2 table")?;
-            let table: Vec<u64> = raw.chunks_exact(8).map(|c| be64(c, 0)).collect();
+            let (entries, _) = raw.as_chunks::<8>();
+            let table: Vec<u64> = entries.iter().map(|c| be64(c, 0)).collect();
             self.l2_cache.insert(l2_off, table);
         }
         Ok(self.l2_cache[&l2_off][idx])
