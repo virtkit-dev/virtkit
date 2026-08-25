@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-08-25
+
 ### Fixed
 
 - `vk build --debug` now checks the filesystem of the cached stages a build
@@ -1865,7 +1867,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.41.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.42.0...HEAD
+[0.42.0]: https://github.com/virtkit-dev/virtkit/compare/v0.41.0...v0.42.0
 [0.41.0]: https://github.com/virtkit-dev/virtkit/compare/v0.40.0...v0.41.0
 [0.40.0]: https://github.com/virtkit-dev/virtkit/compare/v0.39.0...v0.40.0
 [0.39.0]: https://github.com/virtkit-dev/virtkit/compare/v0.38.0...v0.39.0
