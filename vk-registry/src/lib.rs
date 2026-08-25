@@ -308,6 +308,24 @@ impl Store {
         Ok(Some((digest, data, ctype)))
     }
 
+    /// Every tag under `repos/<name>/tags`, sorted. Best-effort: an invalid name, an
+    /// absent repo, an unreadable directory and a non-UTF-8 entry all just yield fewer
+    /// tags. Tag listing is off the pull path (see `route`), so it never fails a caller.
+    pub(crate) fn list_tags(&self, name: &str) -> Vec<String> {
+        if !valid_name(name) {
+            return Vec::new();
+        }
+        let dir = self.root.join("repos").join(name).join("tags");
+        let mut tags: Vec<String> = std::fs::read_dir(&dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .collect();
+        tags.sort();
+        tags
+    }
+
     /// Take the store lock shared — held by every writer/reader across its whole
     /// check→reference window (a local push: first `has_blob` through
     /// `put_manifest`), so a `vk registry gc` holding it *exclusive* can never
@@ -1186,14 +1204,7 @@ pub(crate) fn get_manifest(
 
 /// GET /v2/<name>/tags/list.
 fn list_tags(store: &Store, name: &str) -> Result<Response<Full<Bytes>>> {
-    let dir = store.root.join("repos").join(name).join("tags");
-    let mut tags: Vec<String> = std::fs::read_dir(&dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect();
-    tags.sort();
+    let tags = store.list_tags(name);
     let body = serde_json::json!({ "name": name, "tags": tags }).to_string();
     Response::builder()
         .status(StatusCode::OK)
@@ -2195,6 +2206,42 @@ mod tests {
         assert!(
             std::fs::metadata(&tag).unwrap().modified().unwrap() > old,
             "a tag hit must bump the tag mtime"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tag listing is sorted, ignores the digest references a push also records, and
+    /// stays best-effort: an unknown repo and a name that could escape the store dir
+    /// both come back empty rather than erroring or reading outside `repos/`.
+    #[test]
+    fn list_tags_sorts_known_tags_and_stays_empty_otherwise() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-tags-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let mut digest = String::new();
+        for reference in ["v2", "v1", "latest"] {
+            digest = store
+                .put_manifest("repo", reference, DEFAULT_MANIFEST_TYPE, b"{}")
+                .unwrap();
+        }
+        // a digest reference is self-describing: it writes no tag file
+        store
+            .put_manifest("repo", &digest, DEFAULT_MANIFEST_TYPE, b"{}")
+            .unwrap();
+
+        assert_eq!(store.list_tags("repo"), ["latest", "v1", "v2"]);
+        assert!(store.list_tags("other").is_empty(), "unknown repo");
+        assert!(store.list_tags("").is_empty(), "empty name");
+
+        // a directory an unguarded `repos/<name>` join would escape into and read
+        let escaped = dir.join("escape-target").join("tags");
+        std::fs::create_dir_all(&escaped).unwrap();
+        std::fs::write(escaped.join("leaked"), b"").unwrap();
+        assert!(
+            store.list_tags("../escape-target").is_empty(),
+            "a traversing name must never be joined into a store path"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
