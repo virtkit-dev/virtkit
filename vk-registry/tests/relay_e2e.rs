@@ -1027,12 +1027,30 @@ async fn browse_belongs_to_accounts_mode_and_redirects_a_signed_out_browser() {
             .status()
             .is_success()
     );
+    // and indistinguishable from any other unknown path, down to the body: an HTML page
+    // where a random path gets JSON would tell an unauthenticated caller that `/browse` is
+    // a route this server knows
+    let unknown = http.get(format!("{url}/nope")).send().await.unwrap();
+    assert_eq!(unknown.status().as_u16(), 404);
+    let unknown_type = unknown
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     for p in ["/browse", "/browse/team-a"] {
         let r = http.get(format!("{url}{p}")).send().await.unwrap();
         assert_eq!(
             r.status().as_u16(),
             404,
             "{p} must not enumerate a shared-secret store"
+        );
+        assert_eq!(
+            r.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some(unknown_type.as_str()),
+            "{p} must answer as any unknown path does"
         );
     }
 

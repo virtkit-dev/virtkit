@@ -46,7 +46,8 @@ use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use sha2::{Digest, Sha256};
 
-use crate::{ServerState, accounts, html_escape, percent_encode, query_param};
+use crate::html;
+use crate::{ServerState, accounts, percent_encode, query_param};
 
 /// How long an in-flight login (redirected to the provider, not yet back) stays valid.
 /// Generous next to a human's login time, tight next to a session's lifetime.
@@ -800,31 +801,6 @@ fn form_field(body: &str, key: &str) -> Option<String> {
     query_param(body, key)
 }
 
-/// A minimal HTML error page. The browser-facing routes must not answer a person with
-/// the OCI API's JSON error envelope.
-fn html_error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
-    let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>vk-registry</title>\
-         </head><body style=\"font-family:system-ui,sans-serif;margin:2rem\">\
-         <h1>{}</h1><p>{}</p></body></html>",
-        status.as_u16(),
-        html_escape(message)
-    );
-    Response::builder()
-        .status(status)
-        .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(hyper::header::CACHE_CONTROL, "no-store")
-        .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .header(hyper::header::REFERRER_POLICY, "no-referrer")
-        .header(
-            hyper::header::CONTENT_SECURITY_POLICY,
-            "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; \
-             frame-ancestors 'none'",
-        )
-        .body(Full::new(Bytes::from(body)))
-        .expect("building an auth error page")
-}
-
 /// This server failed, not the caller — log the detail, say nothing about it.
 fn internal_failure(what: &str, e: &anyhow::Error) -> Response<Full<Bytes>> {
     eprintln!("vk-registry: {what} failed: {e:#}");
@@ -832,6 +808,12 @@ fn internal_failure(what: &str, e: &anyhow::Error) -> Response<Full<Bytes>> {
         StatusCode::INTERNAL_SERVER_ERROR,
         "Something went wrong on the server. Try again shortly.",
     )
+}
+
+/// An error page for a caller who is, by definition, not signed in yet — so it renders
+/// without the signed-in chrome, but with the same headers every other page here sets.
+fn html_error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
+    html::error(status, None, None, status.as_str(), message)
 }
 
 /// The provider, or the network to it, failed us — log the detail, tell the caller only
@@ -846,12 +828,13 @@ fn upstream_failure(what: &str, e: &anyhow::Error) -> Response<Full<Bytes>> {
 
 /// A `target` is safe to redirect a browser to after login only if it cannot leave this
 /// origin. An allowlist, not a denylist: the only targets this server ever produces are
-/// `/browse` paths, and a denylist has to anticipate every form a browser treats as
-/// off-origin — `//host`, `/\host` (browsers read `\` as `/`), a tab or newline before
-/// either, an embedded scheme. Enumerating what is allowed does not.
+/// its own browser-facing pages, and a denylist has to anticipate every form a browser
+/// treats as off-origin — `//host`, `/\host` (browsers read `\` as `/`), a tab or newline
+/// before either, an embedded scheme. Enumerating what is allowed does not — so a page
+/// added later has to be added here too, or it is simply not a landing target.
 fn is_safe_redirect_target(t: &str) -> bool {
-    let is_browse = t == DEFAULT_TARGET || t.starts_with("/browse/");
-    is_browse
+    let known = t == DEFAULT_TARGET || t.starts_with("/browse/");
+    known
         && t.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b':'))
         && !t.contains("..")

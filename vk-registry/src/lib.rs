@@ -44,6 +44,7 @@ pub mod auth;
 pub(crate) mod browse;
 pub mod client;
 pub mod config;
+pub(crate) mod html;
 pub mod lock;
 pub mod oidc;
 pub mod relay;
@@ -1003,8 +1004,28 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
     let is_browse = is_browse_path(&path);
     let principal = match &state.auth {
         Authenticator::Accounts { db, .. } => {
-            let Some(resolved) = accounts::resolve_principal(db, &req, state.cookies_are_secure())?
-            else {
+            let resolved = match accounts::resolve_principal(db, &req, state.cookies_are_secure()) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vk-registry: resolving a credential: {e:#}");
+                    return Ok(if is_browse {
+                        html::error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            None,
+                            None,
+                            "Something went wrong",
+                            "The server could not check your credentials. Try again shortly.",
+                        )
+                    } else {
+                        error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "INTERNAL",
+                            "could not check the request's credentials",
+                        )
+                    });
+                }
+            };
+            if resolved.is_none() {
                 // A browser on a human-facing page is sent to sign in and back to where
                 // it started; an API path (`/v2/*`, `/lock/*`) gets the 401 an OCI/CI
                 // client already knows how to react to.
@@ -1012,8 +1033,8 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
                     return Ok(redirect_to_login(&path));
                 }
                 return Ok(accounts::challenge());
-            };
-            Some(resolved)
+            }
+            resolved
         }
         Authenticator::Shared(auth) => {
             if auth.enabled() && !auth.allows(&req) {
@@ -1041,14 +1062,12 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
         // unauthenticated.
         let (Authenticator::Accounts { db, .. }, Some(principal)) = (&state.auth, &principal)
         else {
-            // Says nothing about why: in shared-secret mode this is an unauthenticated
-            // caller, and which auth model a server runs is not something to confirm to
-            // one.
-            return Ok(error_response(
-                StatusCode::NOT_FOUND,
-                "NOT_FOUND",
-                "not a v2 path",
-            ));
+            // Byte-identical to the catch-all 404 below, deliberately: the other pages
+            // here answer a browser with HTML, but this one has to be indistinguishable
+            // from any unknown path. An HTML page where a random path gets JSON would
+            // tell an unauthenticated caller that `/browse` is a route this server knows,
+            // which is the one thing this branch exists not to say.
+            return Ok(error_response(StatusCode::NOT_FOUND, "NOT_FOUND", &path));
         };
         // Read-only pages: they answer the two methods a browser reads with and nothing
         // else, like every other route here. A page that carries a session's CSRF secret

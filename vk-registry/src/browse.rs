@@ -21,6 +21,7 @@ use http_body_util::Full;
 use hyper::{Response, StatusCode};
 
 use crate::accounts::{Action, authorize};
+use crate::html::{self, page, respond};
 use crate::{
     Store, accounts, html_escape, human_bytes, manifest_descriptors, valid_digest, valid_name,
     valid_reference,
@@ -66,15 +67,16 @@ fn repo_list(
     // A listing needs the names and how many tags each has — which is still a bounded walk
     // of `repos/` plus one `read_dir` per rendered row, hence [`MAX_ROWS`].
     //
-    // Filtered to what this principal may read: the listing is the only place a repository
-    // name is enumerated, so an API key scoped to one team must not learn the others exist
-    // from it. Filtered *before* the cap, so the cap counts rows the caller may see.
+    // Filtered to what this principal may read: the listing is the only place a
+    // repository name is enumerated, so an API key scoped to one team must not learn the
+    // others exist from it.
     let mut repos: Vec<String> = store
         .repo_names()
         .into_iter()
         .filter(|name| authorize(principal, Action::Read, name))
         .collect();
     repos.sort();
+    // After the scope filter, so the cap counts rows this caller may actually see.
     let total = repos.len();
     let mut rows = String::new();
     for name in repos.iter().take(MAX_ROWS) {
@@ -99,13 +101,16 @@ fn repo_list(
             total - MAX_ROWS
         ));
     }
-    html_response(&page(
-        "vk-registry",
-        principal,
-        csrf,
-        &format!(
-            "<h1>Repositories</h1>\n\
+    Ok(respond(
+        StatusCode::OK,
+        &page(
+            "vk-registry",
+            principal,
+            csrf,
+            &format!(
+                "<h1>Repositories</h1>\n\
              <table><tr><th>Name</th><th>Tags</th><th>Last tag</th></tr>\n{rows}</table>"
+            ),
         ),
     ))
 }
@@ -139,15 +144,18 @@ fn tag_list(
             tags.len() - MAX_ROWS
         ));
     }
-    html_response(&page(
-        &format!("vk-registry: {name}"),
-        principal,
-        csrf,
-        &format!(
-            "<p><a href=\"/browse\">&larr; repositories</a></p>\n\
+    Ok(respond(
+        StatusCode::OK,
+        &page(
+            &format!("vk-registry: {name}"),
+            principal,
+            csrf,
+            &format!(
+                "<p><a href=\"/browse\">&larr; repositories</a></p>\n\
              <h1>{}</h1>\n\
              <table><tr><th>Tag</th></tr>\n{rows}</table>",
-            html_escape(name)
+                html_escape(name)
+            ),
         ),
     ))
 }
@@ -173,15 +181,13 @@ fn manifest_detail(
         Ok(v) => v,
         Err(e) => {
             eprintln!("vk-registry: reading {name}@{reference}: {e:#}");
-            return Ok(html(
+            return Ok(html::error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &page(
-                    "vk-registry: error",
-                    principal,
-                    csrf,
-                    "<h1>Could not read that manifest</h1>\n\
-                     <p><a href=\"/browse\">Back to the repositories</a>.</p>",
-                ),
+                Some(principal),
+                csrf,
+                "Could not read that manifest",
+                "The store could not be read. Try again, or ask an operator to look at \
+                 the server log.",
             ));
         }
     };
@@ -197,15 +203,13 @@ fn manifest_detail(
         Ok(v) => v,
         Err(e) => {
             eprintln!("vk-registry: {name}@{reference} is not parseable JSON: {e:#}");
-            return Ok(html(
+            return Ok(html::error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &page(
-                    "vk-registry: error",
-                    principal,
-                    csrf,
-                    "<h1>Could not read that manifest</h1>\n\
-                     <p><a href=\"/browse\">Back to the repositories</a>.</p>",
-                ),
+                Some(principal),
+                csrf,
+                "Could not read that manifest",
+                "The stored manifest is not readable. Ask an operator to look at the \
+                 server log.",
             ));
         }
     };
@@ -255,106 +259,36 @@ fn manifest_detail(
             described - MAX_ROWS
         ));
     }
-    html_response(&page(
-        &format!("vk-registry: {name}@{reference}"),
-        principal,
-        csrf,
-        &format!(
-            "<p><a href=\"/browse\">&larr; repositories</a> / <a href=\"/browse/{name}\">{name}</a></p>\n\
+    Ok(respond(
+        StatusCode::OK,
+        &page(
+            &format!("vk-registry: {name}@{reference}"),
+            principal,
+            csrf,
+            &format!(
+                "<p><a href=\"/browse\">&larr; repositories</a> / <a href=\"/browse/{name}\">{name}</a></p>\n\
              <h1>{reference}</h1>\n\
              <p>digest: <code>{digest}</code> &middot; content-type: <code>{ctype}</code></p>\n\
              <table><tr><th></th><th>Digest</th><th>Size</th><th>Media type</th></tr>\n{blob_rows}</table>",
-            name = html_escape(name),
-            reference = html_escape(reference),
-            digest = html_escape(&digest),
-            ctype = html_escape(&ctype),
+                name = html_escape(name),
+                reference = html_escape(reference),
+                digest = html_escape(&digest),
+                ctype = html_escape(&ctype),
+            ),
         ),
     ))
 }
 
-fn page(title: &str, principal: &accounts::Principal, csrf: Option<&str>, body: &str) -> String {
-    let nav = match principal {
-        accounts::Principal::Session(u) => {
-            let who = html_escape(
-                u.display_name
-                    .as_deref()
-                    .or(u.email.as_deref())
-                    .unwrap_or(&u.oidc_subject),
-            );
-            // Signing out changes state, so it is a POST carrying the session's CSRF
-            // token — a link would let any page on the internet end this session. With no
-            // token the control is omitted rather than rendered dead: a button whose only
-            // possible outcome is a 403 is worse than no button.
-            match csrf {
-                Some(token) => format!(
-                    "signed in as {who} &middot; \
-                     <form method=\"post\" action=\"/logout\">\
-                     <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
-                     <button type=\"submit\">log out</button></form>",
-                    html_escape(token)
-                ),
-                None => format!("signed in as {who}"),
-            }
-        }
-        accounts::Principal::ApiKey(k) => {
-            format!("authenticated with API key {}", html_escape(&k.name))
-        }
-    };
-    format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title>\n\
-         <style>\n\
-         body{{font-family:system-ui,sans-serif;margin:2rem;color:#1a1a1a}}\n\
-         table{{border-collapse:collapse;margin-top:.5rem}}\n\
-         td,th{{padding:.25rem .75rem;text-align:left;border-bottom:1px solid #ddd}}\n\
-         a{{color:#0645ad;text-decoration:none}} a:hover{{text-decoration:underline}}\n\
-         nav{{float:right;color:#555;font-size:.9rem}}\n\
-         nav form{{display:inline}}\n\
-         code{{font-size:.9rem}}\n\
-         </style></head><body>\n\
-         <nav>{nav}</nav>\n\
-         {body}\n\
-         </body></html>",
-        title = html_escape(title),
-    )
-}
-
-fn html_response(body: &str) -> Result<Response<Full<Bytes>>> {
-    Ok(html(StatusCode::OK, body))
-}
-
-/// Every page here is rendered for one signed-in person and lists the store's inventory,
-/// so: never cached (a shared cache or a back-button on a shared machine would show one
-/// person's page to another), never sniffed, no referrer to the identity provider or
-/// anywhere else, and no resource loads at all beyond the inline stylesheet.
-fn html(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(status)
-        .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(hyper::header::CACHE_CONTROL, "no-store")
-        .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .header(hyper::header::REFERRER_POLICY, "no-referrer")
-        .header(
-            hyper::header::CONTENT_SECURITY_POLICY,
-            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; \
-             base-uri 'none'; frame-ancestors 'none'",
-        )
-        .body(Full::new(Bytes::from(body.to_string())))
-        .expect("building a browse response")
-}
-
-/// A 404 a person can read — the OCI JSON error envelope renders as raw text in a
-/// browser.
+/// A 404 a person can read, keeping the page chrome — which for a session carries a link
+/// back to the listing, and for an API key carries only who it is: a machine credential is
+/// not going to navigate.
 fn not_found(principal: &accounts::Principal, csrf: Option<&str>) -> Response<Full<Bytes>> {
-    html(
+    html::error(
         StatusCode::NOT_FOUND,
-        &page(
-            "vk-registry: not found",
-            principal,
-            csrf,
-            "<h1>Not found</h1>\n\
-             <p>No such repository or reference. \
-             <a href=\"/browse\">Back to the repositories</a>.</p>",
-        ),
+        Some(principal),
+        csrf,
+        "Not found",
+        "No such repository or reference.",
     )
 }
 
@@ -442,13 +376,9 @@ mod tests {
             assert_eq!(h.get(hyper::header::CACHE_CONTROL).unwrap(), "no-store");
             assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
             assert_eq!(h.get("referrer-policy").unwrap(), "no-referrer");
-            // The value, not just its presence: `script-src` is blocked only because it
-            // falls back to `default-src 'none'`, so a later page loosening this would
-            // otherwise pass unnoticed.
             assert_eq!(
                 h.get("content-security-policy").unwrap(),
-                "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; \
-                 base-uri 'none'; frame-ancestors 'none'",
+                crate::html::CSP,
                 "{path}"
             );
         }
@@ -552,6 +482,39 @@ mod tests {
         assert!(!html.contains("href=\"/v2/team-a/app/blobs/../"), "{html}");
         assert!(!html.contains("<script>"), "{html}");
         assert!(html.contains("&lt;script&gt;"), "{html}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An image index has no config or layers; say so rather than render a blank table.
+    #[tokio::test]
+    async fn an_image_index_says_what_it_is() {
+        let (dir, store) = store_in("index");
+        let index = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {"digest": "sha256:aa", "size": 1},
+                {"digest": "sha256:bb", "size": 2},
+            ],
+        });
+        store
+            .put_manifest(
+                "team-a/multi",
+                "v1",
+                "application/vnd.oci.image.index.v1+json",
+                &serde_json::to_vec(&index).unwrap(),
+            )
+            .unwrap();
+        let html = body_of(
+            page_at(
+                &store,
+                "/browse/team-a/multi/manifests/v1",
+                &session("A"),
+                Some("csrf-token"),
+            )
+            .unwrap(),
+        )
+        .await;
+        assert!(html.contains("image index, 2 child manifest(s)"), "{html}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -674,39 +637,6 @@ mod tests {
         let html = body_of(page_at(&store, "/browse", &session("Alice"), None).unwrap()).await;
         assert!(html.contains("signed in as Alice"), "{html}");
         assert!(!html.contains("<form"), "{html}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// An image index has no config or layers; say so rather than render a blank table.
-    #[tokio::test]
-    async fn an_image_index_says_what_it_is() {
-        let (dir, store) = store_in("index");
-        let index = serde_json::json!({
-            "mediaType": "application/vnd.oci.image.index.v1+json",
-            "manifests": [
-                {"digest": "sha256:aa", "size": 1},
-                {"digest": "sha256:bb", "size": 2},
-            ],
-        });
-        store
-            .put_manifest(
-                "team-a/multi",
-                "v1",
-                "application/vnd.oci.image.index.v1+json",
-                &serde_json::to_vec(&index).unwrap(),
-            )
-            .unwrap();
-        let html = body_of(
-            page_at(
-                &store,
-                "/browse/team-a/multi/manifests/v1",
-                &session("A"),
-                Some("csrf-token"),
-            )
-            .unwrap(),
-        )
-        .await;
-        assert!(html.contains("image index, 2 child manifest(s)"), "{html}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
