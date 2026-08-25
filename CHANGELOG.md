@@ -68,6 +68,34 @@ All notable changes to virtkit will be documented in this file.
   body has a `%` in front of a non-ASCII character. Signing out from a page with
   such a body was enough to trigger it.
 
+- **Breaking.** In a registry with accounts, an API key limited to certain
+  repositories can no longer read the others' content — before, it could, once it
+  learned the right identifier. A key is now served only what its own
+  repositories hold, or what it could have fetched from another repository it may
+  read anyway, so sharing identical content between repositories still costs
+  nothing. Registries on the older shared-secret setting keep serving every
+  repository to every client, as they did.
+
+  Two things to do. An existing store's layers are not reachable under the new
+  rules — a tag still resolves, but pulling what it points at fails — so start
+  from an empty store, or push into it again. And a push that names content the
+  registry does not hold is now refused, so it has to send its pieces first. One
+  setup no longer works: a repository that both caches an upstream and receives
+  pushes now fails the push instead of falling back to uploading — give the two
+  separate repositories.
+
+- A repository name may no longer have `blobs`, `tags` or `manifests` as one of
+  its path components; such a name is indistinguishable from how the store lays
+  itself out on disk, and content pushed under one could be collected as
+  unreferenced. Rename before upgrading if you have one.
+
+- `vk-registry` now refuses a manifest larger than 4 MiB, or one referencing more
+  than 4096 distinct pieces of content. Both are far above any real image, and
+  both apply however the registry authenticates.
+
+- `vk registry status` and `vk-registry status` report how many pieces of content
+  each repository holds, and `gc` says how many of those records it dropped.
+
 - `vk-registry` now checks that a pushed layer or manifest really is the content
   its digest names, and refuses the push when it is not. A client can no longer
   claim a piece of content it did not send.

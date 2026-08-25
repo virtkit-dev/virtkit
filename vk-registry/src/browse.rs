@@ -23,8 +23,8 @@ use hyper::{Response, StatusCode};
 use crate::accounts::{Action, authorize};
 use crate::html::{self, page, respond};
 use crate::{
-    Store, accounts, html_escape, human_bytes, manifest_descriptors, valid_digest, valid_name,
-    valid_reference,
+    Authz, Store, accounts, html_escape, human_bytes, manifest_descriptors, valid_digest,
+    valid_name, valid_reference,
 };
 
 /// Ceiling on the rows any one table here renders, and the reason is the same for all
@@ -35,12 +35,19 @@ use crate::{
 /// how much HTML every later GET of that page builds. Truncate and say so.
 const MAX_ROWS: usize = 500;
 
-/// `rest` is the path with its `/browse` prefix already stripped — taking it that way
-/// puts "this is a browse path" in the signature instead of in a runtime check the sole
-/// caller has already made.
+/// `rest` is the path with its `/browse` prefix already stripped — taking it that way puts
+/// "this is a browse path" in the signature instead of in a runtime check the sole caller
+/// has already made.
+///
+/// The content gate (`readable_through`) takes the caller's `Authz` rather than rebuilding
+/// one from `principal`: the route that reaches this module has already decided what this
+/// caller may read, and a second copy of that decision is a second thing to keep in step.
+/// `principal` stays because the pages render the identity it names, and because the
+/// per-page `Read` checks predate `Authz` and still go through `accounts::authorize`.
 pub(crate) fn route(
     store: &Store,
     rest: &str,
+    authz: &Authz<'_>,
     principal: &accounts::Principal,
     csrf: Option<&str>,
 ) -> Result<Response<Full<Bytes>>> {
@@ -51,7 +58,7 @@ pub(crate) fn route(
     if let Some(idx) = rest.rfind("/manifests/") {
         let name = &rest[..idx];
         let reference = &rest[idx + "/manifests/".len()..];
-        return manifest_detail(store, name, reference, principal, csrf);
+        return manifest_detail(store, name, reference, authz, principal, csrf);
     }
     tag_list(store, rest, principal, csrf)
 }
@@ -164,10 +171,20 @@ fn manifest_detail(
     store: &Store,
     name: &str,
     reference: &str,
+    authz: &Authz<'_>,
     principal: &accounts::Principal,
     csrf: Option<&str>,
 ) -> Result<Response<Full<Bytes>>> {
     if !valid_name(name) || !valid_reference(reference) || !authorize(principal, Action::Read, name)
+    {
+        return Ok(not_found(principal, csrf));
+    }
+    // A digest reference is not scoped by the repository in the URL — this page renders a
+    // manifest's layer digests, so without the same gate `/v2/` applies it would be the way
+    // to enumerate another repository's content. A tag lives in the repository and needs no
+    // check.
+    if let Some(hex) = reference.strip_prefix("sha256:")
+        && !crate::readable_through(authz, store, name, hex)
     {
         return Ok(not_found(principal, csrf));
     }
@@ -316,8 +333,10 @@ mod tests {
 
     const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
-    /// [`route`] by the URL a page is reached at, stripped the way `route`'s caller
-    /// strips it — so a test names the URL it means rather than the remainder.
+    /// [`route`] by the URL a page is reached at, stripped the way `route`'s caller strips
+    /// it — so a test names the URL it means rather than the remainder — and with the
+    /// `Authz` that caller would have built: a session may read every repository, which is
+    /// what `/browse` is for.
     fn page_at(
         store: &Store,
         path: &str,
@@ -328,7 +347,7 @@ mod tests {
             .strip_prefix("/browse")
             .expect("a /browse path")
             .trim_start_matches('/');
-        route(store, rest, principal, csrf)
+        route(store, rest, &Authz::Accounts(principal), principal, csrf)
     }
 
     fn store_in(tag: &str) -> (std::path::PathBuf, Store) {

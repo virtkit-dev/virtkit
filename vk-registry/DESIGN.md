@@ -354,14 +354,9 @@ including a read-only key, can take a build-once lock and see other holders' nam
 `blockers` list — acceptable while every principal on a registry is a colleague, and the
 thing to revisit if that stops being true.
 
-Two limits worth stating plainly, both about the content-addressed store being shared by
-every repository:
+A few invariants worth stating plainly, the first three about the content-addressed store
+being shared by every repository:
 
-- **Blob reads are not repo-scoped.** `GET /v2/<name>/blobs/<digest>` checks `Read` on
-  `<name>`, then looks the digest up in the global CAS: a caller who learns a digest can
-  fetch it through any repository it may read. Manifests and tags are what scoping
-  protects, and they are where digests come from — so this matters only against a caller
-  who obtains a digest another way. Per-repo blob membership is deferred.
 - **A key's scopes are bounded at the route, not in the store.** `create_api_key` takes
   the scopes it is given, so it is `/settings/keys` that refuses a plain session a
   `Write` key — without that check a session which may only read could mint itself one
@@ -385,6 +380,134 @@ every repository:
   relabel never changes the bytes a digest names: `put_manifest` verifies the digest
   against the body before it writes, so a cached upstream manifest may carry a different
   label than upstream sent but never different content.
+
+### Repo-scoped content: membership
+
+The store is one content-addressed pool shared by every repository, so a digest is not an
+entitlement to the bytes it names. What makes a read repo-scoped is a **membership**
+record — `repos/<name>/blobs/<hex>`, an empty marker, one inode per (repo, blob) pair:
+
+```
+repos/<name>/blobs/<hex>     this blob may be read through this repo
+repos/<name>/manifests/<hex> already per-repo, and is a manifest's membership record
+```
+
+Membership is recorded **only for content this registry received or verified**:
+
+- an upload session finishing (`finish_upload` — the session carries the repository it was
+  authorized for, and the bytes were hashed against the digest);
+- a blob the relay fetched for that repository and hashed before promoting it;
+- a manifest's own bytes, which we hold because we just wrote them;
+- a digest an authorized caller mounted (below).
+
+Nothing infers membership from a manifest *referencing* a digest. A manifest is the one
+thing a caller can write without holding the content it names, so treating a reference as
+evidence would make "may write here" mean "may read anything whose digest I can name" —
+and would hand the same power to anything that writes a manifest on a caller's behalf, the
+relay's manifest cache included. `Store::put_blob` records nothing either: putting bytes in
+the pool is not the same as granting a repository the right to serve them.
+
+A client's manifest `PUT` body is capped (`MAX_MANIFEST_BYTES`) and so is the number of
+distinct digests one may reference (`MAX_MANIFEST_REFERENCES`): the authorization above
+costs a `stat` per (digest, readable repository) pair and runs under the store lock, so both
+are limits on the work one write-scoped caller can ask for. Both apply in either auth mode —
+the reference count is checked before the shared-secret path returns, so the bound is one
+rule and not one only some deployments get. A digest the store does not hold at all is
+settled by one `stat`, before any per-repository walk; that makes the two refusals differ in
+latency, which is a weak "does this store hold D" probe accepted deliberately over walking
+every readable repository per guess. A manifest the *relay* caches from an upstream is not
+capped: an upstream is configured rather than merely authenticated.
+
+**Reading.** `GET`/`HEAD` of a blob, and of a manifest *by digest*, answer `404` unless the
+digest is readable through that repository — a member, or held by some repository the caller
+may read (`readable_through`). The second clause keeps the rule from being pointlessly
+strict: a caller who may read repo B, which holds the blob, can fetch the same bytes from B,
+so serving them through A discloses nothing it did not already have, and cross-repo dedup
+keeps working. A tag reference needs no check: tags live in the repository. `/browse` applies
+the same gate to a digest reference, since its manifest page is what would otherwise
+enumerate another repository's layers.
+
+Scoping adds a third candidate for a manifest's Content-Type, and it is caller-supplied
+like the other two: a manifest readable here without having been pushed here has no sidecar,
+so the type comes from its own declared `mediaType` (`declared_media_type`). It is held to
+`MANIFEST_MEDIA_TYPES` exactly as the sidecar is — see above for why that list is closed.
+
+In `mode = "shared-secret"` every repository is readable, so `readable_through` short-circuits
+to true and no read is ever refused that was served before, and a manifest `PUT` does no
+membership work at all. The mechanism leaves no new trace there at all: a
+manifest's membership record is the Content-Type sidecar `put_manifest` has always
+written. This scoping bites only on a **narrowly
+scoped API key**; a session reads every repository either way.
+
+Reading is O(1) on the path that matters: a pull names digests that are members of the
+repository it pulls from, which is one `stat`. Only a miss walks `repos/` to find the
+repositories the caller may read, so a caller naming digests it does not hold pays that walk
+per request — bounded by the repository count, and the manifest `PUT` path hoists it out of
+its per-digest loop.
+
+**Writing.** A manifest `PUT` refuses (`MANIFEST_BLOB_UNKNOWN`) unless every digest it
+references is already readable by that caller, and records membership for the ones it
+accepts. That is the OCI cross-repo mount arrived at from the other end: a push whose layers
+are already in the store and already readable by the pusher does not re-upload them, and one
+naming a layer it cannot read is refused rather than quietly granted. The check runs inside
+the same shared store lock as the write, so a `gc` cannot sweep a layer in between.
+
+A consequence worth stating: in accounts mode a manifest naming a layer the store does not
+hold at all is refused, where it used to be accepted. That is what the OCI spec asks for,
+and it is why a push uploads its blobs first.
+
+Membership granted by a mount is permanent, where the read that justified it was not: later
+narrowing the key's scopes does not un-mount what it already mounted. That is deliberate —
+the caller could have downloaded those bytes and re-uploaded them while it still had the
+scope, so the mount grants it nothing it could not otherwise have taken.
+
+The mount walks an image index's child manifests as well as a manifest's config and layers.
+Bytes that do not parse as JSON contribute no digests, and so record nothing: failing open
+there grants nothing, since the only thing readable afterwards is the manifest's own bytes,
+which the caller supplied. Note that the gc mark still refuses an image index outright
+(`manifest_digest_hexes`), so a store that has been pushed one cannot be collected until
+that is fixed — indexes are more mountable than they are supported. Such a pass aborts
+part-way, which is why the sidecar sweep waits until after the blob sweep (below): a pass
+that removes nothing is safe, one that revokes a live manifest's membership is not. TODO:
+teach the gc mark to walk `manifests[]` so that stops being true.
+
+The explicit `POST /v2/<name>/blobs/uploads/?mount=<digest>&from=<repo>` is **not**
+implemented. A server may ignore `mount` and hand back an ordinary upload session, which is
+what this one does, so a client that asks for it falls back to uploading. Nothing in this
+tree asks; the `HEAD` dedup probe plus the mount-on-manifest-`PUT` above already give
+`vk push` the same saving without a client change.
+
+Do not, however, front an upstream for a repository you also push to in accounts mode. The
+`HEAD` dedup probe misses locally (not a member), relays, and the upstream answers 200 for
+content it holds; `vk push` takes that as "already there" and skips the upload, so the
+manifest `PUT` then refuses with `MANIFEST_BLOB_UNKNOWN` — and nothing in this tree retries
+by uploading, so the push fails outright rather than falling back. Pull-through caching and
+pushing want separate repository prefixes until the client re-uploads on that error.
+
+**There is no migration.** A store written before this has no membership records, so its
+content is unreadable through the API: start from an empty store, or re-push into it. This is
+deliberate — reconstructing membership from existing manifests is exactly the inference the
+write rule above rejects, so a backfill would reintroduce the hole it is meant to close.
+
+**Collecting it.** A membership record is not a gc root: what keeps a blob alive is a tag or
+a fresh manifest, exactly as before. The gc sweeps records whose blob is gone, after the blob
+sweep, so it also clears the ones it just orphaned (`GcReport::blob_markers_dropped`). The
+manifest sidecars move with them for the same reason: a sidecar *is* a manifest's membership,
+so it is dropped exactly when its blob is, never before the pass has decided.
+
+The walk in `Store::repo_dirs_any` stops at a repository's own `tags`/`manifests`/`blobs`,
+so listing repositories, `stats` and `gc` stay O(repositories) rather than paying a `stat`
+per membership record. That is why `valid_name` refuses a repository path component named
+any of those three: such a name is indistinguishable from the layout, and the walk would
+never reach its tags, so the gc mark would miss its roots and sweep its content. The
+constraint was always implicit for `tags` and `manifests`; it is now enforced, and `blobs`
+joins it.
+
+`vk registry status` reports the record count per repository (a `MEMBERS` column — how many
+blobs that repository may serve) and in total, so the inode cost of membership is visible
+rather than inferred. A pull-through cache serving tag pulls shows up here
+holding records and no tags: a relayed *tag* manifest is never persisted, though a
+digest-referenced one is, so it may still have manifests.
 
 `mode` is a top-level config key, like the credentials it chooses between. An
 unrecognized key anywhere in the file, `[oidc]` included, is an error: a mistyped or

@@ -17,6 +17,8 @@
 //!                                 manifests, any kernel/initrd) — shared by all repos
 //!   repos/<name>/tags/<tag>       file holding the tagged manifest's digest
 //!   repos/<name>/manifests/<hex>  sidecar: that manifest's Content-Type
+//!   repos/<name>/blobs/<hex>      empty marker: this blob is a member of this repo,
+//!                                 which is what makes a blob read repo-scoped
 //!   uploads/<id>                  in-progress blob uploads (this process only)
 //!   uploads/owners/<id>           the repository that upload session was opened for
 
@@ -258,6 +260,14 @@ impl Store {
     fn tag_path(&self, name: &str, tag: &str) -> PathBuf {
         self.root.join("repos").join(name).join("tags").join(tag)
     }
+    /// Marker recording that blob `hex` belongs to repository `name`. The store is one
+    /// content-addressed pool shared by every repo, so holding a digest is not the same
+    /// as being entitled to it: this is the record that says which repos a blob may be
+    /// read through.
+    fn repo_blob_path(&self, name: &str, hex: &str) -> PathBuf {
+        self.root.join("repos").join(name).join("blobs").join(hex)
+    }
+
     fn manifest_type_path(&self, name: &str, hex: &str) -> PathBuf {
         self.root
             .join("repos")
@@ -346,6 +356,18 @@ impl Store {
         } else {
             atomic_write(&dest, body)?;
         }
+        // The sidecar just written *is* this manifest's membership record — its own bytes
+        // are ours, so it becomes readable through this repository, and `repo_has_manifest`
+        // reads exactly that file. No second marker under `blobs/`: it would double the
+        // inode cost and the reported count, and let the two disagree once the gc sweeps
+        // one of them.
+        //
+        // Deliberately nothing for its children: a manifest is the one thing a caller can
+        // write without holding the content it names, so inferring membership from a
+        // reference would make "write here" mean "read anything whose digest I can name".
+        // The children are recorded by whatever actually produced them — an upload, a
+        // relay fetch, or an authorized mount in `authorize_and_mount_manifest_blobs`.
+        //
         // Normalized on the way in as well as on the way out. Not because the two could
         // otherwise disagree — every reader goes through `get_manifest`, which filters too —
         // but so a caller-supplied string is never what is persisted, and so a future reader
@@ -389,12 +411,105 @@ impl Store {
         };
         // Also filtered on read: a sidecar written before this rule existed still holds
         // whatever it was pushed as.
+        //
+        // A manifest readable through a repository that was never pushed it — a mounted
+        // index child, or the cross-repo clause of `readable_through` — has no sidecar
+        // here, and answering `DEFAULT_MANIFEST_TYPE` would hand a client an
+        // image-manifest type for a manifest list. The bytes say what they are, so ask
+        // them before falling back; the filter keeps that answer honest too.
         let ctype = std::fs::read_to_string(self.manifest_type_path(name, hex))
             .ok()
             .map(|s| s.trim().to_string())
+            .or_else(|| declared_media_type(&data))
             .map(|t| manifest_media_type(&t).to_string())
             .unwrap_or_else(|| DEFAULT_MANIFEST_TYPE.to_string());
         Ok(Some((digest, data, ctype)))
+    }
+
+    /// Record that `hex` belongs to repository `name` — an empty marker, so membership
+    /// costs one inode per (repo, blob) pair. Idempotent.
+    ///
+    /// Only ever called for content this registry received or verified: bytes uploaded
+    /// into this repository, a blob the relay fetched and hashed for it, a manifest whose
+    /// bytes we hold, or a digest an authorized caller mounted. Nothing infers membership
+    /// from a manifest merely *naming* a digest — that is the whole point, since a
+    /// manifest is the one thing a caller can write without holding the content.
+    ///
+    /// Public alongside [`Store::repo_has_blob`] so the crate's integration tests can seed
+    /// a store the way a push would leave it — `#[doc(hidden)]` because that is the only
+    /// caller outside this crate, and a membership *mutator* is not part of the library's
+    /// intended surface. `vk-driver` embeds this store as a purely local build cache that
+    /// it reads through `Store` directly and never serves, so the sidecar its
+    /// `put_manifest` writes is all the membership it has, and all it needs.
+    #[doc(hidden)]
+    pub fn record_blob(&self, name: &str, hex: &str) -> Result<()> {
+        if !valid_name(name) || !is_blob_hex(hex) {
+            bail!("cannot record blob {hex} in {name}: invalid name or digest");
+        }
+        let path = self.repo_blob_path(name, hex);
+        if path.is_file() {
+            return Ok(());
+        }
+        // Created directly rather than through `atomic_write`: there is no content to
+        // tear, and a `.tmp.*` left behind in this directory would never be swept — the
+        // gc only recognises 64-hex names here.
+        let Some(dir) = path.parent() else {
+            // Unreachable: `repo_blob_path` always joins at least `repos/<name>/blobs`.
+            // Refuse rather than fall back to a relative path and create it in the cwd.
+            bail!("no parent for the membership marker {}", path.display());
+        };
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        match std::fs::File::create_new(&path) {
+            Ok(_) => Ok(()),
+            // Another request recorded it first, which is the same outcome.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("recording {}", path.display())),
+        }
+    }
+
+    /// Whether `name` holds `hex` — one `stat`, and the answer on every read's hot path.
+    ///
+    /// Public because it is the store's half of the repo-scoping contract: what a caller
+    /// may read through a repository is exactly what that repository holds. Out of the
+    /// crate, only the tests use it, hence `#[doc(hidden)]`.
+    #[doc(hidden)]
+    pub fn repo_has_blob(&self, name: &str, hex: &str) -> bool {
+        valid_name(name) && is_blob_hex(hex) && self.repo_blob_path(name, hex).is_file()
+    }
+
+    /// Whether `name` holds the manifest `hex`. The `manifests/<hex>` sidecar
+    /// [`Store::put_manifest`] already writes per repository *is* this record — a
+    /// manifest read by digest is repo-scoped by the same reasoning as a blob read.
+    pub(crate) fn repo_has_manifest(&self, name: &str, hex: &str) -> bool {
+        valid_name(name) && is_blob_hex(hex) && self.manifest_type_path(name, hex).is_file()
+    }
+
+    /// Whether `hex` is held by any repository in `candidates`, stopping at the first.
+    /// The caller filters `candidates` to what it may read *before* calling, so this
+    /// touches the filesystem only for repositories whose answer it is entitled to.
+    pub(crate) fn any_holds(&self, candidates: &[String], hex: &str) -> bool {
+        candidates
+            .iter()
+            .any(|r| self.repo_has_blob(r, hex) || self.repo_has_manifest(r, hex))
+    }
+
+    /// Every repository in the store — one with manifests but no tags counts, unlike
+    /// [`Store::repo_names`], which answers the browse listing. One walk: `repo_dirs`
+    /// stops at a repository's own subdirectories, so this is O(repositories) and does
+    /// not pay a `stat` per membership marker.
+    pub(crate) fn all_repo_names(&self) -> BTreeSet<String> {
+        let repos = self.root.join("repos");
+        self.repo_dirs_any(REPO_SUBDIRS)
+            .0
+            .into_iter()
+            .filter_map(|d| {
+                let name = d.parent()?.strip_prefix(&repos).ok()?.to_str()?;
+                // Only a name this store could have written itself, as `repo_names` does:
+                // this feeds `accounts::authorize`, and a directory left there by anything
+                // else is not a repository to ask about.
+                valid_name(name).then(|| name.to_string())
+            })
+            .collect()
     }
 
     /// Every tag under `repos/<name>/tags`, sorted — shared by the OCI `tags/list`
@@ -531,7 +646,13 @@ impl Store {
         }
 
         // manifest sidecars: rooted by a surviving tag, or by their own freshness
-        // (digest-pinned); the rest drop, their manifest blob falling to the sweep.
+        // (digest-pinned). The rest are *candidates*, not casualties — the removal waits
+        // until after the blob sweep below, because a sidecar is a manifest's membership
+        // record: dropping one whose blob the same pass then decides to keep would make a
+        // live manifest permanently unreadable through its repository, with nothing left to
+        // rebuild it from. (An image index does exactly that: the mark aborts on it, so
+        // anything removed before the mark is removed on a pass that never sweeps.)
+        let mut sidecar_candidates: Vec<(PathBuf, String)> = Vec::new();
         for man_dir in man_dirs {
             for sidecar in root_dir_files(&man_dir)? {
                 let Some(hex) = sidecar.file_name().and_then(|n| n.to_str()) else {
@@ -550,8 +671,7 @@ impl Store {
                     roots.insert(hex.to_string());
                     continue;
                 }
-                remove(&sidecar)?;
-                report.manifests_dropped += 1;
+                sidecar_candidates.push((sidecar.clone(), hex.to_string()));
             }
         }
 
@@ -570,19 +690,62 @@ impl Store {
             marked.insert(hex.clone());
         }
 
-        // sweep unmarked blobs idle past the grace window, in both storage forms.
+        // sweep unmarked blobs idle past the grace window, in both storage forms, noting
+        // every hex that keeps at least one form: that — not what is still on disk — is
+        // what the membership sweep below has to consult, since `remove` is a no-op on a
+        // dry run and would otherwise make it report nothing.
+        //
+        // Read strictly, like the tag and manifest listings above. This listing used to be
+        // lenient because a missed entry only left a blob unswept; it is now what the two
+        // sweeps below *delete* against, so an unreadable blob directory would produce an
+        // empty `survivors` and take every membership record and every held-back sidecar
+        // with it — while keeping the blobs, leaving live content unreachable and nothing
+        // to rebuild the records from.
+        let mut survivors: HashSet<String> = HashSet::new();
         for sub in ["blobs/sha256", "blobs/zstd"] {
-            for blob in dir_files(&self.root.join(sub)) {
-                let is_marked = blob
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| marked.contains(n));
-                if is_marked || !idle(&blob, grace) {
+            for blob in root_dir_files_opt(&self.root.join(sub))? {
+                let Some(hex) = blob.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if marked.contains(hex) || !idle(&blob, grace) {
+                    survivors.insert(hex.to_string());
                     continue;
                 }
                 report.bytes_freed += std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
                 remove(&blob)?;
                 report.blobs_dropped += 1;
+            }
+        }
+
+        // Now the sidecars held back above: drop one exactly when its manifest blob is
+        // gone. A candidate whose blob survived — an index child the mark kept — keeps the
+        // record that makes it readable.
+        for (sidecar, hex) in &sidecar_candidates {
+            if survivors.contains(hex) {
+                continue;
+            }
+            remove(sidecar)?;
+            report.manifests_dropped += 1;
+        }
+
+        // Membership markers whose blob is gone — including the ones this run just
+        // orphaned, which is why it runs after the blob sweep and reads `survivors`. A
+        // marker is never a gc *root*: what keeps a blob alive is a tag or a fresh
+        // manifest, not a record of which repo may read it.
+        // The walk's completeness answer is discarded here only because it does not depend
+        // on `kind`: the `bail!` above already refused this pass if any of `repos/` was
+        // unreadable, so by now there is nothing left for it to report.
+        for blobs_dir in self.repo_dirs("blobs").0 {
+            for marker in dir_files(&blobs_dir) {
+                let Some(hex) = marker.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                // Anything not named like a blob is not a marker; leave it alone.
+                if !is_blob_hex(hex) || survivors.contains(hex) {
+                    continue;
+                }
+                remove(&marker)?;
+                report.blob_markers_dropped += 1;
             }
         }
 
@@ -641,17 +804,18 @@ impl Store {
             s.upload_bytes += std::fs::metadata(&up).map(|m| m.len()).unwrap_or(0);
         }
 
-        // per-repo content: a repo is a dir under repos/ holding a tags/ + manifests/.
+        // per-repo content: a repo is a dir under repos/ holding any of its own
+        // subdirectories. `blobs/` counts — a pull-through cache serving tag pulls holds
+        // membership records and nothing else (a relayed tag manifest is never persisted),
+        // and reporting it as no repositories at all would hide every one of those inodes.
         let base = self.root.join("repos");
         let mut repo_dirs: BTreeSet<PathBuf> = BTreeSet::new();
-        for kind in ["tags", "manifests"] {
-            // `stats` reports; it deletes nothing, so an incomplete walk here only
-            // under-reports and is not worth failing the command for.
-            let (dirs, _unseen) = self.repo_dirs(kind);
-            for d in dirs {
-                if let Some(p) = d.parent() {
-                    repo_dirs.insert(p.to_path_buf());
-                }
+        // `stats` reports; it deletes nothing, so an incomplete walk here only
+        // under-reports and is not worth failing the command for.
+        let (dirs, _unseen) = self.repo_dirs_any(REPO_SUBDIRS);
+        for d in dirs {
+            if let Some(p) = d.parent() {
+                repo_dirs.insert(p.to_path_buf());
             }
         }
         // distinct blobs referenced by any manifest, so `referenced_ondisk` counts each
@@ -674,7 +838,24 @@ impl Store {
                 name,
                 ..Default::default()
             };
-            r.manifests = dir_files(&repo_dir.join("manifests")).len();
+            // Filtered like the membership count below, so a stray `.tmp.*` from a torn
+            // write cannot inflate one and not the other.
+            r.manifests = dir_files(&repo_dir.join("manifests"))
+                .iter()
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(is_blob_hex)
+                })
+                .count();
+            r.members = dir_files(&repo_dir.join("blobs"))
+                .iter()
+                .filter(|m| {
+                    m.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(is_blob_hex)
+                })
+                .count();
             // distinct manifests reachable from this repo's tags, and the latest tag.
             let mut manifest_hexes: BTreeSet<String> = BTreeSet::new();
             let mut latest: Option<(SystemTime, String)> = None;
@@ -714,15 +895,21 @@ impl Store {
             }
             s.total_tags += r.tags;
             s.total_manifests += r.manifests;
+            s.total_members += r.members;
             s.repos.push(r);
         }
         Ok(s)
     }
 
-    /// Every `tags/` or `manifests/` directory under `repos/` — repo names may be
-    /// nested (`bundles/appbuilder`), so walk down to the layout dirs. A repo path
-    /// *component* itself named `tags`/`manifests` would be indistinguishable from
-    /// the layout and is not supported by the gc.
+    /// One kind of layout directory under `repos/`, and the first path the walk could not
+    /// see through — see [`Store::repo_dirs_any`] for the walk's rules, for why it stops at
+    /// every one of [`REPO_SUBDIRS`], and for what that second element obliges `gc` to do.
+    fn repo_dirs(&self, kind: &str) -> (Vec<PathBuf>, Option<PathBuf>) {
+        self.repo_dirs_any(&[kind])
+    }
+
+    /// Every directory under `repos/` whose name is one of `kinds`, and the first path the
+    /// walk could not see through.
     ///
     /// The descent is `lstat`-based (`DirEntry::file_type`, not `Path::is_dir`), so a
     /// symlink is never followed — it could point back up its own tree, and `/browse`
@@ -730,12 +917,11 @@ impl Store {
     /// same bound `valid_name` puts on a name, so no name this store accepted is out of
     /// reach.
     ///
-    /// The second return is the first path the walk could *not* see through — a symlink,
-    /// an unreadable directory, or a subtree past the depth bound — or `None` if it saw all
-    /// of `repos/`. [`Store::gc`] *deletes* on the strength of this walk, so for it an
-    /// incomplete answer is as fatal as a parse failure; the listing and `stats` callers
-    /// only under-report.
-    fn repo_dirs(&self, kind: &str) -> (Vec<PathBuf>, Option<PathBuf>) {
+    /// It stops at any of [`REPO_SUBDIRS`], not only at `kinds`: a repository's `blobs/`
+    /// holds one marker per member, and descending into it to look for a `tags/` that
+    /// cannot be there would cost a `stat` per marker on every gc, `stats` and repository
+    /// listing. Stopping there makes this O(repositories).
+    fn repo_dirs_any(&self, kinds: &[&str]) -> (Vec<PathBuf>, Option<PathBuf>) {
         let mut out = Vec::new();
         let mut unseen: Option<PathBuf> = None;
         let mut stack = vec![(self.root.join("repos"), 0usize)];
@@ -764,16 +950,15 @@ impl Store {
                 if !ft.is_dir() {
                     continue;
                 }
-                // Both layout dirs terminate the descent, not just the one being collected:
-                // a repo path component named `tags`/`manifests` is unsupported either way
-                // (see above), so the sibling is never a repo to descend into. Descending
-                // it would also spend the depth budget a full-length name needs — and then
-                // report the store's own tree as unseen.
-                let layout = p
-                    .file_name()
-                    .is_some_and(|n| n == "tags" || n == "manifests");
-                if layout {
-                    if p.file_name().is_some_and(|n| n == kind) {
+                // Every layout dir terminates the descent, not just the ones asked for: a
+                // repo path component named like one is unsupported either way (see above),
+                // so a sibling is never a repo to descend into. Descending one would also
+                // spend the depth budget a full-length name needs — and then report the
+                // store's own tree as unseen. It is what keeps this O(repositories) rather
+                // than one `stat` per membership marker under `blobs/`.
+                let base = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                if REPO_SUBDIRS.contains(&base) {
+                    if kinds.contains(&base) {
                         out.push(p);
                     }
                 } else if depth < MAX_NAME_SEGMENTS {
@@ -787,6 +972,22 @@ impl Store {
     }
 }
 
+/// The directories a repository keeps its own state in. The walk in
+/// [`Store::repo_dirs_any`] stops at these, so they are also the names a repository path
+/// component may not have — a pre-existing limitation of this layout, now shared by
+/// `blobs` as it always was by `tags` and `manifests`.
+const REPO_SUBDIRS: &[&str] = &["tags", "manifests", "blobs"];
+
+/// Ceiling on a manifest `PUT` body. An OCI manifest is kilobytes — the OCI spec suggests
+/// 4 MiB as an upper bound — and every digest inside one costs authorization work under
+/// the store lock, so this is a limit on that work as much as on memory.
+const MAX_MANIFEST_BYTES: usize = 4 << 20;
+
+/// Ceiling on the distinct digests one manifest may reference. Real images have tens of
+/// layers; this is far above that, and it is what bounds the `stat`s a single `PUT` can
+/// ask for (references × repositories the caller may read).
+const MAX_MANIFEST_REFERENCES: usize = 4096;
+
 /// What a [`Store::gc`] pass removed (or, on a dry run, would remove).
 #[derive(Default)]
 pub struct GcReport {
@@ -796,6 +997,8 @@ pub struct GcReport {
     /// stored (on-disk) bytes of the dropped blobs
     pub bytes_freed: u64,
     pub uploads_dropped: usize,
+    /// membership markers removed because the blob they named is gone
+    pub blob_markers_dropped: usize,
 }
 
 /// A [`Store::stats`] snapshot: on-disk totals plus a per-repo breakdown.
@@ -809,6 +1012,8 @@ pub struct StoreStats {
     pub upload_bytes: u64,
     pub total_tags: usize,
     pub total_manifests: usize,
+    /// membership markers across every repo, summed — the inode cost of repo-scoping
+    pub total_members: usize,
     /// each tagged manifest plus its config/layer references, summed with no dedup — the
     /// logical (uncompressed) content the store stands in for
     pub logical_naive: u64,
@@ -827,6 +1032,9 @@ pub struct RepoStat {
     pub latest_tag: Option<String>,
     /// size of the blobs this repo's tagged manifests reference, deduped within the repo
     pub logical_bytes: u64,
+    /// membership markers this repo holds — one inode per blob it may serve, which is the
+    /// only on-disk cost repo-scoping adds
+    pub members: usize,
 }
 
 /// A manifest's referenced descriptors, in order: its config (if any) then each layer,
@@ -844,6 +1052,63 @@ pub(crate) fn manifest_descriptors(
         out.extend(layers.iter().map(|l| ("layer", l)));
     }
     out
+}
+
+/// A manifest's own declared `mediaType`, when it declares one. OCI requires the field and
+/// Docker's schema 2 has always sent it, so it is the honest answer for a manifest read
+/// through a repository that holds no Content-Type sidecar for it. The caller holds it to
+/// [`MANIFEST_MEDIA_TYPES`], which is what makes an arbitrary string here harmless.
+fn declared_media_type(manifest: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(manifest).ok()?;
+    Some(v.pointer("/mediaType")?.as_str()?.to_string())
+}
+
+/// A lowercase 64-char sha256 hex — what names a blob on disk, and therefore what may be
+/// a membership marker.
+fn is_blob_hex(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// Every digest a manifest references, tolerantly: its config and layers, *and* an image
+/// index's child manifests. Unlike [`manifest_digest_hexes`] — whose caller is the gc
+/// mark, which must refuse what it cannot fully walk — this is for recording membership,
+/// where an unparseable or unfamiliar manifest should contribute what it can rather than
+/// fail a push.
+///
+/// Failing open (an empty result for bytes that are not JSON) is deliberate and grants
+/// nothing: contributing no digests records no membership, so the only thing readable
+/// through the repository afterwards is the manifest's own bytes, which the caller
+/// supplied. A digest in an algorithm this store does not use, or in uppercase hex, is
+/// dropped for the same reason — nothing here can serve it either.
+fn manifest_child_hexes(manifest: &[u8]) -> Vec<String> {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(manifest) else {
+        return Vec::new();
+    };
+    let children = v
+        .pointer("/manifests")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten()
+        .map(|m| m.pointer("/digest"));
+    // `subject` is a reference like any other: a referrers manifest that named one and did
+    // not mount it would push fine and then 404 on the subject it points at.
+    manifest_descriptors(&v)
+        .into_iter()
+        .map(|(_, d)| d.pointer("/digest"))
+        .chain(children)
+        .chain(std::iter::once(v.pointer("/subject/digest")))
+        .filter_map(|d| d?.as_str())
+        // `strip_prefix`, not `trim_start_matches`: exactly one `sha256:`, and a digest in
+        // another algorithm — or with no algorithm at all — is dropped rather than
+        // half-parsed. Dropping one means it is not checked, which grants nothing: this
+        // store names blobs by `sha256:<lowercase hex>` and `valid_digest` refuses any
+        // other spelling, so there is no way to read back what was skipped.
+        .filter_map(|d| d.strip_prefix("sha256:"))
+        .filter(|h| is_blob_hex(h))
+        .map(str::to_string)
+        .collect()
 }
 
 /// The digest hexes a manifest references: its config and every layer, read
@@ -885,11 +1150,11 @@ fn manifest_blob_sizes(manifest: &[u8]) -> Vec<(String, u64)> {
         .collect()
 }
 
-/// [`dir_files`] for the directories [`Store::gc`] roots its mark phase in, where a
-/// listing it could not complete is a set of roots it must not sweep against: an
-/// unreadable `tags/` yields no tags, which unroots every blob that repo's tags reference.
-/// The lenient version stays right for `blobs/*` and `uploads/`, where a missed entry only
-/// leaves something unswept.
+/// [`dir_files`] for the directories [`Store::gc`] decides removals against, where a
+/// listing it could not complete is a set it must not sweep against: an unreadable `tags/`
+/// yields no tags, which unroots every blob that repo's tags reference, and an unreadable
+/// `blobs/sha256` yields no survivors, which unroots every membership record. The lenient
+/// version stays right for `uploads/`, where a missed entry only leaves something unswept.
 fn root_dir_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for e in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
@@ -906,6 +1171,16 @@ fn root_dir_files(dir: &Path) -> Result<Vec<PathBuf>> {
         out.push(e.path());
     }
     Ok(out)
+}
+
+/// [`root_dir_files`] where the directory may legitimately not exist yet — `blobs/zstd`
+/// is created on the first compressed blob, so its absence is an empty pool rather than a
+/// listing that failed.
+fn root_dir_files_opt(dir: &Path) -> Result<Vec<PathBuf>> {
+    match std::fs::metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        _ => root_dir_files(dir),
+    }
 }
 
 /// The files directly inside `dir` (a missing dir reads as empty; subdirectories
@@ -1158,7 +1433,7 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
             .strip_prefix("/browse")
             .unwrap_or_default()
             .trim_start_matches('/');
-        return browse::route(&state.store, rest, principal, csrf.as_deref());
+        return browse::route(&state.store, rest, &authz, principal, csrf.as_deref());
     }
     if is_settings_path(&path) {
         let (Authenticator::Accounts { db, .. }, Some(p)) = (&state.auth, &principal) else {
@@ -1262,7 +1537,21 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
         let head = method == Method::HEAD;
         return match method {
             Method::GET | Method::HEAD => {
-                let local = get_blob(&store, digest, head, accept_zstd)?;
+                // Repo-scoped: the digest has to be one this repository holds, or one the
+                // caller could fetch from a repository it may read anyway. A digest it
+                // merely *knows* is not a key to the whole store.
+                let hex = digest.trim_start_matches("sha256:");
+                let local = if readable_through(&authz, &store, name, hex) {
+                    get_blob(&store, digest, head, accept_zstd)?
+                } else {
+                    error_response(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", digest)
+                };
+                // A blob this repository does not hold falls through to the relay
+                // exactly as an absent one does — which is the point: "not a member" and
+                // "not here" must be indistinguishable to the caller. The upstream fetch
+                // is authorized by the `Read` on `name` checked above, and the relay maps
+                // `name` to its own upstream repository, so what comes back belongs to
+                // this repository and is recorded as such.
                 if local.status() == StatusCode::NOT_FOUND && !state.upstreams.is_empty() {
                     relay::get_blob(&state, name, digest, head, accept_zstd).await
                 } else {
@@ -1304,12 +1593,39 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or(DEFAULT_MANIFEST_TYPE)
                     .to_string();
-                let body = collect(req).await?;
-                put_manifest(&store, name, reference, &ctype, &body)
+                // Capped, because the authorization below is per referenced digest and
+                // runs while holding the store lock: an unbounded body would be an
+                // unbounded amount of work a single write-scoped caller can ask for.
+                match collect_capped(req, MAX_MANIFEST_BYTES).await {
+                    // Every digest this manifest names has to be one the caller may
+                    // already read; otherwise write access to one repository would be a
+                    // way to pull anything whose digest you can guess or overhear.
+                    // Checked under the store lock, inside `put_manifest`.
+                    Ok(body) => put_manifest(&authz, &store, name, reference, &ctype, &body),
+                    // A body that failed mid-read lands here too; it gets the same answer
+                    // because there is no longer a connection to give it a better one.
+                    Err(_) => Ok(error_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "MANIFEST_INVALID",
+                        reference,
+                    )),
+                }
             }
             Method::GET | Method::HEAD => {
                 let head = method == Method::HEAD;
-                let local = get_manifest(&store, name, reference, head)?;
+                // A tag lives in the repository, so it is already scoped; a digest
+                // reference is not, and gets the same treatment as a blob — a manifest
+                // read by digest is how one would otherwise enumerate another repo's
+                // layers.
+                let scoped = match reference.strip_prefix("sha256:") {
+                    Some(hex) => readable_through(&authz, &store, name, hex),
+                    None => true,
+                };
+                let local = if scoped {
+                    get_manifest(&store, name, reference, head)?
+                } else {
+                    error_response(StatusCode::NOT_FOUND, "MANIFEST_UNKNOWN", reference)
+                };
                 if local.status() == StatusCode::NOT_FOUND && !state.upstreams.is_empty() {
                     relay::get_manifest(&state, name, reference, head).await
                 } else {
@@ -1503,6 +1819,10 @@ fn finish_upload(
         store.put_blob_at(&hex, raw.as_deref().unwrap_or_default())?;
         let _ = std::fs::remove_file(&upload);
     }
+    // The upload was authorized for, and bound to, this repository, and the bytes hashed
+    // to the digest above — so this is where the blob becomes readable through it. After
+    // the promotion, so a membership record never names a blob that is not there.
+    store.record_blob(name, &hex)?;
     let _ = std::fs::remove_file(store.upload_owner_path(id));
 
     Response::builder()
@@ -1598,7 +1918,12 @@ pub(crate) fn get_blob(
 
 /// PUT /v2/<name>/manifests/<tag|digest> — store the manifest bytes (content
 /// addressed) + its Content-Type sidecar, and point the tag at it (if a tag).
+///
+/// The membership check on the referenced digests happens here, inside the same shared
+/// lock as the write: checking it outside would leave a window for a `gc` to sweep a
+/// layer between "the caller may reference this" and the manifest that references it.
 fn put_manifest(
+    authz: &Authz<'_>,
     store: &Store,
     name: &str,
     reference: &str,
@@ -1615,6 +1940,23 @@ fn put_manifest(
             "DIGEST_INVALID",
             &format!("the manifest body does not hash to {reference}"),
         ));
+    }
+    match authorize_and_mount_manifest_blobs(authz, store, name, body)? {
+        Mount::Done => {}
+        Mount::Unreadable(hex) => {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "MANIFEST_BLOB_UNKNOWN",
+                &format!("sha256:{hex}"),
+            ));
+        }
+        Mount::TooManyReferences => {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "MANIFEST_INVALID",
+                &format!("over {MAX_MANIFEST_REFERENCES} referenced digests"),
+            ));
+        }
     }
     let digest = store.put_manifest(name, reference, ctype, body)?;
     Response::builder()
@@ -1716,11 +2058,140 @@ pub(crate) fn unauthorized(challenge: &'static str, message: &str) -> Response<F
 /// from having to read "no principal" as "allow"; in accounts mode a request without one
 /// is refused before this is built, and a future path that reached here without one is a
 /// refusal rather than a check silently skipped.
-enum Authz<'a> {
+pub(crate) enum Authz<'a> {
     /// Shared-secret (or open) mode: the single gate at the top of `route` is the whole
     /// authorization model, and there is nothing per-repo to check.
     NoScopes,
     Accounts(&'a accounts::Principal),
+}
+
+impl Authz<'_> {
+    /// Whether this caller may read `repo`.
+    fn may_read(&self, repo: &str) -> bool {
+        match self {
+            Authz::NoScopes => true,
+            Authz::Accounts(p) => accounts::authorize(p, accounts::Action::Read, repo),
+        }
+    }
+}
+
+/// Whether `hex` may be read through repository `name` by this caller.
+///
+/// The store is one content-addressed pool, so holding a digest is not an entitlement to
+/// it: the blob has to be a member of `name`. The second clause is what keeps that from
+/// being needlessly strict — if the caller may read *some* repository that holds the
+/// blob, it could fetch the same bytes there, so serving them here discloses nothing new
+/// and cross-repo dedup keeps working. In shared-secret mode every repo is readable, so
+/// no read is ever refused that was served before.
+///
+/// The `any_holds` walk is O(readable repositories) and runs only on a miss in `name`,
+/// so a pull — every digest a member of the repository it is pulled from — pays one
+/// `stat`. A caller naming digests it does not hold pays the walk per request; see
+/// DESIGN.md.
+pub(crate) fn readable_through(authz: &Authz<'_>, store: &Store, name: &str, hex: &str) -> bool {
+    // Shared-secret (or open) mode has no per-repo scopes to enforce: every repository is
+    // readable, so this is unconditionally true and no read is refused that was not
+    // refused before.
+    if matches!(authz, Authz::NoScopes) {
+        return true;
+    }
+    if store.repo_has_blob(name, hex) || store.repo_has_manifest(name, hex) {
+        return true;
+    }
+    store.any_holds(&readable_repos(authz, store, name), hex)
+}
+
+/// The other repositories this caller may read — computed before any per-digest work, so
+/// a manifest with hundreds of layers walks `repos/` once rather than once per layer, and
+/// so no repository the caller may not read is ever consulted on disk.
+fn readable_repos(authz: &Authz<'_>, store: &Store, name: &str) -> Vec<String> {
+    store
+        .all_repo_names()
+        .into_iter()
+        .filter(|r| r != name && authz.may_read(r))
+        .collect()
+}
+
+/// What [`authorize_and_mount_manifest_blobs`] decided about a manifest's references.
+enum Mount {
+    /// Every referenced digest was readable by the caller; membership is now recorded in
+    /// this repository for the ones that were not already members of it.
+    Done,
+    /// This digest is readable by the caller nowhere, so the manifest is refused. It is
+    /// the first such digest in the manifest's own order, which is the one a client
+    /// author reading the error will look for.
+    Unreadable(String),
+    /// More distinct references than [`MAX_MANIFEST_REFERENCES`], so the manifest is
+    /// refused before doing the work: each reference costs a `stat` per repository the
+    /// caller may read.
+    TooManyReferences,
+}
+
+/// Authorize a manifest's references and record, in `name`, the ones it accepts —
+/// refusing the whole manifest if the caller cannot already read one of them somewhere.
+///
+/// This is the check that stops a caller with write access to one repository from naming a
+/// digest it learned elsewhere and reading the content back through its own repo. It is
+/// also the OCI cross-repo mount, arrived at from the other end: a push whose layers are
+/// already in the store and already readable by this caller does not re-upload them.
+///
+/// Membership granted here is permanent, where the read that justified it was not: later
+/// revoking this caller's read scope on the repository a digest was mounted from does not
+/// un-mount it. That is deliberate — the caller could have downloaded the bytes and
+/// re-uploaded them while it still had the scope, so mounting grants it nothing it could
+/// not already have taken. See DESIGN.md.
+fn authorize_and_mount_manifest_blobs(
+    authz: &Authz<'_>,
+    store: &Store,
+    name: &str,
+    body: &[u8],
+) -> Result<Mount> {
+    // Manifest order, deduped — so the refusal names the first offending digest as the
+    // manifest lists it, not the lexicographically smallest one. Counted before any
+    // filesystem work, so the cap bounds the `stat`s below whatever order the digests
+    // happen to resolve in — and before the shared-secret shortcut below, so the cap is
+    // one rule rather than one that only some deployments get.
+    let mut seen = HashSet::new();
+    let references: Vec<String> = manifest_child_hexes(body)
+        .into_iter()
+        .filter(|hex| seen.insert(hex.clone()))
+        .collect();
+    if references.len() > MAX_MANIFEST_REFERENCES {
+        return Ok(Mount::TooManyReferences);
+    }
+    // Without per-repo scopes there is nothing to authorize, and nothing to record: a
+    // reference is not evidence that whoever wrote it holds the content, in this mode as
+    // in any other. Pre-seeding membership here would hand a later switch to accounts
+    // mode exactly the reference-derived graph the write rule refuses to build.
+    if matches!(authz, Authz::NoScopes) {
+        return Ok(Mount::Done);
+    }
+    let elsewhere = readable_repos(authz, store, name);
+    let mut to_mount = Vec::new();
+    for hex in references {
+        if store.repo_has_blob(name, &hex) || store.repo_has_manifest(name, &hex) {
+            continue;
+        }
+        // One `stat` settles a digest this store does not hold at all — which is what a
+        // caller guessing digests produces — before paying a walk per readable repository.
+        // `find_blob` rather than `has_blob`: a probe must not refresh the gc clock on
+        // content the caller has no claim to.
+        //
+        // The two refusals are the same answer, but not the same *latency*: "not here at
+        // all" costs two `stat`s where "here but not yours" costs a walk. That is a noisy
+        // timing probe for "this store holds D", which is a weaker leak than the ordering
+        // is worth — a caller guessing digests would otherwise walk every readable
+        // repository per guess.
+        if store.find_blob(&hex).is_none() || !store.any_holds(&elsewhere, &hex) {
+            return Ok(Mount::Unreadable(hex));
+        }
+        // Readable elsewhere, so mounting it here grants nothing new.
+        to_mount.push(hex);
+    }
+    for hex in &to_mount {
+        store.record_blob(name, hex)?;
+    }
+    Ok(Mount::Done)
 }
 
 /// Enforce [`accounts::authorize`] for `action` on `name`. `Some(response)` ⇒ refuse and
@@ -1781,7 +2252,8 @@ async fn collect(req: Request<Incoming>) -> Result<Bytes> {
     Ok(req.into_body().collect().await?.to_bytes())
 }
 
-/// Collect a body that has a small, known ceiling — a browser form, not a blob. The cap
+/// Collect a body that has a small, known ceiling — a browser form or a manifest, not a
+/// blob. The cap
 /// is enforced *while* reading, not after: a `Transfer-Encoding: chunked` request
 /// declares no length, so a check on the size hint alone would buffer the whole thing
 /// first and cap nothing.
@@ -2058,6 +2530,13 @@ pub(crate) fn valid_name(name: &str) -> bool {
             !seg.is_empty()
                 && seg != "."
                 && seg != ".."
+                // A component named like one of a repository's own subdirectories would be
+                // indistinguishable from the layout: `repos/a/blobs` would be both a
+                // repository and `a`'s membership directory, and the walk in
+                // `repo_dirs_any` — which stops at those names — would never reach its
+                // tags, so the gc mark would miss its roots and sweep its content. Refuse
+                // the name instead of losing the data.
+                && !REPO_SUBDIRS.contains(&seg)
                 && seg
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
@@ -2068,11 +2547,10 @@ pub(crate) fn valid_name(name: &str) -> bool {
 /// [`sha256_hex_raw`] produces, so a digest that passes here is one the store can
 /// actually compare against and find.
 fn valid_digest(d: &str) -> bool {
-    d.strip_prefix("sha256:").is_some_and(|h| {
-        h.len() == 64
-            && h.bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    })
+    // Lowercase only, matching [`is_blob_hex`]: blobs are named by lowercase hex on disk,
+    // so accepting uppercase here would let the read predicate and the write predicate
+    // disagree about the same digest.
+    d.strip_prefix("sha256:").is_some_and(is_blob_hex)
 }
 
 /// A manifest reference: a digest, or a single safe tag component. Shared with
@@ -2192,7 +2670,8 @@ pub fn gc(root: PathBuf, retention: Duration, grace: Duration, dry_run: bool) ->
     };
     let r = store.gc(retention, grace, dry_run)?;
     println!(
-        "vk registry: gc {}: {} {} tag(s), {} manifest(s), {} blob(s) ({:.1} MiB), {} upload(s)",
+        "vk registry: gc {}: {} {} tag(s), {} manifest(s), {} blob(s) ({:.1} MiB), \
+         {} upload(s), {} membership record(s)",
         store.root.display(),
         if dry_run { "would drop" } else { "dropped" },
         r.tags_dropped,
@@ -2200,6 +2679,7 @@ pub fn gc(root: PathBuf, retention: Duration, grace: Duration, dry_run: bool) ->
         r.blobs_dropped,
         r.bytes_freed as f64 / f64::from(1u32 << 20),
         r.uploads_dropped,
+        r.blob_markers_dropped,
     );
     Ok(())
 }
@@ -2234,10 +2714,11 @@ pub fn status(root: PathBuf) -> Result<()> {
         );
     }
     println!(
-        "  content:  {} repo(s), {} tag(s), {} manifest(s)",
+        "  content:  {} repo(s), {} tag(s), {} manifest(s), {} membership record(s)",
         s.repos.len(),
         s.total_tags,
         s.total_manifests,
+        s.total_members,
     );
     if s.referenced_ondisk > 0 {
         println!(
@@ -2257,14 +2738,15 @@ pub fn status(root: PathBuf) -> Result<()> {
     if !s.repos.is_empty() {
         println!();
         println!(
-            "  {:<40} {:>5} {:>10}  LATEST",
-            "REPOSITORY", "TAGS", "SIZE"
+            "  {:<40} {:>5} {:>7} {:>10}  LATEST",
+            "REPOSITORY", "TAGS", "MEMBERS", "SIZE"
         );
         for r in &s.repos {
             println!(
-                "  {:<40} {:>5} {:>10}  {}",
+                "  {:<40} {:>5} {:>7} {:>10}  {}",
                 r.name,
                 r.tags,
+                r.members,
                 human_bytes(r.logical_bytes),
                 r.latest_tag.as_deref().unwrap_or("-"),
             );
@@ -3122,7 +3604,15 @@ mod tests {
         let right = format!("sha256:{}", sha256_hex_raw(&body));
         let wrong = format!("sha256:{}", "b".repeat(64));
 
-        let res = put_manifest(&store, "img", &wrong, DEFAULT_MANIFEST_TYPE, &body).unwrap();
+        let res = put_manifest(
+            &Authz::NoScopes,
+            &store,
+            "img",
+            &wrong,
+            DEFAULT_MANIFEST_TYPE,
+            &body,
+        )
+        .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert!(
             !store.has_blob(&hex(&right)),
@@ -3134,12 +3624,28 @@ mod tests {
                 .is_err()
         );
 
-        let res = put_manifest(&store, "img", &right, DEFAULT_MANIFEST_TYPE, &body).unwrap();
+        let res = put_manifest(
+            &Authz::NoScopes,
+            &store,
+            "img",
+            &right,
+            DEFAULT_MANIFEST_TYPE,
+            &body,
+        )
+        .unwrap();
         assert_eq!(res.status(), StatusCode::CREATED);
         assert!(store.has_blob(&hex(&right)));
         // a tag reference is not a claim about the bytes, so it is stored under the digest
         // they hash to, as before
-        let res = put_manifest(&store, "img", "v1", DEFAULT_MANIFEST_TYPE, &body).unwrap();
+        let res = put_manifest(
+            &Authz::NoScopes,
+            &store,
+            "img",
+            "v1",
+            DEFAULT_MANIFEST_TYPE,
+            &body,
+        )
+        .unwrap();
         assert_eq!(res.status(), StatusCode::CREATED);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3654,6 +4160,29 @@ mod tests {
             assert!(store.has_blob(&hex), "and it deleted nothing");
         }
 
+        // a `blobs/sha256` the pass cannot list is the same class of blindness, and now a
+        // worse one: it decides no blob survived, and the membership and sidecar sweeps that
+        // read that answer would drop every record while keeping every blob
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // the membership record a push would have left, which is what the sweeps that
+            // read `survivors` would drop
+            store.record_blob("app", &hex).unwrap();
+            assert!(store.repo_has_blob("app", &hex));
+
+            let pool = dir.join("blobs").join("sha256");
+            std::fs::set_permissions(&pool, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let e = refusal(&store);
+            std::fs::set_permissions(&pool, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(e.contains("blobs"), "{e}");
+            assert!(store.has_blob(&hex), "and it deleted nothing");
+            assert!(
+                store.repo_has_blob("app", &hex),
+                "nor revoked the membership that makes it readable"
+            );
+        }
+
         // and a repository name of the full permitted depth is still swept: the walk's
         // depth bound and `valid_name`'s have to meet exactly, or a name the store accepts
         // is a name gc refuses forever
@@ -3682,6 +4211,413 @@ mod tests {
         assert!(valid_reference("20260627-abc"));
         assert!(!valid_reference("../x"));
         assert!(!valid_reference("a/b"));
+    }
+
+    /// Membership is recorded for content the registry received, and nothing else. In
+    /// particular a manifest records *itself* but not what it references: a reference is
+    /// not evidence that whoever wrote it holds the content.
+    #[test]
+    fn a_blob_is_a_member_only_of_the_repos_that_hold_it() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-member-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let layer = store.put_blob(b"layer bytes").unwrap();
+        let hex = layer.trim_start_matches("sha256:").to_string();
+        // `put_blob` alone is content, not entitlement: nobody holds it yet.
+        assert!(!store.repo_has_blob("team-a/app", &hex));
+
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"config":{{"digest":"{layer}","size":11}},"layers":[]}}"#
+        );
+        let mdigest = store
+            .put_manifest(
+                "team-a/app",
+                "v1",
+                DEFAULT_MANIFEST_TYPE,
+                manifest.as_bytes(),
+            )
+            .unwrap();
+        let mhex = mdigest.trim_start_matches("sha256:").to_string();
+
+        // The manifest's own bytes are ours, so it is readable through this repo — on the
+        // strength of its Content-Type sidecar, which *is* its membership record. There is
+        // deliberately no second marker under `blobs/` for it.
+        assert!(store.repo_has_manifest("team-a/app", &mhex));
+        assert!(!store.repo_has_blob("team-a/app", &mhex));
+        assert!(store.any_holds(&["team-a/app".to_string()], &mhex));
+        // ... but naming the layer granted nothing. Only an upload, a relay fetch, or an
+        // authorized mount does that.
+        assert!(!store.repo_has_blob("team-a/app", &hex));
+        assert!(!store.repo_has_blob("team-b/app", &hex));
+
+        store.record_blob("team-a/app", &hex).unwrap();
+        assert!(store.repo_has_blob("team-a/app", &hex));
+        assert!(!store.repo_has_blob("team-b/app", &hex));
+        assert!(store.any_holds(&["team-a/app".to_string()], &hex));
+        assert!(!store.any_holds(&["team-b/app".to_string()], &hex));
+
+        // and a name nobody pushed to is answered without creating anything for it
+        assert!(!store.repo_has_blob("made/up", &hex));
+        assert!(!dir.join("repos/made/up").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A marker records which repo may read a blob; it must not keep the blob alive, and
+    /// it must not outlive it.
+    #[test]
+    fn gc_sweeps_a_membership_record_whose_blob_is_gone() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-memgc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let layer = store.put_blob(b"collectible").unwrap();
+        let hex = layer.trim_start_matches("sha256:").to_string();
+        store.record_blob("team-a/app", &hex).unwrap();
+        assert!(store.repo_has_blob("team-a/app", &hex));
+
+        // A dry run reports what a real one would take, records included: it must not
+        // read "nothing to sweep" off a blob its own `remove` deliberately left in place.
+        let dry = store.gc(Duration::ZERO, Duration::ZERO, true).unwrap();
+        assert_eq!(dry.blobs_dropped, 1);
+        assert_eq!(dry.blob_markers_dropped, 1);
+        assert!(
+            store.repo_has_blob("team-a/app", &hex),
+            "a dry run removes nothing"
+        );
+
+        // Nothing roots the blob — no tag, no manifest — so the sweep takes it, and the
+        // record of who could read it goes with it.
+        let report = store.gc(Duration::ZERO, Duration::ZERO, false).unwrap();
+        assert_eq!(report.blobs_dropped, dry.blobs_dropped);
+        assert_eq!(report.blob_markers_dropped, dry.blob_markers_dropped);
+        assert!(!store.repo_has_blob("team-a/app", &hex));
+        // and the marker did not root it
+        assert!(store.find_blob(&hex).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A membership record names content, so it is refused for anything that could not be
+    /// content: a bad repository name, or a digest that is not how a blob is named.
+    #[test]
+    fn recording_a_membership_rejects_an_invalid_name_or_digest() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-memval-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let hex = "a".repeat(64);
+
+        assert!(store.record_blob("team-a/app", &hex).is_ok());
+        assert!(store.record_blob("../escape", &hex).is_err());
+        assert!(store.record_blob("team-a/blobs", &hex).is_err());
+        assert!(store.record_blob("", &hex).is_err());
+        assert!(store.record_blob("team-a/app", "").is_err());
+        assert!(store.record_blob("team-a/app", "../../etc/passwd").is_err());
+        assert!(store.record_blob("team-a/app", &"A".repeat(64)).is_err());
+        // and a refusal creates nothing
+        assert!(!dir.join("repos/../escape").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A manifest's Content-Type sidecar is its membership record, so the gc must not drop
+    /// one whose bytes the same pass keeps. An image index is the case that bites: the mark
+    /// aborts on it, so anything removed before the mark is removed on a pass that then
+    /// sweeps nothing — and the index's children would be left permanently unreadable.
+    #[test]
+    fn gc_keeps_the_membership_of_a_manifest_whose_blob_it_keeps() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-memidx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        // Two per-arch children, pushed by digest, then an index tagged `v1`.
+        let mut children = Vec::new();
+        for arch in ["amd64", "arm64"] {
+            let body = format!(
+                r#"{{"schemaVersion":2,"config":{{"digest":"sha256:{}","size":1}},"layers":[],"arch":"{arch}"}}"#,
+                "c".repeat(64)
+            );
+            let digest = store
+                .put_manifest(
+                    "team-a/app",
+                    &format!("sha256:{}", sha256_hex_raw(body.as_bytes())),
+                    DEFAULT_MANIFEST_TYPE,
+                    body.as_bytes(),
+                )
+                .unwrap();
+            children.push(digest.trim_start_matches("sha256:").to_string());
+        }
+        let index = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"digest":"sha256:{}","size":1}},{{"digest":"sha256:{}","size":1}}]}}"#,
+            children[0], children[1]
+        );
+        store
+            .put_manifest("team-a/app", "v1", DEFAULT_MANIFEST_TYPE, index.as_bytes())
+            .unwrap();
+        for hex in &children {
+            assert!(store.repo_has_manifest("team-a/app", hex));
+        }
+
+        // A retention window that keeps the tag (so the index is a root and the mark
+        // reaches it) with no grace on the blobs (so the children are sweep candidates).
+        // The mark refuses an index, so the pass aborts — and nothing may have been
+        // revoked on the way there.
+        assert!(
+            store
+                .gc(Duration::from_secs(3600), Duration::ZERO, false)
+                .is_err(),
+            "the gc mark still refuses an image index"
+        );
+        for hex in &children {
+            assert!(
+                store.repo_has_manifest("team-a/app", hex),
+                "an aborted pass must not have dropped a child's membership"
+            );
+            assert!(
+                store
+                    .get_manifest("team-a/app", &format!("sha256:{hex}"))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pull-through cache serving tag pulls holds membership records and nothing else —
+    /// a relayed tag manifest is never persisted. `status` has to see that repository, or
+    /// it reports no repositories and no records while the inodes pile up.
+    #[test]
+    fn stats_counts_a_repo_that_holds_only_membership_records() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-memstats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let layer = store.put_blob(b"relayed layer").unwrap();
+        let hex = layer.trim_start_matches("sha256:").to_string();
+        store.record_blob("cache/app", &hex).unwrap();
+
+        let s = store.stats().unwrap();
+        assert_eq!(s.repos.len(), 1, "a records-only repo is still a repo");
+        assert_eq!(s.repos[0].name, "cache/app");
+        assert_eq!(s.repos[0].tags, 0);
+        assert_eq!(s.repos[0].manifests, 0);
+        assert_eq!(s.repos[0].members, 1);
+        assert_eq!(s.total_members, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The authorization a manifest `PUT` runs costs a `stat` per (referenced digest,
+    /// readable repository) pair, under the store lock, so the reference count is capped:
+    /// one write-scoped caller must not be able to ask for unbounded work.
+    #[test]
+    fn a_manifest_referencing_too_many_digests_is_refused() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-memcap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let principal = accounts::Principal::Session(accounts::User {
+            id: "https://issuer\u{1f}sub-1".to_string(),
+            oidc_issuer: "https://issuer".to_string(),
+            oidc_subject: "sub-1".to_string(),
+            email: None,
+            display_name: None,
+            is_admin: false,
+            created_at: SystemTime::UNIX_EPOCH,
+            last_login_at: SystemTime::UNIX_EPOCH,
+        });
+        let authz = Authz::Accounts(&principal);
+
+        let layers: Vec<String> = (0..=MAX_MANIFEST_REFERENCES)
+            .map(|i| format!(r#"{{"digest":"sha256:{i:064x}","size":1}}"#))
+            .collect();
+        let over = format!(r#"{{"schemaVersion":2,"layers":[{}]}}"#, layers.join(","));
+        assert!(matches!(
+            authorize_and_mount_manifest_blobs(&authz, &store, "team-a/app", over.as_bytes())
+                .unwrap(),
+            Mount::TooManyReferences
+        ));
+
+        // Just inside the cap is refused for the honest reason instead: the store holds
+        // none of it, so the first digest is simply not readable anywhere.
+        let under = format!(
+            r#"{{"schemaVersion":2,"layers":[{}]}}"#,
+            layers[..MAX_MANIFEST_REFERENCES].join(",")
+        );
+        assert!(matches!(
+            authorize_and_mount_manifest_blobs(&authz, &store, "team-a/app", under.as_bytes())
+                .unwrap(),
+            Mount::Unreadable(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repository whose path component collides with the layout would be both a
+    /// repository and another repository's membership directory — and the walk that stops
+    /// at those names would never reach its tags, so the gc would sweep its content.
+    #[test]
+    fn a_repo_name_may_not_collide_with_the_layout() {
+        for kind in REPO_SUBDIRS {
+            assert!(!valid_name(kind), "{kind} is a layout directory");
+            assert!(!valid_name(&format!("team-a/{kind}")), "{kind} as a leaf");
+            assert!(
+                !valid_name(&format!("team-a/{kind}/app")),
+                "{kind} in the middle"
+            );
+            // the name is only refused as a whole component
+            assert!(valid_name(&format!("team-a/{kind}-cache")));
+        }
+        assert!(valid_name("team-a/app"));
+    }
+
+    /// A manifest readable through a repository that was never pushed it — a mounted index
+    /// child, or the cross-repo clause of `readable_through` — has no Content-Type sidecar
+    /// there. Answering the default would call a manifest list an image manifest, so the
+    /// bytes' own `mediaType` answers instead.
+    #[test]
+    fn a_manifest_without_a_sidecar_is_served_the_type_it_declares() {
+        let dir =
+            std::env::temp_dir().join(format!("vk-regserve-nosidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let index_type = "application/vnd.oci.image.index.v1+json";
+        let index =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
+        let digest = store
+            .put_manifest("team-a/app", "v1", index_type, index)
+            .unwrap();
+
+        // Pushed here, so the sidecar answers.
+        let (_, _, ctype) = store.get_manifest("team-a/app", &digest).unwrap().unwrap();
+        assert_eq!(ctype, index_type);
+        // Readable through a repository that never received it: no sidecar, so the
+        // manifest says what it is rather than being mislabelled an image manifest.
+        store
+            .record_blob("team-b/app", digest.trim_start_matches("sha256:"))
+            .unwrap();
+        let (_, _, ctype) = store.get_manifest("team-b/app", &digest).unwrap().unwrap();
+        assert_eq!(ctype, index_type);
+
+        assert_eq!(declared_media_type(b"not json"), None);
+        assert_eq!(declared_media_type(br#"{"mediaType":42}"#), None);
+
+        // And a type outside the allowlist is not served, however it got there. These are
+        // uploaded bytes, not a pushed manifest, so nothing vouched for them: a caller who
+        // may write one repository must not be able to read JSON back off this origin as
+        // `text/html`, nor smuggle a header through a `mediaType`.
+        let hostile = br#"{"mediaType":"text/html","layers":[]}"#;
+        let hhex = sha256_hex_raw(hostile);
+        store.put_blob_at(&hhex, hostile).unwrap();
+        store.record_blob("team-a/app", &hhex).unwrap();
+        let (_, _, ctype) = store
+            .get_manifest("team-a/app", &format!("sha256:{hhex}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(ctype, DEFAULT_MANIFEST_TYPE);
+        // same for a pushed Content-Type, which lands in the sidecar verbatim
+        let pushed = store
+            .put_manifest("team-a/app", "evil", "text/html", br#"{"layers":[]}"#)
+            .unwrap();
+        let (_, _, ctype) = store.get_manifest("team-a/app", &pushed).unwrap().unwrap();
+        assert_eq!(ctype, DEFAULT_MANIFEST_TYPE);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without per-repo scopes there is nothing to authorize *and* nothing to record: a
+    /// reference is not evidence in shared-secret mode either. Recording here would hand a
+    /// later switch to accounts mode the reference-derived membership the write rule
+    /// refuses to build.
+    #[test]
+    fn a_manifest_put_without_scopes_records_only_the_manifest() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-noscope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let layer = store.put_blob(b"someone else's layer").unwrap();
+        let hex = layer.trim_start_matches("sha256:").to_string();
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"config":{{"digest":"{layer}","size":20}},"layers":[]}}"#
+        );
+
+        // The bytes are in the pool, and the manifest names them — which grants nothing.
+        let outcome = authorize_and_mount_manifest_blobs(
+            &Authz::NoScopes,
+            &store,
+            "team-a/app",
+            manifest.as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(outcome, Mount::Done), "nothing to authorize");
+        assert!(!store.repo_has_blob("team-a/app", &hex));
+
+        let digest = store
+            .put_manifest(
+                "team-a/app",
+                "v1",
+                DEFAULT_MANIFEST_TYPE,
+                manifest.as_bytes(),
+            )
+            .unwrap();
+        // Its own bytes, and only those.
+        assert!(store.repo_has_manifest("team-a/app", digest.trim_start_matches("sha256:")));
+        assert!(!store.repo_has_blob("team-a/app", &hex));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `repo_dirs` stops at a repository's own subdirectories: descending into `blobs/`
+    /// would cost a `stat` per membership marker on every gc, `stats` and listing.
+    #[test]
+    fn the_repo_walk_does_not_descend_into_membership_markers() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let manifest =
+            br#"{"schemaVersion":2,"config":{"digest":"sha256:x","size":0},"layers":[]}"#;
+        store
+            .put_manifest("team-a/app", "v1", DEFAULT_MANIFEST_TYPE, manifest)
+            .unwrap();
+        for i in 0..40u32 {
+            store
+                .record_blob("team-a/app", &format!("{i:064x}"))
+                .unwrap();
+        }
+
+        // The markers are not repositories, and do not multiply the walk's answers.
+        assert_eq!(
+            store.all_repo_names().into_iter().collect::<Vec<_>>(),
+            vec!["team-a/app".to_string()]
+        );
+        assert_eq!(store.repo_dirs("tags").0.len(), 1);
+        assert_eq!(store.repo_dirs("manifests").0.len(), 1);
+        assert_eq!(store.repo_dirs("blobs").0.len(), 1);
+        // and the markers change no reported count
+        let s = store.stats().unwrap();
+        assert_eq!(s.repos.len(), 1);
+        assert_eq!(s.total_manifests, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_blob_hex_is_lowercase_sha256() {
+        assert!(is_blob_hex(&"a".repeat(64)));
+        assert!(is_blob_hex(&"0123456789abcdef".repeat(4)));
+        assert!(
+            !is_blob_hex(&"A".repeat(64)),
+            "uppercase is not how we name blobs"
+        );
+        assert!(!is_blob_hex(&"a".repeat(63)));
+        assert!(!is_blob_hex(&"a".repeat(65)));
+        assert!(!is_blob_hex(""));
+        assert!(!is_blob_hex(&"g".repeat(64)));
+        assert!(!is_blob_hex(&".".repeat(64)));
     }
 
     /// A manifest's Content-Type comes from whoever pushed it, and comes back out of `/v2`
@@ -3759,6 +4695,8 @@ mod tests {
         }
     }
 
+    /// An upload id names a file under `uploads/`, so it must not be able to name anything
+    /// else — and it carries a random hex tail, so hex digits are part of the alphabet.
     #[test]
     fn upload_id_validation() {
         assert!(valid_upload_id("12345-7"));

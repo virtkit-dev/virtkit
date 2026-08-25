@@ -161,6 +161,16 @@ pub async fn get_blob(
                 .await
                 .with_context(|| format!("promoting the relayed blob {digest}"))?;
         }
+        // The caller was authorized to read `name`, the upstream for `name` served this
+        // digest, and the bytes were hashed against it above — so the cached copy is
+        // readable through `name`. Record that, or the next request for it would be
+        // refused by the very cache that just fetched it.
+        //
+        // Note this is the *blob* path, where upstream vouched for the content. The
+        // manifest path deliberately records nothing but the manifest itself: a relayed
+        // manifest naming a digest this store happens to hold must not hand that local
+        // blob to the caller — each layer earns its own membership by being fetched here.
+        state.store.record_blob(name, hex)?;
     }
     serve_blob_local(&state.store, digest, head, accept_zstd)
 }
@@ -219,6 +229,10 @@ pub async fn get_manifest(
 
     if reference.starts_with("sha256:") {
         // immutable: persist (a digest reference writes no tag) and serve canonically.
+        // Under the shared store lock, as the blob path is: the write puts the bytes and
+        // the sidecar that makes them readable here, and an exclusive `gc` in between
+        // would leave the one without the other.
+        let _lock = state.store.lock_shared()?;
         let got = state.store.put_manifest(name, reference, &ctype, &body)?;
         if got != reference {
             bail!("upstream manifest digest mismatch for {name}: got {got}, want {reference}");

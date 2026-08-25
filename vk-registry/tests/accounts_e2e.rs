@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vk_registry::accounts::{Action, Db, Scope};
-use vk_registry::config::{AuthMode, OidcSpec};
-use vk_registry::{Authenticator, ServerConfig, ServerState};
+use vk_registry::config::{AuthMode, OidcSpec, UpstreamSpec};
+use vk_registry::lock::LockManager;
+use vk_registry::{Authenticator, ServerConfig, ServerState, Store};
 
 fn tmp(tag: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!(
@@ -51,6 +52,15 @@ fn no_redirect_client() -> reqwest::Client {
 /// `relay_e2e.rs`. Discovery is deferred to the first login, so naming a provider costs
 /// no network.
 fn accounts_state(dir: &std::path::Path) -> Arc<ServerState> {
+    accounts_state_relaying(dir, vec![])
+}
+
+/// [`accounts_state`] with relay upstreams, built the same way — through `UpstreamSpec`,
+/// so the client behind each one is the one `serve` would have built.
+fn accounts_state_relaying(
+    dir: &std::path::Path,
+    upstreams: Vec<UpstreamSpec>,
+) -> Arc<ServerState> {
     std::fs::create_dir_all(dir).unwrap();
     let secret = dir.join("oidc-secret");
     std::fs::write(&secret, "s3cr3t\n").unwrap();
@@ -62,6 +72,7 @@ fn accounts_state(dir: &std::path::Path) -> Arc<ServerState> {
         client_secret_file: secret,
         public_url: "https://registry.internal".to_string(),
     });
+    cfg.upstreams = upstreams;
     Arc::new(cfg.into_state().expect("a valid accounts config starts"))
 }
 
@@ -635,6 +646,622 @@ async fn a_non_admin_session_cannot_mint_a_write_scoped_key() {
         .unwrap();
     assert!(resp.status().is_success());
     assert_eq!(db.list_api_keys(&user.id).unwrap().len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The cross-tenant read this scoping exists to close: a key scoped to one team must not
+/// be able to fetch another team's layers by naming their digests through a repository it
+/// *can* read, nor to smuggle them in by referencing them from a manifest of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scoped_key_cannot_read_another_teams_blobs_by_digest() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tmp("scoped-blobs");
+    let state = accounts_state(&dir);
+    let store = state.store.clone();
+    let db = accounts_db(&state);
+
+    let admin = db
+        .upsert_user("https://issuer", "admin", None, None)
+        .unwrap();
+    assert!(db.set_admin(&admin.id, true).unwrap());
+    let admin_session = db
+        .create_session(&admin.id, Duration::from_secs(3600))
+        .unwrap();
+    let user = db.upsert_user("https://issuer", "ci", None, None).unwrap();
+    let team_a = Scope {
+        action: Action::Write,
+        repo_pattern: "team-a/*".to_string(),
+    };
+    let (_, key) = db
+        .create_api_key(
+            Some(&user.id),
+            "team-a ci",
+            std::slice::from_ref(&team_a),
+            None,
+        )
+        .unwrap();
+
+    // team-b's secret layer, pushed by the admin, referenced by a team-b manifest.
+    let secret = b"team-b's private layer";
+    let secret_digest = store.put_blob(secret).unwrap();
+    // Seeded as a push would leave it: bytes in the pool *and* the membership the upload
+    // would have recorded. `put_blob` alone records nothing, by design.
+    store
+        .record_blob("team-b/app", secret_digest.trim_start_matches("sha256:"))
+        .unwrap();
+    let team_b_manifest = format!(
+        r#"{{"schemaVersion":2,"config":{{"digest":"{secret_digest}","size":{}}},"layers":[]}}"#,
+        secret.len()
+    );
+    let team_b_mdigest = store
+        .put_manifest(
+            "team-b/app",
+            "v1",
+            "application/vnd.oci.image.manifest.v1+json",
+            team_b_manifest.as_bytes(),
+        )
+        .unwrap();
+    // and team-a has a repository of its own, so its key has somewhere legitimate to look
+    let own = store.put_blob(b"team-a's own layer").unwrap();
+    store
+        .record_blob("team-a/app", own.trim_start_matches("sha256:"))
+        .unwrap();
+    let own_manifest =
+        format!(r#"{{"schemaVersion":2,"config":{{"digest":"{own}","size":18}},"layers":[]}}"#);
+    store
+        .put_manifest(
+            "team-a/app",
+            "v1",
+            "application/vnd.oci.image.manifest.v1+json",
+            own_manifest.as_bytes(),
+        )
+        .unwrap();
+
+    let url = spawn(state.clone());
+    let client = no_redirect_client();
+
+    // Its own repository's blob: readable, as before.
+    let resp = client
+        .get(format!("{url}/v2/team-a/app/blobs/{own}"))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // team-b's blob, named through the repo it *can* read: refused as absent, because it
+    // is not a member of team-a/app and the key may not read any repo that holds it.
+    let resp = client
+        .get(format!("{url}/v2/team-a/app/blobs/{secret_digest}"))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "a digest is not a key to the whole store"
+    );
+    // the dedup probe answers the same way, so HEAD and GET cannot disagree
+    let resp = client
+        .head(format!("{url}/v2/team-a/app/blobs/{secret_digest}"))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // team-b's *manifest* by digest is refused too — that is where the layer digests
+    // would have come from.
+    let resp = client
+        .get(format!("{url}/v2/team-a/app/manifests/{team_b_mdigest}"))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // And it cannot smuggle the blob in by referencing it from a manifest of its own:
+    // the push is refused, and the blob does not become readable.
+    let smuggle = format!(
+        r#"{{"schemaVersion":2,"config":{{"digest":"{secret_digest}","size":{}}},"layers":[]}}"#,
+        secret.len()
+    );
+    let resp = client
+        .put(format!("{url}/v2/team-a/app/manifests/smuggled"))
+        .bearer_auth(&key)
+        .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+        .body(smuggle)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("MANIFEST_BLOB_UNKNOWN"), "{body}");
+    let resp = client
+        .get(format!("{url}/v2/team-a/app/blobs/{secret_digest}"))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "the refused push granted nothing");
+
+    // An admin session reads every repo, so scoping costs it nothing — the blob is
+    // reachable through the repo that holds it and through one it may read.
+    for path in [
+        format!("/v2/team-b/app/blobs/{secret_digest}"),
+        format!("/v2/team-a/app/blobs/{secret_digest}"),
+    ] {
+        let resp = client
+            .get(format!("{url}{path}"))
+            .header("Cookie", format!("__Host-vk_session={admin_session}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{path}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Dedup across a key's own repositories must keep working: a blob it can already read
+/// in one is mountable into another by naming it, with no re-upload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dedup_still_works_within_a_keys_own_scope() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tmp("scoped-dedup");
+    let state = accounts_state(&dir);
+    let store = state.store.clone();
+    let db = accounts_db(&state);
+    let user = db.upsert_user("https://issuer", "ci", None, None).unwrap();
+    let scope = Scope {
+        action: Action::Write,
+        repo_pattern: "team-a/*".to_string(),
+    };
+    let (_, key) = db
+        .create_api_key(Some(&user.id), "ci", std::slice::from_ref(&scope), None)
+        .unwrap();
+
+    let shared = b"a layer both images share";
+    let digest = store.put_blob(shared).unwrap();
+    // a member of the first repo, as its own push would have left it
+    store
+        .record_blob("team-a/first", digest.trim_start_matches("sha256:"))
+        .unwrap();
+    let manifest = format!(
+        r#"{{"schemaVersion":2,"config":{{"digest":"{digest}","size":{}}},"layers":[]}}"#,
+        shared.len()
+    );
+    // it is already a member of one repo in the key's scope
+    store
+        .put_manifest(
+            "team-a/first",
+            "v1",
+            "application/vnd.oci.image.manifest.v1+json",
+            manifest.as_bytes(),
+        )
+        .unwrap();
+
+    let url = spawn(state.clone());
+    let client = no_redirect_client();
+
+    // The dedup probe against the *other* repo says "already here" — the key may read
+    // the repo that holds it, so there is nothing to re-upload.
+    let resp = client
+        .head(format!("{url}/v2/team-a/second/blobs/{digest}"))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "cross-repo dedup within scope");
+
+    // So the manifest push into the second repo succeeds without the layer being sent
+    // again, and the blob is then a member of both.
+    let resp = client
+        .put(format!("{url}/v2/team-a/second/manifests/v1"))
+        .bearer_auth(&key)
+        .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+        .body(manifest)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let hex = digest.trim_start_matches("sha256:");
+    assert!(store.repo_has_blob("team-a/first", hex));
+    assert!(store.repo_has_blob("team-a/second", hex));
+    // one copy on disk, as always
+    assert_eq!(store.stats().unwrap().identity_blobs, 2, "layer + manifest");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The plain push path, over HTTP, end to end: a blob uploaded through an upload session
+/// is readable through the repository it was pushed to, and a manifest naming it is
+/// accepted. Seeding the store directly, as the tests above do, would not catch a
+/// membership record the *upload* path forgot to write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pushed_blob_is_readable_through_the_repo_it_was_pushed_to() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tmp("pushed");
+    let state = accounts_state(&dir);
+    let store = state.store.clone();
+    let db = accounts_db(&state);
+    let user = db.upsert_user("https://issuer", "ci", None, None).unwrap();
+    let scope = Scope {
+        action: Action::Write,
+        repo_pattern: "team-a/*".to_string(),
+    };
+    let (_, key) = db
+        .create_api_key(Some(&user.id), "ci", std::slice::from_ref(&scope), None)
+        .unwrap();
+    let url = spawn(state.clone());
+    let client = no_redirect_client();
+
+    let layer = b"a genuinely uploaded layer";
+    let hex = <sha2::Sha256 as sha2::Digest>::digest(layer)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let digest = format!("sha256:{hex}");
+
+    // Nothing holds it yet, so it is not readable anywhere.
+    let resp = client
+        .get(format!("{url}/v2/team-a/app/blobs/{digest}"))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // POST a session, PUT the bytes.
+    let resp = client
+        .post(format!("{url}/v2/team-a/app/blobs/uploads/"))
+        .bearer_auth(&key)
+        .header("Content-Length", "0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    let resp = client
+        .put(format!(
+            "{url}{location}?digest={}",
+            digest.replace(':', "%3A")
+        ))
+        .bearer_auth(&key)
+        .body(layer.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // Now it is readable through that repository, and the bytes come back intact.
+    let resp = client
+        .get(format!("{url}/v2/team-a/app/blobs/{digest}"))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "an uploaded blob must be readable");
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), layer);
+    assert!(store.repo_has_blob("team-a/app", &hex));
+
+    // ... and a manifest naming it is accepted, since it is already a member.
+    let manifest = format!(
+        r#"{{"schemaVersion":2,"config":{{"digest":"{digest}","size":{}}},"layers":[]}}"#,
+        layer.len()
+    );
+    let resp = client
+        .put(format!("{url}/v2/team-a/app/manifests/v1"))
+        .bearer_auth(&key)
+        .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+        .body(manifest)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // The pull path a client actually takes: tag -> manifest -> blob.
+    let resp = client
+        .get(format!("{url}/v2/team-a/app/manifests/v1"))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let fetched: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(fetched["config"]["digest"], digest);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `/browse` renders a manifest's layer digests, so it has to apply the same gate `/v2/`
+/// does — otherwise the enumeration this scoping exists to stop is available one URL over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browse_cannot_show_another_teams_manifest_by_digest() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tmp("browse-scoped");
+    let state = accounts_state(&dir);
+    let store = state.store.clone();
+    let db = accounts_db(&state);
+    let user = db.upsert_user("https://issuer", "ci", None, None).unwrap();
+    let scope = Scope {
+        action: Action::Read,
+        repo_pattern: "team-a/*".to_string(),
+    };
+    let (_, key) = db
+        .create_api_key(Some(&user.id), "team-a", std::slice::from_ref(&scope), None)
+        .unwrap();
+
+    // team-b's manifest, naming a layer only team-b holds.
+    let secret = store.put_blob(b"team-b layer").unwrap();
+    store
+        .record_blob("team-b/app", secret.trim_start_matches("sha256:"))
+        .unwrap();
+    let team_b =
+        format!(r#"{{"schemaVersion":2,"config":{{"digest":"{secret}","size":12}},"layers":[]}}"#);
+    let team_b_digest = store
+        .put_manifest(
+            "team-b/app",
+            "v1",
+            "application/vnd.oci.image.manifest.v1+json",
+            team_b.as_bytes(),
+        )
+        .unwrap();
+    // and team-a has one of its own, so the page works at all
+    let own = store.put_blob(b"team-a layer").unwrap();
+    store
+        .record_blob("team-a/app", own.trim_start_matches("sha256:"))
+        .unwrap();
+    let team_a =
+        format!(r#"{{"schemaVersion":2,"config":{{"digest":"{own}","size":12}},"layers":[]}}"#);
+    let team_a_digest = store
+        .put_manifest(
+            "team-a/app",
+            "v1",
+            "application/vnd.oci.image.manifest.v1+json",
+            team_a.as_bytes(),
+        )
+        .unwrap();
+
+    let url = spawn(state.clone());
+    let client = no_redirect_client();
+
+    // its own manifest by digest renders
+    let resp = client
+        .get(format!("{url}/browse/team-a/app/manifests/{team_a_digest}"))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // team-b's, named through the repo it may read, does not — and the layer digest is
+    // nowhere in the response.
+    let resp = client
+        .get(format!("{url}/browse/team-a/app/manifests/{team_b_digest}"))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body = resp.text().await.unwrap();
+    assert!(
+        !body.contains(secret.trim_start_matches("sha256:")),
+        "the page must not disclose another repo's layer digest"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A manifest only proves its author *named* a digest, never that they hold it. Storing
+/// one must therefore grant nothing — otherwise anything that writes a manifest on a
+/// caller's behalf (the relay's manifest cache) becomes a way to read local content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn storing_a_manifest_grants_nothing_it_merely_references() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tmp("manifest-grants");
+    let store = Store::new(dir.join("store")).unwrap();
+
+    // A private layer belonging to one repo.
+    let secret = store.put_blob(b"someone else's bytes").unwrap();
+    let hex = secret.trim_start_matches("sha256:").to_string();
+    store.record_blob("team-b/app", &hex).unwrap();
+
+    // A manifest stored into a different repo that merely names it — as the relay would
+    // cache one it fetched upstream.
+    let naming =
+        format!(r#"{{"schemaVersion":2,"config":{{"digest":"{secret}","size":20}},"layers":[]}}"#);
+    store
+        .put_manifest(
+            "team-a/app",
+            "cached",
+            "application/vnd.oci.image.manifest.v1+json",
+            naming.as_bytes(),
+        )
+        .unwrap();
+
+    assert!(
+        !store.repo_has_blob("team-a/app", &hex),
+        "naming a digest must not make it a member"
+    );
+    assert!(store.repo_has_blob("team-b/app", &hex));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A relayed blob is content this registry fetched and hashed *for* the repository the
+/// caller named, so it becomes readable through it — otherwise the very cache that just
+/// filled would refuse the next request for it. Every other relay test runs in
+/// shared-secret mode, where `readable_through` short-circuits and none of this is
+/// exercised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relayed_blob_becomes_a_member_of_the_repo_it_was_fetched_for() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Upstream: an ordinary shared-secret registry holding team-a's layer.
+    let up_dir = tmp("relay-up");
+    let up_store = Store::new(up_dir.join("store")).unwrap();
+    let layer = b"upstream layer bytes".to_vec();
+    let digest = up_store.put_blob(&layer).unwrap();
+    up_store
+        .record_blob("team-a/app", digest.trim_start_matches("sha256:"))
+        .unwrap();
+    let up_url = spawn(Arc::new(ServerState {
+        store: Arc::new(up_store),
+        upstreams: vec![],
+        locks: LockManager::new(),
+        auth: Authenticator::Shared(vk_registry::auth::Auth::None),
+        tls: None,
+    }));
+
+    // Mirror: accounts mode, empty store, everything routed upstream.
+    let dir = tmp("relay-mirror");
+    let state = accounts_state_relaying(
+        &dir,
+        vec![UpstreamSpec {
+            prefix: String::new(),
+            url: up_url.clone(),
+            username: None,
+            password_file: None,
+            ca_file: None,
+        }],
+    );
+    let store = state.store.clone();
+    let db = accounts_db(&state);
+    let user = db.upsert_user("https://issuer", "ci", None, None).unwrap();
+    let (_, key) = db
+        .create_api_key(
+            Some(&user.id),
+            "team-a ci",
+            &[Scope {
+                action: Action::Read,
+                repo_pattern: "team-a/*".to_string(),
+            }],
+            None,
+        )
+        .unwrap();
+    let url = spawn(state.clone());
+    let client = no_redirect_client();
+    let hex = digest.trim_start_matches("sha256:").to_string();
+
+    // Nothing local yet, so this is served by the relay — and recorded on the way through.
+    assert!(!store.repo_has_blob("team-a/app", &hex));
+    let resp = client
+        .get(format!("{url}/v2/team-a/app/blobs/{digest}"))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), layer.as_slice());
+    assert!(
+        store.repo_has_blob("team-a/app", &hex),
+        "the relay must record what it fetched, or the cache refuses its own content"
+    );
+    // Recorded in the repository the fetch was authorized for, not in the store at large:
+    // a sibling the key may also read is not made a member by someone else's fetch.
+    assert!(!store.repo_has_blob("team-a/other", &hex));
+
+    // The second request is served locally, by membership, with the relay unused.
+    let resp = client
+        .get(format!("{url}/v2/team-a/app/blobs/{digest}"))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), layer.as_slice());
+
+    // A key with no read on the repository is refused before the relay is consulted, so
+    // fronting an upstream never widens what a scope reaches.
+    let resp = client
+        .get(format!("{url}/v2/team-b/app/blobs/{digest}"))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert!(
+        !store.repo_has_blob("team-b/app", &hex),
+        "a refused request must not cache, nor record"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&up_dir);
+}
+
+/// A registry on the older shared-secret setting is unchanged by any of this: one token is
+/// the whole authorization model, so a blob is readable by digest through any repository
+/// and a manifest may name content the store does not hold. The membership machinery must
+/// stay invisible there — and must not quietly pre-seed itself, which would hand a later
+/// switch to accounts mode the reference-derived graph the write rule refuses to build.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_secret_mode_is_unchanged_by_repo_scoping() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tmp("shared-secret");
+    let store = Arc::new(Store::new(dir.join("store")).unwrap());
+    // In the pool, recorded nowhere — exactly what a pre-existing store looks like.
+    let layer = b"a layer nobody recorded".to_vec();
+    let digest = store.put_blob(&layer).unwrap();
+    let hex = digest.trim_start_matches("sha256:").to_string();
+
+    let url = spawn(Arc::new(ServerState {
+        store: store.clone(),
+        upstreams: vec![],
+        locks: LockManager::new(),
+        auth: Authenticator::Shared(vk_registry::auth::Auth::None),
+        tls: None,
+    }));
+    let client = no_redirect_client();
+
+    // Readable by digest through a repository that holds nothing at all.
+    let resp = client
+        .get(format!("{url}/v2/any/repo/blobs/{digest}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), layer.as_slice());
+
+    // A manifest naming a digest the store does not hold is still accepted here.
+    let absent = format!("sha256:{}", "b".repeat(64));
+    let manifest =
+        format!(r#"{{"schemaVersion":2,"config":{{"digest":"{absent}","size":1}},"layers":[]}}"#);
+    let resp = client
+        .put(format!("{url}/v2/any/repo/manifests/v1"))
+        .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+        .body(manifest.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // And storing it recorded nothing it merely referenced — not even the digest that is
+    // in the pool, had the manifest named it.
+    let referencing = format!(
+        r#"{{"schemaVersion":2,"config":{{"digest":"{digest}","size":{}}},"layers":[]}}"#,
+        layer.len()
+    );
+    let resp = client
+        .put(format!("{url}/v2/any/repo/manifests/v2"))
+        .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+        .body(referencing)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    assert!(
+        !store.repo_has_blob("any/repo", &hex),
+        "a reference is not evidence in shared-secret mode either"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

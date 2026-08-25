@@ -326,6 +326,13 @@ fn store_upload(
     let _lock = store.lock_shared()?;
     let config_digest = store.put_blob(EMPTY_CONFIG)?;
     let layer_digest = store.put_blob(file_bytes)?;
+    // These bytes arrived through this form, for this repository, so they are readable
+    // through it. `put_manifest` records only the manifest itself — a reference is not
+    // evidence that the referrer holds the content — so the two blobs are recorded here,
+    // where we do hold them.
+    for digest in [&config_digest, &layer_digest] {
+        store.record_blob(name, digest.trim_start_matches("sha256:"))?;
+    }
     let mut layer = serde_json::json!({
         "mediaType": RAW_FILE_MEDIA_TYPE,
         "digest": layer_digest,

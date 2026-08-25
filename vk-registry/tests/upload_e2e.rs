@@ -210,6 +210,14 @@ async fn upload_round_trips_through_the_shared_store_and_dedups() {
         .unwrap()
         .unwrap();
     assert_eq!(blob, b"hello world");
+    // and it is a *member* of the repository it was uploaded into — reads are repo-scoped,
+    // so a blob the form stored without recording membership would be stored and
+    // unpullable. `get_blob` above goes through the store and would not have noticed.
+    let layer_hex = layer_digest.trim_start_matches("sha256:");
+    assert!(
+        store.repo_has_blob("team-a/doc", layer_hex),
+        "the uploaded layer must belong to the repository it went into"
+    );
 
     // ... and over real HTTP, which is the property that matters to a client.
     let over_http = client
