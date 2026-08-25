@@ -18,11 +18,12 @@
 //! credential: an API key row is keyed by `sha256(token)` and a session row by
 //! `sha256(session_id)`, so the file holds no bearer string and no cookie value.
 //!
-//! This module only *authenticates* a request (who is this, if anyone). Authorization
-//! (what a resolved principal may do) is [`Scope::allows`] plus route-level checks that
-//! arrive in the order `DESIGN.md` sets out — until then, an accounts-mode server behind
-//! [`crate::route`] accepts any resolved principal for any request, the same coarse shape
-//! as the shared-secret mode it replaces.
+//! [`resolve_principal`] only *authenticates* a request (who is this, if anyone);
+//! [`authorize`] decides what that principal may then do. `route()` calls both: the
+//! first as a blanket gate (no principal ⇒ 401/redirect-to-login before any routing
+//! decision), the second per `/v2/*` branch once it knows the repo name and whether the
+//! request reads or writes. `/lock/*` stops at authentication — lock names are not
+//! necessarily repo names, so there is nothing to scope-check there yet.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -31,12 +32,12 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::body::Incoming;
-use hyper::{HeaderMap, Request, Response};
+use hyper::{HeaderMap, Request, Response, StatusCode};
 use rand::Rng;
 use redb::{Database, Durability, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use crate::{hex_of, sha256_hex_raw};
+use crate::{error_response, hex_of, sha256_hex_raw};
 
 /// Key: `"{issuer}\x1f{subject}"` (see [`user_key`]). Value: JSON [`UserRow`].
 const USERS: TableDefinition<&str, &[u8]> = TableDefinition::new("users");
@@ -149,8 +150,14 @@ pub enum Action {
 }
 
 /// One `(action, repo_pattern)` grant. `repo_pattern` matches the same `<name>` used in
-/// `/v2/<name>/...` and `repos/<name>` on disk; a trailing `*` is a prefix match, else
-/// exact.
+/// `/v2/<name>/...` and `repos/<name>` on disk, in one of three shapes:
+///
+/// - `*` — every repository;
+/// - `<prefix>/*` — `<prefix>` itself and everything under it, cut at a path component
+///   so `team-a/*` covers `team-a/app` but not the unrelated repository `team-abc`;
+/// - anything else — that repository exactly.
+///
+/// [`validate_scopes`] rejects any other shape, so a grant always reads as what it does.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
     pub action: Action,
@@ -164,8 +171,16 @@ impl Scope {
         if !action_ok {
             return false;
         }
-        match self.repo_pattern.strip_suffix('*') {
-            Some(prefix) => repo.starts_with(prefix),
+        if self.repo_pattern == "*" {
+            return true;
+        }
+        match self.repo_pattern.strip_suffix("/*") {
+            Some(prefix) => {
+                repo == prefix
+                    || repo
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            }
             None => repo == self.repo_pattern,
         }
     }
@@ -336,6 +351,32 @@ impl Db {
         };
         txn.commit().context("upserting a user")?;
         Ok(user_from_row(key, row))
+    }
+
+    /// Grant or revoke admin on an existing user (by [`User::id`]). `Ok(false)` if there
+    /// is no such user, so a caller that mistyped an id hears about it rather than
+    /// reporting a grant it did not make. No HTTP route: an operator sets this from the
+    /// `vk-registry accounts` CLI.
+    pub fn set_admin(&self, user_id: &str, is_admin: bool) -> Result<bool> {
+        let found;
+        let txn = self.db.begin_write().context("starting a write")?;
+        {
+            let mut table = txn.open_table(USERS)?;
+            let existing = table
+                .get(user_id)?
+                .map(|g| decode::<UserRow>(g.value()))
+                .transpose()?;
+            match existing {
+                Some(mut row) => {
+                    row.is_admin = is_admin;
+                    table.insert(user_id, encode(&row)?.as_slice())?;
+                    found = true;
+                }
+                None => found = false,
+            }
+        }
+        txn.commit().context("setting a user's admin flag")?;
+        Ok(found)
     }
 
     pub fn get_user(&self, id: &str) -> Result<Option<User>> {
@@ -681,6 +722,32 @@ fn credential<'h>(headers: &'h HeaderMap, scheme: &str) -> Option<&'h str> {
         .then(|| credential.trim_start())
 }
 
+/// The 403 a resolved principal gets from [`authorize`] when it lacks the scope for
+/// `action` on `repo` — distinct from [`challenge`]'s 401 (this principal is real, it
+/// just cannot do this).
+pub fn forbidden() -> Response<Full<Bytes>> {
+    error_response(
+        StatusCode::FORBIDDEN,
+        "DENIED",
+        "the current session or API key has no scope for this repository/action",
+    )
+}
+
+/// What `principal` may do, once authenticated. A session gets read-all — any signed-in
+/// user can browse and pull — and write only if `is_admin`; an API key is scoped
+/// exactly by its `scopes` (a `Write` grant also satisfies `Read` for the same pattern,
+/// per [`Scope::allows`]). Session write being admin-only (rather than, say, "the repos
+/// this user owns") is a deliberate starting point with no ownership model yet to be
+/// more specific than that — revisit when `/upload` needs finer per-user grants.
+/// Revocation and expiry are not checked here — [`Db::get_api_key_by_token`] already
+/// refuses those at authentication, so a `Principal` in hand is a live credential.
+pub fn authorize(principal: &Principal, action: Action, repo: &str) -> bool {
+    match principal {
+        Principal::Session(user) => action == Action::Read || user.is_admin,
+        Principal::ApiKey(key) => key.scopes.iter().any(|s| s.allows(action, repo)),
+    }
+}
+
 /// The session cookie's name in its `__Host-`-prefixed form — accepted by a browser only
 /// with `Secure` and `Path=/`, and, the point, writable by no other host: without the
 /// prefix a sibling or parent host on the same registrable domain can plant a session
@@ -806,30 +873,34 @@ fn validate_key_input(name: &str, scopes: &[Scope]) -> Result<()> {
     if scopes.len() > MAX_KEY_SCOPES {
         bail!("an API key may not carry more than {MAX_KEY_SCOPES} scopes");
     }
+    validate_scopes(scopes)
+}
+
+/// A grant has to say exactly what it covers, so only the three shapes [`Scope::allows`]
+/// documents are accepted. Anything else — a bare `team-a*`, a pattern with a control
+/// character, an empty one — is rejected where it enters the store rather than quietly
+/// granting more or less than it reads as.
+pub(crate) fn validate_scopes(scopes: &[Scope]) -> Result<()> {
     for s in scopes {
-        if s.repo_pattern.len() > MAX_REPO_PATTERN_LEN {
+        let p = &s.repo_pattern;
+        if p.len() > MAX_REPO_PATTERN_LEN {
             bail!(
                 "a scope's repo pattern may not exceed {MAX_REPO_PATTERN_LEN} bytes (got {})",
-                s.repo_pattern.len()
+                p.len()
             );
         }
-        if !valid_repo_pattern(&s.repo_pattern) {
+        if p == "*" {
+            continue;
+        }
+        let repo = p.strip_suffix("/*").unwrap_or(p);
+        if !crate::valid_name(repo) {
             bail!(
-                "{:?} cannot match any repository name, so it would grant nothing",
-                s.repo_pattern
+                "a scope's repo pattern must be \"*\", a repository name, or a name \
+                 followed by \"/*\" (got {p:?})"
             );
         }
     }
     Ok(())
-}
-
-/// A repo pattern that [`Scope::allows`] can actually match: `*`, or a repository name
-/// optionally followed by `/*`. Checked at the store rather than left to fail closed at
-/// authorization time, because a grant that silently matches nothing is indistinguishable
-/// from one that was never made — and the pattern is echoed back in listings alongside the
-/// key's name, which gets the same treatment for the same reason.
-fn valid_repo_pattern(pattern: &str) -> bool {
-    pattern == "*" || crate::valid_name(pattern.strip_suffix("/*").unwrap_or(pattern))
 }
 
 /// The `sessions` key for a session id — the id is a credential, so only its hash is
@@ -930,7 +1001,7 @@ mod tests {
 
     #[test]
     /// `Scope::allows` alone, over patterns including ones `validate_key_input` no longer
-    /// lets into the db (an interior `*`, the empty string): the matcher is what the stored
+    /// lets into the db (an interior `*`, an empty pattern): the matcher is what the stored
     /// rows are read back through, so its behaviour on them is worth pinning even where the
     /// write path has since made them unreachable.
     fn scope_matching() {
@@ -947,11 +1018,105 @@ mod tests {
         assert!(exact.allows(Action::Read, "exact/name"));
         assert!(!exact.allows(Action::Read, "exact/name/sub"));
 
-        // A bare `*` prefix is a *string* prefix, not a path-component one: `team-a*`
-        // deliberately covers `team-abc`, so a pattern meant per-team ends with `/`.
-        assert!(scope(Action::Read, "team-a*").allows(Action::Read, "team-abc/x"));
-        assert!(scope(Action::Read, "").allows(Action::Read, ""));
-        assert!(!scope(Action::Read, "").allows(Action::Read, "x"));
+        // `/*` cuts at a path component, so a grant covers the prefix and what is under
+        // it — never a differently-named repository that merely starts the same way.
+        let team_a = scope(Action::Read, "team-a/*");
+        assert!(team_a.allows(Action::Read, "team-a"));
+        assert!(team_a.allows(Action::Read, "team-a/app"));
+        assert!(team_a.allows(Action::Read, "team-a/sub/app"));
+        assert!(!team_a.allows(Action::Read, "team-abc"));
+        assert!(!team_a.allows(Action::Read, "team-abc/app"));
+
+        // `*` alone is every repository; a bare `team-a*` is not a pattern at all
+        assert!(scope(Action::Read, "*").allows(Action::Read, "anything/at/all"));
+        assert!(!scope(Action::Read, "team-a*").allows(Action::Read, "team-abc/x"));
+        assert!(!scope(Action::Read, "team-a*").allows(Action::Read, "team-a/x"));
+
+        // and only the shapes above may be stored in the first place
+        assert!(validate_scopes(&[scope(Action::Read, "*")]).is_ok());
+        assert!(validate_scopes(&[scope(Action::Read, "team-a/*")]).is_ok());
+        assert!(validate_scopes(&[scope(Action::Read, "team-a/app")]).is_ok());
+        for bad in ["team-a*", "", "/*", "../*", "team-a/*/x", "a b"] {
+            assert!(
+                validate_scopes(&[scope(Action::Read, bad)]).is_err(),
+                "{bad:?} must not be storable"
+            );
+        }
+    }
+
+    #[test]
+    fn authorize_session_is_read_all_and_admin_write() {
+        let plain = User {
+            id: "u1".to_string(),
+            oidc_issuer: "https://issuer".to_string(),
+            oidc_subject: "sub-1".to_string(),
+            email: None,
+            display_name: None,
+            is_admin: false,
+        };
+        let admin = User {
+            is_admin: true,
+            ..plain.clone()
+        };
+        assert!(authorize(
+            &Principal::Session(plain.clone()),
+            Action::Read,
+            "any/repo"
+        ));
+        assert!(!authorize(
+            &Principal::Session(plain),
+            Action::Write,
+            "any/repo"
+        ));
+        assert!(authorize(
+            &Principal::Session(admin),
+            Action::Write,
+            "any/repo"
+        ));
+    }
+
+    #[test]
+    fn authorize_api_key_is_scoped() {
+        let key = ApiKey {
+            id: "hash".to_string(),
+            owner_user_id: None,
+            name: "ci".to_string(),
+            token_prefix: "0123abcd".to_string(),
+            scopes: vec![Scope {
+                action: Action::Write,
+                repo_pattern: "team-a/*".to_string(),
+            }],
+            created_at: SystemTime::UNIX_EPOCH,
+            last_used_at: None,
+            expires_at: None,
+            revoked_at: None,
+        };
+        let p = Principal::ApiKey(key);
+        assert!(authorize(&p, Action::Write, "team-a/app"));
+        assert!(authorize(&p, Action::Read, "team-a/app")); // write implies read
+        assert!(!authorize(&p, Action::Write, "team-b/app"));
+        assert!(!authorize(&p, Action::Read, "team-b/app"));
+    }
+
+    #[test]
+    fn set_admin_survives_a_relogin() -> Result<()> {
+        let db = Db::open_memory()?;
+        let user = db.upsert_user("https://issuer", "sub-1", None, None)?;
+        assert!(!user.is_admin);
+        assert!(db.set_admin(&user.id, true)?);
+        assert!(db.get_user(&user.id)?.unwrap().is_admin);
+
+        // a re-login (upsert_user again) must not silently drop the admin grant
+        let relogin = db.upsert_user("https://issuer", "sub-1", Some("a@example.com"), None)?;
+        assert!(relogin.is_admin);
+
+        assert!(db.set_admin(&user.id, false)?);
+        assert!(!db.get_user(&user.id)?.unwrap().is_admin);
+        assert!(
+            !db.set_admin("https://issuer\u{1f}ghost", true)?,
+            "an id nobody has is not a silent success"
+        );
+        Ok(())
     }
 
     #[test]

@@ -319,17 +319,16 @@ enum Principal { Session(User), ApiKey(ApiKey) }
 fn authorize(principal: &Principal, action: Read | Write, repo: &str) -> bool
 ```
 
-Every `/v2/*` handler gains this check in place of today's global gate. `/lock/*` does
-**not**: a scope is `(action, repo_pattern)` and a lock name is an arbitrary build-once key,
-not a repository, so there is nothing for a pattern to match. The lock API stays gated on
-being an authenticated principal at all — which means any key, however narrowly scoped, can
-take and hold locks.
-Session principals: any authenticated user gets **read-all**; **write** requires
-`is_admin` or an explicit key (a human uploading through the browser still goes through an
-API-key-shaped grant, just session-authenticated — see manual upload below). API-key
-principals: hash the presented token, look up `api_keys`, reject if `revoked_at` is set or
-`expires_at` has passed, then match `action`/`repo` against `scopes`; on success bump
-`last_used_at`.
+Every `/v2/*` write/read branch calls `authorize()` in place of today's global gate
+(`/lock/*` still stops at authentication — see the module doc for why). Session
+principals: any authenticated user gets **read-all**; **write** requires `is_admin`
+(a human uploading through the browser is still session-authenticated with no
+separate key — see manual upload below; there is no per-user "repos I own" model yet,
+so admin-only is the deliberately simple starting point). API-key principals: hash the
+presented token, look up `api_keys`, reject if `revoked_at` is set or `expires_at` has
+passed, then match `action`/`repo` against `scopes` (bumping `last_used_at` on success);
+`authorize()` itself just checks `scopes.iter().any(|s| s.allows(action, repo))` once a
+key has resolved.
 
 Credential lookup is on the request path, so it runs in a read transaction. An API key
 lookup's only write is a `last_used_at` bump, coarse enough (a minute) that a push does not
@@ -339,9 +338,35 @@ A session found expired is deleted by the lookup that found it, which is one dur
 per dead cookie; a session someone comes back to is therefore reclaimed, one simply
 abandoned is not, and a periodic sweep is deferred.
 
-`authorize()`'s scope enforcement lands with the routes that need it (step 3 below); until
-then an accounts-mode server accepts any resolved principal for anything, the same coarse
-shape as the shared-secret mode it replaces.
+`authorize()` (`accounts.rs`) gates every `/v2/*` branch (`blobs/uploads`,
+`blobs/<digest>`, `manifests/<reference>`, `tags/list`) through `authorize_or_forbidden`
+in `route()`, and filters `/browse`: a principal is shown only the repositories it may
+read, and one it may not read answers 404 rather than 403, so a listing does not confirm
+what it excludes. Granting admin is `set_admin`, with no HTTP route by
+design — an operator's job, from the `vk-registry accounts` CLI (step 4 below).
+
+`/lock/*` stays authentication-only: a lock name is a build key, not a repository name,
+so there is nothing per-repo to check against. The consequence is that any principal,
+including a read-only key, can take a build-once lock and see other holders' names in a
+`blockers` list — acceptable while every principal on a registry is a colleague, and the
+thing to revisit if that stops being true.
+
+Two limits worth stating plainly, both about the content-addressed store being shared by
+every repository:
+
+- **Blob reads are not repo-scoped.** `GET /v2/<name>/blobs/<digest>` checks `Read` on
+  `<name>`, then looks the digest up in the global CAS: a caller who learns a digest can
+  fetch it through any repository it may read. Manifests and tags are what scoping
+  protects, and they are where digests come from — so this matters only against a caller
+  who obtains a digest another way. Per-repo blob membership is deferred.
+- **A key's scopes are not bounded by its creator's rights.** `create_api_key` takes the
+  scopes it is given, so once `/settings/keys` exists a non-admin session — which may only
+  read — must not be allowed to mint a `Write` key, or it escalates past itself. Nothing
+  can reach `create_api_key` over HTTP yet; the bound belongs with that route.
+- **Writes cannot claim a digest they did not produce.** `finish_upload` hashes the bytes
+  and refuses a mismatch, and an upload session records the repository it was opened for,
+  so a caller cannot start an upload where it may write and finish it where it may not.
+  Session ids carry a random tail for the same reason.
 
 `mode` is a top-level config key, like the credentials it chooses between. An
 unrecognized key anywhere in the file, `[oidc]` included, is an error: a mistyped or
@@ -490,13 +515,13 @@ what went wrong goes to the log.
 
 New routes alongside the existing `/v2/` and `/lock/` prefixes in `route()`:
 
-| Route                                   | Auth          | Behavior                                                |
-|-----------------------------------------|---------------|---------------------------------------------------------|
-| `/browse`                               | any principal | list repos, via `Store::repo_names`/`list_tags`         |
-| `/browse/<name>`                        | any principal | list tags for one repo, via `Store::list_tags`          |
-| `/browse/<name>/manifests/<reference>`  | any principal | manifest detail: layers, digests, sizes, download links |
-| `/upload` (GET form, POST multipart)    | session       | manual upload (see below) — not yet implemented         |
-| `/settings/keys`                        | session       | the caller's API keys — not yet implemented             |
+| Route                                  | Auth                              | Behavior                                        |
+|----------------------------------------|-----------------------------------|-------------------------------------------------|
+| `/browse`                              | any principal, scope-filtered     | list repos, via `Store::repo_names`/`list_tags` |
+| `/browse/<name>`                       | any principal, `Read` on `<name>` | list tags for one repo                          |
+| `/browse/<name>/manifests/<reference>` | any principal, `Read` on `<name>` | manifest detail: layers, digests, sizes, links  |
+| `/upload` (GET form, POST multipart)   | session                           | manual upload — not yet implemented             |
+| `/settings/keys`                       | session                           | the caller's API keys — not yet implemented     |
 
 `/browse` exists **only in accounts mode**: it is the one surface that *enumerates*
 repository names (there is no `/v2/_catalog` here), so a shared-secret server — where an
@@ -534,14 +559,18 @@ instead of content-addressing).
    until `mode = "accounts"` is set. `vk-registry/src/accounts.rs`, wired in
    `config.rs`/`lib.rs`.
 2. OIDC login/callback/logout (`oidc.rs`) + read-only `/browse`, gated by
-   session-read-all (no per-scope filtering yet).
-3. API key CRUD (`/settings/keys`) + `authorize()` enforcement on `/v2/*` write paths.
-   That enforcement presumes two things the write path establishes first: a blob is
-   stored only under a digest the server itself hashed the bytes to, and an upload
-   session can only be finished into the repository it was opened in — otherwise a
-   per-repo scope check on `POST .../uploads/` says nothing about where the blob lands.
-4. `/upload` (session-authed, writes through `Store` as a synthetic manifest+blob).
-5. Optional: a `request_log` table (who pushed/pulled what, when) for audit.
+   session-read-all.
+3. `authorize()` enforcement on every `/v2/*` branch (`lib.rs`'s
+   `authorize_or_forbidden`) and scope-filtering on `/browse`; API key CRUD
+   (`/settings/keys`) still to come. That enforcement presumes two things the write
+   path establishes first: a blob is stored only under a digest the server itself
+   hashed the bytes to, and an upload session can only be finished into the
+   repository it was opened in — otherwise a per-repo scope check on
+   `POST .../uploads/` says nothing about where the blob lands.
+4. `vk-registry accounts`, the CLI that grants admin and manages accounts and keys with
+   no HTTP route to do it through.
+5. `/upload` (session-authed, writes through `Store` as a synthetic manifest+blob).
+6. Optional: a `request_log` table (who pushed/pulled what, when) for audit.
 
 ## Deferred
 

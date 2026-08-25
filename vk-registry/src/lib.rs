@@ -996,14 +996,15 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
     // (200) makes the client assume no auth is needed and then 401 on the real blob
     // requests. Capability detection (transparent-zstd) authenticates its own `/v2/` probe.
     //
-    // Accounts mode resolves a `Principal` instead: any valid session or `vkr_…` API key
-    // is accepted for now, with per-scope enforcement arriving in the order DESIGN.md's
-    // "Accounts, OIDC, and scoped API keys" sets out.
-    let is_browse = path == "/browse" || path.starts_with("/browse/");
+    // Accounts mode resolves a `Principal` instead: authentication only here (is there
+    // *anyone* valid) — the `/v2/*` branches below each call `authorize_or_forbidden` once
+    // they know the repo name and whether the request reads or writes (see DESIGN.md's
+    // "Accounts, OIDC, and scoped API keys").
+    let is_browse = is_browse_path(&path);
     let principal = match &state.auth {
         Authenticator::Accounts { db, .. } => {
-            let resolved = accounts::resolve_principal(db, &req, state.cookies_are_secure())?;
-            if resolved.is_none() {
+            let Some(resolved) = accounts::resolve_principal(db, &req, state.cookies_are_secure())?
+            else {
                 // A browser on a human-facing page is sent to sign in and back to where
                 // it started; an API path (`/v2/*`, `/lock/*`) gets the 401 an OCI/CI
                 // client already knows how to react to.
@@ -1011,8 +1012,8 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
                     return Ok(redirect_to_login(&path));
                 }
                 return Ok(accounts::challenge());
-            }
-            resolved
+            };
+            Some(resolved)
         }
         Authenticator::Shared(auth) => {
             if auth.enabled() && !auth.allows(&req) {
@@ -1020,6 +1021,15 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
             }
             None
         }
+    };
+
+    // Derived from `state.auth`, not from whether a principal happens to be present: in
+    // accounts mode a missing one is refused above, and reading its absence as `NoScopes`
+    // here would be a path that silently skips every per-repo check.
+    let authz = match (&state.auth, &principal) {
+        (Authenticator::Accounts { .. }, Some(p)) => Authz::Accounts(p),
+        (Authenticator::Accounts { .. }, None) => return Ok(accounts::challenge()),
+        (Authenticator::Shared(_), _) => Authz::NoScopes,
     };
 
     if is_browse {
@@ -1124,6 +1134,9 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
                 name,
             ));
         }
+        if let Some(resp) = authorize_or_forbidden(&authz, accounts::Action::Write, name) {
+            return Ok(resp);
+        }
         return match method {
             Method::POST => start_upload(&store, name),
             Method::PATCH => {
@@ -1153,6 +1166,9 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
                 digest,
             ));
         }
+        if let Some(resp) = authorize_or_forbidden(&authz, accounts::Action::Read, name) {
+            return Ok(resp);
+        }
         let head = method == Method::HEAD;
         return match method {
             Method::GET | Method::HEAD => {
@@ -1181,6 +1197,14 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
                 "NAME_INVALID",
                 reference,
             ));
+        }
+        let action = if method == Method::PUT {
+            accounts::Action::Write
+        } else {
+            accounts::Action::Read
+        };
+        if let Some(resp) = authorize_or_forbidden(&authz, action, name) {
+            return Ok(resp);
         }
         return match method {
             Method::PUT => {
@@ -1214,6 +1238,9 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
     if let Some(name) = rest.strip_suffix("/tags/list")
         && valid_name(name)
     {
+        if let Some(resp) = authorize_or_forbidden(&authz, accounts::Action::Read, name) {
+            return Ok(resp);
+        }
         return list_tags(&store, name);
     }
 
@@ -1586,6 +1613,40 @@ pub(crate) fn unauthorized(challenge: &'static str, message: &str) -> Response<F
         hyper::header::HeaderValue::from_static(challenge),
     );
     response
+}
+
+/// Which authorization model this request is being served under — built from
+/// `ServerState::auth`, so "which model" is never inferred from whether a principal turned
+/// up. Passing this rather than an `Option<Principal>` keeps [`authorize_or_forbidden`]
+/// from having to read "no principal" as "allow"; in accounts mode a request without one
+/// is refused before this is built, and a future path that reached here without one is a
+/// refusal rather than a check silently skipped.
+enum Authz<'a> {
+    /// Shared-secret (or open) mode: the single gate at the top of `route` is the whole
+    /// authorization model, and there is nothing per-repo to check.
+    NoScopes,
+    Accounts(&'a accounts::Principal),
+}
+
+/// Enforce [`accounts::authorize`] for `action` on `name`. `Some(response)` ⇒ refuse and
+/// return it; `None` ⇒ the caller may proceed.
+fn authorize_or_forbidden(
+    authz: &Authz<'_>,
+    action: accounts::Action,
+    name: &str,
+) -> Option<Response<Full<Bytes>>> {
+    match authz {
+        Authz::NoScopes => None,
+        Authz::Accounts(p) if accounts::authorize(p, action, name) => None,
+        Authz::Accounts(_) => Some(accounts::forbidden()),
+    }
+}
+
+/// The paths a browser hits rather than an OCI/CI client — so an unauthenticated request
+/// there is sent to `/login` instead of getting the bare 401 `/v2/*`/`/lock/*` clients
+/// expect, and so shared-secret mode can refuse them outright.
+fn is_browse_path(path: &str) -> bool {
+    path == "/browse" || path.starts_with("/browse/")
 }
 
 /// Send an unauthenticated browser to `/login`, remembering `target` so it lands back

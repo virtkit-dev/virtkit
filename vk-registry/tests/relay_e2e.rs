@@ -814,7 +814,16 @@ async fn accounts_auth_gates_everything_including_the_probe() {
     let session = db
         .create_session(&user.id, std::time::Duration::from_secs(3600))
         .unwrap();
-    let (_, token) = db.create_api_key(Some(&user.id), "ci", &[], None).unwrap();
+    // `Write` on `app` — it satisfies `Read` too, so this one scope covers both the reads
+    // below and the push/pull round-trip at the end, while leaving every other repository
+    // outside the grant for the 403 case
+    let scope = vk_registry::accounts::Scope {
+        action: vk_registry::accounts::Action::Write,
+        repo_pattern: "app".to_string(),
+    };
+    let (_, token) = db
+        .create_api_key(Some(&user.id), "ci", std::slice::from_ref(&scope), None)
+        .unwrap();
     let (old, revoked_token) = db
         .create_api_key(Some(&user.id), "old ci", &[], None)
         .unwrap();
@@ -834,7 +843,8 @@ async fn accounts_auth_gates_everything_including_the_probe() {
         Some("Bearer realm=\"vk-registry\"")
     );
 
-    // an API key authenticates the probe and a protected route (404: the store is empty)
+    // an API key authenticates the probe and, within its scope, a protected route
+    // (404: the store is empty)
     let r = http
         .get(format!("{url}/v2/"))
         .bearer_auth(&token)
@@ -849,6 +859,15 @@ async fn accounts_auth_gates_everything_including_the_probe() {
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 404);
+    // outside its scope the same key is authenticated but not authorized — 403, and
+    // distinct from the 401 an unauthenticated caller gets
+    let r = http
+        .get(format!("{url}/v2/other/manifests/latest"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 403);
 
     // so does a session cookie, the browser half of the same gate. Under the name this
     // deployment writes: `public_url` is https, so the cookie is `__Host-` prefixed, and

@@ -1,0 +1,394 @@
+//! End-to-end accounts-mode test: a real server, real HTTP, seeded sessions/API keys
+//! (bypassing the OIDC network round-trip, which `oidc.rs`'s own tests already cover
+//! against a fake IdP) — proves the `Principal` → `authorize()` wiring actually gates
+//! `/v2/*` and `/browse` over the wire, not just as isolated unit calls.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use vk_registry::accounts::{Action, Db, Scope};
+use vk_registry::config::{AuthMode, OidcSpec};
+use vk_registry::{Authenticator, ServerConfig, ServerState};
+
+fn tmp(tag: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!(
+        "vk-registry-accounts-e2e-{tag}-{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&p);
+    p
+}
+
+fn spawn(state: Arc<ServerState>) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let l = tokio::net::TcpListener::from_std(listener).unwrap();
+            let _ = vk_registry::serve_on(l, state).await;
+        });
+    });
+    format!("http://{addr}")
+}
+
+fn no_redirect_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+}
+
+/// Accounts-mode state built the way `serve` builds it — see the identical helper in
+/// `relay_e2e.rs`. Discovery is deferred to the first login, so naming a provider costs
+/// no network.
+fn accounts_state(dir: &std::path::Path) -> Arc<ServerState> {
+    std::fs::create_dir_all(dir).unwrap();
+    let secret = dir.join("oidc-secret");
+    std::fs::write(&secret, "s3cr3t\n").unwrap();
+    let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), dir.join("store"));
+    cfg.mode = AuthMode::Accounts;
+    cfg.oidc = Some(OidcSpec {
+        issuer: "https://login.example.com".to_string(),
+        client_id: "vk-registry".to_string(),
+        client_secret_file: secret,
+        public_url: "https://registry.internal".to_string(),
+    });
+    Arc::new(cfg.into_state().expect("a valid accounts config starts"))
+}
+
+/// The accounts db that server opened, for seeding users and keys into.
+fn accounts_db(state: &ServerState) -> &Db {
+    match &state.auth {
+        Authenticator::Accounts { db, .. } => db,
+        _ => panic!("not accounts mode"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accounts_mode_gates_v2_and_browse_by_scope() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tmp("main");
+    let state = accounts_state(&dir);
+    let db = accounts_db(&state);
+
+    let admin = db
+        .upsert_user("https://issuer", "admin", None, None)
+        .unwrap();
+    db.set_admin(&admin.id, true).unwrap();
+    let admin_session = db
+        .create_session(&admin.id, Duration::from_secs(3600))
+        .unwrap();
+
+    let plain_user = db
+        .upsert_user("https://issuer", "plain", None, None)
+        .unwrap();
+    let plain_session = db
+        .create_session(&plain_user.id, Duration::from_secs(3600))
+        .unwrap();
+
+    let (_, team_a_key) = db
+        .create_api_key(
+            Some(&plain_user.id),
+            "ci",
+            &[Scope {
+                action: Action::Write,
+                repo_pattern: "team-a/*".to_string(),
+            }],
+            None,
+        )
+        .unwrap();
+
+    // a key that may only read, and only under team-a
+    let (_, read_only_key) = db
+        .create_api_key(
+            Some(&plain_user.id),
+            "ci-read",
+            &[Scope {
+                action: Action::Read,
+                repo_pattern: "team-a/*".to_string(),
+            }],
+            None,
+        )
+        .unwrap();
+
+    let url = spawn(state.clone());
+    let client = no_redirect_client();
+
+    // No credentials at all: /v2/ is the plain 401 an OCI client expects.
+    let resp = client.get(format!("{url}/v2/")).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // No credentials, a browser page: redirected to /login instead.
+    let resp = client.get(format!("{url}/browse")).send().await.unwrap();
+    assert_eq!(resp.status(), 302);
+    assert!(
+        resp.headers()["location"]
+            .to_str()
+            .unwrap()
+            .starts_with("/login?target=")
+    );
+
+    // Any signed-in session can read.
+    let resp = client
+        .get(format!("{url}/v2/team-a/app/tags/list"))
+        .header("Cookie", format!("__Host-vk_session={plain_session}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // A plain (non-admin) session cannot write.
+    let resp = client
+        .put(format!("{url}/v2/team-a/app/manifests/v1"))
+        .header("Cookie", format!("__Host-vk_session={plain_session}"))
+        .body(r#"{"schemaVersion":2,"config":{"digest":"sha256:00","size":0},"layers":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // An admin session can write anywhere.
+    let resp = client
+        .put(format!("{url}/v2/team-a/app/manifests/v1"))
+        .header("Cookie", format!("__Host-vk_session={admin_session}"))
+        .body(r#"{"schemaVersion":2,"config":{"digest":"sha256:00","size":0},"layers":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // A key scoped to team-a/* can push to team-a/... ...
+    let resp = client
+        .put(format!("{url}/v2/team-a/other/manifests/v1"))
+        .bearer_auth(&team_a_key)
+        .body(r#"{"schemaVersion":2,"config":{"digest":"sha256:00","size":0},"layers":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // ... but not to team-b/... .
+    let resp = client
+        .put(format!("{url}/v2/team-b/app/manifests/v1"))
+        .bearer_auth(&team_a_key)
+        .body(r#"{"schemaVersion":2,"config":{"digest":"sha256:00","size":0},"layers":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // A read-only key reads where it is scoped and writes nowhere: `Write` implies `Read`,
+    // never the other way round, and the route has to enforce the direction the matcher
+    // does.
+    let resp = client
+        .get(format!("{url}/v2/team-a/app/tags/list"))
+        .bearer_auth(&read_only_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .post(format!("{url}/v2/team-a/app/blobs/uploads/"))
+        .bearer_auth(&read_only_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "a read scope opens no upload session");
+    let resp = client
+        .put(format!("{url}/v2/team-a/app/manifests/v2"))
+        .bearer_auth(&read_only_key)
+        .body(r#"{"schemaVersion":2,"config":{"digest":"sha256:00","size":0},"layers":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "nor pushes a manifest");
+
+    // A tag listing is a per-repo read like any other: outside the scope it is refused,
+    // and refused before the store is consulted, so it is no existence oracle either.
+    let resp = client
+        .get(format!("{url}/v2/team-b/app/tags/list"))
+        .bearer_auth(&team_a_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let resp = client
+        .get(format!("{url}/v2/team-b/never-pushed/tags/list"))
+        .bearer_auth(&team_a_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "a repo that does not exist answers the same as one that does"
+    );
+
+    // A write scope also satisfies a read of the same repo.
+    let resp = client
+        .get(format!("{url}/v2/team-a/other/manifests/v1"))
+        .bearer_auth(&team_a_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // ... but still not a read of an out-of-scope repo.
+    let resp = client
+        .get(format!("{url}/v2/team-b/app/manifests/v1"))
+        .bearer_auth(&team_a_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // HEAD is the dedup probe a push leans on, and it takes the same read gate.
+    let resp = client
+        .head(format!("{url}/v2/team-b/app/manifests/v1"))
+        .bearer_auth(&team_a_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // The blob branches are gated too — starting an upload and reading a blob.
+    let resp = client
+        .post(format!("{url}/v2/team-b/app/blobs/uploads/"))
+        .bearer_auth(&team_a_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let resp = client
+        .post(format!("{url}/v2/team-a/app/blobs/uploads/"))
+        .bearer_auth(&team_a_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let absent = format!("sha256:{}", "0".repeat(64));
+    let resp = client
+        .get(format!("{url}/v2/team-b/app/blobs/{absent}"))
+        .bearer_auth(&team_a_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "denied before the store is consulted");
+    let resp = client
+        .get(format!("{url}/v2/team-a/app/blobs/{absent}"))
+        .bearer_auth(&team_a_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // An upload started in one repo cannot be finished in another.
+    let resp = client
+        .post(format!("{url}/v2/team-a/app/blobs/uploads/"))
+        .bearer_auth(&team_a_key)
+        .send()
+        .await
+        .unwrap();
+    let upload = resp.headers()["location"].to_str().unwrap().to_string();
+    let id = upload.rsplit('/').next().unwrap();
+    let body = b"layer bytes".to_vec();
+    let digest = format!(
+        "sha256:{}",
+        <sha2::Sha256 as sha2::Digest>::digest(&body)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    let resp = client
+        .put(format!(
+            "{url}/v2/team-b/app/blobs/uploads/{id}?digest={}",
+            digest.replace(':', "%3A")
+        ))
+        .bearer_auth(&team_a_key)
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "team-b is not this key's to write");
+
+    // ... and finishing it with a digest that is not the digest of the bytes is refused.
+    let resp = client
+        .put(format!(
+            "{url}/v2/team-a/app/blobs/uploads/{id}?digest={}",
+            absent.replace(':', "%3A")
+        ))
+        .bearer_auth(&team_a_key)
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    // Give team-b a repository to be excluded from, written by the admin session (the
+    // team-a key is refused there, as asserted above).
+    let resp = client
+        .put(format!("{url}/v2/team-b/app/manifests/v1"))
+        .header("Cookie", format!("__Host-vk_session={admin_session}"))
+        .body(r#"{"schemaVersion":2,"config":{"digest":"sha256:00","size":0},"layers":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // /browse shows a principal only what it may read, and an out-of-scope repo reads
+    // as absent rather than as forbidden.
+    let listing = client
+        .get(format!("{url}/browse"))
+        .bearer_auth(&team_a_key)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(listing.contains("team-a/app"), "{listing}");
+    assert!(!listing.contains("team-b"), "{listing}");
+    let resp = client
+        .get(format!("{url}/browse/team-b/app"))
+        .bearer_auth(&team_a_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    // the manifest page too — it is the one that reveals a repo's layer digests
+    let resp = client
+        .get(format!("{url}/browse/team-b/app/manifests/v1"))
+        .bearer_auth(&team_a_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "404, not 403: no existence oracle");
+
+    // and a plain session sees everything, because *any* session reads everything — this
+    // is the case that shows read-all is not gated on being an admin
+    let listing = client
+        .get(format!("{url}/browse"))
+        .header("Cookie", format!("__Host-vk_session={plain_session}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        listing.contains("team-a/app") && listing.contains("team-b"),
+        "{listing}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

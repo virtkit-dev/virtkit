@@ -4,9 +4,10 @@
 //! HTML, it does not re-serve content).
 //!
 //! Reached only in accounts mode and only with a resolved principal — `route`'s caller
-//! enforces both, and refuses the path outright in shared-secret mode: this is the one
-//! surface that *enumerates* repository names, so it is not something an unauthenticated
-//! client should be able to reach.
+//! enforces both, and refuses the path outright in shared-secret mode. This is the one
+//! surface that *enumerates* repository names, so on top of that gate every page here
+//! filters by [`crate::accounts::authorize`]: a principal sees only the repositories it
+//! may read, and one it may not read is answered as absent rather than as forbidden.
 //!
 //! Reference disambiguation reuses the OCI API's own marker instead of inventing one:
 //! `/browse/<name>` lists tags, `/browse/<name>/manifests/<reference>` is the detail
@@ -19,6 +20,7 @@ use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Response, StatusCode};
 
+use crate::accounts::{Action, authorize};
 use crate::{
     Store, accounts, html_escape, human_bytes, manifest_descriptors, valid_digest, valid_name,
     valid_reference,
@@ -61,9 +63,17 @@ fn repo_list(
     // Built from the repo directories and their tags, not from `Store::stats()`: stats
     // walks every blob and parses every manifest in the store under the shared store
     // lock, which is a whole-store scan per page load and contention against a `gc`.
-    // A listing needs the names and how many tags each has — which is still a bounded
-    // walk of `repos/` plus one `read_dir` per rendered row, hence [`MAX_ROWS`].
-    let mut repos = store.repo_names();
+    // A listing needs the names and how many tags each has — which is still a bounded walk
+    // of `repos/` plus one `read_dir` per rendered row, hence [`MAX_ROWS`].
+    //
+    // Filtered to what this principal may read: the listing is the only place a repository
+    // name is enumerated, so an API key scoped to one team must not learn the others exist
+    // from it. Filtered *before* the cap, so the cap counts rows the caller may see.
+    let mut repos: Vec<String> = store
+        .repo_names()
+        .into_iter()
+        .filter(|name| authorize(principal, Action::Read, name))
+        .collect();
     repos.sort();
     let total = repos.len();
     let mut rows = String::new();
@@ -106,7 +116,9 @@ fn tag_list(
     principal: &accounts::Principal,
     csrf: Option<&str>,
 ) -> Result<Response<Full<Bytes>>> {
-    if !valid_name(name) {
+    // Out of scope reads as absent, not as forbidden: a 403 would confirm the repository
+    // exists to someone who may not know that.
+    if !valid_name(name) || !authorize(principal, Action::Read, name) {
         return Ok(not_found(principal, csrf));
     }
     let tags = store.list_tags(name);
@@ -147,7 +159,8 @@ fn manifest_detail(
     principal: &accounts::Principal,
     csrf: Option<&str>,
 ) -> Result<Response<Full<Bytes>>> {
-    if !valid_name(name) || !valid_reference(reference) {
+    if !valid_name(name) || !valid_reference(reference) || !authorize(principal, Action::Read, name)
+    {
         return Ok(not_found(principal, csrf));
     }
     // Note that this bumps the tag's mtime, which is the "last used" record `Store::gc`
