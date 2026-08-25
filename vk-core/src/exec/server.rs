@@ -355,17 +355,30 @@ fn build_command(cmd: &CmdExec) -> Command {
         command.current_dir(dir);
     }
     // Drop to the requested user (per-command override) or the guest's default
-    // (the image's USER, exported as VIRTKIT_DEFAULT_RUN_USER by the microVM
-    // init). Unset/empty => keep running as the virtkit-agent user (root).
-    let run_as = cmd
-        .user
-        .clone()
-        .or_else(|| std::env::var("VIRTKIT_DEFAULT_RUN_USER").ok())
-        .filter(|u| !u.is_empty());
-    if let Some(user) = run_as {
+    // (the image's USER, exported as VIRTKIT_DEFAULT_RUN_USER by the microVM init).
+    if let Some(user) = run_as(
+        cmd.user.as_deref(),
+        std::env::var("VIRTKIT_DEFAULT_RUN_USER").ok(),
+    ) {
         apply_user(&mut command, cmd, &user);
     }
     command
+}
+
+/// Resolve which Unix user to drop to: the per-command override wins, otherwise the
+/// guest default. An empty name on either side means "keep the current user", so an
+/// explicit `Some("")` both skips the fallback and drops no privileges — the escape
+/// hatch a caller already running unprivileged needs, since `apply_user` would
+/// otherwise call `setgroups` and fail with EPERM even for its own uid.
+///
+/// The order matters: the override must be consulted before it is tested for
+/// emptiness, or an empty one would fall through to the default it is meant to
+/// suppress.
+fn run_as(requested: Option<&str>, default: Option<String>) -> Option<String> {
+    requested
+        .map(str::to_owned)
+        .or(default)
+        .filter(|u| !u.is_empty())
 }
 
 pub struct ResolvedUser {
@@ -1065,7 +1078,7 @@ async fn writer_task(
 mod tests {
     use super::{
         ExecWrapper, TaskState, apply_user, glob_match, inactivity_check_period, resolve_user,
-        split_user_group, wrap_cmd,
+        run_as, split_user_group, wrap_cmd,
     };
     use crate::messages::{CmdExec, RunMode};
     use std::path::PathBuf;
@@ -1125,6 +1138,24 @@ mod tests {
         // The `:group` half is dropped: USER/LOGNAME name the login user, not the spec.
         assert_eq!(env_val("USER"), Some(OsStr::new("root").to_owned()));
         assert_eq!(env_val("LOGNAME"), Some(OsStr::new("root").to_owned()));
+    }
+
+    #[test]
+    fn run_as_prefers_the_override_and_treats_empty_as_keep_current() {
+        let default = || Some("dev".to_string());
+        // A named override wins over the guest default.
+        assert_eq!(run_as(Some("nobody"), default()), Some("nobody".into()));
+        // No override falls back to the guest default.
+        assert_eq!(run_as(None, default()), Some("dev".into()));
+        // An empty override suppresses the fallback instead of deferring to it —
+        // the property vk-core/tests/exec.rs relies on to stay hermetic.
+        assert_eq!(run_as(Some(""), default()), None);
+        // Neither side set, and an empty default, both mean "keep the current user".
+        assert_eq!(run_as(None, None), None);
+        assert_eq!(run_as(None, Some(String::new())), None);
+        // With no default to fall back to, the override still decides on its own.
+        assert_eq!(run_as(Some("nobody"), None), Some("nobody".into()));
+        assert_eq!(run_as(Some(""), None), None);
     }
 
     fn sample_cmd() -> CmdExec {
