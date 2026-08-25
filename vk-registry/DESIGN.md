@@ -372,6 +372,19 @@ every repository:
   and refuses a mismatch, and an upload session records the repository it was opened for,
   so a caller cannot start an upload where it may write and finish it where it may not.
   Session ids carry a random tail for the same reason.
+- **A pusher does not choose what type this origin serves.** A manifest goes back out as
+  one of `MANIFEST_MEDIA_TYPES` and nothing else; the manifest, blob and error responses
+  set `nosniff`. Both candidate answers for the type — the `Content-Type` a pusher sent,
+  kept beside the manifest, and the one an upstream returned to the relay — are
+  caller-supplied, and this origin also serves `/browse` and `/settings/keys` and holds the
+  session cookie; a `/v2` response carries no CSP, so an unconstrained type there would let
+  anyone who may push serve a script from this origin. Anything outside the list is stored
+  and served as `DEFAULT_MANIFEST_TYPE`. The type is matched as a media type — parameters
+  dropped, case-insensitively — so a spec-legal spelling is recognised rather than
+  relabelled as a different *kind* of manifest, which a conforming client would refuse. A
+  relabel never changes the bytes a digest names: `put_manifest` verifies the digest
+  against the body before it writes, so a cached upstream manifest may carry a different
+  label than upstream sent but never different content.
 
 `mode` is a top-level config key, like the credentials it chooses between. An
 unrecognized key anywhere in the file, `[oidc]` included, is an error: a mistyped or

@@ -75,6 +75,11 @@ All notable changes to virtkit will be documented in this file.
 - An upload to `vk-registry` now stays in the repository it was started in, so it
   cannot be finished somewhere the client was not allowed to start one.
 
+- `vk-registry` no longer echoes back an arbitrary content type for a stored
+  manifest. It serves one of the four standard manifest types, whatever a client
+  or an upstream labelled it, so nobody who can push to a registry can get the
+  browser to treat stored bytes as a page from it.
+
 - `vk registry gc` and `vk-registry gc` no longer delete images that are still in
   use when part of the store is not readable, or holds something they did not
   write. They now name the offending path and stop, having deleted nothing; the

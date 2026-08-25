@@ -28,13 +28,14 @@ use crate::{
 /// Unique suffix source for a relay's staging temp file (per process).
 static RELAY_TMP: AtomicU64 = AtomicU64::new(0);
 
-/// Manifest media types we accept from upstream (OCI + Docker, image + index).
+/// Manifest media types we accept from upstream (OCI + Docker, image + index) — the same
+/// four as `crate::MANIFEST_MEDIA_TYPES`, which is what we will serve them as — a test
+/// holds the two together, because asking for a type we then relabel is the one drift that
+/// would go unnoticed.
 const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json,\
 application/vnd.docker.distribution.manifest.v2+json,\
 application/vnd.oci.image.index.v1+json,\
 application/vnd.docker.distribution.manifest.list.v2+json";
-
-const DEFAULT_MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
 /// A configured upstream registry this server mirrors.
 pub struct Upstream {
@@ -190,11 +191,15 @@ pub async fn get_manifest(
             reference,
         ));
     }
+    // Held to the same allowlist a locally stored manifest is: an upstream's
+    // `Content-Type` is no more trustworthy than a pusher's, and this response comes from
+    // the origin that serves `/browse` and holds the session cookie.
     let ctype = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or(DEFAULT_MANIFEST_TYPE)
+        .map(|t| crate::manifest_media_type(t))
+        .unwrap_or(crate::DEFAULT_MANIFEST_TYPE)
         .to_string();
     let up_digest = resp
         .headers()
@@ -226,6 +231,7 @@ pub async fn get_manifest(
     Response::builder()
         .status(StatusCode::OK)
         .header("Docker-Content-Digest", &digest)
+        .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(hyper::header::CONTENT_TYPE, &ctype)
         .header(hyper::header::CONTENT_LENGTH, body.len().to_string())
         .body(Full::new(Bytes::from(body.to_vec())))
@@ -326,6 +332,7 @@ fn blob_head_response(digest: &str, len: Option<u64>) -> Result<Response<Full<By
     let mut b = Response::builder()
         .status(StatusCode::OK)
         .header("Docker-Content-Digest", digest)
+        .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(hyper::header::CONTENT_TYPE, "application/octet-stream");
     if let Some(len) = len {
         b = b.header(hyper::header::CONTENT_LENGTH, len.to_string());
@@ -337,6 +344,7 @@ fn manifest_head_response(digest: &str, ctype: &str) -> Result<Response<Full<Byt
     Response::builder()
         .status(StatusCode::OK)
         .header("Docker-Content-Digest", digest)
+        .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(hyper::header::CONTENT_TYPE, ctype)
         .body(Full::new(Bytes::new()))
         .map_err(Into::into)
@@ -345,6 +353,19 @@ fn manifest_head_response(digest: &str, ctype: &str) -> Result<Response<Full<Byt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Asking upstream for a type we would then relabel is the one drift between these two
+    /// lists that nothing else would catch: the request succeeds, and every response of that
+    /// type is quietly served as something else. Compared as sets — the orders differ, and
+    /// the `Accept` order is a preference this does not constrain.
+    #[test]
+    fn the_accept_list_is_exactly_what_we_will_serve() {
+        let mut asked: Vec<&str> = MANIFEST_ACCEPT.split(',').collect();
+        let mut served: Vec<&str> = crate::MANIFEST_MEDIA_TYPES.to_vec();
+        asked.sort_unstable();
+        served.sort_unstable();
+        assert_eq!(asked, served);
+    }
 
     fn up(prefix: &str) -> Upstream {
         // reqwest (rustls-no-provider) needs a crypto provider before a client builds.

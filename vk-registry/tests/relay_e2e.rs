@@ -1139,3 +1139,147 @@ async fn browse_belongs_to_accounts_mode_and_redirects_a_signed_out_browser() {
     let _ = std::fs::remove_dir_all(&open_dir);
     let _ = std::fs::remove_dir_all(&acc_dir);
 }
+
+/// An upstream's `Content-Type` is as caller-supplied as a pusher's: the relay caches a
+/// digest-pinned manifest and then serves it from *this* origin — the one that serves
+/// `/browse` and holds the session cookie. Whatever the upstream labelled it, the mirror
+/// must answer one of the four manifest types, and must not let a browser sniff past that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relayed_manifests_content_type_is_held_to_a_manifest_type() {
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use hyper::body::Incoming;
+    use hyper::service::service_fn;
+    use hyper::{Request, Response};
+    use hyper_util::rt::TokioIo;
+    use sha2::{Digest, Sha256};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let manifest = br#"{"schemaVersion":2,"layers":[]}"#.to_vec();
+    let hex: String = Sha256::digest(&manifest)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mdigest = format!("sha256:{hex}");
+
+    // An upstream that labels a manifest `text/html` — a real one would not, which is the
+    // point: the mirror cannot depend on it not doing so.
+    let up_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    up_listener.set_nonblocking(true).unwrap();
+    let up_addr = up_listener.local_addr().unwrap();
+    {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let l = tokio::net::TcpListener::from_std(up_listener).unwrap();
+                loop {
+                    let Ok((stream, _)) = l.accept().await else {
+                        return;
+                    };
+                    let manifest = manifest.clone();
+                    tokio::spawn(async move {
+                        let svc = service_fn(move |_req: Request<Incoming>| {
+                            let manifest = manifest.clone();
+                            async move {
+                                Ok::<_, std::convert::Infallible>(
+                                    Response::builder()
+                                        .header("content-type", "text/html")
+                                        .body(Full::new(Bytes::from(manifest)))
+                                        .unwrap(),
+                                )
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), svc)
+                            .await;
+                    });
+                }
+            });
+        });
+    }
+
+    let dir = tmp("relay-ctype");
+    let mirror = Arc::new(ServerState {
+        store: Arc::new(Store::new(dir.clone()).unwrap()),
+        upstreams: vec![Upstream {
+            prefix: String::new(),
+            base: format!("http://{up_addr}"),
+            username: None,
+            password: None,
+            client: reqwest::Client::new(),
+        }],
+        locks: LockManager::new(),
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
+        tls: None,
+    });
+    let url = spawn(mirror);
+    let http = reqwest::Client::new();
+
+    let r = http
+        .get(format!("{url}/v2/app/manifests/{mdigest}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "got {}", r.status());
+    let ctype = r
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let nosniff = r
+        .headers()
+        .get("x-content-type-options")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    assert_ne!(
+        ctype, "text/html",
+        "an upstream cannot label this origin's bytes"
+    );
+    assert_eq!(ctype, "application/vnd.oci.image.manifest.v1+json");
+    assert_eq!(nosniff.as_deref(), Some("nosniff"));
+    assert_eq!(r.bytes().await.unwrap().as_ref(), &manifest[..]);
+
+    // and the cached copy is served the same way on the next request, from the store
+    let r = http
+        .get(format!("{url}/v2/app/manifests/{mdigest}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/vnd.oci.image.manifest.v1+json")
+    );
+
+    // A *tag* is relayed live and never persisted, so the header comes straight from the
+    // relay rather than from a stored sidecar — the one path the store's own filter cannot
+    // cover.
+    let r = http
+        .get(format!("{url}/v2/app/manifests/latest"))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "got {}", r.status());
+    assert_eq!(
+        r.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/vnd.oci.image.manifest.v1+json"),
+        "a relayed tag is held to a manifest type too"
+    );
+    assert_eq!(
+        r.headers()
+            .get("x-content-type-options")
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff")
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

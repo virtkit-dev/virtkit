@@ -102,6 +102,42 @@ impl ServerState {
 /// Default content type for a manifest whose Content-Type sidecar is missing.
 pub(crate) const DEFAULT_MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
+/// The media types a stored manifest may be *served* as.
+///
+/// The Content-Type a pusher sends is kept beside the manifest and handed back on a read,
+/// and an upstream's is handed back by the relay — both caller-supplied strings, labelling
+/// a response from the origin that also serves `/browse` and `/settings/keys` and holds the
+/// session cookie. Anyone who may write one repository could therefore have stored bytes
+/// served as `text/html` from this origin, which is a script on it. Serving only these four
+/// keeps that shut; anything else is served as [`DEFAULT_MANIFEST_TYPE`], and the manifest,
+/// blob and error responses set `nosniff`. `relay::MANIFEST_ACCEPT` asks upstream for exactly
+/// this set, and a test holds the two together.
+pub(crate) const MANIFEST_MEDIA_TYPES: &[&str] = &[
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+];
+
+/// Which of [`MANIFEST_MEDIA_TYPES`] a caller-supplied `Content-Type` is, else
+/// [`DEFAULT_MANIFEST_TYPE`].
+///
+/// A media type is matched the way HTTP defines one, not by string equality: parameters are
+/// dropped (`…index.v1+json; charset=utf-8` is that index) and the comparison is
+/// ASCII-case-insensitive. Exact equality would relabel a spec-legal variant as a
+/// *different kind* of manifest — an index served as an image manifest — and the
+/// distribution spec tells a client to reject a manifest whose `Content-Type` disagrees
+/// with the `mediaType` in its body, so that would turn a lenient push into an unpullable
+/// image. The return is always one of the four literals, so the stored label is canonical.
+pub(crate) fn manifest_media_type(ctype: &str) -> &'static str {
+    let base = ctype.split(';').next().unwrap_or("").trim();
+    MANIFEST_MEDIA_TYPES
+        .iter()
+        .find(|t| t.eq_ignore_ascii_case(base))
+        .copied()
+        .unwrap_or(DEFAULT_MANIFEST_TYPE)
+}
+
 /// Fixed zstd level: identical raw chunks must compress to identical bytes for a
 /// compressed-digest chunk to dedup. Shared by the client push path (registry.rs),
 /// the transparent-zstd upload, and this store's adaptive storage compression.
@@ -310,7 +346,14 @@ impl Store {
         } else {
             atomic_write(&dest, body)?;
         }
-        atomic_write(&self.manifest_type_path(name, hex), ctype.as_bytes())?;
+        // Normalized on the way in as well as on the way out. Not because the two could
+        // otherwise disagree — every reader goes through `get_manifest`, which filters too —
+        // but so a caller-supplied string is never what is persisted, and so a future reader
+        // that skips the filter still cannot serve one.
+        atomic_write(
+            &self.manifest_type_path(name, hex),
+            manifest_media_type(ctype).as_bytes(),
+        )?;
         if !reference.starts_with("sha256:") {
             atomic_write(&self.tag_path(name, reference), digest.as_bytes())?;
         }
@@ -344,9 +387,13 @@ impl Store {
         let Ok(data) = std::fs::read(self.blob_path(hex)) else {
             return Ok(None);
         };
+        // Also filtered on read: a sidecar written before this rule existed still holds
+        // whatever it was pushed as.
         let ctype = std::fs::read_to_string(self.manifest_type_path(name, hex))
+            .ok()
             .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| DEFAULT_MANIFEST_TYPE.to_string());
+            .map(|t| manifest_media_type(&t).to_string())
+            .unwrap_or_else(|| DEFAULT_MANIFEST_TYPE.to_string());
         Ok(Some((digest, data, ctype)))
     }
 
@@ -1494,6 +1541,7 @@ pub(crate) fn get_blob(
     let builder = Response::builder()
         .status(StatusCode::OK)
         .header("Docker-Content-Digest", digest)
+        .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(hyper::header::CONTENT_TYPE, "application/octet-stream");
 
     // serve the stored frame as-is; the client decodes it back to canonical. The
@@ -1595,6 +1643,7 @@ pub(crate) fn get_manifest(
     Response::builder()
         .status(StatusCode::OK)
         .header("Docker-Content-Digest", &digest)
+        .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(hyper::header::CONTENT_TYPE, &ctype)
         .header(hyper::header::CONTENT_LENGTH, len.to_string())
         .body(Full::new(if head {
@@ -1641,6 +1690,9 @@ pub(crate) fn error_response(
     Response::builder()
         .status(status)
         .header(hyper::header::CONTENT_TYPE, "application/json")
+        // `message` echoes caller-supplied bytes (a path, a reference) on every `/v2` error,
+        // from the origin that also serves `/browse`; one header here covers all of them.
+        .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(Full::new(Bytes::from(body)))
         .expect("building an error response")
 }
@@ -3630,6 +3682,81 @@ mod tests {
         assert!(valid_reference("20260627-abc"));
         assert!(!valid_reference("../x"));
         assert!(!valid_reference("a/b"));
+    }
+
+    /// A manifest's Content-Type comes from whoever pushed it, and comes back out of `/v2`
+    /// on this origin — the one that serves `/browse` and holds the session cookie. Anyone
+    /// who may push must not be able to have stored bytes labelled `text/html`.
+    #[test]
+    fn a_manifest_is_served_only_as_a_manifest_type() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-mtype-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        // A standard type is kept as pushed.
+        let index_type = "application/vnd.oci.image.index.v1+json";
+        let good = br#"{"schemaVersion":2,"manifests":[]}"#;
+        let digest = store
+            .put_manifest("team-a/app", "v1", index_type, good)
+            .unwrap();
+        let (_, _, ctype) = store.get_manifest("team-a/app", "v1").unwrap().unwrap();
+        assert_eq!(ctype, index_type);
+
+        // A different body, so this one's sidecar is its own file rather than the one above.
+        let evil = br#"{"schemaVersion":2,"layers":[]}"#;
+        let evil_digest = store
+            .put_manifest("team-a/app", "evil", "text/html", evil)
+            .unwrap();
+        let evil_hex = evil_digest.trim_start_matches("sha256:");
+        // On disk, checked directly: a caller-supplied string is never what is persisted,
+        // which the read filter below cannot tell us.
+        assert_eq!(
+            std::fs::read_to_string(store.manifest_type_path("team-a/app", evil_hex))
+                .unwrap()
+                .trim(),
+            DEFAULT_MANIFEST_TYPE
+        );
+        let (_, _, ctype) = store.get_manifest("team-a/app", "evil").unwrap().unwrap();
+        assert_eq!(ctype, DEFAULT_MANIFEST_TYPE);
+
+        // And on read, so a sidecar written before this rule — or by anything that skips
+        // the write filter — is covered too.
+        let hex = digest.trim_start_matches("sha256:");
+        std::fs::write(store.manifest_type_path("team-a/app", hex), "text/html").unwrap();
+        let (_, _, ctype) = store.get_manifest("team-a/app", "v1").unwrap().unwrap();
+        assert_eq!(ctype, DEFAULT_MANIFEST_TYPE);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A media type is not a string: parameters and case are part of how HTTP spells one,
+    /// and treating a spec-legal variant as unrecognized would relabel an index as an image
+    /// manifest — a manifest the distribution spec tells a client to reject.
+    #[test]
+    fn a_manifest_media_type_is_matched_as_a_media_type() {
+        let index = "application/vnd.oci.image.index.v1+json";
+        for spelling in [
+            index,
+            "application/vnd.oci.image.index.v1+json; charset=utf-8",
+            "APPLICATION/VND.OCI.IMAGE.INDEX.V1+JSON",
+            "  application/vnd.oci.image.index.v1+json  ",
+        ] {
+            assert_eq!(manifest_media_type(spelling), index, "{spelling}");
+        }
+        // and everything else is the default, whatever it tries
+        for bad in [
+            "text/html",
+            "text/html; x=application/vnd.oci.image.index.v1+json",
+            "application/vnd.oci.image.index.v1+json.evil",
+            "",
+            ";",
+        ] {
+            assert_eq!(manifest_media_type(bad), DEFAULT_MANIFEST_TYPE, "{bad}");
+        }
+        // every listed type maps to itself, so a stored label is always canonical
+        for t in MANIFEST_MEDIA_TYPES {
+            assert_eq!(manifest_media_type(t), *t);
+        }
     }
 
     #[test]
