@@ -4,14 +4,24 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `vk-registry` can be configured with `mode = "accounts"` to authenticate each
+  request as a particular person, or as a named, scoped, revocable API key,
+  instead of as whoever holds the one shared secret. Accounts live in an
+  owner-only directory under the store (`accounts_db` to put the file
+  elsewhere); the file holds no password and no usable copy of any key or
+  session.
+
 ### Changed
 
-- `vk-registry` now refuses to start on a config file containing a setting it
-  does not recognise — at the top level or inside an `[[upstream]]` — instead of
-  ignoring it. Every setting in that file bears on how the server authenticates
-  its clients or reaches its upstreams, so one dropped in silence means serving
-  with less authentication than the file asks for. `serve`, `status`, `gc` and
-  `install-service` all read the file, so all four report the bad setting.
+- `vk-registry` now refuses to start on a config file it does not fully
+  understand — a setting it does not recognise, at the top level or inside an
+  `[[upstream]]`, and an authentication setting the chosen mode would ignore.
+  Any of them used to be dropped in silence, which for a misspelt `mode` meant
+  serving with the authentication the file was written to replace. `serve`,
+  `status`, `gc` and `install-service` all read the file, so all four report
+  the bad setting.
 
 ## [0.42.0] - 2026-08-25
 

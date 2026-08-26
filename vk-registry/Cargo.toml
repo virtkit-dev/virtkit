@@ -37,6 +37,8 @@ sha2.workspace = true
 zstd.workspace = true
 libc.workspace = true
 futures.workspace = true
+redb.workspace = true
+rand.workspace = true
 
 [target.'cfg(target_env = "musl")'.dependencies]
 jemallocator.workspace = true

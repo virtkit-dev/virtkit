@@ -2,10 +2,11 @@
 //! auth.
 //!
 //! The listen address and store root usually come from the CLI; the TOML config file
-//! carries the relay `[[upstream]]` entries, the TLS cert/key, and the auth credentials
-//! (and may name addr/root, for the flags that were not passed). No upstreams ⇒ a plain
-//! local registry; no TLS ⇒ plain HTTP; no auth ⇒ open. A central, network-exposed
-//! deployment sets all three.
+//! carries the relay `[[upstream]]` entries, the TLS cert/key, and the client-auth model
+//! — `mode` plus either the shared-secret credentials or `accounts_db` (and may name
+//! addr/root, for the flags that were not passed). No upstreams ⇒ a plain local registry;
+//! no TLS ⇒ plain HTTP; no auth ⇒ open. A central, network-exposed deployment sets all
+//! three.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -17,10 +18,23 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use tokio_rustls::TlsAcceptor;
 
+use crate::accounts;
 use crate::auth::Auth;
 use crate::lock::LockManager;
 use crate::relay::Upstream;
 use crate::{ServerState, Store};
+
+/// The client-auth model for the whole server — mutually exclusive, chosen once at
+/// startup. See `DESIGN.md`'s "Accounts, OIDC, and scoped API keys".
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum AuthMode {
+    /// One shared secret for every client (`token_file`/`username`+`password_file`),
+    /// or none — today's model.
+    #[default]
+    SharedSecret,
+    /// Per-user OIDC sessions + per-key scoped API keys, backed by an `accounts::Db`.
+    Accounts,
+}
 
 /// Resolved server configuration, ready to turn into a [`ServerState`] (+ a TLS acceptor).
 pub struct ServerConfig {
@@ -34,6 +48,10 @@ pub struct ServerConfig {
     /// HTTP Basic username (+ `password_file`); an alternative to `token_file`.
     pub username: Option<String>,
     pub password_file: Option<PathBuf>,
+    pub mode: AuthMode,
+    /// Where the accounts db lives, in `mode = "accounts"`. Defaults to
+    /// `<root>/accounts/accounts.db` when unset.
+    pub accounts_db: Option<PathBuf>,
 }
 
 /// What a config file states about the server it would start, as stated — see
@@ -56,10 +74,10 @@ pub struct UpstreamSpec {
     pub ca_file: Option<PathBuf>,
 }
 
-/// `deny_unknown_fields` is load-bearing, not tidiness: every key here selects how the
-/// server authenticates its clients or reaches its upstreams, so a misspelt one being
-/// dropped in silence means serving with less authentication than the file asks for — a
-/// mistyped `token_file` leaves the registry open. An unknown key is an error instead.
+/// `deny_unknown_fields` is load-bearing, not tidiness: `mode` selects the auth model,
+/// so a misspelt or misplaced key (`[auth] mode = ...`, say) silently starting the server
+/// in shared-secret mode would hand the operator the very auth they believed they had
+/// replaced. An unknown key is an error instead.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
@@ -70,13 +88,17 @@ struct FileConfig {
     token_file: Option<PathBuf>,
     username: Option<String>,
     password_file: Option<PathBuf>,
+    /// `"shared-secret"` (default) or `"accounts"` — a top-level key, like the
+    /// credentials it chooses between.
+    mode: Option<String>,
+    accounts_db: Option<PathBuf>,
     #[serde(default)]
     upstream: Vec<FileUpstream>,
 }
 
-/// `deny_unknown_fields` for the same reason as on [`FileConfig`], against the same kind of
-/// mistake: a misspelt `username`/`password_file` here leaves the relay fetching from the
-/// upstream unauthenticated rather than saying so.
+/// `deny_unknown_fields` here for the same reason as on [`FileConfig`], applied to the
+/// same kind of mistake: a misspelt `username`/`password_file` would leave the relay
+/// fetching from the upstream unauthenticated rather than say so.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileUpstream {
@@ -105,6 +127,8 @@ impl ServerConfig {
             token_file: None,
             username: None,
             password_file: None,
+            mode: AuthMode::SharedSecret,
+            accounts_db: None,
         }
     }
 
@@ -168,6 +192,20 @@ impl ServerConfig {
                 ca_file: u.ca_file,
             })
             .collect();
+        let mode = match f.mode.as_deref() {
+            None | Some("shared-secret") => AuthMode::SharedSecret,
+            Some("accounts") => AuthMode::Accounts,
+            Some(other) => {
+                bail!("unknown auth mode {other:?} (expected \"shared-secret\" or \"accounts\")")
+            }
+        };
+        // The mirror of `build_auth`'s check, and the more dangerous direction: nothing
+        // reads `accounts_db` in shared-secret mode, so a file that configures one with
+        // `mode` forgotten would start wide open — the same silent auth downgrade
+        // `deny_unknown_fields` above exists to prevent, reached through a key spelt right.
+        if f.accounts_db.is_some() && mode != AuthMode::Accounts {
+            bail!("accounts_db is set but mode is not \"accounts\", so it would be ignored");
+        }
         Ok(ServerConfig {
             addr,
             root,
@@ -177,6 +215,8 @@ impl ServerConfig {
             token_file: f.token_file,
             username: f.username,
             password_file: f.password_file,
+            mode,
+            accounts_db: f.accounts_db,
         })
     }
 
@@ -199,11 +239,22 @@ impl ServerConfig {
     }
 
     /// The client-auth scheme: a bearer token file takes precedence, else Basic from a
-    /// username + password file, else open.
+    /// username + password file, else open. `mode = "accounts"` replaces this scheme
+    /// entirely (see `route`'s auth gate), so it is an error to also configure one.
     fn build_auth(&self) -> Result<Auth> {
         if self.token_file.is_some() && self.username.as_ref().is_some_and(|u| !u.is_empty()) {
             bail!(
                 "configure either token_file or username/password_file for client auth, not both"
+            );
+        }
+        if self.mode == AuthMode::Accounts
+            && (self.token_file.is_some()
+                || self.password_file.is_some()
+                || self.username.as_ref().is_some_and(|u| !u.is_empty()))
+        {
+            bail!(
+                "mode = \"accounts\" is mutually exclusive with \
+                 token_file/username/password_file — configure accounts_db instead"
             );
         }
         if let Some(tf) = &self.token_file {
@@ -234,20 +285,41 @@ impl ServerConfig {
     }
 
     /// Build the shared runtime state: open the store, build each upstream's HTTP client
-    /// (reading its password file), the lock manager, and the auth scheme. TLS is set
-    /// separately by the serve path.
+    /// (reading its password file), the lock manager, and the auth scheme (or the
+    /// accounts db, in `mode = "accounts"`). TLS is set separately by the serve path.
     pub fn into_state(self) -> Result<ServerState> {
         let auth = self.build_auth()?;
         // Auth over plain HTTP on a routable address would put the bearer token / Basic
-        // password on the wire in cleartext; refuse it rather than silently expose creds.
-        if auth.enabled() && self.tls_cert.is_none() && !self.addr.ip().is_loopback() {
+        // password (or, in accounts mode, a session cookie / API key) on the wire in
+        // cleartext; refuse it rather than silently expose creds.
+        let creds_in_play = auth.enabled() || self.mode == AuthMode::Accounts;
+        if creds_in_play && self.tls_cert.is_none() && !self.addr.ip().is_loopback() {
             bail!(
                 "client auth is enabled without TLS on non-loopback address {} — credentials \
                  would be sent in cleartext; set tls_cert/tls_key or bind a loopback address",
                 self.addr
             );
         }
+        // `Store::new` first: the store owns the root, so it is the one that gets to
+        // create it — `Db::open` would otherwise bring it into being as a side effect of
+        // making room for the db file under it.
+        //
+        // A directory of its own, not the root itself: `Store::new` creates the root with
+        // `create_dir_all`, so its mode is the ambient umask's to decide, and on the common
+        // 002 that leaves it group-writable — which lets a group member rename the db aside
+        // and plant one naming themselves admin, `0600` on the file notwithstanding. The
+        // subdirectory is one `Db::open` creates itself, at 0700 whatever the umask.
+        let db_path = self
+            .accounts_db
+            .clone()
+            .unwrap_or_else(|| self.root.join("accounts").join("accounts.db"));
         let store = Arc::new(Store::new(self.root)?);
+        let auth = match self.mode {
+            AuthMode::SharedSecret => crate::Authenticator::Shared(auth),
+            AuthMode::Accounts => {
+                crate::Authenticator::Accounts(Arc::new(accounts::Db::open(&db_path)?))
+            }
+        };
         let upstreams = self
             .upstreams
             .into_iter()
@@ -488,6 +560,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The auth model is chosen by one key, so each way of getting that key wrong has to
+    /// be an error rather than a quiet fall back to shared-secret auth.
+    #[test]
+    fn the_auth_mode_is_parsed_and_every_wrong_way_to_write_it_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+
+        // the default, and the one alternative
+        let bare = write("bare.toml", "root = \"/srv/reg\"\n");
+        assert_eq!(
+            ServerConfig::load(&bare, None, None).unwrap().mode,
+            AuthMode::SharedSecret
+        );
+        let accounts = write(
+            "accounts.toml",
+            "root = \"/srv/reg\"\nmode = \"accounts\"\n",
+        );
+        let cfg = ServerConfig::load(&accounts, None, None).unwrap();
+        assert_eq!(cfg.mode, AuthMode::Accounts);
+        // and the db defaults to a directory of its own under the store it guards
+        assert_eq!(cfg.accounts_db, None);
+
+        // an unknown mode names the two that exist rather than picking one
+        let load_err = |p: &Path| {
+            ServerConfig::load(p, None, None)
+                .map(|_| ())
+                .unwrap_err()
+                .to_string()
+        };
+        let bad = write("bad.toml", "mode = \"oidc\"\n");
+        let err = load_err(&bad);
+        assert!(err.contains("unknown auth mode"), "{err}");
+
+        // the shape `DESIGN.md` used to suggest: a table, not a top-level key. Dropping it
+        // silently would start the server in the mode the operator meant to replace.
+        let table = write("table.toml", "[auth]\nmode = \"accounts\"\n");
+        assert!(!load_err(&table).is_empty());
+        let typo = write("typo.toml", "moed = \"accounts\"\n");
+        assert!(!load_err(&typo).is_empty());
+        // a key spelt right but unread: nothing consumes `accounts_db` in shared-secret
+        // mode, so a file that sets one with `mode` forgotten would serve wide open
+        let orphan = write("orphan.toml", "accounts_db = \"/srv/reg/a.db\"\n");
+        let err = load_err(&orphan);
+        assert!(err.contains("mode is not"), "{err}");
+    }
+
     /// A key the file spells wrong is a key the server does not apply, and every key here
     /// is about how it authenticates — so it has to be an error rather than a default.
     #[test]
@@ -526,6 +650,55 @@ mod tests {
         let cfg = ServerConfig::load(&good, None, None).unwrap();
         assert_eq!(cfg.token_file, Some(PathBuf::from("/etc/t")));
         assert_eq!(cfg.upstreams.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Accounts mode replaces the shared secret rather than layering on it, and it carries
+    /// credentials, so the two guards that mode implies have to hold.
+    #[test]
+    fn accounts_mode_refuses_a_shared_secret_beside_it_and_cleartext_under_it() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-amode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), dir.join("store"));
+        cfg.mode = AuthMode::Accounts;
+        cfg.token_file = Some(PathBuf::from("/etc/vk-registry/token"));
+        let err = cfg.build_auth().map(|_| ()).unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+
+        let mut cfg = ServerConfig::local("0.0.0.0:5000".parse().unwrap(), dir.join("store"));
+        cfg.mode = AuthMode::Accounts;
+        let err = cfg.into_state().map(|_| ()).unwrap_err().to_string();
+        assert!(err.contains("cleartext"), "{err}");
+
+        // on loopback it is allowed, and the db lands in a directory of its own under the
+        // store — one `Db::open` makes at 0700 rather than the umask-dependent root
+        let root = dir.join("store");
+        let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), root.clone());
+        cfg.mode = AuthMode::Accounts;
+        let state = cfg.into_state().unwrap();
+        assert!(matches!(state.auth, crate::Authenticator::Accounts(_)));
+        assert!(root.join("accounts").join("accounts.db").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(root.join("accounts"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "the accounts dir: {mode:o}");
+        }
+        drop(state);
+
+        // and a configured path is honoured instead
+        let elsewhere = dir.join("elsewhere").join("ours.db");
+        let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), dir.join("store-two"));
+        cfg.mode = AuthMode::Accounts;
+        cfg.accounts_db = Some(elsewhere.clone());
+        drop(cfg.into_state().unwrap());
+        assert!(elsewhere.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

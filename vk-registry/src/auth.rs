@@ -7,7 +7,7 @@
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::body::Incoming;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Request, Response};
 
 /// The configured authentication scheme.
 #[derive(Clone, Default)]
@@ -50,18 +50,11 @@ impl Auth {
 
     /// The 401 challenge to return for an unauthenticated protected request.
     pub fn challenge(&self) -> Response<Full<Bytes>> {
-        let scheme = match self {
+        let challenge = match self {
             Auth::Basic { .. } => "Basic realm=\"vk-registry\"",
             _ => "Bearer realm=\"vk-registry\"",
         };
-        Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .header(hyper::header::WWW_AUTHENTICATE, scheme)
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .body(Full::new(Bytes::from_static(
-                br#"{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}"#,
-            )))
-            .expect("building the auth challenge")
+        crate::unauthorized(challenge, "authentication required")
     }
 }
 
@@ -86,7 +79,7 @@ fn constant_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Minimal standard-alphabet base64 decode (for the Basic credentials); `None` on any
 /// invalid input. Handles optional `=` padding.
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),

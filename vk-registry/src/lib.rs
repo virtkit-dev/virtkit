@@ -38,6 +38,7 @@ use hyper_util::rt::TokioIo;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
+pub mod accounts;
 pub mod auth;
 pub mod client;
 pub mod config;
@@ -47,6 +48,17 @@ pub mod relay;
 pub use client::{ClientAuth, FailInfo, Held, LockClient};
 pub use config::{DEFAULT_ADDR, ServerConfig};
 
+/// The client-auth model in force, resolved once at startup from [`config::AuthMode`].
+/// One field rather than a shared-secret/accounts pair, so "one or the other, never both"
+/// is what the type says instead of what a comment promises.
+pub enum Authenticator {
+    /// One shared secret for every client (`token_file`/`username`+`password_file`), or
+    /// none at all.
+    Shared(auth::Auth),
+    /// Per-user sessions and scoped API keys — see [`accounts::resolve_principal`].
+    Accounts(Arc<accounts::Db>),
+}
+
 /// Everything a connection handler needs: the content-addressed store, the relay
 /// upstreams (empty ⇒ a plain local registry, no mirroring), the build-once lock
 /// authority, the client-auth scheme, and the optional TLS acceptor. Cheap to
@@ -55,7 +67,7 @@ pub struct ServerState {
     pub store: Arc<Store>,
     pub upstreams: Vec<relay::Upstream>,
     pub locks: lock::LockManager,
-    pub auth: auth::Auth,
+    pub auth: Authenticator,
     pub tls: Option<tokio_rustls::TlsAcceptor>,
 }
 
@@ -765,13 +777,26 @@ async fn handle(
 }
 
 async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
-    // Client auth (when configured) on every path, including the `/v2/` version probe.
-    // Returning 401 + WWW-Authenticate on `/v2/` is exactly how OCI clients discover they
-    // must authenticate (oci_client's store_auth_if_needed probes `/v2/`): leaving it open
+    // Client auth on every path, including the `/v2/` version probe. Returning 401 +
+    // WWW-Authenticate on `/v2/` is exactly how OCI clients discover they must
+    // authenticate (oci_client's store_auth_if_needed probes `/v2/`): leaving it open
     // (200) makes the client assume no auth is needed and then 401 on the real blob
     // requests. Capability detection (transparent-zstd) authenticates its own `/v2/` probe.
-    if state.auth.enabled() && !state.auth.allows(&req) {
-        return Ok(state.auth.challenge());
+    //
+    // Accounts mode resolves a `Principal` instead: any valid session or `vkr_…` API key
+    // is accepted for now, with per-scope enforcement arriving in the order DESIGN.md's
+    // "Accounts, OIDC, and scoped API keys" sets out.
+    match &state.auth {
+        Authenticator::Accounts(db) => {
+            if accounts::resolve_principal(db, &req)?.is_none() {
+                return Ok(accounts::challenge());
+            }
+        }
+        Authenticator::Shared(auth) => {
+            if auth.enabled() && !auth.allows(&req) {
+                return Ok(auth.challenge());
+            }
+        }
     }
 
     // The build-once lock API lives under `/lock/<action>` (all POST), outside the
@@ -1206,6 +1231,19 @@ pub(crate) fn error_response(
         .expect("building an error response")
 }
 
+/// The 401 an unauthenticated protected request gets. `challenge` is the whole
+/// `WWW-Authenticate` value, and it is load-bearing rather than decoration: an OCI client
+/// that probes `/v2/` and gets a 401 without it concludes no credential is wanted and then
+/// fails on the real blob requests (see `route`'s auth gate).
+pub(crate) fn unauthorized(challenge: &'static str, message: &str) -> Response<Full<Bytes>> {
+    let mut response = error_response(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", message);
+    response.headers_mut().insert(
+        hyper::header::WWW_AUTHENTICATE,
+        hyper::header::HeaderValue::from_static(challenge),
+    );
+    response
+}
+
 /// Collect a request body fully into memory. Bodies here are bounded by the
 /// client's chunk size (≤ one FastCDC chunk, ≤16 MiB) plus small manifests.
 async fn collect(req: Request<Incoming>) -> Result<Bytes> {
@@ -1276,14 +1314,23 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Warn when an open file is reachable in a way it should not be — `forbidden` is the mode
-/// bits that must be clear (`0o077` for "owner only", `0o022` for "nobody else may write").
+/// Warn when `path` is reachable in a way it should not be — `forbidden` is the mode bits
+/// that must be clear (`0o077` for "owner only", `0o022` for "nobody else may write").
 /// A warning, not an error: the operator may have a reason, and refusing to start would be
 /// a worse answer than saying so.
 ///
-/// Off the descriptor rather than the path, because the caller is opening the file anyway:
-/// checking the path and then opening it resolves it twice, and the file described would
-/// not have to be the file opened.
+/// For a file that is about to be opened anyway, prefer [`warn_if_file_mode`]: this
+/// resolves the path a second time, so the mode it reports is not necessarily the file the
+/// caller goes on to open.
+#[cfg(unix)]
+pub(crate) fn warn_if_mode(path: &Path, forbidden: u32, what: &str, advice: &str) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        warn_mode(&meta, path, forbidden, what, advice);
+    }
+}
+
+/// [`warn_if_mode`] against an open descriptor — one path resolution, so the mode reported
+/// is the file that got opened.
 #[cfg(unix)]
 pub(crate) fn warn_if_file_mode(
     file: &std::fs::File,
@@ -1292,10 +1339,15 @@ pub(crate) fn warn_if_file_mode(
     what: &str,
     advice: &str,
 ) {
+    if let Ok(meta) = file.metadata() {
+        warn_mode(&meta, path, forbidden, what, advice);
+    }
+}
+
+#[cfg(unix)]
+fn warn_mode(meta: &std::fs::Metadata, path: &Path, forbidden: u32, what: &str, advice: &str) {
     use std::os::unix::fs::PermissionsExt;
-    let Ok(mode) = file.metadata().map(|m| m.permissions().mode()) else {
-        return;
-    };
+    let mode = meta.permissions().mode();
     if mode & forbidden != 0 {
         eprintln!(
             "vk-registry: warning: {what} {} has mode {:o}; {advice}",
@@ -1304,6 +1356,9 @@ pub(crate) fn warn_if_file_mode(
         );
     }
 }
+
+#[cfg(not(unix))]
+pub(crate) fn warn_if_mode(_path: &Path, _forbidden: u32, _what: &str, _advice: &str) {}
 
 #[cfg(not(unix))]
 pub(crate) fn warn_if_file_mode(

@@ -251,9 +251,180 @@ Each step is one concern, independently buildable.
 11. **Ship.** `build.sh`/`release.yml`/`.gitlab-ci.yml` build + sign the third
     reproducible binary; README + AGENTS.md architecture section.
 
+## Accounts, OIDC, and scoped API keys
+
+Today's auth (`auth.rs`) is one shared secret for the whole server, checked before any
+route dispatch — fine for a handful of trusted CI runners, not enough once humans need to
+browse/upload through a UI and CI needs per-pipeline, revocable, scoped credentials. This
+section adds accounts on top **without changing the content store or the existing
+OCI/`lock` wire protocol** — `push`/`pull`/`inspect` against a shared-secret or
+account-issued token behave identically, and the CAS layout is untouched (the root gains
+one sibling directory for the accounts db); only *who is authorized for what* becomes
+richer.
+
+### New state: an embedded identity store alongside the CAS store
+
+The store stays 100% filesystem (§ above). Everything identity-related — users, sessions,
+API keys — goes in a new **`redb`** file, `<root>/accounts/accounts.db`. It gets a
+directory of its own because `Db::open` creates that one `0700` itself, whereas the store
+root's mode is whatever the ambient umask left (`002` is common), and a directory a group
+member can write to lets them rename the db aside and plant one naming themselves admin —
+`0600` on the file does not help.
+
+**Not sqlite**: a bundled sqlite (`rusqlite`, `features = ["bundled"]`) does not *link*
+under this project's musl cross-toolchain — `libsqlite3-sys`'s vendored `sqlite3.c` calls
+the LFS64 symbols (`open64`, `stat64`, `fstat64`, `ftruncate64`, `fcntl64`, `pread64`,
+`pwrite64`, `mmap64`, `lstat64`) directly, and this repo's `gcc`-as-musl-cc setup
+(`.cargo/config.toml`) doesn't expose them the way a real musl cross-compiler's headers
+would. `redb` is pure Rust (no C, no cc-rs build script), so it needs none of that and
+links clean. This is the one new piece of infrastructure; content, GC, and locking are
+untouched.
+
+Three tables of JSON-blob rows (`vk-registry/src/accounts.rs`), keyed by stable strings
+instead of an autoincrement id — `redb` has no natural `last_insert_rowid`, and stable
+keys turn out to be available for free:
+
+```
+users     : "{oidc_issuer}\x1f{oidc_subject}" -> {email, display_name, is_admin, created_at, last_login_at}
+sessions  : sha256(session_id) hex            -> {user_key, csrf_secret, created_at, expires_at}
+api_keys  : sha256(bearer_token) hex          -> {owner_user_key, name, token_prefix, scopes,
+                                                   created_at, expires_at, last_used_at, revoked_at}
+```
+
+Neither credential is stored in a replayable form: a session row is keyed by the *hash*
+of its cookie value and an API key row by the hash of its bearer token, so a reader of the
+db file holds nothing it can present to the server. A user's id *is* its OIDC identity
+(issuer+subject need no separate index, and `\x1f` is what makes the pair unambiguous, so
+an issuer or subject containing a control character is rejected on the way in); an API
+key's id *is* its token hash (already irreversible, so it doubles as a safe-to-display
+identifier for revoke calls — no separate id needed either, though a revoke is still
+checked against the key's owner, since an id shown in a listing is not authority over it).
+`scopes` = `[{"action":"read"|"write","repo_pattern":"team-a/*"}]`; `repo_pattern` matches
+the same `<name>` used in `/v2/<name>/...` and `repos/<name>` on disk — no new naming
+concept, and a pattern that could match no such name is refused when the key is made. A
+key's secret is never stored: only its hash (the row's key) and `token_prefix` (the first
+8 chars of the token's *random half* — not of the token, whose first 4 are the constant
+`vkr_` — for identifying a key in a listing without showing enough of it to be usable).
+`list_api_keys(owner)` is a linear scan over `api_keys` filtering by
+`owner_user_key` — fine at this data's expected scale (one team/org's users and keys, not
+a hot path), and it avoids needing a secondary owner→keys index.
+
+### Principal + authz
+
+A request resolves to at most one principal, cookie and bearer header being mutually
+exclusive (bearer present ⇒ ignore any cookie):
+
+```rust
+enum Principal { Session(User), ApiKey(ApiKey) }
+fn authorize(principal: &Principal, action: Read | Write, repo: &str) -> bool
+```
+
+Every `/v2/*` handler gains this check in place of today's global gate. `/lock/*` does
+**not**: a scope is `(action, repo_pattern)` and a lock name is an arbitrary build-once key,
+not a repository, so there is nothing for a pattern to match. The lock API stays gated on
+being an authenticated principal at all — which means any key, however narrowly scoped, can
+take and hold locks.
+Session principals: any authenticated user gets **read-all**; **write** requires
+`is_admin` or an explicit key (a human uploading through the browser still goes through an
+API-key-shaped grant, just session-authenticated — see manual upload below). API-key
+principals: hash the presented token, look up `api_keys`, reject if `revoked_at` is set or
+`expires_at` has passed, then match `action`/`repo` against `scopes`; on success bump
+`last_used_at`.
+
+Credential lookup is on the request path, so it runs in a read transaction. An API key
+lookup's only write is a `last_used_at` bump, coarse enough (a minute) that a push does not
+pay an fsync per chunk and committed with `Durability::Eventual` — still a real commit,
+just without the final barrier, because losing the last-seen time to a crash costs nothing.
+A session found expired is deleted by the lookup that found it, which is one durable write
+per dead cookie; a session someone comes back to is therefore reclaimed, one simply
+abandoned is not, and a periodic sweep is deferred.
+
+`authorize()`'s scope enforcement lands with the routes that need it (step 3 below); until
+then an accounts-mode server accepts any resolved principal for anything, the same coarse
+shape as the shared-secret mode it replaces.
+
+`mode` is a top-level config key, like the credentials it chooses between, and an
+unrecognized key in the file is an error — a mistyped or misplaced `mode` must not start
+the server in the auth model the operator meant to replace. The existing shared-secret
+`Auth` stays as `mode = "shared-secret"` (the default), mutually exclusive with
+`mode = "accounts"` — cheap to keep, and useful for solo/dev use and for
+bootstrapping the first admin before OIDC is reachable.
+
+### OIDC login
+
+`openidconnect` (pure Rust, pluggable HTTP client — reuses the existing `reqwest`+`rustls`
+stack already linked for TLS and the relay). Routes, config shape, and the
+state-nonce/target-passthrough flow mirror idaas's `assetserver` (`auth.go`), with three
+deliberate fixes over that implementation:
+
+- session cookie is `Secure` + `HttpOnly` + `SameSite=Lax` (assetserver sets none of the
+  last two);
+- a real per-session CSRF token guards state-changing forms — upload, key create/revoke
+  (assetserver wires a CSRF key through config but never uses it);
+- session expiry is decided once, at creation, and is not extended by use — assetserver's
+  `LastUpdate` is set once and never renewed either, but there it is a bug rather than a
+  choice; here a bounded absolute lifetime is the point, and it costs no per-request write.
+
+```toml
+[oidc]
+issuer        = "https://login.example.com/app/…"
+client_id     = "vk-registry"
+client_secret_file = "/etc/vk-registry/oidc-secret"
+public_url    = "https://registry.internal"
+```
+
+Routes: `/login`, `/auth/callback`, `/logout` (RP-initiated, same `end_session_endpoint`
+discovery trick as assetserver). Identity is claims-based (`sub`, `email`) — a `users` row
+is upserted on first login, not pre-provisioned.
+
+### HTTP surface: browse, download, manual upload
+
+New routes alongside the existing `/v2/` and `/lock/` prefixes in `route()`:
+
+| Route                                | Auth    | Behavior                                                               |
+|--------------------------------------|---------|------------------------------------------------------------------------|
+| `/browse`                            | session | list repos — walks `repos/` (mirrors `Store::repo_dirs`)               |
+| `/browse/<repo>`                     | session | list tags/manifests for one repo, filtered to what the caller can read |
+| `/browse/<repo>/<ref>`               | session | manifest detail: layers, digests, sizes, download links                |
+| `/upload` (GET form, POST multipart) | session | manual upload (see below)                                              |
+| `/settings/keys`                     | session | list/create/revoke the caller's API keys                               |
+
+Actual bytes are **not** re-served by new code: browse/download links point at the
+existing `/v2/<name>/blobs/<digest>` and `/v2/<name>/manifests/<ref>` GETs, now gated by
+`authorize()` instead of the global secret. `/browse` listings filter out repos the caller
+can't read rather than 403ing the whole page (the one assetserver pattern worth copying
+directly — `RegisterDirEndpoints` in `assetserver.go`).
+
+**Manual upload shares the dedup store natively**: a file dropped through `/upload` is
+turned into one blob (`Store::put_blob`, digest = sha256 of the file) plus a small
+single-layer manifest (`Store::put_manifest`, a generic media type such as
+`application/vnd.virtkit.raw-file`) tagged with the given `name:tag` — exactly the shape a
+CI `push` produces. A human-uploaded artifact is therefore pullable by `vk registry pull`
+with no special-casing, and a duplicate upload of already-known bytes costs no new disk —
+this is the point of routing it through `Store` instead of a parallel raw-file tree like
+assetserver's (which stores every upload as its own file, no dedup, reject-on-name-clash
+instead of content-addressing).
+
+### Implementation order
+
+1. `redb`-backed `users`/`sessions`/`api_keys` + `Principal` resolution, behaviour-neutral
+   until `mode = "accounts"` is set. `vk-registry/src/accounts.rs`, wired in
+   `config.rs`/`lib.rs`.
+2. OIDC login/callback/logout + read-only `/browse`, gated by session-read-all.
+3. API key CRUD (`/settings/keys`) + `authorize()` enforcement on `/v2/*` write paths.
+4. `/upload` (session-authed, writes through `Store` as a synthetic manifest+blob).
+5. Optional: a `request_log` table (who pushed/pulled what, when) for audit.
+
 ## Deferred
 
 - Size-capped LRU eviction for the relay cache.
 - Aligning `task`/virtkit chunk boundaries for a shared dedup pool.
 - Multi-replica `vk-registry` (would reintroduce an external lock backend — Redis/etcd —
-  behind the same lock API).
+  behind the same lock API). The accounts `redb` file is single-writer for the same
+  reason; a multi-replica accounts story needs this resolved together with locking.
+- A periodic sweep of expired sessions. A session presented again is dropped by the lookup
+  that finds it stale; one abandoned without a further request is not, so the table grows
+  with logins that are never returned to.
+- Per-user custom scopes beyond `is_admin` (e.g. a non-admin user with a *scoped* session,
+  not just all-or-nothing read-all) — start simple, revisit if a real need shows up.
+- Audit log (`request_log`) — noted above as optional, not required for v1.

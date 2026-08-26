@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use vk_registry::lock::LockManager;
 use vk_registry::relay::Upstream;
-use vk_registry::{ServerState, Store};
+use vk_registry::{ServerState, Store, accounts};
 
 fn tmp(tag: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!(
@@ -64,7 +64,7 @@ async fn relay_caches_digest_not_tag() {
         store: Arc::new(up_store),
         upstreams: vec![],
         locks: LockManager::new(),
-        auth: vk_registry::auth::Auth::None,
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
     });
     let up_url = spawn(up_state);
@@ -82,7 +82,7 @@ async fn relay_caches_digest_not_tag() {
             client: reqwest::Client::new(),
         }],
         locks: LockManager::new(),
-        auth: vk_registry::auth::Auth::None,
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
     });
     let mirror_url = spawn(mirror_state);
@@ -153,7 +153,7 @@ async fn multi_lock_is_atomic_all_or_nothing() {
         store: Arc::new(Store::new(dir.clone()).unwrap()),
         upstreams: vec![],
         locks: LockManager::new(),
-        auth: vk_registry::auth::Auth::None,
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
     });
     let url = spawn(state);
@@ -223,10 +223,10 @@ async fn lock_client_authenticates_with_basic() {
         store: Arc::new(Store::new(dir.clone()).unwrap()),
         upstreams: vec![],
         locks: LockManager::new(),
-        auth: vk_registry::auth::Auth::Basic {
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::Basic {
             user: "u".into(),
             pass: "p".into(),
-        },
+        }),
         tls: None,
     });
     let url = spawn(state);
@@ -265,9 +265,9 @@ async fn lock_client_authenticates_with_bearer() {
         store: Arc::new(Store::new(dir.clone()).unwrap()),
         upstreams: vec![],
         locks: LockManager::new(),
-        auth: vk_registry::auth::Auth::Bearer {
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::Bearer {
             token: "s3cret".into(),
-        },
+        }),
         tls: None,
     });
     let url = spawn(state);
@@ -304,7 +304,7 @@ async fn lock_client_round_trips_against_the_server() {
         store: Arc::new(Store::new(dir.clone()).unwrap()),
         upstreams: vec![],
         locks: LockManager::new(),
-        auth: vk_registry::auth::Auth::None,
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
     });
     let url = spawn(state);
@@ -368,9 +368,9 @@ async fn bearer_auth_gates_everything_including_the_probe() {
         store: Arc::new(Store::new(dir.clone()).unwrap()),
         upstreams: vec![],
         locks: LockManager::new(),
-        auth: vk_registry::auth::Auth::Bearer {
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::Bearer {
             token: "s3cret".to_string(),
-        },
+        }),
         tls: None,
     });
     let url = spawn(state);
@@ -449,10 +449,10 @@ async fn basic_auth_gates_and_challenges() {
         store: Arc::new(Store::new(dir.clone()).unwrap()),
         upstreams: vec![],
         locks: LockManager::new(),
-        auth: vk_registry::auth::Auth::Basic {
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::Basic {
             user: "u".to_string(),
             pass: "p".to_string(),
-        },
+        }),
         tls: None,
     });
     let url = spawn(state);
@@ -666,7 +666,7 @@ async fn relay_does_not_leak_upstream_credentials_to_the_client() {
             client: reqwest::Client::new(),
         }],
         locks: LockManager::new(),
-        auth: vk_registry::auth::Auth::None,
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
     });
     let mirror_url = spawn(mirror_state);
@@ -707,7 +707,7 @@ async fn lock_api_build_once_over_http() {
         store: Arc::new(Store::new(dir.clone()).unwrap()),
         upstreams: vec![],
         locks: LockManager::new(),
-        auth: vk_registry::auth::Auth::None,
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
     });
     let url = spawn(state);
@@ -766,6 +766,143 @@ async fn lock_api_build_once_over_http() {
         .await
         .unwrap();
     assert!(r.status().is_success());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Accounts mode's half of the gate above: `route` swaps the shared secret for a resolved
+/// principal, so the same three properties have to hold against an `accounts::Db` — the
+/// `/v2/` probe challenges (with `WWW-Authenticate`, or an OCI client never sends a
+/// credential at all), a `vkr_…` key is accepted, and a stale one is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accounts_auth_gates_everything_including_the_probe() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tmp("accounts");
+    // `Store::new` first, then the db under it, exactly as `into_state` does it
+    let store = Arc::new(Store::new(dir.clone()).unwrap());
+    let db = accounts::Db::open(&dir.join("accounts").join("accounts.db")).unwrap();
+    let user = db
+        .upsert_user("https://issuer", "sub-1", Some("a@example.com"), None)
+        .unwrap();
+    let session = db
+        .create_session(&user.id, std::time::Duration::from_secs(3600))
+        .unwrap();
+    let (_, token) = db.create_api_key(Some(&user.id), "ci", &[], None).unwrap();
+    let (old, revoked_token) = db
+        .create_api_key(Some(&user.id), "old ci", &[], None)
+        .unwrap();
+    assert!(db.revoke_api_key(&user.id, &old.id).unwrap());
+
+    let state = Arc::new(ServerState {
+        store,
+        upstreams: vec![],
+        locks: LockManager::new(),
+        auth: vk_registry::Authenticator::Accounts(Arc::new(db)),
+        tls: None,
+    });
+    let url = spawn(state);
+    let http = reqwest::Client::new();
+
+    // no credential: the probe challenges, and it says how — an OCI client that gets a
+    // bare 401 here concludes no auth is wanted and never presents anything.
+    let r = http.get(format!("{url}/v2/")).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    assert_eq!(
+        r.headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer realm=\"vk-registry\"")
+    );
+
+    // an API key authenticates the probe and a protected route (404: the store is empty)
+    let r = http
+        .get(format!("{url}/v2/"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "got {}", r.status());
+    let r = http
+        .get(format!("{url}/v2/app/manifests/latest"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 404);
+
+    // so does a session cookie, the browser half of the same gate
+    let r = http
+        .get(format!("{url}/v2/"))
+        .header("cookie", format!("vk_session={session}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "got {}", r.status());
+
+    // the shared secret is not a credential here, and neither is a made-up or revoked key
+    for bad in ["s3cret", "vkr_deadbeef", revoked_token.as_str()] {
+        let r = http
+            .get(format!("{url}/v2/"))
+            .bearer_auth(bad)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 401, "{bad} must not authenticate");
+    }
+
+    // the lock API and the write path are behind the same gate
+    for r in [
+        http.post(format!("{url}/lock/acquire?name=k&wait=0"))
+            .send()
+            .await
+            .unwrap(),
+        http.post(format!("{url}/v2/app/blobs/uploads/"))
+            .send()
+            .await
+            .unwrap(),
+    ] {
+        assert_eq!(r.status().as_u16(), 401);
+    }
+
+    // and the whole point: an authenticated client can push a blob and read it back. The
+    // gate resolves a principal per request, so a push is several separately authenticated
+    // requests, not one authenticated session.
+    let body = b"accounts-mode blob";
+    let hex: String = <sha2::Sha256 as sha2::Digest>::digest(body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let digest = format!("sha256:{hex}");
+    let r = http
+        .post(format!("{url}/v2/app/blobs/uploads/"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 202, "opening an upload");
+    let location = r
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .expect("an upload session has a Location")
+        .to_string();
+    // the key presented the way an OCI client would have to send it, as Basic credentials
+    let r = http
+        .put(format!("{url}{location}?digest={digest}"))
+        .basic_auth("unused", Some(&token))
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 201, "finishing the upload");
+    let r = http
+        .get(format!("{url}/v2/app/blobs/{digest}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "got {}", r.status());
+    assert_eq!(r.bytes().await.unwrap().as_ref(), body);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

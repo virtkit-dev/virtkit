@@ -138,6 +138,10 @@ tokio-vsock = "0.7"
 rmp-serde = "1"
 # musl builds use jemalloc instead of the default musl allocator (same approach as ripgrep)
 jemallocator = "0.5"
+# vk-registry accounts.rs: an embedded users/sessions/API-keys store, alongside the
+# filesystem CAS store. Pure Rust, so the binary stays musl-static — see
+# vk-registry/DESIGN.md for why not a bundled sqlite.
+redb = "2"
 # `vk build` live progress dashboard: a multi-line, in-place-updating overview that is
 # robust across terminals and multiplexers (tmux/zellij). Pure Rust (console uses libc
 # termios, no C lib), so the musl-static build is unaffected.
