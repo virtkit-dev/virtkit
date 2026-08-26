@@ -1276,6 +1276,45 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Warn when an open file is reachable in a way it should not be — `forbidden` is the mode
+/// bits that must be clear (`0o077` for "owner only", `0o022` for "nobody else may write").
+/// A warning, not an error: the operator may have a reason, and refusing to start would be
+/// a worse answer than saying so.
+///
+/// Off the descriptor rather than the path, because the caller is opening the file anyway:
+/// checking the path and then opening it resolves it twice, and the file described would
+/// not have to be the file opened.
+#[cfg(unix)]
+pub(crate) fn warn_if_file_mode(
+    file: &std::fs::File,
+    path: &Path,
+    forbidden: u32,
+    what: &str,
+    advice: &str,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(mode) = file.metadata().map(|m| m.permissions().mode()) else {
+        return;
+    };
+    if mode & forbidden != 0 {
+        eprintln!(
+            "vk-registry: warning: {what} {} has mode {:o}; {advice}",
+            path.display(),
+            mode & 0o7777
+        );
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn warn_if_file_mode(
+    _file: &std::fs::File,
+    _path: &Path,
+    _forbidden: u32,
+    _what: &str,
+    _advice: &str,
+) {
+}
+
 /// Lowercase hex of a byte slice.
 pub(crate) fn hex_of(bytes: &[u8]) -> String {
     use std::fmt::Write;

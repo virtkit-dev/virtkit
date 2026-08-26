@@ -309,23 +309,15 @@ fn load_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'stat
 }
 
 fn load_key(path: &Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(path) {
-            let mode = meta.permissions().mode();
-            if mode & 0o077 != 0 {
-                eprintln!(
-                    "vk-registry: warning: TLS private key {} is group/world-accessible \
-                     (mode {:o}); restrict it to 0600",
-                    path.display(),
-                    mode & 0o7777
-                );
-            }
-        }
-    }
-    let mut r =
-        BufReader::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    crate::warn_if_file_mode(
+        &file,
+        path,
+        0o077,
+        "TLS private key",
+        "it is group/world-accessible — restrict it to 0600",
+    );
+    let mut r = BufReader::new(file);
     use rustls::pki_types::pem::PemObject;
     rustls::pki_types::PrivateKeyDer::from_pem_reader(&mut r)
         .with_context(|| format!("reading a private key from {}", path.display()))
