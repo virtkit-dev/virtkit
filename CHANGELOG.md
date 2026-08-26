@@ -36,6 +36,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- `vk-registry` now checks that a pushed layer or manifest really is the content
+  its digest names, and refuses the push when it is not. A client can no longer
+  claim a piece of content it did not send.
+
 - `vk registry gc` and `vk-registry gc` no longer delete images that are still in
   use when part of the store is not readable, or holds something they did not
   write. They now name the offending path and stop, having deleted nothing; the

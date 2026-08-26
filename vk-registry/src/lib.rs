@@ -242,8 +242,8 @@ impl Store {
         Ok(format!("sha256:{hex}"))
     }
 
-    /// [`Store::put_blob`] under an already-known digest hex — the HTTP push path,
-    /// where the client's digest is trusted (see `finish_upload`).
+    /// [`Store::put_blob`] under an already-known digest hex — the HTTP push path, where
+    /// `finish_upload` has already hashed `raw` and checked it against `hex`.
     fn put_blob_at(&self, hex: &str, raw: &[u8]) -> Result<()> {
         if !self.has_blob(hex) {
             let z = zstd_with_size(raw)?;
@@ -284,6 +284,14 @@ impl Store {
             bail!("invalid manifest reference {name}:{reference}");
         }
         let digest = format!("sha256:{}", sha256_hex_raw(body));
+        // A digest reference is a claim about the body, so it is checked rather than
+        // ignored. Storing under the *computed* digest instead would answer 201 for a
+        // manifest the client cannot then fetch under the reference it pushed, and would
+        // persist content it never asked to store. Before any write, so a refusal leaves
+        // nothing behind — the relay's upstream-manifest caching depends on that too.
+        if reference.starts_with("sha256:") && reference != digest {
+            bail!("manifest body hashes to {digest}, not the requested {reference}");
+        }
         let hex = &digest[7..];
         let dest = self.blob_path(hex);
         if dest.exists() {
@@ -1274,6 +1282,35 @@ fn finish_upload(
         f.write_all(body).context("appending the final chunk")?;
     }
 
+    // Check the digest against the canonical bytes before anything is promoted: the store
+    // is content-addressed, so a blob filed under a digest it does not hash to is a lie
+    // every later pull repeats. A zstd upload is hashed by streaming its decode
+    // ([`hash_zstd_frame`]) rather than reading the canonical form into memory — the frame
+    // is client-controlled and expands without bound, so materialising it is a one-request
+    // memory exhaustion. A raw upload *is* its canonical form, so it is read once and
+    // reused for the adaptive store below.
+    let mut raw: Option<Vec<u8>> = None;
+    let hashed = if body_is_zstd {
+        hash_zstd_frame(&upload)?.map(|(hex, _)| hex)
+    } else {
+        let bytes =
+            std::fs::read(&upload).with_context(|| format!("reading {}", upload.display()))?;
+        let hex = sha256_hex_raw(&bytes);
+        raw = Some(bytes);
+        Some(hex)
+    };
+    // A frame this server will not store, or bytes that hash to something else: either way
+    // the client's request is wrong, not this server, so it is a 400 rather than a 500 —
+    // and the session goes, so a retry cannot append onto a body already found bad.
+    if hashed.as_deref() != Some(hex.as_str()) {
+        let _ = std::fs::remove_file(&upload);
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            &format!("the uploaded bytes are not a storable frame hashing to {digest}"),
+        ));
+    }
+
     // already stored (either form)? idempotent — drop the upload.
     if store.has_blob(&hex) {
         let _ = std::fs::remove_file(&upload);
@@ -1285,9 +1322,7 @@ fn finish_upload(
     } else {
         // raw canonical bytes: put_blob_at compresses adaptively (compressed form
         // only if it actually shrinks — a compressed-digest chunk stays identity).
-        let raw =
-            std::fs::read(&upload).with_context(|| format!("reading {}", upload.display()))?;
-        store.put_blob_at(&hex, &raw)?;
+        store.put_blob_at(&hex, raw.as_deref().unwrap_or_default())?;
         let _ = std::fs::remove_file(&upload);
     }
 
@@ -1392,6 +1427,15 @@ fn put_manifest(
 ) -> Result<Response<Full<Bytes>>> {
     // shared store lock for the write (vs. an exclusive gc); see lock_shared.
     let _lock = store.lock_shared()?;
+    // A digest reference that does not match the body is the client's error, not this
+    // server's, so it is the spec's 400 rather than `handle`'s JSON 500.
+    if reference.starts_with("sha256:") && reference != format!("sha256:{}", sha256_hex_raw(body)) {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            &format!("the manifest body does not hash to {reference}"),
+        ));
+    }
     let digest = store.put_manifest(name, reference, ctype, body)?;
     Response::builder()
         .status(StatusCode::CREATED)
@@ -1549,6 +1593,63 @@ fn header_has(req: &Request<Incoming>, name: hyper::header::HeaderName, needle: 
         .is_some_and(|v| v.contains(needle))
 }
 
+/// Ceiling on the canonical (decompressed) size of a *pushed* blob. A zstd frame is a
+/// client-controlled input that expands without bound — tens of KiB of zeros become tens
+/// of GB — so the push path will not decompress one that does not declare a size up front,
+/// and will not read past the size it declared. Far above any real layer.
+const MAX_CANONICAL_BLOB: u64 = 64 << 30;
+
+/// `(sha256 hex, byte count)` of a zstd frame's decompressed content, or `None` if the
+/// frame is not one this server will store.
+///
+/// The content is streamed through the hasher, never materialised: it is the digest that
+/// is wanted, and the bytes stored are the frame itself. Refused unless the header declares
+/// a content size within [`MAX_CANONICAL_BLOB`] *and* the decode produces exactly that many
+/// bytes — the header is what a later `HEAD` answers `Content-Length` from (see
+/// [`zstd_canonical_len`]), so a frame whose header and body disagree, or a concatenation
+/// of frames whose first header speaks only for itself, would make `HEAD` and `GET`
+/// contradict each other about a blob this server had certified.
+fn hash_zstd_frame(path: &Path) -> Result<Option<(String, u64)>> {
+    use std::io::Read;
+
+    let mut f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut head = Vec::with_capacity(ZSTD_HEADER_MAX);
+    f.by_ref()
+        .take(ZSTD_HEADER_MAX as u64)
+        .read_to_end(&mut head)
+        .with_context(|| format!("reading the zstd header of {}", path.display()))?;
+    let Some(declared) = zstd_frame_len(&head).filter(|n| *n <= MAX_CANONICAL_BLOB) else {
+        return Ok(None);
+    };
+    std::io::Seek::rewind(&mut f).with_context(|| format!("rewinding {}", path.display()))?;
+
+    // Multi-frame, like the `decode_all` the read path serves with, so `total` counts what
+    // a reader would actually get.
+    let mut dec = zstd::stream::read::Decoder::new(std::io::BufReader::new(f))
+        .context("starting a zstd decode")?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        // A malformed frame is invalid client input, not a server fault: `None`, not `Err`.
+        let Ok(n) = dec.read(&mut buf) else {
+            return Ok(None);
+        };
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > declared {
+            return Ok(None);
+        }
+        hasher.update(buf.get(..n).unwrap_or_default());
+    }
+    if total != declared {
+        return Ok(None);
+    }
+    Ok(Some((hex_of(&hasher.finalize()), total)))
+}
+
 /// The decompressed length of a zstd frame, read from its header (no full decode);
 /// `None` if the frame doesn't record it (see [`zstd_with_size`]).
 fn zstd_frame_len(frame: &[u8]) -> Option<u64> {
@@ -1698,10 +1799,15 @@ pub(crate) fn valid_name(name: &str) -> bool {
         })
 }
 
-/// `sha256:<64 lowercase hex>`.
+/// `sha256:<64 lowercase hex>` — lowercase as the spec mandates, and as
+/// [`sha256_hex_raw`] produces, so a digest that passes here is one the store can
+/// actually compare against and find.
 fn valid_digest(d: &str) -> bool {
-    d.strip_prefix("sha256:")
-        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+    d.strip_prefix("sha256:").is_some_and(|h| {
+        h.len() == 64
+            && h.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    })
 }
 
 /// A manifest reference: a digest, or a single safe tag component. Shared with
@@ -2552,6 +2658,197 @@ mod tests {
             store.list_tags("../escape-target").is_empty(),
             "a traversing name must never be joined into a store path"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The store is content-addressed and shared by every repository, so a digest a
+    /// client names has to be the digest of what it sent.
+    #[test]
+    fn finishing_an_upload_verifies_the_clients_digest() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-updig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let lie = format!("sha256:{}", "0".repeat(64));
+
+        let res = start_upload(&store, "team-a/app").unwrap();
+        let location = res.headers().get("Location").unwrap().to_str().unwrap();
+        let id = location.rsplit('/').next().unwrap().to_string();
+        let refused = finish_upload(
+            &store,
+            "team-a/app",
+            &id,
+            &format!("digest={}", percent_encode(&lie)),
+            b"not those bytes",
+            false,
+        )
+        .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert!(store.find_blob(&"0".repeat(64)).is_none());
+
+        // the truthful push still works
+        let body = b"the real bytes";
+        let digest = format!("sha256:{}", sha256_hex_raw(body));
+        let res = start_upload(&store, "team-a/app").unwrap();
+        let location = res.headers().get("Location").unwrap().to_str().unwrap();
+        let id = location.rsplit('/').next().unwrap().to_string();
+        let ok = finish_upload(
+            &store,
+            "team-a/app",
+            &id,
+            &format!("digest={}", percent_encode(&digest)),
+            body,
+            false,
+        )
+        .unwrap();
+        assert_eq!(ok.status(), StatusCode::CREATED);
+        assert!(store.has_blob(&sha256_hex_raw(body)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A transparent-zstd push stores the frame it was sent, verbatim, and only after
+    /// checking that the frame decompresses to the digest claimed for it. The frame is
+    /// client-controlled and expands without bound, so it is verified by streaming — never
+    /// by materialising the canonical bytes — and a frame whose declared content size does
+    /// not match what it actually produces is refused, because that size is what a later
+    /// `HEAD` answers with.
+    #[test]
+    fn a_zstd_push_is_verified_by_streaming_and_stored_verbatim() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-zpush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let raw = vec![3u8; 80_000];
+        let frame = zstd_with_size(&raw).unwrap();
+        let digest = format!("sha256:{}", sha256_hex_raw(&raw));
+
+        // an honest frame: verified, then renamed into the zstd store as-is
+        std::fs::write(store.upload_path("70-0"), b"").unwrap();
+        let res = finish_upload(
+            &store,
+            "img",
+            "70-0",
+            &format!("digest={digest}"),
+            &frame,
+            true,
+        )
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let (path, is_zstd) = store.find_blob(&hex(&digest)).expect("stored");
+        assert!(is_zstd);
+        assert_eq!(std::fs::read(&path).unwrap(), frame, "stored verbatim");
+        assert_eq!(zstd_canonical_len(&path).unwrap(), raw.len() as u64);
+
+        // a frame that decompresses to something else is refused, and takes its session
+        let other = zstd_with_size(&vec![4u8; 80_000]).unwrap();
+        std::fs::write(store.upload_path("71-0"), b"").unwrap();
+        let res = finish_upload(
+            &store,
+            "img",
+            "71-0",
+            &format!("digest={digest}"),
+            &other,
+            true,
+        )
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !store.upload_path("71-0").exists(),
+            "the session is dropped"
+        );
+
+        // a body that is not a zstd frame at all is the client's error, not a 500
+        std::fs::write(store.upload_path("72-0"), b"").unwrap();
+        let res = finish_upload(
+            &store,
+            "img",
+            "72-0",
+            &format!("digest={digest}"),
+            b"not zstd",
+            true,
+        )
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // two frames back to back: `decode_all` (and so a GET) yields both, while the
+        // first header — all a HEAD reads — speaks only for the first. Refused, or the
+        // two would contradict each other about a blob this server had certified.
+        let pair = [frame.clone(), frame.clone()].concat();
+        let pair_digest = format!(
+            "sha256:{}",
+            sha256_hex_raw(&[raw.clone(), raw.clone()].concat())
+        );
+        assert_eq!(
+            zstd_frame_len(&pair),
+            Some(raw.len() as u64),
+            "the first header only"
+        );
+        assert_eq!(zstd::decode_all(&pair[..]).unwrap().len(), raw.len() * 2);
+        std::fs::write(store.upload_path("74-0"), b"").unwrap();
+        let res = finish_upload(
+            &store,
+            "img",
+            "74-0",
+            &format!("digest={pair_digest}"),
+            &pair,
+            true,
+        )
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(!store.has_blob(&hex(&pair_digest)));
+
+        // and a frame that does not declare its content size is not storable either: the
+        // header is what `HEAD` reports, so one that says nothing cannot be certified
+        let sizeless = zstd::encode_all(&raw[..], ZSTD_LEVEL).unwrap();
+        assert_eq!(zstd_frame_len(&sizeless), None);
+        std::fs::write(store.upload_path("73-0"), b"").unwrap();
+        let res = finish_upload(
+            &store,
+            "img",
+            "73-0",
+            &format!("digest={digest}"),
+            &sizeless,
+            true,
+        )
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A manifest pushed *by digest* is a claim about its own bytes. Storing it under the
+    /// digest they actually hash to would answer 201 for content the client then cannot
+    /// fetch under the reference it pushed — and would persist bytes it never asked to
+    /// store — so the claim is checked, before anything is written.
+    #[test]
+    fn a_manifest_pushed_by_digest_must_hash_to_that_digest() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-mdig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let body = manifest_body(&format!("sha256:{}", "a".repeat(64)), &[]);
+        let right = format!("sha256:{}", sha256_hex_raw(&body));
+        let wrong = format!("sha256:{}", "b".repeat(64));
+
+        let res = put_manifest(&store, "img", &wrong, DEFAULT_MANIFEST_TYPE, &body).unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !store.has_blob(&hex(&right)),
+            "a refused push stores nothing"
+        );
+        assert!(
+            store
+                .put_manifest("img", &wrong, DEFAULT_MANIFEST_TYPE, &body)
+                .is_err()
+        );
+
+        let res = put_manifest(&store, "img", &right, DEFAULT_MANIFEST_TYPE, &body).unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert!(store.has_blob(&hex(&right)));
+        // a tag reference is not a claim about the bytes, so it is stored under the digest
+        // they hash to, as before
+        let res = put_manifest(&store, "img", "v1", DEFAULT_MANIFEST_TYPE, &body).unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
