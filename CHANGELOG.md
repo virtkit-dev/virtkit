@@ -40,6 +40,9 @@ All notable changes to virtkit will be documented in this file.
   its digest names, and refuses the push when it is not. A client can no longer
   claim a piece of content it did not send.
 
+- An upload to `vk-registry` now stays in the repository it was started in, so it
+  cannot be finished somewhere the client was not allowed to start one.
+
 - `vk registry gc` and `vk-registry gc` no longer delete images that are still in
   use when part of the store is not readable, or holds something they did not
   write. They now name the offending path and stop, having deleted nothing; the

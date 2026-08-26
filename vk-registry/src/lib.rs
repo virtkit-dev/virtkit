@@ -18,6 +18,7 @@
 //!   repos/<name>/tags/<tag>       file holding the tagged manifest's digest
 //!   repos/<name>/manifests/<hex>  sidecar: that manifest's Content-Type
 //!   uploads/<id>                  in-progress blob uploads (this process only)
+//!   uploads/owners/<id>           the repository that upload session was opened for
 
 use std::collections::{BTreeSet, HashSet};
 use std::convert::Infallible;
@@ -138,7 +139,7 @@ impl Store {
     /// paths, and for the in-process build cache, whose reads share the root it pushes to.
     /// Looking at a store without bringing one into being is [`Store::open`].
     pub fn new(root: PathBuf) -> Result<Self> {
-        for sub in ["blobs/sha256", "blobs/zstd", "uploads", "repos"] {
+        for sub in ["blobs/sha256", "blobs/zstd", "uploads/owners", "repos"] {
             let p = root.join(sub);
             std::fs::create_dir_all(&p).with_context(|| format!("creating {}", p.display()))?;
         }
@@ -208,6 +209,12 @@ impl Store {
     }
     fn upload_path(&self, id: &str) -> PathBuf {
         self.root.join("uploads").join(id)
+    }
+    /// Where an upload session's repository is recorded. A subdirectory, not a sidecar
+    /// beside the session file: `dir_files` walks only the files directly inside a
+    /// directory, so `gc` and `stats` keep counting one entry per upload rather than two.
+    fn upload_owner_path(&self, id: &str) -> PathBuf {
+        self.root.join("uploads").join("owners").join(id)
     }
     fn tag_path(&self, name: &str, tag: &str) -> PathBuf {
         self.root.join("repos").join(name).join("tags").join(tag)
@@ -531,8 +538,27 @@ impl Store {
 
         for upload in dir_files(&self.root.join("uploads")) {
             if idle(&upload, grace) {
+                if let Some(id) = upload.file_name().and_then(|n| n.to_str()) {
+                    // One syscall, not `exists()` then `remove`: the same path resolved
+                    // twice is a race, and a binding already gone is success here.
+                    remove_if_present(&self.upload_owner_path(id))?;
+                }
                 remove(&upload)?;
                 report.uploads_dropped += 1;
+            }
+        }
+        // An owner record whose session is already gone (dropped by an earlier sweep, or by
+        // a finish that could not clean up) is not an upload and is not counted as one.
+        // Gated on `grace` like every other removal here: `start_upload` writes the binding
+        // *before* the session, so a binding with no session may simply be a push that
+        // started moments ago, and deleting it would leave a session nothing can finish.
+        for owner in dir_files(&self.root.join("uploads").join("owners")) {
+            let orphaned = owner
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_none_or(|id| !self.upload_path(id).is_file());
+            if orphaned && idle(&owner, grace) {
+                remove(&owner)?;
             }
         }
         Ok(report)
@@ -1196,13 +1222,40 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
 
 /// POST /v2/<name>/blobs/uploads/ — open an upload session (an empty temp file).
 fn start_upload(store: &Store, name: &str) -> Result<Response<Full<Bytes>>> {
+    // The counter keeps ids unique within a process; the random tail keeps them
+    // unguessable, so one client cannot append to another's in-flight upload by
+    // enumerating session ids.
     let id = format!(
-        "{}-{}",
+        "{}-{}-{}",
         std::process::id(),
-        store.next_upload.fetch_add(1, Ordering::Relaxed)
+        store.next_upload.fetch_add(1, Ordering::Relaxed),
+        accounts::random_token(16),
     );
-    std::fs::write(store.upload_path(&id), b"").context("creating the upload file")?;
+    // The binding first, the session second: `upload_is_for` fails closed, so a session
+    // file that existed before its binding would be a session nothing could finish — and,
+    // worse, the gc's orphaned-binding sweep keys on "a binding whose session is absent".
+    // Written with `create_new` so a colliding id is an error rather than an overwrite of
+    // somebody else's session, and owner-only from creation.
+    //
+    // Remember which repository this session was authorized for: the caller is checked
+    // against `name` at every step, so a session started in a repo the caller may write
+    // must not be finishable into one it may not.
+    create_private(&store.upload_owner_path(&id), name.as_bytes())
+        .context("recording the upload's repository")?;
+    create_private(&store.upload_path(&id), b"").context("creating the upload file")?;
     accepted_upload(name, &id, 0)
+}
+
+/// Whether `id` is an upload session opened for `name`.
+///
+/// Fails closed: this is the check that keeps a session from being finished into a
+/// repository it was not opened in, and an authorization question whose answer on a read
+/// error is "yes" is not a check. A binding that cannot be read — absent, unreadable,
+/// truncated — therefore means "no", and the client re-POSTs the session, which is what
+/// every OCI client already does with a `BLOB_UPLOAD_UNKNOWN`. `start_upload` writes the
+/// binding before the session, so there is no window in which a live session has none.
+fn upload_is_for(store: &Store, id: &str, name: &str) -> bool {
+    std::fs::read(store.upload_owner_path(id)).is_ok_and(|recorded| recorded == name.as_bytes())
 }
 
 /// PATCH /v2/<name>/blobs/uploads/<id> — append a chunk to the session file.
@@ -1215,7 +1268,7 @@ fn patch_upload(store: &Store, name: &str, id: &str, body: &[u8]) -> Result<Resp
         ));
     }
     let path = store.upload_path(id);
-    if !path.is_file() {
+    if !path.is_file() || !upload_is_for(store, id, name) {
         return Ok(error_response(
             StatusCode::NOT_FOUND,
             "BLOB_UPLOAD_UNKNOWN",
@@ -1233,8 +1286,8 @@ fn patch_upload(store: &Store, name: &str, id: &str, body: &[u8]) -> Result<Resp
 }
 
 /// PUT /v2/<name>/blobs/uploads/<id>?digest=<d> — append the final bytes (if any) and
-/// promote the session file to the store under the client's digest. The digest is
-/// trusted (local single-user registry; oci-client re-verifies on pull). Storage is
+/// promote the session file to the store under the client's digest — which is verified
+/// against the bytes, and only for the repository the session was opened in. Storage is
 /// transparently compressed: if the body is already a zstd frame (`Content-Encoding:
 /// zstd`, an aware client) it is stored verbatim in the zstd store; otherwise the raw
 /// body is zstd'd and stored compressed when that's actually smaller (so an
@@ -1273,6 +1326,13 @@ fn finish_upload(
     let _lock = store.lock_shared()?;
     let hex = digest.trim_start_matches("sha256:").to_string();
     let upload = store.upload_path(id);
+    if !upload.is_file() || !upload_is_for(store, id, name) {
+        return Ok(error_response(
+            StatusCode::NOT_FOUND,
+            "BLOB_UPLOAD_UNKNOWN",
+            id,
+        ));
+    }
     if !body.is_empty() {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -1304,6 +1364,7 @@ fn finish_upload(
     // and the session goes, so a retry cannot append onto a body already found bad.
     if hashed.as_deref() != Some(hex.as_str()) {
         let _ = std::fs::remove_file(&upload);
+        let _ = std::fs::remove_file(store.upload_owner_path(id));
         return Ok(error_response(
             StatusCode::BAD_REQUEST,
             "DIGEST_INVALID",
@@ -1325,6 +1386,7 @@ fn finish_upload(
         store.put_blob_at(&hex, raw.as_deref().unwrap_or_default())?;
         let _ = std::fs::remove_file(&upload);
     }
+    let _ = std::fs::remove_file(store.upload_owner_path(id));
 
     Response::builder()
         .status(StatusCode::CREATED)
@@ -1593,6 +1655,41 @@ fn header_has(req: &Request<Incoming>, name: hyper::header::HeaderName, needle: 
         .is_some_and(|v| v.contains(needle))
 }
 
+/// Remove `path`, treating "it was not there" as success — one resolution, where an
+/// `exists()` test followed by a `remove` would be two and could lose the race between
+/// them.
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+/// Create `path` with `data`, failing if it already exists — `create_new` rather than
+/// `write`, so a path that is already a file (or a symlink to one) is an error instead of
+/// something this server writes through, and the mode is set at creation rather than in a
+/// second call with a window in between.
+fn create_private(path: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+        .with_context(|| format!("creating {}", path.display()))?
+        .write_all(data)
+        .with_context(|| format!("writing {}", path.display()))
+}
+
 /// Ceiling on the canonical (decompressed) size of a *pushed* blob. A zstd frame is a
 /// client-controlled input that expands without bound — tens of KiB of zeros become tens
 /// of GB — so the push path will not decompress one that does not declare a size up front,
@@ -1825,10 +1922,11 @@ fn valid_tag(t: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// An upload id is one this server minted (`<pid>-<n>`): digits and a single dash,
-/// no path separators.
+/// An upload id is one this server minted (`<pid>-<n>-<random hex>`): hex digits and
+/// dashes, nothing else — no path separator, and no `.`, so an id can never name the
+/// `owners/` record that sits in a subdirectory of its own.
 fn valid_upload_id(id: &str) -> bool {
-    !id.is_empty() && !id.contains('/') && id.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+    !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
 }
 
 /// Look up a query parameter (percent-decoding the value, since the client encodes
@@ -2536,7 +2634,7 @@ mod tests {
         let raw = vec![7u8; 100_000];
         let digest = format!("sha256:{}", sha256_hex_raw(&raw));
         let hex = digest.trim_start_matches("sha256:");
-        std::fs::write(store.upload_path("1-0"), b"").unwrap();
+        open_session(&store, "img", "1-0");
         let resp = finish_upload(
             &store,
             "img",
@@ -2569,7 +2667,7 @@ mod tests {
             .collect();
         let rdigest = format!("sha256:{}", sha256_hex_raw(&rnd));
         let rhex = rdigest.trim_start_matches("sha256:");
-        std::fs::write(store.upload_path("1-1"), b"").unwrap();
+        open_session(&store, "img", "1-1");
         finish_upload(
             &store,
             "img",
@@ -2724,11 +2822,11 @@ mod tests {
         let digest = format!("sha256:{}", sha256_hex_raw(&raw));
 
         // an honest frame: verified, then renamed into the zstd store as-is
-        std::fs::write(store.upload_path("70-0"), b"").unwrap();
+        open_session(&store, "img", "aa-0");
         let res = finish_upload(
             &store,
             "img",
-            "70-0",
+            "aa-0",
             &format!("digest={digest}"),
             &frame,
             true,
@@ -2742,11 +2840,11 @@ mod tests {
 
         // a frame that decompresses to something else is refused, and takes its session
         let other = zstd_with_size(&vec![4u8; 80_000]).unwrap();
-        std::fs::write(store.upload_path("71-0"), b"").unwrap();
+        open_session(&store, "img", "aa-1");
         let res = finish_upload(
             &store,
             "img",
-            "71-0",
+            "aa-1",
             &format!("digest={digest}"),
             &other,
             true,
@@ -2754,16 +2852,16 @@ mod tests {
         .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert!(
-            !store.upload_path("71-0").exists(),
+            !store.upload_path("aa-1").exists(),
             "the session is dropped"
         );
 
         // a body that is not a zstd frame at all is the client's error, not a 500
-        std::fs::write(store.upload_path("72-0"), b"").unwrap();
+        open_session(&store, "img", "aa-2");
         let res = finish_upload(
             &store,
             "img",
-            "72-0",
+            "aa-2",
             &format!("digest={digest}"),
             b"not zstd",
             true,
@@ -2785,11 +2883,11 @@ mod tests {
             "the first header only"
         );
         assert_eq!(zstd::decode_all(&pair[..]).unwrap().len(), raw.len() * 2);
-        std::fs::write(store.upload_path("74-0"), b"").unwrap();
+        open_session(&store, "img", "aa-4");
         let res = finish_upload(
             &store,
             "img",
-            "74-0",
+            "aa-4",
             &format!("digest={pair_digest}"),
             &pair,
             true,
@@ -2802,11 +2900,11 @@ mod tests {
         // header is what `HEAD` reports, so one that says nothing cannot be certified
         let sizeless = zstd::encode_all(&raw[..], ZSTD_LEVEL).unwrap();
         assert_eq!(zstd_frame_len(&sizeless), None);
-        std::fs::write(store.upload_path("73-0"), b"").unwrap();
+        open_session(&store, "img", "aa-3");
         let res = finish_upload(
             &store,
             "img",
-            "73-0",
+            "aa-3",
             &format!("digest={digest}"),
             &sizeless,
             true,
@@ -2851,6 +2949,14 @@ mod tests {
         assert_eq!(res.status(), StatusCode::CREATED);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An upload session opened for `name`, the way `start_upload` opens one: the binding
+    /// first, then the session. Writing only the session file would leave it unfinishable,
+    /// which is what `upload_is_for` failing closed means.
+    fn open_session(store: &Store, name: &str, id: &str) {
+        create_private(&store.upload_owner_path(id), name.as_bytes()).unwrap();
+        create_private(&store.upload_path(id), b"").unwrap();
     }
 
     /// `sha256:<hex>` → `<hex>`.
@@ -3387,9 +3493,16 @@ mod tests {
     #[test]
     fn upload_id_validation() {
         assert!(valid_upload_id("12345-7"));
+        assert!(valid_upload_id("12345-7-0f1e2d3c4b5a69788796a5b4c3d2e1f0"));
         assert!(!valid_upload_id("../escape"));
         assert!(!valid_upload_id("a/b"));
-        assert!(!valid_upload_id("abc")); // letters are not minted ids
+        assert!(!valid_upload_id(""));
+        // no `/` and no `.`, so an id can name nothing but a session file — not the
+        // `owners/` subdirectory beside them, and not a relay `.relay-*` staging file
+        assert!(!valid_upload_id("12345-7.repo"));
+        assert!(!valid_upload_id("owners"));
+        assert!(!valid_upload_id("nothex-zz"));
+        assert!(!valid_upload_id(&"a".repeat(129)));
     }
 
     #[test]
@@ -3405,6 +3518,113 @@ mod tests {
             zstd_frame_len(&zstd::encode_all(&raw[..], ZSTD_LEVEL).unwrap()),
             None
         );
+    }
+
+    /// An upload is finishable only in the repository it was started in: otherwise a
+    /// caller who may write one repo could push into another by starting there and
+    /// finishing here.
+    #[test]
+    fn an_upload_session_belongs_to_the_repo_it_was_opened_for() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-upown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let res = start_upload(&store, "team-a/app").unwrap();
+        let location = res.headers().get("Location").unwrap().to_str().unwrap();
+        let id = location.rsplit('/').next().unwrap().to_string();
+        assert!(valid_upload_id(&id), "{id}");
+        assert!(
+            id.len() > "12345-7".len(),
+            "the id carries a random tail: {id}"
+        );
+
+        assert!(upload_is_for(&store, &id, "team-a/app"));
+        assert!(!upload_is_for(&store, &id, "team-b/app"));
+
+        // and the wrong repo cannot append to it
+        let denied = patch_upload(&store, "team-b/app", &id, b"bytes").unwrap();
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+        let ok = patch_upload(&store, "team-a/app", &id, b"bytes").unwrap();
+        assert_eq!(ok.status(), StatusCode::ACCEPTED);
+
+        // nor finish it — the check is on the finish as much as on the append, and with a
+        // correct digest, so it is the binding being tested and nothing else
+        let digest = format!("sha256:{}", sha256_hex_raw(b"bytes"));
+        let denied = finish_upload(
+            &store,
+            "team-b/app",
+            &id,
+            &format!("digest={digest}"),
+            b"",
+            false,
+        )
+        .unwrap();
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !store.has_blob(&hex(&digest)),
+            "a finish into the wrong repo stores nothing"
+        );
+        let ok = finish_upload(
+            &store,
+            "team-a/app",
+            &id,
+            &format!("digest={digest}"),
+            b"",
+            false,
+        )
+        .unwrap();
+        assert_eq!(ok.status(), StatusCode::CREATED);
+        assert!(store.has_blob(&hex(&digest)));
+
+        // a binding that cannot be read is not a licence: `upload_is_for` fails closed, so
+        // a session whose record is gone is unfinishable rather than finishable anywhere
+        let res = start_upload(&store, "team-a/app").unwrap();
+        let id = res
+            .headers()
+            .get("Location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+        std::fs::remove_file(store.upload_owner_path(&id)).unwrap();
+        assert!(!upload_is_for(&store, &id, "team-a/app"));
+        assert_eq!(
+            patch_upload(&store, "team-a/app", &id, b"x")
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The record binding an upload to its repository must not read as an upload itself:
+    /// `stats` would double-count every push in flight and `gc` would report twice the
+    /// uploads it dropped.
+    #[test]
+    fn an_uploads_owner_record_is_not_counted_as_an_upload() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-upcount-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let res = start_upload(&store, "team-a/app").unwrap();
+        let location = res.headers().get("Location").unwrap().to_str().unwrap();
+        let id = location.rsplit('/').next().unwrap().to_string();
+        assert!(store.upload_owner_path(&id).is_file());
+
+        let s = store.stats().unwrap();
+        assert_eq!(s.uploads, 1, "one session in flight, not two");
+
+        // and dropping the abandoned session takes its record with it, counted once
+        let report = store.gc(Duration::ZERO, Duration::ZERO, false).unwrap();
+        assert_eq!(report.uploads_dropped, 1);
+        assert!(!store.upload_owner_path(&id).exists());
+        assert_eq!(store.stats().unwrap().uploads, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

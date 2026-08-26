@@ -536,6 +536,10 @@ instead of content-addressing).
 2. OIDC login/callback/logout (`oidc.rs`) + read-only `/browse`, gated by
    session-read-all (no per-scope filtering yet).
 3. API key CRUD (`/settings/keys`) + `authorize()` enforcement on `/v2/*` write paths.
+   That enforcement presumes two things the write path establishes first: a blob is
+   stored only under a digest the server itself hashed the bytes to, and an upload
+   session can only be finished into the repository it was opened in — otherwise a
+   per-repo scope check on `POST .../uploads/` says nothing about where the blob lands.
 4. `/upload` (session-authed, writes through `Store` as a synthetic manifest+blob).
 5. Optional: a `request_log` table (who pushed/pulled what, when) for audit.
 
