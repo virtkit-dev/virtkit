@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- `vk-registry` now refuses to start on a config file containing a setting it
+  does not recognise — at the top level or inside an `[[upstream]]` — instead of
+  ignoring it. Every setting in that file bears on how the server authenticates
+  its clients or reaches its upstreams, so one dropped in silence means serving
+  with less authentication than the file asks for. `serve`, `status`, `gc` and
+  `install-service` all read the file, so all four report the bad setting.
+
 ## [0.42.0] - 2026-08-25
 
 ### Fixed

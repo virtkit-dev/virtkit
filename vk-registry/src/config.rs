@@ -56,7 +56,12 @@ pub struct UpstreamSpec {
     pub ca_file: Option<PathBuf>,
 }
 
+/// `deny_unknown_fields` is load-bearing, not tidiness: every key here selects how the
+/// server authenticates its clients or reaches its upstreams, so a misspelt one being
+/// dropped in silence means serving with less authentication than the file asks for — a
+/// mistyped `token_file` leaves the registry open. An unknown key is an error instead.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
     addr: Option<String>,
     root: Option<PathBuf>,
@@ -69,7 +74,11 @@ struct FileConfig {
     upstream: Vec<FileUpstream>,
 }
 
+/// `deny_unknown_fields` for the same reason as on [`FileConfig`], against the same kind of
+/// mistake: a misspelt `username`/`password_file` here leaves the relay fetching from the
+/// upstream unauthenticated rather than saying so.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileUpstream {
     /// repo-name prefix selecting this upstream; omitted/empty = catch-all
     #[serde(default)]
@@ -475,6 +484,48 @@ mod tests {
                 .root,
             ServerConfig::root_of(Some(&path), Some(PathBuf::from("/flag"))).unwrap()
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A key the file spells wrong is a key the server does not apply, and every key here
+    /// is about how it authenticates — so it has to be an error rather than a default.
+    #[test]
+    fn a_config_file_key_that_is_not_recognised_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-strict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let load_err = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            ServerConfig::load(&p, None, None).map(|_| ()).unwrap_err()
+        };
+
+        // a misspelt top-level credential would otherwise serve the store wide open
+        assert!(
+            !load_err("typo.toml", "tokenfile = \"/etc/t\"\n")
+                .to_string()
+                .is_empty()
+        );
+        // and one inside [[upstream]] would relay unauthenticated
+        assert!(
+            !load_err(
+                "upstream.toml",
+                "[[upstream]]\nurl = \"https://example\"\nusrname = \"ci\"\n",
+            )
+            .to_string()
+            .is_empty()
+        );
+        // the keys it does know still load
+        let good = dir.join("good.toml");
+        std::fs::write(
+            &good,
+            "root = \"/srv/reg\"\ntoken_file = \"/etc/t\"\n\n[[upstream]]\nurl = \"https://example\"\n",
+        )
+        .unwrap();
+        let cfg = ServerConfig::load(&good, None, None).unwrap();
+        assert_eq!(cfg.token_file, Some(PathBuf::from("/etc/t")));
+        assert_eq!(cfg.upstreams.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
