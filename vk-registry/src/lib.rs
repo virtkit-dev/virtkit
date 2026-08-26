@@ -631,6 +631,23 @@ pub struct RepoStat {
     pub logical_bytes: u64,
 }
 
+/// A manifest's referenced descriptors, in order: its config (if any) then each layer,
+/// as `(label, descriptor)`. Structural, so it needs no OCI types and tolerates media
+/// types it does not know — the one walk [`manifest_blob_sizes`] reads the referenced
+/// blobs out of.
+pub(crate) fn manifest_descriptors(
+    manifest: &serde_json::Value,
+) -> Vec<(&'static str, &serde_json::Value)> {
+    let mut out = Vec::new();
+    if let Some(c) = manifest.pointer("/config") {
+        out.push(("config", c));
+    }
+    if let Some(layers) = manifest.pointer("/layers").and_then(|l| l.as_array()) {
+        out.extend(layers.iter().map(|l| ("layer", l)));
+    }
+    out
+}
+
 /// The digest hexes a manifest references: its config and every layer, read
 /// structurally (`config.digest`, `layers[].digest`) so the gc mark needs no OCI
 /// types and tolerates media types it doesn't know. An image index (`manifests[]`)
@@ -657,11 +674,9 @@ fn manifest_blob_sizes(manifest: &[u8]) -> Vec<(String, u64)> {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(manifest) else {
         return Vec::new();
     };
-    let layers = v.pointer("/layers").and_then(|l| l.as_array());
-    std::iter::once(v.pointer("/config"))
-        .chain(layers.into_iter().flatten().map(Some))
-        .flatten()
-        .filter_map(|d| {
+    manifest_descriptors(&v)
+        .into_iter()
+        .filter_map(|(_, d)| {
             let hex = d.pointer("/digest").and_then(|x| x.as_str())?;
             let size = d
                 .pointer("/size")
