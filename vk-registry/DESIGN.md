@@ -68,7 +68,8 @@ upstream by **longest-prefix match on the repo name** and act by addressing mode
 
 | Request                         | Miss action                              | Persist? |
 |---------------------------------|------------------------------------------|----------|
-| GET/HEAD blob `sha256:…`        | fetch upstream, verify, stream back      | **yes**  |
+| GET blob `sha256:…`             | fetch upstream, verify, stream back      | **yes**  |
+| HEAD blob `sha256:…`            | answered locally, never relayed          | n/a      |
 | GET/HEAD manifest `@sha256:…`   | fetch upstream, verify, stream back      | **yes**  |
 | GET/HEAD manifest `:tag`        | resolve + relay upstream live            | **no**   |
 
@@ -477,12 +478,20 @@ what this one does, so a client that asks for it falls back to uploading. Nothin
 tree asks; the `HEAD` dedup probe plus the mount-on-manifest-`PUT` above already give
 `vk push` the same saving without a client change.
 
-Do not, however, front an upstream for a repository you also push to in accounts mode. The
-`HEAD` dedup probe misses locally (not a member), relays, and the upstream answers 200 for
-content it holds; `vk push` takes that as "already there" and skips the upload, so the
-manifest `PUT` then refuses with `MANIFEST_BLOB_UNKNOWN` — and nothing in this tree retries
-by uploading, so the push fails outright rather than falling back. Pull-through caching and
-pushing want separate repository prefixes until the client re-uploads on that error.
+That probe is why a blob `HEAD` is answered locally and **never relayed**. A `HEAD` asks
+this registry whether it holds the blob, and `vk push` skips the upload when told yes; an
+upstream's answer is about the upstream, so relaying it would make the client skip an upload
+this store never received, and the manifest `PUT` would then refuse the digest it named.
+Under a catch-all upstream prefix that is any push to this registry, so the probe has to be
+answered by the store the push is going to. A puller loses nothing: its `GET` still relays,
+and a `HEAD` after that is a local hit.
+
+This is a deliberate divergence from the distribution spec, which has a blob `HEAD` answer
+as the `GET` would without a body: on a cold pull-through repository the two now differ,
+`HEAD` saying 404 where `GET` returns 200 and caches. A client that reads a blob `HEAD` as
+"is this pullable" rather than "is this stored here" — `task`'s `ocicas` probes one for a
+canonical `Content-Length` — will see that 404 against an upstream-fronting repository and
+has to follow with the `GET` it would have made anyway.
 
 **There is no migration.** A store written before this has no membership records, so its
 content is unreadable through the API: start from an empty store, or re-push into it. This is

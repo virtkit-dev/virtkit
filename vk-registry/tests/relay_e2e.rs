@@ -1283,3 +1283,142 @@ async fn a_relayed_manifests_content_type_is_held_to_a_manifest_type() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A blob `HEAD` is a pusher's dedup probe: the client reads a 200 as "already stored
+/// here, skip the upload". Relaying it answers for the upstream instead, so the client
+/// skips an upload this registry never received and the manifest naming the blob is then
+/// refused. It stays local; the `GET` a puller follows up with still relays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blob_head_is_never_relayed() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let up_dir = tmp("head-up");
+    let up_store = Store::new(up_dir.clone()).unwrap();
+    let blob = vec![7u8; 4096];
+    let bdigest = up_store.put_blob(&blob).unwrap();
+    let up_url = spawn(Arc::new(ServerState {
+        store: Arc::new(up_store),
+        upstreams: vec![],
+        locks: LockManager::new(),
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
+        tls: None,
+    }));
+
+    let mirror_dir = tmp("head-mirror");
+    let mirror_store = Arc::new(Store::new(mirror_dir.clone()).unwrap());
+    let mirror_url = spawn(Arc::new(ServerState {
+        store: mirror_store.clone(),
+        upstreams: vec![Upstream {
+            prefix: String::new(),
+            base: up_url.clone(),
+            username: None,
+            password: None,
+            client: reqwest::Client::new(),
+        }],
+        locks: LockManager::new(),
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
+        tls: None,
+    }));
+    let http = reqwest::Client::new();
+    let hex = bdigest.trim_start_matches("sha256:");
+
+    // The upstream has it; the mirror does not. HEAD must say so.
+    let r = http
+        .head(format!("{mirror_url}/v2/app/blobs/{bdigest}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404, "a blob HEAD must not consult the upstream");
+    assert!(
+        mirror_store.get_blob(hex).unwrap().is_none(),
+        "and must not have cached anything"
+    );
+
+    // A puller is unaffected: the GET relays, caches, and the HEAD then answers 200.
+    let r = http
+        .get(format!("{mirror_url}/v2/app/blobs/{bdigest}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert_eq!(r.bytes().await.unwrap().as_ref(), &blob[..]);
+    let r = http
+        .head(format!("{mirror_url}/v2/app/blobs/{bdigest}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some(blob.len().to_string().as_str()),
+    );
+
+    let _ = std::fs::remove_dir_all(&mirror_dir);
+    let _ = std::fs::remove_dir_all(&up_dir);
+}
+
+/// A blob `HEAD` and the `GET` after it must describe the same bytes, and the one case
+/// where they could drift is a blob the store holds *compressed*: the length then comes
+/// from the zstd frame's header rather than from a `stat` of the file. (A relayed blob is
+/// stored identity, so this needs a blob that arrived by push.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blob_head_agrees_with_the_get_for_a_compressed_blob() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tmp("head-zstd");
+    let store = Store::new(dir.clone()).unwrap();
+    // compressible, so the adaptive store keeps it as a frame
+    let blob = vec![9u8; 100_000];
+    let bdigest = store.put_blob(&blob).unwrap();
+    let hex = bdigest.trim_start_matches("sha256:").to_string();
+    assert!(
+        dir.join("blobs").join("zstd").join(&hex).is_file(),
+        "this test is about the compressed branch"
+    );
+    let url = spawn(Arc::new(ServerState {
+        store: Arc::new(store),
+        upstreams: vec![],
+        locks: LockManager::new(),
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
+        tls: None,
+    }));
+    let http = reqwest::Client::new();
+
+    let head = http
+        .head(format!("{url}/v2/app/blobs/{bdigest}"))
+        .send()
+        .await
+        .unwrap();
+    let get = http
+        .get(format!("{url}/v2/app/blobs/{bdigest}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.status(), 200);
+    assert_eq!(get.status(), 200);
+    for h in [
+        reqwest::header::CONTENT_LENGTH.as_str(),
+        reqwest::header::CONTENT_TYPE.as_str(),
+        "docker-content-digest",
+        "x-content-type-options",
+    ] {
+        assert_eq!(
+            head.headers().get(h).and_then(|v| v.to_str().ok()),
+            get.headers().get(h).and_then(|v| v.to_str().ok()),
+            "HEAD and GET disagree about {h}"
+        );
+    }
+    // and the length they agree on is the canonical one, not the frame's size on disk
+    let body = get.bytes().await.unwrap();
+    assert_eq!(body.len(), blob.len());
+    assert_eq!(
+        head.headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some(blob.len().to_string().as_str())
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

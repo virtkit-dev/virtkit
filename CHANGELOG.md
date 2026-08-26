@@ -79,10 +79,7 @@ All notable changes to virtkit will be documented in this file.
   Two things to do. An existing store's layers are not reachable under the new
   rules — a tag still resolves, but pulling what it points at fails — so start
   from an empty store, or push into it again. And a push that names content the
-  registry does not hold is now refused, so it has to send its pieces first. One
-  setup no longer works: a repository that both caches an upstream and receives
-  pushes now fails the push instead of falling back to uploading — give the two
-  separate repositories.
+  registry does not hold is now refused, so it has to send its pieces first.
 
 - A repository name may no longer have `blobs`, `tags` or `manifests` as one of
   its path components; such a name is indistinguishable from how the store lays

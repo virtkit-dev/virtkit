@@ -1552,8 +1552,15 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
                 // is authorized by the `Read` on `name` checked above, and the relay maps
                 // `name` to its own upstream repository, so what comes back belongs to
                 // this repository and is recorded as such.
-                if local.status() == StatusCode::NOT_FOUND && !state.upstreams.is_empty() {
-                    relay::get_blob(&state, name, digest, head, accept_zstd).await
+                //
+                // A `HEAD` never relays. It is a client's dedup probe before a push, and
+                // relaying it answers for the upstream a question the client asked about
+                // *this* registry: it would report a blob this store does not hold, the
+                // client would skip the upload, and the manifest naming it would then be
+                // refused. A puller loses nothing — a 404 here is followed by the `GET`,
+                // which does relay.
+                if !head && local.status() == StatusCode::NOT_FOUND && !state.upstreams.is_empty() {
+                    relay::get_blob(&state, name, digest, accept_zstd).await
                 } else {
                     Ok(local)
                 }

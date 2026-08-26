@@ -6,6 +6,10 @@
 //! manifests); a `:tag` manifest is relayed live and never cached, since a tag can move.
 //! A client warms the cache by pinning the digest.
 //!
+//! A blob `HEAD` is the exception: it is answered locally and never relayed, because it is
+//! a pusher's dedup probe and an upstream's answer to it is not about this store. See
+//! [`get_blob`].
+//!
 //! Upstream auth (the Docker-registry bearer-token dance) is handled here, so a client
 //! of this server never needs the upstream credentials — the reason a central
 //! `vk-registry` can front a private registry for many runners.
@@ -65,14 +69,17 @@ pub fn route<'a>(ups: &'a [Upstream], name: &str) -> Option<(&'a Upstream, Strin
         .map(|(u, repo, _)| (u, repo))
 }
 
-/// Relay a blob GET/HEAD. GET downloads, verifies against `digest`, persists to the
-/// store, and serves it back canonically; HEAD probes upstream existence without
-/// persisting (a blob is only cached once it is actually pulled).
+/// Relay a blob GET: download, verify against `digest`, persist to the store, and serve
+/// it back canonically.
+///
+/// GET only — a blob `HEAD` is answered from the local store and never reaches here. A
+/// `HEAD` is a dedup probe a client issues before pushing, and an upstream's answer to it
+/// is about the upstream, not about what this registry holds; reporting it would make the
+/// client skip an upload whose blob the following manifest `PUT` then cannot find.
 pub async fn get_blob(
     state: &ServerState,
     name: &str,
     digest: &str,
-    head: bool,
     accept_zstd: bool,
 ) -> Result<Response<Full<Bytes>>> {
     let Some((u, repo)) = route(&state.upstreams, name) else {
@@ -83,19 +90,6 @@ pub async fn get_blob(
         ));
     };
     let url = format!("{}/v2/{repo}/blobs/{digest}", u.base);
-
-    if head {
-        let resp = authed(u, RMethod::HEAD, &url, None).await?;
-        if !resp.status().is_success() {
-            return Ok(error_response(
-                StatusCode::NOT_FOUND,
-                "BLOB_UNKNOWN",
-                digest,
-            ));
-        }
-        let len = content_length(&resp);
-        return blob_head_response(digest, len);
-    }
 
     let resp = authed(u, RMethod::GET, &url, None).await?;
     if !resp.status().is_success() {
@@ -172,7 +166,7 @@ pub async fn get_blob(
         // blob to the caller — each layer earns its own membership by being fetched here.
         state.store.record_blob(name, hex)?;
     }
-    serve_blob_local(&state.store, digest, head, accept_zstd)
+    serve_blob_local(&state.store, digest, /* head */ false, accept_zstd)
 }
 
 /// Relay a manifest GET/HEAD. A digest reference is immutable, so it is persisted (a
@@ -332,26 +326,6 @@ async fn obtain_token(u: &Upstream, challenge: &str) -> Result<Option<String>> {
     }
     let t: Tok = resp.json().await.context("parsing the token response")?;
     Ok(t.token.or(t.access_token))
-}
-
-fn content_length(resp: &reqwest::Response) -> Option<u64> {
-    resp.headers()
-        .get(reqwest::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok())
-}
-
-/// A blob HEAD response mirroring the store's own (200, digest, octet-stream, length).
-fn blob_head_response(digest: &str, len: Option<u64>) -> Result<Response<Full<Bytes>>> {
-    let mut b = Response::builder()
-        .status(StatusCode::OK)
-        .header("Docker-Content-Digest", digest)
-        .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .header(hyper::header::CONTENT_TYPE, "application/octet-stream");
-    if let Some(len) = len {
-        b = b.header(hyper::header::CONTENT_LENGTH, len.to_string());
-    }
-    b.body(Full::new(Bytes::new())).map_err(Into::into)
 }
 
 fn manifest_head_response(digest: &str, ctype: &str) -> Result<Response<Full<Bytes>>> {
