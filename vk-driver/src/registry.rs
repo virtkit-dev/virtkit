@@ -30,6 +30,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use oci_client::Reference as OciReference;
 use oci_client::client::{Certificate, CertificateEncoding, ClientConfig, ClientProtocol};
+use oci_client::errors::{OciDistributionError, OciEnvelope, OciErrorCode};
 use oci_client::manifest::{OCI_IMAGE_MEDIA_TYPE, OciDescriptor, OciImageManifest, OciManifest};
 use oci_client::secrets::RegistryAuth;
 use serde::{Deserialize, Serialize};
@@ -232,7 +233,9 @@ pub fn push(cfg: &Config, dir: &Path, image_ref: &str) -> Result<String> {
     if let Some(root) = rg.local_root() {
         return local::push_bundle(&root, dir, &name, &tag);
     }
-    block_on(push_async(rg, dir, &name, &tag))
+    block_on(with_upload_retry("push", |force| {
+        push_async(rg, dir, &name, &tag, force)
+    }))
 }
 
 /// Pull+cache a registry bundle for a job, returning a `ResolvedImage` exactly like
@@ -512,7 +515,7 @@ async fn push_ext4_async(
         std::fs::copy(ext4, &runner).with_context(|| format!("copying {}", ext4.display()))?;
     }
     std::fs::write(bundle.join("boot.kind"), boot_kind).context("writing boot.kind")?;
-    let r = push_async(rg, &bundle, name, tag).await;
+    let r = with_upload_retry("push", |force| push_async(rg, &bundle, name, tag, force)).await;
     let _ = std::fs::remove_dir_all(&bundle);
     r
 }
@@ -608,17 +611,20 @@ pub fn push_ext4_diff(
             parent_layers,
         );
     }
-    block_on(push_ext4_diff_async(
-        rg,
-        name,
-        tag,
-        ext4,
-        boot_kind,
-        total_size,
-        dirty,
-        holes,
-        parent_layers,
-    ))
+    block_on(with_upload_retry("diff push", |force| {
+        push_ext4_diff_async(
+            rg,
+            name,
+            tag,
+            ext4,
+            boot_kind,
+            total_size,
+            dirty,
+            holes,
+            parent_layers,
+            force,
+        )
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -632,6 +638,7 @@ async fn push_ext4_diff_async(
     dirty: &[(u64, u64)],
     holes: &[(u64, u64)],
     parent_layers: &[OciDescriptor],
+    force: bool,
 ) -> Result<(Vec<OciDescriptor>, u64, String)> {
     let (client, auth) = client(rg)?;
     let image = make_ref(rg, name, tag)?;
@@ -668,7 +675,12 @@ async fn push_ext4_diff_async(
         };
         let is_dirty = overlaps(dirty);
         let is_hole = overlaps(holes);
-        if !is_dirty && !is_hole {
+        // `force` regenerates even an untouched chunk. This reuse is the diff push's
+        // dominant dedup and takes no probe at all — the parent's digest goes straight into
+        // the manifest — so it is the one a `gc` between the parent push and this one leaves
+        // dangling, and skipping it is the whole point of the retry. The bytes are still
+        // reachable: `q.read_at` below resolves an untouched chunk through the backing chain.
+        if !force && !is_dirty && !is_hole {
             layers.push(layer.clone());
             reused += 1;
             continue;
@@ -696,6 +708,7 @@ async fn push_ext4_diff_async(
             buf,
             offset,
             length,
+            force,
         )
         .await?;
         if was_uploaded {
@@ -733,6 +746,7 @@ async fn push_ext4_diff_async(
             reader,
             start,
             ext4,
+            force,
         )
         .await?
         {
@@ -766,7 +780,7 @@ async fn push_ext4_diff_async(
         size: config_json.len() as i64,
         ..Default::default()
     };
-    if !client.blob_exists(&image, &config_digest).await? {
+    if force || !client.blob_exists(&image, &config_digest).await? {
         client
             .push_blob(&image, config_json, &config_digest)
             .await
@@ -795,6 +809,67 @@ async fn push_ext4_diff_async(
     Ok((ret_layers, total_size, digest))
 }
 
+/// Whether a push failed because the registry does not hold a blob the manifest names.
+///
+/// A push dedups by asking `blob_exists` before uploading, and a registry that answers for
+/// content it cannot actually serve under this repository — a stale answer, a pull-through
+/// cache, a `gc` that swept between the probe and the manifest — makes the push skip an
+/// upload it needed. The registry catches that at the manifest `PUT`; this recognises it so
+/// the push can be retried honestly instead of failing.
+///
+/// `oci_client` surfaces a 4xx as `ServerError` with the raw body, not as its parsed
+/// `RegistryError`, so the OCI envelope is parsed here.
+fn is_manifest_blob_unknown(err: &anyhow::Error) -> bool {
+    let names_it = |env: &OciEnvelope| {
+        env.errors
+            .iter()
+            .any(|e| e.code == OciErrorCode::ManifestBlobUnknown)
+    };
+    err.chain().any(|e| {
+        match e.downcast_ref::<OciDistributionError>() {
+            // Our registry answers 400, which is what the spec prescribes; accept any
+            // client-error status so a stricter or looser registry is handled too. There
+            // is no loop to worry about — the retry happens at most once.
+            //
+            // The manifest-PUT path hands a 4xx back as `ServerError` with the body
+            // un-parsed; `oci_client`'s other 4xx path parses it into `RegistryError`
+            // instead. Both are matched, so this does not depend on which one a given
+            // version routes a manifest refusal through.
+            Some(OciDistributionError::ServerError { code, message, .. }) => {
+                (400..500).contains(code)
+                    && serde_json::from_str::<OciEnvelope>(message).is_ok_and(|e| names_it(&e))
+            }
+            Some(OciDistributionError::RegistryError { envelope, .. }) => names_it(envelope),
+            _ => false,
+        }
+    })
+}
+
+/// Run a push, and if the registry refuses the manifest because it does not hold a blob the
+/// push deduped away, run it once more uploading everything.
+///
+/// The retry re-reads the source rather than holding every skipped chunk in memory — layers
+/// are gigabytes, and this path is the rare one. `attempt`'s argument is "upload
+/// unconditionally".
+async fn with_upload_retry<T, F, Fut>(what: &str, mut attempt: F) -> Result<T>
+where
+    F: FnMut(bool) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    match attempt(false).await {
+        Err(e) if is_manifest_blob_unknown(&e) => {
+            eprintln!(
+                "virtkit: registry: {what}: the registry does not hold content this push \
+                 skipped uploading; re-pushing without dedup ({e:#})"
+            );
+            attempt(true)
+                .await
+                .context("re-pushing without dedup after the registry refused the manifest")
+        }
+        r => r,
+    }
+}
+
 /// Process one raw chunk for a push: dedup on its content (raw digest in transparent
 /// mode, else the chunkmap over the compressed-digest path), uploading the blob only if
 /// absent. Returns the layer descriptor (carrying `offset`/`length`) and whether a blob
@@ -811,12 +886,13 @@ async fn put_raw_chunk(
     raw: Vec<u8>,
     offset: u64,
     length: u64,
+    force: bool,
 ) -> Result<(OciDescriptor, bool)> {
     let raw_hex = sha256_hex_raw(&raw);
     if transparent {
         let digest = format!("sha256:{raw_hex}");
         let size = raw.len() as i64;
-        let uploaded = if client.blob_exists(image, &digest).await? {
+        let uploaded = if !force && client.blob_exists(image, &digest).await? {
             false
         } else {
             let frame = zstd_with_size(&raw)?;
@@ -830,7 +906,8 @@ async fn put_raw_chunk(
             uploaded,
         ));
     }
-    if let Some(dir) = chunkmap
+    if !force
+        && let Some(dir) = chunkmap
         && let Some((digest, size)) = chunkmap_get(dir, &raw_hex)
         && client.blob_exists(image, &digest).await?
     {
@@ -845,7 +922,7 @@ async fn put_raw_chunk(
     if let Some(dir) = chunkmap {
         chunkmap_put(dir, &raw_hex, &digest, size);
     }
-    let uploaded = if client.blob_exists(image, &digest).await? {
+    let uploaded = if !force && client.blob_exists(image, &digest).await? {
         false
     } else {
         client
@@ -941,6 +1018,7 @@ async fn chunk_region(
     reader: Box<dyn std::io::Read + Send>,
     start: u64,
     label: &Path,
+    force: bool,
 ) -> Result<Vec<(OciDescriptor, bool)>> {
     use futures::StreamExt;
     const CHUNK_CONCURRENCY: usize = 16;
@@ -964,6 +1042,7 @@ async fn chunk_region(
                 chunk.data,
                 offset,
                 length,
+                force,
             )
             .await?;
             Ok(Some(r))
@@ -1053,7 +1132,13 @@ fn make_digest_ref(rg: &Registry, name: &str, digest: &str) -> Result<OciReferen
         .with_context(|| format!("parsing OCI reference {whole:?}"))
 }
 
-async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<String> {
+async fn push_async(
+    rg: &Registry,
+    dir: &Path,
+    name: &str,
+    tag: &str,
+    force: bool,
+) -> Result<String> {
     let (client, auth) = client(rg)?;
     let image = make_ref(rg, name, tag)?;
     // The granular blob_exists/push_blob/push_manifest calls apply the cached token
@@ -1116,6 +1201,7 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
             reader,
             start,
             &ext4,
+            force,
         )
         .await?
         {
@@ -1136,10 +1222,28 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
     let has_kernel = dir.join("vmlinuz").is_file();
     let has_initrd = dir.join("initrd.img").is_file();
     if has_kernel {
-        layers.push(push_file(&client, &image, &dir.join("vmlinuz"), KERNEL_MEDIA_TYPE).await?);
+        layers.push(
+            push_file(
+                &client,
+                &image,
+                &dir.join("vmlinuz"),
+                KERNEL_MEDIA_TYPE,
+                force,
+            )
+            .await?,
+        );
     }
     if has_initrd {
-        layers.push(push_file(&client, &image, &dir.join("initrd.img"), INITRD_MEDIA_TYPE).await?);
+        layers.push(
+            push_file(
+                &client,
+                &image,
+                &dir.join("initrd.img"),
+                INITRD_MEDIA_TYPE,
+                force,
+            )
+            .await?,
+        );
     }
 
     let config = bundle_config_from_dir(dir, total_size, chunk_count, has_kernel, has_initrd)?;
@@ -1151,7 +1255,7 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
         size: config_json.len() as i64,
         ..Default::default()
     };
-    if !client.blob_exists(&image, &config_digest).await? {
+    if force || !client.blob_exists(&image, &config_digest).await? {
         client
             .push_blob(&image, config_json, &config_digest)
             .await
@@ -1180,16 +1284,21 @@ async fn push_async(rg: &Registry, dir: &Path, name: &str, tag: &str) -> Result<
 
 /// Push a small file (kernel/initrd) as a single raw blob, returning its layer
 /// descriptor. The digest is the sha256 of the raw bytes.
+///
+/// `force` skips the dedup probe, for [`with_upload_retry`]'s second attempt. It has to
+/// reach here as much as anywhere: a kernel blob is shared by every bundle, so it is the
+/// most-deduped blob in the store and the likeliest one a probe is stale about.
 async fn push_file(
     client: &oci_client::Client,
     image: &OciReference,
     path: &Path,
     media_type: &str,
+    force: bool,
 ) -> Result<OciDescriptor> {
     let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let digest = sha256_hex(&data);
     let size = data.len() as i64;
-    if !client.blob_exists(image, &digest).await? {
+    if force || !client.blob_exists(image, &digest).await? {
         client
             .push_blob(image, data, &digest)
             .await
@@ -2805,6 +2914,197 @@ mod local {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn server_error(code: u16, body: &str) -> anyhow::Error {
+        anyhow::Error::from(OciDistributionError::ServerError {
+            url: "http://registry.invalid/v2/team-a/app/manifests/v1".to_string(),
+            code,
+            message: body.to_string(),
+        })
+        .context("pushing the bundle manifest to team-a/app:v1")
+    }
+
+    /// The registry refuses a manifest naming content it does not hold, which is how a push
+    /// learns that a `blob_exists` probe told it something untrue. `oci_client` hands that
+    /// back as a `ServerError` carrying the raw body, wrapped in whatever context the push
+    /// added, so recognising it means digging the OCI envelope out of the chain.
+    #[test]
+    fn a_refused_manifest_is_recognised_through_the_error_chain() {
+        let envelope = r#"{"errors":[{"code":"MANIFEST_BLOB_UNKNOWN","message":"sha256:abc"}]}"#;
+        assert!(is_manifest_blob_unknown(&server_error(400, envelope)));
+        // a registry that picks a different client-error status still gets the retry
+        assert!(is_manifest_blob_unknown(&server_error(404, envelope)));
+        // and the shape `oci_client`'s other 4xx path produces, where the body is already
+        // parsed for us
+        assert!(is_manifest_blob_unknown(&anyhow::Error::from(
+            OciDistributionError::RegistryError {
+                envelope: serde_json::from_str::<OciEnvelope>(envelope).unwrap(),
+                url: "http://registry/v2/app/manifests/v1".to_string(),
+            }
+        )));
+
+        // and nothing else does
+        let other = r#"{"errors":[{"code":"MANIFEST_INVALID","message":"nope"}]}"#;
+        assert!(!is_manifest_blob_unknown(&server_error(400, other)));
+        assert!(!is_manifest_blob_unknown(&server_error(500, envelope)));
+        assert!(!is_manifest_blob_unknown(&server_error(
+            400,
+            "<html>502</html>"
+        )));
+        assert!(!is_manifest_blob_unknown(&anyhow::anyhow!(
+            "connection reset"
+        )));
+    }
+
+    /// On that refusal the push runs again with dedup off, and only then — a push that fails
+    /// for any other reason must not silently re-upload the whole image.
+    #[test]
+    fn a_refused_manifest_re_pushes_once_without_dedup() {
+        let envelope = r#"{"errors":[{"code":"MANIFEST_BLOB_UNKNOWN","message":"sha256:abc"}]}"#;
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        let out = crate::blockrt::block_on(with_upload_retry("push", |force| {
+            seen.lock().unwrap().push(force);
+            async move {
+                if force {
+                    Ok("pushed")
+                } else {
+                    Err(server_error(400, envelope))
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(out, "pushed");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![false, true],
+            "one retry, dedup off"
+        );
+
+        // an unrelated failure is returned as-is, with no second attempt
+        let seen = std::sync::Mutex::new(Vec::new());
+        let err = crate::blockrt::block_on(with_upload_retry("push", |force| {
+            seen.lock().unwrap().push(force);
+            async move { Err::<&str, _>(anyhow::anyhow!("connection reset")) }
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("connection reset"));
+        assert_eq!(*seen.lock().unwrap(), vec![false], "no retry");
+    }
+
+    /// A `vk-registry` on a loopback port, served from its own thread and runtime so the
+    /// blocking `push` below can drive it — the same shape `vk-registry`'s own e2e tests use.
+    fn spawn_registry(state: std::sync::Arc<vk_registry::ServerState>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let l = tokio::net::TcpListener::from_std(listener).unwrap();
+                let _ = vk_registry::serve_on(l, state).await;
+            });
+        });
+        format!("{addr}")
+    }
+
+    fn retry_tmpdir(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "vk-push-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    /// The forced push the retry re-runs, end to end against a real `vk-registry`: every
+    /// blob a bundle is made of — ext4 chunks, config, kernel, initrd — is uploaded and the
+    /// manifest is accepted, with the kernel blob deleted behind the client's back first so
+    /// the push has to put it back.
+    ///
+    /// This is a smoke test of the forced path, not a discriminator for any one dedup site:
+    /// a blob `HEAD` against this registry is answered locally and truthfully, so an
+    /// ordinary push recovers from a deleted blob too. What makes `force` load-bearing is
+    /// the diff push's parent-layer reuse, which takes no probe at all — covered by the
+    /// `with_upload_retry` tests above for control flow, and by this one for the property
+    /// that a forced push of a whole bundle leaves the store complete.
+    #[test]
+    fn a_forced_push_uploads_every_blob_a_bundle_is_made_of() {
+        // reqwest here is built on `rustls-no-provider`, so a provider has to be installed
+        // before any client is
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = retry_tmpdir("push-retry");
+        let store_root = dir.join("store");
+        let bundle = dir.join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        // an ext4 image, plus the two raw blobs `push_file` handles
+        std::fs::write(bundle.join("runner.ext4"), vec![3u8; 200_000]).unwrap();
+        std::fs::write(bundle.join("vmlinuz"), b"kernel bytes").unwrap();
+        std::fs::write(bundle.join("initrd.img"), b"initrd bytes").unwrap();
+
+        let store = vk_registry::Store::new(store_root.clone()).unwrap();
+        let url = spawn_registry(std::sync::Arc::new(vk_registry::ServerState {
+            store: std::sync::Arc::new(store),
+            upstreams: vec![],
+            locks: vk_registry::lock::LockManager::new(),
+            auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
+            tls: None,
+        }));
+        // plain HTTP on loopback, which `for_share`'s `insecure` flag is for. The directory
+        // push is the path that reaches `push_file`, and it goes through a `Config`.
+        let cfg = crate::config::Config {
+            registry: Some(Registry::for_share(
+                url,
+                true,
+                None,
+                String::new(),
+                None,
+                None,
+                None,
+            )),
+            ..Default::default()
+        };
+
+        let rg = cfg.registry.as_ref().unwrap();
+        push(&cfg, &bundle, "app:v1").expect("the first push succeeds");
+
+        // Delete the kernel blob, leaving everything the client remembers intact — the
+        // shape a `gc` between two pushes produces. Without `force` reaching `push_file`
+        // the retry would skip it again and be refused a second time.
+        // `sha256_hex` returns the `sha256:`-prefixed digest; the store names files by the
+        // bare hex.
+        let bare = |digest: &str| digest.trim_start_matches("sha256:").to_string();
+        let kernel_hex = bare(&sha256_hex(b"kernel bytes"));
+        for sub in ["blobs/sha256", "blobs/zstd"] {
+            let _ = std::fs::remove_file(store_root.join(sub).join(&kernel_hex));
+        }
+
+        let present = |hex: &str| {
+            store_root.join("blobs/sha256").join(hex).is_file()
+                || store_root.join("blobs/zstd").join(hex).is_file()
+        };
+        assert!(!present(&kernel_hex), "the fixture deleted it");
+
+        crate::blockrt::block_on(push_async(rg, &bundle, "app", "v2", true))
+            .expect("a forced push succeeds");
+        assert!(
+            present(&kernel_hex),
+            "a forced push must re-upload the kernel"
+        );
+        assert!(
+            present(&bare(&sha256_hex(b"initrd bytes"))),
+            "and the initrd, by the same route"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn inspect_without_registry_section_errs() {

@@ -493,6 +493,11 @@ as the `GET` would without a body: on a cold pull-through repository the two now
 canonical `Content-Length` — will see that 404 against an upstream-fronting repository and
 has to follow with the `GET` it would have made anyway.
 
+`vk push` also recovers on its own if a probe is wrong for some other reason — a `gc` between
+the probe and the manifest, or a registry that is simply not this one: on
+`MANIFEST_BLOB_UNKNOWN` it re-runs the push once with dedup off, uploading everything rather
+than failing (`is_manifest_blob_unknown`/`with_upload_retry` in `vk-driver`'s `registry.rs`).
+
 **There is no migration.** A store written before this has no membership records, so its
 content is unreadable through the API: start from an empty store, or re-push into it. This is
 deliberate — reconstructing membership from existing manifests is exactly the inference the

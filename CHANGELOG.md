@@ -105,6 +105,10 @@ All notable changes to virtkit will be documented in this file.
   or an upstream labelled it, so nobody who can push to a registry can get the
   browser to treat stored bytes as a page from it.
 
+- `vk push` no longer fails when the registry turns out not to hold a piece of
+  content the push skipped uploading — it re-sends the image rather than giving
+  up. This could happen when housekeeping ran on the registry mid-push.
+
 - `vk registry gc` and `vk-registry gc` no longer delete images that are still in
   use when part of the store is not readable, or holds something they did not
   write. They now name the offending path and stop, having deleted nothing; the
