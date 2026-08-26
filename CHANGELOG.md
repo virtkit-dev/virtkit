@@ -28,6 +28,14 @@ All notable changes to virtkit will be documented in this file.
   `status`, `gc` and `install-service` all read the file, so all four report
   the bad setting.
 
+### Fixed
+
+- `vk registry gc` and `vk-registry gc` no longer delete images that are still in
+  use when part of the store is not readable, or holds something they did not
+  write. They now name the offending path and stop, having deleted nothing; the
+  fix is to remove that path from the store and run the gc again. Repository
+  names are capped at 16 `/`-separated parts, far past any real name.
+
 ## [0.42.0] - 2026-08-25
 
 ### Fixed

@@ -412,14 +412,33 @@ impl Store {
         };
         let mut report = GcReport::default();
 
+        // Everything the mark phase roots in is read strictly, and nothing is deleted
+        // before all of it is: a root this pass fails to see is a blob it goes on to sweep
+        // out from under a live tag. Same reason a manifest that will not parse aborts
+        // below — only here the omission would be silent.
+        let (tags_dirs, tags_unseen) = self.repo_dirs("tags");
+        let (man_dirs, man_unseen) = self.repo_dirs("manifests");
+        if let Some(p) = tags_unseen.or(man_unseen) {
+            bail!(
+                "{} is a symlink, unreadable, or nested deeper than {MAX_NAME_SEGMENTS} \
+                 repository name components; refusing to sweep on marks that would be \
+                 incomplete. Remove it from the store, then run the gc again",
+                p.display()
+            );
+        }
+
         // drop idle tags; the survivors' manifest hexes root the mark phase.
         let mut roots: HashSet<String> = HashSet::new();
-        for tags_dir in self.repo_dirs("tags") {
-            for tag in dir_files(&tags_dir) {
+        for tags_dir in tags_dirs {
+            for tag in root_dir_files(&tags_dir)? {
                 if idle(&tag, retention) {
                     remove(&tag)?;
                     report.tags_dropped += 1;
-                } else if let Ok(d) = std::fs::read_to_string(&tag) {
+                } else {
+                    // A tag being kept has to be readable: leaving it unrooted would mean
+                    // sweeping the blobs it still references.
+                    let d = std::fs::read_to_string(&tag)
+                        .with_context(|| format!("reading the tag {}", tag.display()))?;
                     roots.insert(d.trim().trim_start_matches("sha256:").to_string());
                 }
             }
@@ -427,10 +446,14 @@ impl Store {
 
         // manifest sidecars: rooted by a surviving tag, or by their own freshness
         // (digest-pinned); the rest drop, their manifest blob falling to the sweep.
-        for man_dir in self.repo_dirs("manifests") {
-            for sidecar in dir_files(&man_dir) {
+        for man_dir in man_dirs {
+            for sidecar in root_dir_files(&man_dir)? {
                 let Some(hex) = sidecar.file_name().and_then(|n| n.to_str()) else {
-                    continue;
+                    bail!(
+                        "{} is not named for a manifest digest; refusing to sweep on marks \
+                         that would be incomplete",
+                        sidecar.display()
+                    );
                 };
                 if roots.contains(hex) {
                     continue;
@@ -517,7 +540,10 @@ impl Store {
         let base = self.root.join("repos");
         let mut repo_dirs: BTreeSet<PathBuf> = BTreeSet::new();
         for kind in ["tags", "manifests"] {
-            for d in self.repo_dirs(kind) {
+            // `stats` reports; it deletes nothing, so an incomplete walk here only
+            // under-reports and is not worth failing the command for.
+            let (dirs, _unseen) = self.repo_dirs(kind);
+            for d in dirs {
                 if let Some(p) = d.parent() {
                     repo_dirs.insert(p.to_path_buf());
                 }
@@ -592,23 +618,65 @@ impl Store {
     /// nested (`bundles/appbuilder`), so walk down to the layout dirs. A repo path
     /// *component* itself named `tags`/`manifests` would be indistinguishable from
     /// the layout and is not supported by the gc.
-    fn repo_dirs(&self, kind: &str) -> Vec<PathBuf> {
+    ///
+    /// The descent is `lstat`-based (`DirEntry::file_type`, not `Path::is_dir`), so a
+    /// symlink is never followed — it could point back up its own tree — and
+    /// depth-bounded by [`MAX_NAME_SEGMENTS`], the same bound `valid_name` puts on a name,
+    /// so no name this store accepted is out of reach.
+    ///
+    /// The second return is the first path the walk could *not* see through — a symlink,
+    /// an unreadable directory, or a subtree past the depth bound — or `None` if it saw all
+    /// of `repos/`. [`Store::gc`] *deletes* on the strength of this walk, so for it an
+    /// incomplete answer is as fatal as a parse failure; `stats` only under-reports.
+    fn repo_dirs(&self, kind: &str) -> (Vec<PathBuf>, Option<PathBuf>) {
         let mut out = Vec::new();
-        let mut stack = vec![self.root.join("repos")];
-        while let Some(d) = stack.pop() {
-            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-                let p = e.path();
-                if !p.is_dir() {
+        let mut unseen: Option<PathBuf> = None;
+        let mut stack = vec![(self.root.join("repos"), 0usize)];
+        while let Some((d, depth)) = stack.pop() {
+            let entries = match std::fs::read_dir(&d) {
+                Ok(e) => e,
+                // `repos/` itself absent is an empty store, not an incomplete walk
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && depth == 0 => continue,
+                Err(_) => {
+                    unseen = unseen.or(Some(d));
                     continue;
                 }
-                if p.file_name().is_some_and(|n| n == kind) {
-                    out.push(p);
+            };
+            for e in entries {
+                let Ok(e) = e.and_then(|e| e.file_type().map(|t| (e.path(), t))) else {
+                    unseen = unseen.or_else(|| Some(d.clone()));
+                    continue;
+                };
+                let (p, ft) = e;
+                if ft.is_symlink() {
+                    // Not followed, and not silently ignored either: nothing this store
+                    // writes is a symlink, so one means the tree is not what gc assumes.
+                    unseen = unseen.or(Some(p));
+                    continue;
+                }
+                if !ft.is_dir() {
+                    continue;
+                }
+                // Both layout dirs terminate the descent, not just the one being collected:
+                // a repo path component named `tags`/`manifests` is unsupported either way
+                // (see above), so the sibling is never a repo to descend into. Descending
+                // it would also spend the depth budget a full-length name needs — and then
+                // report the store's own tree as unseen.
+                let layout = p
+                    .file_name()
+                    .is_some_and(|n| n == "tags" || n == "manifests");
+                if layout {
+                    if p.file_name().is_some_and(|n| n == kind) {
+                        out.push(p);
+                    }
+                } else if depth < MAX_NAME_SEGMENTS {
+                    stack.push((p, depth + 1));
                 } else {
-                    stack.push(p);
+                    unseen = unseen.or(Some(p));
                 }
             }
         }
-        out
+        (out, unseen)
     }
 }
 
@@ -708,6 +776,29 @@ fn manifest_blob_sizes(manifest: &[u8]) -> Vec<(String, u64)> {
             Some((hex.trim_start_matches("sha256:").to_string(), size))
         })
         .collect()
+}
+
+/// [`dir_files`] for the directories [`Store::gc`] roots its mark phase in, where a
+/// listing it could not complete is a set of roots it must not sweep against: an
+/// unreadable `tags/` yields no tags, which unroots every blob that repo's tags reference.
+/// The lenient version stays right for `blobs/*` and `uploads/`, where a missed entry only
+/// leaves something unswept.
+fn root_dir_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let e = e.with_context(|| format!("reading an entry of {}", dir.display()))?;
+        let ft = e
+            .file_type()
+            .with_context(|| format!("stat-ing {}", e.path().display()))?;
+        if !ft.is_file() {
+            bail!(
+                "{} is not a plain file; refusing to sweep on marks that would be incomplete",
+                e.path().display()
+            );
+        }
+        out.push(e.path());
+    }
+    Ok(out)
 }
 
 /// The files directly inside `dir` (a missing dir reads as empty; subdirectories
@@ -1471,10 +1562,18 @@ pub(crate) fn sha256_hex_raw(data: &[u8]) -> String {
     hex_of(&Sha256::digest(data))
 }
 
-/// A repository name: one or more `/`-separated path components, each a non-empty
-/// run of `[A-Za-z0-9._-]` and not `.`/`..` — so it never escapes the store dir.
+/// Ceiling on a repository name's `/`-separated components. A name *is* a directory path
+/// under `repos/`, so its depth is what [`Store::repo_dirs`]' walk has to descend — and
+/// `gc` marks from that walk. Bounding it here, where a name is accepted, is what keeps
+/// the walk's own bound unreachable: a name gc could not reach is a name whose blobs it
+/// would sweep. Far past any real name (`bundles/appbuilder` is two).
+const MAX_NAME_SEGMENTS: usize = 16;
+
+/// A repository name: one to [`MAX_NAME_SEGMENTS`] `/`-separated path components, each a
+/// non-empty run of `[A-Za-z0-9._-]` and not `.`/`..` — so it never escapes the store dir.
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
+        && name.split('/').count() <= MAX_NAME_SEGMENTS
         && name.split('/').all(|seg| {
             !seg.is_empty()
                 && seg != "."
@@ -2771,6 +2870,93 @@ mod tests {
         assert!(!valid_name("a/../b"));
         assert!(!valid_name(""));
         assert!(!valid_name("bad name"));
+
+        // A name is a directory path under `repos/`, and `gc` marks from a walk of that
+        // tree — so a name deeper than the walk descends would be a name whose blobs get
+        // swept. The bound belongs here, where the name is accepted.
+        let segs = |n: usize| vec!["a"; n].join("/");
+        assert!(valid_name(&segs(MAX_NAME_SEGMENTS)));
+        assert!(!valid_name(&segs(MAX_NAME_SEGMENTS + 1)));
+    }
+
+    /// `gc` deletes on the strength of the `repos/` walk and the tag/manifest listings it
+    /// roots from, so anything it cannot see there has to abort the sweep, exactly as an
+    /// unparseable manifest does. Every case runs a *real* sweep (`dry_run = false`) — a
+    /// dry run deletes nothing whatever the walk said, so it could not tell the refusal
+    /// from the sweep it is meant to prevent.
+    #[test]
+    fn gc_refuses_to_sweep_on_roots_it_could_not_read() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gcwalk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        let raw = vec![7u8; 4096];
+        let digest = store.put_blob(&raw).unwrap();
+        let hex = digest.trim_start_matches("sha256:").to_string();
+        let body = manifest_body(&digest, &[]);
+        store
+            .put_manifest("app", "v1", DEFAULT_MANIFEST_TYPE, &body)
+            .unwrap();
+        // a retention window the fresh tag is well inside, so a sweep that sees the tag
+        // keeps its blob and one that does not deletes it — the difference under test
+        let sweep = |store: &Store| store.gc(DAY, DAY, false);
+        let refusal = |store: &Store| match sweep(store) {
+            Ok(_) => panic!("gc must refuse roots it could not read"),
+            Err(e) => e.to_string(),
+        };
+
+        // the ordinary case: a complete walk, and the tag keeps its blob alive
+        assert!(
+            store.repo_dirs("tags").1.is_none(),
+            "a plain store is all seen"
+        );
+        sweep(&store).expect("an ordinary sweep");
+        assert!(store.has_blob(&hex), "a tagged manifest's blob survives");
+
+        // a symlink under `repos/` is not followed, so the walk cannot see through it
+        let link = dir.join("repos").join("elsewhere");
+        std::os::unix::fs::symlink(dir.join("repos").join("app"), &link).unwrap();
+        assert_eq!(
+            store.repo_dirs("tags").1.as_deref(),
+            Some(link.as_path()),
+            "the walk names the symlink it would not follow"
+        );
+        let e = refusal(&store);
+        assert!(
+            e.contains("refusing to sweep") && e.contains("elsewhere"),
+            "{e}"
+        );
+        assert!(store.has_blob(&hex), "and it deleted nothing");
+        std::fs::remove_file(&link).unwrap();
+
+        // a `tags/` directory the walk *reaches* but cannot list: it yields no tags, so
+        // without the strict listing the manifest would be unrooted and its blob swept
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let tags = dir.join("repos").join("app").join("tags");
+            std::fs::set_permissions(&tags, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let e = refusal(&store);
+            std::fs::set_permissions(&tags, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(e.contains("tags"), "{e}");
+            assert!(store.has_blob(&hex), "and it deleted nothing");
+        }
+
+        // and a repository name of the full permitted depth is still swept: the walk's
+        // depth bound and `valid_name`'s have to meet exactly, or a name the store accepts
+        // is a name gc refuses forever
+        let deep = vec!["a"; MAX_NAME_SEGMENTS].join("/");
+        assert!(valid_name(&deep));
+        store
+            .put_manifest(&deep, "v1", DEFAULT_MANIFEST_TYPE, &body)
+            .unwrap();
+        assert!(
+            store.repo_dirs("tags").1.is_none(),
+            "a name of the full permitted depth is not past the walk's bound"
+        );
+        sweep(&store).expect("and it still sweeps");
+        assert!(store.has_blob(&hex));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
