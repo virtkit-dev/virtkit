@@ -43,6 +43,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- `vk-registry` no longer drops a connection when a request's query string or form
+  body has a `%` in front of a non-ASCII character. Signing out from a page with
+  such a body was enough to trigger it.
+
 - `vk-registry` now checks that a pushed layer or manifest really is the content
   its digest names, and refuses the push when it is not. A client can no longer
   claim a piece of content it did not send.

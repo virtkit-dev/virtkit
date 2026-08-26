@@ -2037,22 +2037,45 @@ pub(crate) fn percent_encode(s: &str) -> String {
 }
 
 /// Minimal application/x-www-form-urlencoded decode: `%XX` hex escapes and `+`.
+///
+/// Bytes throughout, and never a `&str` slice: a byte-length guard is not a char-boundary
+/// guard, so slicing `s[i + 1..i + 3]` after checking `i + 3 <= s.len()` panics whenever a
+/// `%` is followed by a multi-byte character (`"%€"`). Every caller here feeds it a query
+/// string or a form body, which is exactly where an attacker chooses the bytes.
 fn percent_decode(s: &str) -> String {
+    /// One hex digit's value, or `None` — including for a byte that is not one.
+    fn hex(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'%' if i + 3 <= b.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                Ok(v) => {
-                    out.push(v);
-                    i += 3;
+    while let Some(&c) = b.get(i) {
+        match c {
+            b'%' => {
+                let pair = b
+                    .get(i + 1)
+                    .copied()
+                    .and_then(hex)
+                    .zip(b.get(i + 2).copied().and_then(hex));
+                match pair {
+                    Some((h, l)) => {
+                        out.push((h << 4) | l);
+                        i += 3;
+                    }
+                    // not an escape after all: the `%` is literal
+                    None => {
+                        out.push(b'%');
+                        i += 1;
+                    }
                 }
-                Err(_) => {
-                    out.push(b'%');
-                    i += 1;
-                }
-            },
+            }
             b'+' => {
                 out.push(b' ');
                 i += 1;
@@ -3713,6 +3736,16 @@ mod tests {
         assert_eq!(percent_decode("a+b"), "a b");
         assert_eq!(percent_decode("plain"), "plain");
         assert_eq!(percent_decode("trailing%"), "trailing%");
+        assert_eq!(percent_decode("%e2%82%ac"), "\u{20ac}");
+
+        // A byte-length guard is not a char boundary: a `%` before a multi-byte character
+        // used to be sliced as a `&str` and panic. Query strings and form bodies come from
+        // the caller, so this is a request away.
+        assert_eq!(percent_decode("%\u{20ac}"), "%\u{20ac}");
+        assert_eq!(percent_decode("%e\u{20ac}"), "%e\u{20ac}");
+        assert_eq!(percent_decode("csrf=%\u{1f600}"), "csrf=%\u{1f600}");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%4"), "%4");
     }
 
     #[test]
