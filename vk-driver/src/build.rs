@@ -3520,33 +3520,48 @@ mod tests {
     /// the sweep emptied.
     #[test]
     fn a_claim_racing_a_sweep_waits_for_a_dir_of_its_own() {
-        use std::os::unix::fs::MetadataExt;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let root = tmpdir("claim-vs-sweep");
         let dir = root.join(format!("{SCRATCH_PREFIX}{}-0", dead_pid()));
         drop(claim_scratch(&dir).unwrap());
 
         let sweeping = claim_if_abandoned(&dir).expect("an unlocked scratch dir is abandoned");
-        let held = std::fs::metadata(&dir).unwrap();
 
-        // The sweep finishes only once the build is already waiting behind it.
+        // The sweep finishes only once the build is already waiting behind it. The flag is
+        // set *before* `remove_dir_all`, which is what makes this an ordering check rather
+        // than a timing one: a claim cannot succeed until either the sweep's lock is gone
+        // or the dir is, and both come strictly after the store. Setting it afterwards
+        // would leave a window — `claim_scratch_until` recreates the dir on its next poll,
+        // so it can win between `remove_dir_all` returning and the store.
+        let sweep_started = Arc::new(AtomicBool::new(false));
         let removing = std::thread::spawn({
             let dir = dir.clone();
+            let sweep_started = Arc::clone(&sweep_started);
             move || {
                 std::thread::sleep(CLAIM_RETRY * 3);
+                sweep_started.store(true, Ordering::SeqCst);
                 std::fs::remove_dir_all(&dir).unwrap();
                 drop(sweeping);
             }
         });
 
         let owner = claim_scratch(&dir).unwrap();
+        assert!(
+            sweep_started.load(Ordering::SeqCst),
+            "a claim must wait the sweep out, not join the dir being swept"
+        );
         removing.join().unwrap();
 
-        let fresh = owner.metadata().unwrap();
-        assert_ne!(
-            (held.dev(), held.ino()),
-            (fresh.dev(), fresh.ino()),
-            "a build must get a fresh dir, not the one the sweep emptied"
+        // And what it came back holding is the live directory at that path, not the one the
+        // sweep unlinked. Identity, not inode *inequality*: the kernel is free to hand the
+        // freed inode straight back to the directory created in its place, so an
+        // `assert_ne!` on (dev, ino) fails at random. It also cannot happen that `owner` is
+        // the unlinked dir *and* the inode was reused — an open handle keeps it alive.
+        assert!(
+            crate::cachelock::same_file(&owner, &dir).unwrap(),
+            "a build must hold the dir its path names, not the one the sweep emptied"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
