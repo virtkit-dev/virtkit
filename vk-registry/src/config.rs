@@ -25,6 +25,9 @@ use crate::oidc::{OidcClient, OidcConfig};
 use crate::relay::Upstream;
 use crate::{ServerState, Store};
 
+mod help;
+pub use help::config_file_help;
+
 /// The client-auth model for the whole server — mutually exclusive, chosen once at
 /// startup. See `DESIGN.md`'s "Accounts, OIDC, and scoped API keys".
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -262,14 +265,7 @@ impl ServerConfig {
                 bail!("unknown auth mode {other:?} (expected \"shared-secret\" or \"accounts\")")
             }
         };
-        // The mirror of `build_auth`'s check, and the more dangerous direction: nothing
-        // reads `accounts_db` in shared-secret mode, so a file that configures one with
-        // `mode` forgotten would start wide open — the same silent auth downgrade
-        // `deny_unknown_fields` above exists to prevent, reached through a key spelt right.
-        if f.accounts_db.is_some() && mode != AuthMode::Accounts {
-            bail!("accounts_db is set but mode is not \"accounts\", so it would be ignored");
-        }
-        Ok(ServerConfig {
+        let cfg = ServerConfig {
             addr,
             root,
             upstreams,
@@ -286,7 +282,73 @@ impl ServerConfig {
                 client_secret_file: o.client_secret_file,
                 public_url: o.public_url,
             }),
-        })
+        };
+        // Also here, not only in `build_auth`: `load` is where a file becomes a config, so
+        // a contradictory file is refused by parsing it at all, not only by the path that
+        // goes on to build the auth scheme. The serve path does both, so no message an
+        // operator sees moves — what it buys is a file settled by `load` alone, as the
+        // help examples' test does.
+        cfg.check_auth_exclusions()?;
+        Ok(cfg)
+    }
+
+    /// The auth keys that cannot be combined, refused before anything they name is read —
+    /// so this is also what a config file can be checked against without the files, the
+    /// store, or a listening socket existing.
+    ///
+    /// Every case is a silent auth *downgrade* if it is allowed through: a server that
+    /// ignores half of what the operator configured is a server authenticating callers
+    /// some other way than they believe.
+    fn check_auth_exclusions(&self) -> Result<()> {
+        if self.token_file.is_some() && self.username.as_ref().is_some_and(|u| !u.is_empty()) {
+            bail!(
+                "configure either token_file or username/password_file for client auth, not both"
+            );
+        }
+        if self.mode == AuthMode::Accounts
+            && (self.token_file.is_some()
+                || self.password_file.is_some()
+                || self.username.as_ref().is_some_and(|u| !u.is_empty()))
+        {
+            bail!(
+                "mode = \"accounts\" is mutually exclusive with \
+                 token_file/username/password_file — configure accounts_db instead"
+            );
+        }
+        if self.mode == AuthMode::SharedSecret && self.oidc.is_some() {
+            // The mirror image of the refusal above: silently ignoring a table the
+            // operator wrote is how a server ends up in the mode they meant to replace.
+            bail!("an [oidc] table needs mode = \"accounts\"; it is ignored otherwise");
+        }
+        // The more dangerous direction: nothing reads `accounts_db` in shared-secret mode,
+        // so a file that configures one with `mode` forgotten would start wide open — the
+        // same silent downgrade `deny_unknown_fields` exists to prevent, reached through a
+        // key spelt right.
+        if self.accounts_db.is_some() && self.mode != AuthMode::Accounts {
+            bail!("accounts_db is set but mode is not \"accounts\", so it would be ignored");
+        }
+        Ok(())
+    }
+
+    /// Auth over plain HTTP on a routable address would put the bearer token / Basic
+    /// password (or, in accounts mode, a session cookie / API key) on the wire in
+    /// cleartext; refuse it rather than silently expose creds. Split out of
+    /// [`ServerConfig::into_state`] for the same reason as [`Self::check_auth_exclusions`]:
+    /// a config file can then be held to it without a store or a listening socket.
+    fn check_no_cleartext_creds(&self) -> Result<()> {
+        // The same condition `build_auth` selects a scheme on, without reading the files
+        // it names — so no caller has to restate it to ask this question.
+        let creds_in_play = self.token_file.is_some()
+            || self.username.as_ref().is_some_and(|u| !u.is_empty())
+            || self.mode == AuthMode::Accounts;
+        if creds_in_play && self.tls_cert.is_none() && !self.addr.ip().is_loopback() {
+            bail!(
+                "client auth is enabled without TLS on non-loopback address {} — credentials \
+                 would be sent in cleartext; set tls_cert/tls_key or bind a loopback address",
+                self.addr
+            );
+        }
+        Ok(())
     }
 
     /// Build the TLS acceptor from the configured cert/key, or `None` for plain HTTP.
@@ -313,11 +375,8 @@ impl ServerConfig {
     /// anything is opened or created.
     fn resolve_oidc(&self) -> Result<Option<OidcConfig>> {
         if self.mode == AuthMode::SharedSecret {
-            // The mirror image of `build_auth`'s refusal: silently ignoring a table the
-            // operator wrote is how a server ends up in the mode they meant to replace.
-            if self.oidc.is_some() {
-                bail!("an [oidc] table needs mode = \"accounts\"; it is ignored otherwise");
-            }
+            // An `[oidc]` table here is refused by `check_auth_exclusions`, so shared-secret
+            // mode simply has no provider.
             return Ok(None);
         }
         let spec = self
@@ -404,21 +463,10 @@ impl ServerConfig {
     /// username + password file, else open. `mode = "accounts"` replaces this scheme
     /// entirely (see `route`'s auth gate), so it is an error to also configure one.
     fn build_auth(&self) -> Result<Auth> {
-        if self.token_file.is_some() && self.username.as_ref().is_some_and(|u| !u.is_empty()) {
-            bail!(
-                "configure either token_file or username/password_file for client auth, not both"
-            );
-        }
-        if self.mode == AuthMode::Accounts
-            && (self.token_file.is_some()
-                || self.password_file.is_some()
-                || self.username.as_ref().is_some_and(|u| !u.is_empty()))
-        {
-            bail!(
-                "mode = \"accounts\" is mutually exclusive with \
-                 token_file/username/password_file — configure accounts_db instead"
-            );
-        }
+        // Also checked at `load`, and still checked here: a `ServerConfig` can be built
+        // in code as well as parsed, and this is the point where ignoring one of these
+        // keys would actually happen.
+        self.check_auth_exclusions()?;
         if let Some(tf) = &self.token_file {
             let token = std::fs::read_to_string(tf)
                 .with_context(|| format!("reading {}", tf.display()))?
@@ -456,17 +504,7 @@ impl ServerConfig {
     /// `/v2/` clients never touch OIDC from starting at all.
     pub fn into_state(self) -> Result<ServerState> {
         let auth = self.build_auth()?;
-        // Auth over plain HTTP on a routable address would put the bearer token / Basic
-        // password (or, in accounts mode, a session cookie / API key) on the wire in
-        // cleartext; refuse it rather than silently expose creds.
-        let creds_in_play = auth.enabled() || self.mode == AuthMode::Accounts;
-        if creds_in_play && self.tls_cert.is_none() && !self.addr.ip().is_loopback() {
-            bail!(
-                "client auth is enabled without TLS on non-loopback address {} — credentials \
-                 would be sent in cleartext; set tls_cert/tls_key or bind a loopback address",
-                self.addr
-            );
-        }
+        self.check_no_cleartext_creds()?;
         // Everything the config can be wrong about is settled before anything is created:
         // a server that is going to refuse to start should not leave a db file behind.
         let oidc_cfg = self.resolve_oidc()?;

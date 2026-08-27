@@ -86,7 +86,8 @@ Routing convention: the first path segment(s) of the repo name select the upstre
 prefix = "docker.io"                 # longest-prefix match; "" = catch-all
 url    = "https://registry-1.docker.io"
 # anonymous by default (bearer-token / WWW-Authenticate handled by oci-client);
-# optional username + password_file, ca_file, insecure
+# optional username + password_file, ca_file
+# (every key is listed in `vk-registry serve --help`)
 [[upstream]]
 prefix = "ghcr.io"
 url    = "https://ghcr.io"

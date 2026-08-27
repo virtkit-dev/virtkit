@@ -54,6 +54,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- `vk-registry serve --help` now documents the `--config` file: every key it
+  accepts and what each one does, plus two complete examples to copy — one with
+  a shared secret, one with accounts and sign-in through an identity provider.
+
 - Build-cache tags now say what they are: an instruction snapshot is `snap-<hash>`
   and a base image's filesystem is `base-<hash>`, where before a snapshot was a
   bare hash and only base entries were prefixed. `vk docker-hash` prints the new

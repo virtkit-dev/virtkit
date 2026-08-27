@@ -30,7 +30,12 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 /// Central OCI-distribution server: build-once dedup, pull-through relay, build lock
 #[derive(Parser)]
-#[command(name = "vk-registry", version)]
+#[command(
+    name = "vk-registry",
+    version,
+    after_help = "The `serve`/`install-service` --config file's keys are documented in \
+                  `vk-registry serve --help`."
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -42,6 +47,12 @@ enum Cmd {
     ///
     /// With no upstreams configured it is a plain local OCI server; configure `[[upstream]]` in
     /// the config file to make it a pull-through mirror.
+    ///
+    /// Every config-file key is listed at the end of this help, with two examples.
+    #[command(
+        after_help = "Every --config key is listed by `vk-registry serve --help`.",
+        after_long_help = vk_registry::config::config_file_help()
+    )]
     Serve {
         /// Listen address [default: the `addr` in --config, else 127.0.0.1:5000]
         #[arg(long)]
@@ -52,6 +63,8 @@ enum Cmd {
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
         /// TOML config file with `[[upstream]]` relay entries, addr/root, TLS and auth
+        ///
+        /// Its keys are documented below.
         #[arg(long, value_name = "FILE")]
         config: Option<PathBuf>,
     },
