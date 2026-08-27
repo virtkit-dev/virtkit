@@ -83,7 +83,7 @@ regex = "1"
 # block-level dedup, each chunk zstd-compressed independently. fastcdc is pure Rust;
 # zstd vendors its C (gcc/musl-dev are in the build image), so the binary stays
 # musl-static.
-fastcdc = "4"
+fastcdc = "5"
 zstd = "0.13"
 # .ko.xz kernel-module decompression for `vk run --kernel image` (fullvm): pure Rust,
 # so it needs no C liblzma and the binary stays musl-static (zstd/gz are covered by the
