@@ -42,6 +42,7 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
 pub mod accounts;
+pub mod admin;
 pub mod auth;
 pub(crate) mod browse;
 pub mod client;
@@ -1222,9 +1223,36 @@ pub async fn serve_config(cfg: ServerConfig) -> Result<()> {
         .await
         .with_context(|| format!("binding {addr}"))?;
     let tls = cfg.build_tls()?;
+    // Resolved before `into_state` consumes the config; bound after it, because the
+    // listener is only worth having once the db behind it is open.
+    let admin_socket = cfg.resolved_admin_socket();
     let mut state = cfg.into_state()?;
     state.tls = tls;
-    serve_on(listener, Arc::new(state)).await
+    let state = Arc::new(state);
+    // Accounts mode only, and the db the socket administers is the one this server holds —
+    // `Authenticator` is what says whether there is one at all.
+    if let (Some(path), Authenticator::Accounts { db, .. }) = (admin_socket, &state.auth) {
+        // A warning, not a failure: the registry's job is serving the store, and this
+        // channel is a convenience for the operator CLI, which still works with the server
+        // stopped. Refusing to start over a socket path — a read-only directory, a file
+        // somebody left at the name, another process listening there — would let the
+        // convenience take the service down, which is the one thing it must not do.
+        match admin::bind(&path) {
+            Ok(listener) => {
+                eprintln!(
+                    "vk-registry: accounts admin socket on {} — `vk-registry accounts` \
+                     needs no downtime",
+                    path.display()
+                );
+                tokio::spawn(admin::serve_admin(listener, db.clone()));
+            }
+            Err(e) => eprintln!(
+                "vk-registry: warning: no accounts admin socket: {e:#}; `vk-registry \
+                 accounts` will need this server stopped"
+            ),
+        }
+    }
+    serve_on(listener, state).await
 }
 
 /// The line a server announces itself with: the store it serves, whether it mirrors, and

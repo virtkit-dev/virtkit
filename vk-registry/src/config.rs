@@ -40,6 +40,27 @@ pub enum AuthMode {
     Accounts,
 }
 
+/// Whether and where `serve` binds the accounts admin socket — the local operator
+/// channel the `vk-registry accounts` CLI uses so it does not need the db to itself.
+/// Only accounts mode has one; see `DESIGN.md`'s "the operator CLI".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum AdminSocket {
+    /// Nothing was said about it: `admin.sock` beside the accounts db in accounts mode, and
+    /// nothing at all in shared-secret mode (there are no accounts to administer). Distinct
+    /// from [`AdminSocket::Default`] only so that a file naming *any* of the three
+    /// spellings outside accounts mode is refused the same way, rather than `true` alone
+    /// being silently ignored.
+    #[default]
+    Unset,
+    /// `true`: the default path, stated.
+    Default,
+    /// Bind nothing. The CLI then works only with the server stopped, as it once always
+    /// did.
+    Off,
+    /// A path the operator named, rather than the one beside the db.
+    At(PathBuf),
+}
+
 /// Resolved server configuration, ready to turn into a [`ServerState`] (+ a TLS acceptor).
 pub struct ServerConfig {
     pub addr: SocketAddr,
@@ -56,6 +77,8 @@ pub struct ServerConfig {
     /// Where the accounts db lives, in `mode = "accounts"`. Defaults to
     /// `<root>/accounts/accounts.db` when unset.
     pub accounts_db: Option<PathBuf>,
+    /// Whether `serve` also listens on the accounts admin socket, in `mode = "accounts"`.
+    pub admin_socket: AdminSocket,
     /// `[oidc]`, required in `mode = "accounts"` — it is the only login path that mode
     /// has.
     pub oidc: Option<OidcSpec>,
@@ -108,9 +131,21 @@ struct FileConfig {
     /// credentials it chooses between.
     mode: Option<String>,
     accounts_db: Option<PathBuf>,
+    /// `false` to bind no admin socket, a path to move it, `true` for the default one.
+    admin_socket: Option<FileAdminSocket>,
     oidc: Option<FileOidc>,
     #[serde(default)]
     upstream: Vec<FileUpstream>,
+}
+
+/// What `admin_socket` accepts: a bool (`false` = bind none, `true` = the default path)
+/// or a path. Untagged, and the bool first, so `admin_socket = false` reads as the switch
+/// it looks like rather than failing as a path.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FileAdminSocket {
+    Enabled(bool),
+    Path(PathBuf),
 }
 
 /// `deny_unknown_fields` for the same reason `FileConfig` has it: this table configures
@@ -155,6 +190,21 @@ pub fn default_accounts_db(root: &Path) -> PathBuf {
     root.join("accounts").join("accounts.db")
 }
 
+/// The admin socket beside an accounts db, in the db's own directory: filesystem access to
+/// the socket is then the same access to the db the `vk-registry accounts` CLI has always
+/// assumed, and one `0700` covers both wherever [`accounts::Db::open`] was the one that
+/// created the directory. It is not where the socket's privacy comes from — see
+/// [`admin::bind`](crate::admin::bind) and the peer-uid check on the other side of it — but
+/// it is the placement that needs no extra configuration to be right.
+pub fn default_admin_socket(accounts_db: &Path) -> PathBuf {
+    // `parent()` is `Some("")` for a bare filename and `None` only for `/` and `""`; both
+    // land on a socket the cwd resolves, which is where such a db file is too.
+    accounts_db
+        .parent()
+        .unwrap_or(Path::new(""))
+        .join("admin.sock")
+}
+
 /// Where the server listens when neither a flag nor a config file names an address.
 /// Loopback: a store served to the world is a deliberate act, not a default.
 pub const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
@@ -173,6 +223,7 @@ impl ServerConfig {
             password_file: None,
             mode: AuthMode::SharedSecret,
             accounts_db: None,
+            admin_socket: AdminSocket::Unset,
             oidc: None,
         }
     }
@@ -214,6 +265,67 @@ impl ServerConfig {
             return Ok(p);
         }
         Ok(default_accounts_db(&Self::root_of(config, root)?))
+    }
+
+    /// Where the admin socket of a server holding `accounts_db` is: an explicit
+    /// `--admin-socket` overrides everything, otherwise the config file's `admin_socket`,
+    /// else [`default_admin_socket`] beside `accounts_db` — which is what
+    /// [`ServerConfig::resolved_admin_socket`] binds for the server. `None` when the file
+    /// turns it off, and `None` outside accounts mode, where `serve` binds none whatever
+    /// else the file says. (There is no server-side `--admin-socket`; that arm is a CLI
+    /// override with nothing to mirror.)
+    ///
+    /// For the `vk-registry accounts` CLI. It takes the db already resolved — the same
+    /// [`ServerConfig::accounts_db_of`] path it would open directly — rather than resolving
+    /// one of its own, so the socket it dials cannot end up belonging to a different db than
+    /// the one it would have read. A path it returns is where a socket *would* be; whether
+    /// one is listening there is what connecting to it answers.
+    pub fn admin_socket_of(
+        config: Option<&Path>,
+        accounts_db: &Path,
+        admin_socket: Option<PathBuf>,
+    ) -> Result<Option<PathBuf>> {
+        if let Some(p) = admin_socket {
+            return Ok(Some(p));
+        }
+        if let Some(path) = config {
+            let f = read_file(path)?;
+            // `serve` binds none outside accounts mode whatever else the file says, so a
+            // CLI that resolved one here would probe a path nothing can ever answer at.
+            if f.mode.as_deref() != Some("accounts") {
+                return Ok(None);
+            }
+            match f.admin_socket {
+                Some(FileAdminSocket::Enabled(false)) => return Ok(None),
+                Some(FileAdminSocket::Path(p)) => return Ok(Some(p)),
+                None | Some(FileAdminSocket::Enabled(true)) => {}
+            }
+        }
+        Ok(Some(default_admin_socket(accounts_db)))
+    }
+
+    /// The accounts db this configuration's `serve` opens. The one resolution of it, because
+    /// the admin socket sits beside the db the server actually holds — two copies of this
+    /// rule could drift apart and put the socket next to a db nobody opened.
+    pub fn resolved_accounts_db(&self) -> PathBuf {
+        self.accounts_db
+            .clone()
+            .unwrap_or_else(|| default_accounts_db(&self.root))
+    }
+
+    /// The socket this configuration's `serve` binds: `None` outside accounts mode (there
+    /// are no accounts to administer) and `None` when the operator turned it off.
+    pub fn resolved_admin_socket(&self) -> Option<PathBuf> {
+        if self.mode != AuthMode::Accounts {
+            return None;
+        }
+        match &self.admin_socket {
+            AdminSocket::Off => None,
+            AdminSocket::Unset | AdminSocket::Default => {
+                Some(default_admin_socket(&self.resolved_accounts_db()))
+            }
+            AdminSocket::At(p) => Some(p.clone()),
+        }
     }
 
     /// What a `serve` config file states, for whoever has to describe the server it will
@@ -276,6 +388,12 @@ impl ServerConfig {
             password_file: f.password_file,
             mode,
             accounts_db: f.accounts_db,
+            admin_socket: match f.admin_socket {
+                None => AdminSocket::Unset,
+                Some(FileAdminSocket::Enabled(true)) => AdminSocket::Default,
+                Some(FileAdminSocket::Enabled(false)) => AdminSocket::Off,
+                Some(FileAdminSocket::Path(p)) => AdminSocket::At(p),
+            },
             oidc: f.oidc.map(|o| OidcSpec {
                 issuer: o.issuer,
                 client_id: o.client_id,
@@ -326,6 +444,12 @@ impl ServerConfig {
         // key spelt right.
         if self.accounts_db.is_some() && self.mode != AuthMode::Accounts {
             bail!("accounts_db is set but mode is not \"accounts\", so it would be ignored");
+        }
+        // Same reasoning, one step milder: there is nothing to administer without an
+        // accounts db, so a file that names the socket with `mode` forgotten has an
+        // operator expecting a channel that would never be bound.
+        if self.admin_socket != AdminSocket::Unset && self.mode != AuthMode::Accounts {
+            bail!("admin_socket is set but mode is not \"accounts\", so it would be ignored");
         }
         Ok(())
     }
@@ -511,10 +635,7 @@ impl ServerConfig {
         // `Store::new` first: the store owns the root, so it is the one that gets to
         // create it — `Db::open` would otherwise bring it into being as a side effect of
         // making room for the db file under it.
-        let db_path = self
-            .accounts_db
-            .clone()
-            .unwrap_or_else(|| default_accounts_db(&self.root));
+        let db_path = self.resolved_accounts_db();
         let store = Arc::new(Store::new(self.root)?);
         // `resolve_oidc` yields `Some` exactly in accounts mode, so it selects the arm as
         // well as supplying the provider.
@@ -796,6 +917,113 @@ mod tests {
             "the CLI must find the db `serve` created: {}",
             resolved.display()
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The CLI dials whatever this resolves, so it has to resolve what `serve` binds —
+    /// including the off switch, since a CLI that kept probing a socket nobody binds would
+    /// report a missing server rather than falling back to the db.
+    #[test]
+    fn admin_socket_of_resolves_the_socket_a_server_would_bind() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-sock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        // The db resolved the way the CLI would, then the socket beside it — the pairing
+        // the signature exists to keep.
+        let sock_of = |cfg: Option<&Path>, over: Option<PathBuf>| {
+            let db = ServerConfig::accounts_db_of(cfg, None, None).unwrap();
+            ServerConfig::admin_socket_of(cfg, &db, over).unwrap()
+        };
+
+        // an explicit path wins over everything, including a file that turns it off
+        let off = write("off.toml", "mode = \"accounts\"\nadmin_socket = false\n");
+        assert_eq!(
+            sock_of(Some(&off), Some(PathBuf::from("/explicit.sock"))),
+            Some(PathBuf::from("/explicit.sock"))
+        );
+        assert_eq!(sock_of(Some(&off), None), None, "the file's off switch");
+
+        let named = write(
+            "named.toml",
+            "mode = \"accounts\"\nadmin_socket = \"/run/vkr/admin.sock\"\n",
+        );
+        assert_eq!(
+            sock_of(Some(&named), None),
+            Some(PathBuf::from("/run/vkr/admin.sock"))
+        );
+
+        // else beside the accounts db, wherever that resolved from
+        let bare = write("bare.toml", "mode = \"accounts\"\nroot = \"/srv/store\"\n");
+        assert_eq!(
+            sock_of(Some(&bare), None),
+            Some(default_admin_socket(&default_accounts_db(Path::new(
+                "/srv/store"
+            ))))
+        );
+        // An explicit accounts db carries the socket with it: the CLI that would have opened
+        // *that* file has to dial the server holding it, not one beside a default root.
+        let elsewhere = dir.join("elsewhere").join("a.db");
+        assert_eq!(
+            ServerConfig::admin_socket_of(None, &elsewhere, None).unwrap(),
+            Some(default_admin_socket(&elsewhere))
+        );
+
+        // Shared-secret mode binds none whatever the file says about the socket, so a CLI
+        // must not resolve a path it would then probe forever.
+        let shared = write("shared.toml", "password_file = \"/etc/vkr.pw\"\n");
+        assert_eq!(sock_of(Some(&shared), None), None, "no accounts, no socket");
+        let shared_on = write(
+            "shared-on.toml",
+            "password_file = \"/etc/vkr.pw\"\nadmin_socket = true\n",
+        );
+        assert_eq!(sock_of(Some(&shared_on), None), None, "even asked for");
+
+        let moved = write(
+            "moved.toml",
+            "mode = \"accounts\"\naccounts_db = \"/srv/elsewhere/a.db\"\n",
+        );
+        assert_eq!(
+            sock_of(Some(&moved), None),
+            Some(PathBuf::from("/srv/elsewhere/admin.sock")),
+            "the socket follows the db, not the root"
+        );
+
+        // and the config a `serve` runs from agrees with all of that
+        let cfg = |body: &str| ServerConfig::load(&write("s.toml", body), None, None).unwrap();
+        let accounts = "mode = \"accounts\"\nroot = \"/srv/store\"\n\
+                        [oidc]\nissuer = \"https://i\"\nclient_id = \"c\"\n\
+                        client_secret_file = \"/s\"\npublic_url = \"https://p\"\n";
+        assert_eq!(
+            cfg(accounts).resolved_admin_socket(),
+            sock_of(Some(&bare), None)
+        );
+        assert_eq!(
+            cfg(&format!("admin_socket = false\n{accounts}")).resolved_admin_socket(),
+            None
+        );
+        // Shared-secret mode has no accounts to administer, so it binds nothing at all…
+        assert_eq!(
+            ServerConfig::local(
+                "127.0.0.1:5000".parse().unwrap(),
+                PathBuf::from("/srv/store")
+            )
+            .resolved_admin_socket(),
+            None
+        );
+        // …and a file that configures the socket without that mode is refused rather than
+        // ignored, as `accounts_db` already is.
+        let orphan = write("orphan.toml", "admin_socket = \"/run/a.sock\"\n");
+        let err = match ServerConfig::load(&orphan, None, None) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("admin_socket without accounts mode must be refused"),
+        };
+        assert!(err.contains("admin_socket"), "{err}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1112,6 +1340,19 @@ mod tests {
         cfg.oidc = Some(spec());
         let err = err_of(cfg);
         assert!(err.contains("needs mode"), "{err}");
+
+        // an admin socket under the mode that binds none — every spelling of it, since a
+        // `true` silently ignored while `false` refused would be the confusing pair
+        for stated in [
+            AdminSocket::Default,
+            AdminSocket::Off,
+            AdminSocket::At(PathBuf::from("/run/vkr/admin.sock")),
+        ] {
+            let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), root.clone());
+            cfg.admin_socket = stated.clone();
+            let err = err_of(cfg);
+            assert!(err.contains("admin_socket is set"), "{stated:?}: {err}");
+        }
 
         // and configured correctly it starts, with the db in a directory of its own under
         // the store — no network, because discovery is deferred to the first login

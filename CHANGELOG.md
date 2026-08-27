@@ -54,6 +54,13 @@ All notable changes to virtkit will be documented in this file.
   misleads anyone auditing later. The catch is that such a key can only be
   revoked from this same command line, with the registry stopped.
 
+- A registry in accounts mode now keeps a private channel open beside its
+  accounts, on the machine it runs on, so that the command line above will not
+  always need it stopped. Nothing off the machine can reach it, and nothing on
+  the machine can either except the account the registry runs as and root; it
+  is named at startup, `admin_socket` moves it, and `admin_socket = false`
+  turns it off. Nothing uses it yet.
+
 ### Changed
 
 - `vk-registry serve --help` now documents the `--config` file: every key it

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vk_registry::accounts::{Action, Db, Scope};
+use vk_registry::admin;
 use vk_registry::config::{AuthMode, OidcSpec, UpstreamSpec};
 use vk_registry::lock::LockManager;
 use vk_registry::{Authenticator, ServerConfig, ServerState, Store};
@@ -1261,6 +1262,214 @@ async fn shared_secret_mode_is_unchanged_by_repo_scoping() {
     assert!(
         !store.repo_has_blob("any/repo", &hex),
         "a reference is not evidence in shared-secret mode either"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The admin socket of a server built by [`accounts_state`], serving the very db that
+/// server holds — the wiring `serve_config` does, done here so the test can also drive the
+/// HTTP surface on an ephemeral port.
+fn spawn_admin_socket(state: &Arc<ServerState>, dir: &std::path::Path) -> std::path::PathBuf {
+    let db = match &state.auth {
+        Authenticator::Accounts { db, .. } => db.clone(),
+        _ => panic!("not accounts mode"),
+    };
+    let socket = vk_registry::config::default_admin_socket(
+        &vk_registry::config::default_accounts_db(&dir.join("store")),
+    );
+    let listener = admin::bind(&socket).unwrap();
+    tokio::spawn(admin::serve_admin(listener, db));
+    socket
+}
+
+/// The point of the socket: an operator changes accounts while the registry serves, and
+/// the very next request is decided by the change. Nothing here stops or restarts the
+/// server, and nothing here opens the accounts db — that file is the server's for as long
+/// as it runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_socket_changes_decide_the_next_request() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tmp("adminsock");
+    let state = accounts_state(&dir);
+    let seeded = accounts_db(&state)
+        .upsert_user("https://issuer", "u", Some("u@example.com"), None)
+        .unwrap();
+    let session = accounts_db(&state)
+        .create_session(&seeded.id, Duration::from_secs(3600))
+        .unwrap();
+    let socket = spawn_admin_socket(&state, &dir);
+    let url = spawn(state.clone());
+    let http = no_redirect_client();
+    let manifest = r#"{"schemaVersion":2,"config":{"digest":"sha256:00","size":0},"layers":[]}"#;
+
+    // A second process cannot open the db: without the socket, this is where an operator
+    // would have had to stop the server.
+    assert!(
+        Db::open(&vk_registry::config::default_accounts_db(
+            &dir.join("store")
+        ))
+        .is_err(),
+        "the running server must still hold the db, or this test proves nothing"
+    );
+    let ops = admin::Client::connect(&socket).expect("the running server answers");
+
+    // What the CLI reads is what the server has.
+    let users = ops.list_users().unwrap();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].email.as_deref(), Some("u@example.com"));
+    assert!(!users[0].is_admin);
+
+    // A key minted through the socket authenticates on the next request, with the scope it
+    // was given and no other.
+    let (key, token) = ops
+        .create_api_key(
+            None,
+            "ci",
+            &[Scope {
+                action: Action::Write,
+                repo_pattern: "team-a/*".to_string(),
+            }],
+            None,
+        )
+        .unwrap();
+    let push = |repo: &str, token: String| {
+        let http = http.clone();
+        let url = url.clone();
+        let repo = repo.to_string();
+        async move {
+            http.put(format!("{url}/v2/{repo}/manifests/v1"))
+                .bearer_auth(token)
+                .body(manifest)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(push("team-a/app", token.clone()).await, 201);
+    assert_eq!(push("team-b/app", token.clone()).await, 403);
+
+    // And revoking it stops the next one — the case that used to cost an outage, because
+    // an ownerless key has no owner-side page to revoke it from.
+    assert!(ops.revoke_api_key_unchecked(&key.id).unwrap());
+    assert_eq!(push("team-a/other", token.clone()).await, 401);
+
+    // A grant lands the same way: this session could not write a moment ago.
+    assert_eq!(
+        http.put(format!("{url}/v2/team-c/app/manifests/v1"))
+            .header("Cookie", format!("__Host-vk_session={session}"))
+            .body(manifest)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert!(ops.set_admin(&users[0].id, true).unwrap());
+    assert_eq!(
+        http.put(format!("{url}/v2/team-c/app/manifests/v1"))
+            .header("Cookie", format!("__Host-vk_session={session}"))
+            .body(manifest)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        201
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The admin operations are not on the HTTP surface, and adding one must not put them
+/// there: nothing off the machine may grant admin or mint a key, which is the whole reason
+/// the channel is a unix socket in an owner-only directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_admin_operations_are_not_reachable_over_http() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tmp("nohttp");
+    let state = accounts_state(&dir);
+    let admin_user = accounts_db(&state)
+        .upsert_user("https://issuer", "admin", None, None)
+        .unwrap();
+    assert!(accounts_db(&state).set_admin(&admin_user.id, true).unwrap());
+    let session = accounts_db(&state)
+        .create_session(&admin_user.id, Duration::from_secs(3600))
+        .unwrap();
+    let url = spawn(state.clone());
+    let http = no_redirect_client();
+
+    // Even an admin session: there is no route, so this is a 404 and not a 403.
+    for path in ["/admin", "/admin/v1", "/admin/v1/set-admin"] {
+        let resp = http
+            .post(format!("{url}{path}"))
+            .header("Cookie", format!("__Host-vk_session={session}"))
+            .body(r#"{"v":1,"call":{"op":"list-users"}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "POST {path}");
+        let resp = http
+            .get(format!("{url}{path}"))
+            .header("Cookie", format!("__Host-vk_session={session}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "GET {path}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `serve` itself binds the socket the CLI dials, at the path the CLI resolves — the two
+/// halves of `ServerConfig::admin_socket_of` agreeing in a running server rather than only
+/// in a unit test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_binds_the_admin_socket_the_cli_resolves() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tmp("servecfg");
+    std::fs::create_dir_all(&dir).unwrap();
+    let secret = dir.join("oidc-secret");
+    std::fs::write(&secret, "s3cr3t\n").unwrap();
+    let root = dir.join("store");
+    let mut cfg = ServerConfig::local("127.0.0.1:0".parse().unwrap(), root.clone());
+    cfg.mode = AuthMode::Accounts;
+    cfg.oidc = Some(OidcSpec {
+        issuer: "https://login.example.com".to_string(),
+        client_id: "vk-registry".to_string(),
+        client_secret_file: secret,
+        public_url: "https://registry.internal".to_string(),
+    });
+    tokio::spawn(async move {
+        let _ = vk_registry::serve_config(cfg).await;
+    });
+
+    // What the CLI would dial: the db the store selector resolves to, then the socket
+    // beside it — the same two steps `open_accounts_ops` takes.
+    let db_path = ServerConfig::accounts_db_of(None, Some(root), None).unwrap();
+    let socket = ServerConfig::admin_socket_of(None, &db_path, None)
+        .unwrap()
+        .expect("accounts mode binds one by default");
+    // Bounded: `serve_config`'s error is discarded above, and cargo has no per-test
+    // timeout, so an unbounded wait on a bind that never happens is a hung suite with
+    // nothing to read.
+    let mut client = None;
+    for _ in 0..250 {
+        match admin::Client::connect(&socket) {
+            Ok(c) => {
+                client = Some(c);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    let client = client.unwrap_or_else(|| panic!("nothing listening at {}", socket.display()));
+    assert!(
+        client.list_users().unwrap().is_empty(),
+        "a fresh registry has no users, and saying so is not the same as failing"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

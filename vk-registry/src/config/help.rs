@@ -82,6 +82,13 @@ const KEYS: &[Key] = &[
     },
     Key {
         table: Table::Top,
+        name: "admin_socket",
+        help: "local socket the `accounts` CLI uses so it needs no\n\
+               downtime; false binds none, in accounts mode only\n\
+               [default: admin.sock beside accounts_db]",
+    },
+    Key {
+        table: Table::Top,
         name: "oidc",
         help: "the [oidc] table below; required in accounts mode",
     },
@@ -270,6 +277,22 @@ mod tests {
             accepted.sort();
             documented.sort();
             assert_eq!(documented, accepted, "in {err}");
+        }
+    }
+
+    /// Every `help` continuation line is indented by `render` alone, so a key that carries
+    /// its own indentation inside the string prints further right than all the others. The
+    /// `\n\` form is what strips it; this is what catches forgetting it.
+    #[test]
+    fn no_key_carries_its_own_indentation() {
+        for key in KEYS {
+            for line in key.help.lines() {
+                assert!(
+                    !line.starts_with(' '),
+                    "{}: {line:?} — continue the string with `\\n\\`, not literal spaces",
+                    key.name
+                );
+            }
         }
     }
 

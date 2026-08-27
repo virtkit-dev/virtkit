@@ -787,6 +787,65 @@ path. Revoking a leaked system key therefore means stopping the registry. A `wri
 system key is an unattended credential that may push to every repository; nothing stops
 an operator minting one, and nothing but this CLI takes it away again.
 
+### The accounts admin socket
+
+`serve` in accounts mode also listens on a unix socket — `admin.sock` beside the accounts
+db by default, `admin_socket` to move it or `admin_socket = false` to bind none
+(`config.rs`; `ServerConfig::admin_socket_of` resolves for a CLI what
+`resolved_admin_socket` binds for a server, the way `accounts_db_of` mirrors what
+`into_state` opens). It exists so the operator CLI above can reach the accounts db while
+the server holds it; `admin.rs` is both ends.
+
+Why a socket rather than a route. Granting admin and minting keys have no HTTP route on
+purpose, and that is worth keeping: the socket is never mounted on `route()`, is
+unreachable from any network, and cannot be dialled by a browser — so there is no session,
+no CSRF token and no `authorize()` check on it.
+
+Two gates in its place, since what this channel can do is worth more than one. The socket
+is never reachable at a laxer mode than `0600`: it is bound inside a `0700` staging
+directory of its own and restricted there, then renamed onto its real name. Binding the
+real name and chmodding it a syscall later would not do, because `bind` also `listen`s —
+the socket is connectable in between, and a connection made then waits in the backlog to
+be served — and `fchmod` on the listener's fd is no escape either, since it changes the
+sockfs inode rather than the directory entry anyone connects through. Inside the staging
+directory nothing else can reach the socket, or swap its name for a symlink between the
+bind and the chmod; the rename then means the published name is never a socket in the
+making, and replacing a dead one leaves no gap. No process-global umask is touched to get
+any of it. And every connection's `SO_PEERCRED` uid must be the server's own or root's,
+which is the gate that holds regardless of where the socket ended up: `Db::open` gives the
+accounts directory `0700` only when it *creates* it, so a pre-existing directory at a
+looser mode, or an `admin_socket` pointed somewhere else, leaves the file modes alone
+doing the work. Together they are the access the CLI already needed to open the db itself,
+and no more. `RestrictAddressFamilies=` in the systemd unit already allows `AF_UNIX`, and
+`ReadWritePaths=` covers the default location — an `accounts_db` set outside the store
+root needs its own.
+
+Mutations leave a line in the server's journal naming the peer's uid and pid — an admin
+grant, a revoke, and for a minted key its id and every grant it carries, never its token. A
+scope *count* would not do: it cannot tell a key that reads one repository from one that
+writes every one, which is the credential worth auditing. This path has no request log, no
+session and no HTTP access log behind it, so without that line a change made here would be
+invisible on the machine that made it.
+
+One JSON request per connection, answered by one JSON reply, each side half-closing to
+frame it — no HTTP, so nothing here parses headers or chunked bodies. The envelope carries
+a protocol version, because the CLI binary and the running server are upgraded separately:
+a mismatch, or an operation the server's build does not know, is reported as skew naming
+which side to restart. The wire types are `admin.rs`'s own rather than `accounts.rs`'s row
+structs — a stored row and a protocol message have different compatibility obligations.
+Only the operations the CLI needs are exposed, one per `Db` method it calls, so this cannot
+grow into general remote control of the store: the content store, the relay and the lock
+authority are not even reachable from `serve_admin`, which takes the accounts db alone.
+
+A socket file that answers a connect is a live server, so binding refuses rather than
+unlinking it; one nobody is listening on is what a killed server leaves behind, and only
+that one is replaced. Anything at the path that is not a socket is refused untouched — a
+`connect` to a regular file also fails with `ECONNREFUSED`, so "nobody answered" is no
+evidence that the file is a socket to remove, and `admin_socket` set to the accounts db
+path by mistake must not delete it. Failing to bind at all is a warning, not a startup
+failure: the CLI still works with the server stopped, so a socket path the filesystem
+refuses must not cost the registry its service.
+
 ### Implementation order
 
 1. `redb`-backed `users`/`sessions`/`api_keys` + `Principal` resolution, behaviour-neutral
