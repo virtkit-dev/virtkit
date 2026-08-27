@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use anyhow::{Context, Result, bail};
 use tokio_util::sync::CancellationToken;
 
+use super::Ns;
 use super::parser::{Cmdline, Copy, Mount};
 use crate::blockrt::block_on;
 use crate::timing::Timings;
@@ -942,22 +943,23 @@ fn label_slug(label: &str) -> String {
     format!("{flat}-{short}")
 }
 
-/// Cache tag for a base image's materialized ext4 — `base-<sha256(image ref)>`, in the
-/// same `CACHE_REPO` as the instruction snapshots (the `base-` prefix can't collide
-/// with the 64-hex chained instruction keys). Salted with the same `CACHE_KEY_VERSION`
-/// as `build.rs`'s `hash_key`, so bumping it invalidates base entries too.
-fn base_cache_key(image: &str) -> String {
+/// Cache key for a base image's materialized ext4 — an [`Ns::Base`] key over the `FROM`
+/// reference — living in the same `CACHE_REPO` as the instruction snapshots.
+///
+/// Salted with the same `CACHE_KEY_VERSION` as `build.rs`'s `hash_key`, so bumping it
+/// invalidates base entries too, and namespaced by the same mechanism: the input here is
+/// the very string `hash_key` builds a stage's chain root from, so it is `Ns`'s label —
+/// folded into both hashes — that keeps the two apart, not the prefix alone.
+pub(super) fn base_cache_key(image: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(super::CACHE_KEY_VERSION.as_bytes());
     h.update(b"\n");
+    h.update(Ns::Base.label().as_bytes());
+    h.update(b"\n");
     h.update(b"FROM image ");
     h.update(image.as_bytes());
-    let mut s = String::from("base-");
-    for b in h.finalize() {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    Ns::Base.key(&super::hex(&h.finalize()))
 }
 
 /// The host's logical CPU count (fallback 4) — the default per-stage build guest vCPUs
@@ -2901,12 +2903,15 @@ mod tests {
     /// `base_cache_key` must actually fold in `CACHE_KEY_VERSION`, not just carry it in a
     /// doc comment — mirrors `build::tests::hash_key_is_salted_by_the_cache_key_version`
     /// for this crate's other root cache key: a change that silently stopped salting it
-    /// would leave old, possibly-corrupt base-image cache entries resolving forever.
+    /// would leave old, possibly-corrupt base-image cache entries resolving forever. The
+    /// reference hash folds in the namespace label, so the version salt is the only
+    /// difference between the two — and dropping it is the only way they can agree.
     #[test]
     fn base_cache_key_is_salted_by_the_cache_key_version() {
         use sha2::{Digest, Sha256};
         let unsalted = {
             let mut h = Sha256::new();
+            h.update(b"base\n");
             h.update(b"FROM image ");
             h.update(b"alpine:3.20");
             let mut s = String::from("base-");

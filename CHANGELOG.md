@@ -54,6 +54,13 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- Build-cache tags now say what they are: an instruction snapshot is `snap-<hash>`
+  and a base image's filesystem is `base-<hash>`, where before a snapshot was a
+  bare hash and only base entries were prefixed. `vk docker-hash` prints the new
+  form, and so does `$DOCKER_STAGE_HASH` inside a build. This is a cache-format
+  change, so the first build after upgrading is a cold one; the old entries are
+  never looked up again and `gc` reclaims them.
+
 - `vk-registry` now refuses to start on a config file it does not fully
   understand — a setting it does not recognise, at the top level or inside an
   `[[upstream]]`, and an authentication setting the chosen mode would ignore.

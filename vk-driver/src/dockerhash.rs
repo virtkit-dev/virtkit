@@ -1,7 +1,9 @@
 //! `vk docker-hash` — print each stage's build-cache key (its `stage_key`: the
 //! chained content key after the stage's last instruction). That key is the exact
 //! identity virtkit's instruction cache stores a stage's snapshot under, so a printed
-//! key is the tag the build's resulting ext4 lives at in the cache registry.
+//! key is the tag the build's resulting ext4 lives at in the cache registry — namespace
+//! prefix included (`snap-<hex>`; see `build::Ns`), because the key and the tag are the
+//! same string by construction.
 //!
 //! The keys are computed by replaying the build's key chain (shared with the builder via
 //! [`crate::build::stage_keys`]) without materializing anything — base manifest digests

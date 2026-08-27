@@ -1392,6 +1392,7 @@ fn resolve_stages(
         // can produce different bytes (a RUN partitions/mkfs on a full kernel) than the
         // embedded build kernel, so fold it into the key to bust the cache when toggled.
         if stage.image_kernel {
+            // `key` is already a `snap-` key; re-salting it just re-roots the chain.
             key = hash_key(&format!("{key}\nKERNEL=image"));
         }
         // Seed the shell state: a stage inherits its base — a prior stage's final
@@ -2734,27 +2735,74 @@ fn stage_input_rootfs(
 
 /// Bump whenever a change to instruction-cache semantics — chunking, restore, or a
 /// correctness fix in the cache-push path — means previously-cached content should no
-/// longer be trusted. Folded into every root cache key ([`hash_key`], `base_cache_key`
-/// in `exec.rs`); `chain_key` derives every other key from one of those roots, so this
-/// alone invalidates a whole cache generation. An old entry does not need deleting: it
-/// simply stops being looked up, and idle GC reclaims it like any other unused blob.
-const CACHE_KEY_VERSION: &str = "3";
+/// longer be trusted, or whenever the key format itself changes. Folded into every root
+/// cache key ([`hash_key`], `base_cache_key` in `exec.rs`); `chain_key` derives every
+/// other key from one of those roots, so this alone invalidates a whole cache generation.
+/// An old entry does not need deleting: it simply stops being looked up, and idle GC
+/// reclaims it like any other unused blob.
+const CACHE_KEY_VERSION: &str = "4";
 
-/// sha256 hex of `s`, salted with [`CACHE_KEY_VERSION`]. The root-key constructor (a
-/// stage's base, with no prior instruction to chain from) — but also reused wherever
-/// else a salted hash is needed, e.g. folding `image_kernel` into an already-chained key.
+/// The namespaces a build-cache key can belong to. One `dfcache` repository holds every
+/// kind of cached artefact, so a key says which kind it is — both to a reader (`/browse`,
+/// `vk registry status`, a gc log) and to the hash itself.
+///
+/// The label is folded into the hash *and* rendered as the key's prefix, which is two
+/// separate jobs:
+///
+/// - **In the hash**, it is domain separation. Without it, two namespaces derived from the
+///   same string collide: [`Ns::Base`]'s key is built from `"FROM image <ref>"` and so was
+///   [`hash_key`]'s chain root for that same stage, giving byte-identical hashes that only
+///   the prefix kept apart. Nothing tags a bare chain root today (`build_stage`'s
+///   `final_key` comes from `steps.last()`), so that overlap was latent rather than
+///   live — but it was one new key kind away from being real.
+/// - **In the key**, it is the prefix, which makes every cache tag self-describing. It
+///   sits on the key itself rather than being added at each use site, so a key and the
+///   tag it is stored under can never disagree.
+#[derive(Clone, Copy)]
+enum Ns {
+    /// An instruction snapshot: a stage's ext4 after one `RUN`/`COPY`, and the chain roots
+    /// and stage keys those derive from.
+    Snap,
+    /// A base image's materialized ext4, keyed by the `FROM` reference it came from.
+    Base,
+}
+
+impl Ns {
+    /// Folded into the hash, and the key's prefix. Kept short: it is repeated in every tag.
+    const fn label(self) -> &'static str {
+        match self {
+            Ns::Snap => "snap",
+            Ns::Base => "base",
+        }
+    }
+
+    /// A finished key in this namespace, from the hash's hex.
+    fn key(self, hex: &str) -> String {
+        format!("{}-{hex}", self.label())
+    }
+}
+
+/// An [`Ns::Snap`] key from `s`, salted with [`CACHE_KEY_VERSION`] and namespaced. The
+/// root-key constructor (a stage's base, with no prior instruction to chain from) — but
+/// also reused wherever else a salted hash is needed, e.g. folding `image_kernel` into an
+/// already-chained key.
 fn hash_key(s: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(CACHE_KEY_VERSION.as_bytes());
     h.update(b"\n");
+    h.update(Ns::Snap.label().as_bytes());
+    h.update(b"\n");
     h.update(s.as_bytes());
-    hex(&h.finalize())
+    Ns::Snap.key(&hex(&h.finalize()))
 }
 
 /// Chain the cache key with one instruction (an explicit canonical form, [`canonical`])
 /// plus, for a context `COPY` or a `RUN --mount=type=bind`, a content hash of the files it
 /// references. A change anywhere in the prefix — or in the referenced bytes — changes the key.
+///
+/// Stays in [`Ns::Snap`]: `prev` is already a namespaced, salted key, so both travel down
+/// the chain through the hash without being folded in again.
 fn chain_key(prev: &str, instr: &Instruction, content: Option<&str>) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -2765,7 +2813,7 @@ fn chain_key(prev: &str, instr: &Instruction, content: Option<&str>) -> String {
         h.update(b"\n");
         h.update(c.as_bytes());
     }
-    hex(&h.finalize())
+    Ns::Snap.key(&hex(&h.finalize()))
 }
 
 /// An explicit, stable canonical string for an instruction — the cache-key identity. Spelled
@@ -4937,11 +4985,13 @@ RUN ship
             resolve_stages(&plan, &order, &ba, &mut ex, None).unwrap()
         };
         let r = resolve(src);
-        // every stage key is a full sha256 hex, and the computation is deterministic.
+        // every stage key is a `snap-` key (its shape is
+        // `every_key_names_its_namespace`'s subject), and the computation is deterministic.
         let r_again = resolve(src);
         for i in [0usize, 1] {
-            assert_eq!(r[&i].final_key.len(), 64);
-            assert_eq!(r[&i].final_key, r_again[&i].final_key);
+            let key = &r[&i].final_key;
+            assert!(key.starts_with("snap-"), "{key}");
+            assert_eq!(*key, r_again[&i].final_key);
         }
         // a `FROM <stage>` child continues a distinct chain from its parent.
         assert_ne!(r[&0].final_key, r[&1].final_key);
@@ -5859,6 +5909,70 @@ RUN ship
         );
     }
 
+    /// A namespace's label must reach the *hash*, not just the prefix — asserted per
+    /// namespace, since each folds its own and one doing so would otherwise mask the other.
+    ///
+    /// This is what keeps a base ext4 and a stage's chain root apart: `base_cache_key`'s
+    /// input is the very `"FROM image <ref>"` that `hash_key` builds a chain root from, so
+    /// before the label was folded in the two hashes were byte-identical and only the
+    /// prefix separated them. Same shape as the `CACHE_KEY_VERSION` tests below.
+    #[test]
+    fn a_namespace_label_reaches_the_hash_not_just_the_prefix() {
+        use sha2::{Digest, Sha256};
+        let bare = |k: &str| k.split_once('-').map(|(_, h)| h.to_string()).unwrap();
+        let unlabelled = |parts: &[&[u8]]| {
+            let mut h = Sha256::new();
+            h.update(CACHE_KEY_VERSION.as_bytes());
+            h.update(b"\n");
+            for p in parts {
+                h.update(p);
+            }
+            hex(&h.finalize())
+        };
+
+        let input = "FROM image alpine:3.20@sha256:abc";
+        let snap = hash_key(input);
+        assert!(snap.starts_with("snap-"), "{snap}");
+        assert_ne!(bare(&snap), unlabelled(&[input.as_bytes()]));
+
+        let base = super::exec::base_cache_key("alpine:3.20@sha256:abc");
+        assert!(base.starts_with("base-"), "{base}");
+        assert_ne!(
+            bare(&base),
+            unlabelled(&[b"FROM image ", b"alpine:3.20@sha256:abc"])
+        );
+
+        // and the consequence the whole change exists for: the same string in two
+        // namespaces is two different keys, under the hash as well as in the prefix.
+        assert_ne!(bare(&snap), bare(&base));
+    }
+
+    /// Every key a build can produce says which namespace it is in — that is what makes a
+    /// `dfcache` listing readable, and `vk docker-hash` prints these verbatim as the tag a
+    /// snapshot lives at.
+    #[test]
+    fn every_key_names_its_namespace() {
+        let run = Instruction::Run(parser::Run {
+            cmd: parser::Cmdline::Shell("make".into()),
+            mounts: vec![],
+            network: None,
+            security: None,
+        });
+        let root = hash_key("FROM scratch");
+        let chained = chain_key(&root, &run, None);
+        let content = chain_key(&root, &run, Some("ab"));
+        // an all-hex remainder is also what says chaining stays in the namespace it
+        // started in rather than nesting one prefix inside another.
+        for key in [&root, &chained, &content] {
+            let digest = key
+                .strip_prefix("snap-")
+                .unwrap_or_else(|| panic!("unnamespaced key: {key}"));
+            assert_eq!(digest.len(), 64, "{key}");
+            assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()), "{key}");
+        }
+        assert_ne!(chained, content, "the content hash still reaches the key");
+    }
+
     /// `hash_key` must actually fold in `CACHE_KEY_VERSION`, not just carry it in a doc
     /// comment: bumping the version is the whole invalidation mechanism, so a change that
     /// silently stopped salting the hash would leave old, possibly-corrupt cache entries
@@ -5866,10 +5980,13 @@ RUN ship
     #[test]
     fn hash_key_is_salted_by_the_cache_key_version() {
         use sha2::{Digest, Sha256};
+        // Everything `hash_key` folds in *except* the version salt, in the same key
+        // shape — so only dropping the salt can make the two agree.
         let unsalted = {
             let mut h = Sha256::new();
+            h.update(b"snap\n");
             h.update(b"FROM scratch");
-            hex(&h.finalize())
+            Ns::Snap.key(&hex(&h.finalize()))
         };
         assert_ne!(hash_key("FROM scratch"), unsalted);
     }
