@@ -742,8 +742,9 @@ Grants and API-key management that intentionally have no HTTP route (`set_admin`
 
 ```
 vk-registry accounts list-users
-vk-registry accounts grant-admin  <EMAIL> [--issuer URL]
-vk-registry accounts revoke-admin <EMAIL> [--issuer URL]
+vk-registry accounts grant-admin     <EMAIL> [--issuer URL]
+vk-registry accounts revoke-admin    <EMAIL> [--issuer URL]
+vk-registry accounts revoke-sessions <EMAIL> [--issuer URL]
 vk-registry accounts list-keys  [--owner-email EMAIL] [--issuer URL]
 vk-registry accounts revoke-key <ID>
 vk-registry accounts create-key --name NAME --scope ACTION:PATTERN [--owner-email EMAIL] [--expires-days DAYS]
@@ -781,6 +782,13 @@ when it matches more than one account the CLI refuses and prints the `--issuer` 
 would narrow it — it never guesses. A key is selected by the id `list-keys` prints in
 full (its token hash — see `accounts.rs`'s `ApiKey::id`); `revoke-key` cannot tell an
 unknown id from an already-revoked one and reports both the same way.
+
+`revoke-sessions` (`accounts::delete_sessions_for_user`) is `revoke-admin`'s companion: a
+grant taken away leaves whatever that person's browser already holds working, because a
+session's TTL is absolute and nothing shortens it. Through a running server it takes effect
+on the next request. Ending zero sessions is a report, not a failure — it is what a user
+signed in nowhere looks like, and the count is live sessions, so an expired row swept on the
+way past is not reported as one ended.
 
 This is deliberately **not** gated by `authorize()`: an operator who can run this CLI
 already has filesystem access to the accounts db, the same trust level `set_admin`

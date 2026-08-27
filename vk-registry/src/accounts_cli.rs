@@ -15,6 +15,9 @@
 //! non-admin user a write-scoped key, and `revoke-admin` does not revoke it. A key minted
 //! with no owner at all has nothing to check a revoke against, so `/settings/keys` cannot
 //! reach it and this CLI is the only way to take it back.
+//!
+//! Separately: a session's TTL is absolute, so `revoke-admin` leaves the cookies that
+//! person already holds working until they expire — `revoke-sessions` is what ends those.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -37,6 +40,7 @@ pub trait AccountsOps {
     fn list_users(&self) -> Result<Vec<User>>;
     fn find_users_by_email(&self, email: &str) -> Result<Vec<User>>;
     fn set_admin(&self, user_id: &str, is_admin: bool) -> Result<bool>;
+    fn delete_sessions_for_user(&self, user_id: &str) -> Result<usize>;
     fn list_api_keys(&self, owner_user_id: &str) -> Result<Vec<ApiKey>>;
     fn list_all_api_keys(&self) -> Result<Vec<ApiKey>>;
     fn revoke_api_key_unchecked(&self, id: &str) -> Result<bool>;
@@ -59,6 +63,9 @@ impl AccountsOps for Db {
     }
     fn set_admin(&self, user_id: &str, is_admin: bool) -> Result<bool> {
         Db::set_admin(self, user_id, is_admin)
+    }
+    fn delete_sessions_for_user(&self, user_id: &str) -> Result<usize> {
+        Db::delete_sessions_for_user(self, user_id)
     }
     fn list_api_keys(&self, owner_user_id: &str) -> Result<Vec<ApiKey>> {
         Db::list_api_keys(self, owner_user_id)
@@ -91,6 +98,9 @@ impl AccountsOps for admin::Client {
     }
     fn set_admin(&self, user_id: &str, is_admin: bool) -> Result<bool> {
         admin::Client::set_admin(self, user_id, is_admin)
+    }
+    fn delete_sessions_for_user(&self, user_id: &str) -> Result<usize> {
+        admin::Client::delete_sessions_for_user(self, user_id)
     }
     fn list_api_keys(&self, owner_user_id: &str) -> Result<Vec<ApiKey>> {
         admin::Client::list_api_keys(self, owner_user_id)
@@ -165,6 +175,25 @@ pub fn set_admin(
             "no longer an admin"
         }
     );
+    Ok(())
+}
+
+/// Sign a user out everywhere: every session of theirs goes away, so the next request under
+/// any of their cookies has to sign in again. The count reported is the *live* ones ended —
+/// an already-expired row swept on the way past was not a session anybody still had.
+///
+/// The companion to `revoke-admin`, which on its own leaves whatever that person's browser
+/// already holds working until it expires (a session's TTL is absolute — see
+/// `accounts.rs`). Through a running server it takes effect on the next request; against a
+/// stopped one it takes effect when that server comes back.
+pub fn revoke_sessions(ops: &dyn AccountsOps, email: &str, issuer: Option<&str>) -> Result<()> {
+    let user = resolve_user(ops, email, issuer)?;
+    let ended = ops.delete_sessions_for_user(&user.id)?;
+    // Zero is a report, not a failure: it is what a user who is not signed in anywhere
+    // looks like, and an operator making sure is entitled to that answer. A count carries no
+    // found-ness, so a zero cannot be told apart from the row going away between the two
+    // calls this seam costs (see `AccountsOps`) — which ends the same sessions either way.
+    println!("vk-registry accounts: ended {ended} session(s) for {email}");
     Ok(())
 }
 
@@ -432,6 +461,8 @@ fn relative(now: SystemTime, t: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -663,6 +694,14 @@ mod tests {
         set_admin(&db, "alice@example.com", None, false)?;
         let alice = db.find_users_by_email("alice@example.com")?.remove(0);
         assert!(!alice.is_admin);
+
+        // The other half of taking admin away: the cookies that person already holds.
+        let session = db.create_session(&alice.id, Duration::from_secs(3600))?;
+        revoke_sessions(&db, "alice@example.com", None)?;
+        assert_eq!(db.get_session_user(&session)?, None);
+        // Unlike `revoke_key`, a second run is not an error: nothing to end is an answer an
+        // operator making sure is entitled to.
+        revoke_sessions(&db, "alice@example.com", None)?;
 
         // Only the operator path can revoke an ownerless key: there is no owner to check
         // it against, so `revoke_key` — what the CLI tells the operator to run — is it.

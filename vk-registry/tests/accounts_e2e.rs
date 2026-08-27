@@ -1379,6 +1379,19 @@ async fn admin_socket_changes_decide_the_next_request() {
         201
     );
 
+    // And a session ended over the socket stops being one, on the request after.
+    assert_eq!(ops.delete_sessions_for_user(&users[0].id).unwrap(), 1);
+    assert_eq!(
+        http.get(format!("{url}/v2/team-c/app/manifests/v1"))
+            .header("Cookie", format!("__Host-vk_session={session}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401,
+        "the cookie was admin's a moment ago; now it is nobody's"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

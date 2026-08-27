@@ -229,7 +229,24 @@ enum AccountsCmd {
         store: StoreArgs,
     },
     /// Revoke a user's admin
+    ///
+    /// Sessions they already hold keep working until they expire on their own — a session's
+    /// TTL is absolute. `accounts revoke-sessions` is what ends them.
     RevokeAdmin {
+        /// The user's OIDC email claim
+        email: String,
+        /// Which provider's user, when one email matches more than one
+        #[arg(long, value_name = "URL")]
+        issuer: Option<String>,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Sign a user out of every session they have open
+    ///
+    /// The companion to `revoke-admin`: that leaves whatever their browser already holds
+    /// working until it expires on its own. Through a running server this takes effect on
+    /// the next request.
+    RevokeSessions {
         /// The user's OIDC email claim
         email: String,
         /// Which provider's user, when one email matches more than one
@@ -542,6 +559,14 @@ fn run_accounts(cmd: AccountsCmd) -> Result<()> {
         } => {
             let (ops, _) = open_accounts_ops(&store)?;
             accounts_cli::set_admin(ops.as_ref(), &email, issuer.as_deref(), false)
+        }
+        AccountsCmd::RevokeSessions {
+            email,
+            issuer,
+            store,
+        } => {
+            let (ops, _) = open_accounts_ops(&store)?;
+            accounts_cli::revoke_sessions(ops.as_ref(), &email, issuer.as_deref())
         }
         AccountsCmd::ListKeys {
             owner_email,

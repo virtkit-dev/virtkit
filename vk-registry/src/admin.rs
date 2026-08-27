@@ -100,6 +100,9 @@ pub(crate) enum Call {
     RevokeApiKey {
         id: String,
     },
+    RevokeSessions {
+        user_id: String,
+    },
     CreateApiKey {
         owner_user_id: Option<String>,
         name: String,
@@ -564,6 +567,14 @@ fn dispatch(body: &[u8], db: &Db, peer: Peer) -> Result<serde_json::Value> {
             );
             json(&revoked)
         }
+        Call::RevokeSessions { user_id } => {
+            let ended = db.delete_sessions_for_user(&user_id)?;
+            audit(
+                peer,
+                format_args!("ended {ended} session(s) of user {user_id:?}"),
+            );
+            json(&ended)
+        }
         Call::CreateApiKey {
             owner_user_id,
             name,
@@ -753,6 +764,12 @@ impl Client {
         self.call(Call::RevokeApiKey { id: id.to_string() })
     }
 
+    pub fn delete_sessions_for_user(&self, user_id: &str) -> Result<usize> {
+        self.call(Call::RevokeSessions {
+            user_id: user_id.to_string(),
+        })
+    }
+
     pub fn create_api_key(
         &self,
         owner_user_id: Option<&str>,
@@ -810,6 +827,13 @@ mod tests {
                 .unwrap();
             db.create_api_key(Some(&alice.id), "alice-key", &[], None)
                 .unwrap();
+            // Two, so ending them is a count and not a boolean; and one already expired,
+            // which is not reported as a session anybody held.
+            db.create_session(&alice.id, Duration::from_secs(3600))
+                .unwrap();
+            db.create_session(&alice.id, Duration::from_secs(3600))
+                .unwrap();
+            db.create_session(&alice.id, Duration::ZERO).unwrap();
             let listener = bind(&socket).unwrap();
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -888,6 +912,13 @@ mod tests {
             Some(to_epoch(expiry)),
             "the expiry has to survive the round trip: it is a security decision"
         );
+
+        // Sessions are the server's to end, and it ends them while it serves: the two live
+        // ones are the count, the expired one is swept without being reported, and a second
+        // call finds nothing left — which is a report, not a failure.
+        assert_eq!(c.delete_sessions_for_user(&alice.id).unwrap(), 2);
+        assert_eq!(c.delete_sessions_for_user(&alice.id).unwrap(), 0);
+        assert_eq!(c.delete_sessions_for_user("no-such-user").unwrap(), 0);
 
         assert_eq!(c.list_all_api_keys().unwrap().len(), 2);
         assert_eq!(c.list_api_keys(&alice.id).unwrap().len(), 1);

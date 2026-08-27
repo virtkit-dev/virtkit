@@ -44,7 +44,10 @@ All notable changes to virtkit will be documented in this file.
 
 - A registry in accounts mode can be administered from the command line, on
   the machine that holds it: see who has signed in, make someone an
-  administrator or stop them being one, and list, create or revoke API keys.
+  administrator or stop them being one, sign somebody out of every session
+  they have open, and list, create or revoke API keys. Signing out is what
+  taking an administrator's rights away needs beside it — a browser already
+  signed in otherwise keeps working until its session runs out on its own.
   This is how the first administrator is appointed, since there is
   deliberately no way to do it over the network. It works with the registry
   running — it asks the server, over a private socket on that machine that
