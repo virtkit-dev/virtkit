@@ -1,10 +1,12 @@
 //! `vk-registry accounts`: operator CLI over the accounts db (`accounts.rs`) — the
 //! admin-grant and API-key management surface with no HTTP route by design.
 //!
-//! It opens the same db a server would (`ServerConfig::accounts_db_of` resolves the same
-//! path `into_state` does), which means **the server has to be stopped**: redb holds an
-//! exclusive `flock` for the life of the process, so a running `serve` locks even the
-//! read-only subcommands out.
+//! It works on the same accounts a server does, whether or not one is running: over the
+//! running server's admin socket (`admin.rs`) when one answers, else by opening the db
+//! itself (`ServerConfig::accounts_db_of` resolves the same path `into_state` does). Both
+//! reach the same rows, because redb holds the file exclusively for the life of a process
+//! — which is why a server that is up has to be asked rather than bypassed. [`AccountsOps`]
+//! is the seam, and every subcommand below is written against it.
 //!
 //! An operator who can run this already has filesystem access to the accounts db — the
 //! same trust level `Db::set_admin` assumed when it had no route at all — so nothing here
@@ -20,11 +22,12 @@ use std::time::SystemTime;
 use anyhow::{Context, Result, bail};
 
 use vk_registry::accounts::{Action, ApiKey, Db, Scope, User};
+use vk_registry::admin;
 
 /// The accounts operations this CLI needs, and nothing else — the seam between *what* a
-/// subcommand does and *which* store it reaches. Implemented here for [`Db`], the db this
-/// process opened; any other transport that can answer these calls serves the same
-/// subcommands.
+/// subcommand does and *which* store it reaches. Two implementations: [`Db`], the db this
+/// process opened, and [`admin::Client`], the db a running server holds — so the two
+/// transports cannot report the same store differently.
 ///
 /// Mirrors the [`Db`] methods one for one, so the resolution and rendering below stay
 /// shared and nothing an operator reads depends on which side of the seam answered. The
@@ -77,9 +80,42 @@ impl AccountsOps for Db {
     }
 }
 
-/// `origin` names the store the rows came from, for the one line that has no rows to
-/// name it. Taken as a [`Display`](std::fmt::Display) so a caller can pass `path.display()`
-/// without materializing a `String` for it.
+/// The other implementation: the accounts db of a running server, over its admin socket.
+/// One forward each, like [`Db`]'s — every subcommand is the same code over either.
+impl AccountsOps for admin::Client {
+    fn list_users(&self) -> Result<Vec<User>> {
+        admin::Client::list_users(self)
+    }
+    fn find_users_by_email(&self, email: &str) -> Result<Vec<User>> {
+        admin::Client::find_users_by_email(self, email)
+    }
+    fn set_admin(&self, user_id: &str, is_admin: bool) -> Result<bool> {
+        admin::Client::set_admin(self, user_id, is_admin)
+    }
+    fn list_api_keys(&self, owner_user_id: &str) -> Result<Vec<ApiKey>> {
+        admin::Client::list_api_keys(self, owner_user_id)
+    }
+    fn list_all_api_keys(&self) -> Result<Vec<ApiKey>> {
+        admin::Client::list_all_api_keys(self)
+    }
+    fn revoke_api_key_unchecked(&self, id: &str) -> Result<bool> {
+        admin::Client::revoke_api_key_unchecked(self, id)
+    }
+    fn create_api_key(
+        &self,
+        owner_user_id: Option<&str>,
+        name: &str,
+        scopes: &[Scope],
+        expires_at: Option<SystemTime>,
+    ) -> Result<(ApiKey, String)> {
+        admin::Client::create_api_key(self, owner_user_id, name, scopes, expires_at)
+    }
+}
+
+/// `origin` names the store the rows came from, for the one line that has no rows to name
+/// it — on stdout, so a redirected listing carries it too. A
+/// [`Display`](std::fmt::Display), so either a label or a `path.display()` names the store
+/// without an allocation in between.
 pub fn list_users(ops: &dyn AccountsOps, origin: &dyn std::fmt::Display) -> Result<()> {
     let users = ops.list_users()?;
     if users.is_empty() {
@@ -258,12 +294,11 @@ pub fn create_key(
     // nothing else; what to do with it goes to stderr, as `install-service` does.
     match owner_email {
         Some(email) => eprintln!("vk-registry accounts: created key {} for {email}", key.id),
-        // No owner: nothing to revoke it *by*, so say which path can.
         // No owner means no owner-side revoke: `/settings/keys` cannot reach this key,
-        // so the only way back is this CLI, which needs the server stopped.
+        // so say which path can.
         None => eprintln!(
             "vk-registry accounts: created system key {} — it belongs to nobody, so \
-             revoking it means `accounts revoke-key {}` with the server stopped",
+             revoking it means `accounts revoke-key {}`",
             key.id, key.id
         ),
     }

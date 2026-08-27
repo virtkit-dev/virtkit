@@ -276,8 +276,9 @@ impl Db {
         // which, rather than leaving the caller with redb's bare "database already open".
         let db = Database::builder().create_file(file).with_context(|| {
             format!(
-                "opening the accounts db at {}: only one process may hold it, so stop \
-                 the running vk-registry first",
+                "opening the accounts db at {}: only one process may hold it — stop the \
+                 running vk-registry, or, for `vk-registry accounts`, ask it over its \
+                 admin socket instead",
                 path.display()
             )
         })?;

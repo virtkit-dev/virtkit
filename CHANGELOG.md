@@ -46,20 +46,22 @@ All notable changes to virtkit will be documented in this file.
   the machine that holds it: see who has signed in, make someone an
   administrator or stop them being one, and list, create or revoke API keys.
   This is how the first administrator is appointed, since there is
-  deliberately no way to do it over the network. The registry has to be
-  stopped while it runs — only one process can hold the accounts file. A key
-  created this way can be left attached to nobody, which is what CI wants: a
-  key tied to a person keeps working with whatever it was given even after
-  that person's own access is taken away, so naming an owner buys nothing and
-  misleads anyone auditing later. The catch is that such a key can only be
-  revoked from this same command line, with the registry stopped.
+  deliberately no way to do it over the network. It works with the registry
+  running — it asks the server, over a private socket on that machine that
+  nothing off the machine can reach — and with it stopped, so appointing an
+  administrator or pulling a key costs no downtime. A key created this way
+  can be left attached to nobody, which is what CI wants: a key tied to a
+  person keeps working with whatever it was given even after that person's
+  own access is taken away, so naming an owner buys nothing and misleads
+  anyone auditing later. Such a key can only be revoked from this same
+  command line, which is why that command line no longer needs the registry
+  down.
 
-- A registry in accounts mode now keeps a private channel open beside its
-  accounts, on the machine it runs on, so that the command line above will not
-  always need it stopped. Nothing off the machine can reach it, and nothing on
-  the machine can either except the account the registry runs as and root; it
-  is named at startup, `admin_socket` moves it, and `admin_socket = false`
-  turns it off. Nothing uses it yet.
+- The private channel that command line uses is named when the registry
+  starts, and nothing on the machine can reach it but the account the registry
+  runs as and root. `admin_socket` puts it somewhere else, and
+  `admin_socket = false` binds none — the command line then needs the registry
+  stopped, as it once always did.
 
 ### Changed
 

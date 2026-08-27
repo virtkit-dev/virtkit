@@ -751,12 +751,28 @@ vk-registry accounts create-key --name NAME --scope ACTION:PATTERN [--owner-emai
 
 Each takes the `--root`/`--config` store-selection flags `status`/`gc` already do, plus
 an `--accounts-db` that replaces them and may not be combined with them
-(`ServerConfig::accounts_db_of`, mirroring
-`root_of`). It opens the same db a server would, which means **the server has to be
-stopped**: redb holds an exclusive `flock` for the life of the process, so a running
-`serve` locks out even `list-users`. The CLI also never *creates* a db — a mistyped
+(`ServerConfig::accounts_db_of`, mirroring `root_of`) and an `--admin-socket` naming where
+a running server is reached.
+
+**The registry does not have to be stopped.** redb holds the accounts file exclusively for
+the life of a process, so a running `serve` locks out even `list-users` — which is why the
+CLI asks that process instead: it dials the admin socket below, and only if nothing answers
+there does it open the db itself. Either path reaches the same rows and prints the same
+lines (`AccountsOps` in `accounts_cli.rs` is the seam), and the direct path is what covers
+a stopped server, `admin_socket = false`, and a store no server has ever served. A socket
+that refuses *this* user is an error rather than a fallback, since opening the db would only
+fail again with a worse explanation. The CLI never *creates* a db either — a mistyped
 `--root` is an error naming the path, not an empty db and a truthful-looking "no users
 yet".
+
+Which accounts an operation lands in is then the socket's answer, not the store selector's.
+Left to default the socket is derived from the resolved db, so the two agree by
+construction; named outright — `--admin-socket`, or `admin_socket` in the config — it is a
+choice of *server*, and no operation carries that server's own db path back for comparison.
+So a named socket belonging to a registry serving a different store is the store the
+operation reaches, with `--root` picking only the fallback. Which is why every subcommand
+announces on stderr which server or which db it reached before touching it, and why the
+socket's default placement is beside the db rather than somewhere shared.
 
 Users are selected by their OIDC `email` claim, matched case-insensitively over ASCII. An
 email is
@@ -783,9 +799,10 @@ an individual buys nothing and misleads an audit. `list-keys` labels such a key'
 
 The trade is that an ownerless key has no owner to check a revoke against, so
 `/settings/keys` cannot reach it and `revoke_api_key_unchecked` — this CLI — is the only
-path. Revoking a leaked system key therefore means stopping the registry. A `write:*`
-system key is an unattended credential that may push to every repository; nothing stops
-an operator minting one, and nothing but this CLI takes it away again.
+path. A `write:*` system key is an unattended credential that may push to every
+repository; nothing stops an operator minting one, and nothing but this CLI takes it away
+again — which is the reason the admin socket exists: revoking a leaked one must not need
+an outage.
 
 ### The accounts admin socket
 

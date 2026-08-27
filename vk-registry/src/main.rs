@@ -176,29 +176,39 @@ enum Cmd {
     },
     /// Manage users and API keys in `mode = "accounts"` (see DESIGN.md)
     ///
-    /// Works on the accounts db directly, so the server must be stopped: only one
-    /// process can hold that file at a time. Granting admin has no HTTP route at all,
-    /// by design — an operator with the db is the trust level it assumes.
+    /// Works with the registry running — through its local admin socket — and with it
+    /// stopped, by opening the accounts db directly; only one process can hold that file
+    /// at a time. Either way there is no HTTP route for any of this, by design: an
+    /// operator on the machine holding the accounts is the trust level it assumes.
     Accounts {
         #[command(subcommand)]
         cmd: AccountsCmd,
     },
 }
 
-/// Where the accounts db is: an explicit `--accounts-db`, else the `serve` config's
-/// (`--config`), else `<root>/accounts/accounts.db` under the resolved store root. Shared
-/// by every `accounts` subcommand.
+/// Which accounts a subcommand works on, and how it reaches them. The db is an explicit
+/// `--accounts-db`, else the `serve` config's (`--config`), else
+/// `<root>/accounts/accounts.db` under the resolved store root; the running server holding
+/// it is `--admin-socket`, else the config's `admin_socket`, else the socket beside that db.
+/// Shared by every `accounts` subcommand.
 #[derive(clap::Args)]
 struct StoreArgs {
     /// Store directory [default: the `root` in --config, else the shared virtkit store]
     #[arg(long, value_name = "DIR")]
     root: Option<PathBuf>,
-    /// The `serve` config file to take root/accounts_db from
+    /// The `serve` config file to take root/accounts_db/admin_socket from
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
     /// Accounts db file [default: --config's accounts_db, else <root>/accounts/accounts.db]
     #[arg(long, value_name = "FILE", conflicts_with_all = ["root", "config"])]
     accounts_db: Option<PathBuf>,
+    /// Admin socket of the running server [default: admin.sock beside the accounts db]
+    ///
+    /// Where to reach a server that holds the db. Nothing listening there is not an
+    /// error: the db is then opened directly. Naming one picks the *server*, so it is that
+    /// server's accounts an operation lands in — check the server each subcommand reports.
+    #[arg(long, value_name = "FILE")]
+    admin_socket: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -279,17 +289,107 @@ enum AccountsCmd {
     },
 }
 
-/// The accounts db a `StoreArgs` resolves to, opened only if it is already there.
+/// How a `StoreArgs` reaches the accounts: over the admin socket of a running server when
+/// one answers there, else by opening the db itself. Also the label naming that store, for
+/// the messages that report on it.
 ///
-/// Never creates one: a mistyped `--root` would otherwise leave an empty db behind and
-/// every subcommand would then report truthfully about the wrong file — "no users yet"
-/// for a registry that has plenty. `serve` is what brings an accounts db into being.
-fn open_accounts_db(store: &StoreArgs) -> Result<(vk_registry::accounts::Db, PathBuf)> {
-    let path = vk_registry::ServerConfig::accounts_db_of(
+/// The socket first, because the alternative fails outright while a server is up: redb
+/// holds the file exclusively. A socket nobody answers is the ordinary case (no server
+/// running) and falls through silently; one that refuses *this* user does not — falling
+/// through would only fail again on the db, with a worse explanation than the real one.
+///
+/// **Which accounts get touched is the socket's answer, not the store selector's.** Left to
+/// default, the socket is derived from the resolved db, so the two agree by construction.
+/// Named instead — `--admin-socket`, or `admin_socket` in the config file — it is a
+/// deliberate choice of *server*, and no handshake carries that server's own db path back
+/// for comparison: if it holds a different one, that is the db the operation lands in and
+/// `--root` picks only the fallback. Which is why every subcommand announces on stderr
+/// which server or which db it reached, before doing anything to it.
+fn open_accounts_ops(store: &StoreArgs) -> Result<(Box<dyn accounts_cli::AccountsOps>, String)> {
+    let db_path = vk_registry::ServerConfig::accounts_db_of(
         store.config.as_deref(),
         store.root.clone(),
         store.accounts_db.clone(),
     )?;
+    // Derived from the resolved db, so an `--accounts-db` is not honoured on one path and
+    // dropped on the other. See the caveat above for a socket named outright.
+    let socket = vk_registry::ServerConfig::admin_socket_of(
+        store.config.as_deref(),
+        &db_path,
+        store.admin_socket.clone(),
+    )?;
+    let mut probed = None;
+    if let Some(path) = &socket {
+        match vk_registry::admin::Client::connect(path) {
+            Ok(client) => {
+                let origin = format!("the running server at {}", path.display());
+                // On stderr, and on both paths: stdout carries the listing and
+                // `create-key`'s token, and an operator has to be able to see which server
+                // a grant landed in — especially when a named socket, not the store
+                // selector, is what chose it.
+                eprintln!("vk-registry accounts: through {origin}");
+                return Ok((Box::new(client), origin));
+            }
+            // Nothing is listening: no server, or one configured with `admin_socket =
+            // false`. The db is then this process's to open.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                probed = Some(path.clone());
+            }
+            // Named, because this is the one the socket's `0600` and its peer-uid check
+            // produce, and the fix is a different user rather than a different path.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "connecting to the admin socket at {} — run as the user vk-registry \
+                     runs as, or as root",
+                    path.display()
+                )));
+            }
+            // Anything else speaks for itself: a path too long for `sun_path`, a component
+            // that is not a directory, a descriptor table that is full. Advising a uid
+            // change for those would send an operator after the wrong thing.
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "connecting to the admin socket at {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    // `probed` is `Some` for every socket that was dialled and did not answer, and every
+    // other outcome returned above — so `None` here means there was no socket to dial.
+    let db = open_accounts_db(&db_path).map_err(|e| match probed {
+        // The db refused *and* nothing was listening: say where a server's socket was
+        // looked for, since a server running without one is the case that lands here.
+        Some(socket) => e.context(format!(
+            "no admin socket answered at {}, so the db itself was tried",
+            socket.display()
+        )),
+        // No socket resolved at all. `admin_socket_of` says `None` both for
+        // `admin_socket = false` and for a config that is not accounts mode, and cannot
+        // tell the caller which — so name both rather than advise removing a setting the
+        // file may not contain.
+        None => e.context(
+            "no admin socket is configured for this store — `admin_socket = false`, or a \
+             config that is not mode = \"accounts\" — so the db itself was tried",
+        ),
+    })?;
+    let origin = format!("the accounts db at {}", db_path.display());
+    eprintln!("vk-registry accounts: on {origin}");
+    Ok((Box::new(db), origin))
+}
+
+/// The accounts db at `path` — the one a `StoreArgs` resolved to — opened only if it is
+/// already there.
+///
+/// Never creates one: a mistyped `--root` would otherwise leave an empty db behind and
+/// every subcommand would then report truthfully about the wrong file — "no users yet"
+/// for a registry that has plenty. `serve` is what brings an accounts db into being.
+fn open_accounts_db(path: &Path) -> Result<vk_registry::accounts::Db> {
     // Advisory only, and deliberately so: this resolves the path a second time, but it is
     // a usability guard (do not leave an empty db behind a mistyped `--root`), not a
     // security one. `Db::open` is the gate — it opens `O_NOFOLLOW` and judges the mode off
@@ -301,8 +401,7 @@ fn open_accounts_db(store: &StoreArgs) -> Result<(vk_registry::accounts::Db, Pat
             path.display()
         );
     }
-    let db = vk_registry::accounts::Db::open(&path)?;
-    Ok((db, path))
+    vk_registry::accounts::Db::open(path)
 }
 
 /// This binary as `update` replaces it: the release asset `vk-registry` ships as, and
@@ -425,36 +524,36 @@ async fn run(cli: Cli) -> Result<()> {
 fn run_accounts(cmd: AccountsCmd) -> Result<()> {
     match cmd {
         AccountsCmd::ListUsers { store } => {
-            let (db, path) = open_accounts_db(&store)?;
-            accounts_cli::list_users(&db, &path.display())
+            let (ops, origin) = open_accounts_ops(&store)?;
+            accounts_cli::list_users(ops.as_ref(), &origin)
         }
         AccountsCmd::GrantAdmin {
             email,
             issuer,
             store,
         } => {
-            let (db, _) = open_accounts_db(&store)?;
-            accounts_cli::set_admin(&db, &email, issuer.as_deref(), true)
+            let (ops, _) = open_accounts_ops(&store)?;
+            accounts_cli::set_admin(ops.as_ref(), &email, issuer.as_deref(), true)
         }
         AccountsCmd::RevokeAdmin {
             email,
             issuer,
             store,
         } => {
-            let (db, _) = open_accounts_db(&store)?;
-            accounts_cli::set_admin(&db, &email, issuer.as_deref(), false)
+            let (ops, _) = open_accounts_ops(&store)?;
+            accounts_cli::set_admin(ops.as_ref(), &email, issuer.as_deref(), false)
         }
         AccountsCmd::ListKeys {
             owner_email,
             issuer,
             store,
         } => {
-            let (db, _) = open_accounts_db(&store)?;
-            accounts_cli::list_keys(&db, owner_email.as_deref(), issuer.as_deref())
+            let (ops, _) = open_accounts_ops(&store)?;
+            accounts_cli::list_keys(ops.as_ref(), owner_email.as_deref(), issuer.as_deref())
         }
         AccountsCmd::RevokeKey { id, store } => {
-            let (db, _) = open_accounts_db(&store)?;
-            accounts_cli::revoke_key(&db, &id)
+            let (ops, _) = open_accounts_ops(&store)?;
+            accounts_cli::revoke_key(ops.as_ref(), &id)
         }
         AccountsCmd::CreateKey {
             owner_email,
@@ -473,9 +572,9 @@ fn run_accounts(cmd: AccountsCmd) -> Result<()> {
                 .map(|s| accounts_cli::parse_scope(s))
                 .collect::<Result<Vec<_>>>()?;
             vk_registry::accounts::validate_key_input(&name, &scopes)?;
-            let (db, _) = open_accounts_db(&store)?;
+            let (ops, _) = open_accounts_ops(&store)?;
             accounts_cli::create_key(
-                &db,
+                ops.as_ref(),
                 owner_email.as_deref(),
                 issuer.as_deref(),
                 &name,
@@ -847,6 +946,32 @@ mod tests {
             .is_err(),
             "--accounts-db beside --root must be refused, not silently preferred"
         );
+
+        // `--admin-socket` names where a *running* server is reached, so unlike
+        // `--accounts-db` it complements the store selector rather than replacing it: the
+        // db is still what the fallback opens.
+        let cli = parse(&[
+            "vk-registry",
+            "accounts",
+            "list-users",
+            "--root",
+            "/srv/store",
+            "--admin-socket",
+            "/run/vkr/admin.sock",
+        ])
+        .expect("--admin-socket sits beside a store selector");
+        match cli.cmd {
+            Cmd::Accounts {
+                cmd: AccountsCmd::ListUsers { store },
+            } => {
+                assert_eq!(store.root.as_deref(), Some(Path::new("/srv/store")));
+                assert_eq!(
+                    store.admin_socket.as_deref(),
+                    Some(Path::new("/run/vkr/admin.sock"))
+                );
+            }
+            _ => panic!("expected accounts list-users"),
+        }
     }
 
     #[test]
@@ -953,5 +1078,172 @@ mod tests {
             "help entries over {LIMIT} chars or missing:\n  {}",
             bad.join("\n  ")
         );
+    }
+
+    /// A `StoreArgs` naming a store directory and nothing else — what every case below
+    /// varies from.
+    fn store_at(dir: &Path) -> StoreArgs {
+        StoreArgs {
+            root: Some(dir.to_path_buf()),
+            config: None,
+            accounts_db: None,
+            admin_socket: None,
+        }
+    }
+
+    /// The error of an `open_accounts_ops` that had to fail — the `Box<dyn AccountsOps>` in
+    /// the `Ok` arm is not `Debug`, so `unwrap_err` cannot report it.
+    fn err_of(r: Result<(Box<dyn accounts_cli::AccountsOps>, String)>) -> String {
+        match r {
+            Ok((_, origin)) => panic!("expected a failure, reached {origin}"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    /// A store root with a real accounts db in it, at the path `StoreArgs` resolves.
+    fn seeded_store(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("vk-registry-ops-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = vk_registry::config::default_accounts_db(&dir);
+        // Opened and dropped: the file has to exist, and nothing may still hold it.
+        drop(vk_registry::accounts::Db::open(&db).unwrap());
+        dir
+    }
+
+    /// With no server running, the accounts are this process's to open — and the origin
+    /// names the db, because a mistyped `--root` reports truthfully about the wrong file
+    /// and the store named is what gives that away.
+    #[test]
+    fn ops_fall_back_to_the_db_when_nothing_answers() {
+        let dir = seeded_store("fallback");
+        let db_path = vk_registry::config::default_accounts_db(&dir);
+
+        let (ops, origin) = open_accounts_ops(&store_at(&dir)).unwrap();
+        assert_eq!(origin, format!("the accounts db at {}", db_path.display()));
+        assert!(ops.list_users().unwrap().is_empty());
+        drop(ops);
+
+        // A socket file with nobody behind it — what a killed server leaves — is the same
+        // case, not an error.
+        let socket = vk_registry::config::default_admin_socket(&db_path);
+        drop(vk_registry::admin::bind(&socket).unwrap());
+        assert!(socket.exists(), "the file outlives the listener");
+        let (ops, origin) = open_accounts_ops(&store_at(&dir)).unwrap();
+        assert!(origin.contains("the accounts db at"), "{origin}");
+        drop(ops);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With a server holding the db, the socket is what answers — the whole point, since
+    /// the db cannot be opened at all while it is held.
+    #[test]
+    fn ops_reach_a_running_server_over_its_socket() {
+        let dir = seeded_store("held");
+        let db_path = vk_registry::config::default_accounts_db(&dir);
+        let socket = vk_registry::config::default_admin_socket(&db_path);
+        let db = std::sync::Arc::new(vk_registry::accounts::Db::open(&db_path).unwrap());
+        db.upsert_user("https://issuer", "sub-1", Some("a@example.com"), None)
+            .unwrap();
+        let listener = vk_registry::admin::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(vk_registry::admin::serve_admin(listener, db));
+        });
+
+        let (ops, origin) = open_accounts_ops(&store_at(&dir)).unwrap();
+        assert_eq!(
+            origin,
+            format!("the running server at {}", socket.display())
+        );
+        assert_eq!(ops.list_users().unwrap().len(), 1, "over the wire");
+        drop(ops);
+
+        // `--admin-socket` reaches the same one by name.
+        let mut store = store_at(&dir);
+        store.admin_socket = Some(socket.clone());
+        let (ops, origin) = open_accounts_ops(&store).unwrap();
+        assert_eq!(
+            origin,
+            format!("the running server at {}", socket.display())
+        );
+        drop(ops);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A socket that cannot be reached for a reason that is not "nobody is listening" is
+    /// reported as itself, rather than as the uid advice that only fits `PermissionDenied`
+    /// — a path over `sun_path` used to send an operator after `sudo`.
+    #[test]
+    fn a_socket_that_cannot_be_dialled_is_not_reported_as_a_uid_problem() {
+        let dir = seeded_store("badsock");
+        let mut store = store_at(&dir);
+        store.admin_socket = Some(dir.join("s".repeat(200)));
+
+        let err = err_of(open_accounts_ops(&store));
+        assert!(err.contains("connecting to the admin socket at"), "{err}");
+        assert!(!err.contains("as root"), "the wrong advice: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Neither path available: the error has to name both, since "stop the server" and
+    /// "check --root" are opposite fixes and only the pair says which.
+    #[test]
+    fn a_missing_db_and_a_missing_socket_name_both() {
+        let dir = std::env::temp_dir().join(format!("vk-registry-ops-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = err_of(open_accounts_ops(&store_at(&dir)));
+        assert!(err.contains("no admin socket answered at"), "{err}");
+        assert!(err.contains("no accounts db at"), "{err}");
+    }
+
+    /// A config that resolves no socket at all: the db is tried, and the failure says the
+    /// socket was never in play without claiming which of the two reasons it was — the
+    /// resolution cannot tell them apart, and advising the removal of a key the file does
+    /// not contain would send an operator after nothing.
+    #[test]
+    fn no_socket_configured_is_said_without_guessing_why() {
+        let dir = std::env::temp_dir().join(format!("vk-registry-ops-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: String| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        let root = dir.join("store");
+        for (name, body) in [
+            (
+                "off.toml",
+                format!("mode = \"accounts\"\nadmin_socket = false\nroot = {root:?}\n"),
+            ),
+            // Not accounts mode, and saying nothing about the socket at all.
+            (
+                "shared.toml",
+                format!("password_file = \"/etc/vkr.pw\"\nroot = {root:?}\n"),
+            ),
+        ] {
+            let cfg = write(name, body);
+            let store = StoreArgs {
+                root: None,
+                config: Some(cfg),
+                accounts_db: None,
+                admin_socket: None,
+            };
+            let err = err_of(open_accounts_ops(&store));
+            assert!(
+                err.contains("no admin socket is configured"),
+                "{name}: {err}"
+            );
+            assert!(err.contains("no accounts db at"), "{name}: {err}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
