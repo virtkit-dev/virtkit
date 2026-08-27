@@ -34,7 +34,7 @@ use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::{HeaderMap, Request, Response, StatusCode};
 use rand::Rng;
-use redb::{Database, Durability, ReadableTable, TableDefinition};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use crate::{error_response, hex_of, sha256_hex_raw};
@@ -675,12 +675,15 @@ impl Db {
             .map(|row| api_key_from_row(id.to_string(), &row)))
     }
 
-    /// Record that a key was just used. Committed with `Durability::Eventual`: losing the
-    /// most recent bump to a crash costs nothing, and an fsync per authenticated request
-    /// would be felt on every chunk of a push.
+    /// Record that a key was just used. Committed with `Durability::None`: losing the most
+    /// recent bump to a crash costs nothing, and an fsync per authenticated request would be
+    /// felt on every chunk of a push. The bump reaches disk with the next durable commit —
+    /// redb 3 dropped `Eventual`, and made `None` free pages, so this no longer trades the
+    /// fsync for a file that only grows.
     fn touch_api_key(&self, id: &str, now: i64) -> Result<()> {
         let mut txn = self.db.begin_write().context("starting a write")?;
-        txn.set_durability(Durability::Eventual);
+        txn.set_durability(Durability::None)
+            .context("relaxing durability for an api-key bump")?;
         {
             let mut table = txn.open_table(API_KEYS)?;
             let Some(mut row) = table

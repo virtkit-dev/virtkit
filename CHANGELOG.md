@@ -6,6 +6,13 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **Breaking:** the accounts database moved to redb's v3 file format. A file
+  created by 0.43.0 is refused (`Manual upgrade required. Expected file format
+  version 3, but file is version 2`) rather than converted: delete
+  `<root>/accounts/accounts.db`, start `serve` once in `mode = "accounts"` to
+  recreate it, then re-grant admin and re-issue API keys. Sessions do not
+  survive either, so everyone signs in again.
+
 - `vk-registry accounts` no longer hides where its store comes from.
   `--config`, `--root`, `--accounts-db` and `--admin-socket` are listed by
   `vk-registry accounts --help` instead of only inside each subcommand's own
