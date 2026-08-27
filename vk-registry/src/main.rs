@@ -181,6 +181,8 @@ enum Cmd {
     /// at a time. Either way there is no HTTP route for any of this, by design: an
     /// operator on the machine holding the accounts is the trust level it assumes.
     Accounts {
+        #[command(flatten)]
+        store: StoreArgs,
         #[command(subcommand)]
         cmd: AccountsCmd,
     },
@@ -190,34 +192,36 @@ enum Cmd {
 /// `--accounts-db`, else the `serve` config's (`--config`), else
 /// `<root>/accounts/accounts.db` under the resolved store root; the running server holding
 /// it is `--admin-socket`, else the config's `admin_socket`, else the socket beside that db.
-/// Shared by every `accounts` subcommand.
+///
+/// Declared once on `accounts` and `global`, so every one of these flags is listed by
+/// `vk-registry accounts --help` — where somebody looking for `--config` looks first — and
+/// is accepted on either side of the subcommand name: ahead of it as a setting for the whole
+/// command, after it as one for that subcommand. Given on both sides, the one after the
+/// subcommand name wins.
 #[derive(clap::Args)]
 struct StoreArgs {
     /// Store directory [default: the `root` in --config, else the shared virtkit store]
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, global = true, value_name = "DIR")]
     root: Option<PathBuf>,
     /// The `serve` config file to take root/accounts_db/admin_socket from
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,
     /// Accounts db file [default: --config's accounts_db, else <root>/accounts/accounts.db]
-    #[arg(long, value_name = "FILE", conflicts_with_all = ["root", "config"])]
+    #[arg(long, global = true, value_name = "FILE", conflicts_with_all = ["root", "config"])]
     accounts_db: Option<PathBuf>,
     /// Admin socket of the running server [default: admin.sock beside the accounts db]
     ///
     /// Where to reach a server that holds the db. Nothing listening there is not an
     /// error: the db is then opened directly. Naming one picks the *server*, so it is that
     /// server's accounts an operation lands in — check the server each subcommand reports.
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, global = true, value_name = "FILE")]
     admin_socket: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
 enum AccountsCmd {
     /// List every known user
-    ListUsers {
-        #[command(flatten)]
-        store: StoreArgs,
-    },
+    ListUsers,
     /// Grant a user admin (write access to every repo)
     GrantAdmin {
         /// The user's OIDC email claim
@@ -225,8 +229,6 @@ enum AccountsCmd {
         /// Which provider's user, when one email matches more than one
         #[arg(long, value_name = "URL")]
         issuer: Option<String>,
-        #[command(flatten)]
-        store: StoreArgs,
     },
     /// Revoke a user's admin
     ///
@@ -238,8 +240,6 @@ enum AccountsCmd {
         /// Which provider's user, when one email matches more than one
         #[arg(long, value_name = "URL")]
         issuer: Option<String>,
-        #[command(flatten)]
-        store: StoreArgs,
     },
     /// Sign a user out of every session they have open
     ///
@@ -252,8 +252,6 @@ enum AccountsCmd {
         /// Which provider's user, when one email matches more than one
         #[arg(long, value_name = "URL")]
         issuer: Option<String>,
-        #[command(flatten)]
-        store: StoreArgs,
     },
     /// List API keys — every key, or one user's
     ListKeys {
@@ -266,8 +264,6 @@ enum AccountsCmd {
         /// own it reads as a filter and would silently list every key instead.
         #[arg(long, value_name = "URL", requires = "owner_email")]
         issuer: Option<String>,
-        #[command(flatten)]
-        store: StoreArgs,
     },
     /// Revoke an API key by id (see `list-keys`)
     ///
@@ -276,8 +272,6 @@ enum AccountsCmd {
     RevokeKey {
         /// The key's id, as `list-keys` prints it
         id: String,
-        #[command(flatten)]
-        store: StoreArgs,
     },
     /// Create a scoped API key, printed once
     CreateKey {
@@ -301,8 +295,6 @@ enum AccountsCmd {
         /// Expire the key after this many days [default: never]
         #[arg(long, value_name = "DAYS")]
         expires_days: Option<u64>,
-        #[command(flatten)]
-        store: StoreArgs,
     },
 }
 
@@ -534,49 +526,36 @@ async fn run(cli: Cli) -> Result<()> {
         }
         // handled in `main`, before this dispatch
         Cmd::Update { .. } => unreachable!("update is handled in main"),
-        Cmd::Accounts { cmd } => run_accounts(cmd),
+        Cmd::Accounts { store, cmd } => run_accounts(store, cmd),
     }
 }
 
-fn run_accounts(cmd: AccountsCmd) -> Result<()> {
+fn run_accounts(store: StoreArgs, cmd: AccountsCmd) -> Result<()> {
     match cmd {
-        AccountsCmd::ListUsers { store } => {
+        AccountsCmd::ListUsers => {
             let (ops, origin) = open_accounts_ops(&store)?;
             accounts_cli::list_users(ops.as_ref(), &origin)
         }
-        AccountsCmd::GrantAdmin {
-            email,
-            issuer,
-            store,
-        } => {
+        AccountsCmd::GrantAdmin { email, issuer } => {
             let (ops, _) = open_accounts_ops(&store)?;
             accounts_cli::set_admin(ops.as_ref(), &email, issuer.as_deref(), true)
         }
-        AccountsCmd::RevokeAdmin {
-            email,
-            issuer,
-            store,
-        } => {
+        AccountsCmd::RevokeAdmin { email, issuer } => {
             let (ops, _) = open_accounts_ops(&store)?;
             accounts_cli::set_admin(ops.as_ref(), &email, issuer.as_deref(), false)
         }
-        AccountsCmd::RevokeSessions {
-            email,
-            issuer,
-            store,
-        } => {
+        AccountsCmd::RevokeSessions { email, issuer } => {
             let (ops, _) = open_accounts_ops(&store)?;
             accounts_cli::revoke_sessions(ops.as_ref(), &email, issuer.as_deref())
         }
         AccountsCmd::ListKeys {
             owner_email,
             issuer,
-            store,
         } => {
             let (ops, _) = open_accounts_ops(&store)?;
             accounts_cli::list_keys(ops.as_ref(), owner_email.as_deref(), issuer.as_deref())
         }
-        AccountsCmd::RevokeKey { id, store } => {
+        AccountsCmd::RevokeKey { id } => {
             let (ops, _) = open_accounts_ops(&store)?;
             accounts_cli::revoke_key(ops.as_ref(), &id)
         }
@@ -586,7 +565,6 @@ fn run_accounts(cmd: AccountsCmd) -> Result<()> {
             name,
             scopes,
             expires_days,
-            store,
         } => {
             // Parsed and validated before the db is touched, so a mistyped --scope or
             // --name is a usage error rather than something that surfaces after a lock is
@@ -819,13 +797,73 @@ mod tests {
         );
     }
 
-    // `status`/`gc` take the same `--config` `serve` does: the store to report on is the
-    // one the server was configured with, and naming that file is how they are told.
-    /// The `accounts` subcommands' shape: a store selector on each, `--scope` required
-    /// and repeatable, and `--accounts-db` refusing to sit beside the flags it replaces.
+    // The `accounts` subcommands' shape: a store selector on `accounts` itself, taken on
+    // either side of the subcommand name, `--scope` required and repeatable, and
+    // `--accounts-db` refusing to sit beside the flags it replaces.
     #[test]
-    fn accounts_subcommands_take_a_store_and_require_a_scope() {
+    fn accounts_store_flags_are_global_and_a_scope_is_required() {
         let parse = |args: &[&str]| Cli::try_parse_from(args);
+
+        // Declared on `accounts`, so each parses ahead of the subcommand name — the
+        // placement an operator reaches for once `accounts --help` is where they are listed
+        // — as well as after it.
+        type Pick = fn(&StoreArgs) -> Option<&PathBuf>;
+        for (flag, value, pick) in [
+            ("--root", "/srv/store", (|s| s.root.as_ref()) as Pick),
+            ("--config", "/etc/reg.toml", |s| s.config.as_ref()),
+            ("--accounts-db", "/srv/a.db", |s| s.accounts_db.as_ref()),
+            ("--admin-socket", "/run/vkr/admin.sock", |s| {
+                s.admin_socket.as_ref()
+            }),
+        ] {
+            let cli = parse(&["vk-registry", "accounts", flag, value, "list-users"])
+                .unwrap_or_else(|e| panic!("{flag} must parse ahead of the subcommand: {e}"));
+            let Cmd::Accounts { store, .. } = cli.cmd else {
+                panic!("expected accounts list-users")
+            };
+            assert_eq!(
+                pick(&store).map(PathBuf::as_path),
+                Some(Path::new(value)),
+                "{flag} ahead of the subcommand name"
+            );
+        }
+
+        // On both sides the one after the name wins. Worth pinning: clap settles it by
+        // occurrence count, so nothing in the declaration says which way it goes.
+        let cli = parse(&[
+            "vk-registry",
+            "accounts",
+            "--root",
+            "/srv/outer",
+            "list-users",
+            "--root",
+            "/srv/inner",
+        ])
+        .expect("the same flag on both sides is an override, not a conflict");
+        let Cmd::Accounts { store, .. } = cli.cmd else {
+            panic!("expected accounts")
+        };
+        assert_eq!(store.root.as_deref(), Some(Path::new("/srv/inner")));
+
+        // `global` reaches down from `accounts`, not up: the top level takes no store flag,
+        // and `serve`'s own `--root` is still `serve`'s.
+        assert!(
+            parse(&[
+                "vk-registry",
+                "--root",
+                "/srv/store",
+                "accounts",
+                "list-users"
+            ])
+            .is_err(),
+            "a store flag ahead of `accounts` must not parse"
+        );
+        let cli = parse(&["vk-registry", "serve", "--root", "/srv/store"])
+            .expect("serve keeps its own --root");
+        let Cmd::Serve { root, .. } = cli.cmd else {
+            panic!("expected serve")
+        };
+        assert_eq!(root.as_deref(), Some(Path::new("/srv/store")));
 
         let cli = parse(&[
             "vk-registry",
@@ -838,7 +876,8 @@ mod tests {
         .expect("grant-admin takes an email and a store");
         match cli.cmd {
             Cmd::Accounts {
-                cmd: AccountsCmd::GrantAdmin { email, store, .. },
+                store,
+                cmd: AccountsCmd::GrantAdmin { email, .. },
             } => {
                 assert_eq!(email, "a@b.c");
                 assert_eq!(store.root.as_deref(), Some(Path::new("/srv/store")));
@@ -908,6 +947,7 @@ mod tests {
         match cli.cmd {
             Cmd::Accounts {
                 cmd: AccountsCmd::CreateKey { scopes, .. },
+                ..
             } => assert_eq!(scopes, vec!["read:*", "write:team-a/*"]),
             _ => panic!("expected accounts create-key"),
         }
@@ -953,6 +993,7 @@ mod tests {
         match cli.cmd {
             Cmd::Accounts {
                 cmd: AccountsCmd::CreateKey { owner_email, .. },
+                ..
             } => assert_eq!(owner_email, None),
             _ => panic!("expected accounts create-key"),
         }
@@ -987,7 +1028,8 @@ mod tests {
         .expect("--admin-socket sits beside a store selector");
         match cli.cmd {
             Cmd::Accounts {
-                cmd: AccountsCmd::ListUsers { store },
+                store,
+                cmd: AccountsCmd::ListUsers,
             } => {
                 assert_eq!(store.root.as_deref(), Some(Path::new("/srv/store")));
                 assert_eq!(
@@ -999,6 +1041,25 @@ mod tests {
         }
     }
 
+    // The page an operator looking for `--config` lands on. Declaring the flags on
+    // `accounts` is what puts them on it — `global` is what also carries them past the
+    // subcommand name, which the placement test above is what pins.
+    #[test]
+    fn accounts_help_lists_the_store_flags() {
+        let cmd = <Cli as clap::CommandFactory>::command();
+        let accounts = cmd
+            .find_subcommand("accounts")
+            .expect("accounts must exist");
+        for long in ["root", "config", "accounts-db", "admin-socket"] {
+            assert!(
+                accounts.get_arguments().any(|a| a.get_long() == Some(long)),
+                "`accounts --help` must list --{long}"
+            );
+        }
+    }
+
+    // `status`/`gc` take the same `--config` `serve` does: the store to report on is the
+    // one the server was configured with, and naming that file is how they are told.
     #[test]
     fn status_and_gc_take_the_serve_config() {
         use std::path::Path;

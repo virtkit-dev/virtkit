@@ -741,6 +741,8 @@ Grants and API-key management that intentionally have no HTTP route (`set_admin`
 `accounts_cli.rs`, under `vk-registry accounts <subcommand>`:
 
 ```
+vk-registry accounts <SUBCOMMAND>  # store flags either side: --root/--config/--accounts-db/--admin-socket
+
 vk-registry accounts list-users
 vk-registry accounts grant-admin     <EMAIL> [--issuer URL]
 vk-registry accounts revoke-admin    <EMAIL> [--issuer URL]
@@ -750,10 +752,14 @@ vk-registry accounts revoke-key <ID>
 vk-registry accounts create-key --name NAME --scope ACTION:PATTERN [--owner-email EMAIL] [--expires-days DAYS]
 ```
 
-Each takes the `--root`/`--config` store-selection flags `status`/`gc` already do, plus
+`accounts` takes the `--root`/`--config` store-selection flags `status`/`gc` already do, plus
 an `--accounts-db` that replaces them and may not be combined with them
 (`ServerConfig::accounts_db_of`, mirroring `root_of`) and an `--admin-socket` naming where
 a running server is reached.
+
+These four are declared once on `accounts` itself and are `global`: listed by
+`vk-registry accounts --help` — where an operator looking for `--config` looks first — as
+well as by each subcommand's own, and accepted on either side of the subcommand name.
 
 **The registry does not have to be stopped.** redb holds the accounts file exclusively for
 the life of a process, so a running `serve` locks out even `list-users` — which is why the

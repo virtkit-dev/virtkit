@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- `vk-registry accounts` no longer hides where its store comes from.
+  `--config`, `--root`, `--accounts-db` and `--admin-socket` are listed by
+  `vk-registry accounts --help` instead of only inside each subcommand's own
+  help, and they work on either side of the subcommand name, so
+  `accounts --config FILE list-users` and `accounts list-users --config FILE`
+  both do the same thing.
+
 ## [0.43.0] - 2026-08-27
 
 ### Added
