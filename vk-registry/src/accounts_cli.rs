@@ -21,11 +21,70 @@ use anyhow::{Context, Result, bail};
 
 use vk_registry::accounts::{Action, ApiKey, Db, Scope, User};
 
-pub fn list_users(db: &Db, path: &std::path::Path) -> Result<()> {
-    let users = db.list_users()?;
+/// The accounts operations this CLI needs, and nothing else — the seam between *what* a
+/// subcommand does and *which* store it reaches. Implemented here for [`Db`], the db this
+/// process opened; any other transport that can answer these calls serves the same
+/// subcommands.
+///
+/// Mirrors the [`Db`] methods one for one, so the resolution and rendering below stay
+/// shared and nothing an operator reads depends on which side of the seam answered. The
+/// flip side of that altitude: a subcommand that resolves a user and then acts on it is
+/// two calls, so an implementation must not assume they are one atomic step.
+pub trait AccountsOps {
+    fn list_users(&self) -> Result<Vec<User>>;
+    fn find_users_by_email(&self, email: &str) -> Result<Vec<User>>;
+    fn set_admin(&self, user_id: &str, is_admin: bool) -> Result<bool>;
+    fn list_api_keys(&self, owner_user_id: &str) -> Result<Vec<ApiKey>>;
+    fn list_all_api_keys(&self) -> Result<Vec<ApiKey>>;
+    fn revoke_api_key_unchecked(&self, id: &str) -> Result<bool>;
+    fn create_api_key(
+        &self,
+        owner_user_id: Option<&str>,
+        name: &str,
+        scopes: &[Scope],
+        expires_at: Option<SystemTime>,
+    ) -> Result<(ApiKey, String)>;
+}
+
+// Qualified calls throughout: the inherent `Db` methods, not this impl.
+impl AccountsOps for Db {
+    fn list_users(&self) -> Result<Vec<User>> {
+        Db::list_users(self)
+    }
+    fn find_users_by_email(&self, email: &str) -> Result<Vec<User>> {
+        Db::find_users_by_email(self, email)
+    }
+    fn set_admin(&self, user_id: &str, is_admin: bool) -> Result<bool> {
+        Db::set_admin(self, user_id, is_admin)
+    }
+    fn list_api_keys(&self, owner_user_id: &str) -> Result<Vec<ApiKey>> {
+        Db::list_api_keys(self, owner_user_id)
+    }
+    fn list_all_api_keys(&self) -> Result<Vec<ApiKey>> {
+        Db::list_all_api_keys(self)
+    }
+    fn revoke_api_key_unchecked(&self, id: &str) -> Result<bool> {
+        Db::revoke_api_key_unchecked(self, id)
+    }
+    fn create_api_key(
+        &self,
+        owner_user_id: Option<&str>,
+        name: &str,
+        scopes: &[Scope],
+        expires_at: Option<SystemTime>,
+    ) -> Result<(ApiKey, String)> {
+        Db::create_api_key(self, owner_user_id, name, scopes, expires_at)
+    }
+}
+
+/// `origin` names the store the rows came from, for the one line that has no rows to
+/// name it. Taken as a [`Display`](std::fmt::Display) so a caller can pass `path.display()`
+/// without materializing a `String` for it.
+pub fn list_users(ops: &dyn AccountsOps, origin: &dyn std::fmt::Display) -> Result<()> {
+    let users = ops.list_users()?;
     if users.is_empty() {
-        // Name the db, so "no users" cannot be mistaken for "wrong --root".
-        println!("vk-registry accounts: {} — no users yet", path.display());
+        // Name the store, so "no users" cannot be mistaken for "wrong --root".
+        println!("vk-registry accounts: {origin} — no users yet");
         return Ok(());
     }
     let now = SystemTime::now();
@@ -47,11 +106,18 @@ pub fn list_users(db: &Db, path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-pub fn set_admin(db: &Db, email: &str, issuer: Option<&str>, admin: bool) -> Result<()> {
-    let user = resolve_user(db, email, issuer)?;
+pub fn set_admin(
+    ops: &dyn AccountsOps,
+    email: &str,
+    issuer: Option<&str>,
+    admin: bool,
+) -> Result<()> {
+    let user = resolve_user(ops, email, issuer)?;
     // `set_admin` reports whether it found the row: the lookup above already resolved
-    // one, so a `false` here means it went away in between, not that the id was wrong.
-    if !db.set_admin(&user.id, admin)? {
+    // one, so a `false` here means it went away between the two calls, not that the id was
+    // wrong. Two calls is what the seam costs — see `AccountsOps` — and the window is real
+    // for an implementation that is not this process.
+    if !ops.set_admin(&user.id, admin)? {
         bail!("user {email:?} disappeared while granting admin; try again");
     }
     println!(
@@ -66,13 +132,17 @@ pub fn set_admin(db: &Db, email: &str, issuer: Option<&str>, admin: bool) -> Res
     Ok(())
 }
 
-pub fn list_keys(db: &Db, owner_email: Option<&str>, issuer: Option<&str>) -> Result<()> {
+pub fn list_keys(
+    ops: &dyn AccountsOps,
+    owner_email: Option<&str>,
+    issuer: Option<&str>,
+) -> Result<()> {
     let keys = match owner_email {
         Some(email) => {
-            let user = resolve_user(db, email, issuer)?;
-            db.list_api_keys(&user.id)?
+            let user = resolve_user(ops, email, issuer)?;
+            ops.list_api_keys(&user.id)?
         }
-        None => db.list_all_api_keys()?,
+        None => ops.list_all_api_keys()?,
     };
     if keys.is_empty() {
         match owner_email {
@@ -81,7 +151,7 @@ pub fn list_keys(db: &Db, owner_email: Option<&str>, issuer: Option<&str>) -> Re
         }
         return Ok(());
     }
-    let owners = owner_labels(db, &keys)?;
+    let owners = owner_labels(ops, &keys)?;
     let now = SystemTime::now();
     for k in &keys {
         println!("{}", key_line(k, &owners, now));
@@ -112,8 +182,8 @@ pub fn list_keys(db: &Db, owner_email: Option<&str>, issuer: Option<&str>) -> Re
 ///
 /// The labels for the two special cases are parenthesised, which no email is, so an
 /// owner's own email can never be mistaken for one of them.
-fn owner_labels(db: &Db, keys: &[ApiKey]) -> Result<HashMap<String, String>> {
-    let by_id: HashMap<String, User> = db
+fn owner_labels(ops: &dyn AccountsOps, keys: &[ApiKey]) -> Result<HashMap<String, String>> {
+    let by_id: HashMap<String, User> = ops
         .list_users()?
         .into_iter()
         .map(|u| (u.id.clone(), u))
@@ -135,11 +205,11 @@ fn owner_labels(db: &Db, keys: &[ApiKey]) -> Result<HashMap<String, String>> {
         .collect())
 }
 
-pub fn revoke_key(db: &Db, id: &str) -> Result<()> {
+pub fn revoke_key(ops: &dyn AccountsOps, id: &str) -> Result<()> {
     // The operator's revoke, not an owner's: `revoke_api_key_unchecked` is the one that
     // reaches an ownerless key, and an operator with the db is already past any
     // ownership question. `Ok(false)` means there was nothing live to revoke.
-    if !db.revoke_api_key_unchecked(id)? {
+    if !ops.revoke_api_key_unchecked(id)? {
         bail!("no live API key with id {id:?} (see `accounts list-keys` for ids)");
     }
     println!("vk-registry accounts: revoked {id}");
@@ -151,7 +221,7 @@ pub fn revoke_key(db: &Db, id: &str) -> Result<()> {
 /// keeps working if that person ever leaves or has their own admin status revoked.
 /// The right choice for CI.
 pub fn create_key(
-    db: &Db,
+    ops: &dyn AccountsOps,
     owner_email: Option<&str>,
     issuer: Option<&str>,
     name: &str,
@@ -159,7 +229,7 @@ pub fn create_key(
     expires_days: Option<u64>,
 ) -> Result<()> {
     let owner = owner_email
-        .map(|email| resolve_user(db, email, issuer))
+        .map(|email| resolve_user(ops, email, issuer))
         .transpose()?;
     // Checked: both the multiply and the addition are on operator input, and a silent
     // wrap would mint a credential that expires in hours rather than years.
@@ -178,7 +248,7 @@ pub fn create_key(
                 .with_context(|| format!("--expires-days {d} is too far in the future"))
         })
         .transpose()?;
-    let (key, token) = db.create_api_key(
+    let (key, token) = ops.create_api_key(
         owner.as_ref().map(|u| u.id.as_str()),
         name,
         scopes,
@@ -224,8 +294,8 @@ pub fn parse_scope(s: &str) -> Result<Scope> {
 /// The one user matching `email` — narrowed by `issuer` when the email alone is
 /// ambiguous, which it is as soon as two identity providers assert the same address.
 /// Never guesses: zero or several matches is an error naming what to do next.
-fn resolve_user(db: &Db, email: &str, issuer: Option<&str>) -> Result<User> {
-    let mut matches = db.find_users_by_email(email)?;
+fn resolve_user(ops: &dyn AccountsOps, email: &str, issuer: Option<&str>) -> Result<User> {
+    let mut matches = ops.find_users_by_email(email)?;
     if let Some(want) = issuer {
         matches.retain(|u| u.oidc_issuer == want);
     }
@@ -504,7 +574,7 @@ mod tests {
             Some("alice@example.com"),
             Some("Alice"),
         )?;
-        list_users(&db, &path)?; // must not error on a real row
+        list_users(&db, &path.display())?; // must not error on a real row
 
         set_admin(&db, "alice@example.com", None, true)?;
         let alice = db.find_users_by_email("alice@example.com")?.remove(0);

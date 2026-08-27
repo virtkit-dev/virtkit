@@ -426,7 +426,7 @@ fn run_accounts(cmd: AccountsCmd) -> Result<()> {
     match cmd {
         AccountsCmd::ListUsers { store } => {
             let (db, path) = open_accounts_db(&store)?;
-            accounts_cli::list_users(&db, &path)
+            accounts_cli::list_users(&db, &path.display())
         }
         AccountsCmd::GrantAdmin {
             email,
