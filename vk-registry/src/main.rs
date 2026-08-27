@@ -191,7 +191,19 @@ enum Cmd {
 /// Which accounts a subcommand works on, and how it reaches them. The db is an explicit
 /// `--accounts-db`, else the `serve` config's (`--config`), else
 /// `<root>/accounts/accounts.db` under the resolved store root; the running server holding
-/// it is `--admin-socket`, else the config's `admin_socket`, else the socket beside that db.
+/// it is `--admin-socket`, else the config's `admin_socket` — or, when `--accounts-db` names
+/// a db outright, neither — else the socket beside that db.
+///
+/// `--root`, `--config` and `--admin-socket` also read `VK_REGISTRY_ROOT` /
+/// `VK_REGISTRY_CONFIG` / `VK_REGISTRY_ADMIN_SOCKET` ([`StoreArgs::resolved`]), each ranking
+/// exactly where its own flag does — save that `--accounts-db` drops an inherited
+/// `VK_REGISTRY_ADMIN_SOCKET`, the way it drops the config file's — under that flag typed on
+/// the command line, over the config file. Which is unchanged *across* selectors, so an
+/// inherited `VK_REGISTRY_ROOT`
+/// still outranks the `root` in a `--config` typed by hand — the stderr line naming the
+/// store each subcommand reached is what shows which won. `--accounts-db` has no variable
+/// because it outranks every other selector: inherited, it would decide the db against both
+/// a `--root` and a `--config` typed by hand.
 ///
 /// Declared once on `accounts` and `global`, so every one of these flags is listed by
 /// `vk-registry accounts --help` — where somebody looking for `--config` looks first — and
@@ -201,21 +213,91 @@ enum Cmd {
 #[derive(clap::Args)]
 struct StoreArgs {
     /// Store directory [default: the `root` in --config, else the shared virtkit store]
+    ///
+    /// `VK_REGISTRY_ROOT` sets it without the flag.
     #[arg(long, global = true, value_name = "DIR")]
     root: Option<PathBuf>,
     /// The `serve` config file to take root/accounts_db/admin_socket from
+    ///
+    /// A registry is usually served from one config file for the life of the machine, so
+    /// naming it on every subcommand is the wrong unit of work: set `VK_REGISTRY_CONFIG`
+    /// once, in a login profile or /etc/environment, and every subcommand here finds the
+    /// same store the server did. It is this CLI that reads it, not `serve` — a unit's
+    /// `Environment=` would not reach an operator's shell anyway.
     #[arg(long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,
-    /// Accounts db file [default: --config's accounts_db, else <root>/accounts/accounts.db]
-    #[arg(long, global = true, value_name = "FILE", conflicts_with_all = ["root", "config"])]
+    // `--accounts-db` refusing `--root`/`--config` only worked while every selector was
+    // typed, so it wins quietly instead — the way --config wins over the default root.
+    /// Accounts db [default: --config's accounts_db, else <root>/accounts/accounts.db]
+    ///
+    /// The one selector with no environment variable of its own: it outranks the others, so
+    /// a path left in the environment would decide the db against a --config typed by hand.
+    #[arg(long, global = true, value_name = "FILE")]
     accounts_db: Option<PathBuf>,
     /// Admin socket of the running server [default: admin.sock beside the accounts db]
     ///
     /// Where to reach a server that holds the db. Nothing listening there is not an
     /// error: the db is then opened directly. Naming one picks the *server*, so it is that
     /// server's accounts an operation lands in — check the server each subcommand reports.
+    /// `VK_REGISTRY_ADMIN_SOCKET` sets it without the flag, and then the choice is not one
+    /// the invocation made: that reported server is the only place it shows. Which is why
+    /// an --accounts-db drops it — only the flag says that server was meant.
     #[arg(long, global = true, value_name = "FILE")]
     admin_socket: Option<PathBuf>,
+}
+
+/// A `VK_REGISTRY_*` value as a path, an empty one counting as unset.
+///
+/// Read here rather than through clap's `env`, which takes `VK_REGISTRY_ROOT=` as a value
+/// and then refuses every `accounts` invocation for want of one — not even a `--root` typed
+/// on the command line gets a look in. `Environment=VK_REGISTRY_CONFIG=` in a unit, or
+/// `VK_REGISTRY_CONFIG="$UNSET"` in a profile, is how that happens by accident. Reading a
+/// variable by hand is how `vk` takes `$VIRTKIT_CONFIG`; the emptiness filter is the
+/// `XDG_CONFIG_HOME` handling in `lib.rs`.
+///
+/// Takes the value rather than the variable's name so the emptiness rule can be tested
+/// without writing to the process environment.
+fn env_path(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value.filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+impl StoreArgs {
+    /// The flags as given, with `VK_REGISTRY_*` filling in the three that have a variable.
+    fn resolved(self) -> Self {
+        self.with_env(|name| std::env::var_os(name))
+    }
+
+    /// The fallback itself, taking the lookup so both the variable names and the precedence
+    /// are testable without writing to the process environment. `--accounts-db` is not among
+    /// them: it has no variable.
+    fn with_env(self, env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Self {
+        let db_named = self.accounts_db.is_some();
+        StoreArgs {
+            root: self.root.or_else(|| env_path(env("VK_REGISTRY_ROOT"))),
+            config: self.config.or_else(|| env_path(env("VK_REGISTRY_CONFIG"))),
+            accounts_db: self.accounts_db,
+            // Dropped once `--accounts-db` names a db outright, the rule `socket_config`
+            // applies to the config file's socket and for the same reason: that socket is a
+            // server holding some other db, and inherited it is not even a choice this
+            // invocation made. Only a typed `--admin-socket` says that is what was meant.
+            admin_socket: self.admin_socket.or_else(|| {
+                (!db_named)
+                    .then(|| env_path(env("VK_REGISTRY_ADMIN_SOCKET")))
+                    .flatten()
+            }),
+        }
+    }
+
+    /// The config file to take the admin socket from — none once `--accounts-db` names a db
+    /// outright, because the file's own `admin_socket` is a server holding the file's db,
+    /// not the one named here. An `--admin-socket` overrides both either way.
+    fn socket_config(&self) -> Option<&Path> {
+        if self.accounts_db.is_some() {
+            None
+        } else {
+            self.config.as_deref()
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -309,11 +391,13 @@ enum AccountsCmd {
 ///
 /// **Which accounts get touched is the socket's answer, not the store selector's.** Left to
 /// default, the socket is derived from the resolved db, so the two agree by construction.
-/// Named instead — `--admin-socket`, or `admin_socket` in the config file — it is a
-/// deliberate choice of *server*, and no handshake carries that server's own db path back
-/// for comparison: if it holds a different one, that is the db the operation lands in and
-/// `--root` picks only the fallback. Which is why every subcommand announces on stderr
-/// which server or which db it reached, before doing anything to it.
+/// Named instead — `--admin-socket`, `VK_REGISTRY_ADMIN_SOCKET`, or `admin_socket` in the
+/// config file, the last two only while no `--accounts-db` names a db — it is a choice of
+/// *server*, and no handshake carries that server's own db
+/// path back for comparison: if it holds a different one, that is the db the operation lands
+/// in and `--root` picks only the fallback. Deliberate when it is the flag, merely inherited
+/// when it is the variable — which is why every subcommand announces on stderr which server
+/// or which db it reached, before doing anything to it.
 fn open_accounts_ops(store: &StoreArgs) -> Result<(Box<dyn accounts_cli::AccountsOps>, String)> {
     let db_path = vk_registry::ServerConfig::accounts_db_of(
         store.config.as_deref(),
@@ -321,9 +405,10 @@ fn open_accounts_ops(store: &StoreArgs) -> Result<(Box<dyn accounts_cli::Account
         store.accounts_db.clone(),
     )?;
     // Derived from the resolved db, so an `--accounts-db` is not honoured on one path and
-    // dropped on the other. See the caveat above for a socket named outright.
+    // dropped on the other — which is what `socket_config` is for. See the caveat above for
+    // a socket named outright.
     let socket = vk_registry::ServerConfig::admin_socket_of(
-        store.config.as_deref(),
+        store.socket_config(),
         &db_path,
         store.admin_socket.clone(),
     )?;
@@ -405,8 +490,9 @@ fn open_accounts_db(path: &Path) -> Result<vk_registry::accounts::Db> {
     // the descriptor, so a symlink or a file swapped in after this check is still refused.
     if !path.is_file() {
         anyhow::bail!(
-            "no accounts db at {} — check --root/--config/--accounts-db, or start the \
-             server once in mode = \"accounts\" to create it",
+            "no accounts db at {} — check --root/--config/--accounts-db (or \
+             VK_REGISTRY_ROOT/VK_REGISTRY_CONFIG), or start the server once in \
+             mode = \"accounts\" to create it",
             path.display()
         );
     }
@@ -531,6 +617,7 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 fn run_accounts(store: StoreArgs, cmd: AccountsCmd) -> Result<()> {
+    let store = store.resolved();
     match cmd {
         AccountsCmd::ListUsers => {
             let (ops, origin) = open_accounts_ops(&store)?;
@@ -799,7 +886,7 @@ mod tests {
 
     // The `accounts` subcommands' shape: a store selector on `accounts` itself, taken on
     // either side of the subcommand name, `--scope` required and repeatable, and
-    // `--accounts-db` refusing to sit beside the flags it replaces.
+    // `--accounts-db` outranking the flags it replaces.
     #[test]
     fn accounts_store_flags_are_global_and_a_scope_is_required() {
         let parse = |args: &[&str]| Cli::try_parse_from(args);
@@ -998,19 +1085,31 @@ mod tests {
             _ => panic!("expected accounts create-key"),
         }
 
-        // and the db selector is not combined with the flags it supersedes
-        assert!(
-            parse(&[
-                "vk-registry",
-                "accounts",
-                "list-users",
-                "--accounts-db",
-                "/srv/a.db",
-                "--root",
-                "/srv/store"
-            ])
-            .is_err(),
-            "--accounts-db beside --root must be refused, not silently preferred"
+        // The db selector outranks the flags it supersedes rather than refusing them: a
+        // `VK_REGISTRY_CONFIG` in the environment counts as a `--config`, so refusing would
+        // make this flag unusable for anyone who set that up.
+        let cli = parse(&[
+            "vk-registry",
+            "accounts",
+            "list-users",
+            "--accounts-db",
+            "/srv/a.db",
+            "--root",
+            "/srv/store",
+        ])
+        .expect("--accounts-db beside --root is an override, not a conflict");
+        let Cmd::Accounts { store, .. } = cli.cmd else {
+            panic!("expected accounts")
+        };
+        assert_eq!(
+            vk_registry::ServerConfig::accounts_db_of(
+                store.config.as_deref(),
+                store.root.clone(),
+                store.accounts_db.clone(),
+            )
+            .unwrap(),
+            PathBuf::from("/srv/a.db"),
+            "the db named outright is the one used"
         );
 
         // `--admin-socket` names where a *running* server is reached, so unlike
@@ -1039,6 +1138,94 @@ mod tests {
             }
             _ => panic!("expected accounts list-users"),
         }
+    }
+
+    // The three selectors that read the environment, and the one that deliberately does
+    // not. Pinned on the two pieces that carry the rule rather than through the process
+    // environment: `std::env::set_var` is unsafe in edition 2024 and racy under a threaded
+    // harness, and the emptiness rule is the half that an accident trips.
+    #[test]
+    fn store_flags_take_the_environment_below_the_command_line() {
+        use std::ffi::OsString;
+
+        // The three variables, and nothing else: a lookup of any other name is the wiring
+        // going wrong, so it fails the test rather than returning `None` quietly.
+        let env = |name: &str| match name {
+            "VK_REGISTRY_ROOT" => Some(OsString::from("/srv/env")),
+            "VK_REGISTRY_CONFIG" => Some(OsString::from("/etc/env.toml")),
+            "VK_REGISTRY_ADMIN_SOCKET" => Some(OsString::from("/run/env.sock")),
+            other => panic!("read an unexpected variable: {other}"),
+        };
+
+        // nothing typed: each of the three is filled in, and `--accounts-db` stays unset
+        let store = store_unset().with_env(env);
+        assert_eq!(store.root.as_deref(), Some(Path::new("/srv/env")));
+        assert_eq!(store.config.as_deref(), Some(Path::new("/etc/env.toml")));
+        assert_eq!(
+            store.admin_socket.as_deref(),
+            Some(Path::new("/run/env.sock"))
+        );
+        assert_eq!(store.accounts_db, None, "no variable names the db");
+
+        // all three typed: the environment fills in nothing
+        let store = StoreArgs {
+            root: Some(PathBuf::from("/srv/typed")),
+            config: Some(PathBuf::from("/etc/typed.toml")),
+            accounts_db: None,
+            admin_socket: Some(PathBuf::from("/run/typed.sock")),
+        }
+        .with_env(env);
+        assert_eq!(store.root.as_deref(), Some(Path::new("/srv/typed")));
+        assert_eq!(store.config.as_deref(), Some(Path::new("/etc/typed.toml")));
+        assert_eq!(
+            store.admin_socket.as_deref(),
+            Some(Path::new("/run/typed.sock"))
+        );
+
+        // an empty value is unset: `Environment=VK_REGISTRY_CONFIG=` must not brick the CLI
+        let store = store_unset().with_env(|_| Some(OsString::new()));
+        assert_eq!(store.root, None);
+        assert_eq!(store.config, None);
+        assert_eq!(store.admin_socket, None);
+
+        // a db named outright drops an *inherited* socket — that server holds some other db
+        let store = StoreArgs {
+            accounts_db: Some(PathBuf::from("/srv/a.db")),
+            ..store_unset()
+        }
+        .with_env(env);
+        assert_eq!(store.accounts_db.as_deref(), Some(Path::new("/srv/a.db")));
+        assert_eq!(store.admin_socket, None);
+        assert_eq!(store.root.as_deref(), Some(Path::new("/srv/env")));
+
+        // but a typed one is what says that server was meant
+        let store = StoreArgs {
+            accounts_db: Some(PathBuf::from("/srv/a.db")),
+            admin_socket: Some(PathBuf::from("/run/typed.sock")),
+            ..store_unset()
+        }
+        .with_env(env);
+        assert_eq!(
+            store.admin_socket.as_deref(),
+            Some(Path::new("/run/typed.sock"))
+        );
+    }
+
+    // A db named outright is the whole selector: the config file's `admin_socket` names a
+    // server holding the *file's* db, so dialling it would land the operation elsewhere.
+    #[test]
+    fn a_db_named_outright_does_not_take_the_configs_socket() {
+        let store = StoreArgs {
+            config: Some(PathBuf::from("/etc/reg.toml")),
+            ..store_at(Path::new("/srv/store"))
+        };
+        assert_eq!(store.socket_config(), Some(Path::new("/etc/reg.toml")));
+
+        let store = StoreArgs {
+            accounts_db: Some(PathBuf::from("/srv/a.db")),
+            ..store
+        };
+        assert_eq!(store.socket_config(), None);
     }
 
     // The page an operator looking for `--config` lands on. Declaring the flags on
@@ -1164,6 +1351,16 @@ mod tests {
             "help entries over {LIMIT} chars or missing:\n  {}",
             bad.join("\n  ")
         );
+    }
+
+    /// A `StoreArgs` with nothing given — what a bare `accounts` subcommand parses to.
+    fn store_unset() -> StoreArgs {
+        StoreArgs {
+            root: None,
+            config: None,
+            accounts_db: None,
+            admin_socket: None,
+        }
     }
 
     /// A `StoreArgs` naming a store directory and nothing else — what every case below

@@ -753,13 +753,33 @@ vk-registry accounts create-key --name NAME --scope ACTION:PATTERN [--owner-emai
 ```
 
 `accounts` takes the `--root`/`--config` store-selection flags `status`/`gc` already do, plus
-an `--accounts-db` that replaces them and may not be combined with them
-(`ServerConfig::accounts_db_of`, mirroring `root_of`) and an `--admin-socket` naming where
-a running server is reached.
+an `--accounts-db` that overrides them (`ServerConfig::accounts_db_of`, mirroring `root_of`)
+and an `--admin-socket` naming where a running server is reached.
 
 These four are declared once on `accounts` itself and are `global`: listed by
 `vk-registry accounts --help` — where an operator looking for `--config` looks first — as
 well as by each subcommand's own, and accepted on either side of the subcommand name.
+`--root`, `--config` and `--admin-socket` also read `VK_REGISTRY_ROOT` /
+`VK_REGISTRY_CONFIG` / `VK_REGISTRY_ADMIN_SOCKET`, because a machine serves one registry from
+one config for its whole life and naming it on every subcommand is the wrong unit of work.
+Each ranks where its own flag does: under that flag typed on the command line, over the
+config file. Which is unchanged *across* selectors, so an inherited `VK_REGISTRY_ROOT` still
+outranks the `root` in a `--config` typed by hand, and a `VK_REGISTRY_CONFIG`'s `accounts_db`
+a typed `--root` — the stderr line naming the store reached is what shows which won.
+`--accounts-db` has no variable, because it outranks every other selector: inherited, it
+would decide the db against both a `--root` and a `--config` typed by hand. It no longer
+*refuses* the flags it supersedes either, which it could only do while every selector was
+typed; naming it does drop the config file's `admin_socket` (and an inherited
+`VK_REGISTRY_ADMIN_SOCKET`), since that socket is a server holding the *file's* db, not the
+one named here. The variables are read directly rather than through clap's `env`, so an
+empty `VK_REGISTRY_CONFIG=` counts as unset instead of refusing every command until it is
+cleared.
+
+Only `accounts` reads them — `serve`, `status`, `gc` and `install-service` take their
+`--root`/`--config` on the command line — so `install-service` writes no `Environment=` line
+into the unit it generates; a login profile or `/etc/environment` is where they belong. The
+`VK_REGISTRY_*` namespace is deliberately separate from `vk`'s `VIRTKIT_*`: a different
+binary reading a different config file, and nothing is shared between the two.
 
 **The registry does not have to be stopped.** redb holds the accounts file exclusively for
 the life of a process, so a running `serve` locks out even `list-users` — which is why the
@@ -774,8 +794,10 @@ yet".
 
 Which accounts an operation lands in is then the socket's answer, not the store selector's.
 Left to default the socket is derived from the resolved db, so the two agree by
-construction; named outright — `--admin-socket`, or `admin_socket` in the config — it is a
-choice of *server*, and no operation carries that server's own db path back for comparison.
+construction; named outright — `--admin-socket`, `VK_REGISTRY_ADMIN_SOCKET`, or
+`admin_socket` in the config, the last two only while no `--accounts-db` names a db — it is
+a choice of *server*, and no operation carries that server's own db path back for
+comparison. From the variable it is not even a choice this invocation made.
 So a named socket belonging to a registry serving a different store is the store the
 operation reaches, with `--root` picking only the fallback. Which is why every subcommand
 announces on stderr which server or which db it reached before touching it, and why the

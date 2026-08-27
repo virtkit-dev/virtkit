@@ -11,7 +11,14 @@ All notable changes to virtkit will be documented in this file.
   `vk-registry accounts --help` instead of only inside each subcommand's own
   help, and they work on either side of the subcommand name, so
   `accounts --config FILE list-users` and `accounts list-users --config FILE`
-  both do the same thing.
+  both do the same thing. `--config`, `--root` and `--admin-socket` can also be
+  set once as `VK_REGISTRY_CONFIG`, `VK_REGISTRY_ROOT` or
+  `VK_REGISTRY_ADMIN_SOCKET`, so an `accounts` command need not name the store
+  every time — a machine usually serves one registry from one config file.
+  Only `accounts` reads them; `serve`, `status`, `gc` and `install-service`
+  still take their `--root`/`--config` on the command line. `--accounts-db`
+  has no variable, and now overrides `--root`/`--config` instead of refusing
+  to sit beside them.
 
 ## [0.43.0] - 2026-08-27
 
