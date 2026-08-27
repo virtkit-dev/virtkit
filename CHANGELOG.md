@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.44.0] - 2026-08-27
+
 ### Changed
 
 - **Breaking:** the accounts database moved to redb's v3 file format. A file
@@ -2031,7 +2033,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.43.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.44.0...HEAD
+[0.44.0]: https://github.com/virtkit-dev/virtkit/compare/v0.43.0...v0.44.0
 [0.43.0]: https://github.com/virtkit-dev/virtkit/compare/v0.42.0...v0.43.0
 [0.42.0]: https://github.com/virtkit-dev/virtkit/compare/v0.41.0...v0.42.0
 [0.41.0]: https://github.com/virtkit-dev/virtkit/compare/v0.40.0...v0.41.0
