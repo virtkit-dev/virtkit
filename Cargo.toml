@@ -115,7 +115,7 @@ jsonwebtoken = { version = "10", default-features = false, features = ["rust_cry
 # the `switch` subcommand: a userspace L2 gateway for microVMs. etherparse parses
 # and builds ethernet/ARP/IPv4/UDP (checksums); ipstack terminates arbitrary guest
 # TCP/UDP for transparent egress through the host's sockets (the gvproxy replacement).
-etherparse = "0.20"
+etherparse = "0.21"
 ipstack = "1"
 listenfd = "1"
 log = "0"

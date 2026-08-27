@@ -1141,6 +1141,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "etherparse"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17304d06addb3283cdc4bd528e42dd95e73c8ee2d6492ffce415e93660885449"
+dependencies = [
+ "arrayvec",
+]
+
+[[package]]
 name = "fastcdc"
 version = "4.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1855,7 +1864,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e889a45c1ce3e97268ad2249951528563ec1d02a120fecbd4db690beac34f7fd"
 dependencies = [
  "ahash",
- "etherparse",
+ "etherparse 0.20.3",
  "log",
  "rand 0.10.2",
  "serde_json",
@@ -4546,7 +4555,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
- "etherparse",
+ "etherparse 0.21.0",
  "fastcdc",
  "flate2",
  "futures",
