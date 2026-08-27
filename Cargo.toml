@@ -128,7 +128,7 @@ russh = { version = "0.62", default-features = false, features = ["flate2", "rin
 russh-sftp = "2"
 # /run/vk control filesystem (`ctlfs`, vk-agent): pure-Rust FUSE, mounted by
 # PID-1 root directly through the mount syscall (no fusermount, no libfuse).
-fuser = { version = "0.17", default-features = false }
+fuser = { version = "0.18", default-features = false }
 simplelog = "0"
 thiserror = "2"
 tokio-serde = { version = "0", features = ["messagepack"] }

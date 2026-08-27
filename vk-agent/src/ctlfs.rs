@@ -97,7 +97,7 @@ pub fn run(mountpoint: &Path, owner: (u32, u32)) -> Result<()> {
         MountOption::DefaultPermissions,
     ];
     opts.acl = SessionACL::All;
-    fuser::mount2(fs, mountpoint, &opts)
+    fuser::mount(fs, mountpoint, &opts)
         .with_context(|| format!("mounting the control fs on {}", mountpoint.display()))
 }
 
