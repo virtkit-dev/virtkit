@@ -23,8 +23,8 @@ use hyper::{Response, StatusCode};
 use crate::accounts::{Action, authorize};
 use crate::html::{self, page, respond};
 use crate::{
-    Authz, Store, accounts, html_escape, human_bytes, manifest_descriptors, valid_digest,
-    valid_name, valid_reference,
+    Authz, Store, accounts, html_escape, human_bytes, is_blob_hex, manifest_descriptors,
+    valid_digest, valid_name, valid_reference,
 };
 
 /// Ceiling on the rows any one table here renders, and the reason is the same for all
@@ -122,6 +122,44 @@ fn repo_list(
     ))
 }
 
+/// The repository `vk` writes its build cache to, as the caption's corroborating check.
+/// Duplicated from `vk-driver`'s `build::exec::CACHE_REPO` because the dependency runs the
+/// other way — a rename there is caught by nothing but this comment and the name itself.
+const CACHE_REPO: &str = "build-cache";
+
+/// The namespace half of a content key — a tag of the form `<namespace>-<64 lowercase
+/// hex>`, whose hash half is what makes it a content key rather than a tag that merely has
+/// a hyphen in it: `snap-latest` is somebody's release, not a cache entry. The split is at
+/// the *first* hyphen, so a namespace is one word: `my-app-<hex>` is nobody's content key.
+/// Lowercase-only, via the same [`is_blob_hex`] a blob name must satisfy, because that is
+/// the only hex any writer in this workspace emits (`vk-driver`'s `build::Ns::key`) — an
+/// uppercase look-alike is a tag someone chose.
+fn cache_namespace(tag: &str) -> Option<&str> {
+    let (namespace, hex) = tag.split_once('-')?;
+    if namespace.is_empty() || !is_blob_hex(hex) {
+        return None;
+    }
+    Some(namespace)
+}
+
+/// What a tag says it is, for the `Kind` column — or `None` for an ordinary tag, which is
+/// a name someone chose and needs no gloss.
+///
+/// A content key's name is decided by its content, so it is nobody's idea of a version.
+/// The two namespaces virtkit's build cache writes are spelled out (they are `vk-driver`'s
+/// `build::Ns`, kept in step by nothing but this comment), because a page of bare hashes is
+/// the one listing here that tells a reader nothing at all — the rest of the crate already
+/// knows what a `vk` bundle is, so a display label for its cache is no new coupling. An
+/// unrecognised namespace still gets the generic gloss rather than nothing: the shape is
+/// the claim being made, and the tag itself shows which namespace.
+fn tag_kind(tag: &str) -> Option<&'static str> {
+    Some(match cache_namespace(tag)? {
+        "snap" => "instruction snapshot",
+        "base" => "base image filesystem",
+        _ => "content-addressed entry",
+    })
+}
+
 fn tag_list(
     store: &Store,
     name: &str,
@@ -134,23 +172,60 @@ fn tag_list(
         return Ok(not_found(principal, csrf));
     }
     let tags = store.list_tags(name);
+    // The column is only drawn where something is in it: a repository of names someone
+    // chose would otherwise gain a header and a column of blanks for a gloss none of its
+    // tags can carry.
+    let shown = tags.get(..MAX_ROWS).unwrap_or(&tags);
+    let kinds = shown.iter().any(|t| tag_kind(t).is_some());
     let mut rows = String::new();
-    for t in tags.iter().take(MAX_ROWS) {
+    for t in shown {
+        let kind = match tag_kind(t) {
+            // A static label, so no escaping is owed — but it goes through the same
+            // helper as everything else here rather than resting on that.
+            Some(k) => format!("<td>{}</td>", html_escape(k)),
+            None if kinds => "<td></td>".to_string(),
+            None => String::new(),
+        };
         rows.push_str(&format!(
-            "<tr><td><a href=\"/browse/{name}/manifests/{tag}\">{tag}</a></td></tr>\n",
+            "<tr><td><a href=\"/browse/{name}/manifests/{tag}\">{tag}</a></td>{kind}</tr>\n",
             name = html_escape(name),
             tag = html_escape(t),
         ));
     }
+    let columns = 1 + kinds as usize;
     if rows.is_empty() {
-        rows = "<tr><td><em>no tags</em></td></tr>\n".to_string();
+        rows = format!("<tr><td colspan=\"{columns}\"><em>no tags</em></td></tr>\n");
     }
     if tags.len() > MAX_ROWS {
         rows.push_str(&format!(
-            "<tr><td><em>{} more not shown</em></td></tr>\n",
+            "<tr><td colspan=\"{columns}\"><em>{} more not shown</em></td></tr>\n",
             tags.len() - MAX_ROWS
         ));
     }
+    let header = if kinds {
+        "<th>Tag</th><th>Kind</th>"
+    } else {
+        "<th>Tag</th>"
+    };
+    // Said once, above a whole page of them, when there is nothing here to mistake for a
+    // release: a repository of content keys is a cache, and reads as an inexplicable list
+    // of hashes to anyone not told that. Named as well as shaped, because this sentence
+    // asserts what the *repository* is where the per-row gloss only reads a tag: `vk`
+    // writes its cache to one repo name (`vk-driver`'s `build::exec::CACHE_REPO`, under
+    // whatever repo prefix the registry is configured with), and a repository holding an
+    // ordinary tag — or somebody else's namespace of the same shape — is not it.
+    let caption = if !tags.is_empty()
+        && name.rsplit('/').next() == Some(CACHE_REPO)
+        && tags
+            .iter()
+            .all(|t| matches!(cache_namespace(t), Some("snap" | "base")))
+    {
+        "<p>Every tag here is a content key computed from what it holds, not a version \
+         anyone chose: this repository is virtkit's build cache; as with any tag in this \
+         registry, an entry <code>vk registry gc</code> finds idle is reclaimed.</p>\n"
+    } else {
+        ""
+    };
     Ok(respond(
         StatusCode::OK,
         &page(
@@ -159,9 +234,9 @@ fn tag_list(
             csrf,
             &format!(
                 "<p><a href=\"/browse\">&larr; repositories</a></p>\n\
-             <h1>{}</h1>\n\
-             <table><tr><th>Tag</th></tr>\n{rows}</table>",
-                html_escape(name)
+             <h1>{name}</h1>\n{caption}\
+             <table><tr>{header}</tr>\n{rows}</table>",
+                name = html_escape(name)
             ),
         ),
     ))
@@ -564,6 +639,159 @@ mod tests {
         let tags =
             body_of(page_at(&store, "/browse/team-a/app", &session("A"), Some("t")).unwrap()).await;
         assert!(tags.contains("v1.0_x-y"), "{tags}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shape is the whole of the claim the `Kind` column makes, so it is asserted
+    /// directly rather than through a page: what a writer here produces is a lowercase
+    /// 64-hex half behind a one-word namespace, and everything that merely resembles it is
+    /// a tag someone chose.
+    #[test]
+    fn only_a_lowercase_64_hex_half_behind_a_namespace_is_a_content_key() {
+        let hex = "a".repeat(64);
+        assert_eq!(
+            tag_kind(&format!("snap-{hex}")),
+            Some("instruction snapshot")
+        );
+        assert_eq!(
+            tag_kind(&format!("base-{hex}")),
+            Some("base image filesystem")
+        );
+        assert_eq!(
+            tag_kind(&format!("blob-{hex}")),
+            Some("content-addressed entry")
+        );
+        for tag in [
+            format!("snap-{}", "A".repeat(64)), // uppercase: no writer here emits it
+            format!("snap-{}", "a".repeat(63)), // too short
+            format!("snap-{}", "a".repeat(65)), // too long
+            format!("snap-{}", "g".repeat(64)), // not hex
+            format!("-{hex}"),                  // no namespace at all
+            format!("my-app-{hex}"),            // the namespace is the first word only
+            "snap-".to_string(),
+            "snap-latest".to_string(),
+            "v1.2".to_string(),
+            hex.clone(), // a bare hash is not namespaced
+        ] {
+            assert_eq!(tag_kind(&tag), None, "{tag} was glossed as a content key");
+        }
+    }
+
+    /// A page of bare hashes explains nothing, so a content key's tag says what kind of
+    /// entry it is and the page says once that the repository is virtkit's cache. Asserted
+    /// per namespace against the row it belongs to, not against the page as a whole: one
+    /// label appearing somewhere would otherwise pass for both.
+    #[tokio::test]
+    async fn a_cache_tag_says_what_kind_of_entry_it_is() {
+        let (dir, store) = store_in("kinds");
+        let snap = format!("snap-{}", "1".repeat(64));
+        let base = format!("base-{}", "2".repeat(64));
+        for tag in [&snap, &base] {
+            store
+                .put_manifest("team-a/build-cache", tag, MANIFEST_TYPE, b"{}")
+                .unwrap();
+        }
+        let html = body_of(
+            page_at(
+                &store,
+                "/browse/team-a/build-cache",
+                &session("A"),
+                Some("t"),
+            )
+            .unwrap(),
+        )
+        .await;
+        assert!(html.contains("<th>Tag</th><th>Kind</th>"), "{html}");
+        for (tag, kind) in [
+            (&snap, "instruction snapshot"),
+            (&base, "base image filesystem"),
+        ] {
+            assert!(
+                html.contains(&format!("{tag}</a></td><td>{kind}</td>")),
+                "{tag} is not labelled {kind}: {html}"
+            );
+        }
+        assert!(
+            html.contains("this repository is virtkit's build cache"),
+            "{html}"
+        );
+
+        // A namespace vk does not write still reads as a content key row by row — and so
+        // do the ones it does, under a name that is not the cache's. Neither page goes on
+        // to call somebody else's repository this cache.
+        let other = format!("blob-{}", "3".repeat(64));
+        for (repo, tag) in [("team-a/theirs", &other), ("team-a/lookalike", &snap)] {
+            store.put_manifest(repo, tag, MANIFEST_TYPE, b"{}").unwrap();
+        }
+        let theirs =
+            body_of(page_at(&store, "/browse/team-a/theirs", &session("A"), Some("t")).unwrap())
+                .await;
+        assert!(
+            theirs.contains(&format!("{other}</a></td><td>content-addressed entry</td>")),
+            "{theirs}"
+        );
+        assert!(!theirs.contains("build cache"), "{theirs}");
+        let lookalike =
+            body_of(page_at(&store, "/browse/team-a/lookalike", &session("A"), Some("t")).unwrap())
+                .await;
+        assert!(
+            lookalike.contains(&format!("{snap}</a></td><td>instruction snapshot</td>")),
+            "{lookalike}"
+        );
+        assert!(!lookalike.contains("build cache"), "{lookalike}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tag someone chose gets no gloss, and a repository holding one is not called a
+    /// cache — a release named `snap-latest` is the case the hash check exists for, and a
+    /// repository with one ordinary tag among its cache entries is somebody's image
+    /// repository. The sibling case, a namespace `vk` does not write, belongs to
+    /// `a_cache_tag_says_what_kind_of_entry_it_is`.
+    #[tokio::test]
+    async fn an_ordinary_tag_is_neither_labelled_nor_called_a_cache() {
+        let (dir, store) = store_in("plain");
+        let snap = format!("snap-{}", "4".repeat(64));
+        for tag in ["v1.2", "snap-latest", &snap] {
+            store
+                .put_manifest("team-a/app", tag, MANIFEST_TYPE, b"{}")
+                .unwrap();
+        }
+        let html =
+            body_of(page_at(&store, "/browse/team-a/app", &session("A"), Some("t")).unwrap()).await;
+        // the cache entry beside them is still labelled
+        assert!(
+            html.contains(&format!("{snap}</a></td><td>instruction snapshot</td>")),
+            "{html}"
+        );
+        for tag in ["v1.2", "snap-latest"] {
+            assert!(
+                html.contains(&format!("{tag}</a></td><td></td>")),
+                "{tag} was glossed as something: {html}"
+            );
+        }
+        // and the page does not claim to be a cache while it holds them
+        assert!(!html.contains("build cache"), "{html}");
+
+        // With no cache entry at all there is no column either, rather than a header over
+        // a stripe of blanks — the whole reason the gloss is not simply always rendered.
+        for tag in ["v1.2", "snap-latest"] {
+            store
+                .put_manifest("team-a/plain", tag, MANIFEST_TYPE, b"{}")
+                .unwrap();
+        }
+        let plain =
+            body_of(page_at(&store, "/browse/team-a/plain", &session("A"), Some("t")).unwrap())
+                .await;
+        assert!(!plain.contains("Kind"), "{plain}");
+        assert!(plain.contains("v1.2</a></td></tr>"), "{plain}");
+
+        // nor does an empty repository, which has nothing to describe — and it is the
+        // rendered listing saying so, not a page that never came back
+        let empty =
+            body_of(page_at(&store, "/browse/nope", &session("A"), Some("t")).unwrap()).await;
+        assert!(empty.contains("no tags"), "{empty}");
+        assert!(!empty.contains("Kind"), "{empty}");
+        assert!(!empty.contains("build cache"), "{empty}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

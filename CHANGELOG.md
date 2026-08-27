@@ -20,7 +20,9 @@ All notable changes to virtkit will be documented in this file.
 
 - A registry in accounts mode has pages to look at: what it holds, each
   repository's tags, and what one image is made of, with links to download the
-  parts. Read-only, and only for a signed-in person or a machine holding an API
+  parts. A tag that is a content key rather than a name someone chose says what
+  kind of entry it is, and the build cache's own repository says so once — so
+  its listing reads as something other than a wall of hashes. Read-only, and only for a signed-in person or a machine holding an API
   key — a registry left on the older shared-secret setting does not serve them
   at all.
 

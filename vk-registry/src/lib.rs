@@ -1064,7 +1064,7 @@ fn declared_media_type(manifest: &[u8]) -> Option<String> {
 }
 
 /// A lowercase 64-char sha256 hex — what names a blob on disk, and therefore what may be
-/// a membership marker.
+/// a membership marker, or the hash half of a content-keyed tag.
 fn is_blob_hex(s: &str) -> bool {
     s.len() == 64
         && s.bytes()
