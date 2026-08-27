@@ -186,7 +186,7 @@
 #                        # `vk-registry` for the hosts that consume the bundles.
 #                        #
 #                        # It is the same store format as [build] cache_registry, and the two
-#                        # occupy different repos inside one (`dfcache` for the build cache,
+#                        # occupy different repos inside one (`build-cache` for the build cache,
 #                        # one per bundle name), so when both are local the simplest setup is
 #                        # ONE directory for both: chunk dedup spans them, a single
 #                        # `vk registry gc` covers both, and `vk registry status` lists them

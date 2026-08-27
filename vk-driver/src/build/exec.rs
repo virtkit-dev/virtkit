@@ -808,8 +808,10 @@ fn source_dev_path(index: usize, has_out_disk: bool) -> String {
     format!("/dev/{}", vd_name(index + src_base))
 }
 
-/// Cache repo (under the registry's repo prefix) holding the instruction snapshots.
-const CACHE_REPO: &str = "dfcache";
+/// Cache repo (under the registry's repo prefix) holding the instruction snapshots and
+/// the base filesystems they chain from. Named for what it is, not for how it is keyed:
+/// it is what `vk registry status` and a shared registry's listings show.
+const CACHE_REPO: &str = "build-cache";
 
 /// Conservative virtio-pci source-disk budget for a build guest. libkrun puts every virtio
 /// device on PCI bus 0, whose 31 usable slots (slot 0 is the host bridge) — not the scarce

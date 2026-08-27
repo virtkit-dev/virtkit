@@ -2742,7 +2742,7 @@ fn stage_input_rootfs(
 /// reclaims it like any other unused blob.
 const CACHE_KEY_VERSION: &str = "4";
 
-/// The namespaces a build-cache key can belong to. One `dfcache` repository holds every
+/// The namespaces a build-cache key can belong to. One `build-cache` repository holds every
 /// kind of cached artefact, so a key says which kind it is — both to a reader (`/browse`,
 /// `vk registry status`, a gc log) and to the hash itself.
 ///
@@ -5948,7 +5948,7 @@ RUN ship
     }
 
     /// Every key a build can produce says which namespace it is in — that is what makes a
-    /// `dfcache` listing readable, and `vk docker-hash` prints these verbatim as the tag a
+    /// `build-cache` listing readable, and `vk docker-hash` prints these verbatim as the tag a
     /// snapshot lives at.
     #[test]
     fn every_key_names_its_namespace() {

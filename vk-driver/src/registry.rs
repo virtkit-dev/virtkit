@@ -322,7 +322,7 @@ pub fn exists(rg: &Registry, name: &str, tag: &str) -> bool {
 /// tag with byte-different (equivalent) bytes in between.
 /// `label` is the human name shown in the pull progress lines (e.g. the Dockerfile
 /// stage being restored) instead of the opaque `<repo>@<digest>` — the cache repo is
-/// always `dfcache`, so the digest alone is unreadable in a job trace. Pass `name`
+/// always `build-cache`, so the digest alone is unreadable in a job trace. Pass `name`
 /// when there is no better label.
 pub fn try_pull_ext4(
     rg: &Registry,
@@ -1385,7 +1385,7 @@ async fn pull_into(
     label: &str,
 ) -> Result<()> {
     // `label` (a Dockerfile stage, a bundle name) is what the trace shows; the cache
-    // repo is always `dfcache`, so `name@digest` alone is unreadable.
+    // repo is always `build-cache`, so `name@digest` alone is unreadable.
     let _lock = image::acquire_pull_lock(dir, "pull", label, digest)?;
     if bundle_present(dir) {
         return Ok(());
@@ -3426,16 +3426,18 @@ mod tests {
             f.write_all_at(&tail, 40 << 20).unwrap();
         }
 
-        assert!(!exists(&rg, "dfcache", "k1"), "empty store has no tag");
-        push_ext4(&rg, "dfcache", "k1", &src, "generic-disk").unwrap();
-        assert!(exists(&rg, "dfcache", "k1"));
-        let (chunks, size) = fetch_chunks(&rg, "dfcache", "k1").unwrap().expect("tagged");
+        assert!(!exists(&rg, "build-cache", "k1"), "empty store has no tag");
+        push_ext4(&rg, "build-cache", "k1", &src, "generic-disk").unwrap();
+        assert!(exists(&rg, "build-cache", "k1"));
+        let (chunks, size) = fetch_chunks(&rg, "build-cache", "k1")
+            .unwrap()
+            .expect("tagged");
         assert_eq!(size, total);
         assert!(chunks.len() > 1, "should split into several chunks");
 
         let dest = dir.join("dest.ext4");
         assert!(
-            try_pull_ext4(&rg, "dfcache", "k1", &dest, "dfcache")
+            try_pull_ext4(&rg, "build-cache", "k1", &dest, "build-cache")
                 .unwrap()
                 .is_some()
         );
@@ -3454,9 +3456,15 @@ mod tests {
         }
         // an absent tag pulls nothing and reports false
         assert!(
-            try_pull_ext4(&rg, "dfcache", "missing", &dir.join("no.ext4"), "dfcache")
-                .unwrap()
-                .is_none()
+            try_pull_ext4(
+                &rg,
+                "build-cache",
+                "missing",
+                &dir.join("no.ext4"),
+                "build-cache"
+            )
+            .unwrap()
+            .is_none()
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3474,8 +3482,8 @@ mod tests {
         // dense 16 MiB base, pushed as the parent.
         let base = dir.join("base.ext4");
         std::fs::write(&base, pseudo_random(16 << 20, 0x1234)).unwrap();
-        push_ext4(&rg, "dfcache", "parent", &base, "generic-disk").unwrap();
-        let (parent_layers, total) = fetch_chunks(&rg, "dfcache", "parent").unwrap().unwrap();
+        push_ext4(&rg, "build-cache", "parent", &base, "generic-disk").unwrap();
+        let (parent_layers, total) = fetch_chunks(&rg, "build-cache", "parent").unwrap().unwrap();
         assert!(parent_layers.len() > 2, "need several chunks to test reuse");
 
         // an empty qcow2 overlay (no writes) with a small dirty range: the dirty
@@ -3485,7 +3493,7 @@ mod tests {
         let dirty = [(0u64, 1u64 << 20)];
         let (layers, size, _digest) = push_ext4_diff(
             &rg,
-            "dfcache",
+            "build-cache",
             "child",
             &overlay,
             "generic-disk",
@@ -3507,7 +3515,7 @@ mod tests {
         );
         let dest = dir.join("child.ext4");
         assert!(
-            try_pull_ext4(&rg, "dfcache", "child", &dest, "dfcache")
+            try_pull_ext4(&rg, "build-cache", "child", &dest, "build-cache")
                 .unwrap()
                 .is_some()
         );
@@ -3539,14 +3547,16 @@ mod tests {
         // `MicroVm` seeding `parent_digest` from its own push.
         let a = dir.join("a.ext4");
         std::fs::write(&a, pseudo_random(1 << 20, 0xAAAA)).unwrap();
-        let digest_a = push_ext4(&rg, "dfcache", "shared-tag", &a, "generic-disk").unwrap();
-        let (chunks_a, _) = fetch_chunks(&rg, "dfcache", "shared-tag").unwrap().unwrap();
+        let digest_a = push_ext4(&rg, "build-cache", "shared-tag", &a, "generic-disk").unwrap();
+        let (chunks_a, _) = fetch_chunks(&rg, "build-cache", "shared-tag")
+            .unwrap()
+            .unwrap();
 
         // A concurrent build of the SAME instruction pushes byte-different content under
         // that same tag — the clobber this fix defends against.
         let b = dir.join("b.ext4");
         std::fs::write(&b, pseudo_random(1 << 20, 0xBBBB)).unwrap();
-        let digest_b = push_ext4(&rg, "dfcache", "shared-tag", &b, "generic-disk").unwrap();
+        let digest_b = push_ext4(&rg, "build-cache", "shared-tag", &b, "generic-disk").unwrap();
         assert_ne!(digest_a, digest_b, "test setup: the two pushes must differ");
 
         // Resolving by the now-clobbered tag follows the overwrite: this is exactly the
@@ -3554,8 +3564,12 @@ mod tests {
         let digest_of = |chunks: &[oci_client::manifest::OciDescriptor]| -> Vec<String> {
             chunks.iter().map(|l| l.digest.clone()).collect()
         };
-        let (chunks_tag_now, _) = fetch_chunks(&rg, "dfcache", "shared-tag").unwrap().unwrap();
-        let (chunks_b, _) = fetch_chunks(&rg, "dfcache", &digest_b).unwrap().unwrap();
+        let (chunks_tag_now, _) = fetch_chunks(&rg, "build-cache", "shared-tag")
+            .unwrap()
+            .unwrap();
+        let (chunks_b, _) = fetch_chunks(&rg, "build-cache", &digest_b)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             digest_of(&chunks_tag_now),
             digest_of(&chunks_b),
@@ -3564,7 +3578,9 @@ mod tests {
 
         // But resolving by A's pinned digest still returns exactly A's own chunks,
         // unaffected by the concurrent overwrite of the tag — the property the fix relies on.
-        let (chunks_pinned, _) = fetch_chunks(&rg, "dfcache", &digest_a).unwrap().unwrap();
+        let (chunks_pinned, _) = fetch_chunks(&rg, "build-cache", &digest_a)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             digest_of(&chunks_pinned),
             digest_of(&chunks_a),
@@ -3732,7 +3748,7 @@ mod tests {
         crate::qcow2::create_overlay(&overlay, &base).unwrap();
         let (layers, size, _digest) = push_ext4_diff(
             &rg,
-            "dfcache",
+            "build-cache",
             "child",
             &overlay,
             "generic-disk",
@@ -3754,7 +3770,7 @@ mod tests {
 
         let dest = dir.join("child.ext4");
         assert!(
-            try_pull_ext4(&rg, "dfcache", "child", &dest, "dfcache")
+            try_pull_ext4(&rg, "build-cache", "child", &dest, "build-cache")
                 .unwrap()
                 .is_some()
         );
@@ -3787,7 +3803,7 @@ mod tests {
             for t in 0..PUSHERS {
                 let (rg, src) = (&rg, &src);
                 s.spawn(move || {
-                    push_ext4(rg, "dfcache", &format!("conc{t}"), src, "generic-disk").unwrap();
+                    push_ext4(rg, "build-cache", &format!("conc{t}"), src, "generic-disk").unwrap();
                 });
             }
             for t in 0..PUSHERS {
@@ -3798,7 +3814,7 @@ mod tests {
                     // (racing the other pushers' blob/tag writes). Bounded so a dead
                     // pusher fails the test instead of hanging it.
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-                    while !exists(rg, "dfcache", &tag) {
+                    while !exists(rg, "build-cache", &tag) {
                         assert!(
                             std::time::Instant::now() < deadline,
                             "tag {tag} never appeared"
@@ -3807,7 +3823,7 @@ mod tests {
                     }
                     let dest = dir.join(format!("pull{t}.ext4"));
                     assert!(
-                        try_pull_ext4(rg, "dfcache", &tag, &dest, "dfcache")
+                        try_pull_ext4(rg, "build-cache", &tag, &dest, "build-cache")
                             .unwrap()
                             .is_some()
                     );
@@ -3934,8 +3950,8 @@ mod tests {
         let dead_src = dir.join("dead.ext4");
         std::fs::write(&live_src, pseudo_random(6 << 20, 0xaaaa)).unwrap();
         std::fs::write(&dead_src, pseudo_random(6 << 20, 0xbbbb)).unwrap();
-        push_ext4(&rg, "dfcache", "live", &live_src, "generic-disk").unwrap();
-        push_ext4(&rg, "dfcache", "dead", &dead_src, "generic-disk").unwrap();
+        push_ext4(&rg, "build-cache", "live", &live_src, "generic-disk").unwrap();
+        push_ext4(&rg, "build-cache", "dead", &dead_src, "generic-disk").unwrap();
 
         // age the whole store past retention, then refresh only the live tag
         // (`exists` resolves it, which bumps its mtime — the retention record).
@@ -3951,7 +3967,7 @@ mod tests {
                 }
             }
         }
-        assert!(exists(&rg, "dfcache", "live"));
+        assert!(exists(&rg, "build-cache", "live"));
 
         let store = vk_registry::Store::new(root.clone()).unwrap();
         let report = store.gc(day * 30, day, false).unwrap();
@@ -3961,10 +3977,10 @@ mod tests {
             "the dead image's chunks must free"
         );
 
-        assert!(!exists(&rg, "dfcache", "dead"));
+        assert!(!exists(&rg, "build-cache", "dead"));
         let dest = dir.join("live-after-gc.ext4");
         assert!(
-            try_pull_ext4(&rg, "dfcache", "live", &dest, "dfcache")
+            try_pull_ext4(&rg, "build-cache", "live", &dest, "build-cache")
                 .unwrap()
                 .is_some()
         );

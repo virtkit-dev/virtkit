@@ -280,7 +280,7 @@ on-disk format, two destinations:
 
 | Setting | Holds | Typical value |
 | --- | --- | --- |
-| `[build] cache_registry` | build-cache stage and base snapshots, in a repo called `dfcache` | a path on this disk, or a registry shared by every runner |
+| `[build] cache_registry` | the build cache's stage and base snapshots, in a repo called `build-cache` | a path on this disk, or a registry shared by every runner |
 | `[registry] repo` | guest bundles, one repo per name | a registry others pull from, or a path on this disk |
 
 Either accepts a registry (`registry.example.com/team`, `127.0.0.1:5000` — a
@@ -292,9 +292,9 @@ builtin store where what was cached before it still is. Nothing keeps them apart
 when both are local, point them at the **same directory** and chunk deduplication
 spans build cache and bundles alike, one `vk registry gc` covers both (it expires
 tags idle past `--retention-days` in every repo, bundles included), and
-`vk registry status` lists `dfcache` beside your bundle repos. Two different paths
-just mean two stores to keep an eye on — `status`/`gc` then follow the build-cache
-one unless you pass `--root`; a `cache_registry` on a registry server keeps its
+`vk registry status` lists `build-cache` beside your bundle repos. Two different
+paths just mean two stores to keep an eye on — `status`/`gc` then follow the cache
+store unless you pass `--root`; a `cache_registry` on a registry server keeps its
 store on that host, so they refuse until `--root` names one here. With no
 configuration at all there is a single store, `$XDG_DATA_HOME/virtkit/registry`,
 holding only the build cache — it shares that directory with the image cache's own
