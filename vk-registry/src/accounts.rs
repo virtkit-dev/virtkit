@@ -519,6 +519,55 @@ impl Db {
         Ok(())
     }
 
+    /// Delete every session belonging to `user_id` (a [`User::id`]) — sign this person out
+    /// everywhere, now — returning how many of them were still live, the number worth
+    /// reporting to whoever asked. A session's TTL is absolute and nothing shortens it, so
+    /// without this a cookie minted before an account was disabled or had its admin
+    /// revoked keeps working until it expires on its own.
+    ///
+    /// A linear scan over a table whose rows are counted in logins. Already-expired rows
+    /// of that user go too — a free sweep — but are not counted, so the number is sessions
+    /// actually ended and not table cleanup. A row that will not decode goes with them
+    /// rather than failing the call: it cannot authenticate anyone either
+    /// ([`Self::get_session_user`] propagates the same decode error) and cannot be
+    /// attributed to a user, and aborting here would commit nothing at all, leaving an
+    /// operator with no way to revoke.
+    pub fn delete_sessions_for_user(&self, user_id: &str) -> Result<usize> {
+        let now = now_secs();
+        let txn = self.db.begin_write().context("starting a write")?;
+        let ended = {
+            let mut table = txn.open_table(SESSIONS)?;
+            // Keys first: `remove` needs `&mut` and the iterator holds a shared borrow.
+            let mut doomed = Vec::new();
+            let mut ended = 0;
+            for entry in table.iter()? {
+                let (k, v) = entry?;
+                match decode::<SessionRow>(v.value()) {
+                    Ok(row) if row.user_key == user_id => {
+                        doomed.push(k.value().to_string());
+                        ended += usize::from(row.expires_at > now);
+                    }
+                    Ok(_) => {}
+                    // Loud, because a field added to `SessionRow` without a default stops
+                    // every row decoding (see the row-format comment), and one revoke
+                    // would then quietly take every user's sessions with it.
+                    Err(e) => {
+                        eprintln!(
+                            "vk-registry: warning: sweeping an undecodable session row: {e:#}"
+                        );
+                        doomed.push(k.value().to_string());
+                    }
+                }
+            }
+            for key in &doomed {
+                table.remove(key.as_str())?;
+            }
+            ended
+        };
+        txn.commit().context("deleting a user's sessions")?;
+        Ok(ended)
+    }
+
     /// Mint a new API key. Returns the key row and the plaintext bearer token — the only
     /// time it is ever available; only its hash is stored (as the row's key).
     pub fn create_api_key(
@@ -1366,6 +1415,57 @@ mod tests {
         let db = Db::open_memory()?;
         let user = db.upsert_user("https://issuer", "sub-1", None, None)?;
         assert!(db.create_session(&user.id, Duration::MAX).is_err());
+        Ok(())
+    }
+
+    /// `delete_sessions_for_user` ends all of one user's sessions and none of anybody
+    /// else's — the property an operator signing someone out is relying on.
+    #[test]
+    fn deleting_a_users_sessions_leaves_other_users_signed_in() -> Result<()> {
+        let db = Db::open_memory()?;
+        let alice = db.upsert_user("https://issuer", "sub-1", None, None)?;
+        let bob = db.upsert_user("https://issuer", "sub-2", None, None)?;
+        let alice_first = db.create_session(&alice.id, Duration::from_secs(3600))?;
+        let alice_second = db.create_session(&alice.id, Duration::from_secs(3600))?;
+        let bobs = db.create_session(&bob.id, Duration::from_secs(3600))?;
+
+        assert_eq!(db.delete_sessions_for_user(&alice.id)?, 2);
+        assert_eq!(db.get_session_user(&alice_first)?, None);
+        assert_eq!(db.get_session_user(&alice_second)?, None);
+        // Not just unresolvable: the rows are gone, and the CSRF secret behind the cookie
+        // with them — a future "mark revoked instead of delete" would fail here.
+        assert_eq!(db.session_csrf(&alice_second)?, None);
+        assert_eq!(db.db.begin_read()?.open_table(SESSIONS)?.len()?, 1);
+        assert_eq!(db.get_session_user(&bobs)?.map(|u| u.id), Some(bob.id));
+
+        // Nothing left to remove, and that is not an error — the same shape a second
+        // `revoke-sessions` sees.
+        assert_eq!(db.delete_sessions_for_user(&alice.id)?, 0);
+        // An unknown user id is the same again, rather than a lookup failure: this only
+        // ever deletes, and there is nothing to delete.
+        assert_eq!(db.delete_sessions_for_user("nobody")?, 0);
+        Ok(())
+    }
+
+    /// The count is sessions actually ended, so an expired row of that user is swept
+    /// without inflating what an operator is told; a row that will not decode is swept
+    /// too, rather than making revocation impossible for everyone.
+    #[test]
+    fn revoking_sweeps_expired_and_undecodable_rows_without_counting_them() -> Result<()> {
+        let db = Db::open_memory()?;
+        let user = db.upsert_user("https://issuer", "sub-1", None, None)?;
+        let live = db.create_session(&user.id, Duration::from_secs(3600))?;
+        db.create_session(&user.id, Duration::ZERO)?;
+        {
+            let txn = db.db.begin_write()?;
+            txn.open_table(SESSIONS)?
+                .insert("not-json", b"{".as_slice())?;
+            txn.commit()?;
+        }
+
+        assert_eq!(db.delete_sessions_for_user(&user.id)?, 1);
+        assert_eq!(db.get_session_user(&live)?, None);
+        assert!(db.db.begin_read()?.open_table(SESSIONS)?.is_empty()?);
         Ok(())
     }
 
