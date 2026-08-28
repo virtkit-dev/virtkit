@@ -205,6 +205,11 @@ pub struct Options {
     pub dockerfiles: Vec<PathBuf>,
     /// Stage selector: an `AS` name or index; `None` = the last stage.
     pub target: Option<String>,
+    /// `--stage-mem NAME=SIZE` / `--stage-cpus NAME=N`, by stage name: this run's last
+    /// word on how big those stages' guests are, over any `# vk:` hint in the Dockerfile
+    /// and over `[build] mem` / `[build] cpus`. A name matching no stage is an error, not
+    /// a no-op — see [`apply_stage_overrides`].
+    pub stage_guests: HashMap<String, parser::GuestHint>,
     /// Build-context roots, zipped positionally with `dockerfiles`; a file without one
     /// defaults to its own directory.
     pub contexts: Vec<PathBuf>,
@@ -765,6 +770,9 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     let t_plan = Instant::now();
     let mut plan = Plan::from_dockerfiles(&inputs, &build_args)?;
     plan.named_contexts = named_context_map(&opts.build_contexts)?;
+    // Before anything is resolved or built: a mistyped stage name should cost nothing.
+    let matched = apply_stage_overrides(&mut plan, &opts.stage_guests);
+    unmatched_stage_overrides(&opts.stage_guests, &matched, &stage_names(&plan))?;
     let target = plan.resolve_target(opts.target.as_deref())?;
     let order = plan.build_order(target)?;
     // Reject a cross-stage source under /tmp up front: /tmp is ephemeral and never
@@ -842,17 +850,21 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
             let kernel = kernel.as_ref().expect("resolved under microvm");
             let agent = agent.as_ref().expect("resolved under microvm");
             let mv = make_microvm(opts, &scratch, &kernel.path, &agent.path, &timings)?;
-            // One reading for both: the ceiling divides it, the gate measures against it.
+            // One reading for both: the ceiling fits stages into it, the gate measures
+            // against it. The ceiling is over the sizes this build's stages actually
+            // declare, not over one nominal size they no longer share.
             let host_total_mib = crate::schedule::host_total_mib();
-            let jobs = resolve_build_jobs(opts, mv.mem_mib(), host_total_mib);
+            let sizes = stage_sizes(&plan, &order, mv.mem_mib());
+            let jobs = resolve_build_jobs(opts, &sizes, host_total_mib);
             progress.note(&concurrency_line(
                 jobs,
                 mv.cpus(),
                 mv.mem(),
                 opts.build_jobs.is_some(),
+                &sized_stages(&plan, &order, ""),
             ));
             let gate_mib = gate_total_mib(host_total_mib);
-            if let Some(line) = gate_note(jobs, gate_mib, mv.mem_mib()) {
+            if let Some(line) = gate_note(jobs, gate_mib) {
                 progress.note(&line);
             }
             let (committed, states) = drive_microvm(
@@ -1053,11 +1065,9 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
     let _scratch_owner = claim_scratch(&scratch)?;
     let mut mv = make_microvm(opts, &scratch, &kernel.path, &agent.path, &timings)?;
     // One job budget for every unit's stages combined (not per unit), so concurrent work
-    // stays within host RAM instead of multiplying live guests.
-    // One reading for both: the ceiling divides it, the gate measures against it.
+    // stays within host RAM instead of multiplying live guests. The ceiling itself is
+    // resolved further down, once every unit's plan says how big its stages are.
     let host_total_mib = crate::schedule::host_total_mib();
-    let jobs = resolve_build_jobs(opts, mv.mem_mib(), host_total_mib);
-    timings.note_jobs(jobs); // so the timing header reports "busy across N jobs"
 
     // A lone unit's stage names are already unique, so it needs no prefix (the dashboard
     // reads exactly like a single build); several units prefix by label to disambiguate.
@@ -1071,16 +1081,6 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
     };
 
     let progress = build_progress(opts);
-    progress.note(&concurrency_line(
-        jobs,
-        mv.cpus(),
-        mv.mem(),
-        opts.build_jobs.is_some(),
-    ));
-    let gate_mib = gate_total_mib(host_total_mib);
-    if let Some(line) = gate_note(jobs, gate_mib, mv.mem_mib()) {
-        progress.note(&line);
-    }
     let result = (|| -> Result<HashMap<String, Built>> {
         /// One resolved target of a unit: its stage index and where it exports.
         struct Tgt {
@@ -1107,6 +1107,8 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
         let mut probe = mv.worker();
         let mut resolved_units: Vec<Unit> = Vec::with_capacity(units.len());
         let mut base = 0usize;
+        let mut matched_overrides: HashSet<String> = HashSet::new();
+        let mut known_stages: Vec<String> = Vec::new();
         for unit in &units {
             let build_args: Vars = unit.build_args.iter().cloned().collect();
             let inputs = match &unit.input {
@@ -1129,6 +1131,10 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
             if let UnitInput::Build { build_contexts, .. } = &unit.input {
                 plan.named_contexts = named_context_map(build_contexts)?;
             }
+            // A stage name addresses that stage in every unit declaring one: units are
+            // separate Dockerfiles, and a name is wrong only if no unit has it at all.
+            matched_overrides.extend(apply_stage_overrides(&mut plan, &opts.stage_guests));
+            known_stages.extend(stage_names(&plan));
             let targets: Vec<Tgt> = unit
                 .targets
                 .iter()
@@ -1169,6 +1175,34 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
             base += stages;
         }
         drop(probe);
+        // Later than `build_backend`'s equivalent, which rejects a mistyped name before
+        // anything is resolved: here a name is only wrong once *every* unit has failed to
+        // match it, and each unit's plan is resolved in the same pass that collects them.
+        unmatched_stage_overrides(&opts.stage_guests, &matched_overrides, &known_stages)?;
+
+        // Every unit's stages against one budget, so the ceiling is over what this build
+        // will actually run — several units' worth of stages, each the size it declared.
+        let sizes: Vec<u64> = resolved_units
+            .iter()
+            .flat_map(|u| stage_sizes(&u.plan, &u.order, mv.mem_mib()))
+            .collect();
+        let jobs = resolve_build_jobs(opts, &sizes, host_total_mib);
+        timings.note_jobs(jobs); // so the timing header reports "busy across N jobs"
+        let sized: Vec<String> = resolved_units
+            .iter()
+            .flat_map(|u| sized_stages(&u.plan, &u.order, &u.prefix))
+            .collect();
+        progress.note(&concurrency_line(
+            jobs,
+            mv.cpus(),
+            mv.mem(),
+            opts.build_jobs.is_some(),
+            &sized,
+        ));
+        let gate_mib = gate_total_mib(host_total_mib);
+        if let Some(line) = gate_note(jobs, gate_mib) {
+            progress.note(&line);
+        }
 
         // The dashboard: every unit's needed stages under one flat id space (prefixed per
         // unit); one export tail per target that actually exports.
@@ -2017,6 +2051,22 @@ fn build_stage(
         // and its guest's RAM against what the host has left. Cache restores above never
         // reach here, so they run at full DAG-dispatch concurrency instead of queuing behind
         // real builds for one of these scarce permits.
+        // Apply the stage hint before reserving memory. Clamp oversized requests and report
+        // the effective value rather than failing the guest later during boot.
+        // Read the default before applying the hint. Guest-backed stages use fresh workers;
+        // only guest-less sequential builds reuse an executor.
+        let default_mib = ex.stage_mem_mib().unwrap_or(0);
+        let mut hint = stage.guest.clone();
+        if let Some(mem) = &hint.mem
+            && let Some(held_to) = clamp_stage_mem(mem, budget.mem.stage_cap_mib(), default_mib)
+        {
+            progress.note(&format!(
+                "virtkit: build: [{name}] mem={mem} is more than this host can give one \
+                 stage; using {held_to}"
+            ));
+            hint.mem = Some(held_to);
+        }
+        ex.set_stage_guest(&hint);
         let _admission = budget.admit(
             ex.stage_mem_mib().unwrap_or(0),
             cancel,
@@ -2480,6 +2530,14 @@ impl MemLedger {
         )
     }
 
+    /// The largest guest a single stage may hold on this host: everything the gate is
+    /// willing to promise, with no siblings live. `None` when the gate is off, and so is
+    /// promising nothing. A stage asking for more is clamped to it — see
+    /// [`clamp_stage_mem`].
+    fn stage_cap_mib(&self) -> Option<u64> {
+        Some(self.total_mib?.saturating_sub(self.reserve_mib))
+    }
+
     /// The ledger's state. Poison-tolerant throughout: a stage that panicked mid-update is
     /// one failed stage, and taking the rest of the build down with it — or, from a `Drop`
     /// during an unwind, aborting the process — helps nobody. Every field is a plain
@@ -2926,10 +2984,17 @@ fn drive_microvm(
 
 /// Resolve the parallel build's job count: the `opts.build_jobs` set from `--build-jobs` or
 /// `[build] jobs` when present — taken as given, since the type rules out the one value that
-/// would need correcting — else RAM-auto: each stage guest reserves `mem_mib`, so cap
-/// concurrency at ~80% of `total_mib`, the host's `MemTotal`, divided by that, clamped to a
-/// sane ceiling. CPU is intentionally allowed to oversubscribe (the host scheduler
-/// time-slices); RAM overcommit would OOM.
+/// would need correcting — else RAM-auto over `sizes`, the guest each stage of this build
+/// will declare (its own `# vk:`/`--stage-mem` size, else `[build] mem`).
+///
+/// Dividing a memory budget by "the" stage size stopped being meaningful once stages size
+/// themselves: four 2G stages and one 24G stage share no divisor. So the rule is instead the
+/// most stages that could ever be co-resident — the smallest guests first, taking them while
+/// they still fit in ~80% of `total_mib` — which is what "up to N at once" has to mean when
+/// the N are different sizes. With every stage the same size it is exactly the old
+/// division, and it can no longer exceed the number of stages there are to run. CPU is
+/// intentionally allowed to oversubscribe (the host scheduler time-slices); RAM overcommit
+/// would OOM.
 ///
 /// The basis is what the host *has*, not the `MemAvailable` it happens to have free: that
 /// figure moves with page cache and with whatever else is running, so a width read off it is
@@ -2941,47 +3006,204 @@ fn drive_microvm(
 /// of the whole machine whatever else is admitted beside it. Which is why it is only a
 /// ceiling — [`MemLedger`] holds each stage until the host actually has room for its guest,
 /// so a build sized for the whole machine still yields to the jobs running next to it.
-fn resolve_build_jobs(opts: &Options, mem_mib: u64, total_mib: Option<u64>) -> usize {
+fn resolve_build_jobs(opts: &Options, sizes: &[u64], total_mib: Option<u64>) -> usize {
     if let Some(j) = opts.build_jobs {
         return j.get();
     }
     let usable = total_mib.unwrap_or(8 * 1024).saturating_mul(8) / 10;
-    ((usable / mem_mib.max(1)) as usize).clamp(1, 16)
+    let mut sizes: Vec<u64> = sizes.iter().map(|&m| m.max(1)).collect();
+    sizes.sort_unstable();
+    let mut committed = 0u64;
+    let mut fit = 0usize;
+    for size in sizes {
+        committed = committed.saturating_add(size);
+        if committed > usable {
+            break;
+        }
+        fit += 1;
+    }
+    fit.clamp(1, 16)
+}
+
+/// The guest RAM each stage of `order` will declare, in MiB: its own `# vk:` / `--stage-mem`
+/// size where it has one, else the build-wide `[build] mem`. The input to
+/// [`resolve_build_jobs`].
+///
+/// Unclamped, unlike what a stage finally boots at ([`clamp_stage_mem`]): the ceiling asks
+/// how wide this build wants to run, and a host too small to grant a request is the case the
+/// gate exists to handle, not one to divide by.
+fn stage_sizes(plan: &Plan, order: &[usize], default_mib: u64) -> Vec<u64> {
+    order
+        .iter()
+        .map(|&i| {
+            plan.stages[i]
+                .guest
+                .mem
+                .as_deref()
+                .and_then(crate::run::parse_mem_mib)
+                .unwrap_or(default_mib)
+        })
+        .collect()
+}
+
+/// The stages of `order` that asked for a size of their own, as `name mem=8G cpus=16`, for
+/// the announcement — with mixed sizes, "each mem=4G" is no longer the whole story, and the
+/// stages that differ are exactly the ones someone reading a trace needs named.
+fn sized_stages(plan: &Plan, order: &[usize], prefix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for &i in order {
+        let g = &plan.stages[i];
+        if g.guest.mem.is_none() && g.guest.cpus.is_none() {
+            continue;
+        }
+        let name = g.name.clone().unwrap_or_else(|| format!("stage{i}"));
+        let mut parts = vec![format!("{prefix}{name}")];
+        if let Some(m) = &g.guest.mem {
+            parts.push(format!("mem={m}"));
+        }
+        if let Some(c) = g.guest.cpus {
+            parts.push(format!("cpus={c}"));
+        }
+        out.push(parts.join(" "));
+    }
+    out
 }
 
 /// How wide the build may run, announced before any stage starts: the cap on stages built at
-/// once, where that number came from (`configured` = `--build-jobs` or `[build] jobs`), and
-/// the size of one stage guest. A build held to one stage at a time reads in a trace exactly
-/// like a build with nothing to parallelize, and the two want opposite things done about them
-/// — so the line names its source. It is a budget, not a prediction: a build with fewer
-/// stages than `jobs` never reaches the cap. Pure over its inputs, so the wording is testable
-/// without a guest.
-fn concurrency_line(jobs: usize, cpus: u32, mem: &str, configured: bool) -> String {
+/// once, where that number came from (`configured` = `--build-jobs` or `[build] jobs`), the
+/// size the stages take by default, and any stage that asked for a different one. A build
+/// held to one stage at a time reads in a trace exactly like a build with nothing to
+/// parallelize, and the two want opposite things done about them — so the line names its
+/// source. It is a ceiling, not a prediction: what a stage actually waits for is the host
+/// having room ([`MemLedger`]). Pure over its inputs, so the wording is testable without a
+/// guest.
+fn concurrency_line(
+    jobs: usize,
+    cpus: u32,
+    mem: &str,
+    configured: bool,
+    sized: &[String],
+) -> String {
     let source = if configured {
         "configured"
     } else {
         "from host memory"
     };
-    format!("virtkit: build: up to {jobs} stage(s) at once ({source}), each cpus={cpus}, mem={mem}")
+    let line = format!(
+        "virtkit: build: up to {jobs} stage(s) at once ({source}), each cpus={cpus}, mem={mem}"
+    );
+    if sized.is_empty() {
+        return line;
+    }
+    format!("{line}; sized apart: {}", sized.join(", "))
 }
 
-/// What the host-memory gate has to work with, announced once beside [`concurrency_line`]: the size
-/// of the box, what is already spoken for by everything that is not this build, the slack held back
-/// from it, and how many `want_mib` stages that leaves room for right now.
-fn gate_line(
-    jobs: usize,
-    total_mib: u64,
-    reserve_mib: u64,
-    foreign_mib: u64,
-    want_mib: u64,
-) -> String {
+/// Fold `--stage-mem NAME=SIZE` and `--stage-cpus NAME=N` into one hint per stage, so the
+/// two flags naming the same stage size it together rather than one winning. Both are
+/// validated by their clap parsers, so anything here is already a size / a count.
+pub fn stage_overrides(
+    mem: &[(String, String)],
+    cpus: &[(String, u32)],
+) -> HashMap<String, parser::GuestHint> {
+    let mut out: HashMap<String, parser::GuestHint> = HashMap::new();
+    for (name, m) in mem {
+        out.entry(name.clone()).or_default().mem = Some(m.clone());
+    }
+    for (name, n) in cpus {
+        out.entry(name.clone()).or_default().cpus = Some(*n);
+    }
+    out
+}
+
+/// Overwrite the sizing of every stage an override names, and report which names matched.
+///
+/// A stage is addressed by its `AS` name, or `stage<N>` by position when it has none. (Not
+/// `docker-hash`'s spelling, which numbers an unnamed stage `<N>` bare.) The flag is this run's decision, so it wins over the
+/// Dockerfile's `# vk:` hint field by field — `--stage-cpus build=4` leaves a `mem=8G` hint
+/// in place. The caller checks the names that matched nothing (a build spanning several
+/// units has to ask every unit before deciding a name is wrong).
+fn apply_stage_overrides(
+    plan: &mut Plan,
+    overrides: &HashMap<String, parser::GuestHint>,
+) -> HashSet<String> {
+    let mut matched = HashSet::new();
+    for (idx, stage) in plan.stages.iter_mut().enumerate() {
+        let name = stage.name.clone().unwrap_or_else(|| format!("stage{idx}"));
+        if let Some(over) = overrides.get(&name) {
+            if over.mem.is_some() {
+                stage.guest.mem = over.mem.clone();
+            }
+            if over.cpus.is_some() {
+                stage.guest.cpus = over.cpus;
+            }
+            matched.insert(name);
+        }
+    }
+    matched
+}
+
+/// The error for `--stage-mem`/`--stage-cpus` naming a stage that does not exist: a typo
+/// would otherwise size nothing and say nothing, which is the failure the `# vk:` hint is
+/// strict about too. `known` is every stage the build declares, in source order.
+fn unmatched_stage_overrides(
+    overrides: &HashMap<String, parser::GuestHint>,
+    matched: &HashSet<String>,
+    known: &[String],
+) -> Result<()> {
+    let mut missing: Vec<&str> = overrides
+        .keys()
+        .filter(|n| !matched.contains(*n))
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort_unstable();
+    // Deduplicated, in declaration order: `known` is every unit's stages concatenated, and a
+    // name declared by two units is one name to the flags, which size it in both. Order is
+    // the Dockerfile's, which is how the reader will scan for the name they meant.
+    let mut seen = HashSet::new();
+    let declared: Vec<&str> = known
+        .iter()
+        .map(String::as_str)
+        .filter(|n| seen.insert(*n))
+        .collect();
+    bail!(
+        "--stage-mem/--stage-cpus {}: no such stage (declared: {})",
+        missing.join(", "),
+        declared.join(", ")
+    )
+}
+
+/// Every stage a plan declares, named as [`apply_stage_overrides`] addresses them.
+fn stage_names(plan: &Plan) -> Vec<String> {
+    plan.stages
+        .iter()
+        .enumerate()
+        .map(|(i, s)| s.name.clone().unwrap_or_else(|| format!("stage{i}")))
+        .collect()
+}
+
+/// A stage's requested guest RAM, held to what this host could ever give one stage: `Some` with the
+/// size to use instead when the request is over that, `None` when it stands as asked (including
+/// when the host size is unknown, which promises nothing to hold it to).
+fn clamp_stage_mem(want: &str, cap_mib: Option<u64>, default_mib: u64) -> Option<String> {
+    let cap = cap_mib?.max(default_mib);
+    let want_mib = crate::run::parse_mem_mib(want)?;
+    (cap > 0 && want_mib > cap).then(|| format!("{cap}M"))
+}
+
+/// Summarize the memory currently available to stage guests.
+///
+/// The value is a current reading rather than an admission guarantee; stage sizes may differ
+/// and other host workloads can change between readings.
+fn gate_line(total_mib: u64, reserve_mib: u64, foreign_mib: u64) -> String {
     let room = total_mib
         .saturating_sub(reserve_mib)
         .saturating_sub(foreign_mib);
-    let fits = (room / want_mib.max(1)).max(1).min(jobs.max(1) as u64);
     format!(
         "virtkit: build: host memory {total_mib} MiB, {foreign_mib} MiB in use elsewhere, \
-         {reserve_mib} MiB held back — room for {fits} stage(s) now"
+         {reserve_mib} MiB held back — {room} MiB free for stage guests now"
     )
 }
 
@@ -2989,14 +3211,12 @@ fn gate_line(
 /// the gate is off (`gate_total_mib` is `None`), or `jobs` is 1 and the ledger is
 /// structurally inert — a build that never has two stages live has nothing to hold back,
 /// and a line announcing room for stages it will not run only reads as noise.
-fn gate_note(jobs: usize, gate_total_mib: Option<u64>, want_mib: u64) -> Option<String> {
+fn gate_note(jobs: usize, gate_total_mib: Option<u64>) -> Option<String> {
     let total = gate_total_mib.filter(|_| jobs > 1)?;
     Some(gate_line(
-        jobs,
         total,
         build_reserve_mib(total),
         measure_foreign_mib().unwrap_or(0),
-        want_mib,
     ))
 }
 
@@ -5601,6 +5821,7 @@ ENTRYPOINT run me
         let opts = |out: PathBuf| Options {
             dockerfiles: vec![tmp.join("Dockerfile")],
             target: None,
+            stage_guests: Default::default(),
             contexts: vec![],
             build_contexts: Vec::new(),
             out: Some(out),
@@ -5672,6 +5893,7 @@ ENTRYPOINT run me
         let built = build_host(&Options {
             dockerfiles: vec![tmp.join("Dockerfile")],
             target: None,
+            stage_guests: Default::default(),
             contexts: vec![],
             build_contexts: Vec::new(),
             out: Some(out.clone()),
@@ -5722,6 +5944,7 @@ ENTRYPOINT run me
         build_host(&Options {
             dockerfiles: dockerfiles.clone(),
             target: None,
+            stage_guests: Default::default(),
             contexts: vec![],
             build_contexts: Vec::new(),
             out: Some(out.clone()),
@@ -5769,6 +5992,7 @@ ENTRYPOINT run me
         build_host(&Options {
             dockerfiles: vec![tmp.join("Dockerfile")],
             target: None,
+            stage_guests: Default::default(),
             contexts: vec![],
             build_contexts: Vec::new(),
             out: Some(out.clone()),
@@ -5817,6 +6041,7 @@ ENTRYPOINT run me
         build_host(&Options {
             dockerfiles: vec![tmp.join("Dockerfile")],
             target: None,
+            stage_guests: Default::default(),
             contexts: vec![],
             build_contexts: Vec::new(),
             out: Some(out.clone()),
@@ -6061,6 +6286,162 @@ RUN ship
     }
 
     #[test]
+    fn a_stage_size_hint_never_reaches_a_cache_key() {
+        // The guarantee that makes the hint safe to add to a Dockerfile at all: sizing a
+        // stage is not editing it, so every key stays what it was and no cache is thrown
+        // away by tuning one. `docker-hash` publishes these keys, so this is a contract.
+        let ba = Vars::new();
+        let keys = |src: &str| {
+            let plan = plan_one(src, &ba);
+            let order = plan.all_order().unwrap();
+            let mut ex = DryRun::new();
+            let r = resolve_stages(&plan, &order, &ba, &mut ex, None).unwrap();
+            order
+                .iter()
+                .map(|i| r[i].final_key.clone())
+                .collect::<Vec<_>>()
+        };
+        let plain = "FROM alpine AS lib\nRUN one\nFROM alpine AS app\nCOPY --from=lib /f /f\n";
+        let sized = "# vk: mem=8G cpus=16\nFROM alpine AS lib\nRUN one\n\
+                     # vk: mem=512M\nFROM alpine AS app\nCOPY --from=lib /f /f\n";
+        assert_eq!(keys(plain), keys(sized));
+        // And the sizes did reach the plan — otherwise the assertion above passes for the
+        // wrong reason.
+        let plan = plan_one(sized, &ba);
+        assert_eq!(plan.stages[0].guest.mem.as_deref(), Some("8G"));
+        assert_eq!(plan.stages[0].guest.cpus, Some(16));
+        assert_eq!(plan.stages[1].guest.mem.as_deref(), Some("512M"));
+    }
+
+    #[test]
+    fn a_stage_flag_outranks_the_dockerfile_hint() {
+        let ba = Vars::new();
+        let mut plan = plan_one(
+            "# vk: mem=8G cpus=16\nFROM alpine AS compile\nRUN one\nFROM alpine\nRUN two\n",
+            &ba,
+        );
+        // The two flags naming one stage size it together, and each field stands alone:
+        // --stage-cpus leaves the hint's mem=8G exactly where it was.
+        let over = stage_overrides(
+            &[("stage1".into(), "512M".into())],
+            &[("compile".into(), 4), ("stage1".into(), 2)],
+        );
+        let matched = apply_stage_overrides(&mut plan, &over);
+        assert_eq!(plan.stages[0].guest.mem.as_deref(), Some("8G"));
+        assert_eq!(plan.stages[0].guest.cpus, Some(4));
+        // A stage with no `AS` name is addressed as the log names it, and had no hint at all.
+        assert_eq!(plan.stages[1].guest.mem.as_deref(), Some("512M"));
+        assert_eq!(plan.stages[1].guest.cpus, Some(2));
+        assert_eq!(matched, ["compile", "stage1"].map(String::from).into());
+        assert_eq!(stage_names(&plan), ["compile", "stage1"]);
+    }
+
+    #[test]
+    fn a_stage_flag_naming_no_stage_is_an_error() {
+        // Reject misspelled stage names instead of silently ignoring their overrides.
+        let over = stage_overrides(&[("compil".into(), "8G".into())], &[("nope".into(), 2)]);
+        let matched = HashSet::new();
+        let err = unmatched_stage_overrides(&over, &matched, &["compile".into(), "app".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("compil, nope"), "{err}");
+        assert!(err.contains("declared: compile, app"), "{err}");
+        // Names that all matched (a build spanning units matches them one unit at a time).
+        let matched = ["compil", "nope"].map(String::from).into();
+        assert!(unmatched_stage_overrides(&over, &matched, &[]).is_ok());
+    }
+
+    #[test]
+    fn a_builds_declared_sizes_are_read_off_its_plan() {
+        // What the ceiling divides and what the trace names: a stage's own size where it
+        // asked for one, the build-wide default where it did not.
+        let ba = Vars::new();
+        let plan = plan_one(
+            "# vk: mem=8G cpus=16\n\
+             FROM alpine AS compile\n\
+             RUN a\n\
+             FROM alpine AS app\n\
+             RUN b\n\
+             # vk: cpus=2\n\
+             FROM alpine\n\
+             RUN c\n",
+            &ba,
+        );
+        let order: Vec<usize> = (0..plan.stages.len()).collect();
+        assert_eq!(stage_sizes(&plan, &order, 4096), vec![8192, 4096, 4096]);
+        // Only the stages that differ are named, each with just the fields it set, and an
+        // unnamed one by its position.
+        assert_eq!(
+            sized_stages(&plan, &order, ""),
+            vec!["compile mem=8G cpus=16", "stage2 cpus=2"]
+        );
+        // A multi-unit build prefixes them, so a name says which unit it came from.
+        assert_eq!(
+            sized_stages(&plan, &order, "web:"),
+            vec!["web:compile mem=8G cpus=16", "web:stage2 cpus=2"]
+        );
+    }
+
+    #[test]
+    fn a_stage_override_names_that_stage_in_every_unit() {
+        // The flags address a bare name, so a name declared by two units sizes both — and
+        // the "no such stage" list says each name once however many units declare it.
+        let ba = Vars::new();
+        let mut a = plan_one("FROM alpine AS build\nRUN a\n", &ba);
+        let mut b = plan_one("FROM alpine AS build\nRUN b\nFROM alpine AS ship\n", &ba);
+        let overrides = HashMap::from([(
+            "build".to_string(),
+            parser::GuestHint {
+                mem: Some("8G".into()),
+                cpus: None,
+            },
+        )]);
+        let mut matched = HashSet::new();
+        matched.extend(apply_stage_overrides(&mut a, &overrides));
+        matched.extend(apply_stage_overrides(&mut b, &overrides));
+        assert_eq!(a.stages[0].guest.mem.as_deref(), Some("8G"));
+        assert_eq!(b.stages[0].guest.mem.as_deref(), Some("8G"));
+        assert_eq!(b.stages[1].guest.mem, None, "only the named stage is sized");
+        let mut known = stage_names(&a);
+        known.extend(stage_names(&b));
+        assert!(unmatched_stage_overrides(&overrides, &matched, &known).is_ok());
+        // A name no unit declares fails, and each declared name is listed once.
+        let absent = HashMap::from([("compile".to_string(), parser::GuestHint::default())]);
+        let err = unmatched_stage_overrides(&absent, &HashSet::new(), &known)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("compile: no such stage"), "{err}");
+        assert!(err.contains("declared: build, ship"), "{err}");
+    }
+
+    #[test]
+    fn a_stage_asking_for_more_than_the_host_has_is_held_to_it() {
+        // A Dockerfile is built on laptops as well as build hosts: the 24G stage has to
+        // stay buildable on the 8 GiB machine, slowly, rather than fail to boot there.
+        assert_eq!(
+            clamp_stage_mem("24G", Some(6144), 4096).as_deref(),
+            Some("6144M")
+        );
+        // Under the cap (and exactly at it) it stands as written.
+        assert_eq!(clamp_stage_mem("4G", Some(6144), 4096), None);
+        assert_eq!(clamp_stage_mem("6144M", Some(6144), 4096), None);
+        // Nothing to hold it to: an unreadable host promises nothing, so it asks the VMM
+        // for what the Dockerfile said and finds out there.
+        assert_eq!(clamp_stage_mem("24G", None, 4096), None);
+        // A size the parser would have rejected is left alone rather than turned into one.
+        assert_eq!(clamp_stage_mem("lots", Some(6144), 4096), None);
+        // Never below what an un-hinted stage gets. A 4 GiB host reserves a flat GiB (the
+        // floor under BUILD_RESERVE_PCT), leaving a 3072 MiB cap — holding the stage that
+        // asked for 8G to that would boot it smaller than the 4G stage beside it.
+        assert_eq!(
+            clamp_stage_mem("8G", Some(3072), 4096).as_deref(),
+            Some("4096M"),
+        );
+        // And never to nothing: a host under that floor caps at zero, which is not a size.
+        assert_eq!(clamp_stage_mem("8G", Some(0), 0), None);
+    }
+
+    #[test]
     fn foreign_use_counts_what_this_build_does_not_hold() {
         // 32 GiB host, 18 GiB of it available, 2 GiB of tmpfs, and 6 GiB resident across this
         // build's process tree (its stage guests, which are children — see `build_rss_mib`).
@@ -6298,19 +6679,18 @@ RUN ship
 
     #[test]
     fn the_gate_line_reports_what_is_left_of_the_host() {
-        // 32 GiB, 3276 held back, 12 GiB elsewhere -> 17204 for 4 GiB stages, i.e. 4.
-        let line = gate_line(8, 32768, 3276, 12288, 4096);
+        // 32 GiB, 3276 held back, 12 GiB elsewhere -> 17204 MiB left to promise. In MiB and
+        // not in stages: with stages sized individually there is no one stage size to
+        // divide it by.
+        let line = gate_line(32768, 3276, 12288);
         assert_eq!(
             line,
             "virtkit: build: host memory 32768 MiB, 12288 MiB in use elsewhere, \
-             3276 MiB held back — room for 4 stage(s) now"
+             3276 MiB held back — 17204 MiB free for stage guests now"
         );
-        // Never below one: the first stage is admitted whatever the host looks like, so a
-        // line saying "room for 0" would describe a build that is about to start anyway.
-        assert!(gate_line(8, 32768, 3276, 32000, 4096).ends_with("room for 1 stage(s) now"));
-        // Never above the ceiling printed directly above it: a host with room for twelve
-        // stages still only runs the `jobs` it announced.
-        assert!(gate_line(2, 32768, 3276, 0, 4096).ends_with("room for 2 stage(s) now"));
+        // A host with nothing to give reads as nothing, not as a negative or a floor: the
+        // first stage in is admitted anyway, and the line is a reading, not the rule.
+        assert!(gate_line(32768, 3276, 32000).ends_with("0 MiB free for stage guests now"));
     }
 
     #[test]
@@ -6407,12 +6787,9 @@ RUN ship
         // A sequential build has nothing to hold back — at most one stage is ever live, so
         // the ledger's own escape admits it whatever the host looks like. Announcing room
         // for stages such a build will not run is noise, not information.
-        assert!(gate_note(1, Some(32768), 4096).is_none());
-        assert!(
-            gate_note(4, None, 4096).is_none(),
-            "gate off, nothing to say"
-        );
-        assert!(gate_note(4, Some(32768), 4096).is_some());
+        assert!(gate_note(1, Some(32768)).is_none());
+        assert!(gate_note(4, None).is_none(), "gate off, nothing to say");
+        assert!(gate_note(4, Some(32768)).is_some());
     }
 
     // Regression test for the dispatch/build-cap decoupling: the fully-cached fast path
@@ -6677,6 +7054,7 @@ RUN ship
         let opts = |j: Option<NonZeroUsize>| Options {
             dockerfiles: vec![],
             target: None,
+            stage_guests: Default::default(),
             contexts: vec![],
             build_contexts: Vec::new(),
             out: None,
@@ -6700,44 +7078,80 @@ RUN ship
             progress_sink: None,
         };
         let host = Some(64 * 1024);
+        let same = |n: usize, mib: u64| vec![mib; n];
         // Explicit build_jobs (--build-jobs, or [build] jobs) wins over the RAM-derived
         // default, and is used as given — zero is unrepresentable, so nothing to floor.
         assert_eq!(
-            resolve_build_jobs(&opts(NonZeroUsize::new(3)), 2048, host),
+            resolve_build_jobs(&opts(NonZeroUsize::new(3)), &same(20, 2048), host),
             3
         );
-        // Auto is 80% of what the host *has* over one stage guest: 64 GiB and a 4 GiB stage
-        // guest is 12 wide, and it stays 12 however little of that memory is free.
-        assert_eq!(resolve_build_jobs(&opts(None), 4096, host), 12);
+        // Auto is 80% of what the host *has* filled with stage guests smallest-first: 64 GiB
+        // and 4 GiB stages is 12 wide, and it stays 12 however little of that is free.
+        assert_eq!(resolve_build_jobs(&opts(None), &same(20, 4096), host), 12);
+        // Never wider than there are stages to run: "up to 3 at once" is the truth about a
+        // three-stage build, and dividing a budget would have claimed 12.
+        assert_eq!(resolve_build_jobs(&opts(None), &same(3, 4096), host), 3);
+        // Sized apart, there is no one size to divide by, so it is the most stages that
+        // could be co-resident: on 8 GiB (6553 usable) the two 512M and the 4G fit, the 8G
+        // does not — and a build of nothing but that 8G stage still gets its one job.
+        assert_eq!(
+            resolve_build_jobs(&opts(None), &[8192, 4096, 512, 512], Some(8192)),
+            3
+        );
+        assert_eq!(resolve_build_jobs(&opts(None), &[8192], Some(8192)), 1);
         // A host whose memory cannot be read is treated as an 8 GiB one rather than an
         // unbounded one, so auto still lands somewhere a stage guest fits.
-        assert_eq!(resolve_build_jobs(&opts(None), 4096, None), 1);
-        assert_eq!(resolve_build_jobs(&opts(None), 1024, None), 6);
+        assert_eq!(resolve_build_jobs(&opts(None), &same(20, 4096), None), 1);
+        assert_eq!(resolve_build_jobs(&opts(None), &same(20, 1024), None), 6);
         // Clamped to [1, 16] at both ends: a stage guest the host cannot fit floors it, and
-        // a 1 MiB one on a machine reporting all the memory there is stops at the ceiling
-        // rather than overflowing the `× 8` on the way.
-        assert_eq!(resolve_build_jobs(&opts(None), u64::MAX / 2, host), 1);
-        assert_eq!(resolve_build_jobs(&opts(None), 1, Some(u64::MAX)), 16);
-        // Same 1 MiB stage guest, but an explicit 1: the override forces the sequential
+        // 1 MiB ones on a machine reporting all the memory there is stop at the ceiling
+        // rather than overflowing the running total on the way.
+        assert_eq!(
+            resolve_build_jobs(&opts(None), &same(2, u64::MAX / 2), host),
+            1
+        );
+        assert_eq!(
+            resolve_build_jobs(&opts(None), &same(40, 1), Some(u64::MAX)),
+            16
+        );
+        // Same 1 MiB stage guests, but an explicit 1: the override forces the sequential
         // build that auto would have widened, which is what makes it an override.
-        assert_eq!(resolve_build_jobs(&opts(NonZeroUsize::new(1)), 1, host), 1);
+        assert_eq!(
+            resolve_build_jobs(&opts(NonZeroUsize::new(1)), &same(40, 1), host),
+            1
+        );
     }
 
     #[test]
     fn concurrency_line_names_where_its_budget_came_from() {
         // The whole point of announcing the budget: a build pinned to one stage on purpose
         // must not read like one the RAM-derived default squeezed down to it.
-        let pinned = concurrency_line(1, 2, "4G", true);
+        let pinned = concurrency_line(1, 2, "4G", true, &[]);
         assert!(pinned.starts_with("virtkit: build: "), "{pinned}");
         assert!(
             pinned.contains("up to 1 stage(s) at once (configured)"),
             "{pinned}"
         );
         assert!(pinned.contains("each cpus=2, mem=4G"), "{pinned}");
-        let auto = concurrency_line(6, 2, "4G", false);
+        assert!(!pinned.contains("sized apart"), "{pinned}");
+        let auto = concurrency_line(6, 2, "4G", false, &[]);
         assert!(
             auto.contains("up to 6 stage(s) at once (from host memory)"),
             "{auto}"
+        );
+        // With stages sized individually, "each mem=4G" is no longer the whole story, so the
+        // ones that differ are named — a trace showing 2 stages where the ceiling says 4 is
+        // otherwise unreadable.
+        let mixed = concurrency_line(
+            4,
+            2,
+            "4G",
+            false,
+            &["compile mem=8G cpus=16".into(), "tools mem=512M".into()],
+        );
+        assert!(
+            mixed.ends_with("sized apart: compile mem=8G cpus=16, tools mem=512M"),
+            "{mixed}"
         );
     }
 

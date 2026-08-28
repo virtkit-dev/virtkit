@@ -10,7 +10,7 @@
 //! since the planner/executor only act on the ones they understand. No heredocs/ADD/
 //! ONBUILD (none appear in our Dockerfiles — see the feature survey).
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 /// A parsed Dockerfile: its instruction stream in source order.
 #[derive(Debug, Clone)]
@@ -49,6 +49,40 @@ pub struct From {
     /// (the preinit boot `vk run --kernel image` uses), not vk's embedded build kernel — so
     /// a RUN can partition disks, mkfs.btrfs, etc. The base must already carry a kernel.
     pub image_kernel: bool,
+    /// How big a guest this stage's RUN steps want, from a `# vk:` line above its `FROM`.
+    /// Sizing only: it never reaches a cache key, so the same stage built at 2G and at 8G
+    /// is the same stage.
+    pub guest: GuestHint,
+}
+
+/// What a `# vk: mem=8G cpus=16` line above a `FROM` asks for: this stage's build guest,
+/// sized against the `[build] mem` / `[build] cpus` every other stage gets.
+///
+/// It rides a comment rather than the `FROM` line so the Dockerfile still builds with
+/// `docker build`, and so the sizing cannot reach the instruction stream that cache keys
+/// are computed from — a stage's identity is what it produces, which a guest size does not
+/// change. Unset fields keep the build-wide default.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GuestHint {
+    /// Guest RAM, in the `[build] mem` grammar (`8G`, `512M`, bare MiB).
+    pub mem: Option<String>,
+    /// Guest vCPUs.
+    pub cpus: Option<u32>,
+}
+
+/// The comment prefix a stage's sizing line carries. Mid-file and stage-scoped, so it cannot
+/// collide with buildkit's file-scoped `# syntax=` / `# check=` parser directives, and any
+/// other comment stays a comment.
+const HINT_PREFIX: &str = "vk:";
+
+/// The body of a `# vk:` sizing line, or `None` for an ordinary comment.
+///
+/// Strip exactly one `#`, allowing `## vk: …` to disable a hint. Match the prefix without
+/// regard to case, consistent with Dockerfile instruction keywords.
+fn hint_body(comment: &str) -> Option<&str> {
+    let rest = comment.strip_prefix('#')?.trim_start();
+    let (prefix, body) = rest.split_at_checked(HINT_PREFIX.len())?;
+    prefix.eq_ignore_ascii_case(HINT_PREFIX).then_some(body)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,12 +142,82 @@ const DEFAULT_ESCAPE: char = '\\';
 /// Parse a Dockerfile's text into its instruction stream.
 pub fn parse(src: &str) -> Result<Dockerfile> {
     let escape = detect_escape(src);
-    let logical = logical_lines(src, escape);
+    let (logical, trailing) = logical_lines(src, escape);
     let mut instructions = Vec::new();
     for line in logical {
-        instructions.push(parse_instruction(&line)?);
+        let mut instr = parse_instruction(&line.text)?;
+        if !line.hints.is_empty() {
+            let hint = parse_guest_hints(&line.hints)?;
+            match &mut instr {
+                Instruction::From(f) => f.guest = hint,
+                // A hint can size only a `FROM`; reject it elsewhere instead of ignoring it.
+                other => bail!(
+                    "`# {HINT_PREFIX}` sizes a stage, so it must precede a FROM; this one \
+                     precedes {}",
+                    keyword_of(other)
+                ),
+            }
+        }
+        instructions.push(instr);
+    }
+    if !trailing.is_empty() {
+        bail!("`# {HINT_PREFIX}` at the end of the file sizes no stage");
     }
     Ok(Dockerfile { instructions })
+}
+
+/// The keyword a parsed instruction came from, for diagnostics.
+fn keyword_of(instr: &Instruction) -> &str {
+    match instr {
+        Instruction::From(_) => "FROM",
+        Instruction::Run(_) => "RUN",
+        Instruction::Copy(_) => "COPY",
+        Instruction::Arg { .. } => "ARG",
+        Instruction::Env(_) => "ENV",
+        Instruction::Workdir(_) => "WORKDIR",
+        Instruction::User(_) => "USER",
+        Instruction::Label(_) => "LABEL",
+        Instruction::Entrypoint(_) => "ENTRYPOINT",
+        Instruction::Cmd(_) => "CMD",
+        Instruction::Other { name, .. } => name,
+    }
+}
+
+/// Merge the `# vk:` lines above an instruction, rejecting duplicate keys.
+fn parse_guest_hints(lines: &[String]) -> Result<GuestHint> {
+    let mut hint = GuestHint::default();
+    for line in lines {
+        for field in line.split_whitespace() {
+            let (key, value) = field
+                .split_once('=')
+                .with_context(|| format!("`# {HINT_PREFIX} {field}`: expected key=value"))?;
+            match key {
+                "mem" => {
+                    if hint.mem.is_some() {
+                        bail!("`# {HINT_PREFIX}`: mem given twice");
+                    }
+                    // Validated here so a typo fails the plan, not the boot half a build in.
+                    crate::run::parse_mem_mib(value)
+                        .filter(|&m| m > 0)
+                        .with_context(|| {
+                            format!("`# {HINT_PREFIX} mem={value}`: expected a size like 8G, 512M")
+                        })?;
+                    hint.mem = Some(value.to_string());
+                }
+                "cpus" => {
+                    if hint.cpus.is_some() {
+                        bail!("`# {HINT_PREFIX}`: cpus given twice");
+                    }
+                    let n: u32 = value.parse().ok().filter(|&n| n >= 1).with_context(|| {
+                        format!("`# {HINT_PREFIX} cpus={value}`: expected a count of 1 or more")
+                    })?;
+                    hint.cpus = Some(n);
+                }
+                _ => bail!("`# {HINT_PREFIX}`: unknown key {key:?} (want mem, cpus)"),
+            }
+        }
+    }
+    Ok(hint)
 }
 
 /// `# escape=<char>` must precede any instruction (and any non-directive comment).
@@ -142,18 +246,33 @@ fn detect_escape(src: &str) -> char {
     DEFAULT_ESCAPE
 }
 
+/// One logical instruction line, with the `# vk:` lines gathered above it.
+struct LogicalLine {
+    text: String,
+    hints: Vec<String>,
+}
+
 /// Join physical lines into logical instruction lines per buildkit's rules: strip
 /// `#` comment-only lines, and continue across lines whose comment-stripped content
 /// ends with the escape token (skipping comment-only lines inside a continuation).
-fn logical_lines(src: &str, escape: char) -> Vec<String> {
-    let mut out = Vec::new();
+///
+/// `# vk:` comments are the one exception to "dropped": they are carried to the next
+/// instruction, which is what makes them a hint about that stage rather than prose. Returns
+/// the lines and any hint left over at the end of the file, which sizes nothing.
+fn logical_lines(src: &str, escape: char) -> (Vec<LogicalLine>, Vec<String>) {
+    let mut out: Vec<LogicalLine> = Vec::new();
+    let mut hints: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut continuing = false;
     for raw in src.lines() {
         let trimmed = raw.trim_end();
         let is_comment = trimmed.trim_start().starts_with('#');
         if is_comment {
-            // comment-only lines are dropped, both standalone and inside a continuation
+            // comment-only lines are dropped, both standalone and inside a continuation —
+            // except a `# vk:` one outside a continuation, held for the coming instruction.
+            if !continuing && let Some(rest) = hint_body(trimmed.trim_start()) {
+                hints.push(rest.trim().to_string());
+            }
             continue;
         }
         if !continuing {
@@ -177,14 +296,20 @@ fn logical_lines(src: &str, escape: char) -> Vec<String> {
         if !continuing {
             let line = cur.trim().to_string();
             if !line.is_empty() {
-                out.push(line);
+                out.push(LogicalLine {
+                    text: line,
+                    hints: std::mem::take(&mut hints),
+                });
             }
         }
     }
     if continuing && !cur.trim().is_empty() {
-        out.push(cur.trim().to_string());
+        out.push(LogicalLine {
+            text: cur.trim().to_string(),
+            hints: std::mem::take(&mut hints),
+        });
     }
-    out
+    (out, hints)
 }
 
 /// Strip a trailing escape token (with optional trailing whitespace) → continuation.
@@ -258,6 +383,7 @@ fn parse_from(rest: &str) -> Result<From> {
         as_name,
         platform,
         image_kernel,
+        guest: GuestHint::default(),
     })
 }
 
@@ -479,6 +605,87 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_vk_comment_sizes_the_stage_it_precedes() {
+        let df = parse(
+            "FROM alpine AS small\n\
+             RUN a\n\
+             # vk: mem=8G cpus=16\n\
+             # an ordinary comment between the two\n\
+             # vk: \n\
+             FROM alpine AS big\n\
+             RUN b\n",
+        )
+        .unwrap();
+        let guest = |i: usize| match &df.instructions[i] {
+            Instruction::From(f) => f.guest.clone(),
+            other => panic!("expected FROM, got {other:?}"),
+        };
+        // The hint lands on the FROM below it, not the one above, and prose between the two
+        // does not break the association (nor does an empty `# vk:`, which asks nothing).
+        assert_eq!(guest(0), GuestHint::default());
+        assert_eq!(
+            guest(2),
+            GuestHint {
+                mem: Some("8G".into()),
+                cpus: Some(16),
+            }
+        );
+        // One key per line reads better for a stage that sets both; they fold together.
+        let df = parse("# vk: cpus=2\n# vk: mem=512M\nFROM alpine\n").unwrap();
+        let Instruction::From(f) = &df.instructions[0] else {
+            unreachable!()
+        };
+        assert_eq!(f.guest.cpus, Some(2));
+        assert_eq!(f.guest.mem.as_deref(), Some("512M"));
+    }
+
+    #[test]
+    fn a_sizing_hint_that_sizes_nothing_is_an_error() {
+        // Silently dropping any of these leaves a stage running at a size nobody chose,
+        // which is the failure this whole hint exists to avoid.
+        let err = |src: &str| parse(src).unwrap_err().to_string();
+        assert!(err("# vk: mem=8G\nRUN a\n").contains("must precede a FROM"),);
+        assert!(err("FROM alpine\n# vk: mem=8G\n").contains("sizes no stage"));
+        assert!(err("# vk: ram=8G\nFROM alpine\n").contains("unknown key"));
+        assert!(err("# vk: mem\nFROM alpine\n").contains("expected key=value"));
+        assert!(err("# vk: mem=lots\nFROM alpine\n").contains("expected a size"));
+        assert!(err("# vk: mem=0\nFROM alpine\n").contains("expected a size"));
+        assert!(err("# vk: cpus=0\nFROM alpine\n").contains("1 or more"));
+        assert!(err("# vk: mem=1G mem=2G\nFROM alpine\n").contains("mem given twice"));
+        // Everything else stays a comment, including a `# vk:` inside a continuation, which
+        // buildkit skips as part of the instruction being joined.
+        assert!(parse("# vklike: mem=8G\nFROM alpine\n").is_ok());
+        assert!(parse("RUN a \\\n  # vk: mem=8G\n  && b\nFROM alpine\n").is_ok());
+    }
+
+    #[test]
+    fn a_hint_is_recognised_by_case_and_commented_out_by_a_second_hash() {
+        // A second `#` disables a hint, including malformed hint-like prose.
+        assert!(parse("## vk: mem=lots of it\nFROM alpine\n").is_ok());
+        let df = parse("## vk: mem=8G\nFROM alpine\n").unwrap();
+        let Instruction::From(f) = &df.instructions[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            f.guest,
+            GuestHint::default(),
+            "a commented-out hint asks nothing"
+        );
+        // The prefix matches whatever the case, like every instruction keyword: a `# VK:`
+        // taken for prose is the silent miss this hint exists to avoid.
+        for src in [
+            "# VK: mem=8G\nFROM alpine\n",
+            "#   Vk:mem=8G\nFROM alpine\n",
+        ] {
+            let df = parse(src).unwrap();
+            let Instruction::From(f) = &df.instructions[0] else {
+                unreachable!()
+            };
+            assert_eq!(f.guest.mem.as_deref(), Some("8G"), "{src:?}");
+        }
+    }
+
+    #[test]
     fn line_continuation_joins_across_comments() {
         // buildkit: a comment line inside a continuation is skipped, the join holds.
         let df = parse("RUN echo a \\\n  # a comment in the middle\n  && echo b\n").unwrap();
@@ -508,6 +715,7 @@ mod tests {
                 as_name: Some("base".into()),
                 platform: None,
                 image_kernel: false,
+                guest: GuestHint::default(),
             })
         );
         assert_eq!(
@@ -517,6 +725,7 @@ mod tests {
                 as_name: None,
                 platform: None,
                 image_kernel: false,
+                guest: GuestHint::default(),
             })
         );
     }
@@ -531,6 +740,7 @@ mod tests {
                 as_name: Some("disk".into()),
                 platform: None,
                 image_kernel: true,
+                guest: GuestHint::default(),
             })
         );
         // without AS, and composing with --platform

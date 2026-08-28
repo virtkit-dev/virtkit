@@ -22,6 +22,13 @@ All notable changes to virtkit will be documented in this file.
   removes it. Repositories `vk` recognizes, such as its build cache, still
   describe themselves when no caption is set.
 
+- A Dockerfile stage can size its own build guest: `# vk: mem=8G cpus=16` above its
+  `FROM` gives that stage a bigger (or smaller) guest than `[build] mem` / `[build]
+  cpus` gives the rest, so a build no longer has to size every stage for its heaviest
+  one. It rides a comment, so the file still builds with `docker build`, and the size
+  never enters a cache key — tuning a stage throws no cache away.
+  `--stage-mem NAME=SIZE` and `--stage-cpus NAME=N` provide per-run overrides.
+
 ### Changed
 
 - A parallel build now waits for the host to have room for a stage's guest before
@@ -31,7 +38,9 @@ All notable changes to virtkit will be documented in this file.
   oldest first. Set `[build] no_mem_gate` to retain jobs-only admission.
 - A build with no `[build] jobs` set now derives how many stages it runs at once from
   the memory the host *has* rather than the memory free at the moment it starts, so
-  the same build runs the same width whatever else was open when it began.
+  the same build runs the same width whatever else was open when it began. With stages
+  sized individually it is how many of them fit, smallest first, rather than a division
+  by one size — and never more stages than the build has to run.
 - A registry no longer holds a whole layer in memory while serving it, so concurrent
   pulls of large images stop risking the host's memory.
 - A registry now stores a relayed blob compressed whenever that makes it smaller,

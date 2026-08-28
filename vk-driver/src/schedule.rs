@@ -201,7 +201,8 @@ pub(crate) fn host_memory() -> Option<HostMemory> {
 }
 
 /// This host's `MemTotal` in MiB — what a percentage `[schedule] mem_budget` is a share of,
-/// and what a build's auto stage count divides by `[build] mem`. `None` on a host whose
+/// and what a build fits its stages' declared sizes into to pick an auto `[build] jobs`
+/// (`build::resolve_build_jobs`), and measures against to admit them. `None` on a host whose
 /// memory cannot be read, which each caller answers its own way: the budget is a share that
 /// cannot be resolved, the build falls back to a modest assumed size.
 pub(crate) fn host_total_mib() -> Option<u64> {

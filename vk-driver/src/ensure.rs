@@ -107,6 +107,7 @@ pub fn ensure_unit_build(
     crate::build::build(&crate::build::Options {
         dockerfiles: recipe.dockerfiles.clone(),
         target: target.map(String::from),
+        stage_guests: Default::default(),
         contexts: recipe.contexts.clone(),
         build_contexts: recipe.build_contexts.clone(),
         out: Some(out.to_path_buf()),

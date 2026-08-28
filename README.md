@@ -37,6 +37,10 @@ cached and only redone when the image actually changes.
 Build Dockerfiles without Docker. `vk build` runs each `RUN` instruction in its
 own microVM, caches per instruction, and produces an image you can boot straight
 away — `vk run -f Dockerfile` chains the two, build then boot, in one command.
+Independent stages build in parallel, and a stage that needs a bigger guest than
+the rest says so in a comment above its `FROM` — `# vk: mem=8G cpus=16` — which
+`docker build` reads as a comment and which never enters a cache key.
+`vk build --stage-mem`/`--stage-cpus NAME=VALUE` override it per run.
 
 Boot an image on its own kernel and init. By default virtkit boots every image
 on its embedded kernel with `vk-agent` as PID 1, but `vk run --kernel image

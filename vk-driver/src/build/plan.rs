@@ -39,6 +39,9 @@ pub struct Stage {
     /// image (the preinit boot), not vk's embedded build kernel. The base must carry a
     /// kernel (build one in a prior stage and `FROM` it).
     pub image_kernel: bool,
+    /// `# vk: mem=8G cpus=16` above the `FROM`: how big a guest this stage's RUN steps
+    /// want. Unset fields take the build-wide `[build] mem` / `[build] cpus`.
+    pub guest: crate::build::parser::GuestHint,
     /// Instructions after the `FROM`, in order (the `FROM` itself excluded).
     pub instructions: Vec<Instruction>,
     /// Build-context root the stage's `COPY` (no `--from`) resolves against — the
@@ -142,6 +145,7 @@ impl Plan {
                             name: f.as_name.clone(),
                             base: Base::Scratch, // placeholder until pass 2
                             image_kernel: f.image_kernel,
+                            guest: f.guest.clone(),
                             instructions: Vec::new(),
                             context: input.context.clone(),
                         });

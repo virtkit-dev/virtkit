@@ -497,8 +497,8 @@ build by the host.
 | | Run phase | Build phase |
 | --- | --- | --- |
 | vCPUs | `[vm] cpus`, per job `MICROVM_CPUS` (capped by `[vm] max_cpus`) | `[build] cpus`, per stage guest — unset = the host's CPU count, capped at 16 |
-| RAM | `[vm] mem`, per job `MICROVM_MEM` (capped by `[vm] max_mem`) | `[build] mem`, per stage guest — unset = `4G` |
-| Concurrency | one VM per job (the runner's own `concurrent`) | `[build] jobs` stages at once — unset = 80% of host `MemTotal` divided by `[build] mem`, capped at 16 |
+| RAM | `[vm] mem`, per job `MICROVM_MEM` (capped by `[vm] max_mem`) | `[build] mem`, per stage guest — unset = `4G`; a stage overrides it with `# vk: mem=…` or `--stage-mem` |
+| Concurrency | one VM per job (the runner's own `concurrent`) | `[build] jobs` stages at once — unset = as many of this build's stages, smallest first, as fit in 80% of host `MemTotal`, capped at 16 |
 
 Build sizing is host configuration only — there are no `MICROVM_*` equivalents, because
 built images are cached and shared across jobs and runners, so no single job owns the
@@ -513,18 +513,52 @@ announces both, and a stage parked on memory says so in the trace:
 
 ```
 virtkit: build: up to 6 stage(s) at once (from host memory), each cpus=12, mem=4G
-virtkit: build: host memory 31241 MiB, 15180 MiB in use elsewhere, 3124 MiB held back — room for 3 stage(s) now
+virtkit: build: host memory 31241 MiB, 15180 MiB in use elsewhere, 3124 MiB held back — 12937 MiB free for stage guests now
 ```
 
-Its own guests are charged at their declared size from the moment they are admitted,
-never at what they have faulted in so far — a guest that booted seconds ago has touched
-almost none of its RAM, and a gate that believed `MemAvailable` would wave the next
+With stages sized individually the ceiling is not a division: it is as many of this build's
+stages as fit, smallest first, in the same 80% — and never more stages than the build has.
+The stages that differ are named on the line, and the gate's own reading is in MiB, since a
+build of one 24G stage and four 2G ones has no single number of stages its free memory is
+worth:
+
+```
+virtkit: build: up to 4 stage(s) at once (from host memory), each cpus=12, mem=4G; sized apart: compile mem=8G cpus=16
+```
+
+One stage often needs far more than the rest — the compile, the link — and sizing every
+stage for it wastes both memory and concurrency. A `# vk:` comment above a stage's `FROM`
+sizes that stage alone:
+
+```dockerfile
+# vk: mem=8G cpus=16
+FROM rust:1.90 AS compile
+```
+
+`mem` and `cpus` are the keys; either may be omitted, and a stage without the comment takes
+`[build] mem` / `[build] cpus` as before. `vk build --stage-mem compile=8G --stage-cpus
+compile=16` says the same thing for one run without editing the file — the flags win over the
+comment, field by field, and name a stage by its `AS` name, or `stage<N>` by position without
+one. In a build of several units (`--compose`, or several `--target`) a name sizes that stage
+in every unit declaring it. A flag naming a stage no unit declares fails the build, as a hint
+that cannot mean anything does. It rides a comment so the Dockerfile still builds with `docker
+build`, and so the size stays out of the instruction stream cache keys are computed from: a
+stage built at 2G and the same stage built at 8G produce the same artifact under the same key,
+so tuning one throws no cache away. A hint larger than the host can give one stage is held to
+what the host has, with a line in the build log — the 24G a stage wants on the build server
+must not make it unbuildable on a laptop. Anything the hint cannot mean — an unknown key, an
+unreadable size, a `# vk:` line that precedes no `FROM` — fails the build rather than being
+ignored.
+
+Back to the gate: a build's own guests are charged at their declared size from the moment they
+are admitted, never at what they have faulted in so far — a guest that booted seconds ago has
+touched almost none of its RAM, and a gate that believed `MemAvailable` would wave the next
 stages in against memory the first one is about to take. Everything else on the host is
-measured afresh each time a stage is about to be admitted, so a build narrows when a job
-VM starts beside it and widens again when one ends. A stage with nothing else of this
-build's live is always admitted, whatever the host looks like: a build with no way to make
-room should be slow, not stuck. Stages that do wait are admitted oldest first, so a large
-stage is not overtaken indefinitely by the smaller ones queued behind it.
+measured afresh each time a stage is about to be admitted, so a build narrows when a job VM
+starts beside it and widens again when one ends. A stage with nothing else of this build's
+live is always admitted, whatever the host looks like: a build with no way to make room should
+be slow, not stuck. Stages that do wait are admitted oldest first, so a large stage is not
+overtaken indefinitely by the smaller ones queued behind it.
 
 The measurement is of memory actually in use, so it lags a job VM that `[schedule]
 mem_budget` has just granted but which has not faulted its RAM in yet — the same trap the

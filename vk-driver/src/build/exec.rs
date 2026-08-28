@@ -98,6 +98,11 @@ pub trait Executor {
     fn context_source(&mut self, _name: &str, _dir: &Path) -> Result<Rootfs> {
         bail!("this backend does not support named build contexts")
     }
+    /// Size the guest for the stage about to be built (`# vk: mem=…` above its `FROM`),
+    /// before it is admitted or booted. Called for every stage, so an unset field must
+    /// restore the build-wide default rather than keep the last stage's. No-op for a
+    /// backend that boots no guest.
+    fn set_stage_guest(&mut self, _hint: &super::parser::GuestHint) {}
     /// Guest RAM reserved before this backend starts a stage, in MiB.
     ///
     /// Guest-less backends return `None` and bypass memory admission.
@@ -441,8 +446,15 @@ pub struct MicroVm {
     /// can boot and serve the exec channel.
     agent: PathBuf,
     scratch: PathBuf,
+    /// The current stage's guest size — the build-wide default, or what its `# vk:` line
+    /// asked for ([`Executor::set_stage_guest`]).
     cpus: u32,
     mem: String,
+    /// The build-wide `[build] cpus` / `[build] mem`, kept so a stage with no hint (or a
+    /// hint that sets only one of the two) goes back to them rather than inheriting the
+    /// last stage's size.
+    build_cpus: u32,
+    build_mem: String,
     boot_timeout_secs: u64,
     /// `--debug`: e2fsck each stage snapshot as it crosses the cache (after a load, before
     /// an upload) to catch a corrupt ext4 early. Best-effort; adds an fsck per instruction.
@@ -1021,6 +1033,8 @@ impl MicroVm {
             kernel,
             agent,
             scratch,
+            build_cpus: cpus,
+            build_mem: mem.clone(),
             cpus,
             mem,
             boot_timeout_secs: 120,
@@ -1075,8 +1089,9 @@ impl MicroVm {
         self.uncacheable_keys = keys;
     }
 
-    /// Memory each stage guest reserves, in MiB — the parallel driver divides the host's
-    /// total RAM by this to pick a default job count.
+    /// This executor's guest RAM in MiB — the build-wide default, or the current stage's own
+    /// size once `set_stage_guest` has applied its `# vk: mem=…`. What the host-memory gate
+    /// charges the stage. `2048` when `mem` cannot be parsed.
     pub fn mem_mib(&self) -> u64 {
         crate::run::parse_mem_mib(&self.mem).unwrap_or(2048)
     }
@@ -1086,8 +1101,8 @@ impl MicroVm {
         self.cpus
     }
 
-    /// Each stage guest's memory as passed to the VMM (`4G`) — [`Self::mem_mib`] is the
-    /// parsed MiB the job budget divides by.
+    /// Each stage guest's memory as passed to the VMM (`4G`) — the build-wide default, which
+    /// a stage's own `# vk: mem=…` overrides. [`Self::mem_mib`] is the same figure parsed.
     pub fn mem(&self) -> &str {
         &self.mem
     }
@@ -1107,6 +1122,8 @@ impl MicroVm {
             scratch: self.scratch.clone(),
             cpus: self.cpus,
             mem: self.mem.clone(),
+            build_cpus: self.build_cpus,
+            build_mem: self.build_mem.clone(),
             boot_timeout_secs: self.boot_timeout_secs,
             debug: self.debug,
             free_blocks: self.free_blocks,
@@ -1843,6 +1860,10 @@ pub(crate) fn resolve_copy_dest(dest: &str, workdir: &str) -> String {
 }
 
 impl Executor for MicroVm {
+    fn set_stage_guest(&mut self, hint: &super::parser::GuestHint) {
+        self.mem = hint.mem.clone().unwrap_or_else(|| self.build_mem.clone());
+        self.cpus = hint.cpus.unwrap_or(self.build_cpus);
+    }
     fn stage_mem_mib(&self) -> Option<u64> {
         Some(self.mem_mib())
     }

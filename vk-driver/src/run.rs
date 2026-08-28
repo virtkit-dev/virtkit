@@ -814,6 +814,7 @@ async fn build_and_boot(
         let opts = crate::build::Options {
             dockerfiles: args.dockerfiles.clone(),
             target: args.target.clone(),
+            stage_guests: Default::default(),
             contexts: args.contexts.clone(),
             build_contexts: args.build_contexts.clone(),
             out: Some(out.clone()),
@@ -2313,6 +2314,7 @@ pub(crate) fn service_build_options(
     crate::build::Options {
         dockerfiles: Vec::new(),
         target: None,
+        stage_guests: Default::default(),
         contexts: Vec::new(),
         build_contexts: Vec::new(),
         out: None,
@@ -3011,7 +3013,9 @@ fn boot_failure(console: &Path, status: std::process::ExitStatus) -> String {
 /// anything else (e.g. cloud-hypervisor's richer syntax) — callers skip their check.
 pub(crate) fn parse_mem_mib(mem: &str) -> Option<u64> {
     if let Some(g) = mem.strip_suffix(['G', 'g']) {
-        return g.parse::<u64>().ok().map(|n| n * 1024);
+        // Checked: this now parses Dockerfile text (`# vk: mem=…`), so an absurd figure is
+        // untrusted input, and `n * 1024` on it panics in a debug build and wraps in release.
+        return g.parse::<u64>().ok().and_then(|n| n.checked_mul(1024));
     }
     if let Some(m) = mem.strip_suffix(['M', 'm']) {
         return m.parse().ok();

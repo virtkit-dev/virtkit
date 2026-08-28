@@ -145,8 +145,8 @@ impl ExportFormat {
     }
 }
 
-/// clap value parser for `--service-cpus NAME=N`.
-fn parse_service_cpus(s: &str) -> Result<(String, u32), String> {
+/// clap value parser for `--service-cpus` / `--stage-cpus NAME=N`.
+fn parse_named_cpus(s: &str) -> Result<(String, u32), String> {
     let (name, n) = s
         .split_once('=')
         .filter(|(name, _)| !name.is_empty())
@@ -159,8 +159,9 @@ fn parse_service_cpus(s: &str) -> Result<(String, u32), String> {
     Ok((name.to_string(), n))
 }
 
-/// clap value parser for `--service-mem NAME=SIZE` (`<n>G`, `<n>M` or a MiB count).
-fn parse_service_mem(s: &str) -> Result<(String, String), String> {
+/// clap value parser for `--service-mem` / `--stage-mem NAME=SIZE` (`<n>G`, `<n>M` or a
+/// MiB count).
+fn parse_named_mem(s: &str) -> Result<(String, String), String> {
     let (name, size) = s
         .split_once('=')
         .filter(|(name, _)| !name.is_empty())
@@ -635,6 +636,28 @@ enum Cmd {
             help_heading = "Build environment"
         )]
         build_jobs: Option<NonZeroUsize>,
+        /// guest RAM for one stage, over its `# vk:` hint and `[build] mem`
+        ///
+        /// NAME is the stage's `AS` name, or `stage<N>` by position when it has none.
+        /// In a multi-unit build it sizes that stage in every unit declaring it.
+        /// Repeatable; a name no unit has is an error.
+        #[arg(
+            long = "stage-mem",
+            value_name = "NAME=SIZE",
+            value_parser = parse_named_mem,
+            help_heading = "Build environment"
+        )]
+        stage_mem: Vec<(String, String)>,
+        /// guest vCPUs for one stage, over its `# vk:` hint and `[build] cpus`
+        ///
+        /// Addressed like `--stage-mem`; the two compose, so a stage can be given both.
+        #[arg(
+            long = "stage-cpus",
+            value_name = "NAME=N",
+            value_parser = parse_named_cpus,
+            help_heading = "Build environment"
+        )]
+        stage_cpus: Vec<(String, u32)>,
         /// verify each stage snapshot with e2fsck as it crosses the instruction cache
         ///
         /// After a load and before an upload, to catch a corrupt ext4 early. Best-effort
@@ -1188,13 +1211,13 @@ enum Cmd {
         ///
         /// Wins over its x-virtkit.cpus declaration.
         #[arg(long = "service-cpus", value_name = "NAME=N", requires = "compose",
-              value_parser = parse_service_cpus, help_heading = "Compose services")]
+              value_parser = parse_named_cpus, help_heading = "Compose services")]
         service_cpus: Vec<(String, u32)>,
         /// override a compose service's guest RAM (repeatable, e.g. `db=2G`)
         ///
         /// Wins over its x-virtkit.mem declaration.
         #[arg(long = "service-mem", value_name = "NAME=SIZE", requires = "compose",
-              value_parser = parse_service_mem, help_heading = "Compose services")]
+              value_parser = parse_named_mem, help_heading = "Compose services")]
         service_mem: Vec<(String, String)>,
         /// Forward the host SSH agent ($SSH_AUTH_SOCK) into the guest
         ///
@@ -2732,6 +2755,8 @@ async fn cli_main() -> ExitCode {
         build_audit_egress,
         require_cached,
         build_jobs,
+        stage_mem,
+        stage_cpus,
         debug,
     } = &cli.cmd
     {
@@ -2816,6 +2841,7 @@ async fn cli_main() -> ExitCode {
             // build_units (the multi-target / --compose path) reads targets from its units;
             // the single-image path uses this one (default: the last stage).
             target: target.first().cloned(),
+            stage_guests: build::stage_overrides(stage_mem, stage_cpus),
             contexts: context.clone(),
             build_contexts,
             out: tag_out.clone().or_else(|| out.clone()),
