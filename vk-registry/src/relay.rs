@@ -101,8 +101,10 @@ pub async fn get_blob(
     }
     // Stream the upstream blob to a temp file (bounded memory — layers can be GBs),
     // hashing as we go; verify it matches the requested digest, then promote it into the
-    // identity blob store and serve it back from there. A relayed layer is already
-    // compressed, so identity storage is right (the adaptive-zstd path wouldn't shrink it).
+    // blob store and serve it back from there. `Store::stage_promotion` decides on the
+    // bytes how it is stored: a `tar+gzip` layer arrives compressed and is kept as it came,
+    // while an image config, an attestation or an uncompressed `tar` layer is stored as a
+    // zstd frame instead of at full size.
     let hex = digest.trim_start_matches("sha256:");
     let uploads = state.store.uploads_dir();
     tokio::fs::create_dir_all(&uploads)
@@ -145,16 +147,23 @@ pub async fn get_blob(
         let _ = tokio::fs::remove_file(&tmp).await;
         bail!("upstream blob digest mismatch for {name}: got {got}, want {digest}");
     }
-    {
+    // Off the runtime: staging compresses, and a multi-gigabyte layer would otherwise
+    // block a tokio worker for seconds. The store lock is taken inside, after that pass.
+    let store = state.store.clone();
+    let (hex, name_owned) = (hex.to_string(), name.to_string());
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let staged = store.stage_promotion(&hex, &tmp)?;
         // shared store lock (vs. an exclusive gc) across the promote; see Store::lock_shared.
-        let _lock = state.store.lock_shared()?;
-        if state.store.has_blob(hex) {
-            let _ = tokio::fs::remove_file(&tmp).await;
-        } else {
-            tokio::fs::rename(&tmp, state.store.identity_blob_path(hex))
-                .await
-                .with_context(|| format!("promoting the relayed blob {digest}"))?;
-        }
+        let _lock = match store.lock_shared() {
+            Ok(lock) => lock,
+            // Nothing else will consume what staging produced; `uploads/` is swept by gc,
+            // but not leaving it there is one line.
+            Err(e) => {
+                staged.discard();
+                return Err(e);
+            }
+        };
+        store.promote_staged(&hex, staged)?;
         // The caller was authorized to read `name`, the upstream for `name` served this
         // digest, and the bytes were hashed against it above — so the cached copy is
         // readable through `name`. Record that, or the next request for it would be
@@ -164,8 +173,11 @@ pub async fn get_blob(
         // manifest path deliberately records nothing but the manifest itself: a relayed
         // manifest naming a digest this store happens to hold must not hand that local
         // blob to the caller — each layer earns its own membership by being fetched here.
-        state.store.record_blob(name, hex)?;
-    }
+        store.record_blob(&name_owned, &hex)
+    })
+    .await
+    .context("joining the promotion of a relayed blob")?
+    .with_context(|| format!("promoting the relayed blob {digest}"))?;
     serve_blob_local(&state.store, digest, /* head */ false, accept_zstd)
 }
 

@@ -97,9 +97,10 @@ How persistence works:
 
 - **Blobs stream to disk** — a pulled blob is streamed into a store temp file (bounded
   memory, never a multi-GB layer in RAM), hashed as it arrives, verified against the
-  requested digest, then promoted to `blobs/sha256/<hex>` and served from the store. A
-  relayed layer is already compressed, so it is stored identity (the adaptive-zstd path
-  wouldn't shrink it). `Store::uploads_dir`/`identity_blob_path` expose the staging seam.
+  requested digest, then promoted into the store — compressed when that shrinks it and
+  identity otherwise, decided on the bytes (`Store::stage_promotion`, which does that pass
+  before the store lock is taken, then `Store::promote_staged`). `Store::uploads_dir`
+  exposes the staging seam.
 - **Manifests** — a digest-referenced manifest is persisted with the existing
   `put_manifest` (a digest reference writes no tag), so relayed manifests are cached
   without ever creating a mutable tag.

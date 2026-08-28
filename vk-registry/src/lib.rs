@@ -153,6 +153,73 @@ pub const ZSTD_LEVEL: i32 = 1;
 /// Absent on any dumb OCI registry.
 pub const TRANSPARENT_ZSTD_HEADER: &str = "x-virtkit-transparent-zstd";
 
+/// Detect gzip, zstd, xz, and bzip2 containers by magic number to avoid recompressing them.
+///
+/// Files shorter than the longest magic are treated as uncompressed; I/O errors propagate.
+fn already_compressed(path: &Path) -> Result<bool> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    // `read_to_end` on a `take`, not one `read`: a single read may return short even on a
+    // longer file, and a truncated header would drop the six-byte xz magic.
+    let mut head = Vec::with_capacity(6);
+    f.take(6)
+        .read_to_end(&mut head)
+        .with_context(|| format!("reading the header of {}", path.display()))?;
+    Ok(
+        head.starts_with(&[0x1f, 0x8b])                       // gzip
+        || head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])       // zstd
+        || head.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) // xz
+        || head.starts_with(b"BZh"),
+    ) // bzip2
+}
+
+/// zstd `tmp` into a sibling temp file, returning its path — or `None`, having removed it,
+/// when the frame did not come out smaller than the `raw_len` bytes it encodes. Streamed
+/// both ways: this runs on blobs that can be gigabytes.
+fn compress_beside(tmp: &Path, raw_len: u64) -> Result<Option<PathBuf>> {
+    // Appended, not `with_extension`, which would replace one: two staged blobs whose
+    // names differ only past a dot must not race for the same output file. Kept as an
+    // `OsString` — a staged name is a file name, not necessarily UTF-8, and a lossy
+    // rewrite would point `out` at a different file than `tmp`.
+    let mut name = tmp
+        .file_name()
+        .context("the staged blob has no file name")?
+        .to_os_string();
+    name.push(".zst");
+    let out = tmp.with_file_name(name);
+    let src = std::fs::File::open(tmp).with_context(|| format!("opening {}", tmp.display()))?;
+    // Buffered: `io::copy` from a raw `File` would feed the encoder 8 KiB at a time for a
+    // blob that can be gigabytes (`hash_zstd_frame` reads the other direction the same way).
+    let mut src = std::io::BufReader::new(src);
+    let dst = std::fs::File::create(&out).with_context(|| format!("creating {}", out.display()))?;
+    // The pledged size is what puts the decompressed length in the frame header, which is
+    // how a HEAD answers with the canonical Content-Length without decompressing (see
+    // `zstd_canonical_len`) — the same reason `zstd_with_size` sets it.
+    let mut enc =
+        zstd::stream::write::Encoder::new(dst, ZSTD_LEVEL).context("creating the encoder")?;
+    enc.set_pledged_src_size(Some(raw_len))
+        .context("setting the zstd pledged size")?;
+    enc.include_contentsize(true)
+        .context("enabling the zstd content size")?;
+    let copied = std::io::copy(&mut src, &mut enc).context("zstd-compressing a blob");
+    let finished = copied.and_then(|_| enc.finish().context("finishing the zstd frame"));
+    let z_len = match finished {
+        Ok(f) => f.metadata().context("stat of the compressed blob")?.len(),
+        Err(e) => {
+            // A half-written frame is of no use to anyone; the error is what the caller
+            // acts on, so a failure to unlink it is not worth masking that with.
+            let _ = std::fs::remove_file(&out);
+            return Err(e);
+        }
+    };
+    if z_len < raw_len {
+        return Ok(Some(out));
+    }
+    // It did not pay. Same reasoning as above for the unlink.
+    let _ = std::fs::remove_file(&out);
+    Ok(None)
+}
+
 /// zstd-compress `raw`, embedding the decompressed size in the frame header so the
 /// registry can report a canonical `Content-Length` on HEAD without decompressing
 /// (`zstd::encode_all` omits the content size). Shared by the transparent-zstd client
@@ -176,6 +243,29 @@ pub struct Store {
     root: PathBuf,
     /// monotonic upload-id source (unique within this server process)
     next_upload: AtomicU64,
+}
+
+/// A digest-verified blob [`Store::stage_promotion`] has decided the storage form of, ready
+/// for [`Store::promote_staged`] to rename into place.
+pub(crate) struct StagedBlob {
+    /// The file to rename into the store.
+    install: PathBuf,
+    /// The other staged file the decision left behind, to remove.
+    discard: Option<PathBuf>,
+    /// Whether `install` is a zstd frame rather than the canonical bytes.
+    zstd: bool,
+}
+
+impl StagedBlob {
+    /// Drop the staged files without installing anything — for a caller that gives up
+    /// between staging and promoting. `gc` would sweep `uploads/` eventually anyway, so an
+    /// unlink that fails is not worth reporting over whatever made the caller give up.
+    pub(crate) fn discard(self) {
+        let _ = std::fs::remove_file(&self.install);
+        if let Some(p) = &self.discard {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 impl Store {
@@ -227,12 +317,9 @@ impl Store {
     fn blob_path(&self, hex: &str) -> PathBuf {
         self.root.join("blobs/sha256").join(hex)
     }
-    /// The identity-store destination for a blob, and the temp/uploads directory to
-    /// stage it in — for the relay, which streams a pulled blob to disk (bounded memory)
-    /// then promotes it here. Both are under the store root, so a rename is atomic.
-    pub fn identity_blob_path(&self, hex: &str) -> PathBuf {
-        self.blob_path(hex)
-    }
+    /// Where the relay stages a blob it streams in (bounded memory — layers can be GBs)
+    /// before [`Store::stage_promotion`] and [`Store::promote_staged`] install it. Under
+    /// the store root, so that rename is atomic.
     pub fn uploads_dir(&self) -> PathBuf {
         self.root.join("uploads")
     }
@@ -312,6 +399,65 @@ impl Store {
                 atomic_write(&self.blob_path(hex), raw)?;
             }
         }
+        Ok(())
+    }
+
+    /// Work out how a fully-written, digest-verified file will be stored, doing everything that
+    /// needs no lock — [`Store::put_blob_at`]'s streaming counterpart, for the relay, which never
+    /// holds a whole layer in memory. [`Store::promote_staged`] installs the result.
+    pub(crate) fn stage_promotion(&self, hex: &str, tmp: &Path) -> Result<StagedBlob> {
+        let raw_len = std::fs::metadata(tmp)
+            .with_context(|| format!("stat {}", tmp.display()))?
+            .len();
+        // Racy on purpose — `promote_staged` looks again under the lock. Losing the race
+        // only costs a compression pass whose output is then dropped.
+        if !self.has_blob(hex)
+            && !already_compressed(tmp)?
+            && let Some(z) = compress_beside(tmp, raw_len)?
+        {
+            return Ok(StagedBlob {
+                install: z,
+                discard: Some(tmp.to_path_buf()),
+                zstd: true,
+            });
+        }
+        Ok(StagedBlob {
+            install: tmp.to_path_buf(),
+            discard: None,
+            zstd: false,
+        })
+    }
+
+    /// Rename a [`Store::stage_promotion`] result into the blob store. Renames and a
+    /// `has_blob` check only, so it is safe to hold [`Store::lock_shared`] across it and
+    /// the reference that follows. The staged files are consumed either way.
+    pub(crate) fn promote_staged(&self, hex: &str, staged: StagedBlob) -> Result<()> {
+        let StagedBlob {
+            install,
+            discard,
+            zstd,
+        } = staged;
+        // Whatever happens to `install`, the other staged file has no further use and the
+        // caller acts on the rename, not on the cleanup.
+        let drop_discard = || {
+            if let Some(p) = &discard {
+                let _ = std::fs::remove_file(p);
+            }
+        };
+        if self.has_blob(hex) {
+            let _ = std::fs::remove_file(&install);
+            drop_discard();
+            return Ok(());
+        }
+        let dest = if zstd {
+            self.zstd_blob_path(hex)
+        } else {
+            self.blob_path(hex)
+        };
+        std::fs::create_dir_all(dest.parent().unwrap_or_else(|| Path::new(".")))
+            .context("creating the blob directory")?;
+        std::fs::rename(&install, &dest).with_context(|| format!("promoting the blob {hex}"))?;
+        drop_discard();
         Ok(())
     }
 
@@ -4606,6 +4752,125 @@ mod tests {
         // Its own bytes, and only those.
         assert!(store.repo_has_manifest("team-a/app", digest.trim_start_matches("sha256:")));
         assert!(!store.repo_has_blob("team-a/app", &hex));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every magic `already_compressed` claims to recognize, and the two shapes that must
+    /// not be mistaken for one: a file too short to carry a magic, and bytes that merely
+    /// start like one.
+    #[test]
+    fn already_compressed_knows_each_container_magic() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-magic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = |name: &str, head: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, head).unwrap();
+            already_compressed(&p).unwrap()
+        };
+        for (name, magic) in [
+            ("gz", &[0x1f, 0x8b, 0x08, 0x00][..]),
+            ("zst", &[0x28, 0xb5, 0x2f, 0xfd][..]),
+            ("xz", &[0xfd, b'7', b'z', b'X', b'Z', 0x00][..]),
+            ("bz2", b"BZh9"),
+        ] {
+            let mut bytes = magic.to_vec();
+            bytes.extend(std::iter::repeat_n(0u8, 64));
+            assert!(probe(name, &bytes), "{name} magic not recognized");
+        }
+        // The xz magic is six bytes, so a five-byte prefix of it is not one.
+        assert!(!probe("short-xz", &[0xfd, b'7', b'z', b'X', b'Z']));
+        assert!(!probe("empty", b""));
+        assert!(!probe("tar", b"./PaxHeaders"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What a promoted blob costs on disk is decided on its bytes: one that is already a
+    /// compressed container is stored as-is, and one that is not — an image config, an
+    /// attestation, a `tar` layer with no compression — is kept as a zstd frame. Either
+    /// way the digest still addresses the canonical bytes, so a pull gets back exactly
+    /// what upstream served.
+    #[test]
+    fn a_promoted_blob_is_compressed_only_when_that_shrinks_it() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-promote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        std::fs::create_dir_all(store.uploads_dir()).unwrap();
+
+        let promote = |name: &str, raw: &[u8]| {
+            let hex = sha256_hex_raw(raw);
+            let tmp = store.uploads_dir().join(name);
+            std::fs::write(&tmp, raw).unwrap();
+            let staged = store.stage_promotion(&hex, &tmp).unwrap();
+            store.promote_staged(&hex, staged).unwrap();
+            assert!(
+                !tmp.exists(),
+                "{name}: the staged file outlived the promote"
+            );
+            // whatever the storage form, the blob reads back byte-identical
+            assert_eq!(
+                store.get_blob(&hex).unwrap().as_deref(),
+                Some(raw),
+                "{name}"
+            );
+            hex
+        };
+
+        // an image config: compressible, so it is kept compressed and takes less room
+        let config = br#"{"architecture":"amd64","os":"linux","config":{"Env":["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],"Cmd":["/bin/sh"]},"rootfs":{"type":"layers","diff_ids":[]}}"#.repeat(8);
+        let hex = promote("config", &config);
+        assert!(
+            store.zstd_blob_path(&hex).is_file(),
+            "not stored compressed"
+        );
+        assert!(std::fs::metadata(store.zstd_blob_path(&hex)).unwrap().len() < config.len() as u64);
+        // The frame carries its decompressed size, which is what lets a HEAD answer with
+        // the canonical Content-Length without decompressing. Nothing else would fail if a
+        // later edit dropped `set_pledged_src_size`/`include_contentsize`.
+        assert_eq!(
+            zstd_canonical_len(&store.zstd_blob_path(&hex)).unwrap(),
+            config.len() as u64
+        );
+
+        // a gzip layer: already a compressed container, so it is never re-compressed
+        let gz = {
+            let mut v = vec![0x1f, 0x8b, 0x08, 0x00];
+            v.extend(std::iter::repeat_n(b'x', 4096));
+            v
+        };
+        let hex = promote("layer.tgz", &gz);
+        assert!(
+            store.blob_path(&hex).is_file() && !store.zstd_blob_path(&hex).is_file(),
+            "an already-compressed layer was re-compressed"
+        );
+
+        // incompressible bytes that carry no compressed-container magic: the pass runs,
+        // does not pay, and identity storage is kept rather than a frame that is bigger.
+        // Chained SHA-256 output avoids patterns that zstd could compress accidentally.
+        let noise: Vec<u8> = {
+            let mut out = Vec::with_capacity(8192);
+            let mut block = [0u8; 32];
+            while out.len() < 8192 {
+                block = sha2::Sha256::digest(block).into();
+                out.extend_from_slice(&block);
+            }
+            out
+        };
+        let hex = promote("noise", &noise);
+        assert!(
+            store.blob_path(&hex).is_file() && !store.zstd_blob_path(&hex).is_file(),
+            "a frame that did not shrink was kept"
+        );
+
+        // a digest already held: the staged file is dropped, nothing is rewritten
+        let hex = sha256_hex_raw(&config);
+        let tmp = store.uploads_dir().join("again");
+        std::fs::write(&tmp, &config).unwrap();
+        let staged = store.stage_promotion(&hex, &tmp).unwrap();
+        store.promote_staged(&hex, staged).unwrap();
+        assert!(!tmp.exists());
+        assert!(!store.blob_path(&hex).is_file(), "stored a second copy");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

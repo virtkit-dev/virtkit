@@ -1387,8 +1387,7 @@ async fn a_blob_head_is_never_relayed() {
 
 /// A blob `HEAD` and the `GET` after it must describe the same bytes, and the one case
 /// where they could drift is a blob the store holds *compressed*: the length then comes
-/// from the zstd frame's header rather than from a `stat` of the file. (A relayed blob is
-/// stored identity, so this needs a blob that arrived by push.)
+/// from the zstd frame's header rather than from a `stat` of the file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_blob_head_agrees_with_the_get_for_a_compressed_blob() {
     let _ = rustls::crypto::ring::default_provider().install_default();

@@ -24,6 +24,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- A registry now stores a relayed blob compressed whenever that makes it smaller,
+  instead of always keeping it at the size it arrived at. Image configs,
+  attestations and uncompressed `tar` layers stop costing full size in a cache
+  that keeps them for a fleet. Pulls return the same bytes as before.
 - `vk-registry status` and `vk-registry gc` take `--root`/`--config` from
   `VK_REGISTRY_ROOT`/`VK_REGISTRY_CONFIG` when the flag is not given, so one exported
   variable now points every store command at the served registry rather than at the
