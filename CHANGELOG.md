@@ -45,6 +45,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- `vk check` judges a `[registry]` credential the way a pull does. It now reports a
+  `token_file` that is unreadable or empty, which used to pass and then fail the
+  first request, and stops reporting a `password_file` that a `token_file`
+  supersedes and nothing reads.
 - The credential proxy that lends a job the runner's registry login now sends a
   bearer token when `[registry]` is configured with one. It only ever knew about
   the Basic pair, so a job proxied to a registry gated by an API key was handed no

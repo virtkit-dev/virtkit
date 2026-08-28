@@ -369,6 +369,28 @@ fn token_problem(token_file: &Path, what: &str) -> Option<String> {
     }
 }
 
+/// What is wrong with a section's Basic pair, if anything. Nothing when a `token_file`
+/// supersedes it: every resolver — `Creds::from_files`, `registry::cred`, and through the
+/// former the guest credential proxy — returns on the token and never opens the password.
+/// `what` prefixes the problem, as it does for [`token_problem`].
+fn basic_problem(
+    username: &str,
+    password_file: Option<&Path>,
+    token_file: Option<&Path>,
+    what: &str,
+) -> Option<String> {
+    if username.is_empty() || token_file.is_some() {
+        return None;
+    }
+    match password_file {
+        Some(p) if !access_ok(p, libc::R_OK) => {
+            Some(format!("{what}password_file unreadable: {}", p.display()))
+        }
+        Some(_) => None,
+        None => Some(format!("{what}username set but no password_file")),
+    }
+}
+
 fn docker(cfg: &Config) -> Outcome {
     let Some(d) = &cfg.docker else {
         return skip("[docker] not configured");
@@ -385,18 +407,12 @@ fn docker(cfg: &Config) -> Outcome {
     if let Some(t) = &d.token_file {
         problems.extend(token_problem(t, ""));
     }
-    // Only when no token_file supersedes it: a section that authenticates with a bearer
-    // token never reads the Basic pair, so half of one left behind is not a problem to
-    // report (`Creds::auth` ignores it).
-    if !d.username.is_empty() && d.token_file.is_none() {
-        match &d.password_file {
-            Some(p) if !access_ok(p, libc::R_OK) => {
-                problems.push(format!("password_file unreadable: {}", p.display()));
-            }
-            Some(_) => {}
-            None => problems.push("username set but no password_file".into()),
-        }
-    }
+    problems.extend(basic_problem(
+        &d.username,
+        d.password_file.as_deref(),
+        d.token_file.as_deref(),
+        "",
+    ));
     if let Some(m) = &d.mirror {
         if let Some(ca) = &m.ca_file
             && !access_ok(ca, libc::R_OK)
@@ -406,15 +422,12 @@ fn docker(cfg: &Config) -> Outcome {
         if let Some(t) = &m.token_file {
             problems.extend(token_problem(t, "mirror "));
         }
-        if !m.username.is_empty() && m.token_file.is_none() {
-            match &m.password_file {
-                Some(p) if !access_ok(p, libc::R_OK) => {
-                    problems.push(format!("mirror password_file unreadable: {}", p.display()));
-                }
-                Some(_) => {}
-                None => problems.push("mirror username set but no password_file".into()),
-            }
-        }
+        problems.extend(basic_problem(
+            &m.username,
+            m.password_file.as_deref(),
+            m.token_file.as_deref(),
+            "mirror ",
+        ));
     }
     if !problems.is_empty() {
         return fail(problems.join("; "));
@@ -445,15 +458,15 @@ fn registry(cfg: &Config) -> Outcome {
     {
         problems.push(format!("ca_file unreadable: {}", ca.display()));
     }
-    if !r.username.is_empty() {
-        match &r.password_file {
-            Some(p) if !access_ok(p, libc::R_OK) => {
-                problems.push(format!("password_file unreadable: {}", p.display()));
-            }
-            Some(_) => {}
-            None => problems.push("username set but no password_file".into()),
-        }
+    if let Some(t) = &r.token_file {
+        problems.extend(token_problem(t, ""));
     }
+    problems.extend(basic_problem(
+        &r.username,
+        r.password_file.as_deref(),
+        r.token_file.as_deref(),
+        "",
+    ));
     if problems.is_empty() {
         ok(format!(
             "remote {} (credential files readable; not probed over the network)",
@@ -608,6 +621,48 @@ fn dir_writable(dir: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::config::Gitlab;
+
+    /// `[registry]` follows the same precedence as `[docker]`, because `registry::cred`
+    /// does: a readable `token_file` settles the credential, so the `password_file` it
+    /// never opens is not a problem — but an empty token file is, since `cred` refuses it.
+    #[test]
+    fn the_registry_check_follows_the_token_precedence() {
+        let dir = std::env::temp_dir().join(format!("vk-check-registry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = dir.join("token");
+        let section = |token_file: Option<PathBuf>| Config {
+            registry: Some(crate::config::Registry::for_share(
+                "registry.example.com/team".to_string(),
+                false,
+                None,
+                "ci".to_string(),
+                // Deliberately absent: what the Basic path would fail on.
+                Some(dir.join("absent")),
+                token_file,
+                None,
+            )),
+            ..Config::default()
+        };
+
+        std::fs::write(&token, "vkr_x\n").unwrap();
+        assert_eq!(registry(&section(Some(token.clone()))).status, Status::Ok);
+
+        std::fs::write(&token, "  \n").unwrap();
+        let out = registry(&section(Some(token)));
+        assert_eq!(out.status, Status::Fail);
+        assert!(out.detail.contains("token_file empty"), "{}", out.detail);
+
+        // With no token to supersede it, the unreadable password_file is reported again.
+        let out = registry(&section(None));
+        assert_eq!(out.status, Status::Fail);
+        assert!(
+            out.detail.contains("password_file unreadable"),
+            "{}",
+            out.detail
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// A `[docker]` whose `token_file` supersedes the Basic pair: the superseded
     /// `password_file` is never read by `Creds::from_files`, so an unreadable one is not a
