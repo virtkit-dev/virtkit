@@ -48,6 +48,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- `vk publish --to tcp://<name>:<port>` reaches a target that listens on only one of
+  the name's addresses. Only the first address the name resolved to was dialed, so a
+  service bound to IPv4 on a host that also has an IPv6 address — `localhost` on any
+  dual-stack machine — was never reached; every address now gets a turn, each under a
+  10s connect timeout rather than the OS's minutes-long SYN retry schedule.
 - `vk exec` without `--tty` ends when the command it ran ends, the way it already does
   with one. A command that left behind a process still holding its output — a daemon, or
   a background job it never waited for — never gave back an exit code, and the session

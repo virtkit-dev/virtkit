@@ -303,24 +303,28 @@ impl AsyncWrite for RawConn {
 /// of forcing every caller to resolve it themselves before ever reaching that
 /// network. Only a `tcp://` target retries this way: any other scheme that fails to
 /// parse has no hostname notion to fall back to, so its original error stands.
-/// When a name resolves to multiple addresses, the first one `lookup_host` returns
-/// is used — good enough for a single compose sibling, which is the only producer
-/// of these targets today.
-pub async fn resolve_connect_target(target: &str) -> Result<SocketAddr, anyhow::Error> {
+/// Every address a name resolves to is returned, in the order `lookup_host` gave
+/// them, for [`raw_connect_any`] to dial in turn: a host with both an AAAA and an A
+/// record commonly listens on only one of the two, and `localhost` on a dual-stack
+/// box is the everyday case.
+pub async fn resolve_connect_target(target: &str) -> Result<Vec<SocketAddr>, anyhow::Error> {
     let parse_err = match target.parse::<SocketAddr>() {
-        Ok(addr) => return Ok(addr),
+        Ok(addr) => return Ok(vec![addr]),
         Err(e) => e,
     };
     let (host, port) = match crate::addr::split_tcp_url(target) {
         Some(r) => r?,
         None => return Err(parse_err),
     };
-    let resolved = tokio::net::lookup_host((host, port))
+    let resolved: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
         .with_context(|| format!("resolving {host:?}"))?
-        .next()
-        .ok_or_else(|| anyhow!("{host:?} resolved to no addresses"))?;
-    Ok(SocketAddr::Tcp(resolved))
+        .map(SocketAddr::Tcp)
+        .collect();
+    if resolved.is_empty() {
+        return Err(anyhow!("{host:?} resolved to no addresses"));
+    }
+    Ok(resolved)
 }
 
 /// Open a raw stream to `target`: tcp, unix, vsock, or hybrid vsock-mux (the
@@ -349,6 +353,32 @@ pub async fn raw_connect(target: &SocketAddr) -> Result<RawConn, anyhow::Error> 
         SocketAddr::VsockAuto { path, port } => RawConn::Unix(connect_auto(path, *port).await?),
         SocketAddr::Systemd => bail!("cannot connect to systemd:// (serve only)"),
     })
+}
+
+/// Dial `targets` in order and return the first connection that is accepted, with
+/// the address that accepted it; if none does, the failure of the last address
+/// tried. A name commonly resolves to both an AAAA and an A record while the host
+/// behind it listens on only one of the two, so stopping at the first address makes
+/// such a target unreachable. Each attempt gets its own `CONNECT_TIMEOUT`: an
+/// address that blackholes the SYN rather than refusing it would otherwise stall on
+/// the OS retry schedule (~127s), and trying several in turn multiplies that wait.
+pub async fn raw_connect_any(
+    targets: &[SocketAddr],
+) -> Result<(RawConn, &SocketAddr), anyhow::Error> {
+    let mut last_err = None;
+    for target in targets {
+        let e = match tokio::time::timeout(CONNECT_TIMEOUT, raw_connect(target)).await {
+            Ok(Ok(conn)) => return Ok((conn, target)),
+            Ok(Err(e)) => e,
+            Err(_) => anyhow!("timed out connecting to {target}"),
+        };
+        debug!("{e:#}");
+        last_err = Some(e);
+    }
+    // only the last failure is reported: with every address of one name refusing for
+    // its own reason, the resolver's order decides which is shown, and a list of them
+    // reads worse than the one the caller most likely cares about
+    Err(last_err.unwrap_or_else(|| anyhow!("no address to dial")))
 }
 
 /// The local side of a forward.
@@ -459,22 +489,71 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_connect_target_passes_through_an_ip_literal() {
-        let addr = resolve_connect_target("tcp://127.0.0.1:4444")
+        let addrs = resolve_connect_target("tcp://127.0.0.1:4444")
             .await
             .unwrap();
-        assert_eq!(addr, "tcp://127.0.0.1:4444".parse().unwrap());
+        assert_eq!(addrs, vec!["tcp://127.0.0.1:4444".parse().unwrap()]);
     }
 
     #[tokio::test]
     async fn resolve_connect_target_resolves_a_hostname() {
-        let addr = resolve_connect_target("tcp://localhost:4444")
+        let addrs = resolve_connect_target("tcp://localhost:4444")
             .await
             .unwrap();
-        let SocketAddr::Tcp(resolved) = addr else {
-            panic!("expected a resolved Tcp address, got {addr:?}");
+        // every address the name has, not just the first: on a dual-stack host that is
+        // both ::1 and 127.0.0.1, and dropping either is what breaks a target listening
+        // on only one of them
+        assert!(!addrs.is_empty());
+        let expected = tokio::net::lookup_host(("localhost", 4444)).await.unwrap();
+        assert_eq!(addrs.len(), expected.count());
+        for addr in &addrs {
+            let SocketAddr::Tcp(resolved) = addr else {
+                panic!("expected a resolved Tcp address, got {addr:?}");
+            };
+            assert_eq!(resolved.port(), 4444);
+            assert!(resolved.ip().is_loopback());
+        }
+    }
+
+    /// The point of the whole change: a name whose first address refuses still reaches
+    /// the target behind its second one.
+    #[tokio::test]
+    async fn raw_connect_any_falls_back_to_a_later_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = SocketAddr::Tcp(listener.local_addr().unwrap());
+        // port 1 on loopback: nothing binds it, and loopback refuses rather than
+        // blackholing, so the first attempt fails fast instead of waiting the timeout
+        let dead: SocketAddr = "tcp://127.0.0.1:1".parse().unwrap();
+
+        let targets = [dead, live.clone()];
+        let Ok((_conn, used)) = raw_connect_any(&targets).await else {
+            panic!("expected the second address to accept");
         };
-        assert_eq!(resolved.port(), 4444);
-        assert!(resolved.ip().is_loopback());
+        assert_eq!(used, &live);
+    }
+
+    #[tokio::test]
+    async fn raw_connect_any_reports_the_last_failure() {
+        let dead: SocketAddr = "tcp://127.0.0.1:1".parse().unwrap();
+        let deader: SocketAddr = "tcp://127.0.0.1:2".parse().unwrap();
+        let Err(err) = raw_connect_any(&[dead, deader]).await else {
+            panic!("expected both addresses to refuse");
+        };
+        assert!(
+            format!("{err:#}").contains("127.0.0.1:2"),
+            "expected the last address in the error, got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_connect_any_rejects_an_empty_list() {
+        let Err(err) = raw_connect_any(&[]).await else {
+            panic!("expected an empty list to fail");
+        };
+        assert!(
+            format!("{err:#}").contains("no address to dial"),
+            "got: {err:#}"
+        );
     }
 
     #[tokio::test]

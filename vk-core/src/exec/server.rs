@@ -1,7 +1,7 @@
 use crate::addr::SocketAddr;
 use crate::framing::{DeSink, SerStream};
 use crate::messages::{self, CmdExec, CmdResult, Message, RunMode, Status};
-use crate::net::{listen, raw_connect};
+use crate::net::{listen, raw_connect_any};
 use crate::pty;
 use crate::status::get_status;
 use anyhow::anyhow;
@@ -324,7 +324,7 @@ async fn do_handle_conn(
                 return Err(anyhow!(msg));
             }
             let req_id = REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let addr = match crate::net::resolve_connect_target(&target).await {
+            let addrs = match crate::net::resolve_connect_target(&target).await {
                 Ok(a) => a,
                 Err(e) => {
                     let msg = format!("invalid connect target {target:?}: {e:#}");
@@ -332,7 +332,7 @@ async fn do_handle_conn(
                     return Err(anyhow!("connect [{req_id}] {msg}"));
                 }
             };
-            srv_run_connect(req_id, stream, sink, addr)
+            srv_run_connect(req_id, stream, sink, &addrs)
                 .await
                 .and(Ok(false))
         }
@@ -966,10 +966,12 @@ async fn srv_run_cmd(
     Ok(())
 }
 
-/// `CmdConnect`: dial `target` and splice raw bytes to it, framed the same way a
-/// `CmdExec`'s stdio is (see [`Message::CmdConnect`]). Reuses the exec session's
-/// `reader_task`/`writer_task` pump against the dialed connection instead of a child
-/// process's stdio — one stream each way (Stdout out, Stdin in), no exit code.
+/// `CmdConnect`: dial `targets` — the addresses the target name resolved to, tried in
+/// order (see [`raw_connect_any`]) — and splice raw bytes to the one that accepts,
+/// framed the same way a `CmdExec`'s stdio is (see [`Message::CmdConnect`]). Reuses
+/// the exec session's `reader_task`/`writer_task` pump against the dialed connection
+/// instead of a child process's stdio — one stream each way (Stdout out, Stdin in),
+/// no exit code.
 async fn srv_run_connect(
     req_id: usize,
     mut stream: impl Stream<Item = Result<Message, std::io::Error>>
@@ -977,14 +979,16 @@ async fn srv_run_connect(
     + Send
     + 'static,
     mut sink: impl Sink<Message, Error = std::io::Error> + Unpin + Send + 'static,
-    target: SocketAddr,
+    targets: &[SocketAddr],
 ) -> Result<(), anyhow::Error> {
-    info!("connect [{req_id}] {target}");
-    let conn = match raw_connect(&target).await {
-        Ok(c) => c,
+    let conn = match raw_connect_any(targets).await {
+        Ok((conn, target)) => {
+            info!("connect [{req_id}] {target}");
+            conn
+        }
         Err(e) => {
             sink.send(Message::StartErr { msg: e.to_string() }).await?;
-            return Err(anyhow!("connect [{req_id}] dialing {target}: {e:#}"));
+            return Err(anyhow!("connect [{req_id}] {e:#}"));
         }
     };
     sink.send(Message::StartOK).await?;
