@@ -110,6 +110,54 @@ async fn unix_exec_roundtrip() {
     assert_eq!(stdout, b"hi\n");
 }
 
+/// A process outliving the command inherits its stdout and stderr pipes, so the
+/// readers never see end-of-file. The session must still end on the command's own exit.
+#[tokio::test]
+async fn exec_ends_when_a_leftover_process_holds_the_pipes() {
+    let addr = start_server("exec-leftover").await;
+
+    let (mut stream, mut sink) = connect(&addr).await.unwrap();
+    sink.send(Message::CmdExec(CmdExec {
+        name: "sh".into(),
+        args: vec!["-c".into(), "sleep 5 & echo bye".into()],
+        env: vec![],
+        clear_env: false,
+        mode: RunMode::Interactive,
+        tty: None,
+        dir: None,
+        user: AMBIENT_USER,
+    }))
+    .await
+    .unwrap();
+
+    let started = Instant::now();
+    let mut stdout = Vec::new();
+    let code = timeout(Duration::from_secs(10), async {
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            Message::StartOK
+        ));
+        loop {
+            match stream.next().await.unwrap().unwrap() {
+                Message::Data {
+                    fd: Fd::Stdout,
+                    msg,
+                } => stdout.extend(msg),
+                Message::ExecDone(result) => return result.code,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(code, Some(0));
+    assert_eq!(stdout, b"bye\n");
+    // the session ends on the drain's grace period, not on the leftover's lifetime
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+}
+
 /// `CmdConnect` end to end at the protocol level: dial an echo server through the
 /// agent and get bytes back framed as an exec session's Stdout would be.
 #[tokio::test]

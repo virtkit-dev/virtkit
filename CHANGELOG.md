@@ -48,6 +48,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- `vk exec` without `--tty` ends when the command it ran ends, the way it already does
+  with one. A command that left behind a process still holding its output — a daemon, or
+  a background job it never waited for — never gave back an exit code, and the session
+  stayed open for as long as that process lived.
 - `vk exec --tty` ends when the command it ran ends. A command that left behind a
   process still holding the terminal — a daemon, or anything that survives the hangup
   sent when the shell exits — kept the session open, so exiting the shell gave back no

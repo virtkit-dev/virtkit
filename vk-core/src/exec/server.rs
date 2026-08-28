@@ -608,14 +608,36 @@ fn apply_user(command: &mut Command, cmd: &CmdExec, user: &str) {
     }
 }
 
-/// Once the command exits, its trailing terminal output is already sitting in the pty
+/// Once the command exits, its trailing output is already sitting in the pipe or pty
 /// buffer, so draining it to the client takes milliseconds. Bound that drain anyway:
-/// a process the command left behind — a daemon, or anything that survives the SIGHUP
-/// the kernel sends when the session leader exits — keeps a slave handle open, so the
-/// master never reaches EIO and an unbounded drain would leave the session hanging
-/// after the command itself is long gone. The bound is wall clock, not progress: a
-/// client too slow to take 500ms of output loses the tail, which beats hanging on it.
-const PTY_DRAIN_GRACE: Duration = Duration::from_millis(500);
+/// the reader tasks end on end-of-file, and a process the command left behind — a
+/// daemon, or anything that survives the SIGHUP the kernel sends when a pty's session
+/// leader exits — holds the other end open and never lets that happen, so an unbounded
+/// drain would leave the session hanging after the command itself is long gone. The
+/// bound is wall clock, not progress: a client too slow to take 500ms of output loses
+/// the tail, which beats hanging on it.
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+/// Wait for one of a command's stdio tasks to run out of work, giving up at `deadline`;
+/// the returned flag says whether it got there on its own. Reaps the task either way —
+/// that is what drops its end of the command's stdio, so the pipe or pty is closed by
+/// the time the session ends — and propagates a panic inside it, which must not pass
+/// for a clean drain.
+async fn drain_until(
+    handle: &mut task::JoinHandle<()>,
+    deadline: time::Instant,
+) -> Result<bool, task::JoinError> {
+    if let Ok(joined) = time::timeout_at(deadline, &mut *handle).await {
+        return joined.map(|()| true);
+    }
+    handle.abort();
+    match handle.await {
+        Ok(()) => Ok(false),
+        // the cancellation we just asked for
+        Err(err) if err.is_cancelled() => Ok(false),
+        Err(err) => Err(err),
+    }
+}
 
 /// `exec --tty`: run the command on a pty. One output stream (the terminal, sent as
 /// Fd::Stdout), stdin bytes go to the master, Resize messages drive TIOCSWINSZ.
@@ -743,19 +765,10 @@ async fn srv_run_cmd_tty(
     if status.signal().is_some() {
         copy_out.abort();
         let _ = copy_out.await;
-    } else {
-        match time::timeout(PTY_DRAIN_GRACE, &mut copy_out).await {
-            // a panic in the drain must not pass for a clean end of session
-            Ok(joined) => joined?,
-            Err(_elapsed) => {
-                // no EIO within the grace period: a process outliving the command still
-                // holds a slave handle. Report the exit now rather than waiting on a pty
-                // nobody is reading.
-                info!("command [{req_id}] pty still held after exit, ending the session anyway");
-                copy_out.abort();
-                let _ = copy_out.await;
-            }
-        }
+    } else if !drain_until(&mut copy_out, time::Instant::now() + OUTPUT_DRAIN_GRACE).await? {
+        // no EIO within the grace period: a process outliving the command still holds a
+        // slave handle. Report the exit rather than wait on a pty nobody is reading.
+        info!("command [{req_id}] pty still held after exit, ending the session anyway");
     }
     // both halves of the master are dropped by now, so the pty is closed and whatever
     // still holds a slave sees its terminal go away
@@ -829,14 +842,14 @@ async fn srv_run_cmd(
     // async task to read from stdout
     let tx_out = tx.clone();
     let stdout = child.stdout.take().unwrap();
-    let copy_out = tokio::spawn(async move {
+    let mut copy_out = tokio::spawn(async move {
         reader_task(req_id, crate::messages::Fd::Stdout, stdout, tx_out).await;
     });
 
     // async task to read from stderr
     let tx_err = tx.clone();
     let stderr = child.stderr.take().unwrap();
-    let copy_err = tokio::spawn(async move {
+    let mut copy_err = tokio::spawn(async move {
         reader_task(req_id, crate::messages::Fd::Stderr, stderr, tx_err).await;
     });
 
@@ -847,7 +860,7 @@ async fn srv_run_cmd(
 
     let mut stdin = child.stdin.take().unwrap();
 
-    let write_stdin = tokio::spawn(async move {
+    let mut write_stdin = tokio::spawn(async move {
         while let Some(data) = stdin_rx.recv().await {
             debug!("copy_stdin_task, writing {} bytes", data.len());
             if stdin.write_all(&data).await.is_ok() {
@@ -920,16 +933,24 @@ async fn srv_run_cmd(
             error: None,
         })
         .await;
+    // wait() has reaped the pid, so a disconnect handled from here on would SIGKILL a
+    // recycled process group: stop reading the client before anything that can block.
+    // Reaping the task also drops the stdin channel, which is what ends write_stdin.
     client_stream_reader.abort();
-    drop(client_stream_reader);
+    let _ = client_stream_reader.await;
     if status.signal().is_some() {
         copy_out.abort();
         copy_err.abort();
         write_stdin.abort();
     } else {
-        copy_out.await?;
-        copy_err.await?;
-        write_stdin.await?;
+        // one budget for the three of them, not one each
+        let deadline = time::Instant::now() + OUTPUT_DRAIN_GRACE;
+        let drained = drain_until(&mut copy_out, deadline).await?
+            & drain_until(&mut copy_err, deadline).await?
+            & drain_until(&mut write_stdin, deadline).await?;
+        if !drained {
+            info!("command [{req_id}] stdio still held after exit, ending the session anyway");
+        }
     }
     let _ = tx
         .send(Message::ExecDone(CmdResult {
