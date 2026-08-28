@@ -47,6 +47,7 @@ pub mod auth;
 pub(crate) mod browse;
 pub mod client;
 pub mod config;
+pub(crate) mod forms;
 pub(crate) mod html;
 pub(crate) mod keys;
 pub mod lock;

@@ -6,10 +6,8 @@
 //! `authorize` lets only an admin session write: a plain session that could mint one
 //! would have a way around that rule. A plain session can still create read-only keys.
 //!
-//! State-changing requests carry a synchronizer CSRF token: the session's own
-//! `csrf_secret` (`accounts::Db::session_csrf`), echoed back as a hidden form field and
-//! compared in constant time. A form served from another origin cannot read that value,
-//! so it cannot forge one of these POSTs.
+//! State-changing requests carry the CSRF token every settings form does, and end on the
+//! shared error pages — see [`crate::forms`].
 
 use std::time::{Duration, SystemTime};
 
@@ -20,11 +18,11 @@ use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 
 use crate::accounts::{self, Action, ApiKey, Db, Principal, Scope, User};
+use crate::forms::{
+    csrf_of, csrf_ok, csrf_rejected, form_body, see_other, server_error, too_large,
+};
 use crate::html::{self, page, respond};
-use crate::{collect_capped, html_escape, query_param};
-
-/// Cap on a form POSTed here — a handful of short fields.
-const MAX_FORM_BODY: usize = 8 * 1024;
+use crate::{html_escape, query_param};
 
 /// The longest life a key may be given. Ten years is past any sensible CI credential's
 /// rotation, and it keeps the seconds arithmetic below far from overflowing.
@@ -217,85 +215,6 @@ async fn revoke(
     }
 }
 
-/// Read a form body, or `None` if it is over [`MAX_FORM_BODY`] or is not UTF-8.
-///
-/// Strict, not `from_utf8_lossy`: a `name` is stored and rendered back, and substituting
-/// U+FFFD for bytes the client never sent would both corrupt it silently and make
-/// `validate_key_input`'s control-character rule meaningless.
-async fn form_body(req: Request<Incoming>) -> Option<String> {
-    let bytes = collect_capped(req, MAX_FORM_BODY).await.ok()?;
-    String::from_utf8(bytes.to_vec()).ok()
-}
-
-/// A POST that changed something answers `303`, so a refresh re-fetches the listing
-/// instead of re-submitting the form.
-fn see_other(location: &str) -> Result<Response<Full<Bytes>>> {
-    Response::builder()
-        .status(StatusCode::SEE_OTHER)
-        .header(hyper::header::LOCATION, location)
-        .header(hyper::header::CACHE_CONTROL, "no-store")
-        .body(Full::new(Bytes::new()))
-        .map_err(Into::into)
-}
-
-/// `submitted`'s `csrf` field must equal the session's own `csrf_secret`, compared in
-/// constant time. A form posted from anywhere but a page this server rendered for this
-/// session cannot have read that value, so this rejects a missing or wrong field, a
-/// token from a different session, and a request with no session cookie at all.
-fn csrf_ok(db: &Db, session_id: Option<&str>, submitted_body: &str) -> bool {
-    let Some(expected) = csrf_of(db, session_id) else {
-        return false;
-    };
-    match query_param(submitted_body, "csrf") {
-        Some(p) => crate::auth::constant_eq(expected.as_bytes(), p.as_bytes()),
-        None => false,
-    }
-}
-
-/// The session's CSRF secret, for embedding in the forms this module renders.
-fn csrf_of(db: &Db, session_id: Option<&str>) -> Option<String> {
-    let id = session_id?;
-    match db.session_csrf(id) {
-        Ok(v) => v,
-        // The page renders fine without it; the forms on it will simply be refused, and
-        // the log says why.
-        Err(e) => {
-            eprintln!("vk-registry: reading a session's CSRF secret: {e:#}");
-            None
-        }
-    }
-}
-
-fn csrf_rejected(db: &Db, user: &User, session_id: Option<&str>) -> Response<Full<Bytes>> {
-    html::error(
-        StatusCode::FORBIDDEN,
-        Some(&Principal::Session(user.clone())),
-        csrf_of(db, session_id).as_deref(),
-        "That request did not come from this page",
-        "Its security token was missing or stale. Reload the page and try again.",
-    )
-}
-
-fn too_large(db: &Db, user: &User, session_id: Option<&str>) -> Response<Full<Bytes>> {
-    html::error(
-        StatusCode::PAYLOAD_TOO_LARGE,
-        Some(&Principal::Session(user.clone())),
-        csrf_of(db, session_id).as_deref(),
-        "That form was too large",
-        "Shorten the fields and try again.",
-    )
-}
-
-fn server_error(db: &Db, user: &User, session_id: Option<&str>) -> Response<Full<Bytes>> {
-    html::error(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Some(&Principal::Session(user.clone())),
-        csrf_of(db, session_id).as_deref(),
-        "Something went wrong",
-        "The server could not complete that. Try again shortly.",
-    )
-}
-
 fn list_page(
     db: &Db,
     user: &User,
@@ -446,49 +365,6 @@ fn ymd(t: Option<SystemTime>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A store of this test's own. Unit tests run as threads in one process, so the pid
-    /// alone does not separate two of them — the caller's tag does.
-    fn store_for(tag: &str) -> Db {
-        let dir = std::env::temp_dir().join(format!("vk-keys-test-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        Db::open(&dir.join("registry.db")).unwrap()
-    }
-
-    #[test]
-    fn csrf_ok_requires_this_sessions_token() {
-        let db = store_for("csrf");
-        let user = db
-            .upsert_user("https://issuer", "sub-1", None, None)
-            .unwrap();
-        let session = db
-            .create_session(&user.id, Duration::from_secs(3600))
-            .unwrap();
-        let real_csrf = db.session_csrf(&session).unwrap().unwrap();
-
-        assert!(csrf_ok(&db, Some(&session), &format!("csrf={real_csrf}")));
-        assert!(!csrf_ok(&db, Some(&session), "csrf=wrong"));
-        // the cross-site shape: a POST with no token at all
-        assert!(!csrf_ok(&db, Some(&session), "name=x&action=read"));
-        assert!(!csrf_ok(&db, Some(&session), ""));
-        assert!(!csrf_ok(&db, None, &format!("csrf={real_csrf}")));
-        assert!(!csrf_ok(
-            &db,
-            Some("no-such-session"),
-            &format!("csrf={real_csrf}")
-        ));
-
-        // and a token minted for a different session does not carry over
-        let other = db
-            .upsert_user("https://issuer", "sub-2", None, None)
-            .unwrap();
-        let other_session = db
-            .create_session(&other.id, Duration::from_secs(3600))
-            .unwrap();
-        let other_csrf = db.session_csrf(&other_session).unwrap().unwrap();
-        assert_ne!(real_csrf, other_csrf);
-        assert!(!csrf_ok(&db, Some(&session), &format!("csrf={other_csrf}")));
-    }
 
     /// `/settings/keys/revoke` matches both the prefix and the suffix test with nothing
     /// between them; computing the id by offset arithmetic panics on it.
