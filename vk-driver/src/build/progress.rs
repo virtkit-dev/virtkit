@@ -5,7 +5,8 @@
 //! plus one line per `RUN`/`COPY` per needed stage, and a final `exporting` line.
 //!
 //! Rendering is delegated to [`indicatif`], which handles the terminal quirks that a
-//! hand-rolled ANSI renderer gets wrong across emulators and multiplexers (tmux/zellij):
+//! hand-rolled ANSI renderer gets wrong across emulators and multiplexers (tmux/zellij) —
+//! all but a terminal resize, which [`ResizeTerm`] recovers from on indicatif's behalf:
 //! a header bar plus one live spinner line per in-flight step stay pinned at the bottom,
 //! while completed/cached steps and each guest command's (stage-prefixed) output scroll
 //! into history above them while the live block is temporarily suspended. Three modes,
@@ -20,13 +21,15 @@
 //! line-buffered and stage-prefixed instead of interleaving unattributed.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle, TermLike};
 use vk_core::messages::Fd;
+use vk_core::pty::get_winsize;
 
 use crate::executor::OutputSink;
 
@@ -806,11 +809,21 @@ impl Progress {
 
 impl Tty {
     fn new() -> Self {
-        let mp = MultiProgress::with_draw_target(ProgressDrawTarget::stdout());
+        // `ProgressDrawTarget::stdout` cannot be used — the resize recovery needs `ResizeTerm` as
+        // the target — so its off-a-terminal check is made here instead, and it is the whole of
+        // what is reproduced. `stdout` also hides on `console::is_dumb()`, which counts an *unset*
+        // `TERM` as dumb where `Progress::new` counts only `TERM=dumb`: a real terminal with no
+        // `TERM` used to reach a hidden target and so print nothing at all, neither dashboard nor
+        // step log.
+        let target = if io::stdout().is_terminal() {
+            // 20 Hz, the refresh rate `ProgressDrawTarget::stdout` sets.
+            ProgressDrawTarget::term_like_with_hz(Box::new(ResizeTerm::new()), 20)
+        } else {
+            ProgressDrawTarget::hidden()
+        };
+        let mp = MultiProgress::with_draw_target(target);
         // Rule first, so it sits at the top of the pinned block, just under the log.
-        let sep = mp.add(ProgressBar::new_spinner());
-        sep.set_style(ProgressStyle::with_template("{msg:.dim}").unwrap());
-        sep.set_message("─".repeat(term_cols()));
+        let sep = sep_bar(&mp);
         let header = mp.add(ProgressBar::new_spinner());
         header.set_style(
             ProgressStyle::with_template("{prefix} {elapsed} ({msg})")
@@ -835,8 +848,9 @@ impl Tty {
 
     /// Write a raw control sequence to the terminal, serialized against indicatif's draws by
     /// the shared stdout lock. No-op when title updates are disabled or the target is hidden.
-    /// The save (`Tty::new`) and restore (`Drop`) go through the same gate, and `is_hidden()`
-    /// is stable for a stdout draw target's lifetime, so the stack push/pop stay paired.
+    /// The save (`Tty::new`) and restore (`Drop`) go through the same gate, and the draw
+    /// target is chosen once in `Tty::new`, so `is_hidden()` cannot change under the dashboard
+    /// and the stack push/pop stay paired.
     fn write_seq(&self, seq: &str) {
         if !self.title || self.mp.is_hidden() {
             return;
@@ -885,27 +899,253 @@ impl Drop for Tty {
     }
 }
 
-/// The controlling terminal's column count (for the separator rule), or 80 if unknown.
+/// The [`TermLike`] indicatif draws the pinned block through: stdout, plus the terminal-resize
+/// recovery indicatif does not do itself.
+struct ResizeTerm {
+    state: Mutex<Frame>,
+    /// the terminal's `(columns, rows)` source — [`term_size`], swapped out by the tests.
+    size: Box<dyn Fn() -> (u16, u16) + Send + Sync>,
+    /// where a finished frame goes — [`write_stdout`], swapped out by the tests.
+    sink: Box<FrameSink>,
+}
+
+/// Where [`ResizeTerm`] writes a finished frame. A named type because the boxed signature
+/// trips `clippy::type_complexity` inline.
+type FrameSink = dyn Fn(&[u8]) -> io::Result<()> + Send + Sync;
+
+impl fmt::Debug for ResizeTerm {
+    /// [`TermLike`] requires it. Neither hook has a representation worth printing, so the
+    /// bookkeeping is the whole of it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResizeTerm")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+/// [`ResizeTerm`]'s per-draw bookkeeping.
+#[derive(Debug, Default)]
+struct Frame {
+    /// the open draw's bytes, held back until it ends and then written under one stdout
+    /// lock, so a frame never reaches the terminal half-written.
+    buf: Vec<u8>,
+    /// the width the frame now on screen was drawn at, or `None` when the screen holds no
+    /// frame: before the first draw, and after a draw that emitted no line (the erase half of
+    /// `MultiProgress::suspend`).
+    drawn_width: Option<u16>,
+    /// the width the open draw is laying its lines out at: sampled when the draw opens and
+    /// again on each of indicatif's `width` calls, the last of which is the one it lays the
+    /// frame out against.
+    render_width: u16,
+    /// a draw is open: the first byte-emitting call opens one, `flush` closes it.
+    drawing: bool,
+    /// the open draw is the first at a new width, so its erase phase is suppressed.
+    recovering: bool,
+    /// the open draw still owes the fresh row a recovery starts on. It is opened by the
+    /// draw's first line, or by `end_draw` when there is none (the erase half of
+    /// `MultiProgress::suspend`) — either way it only ends the stale frame's last row, so the
+    /// log lines that follow start clean and no blank row is spent.
+    open_row: bool,
+    /// the open draw has emitted a line, so it leaves a frame on screen.
+    wrote: bool,
+}
+
+impl ResizeTerm {
+    fn new() -> Self {
+        Self::with(term_size, write_stdout)
+    }
+
+    fn with(
+        size: impl Fn() -> (u16, u16) + Send + Sync + 'static,
+        sink: impl Fn(&[u8]) -> io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        ResizeTerm {
+            state: Mutex::new(Frame::default()),
+            size: Box::new(size),
+            sink: Box::new(sink),
+        }
+    }
+
+    /// Open a draw (a no-op once one is open) and decide whether it has to recover from a
+    /// resize. Every [`TermLike`] method that appends a byte calls this first, so the decision
+    /// is taken from the state the draw actually starts in whichever call indicatif leads
+    /// with — today always `move_cursor_up`, but nothing in the trait promises that.
+    fn begin(&self, f: &mut Frame) {
+        if f.drawing {
+            return;
+        }
+        let cols = (self.size)().0;
+        f.drawing = true;
+        f.wrote = false;
+        f.recovering = f.drawn_width.is_some_and(|w| w != cols);
+        f.open_row = f.recovering;
+        // A width for `end_draw` to record even if indicatif never asks for one.
+        f.render_width = cols;
+    }
+
+    /// Close the open draw and take its bytes, recording whether it left a frame on screen and
+    /// at which width — the baseline the next draw's resize check compares against.
+    fn end_draw(&self) -> Vec<u8> {
+        let mut f = self.state.lock().unwrap();
+        // A recovering draw that wrote nothing still owes the row break: without it the
+        // cursor stays wherever the abandoned frame left it — mid-row, since that frame was
+        // padded to the old width — and the next log line is glued onto its tail.
+        if std::mem::take(&mut f.open_row) {
+            f.buf.extend_from_slice(b"\r\n");
+        }
+        f.drawn_width = f.wrote.then_some(f.render_width);
+        f.drawing = false;
+        f.recovering = false;
+        std::mem::take(&mut f.buf)
+    }
+}
+
+impl Frame {
+    /// Append `bytes` as part of a line, first opening the fresh row a resize recovery owes:
+    /// the stale frame is abandoned where it lies and this draw starts under it.
+    fn put(&mut self, bytes: &[u8]) {
+        if std::mem::take(&mut self.open_row) {
+            self.buf.extend_from_slice(b"\r\n");
+        }
+        self.wrote = true;
+        self.buf.extend_from_slice(bytes);
+    }
+}
+
+impl TermLike for ResizeTerm {
+    /// Sampled fresh per call: indicatif lays every line out against it, so a widened terminal
+    /// is used immediately, and [`ResizeTerm::end_draw`] records it as the drawn width.
+    fn width(&self) -> u16 {
+        let cols = (self.size)().0;
+        self.state.lock().unwrap().render_width = cols;
+        cols
+    }
+
+    fn height(&self) -> u16 {
+        (self.size)().1
+    }
+
+    fn move_cursor_up(&self, n: usize) -> io::Result<()> {
+        let mut f = self.state.lock().unwrap();
+        self.begin(&mut f);
+        if !f.recovering {
+            move_cursor(&mut f.buf, n, 'A');
+        }
+        Ok(())
+    }
+
+    fn move_cursor_down(&self, n: usize) -> io::Result<()> {
+        let mut f = self.state.lock().unwrap();
+        self.begin(&mut f);
+        if !f.recovering {
+            move_cursor(&mut f.buf, n, 'B');
+        }
+        Ok(())
+    }
+
+    /// Horizontal moves are neither erase nor content, so they neither suppress under a
+    /// recovery nor open its fresh row — they only reposition within the row the draw is
+    /// already on. indicatif's own draws never emit one.
+    fn move_cursor_right(&self, n: usize) -> io::Result<()> {
+        let mut f = self.state.lock().unwrap();
+        self.begin(&mut f);
+        move_cursor(&mut f.buf, n, 'C');
+        Ok(())
+    }
+
+    fn move_cursor_left(&self, n: usize) -> io::Result<()> {
+        let mut f = self.state.lock().unwrap();
+        self.begin(&mut f);
+        move_cursor(&mut f.buf, n, 'D');
+        Ok(())
+    }
+
+    fn write_line(&self, s: &str) -> io::Result<()> {
+        let mut f = self.state.lock().unwrap();
+        self.begin(&mut f);
+        f.put(s.as_bytes());
+        f.buf.push(b'\n');
+        Ok(())
+    }
+
+    fn write_str(&self, s: &str) -> io::Result<()> {
+        let mut f = self.state.lock().unwrap();
+        self.begin(&mut f);
+        f.put(s.as_bytes());
+        Ok(())
+    }
+
+    /// Clearing a row is the erase phase, so it too is skipped while recovering.
+    fn clear_line(&self) -> io::Result<()> {
+        let mut f = self.state.lock().unwrap();
+        self.begin(&mut f);
+        if !f.recovering {
+            f.buf.extend_from_slice(b"\r\x1b[2K");
+        }
+        Ok(())
+    }
+
+    /// indicatif ends every draw with a flush, so this is where a whole frame reaches the
+    /// terminal — under one stdout lock, taken without holding the frame lock across it. A
+    /// draw that emitted nothing at all skips the write rather than syscalling for zero bytes.
+    fn flush(&self) -> io::Result<()> {
+        let frame = self.end_draw();
+        if frame.is_empty() {
+            return Ok(());
+        }
+        (self.sink)(&frame)
+    }
+}
+
+/// The rule at the top of the pinned block, added to `mp`.
+///
+/// It is a `wide_bar` filled to `position == len`, with `─` as both its filled and its empty
+/// cluster so that any width renders as a solid rule — not a message of that many dashes,
+/// because indicatif re-fits a `wide_bar` to the terminal every time it renders the bar, which
+/// is what makes the rule follow a resize. That only happens when the bar itself ticks: a
+/// member that does not is re-emitted from indicatif's cached lines, frozen at the width it
+/// last rendered at. Hence the steady tick, matching the header's.
+fn sep_bar(mp: &MultiProgress) -> ProgressBar {
+    let sep = mp.add(ProgressBar::new(1));
+    sep.set_style(
+        ProgressStyle::with_template("{wide_bar:.dim}")
+            .unwrap()
+            .progress_chars("──"),
+    );
+    sep.set_position(1);
+    sep.enable_steady_tick(Duration::from_millis(120));
+    sep
+}
+
+/// [`ResizeTerm`]'s production sink: a finished frame, written and flushed under one lock,
+/// so nothing else on stdout can land inside it.
+fn write_stdout(frame: &[u8]) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    out.write_all(frame)?;
+    out.flush()
+}
+
+/// Append a CSI cursor move of `n` cells in `dir` (`A` up, `B` down, `C` right, `D` left).
+/// A zero-cell move emits nothing: terminals read a zero parameter as one cell.
+fn move_cursor(buf: &mut Vec<u8>, n: usize, dir: char) {
+    if n > 0 {
+        buf.extend_from_slice(format!("\x1b[{n}{dir}").as_bytes());
+    }
+}
+
+/// The controlling terminal's `(columns, rows)`, each falling back to the conventional 80x24
+/// when the terminal does not report it.
+fn term_size() -> (u16, u16) {
+    let (rows, cols) = get_winsize(libc::STDOUT_FILENO).unwrap_or((0, 0));
+    (
+        if cols > 0 { cols } else { 80 },
+        if rows > 0 { rows } else { 24 },
+    )
+}
+
+/// The controlling terminal's column count, or 80 if unknown.
 fn term_cols() -> usize {
-    #[repr(C)]
-    struct WinSize {
-        row: libc::c_ushort,
-        col: libc::c_ushort,
-        x: libc::c_ushort,
-        y: libc::c_ushort,
-    }
-    let mut ws = WinSize {
-        row: 0,
-        col: 0,
-        x: 0,
-        y: 0,
-    };
-    let r = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
-    if r == 0 && ws.col > 0 {
-        ws.col as usize
-    } else {
-        80
-    }
+    term_size().0 as usize
 }
 
 /// Elapsed as `12.3s` (buildkit style).
@@ -988,6 +1228,8 @@ fn clip(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU16;
+
     use super::*;
 
     fn two_stages() -> Vec<StageInit> {
@@ -1045,6 +1287,199 @@ mod tests {
             Backend::Tty(Box::new(Tty::new())),
             false,
         )));
+    }
+
+    /// The shared handles a [`ResizeTerm`] under test is driven through: a settable terminal
+    /// width, and the bytes its `flush` wrote. Per-instance rather than in statics, so the
+    /// tests stay independent of each other under cargo's parallel runner.
+    struct Screen {
+        cols: Arc<AtomicU16>,
+        out: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Screen {
+        /// An 80x24 screen, plus the `ResizeTerm` that draws to it.
+        fn new() -> (Self, ResizeTerm) {
+            let screen = Screen {
+                cols: Arc::new(AtomicU16::new(80)),
+                out: Arc::new(Mutex::new(Vec::new())),
+            };
+            let (cols, out) = (Arc::clone(&screen.cols), Arc::clone(&screen.out));
+            let term = ResizeTerm::with(
+                move || (cols.load(Ordering::Relaxed), 24),
+                move |bytes| {
+                    out.lock().unwrap().extend_from_slice(bytes);
+                    Ok(())
+                },
+            );
+            (screen, term)
+        }
+
+        fn resize(&self, cols: u16) {
+            self.cols.store(cols, Ordering::Relaxed);
+        }
+
+        /// Everything written since the last call, draining it.
+        fn take(&self) -> String {
+            String::from_utf8(std::mem::take(&mut *self.out.lock().unwrap())).unwrap()
+        }
+    }
+
+    /// The erase phase indicatif opens every draw with, for `rows` previously drawn rows.
+    /// Mirrors `indicatif::DrawState::draw_to_term`.
+    fn erase(t: &ResizeTerm, rows: usize) {
+        t.move_cursor_up(rows.saturating_sub(1)).unwrap();
+        for i in 0..rows {
+            t.clear_line().unwrap();
+            if i + 1 != rows {
+                t.move_cursor_down(1).unwrap();
+            }
+        }
+        t.move_cursor_up(rows.saturating_sub(1)).unwrap();
+        t.width(); // indicatif samples the width to lay the frame out
+    }
+
+    /// A whole draw: the erase phase, then `lines` written back to back the way indicatif
+    /// writes them (its own width padding between them is not what is under test here).
+    /// Returns what reached the screen.
+    fn draw(t: &ResizeTerm, screen: &Screen, rows: usize, lines: &[&str]) -> String {
+        erase(t, rows);
+        for line in lines {
+            t.write_str(line).unwrap();
+        }
+        t.flush().unwrap();
+        screen.take()
+    }
+
+    /// A draw that writes no line — `MultiProgress::clear`, and the first half of its
+    /// `suspend`, which take the block off the screen so the log can scroll under it.
+    fn clear(t: &ResizeTerm, screen: &Screen, rows: usize) -> String {
+        erase(t, rows);
+        t.flush().unwrap();
+        screen.take()
+    }
+
+    /// At a steady width the erase phase passes straight through, so indicatif's own row
+    /// accounting drives the frame exactly as it would against a plain terminal.
+    #[test]
+    fn resize_term_passes_the_erase_through_at_a_steady_width() {
+        let (screen, t) = Screen::new();
+        // The very first draw has no frame to erase and no width to have changed from, so it
+        // is not a recovery either — it just writes.
+        assert_eq!(draw(&t, &screen, 0, &["first frame"]), "first frame");
+        assert_eq!(
+            draw(&t, &screen, 3, &["second frame"]),
+            "\x1b[2A\r\x1b[2K\x1b[1B\r\x1b[2K\x1b[1B\r\x1b[2K\x1b[2Asecond frame"
+        );
+        assert_eq!(clear(&t, &screen, 1), "\r\x1b[2K");
+    }
+
+    /// The first draw at a new width abandons the frame on screen instead of erasing it: no
+    /// cursor motion and no line clears, just a fresh row to draw on. The row count indicatif
+    /// held for that frame described the pre-resize screen, and nothing portable can say what
+    /// the emulator did with those rows.
+    #[test]
+    fn resize_term_skips_the_erase_after_a_resize() {
+        for cols in [60, 100] {
+            let (screen, t) = Screen::new();
+            draw(&t, &screen, 0, &["first frame"]);
+            screen.resize(cols);
+            assert_eq!(draw(&t, &screen, 3, &["after resize"]), "\r\nafter resize");
+            // ...and the frame that recovered is itself the new baseline, so the draw after it
+            // erases normally again.
+            assert!(draw(&t, &screen, 1, &["settled"]).starts_with("\r\x1b[2K"));
+        }
+    }
+
+    /// The fresh row a recovery starts on is opened once, ahead of the frame, however many
+    /// lines that frame turns out to have.
+    #[test]
+    fn resize_term_opens_one_row_for_a_multi_line_recovery() {
+        let (screen, t) = Screen::new();
+        draw(&t, &screen, 0, &["first frame"]);
+        screen.resize(60);
+        assert_eq!(draw(&t, &screen, 2, &["rule", "header"]), "\r\nruleheader");
+    }
+
+    /// A resize noticed by a draw that writes no line costs no blank row: all the recovery
+    /// owes is the break off the abandoned frame's last row, so the log lines that follow land
+    /// under it on a clean row and the redraw beneath them needs no recovery of its own.
+    #[test]
+    fn resize_term_recovery_is_free_for_a_draw_without_lines() {
+        let (screen, t) = Screen::new();
+        draw(&t, &screen, 0, &["first frame"]);
+        screen.resize(60);
+        assert_eq!(clear(&t, &screen, 3), "\r\n");
+        assert_eq!(draw(&t, &screen, 0, &["redrawn"]), "redrawn");
+    }
+
+    /// The size and the horizontal moves are plain pass-throughs, and a zero-cell move emits
+    /// nothing at all (terminals read a zero parameter as one cell).
+    #[test]
+    fn resize_term_passes_size_and_horizontal_moves_through() {
+        let (screen, t) = Screen::new();
+        screen.resize(120);
+        assert_eq!(t.width(), 120);
+        assert_eq!(t.height(), 24);
+        t.move_cursor_right(3).unwrap();
+        t.move_cursor_left(0).unwrap();
+        t.move_cursor_left(2).unwrap();
+        t.flush().unwrap();
+        assert_eq!(screen.take(), "\x1b[3C\x1b[2D");
+    }
+
+    /// The separator rule follows the terminal instead of freezing at the width it was built
+    /// at. Drawn through a real `MultiProgress`, because what makes it follow is indicatif
+    /// re-rendering the bar — which only its own tick triggers.
+    #[test]
+    fn separator_rule_refits_to_the_terminal_width() {
+        let (screen, term) = Screen::new();
+        let mp = MultiProgress::with_draw_target(ProgressDrawTarget::term_like_with_hz(
+            Box::new(term),
+            20,
+        ));
+        let sep = sep_bar(&mp);
+        assert!(
+            wait_for_rule(&screen, 80),
+            "the rule was never drawn at the terminal's width"
+        );
+        screen.resize(40);
+        assert!(
+            wait_for_rule(&screen, 40),
+            "the rule did not follow the terminal down to 40 columns"
+        );
+        sep.finish_and_clear();
+    }
+
+    /// Poll the screen until the rule it last drew is `cols` glyphs wide. The steady tick
+    /// redraws every 120ms, so only a rule that never re-fits runs out the deadline.
+    fn wait_for_rule(screen: &Screen, cols: usize) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let drawn = screen.take();
+            if !drawn.is_empty() && rule_width(&drawn) == cols {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// The length of the last run of rule glyphs in `s`.
+    fn rule_width(s: &str) -> usize {
+        let mut last = 0;
+        let mut run = 0;
+        for c in s.chars() {
+            if c == '─' {
+                run += 1;
+            } else {
+                if run > 0 {
+                    last = run;
+                }
+                run = 0;
+            }
+        }
+        if run > 0 { run } else { last }
     }
 
     /// The status column sits flush at the right margin: the line fills the width, ends

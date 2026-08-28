@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- `vk build`'s live progress dashboard survives a terminal resize. Resizing the
+  window mid-build used to make the pinned block walk up the screen and overwrite
+  the build log above it, and left its separator rule at the old width.
+- `vk build` reports progress on a terminal that sets no `TERM`. Such a build
+  printed nothing at all — no dashboard, and no per-step log either.
+
 ## [0.44.0] - 2026-08-27
 
 ### Changed
