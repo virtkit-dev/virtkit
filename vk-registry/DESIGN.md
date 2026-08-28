@@ -282,15 +282,17 @@ would. `redb` is pure Rust (no C, no cc-rs build script), so it needs none of th
 links clean. This is the one new piece of infrastructure; content, GC, and locking are
 untouched.
 
-Three tables of JSON-blob rows (`vk-registry/src/accounts.rs`), keyed by stable strings
-instead of an autoincrement id — `redb` has no natural `last_insert_rowid`, and stable
-keys turn out to be available for free:
+Four tables (`vk-registry/src/accounts.rs`), keyed by stable strings instead of an
+autoincrement id — `redb` has no natural `last_insert_rowid`, and stable keys turn out to
+be available for free. The first three hold JSON-blob rows; `repo_captions` holds one
+string, for the reason given below:
 
 ```
 users     : "{oidc_issuer}\x1f{oidc_subject}" -> {email, display_name, is_admin, created_at, last_login_at}
 sessions  : sha256(session_id) hex            -> {user_key, csrf_secret, created_at, expires_at}
 api_keys  : sha256(bearer_token) hex          -> {owner_user_key, name, token_prefix, scopes,
                                                    created_at, expires_at, last_used_at, revoked_at}
+repo_captions : repository name               -> caption (one line of plain text)
 ```
 
 Neither credential is stored in a replayable form: a session row is keyed by the *hash*
@@ -310,6 +312,21 @@ key's secret is never stored: only its hash (the row's key) and `token_prefix` (
 `list_api_keys(owner)` is a linear scan over `api_keys` filtering by
 `owner_user_key` — fine at this data's expected scale (one team/org's users and keys, not
 a hot path), and it avoids needing a secondary owner→keys index.
+
+`repo_captions` is the odd one out: not a credential, not identity, and losing it costs a
+sentence. It rides here because the accounts db is the only store a `/browse` deployment
+already has, and captions are only editable where accounts exist. The caption is what
+`/browse/<repo>` shows above a tag list — set by an admin session from the repository's
+own page (POST `/settings/captions`, since `/browse` answers GET and HEAD only), read by
+everyone who may read the repository. Plain text, validated free of control characters and
+escaped on render: an admin writes it, but other people are shown it. With none stored,
+the page falls back to what it can work out for itself — today, that a repository of
+`snap-`/`base-` content keys named `build-cache` is virtkit's build cache.
+
+A caption outlives its repository: nothing sweeps `repo_captions`, because `gc` works on
+the store and never opens the accounts db. Two consequences, both accepted for a table
+whose rows are one sentence each — a removed repository leaves its caption behind, and a
+name pushed again later comes back wearing it. An admin empties the box to be rid of one.
 
 ### Principal + authz
 

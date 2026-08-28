@@ -45,6 +45,7 @@ pub mod accounts;
 pub mod admin;
 pub mod auth;
 pub(crate) mod browse;
+pub(crate) mod captions;
 pub mod client;
 pub mod config;
 pub(crate) mod forms;
@@ -1462,7 +1463,7 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
             .strip_prefix("/browse")
             .unwrap_or_default()
             .trim_start_matches('/');
-        return browse::route(&state.store, rest, &authz, principal, csrf.as_deref());
+        return browse::route(&state.store, db, rest, &authz, principal, csrf.as_deref());
     }
     if is_settings_path(&path) {
         let (Authenticator::Accounts { db, .. }, Some(p)) = (&state.auth, &principal) else {
@@ -1471,6 +1472,9 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
             // existing and saying so.
             return Ok(error_response(StatusCode::NOT_FOUND, "NOT_FOUND", &path));
         };
+        if path == "/settings/captions" {
+            return captions::route(db, p, state.cookies_are_secure(), req).await;
+        }
         return keys::route(db, p, state.cookies_are_secure(), req).await;
     }
     if is_upload_path(&path) {
@@ -2256,7 +2260,7 @@ fn is_browse_path(path: &str) -> bool {
 }
 
 fn is_settings_path(path: &str) -> bool {
-    path == "/settings/keys" || path.starts_with("/settings/keys/")
+    path == "/settings/keys" || path.starts_with("/settings/keys/") || path == "/settings/captions"
 }
 
 fn is_upload_path(path: &str) -> bool {

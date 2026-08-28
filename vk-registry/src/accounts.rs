@@ -47,6 +47,13 @@ const SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("sessions");
 /// Key: `sha256(bearer token)`, hex. Value: JSON [`ApiKeyRow`].
 const API_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("api_keys");
 
+/// `repository name -> caption`, the one line `/browse/<repo>` shows above a tag list to
+/// say what the repository is. Plain text, not a row struct: there is one field, and a
+/// caption is not identity — losing this table costs a sentence, so it rides in the
+/// accounts db (the only store a `/browse` deployment already has) rather than earning a
+/// file of its own.
+const REPO_CAPTIONS: TableDefinition<&str, &str> = TableDefinition::new("repo_captions");
+
 /// Every API key's bearer string starts with this, so a credential can be recognized as
 /// one of ours before it is hashed and looked up.
 const KEY_PREFIX: &str = "vkr_";
@@ -64,8 +71,18 @@ const MAX_KEY_NAME_LEN: usize = 128;
 const MAX_KEY_SCOPES: usize = 32;
 const MAX_REPO_PATTERN_LEN: usize = 256;
 
+/// The longest repository caption. It is one line above a table, read by whoever opens
+/// the page — long enough for a sentence saying what the repository holds and what
+/// removes an entry from it, short enough that it cannot become the page.
+pub(crate) const MAX_CAPTION_LEN: usize = 300;
+
 /// Both halves of a user key are IdP-supplied, and the pair becomes a redb key.
 const MAX_IDENTITY_LEN: usize = 512;
+
+/// A repository name becomes a redb key too, and `valid_name` bounds its segment count
+/// but not its length. Well past any real `<prefix>/<team>/<repo>` and far short of a form
+/// field's worth.
+const MAX_REPO_NAME_LEN: usize = 512;
 
 /// Cap on an IdP-supplied display claim (`email`, `name`). Like a key's name, these are
 /// stored and rendered back into a page, so the bound belongs here — at the store, so
@@ -285,9 +302,10 @@ impl Db {
         Self::init(db)
     }
 
-    /// In-memory store, for tests.
+    /// In-memory store, for tests. `pub(crate)` since `browse`'s pages read a caption out
+    /// of one — a test of those needs a db, and this is the one that leaves no file.
     #[cfg(test)]
-    fn open_memory() -> Result<Self> {
+    pub(crate) fn open_memory() -> Result<Self> {
         let db = Database::builder()
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .context("opening an in-memory accounts db")?;
@@ -303,6 +321,11 @@ impl Db {
             .context("opening the sessions table")?;
         txn.open_table(API_KEYS)
             .context("opening the api_keys table")?;
+        // Also created here, not on first write: a db from a build before captions
+        // existed is opened by this same call, and a read of a table that was never
+        // created is an error rather than an empty table.
+        txn.open_table(REPO_CAPTIONS)
+            .context("opening the repo_captions table")?;
         txn.commit().context("initializing the accounts db")?;
         Ok(Db { db })
     }
@@ -509,6 +532,34 @@ impl Db {
             .transpose()?
             .filter(|row| row.expires_at > now_secs())
             .map(|row| row.csrf_secret))
+    }
+
+    /// The caption set for `repo`, if any. Absent is the normal case: a repository with
+    /// nothing said about it renders whatever `/browse` can work out for itself.
+    pub fn repo_caption(&self, repo: &str) -> Result<Option<String>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let captions = txn.open_table(REPO_CAPTIONS)?;
+        Ok(captions.get(repo)?.map(|g| g.value().to_string()))
+    }
+
+    /// Set `repo`'s caption, or remove it when `caption` is empty after trimming.
+    pub fn set_repo_caption(&self, repo: &str, caption: &str) -> Result<()> {
+        if repo.len() > MAX_REPO_NAME_LEN || !crate::valid_name(repo) {
+            bail!("{repo:?} is not a repository name a caption can be stored under");
+        }
+        let caption = caption.trim();
+        validate_caption(caption)?;
+        let txn = self.db.begin_write().context("starting a write")?;
+        {
+            let mut captions = txn.open_table(REPO_CAPTIONS)?;
+            if caption.is_empty() {
+                captions.remove(repo)?;
+            } else {
+                captions.insert(repo, caption)?;
+            }
+        }
+        txn.commit().context("writing a repository caption")?;
+        Ok(())
     }
 
     pub fn delete_session(&self, id: &str) -> Result<()> {
@@ -1011,6 +1062,20 @@ pub fn validate_key_input(name: &str, scopes: &[Scope]) -> Result<()> {
     validate_scopes(scopes)
 }
 
+/// A caption is one line of plain text, bounded and free of control characters.
+pub(crate) fn validate_caption(caption: &str) -> Result<()> {
+    if caption.len() > MAX_CAPTION_LEN {
+        bail!(
+            "a caption may not exceed {MAX_CAPTION_LEN} bytes (got {})",
+            caption.len()
+        );
+    }
+    if caption.chars().any(char::is_control) {
+        bail!("a caption is one line: it may not contain control characters");
+    }
+    Ok(())
+}
+
 /// A grant has to say exactly what it covers, so only the three shapes [`Scope::allows`]
 /// documents are accepted. Anything else — a bare `team-a*`, a pattern with a control
 /// character, an empty one — is rejected where it enters the store rather than quietly
@@ -1344,6 +1409,92 @@ mod tests {
         assert!(db.upsert_user("iss", "", None, None).is_err());
         assert!(db.upsert_user("iss\n", "sub", None, None).is_err());
         Ok(())
+    }
+
+    /// A caption round-trips, is trimmed, and clears through the same call that sets it —
+    /// the edit box has one field, so emptying it is the only way back.
+    #[test]
+    fn a_repo_caption_round_trips_and_clears() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(db.repo_caption("team-a/app").unwrap(), None);
+
+        db.set_repo_caption("team-a/app", "  the team-a app  ")
+            .unwrap();
+        assert_eq!(
+            db.repo_caption("team-a/app").unwrap().as_deref(),
+            Some("the team-a app")
+        );
+        // one repository's caption is its own
+        assert_eq!(db.repo_caption("team-b/app").unwrap(), None);
+
+        for empty in ["", "   "] {
+            db.set_repo_caption("team-a/app", "kept").unwrap();
+            db.set_repo_caption("team-a/app", empty).unwrap();
+            assert_eq!(
+                db.repo_caption("team-a/app").unwrap(),
+                None,
+                "an empty caption is removed, not stored"
+            );
+        }
+
+        // and what it refuses is refused at the store, not only at the form
+        assert!(db.set_repo_caption("team-a/app", "two\nlines").is_err());
+        assert!(
+            db.set_repo_caption("team-a/app", &"x".repeat(MAX_CAPTION_LEN + 1))
+                .is_err()
+        );
+        assert_eq!(db.repo_caption("team-a/app").unwrap(), None);
+    }
+
+    /// The *key* is bounded here and not only by the route, since it is a redb key: a
+    /// second caller — the `accounts` CLI, another route — gets the same refusal.
+    #[test]
+    fn a_repo_caption_needs_a_repository_name_redb_can_key_on() {
+        let db = Db::open_memory().unwrap();
+        for repo in [
+            "",
+            "../etc",
+            "team-a/..",
+            "team-a//app",
+            "team-a/blobs",
+            "team a/app",
+        ] {
+            assert!(
+                db.set_repo_caption(repo, "x").is_err(),
+                "{repo:?} was accepted as a caption key"
+            );
+        }
+        // and a name far past any real `<prefix>/<team>/<repo>`, which `valid_name` bounds
+        // by segment count but not by length
+        let long = format!("a/{}", "b".repeat(MAX_REPO_NAME_LEN));
+        assert!(db.set_repo_caption(&long, "x").is_err());
+        assert_eq!(db.repo_caption(&long).unwrap(), None);
+
+        db.set_repo_caption("team-a/app", "x").unwrap();
+    }
+
+    /// The captions table is created by `init`, not by the first write, so a db written by
+    /// a build that predates captions reads back an absent caption rather than an error.
+    /// Needs a file: an in-memory backend cannot be reopened, which is the whole case.
+    #[test]
+    fn a_db_reopened_reads_a_caption_table_that_was_never_written() {
+        let dir = std::env::temp_dir().join(format!("vk-caption-reopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("accounts.db");
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.repo_caption("team-a/app").unwrap(), None);
+        drop(db);
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.repo_caption("team-a/app").unwrap(),
+            None,
+            "a reopened db must read an untouched captions table as empty, not as an error"
+        );
+        db.set_repo_caption("team-a/app", "written after a reopen")
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

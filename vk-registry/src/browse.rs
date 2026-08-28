@@ -15,12 +15,14 @@
 //! repository name with a `manifests` component is the one ambiguous case — the split
 //! takes the last one — and it is ambiguous on `/v2/` in exactly the same way.
 
+use std::borrow::Cow;
+
 use anyhow::Result;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Response, StatusCode};
 
-use crate::accounts::{Action, authorize};
+use crate::accounts::{Action, Db, MAX_CAPTION_LEN, authorize};
 use crate::html::{self, page, respond};
 use crate::{
     Authz, Store, accounts, html_escape, human_bytes, is_blob_hex, manifest_descriptors,
@@ -46,6 +48,7 @@ const MAX_ROWS: usize = 500;
 /// per-page `Read` checks predate `Authz` and still go through `accounts::authorize`.
 pub(crate) fn route(
     store: &Store,
+    db: &Db,
     rest: &str,
     authz: &Authz<'_>,
     principal: &accounts::Principal,
@@ -60,7 +63,7 @@ pub(crate) fn route(
         let reference = &rest[idx + "/manifests/".len()..];
         return manifest_detail(store, name, reference, authz, principal, csrf);
     }
-    tag_list(store, rest, principal, csrf)
+    tag_list(store, db, rest, principal, csrf)
 }
 
 fn repo_list(
@@ -160,8 +163,25 @@ fn tag_kind(tag: &str) -> Option<&'static str> {
     })
 }
 
+/// The caption a repository gets when nobody has written one: what this server can work out about
+/// it, which today is one case.
+fn default_caption(name: &str, tags: &[String]) -> &'static str {
+    if !tags.is_empty()
+        && name.rsplit('/').next() == Some(CACHE_REPO)
+        && tags
+            .iter()
+            .all(|t| matches!(cache_namespace(t), Some("snap" | "base")))
+    {
+        "<p>virtkit's build cache: each tag is a hash of the build that produced it, not \
+         a version anyone chose. <code>vk-registry gc</code> reclaims the idle ones.</p>\n"
+    } else {
+        ""
+    }
+}
+
 fn tag_list(
     store: &Store,
+    db: &Db,
     name: &str,
     principal: &accounts::Principal,
     csrf: Option<&str>,
@@ -207,28 +227,51 @@ fn tag_list(
     } else {
         "<th>Tag</th>"
     };
-    // Said once, above a whole page of them, when there is nothing here to mistake for a
-    // release: a repository of content keys is a cache, and reads as an inexplicable list
-    // of hashes to anyone not told that. Said without naming a content key, because the
-    // reader it is for is the one who does not know the term — and as a hash of the build
-    // rather than of the content, which is what these keys are: they hash the inputs
-    // (`vk-driver`'s `build::chain_key` and `build::exec::base_cache_key`), so two builds
-    // that produce identical bytes still land on two tags. Named as well as shaped,
-    // because this sentence asserts what the *repository* is where the per-row gloss only
-    // reads a tag: `vk` writes its cache to one repo name (`vk-driver`'s
-    // `build::exec::CACHE_REPO`, under whatever repo prefix the registry is configured
-    // with), and a repository holding an ordinary tag — or somebody else's namespace of
-    // the same shape — is not it.
-    let caption = if !tags.is_empty()
-        && name.rsplit('/').next() == Some(CACHE_REPO)
-        && tags
-            .iter()
-            .all(|t| matches!(cache_namespace(t), Some("snap" | "base")))
-    {
-        "<p>virtkit's build cache: each tag is a hash of the build that produced it, not \
-         a version anyone chose. <code>vk-registry gc</code> reclaims the idle ones.</p>\n"
-    } else {
-        ""
+    // What an admin wrote about this repository, if anyone has. Not worth failing the
+    // page over: a caption is the one thing on it that is nobody's data.
+    let stored = match db.repo_caption(name) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("vk-registry: reading a repository caption: {e:#}");
+            None
+        }
+    };
+    // A stored caption is plain text (`accounts::validate_caption`) and is escaped; the built-in
+    // one below is this module's own markup and is not. The stored one wins, including over the
+    // built-in — an admin who disagrees with what this server worked out about a repository is
+    // right by definition, and clearing the box puts the built-in back.
+    let caption: Cow<'_, str> = match &stored {
+        Some(text) => format!("<p>{}</p>\n", html_escape(text)).into(),
+        None => default_caption(name, &tags).into(),
+    };
+    // Editing lives on the page the caption is on, because that is where a person is when they know
+    // what it should say — but `/browse` answers GET and HEAD only, so the form posts to
+    // `/settings/captions`, which redirects back here. Rendered only for the session that may
+    // actually save it: an API key holder and a plain session are shown the caption, not a box that
+    // would be refused (`captions::route` still checks).
+    let edit = match (principal, csrf) {
+        // The same `authorize` question `captions::route` asks, so the box appears exactly
+        // where the POST would be accepted — and only for a session, since that route takes
+        // no API key however it is scoped.
+        (accounts::Principal::Session(_), Some(token))
+            if authorize(principal, Action::Write, name) =>
+        {
+            format!(
+                "<form method=\"post\" action=\"/settings/captions\">\n\
+             <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\n\
+             <input type=\"hidden\" name=\"repo\" value=\"{repo}\">\n\
+             <label>Caption <input name=\"caption\" maxlength=\"{MAX_CAPTION_LEN}\" \
+             value=\"{current}\" placeholder=\"what this repository holds\"></label>\n\
+             <button type=\"submit\">Save</button>\n\
+             <p>Shown to everyone who can read this repository. \
+             Empty restores the default.</p>\n\
+             </form>\n",
+                csrf = html_escape(token),
+                repo = html_escape(name),
+                current = html_escape(stored.as_deref().unwrap_or_default()),
+            )
+        }
+        _ => String::new(),
     };
     Ok(respond(
         StatusCode::OK,
@@ -238,7 +281,7 @@ fn tag_list(
             csrf,
             &format!(
                 "<p><a href=\"/browse\">&larr; repositories</a></p>\n\
-             <h1>{name}</h1>\n{caption}\
+             <h1>{name}</h1>\n{caption}{edit}\
              <table><tr>{header}</tr>\n{rows}</table>",
                 name = html_escape(name)
             ),
@@ -406,6 +449,14 @@ mod tests {
         })
     }
 
+    fn admin_session(name: &str) -> accounts::Principal {
+        let accounts::Principal::Session(mut u) = session(name) else {
+            unreachable!()
+        };
+        u.is_admin = true;
+        accounts::Principal::Session(u)
+    }
+
     async fn body_of(res: Response<Full<Bytes>>) -> String {
         String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap()
     }
@@ -416,8 +467,20 @@ mod tests {
     /// it — so a test names the URL it means rather than the remainder — and with the
     /// `Authz` that caller would have built: a session may read every repository, which is
     /// what `/browse` is for.
+    /// Against a db of this call's own: most pages here read no caption, so a test that
+    /// does not care about one should not have to carry a db to say so.
     fn page_at(
         store: &Store,
+        path: &str,
+        principal: &accounts::Principal,
+        csrf: Option<&str>,
+    ) -> Result<Response<Full<Bytes>>> {
+        page_at_db(store, &Db::open_memory().unwrap(), path, principal, csrf)
+    }
+
+    fn page_at_db(
+        store: &Store,
+        db: &Db,
         path: &str,
         principal: &accounts::Principal,
         csrf: Option<&str>,
@@ -426,7 +489,14 @@ mod tests {
             .strip_prefix("/browse")
             .expect("a /browse path")
             .trim_start_matches('/');
-        route(store, rest, &Authz::Accounts(principal), principal, csrf)
+        route(
+            store,
+            db,
+            rest,
+            &Authz::Accounts(principal),
+            principal,
+            csrf,
+        )
     }
 
     fn store_in(tag: &str) -> (std::path::PathBuf, Store) {
@@ -926,6 +996,110 @@ mod tests {
             "{html}"
         );
         assert!(!html.contains("<a href=\"/logout\""), "{html}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A caption an admin wrote is what the page shows — over the built-in one, and
+    /// escaped, since it is plain text written by a person and rendered for everyone who
+    /// can read the repository.
+    #[tokio::test]
+    async fn a_stored_caption_replaces_the_built_in_one() {
+        let (dir, store) = store_in("caption");
+        let db = Db::open_memory().unwrap();
+        let snap = format!("snap-{}", "1".repeat(64));
+        store
+            .put_manifest("team-a/build-cache", &snap, MANIFEST_TYPE, b"{}")
+            .unwrap();
+
+        // nothing stored: the built-in caption, because this repository is one this
+        // server can name for itself
+        let html = body_of(
+            page_at_db(
+                &store,
+                &db,
+                "/browse/team-a/build-cache",
+                &session("A"),
+                Some("t"),
+            )
+            .unwrap(),
+        )
+        .await;
+        assert!(
+            html.contains("virtkit's build cache: each tag is a hash"),
+            "{html}"
+        );
+
+        db.set_repo_caption("team-a/build-cache", "task-rs <b>cache</b>")
+            .unwrap();
+        let html = body_of(
+            page_at_db(
+                &store,
+                &db,
+                "/browse/team-a/build-cache",
+                &session("A"),
+                Some("t"),
+            )
+            .unwrap(),
+        )
+        .await;
+        assert!(html.contains("task-rs &lt;b&gt;cache&lt;/b&gt;"), "{html}");
+        assert!(
+            !html.contains("<b>cache</b>"),
+            "a caption is text, not markup: {html}"
+        );
+        assert!(
+            !html.contains("virtkit's build cache: each tag is a hash"),
+            "the stored caption replaces the built-in one: {html}"
+        );
+
+        // cleared: the built-in one is back, so an admin can undo without knowing what it
+        // said
+        db.set_repo_caption("team-a/build-cache", "   ").unwrap();
+        let html = body_of(
+            page_at_db(
+                &store,
+                &db,
+                "/browse/team-a/build-cache",
+                &session("A"),
+                Some("t"),
+            )
+            .unwrap(),
+        )
+        .await;
+        assert!(
+            html.contains("virtkit's build cache: each tag is a hash"),
+            "{html}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The edit box is rendered for the session that may save it and for nobody else —
+    /// the rule `captions::route` enforces, said on the page before anyone types.
+    #[tokio::test]
+    async fn only_an_admin_session_is_offered_the_caption_box() {
+        let (dir, store) = store_in("caption-form");
+        let db = Db::open_memory().unwrap();
+        store
+            .put_manifest("team-a/app", "v1", MANIFEST_TYPE, b"{}")
+            .unwrap();
+        let page = async |principal, csrf| {
+            body_of(page_at_db(&store, &db, "/browse/team-a/app", principal, csrf).unwrap()).await
+        };
+
+        let (admin_p, plain_p) = (admin_session("A"), session("B"));
+        let admin = page(&admin_p, Some("tok")).await;
+        assert!(admin.contains("action=\"/settings/captions\""), "{admin}");
+        assert!(
+            admin.contains("name=\"repo\" value=\"team-a/app\""),
+            "{admin}"
+        );
+
+        let plain = page(&plain_p, Some("tok")).await;
+        assert!(!plain.contains("/settings/captions"), "{plain}");
+        // and an admin whose session carries no CSRF token is not shown a form that would
+        // only be refused, the rule the sign-out control already follows
+        let unarmed = page(&admin_p, None).await;
+        assert!(!unarmed.contains("/settings/captions"), "{unarmed}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

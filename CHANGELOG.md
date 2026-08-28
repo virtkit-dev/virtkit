@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- An admin can give a repository a one-line caption on its page, saying what it
+  holds. Everyone who can read the repository sees it, and emptying the box
+  removes it. Repositories `vk` recognizes, such as its build cache, still
+  describe themselves when no caption is set.
+
 ### Changed
 
 - `vk-registry status` and `vk-registry gc` take `--root`/`--config` from

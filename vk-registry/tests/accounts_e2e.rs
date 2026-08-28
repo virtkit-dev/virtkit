@@ -409,6 +409,205 @@ async fn accounts_mode_gates_v2_and_browse_by_scope() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `/settings/captions`: who may write one, what the write has to carry, and that the
+/// page it belongs to shows the result. The rule is the same one `authorize` applies to a
+/// repository write — an admin session, never a plain one and never an API key — because
+/// a caption is text this server renders into a page other people read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_captions_are_admin_only_and_show_up_on_the_page() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tmp("captions");
+    let state = accounts_state(&dir);
+    let db = accounts_db(&state);
+    state
+        .store
+        .put_manifest(
+            "team-a/app",
+            "v1",
+            "application/vnd.oci.image.manifest.v1+json",
+            b"{}",
+        )
+        .unwrap();
+
+    let plain = db
+        .upsert_user("https://issuer", "plain", None, None)
+        .unwrap();
+    let plain_session = db
+        .create_session(&plain.id, Duration::from_secs(3600))
+        .unwrap();
+    let plain_csrf = db.session_csrf(&plain_session).unwrap().unwrap();
+
+    let admin = db
+        .upsert_user("https://issuer", "admin", None, None)
+        .unwrap();
+    assert!(db.set_admin(&admin.id, true).unwrap());
+    let admin_session = db
+        .create_session(&admin.id, Duration::from_secs(3600))
+        .unwrap();
+    let admin_csrf = db.session_csrf(&admin_session).unwrap().unwrap();
+
+    let url = spawn(state.clone());
+    let client = no_redirect_client();
+    let post = async |session: &str, body: String| {
+        client
+            .post(format!("{url}/settings/captions"))
+            .header("Cookie", format!("__Host-vk_session={session}"))
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+    };
+
+    // A plain session is refused, and nothing is written.
+    let r = post(
+        &plain_session,
+        format!("repo=team-a/app&caption=mine&csrf={plain_csrf}"),
+    )
+    .await;
+    assert_eq!(r.status(), 403);
+    assert_eq!(db.repo_caption("team-a/app").unwrap(), None);
+
+    // So is an admin session whose form carries no usable token.
+    let r = post(
+        &admin_session,
+        "repo=team-a/app&caption=x&csrf=wrong".into(),
+    )
+    .await;
+    assert_eq!(r.status(), 403);
+    assert_eq!(db.repo_caption("team-a/app").unwrap(), None);
+
+    // An admin with the token: stored, and answered with a redirect back to the page the
+    // form was on, so a refresh does not re-submit it.
+    let r = post(
+        &admin_session,
+        format!("repo=team-a/app&caption=the+team-a+app&csrf={admin_csrf}"),
+    )
+    .await;
+    assert_eq!(r.status(), 303);
+    assert_eq!(
+        r.headers().get("location").and_then(|v| v.to_str().ok()),
+        Some("/browse/team-a/app")
+    );
+    assert_eq!(
+        db.repo_caption("team-a/app").unwrap().as_deref(),
+        Some("the team-a app")
+    );
+
+    // and it is on the page, for a reader who cannot edit it
+    let body = client
+        .get(format!("{url}/browse/team-a/app"))
+        .header("Cookie", format!("__Host-vk_session={plain_session}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("the team-a app"), "{body}");
+    assert!(!body.contains("/settings/captions"), "{body}");
+
+    // An API key is not a session, so it cannot write one however it is scoped.
+    let scope = vk_registry::accounts::Scope {
+        action: vk_registry::accounts::Action::Write,
+        repo_pattern: "*".to_string(),
+    };
+    let (_, token) = db
+        .create_api_key(Some(&admin.id), "ci", std::slice::from_ref(&scope), None)
+        .unwrap();
+    let r = client
+        .post(format!("{url}/settings/captions"))
+        .bearer_auth(&token)
+        .body("repo=team-a/app&caption=by+key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+
+    // A caption is not shown to a principal that cannot read the repository at all: the
+    // page is 404 and carries none of it. The scope check `/browse` already applies is what
+    // makes that true — this pins that a caption did not become an exception to it.
+    let (_, team_b_token) = db
+        .create_api_key(
+            Some(&admin.id),
+            "team-b-only",
+            &[vk_registry::accounts::Scope {
+                action: vk_registry::accounts::Action::Read,
+                repo_pattern: "team-b/*".to_string(),
+            }],
+            None,
+        )
+        .unwrap();
+    let r = client
+        .get(format!("{url}/browse/team-a/app"))
+        .bearer_auth(&team_b_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    let body = r.text().await.unwrap();
+    assert!(!body.contains("the team-a app"), "{body}");
+
+    // A name the OCI API would refuse is refused here too, before it reaches a `Location`
+    // header or a table key — and the caption that was already stored is untouched.
+    for repo in ["../etc", "", "team-a/blobs", "team-a/.."] {
+        let r = post(
+            &admin_session,
+            format!("repo={repo}&caption=anything&csrf={admin_csrf}"),
+        )
+        .await;
+        assert_eq!(r.status(), 400, "{repo:?}");
+    }
+    assert_eq!(
+        db.repo_caption("team-a/app").unwrap().as_deref(),
+        Some("the team-a app")
+    );
+
+    // Enforce the one-line length limit server-side; the form's `maxlength` is only a hint.
+    let too_long = "x".repeat(1000);
+    for caption in [too_long.as_str(), "two%0Alines"] {
+        let r = post(
+            &admin_session,
+            format!("repo=team-a/app&caption={caption}&csrf={admin_csrf}"),
+        )
+        .await;
+        assert_eq!(r.status(), 400, "{caption:?}");
+    }
+    assert_eq!(
+        db.repo_caption("team-a/app").unwrap().as_deref(),
+        Some("the team-a app")
+    );
+
+    // A form with no `caption` field at all is a malformed request, not a clear: the two
+    // must not be the same POST when one of them destroys a caption.
+    let r = post(&admin_session, format!("repo=team-a/app&csrf={admin_csrf}")).await;
+    assert_eq!(r.status(), 400);
+    assert_eq!(
+        db.repo_caption("team-a/app").unwrap().as_deref(),
+        Some("the team-a app")
+    );
+
+    // There is no page here to GET; the form lives on `/browse`.
+    let r = client
+        .get(format!("{url}/settings/captions"))
+        .header("Cookie", format!("__Host-vk_session={admin_session}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 405);
+
+    // An empty box clears it, and the repository goes back to having nothing said about it.
+    let r = post(
+        &admin_session,
+        format!("repo=team-a/app&caption=&csrf={admin_csrf}"),
+    )
+    .await;
+    assert_eq!(r.status(), 303);
+    assert_eq!(db.repo_caption("team-a/app").unwrap(), None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settings_keys_round_trips_create_and_revoke_with_csrf() {
     let _ = rustls::crypto::ring::default_provider().install_default();
