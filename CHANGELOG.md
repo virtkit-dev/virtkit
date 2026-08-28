@@ -24,6 +24,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- A parallel build now waits for the host to have room for a stage's guest before
+  booting it, instead of committing whatever `[build] jobs` allows and leaving the OOM
+  killer to pick which stage dies. A build narrows while a job VM, a desktop or a second
+  build holds the host and widens again when they let go; stages waiting are started
+  oldest first. Set `[build] no_mem_gate` to retain jobs-only admission.
 - A build with no `[build] jobs` set now derives how many stages it runs at once from
   the memory the host *has* rather than the memory free at the moment it starts, so
   the same build runs the same width whatever else was open when it began.

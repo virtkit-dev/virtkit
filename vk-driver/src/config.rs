@@ -136,6 +136,12 @@ pub struct Build {
     /// scratch. Disk-backed `/tmp` (the default) bounds bulk `/tmp` writes by disk rather
     /// than ½·guest-RAM; set this to trade that for a RAM tmpfs. Default off (disk-backed).
     pub tmp_tmpfs: bool,
+    /// Skip the host-memory admission gate: stages then start as soon as a `jobs` slot is
+    /// free, without also waiting for the host to have room for the guest they are about to
+    /// boot (the behaviour before the gate existed). The gate only ever narrows a build, so
+    /// this is for a host where `jobs` is set by hand and deliberately overcommits — a
+    /// build guest that balloons back most of its declared RAM, say. Default off (gated).
+    pub no_mem_gate: bool,
     /// max stages built concurrently on the microVM backend (`--build-jobs` overrides).
     /// Unset = auto, bounded by the host's total RAM (each stage guest reserves `mem`).
     /// `1` forces a sequential build; `0` is refused when the config loads rather than read
@@ -1091,6 +1097,16 @@ mod tests {
     fn build_no_journal_parses() {
         let cfg: Config = toml::from_str("[build]\nno_journal = true\n").unwrap();
         assert!(cfg.build.no_journal);
+    }
+
+    #[test]
+    fn build_no_mem_gate_parses_and_defaults_to_gated() {
+        let cfg: Config = toml::from_str("[build]\nno_mem_gate = true\n").unwrap();
+        assert!(cfg.build.no_mem_gate);
+        assert!(
+            !Config::default().build.no_mem_gate,
+            "the host-memory gate is on unless a host opts out"
+        );
     }
 
     /// The renamed-away `journal` key (superseded by `no_journal` when the default

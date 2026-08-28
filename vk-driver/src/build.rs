@@ -46,7 +46,7 @@ pub(crate) use exec::vd_name;
 mod plan;
 mod progress;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -123,6 +123,9 @@ static CHECKPOINT_DEFAULT: std::sync::atomic::AtomicU64 =
 static BUILD_CPUS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// `[build] mem`, or None when unset (→ 4G, see [`exec::resolve_build_mem`]).
 static BUILD_MEM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// `[build] no_mem_gate`: skip the host-memory admission gate (see [`MemLedger`]) and let
+/// `jobs` alone bound the build, as it did before the gate existed.
+static BUILD_NO_MEM_GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Apply the host's `[build]` tuning process-wide. Called once from `cli_main` after the
 /// config loads (and by the re-exec'd `gitlab supervise` that runs the on-demand builder),
@@ -134,7 +137,19 @@ pub fn set_tuning(build: &crate::config::Build) {
         Relaxed,
     );
     BUILD_CPUS.store(build.cpus.unwrap_or(0), Relaxed);
+    BUILD_NO_MEM_GATE.store(build.no_mem_gate, Relaxed);
     *BUILD_MEM.lock().unwrap() = build.mem.clone();
+}
+
+/// `MemTotal` for the host-memory gate to measure against, or `None` when there is no gate:
+/// `/proc/meminfo` unreadable, or `[build] no_mem_gate` set. Takes the host reading the
+/// `jobs` ceiling already made rather than making its own, so the two can never disagree
+/// about the size of the host — the ceiling still derives from `MemTotal` with the gate off.
+fn gate_total_mib(host_total_mib: Option<u64>) -> Option<u64> {
+    if BUILD_NO_MEM_GATE.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    host_total_mib
 }
 
 /// The configured per-stage build vCPUs (`[build] cpus`), None when unset.
@@ -827,19 +842,26 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
             let kernel = kernel.as_ref().expect("resolved under microvm");
             let agent = agent.as_ref().expect("resolved under microvm");
             let mv = make_microvm(opts, &scratch, &kernel.path, &agent.path, &timings)?;
-            let jobs = resolve_build_jobs(opts, mv.mem_mib(), crate::schedule::host_total_mib());
+            // One reading for both: the ceiling divides it, the gate measures against it.
+            let host_total_mib = crate::schedule::host_total_mib();
+            let jobs = resolve_build_jobs(opts, mv.mem_mib(), host_total_mib);
             progress.note(&concurrency_line(
                 jobs,
                 mv.cpus(),
                 mv.mem(),
                 opts.build_jobs.is_some(),
             ));
+            let gate_mib = gate_total_mib(host_total_mib);
+            if let Some(line) = gate_note(jobs, gate_mib, mv.mem_mib()) {
+                progress.note(&line);
+            }
             let (committed, states) = drive_microvm(
                 &plan,
                 &order,
                 &build_args,
                 &mv,
                 jobs,
+                gate_mib,
                 opts.require_cached,
                 opts.build_cache,
                 opts.out_disk.as_deref(),
@@ -1032,7 +1054,9 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
     let mut mv = make_microvm(opts, &scratch, &kernel.path, &agent.path, &timings)?;
     // One job budget for every unit's stages combined (not per unit), so concurrent work
     // stays within host RAM instead of multiplying live guests.
-    let jobs = resolve_build_jobs(opts, mv.mem_mib(), crate::schedule::host_total_mib());
+    // One reading for both: the ceiling divides it, the gate measures against it.
+    let host_total_mib = crate::schedule::host_total_mib();
+    let jobs = resolve_build_jobs(opts, mv.mem_mib(), host_total_mib);
     timings.note_jobs(jobs); // so the timing header reports "busy across N jobs"
 
     // A lone unit's stage names are already unique, so it needs no prefix (the dashboard
@@ -1053,6 +1077,10 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
         mv.mem(),
         opts.build_jobs.is_some(),
     ));
+    let gate_mib = gate_total_mib(host_total_mib);
+    if let Some(line) = gate_note(jobs, gate_mib, mv.mem_mib()) {
+        progress.note(&line);
+    }
     let result = (|| -> Result<HashMap<String, Built>> {
         /// One resolved target of a unit: its stage index and where it exports.
         struct Tgt {
@@ -1194,14 +1222,14 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
         };
 
         let cancel = CancellationToken::new();
-        // `jobs` caps concurrent guest builds (sized to host memory) via `build_permits`,
-        // not the DAG dispatch pool: a fully-cached stage never touches a guest, so it
-        // must not queue behind that cap just to restore from cache. Dispatch gets one
+        // `budget` caps concurrent guest builds — `jobs` slots, plus the host-memory
+        // ledger — not the DAG dispatch pool: a fully-cached stage never touches a guest,
+        // so it must not queue behind either just to restore from cache. Dispatch gets one
         // thread per node so every cache hit can proceed the moment its deps are ready;
         // total thread count (and any concurrent remote build-lock requests each node's
         // uncached path makes) now scales with the DAG instead of `jobs`, which is fine
-        // since a node either restores instantly or waits on `build_permits` next.
-        let build_permits = Semaphore::new(jobs);
+        // since a node either restores instantly or waits on `budget` next.
+        let budget = BuildBudget::new(jobs, gate_mib);
         let done = run_dag(
             &nodes,
             &deps,
@@ -1231,7 +1259,7 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
                     Some(&cancel),
                     &u.prefix,
                     gid,
-                    &build_permits,
+                    &budget,
                 )
             },
         )?;
@@ -1899,7 +1927,7 @@ fn build_stage(
     cancel: Option<&CancellationToken>,
     name_prefix: &str,
     display: progress::StageId,
-    build_permits: &Semaphore,
+    budget: &BuildBudget,
 ) -> Result<Rootfs> {
     // Abort before doing any work if an earlier stage already failed, and hand the token
     // to the backend so a RUN launched below is interrupted the moment a sibling fails.
@@ -1985,10 +2013,17 @@ fn build_stage(
             );
         }
         // Past this point the stage needs a live guest (at minimum to probe/build its
-        // remaining steps), so it competes for the host-memory-derived build budget. Cache
-        // restores above never reach here, so they run at full DAG-dispatch concurrency
-        // instead of queuing behind real builds for one of these scarce permits.
-        let _permit = build_permits.acquire();
+        // remaining steps), so it competes for the build budget: one of the `jobs` slots,
+        // and its guest's RAM against what the host has left. Cache restores above never
+        // reach here, so they run at full DAG-dispatch concurrency instead of queuing behind
+        // real builds for one of these scarce permits.
+        let _admission = budget.admit(
+            ex.stage_mem_mib().unwrap_or(0),
+            cancel,
+            progress,
+            display,
+            &name,
+        );
         // Declare the stage's inputs — the source stages it copies/mounts from, and its
         // build context — so the backend can attach them before the guest boots. Read off the
         // resolved steps, not the raw plan: a `--from=$VAR` reaches the backend interpolated, so
@@ -2200,9 +2235,10 @@ fn drive(
     let (needed, cached_final) =
         compute_needed(plan, order, &resolved, ex, require_cached, &targets)?;
     progress.init(stage_inits(plan, order, &resolved, &needed, 0, ""), 1);
-    // Sequential driver: one stage at a time on the single `ex`, so the permit count is
-    // irrelevant — it exists only to satisfy `build_stage`'s signature.
-    let build_permits = Semaphore::new(1);
+    // Sequential driver: one stage at a time on the single `ex`, so neither the permit count
+    // nor the memory gate has anything to hold back — they exist only to satisfy
+    // `build_stage`'s signature.
+    let budget = BuildBudget::new(1, None);
     let mut committed: HashMap<usize, Rootfs> = HashMap::new();
     for &idx in order {
         if !needed.contains(&idx) {
@@ -2221,7 +2257,7 @@ fn drive(
             None,
             "",
             idx,
-            &build_permits,
+            &budget,
         )?;
         committed.insert(idx, fs);
     }
@@ -2275,6 +2311,396 @@ impl Drop for SemaphorePermit<'_> {
         *self.0.permits.lock().unwrap() += 1;
         self.0.cv.notify_one();
     }
+}
+
+/// How often the stage at the head of the memory queue re-measures the host. What it is
+/// waiting for is usually freed by something outside this build, which never touches the
+/// condvar, so a wait that is not polled is a wait that does not end.
+///
+/// A measurement reads `/proc/meminfo` and then one `status` per process on the host
+/// ([`build_rss_mib`]), which is what keeps this interval as long as it is. Only the head of
+/// the queue polls — the rest sleep until their turn — so the cost is one walk every two
+/// seconds however wide the build is, not one per waiting stage.
+const MEM_POLL: Duration = Duration::from_secs(2);
+
+/// The share of `MemTotal` a build keeps outside its own stage guests: the driver's own
+/// footprint and the VMMs', the ext4 snapshots it writes, and enough slack that the host
+/// stays usable. Lower than the runner's `schedule::RESERVE_PCT`, which also stands in for
+/// job VMs it never measures — here every live guest is charged explicitly.
+///
+/// It is deliberately not the same 20% the auto `jobs` ceiling leaves ([`resolve_build_jobs`]):
+/// the ceiling is a fixed share of the whole machine, this is measured against what is left
+/// of it, so on a host with a real baseline the gate is the tighter of the two.
+const BUILD_RESERVE_PCT: u64 = 10;
+
+/// Floor under [`BUILD_RESERVE_PCT`], so a small host still keeps a GiB for itself.
+const BUILD_RESERVE_MIN_MIB: u64 = 1024;
+
+/// What a host of `total_mib` holds back from its build stages — [`BUILD_RESERVE_PCT`] of
+/// it, never less than [`BUILD_RESERVE_MIN_MIB`].
+fn build_reserve_mib(total_mib: u64) -> u64 {
+    (total_mib.saturating_mul(BUILD_RESERVE_PCT) / 100).max(BUILD_RESERVE_MIN_MIB)
+}
+
+/// Host-memory admission for the stages of one build, on top of the `jobs` count ceiling.
+struct MemLedger {
+    /// `MemTotal`. `None` disables the gate entirely — no queue, no measuring
+    /// ([`MemLedger::reserve`]): `/proc/meminfo` unreadable, `[build] no_mem_gate`, and the
+    /// sequential backends, which run one stage at a time and have nothing to hold back.
+    ///
+    /// The ledger tests do give a total, and so do measure the machine they run on. They
+    /// pass it a total of 1 MiB, which no stage can ever fit in, so what the host happens to
+    /// report cannot change the answer.
+    total_mib: Option<u64>,
+    /// Held back from `total_mib` — see [`BUILD_RESERVE_PCT`].
+    reserve_mib: u64,
+    state: Mutex<LedgerState>,
+    cv: Condvar,
+}
+
+/// [`MemLedger`]'s mutable half. Kept behind one lock so a queue position and the figure it
+/// is judged against can never be read from two different moments.
+#[derive(Default)]
+struct LedgerState {
+    /// Declared guest RAM of the stages holding a reservation right now.
+    held_mib: u64,
+    /// Next queue ticket to hand out; tickets only ever increase.
+    next_ticket: u64,
+    /// Tickets still waiting. The lowest is the one that may be admitted — held as a set
+    /// rather than a counter so a stage that gives up (cancelled) drops out of the middle
+    /// without stalling everyone queued behind it.
+    waiting: BTreeSet<u64>,
+}
+
+impl MemLedger {
+    fn new(total_mib: Option<u64>) -> Self {
+        Self {
+            total_mib,
+            reserve_mib: total_mib.map(build_reserve_mib).unwrap_or(0),
+            state: Mutex::new(LedgerState::default()),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// What `want_mib` is short by right now: `0` when it fits (and always when the gate is
+    /// off). Pure over its inputs, so the rule itself is testable without a host.
+    fn short_by(&self, want_mib: u64, held_mib: u64, foreign_mib: u64) -> u64 {
+        let Some(total) = self.total_mib else {
+            return 0;
+        };
+        let room = total
+            .saturating_sub(self.reserve_mib)
+            .saturating_sub(foreign_mib)
+            .saturating_sub(held_mib);
+        want_mib.saturating_sub(room)
+    }
+
+    /// Reserve `want_mib` until the returned guard drops, waiting for the host to have room.
+    /// Returns whether it parked and how that ended, so the caller can pair a spinner without
+    /// tracking the same state twice; `on_wait` is called once, with the shortfall, when it parks.
+    fn reserve(
+        &self,
+        want_mib: u64,
+        cancel: Option<&CancellationToken>,
+        mut on_wait: impl FnMut(u64),
+    ) -> (MemReservation<'_>, MemWait) {
+        // Nothing to account for, so nothing to queue behind either: the gate turned off (`[build]
+        // no_mem_gate`, or a host whose memory cannot be read) and the guest-less backends
+        // (`DryRun`, `Planner`, `Host`) both go straight through, without taking a ticket and
+        // without walking `/proc`. `held_mib` is read by nothing else, so leaving it at zero costs
+        // nothing.
+        if want_mib == 0 || self.total_mib.is_none() {
+            return (
+                MemReservation {
+                    ledger: self,
+                    mib: 0,
+                },
+                MemWait::No,
+            );
+        }
+        // Declared before the guard below so it is dropped *after* it: a queue place that
+        // outlived its stage would be a head no one is behind, and every later waiter would
+        // sleep out the build behind it.
+        let queued = QueuedTicket::take(self);
+        let ticket = queued.ticket;
+        let mut st = self.lock();
+        let mut wait = MemWait::No;
+        let admitted = loop {
+            if cancel.is_some_and(|c| c.is_cancelled()) {
+                break false;
+            }
+            // Only the oldest waiter is measured against the host; the rest sleep until it
+            // is their turn, so a late small stage cannot take the room an early large one
+            // is waiting for.
+            if st.waiting.first() == Some(&ticket) {
+                if st.held_mib == 0 {
+                    break true;
+                }
+                // Measured with the lock released: this walks `/proc`, and a stage releasing
+                // its own reservation must never queue behind that.
+                drop(st);
+                let foreign = measure_foreign_mib().unwrap_or(0);
+                st = self.lock();
+                // Judged against what is held *now*, not against a snapshot from before the
+                // walk: a reservation released in that window would otherwise go unseen
+                // until the next poll, and a waiter that gave up mid-walk raises `held_mib`
+                // from behind us. Only `foreign` is allowed to be a moment stale.
+                let short = self.short_by(want_mib, st.held_mib, foreign);
+                if short == 0 {
+                    break true;
+                }
+                if wait == MemWait::No {
+                    wait = MemWait::Abandoned; // until this stage is actually let in
+                    drop(st);
+                    on_wait(short);
+                    st = self.lock();
+                    continue; // the host may have moved on while that was reported
+                }
+            }
+            // Timed, not a plain wait: the memory being waited for is usually freed by a
+            // process outside this build, which will never notify us.
+            st = self
+                .cv
+                .wait_timeout(st, MEM_POLL)
+                .unwrap_or_else(poisoned)
+                .0;
+        };
+        if admitted && wait == MemWait::Abandoned {
+            wait = MemWait::Admitted;
+        }
+        st.held_mib = st.held_mib.saturating_add(want_mib);
+        drop(st);
+        drop(queued); // hands the queue to the next stage, and wakes it
+        (
+            MemReservation {
+                ledger: self,
+                mib: want_mib,
+            },
+            wait,
+        )
+    }
+
+    /// The ledger's state. Poison-tolerant throughout: a stage that panicked mid-update is
+    /// one failed stage, and taking the rest of the build down with it — or, from a `Drop`
+    /// during an unwind, aborting the process — helps nobody. Every field is a plain
+    /// counter, so the worst a poisoned lock leaves behind is a figure to re-derive.
+    fn lock(&self) -> std::sync::MutexGuard<'_, LedgerState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Whether a stage waited on host memory, and how that wait ended. A stage let through by
+/// cancellation has its spinner cleared like any other, but must not also be announced as
+/// starting: it is about to fail its own cancellation check.
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+enum MemWait {
+    No,
+    Admitted,
+    Abandoned,
+}
+
+/// One stage's place in [`MemLedger`]'s queue, released on drop.
+///
+/// A guard rather than a matching pair of statements because the window between them runs
+/// `on_wait` — which reaches `println!` on the plain backend, and so panics on `EPIPE` the
+/// moment a build's output is piped into something that stops reading. A ticket stranded by
+/// that unwind would be a head that never advances, and every stage behind it would wait out
+/// the build on the 2-second poll rather than fail with it.
+struct QueuedTicket<'a> {
+    ledger: &'a MemLedger,
+    ticket: u64,
+}
+
+impl<'a> QueuedTicket<'a> {
+    fn take(ledger: &'a MemLedger) -> Self {
+        let mut st = ledger.lock();
+        let ticket = st.next_ticket;
+        st.next_ticket = st.next_ticket.saturating_add(1);
+        st.waiting.insert(ticket);
+        Self { ledger, ticket }
+    }
+}
+
+impl Drop for QueuedTicket<'_> {
+    fn drop(&mut self) {
+        let mut st = self.ledger.lock();
+        st.waiting.remove(&self.ticket);
+        let next_waiting = !st.waiting.is_empty();
+        drop(st);
+        // The stage behind this one is now the head, and only the head measures anything.
+        // Without this it would sit out a full `MEM_POLL` before noticing its turn came —
+        // on an idle host, once per admission, for every stage in the queue.
+        if next_waiting {
+            self.ledger.cv.notify_all();
+        }
+    }
+}
+
+/// Recover a poisoned ledger guard — see [`MemLedger::lock`].
+fn poisoned<T>(e: std::sync::PoisonError<T>) -> T {
+    e.into_inner()
+}
+
+/// One stage's live reservation against a [`MemLedger`]; releases on drop, so a stage that
+/// fails or panics frees what it held.
+struct MemReservation<'a> {
+    ledger: &'a MemLedger,
+    mib: u64,
+}
+
+impl Drop for MemReservation<'_> {
+    fn drop(&mut self) {
+        if self.mib == 0 {
+            return; // never queued (see `MemLedger::reserve`), so nothing to wake
+        }
+        // Never a second panic: this runs during a failing stage's unwind, and a panic out
+        // of a `Drop` that is already unwinding aborts the process. So no assertion here
+        // either, however tempting — `saturating_sub` is the only safe way to be wrong.
+        let mut st = self.ledger.lock();
+        st.held_mib = st.held_mib.saturating_sub(self.mib);
+        drop(st);
+        // The oldest waiter may not be the one this fits, and only it is allowed to take
+        // the room anyway — so wake everyone and let the queue decide whose turn it is.
+        self.ledger.cv.notify_all();
+    }
+}
+
+/// Host memory committed to anything other than this build's guests, in MiB.
+fn foreign_used_mib(host: crate::schedule::HostMemory, ours_mib: u64) -> u64 {
+    (host.total_mib.saturating_add(host.shmem_mib))
+        .saturating_sub(host.available_mib)
+        .saturating_sub(ours_mib)
+}
+
+/// [`foreign_used_mib`] measured against this host, or `None` when `/proc` cannot be read.
+/// The caller then reads it as zero foreign use, so the gate still holds a stage against
+/// what this build itself has promised, and only stops seeing the rest of the host.
+///
+/// Note what this cannot see: a CI job VM that `crate::admit` granted RAM to seconds ago
+/// but which has not faulted it in yet reads as free space here, exactly as an unwarmed
+/// stage guest would without the ledger. Folding that ledger in needs the runner's state
+/// dir, which a build does not carry.
+fn measure_foreign_mib() -> Option<u64> {
+    Some(foreign_used_mib(
+        crate::schedule::host_memory()?,
+        build_rss_mib(Path::new("/proc"))?,
+    ))
+}
+
+/// Resident size of this process and every descendant of it, in MiB — the build's own
+/// footprint, guests included (see [`foreign_used_mib`]). `proc` is the mount to read, so
+/// this is testable against a fixture rather than only against the machine running it.
+///
+/// A process that exits mid-scan simply drops out; the reading is a sample either way.
+fn build_rss_mib(proc: &Path) -> Option<u64> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut rss_kib: HashMap<u32, u64> = HashMap::new();
+    // An unreadable `/proc` is `None` (no reading at all), but a single entry that cannot be
+    // listed is just a process that is no longer there — skipped, like one that exits below.
+    for entry in std::fs::read_dir(proc).ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+            continue; // exited between the readdir and the open
+        };
+        let Some((ppid, rss)) = ppid_and_rss_kib(&status) else {
+            continue;
+        };
+        children.entry(ppid).or_default().push(pid);
+        rss_kib.insert(pid, rss);
+    }
+    // Walk down from this process rather than up from every process: a `ppid` chain read
+    // one pid at a time can be re-parented to init mid-walk, which would silently drop a
+    // whole subtree into the foreign figure.
+    let mut total_kib = 0u64;
+    let mut stack = vec![std::process::id()];
+    let mut seen: HashSet<u32> = HashSet::new();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue; // a pid cannot be its own ancestor, but never loop on a bad reading
+        }
+        total_kib = total_kib.saturating_add(rss_kib.get(&pid).copied().unwrap_or(0));
+        stack.extend(children.get(&pid).into_iter().flatten().copied());
+    }
+    Some(total_kib / 1024)
+}
+
+/// `(PPid, VmRSS)` in kB from one `/proc/<pid>/status`. `None` when either field is absent
+/// or unparsable — a kernel thread (no `VmRSS`) reads as neither, which is what it is.
+fn ppid_and_rss_kib(status: &str) -> Option<(u32, u64)> {
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))?
+            .split_whitespace()
+            .next()
+    };
+    Some((
+        field("PPid:")?.parse().ok()?,
+        field("VmRSS:")?.parse().ok()?,
+    ))
+}
+
+/// What a stage must hold before it may boot a guest: one of the `jobs` slots, and its guest
+/// RAM in the host-memory ledger. The slot bounds how many stages are in flight at all; the
+/// ledger bounds how many bytes they commit between them — which is the one that has to
+/// decide once stages stop being the same size.
+struct BuildBudget {
+    permits: Semaphore,
+    mem: MemLedger,
+}
+
+impl BuildBudget {
+    /// `gate_total_mib` is the host's `MemTotal` for the memory gate to measure against
+    /// (see [`gate_total_mib`]); `None` builds a count-only budget.
+    fn new(jobs: usize, gate_total_mib: Option<u64>) -> Self {
+        Self {
+            permits: Semaphore::new(jobs),
+            mem: MemLedger::new(gate_total_mib),
+        }
+    }
+
+    /// Hold a job slot and `want_mib` of host memory for as long as the guard lives. A wait
+    /// on memory gets its own spinner: on the dashboard it is otherwise indistinguishable
+    /// from a stage that is simply slow to boot.
+    fn admit(
+        &self,
+        want_mib: u64,
+        cancel: Option<&CancellationToken>,
+        progress: &Progress,
+        stage: progress::StageId,
+        name: &str,
+    ) -> BuildAdmission<'_> {
+        let permit = self.permits.acquire();
+        let (mem, wait) = self.mem.reserve(want_mib, cancel, |short| {
+            progress.wait_mem_start(stage, name, short);
+        });
+        if wait != MemWait::No {
+            progress.wait_mem_done(stage, name, wait == MemWait::Admitted);
+        }
+        BuildAdmission {
+            _mem: mem,
+            _permit: permit,
+        }
+    }
+}
+
+/// A stage's admission, held for as long as its guest may live.
+///
+/// The memory is declared first so it is released first: the stage taking the freed job slot
+/// tickets immediately, and would otherwise measure the host with the departing stage's RAM
+/// still charged — a needless `/proc` walk, and a "waiting for host memory" line for memory
+/// that was free microseconds later.
+struct BuildAdmission<'a> {
+    _mem: MemReservation<'a>,
+    _permit: SemaphorePermit<'a>,
 }
 
 /// Run a DAG of tasks with bounded concurrency. `nodes` is the set to run; `deps[n]`
@@ -2395,6 +2821,7 @@ fn drive_microvm(
     build_args: &Vars,
     base: &MicroVm,
     jobs: usize,
+    gate_total_mib: Option<u64>,
     require_cached: bool,
     cache: BuildCache,
     out_disk: Option<&Path>,
@@ -2453,14 +2880,14 @@ fn drive_microvm(
     // stage honors it, so a failure interrupts the RUN steps in flight on sibling guests
     // instead of letting them run to completion before the build bails.
     let cancel = CancellationToken::new();
-    // `jobs` caps concurrent guest builds (sized to host memory) via `build_permits`, not
-    // the DAG dispatch pool: a fully-cached stage never touches a guest, so it must not
-    // queue behind that cap just to restore from cache. Dispatch gets one thread per
+    // `budget` caps concurrent guest builds — `jobs` slots, plus the host-memory ledger —
+    // not the DAG dispatch pool: a fully-cached stage never touches a guest, so it must not
+    // queue behind either just to restore from cache. Dispatch gets one thread per
     // needed stage so every cache hit can proceed the moment its deps are ready; total
     // thread count (and any concurrent remote build-lock requests each node's uncached
     // path makes) now scales with the DAG instead of `jobs`, which is fine since a node
-    // either restores instantly or waits on `build_permits` next.
-    let build_permits = Semaphore::new(jobs);
+    // either restores instantly or waits on `budget` next.
+    let budget = BuildBudget::new(jobs, gate_total_mib);
     let committed = run_dag(
         &needed_order,
         &deps,
@@ -2490,7 +2917,7 @@ fn drive_microvm(
                 Some(&cancel),
                 "",
                 idx,
-                &build_permits,
+                &budget,
             )
         },
     )?;
@@ -2510,9 +2937,10 @@ fn drive_microvm(
 /// property of the host, which is what a budget announced once and held for the whole build
 /// has to be.
 ///
-/// The cost of that is a width blind to how busy the host already is: auto claims its share
-/// of the whole machine whatever else is admitted beside it, so a host running jobs and
-/// builds side by side should set `[build] jobs` rather than let each build size itself.
+/// The cost of that is a ceiling blind to how busy the host already is: auto claims its share
+/// of the whole machine whatever else is admitted beside it. Which is why it is only a
+/// ceiling — [`MemLedger`] holds each stage until the host actually has room for its guest,
+/// so a build sized for the whole machine still yields to the jobs running next to it.
 fn resolve_build_jobs(opts: &Options, mem_mib: u64, total_mib: Option<u64>) -> usize {
     if let Some(j) = opts.build_jobs {
         return j.get();
@@ -2535,6 +2963,41 @@ fn concurrency_line(jobs: usize, cpus: u32, mem: &str, configured: bool) -> Stri
         "from host memory"
     };
     format!("virtkit: build: up to {jobs} stage(s) at once ({source}), each cpus={cpus}, mem={mem}")
+}
+
+/// What the host-memory gate has to work with, announced once beside [`concurrency_line`]: the size
+/// of the box, what is already spoken for by everything that is not this build, the slack held back
+/// from it, and how many `want_mib` stages that leaves room for right now.
+fn gate_line(
+    jobs: usize,
+    total_mib: u64,
+    reserve_mib: u64,
+    foreign_mib: u64,
+    want_mib: u64,
+) -> String {
+    let room = total_mib
+        .saturating_sub(reserve_mib)
+        .saturating_sub(foreign_mib);
+    let fits = (room / want_mib.max(1)).max(1).min(jobs.max(1) as u64);
+    format!(
+        "virtkit: build: host memory {total_mib} MiB, {foreign_mib} MiB in use elsewhere, \
+         {reserve_mib} MiB held back — room for {fits} stage(s) now"
+    )
+}
+
+/// [`gate_line`] for this build, measured now, or `None` when there is nothing to say:
+/// the gate is off (`gate_total_mib` is `None`), or `jobs` is 1 and the ledger is
+/// structurally inert — a build that never has two stages live has nothing to hold back,
+/// and a line announcing room for stages it will not run only reads as noise.
+fn gate_note(jobs: usize, gate_total_mib: Option<u64>, want_mib: u64) -> Option<String> {
+    let total = gate_total_mib.filter(|_| jobs > 1)?;
+    Some(gate_line(
+        jobs,
+        total,
+        build_reserve_mib(total),
+        measure_foreign_mib().unwrap_or(0),
+        want_mib,
+    ))
 }
 
 /// Remove build scratch orphaned by earlier runs that were hard-killed (SIGKILL, OOM,
@@ -3690,7 +4153,7 @@ mod tests {
             // Build every needed stage in dependency order; hand each one only its own
             // unit's committed rootfs, re-keyed to local indices (as build_units does).
             let mut committed_local: HashMap<usize, Rootfs> = HashMap::new();
-            let build_permits = Semaphore::new(1);
+            let budget = BuildBudget::new(1, None);
             for &idx in &order {
                 if !needed.contains(&idx) {
                     continue;
@@ -3708,7 +4171,7 @@ mod tests {
                     None,
                     &prefix,
                     base + idx,
-                    &build_permits,
+                    &budget,
                 )
                 .unwrap();
                 committed_local.insert(idx, fs.clone());
@@ -5597,8 +6060,363 @@ RUN ship
         );
     }
 
+    #[test]
+    fn foreign_use_counts_what_this_build_does_not_hold() {
+        // 32 GiB host, 18 GiB of it available, 2 GiB of tmpfs, and 6 GiB resident across this
+        // build's process tree (its stage guests, which are children — see `build_rss_mib`).
+        // Unavailable is 14 GiB; the tmpfs counts as unavailable too (`MemAvailable` calls it
+        // reclaimable, but it can only leave for swap), and our own 6 GiB comes back out, since the
+        // ledger charges those guests by declaration.
+        let host = crate::schedule::HostMemory {
+            total_mib: 32768,
+            available_mib: 18432,
+            shmem_mib: 2048,
+        };
+        assert_eq!(foreign_used_mib(host, 6144), 32768 + 2048 - 18432 - 6144);
+        // A guest that has faulted in nothing yet leaves the foreign reading unchanged —
+        // this is what stops a just-booted stage from looking like free memory to the next.
+        assert_eq!(foreign_used_mib(host, 0), 32768 + 2048 - 18432);
+        // Nothing goes negative: a tree whose RSS exceeds what the host calls used (page
+        // cache it owns, double-counted shared mappings) reads as no foreign use at all.
+        assert_eq!(foreign_used_mib(host, u64::MAX / 2), 0);
+    }
+
+    #[test]
+    fn one_status_file_yields_its_parent_and_resident_size() {
+        assert_eq!(
+            ppid_and_rss_kib("Name:\tvk\nPPid:\t41\nVmRSS:\t  2048 kB\n"),
+            Some((41, 2048))
+        );
+        // A kernel thread has a PPid but no VmRSS, and is not a process holding host RAM.
+        assert_eq!(ppid_and_rss_kib("Name:\tkthreadd\nPPid:\t2\n"), None);
+        assert_eq!(ppid_and_rss_kib("VmRSS:\t 4 kB\n"), None);
+        assert_eq!(ppid_and_rss_kib("PPid:\tx\nVmRSS:\t4 kB\n"), None);
+    }
+
+    #[test]
+    fn the_build_footprint_is_the_whole_process_tree() {
+        // The guests are children, not `/proc/self`: both backends run a VM in its own
+        // process (libkrun re-execs this binary), so a reading that stopped at self would
+        // miss every guest and charge each one twice — once here, once in `held_mib`.
+        let proc = tmpdir("rss-tree");
+        let proc = proc.as_path();
+        let me = std::process::id();
+        let write = |pid: u32, ppid: u32, rss_kib: u64| {
+            let d = proc.join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("status"),
+                format!("Name:\tp{pid}\nPPid:\t{ppid}\nVmRSS:\t{rss_kib} kB\n"),
+            )
+            .unwrap();
+        };
+        write(1, 0, 100 * 1024); // init: not ours
+        write(me, 1, 3 * 1024); // the driver itself
+        write(me + 1, me, 4096 * 1024); // a stage guest
+        write(me + 2, me + 1, 8 * 1024); // its virtiofsd, a grandchild
+        write(me + 3, 1, 9999 * 1024); // someone else's, sharing the host
+        // Not a number, and a directory with no status: neither derails the scan.
+        std::fs::create_dir_all(proc.join("self")).unwrap();
+        std::fs::create_dir_all(proc.join(format!("{}", me + 4))).unwrap();
+        assert_eq!(build_rss_mib(proc), Some(3 + 4096 + 8));
+        assert_eq!(build_rss_mib(Path::new("/nonexistent")), None);
+    }
+
+    #[test]
+    fn the_ledger_charges_declared_size_against_what_is_left() {
+        // 32 GiB host: 10% held back (3276 MiB), 12 GiB used by things that are not us.
+        let ledger = MemLedger::new(Some(32768));
+        assert_eq!(ledger.reserve_mib, 3276);
+        // 32768 - 3276 - 12288 = 17204 free to promise. A 4 GiB stage fits with 8 GiB of
+        // siblings already promised (12288 + 4096 <= 17204) and not with 16 GiB (20480).
+        assert_eq!(ledger.short_by(4096, 8192, 12288), 0);
+        assert_eq!(ledger.short_by(4096, 16384, 12288), 4096 + 16384 - 17204);
+        // A small host keeps the floor rather than 10% of very little.
+        assert_eq!(
+            MemLedger::new(Some(4096)).reserve_mib,
+            BUILD_RESERVE_MIN_MIB
+        );
+        // Gate off: every size fits, whatever is held or in use elsewhere.
+        assert_eq!(
+            MemLedger::new(None).short_by(u64::MAX, u64::MAX, u64::MAX),
+            0
+        );
+    }
+
+    #[test]
+    fn the_ledger_admits_the_first_stage_and_holds_the_next() {
+        // A host too small for even one stage, so the fit check can never pass: the first
+        // reservation must still go through (a build with nothing running has no way to make
+        // room, and parking it forever would deadlock rather than throttle), and the second
+        // must wait for that one to be released rather than pile on.
+        let ledger = Arc::new(MemLedger::new(Some(1)));
+        let (first, wait) = ledger.reserve(4096, None, |_| {});
+        assert_eq!(
+            wait,
+            MemWait::No,
+            "nothing of ours was live, so it cannot have waited"
+        );
+        // Signalled, not slept on: the assertion below is that the second stage is *still*
+        // waiting, so it has to be taken at a moment the second stage has demonstrably
+        // reached — a fixed sleep would let a slow machine pass it before the thread ran.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let (l2, e2) = (Arc::clone(&ledger), Arc::clone(&entered));
+        let second = std::thread::spawn(move || {
+            let (_r, wait) = l2.reserve(4096, None, |short| tx.send(short).unwrap());
+            e2.store(1, SeqCst);
+            wait
+        });
+        let short = rx.recv().unwrap();
+        assert!(short > 0, "a parked stage reports what it is short by");
+        assert_eq!(
+            entered.load(SeqCst),
+            0,
+            "a second stage must wait while the host has no room for it"
+        );
+        drop(first);
+        assert_eq!(
+            second.join().unwrap(),
+            MemWait::Admitted,
+            "and must report that it waited and was then let in"
+        );
+        assert_eq!(
+            entered.load(SeqCst),
+            1,
+            "releasing the first stage's reservation should let the next one in"
+        );
+        assert_eq!(
+            ledger.state.lock().unwrap().held_mib,
+            0,
+            "guards release on drop"
+        );
+    }
+
+    #[test]
+    fn the_ledger_admits_waiting_stages_oldest_first() {
+        // Mixed sizes on a host with no room: the big stage queued first must get the
+        // memory the release frees, even though the small one behind it would also fit.
+        // Without that, a large stage is overtaken by every small one and never runs.
+        let ledger = Arc::new(MemLedger::new(Some(1)));
+        let (held, _) = ledger.reserve(1024, None, |_| {});
+        // Queue depth, not the wait callback: only the oldest waiter measures the host and
+        // so only it ever calls back, which is the very property under test.
+        let queued = |n: usize| {
+            for _ in 0..2000 {
+                if ledger.state.lock().unwrap().waiting.len() == n {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!("waited for {n} queued stage(s) and never saw them");
+        };
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut waiters = Vec::new();
+        for (i, (label, want)) in [("big", 8192u64), ("small", 512)].into_iter().enumerate() {
+            let (l, o) = (Arc::clone(&ledger), Arc::clone(&order));
+            waiters.push(std::thread::spawn(move || {
+                let (_r, _) = l.reserve(want, None, |_| {});
+                o.lock().unwrap().push(label);
+                // Hold until every waiter has been admitted, so the order recorded is the
+                // order they were let in and not the order they happened to finish.
+                std::thread::sleep(Duration::from_millis(50));
+            }));
+            // Queue strictly: only once this one has a ticket does the next take one.
+            queued(i + 1);
+        }
+        drop(held);
+        for w in waiters {
+            w.join().unwrap();
+        }
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["big", "small"],
+            "the stage that queued first is admitted first"
+        );
+    }
+
+    #[test]
+    fn a_guest_less_backend_never_queues() {
+        // `DryRun`/`Planner`/`Host` declare no stage RAM (`stage_mem_mib` is None -> 0), so
+        // they must pass straight through a ledger that is otherwise wedged shut.
+        let ledger = MemLedger::new(Some(1));
+        let (_blocking, _) = ledger.reserve(4096, None, |_| {});
+        let (free, wait) = ledger.reserve(0, None, |_| panic!("must not park"));
+        assert_eq!(wait, MemWait::No);
+        assert_eq!(
+            ledger.state.lock().unwrap().held_mib,
+            4096,
+            "a zero-size admission charges nothing"
+        );
+        assert!(
+            ledger.state.lock().unwrap().waiting.is_empty(),
+            "and takes no place in the queue"
+        );
+        drop(free);
+    }
+
+    #[test]
+    fn a_cancelled_build_stops_waiting_for_memory() {
+        // Same unfittable host, but the build is already cancelled: the stage is let through
+        // to fail at its own cancellation check instead of parking behind memory that a
+        // build now tearing down will never free.
+        let ledger = MemLedger::new(Some(1));
+        let (_first, _) = ledger.reserve(4096, None, |_| {});
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (_second, wait) = ledger.reserve(4096, Some(&cancel), |_| {
+            panic!("a cancelled build must not park on memory")
+        });
+        assert_eq!(wait, MemWait::No);
+        let st = ledger.state.lock().unwrap();
+        assert_eq!(st.held_mib, 8192);
+        assert!(
+            st.waiting.is_empty(),
+            "a stage that gives up leaves the queue"
+        );
+    }
+
+    #[test]
+    fn a_failing_stage_releases_the_memory_it_reserved() {
+        // The reservation is a guard, so the unwind of a stage that panics has to hand its
+        // memory back — otherwise one failure narrows the rest of the build for good.
+        let ledger = Arc::new(MemLedger::new(Some(32768)));
+        let l = Arc::clone(&ledger);
+        let panicked = std::thread::spawn(move || {
+            let (_r, _) = l.reserve(4096, None, |_| {});
+            assert_eq!(l.state.lock().unwrap().held_mib, 4096);
+            panic!("stage failed");
+        })
+        .join();
+        assert!(panicked.is_err(), "the stage was supposed to panic");
+        assert_eq!(
+            ledger.state.lock().unwrap().held_mib,
+            0,
+            "an unwinding stage still releases its reservation"
+        );
+    }
+
+    #[test]
+    fn the_gate_line_reports_what_is_left_of_the_host() {
+        // 32 GiB, 3276 held back, 12 GiB elsewhere -> 17204 for 4 GiB stages, i.e. 4.
+        let line = gate_line(8, 32768, 3276, 12288, 4096);
+        assert_eq!(
+            line,
+            "virtkit: build: host memory 32768 MiB, 12288 MiB in use elsewhere, \
+             3276 MiB held back — room for 4 stage(s) now"
+        );
+        // Never below one: the first stage is admitted whatever the host looks like, so a
+        // line saying "room for 0" would describe a build that is about to start anyway.
+        assert!(gate_line(8, 32768, 3276, 32000, 4096).ends_with("room for 1 stage(s) now"));
+        // Never above the ceiling printed directly above it: a host with room for twelve
+        // stages still only runs the `jobs` it announced.
+        assert!(gate_line(2, 32768, 3276, 0, 4096).ends_with("room for 2 stage(s) now"));
+    }
+
+    #[test]
+    fn a_stage_that_panics_while_parking_leaves_the_queue() {
+        // `on_wait` reaches `println!` on the plain backend, so it panics on EPIPE the
+        // moment a build's output is piped into something that stops reading. The queue
+        // place has to come back regardless: a ticket stranded by that unwind would be a
+        // head that never advances, and the build would hang instead of failing.
+        let ledger = Arc::new(MemLedger::new(Some(1)));
+        let (held, _) = ledger.reserve(4096, None, |_| {});
+        let l = Arc::clone(&ledger);
+        let died = std::thread::spawn(move || {
+            let _ = l.reserve(4096, None, |_| panic!("stdout went away"));
+        })
+        .join();
+        assert!(died.is_err(), "the parking stage was supposed to panic");
+        assert!(
+            ledger.state.lock().unwrap().waiting.is_empty(),
+            "an unwinding stage must give its queue place back"
+        );
+        // And the queue still works: without the guard above this would block forever
+        // behind a ticket whose owner is gone.
+        drop(held);
+        let (_next, wait) = ledger.reserve(4096, None, |_| {});
+        assert_eq!(wait, MemWait::No, "the next stage walks straight in");
+    }
+
+    #[test]
+    fn admitting_one_stage_wakes_the_next_in_the_queue() {
+        // Leaving the queue has to notify, not just releasing memory does. Otherwise the
+        // stage that becomes head sleeps out a whole `MEM_POLL` before it even looks —
+        // once per admission, on a host with nothing wrong with it.
+        let ledger = Arc::new(MemLedger::new(Some(1)));
+        let (first, _) = ledger.reserve(4096, None, |_| {});
+        let queued = |n: usize| {
+            for _ in 0..2000 {
+                if ledger.state.lock().unwrap().waiting.len() == n {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!("waited for {n} queued stage(s) and never saw them");
+        };
+        // The head: parks now, and is admitted as soon as `first` lets go.
+        let (head_tx, head_rx) = std::sync::mpsc::channel();
+        let l = Arc::clone(&ledger);
+        let head = std::thread::spawn(move || {
+            let (r, _) = l.reserve(4096, None, |_| {});
+            head_tx.send(Instant::now()).unwrap();
+            std::thread::sleep(Duration::from_millis(100)); // hold, so the next one parks
+            drop(r);
+        });
+        queued(1);
+        // Behind it: cannot measure anything until the head leaves, so the moment it first
+        // reports a shortfall is the moment it learned its turn had come.
+        let (next_tx, next_rx) = std::sync::mpsc::channel();
+        let l = Arc::clone(&ledger);
+        let next = std::thread::spawn(move || {
+            let (_r, _) = l.reserve(4096, None, |_| next_tx.send(Instant::now()).unwrap());
+        });
+        queued(2);
+        drop(first);
+        let (admitted_at, noticed_at) = (head_rx.recv().unwrap(), next_rx.recv().unwrap());
+        head.join().unwrap();
+        next.join().unwrap();
+        // Generously under the poll interval: the handoff is a condvar wake and a `/proc`
+        // walk, microseconds of work. Without the notify it is the full `MEM_POLL`.
+        assert!(
+            noticed_at.duration_since(admitted_at) < MEM_POLL / 2,
+            "the new head waited {:?} to notice its turn",
+            noticed_at.duration_since(admitted_at),
+        );
+    }
+
+    #[test]
+    fn an_ungated_build_never_queues_or_measures() {
+        // `[build] no_mem_gate` (and a host whose memory cannot be read) must not merely
+        // make every size fit — it has to skip the queue and the `/proc` walk entirely,
+        // which is what "the behaviour before the gate existed" means.
+        let ledger = MemLedger::new(None);
+        let (a, wait) = ledger.reserve(u64::MAX, None, |_| panic!("an ungated build cannot park"));
+        let (b, _) = ledger.reserve(u64::MAX, None, |_| panic!("an ungated build cannot park"));
+        assert_eq!(wait, MemWait::No);
+        let st = ledger.state.lock().unwrap();
+        assert_eq!(st.held_mib, 0, "nothing is charged when there is no gate");
+        assert_eq!(st.next_ticket, 0, "and no queue place is ever taken");
+        assert!(st.waiting.is_empty());
+        drop(st);
+        drop((a, b));
+    }
+
+    #[test]
+    fn the_gate_announces_itself_only_when_it_can_bind() {
+        // A sequential build has nothing to hold back — at most one stage is ever live, so
+        // the ledger's own escape admits it whatever the host looks like. Announcing room
+        // for stages such a build will not run is noise, not information.
+        assert!(gate_note(1, Some(32768), 4096).is_none());
+        assert!(
+            gate_note(4, None, 4096).is_none(),
+            "gate off, nothing to say"
+        );
+        assert!(gate_note(4, Some(32768), 4096).is_some());
+    }
+
     // Regression test for the dispatch/build-cap decoupling: the fully-cached fast path
-    // must return before ever touching `build_permits`, so it has to complete even with
+    // must return before ever touching `budget`, so it has to complete even with
     // the semaphore fully exhausted (0 permits) — a build-bound acquire here would block
     // forever, so drive the call off-thread and assert it finishes instead of hanging.
     #[test]
@@ -5618,7 +6436,7 @@ RUN ship
             cached_final.contains_key(&target),
             "test setup: stage must be a full cache hit"
         );
-        let build_permits = Semaphore::new(0);
+        let budget = BuildBudget::new(0, None);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let result = build_stage(
@@ -5634,7 +6452,7 @@ RUN ship
                 None,
                 "",
                 target,
-                &build_permits,
+                &budget,
             );
             let _ = tx.send(result.is_ok());
         });
@@ -5665,7 +6483,7 @@ RUN ship
             reason: "ENOSPC".into(),
             age: Duration::from_secs(5),
         });
-        let build_permits = Semaphore::new(0);
+        let budget = BuildBudget::new(0, None);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let result = build_stage(
@@ -5681,7 +6499,7 @@ RUN ship
                 None,
                 "",
                 target,
-                &build_permits,
+                &budget,
             );
             let _ = tx.send(result.err().map(|e| e.to_string()));
         });
@@ -5713,7 +6531,7 @@ RUN ship
         let key = resolved[&target].steps.last().unwrap().key.clone();
         let (_needed, cached_final) =
             compute_needed(&plan, &order, &resolved, &mut ex, false, &[target]).unwrap();
-        let build_permits = Semaphore::new(1);
+        let budget = BuildBudget::new(1, None);
         let result = build_stage(
             &plan,
             &resolved,
@@ -5727,7 +6545,7 @@ RUN ship
             None,
             "",
             target,
-            &build_permits,
+            &budget,
         );
         assert!(
             result.is_err(),
@@ -5760,7 +6578,7 @@ RUN ship
         let resolved = resolve_all(&plan, &order, &ba, &mut ex, &[target]).unwrap();
         let (_needed, cached_final) =
             compute_needed(&plan, &order, &resolved, &mut ex, false, &[target]).unwrap();
-        let build_permits = Semaphore::new(1);
+        let budget = BuildBudget::new(1, None);
         let cancel = CancellationToken::new();
         let result = build_stage(
             &plan,
@@ -5775,7 +6593,7 @@ RUN ship
             Some(&cancel),
             "",
             target,
-            &build_permits,
+            &budget,
         );
         assert!(
             result.is_err(),
@@ -5807,7 +6625,7 @@ RUN ship
         let resolved = resolve_all(&plan, &order, &ba, &mut ex, &[target]).unwrap();
         let (_needed, cached_final) =
             compute_needed(&plan, &order, &resolved, &mut ex, false, &[target]).unwrap();
-        let build_permits = Semaphore::new(1);
+        let budget = BuildBudget::new(1, None);
         let result = build_stage(
             &plan,
             &resolved,
@@ -5821,7 +6639,7 @@ RUN ship
             None,
             "",
             target,
-            &build_permits,
+            &budget,
         );
         assert!(
             result.is_err(),

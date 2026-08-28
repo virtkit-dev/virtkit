@@ -98,6 +98,12 @@ pub trait Executor {
     fn context_source(&mut self, _name: &str, _dir: &Path) -> Result<Rootfs> {
         bail!("this backend does not support named build contexts")
     }
+    /// Guest RAM reserved before this backend starts a stage, in MiB.
+    ///
+    /// Guest-less backends return `None` and bypass memory admission.
+    fn stage_mem_mib(&self) -> Option<u64> {
+        None
+    }
     /// Execute a `RUN` over `fs` with the accumulated shell state and resolved mounts.
     fn run(
         &mut self,
@@ -1837,6 +1843,9 @@ pub(crate) fn resolve_copy_dest(dest: &str, workdir: &str) -> String {
 }
 
 impl Executor for MicroVm {
+    fn stage_mem_mib(&self) -> Option<u64> {
+        Some(self.mem_mib())
+    }
     fn from_image(&mut self, stage: &str, image: &str) -> Result<Rootfs> {
         // The stage's writable working rootfs: a qcow2 overlay over the materialized base,
         // whose cache key + digest seed this stage's snapshot lineage.

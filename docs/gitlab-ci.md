@@ -505,6 +505,34 @@ built images are cached and shared across jobs and runners, so no single job own
 build guest it happens to trigger. Raising `[build] mem` lowers the derived `jobs` count
 unless you also set it: per-stage headroom and stage concurrency trade against each other.
 
+`jobs` is a ceiling, not a promise. It is derived from the memory the host *has*, so that
+a build's width does not depend on the minute it started — but a host also carries job
+VMs, other builds and whatever else it runs, so a stage additionally reserves its guest
+RAM against what is free before it boots, and waits when the host is full. The build
+announces both, and a stage parked on memory says so in the trace:
+
+```
+virtkit: build: up to 6 stage(s) at once (from host memory), each cpus=12, mem=4G
+virtkit: build: host memory 31241 MiB, 15180 MiB in use elsewhere, 3124 MiB held back — room for 3 stage(s) now
+```
+
+Its own guests are charged at their declared size from the moment they are admitted,
+never at what they have faulted in so far — a guest that booted seconds ago has touched
+almost none of its RAM, and a gate that believed `MemAvailable` would wave the next
+stages in against memory the first one is about to take. Everything else on the host is
+measured afresh each time a stage is about to be admitted, so a build narrows when a job
+VM starts beside it and widens again when one ends. A stage with nothing else of this
+build's live is always admitted, whatever the host looks like: a build with no way to make
+room should be slow, not stuck. Stages that do wait are admitted oldest first, so a large
+stage is not overtaken indefinitely by the smaller ones queued behind it.
+
+The measurement is of memory actually in use, so it lags a job VM that `[schedule]
+mem_budget` has just granted but which has not faulted its RAM in yet — the same trap the
+gate avoids for the build's own guests, one level out. Where jobs and builds share a host,
+that is a reason to bound both up front rather than to rely on the gate alone. Set
+`[build] no_mem_gate` to switch the gate off entirely and let `jobs` bound the build by
+itself.
+
 ### Keeping the host inside its memory
 
 gitlab-runner decides how many jobs to take with `concurrent`, a count that knows nothing
@@ -692,9 +720,12 @@ work out of the runner. For that, see below.
 Nor does it cover everything a job boots. The claim is taken at the start of prepare, so a
 job that builds its own image holds its full guest RAM across that build — and the build's
 own stage guests (`[build] mem` × `[build] jobs`) are outside the budget entirely. A host
-has to leave room for both. An auto `[build] jobs` does not close that gap either: it is a
-fixed share of the whole machine, not of what is left of it, so a host that runs jobs and
-builds side by side should set `[build] jobs` by hand.
+has to leave room for both. An auto `[build] jobs` does not close that gap on its own: it is
+a fixed share of the whole machine, not of what is left of it. A stage does also wait for
+the memory it is about to use (see [Sizing the two phases](#sizing-the-two-phases)), so a
+build narrows while jobs hold the host — but that waiting measures memory already faulted
+in, not what the job ledger has granted, so it lags a job VM that has only just been
+admitted. Set `[build] jobs` by hand to bound the build up front as well.
 
 ## Throttling a busy runner
 

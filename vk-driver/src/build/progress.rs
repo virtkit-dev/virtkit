@@ -118,6 +118,10 @@ const WAIT_LOCK_NUM: usize = usize::MAX - 1;
 /// scrolling log (real cells are 1..=total; distinct from the other transient sentinels).
 const OUTPUT_TAIL_NUM: usize = usize::MAX - 2;
 
+/// bars-map cell num for a stage's transient "waiting for host memory" spinner (real cells
+/// are 1..=total; distinct from the other transient sentinels).
+const WAIT_MEM_NUM: usize = usize::MAX - 3;
+
 enum Backend {
     Tty(Box<Tty>),
     Plain,
@@ -427,6 +431,47 @@ impl Progress {
             && let Some(pb) = tty.bars.lock().unwrap().remove(&(stage, WAIT_LOCK_NUM))
         {
             pb.finish_and_clear();
+        }
+    }
+
+    /// Show a transient spinner while this stage waits for the host to have room for its
+    /// guest — it holds a job slot but not yet the memory, and without a line of its own the
+    /// wait is indistinguishable from a guest that is slow to boot. `short` is how many MiB
+    /// it is waiting on. Cleared by [`Progress::wait_mem_done`], or drained by
+    /// [`Progress::finish`] on error.
+    pub fn wait_mem_start(&self, stage: StageId, name: &str, short: u64) {
+        let msg = format!("[{name}] waiting for host memory ({short} MiB short)");
+        match &self.backend {
+            Backend::Tty(tty) => {
+                let pb = tty.mp.add(ProgressBar::new_spinner());
+                pb.set_style(self.step_style());
+                pb.set_message(msg);
+                pb.enable_steady_tick(Duration::from_millis(120));
+                tty.bars.lock().unwrap().insert((stage, WAIT_MEM_NUM), pb);
+            }
+            // Off-terminal (CI logs) a build that is waiting on memory rather than working
+            // is exactly what someone reading the log needs told.
+            Backend::Plain | Backend::Routed(_) => self.plain_line(format_args!("{msg}")),
+            Backend::Disabled => {}
+        }
+    }
+
+    /// Clear [`Progress::wait_mem_start`]'s spinner. `started` says why the wait ended: the
+    /// host found room, or the build was cancelled and the stage was let through to fail its
+    /// own check. Off-terminal only the first prints the other half of the pair — a log that
+    /// shows every park and no resume cannot tell a two-second wait from a twenty-minute
+    /// one, but a cancelled build must not claim a stage is starting.
+    pub fn wait_mem_done(&self, stage: StageId, name: &str, started: bool) {
+        match &self.backend {
+            Backend::Tty(tty) => {
+                if let Some(pb) = tty.bars.lock().unwrap().remove(&(stage, WAIT_MEM_NUM)) {
+                    pb.finish_and_clear();
+                }
+            }
+            Backend::Plain | Backend::Routed(_) if started => {
+                self.plain_line(format_args!("[{name}] host memory available, starting"));
+            }
+            Backend::Plain | Backend::Routed(_) | Backend::Disabled => {}
         }
     }
 
@@ -1608,6 +1653,50 @@ mod tests {
                 assert!(
                     tty.bars.lock().unwrap().is_empty(),
                     "finish must drain the leftover wait-lock spinner"
+                );
+            }
+        }
+    }
+
+    /// The host-memory wait is the pair that repeats — a stage can park once per admission —
+    /// so both halves have to hold: the spinner is cleared whether the stage was let in or
+    /// cancelled, and `finish(false)` drains one left behind by a failure.
+    #[test]
+    fn wait_mem_spinner_is_cleared_however_the_wait_ends() {
+        for started in [true, false] {
+            let p = Arc::new(Progress::new_backend(
+                Backend::Tty(Box::new(Tty::new())),
+                false,
+            ));
+            p.init(two_stages(), 1);
+            let Backend::Tty(tty) = &p.backend else {
+                unreachable!("built with a tty backend")
+            };
+            p.wait_mem_start(0, "base", 2048);
+            assert!(
+                tty.bars.lock().unwrap().contains_key(&(0, WAIT_MEM_NUM)),
+                "a parked stage shows a spinner of its own"
+            );
+            p.wait_mem_done(0, "base", started);
+            assert!(
+                !tty.bars.lock().unwrap().contains_key(&(0, WAIT_MEM_NUM)),
+                "and loses it once the wait ends, admitted or cancelled"
+            );
+        }
+        for p in [
+            Arc::new(Progress::new_backend(Backend::Plain, false)),
+            Arc::new(Progress::new_backend(
+                Backend::Tty(Box::new(Tty::new())),
+                false,
+            )),
+        ] {
+            p.init(two_stages(), 1);
+            p.wait_mem_start(0, "base", 2048); // no wait_mem_done: the build failed
+            p.finish(false);
+            if let Backend::Tty(tty) = &p.backend {
+                assert!(
+                    tty.bars.lock().unwrap().is_empty(),
+                    "finish must drain the leftover wait-memory spinner"
                 );
             }
         }

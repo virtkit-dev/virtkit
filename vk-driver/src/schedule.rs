@@ -118,6 +118,11 @@ pub fn tune(cfg: &Config) -> Result<()> {
 pub struct HostMemory {
     pub available_mib: u64,
     pub total_mib: u64,
+    /// tmpfs and other shared pages. They sit on the file LRU, so `MemAvailable` counts them
+    /// as reclaimable although they can only leave for swap — a reader that must not
+    /// over-count what the host can hand out subtracts them again (see
+    /// `crate::build::foreign_used_mib`). `0` on a kernel that does not report it.
+    pub shmem_mib: u64,
 }
 
 /// Everything the decision rests on, so the rule itself can be read — and tested — without
@@ -186,11 +191,12 @@ fn typical_job_mib(cfg: &Config, declared_mib: u64) -> u64 {
 /// This host's memory, from `/proc/meminfo`. `None` — a host whose memory cannot be read — is
 /// treated as roomy: the ledger is the real guard, and this is only the brake for what the
 /// ledger cannot see.
-fn host_memory() -> Option<HostMemory> {
-    let (available_kib, total_kib) = meminfo(Path::new("/proc/meminfo"))?;
+pub(crate) fn host_memory() -> Option<HostMemory> {
+    let (available_kib, total_kib, shmem_kib) = meminfo(Path::new("/proc/meminfo"))?;
     Some(HostMemory {
         available_mib: available_kib / 1024,
         total_mib: total_kib / 1024,
+        shmem_mib: shmem_kib / 1024,
     })
 }
 
@@ -208,12 +214,15 @@ fn total_mib(path: &Path) -> Option<u64> {
     Some(meminfo_field(&std::fs::read_to_string(path).ok()?, "MemTotal:")? / 1024)
 }
 
-/// `(MemAvailable, MemTotal)` in kB.
-fn meminfo(path: &Path) -> Option<(u64, u64)> {
+/// `(MemAvailable, MemTotal, Shmem)` in kB. The first two are required — a `/proc/meminfo`
+/// without them is not one this can read — while `Shmem` reads as 0 when absent, which is
+/// what a kernel that does not report it effectively means.
+fn meminfo(path: &Path) -> Option<(u64, u64, u64)> {
     let text = std::fs::read_to_string(path).ok()?;
     Some((
         meminfo_field(&text, "MemAvailable:")?,
         meminfo_field(&text, "MemTotal:")?,
+        meminfo_field(&text, "Shmem:").unwrap_or(0),
     ))
 }
 
@@ -242,6 +251,7 @@ mod tests {
             host: Some(HostMemory {
                 available_mib: 65536,
                 total_mib: 65536,
+                shmem_mib: 0,
             }),
             previous: None,
         }
@@ -252,6 +262,7 @@ mod tests {
         Some(HostMemory {
             available_mib: mib,
             total_mib: 65536,
+            shmem_mib: 0,
         })
     }
 
@@ -518,10 +529,15 @@ mod tests {
         let path = dir.join("meminfo");
         std::fs::write(
             &path,
-            "MemTotal:       65790616 kB\nMemFree:  123 kB\nMemAvailable:   32895308 kB\n",
+            "MemTotal:       65790616 kB\nMemFree:  123 kB\nMemAvailable:   32895308 kB\n\
+             Shmem:           1048576 kB\n",
         )
         .unwrap();
-        assert_eq!(meminfo(&path), Some((32895308, 65790616)));
+        assert_eq!(meminfo(&path), Some((32895308, 65790616, 1048576)));
+        // A kernel that reports no Shmem reads as none held, not as an unreadable host.
+        let no_shmem = dir.join("meminfo-no-shmem");
+        std::fs::write(&no_shmem, "MemTotal: 100 kB\nMemAvailable: 50 kB\n").unwrap();
+        assert_eq!(meminfo(&no_shmem), Some((50, 100, 0)));
         assert_eq!(meminfo(Path::new("/nonexistent")), None);
         assert_eq!(total_mib(&path), Some(64248));
 
