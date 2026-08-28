@@ -23,6 +23,7 @@ use anyhow::{Context, Result, bail};
 use crate::blockrt::block_on;
 use crate::config::{Config, Docker};
 use crate::image::{self, BootKind, Reference, ResolvedImage};
+use crate::oci::Creds;
 
 /// `MICROVM_IMAGE: docker/<name>[:tag|@digest]`. Routed onto `[docker].repo` (with its
 /// credentials) when that is set; with no repo — an absent `[docker]`, or one carrying only
@@ -44,7 +45,7 @@ pub fn resolve(cfg: &Config, state_dir: &Path, image_ref: &str) -> Result<Resolv
                 Reference::Digest(d) => format!("{name}@{d}"),
                 Reference::Tag(t) => format!("{name}:{t}"),
             };
-            (full, Creds::anon())
+            (full, Creds::anonymous())
         }
     };
     resolve_full(cfg, state_dir, &name, &full, &creds)
@@ -64,75 +65,19 @@ pub fn resolve_image(cfg: &Config, state_dir: &Path, image: &str) -> Result<Reso
             Route::Mirror { full, name } => {
                 (full, name, Creds::from_mirror(dk.mirror.as_ref().unwrap())?)
             }
-            Route::Direct => (image.to_string(), ref_cache_name(image)?, Creds::anon()),
+            Route::Direct => (
+                image.to_string(),
+                ref_cache_name(image)?,
+                Creds::anonymous(),
+            ),
         },
-        None => (image.to_string(), ref_cache_name(image)?, Creds::anon()),
+        None => (
+            image.to_string(),
+            ref_cache_name(image)?,
+            Creds::anonymous(),
+        ),
     };
     resolve_full(cfg, state_dir, &name, &full, &creds)
-}
-
-/// Registry credentials for one pull. Anonymous for a direct pull; from `[docker]` when a
-/// bare name is routed onto the configured proxy repo, or from `[docker.mirror]` when a
-/// Docker Hub ref is routed through the mirror.
-struct Creds {
-    username: Option<String>,
-    password: Option<String>,
-    ca_pem: Option<Vec<u8>>,
-    insecure: bool,
-}
-
-impl Creds {
-    fn anon() -> Creds {
-        Creds {
-            username: None,
-            password: None,
-            ca_pem: None,
-            insecure: false,
-        }
-    }
-
-    fn from_parts(
-        ca_file: Option<&Path>,
-        username: &str,
-        password_file: Option<&Path>,
-        insecure: bool,
-    ) -> Result<Creds> {
-        let ca_pem = ca_file
-            .map(|p| std::fs::read(p).with_context(|| format!("reading {}", p.display())))
-            .transpose()?;
-        let password = password_file
-            .map(|p| {
-                std::fs::read_to_string(p)
-                    .map(|s| s.trim_end().to_string())
-                    .with_context(|| format!("reading {}", p.display()))
-            })
-            .transpose()?;
-        let username = (!username.is_empty()).then(|| username.to_string());
-        Ok(Creds {
-            username,
-            password,
-            ca_pem,
-            insecure,
-        })
-    }
-
-    fn from_docker(dk: &crate::config::Docker) -> Result<Creds> {
-        Self::from_parts(
-            dk.ca_file.as_deref(),
-            &dk.username,
-            dk.password_file.as_deref(),
-            dk.insecure,
-        )
-    }
-
-    fn from_mirror(m: &crate::config::Mirror) -> Result<Creds> {
-        Self::from_parts(
-            m.ca_file.as_deref(),
-            &m.username,
-            m.password_file.as_deref(),
-            m.insecure,
-        )
-    }
 }
 
 /// Pull + cache + boot the OCI ref `full` with `creds` (cache-keyed by `name` + digest).
@@ -143,14 +88,8 @@ fn resolve_full(
     full: &str,
     creds: &Creds,
 ) -> Result<ResolvedImage> {
-    let digest = block_on(crate::oci::resolve_digest_auth(
-        full,
-        creds.username.as_deref(),
-        creds.password.as_deref(),
-        creds.ca_pem.clone(),
-        creds.insecure,
-    ))
-    .with_context(|| format!("resolving {full}"))?;
+    let digest = block_on(crate::oci::resolve_digest_auth(full, creds))
+        .with_context(|| format!("resolving {full}"))?;
 
     // Pull by the resolved digest, not the tag, so the digest-keyed cache dir is always
     // populated with exactly that content even if the tag moves under us (mirrors the
@@ -168,14 +107,7 @@ fn resolve_full(
             // before asking for more space ourselves — otherwise a tier stuck failing
             // (e.g. ENOSPC) never gets a chance to recover.
             image::sweep_orphaned_build_tmp(&state_dir.join("docker"));
-            build(
-                &pinned,
-                creds.username.clone(),
-                creds.password.clone(),
-                creds.ca_pem.clone(),
-                creds.insecure,
-                &dir,
-            )?;
+            build(&pinned, creds, &dir)?;
             let docker_root = state_dir.join("docker");
             image::gc_idle(&docker_root, cfg.image_cache_idle());
             image::sweep_orphaned_build_tmp(&docker_root);
@@ -191,14 +123,7 @@ fn resolve_full(
 /// Pull + flatten the image into `dir/runner.ext4` (byte-clean) and write its captured
 /// runtime config to `runner.ext4.json`. A tmp sibling is promoted on success so a killed
 /// prepare never leaves a half-built rootfs a cache check would trust.
-fn build(
-    full: &str,
-    username: Option<String>,
-    password: Option<String>,
-    ca_pem: Option<Vec<u8>>,
-    insecure: bool,
-    dir: &Path,
-) -> Result<()> {
+fn build(full: &str, creds: &Creds, dir: &Path) -> Result<()> {
     let tmp = dir.with_extension("tmp");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
@@ -213,10 +138,7 @@ fn build(
     let rootfs = tmp.join("runner.ext4");
     block_on(crate::source::oci_flatten(
         full,
-        username.as_deref(),
-        password.as_deref(),
-        ca_pem,
-        insecure,
+        creds,
         0,
         &crate::ext4::FsId {
             with_journal: true,

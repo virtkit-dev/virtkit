@@ -435,7 +435,7 @@ pub struct Docker {
     #[serde(default)]
     pub username: String,
     /// Path to a file holding the Basic-auth password (read at runtime, trailing newline
-    /// trimmed; only when `username` is set). Provision out of band, 0600.
+    /// trimmed; sent only when `username` is set). Provision out of band, 0600.
     #[serde(default)]
     pub password_file: Option<PathBuf>,
     /// Plain HTTP registry (a local/insecure registry); default TLS.
@@ -467,7 +467,7 @@ pub struct Mirror {
     #[serde(default)]
     pub username: String,
     /// Path to a file holding the Basic-auth password (read at runtime, trailing newline
-    /// trimmed; only when `username` is set). Provision out of band, 0600.
+    /// trimmed; sent only when `username` is set). Provision out of band, 0600.
     #[serde(default)]
     pub password_file: Option<PathBuf>,
     /// Plain HTTP mirror (a local/insecure registry); default TLS.

@@ -2978,24 +2978,17 @@ async fn cli_main() -> ExitCode {
         insecure,
     } = &cli.cmd
     {
-        let ca_pem = match ca {
-            Some(p) => match std::fs::read(p) {
-                Ok(b) => Some(b),
-                Err(e) => return fail(&anyhow::anyhow!("reading {}: {e}", p.display()), 1),
-            },
-            None => None,
+        let creds = oci::Creds {
+            username: username.clone(),
+            password: password.clone(),
+            ca_pem: None,
+            insecure: *insecure,
         };
-        return match oci::pull_flatten(
-            reference,
-            username.as_deref(),
-            password.as_deref(),
-            ca_pem,
-            *insecure,
-            out,
-            &|m| println!("{m}"),
-        )
-        .await
-        {
+        let creds = match creds.with_ca_file(ca.as_deref()) {
+            Ok(c) => c,
+            Err(e) => return fail(&e, 1),
+        };
+        return match oci::pull_flatten(reference, &creds, out, &|m| println!("{m}")).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         };

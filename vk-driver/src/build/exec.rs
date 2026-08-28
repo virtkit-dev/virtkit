@@ -379,7 +379,10 @@ impl Executor for Planner {
         if let Some(c) = self.configs.get(image) {
             return Ok(c.clone());
         }
-        let c = block_on(crate::oci::pull_config(image, None, None, None, false))?;
+        let c = block_on(crate::oci::pull_config(
+            image,
+            &crate::oci::Creds::anonymous(),
+        ))?;
         self.configs.insert(image.to_string(), c.clone());
         Ok(c)
     }
@@ -1526,10 +1529,7 @@ impl MicroVm {
         // stage's FROM step, so the "pulling …"/"flattened …" notes are redundant here.
         block_on(crate::oci::pull_flatten(
             image,
-            None,
-            None,
-            None,
-            false,
+            &crate::oci::Creds::anonymous(),
             &tar,
             &|_| {},
         ))
@@ -2553,7 +2553,10 @@ impl Executor for MicroVm {
     }
 
     fn base_config(&mut self, image: &str) -> Result<crate::oci::ImageConfig> {
-        block_on(crate::oci::pull_config(image, None, None, None, false))
+        block_on(crate::oci::pull_config(
+            image,
+            &crate::oci::Creds::anonymous(),
+        ))
     }
 
     fn resolve_base_digest(&mut self, image: &str) -> Option<String> {

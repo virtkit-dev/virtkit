@@ -15,6 +15,8 @@ use oci_client::client::{Certificate, CertificateEncoding, ClientConfig, ClientP
 use oci_client::manifest;
 use oci_client::secrets::RegistryAuth;
 
+use crate::config::{Docker, Mirror};
+
 /// A sink for the human-readable status lines a pull emits (`pulling …`, `flattened …`).
 /// The caller supplies where they go: straight to stdout for a standalone pull, or a
 /// no-op under the `vk build` dashboard — which owns the terminal, so a raw `println!`
@@ -50,6 +52,134 @@ impl From<ImageConfig> for vk_core::runcfg::RunConfig {
     }
 }
 
+/// What one registry conversation needs: the HTTP Basic pair to authenticate with, the
+/// trust anchor its TLS certificate must chain to, and whether it speaks plain HTTP.
+/// One struct so a caller cannot transpose two arguments of the same type, and so the
+/// `ClientConfig` assembly has a single home.
+#[derive(Default, Clone)]
+pub struct Creds {
+    /// HTTP Basic username. `None` — or a `None` `password` — sends no `Authorization`.
+    pub username: Option<String>,
+    /// The Basic password: as `--password` gave it, or read from a config section's
+    /// `password_file` by [`Creds::from_docker`] / [`Creds::from_mirror`]. Sent only
+    /// alongside a `username`.
+    pub password: Option<String>,
+    /// PEM CA bundle the registry's TLS certificate chains to. `None` = the system roots.
+    pub ca_pem: Option<Vec<u8>>,
+    /// Plain HTTP (a local/insecure registry); TLS otherwise.
+    pub insecure: bool,
+}
+
+/// Hand-written so the password cannot escape through a `{:?}`: `Creds` is public and is
+/// carried inside [`crate::source::Source`], so the day anything up that chain derives
+/// `Debug` the secret would otherwise land in a log or an `anyhow` context. The CA bundle
+/// is public data but bulky, so it prints as its length.
+impl std::fmt::Debug for Creds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Creds")
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("ca_pem_len", &self.ca_pem.as_ref().map(Vec::len))
+            .field("insecure", &self.insecure)
+            .finish()
+    }
+}
+
+impl Creds {
+    /// Anonymous, over TLS verified against the system roots: what a pull from a registry
+    /// nothing is configured for uses, and the spelling to prefer over `Creds::default()`.
+    pub fn anonymous() -> Creds {
+        Creds::default()
+    }
+
+    /// What `[docker]` names, for a bare image name routed onto the configured proxy repo.
+    pub fn from_docker(dk: &Docker) -> Result<Creds> {
+        Creds::from_files(
+            dk.ca_file.as_deref(),
+            &dk.username,
+            dk.password_file.as_deref(),
+            dk.insecure,
+        )
+    }
+
+    /// What `[docker.mirror]` names, for a Docker Hub reference routed through the mirror.
+    /// A mirror usually carries its own account, hence the second constructor.
+    pub fn from_mirror(m: &Mirror) -> Result<Creds> {
+        Creds::from_files(
+            m.ca_file.as_deref(),
+            &m.username,
+            m.password_file.as_deref(),
+            m.insecure,
+        )
+    }
+
+    /// The shared body of [`Creds::from_docker`] and [`Creds::from_mirror`]. Private on
+    /// purpose: its two `Option<&Path>` are of the same shape, so no caller outside this
+    /// impl is in a position to transpose them.
+    ///
+    /// The files are read here, once, rather than at each use: a pull that would fail for
+    /// an unreadable 0600 file says so before the first request, naming the path. The
+    /// password is `trim_end`ed only — it may legitimately begin with whitespace —
+    /// matching `registry::cred`, so one credential file behaves the same on either path.
+    fn from_files(
+        ca_file: Option<&Path>,
+        username: &str,
+        password_file: Option<&Path>,
+        insecure: bool,
+    ) -> Result<Creds> {
+        let password = password_file
+            .map(|p| {
+                std::fs::read_to_string(p)
+                    .map(|s| s.trim_end().to_string())
+                    .with_context(|| format!("reading {}", p.display()))
+            })
+            .transpose()?;
+        Creds {
+            username: (!username.is_empty()).then(|| username.to_string()),
+            password,
+            ca_pem: None,
+            insecure,
+        }
+        .with_ca_file(ca_file)
+    }
+
+    /// Read `ca_file` into this credential's trust anchor — for the `--ca` flag, whose
+    /// callers hold a path rather than the PEM. Reading it up front means an unreadable
+    /// bundle fails naming the path instead of as an opaque TLS error mid-pull. `None`
+    /// leaves the anchor as it was, so this only ever adds what a path names.
+    pub fn with_ca_file(mut self, ca_file: Option<&Path>) -> Result<Creds> {
+        if let Some(p) = ca_file {
+            self.ca_pem =
+                Some(std::fs::read(p).with_context(|| format!("reading {}", p.display()))?);
+        }
+        Ok(self)
+    }
+
+    /// The `Authorization` this sends: the Basic pair when both halves are set, else
+    /// nothing — a username with no password authenticates as nobody, not as that user.
+    fn auth(&self) -> RegistryAuth {
+        match (&self.username, &self.password) {
+            (Some(u), Some(p)) => RegistryAuth::Basic(u.clone(), p.clone()),
+            _ => RegistryAuth::Anonymous,
+        }
+    }
+
+    /// A client configured for this registry's transport (scheme + trust anchor).
+    fn client(&self) -> oci_client::Client {
+        let mut cfg = ClientConfig::default();
+        if self.insecure {
+            cfg.protocol = ClientProtocol::Http;
+        }
+        if let Some(data) = &self.ca_pem {
+            cfg.extra_root_certificates.push(Certificate {
+                encoding: CertificateEncoding::Pem,
+                data: data.clone(),
+            });
+        }
+        oci_client::Client::new(cfg)
+    }
+}
+
 /// Resolve `reference` to its manifest digest (`sha256:…`), anonymously — for the build
 /// cache key, so a moved tag changes the key (and a stale cached base is not reused).
 /// Errors (offline, private registry) propagate; the caller falls back to keying by ref.
@@ -65,7 +195,7 @@ pub async fn resolve_digest(reference: &str) -> Result<String> {
     if let Some(digest) = reference.digest() {
         return Ok(digest.to_string());
     }
-    let client = oci_client::Client::new(ClientConfig::default());
+    let client = Creds::anonymous().client();
     client
         .fetch_manifest_digest(&reference, &RegistryAuth::Anonymous)
         .await
@@ -76,36 +206,16 @@ pub async fn resolve_digest(reference: &str) -> Result<String> {
 /// the executor keys its per-image cache on the digest, and a digest-pinned ref returns
 /// without a round-trip. Mirrors [`resolve_digest`] but carries the `[docker]` creds so a
 /// private corp registry answers.
-pub async fn resolve_digest_auth(
-    reference: &str,
-    username: Option<&str>,
-    password: Option<&str>,
-    ca_pem: Option<Vec<u8>>,
-    insecure: bool,
-) -> Result<String> {
+pub async fn resolve_digest_auth(reference: &str, creds: &Creds) -> Result<String> {
     let parsed: Reference = reference
         .parse()
         .with_context(|| format!("parsing OCI reference {reference:?}"))?;
     if let Some(digest) = parsed.digest() {
         return Ok(digest.to_string());
     }
-    let mut cfg = ClientConfig::default();
-    if insecure {
-        cfg.protocol = ClientProtocol::Http;
-    }
-    if let Some(data) = ca_pem {
-        cfg.extra_root_certificates.push(Certificate {
-            encoding: CertificateEncoding::Pem,
-            data,
-        });
-    }
-    let client = oci_client::Client::new(cfg);
-    let auth = match (username, password) {
-        (Some(u), Some(p)) => RegistryAuth::Basic(u.to_string(), p.to_string()),
-        _ => RegistryAuth::Anonymous,
-    };
-    client
-        .fetch_manifest_digest(&parsed, &auth)
+    creds
+        .client()
+        .fetch_manifest_digest(&parsed, &creds.auth())
         .await
         .with_context(|| format!("resolving manifest digest for {reference}"))
 }
@@ -115,32 +225,13 @@ pub async fn resolve_digest_auth(
 /// for auth/network/other failures. Lets an `auto` source fall back to docker *only* when
 /// the image truly is not in a registry, while surfacing auth errors instead of masking
 /// them behind a docker fallback.
-pub async fn manifest_exists(
-    reference: &str,
-    username: Option<&str>,
-    password: Option<&str>,
-    ca_pem: Option<Vec<u8>>,
-    insecure: bool,
-) -> Result<bool> {
+pub async fn manifest_exists(reference: &str, creds: &Creds) -> Result<bool> {
     use oci_client::errors::{OciDistributionError, OciErrorCode};
     let parsed: Reference = reference
         .parse()
         .with_context(|| format!("parsing OCI reference {reference:?}"))?;
-    let mut cfg = ClientConfig::default();
-    if insecure {
-        cfg.protocol = ClientProtocol::Http;
-    }
-    if let Some(data) = ca_pem {
-        cfg.extra_root_certificates.push(Certificate {
-            encoding: CertificateEncoding::Pem,
-            data,
-        });
-    }
-    let client = oci_client::Client::new(cfg);
-    let auth = match (username, password) {
-        (Some(u), Some(p)) => RegistryAuth::Basic(u.to_string(), p.to_string()),
-        _ => RegistryAuth::Anonymous,
-    };
+    let client = creds.client();
+    let auth = creds.auth();
     let not_found = |c: &OciErrorCode| {
         matches!(
             c,
@@ -163,39 +254,18 @@ pub async fn manifest_exists(
 /// Fetch `reference`'s image config (`Env`/`User`/`WorkingDir`), so a stage's `RUN`s
 /// inherit the base image's environment. Cached on disk keyed by the reference, so it
 /// is fetched at most once per ref (a warm build reads the cache, no network).
-pub async fn pull_config(
-    reference: &str,
-    username: Option<&str>,
-    password: Option<&str>,
-    ca_pem: Option<Vec<u8>>,
-    insecure: bool,
-) -> Result<ImageConfig> {
+pub async fn pull_config(reference: &str, creds: &Creds) -> Result<ImageConfig> {
     if let Some(json) = read_cached_config(reference) {
         return Ok(parse_config(&json));
     }
     let parsed: Reference = reference
         .parse()
         .with_context(|| format!("parsing OCI reference {reference:?}"))?;
-    let mut cfg = ClientConfig::default();
-    if insecure {
-        cfg.protocol = ClientProtocol::Http;
-    }
-    if let Some(data) = ca_pem {
-        cfg.extra_root_certificates.push(Certificate {
-            encoding: CertificateEncoding::Pem,
-            data,
-        });
-    }
-    let client = oci_client::Client::new(cfg);
-    let auth = match (username, password) {
-        (Some(u), Some(p)) => RegistryAuth::Basic(u.to_string(), p.to_string()),
-        _ => RegistryAuth::Anonymous,
-    };
-    let (_manifest, _digest, config_json) =
-        client
-            .pull_manifest_and_config(&parsed, &auth)
-            .await
-            .with_context(|| format!("pulling the config of {reference}"))?;
+    let (_manifest, _digest, config_json) = creds
+        .client()
+        .pull_manifest_and_config(&parsed, &creds.auth())
+        .await
+        .with_context(|| format!("pulling the config of {reference}"))?;
     write_cached_config(reference, &config_json);
     Ok(parse_config(&config_json))
 }
@@ -285,10 +355,7 @@ fn write_cached_config(reference: &str, json: &str) {
 /// Pull `reference` and flatten it into a rootfs tar at `out_tar`.
 pub async fn pull_flatten(
     reference: &str,
-    username: Option<&str>,
-    password: Option<&str>,
-    ca_pem: Option<Vec<u8>>,
-    insecure: bool,
+    creds: &Creds,
     out_tar: &Path,
     note: Note<'_>,
 ) -> Result<()> {
@@ -298,16 +365,7 @@ pub async fn pull_flatten(
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let (merger, layers) = pull_merged(
-        reference,
-        username,
-        password,
-        ca_pem,
-        insecure,
-        scratch_dir,
-        note,
-    )
-    .await?;
+    let (merger, layers) = pull_merged(reference, creds, scratch_dir, note).await?;
     let n = merger.finish(out_tar)?;
     note(&format!(
         "virtkit: flattened {layers} layers -> {n} entries"
@@ -321,31 +379,15 @@ pub async fn pull_flatten(
 /// intermediate tar.
 pub(crate) async fn pull_merged(
     reference: &str,
-    username: Option<&str>,
-    password: Option<&str>,
-    ca_pem: Option<Vec<u8>>,
-    insecure: bool,
+    creds: &Creds,
     scratch_dir: &Path,
     note: Note<'_>,
 ) -> Result<(Merger, usize)> {
     let reference: Reference = reference
         .parse()
         .with_context(|| format!("parsing OCI reference {reference:?}"))?;
-    let mut cfg = ClientConfig::default();
-    if insecure {
-        cfg.protocol = ClientProtocol::Http;
-    }
-    if let Some(data) = ca_pem {
-        cfg.extra_root_certificates.push(Certificate {
-            encoding: CertificateEncoding::Pem,
-            data,
-        });
-    }
-    let client = oci_client::Client::new(cfg);
-    let auth = match (username, password) {
-        (Some(u), Some(p)) => RegistryAuth::Basic(u.to_string(), p.to_string()),
-        _ => RegistryAuth::Anonymous,
-    };
+    let client = creds.client();
+    let auth = creds.auth();
     let accepted = vec![
         manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
         manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
@@ -606,6 +648,133 @@ fn join(parent: &str, name: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// A scratch dir for one test's credential files, named per test and process so
+    /// concurrent runs never collide (the crate's idiom — see `config.rs`'s tests).
+    fn creds_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("vk-oci-creds-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("creating the scratch dir");
+        d
+    }
+
+    fn docker_section(dir: &Path, username: &str, password_file: Option<PathBuf>) -> Docker {
+        Docker {
+            repo: None,
+            ca_file: Some(dir.join("ca.pem")),
+            username: username.to_string(),
+            password_file,
+            insecure: false,
+            mirror: None,
+        }
+    }
+
+    #[test]
+    fn from_docker_reads_the_files_a_section_names() {
+        let dir = creds_dir("read");
+        std::fs::write(dir.join("ca.pem"), b"-----BEGIN CERTIFICATE-----\n").unwrap();
+        let pw = dir.join("password");
+        // Only the trailing newline goes: a password may legitimately begin with spaces.
+        std::fs::write(&pw, "  s3cret \n").unwrap();
+
+        let creds = Creds::from_docker(&docker_section(&dir, "bob", Some(pw))).unwrap();
+        assert_eq!(creds.username.as_deref(), Some("bob"));
+        assert_eq!(creds.password.as_deref(), Some("  s3cret"));
+        assert_eq!(
+            creds.ca_pem.as_deref(),
+            Some(&b"-----BEGIN CERTIFICATE-----\n"[..])
+        );
+        assert!(!creds.insecure);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn from_docker_leaves_an_empty_username_anonymous() {
+        let dir = creds_dir("anon");
+        std::fs::write(dir.join("ca.pem"), b"pem").unwrap();
+        let pw = dir.join("password");
+        std::fs::write(&pw, "s3cret\n").unwrap();
+
+        // The password file is still read (and still fails loudly if it cannot be), but
+        // with nobody to send it as, `auth()` stays anonymous.
+        let creds = Creds::from_docker(&docker_section(&dir, "", Some(pw))).unwrap();
+        assert_eq!(creds.username, None);
+        assert!(matches!(creds.auth(), RegistryAuth::Anonymous));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn from_docker_fails_naming_an_unreadable_file() {
+        let dir = creds_dir("missing");
+        std::fs::write(dir.join("ca.pem"), b"pem").unwrap();
+        let pw = dir.join("absent");
+
+        let err = Creds::from_docker(&docker_section(&dir, "bob", Some(pw.clone())))
+            .expect_err("a missing password_file must abort the pull, not go anonymous");
+        assert!(
+            err.to_string().contains(&pw.display().to_string()),
+            "the error must name the path, got {err}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn from_mirror_reads_its_own_account() {
+        let dir = creds_dir("mirror");
+        std::fs::write(dir.join("ca.pem"), b"pem").unwrap();
+        let pw = dir.join("password");
+        std::fs::write(&pw, "hub-token\n").unwrap();
+
+        // A mirror's account is independent of `[docker]`'s, so it has its own reader.
+        let m = crate::config::Mirror {
+            repo: "hq-nexus.example.com:8440".to_string(),
+            ca_file: Some(dir.join("ca.pem")),
+            username: "alice".to_string(),
+            password_file: Some(pw),
+            insecure: true,
+        };
+        let creds = Creds::from_mirror(&m).unwrap();
+        assert_eq!(creds.username.as_deref(), Some("alice"));
+        assert_eq!(creds.password.as_deref(), Some("hub-token"));
+        assert!(creds.insecure);
+        assert!(matches!(
+            creds.auth(),
+            RegistryAuth::Basic(u, p) if u == "alice" && p == "hub-token"
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn auth_needs_both_halves_of_the_basic_pair() {
+        // Half a pair authenticates as nobody rather than as that user — both directions.
+        for (username, password) in [(Some("bob"), None), (None, Some("s3cret"))] {
+            let creds = Creds {
+                username: username.map(str::to_string),
+                password: password.map(str::to_string),
+                ..Default::default()
+            };
+            assert!(
+                matches!(creds.auth(), RegistryAuth::Anonymous),
+                "half a Basic pair must not authenticate: {creds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_redacts_the_password() {
+        let creds = Creds {
+            username: Some("bob".to_string()),
+            password: Some("s3cret".to_string()),
+            ca_pem: Some(b"pem".to_vec()),
+            insecure: false,
+        };
+        let shown = format!("{creds:?}");
+        assert!(
+            !shown.contains("s3cret"),
+            "password leaked into Debug: {shown}"
+        );
+        assert!(shown.contains("bob"), "username should still show: {shown}");
+    }
 
     #[test]
     fn resolve_digest_shortcircuits_a_pinned_ref() {

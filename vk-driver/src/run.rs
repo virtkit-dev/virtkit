@@ -596,23 +596,20 @@ fn remove_stale_sockets(dir: &Path) -> Result<()> {
 /// (daemonless) and falls back to `docker export` only when the image is not in a registry
 /// (a not-found resolve); auth/network errors propagate rather than silently using docker.
 async fn resolve_source(args: &RunArgs) -> Result<Source> {
-    let ca_pem = match &args.ca {
-        Some(p) => Some(std::fs::read(p).with_context(|| format!("reading {}", p.display()))?),
-        None => None,
-    };
+    let creds = crate::oci::Creds {
+        username: args.username.clone(),
+        password: args.password.clone(),
+        ca_pem: None,
+        insecure: args.insecure,
+    }
+    .with_ca_file(args.ca.as_deref())?;
     let use_oci = match args.source {
         SourceMode::Oci => true,
         SourceMode::Docker => false,
         SourceMode::Auto => {
-            let exists = crate::oci::manifest_exists(
-                &args.image,
-                args.username.as_deref(),
-                args.password.as_deref(),
-                ca_pem.clone(),
-                args.insecure,
-            )
-            .await
-            .with_context(|| format!("checking the registry for {}", args.image))?;
+            let exists = crate::oci::manifest_exists(&args.image, &creds)
+                .await
+                .with_context(|| format!("checking the registry for {}", args.image))?;
             if !exists {
                 println!(
                     "virtkit: {} is not in a registry — falling back to docker",
@@ -625,10 +622,7 @@ async fn resolve_source(args: &RunArgs) -> Result<Source> {
     if use_oci {
         Ok(Source::Oci {
             reference: args.image.clone(),
-            username: args.username.clone(),
-            password: args.password.clone(),
-            ca_pem,
-            insecure: args.insecure,
+            creds,
         })
     } else {
         Ok(Source::Docker {

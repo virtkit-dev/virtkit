@@ -14,10 +14,7 @@ pub enum Source {
     /// Pull straight from a registry, no docker daemon.
     Oci {
         reference: String,
-        username: Option<String>,
-        password: Option<String>,
-        ca_pem: Option<Vec<u8>>,
-        insecure: bool,
+        creds: crate::oci::Creds,
     },
 }
 
@@ -67,23 +64,10 @@ impl Source {
     ) -> Result<T> {
         match self {
             Source::Docker { docker, image } => docker_export_stream(docker, image, consume),
-            Source::Oci {
-                reference,
-                username,
-                password,
-                ca_pem,
-                insecure,
-            } => {
-                let (merger, layers) = crate::oci::pull_merged(
-                    reference,
-                    username.as_deref(),
-                    password.as_deref(),
-                    ca_pem.clone(),
-                    *insecure,
-                    scratch_dir,
-                    &|m| println!("{m}"),
-                )
-                .await?;
+            Source::Oci { reference, creds } => {
+                let (merger, layers) =
+                    crate::oci::pull_merged(reference, creds, scratch_dir, &|m| println!("{m}"))
+                        .await?;
                 let hints = TarHints {
                     data_bytes: merger.data_bytes(),
                     entries: Some(merger.entry_count() as u64),
@@ -102,21 +86,9 @@ impl Source {
     pub async fn run_config(&self) -> Result<vk_core::runcfg::RunConfig> {
         match self {
             Source::Docker { docker, image } => docker_run_config(docker, image),
-            Source::Oci {
-                reference,
-                username,
-                password,
-                ca_pem,
-                insecure,
-            } => Ok(crate::oci::pull_config(
-                reference,
-                username.as_deref(),
-                password.as_deref(),
-                ca_pem.clone(),
-                *insecure,
-            )
-            .await?
-            .into()),
+            Source::Oci { reference, creds } => {
+                Ok(crate::oci::pull_config(reference, creds).await?.into())
+            }
         }
     }
 }
@@ -126,30 +98,20 @@ impl Source {
 /// runtime config (`Env`/`User`/`WorkingDir`/`Entrypoint`/`Cmd`/`ExposedPorts`) to `config_sidecar(out)`
 /// for the boot to apply. `extra_blocks` is writable free-space headroom beyond the sparse
 /// fit (a guest boots through a CoW overlay, but the filesystem still needs free blocks to
-/// allocate); `fs_id` sets the journal and any freshness UUID. The shared core of the
-/// executor's OCI-direct image path (`dockerimg.rs`) and the units OCI service path
-/// (`ensure.rs`). Returns the config it wrote.
-#[allow(clippy::too_many_arguments)]
+/// allocate); `fs_id` sets the journal and any freshness UUID. The executor's OCI-direct
+/// image path (`dockerimg.rs`) is its caller. Returns the config it wrote.
 pub async fn oci_flatten(
     reference: &str,
-    username: Option<&str>,
-    password: Option<&str>,
-    ca_pem: Option<Vec<u8>>,
-    insecure: bool,
+    creds: &crate::oci::Creds,
     extra_blocks: u64,
     fs_id: &crate::ext4::FsId,
     out: &Path,
 ) -> Result<vk_core::runcfg::RunConfig> {
     let config: vk_core::runcfg::RunConfig =
-        crate::oci::pull_config(reference, username, password, ca_pem.clone(), insecure)
-            .await?
-            .into();
+        crate::oci::pull_config(reference, creds).await?.into();
     let source = Source::Oci {
         reference: reference.to_string(),
-        username: username.map(str::to_string),
-        password: password.map(str::to_string),
-        ca_pem,
-        insecure,
+        creds: creds.clone(),
     };
     let scratch = out.parent().unwrap_or_else(|| Path::new("."));
     source
