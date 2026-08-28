@@ -31,6 +31,10 @@ All notable changes to virtkit will be documented in this file.
   (any username, the key as the password), `oras -u` and `[build]
   cache_username`/`cache_password_file` all authenticate; before, such a client was
   turned away whatever key it was given. Browser sign-in is unchanged.
+- The build cache's page in a registry's browser names the command that actually
+  sweeps that registry, and says what a tag there is in one line. It told the
+  reader to run `vk registry gc`, which reclaims a store on whichever host it is
+  typed on rather than the server's.
 
 ## [0.44.0] - 2026-08-27
 

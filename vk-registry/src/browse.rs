@@ -209,20 +209,24 @@ fn tag_list(
     };
     // Said once, above a whole page of them, when there is nothing here to mistake for a
     // release: a repository of content keys is a cache, and reads as an inexplicable list
-    // of hashes to anyone not told that. Named as well as shaped, because this sentence
-    // asserts what the *repository* is where the per-row gloss only reads a tag: `vk`
-    // writes its cache to one repo name (`vk-driver`'s `build::exec::CACHE_REPO`, under
-    // whatever repo prefix the registry is configured with), and a repository holding an
-    // ordinary tag — or somebody else's namespace of the same shape — is not it.
+    // of hashes to anyone not told that. Said without naming a content key, because the
+    // reader it is for is the one who does not know the term — and as a hash of the build
+    // rather than of the content, which is what these keys are: they hash the inputs
+    // (`vk-driver`'s `build::chain_key` and `build::exec::base_cache_key`), so two builds
+    // that produce identical bytes still land on two tags. Named as well as shaped,
+    // because this sentence asserts what the *repository* is where the per-row gloss only
+    // reads a tag: `vk` writes its cache to one repo name (`vk-driver`'s
+    // `build::exec::CACHE_REPO`, under whatever repo prefix the registry is configured
+    // with), and a repository holding an ordinary tag — or somebody else's namespace of
+    // the same shape — is not it.
     let caption = if !tags.is_empty()
         && name.rsplit('/').next() == Some(CACHE_REPO)
         && tags
             .iter()
             .all(|t| matches!(cache_namespace(t), Some("snap" | "base")))
     {
-        "<p>Every tag here is a content key computed from what it holds, not a version \
-         anyone chose: this repository is virtkit's build cache; as with any tag in this \
-         registry, an entry <code>vk registry gc</code> finds idle is reclaimed.</p>\n"
+        "<p>virtkit's build cache: each tag is a hash of the build that produced it, not \
+         a version anyone chose. <code>vk-registry gc</code> reclaims the idle ones.</p>\n"
     } else {
         ""
     };
@@ -711,8 +715,15 @@ mod tests {
                 "{tag} is not labelled {kind}: {html}"
             );
         }
+        // The caption: what this repository is, and what takes an entry away again. The
+        // command in full, so a regression to `vk registry gc` — which sweeps a store on
+        // whichever host it is typed on, not this server's — fails here.
         assert!(
-            html.contains("this repository is virtkit's build cache"),
+            html.contains(
+                "virtkit's build cache: each tag is a hash of the build that produced it, \
+                 not a version anyone chose. <code>vk-registry gc</code> reclaims the idle \
+                 ones."
+            ),
             "{html}"
         );
 
