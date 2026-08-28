@@ -6,6 +6,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- A host configured against a vk-registry now pulls job images through it by default. A
+  reference no `[docker]` routing claims is looked up on that registry under the
+  registry it comes from — `alpine:3` as `<vk-registry>/docker.io/library/alpine:3`,
+  `ghcr.io/o/i` as `<vk-registry>/ghcr.io/o/i` — so a fleet pulls each layer over the
+  WAN once and every later runner reads it over the LAN.
 - `[docker]` and `[docker.mirror]` accept a `token_file`, so a job image can be pulled
   through a registry gated by a bearer token — a `vk-registry` in `mode = "accounts"`,
   whose API keys are exactly that and which has no shared password to configure instead.

@@ -15,7 +15,7 @@ use oci_client::client::{Certificate, CertificateEncoding, ClientConfig, ClientP
 use oci_client::manifest;
 use oci_client::secrets::RegistryAuth;
 
-use crate::config::{Docker, Mirror};
+use crate::config::{Build, Docker, Mirror, Registry};
 
 /// A sink for the human-readable status lines a pull emits (`pulling …`, `flattened …`).
 /// The caller supplies where they go: straight to stdout for a standalone pull, or a
@@ -63,7 +63,7 @@ pub struct Creds {
     /// unless a `token` does.
     pub username: Option<String>,
     /// The Basic password: as `--password` gave it, or read from a config section's
-    /// `password_file` by [`Creds::from_docker`] / [`Creds::from_mirror`]. Sent only
+    /// `password_file` by one of the `from_*` constructors. Sent only
     /// alongside a `username`.
     pub password: Option<String>,
     /// A static bearer token, for a registry gated by one rather than by a password (a
@@ -93,11 +93,11 @@ impl std::fmt::Debug for Creds {
     }
 }
 
-/// The credential files one `[docker]`-shaped config section names, plus the section's own
-/// name for the errors. Named fields rather than five positional arguments: three of them
-/// are `Option<&Path>`, so a transposed pair would compile and surface much later as a 401.
+/// The credential files one config section names, plus the section's own name for the
+/// errors. Named fields rather than five positional arguments: three of them are
+/// `Option<&Path>`, so a transposed pair would compile and surface much later as a 401.
 struct CredFiles<'a> {
-    /// Which section these came from (`[docker]`, `[docker.mirror]`), to name in an error.
+    /// Which section these came from (`[docker]`, `[registry]`, …), to name in an error.
     section: &'a str,
     ca_file: Option<&'a Path>,
     username: &'a str,
@@ -138,7 +138,33 @@ impl Creds {
         })
     }
 
-    /// The shared body of [`Creds::from_docker`] and [`Creds::from_mirror`].
+    /// What `[build]`'s `cache_*` keys name, for the vk-registry a runner is handed as its
+    /// build cache — also the first server a job image that nothing routes is offered to.
+    pub fn from_build_cache(b: &Build) -> Result<Creds> {
+        Creds::from_files(CredFiles {
+            section: "[build] cache_*",
+            ca_file: b.cache_ca_file.as_deref(),
+            username: &b.cache_username,
+            password_file: b.cache_password_file.as_deref(),
+            token_file: b.cache_token_file.as_deref(),
+            insecure: b.cache_insecure,
+        })
+    }
+
+    /// What `[registry]` names — the same credential `registry::cred` resolves for the
+    /// bundle paths, in the shape the OCI client here takes.
+    pub fn from_registry(rg: &Registry) -> Result<Creds> {
+        Creds::from_files(CredFiles {
+            section: "[registry]",
+            ca_file: rg.ca_file.as_deref(),
+            username: &rg.username,
+            password_file: rg.password_file.as_deref(),
+            token_file: rg.token_file.as_deref(),
+            insecure: rg.insecure,
+        })
+    }
+
+    /// The shared body of the four `from_*` constructors.
     ///
     /// The files are read here, once, rather than at each use: a pull that would fail for
     /// an unreadable 0600 file says so before the first request, naming the path. A
@@ -267,27 +293,60 @@ pub async fn resolve_digest_auth(reference: &str, creds: &Creds) -> Result<Strin
 /// the image truly is not in a registry, while surfacing auth errors instead of masking
 /// them behind a docker fallback.
 pub async fn manifest_exists(reference: &str, creds: &Creds) -> Result<bool> {
+    Ok(resolve_digest_if_present(reference, creds).await?.is_some())
+}
+
+/// Whether `err` is a registry refusing the caller rather than failing: a 401/403, or an
+/// OCI `UNAUTHORIZED`/`DENIED` envelope. Kept out of [`resolve_digest_if_present`]'s
+/// not-found set on purpose — a caller that must surface an auth problem (an `auto` source
+/// deciding whether to fall back to docker) still sees it as an error, while one that only
+/// *offers* a ref to a registry, and pulls it elsewhere otherwise, can treat a key scoped
+/// away from that namespace as ordinary as a 404.
+pub fn is_access_denied(err: &anyhow::Error) -> bool {
+    use oci_client::errors::{OciDistributionError, OciErrorCode};
+    match err.downcast_ref::<OciDistributionError>() {
+        // Deliberately not `AuthenticationFailure`: oci-client raises that for any non-200
+        // from the token endpoint, so a 503 there would be silenced along with a refusal.
+        Some(OciDistributionError::UnauthorizedError { .. }) => true,
+        Some(OciDistributionError::ServerError { code, .. }) => matches!(code, 401 | 403),
+        Some(OciDistributionError::RegistryError { envelope, .. }) => envelope
+            .errors
+            .iter()
+            .any(|e| matches!(e.code, OciErrorCode::Unauthorized | OciErrorCode::Denied)),
+        _ => false,
+    }
+}
+
+/// `reference`'s manifest digest, or `None` when that registry does not hold it — the
+/// same not-found/error split [`manifest_exists`] draws, keeping the digest the round
+/// trip already fetched so a caller that wants both does not ask twice.
+pub async fn resolve_digest_if_present(reference: &str, creds: &Creds) -> Result<Option<String>> {
     use oci_client::errors::{OciDistributionError, OciErrorCode};
     let parsed: Reference = reference
         .parse()
         .with_context(|| format!("parsing OCI reference {reference:?}"))?;
-    let client = creds.client();
-    let auth = creds.auth();
+    // Deliberately no digest-pinned shortcut of the kind `resolve_digest_auth` takes: a
+    // pinned ref carries its own digest but says nothing about whether *this* registry
+    // holds it, which is the whole question here.
     let not_found = |c: &OciErrorCode| {
         matches!(
             c,
             OciErrorCode::ManifestUnknown | OciErrorCode::NameUnknown | OciErrorCode::NotFound
         )
     };
-    match client.fetch_manifest_digest(&parsed, &auth).await {
-        Ok(_) => Ok(true),
-        Err(OciDistributionError::ImageManifestNotFoundError(_)) => Ok(false),
+    match creds
+        .client()
+        .fetch_manifest_digest(&parsed, &creds.auth())
+        .await
+    {
+        Ok(d) => Ok(Some(d)),
+        Err(OciDistributionError::ImageManifestNotFoundError(_)) => Ok(None),
         Err(OciDistributionError::RegistryError { envelope, .. })
             if envelope.errors.iter().any(|e| not_found(&e.code)) =>
         {
-            Ok(false)
+            Ok(None)
         }
-        Err(OciDistributionError::ServerError { code: 404, .. }) => Ok(false),
+        Err(OciDistributionError::ServerError { code: 404, .. }) => Ok(None),
         Err(e) => Err(e).with_context(|| format!("resolving {reference} in its registry")),
     }
 }

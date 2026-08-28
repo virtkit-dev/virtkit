@@ -131,7 +131,10 @@ job's plain GitLab `image:` is read the same way):
 - `local/<name>` — a bundle directory under `[local] dir`;
 - `virtkit/<name>[:tag|@sha256:…]` — a bundle in the `[registry]` repo;
 - `docker/<name>[:tag|@sha256:…]` — an OCI image from the `[docker]` repo, booted
-  directly (embedded kernel + agent);
+  directly (embedded kernel + agent). A reference `[docker]` does not route — and every
+  one of them when that section is absent — is offered first to the vk-registry this
+  runner already uses (`[build] cache_registry`/`[registry]`), which relays and caches
+  the upstreams it is configured for, and pulled from the registry it names otherwise;
 - `dockerfile:<path>[?context=<dir>&buildcontext=NAME=DIR&arg=NAME=VALUE][#<stage>]` — a
   **git-defined** image: virtkit builds the Dockerfile from the job's own checkout (each
   `RUN` in a microVM, no Docker involved) and boots the result, so the job image lives in

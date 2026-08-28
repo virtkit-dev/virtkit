@@ -409,13 +409,15 @@ impl Default for Guest {
     }
 }
 
-/// `[docker]` — OPTIONAL registry proxy for direct OCI image boots. Absent (the default),
-/// an image reference is pulled directly from whatever registry it names: the microVM
-/// boundary is the security model, so image sources are not gated. Present, it *routes*
+/// `[docker]` — OPTIONAL registry proxy for direct OCI image boots. Present, it *routes*
 /// pulls: the `docker/<name>` MICROVM_IMAGE form and bare docker-hub-style names go
 /// through `repo` (with these credentials); a `[docker.mirror]` redirects Docker Hub
-/// references onto a pull-through mirror instead (the `registry-mirrors` equivalent);
-/// any other registry is still pulled directly. It never refuses an image. The native
+/// references onto a pull-through mirror instead (the `registry-mirrors` equivalent).
+/// A reference neither claims — and every reference when this section is absent — is
+/// offered to the vk-registry `[build] cache_registry`/`[registry]` already names, under
+/// its own registry as a prefix (`<vk-registry>/ghcr.io/o/i`), and pulled from the
+/// registry it names when that one does not relay it. It never refuses an image: the
+/// microVM boundary is the security model, so image sources are not gated. The native
 /// OCI client fetches the image, the embedded vk-agent is PID 1, the embedded kernel
 /// boots it. Auth mirrors `[registry]`.
 #[derive(Debug, Serialize, Deserialize)]

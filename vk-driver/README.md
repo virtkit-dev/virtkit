@@ -207,3 +207,9 @@ the resolved digest from the `[docker] repo` (the allowlist), flattens it into a
 ext4 with `virtkit-agent` injected as PID 1, and boots it on vk's embedded kernel. The
 image's Env/User are captured so the guest runs like `docker run` would. Results are
 cached (digest-keyed) under `<state_dir>/docker/` and GC'd; no Docker daemon is involved.
+
+A reference no `[docker]` routing claims — every one of them when that section is absent —
+is first offered to the vk-registry this host already names in `[build] cache_registry` or
+`[registry]`, under the registry it comes from (`<vk-registry>/docker.io/library/alpine`),
+so a fleet pulls each layer over the WAN once. A registry that does not relay that
+upstream says so, and the image is pulled where it lives: nothing is ever refused.

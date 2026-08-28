@@ -374,7 +374,7 @@ fn run_config(st: &ShellState) -> vk_core::runcfg::RunConfig {
 /// a `vk registry serve` shares, accessed in-process (no server, no port). Only absolute
 /// paths and `file://` URLs select the in-process store, everything else is a registry
 /// host — so a spelling that names neither is refused rather than read as one of them.
-fn cache_repo(cache_registry: Option<&str>) -> Result<Option<String>> {
+pub(crate) fn cache_repo(cache_registry: Option<&str>) -> Result<Option<String>> {
     Ok(match cache_registry {
         Some("none") => None,
         // A hostname can start with neither a dot nor nothing at all, and a `file://` URL
