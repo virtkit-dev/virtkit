@@ -112,14 +112,19 @@ enum Cmd {
     /// On-disk size, dedup savings, and a per-repository breakdown. Read-only — it creates no
     /// store.
     Status {
-        /// Store directory [default: the `root` in --config, else the shared virtkit store]
+        /// Store directory [default: VK_REGISTRY_ROOT, then --config, then the shared store]
         ///
-        /// The shared store is $XDG_DATA_HOME/virtkit/registry.
+        /// The shared store is $XDG_DATA_HOME/virtkit/registry — where `vk` keeps its own
+        /// build cache unless `[build] cache_registry` sends it elsewhere.
+        /// `VK_REGISTRY_ROOT` supplies this flag when it is not typed, and ranks where the
+        /// flag does: an inherited one outranks the `root` in a --config typed by hand.
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
         /// The `serve` config file to take the store root from
         ///
-        /// Reporting then covers the store the server actually uses.
+        /// Reporting then covers the store the server actually uses. `VK_REGISTRY_CONFIG`
+        /// supplies this flag when it is not typed, and a file it names that cannot be read
+        /// is an error rather than a quiet fall back to the default store.
         #[arg(long, value_name = "FILE")]
         config: Option<PathBuf>,
     },
@@ -128,14 +133,19 @@ enum Cmd {
     /// Drops tags idle past the retention window, then sweeps unreferenced blobs and stale
     /// uploads (both after a grace window).
     Gc {
-        /// Store directory [default: the `root` in --config, else the shared virtkit store]
+        /// Store directory [default: VK_REGISTRY_ROOT, then --config, then the shared store]
         ///
-        /// The shared store is $XDG_DATA_HOME/virtkit/registry.
+        /// The shared store is $XDG_DATA_HOME/virtkit/registry — where `vk` keeps its own
+        /// build cache unless `[build] cache_registry` sends it elsewhere.
+        /// `VK_REGISTRY_ROOT` supplies this flag when it is not typed, and ranks where the
+        /// flag does: an inherited one outranks the `root` in a --config typed by hand.
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
         /// The `serve` config file to take the store root from
         ///
-        /// The sweep then covers the store the server actually uses.
+        /// The sweep then covers the store the server actually uses. `VK_REGISTRY_CONFIG`
+        /// supplies this flag when it is not typed, and a file it names that cannot be read
+        /// is an error rather than a quiet fall back to the default store.
         #[arg(long, value_name = "FILE")]
         config: Option<PathBuf>,
         /// Drop tags unused for more than this many days
@@ -212,18 +222,20 @@ enum Cmd {
 /// subcommand name wins.
 #[derive(clap::Args)]
 struct StoreArgs {
-    /// Store directory [default: the `root` in --config, else the shared virtkit store]
+    /// Store directory [default: VK_REGISTRY_ROOT, then --config, then the shared store]
     ///
-    /// `VK_REGISTRY_ROOT` sets it without the flag.
+    /// `VK_REGISTRY_ROOT` supplies this flag when it is not typed.
     #[arg(long, global = true, value_name = "DIR")]
     root: Option<PathBuf>,
     /// The `serve` config file to take root/accounts_db/admin_socket from
     ///
     /// A registry is usually served from one config file for the life of the machine, so
     /// naming it on every subcommand is the wrong unit of work: set `VK_REGISTRY_CONFIG`
-    /// once, in a login profile or /etc/environment, and every subcommand here finds the
-    /// same store the server did. It is this CLI that reads it, not `serve` — a unit's
-    /// `Environment=` would not reach an operator's shell anyway.
+    /// once, in a login profile or /etc/environment, and every store-reading subcommand
+    /// finds the same store the server did. It is the operator's CLI that reads it, not
+    /// `serve` — a unit's `Environment=` would not reach an operator's shell anyway, and a
+    /// server picking its store out of the environment is how one ends up serving the
+    /// wrong one.
     #[arg(long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,
     // `--accounts-db` refusing `--root`/`--config` only worked while every selector was
@@ -261,6 +273,31 @@ fn env_path(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
     value.filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
+/// `--root` and `--config` with `VK_REGISTRY_ROOT` / `VK_REGISTRY_CONFIG` filling in whichever of
+/// the two was not typed. Returned in declaration order, `(root, config)`.
+fn selectors_with_env(
+    root: Option<PathBuf>,
+    config: Option<PathBuf>,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> (Option<PathBuf>, Option<PathBuf>) {
+    (
+        root.or_else(|| env_path(env("VK_REGISTRY_ROOT"))),
+        config.or_else(|| env_path(env("VK_REGISTRY_CONFIG"))),
+    )
+}
+
+/// The store `status` and `gc` work on: the flags above the config file above the shared default
+/// ([`ServerConfig::root_of`](vk_registry::ServerConfig::root_of)), with the variables standing in
+/// for a flag not typed.
+fn store_root(
+    root: Option<PathBuf>,
+    config: Option<PathBuf>,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    let (root, config) = selectors_with_env(root, config, env);
+    vk_registry::ServerConfig::root_of(config.as_deref(), root)
+}
+
 impl StoreArgs {
     /// The flags as given, with `VK_REGISTRY_*` filling in the three that have a variable.
     fn resolved(self) -> Self {
@@ -272,9 +309,10 @@ impl StoreArgs {
     /// them: it has no variable.
     fn with_env(self, env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Self {
         let db_named = self.accounts_db.is_some();
+        let (root, config) = selectors_with_env(self.root, self.config, &env);
         StoreArgs {
-            root: self.root.or_else(|| env_path(env("VK_REGISTRY_ROOT"))),
-            config: self.config.or_else(|| env_path(env("VK_REGISTRY_CONFIG"))),
+            root,
+            config,
             accounts_db: self.accounts_db,
             // Dropped once `--accounts-db` names a db outright, the rule `socket_config`
             // applies to the config file's socket and for the same reason: that socket is a
@@ -588,12 +626,11 @@ async fn run(cli: Cli) -> Result<()> {
             eprintln!("    sudo systemctl daemon-reload && sudo systemctl enable --now {unit}");
             Ok(())
         }
-        // `--root` first, then the root the `serve` config file names, then the shared
-        // default: the same order `serve` resolves them in, so these report on and sweep
-        // the store the server actually uses.
+        // Both resolve their store through `store_root`, which is where the order is: it
+        // reaches the one the server uses, and it is `accounts`' order too, so an operator
+        // who exported a `VK_REGISTRY_*` once does not have to know which subcommand this is.
         Cmd::Status { root, config } => {
-            let root = vk_registry::ServerConfig::root_of(config.as_deref(), root)?;
-            vk_registry::status(root)
+            vk_registry::status(store_root(root, config, |name| std::env::var_os(name))?)
         }
         Cmd::Gc {
             root,
@@ -602,13 +639,13 @@ async fn run(cli: Cli) -> Result<()> {
             grace_days,
             dry_run,
         } => {
+            let root = store_root(root, config, |name| std::env::var_os(name))?;
             let days = |d: u64| Duration::from_secs(d * 86_400);
-            vk_registry::gc(
-                vk_registry::ServerConfig::root_of(config.as_deref(), root)?,
-                days(retention_days),
-                days(grace_days),
-                dry_run,
-            )
+            // On stderr and before the sweep, the way `accounts` names its store: the
+            // result line names it too, but by then the blobs are gone, and the store can
+            // now come from a variable the operator did not type on this command.
+            eprintln!("vk-registry gc: on the store at {}", root.display());
+            vk_registry::gc(root, days(retention_days), days(grace_days), dry_run)
         }
         // handled in `main`, before this dispatch
         Cmd::Update { .. } => unreachable!("update is handled in main"),
@@ -1209,6 +1246,71 @@ mod tests {
             store.admin_socket.as_deref(),
             Some(Path::new("/run/typed.sock"))
         );
+    }
+
+    // `status` and `gc` reach a store through the same two variables `accounts` does, but their
+    // flags are their own, so the two paths can drift apart. Exercised through `store_root`, the
+    // whole of what those two arms delegate to, because the flags are only half of it: what a
+    // missed variable costs is not an error but the shared default, which on a host that also runs
+    // `vk` is `vk`'s own store — a real one to report on and a real one to sweep.
+    #[test]
+    fn status_and_gc_take_the_environment_below_the_command_line() {
+        use std::ffi::OsString;
+
+        let dir = std::env::temp_dir().join(format!("vk-regcli-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("registry.toml");
+        std::fs::write(&file, "root = \"/srv/file\"\n").unwrap();
+        let file = file.to_str().unwrap();
+
+        // The two variables these read, and nothing else — an admin socket is not theirs
+        // to take, so reaching for one is the wiring going wrong. An empty value stands for
+        // an unset variable, which is what `env_path` makes of it.
+        let env = |root: &str, config: &str| {
+            let (root, config) = (OsString::from(root), OsString::from(config));
+            move |name: &str| match name {
+                "VK_REGISTRY_ROOT" => Some(root.clone()),
+                "VK_REGISTRY_CONFIG" => Some(config.clone()),
+                other => panic!("read an unexpected variable: {other}"),
+            }
+        };
+        let root_of = |root: Option<&str>, config: Option<&str>, env| {
+            store_root(root.map(PathBuf::from), config.map(PathBuf::from), env)
+        };
+
+        // nothing typed: the variables stand in, and `VK_REGISTRY_ROOT` outranks the file
+        // the other one names, exactly as a typed `--root` would
+        assert_eq!(
+            root_of(None, None, env("/srv/env", file)).unwrap(),
+            Path::new("/srv/env")
+        );
+        // typed: the variable fills in nothing
+        assert_eq!(
+            root_of(Some("/srv/typed"), None, env("/srv/env", file)).unwrap(),
+            Path::new("/srv/typed")
+        );
+        // only `VK_REGISTRY_CONFIG` exported: the store is the one that file names
+        assert_eq!(
+            root_of(None, None, env("", file)).unwrap(),
+            Path::new("/srv/file")
+        );
+        // An inherited root retains the same precedence as an explicit `--root`.
+        assert_eq!(
+            root_of(None, Some(file), env("/srv/env", "")).unwrap(),
+            Path::new("/srv/env")
+        );
+        // both empty is both unset, and nothing is left but the shared default
+        assert_eq!(
+            root_of(None, None, env("", "")).unwrap(),
+            vk_registry::default_root().unwrap()
+        );
+        // a config file inherited from the environment still has to be readable: silently
+        // falling back to the default store is the behaviour this replaced
+        let absent = dir.join("absent.toml");
+        assert!(root_of(None, None, env("", absent.to_str().unwrap())).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // A db named outright is the whole selector: the config file's `admin_socket` names a

@@ -775,11 +775,16 @@ one named here. The variables are read directly rather than through clap's `env`
 empty `VK_REGISTRY_CONFIG=` counts as unset instead of refusing every command until it is
 cleared.
 
-Only `accounts` reads them — `serve`, `status`, `gc` and `install-service` take their
-`--root`/`--config` on the command line — so `install-service` writes no `Environment=` line
-into the unit it generates; a login profile or `/etc/environment` is where they belong. The
-`VK_REGISTRY_*` namespace is deliberately separate from `vk`'s `VIRTKIT_*`: a different
-binary reading a different config file, and nothing is shared between the two.
+`status` and `gc` read `VK_REGISTRY_ROOT`/`VK_REGISTRY_CONFIG` for their own two flags under
+the same rule, so one exported variable reaches every subcommand that reads a store; the
+default they fell through to before is the shared per-user store, which on a host that also
+runs `vk` holds `vk`'s own build cache — a real store for `status` to report on and for `gc`
+to sweep. `serve` and `install-service` still take their `--root`/`--config` on the command
+line — a server should not pick what it serves out of the environment — so `install-service`
+writes no `Environment=` line into the unit it generates; a login profile or
+`/etc/environment` is where they belong. The `VK_REGISTRY_*` namespace is deliberately
+separate from `vk`'s `VIRTKIT_*`: a different binary reading a different config file, and
+nothing is shared between the two.
 
 **The registry does not have to be stopped.** redb holds the accounts file exclusively for
 the life of a process, so a running `serve` locks out even `list-users` — which is why the

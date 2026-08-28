@@ -275,10 +275,11 @@ variables are:
 | `VIRTKIT_PROGRESS=plain` | plain build progress instead of the live dashboard (CI logs) |
 | `VIRTKIT_NO_TITLE` | suppress terminal-title updates (keeps the dashboard) |
 
-`vk-registry accounts` reads three of its own, in a namespace kept separate because it is
-a different binary with a different config file: `VK_REGISTRY_CONFIG`, `VK_REGISTRY_ROOT`
-and `VK_REGISTRY_ADMIN_SOCKET`, each standing in for the flag of the same name (see
-`vk-registry/DESIGN.md`).
+`vk-registry` reads three of its own, in a namespace kept separate because it is a
+different binary with a different config file, each standing in for the flag of the same
+name: `VK_REGISTRY_CONFIG` and `VK_REGISTRY_ROOT` on every subcommand that reads a store
+(`accounts`, `status`, `gc` — not `serve` or `install-service`, which take theirs on the
+command line), and `VK_REGISTRY_ADMIN_SOCKET` on `accounts` (see `vk-registry/DESIGN.md`).
 
 Two settings name a content-addressed store. They are not two kinds of store — one
 on-disk format, two destinations:

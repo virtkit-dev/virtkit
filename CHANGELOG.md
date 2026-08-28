@@ -4,6 +4,17 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- `vk-registry status` and `vk-registry gc` take `--root`/`--config` from
+  `VK_REGISTRY_ROOT`/`VK_REGISTRY_CONFIG` when the flag is not given, so one exported
+  variable now points every store command at the served registry rather than at the
+  shared per-user store — which, on a host that also runs `vk`, is `vk`'s own. Two
+  consequences on a host where one of these is already exported: an inherited
+  `VK_REGISTRY_ROOT` outranks the `root` in a `--config` typed by hand, and a
+  `VK_REGISTRY_CONFIG` pointing at a file that cannot be read is now an error instead of
+  being ignored. `gc` names the selected store before sweeping it.
+
 ### Fixed
 
 - `vk build`'s live progress dashboard survives a terminal resize. Resizing the

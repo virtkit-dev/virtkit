@@ -230,7 +230,7 @@ impl ServerConfig {
 
     /// The store root alone, for the commands that operate on a store without serving it
     /// (`status`, `gc`). The root is resolved in [`ServerConfig::load`]'s order — an
-    /// explicit `--root` first (for the `accounts` CLI, the flag or `VK_REGISTRY_ROOT`), then
+    /// explicit `--root` first (for the CLI, the flag or `VK_REGISTRY_ROOT`), then
     /// the config file's, then the shared default — so a store configured for the server is
     /// the one they report on and sweep, instead of a default store the server never touches.
     /// Only the root is taken: a file whose `addr`/TLS/auth keys `serve` would reject still
