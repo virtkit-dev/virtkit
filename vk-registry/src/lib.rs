@@ -33,7 +33,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -165,6 +165,60 @@ pub(crate) fn body_of(bytes: Bytes) -> Body {
     Full::new(bytes)
         .map_err(|never: Infallible| match never {})
         .boxed()
+}
+
+/// How much of a streamed blob is read per chunk — a default, not a measured optimum:
+/// big enough that a multi-GB layer is not millions of wakeups, small enough that the
+/// peak per in-flight response is a rounding error next to the layer itself.
+const STREAM_CHUNK: usize = 256 * 1024;
+
+/// A body that pulls from a blocking reader — a file, or a zstd decoder over one.
+fn stream_body(reader: impl std::io::Read + Send + Sync + 'static, what: &str) -> Body {
+    // Refcounted, not re-allocated: the label outlives every chunk but is only read on the
+    // error path.
+    let what: std::sync::Arc<str> = what.into();
+    let stream = futures::stream::unfold(Some(reader), move |state| {
+        let what = what.clone();
+        async move {
+            let mut reader = state?;
+            // A fresh buffer per chunk: the `Bytes` handed out lives as long as the client
+            // takes to read it, so it cannot be one this reader keeps writing into.
+            let read = tokio::task::spawn_blocking(move || {
+                let mut buf = vec![0u8; STREAM_CHUNK];
+                let mut filled = 0;
+                // Filled rather than one `read`: `Read` may return short at any time (a
+                // zstd decoder returns as soon as one block is out), and `Interrupted` is
+                // a retry, not the end of the blob.
+                while filled < buf.len() {
+                    match reader.read(&mut buf[filled..]) {
+                        Ok(0) => break,
+                        Ok(n) => filled += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+                if filled == 0 {
+                    return Ok(None);
+                }
+                buf.truncate(filled);
+                Ok(Some((Bytes::from(buf), reader)))
+            })
+            .await;
+            // A mid-response error reaches the log as the connection's, where a bad disk and a
+            // client hangup look alike — so say which blob it was while that is still known.
+            let named = |e: std::io::Error| std::io::Error::new(e.kind(), format!("{what}: {e}"));
+            match read {
+                Ok(Ok(None)) => None,
+                Ok(Ok(Some((chunk, reader)))) => {
+                    Some((Ok(hyper::body::Frame::data(chunk)), Some(reader)))
+                }
+                // Either way the body ends here, so there is no reader left to carry.
+                Ok(Err(e)) => Some((Err(named(e)), None)),
+                Err(e) => Some((Err(named(std::io::Error::other(e))), None)),
+            }
+        }
+    });
+    StreamBody::new(stream).boxed()
 }
 
 /// Capability header a cooperating server sets on its `GET /v2/` response, so an
@@ -2069,56 +2123,50 @@ pub(crate) fn get_blob(
         .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(hyper::header::CONTENT_TYPE, "application/octet-stream");
 
-    // serve the stored frame as-is; the client decodes it back to canonical. The
-    // wire length is the stored (compressed) size — `stat` it; HEAD reads nothing.
-    if is_zstd && accept_zstd {
-        let builder = builder.header(hyper::header::CONTENT_ENCODING, "zstd");
-        if head {
-            return builder
-                .header(hyper::header::CONTENT_LENGTH, blob_len(&path)?.to_string())
-                .body(body_of(Bytes::new()))
-                .map_err(Into::into);
-        }
-        let stored = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        return builder
-            .header(hyper::header::CONTENT_LENGTH, stored.len().to_string())
-            .body(body_of(Bytes::from(stored)))
-            .map_err(Into::into);
-    }
-
-    // serve the canonical (decompressed, for a zstd blob) bytes.
-    if is_zstd {
-        // HEAD only needs the canonical length, read from the frame header (a handful
-        // of bytes) without touching the rest; GET decompresses the whole body.
-        if head {
-            return builder
-                .header(
-                    hyper::header::CONTENT_LENGTH,
-                    zstd_canonical_len(&path)?.to_string(),
-                )
-                .body(body_of(Bytes::new()))
-                .map_err(Into::into);
-        }
-        let stored = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        let raw = zstd::decode_all(&stored[..]).context("decompressing a stored blob")?;
-        return builder
-            .header(hyper::header::CONTENT_LENGTH, raw.len().to_string())
-            .body(body_of(Bytes::from(raw)))
-            .map_err(Into::into);
-    }
-
-    // identity blob: HEAD needs only the size (`stat`); GET serves the bytes.
+    // The wire length, and what the body has to produce to match it: the stored frame
+    // verbatim when the client takes zstd, the canonical bytes otherwise. Both are known
+    // without reading the blob — a zstd frame carries its decompressed size in the header
+    // — so `Content-Length` is exact on a streamed response, as a HEAD needs it to be.
+    let serve_frame = is_zstd && accept_zstd;
+    let decode = is_zstd && !serve_frame;
+    let builder = if serve_frame {
+        builder.header(hyper::header::CONTENT_ENCODING, "zstd")
+    } else {
+        builder
+    };
+    // Opened once, and the length taken from that same descriptor rather than from the path again:
+    // a `gc` can unlink the stored form, and a re-push can rename a different encoding of the same
+    // content over it, between two resolutions of one path. The fd also pins the inode for the
+    // whole response — every writer here reaches a blob path by `rename`, never by truncating in
+    // place, so an in-flight stream keeps serving what it opened even once `gc` has swept the name.
+    let mut file =
+        std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+    let len = if decode {
+        zstd_canonical_len(&mut file)
+            .with_context(|| format!("measuring the stored blob {digest}"))?
+    } else {
+        file.metadata()
+            .with_context(|| format!("stat {}", path.display()))?
+            .len()
+    };
+    let builder = builder.header(hyper::header::CONTENT_LENGTH, len.to_string());
     if head {
-        return builder
-            .header(hyper::header::CONTENT_LENGTH, blob_len(&path)?.to_string())
-            .body(body_of(Bytes::new()))
-            .map_err(Into::into);
+        return builder.body(body_of(Bytes::new())).map_err(Into::into);
     }
-    let stored = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    builder
-        .header(hyper::header::CONTENT_LENGTH, stored.len().to_string())
-        .body(body_of(Bytes::from(stored)))
-        .map_err(Into::into)
+
+    // Streamed, never read whole: a layer can be gigabytes, and one buffered per
+    // in-flight request is how a registry runs its host out of memory. The decode for a
+    // client that does not take zstd rides the same stream — `zstd::stream::read::Decoder`
+    // is just another reader, and it is decompressing on the blocking pool either way.
+    let body = if decode {
+        stream_body(
+            zstd::stream::read::Decoder::new(file).context("opening a stored blob")?,
+            digest,
+        )
+    } else {
+        stream_body(file, digest)
+    };
+    builder.body(body).map_err(Into::into)
 }
 
 /// PUT /v2/<name>/manifests/<tag|digest> — store the manifest bytes (content
@@ -2600,31 +2648,37 @@ fn zstd_frame_len(frame: &[u8]) -> Option<u64> {
 /// for [`zstd_frame_len`] to read the embedded content size.
 const ZSTD_HEADER_MAX: usize = 18;
 
-/// Size of a stored blob on disk, from `stat` — no read.
-fn blob_len(path: &Path) -> Result<u64> {
-    Ok(std::fs::metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?
-        .len())
-}
-
 /// Canonical (decompressed) length of a stored zstd blob, read from the frame header
-/// alone. Our encoder always records the content size, so the full-decode fallback
-/// (for a frame that omits it) is only a correctness backstop.
-fn zstd_canonical_len(path: &Path) -> Result<u64> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+/// alone. Our encoder always records the content size, so the full-decode fallback (for a
+/// frame that omits it) is only a correctness backstop — and it counts the decoded bytes
+/// through a sink rather than collecting them, so no path here holds a blob in memory.
+///
+/// `f` is left rewound to the start, so the caller can go on to stream the same
+/// descriptor. Only the *first* frame's header is read, while a decoder consumes every
+/// concatenated frame; the two agree because every writer of `blobs/zstd` makes them —
+/// [`hash_zstd_frame`] refuses an upload whose declared size does not match what the whole
+/// decode produced, and `compress_beside`/[`zstd_with_size`] pledge the size to the
+/// encoder, which then fails the frame itself on a mismatch.
+fn zstd_canonical_len(f: &mut std::fs::File) -> Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
     let mut head = Vec::with_capacity(ZSTD_HEADER_MAX);
     f.by_ref()
         .take(ZSTD_HEADER_MAX as u64)
         .read_to_end(&mut head)
-        .with_context(|| format!("reading the zstd header of {}", path.display()))?;
+        .context("reading a stored blob's zstd header")?;
+    f.seek(SeekFrom::Start(0))
+        .context("rewinding a stored blob")?;
     if let Some(len) = zstd_frame_len(&head) {
         return Ok(len);
     }
-    let stored = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(zstd::decode_all(&stored[..])
-        .context("decompressing a stored blob")?
-        .len() as u64)
+    let counted = std::io::copy(
+        &mut zstd::stream::read::Decoder::new(&mut *f).context("decompressing a stored blob")?,
+        &mut std::io::sink(),
+    )
+    .context("decompressing a stored blob")?;
+    f.seek(SeekFrom::Start(0))
+        .context("rewinding a stored blob")?;
+    Ok(counted)
 }
 
 /// Monotonic suffix source for [`atomic_write`] temp files (unique within a process;
@@ -3713,7 +3767,8 @@ mod tests {
         let (path, is_zstd) = store.find_blob(&hex(&digest)).expect("stored");
         assert!(is_zstd);
         assert_eq!(std::fs::read(&path).unwrap(), frame, "stored verbatim");
-        assert_eq!(zstd_canonical_len(&path).unwrap(), raw.len() as u64);
+        let mut f = std::fs::File::open(&path).unwrap();
+        assert_eq!(zstd_canonical_len(&mut f).unwrap(), raw.len() as u64);
 
         // a frame that decompresses to something else is refused, and takes its session
         let other = zstd_with_size(&vec![4u8; 80_000]).unwrap();
@@ -4771,6 +4826,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A read that fails part-way ends the body as an error, naming the blob — not as a
+    /// short but successful one, which would hand a client a truncated blob under a
+    /// `Content-Length` that says otherwise.
+    #[tokio::test]
+    async fn a_stream_that_fails_part_way_ends_as_an_error() {
+        /// Yields one full chunk, then fails.
+        struct Flaky(bool);
+        impl std::io::Read for Flaky {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if std::mem::replace(&mut self.0, false) {
+                    buf.fill(b'x');
+                    return Ok(buf.len());
+                }
+                Err(std::io::Error::other("the disk went away"))
+            }
+        }
+
+        let mut body = stream_body(Flaky(true), "sha256:beef");
+        let first = body
+            .frame()
+            .await
+            .expect("a frame")
+            .expect("the first chunk must arrive");
+        assert_eq!(first.into_data().unwrap().len(), STREAM_CHUNK);
+
+        let err = body
+            .frame()
+            .await
+            .expect("the body must not simply end")
+            .expect_err("a failed read must end the body as an error");
+        let shown = err.to_string();
+        assert!(
+            shown.contains("sha256:beef") && shown.contains("the disk went away"),
+            "the error must name the blob and the cause, got {shown}"
+        );
+    }
+
+    /// A reader whose length is an exact multiple of the chunk ends on the empty read,
+    /// neither one chunk short nor with a trailing empty frame.
+    #[tokio::test]
+    async fn a_stream_of_whole_chunks_ends_cleanly() {
+        let reader = std::io::Cursor::new(vec![b'x'; 2 * STREAM_CHUNK]);
+        let body = stream_body(reader, "sha256:beef");
+        let collected = body.collect().await.unwrap().to_bytes();
+        assert_eq!(collected.len(), 2 * STREAM_CHUNK);
+        assert!(collected.iter().all(|b| *b == b'x'));
+    }
+
     /// Every magic `already_compressed` claims to recognize, and the two shapes that must
     /// not be mistaken for one: a file too short to carry a magic, and bytes that merely
     /// start like one.
@@ -4844,7 +4947,8 @@ mod tests {
         // the canonical Content-Length without decompressing. Nothing else would fail if a
         // later edit dropped `set_pledged_src_size`/`include_contentsize`.
         assert_eq!(
-            zstd_canonical_len(&store.zstd_blob_path(&hex)).unwrap(),
+            zstd_canonical_len(&mut std::fs::File::open(store.zstd_blob_path(&hex)).unwrap())
+                .unwrap(),
             config.len() as u64
         );
 

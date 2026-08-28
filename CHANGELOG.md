@@ -24,6 +24,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- A registry no longer holds a whole layer in memory while serving it, so concurrent
+  pulls of large images stop risking the host's memory.
 - A registry now stores a relayed blob compressed whenever that makes it smaller,
   instead of always keeping it at the size it arrived at. Image configs,
   attestations and uncompressed `tar` layers stop costing full size in a cache

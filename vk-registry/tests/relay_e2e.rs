@@ -1447,3 +1447,135 @@ async fn a_blob_head_agrees_with_the_get_for_a_compressed_blob() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A blob is served in chunks, not read whole — so one bigger than the stream chunk still
+/// arrives byte-identical, in each of the three shapes the serve path can take: an
+/// identity blob, a stored frame handed over verbatim to a client that takes zstd, and
+/// that same frame decoded on the way out for a client that does not. `Content-Length`
+/// has to match the bytes in every one of them, or a client hangs waiting for the rest.
+#[tokio::test]
+async fn a_blob_larger_than_one_chunk_streams_back_intact() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tmp("stream-chunks");
+    let store = Store::new(dir.clone()).unwrap();
+
+    // The server reads a blob 256 KiB at a time; every body here has to be well past that in the
+    // form it goes out in, or nothing is being streamed. Mirrors the crate-private `STREAM_CHUNK`;
+    // the in-crate `a_stream_of_whole_chunks_ends_cleanly` pins the alignment case to the real
+    // constant, so this one only needs a size comfortably past it.
+    const CHUNK: usize = 256 * 1024;
+    // Chained sha256: incompressible, so the store keeps it as identity bytes.
+    let noise = |len: usize| -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut block = [0u8; 32];
+        while out.len() < len {
+            block = <sha2::Sha256 as sha2::Digest>::digest(block).into();
+            out.extend_from_slice(&block);
+        }
+        out.truncate(len);
+        out
+    };
+    let plain = noise(3_000_000);
+    // The same noise with every block written twice: compressible enough that the store
+    // keeps a frame, incompressible enough that the frame is itself several chunks long —
+    // which is what makes the verbatim branch below a streamed response and not one read.
+    let packed: Vec<u8> = plain.chunks(32).flat_map(|b| [b, b].concat()).collect();
+    // An identity blob of exactly a whole number of chunks: the read loop must end on the
+    // 0-byte read rather than one chunk early or a chunk late.
+    let aligned = noise(2 * CHUNK);
+
+    let packed_digest = store.put_blob(&packed).unwrap();
+    let plain_digest = store.put_blob(&plain).unwrap();
+    let aligned_digest = store.put_blob(&aligned).unwrap();
+    let hex = |d: &str| d.trim_start_matches("sha256:").to_string();
+    assert!(
+        dir.join("blobs/zstd").join(hex(&packed_digest)).is_file()
+            && dir.join("blobs/sha256").join(hex(&plain_digest)).is_file()
+            && dir
+                .join("blobs/sha256")
+                .join(hex(&aligned_digest))
+                .is_file(),
+        "this test needs one blob of each storage form"
+    );
+    let frame = std::fs::read(dir.join("blobs/zstd").join(hex(&packed_digest))).unwrap();
+    assert!(
+        frame.len() > CHUNK && frame.len() < packed.len(),
+        "the stored frame must be smaller than the blob and still several chunks long"
+    );
+
+    let url = spawn(Arc::new(ServerState {
+        store: Arc::new(store),
+        upstreams: vec![],
+        locks: LockManager::new(),
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
+        tls: None,
+    }));
+
+    // This client is built without any compression feature, so it sends no
+    // `Accept-Encoding` of its own and decodes nothing: what arrives is what the server
+    // sent, which is the only way to tell the three branches apart.
+    let client = reqwest::Client::builder().no_zstd().build().unwrap();
+    for (what, digest, want) in [
+        ("identity", &plain_digest, &plain),
+        (
+            "identity, a whole number of chunks",
+            &aligned_digest,
+            &aligned,
+        ),
+        ("frame, decoded by the server", &packed_digest, &packed),
+    ] {
+        let got = client
+            .get(format!("{url}/v2/app/blobs/{digest}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(got.status(), 200, "{what}");
+        assert!(
+            got.headers()
+                .get(reqwest::header::CONTENT_ENCODING)
+                .is_none(),
+            "{what}: canonical bytes must not be labelled as encoded"
+        );
+        assert_eq!(got.content_length(), Some(want.len() as u64), "{what}");
+        assert_eq!(
+            got.bytes().await.unwrap().as_ref(),
+            want.as_slice(),
+            "{what}"
+        );
+    }
+
+    // Asked for zstd, the stored frame goes out verbatim rather than being decoded and
+    // re-encoded: the body is the file on disk, byte for byte, and the length is its size.
+    let got = client
+        .get(format!("{url}/v2/app/blobs/{packed_digest}"))
+        .header(reqwest::header::ACCEPT_ENCODING, "zstd")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.status(), 200);
+    assert_eq!(
+        got.headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("zstd")
+    );
+    assert_eq!(got.content_length(), Some(frame.len() as u64));
+    assert_eq!(got.bytes().await.unwrap().as_ref(), frame.as_slice());
+
+    // And a HEAD says the same thing without producing a body.
+    let head = client
+        .head(format!("{url}/v2/app/blobs/{packed_digest}"))
+        .header(reqwest::header::ACCEPT_ENCODING, "zstd")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        head.headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some(frame.len().to_string().as_str())
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

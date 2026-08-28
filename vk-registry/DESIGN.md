@@ -95,12 +95,14 @@ url    = "https://ghcr.io"
 
 How persistence works:
 
-- **Blobs stream to disk** — a pulled blob is streamed into a store temp file (bounded
+- **Blobs stream both ways** — a pulled blob is streamed into a store temp file (bounded
   memory, never a multi-GB layer in RAM), hashed as it arrives, verified against the
   requested digest, then promoted into the store — compressed when that shrinks it and
   identity otherwise, decided on the bytes (`Store::stage_promotion`, which does that pass
   before the store lock is taken, then `Store::promote_staged`). `Store::uploads_dir`
-  exposes the staging seam.
+  exposes the staging seam. Serving is symmetric: a blob GET reads the stored file a chunk
+  at a time at the client's pace, decoding a stored frame on the way out for a client that
+  cannot take zstd, so no response ever holds a layer in memory either.
 - **Manifests** — a digest-referenced manifest is persisted with the existing
   `put_manifest` (a digest reference writes no tag), so relayed manifests are cached
   without ever creating a mutable tag.
