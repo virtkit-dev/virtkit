@@ -337,11 +337,12 @@ fn list_page(
              <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\n\
              <label>Name <input name=\"name\" maxlength=\"128\" required></label>\n\
              <label>Repo pattern <input name=\"repo_pattern\" placeholder=\"team-a/*\" required></label>\n\
-             <label>Action <select name=\"action\"><option value=\"write\">write (implies read)</option><option value=\"read\">read</option></select></label>\n\
+             {action}\n\
              <label>Expires in days (blank = never, max {MAX_EXPIRY_DAYS}) <input name=\"expires_days\" type=\"number\" min=\"1\" max=\"{MAX_EXPIRY_DAYS}\"></label>\n\
              <button type=\"submit\">Create</button>\n\
              </form>",
             csrf = html_escape(token),
+            action = action_field(user.is_admin),
         ),
         None => String::new(),
     };
@@ -354,6 +355,21 @@ fn list_page(
             &format!("<h1>API keys</h1>\n{notice_html}{table}{new_key_form}"),
         ),
     ))
+}
+
+/// The Action field for this session: a choice for an admin, and for anyone else the one value they
+/// can mint, plus a line below it saying who can mint the other.
+fn action_field(is_admin: bool) -> &'static str {
+    if is_admin {
+        "<label>Action <select name=\"action\"><option value=\"write\">write (implies read)</option>\
+         <option value=\"read\">read</option></select></label>"
+    } else {
+        "<label>Action read</label>\n\
+         <input type=\"hidden\" name=\"action\" value=\"read\">\n\
+         <p>A write-scoped key can only be created from an admin session. Ask an admin \
+         for one, or an operator to grant you admin \
+         (<code>vk-registry accounts grant-admin</code>).</p>"
+    }
 }
 
 fn key_row(k: &ApiKey, csrf: Option<&str>) -> String {
@@ -496,6 +512,33 @@ mod tests {
         assert_eq!(
             id_of("/settings/keys/abc123/revoke").as_deref(),
             Some("abc123")
+        );
+    }
+
+    /// The form offers only what the POST will accept: a plain session that is shown a
+    /// `write` option finds out it cannot have one by submitting the form and losing it.
+    #[test]
+    fn the_action_choices_are_the_ones_this_session_can_mint() {
+        let admin = action_field(true);
+        assert!(admin.contains("value=\"write\""), "{admin}");
+        assert!(admin.contains("value=\"read\""), "{admin}");
+
+        let plain = action_field(false);
+        assert!(
+            !plain.contains("value=\"write\"") && !plain.contains("<option"),
+            "a plain session must be offered no scope to pick from: {plain}"
+        );
+        assert!(plain.contains("value=\"read\""), "{plain}");
+        // and it says who can, rather than dropping the option silently. Asserted across
+        // both line continuations rather than on a phrase inside one: a continuation eats
+        // the newline *and* the indentation after it, so a missing trailing space runs two
+        // words together, and only a match spanning the seam catches that.
+        assert!(
+            plain.contains(
+                "created from an admin session. Ask an admin for one, or an operator to \
+                 grant you admin (<code>vk-registry accounts grant-admin</code>)."
+            ),
+            "{plain}"
         );
     }
 

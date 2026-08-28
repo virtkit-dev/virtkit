@@ -14,6 +14,10 @@ All notable changes to virtkit will be documented in this file.
   `VK_REGISTRY_ROOT` outranks the `root` in a `--config` typed by hand, and a
   `VK_REGISTRY_CONFIG` pointing at a file that cannot be read is now an error instead of
   being ignored. `gc` names the selected store before sweeping it.
+- The API-key form at `/settings/keys` no longer offers a **write** scope to a
+  session that cannot create one. Such a session used to pick it, submit, and get
+  the form back cleared with a refusal; it now sees `read` alone, with a line
+  saying who can create a write-scoped key.
 
 ### Fixed
 

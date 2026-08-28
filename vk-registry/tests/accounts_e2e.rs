@@ -574,6 +574,13 @@ async fn settings_keys_round_trips_create_and_revoke_with_csrf() {
     );
     assert_eq!(db.list_api_keys(&user.id).unwrap().len(), before);
 
+    // and it is the page an admin session gets: both scopes to pick from.
+    let page = resp.text().await.unwrap();
+    assert!(
+        page.contains("<option") && page.contains("value=\"write\""),
+        "an admin session is offered both scopes: {page}"
+    );
+
     // The path that used to be sliced by offset arithmetic.
     let resp = client
         .post(format!("{url}/settings/keys/revoke"))
@@ -634,6 +641,22 @@ async fn a_non_admin_session_cannot_mint_a_write_scoped_key() {
         db.list_api_keys(&user.id).unwrap().is_empty(),
         "no key may have been created"
     );
+
+    // and the form does not invite that in the first place: the refusal above is what
+    // holds, but a session is told before it types rather than after it submits.
+    let resp = client
+        .get(format!("{url}/settings/keys"))
+        .header("Cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let page = resp.text().await.unwrap();
+    assert!(
+        !page.contains("value=\"write\"") && !page.contains("<option"),
+        "a plain session must be offered no scope to pick from: {page}"
+    );
+    assert!(page.contains("value=\"read\""), "{page}");
 
     // a read-only key is still theirs to create
     let resp = client
