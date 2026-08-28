@@ -435,9 +435,17 @@ pub struct Docker {
     #[serde(default)]
     pub username: String,
     /// Path to a file holding the Basic-auth password (read at runtime, trailing newline
-    /// trimmed; sent only when `username` is set). Provision out of band, 0600.
+    /// trimmed; sent only when `username` is set, and not read at all when a `token_file`
+    /// supersedes it). Provision out of band, 0600.
     #[serde(default)]
     pub password_file: Option<PathBuf>,
+    /// Path to a file holding a static bearer token — an alternative to `username`/
+    /// `password_file` for a registry gated by a bearer token, which a `vk-registry` in
+    /// `mode = "accounts"` is: its API keys are bearer tokens and it has no shared
+    /// password to configure instead. Takes precedence over Basic when set; read at
+    /// runtime (trimmed), provision 0600. Sent over TLS (see `ca_file`).
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
     /// Plain HTTP registry (a local/insecure registry); default TLS.
     #[serde(default)]
     pub insecure: bool,
@@ -467,9 +475,15 @@ pub struct Mirror {
     #[serde(default)]
     pub username: String,
     /// Path to a file holding the Basic-auth password (read at runtime, trailing newline
-    /// trimmed; sent only when `username` is set). Provision out of band, 0600.
+    /// trimmed; sent only when `username` is set, and not read at all when a `token_file`
+    /// supersedes it). Provision out of band, 0600.
     #[serde(default)]
     pub password_file: Option<PathBuf>,
+    /// Path to a file holding a static bearer token, as `[docker]`'s — a mirror fronted by
+    /// a `vk-registry` in `mode = "accounts"` is gated by one. Takes precedence over Basic,
+    /// and is sent over TLS (see `ca_file`).
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
     /// Plain HTTP mirror (a local/insecure registry); default TLS.
     #[serde(default)]
     pub insecure: bool,

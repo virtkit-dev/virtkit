@@ -215,6 +215,9 @@
 # username = "ci-push"             # HTTP Basic; empty = anonymous
 # password_file = "/etc/virtkit/registry-password"   # file holding the password
 #                                  # (read at runtime, provision it 0600)
+# token_file = "/etc/virtkit/docker-token"   # static bearer token instead of Basic
+#                                  # (a vk-registry in mode = "accounts"); wins over
+#                                  # username. Sent over TLS — see ca_file.
 # insecure = false                 # plain HTTP (a local/insecure registry)
 
 # [docker.mirror]        # Docker Hub pull-through mirror = the `registry-mirrors` equivalent.
@@ -226,6 +229,8 @@
 # ca_file = "/etc/virtkit/mirror-ca.crt"   # PEM CA the mirror TLS chains to
 # username = ""                    # HTTP Basic; empty = anonymous
 # password_file = "/etc/virtkit/mirror-password"   # file holding the password
+# token_file = "/etc/virtkit/mirror-token"   # static bearer token instead of Basic;
+#                                  # wins over username. Sent over TLS — see ca_file.
 # insecure = false                 # plain HTTP
 
 # [services]            # CI `services:` support. Each declared service boots as a

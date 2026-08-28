@@ -351,6 +351,24 @@ fn net(cfg: &Config) -> Outcome {
     }
 }
 
+/// What is wrong with a `token_file`, if anything: unreadable, or holding nothing once trimmed. The
+/// empty case is worth its own report — `Creds::from_files` refuses it rather than sending an empty
+/// `Bearer `, so a provisioning script that created the file but never wrote to it fails the first
+/// pull, which is exactly what `vk check` is for. `what` prefixes the problem so
+/// `[docker.mirror]`'s reads "mirror token_file …".
+fn token_problem(token_file: &Path, what: &str) -> Option<String> {
+    match std::fs::read_to_string(token_file) {
+        Err(e) => Some(format!(
+            "{what}token_file unreadable: {} ({e})",
+            token_file.display()
+        )),
+        Ok(t) if t.trim().is_empty() => {
+            Some(format!("{what}token_file empty: {}", token_file.display()))
+        }
+        Ok(_) => None,
+    }
+}
+
 fn docker(cfg: &Config) -> Outcome {
     let Some(d) = &cfg.docker else {
         return skip("[docker] not configured");
@@ -364,7 +382,13 @@ fn docker(cfg: &Config) -> Outcome {
     {
         problems.push(format!("ca_file unreadable: {}", ca.display()));
     }
-    if !d.username.is_empty() {
+    if let Some(t) = &d.token_file {
+        problems.extend(token_problem(t, ""));
+    }
+    // Only when no token_file supersedes it: a section that authenticates with a bearer
+    // token never reads the Basic pair, so half of one left behind is not a problem to
+    // report (`Creds::auth` ignores it).
+    if !d.username.is_empty() && d.token_file.is_none() {
         match &d.password_file {
             Some(p) if !access_ok(p, libc::R_OK) => {
                 problems.push(format!("password_file unreadable: {}", p.display()));
@@ -379,7 +403,10 @@ fn docker(cfg: &Config) -> Outcome {
         {
             problems.push(format!("mirror ca_file unreadable: {}", ca.display()));
         }
-        if !m.username.is_empty() {
+        if let Some(t) = &m.token_file {
+            problems.extend(token_problem(t, "mirror "));
+        }
+        if !m.username.is_empty() && m.token_file.is_none() {
             match &m.password_file {
                 Some(p) if !access_ok(p, libc::R_OK) => {
                     problems.push(format!("mirror password_file unreadable: {}", p.display()));
@@ -581,6 +608,48 @@ fn dir_writable(dir: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::config::Gitlab;
+
+    /// A `[docker]` whose `token_file` supersedes the Basic pair: the superseded
+    /// `password_file` is never read by `Creds::from_files`, so an unreadable one is not a
+    /// problem to report — but an empty token file is, since the pull refuses it.
+    #[test]
+    fn the_docker_check_follows_the_token_precedence() {
+        let dir = std::env::temp_dir().join(format!("vk-check-docker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = dir.join("token");
+        let section = |token_file: Option<PathBuf>| Config {
+            docker: Some(crate::config::Docker {
+                repo: Some("registry.example.com/team".to_string()),
+                ca_file: None,
+                username: "ci".to_string(),
+                // Deliberately absent: what the Basic path would fail on.
+                password_file: Some(dir.join("absent")),
+                token_file,
+                insecure: false,
+                mirror: None,
+            }),
+            ..Config::default()
+        };
+
+        std::fs::write(&token, "vkr_x\n").unwrap();
+        assert_eq!(docker(&section(Some(token.clone()))).status, Status::Ok);
+
+        std::fs::write(&token, "  \n").unwrap();
+        let out = docker(&section(Some(token)));
+        assert_eq!(out.status, Status::Fail);
+        assert!(out.detail.contains("token_file empty"), "{}", out.detail);
+
+        // With no token to supersede it, the unreadable password_file is reported again.
+        let out = docker(&section(None));
+        assert_eq!(out.status, Status::Fail);
+        assert!(
+            out.detail.contains("password_file unreadable"),
+            "{}",
+            out.detail
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     // A feature the default config leaves unconfigured is a skip, so the default
     // sweep passes on hosts that don't use it; run() escalates it to a failure

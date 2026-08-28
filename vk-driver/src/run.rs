@@ -599,6 +599,7 @@ async fn resolve_source(args: &RunArgs) -> Result<Source> {
     let creds = crate::oci::Creds {
         username: args.username.clone(),
         password: args.password.clone(),
+        token: None,
         ca_pem: None,
         insecure: args.insecure,
     }

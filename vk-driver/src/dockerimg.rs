@@ -322,12 +322,14 @@ mod tests {
             ca_file: None,
             username: String::new(),
             password_file: None,
+            token_file: None,
             insecure: false,
             mirror: mirror.map(|r| crate::config::Mirror {
                 repo: r.to_string(),
                 ca_file: None,
                 username: String::new(),
                 password_file: None,
+                token_file: None,
                 insecure: false,
             }),
         }

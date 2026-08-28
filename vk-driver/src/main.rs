@@ -2981,6 +2981,7 @@ async fn cli_main() -> ExitCode {
         let creds = oci::Creds {
             username: username.clone(),
             password: password.clone(),
+            token: None,
             ca_pem: None,
             insecure: *insecure,
         };

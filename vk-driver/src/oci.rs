@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use oci_client::Reference;
 use oci_client::client::{Certificate, CertificateEncoding, ClientConfig, ClientProtocol};
@@ -52,37 +52,58 @@ impl From<ImageConfig> for vk_core::runcfg::RunConfig {
     }
 }
 
-/// What one registry conversation needs: the HTTP Basic pair to authenticate with, the
-/// trust anchor its TLS certificate must chain to, and whether it speaks plain HTTP.
+/// What one registry conversation needs: the credential to authenticate with (a bearer
+/// token or an HTTP Basic pair), the trust anchor its TLS certificate must chain to, and
+/// whether it speaks plain HTTP.
 /// One struct so a caller cannot transpose two arguments of the same type, and so the
 /// `ClientConfig` assembly has a single home.
 #[derive(Default, Clone)]
 pub struct Creds {
-    /// HTTP Basic username. `None` — or a `None` `password` — sends no `Authorization`.
+    /// HTTP Basic username. `None` — or a `None` `password` — sends no `Authorization`,
+    /// unless a `token` does.
     pub username: Option<String>,
     /// The Basic password: as `--password` gave it, or read from a config section's
     /// `password_file` by [`Creds::from_docker`] / [`Creds::from_mirror`]. Sent only
     /// alongside a `username`.
     pub password: Option<String>,
+    /// A static bearer token, for a registry gated by one rather than by a password (a
+    /// `vk-registry` in `mode = "accounts"`, whose API keys are exactly that). Takes
+    /// precedence over the Basic pair when both are set.
+    pub token: Option<String>,
     /// PEM CA bundle the registry's TLS certificate chains to. `None` = the system roots.
     pub ca_pem: Option<Vec<u8>>,
     /// Plain HTTP (a local/insecure registry); TLS otherwise.
     pub insecure: bool,
 }
 
-/// Hand-written so the password cannot escape through a `{:?}`: `Creds` is public and is
-/// carried inside [`crate::source::Source`], so the day anything up that chain derives
-/// `Debug` the secret would otherwise land in a log or an `anyhow` context. The CA bundle
+/// Hand-written so no secret escapes through a `{:?}`: `Creds` is public and is carried
+/// inside [`crate::source::Source`], so the day anything up that chain derives `Debug` the
+/// password or token would otherwise land in a log or an `anyhow` context. The CA bundle
 /// is public data but bulky, so it prints as its length.
 impl std::fmt::Debug for Creds {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
         f.debug_struct("Creds")
             .field("username", &self.username)
-            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("password", &redacted(&self.password))
+            .field("token", &redacted(&self.token))
             .field("ca_pem_len", &self.ca_pem.as_ref().map(Vec::len))
             .field("insecure", &self.insecure)
             .finish()
     }
+}
+
+/// The credential files one `[docker]`-shaped config section names, plus the section's own
+/// name for the errors. Named fields rather than five positional arguments: three of them
+/// are `Option<&Path>`, so a transposed pair would compile and surface much later as a 401.
+struct CredFiles<'a> {
+    /// Which section these came from (`[docker]`, `[docker.mirror]`), to name in an error.
+    section: &'a str,
+    ca_file: Option<&'a Path>,
+    username: &'a str,
+    password_file: Option<&'a Path>,
+    token_file: Option<&'a Path>,
+    insecure: bool,
 }
 
 impl Creds {
@@ -94,53 +115,69 @@ impl Creds {
 
     /// What `[docker]` names, for a bare image name routed onto the configured proxy repo.
     pub fn from_docker(dk: &Docker) -> Result<Creds> {
-        Creds::from_files(
-            dk.ca_file.as_deref(),
-            &dk.username,
-            dk.password_file.as_deref(),
-            dk.insecure,
-        )
+        Creds::from_files(CredFiles {
+            section: "[docker]",
+            ca_file: dk.ca_file.as_deref(),
+            username: &dk.username,
+            password_file: dk.password_file.as_deref(),
+            token_file: dk.token_file.as_deref(),
+            insecure: dk.insecure,
+        })
     }
 
     /// What `[docker.mirror]` names, for a Docker Hub reference routed through the mirror.
     /// A mirror usually carries its own account, hence the second constructor.
     pub fn from_mirror(m: &Mirror) -> Result<Creds> {
-        Creds::from_files(
-            m.ca_file.as_deref(),
-            &m.username,
-            m.password_file.as_deref(),
-            m.insecure,
-        )
+        Creds::from_files(CredFiles {
+            section: "[docker.mirror]",
+            ca_file: m.ca_file.as_deref(),
+            username: &m.username,
+            password_file: m.password_file.as_deref(),
+            token_file: m.token_file.as_deref(),
+            insecure: m.insecure,
+        })
     }
 
-    /// The shared body of [`Creds::from_docker`] and [`Creds::from_mirror`]. Private on
-    /// purpose: its two `Option<&Path>` are of the same shape, so no caller outside this
-    /// impl is in a position to transpose them.
+    /// The shared body of [`Creds::from_docker`] and [`Creds::from_mirror`].
     ///
     /// The files are read here, once, rather than at each use: a pull that would fail for
-    /// an unreadable 0600 file says so before the first request, naming the path. The
-    /// password is `trim_end`ed only — it may legitimately begin with whitespace —
-    /// matching `registry::cred`, so one credential file behaves the same on either path.
-    fn from_files(
-        ca_file: Option<&Path>,
-        username: &str,
-        password_file: Option<&Path>,
-        insecure: bool,
-    ) -> Result<Creds> {
-        let password = password_file
+    /// an unreadable 0600 file says so before the first request, naming the path. A
+    /// `token_file` supersedes the Basic pair, so the password is not read at all when one
+    /// is set — what [`Creds::auth`] would ignore, and what `vk check` skips validating.
+    /// The trimming rules are `registry::cred`'s, so one credential file behaves the same
+    /// whichever path reads it: a token loses whitespace at both ends, while a password is
+    /// `trim_end`ed only — it may legitimately begin with whitespace.
+    fn from_files(f: CredFiles<'_>) -> Result<Creds> {
+        let token = f
+            .token_file
             .map(|p| {
-                std::fs::read_to_string(p)
-                    .map(|s| s.trim_end().to_string())
-                    .with_context(|| format!("reading {}", p.display()))
+                let t = std::fs::read_to_string(p)
+                    .map(|s| s.trim().to_string())
+                    .with_context(|| format!("reading {}", p.display()))?;
+                // An empty token_file is a misconfiguration, not a request to stay
+                // anonymous: an empty `Bearer ` only ever 401s, so name the file to fix.
+                if t.is_empty() {
+                    bail!("{} token_file {} is empty", f.section, p.display());
+                }
+                Ok(t)
             })
             .transpose()?;
+        let password = match (&token, f.password_file) {
+            (None, Some(p)) => Some(
+                std::fs::read_to_string(p)
+                    .map(|s| s.trim_end().to_string())
+                    .with_context(|| format!("reading {}", p.display()))?,
+            ),
+            _ => None,
+        };
         Creds {
-            username: (!username.is_empty()).then(|| username.to_string()),
+            username: (!f.username.is_empty()).then(|| f.username.to_string()),
             password,
+            token,
             ca_pem: None,
-            insecure,
+            insecure: f.insecure,
         }
-        .with_ca_file(ca_file)
+        .with_ca_file(f.ca_file)
     }
 
     /// Read `ca_file` into this credential's trust anchor — for the `--ca` flag, whose
@@ -155,11 +192,15 @@ impl Creds {
         Ok(self)
     }
 
-    /// The `Authorization` this sends: the Basic pair when both halves are set, else
-    /// nothing — a username with no password authenticates as nobody, not as that user.
+    /// The `Authorization` this sends: a bearer token when one is configured, else the
+    /// Basic pair when both halves are set, else nothing — a username with no password
+    /// authenticates as nobody, not as that user. A token wins over a password that is
+    /// also set, the precedence `[registry] token_file` documents and `vk-registry`
+    /// applies on the other side.
     fn auth(&self) -> RegistryAuth {
-        match (&self.username, &self.password) {
-            (Some(u), Some(p)) => RegistryAuth::Basic(u.clone(), p.clone()),
+        match (&self.token, &self.username, &self.password) {
+            (Some(t), _, _) => RegistryAuth::Bearer(t.clone()),
+            (None, Some(u), Some(p)) => RegistryAuth::Basic(u.clone(), p.clone()),
             _ => RegistryAuth::Anonymous,
         }
     }
@@ -664,9 +705,40 @@ mod tests {
             ca_file: Some(dir.join("ca.pem")),
             username: username.to_string(),
             password_file,
+            token_file: None,
             insecure: false,
             mirror: None,
         }
+    }
+
+    /// A `token_file` supersedes the Basic pair all the way through the constructors, and
+    /// the superseded password is not even read — which is what lets `vk check` skip
+    /// validating it. The unreadable `password_file` here would abort the pull otherwise.
+    #[test]
+    fn a_section_token_file_supersedes_its_password() {
+        let dir = creds_dir("section-token");
+        std::fs::write(dir.join("ca.pem"), b"pem").unwrap();
+        let token = dir.join("token");
+        std::fs::write(&token, "vkr_x\n").unwrap();
+
+        let mut dk = docker_section(&dir, "ci", Some(dir.join("absent")));
+        dk.token_file = Some(token.clone());
+        let creds = Creds::from_docker(&dk).unwrap();
+        assert_eq!(creds.password, None);
+        assert!(matches!(creds.auth(), RegistryAuth::Bearer(t) if t == "vkr_x"));
+
+        let m = crate::config::Mirror {
+            repo: "hq-nexus.example.com:8440".to_string(),
+            ca_file: None,
+            username: "ci".to_string(),
+            password_file: Some(dir.join("absent")),
+            token_file: Some(token),
+            insecure: false,
+        };
+        let creds = Creds::from_mirror(&m).unwrap();
+        assert_eq!(creds.password, None);
+        assert!(matches!(creds.auth(), RegistryAuth::Bearer(t) if t == "vkr_x"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -731,6 +803,7 @@ mod tests {
             ca_file: Some(dir.join("ca.pem")),
             username: "alice".to_string(),
             password_file: Some(pw),
+            token_file: None,
             insecure: true,
         };
         let creds = Creds::from_mirror(&m).unwrap();
@@ -761,10 +834,11 @@ mod tests {
     }
 
     #[test]
-    fn debug_redacts_the_password() {
+    fn debug_redacts_the_secrets() {
         let creds = Creds {
             username: Some("bob".to_string()),
             password: Some("s3cret".to_string()),
+            token: Some("vkr_x".to_string()),
             ca_pem: Some(b"pem".to_vec()),
             insecure: false,
         };
@@ -773,7 +847,59 @@ mod tests {
             !shown.contains("s3cret"),
             "password leaked into Debug: {shown}"
         );
+        assert!(!shown.contains("vkr_x"), "token leaked into Debug: {shown}");
         assert!(shown.contains("bob"), "username should still show: {shown}");
+    }
+
+    /// A token wins over a password that is also configured, an absent one leaves the
+    /// Basic pair — the precedence `[registry]` documents and `vk-registry` applies on
+    /// the other side.
+    #[test]
+    fn a_bearer_token_supersedes_the_basic_pair() {
+        let creds = |token: Option<&str>| Creds {
+            username: Some("ci".to_string()),
+            password: Some("pw".to_string()),
+            token: token.map(str::to_string),
+            ..Creds::anonymous()
+        };
+        assert!(matches!(
+            creds(Some("vkr_x")).auth(),
+            RegistryAuth::Bearer(t) if t == "vkr_x"
+        ));
+        assert!(matches!(
+            creds(None).auth(),
+            RegistryAuth::Basic(u, p) if u == "ci" && p == "pw"
+        ));
+    }
+
+    /// An empty `token_file` is a misconfiguration, not a request to stay anonymous:
+    /// sending `Bearer ` only ever 401s, and the path is what says which file to fix.
+    #[test]
+    fn an_empty_token_file_is_refused_by_name() {
+        let dir = creds_dir("token");
+        let token = dir.join("token");
+        std::fs::write(&token, "  \n").unwrap();
+        let files = |token_file| CredFiles {
+            section: "[docker]",
+            ca_file: None,
+            username: "",
+            password_file: None,
+            token_file: Some(token_file),
+            insecure: false,
+        };
+        let err = Creds::from_files(files(&token))
+            .expect_err("an empty token_file must abort the pull, not go anonymous");
+        let shown = err.to_string();
+        assert!(
+            shown.contains(&token.display().to_string()) && shown.contains("[docker]"),
+            "the error must name the section and the path, got {err}"
+        );
+
+        // A token carries no meaningful surrounding whitespace, so both ends are trimmed.
+        std::fs::write(&token, "  vkr_x\n").unwrap();
+        let ok = Creds::from_files(files(&token)).unwrap();
+        assert_eq!(ok.token.as_deref(), Some("vkr_x"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

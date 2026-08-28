@@ -6,6 +6,12 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- `[docker]` and `[docker.mirror]` accept a `token_file`, so a job image can be pulled
+  through a registry gated by a bearer token — a `vk-registry` in `mode = "accounts"`,
+  whose API keys are exactly that and which has no shared password to configure instead.
+  It supersedes `username`/`password_file` when both are set, as `[registry] token_file`
+  does, and `vk check` reports a token file that is unreadable or empty rather than
+  leaving it to fail the first pull.
 - An admin can give a repository a one-line caption on its page, saying what it
   holds. Everyone who can read the repository sees it, and emptying the box
   removes it. Repositories `vk` recognizes, such as its build cache, still
