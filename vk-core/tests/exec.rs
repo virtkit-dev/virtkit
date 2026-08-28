@@ -3,7 +3,7 @@
 //! module), so the vsock:// transport itself is not covered here.
 
 use futures::{SinkExt, StreamExt};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
 use tokio::time::timeout;
@@ -479,6 +479,23 @@ async fn tty_exec() {
     // the pty translates \n to \r\n (ONLCR)
     assert!(stdout.contains("33 117\r\n"), "stdout: {stdout}");
     assert!(stdout.contains("TERM=xterm\r\n"), "stdout: {stdout}");
+}
+
+/// A process outliving the command keeps a pty slave handle open, so the master
+/// never reports EIO. The session must still end on the command's own exit.
+#[tokio::test]
+async fn tty_exec_ends_when_a_leftover_process_holds_the_pty() {
+    let addr = start_server("tty-leftover").await;
+    // the trap has to be installed before the fork, not inside the background job: the
+    // kernel hangs up the pty's process group when the session leader exits, and a
+    // leftover that takes the SIGHUP closes the pty, hiding the case under test
+    let started = Instant::now();
+    let (stdout, code) = run_tty(&addr, "trap '' HUP; sleep 5 & echo bye", 24, 80).await;
+    assert_eq!(code, Some(0), "stdout: {stdout}");
+    assert!(stdout.contains("bye\r\n"), "stdout: {stdout}");
+    // the session ends on the drain's grace period, not on the leftover's lifetime
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
 }
 
 #[tokio::test]

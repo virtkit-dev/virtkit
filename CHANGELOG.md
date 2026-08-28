@@ -48,6 +48,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- `vk exec --tty` ends when the command it ran ends. A command that left behind a
+  process still holding the terminal — a daemon, or anything that survives the hangup
+  sent when the shell exits — kept the session open, so exiting the shell gave back no
+  prompt and the terminal answered nothing but echoed keystrokes, until the `vk` process
+  was killed from elsewhere.
 - `vk check` judges a `[registry]` credential the way a pull does. It now reports a
   `token_file` that is unreadable or empty, which used to pass and then fail the
   first request, and stops reporting a `password_file` that a `token_file`
