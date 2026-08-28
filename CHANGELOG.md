@@ -24,6 +24,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- A build with no `[build] jobs` set now derives how many stages it runs at once from
+  the memory the host *has* rather than the memory free at the moment it starts, so
+  the same build runs the same width whatever else was open when it began.
 - A registry no longer holds a whole layer in memory while serving it, so concurrent
   pulls of large images stop risking the host's memory.
 - A registry now stores a relayed blob compressed whenever that makes it smaller,

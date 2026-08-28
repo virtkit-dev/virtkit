@@ -627,7 +627,7 @@ enum Cmd {
         /// max stages built concurrently on the microVM backend
         ///
         /// Independent stages build in parallel over the dependency graph. Default: `[build]
-        /// jobs`, else auto, bounded by host RAM. 1 forces a sequential build.
+        /// jobs`, else auto, bounded by the host's total RAM. 1 forces a sequential build.
         #[arg(
             long = "build-jobs",
             value_name = "N",

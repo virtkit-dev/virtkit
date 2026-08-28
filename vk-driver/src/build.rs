@@ -246,7 +246,7 @@ pub struct Options {
     pub require_cached: bool,
     /// Max stages built concurrently (microVM backend). `Some` (the `--build-jobs` flag,
     /// or the config's `[build] jobs`) overrides the `None` = auto default (bounded by
-    /// host RAM, each stage guest reserving a fixed slice). `1` forces the sequential
+    /// the host's total RAM, each stage guest reserving a fixed slice). `1` forces the sequential
     /// build. Ignored by the host backend. Non-zero by type: a budget of no stages at all
     /// is not a build, and silently reading it as `1` would have the announced concurrency
     /// cite a configured number the build never used.
@@ -827,7 +827,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
             let kernel = kernel.as_ref().expect("resolved under microvm");
             let agent = agent.as_ref().expect("resolved under microvm");
             let mv = make_microvm(opts, &scratch, &kernel.path, &agent.path, &timings)?;
-            let jobs = resolve_build_jobs(opts, mv.mem_mib());
+            let jobs = resolve_build_jobs(opts, mv.mem_mib(), crate::schedule::host_total_mib());
             progress.note(&concurrency_line(
                 jobs,
                 mv.cpus(),
@@ -1032,7 +1032,7 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
     let mut mv = make_microvm(opts, &scratch, &kernel.path, &agent.path, &timings)?;
     // One job budget for every unit's stages combined (not per unit), so concurrent work
     // stays within host RAM instead of multiplying live guests.
-    let jobs = resolve_build_jobs(opts, mv.mem_mib());
+    let jobs = resolve_build_jobs(opts, mv.mem_mib(), crate::schedule::host_total_mib());
     timings.note_jobs(jobs); // so the timing header reports "busy across N jobs"
 
     // A lone unit's stage names are already unique, so it needs no prefix (the dashboard
@@ -2500,15 +2500,24 @@ fn drive_microvm(
 /// Resolve the parallel build's job count: the `opts.build_jobs` set from `--build-jobs` or
 /// `[build] jobs` when present — taken as given, since the type rules out the one value that
 /// would need correcting — else RAM-auto: each stage guest reserves `mem_mib`, so cap
-/// concurrency at ~80% of available RAM divided by that, clamped to a sane ceiling. CPU is
-/// intentionally allowed to oversubscribe (the host scheduler time-slices); RAM overcommit
-/// would OOM.
-fn resolve_build_jobs(opts: &Options, mem_mib: u64) -> usize {
+/// concurrency at ~80% of `total_mib`, the host's `MemTotal`, divided by that, clamped to a
+/// sane ceiling. CPU is intentionally allowed to oversubscribe (the host scheduler
+/// time-slices); RAM overcommit would OOM.
+///
+/// The basis is what the host *has*, not the `MemAvailable` it happens to have free: that
+/// figure moves with page cache and with whatever else is running, so a width read off it is
+/// a width read off the minute the build started. A width derived from `MemTotal` is a
+/// property of the host, which is what a budget announced once and held for the whole build
+/// has to be.
+///
+/// The cost of that is a width blind to how busy the host already is: auto claims its share
+/// of the whole machine whatever else is admitted beside it, so a host running jobs and
+/// builds side by side should set `[build] jobs` rather than let each build size itself.
+fn resolve_build_jobs(opts: &Options, mem_mib: u64, total_mib: Option<u64>) -> usize {
     if let Some(j) = opts.build_jobs {
         return j.get();
     }
-    let avail = mem_available_mib().unwrap_or(8 * 1024);
-    let usable = avail * 8 / 10;
+    let usable = total_mib.unwrap_or(8 * 1024).saturating_mul(8) / 10;
     ((usable / mem_mib.max(1)) as usize).clamp(1, 16)
 }
 
@@ -2585,18 +2594,6 @@ fn claim_if_abandoned(path: &Path) -> Option<std::fs::File> {
     // inode; removing what we opened would then delete nothing it owns, but reporting it
     // swept would be a lie. Only act on the dir the path still names.
     crate::cachelock::same_file(&dir, path).ok()?.then_some(dir)
-}
-
-/// Available host RAM in MiB, from `/proc/meminfo` `MemAvailable`. `None` if unreadable.
-fn mem_available_mib() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-            return Some(kb / 1024);
-        }
-    }
-    None
 }
 
 /// The stage indices an instruction list references via `COPY --from` / `RUN
@@ -5884,22 +5881,34 @@ RUN ship
             debug: false,
             progress_sink: None,
         };
+        let host = Some(64 * 1024);
         // Explicit build_jobs (--build-jobs, or [build] jobs) wins over the RAM-derived
         // default, and is used as given — zero is unrepresentable, so nothing to floor.
-        assert_eq!(resolve_build_jobs(&opts(NonZeroUsize::new(3)), 2048), 3);
-        // Auto is RAM-bounded and clamped to [1, 16]: a stage guest the host cannot fit
-        // floors it, a 1 MiB one lets it run to the ceiling.
-        assert_eq!(resolve_build_jobs(&opts(None), u64::MAX / 2), 1);
-        assert_eq!(resolve_build_jobs(&opts(None), 1), 16);
+        assert_eq!(
+            resolve_build_jobs(&opts(NonZeroUsize::new(3)), 2048, host),
+            3
+        );
+        // Auto is 80% of what the host *has* over one stage guest: 64 GiB and a 4 GiB stage
+        // guest is 12 wide, and it stays 12 however little of that memory is free.
+        assert_eq!(resolve_build_jobs(&opts(None), 4096, host), 12);
+        // A host whose memory cannot be read is treated as an 8 GiB one rather than an
+        // unbounded one, so auto still lands somewhere a stage guest fits.
+        assert_eq!(resolve_build_jobs(&opts(None), 4096, None), 1);
+        assert_eq!(resolve_build_jobs(&opts(None), 1024, None), 6);
+        // Clamped to [1, 16] at both ends: a stage guest the host cannot fit floors it, and
+        // a 1 MiB one on a machine reporting all the memory there is stops at the ceiling
+        // rather than overflowing the `× 8` on the way.
+        assert_eq!(resolve_build_jobs(&opts(None), u64::MAX / 2, host), 1);
+        assert_eq!(resolve_build_jobs(&opts(None), 1, Some(u64::MAX)), 16);
         // Same 1 MiB stage guest, but an explicit 1: the override forces the sequential
         // build that auto would have widened, which is what makes it an override.
-        assert_eq!(resolve_build_jobs(&opts(NonZeroUsize::new(1)), 1), 1);
+        assert_eq!(resolve_build_jobs(&opts(NonZeroUsize::new(1)), 1, host), 1);
     }
 
     #[test]
     fn concurrency_line_names_where_its_budget_came_from() {
         // The whole point of announcing the budget: a build pinned to one stage on purpose
-        // must not read like one the host's free memory squeezed down to it.
+        // must not read like one the RAM-derived default squeezed down to it.
         let pinned = concurrency_line(1, 2, "4G", true);
         assert!(pinned.starts_with("virtkit: build: "), "{pinned}");
         assert!(

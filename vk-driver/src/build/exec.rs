@@ -1069,8 +1069,8 @@ impl MicroVm {
         self.uncacheable_keys = keys;
     }
 
-    /// Memory each stage guest reserves, in MiB — the parallel driver divides available
-    /// host RAM by this to pick a default job count.
+    /// Memory each stage guest reserves, in MiB — the parallel driver divides the host's
+    /// total RAM by this to pick a default job count.
     pub fn mem_mib(&self) -> u64 {
         crate::run::parse_mem_mib(&self.mem).unwrap_or(2048)
     }

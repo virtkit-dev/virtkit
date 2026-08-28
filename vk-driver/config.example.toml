@@ -109,7 +109,7 @@
 # cache_token_file = "/etc/virtkit/registry-token"      # static bearer (wins over Basic)
 # journal = false                                       # add an ext4 journal to the export
 # jobs = 4               # max stages built concurrently (--build-jobs overrides;
-#                        # default: auto, bounded by host RAM). 1 = sequential
+#                        # default: auto, bounded by the host's total RAM). 1 = sequential
 # cpus = 8               # per-stage build guest vCPUs (default: host CPUs, capped 16)
 # mem = "8G"             # per-stage build guest RAM (default: 4G)
 # cache_checkpoint_secs = 20  # `auto` cache mode: seconds of run time before a checkpoint

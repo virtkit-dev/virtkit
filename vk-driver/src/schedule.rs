@@ -194,25 +194,39 @@ fn host_memory() -> Option<HostMemory> {
     })
 }
 
-/// This host's `MemTotal` in MiB — what a percentage `[schedule] mem_budget` is a share of.
-/// `None` on a host whose memory cannot be read, which is a percentage that cannot be resolved.
+/// This host's `MemTotal` in MiB — what a percentage `[schedule] mem_budget` is a share of,
+/// and what a build's auto stage count divides by `[build] mem`. `None` on a host whose
+/// memory cannot be read, which each caller answers its own way: the budget is a share that
+/// cannot be resolved, the build falls back to a modest assumed size.
 pub(crate) fn host_total_mib() -> Option<u64> {
-    host_memory().map(|h| h.total_mib)
+    total_mib(Path::new("/proc/meminfo"))
+}
+
+/// `MemTotal` in MiB, on its own: a caller that wants only the size of the host must not be
+/// denied it by a `/proc/meminfo` that happens to omit `MemAvailable`.
+fn total_mib(path: &Path) -> Option<u64> {
+    Some(meminfo_field(&std::fs::read_to_string(path).ok()?, "MemTotal:")? / 1024)
 }
 
 /// `(MemAvailable, MemTotal)` in kB.
 fn meminfo(path: &Path) -> Option<(u64, u64)> {
     let text = std::fs::read_to_string(path).ok()?;
-    let field = |name: &str| {
-        text.lines().find_map(|l| {
-            l.strip_prefix(name)?
-                .split_whitespace()
-                .next()?
-                .parse::<u64>()
-                .ok()
-        })
-    };
-    Some((field("MemAvailable:")?, field("MemTotal:")?))
+    Some((
+        meminfo_field(&text, "MemAvailable:")?,
+        meminfo_field(&text, "MemTotal:")?,
+    ))
+}
+
+/// One `/proc/meminfo` field in kB, by its `Name:` prefix. `None` when it is absent or
+/// unparsable.
+fn meminfo_field(text: &str, name: &str) -> Option<u64> {
+    text.lines().find_map(|l| {
+        l.strip_prefix(name)?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+    })
 }
 
 #[cfg(test)]
@@ -498,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_two_meminfo_fields_it_needs() {
+    fn reads_the_meminfo_fields_each_caller_needs() {
         let dir = std::env::temp_dir().join(format!("vk-meminfo-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("meminfo");
@@ -509,6 +523,14 @@ mod tests {
         .unwrap();
         assert_eq!(meminfo(&path), Some((32895308, 65790616)));
         assert_eq!(meminfo(Path::new("/nonexistent")), None);
+        assert_eq!(total_mib(&path), Some(64248));
+
+        // A size question is answered from `MemTotal` alone. A kernel that reports no
+        // `MemAvailable` still has a size, and a caller asking only for it gets an answer.
+        std::fs::write(&path, "MemTotal:       65790616 kB\nMemFree:  123 kB\n").unwrap();
+        assert_eq!(total_mib(&path), Some(64248));
+        assert_eq!(meminfo(&path), None);
+        assert_eq!(total_mib(Path::new("/nonexistent")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

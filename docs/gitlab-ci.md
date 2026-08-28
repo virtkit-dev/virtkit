@@ -498,7 +498,7 @@ build by the host.
 | --- | --- | --- |
 | vCPUs | `[vm] cpus`, per job `MICROVM_CPUS` (capped by `[vm] max_cpus`) | `[build] cpus`, per stage guest — unset = the host's CPU count, capped at 16 |
 | RAM | `[vm] mem`, per job `MICROVM_MEM` (capped by `[vm] max_mem`) | `[build] mem`, per stage guest — unset = `4G` |
-| Concurrency | one VM per job (the runner's own `concurrent`) | `[build] jobs` stages at once — unset = 80% of host `MemAvailable` divided by `[build] mem`, capped at 16 |
+| Concurrency | one VM per job (the runner's own `concurrent`) | `[build] jobs` stages at once — unset = 80% of host `MemTotal` divided by `[build] mem`, capped at 16 |
 
 Build sizing is host configuration only — there are no `MICROVM_*` equivalents, because
 built images are cached and shared across jobs and runners, so no single job owns the
@@ -692,7 +692,9 @@ work out of the runner. For that, see below.
 Nor does it cover everything a job boots. The claim is taken at the start of prepare, so a
 job that builds its own image holds its full guest RAM across that build — and the build's
 own stage guests (`[build] mem` × `[build] jobs`) are outside the budget entirely. A host
-has to leave room for both.
+has to leave room for both. An auto `[build] jobs` does not close that gap either: it is a
+fixed share of the whole machine, not of what is left of it, so a host that runs jobs and
+builds side by side should set `[build] jobs` by hand.
 
 ## Throttling a busy runner
 

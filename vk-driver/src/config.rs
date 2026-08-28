@@ -137,9 +137,9 @@ pub struct Build {
     /// than ½·guest-RAM; set this to trade that for a RAM tmpfs. Default off (disk-backed).
     pub tmp_tmpfs: bool,
     /// max stages built concurrently on the microVM backend (`--build-jobs` overrides).
-    /// Unset = auto, bounded by host RAM (each stage guest reserves `mem`). `1` forces a
-    /// sequential build; `0` is refused when the config loads rather than read as a request
-    /// for a build that runs nothing.
+    /// Unset = auto, bounded by the host's total RAM (each stage guest reserves `mem`).
+    /// `1` forces a sequential build; `0` is refused when the config loads rather than read
+    /// as a request for a build that runs nothing.
     pub jobs: Option<NonZeroUsize>,
     /// per-stage build guest vCPUs. Unset = the host's logical CPU count, clamped to 16.
     pub cpus: Option<u32>,
