@@ -22,6 +22,11 @@ All notable changes to virtkit will be documented in this file.
   the build log above it, and left its separator rule at the old width.
 - `vk build` reports progress on a terminal that sets no `TERM`. Such a build
   printed nothing at all — no dashboard, and no per-step log either.
+- A `vkr_…` API key now works with ordinary OCI clients against a registry in `mode =
+  "accounts"`. The key is accepted as a plain password, so `docker login <registry>`
+  (any username, the key as the password), `oras -u` and `[build]
+  cache_username`/`cache_password_file` all authenticate; before, such a client was
+  turned away whatever key it was given. Browser sign-in is unchanged.
 
 ## [0.44.0] - 2026-08-27
 

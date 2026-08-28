@@ -49,6 +49,11 @@ impl Auth {
     }
 
     /// The 401 challenge to return for an unauthenticated protected request.
+    ///
+    /// Each mode names its own scheme, unlike accounts mode, which challenges with `Basic`
+    /// whatever the credential is (see [`crate::accounts::challenge`]): here a client is
+    /// configured for one scheme and sends it unprompted, so the challenge is a statement of
+    /// what this server takes rather than something a client has to be steered by.
     pub fn challenge(&self) -> Response<Full<Bytes>> {
         let challenge = match self {
             Auth::Basic { .. } => "Basic realm=\"vk-registry\"",

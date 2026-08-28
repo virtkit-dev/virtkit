@@ -821,17 +821,19 @@ fn api_key_token(headers: &HeaderMap) -> Option<String> {
 
 /// The 401 challenge for a request with no valid session cookie or API key.
 ///
-/// `Bearer`, even though [`api_key_token`] also accepts a key presented as Basic. A client
-/// that follows the challenge cannot use that: `oci-client` (and docker) read
-/// `Bearer realm=…` as a token-endpoint URL to fetch from, and `"vk-registry"` is not one,
-/// so they fail rather than fall back to Basic. Advertising both does not help — the first
-/// parseable `Bearer` wins. The Basic path is therefore for a client sending credentials it
-/// was configured with, not one discovering how to authenticate; making discovery work
-/// needs a real token endpoint or the browser login flow, which is what the OIDC step
-/// brings, so the choice belongs there rather than here.
+/// Use `Basic` because `oci-client` treats a Bearer challenge as token-service discovery.
+/// The registry advertises no token endpoint, so that path drops the configured key and
+/// sends the request anonymously. A Basic challenge makes the client send the key, which
+/// [`api_key_token`] accepts in either credential field.
+///
+/// Preemptive Bearer authentication remains valid. Account mode requires TLS away from
+/// loopback, so the Basic fallback does not weaken transport requirements.
+///
+/// Human-facing routes redirect to OIDC before reaching this response. Other browser
+/// requests may display a native Basic prompt.
 pub fn challenge() -> Response<Full<Bytes>> {
     crate::unauthorized(
-        "Bearer realm=\"vk-registry\"",
+        "Basic realm=\"vk-registry\"",
         "sign in or provide a vkr_ API key",
     )
 }
@@ -1691,10 +1693,18 @@ mod tests {
             );
         }
         // something that is not one of ours is a failed authentication, not a fallthrough
+        // — including a header the server cannot decode at all: `!!!!` is not base64,
+        // `//4=` decodes to bytes that are not UTF-8, and `Basic` carries nothing (the
+        // trailing space of `Basic ` never survives the wire, so the empty credential is
+        // only reachable here).
         for header in [
             "Basic dXNlcg==",
             "Basic dXNlcjpwYXNz",
             "Bearer shared-secret",
+            "Basic !!!!",
+            "Basic //4=",
+            "Basic ",
+            "Basic",
         ] {
             headers.insert(hyper::header::AUTHORIZATION, header.parse().unwrap());
             assert_eq!(api_key_token(&headers), None, "{header}");
@@ -1784,15 +1794,18 @@ mod tests {
         }
     }
 
+    // The scheme is the contract, not the header's presence: `Bearer` here names a token
+    // endpoint that does not exist, and `oci-client` answers that by dropping the key it
+    // was configured with instead of sending it as Basic.
     #[test]
-    fn the_challenge_carries_a_www_authenticate_header() {
+    fn the_challenge_names_the_basic_scheme() {
         let res = challenge();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
             res.headers()
                 .get(hyper::header::WWW_AUTHENTICATE)
                 .and_then(|v| v.to_str().ok()),
-            Some("Bearer realm=\"vk-registry\"")
+            Some("Basic realm=\"vk-registry\"")
         );
     }
 

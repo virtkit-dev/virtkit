@@ -833,18 +833,35 @@ async fn accounts_auth_gates_everything_including_the_probe() {
     let http = reqwest::Client::new();
 
     // no credential: the probe challenges, and it says how — an OCI client that gets a
-    // bare 401 here concludes no auth is wanted and never presents anything.
+    // bare 401 here concludes no auth is wanted and never presents anything, and one told
+    // `Bearer` goes looking for a token endpoint instead of sending the key it holds.
     let r = http.get(format!("{url}/v2/")).send().await.unwrap();
     assert_eq!(r.status().as_u16(), 401);
     assert_eq!(
         r.headers()
             .get("www-authenticate")
             .and_then(|v| v.to_str().ok()),
-        Some("Bearer realm=\"vk-registry\"")
+        Some("Basic realm=\"vk-registry\"")
     );
 
-    // an API key authenticates the probe and, within its scope, a protected route
-    // (404: the store is empty)
+    // and the shape that challenge asks for is answered: a tool that carries the key in
+    // the username half of the pair gets in. The password half — what `docker login` and
+    // `oras -u` produce — is the `basic_auth("unused", …)` push below.
+    let r = http
+        .get(format!("{url}/v2/"))
+        .basic_auth(&token, Some(""))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        r.status().is_success(),
+        "a key sent as Basic must authenticate: got {}",
+        r.status()
+    );
+
+    // a key sent as Bearer keeps working — the half of the contract the challenge change
+    // does not touch, since a client holding the key natively never reads the challenge.
+    // Within its scope it also reaches a protected route (404: the store is empty).
     let r = http
         .get(format!("{url}/v2/"))
         .bearer_auth(&token)
@@ -939,7 +956,10 @@ async fn accounts_auth_gates_everything_including_the_probe() {
         assert_eq!(r.status().as_u16(), 401, "{bad} must not authenticate");
     }
 
-    // the lock API and the write path are behind the same gate
+    // the lock API and the write path are behind the same gate, and are challenged the
+    // same way: `/lock` is what vk's own build-cache lease client talks to. A browser is
+    // not challenged at all on the pages meant for it — see
+    // `browse_belongs_to_accounts_mode_and_redirects_a_signed_out_browser`.
     for r in [
         http.post(format!("{url}/lock/acquire?name=k&wait=0"))
             .send()
@@ -951,6 +971,12 @@ async fn accounts_auth_gates_everything_including_the_probe() {
             .unwrap(),
     ] {
         assert_eq!(r.status().as_u16(), 401);
+        assert_eq!(
+            r.headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok()),
+            Some("Basic realm=\"vk-registry\"")
+        );
     }
 
     // and the whole point: an authenticated client can push a blob and read it back. The

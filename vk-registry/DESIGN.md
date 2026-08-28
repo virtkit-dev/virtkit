@@ -332,6 +332,22 @@ passed, then match `action`/`repo` against `scopes` (bumping `last_used_at` on s
 `authorize()` itself just checks `scopes.iter().any(|s| s.allows(action, repo))` once a
 key has resolved.
 
+In accounts mode an unauthenticated request lands in one of three places: the OIDC paths
+(`/login`, `/auth/callback`, `/logout`) are outside the gate; the human-facing pages
+redirect to the login; everything else — `/v2/*`, `/lock/*`, `/`, anything unrecognised —
+is challenged with `WWW-Authenticate: Basic realm="vk-registry"`.
+
+Basic rather than Bearer because here the scheme decides whether a configured OCI client
+sends its key at all, not just how an unconfigured one would find the way in: a `Bearer`
+challenge names a token endpoint, this server has none, and the client is left holding a
+key it never sends (`accounts::challenge` has the mechanism, traced through `oci-client`,
+which is what vk's own build cache talks through). The cost is that a browser landing on
+one of these paths gets a native Basic prompt it cannot usefully answer, and that the key
+now travels where it did not before — safe because accounts mode is refused without TLS
+off loopback. A key is accepted in either scheme and in either half of the Basic pair, so
+`docker login` with the key as the password works. The shared-secret modes keep their own
+challenge (`Auth::challenge`): a client configured for a token there sends it unprompted.
+
 Credential lookup is on the request path, so it runs in a read transaction. An API key
 lookup's only write is a `last_used_at` bump, coarse enough (a minute) that a push does not
 pay an fsync per chunk and committed with `Durability::Eventual` — still a real commit,
