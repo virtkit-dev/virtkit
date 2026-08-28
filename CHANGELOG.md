@@ -45,6 +45,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- The credential proxy that lends a job the runner's registry login now sends a
+  bearer token when `[registry]` is configured with one. It only ever knew about
+  the Basic pair, so a job proxied to a registry gated by an API key was handed no
+  credential at all and got a 401.
 - `vk build`'s live progress dashboard survives a terminal resize. Resizing the
   window mid-build used to make the pinned block walk up the screen and overwrite
   the build log above it, and left its separator rule at the old width.

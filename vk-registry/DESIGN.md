@@ -193,7 +193,7 @@ boundary alignment (see the note below); client-side compression is independent 
 Off by default; opt-in per VM via `vk run --registry-proxy <upstream-url>` (needs `--net`).
 When set, `vk` runs a host-local reverse proxy (`regproxy.rs`) on loopback that forwards to
 the upstream registry, injecting the runner's `--username`/`--password`/`--ca` credential
-(`reqwest` Basic auth). The guest reaches it **credential-free** at `registry.vk` (a hint
+as `reqwest` Basic auth. The guest reaches it **credential-free** at `registry.vk` (a hint
 also exported as `VIRTKIT_REGISTRY`). Delivery: the switch's resolver maps `registry.vk` to
 an unroutable sentinel (`240.0.0.1`), and its TCP egress (`proxy_tcp`) special-cases that
 sentinel — splicing the flow to the loopback proxy instead of egressing. So the proxy is
@@ -202,7 +202,8 @@ the job never holds the secret. A guest that doesn't opt in has no such path.
 
 The GitLab executor opts in runner-wide with `[registry] proxy_guests = true`: each job's
 switch (`vm.rs`) starts the same `regproxy` forwarding to the host `[registry]` with its
-credentials, exposed to the job at `registry.vk`. Proxy bodies stream both ways, so a job
+credential — a bearer token when `token_file` names one, else the Basic pair, the
+precedence every other `[registry]` client applies — exposed to the job at `registry.vk`. Proxy bodies stream both ways, so a job
 pushing/pulling multi-GB layers through it never buffers a whole blob.
 
 ## Auth / TLS

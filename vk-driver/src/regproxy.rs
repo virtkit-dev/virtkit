@@ -27,6 +27,8 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
+use crate::oci::Creds;
+
 /// The streaming response body the proxy returns.
 type ProxyBody = BoxBody<Bytes, std::io::Error>;
 
@@ -34,32 +36,22 @@ type ProxyBody = BoxBody<Bytes, std::io::Error>;
 pub struct ProxyCfg {
     /// upstream base URL, `scheme://authority` (no trailing slash)
     pub upstream: String,
-    pub username: Option<String>,
-    pub password: Option<String>,
+    /// The credential injected into every forwarded request, so the job stays
+    /// credential-free — and the trust anchor `client` was built against.
+    pub creds: Creds,
     pub client: reqwest::Client,
 }
 
 impl ProxyCfg {
-    /// Build from explicit parts (the `vk run --registry-proxy` path): `upstream` is the
-    /// full base URL (`scheme://host`), with optional Basic credentials + CA to inject.
-    pub fn from_parts(
-        upstream: &str,
-        username: Option<String>,
-        password: Option<String>,
-        ca_file: Option<std::path::PathBuf>,
-        insecure: bool,
-    ) -> Result<Self> {
-        Self::build(
-            upstream.trim_end_matches('/').to_string(),
-            username,
-            password,
-            ca_file.as_deref(),
-            insecure,
-        )
+    /// Build from the `vk run --registry-proxy` flags: `upstream` is the full base URL
+    /// (`scheme://host`), `creds` both what to inject and what TLS to trust.
+    pub fn from_parts(upstream: &str, creds: Creds) -> Result<Self> {
+        Self::build(upstream.trim_end_matches('/').to_string(), creds)
     }
 
     /// Build from the runner's `[registry]` config (the executor path): the central
-    /// registry's base URL + TLS + Basic credentials the proxy injects.
+    /// registry's base URL, and the credential every other `[registry]` client resolves —
+    /// a bearer token when one is configured, else the Basic pair.
     pub fn from_registry(rg: &crate::config::Registry) -> Result<Self> {
         let repo = rg
             .repo
@@ -68,47 +60,23 @@ impl ProxyCfg {
             .unwrap_or(&rg.repo);
         let authority = repo.split('/').next().unwrap_or(repo);
         let scheme = if rg.insecure { "http" } else { "https" };
-        let password = match &rg.password_file {
-            Some(pf) => Some(
-                std::fs::read_to_string(pf)
-                    .with_context(|| format!("reading {}", pf.display()))?
-                    .trim_end()
-                    .to_string(),
-            ),
-            None => None,
-        };
-        let username = (!rg.username.is_empty()).then(|| rg.username.clone());
-        Self::build(
-            format!("{scheme}://{authority}"),
-            username,
-            password,
-            rg.ca_file.as_deref(),
-            rg.insecure,
-        )
+        Self::build(format!("{scheme}://{authority}"), Creds::from_registry(rg)?)
     }
 
-    fn build(
-        upstream: String,
-        username: Option<String>,
-        password: Option<String>,
-        ca_file: Option<&std::path::Path>,
-        insecure: bool,
-    ) -> Result<Self> {
+    fn build(upstream: String, creds: Creds) -> Result<Self> {
         let mut b = reqwest::Client::builder();
-        if let Some(ca) = ca_file {
-            let pem = std::fs::read(ca).with_context(|| format!("reading {}", ca.display()))?;
+        if let Some(pem) = &creds.ca_pem {
             b = b.add_root_certificate(
-                reqwest::Certificate::from_pem(&pem).context("parsing the registry CA")?,
+                reqwest::Certificate::from_pem(pem).context("parsing the registry CA")?,
             );
         }
-        if insecure {
+        if creds.insecure {
             // match the other OCI paths' `--insecure`: accept the upstream's cert as-is.
             b = b.danger_accept_invalid_certs(true);
         }
         Ok(ProxyCfg {
             upstream,
-            username: username.filter(|u| !u.is_empty()),
-            password,
+            creds,
             client: b.build().context("building the registry proxy client")?,
         })
     }
@@ -226,9 +194,7 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
             rb = rb.header(k, v);
         }
     }
-    if let Some(user) = &cfg.username {
-        rb = rb.basic_auth(user, cfg.password.as_ref());
-    }
+    rb = cfg.creds.apply(rb);
     if bodyful {
         // stream the guest's request body upstream without buffering (blob uploads).
         let stream = incoming
@@ -320,8 +286,11 @@ mod tests {
         let (up_addr, seen) = fake_upstream();
         let cfg = ProxyCfg {
             upstream: format!("http://{up_addr}"),
-            username: Some("robot".to_string()),
-            password: Some("s3cret".to_string()),
+            creds: Creds {
+                username: Some("robot".to_string()),
+                password: Some("s3cret".to_string()),
+                ..Creds::anonymous()
+            },
             client: reqwest::Client::new(),
         };
         let proxy = spawn_blocking(cfg).unwrap();
@@ -347,14 +316,51 @@ mod tests {
         );
     }
 
+    /// A `[registry]` gated by a bearer token — a vk-registry in `mode = "accounts"`, whose
+    /// API keys are exactly that — is what the proxy has to lend the guest. It used to
+    /// inject nothing at all for one, since it only ever knew about the Basic pair.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn injects_a_bearer_token_ahead_of_the_basic_pair() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, seen) = fake_upstream();
+        let cfg = ProxyCfg {
+            upstream: format!("http://{up_addr}"),
+            creds: Creds {
+                // Both set: the token wins, as it does on every other client path.
+                username: Some("robot".to_string()),
+                password: Some("s3cret".to_string()),
+                token: Some("vkr_x".to_string()),
+                ..Creds::anonymous()
+            },
+            client: reqwest::Client::new(),
+        };
+        let proxy = spawn_blocking(cfg).unwrap();
+
+        let r = reqwest::Client::new()
+            .get(format!("http://{proxy}/v2/app/manifests/latest"))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+
+        let (auth, _) = seen.lock().unwrap().clone();
+        assert_eq!(
+            auth, "Bearer vkr_x",
+            "the proxy must inject the bearer token"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn refuses_paths_outside_v2() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (up_addr, seen) = fake_upstream();
         let cfg = ProxyCfg {
             upstream: format!("http://{up_addr}"),
-            username: Some("robot".to_string()),
-            password: Some("s3cret".to_string()),
+            creds: Creds {
+                username: Some("robot".to_string()),
+                password: Some("s3cret".to_string()),
+                ..Creds::anonymous()
+            },
             client: reqwest::Client::new(),
         };
         let proxy = spawn_blocking(cfg).unwrap();

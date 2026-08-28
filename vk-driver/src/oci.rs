@@ -231,6 +231,18 @@ impl Creds {
         }
     }
 
+    /// Attach this credential to a raw HTTP request — the registry-proxy path, which
+    /// forwards a guest's request upstream rather than going through the OCI client.
+    ///
+    /// Uses [`Creds::auth`] so request and client authentication share one precedence rule.
+    pub fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.auth() {
+            RegistryAuth::Bearer(t) => req.bearer_auth(t),
+            RegistryAuth::Basic(u, p) => req.basic_auth(u, Some(p)),
+            _ => req,
+        }
+    }
+
     /// A client configured for this registry's transport (scheme + trust anchor).
     fn client(&self) -> oci_client::Client {
         let mut cfg = ClientConfig::default();

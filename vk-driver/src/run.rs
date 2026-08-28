@@ -592,18 +592,26 @@ fn remove_stale_sockets(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Pick the rootfs source for an image boot per `--source`. `auto` prefers the registry
-/// (daemonless) and falls back to `docker export` only when the image is not in a registry
-/// (a not-found resolve); auth/network errors propagate rather than silently using docker.
-async fn resolve_source(args: &RunArgs) -> Result<Source> {
-    let creds = crate::oci::Creds {
+/// The registry credential `--username/--password/--ca/--insecure` name. Both the pull and
+/// the `--registry-proxy` that lends it to the guest authenticate with it, so `--ca` is
+/// turned into PEM in one place and an unreadable bundle fails naming the path rather than
+/// as an opaque TLS error later.
+fn cli_creds(args: &RunArgs) -> Result<crate::oci::Creds> {
+    crate::oci::Creds {
         username: args.username.clone(),
         password: args.password.clone(),
         token: None,
         ca_pem: None,
         insecure: args.insecure,
     }
-    .with_ca_file(args.ca.as_deref())?;
+    .with_ca_file(args.ca.as_deref())
+}
+
+/// Pick the rootfs source for an image boot per `--source`. `auto` prefers the registry
+/// (daemonless) and falls back to `docker export` only when the image is not in a registry
+/// (a not-found resolve); auth/network errors propagate rather than silently using docker.
+async fn resolve_source(args: &RunArgs) -> Result<Source> {
+    let creds = cli_creds(args)?;
     let use_oci = match args.source {
         SourceMode::Oci => true,
         SourceMode::Docker => false,
@@ -1305,13 +1313,7 @@ async fn build_and_boot(
         let registry_proxy = match &args.registry_proxy {
             Some(upstream) => {
                 const SENTINEL: std::net::Ipv4Addr = std::net::Ipv4Addr::new(240, 0, 0, 1);
-                let cfg = crate::regproxy::ProxyCfg::from_parts(
-                    upstream,
-                    args.username.clone(),
-                    args.password.clone(),
-                    args.ca.clone(),
-                    args.insecure,
-                )?;
+                let cfg = crate::regproxy::ProxyCfg::from_parts(upstream, cli_creds(args)?)?;
                 let addr = crate::regproxy::spawn(cfg).await?;
                 hosts.push(("registry.vk".to_string(), SENTINEL.to_string()));
                 cmdline.push_str(" VIRTKIT_REGISTRY=registry.vk");
