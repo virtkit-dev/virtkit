@@ -4,10 +4,10 @@
 //! `GET /v2/` version probe — its 401 + `WWW-Authenticate` is how OCI clients discover
 //! they must authenticate before the real blob requests.
 
-use bytes::Bytes;
-use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
+
+use crate::Body;
 
 /// The configured authentication scheme.
 #[derive(Clone, Default)]
@@ -54,7 +54,7 @@ impl Auth {
     /// whatever the credential is (see [`crate::accounts::challenge`]): here a client is
     /// configured for one scheme and sends it unprompted, so the challenge is a statement of
     /// what this server takes rather than something a client has to be steered by.
-    pub fn challenge(&self) -> Response<Full<Bytes>> {
+    pub fn challenge(&self) -> Response<Body> {
         let challenge = match self {
             Auth::Basic { .. } => "Basic realm=\"vk-registry\"",
             _ => "Bearer realm=\"vk-registry\"",

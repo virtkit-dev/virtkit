@@ -29,14 +29,13 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use bytes::Bytes;
-use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::{HeaderMap, Request, Response, StatusCode};
 use rand::Rng;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
+use crate::Body;
 use crate::{error_response, hex_of, sha256_hex_raw};
 
 /// Key: `"{issuer}\x1f{subject}"` (see [`user_key`]). Value: JSON [`UserRow`].
@@ -882,7 +881,7 @@ fn api_key_token(headers: &HeaderMap) -> Option<String> {
 ///
 /// Human-facing routes redirect to OIDC before reaching this response. Other browser
 /// requests may display a native Basic prompt.
-pub fn challenge() -> Response<Full<Bytes>> {
+pub fn challenge() -> Response<Body> {
     crate::unauthorized(
         "Basic realm=\"vk-registry\"",
         "sign in or provide a vkr_ API key",
@@ -903,7 +902,7 @@ fn credential<'h>(headers: &'h HeaderMap, scheme: &str) -> Option<&'h str> {
 /// The 403 a resolved principal gets from [`authorize`] when it lacks the scope for
 /// `action` on `repo` — distinct from [`challenge`]'s 401 (this principal is real, it
 /// just cannot do this).
-pub fn forbidden() -> Response<Full<Bytes>> {
+pub fn forbidden() -> Response<Body> {
     error_response(
         StatusCode::FORBIDDEN,
         "DENIED",

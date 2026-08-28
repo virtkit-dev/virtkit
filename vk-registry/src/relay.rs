@@ -19,14 +19,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use futures::StreamExt;
-use http_body_util::Full;
 use hyper::{Response, StatusCode};
 use reqwest::Method as RMethod;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::{
-    ServerState, error_response, get_blob as serve_blob_local, get_manifest as serve_manifest_local,
+    Body, ServerState, body_of, error_response, get_blob as serve_blob_local,
+    get_manifest as serve_manifest_local,
 };
 
 /// Unique suffix source for a relay's staging temp file (per process).
@@ -81,7 +81,7 @@ pub async fn get_blob(
     name: &str,
     digest: &str,
     accept_zstd: bool,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     let Some((u, repo)) = route(&state.upstreams, name) else {
         return Ok(error_response(
             StatusCode::NOT_FOUND,
@@ -189,7 +189,7 @@ pub async fn get_manifest(
     name: &str,
     reference: &str,
     head: bool,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     let Some((u, repo)) = route(&state.upstreams, name) else {
         return Ok(error_response(
             StatusCode::NOT_FOUND,
@@ -254,7 +254,7 @@ pub async fn get_manifest(
         .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(hyper::header::CONTENT_TYPE, &ctype)
         .header(hyper::header::CONTENT_LENGTH, body.len().to_string())
-        .body(Full::new(Bytes::from(body.to_vec())))
+        .body(body_of(Bytes::from(body.to_vec())))
         .map_err(Into::into)
 }
 
@@ -340,13 +340,13 @@ async fn obtain_token(u: &Upstream, challenge: &str) -> Result<Option<String>> {
     Ok(t.token.or(t.access_token))
 }
 
-fn manifest_head_response(digest: &str, ctype: &str) -> Result<Response<Full<Bytes>>> {
+fn manifest_head_response(digest: &str, ctype: &str) -> Result<Response<Body>> {
     Response::builder()
         .status(StatusCode::OK)
         .header("Docker-Content-Digest", digest)
         .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(hyper::header::CONTENT_TYPE, ctype)
-        .body(Full::new(Bytes::new()))
+        .body(body_of(Bytes::new()))
         .map_err(Into::into)
 }
 

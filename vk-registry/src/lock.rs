@@ -19,9 +19,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
+
+use crate::{Body, body_of};
 use tokio::sync::Notify;
 
 /// Default lease if the client sends no `?ttl=` (seconds).
@@ -322,7 +324,7 @@ impl LockManager {
 /// - `POST /lock/fail?name=…&ttl=` (`X-Vk-Lock-Pipeline`, body = reason text) → `{recorded:true}`
 /// - `POST /lock/fail-status?name=…` (`X-Vk-Lock-Pipeline`) → `{failed:false}` |
 ///   `{failed:true, reason, age_secs}`
-pub async fn route(mgr: &LockManager, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+pub async fn route(mgr: &LockManager, req: Request<Incoming>) -> Result<Response<Body>> {
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
     let owner = header(&req, "x-vk-lock-owner");
@@ -563,11 +565,11 @@ fn fail_ttl(query: &str) -> Duration {
     )
 }
 
-fn json(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
+fn json(status: StatusCode, body: &str) -> Response<Body> {
     Response::builder()
         .status(status)
         .header(hyper::header::CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(body_of(Bytes::from(body.to_string())))
         .expect("building a lock response")
 }
 
@@ -841,14 +843,14 @@ mod tests {
 
     #[tokio::test]
     async fn read_body_capped_accepts_a_body_at_the_cap() {
-        let body = Full::new(Bytes::from(vec![b'x'; 8]));
+        let body = body_of(Bytes::from(vec![b'x'; 8]));
         let got = read_body_capped(body, 8).await.unwrap();
         assert_eq!(got.len(), 8);
     }
 
     #[tokio::test]
     async fn read_body_capped_rejects_a_body_over_the_cap() {
-        let body = Full::new(Bytes::from(vec![b'x'; 9]));
+        let body = body_of(Bytes::from(vec![b'x'; 9]));
         assert!(read_body_capped(body, 8).await.is_err());
     }
 

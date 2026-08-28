@@ -4,9 +4,9 @@
 //! module.
 
 use bytes::Bytes;
-use http_body_util::Full;
 use hyper::{Response, StatusCode};
 
+use crate::{Body, body_of};
 use crate::{accounts, html_escape};
 
 /// A response carrying an HTML page.
@@ -16,7 +16,7 @@ use crate::{accounts, html_escape};
 /// show one person's page to another), never sniffed, no referrer to the identity
 /// provider or anywhere else, forms only to this origin, and no resource loads at all
 /// beyond the inline stylesheet.
-pub(crate) fn respond(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
+pub(crate) fn respond(status: StatusCode, body: &str) -> Response<Body> {
     Response::builder()
         .status(status)
         .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
@@ -28,7 +28,7 @@ pub(crate) fn respond(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
             "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; \
              base-uri 'none'; frame-ancestors 'none'",
         )
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(body_of(Bytes::from(body.to_string())))
         .expect("building an HTML response")
 }
 
@@ -115,7 +115,7 @@ pub(crate) fn error(
     csrf: Option<&str>,
     heading: &str,
     detail: &str,
-) -> Response<Full<Bytes>> {
+) -> Response<Body> {
     let body = format!(
         "<h1>{}</h1>\n<p>{}</p>",
         html_escape(heading),

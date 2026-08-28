@@ -41,12 +41,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use sha2::{Digest, Sha256};
 
 use crate::html;
+use crate::{Body, body_of};
 use crate::{ServerState, accounts, percent_encode, query_param};
 
 /// How long an in-flight login (redirected to the provider, not yet back) stays valid.
@@ -471,10 +471,7 @@ async fn bytes_capped(mut res: reqwest::Response, what: &str) -> Result<Vec<u8>>
 /// `/login`, `/auth/callback`, `/logout` — reachable without a principal (a login page
 /// gated on being logged in already would be unreachable). 404s if accounts mode is off
 /// or `[oidc]` was never configured.
-pub async fn route(
-    state: &Arc<ServerState>,
-    req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>> {
+pub async fn route(state: &Arc<ServerState>, req: Request<Incoming>) -> Result<Response<Body>> {
     let crate::Authenticator::Accounts { db, oidc: client } = &state.auth else {
         return Ok(html_error(
             StatusCode::NOT_FOUND,
@@ -499,7 +496,7 @@ pub async fn route(
     }
 }
 
-async fn login(client: &OidcClient, query: &str, secure: bool) -> Result<Response<Full<Bytes>>> {
+async fn login(client: &OidcClient, query: &str, secure: bool) -> Result<Response<Body>> {
     // Anything unsafe is replaced with [`DEFAULT_TARGET`] inside `login_url`, which is
     // where a `PendingLogin`'s target invariant is enforced.
     let target = query_param(query, "target").unwrap_or_default();
@@ -520,7 +517,7 @@ async fn callback(
     db: &accounts::Db,
     req: &Request<Incoming>,
     secure: bool,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     let query = req.uri().query().unwrap_or("");
     let cookie_state = login_cookie_value(req.headers(), secure);
     // A user who declines consent gets an `error`, not a `code`; say which. Both fields
@@ -623,7 +620,7 @@ async fn callback(
 
 /// Every exit from the callback expires the login cookie: the login it named is over,
 /// successfully or not, and leaving it set is a value the next attempt would trip over.
-fn done_with_login(mut res: Response<Full<Bytes>>, secure: bool) -> Result<Response<Full<Bytes>>> {
+fn done_with_login(mut res: Response<Body>, secure: bool) -> Result<Response<Body>> {
     res.headers_mut()
         .append(hyper::header::SET_COOKIE, login_cookie("", secure).parse()?);
     Ok(res)
@@ -634,7 +631,7 @@ async fn logout(
     db: &accounts::Db,
     req: Request<Incoming>,
     secure: bool,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     let Some(id) = accounts::session_cookie(req.headers(), secure) else {
         // No cookie at all — and a `SameSite=Lax` cookie is sent with no cross-site POST,
         // so this is the branch every cross-site sign-out attempt lands in. It gets a bare
@@ -696,7 +693,7 @@ async fn logout(
 /// bouncing an unauthenticated POST there would let any page sign a visitor out of their
 /// identity provider. Only for a request that actually presented the cookie (see
 /// [`logout`]); a request with none gets a redirect and no `Set-Cookie`.
-fn already_signed_out(secure: bool) -> Result<Response<Full<Bytes>>> {
+fn already_signed_out(secure: bool) -> Result<Response<Body>> {
     let mut res = redirect(DEFAULT_TARGET)?;
     res.headers_mut().append(
         hyper::header::SET_COOKIE,
@@ -715,7 +712,7 @@ fn csrf_ok(expected: &str, body: &[u8]) -> bool {
         .is_some_and(|p| crate::auth::constant_eq(expected.as_bytes(), p.as_bytes()))
 }
 
-fn redirect(location: &str) -> Result<Response<Full<Bytes>>> {
+fn redirect(location: &str) -> Result<Response<Body>> {
     Response::builder()
         .status(StatusCode::FOUND)
         .header(hyper::header::LOCATION, location)
@@ -724,7 +721,7 @@ fn redirect(location: &str) -> Result<Response<Full<Bytes>>> {
         // referrer, not this URL, so the callback's `code`/`state` would not have leaked
         // here anyway.
         .header(hyper::header::REFERRER_POLICY, "no-referrer")
-        .body(Full::new(Bytes::new()))
+        .body(body_of(Bytes::new()))
         .map_err(Into::into)
 }
 
@@ -802,7 +799,7 @@ fn form_field(body: &str, key: &str) -> Option<String> {
 }
 
 /// This server failed, not the caller — log the detail, say nothing about it.
-fn internal_failure(what: &str, e: &anyhow::Error) -> Response<Full<Bytes>> {
+fn internal_failure(what: &str, e: &anyhow::Error) -> Response<Body> {
     eprintln!("vk-registry: {what} failed: {e:#}");
     html_error(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -812,13 +809,13 @@ fn internal_failure(what: &str, e: &anyhow::Error) -> Response<Full<Bytes>> {
 
 /// An error page for a caller who is, by definition, not signed in yet — so it renders
 /// without the signed-in chrome, but with the same headers every other page here sets.
-fn html_error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
+fn html_error(status: StatusCode, message: &str) -> Response<Body> {
     html::error(status, None, None, status.as_str(), message)
 }
 
 /// The provider, or the network to it, failed us — log the detail, tell the caller only
 /// that it was not their fault.
-fn upstream_failure(what: &str, e: &anyhow::Error) -> Response<Full<Bytes>> {
+fn upstream_failure(what: &str, e: &anyhow::Error) -> Response<Body> {
     eprintln!("vk-registry: {what} failed: {e:#}");
     html_error(
         StatusCode::BAD_GATEWAY,
@@ -1073,7 +1070,7 @@ mod tests {
         addr: SocketAddr,
         basic_auth: bool,
         doc: DocOverride,
-    ) -> Response<Full<Bytes>> {
+    ) -> Response<Body> {
         let path = req.uri().path().to_string();
         let issuer = doc.issuer.unwrap_or_else(|| format!("http://{addr}"));
         let token_endpoint = doc
@@ -1082,13 +1079,13 @@ mod tests {
         let json = |v: serde_json::Value| {
             Response::builder()
                 .header(hyper::header::CONTENT_TYPE, "application/json")
-                .body(Full::new(Bytes::from(v.to_string())))
+                .body(body_of(Bytes::from(v.to_string())))
                 .unwrap()
         };
         let refuse = |why: &str| {
             Response::builder()
                 .status(StatusCode::BAD_REQUEST)
-                .body(Full::new(Bytes::from(format!("fake idp: {why}"))))
+                .body(body_of(Bytes::from(format!("fake idp: {why}"))))
                 .unwrap()
         };
         match path.as_str() {
@@ -1144,7 +1141,7 @@ mod tests {
             }
             _ => Response::builder()
                 .status(StatusCode::NOT_FOUND)
-                .body(Full::new(Bytes::new()))
+                .body(body_of(Bytes::new()))
                 .unwrap(),
         }
     }

@@ -32,6 +32,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -147,6 +148,24 @@ pub(crate) fn manifest_media_type(ctype: &str) -> &'static str {
 /// compressed-digest chunk to dedup. Shared by the client push path (registry.rs),
 /// the transparent-zstd upload, and this store's adaptive storage compression.
 pub const ZSTD_LEVEL: i32 = 1;
+
+/// The body every handler in this server returns.
+///
+/// Boxed rather than `Full<Bytes>`, so one signature covers both shapes a response can
+/// take: a small one already in memory (every page, every error, every manifest) and a
+/// blob streamed off disk — a layer can be gigabytes, and buffering one per in-flight
+/// request is how a registry gets killed by its own cache. Its error type is
+/// `io::Error` because that is what a body read off disk can fail with, mid-response.
+pub type Body = BoxBody<Bytes, std::io::Error>;
+
+/// A body that is already entirely in memory.
+pub(crate) fn body_of(bytes: Bytes) -> Body {
+    // `Full`'s error is `Infallible`, so the map is a proof that it never runs, not a
+    // conversion.
+    Full::new(bytes)
+        .map_err(|never: Infallible| match never {})
+        .boxed()
+}
 
 /// Capability header a cooperating server sets on its `GET /v2/` response, so an
 /// auto-mode client knows it may push transparent-zstd (uncompressed-digest) chunks.
@@ -1471,7 +1490,7 @@ where
 async fn handle(
     req: Request<Incoming>,
     state: Arc<ServerState>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<Body>, Infallible> {
     Ok(route(req, state).await.unwrap_or_else(|e| {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1481,7 +1500,7 @@ async fn handle(
     }))
 }
 
-async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
+async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Response<Body>> {
     let path = req.uri().path().to_string();
 
     // OIDC login/callback/logout must be reachable without a principal — gating the
@@ -1655,7 +1674,7 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
             .status(StatusCode::OK)
             .header("Docker-Distribution-Api-Version", "registry/2.0")
             .header(TRANSPARENT_ZSTD_HEADER, "1")
-            .body(Full::new(Bytes::from_static(b"{}")))
+            .body(body_of(Bytes::from_static(b"{}")))
             .map_err(Into::into);
     }
     let Some(rest) = path.strip_prefix("/v2/") else {
@@ -1840,7 +1859,7 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
 }
 
 /// POST /v2/<name>/blobs/uploads/ — open an upload session (an empty temp file).
-fn start_upload(store: &Store, name: &str) -> Result<Response<Full<Bytes>>> {
+fn start_upload(store: &Store, name: &str) -> Result<Response<Body>> {
     // The counter keeps ids unique within a process; the random tail keeps them
     // unguessable, so one client cannot append to another's in-flight upload by
     // enumerating session ids.
@@ -1878,7 +1897,7 @@ fn upload_is_for(store: &Store, id: &str, name: &str) -> bool {
 }
 
 /// PATCH /v2/<name>/blobs/uploads/<id> — append a chunk to the session file.
-fn patch_upload(store: &Store, name: &str, id: &str, body: &[u8]) -> Result<Response<Full<Bytes>>> {
+fn patch_upload(store: &Store, name: &str, id: &str, body: &[u8]) -> Result<Response<Body>> {
     if !valid_upload_id(id) {
         return Ok(error_response(
             StatusCode::BAD_REQUEST,
@@ -1919,7 +1938,7 @@ fn finish_upload(
     query: &str,
     body: &[u8],
     body_is_zstd: bool,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     if !valid_upload_id(id) {
         return Ok(error_response(
             StatusCode::BAD_REQUEST,
@@ -2016,7 +2035,7 @@ fn finish_upload(
         .header("Location", format!("/v2/{name}/blobs/{digest}"))
         .header("Docker-Content-Digest", &digest)
         .header(hyper::header::CONTENT_LENGTH, "0")
-        .body(Full::new(Bytes::new()))
+        .body(body_of(Bytes::new()))
         .map_err(Into::into)
 }
 
@@ -2029,7 +2048,7 @@ pub(crate) fn get_blob(
     digest: &str,
     head: bool,
     accept_zstd: bool,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     let hex = digest.trim_start_matches("sha256:");
     let Some((path, is_zstd)) = store.find_blob(hex) else {
         return Ok(error_response(
@@ -2057,13 +2076,13 @@ pub(crate) fn get_blob(
         if head {
             return builder
                 .header(hyper::header::CONTENT_LENGTH, blob_len(&path)?.to_string())
-                .body(Full::new(Bytes::new()))
+                .body(body_of(Bytes::new()))
                 .map_err(Into::into);
         }
         let stored = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         return builder
             .header(hyper::header::CONTENT_LENGTH, stored.len().to_string())
-            .body(Full::new(Bytes::from(stored)))
+            .body(body_of(Bytes::from(stored)))
             .map_err(Into::into);
     }
 
@@ -2077,14 +2096,14 @@ pub(crate) fn get_blob(
                     hyper::header::CONTENT_LENGTH,
                     zstd_canonical_len(&path)?.to_string(),
                 )
-                .body(Full::new(Bytes::new()))
+                .body(body_of(Bytes::new()))
                 .map_err(Into::into);
         }
         let stored = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         let raw = zstd::decode_all(&stored[..]).context("decompressing a stored blob")?;
         return builder
             .header(hyper::header::CONTENT_LENGTH, raw.len().to_string())
-            .body(Full::new(Bytes::from(raw)))
+            .body(body_of(Bytes::from(raw)))
             .map_err(Into::into);
     }
 
@@ -2092,13 +2111,13 @@ pub(crate) fn get_blob(
     if head {
         return builder
             .header(hyper::header::CONTENT_LENGTH, blob_len(&path)?.to_string())
-            .body(Full::new(Bytes::new()))
+            .body(body_of(Bytes::new()))
             .map_err(Into::into);
     }
     let stored = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     builder
         .header(hyper::header::CONTENT_LENGTH, stored.len().to_string())
-        .body(Full::new(Bytes::from(stored)))
+        .body(body_of(Bytes::from(stored)))
         .map_err(Into::into)
 }
 
@@ -2115,7 +2134,7 @@ fn put_manifest(
     reference: &str,
     ctype: &str,
     body: &[u8],
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     // shared store lock for the write (vs. an exclusive gc); see lock_shared.
     let _lock = store.lock_shared()?;
     // A digest reference that does not match the body is the client's error, not this
@@ -2149,7 +2168,7 @@ fn put_manifest(
         .status(StatusCode::CREATED)
         .header("Location", format!("/v2/{name}/manifests/{digest}"))
         .header("Docker-Content-Digest", &digest)
-        .body(Full::new(Bytes::new()))
+        .body(body_of(Bytes::new()))
         .map_err(Into::into)
 }
 
@@ -2159,7 +2178,7 @@ pub(crate) fn get_manifest(
     name: &str,
     reference: &str,
     head: bool,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     let Some((digest, data, ctype)) = store.get_manifest(name, reference)? else {
         return Ok(error_response(
             StatusCode::NOT_FOUND,
@@ -2174,7 +2193,7 @@ pub(crate) fn get_manifest(
         .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(hyper::header::CONTENT_TYPE, &ctype)
         .header(hyper::header::CONTENT_LENGTH, len.to_string())
-        .body(Full::new(if head {
+        .body(body_of(if head {
             Bytes::new()
         } else {
             Bytes::from(data)
@@ -2183,19 +2202,19 @@ pub(crate) fn get_manifest(
 }
 
 /// GET /v2/<name>/tags/list.
-fn list_tags(store: &Store, name: &str) -> Result<Response<Full<Bytes>>> {
+fn list_tags(store: &Store, name: &str) -> Result<Response<Body>> {
     let tags = store.list_tags(name);
     let body = serde_json::json!({ "name": name, "tags": tags }).to_string();
     Response::builder()
         .status(StatusCode::OK)
         .header(hyper::header::CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(body)))
+        .body(body_of(Bytes::from(body)))
         .map_err(Into::into)
 }
 
 /// A 202 Accepted upload-progress response (POST/PATCH), carrying the session
 /// Location the client uses for the next request.
-fn accepted_upload(name: &str, id: &str, size: u64) -> Result<Response<Full<Bytes>>> {
+fn accepted_upload(name: &str, id: &str, size: u64) -> Result<Response<Body>> {
     let range_end = size.saturating_sub(1);
     Response::builder()
         .status(StatusCode::ACCEPTED)
@@ -2203,16 +2222,12 @@ fn accepted_upload(name: &str, id: &str, size: u64) -> Result<Response<Full<Byte
         .header("Range", format!("0-{range_end}"))
         .header("Docker-Upload-UUID", id)
         .header(hyper::header::CONTENT_LENGTH, "0")
-        .body(Full::new(Bytes::new()))
+        .body(body_of(Bytes::new()))
         .map_err(Into::into)
 }
 
 /// An OCI error response: the documented `{ "errors": [ { code, message } ] }` body.
-pub(crate) fn error_response(
-    status: StatusCode,
-    code: &str,
-    message: &str,
-) -> Response<Full<Bytes>> {
+pub(crate) fn error_response(status: StatusCode, code: &str, message: &str) -> Response<Body> {
     let body =
         serde_json::json!({ "errors": [ { "code": code, "message": message } ] }).to_string();
     Response::builder()
@@ -2221,7 +2236,7 @@ pub(crate) fn error_response(
         // `message` echoes caller-supplied bytes (a path, a reference) on every `/v2` error,
         // from the origin that also serves `/browse`; one header here covers all of them.
         .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .body(Full::new(Bytes::from(body)))
+        .body(body_of(Bytes::from(body)))
         .expect("building an error response")
 }
 
@@ -2229,7 +2244,7 @@ pub(crate) fn error_response(
 /// `WWW-Authenticate` value, and it is load-bearing rather than decoration: an OCI client
 /// that probes `/v2/` and gets a 401 without it concludes no credential is wanted and then
 /// fails on the real blob requests (see `route`'s auth gate).
-pub(crate) fn unauthorized(challenge: &'static str, message: &str) -> Response<Full<Bytes>> {
+pub(crate) fn unauthorized(challenge: &'static str, message: &str) -> Response<Body> {
     let mut response = error_response(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", message);
     response.headers_mut().insert(
         hyper::header::WWW_AUTHENTICATE,
@@ -2386,7 +2401,7 @@ fn authorize_or_forbidden(
     authz: &Authz<'_>,
     action: accounts::Action,
     name: &str,
-) -> Option<Response<Full<Bytes>>> {
+) -> Option<Response<Body>> {
     match authz {
         Authz::NoScopes => None,
         Authz::Accounts(p) if accounts::authorize(p, action, name) => None,
@@ -2422,13 +2437,13 @@ fn is_upload_path(path: &str) -> bool {
 /// does, both ends move together. Same reason a `/browse/a..b` — which `valid_name`
 /// permits and that allowlist does not — lands on `/browse` rather than the page asked
 /// for: fail closed, and keep the allowlist the narrower of the two.
-fn redirect_to_login(target: &str) -> Response<Full<Bytes>> {
+fn redirect_to_login(target: &str) -> Response<Body> {
     let url = format!("/login?target={}", percent_encode(target));
     Response::builder()
         .status(StatusCode::FOUND)
         .header(hyper::header::LOCATION, url)
         .header(hyper::header::CACHE_CONTROL, "no-store")
-        .body(Full::new(Bytes::new()))
+        .body(body_of(Bytes::new()))
         .expect("building a login redirect")
 }
 

@@ -12,11 +12,10 @@
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use bytes::Bytes;
-use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 
+use crate::Body;
 use crate::accounts::{self, Action, ApiKey, Db, Principal, Scope, User};
 use crate::forms::{
     csrf_of, csrf_ok, csrf_rejected, form_body, see_other, server_error, too_large,
@@ -42,7 +41,7 @@ pub(crate) async fn route(
     principal: &Principal,
     secure: bool,
     req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     let Principal::Session(user) = principal else {
         return Ok(html::error(
             StatusCode::FORBIDDEN,
@@ -84,7 +83,7 @@ async fn create(
     user: &User,
     secure: bool,
     req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     let session_id = accounts::session_cookie(req.headers(), secure);
     let Some(body) = form_body(req).await else {
         return Ok(too_large(db, user, session_id.as_deref()));
@@ -187,7 +186,7 @@ async fn revoke(
     secure: bool,
     id: &str,
     req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     let session_id = accounts::session_cookie(req.headers(), secure);
     let Some(body) = form_body(req).await else {
         return Ok(too_large(db, user, session_id.as_deref()));
@@ -221,7 +220,7 @@ fn list_page(
     session_id: Option<&str>,
     status: StatusCode,
     notice: Option<&str>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     // Kept as an `Option`, not flattened to `""`: every form on this page is a POST that
     // the CSRF check will refuse without a real token, so with no token the forms are left
     // out rather than rendered dead — the same rule `html::page` applies to the sign-out

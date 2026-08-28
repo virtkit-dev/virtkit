@@ -24,12 +24,13 @@
 
 use anyhow::Result;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 
 use crate::accounts::{self, Db, Principal};
 use crate::html::{self, page, respond};
+use crate::{Body, body_of};
 use crate::{DEFAULT_MANIFEST_TYPE, Store, html_escape, valid_name, valid_tag};
 
 /// The manifest's config blob: fixed, empty content — a raw-file upload has no build
@@ -65,7 +66,7 @@ pub(crate) async fn route(
     principal: &Principal,
     secure: bool,
     req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     let Principal::Session(user) = principal else {
         return Ok(html::error(
             StatusCode::FORBIDDEN,
@@ -99,7 +100,7 @@ async fn submit(
     user: &accounts::User,
     session_id: Option<String>,
     req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     let Some(boundary) = req
         .headers()
         .get(hyper::header::CONTENT_TYPE)
@@ -310,7 +311,7 @@ async fn submit(
             format!("/browse/{name}/manifests/{tag}"),
         )
         .header(hyper::header::CACHE_CONTROL, "no-store")
-        .body(Full::new(Bytes::new()))
+        .body(body_of(Bytes::new()))
         .map_err(Into::into)
 }
 
@@ -369,7 +370,7 @@ fn bad(
     session_id: Option<&str>,
     status: StatusCode,
     msg: &str,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     form_page(db, user, session_id, status, Some(msg))
 }
 
@@ -626,11 +627,7 @@ fn csrf_of(db: &Db, session_id: Option<&str>) -> Option<String> {
     }
 }
 
-fn csrf_rejected(
-    db: &Db,
-    principal: &Principal,
-    session_id: Option<&str>,
-) -> Response<Full<Bytes>> {
+fn csrf_rejected(db: &Db, principal: &Principal, session_id: Option<&str>) -> Response<Body> {
     html::error(
         StatusCode::FORBIDDEN,
         Some(principal),
@@ -646,7 +643,7 @@ fn form_page(
     session_id: Option<&str>,
     status: StatusCode,
     error: Option<&str>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     let csrf = csrf_of(db, session_id).unwrap_or_default();
     let error_html = error
         .map(|e| format!("<p class=\"error\">{}</p>\n", html_escape(e)))

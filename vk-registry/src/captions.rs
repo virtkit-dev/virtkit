@@ -2,11 +2,10 @@
 //! `/browse/<repo>` shows above its tag list.
 
 use anyhow::Result;
-use bytes::Bytes;
-use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 
+use crate::Body;
 use crate::accounts::{self, Action, Db, Principal, User};
 use crate::forms::{
     csrf_of, csrf_ok, csrf_rejected, form_body, see_other, server_error, too_large,
@@ -19,7 +18,7 @@ pub(crate) async fn route(
     principal: &Principal,
     secure: bool,
     req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     let Principal::Session(user) = principal else {
         return Ok(html::error(
             StatusCode::FORBIDDEN,
@@ -47,7 +46,7 @@ async fn set(
     user: &User,
     secure: bool,
     req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     let session_id = accounts::session_cookie(req.headers(), secure);
     let Some(body) = form_body(req).await else {
         return Ok(too_large(db, user, session_id.as_deref()));

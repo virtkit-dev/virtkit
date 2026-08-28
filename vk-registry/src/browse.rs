@@ -18,14 +18,12 @@
 use std::borrow::Cow;
 
 use anyhow::Result;
-use bytes::Bytes;
-use http_body_util::Full;
 use hyper::{Response, StatusCode};
 
 use crate::accounts::{Action, Db, MAX_CAPTION_LEN, authorize};
 use crate::html::{self, page, respond};
 use crate::{
-    Authz, Store, accounts, html_escape, human_bytes, is_blob_hex, manifest_descriptors,
+    Authz, Body, Store, accounts, html_escape, human_bytes, is_blob_hex, manifest_descriptors,
     valid_digest, valid_name, valid_reference,
 };
 
@@ -53,7 +51,7 @@ pub(crate) fn route(
     authz: &Authz<'_>,
     principal: &accounts::Principal,
     csrf: Option<&str>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     let rest = rest.trim_start_matches('/');
     if rest.is_empty() {
         return repo_list(store, principal, csrf);
@@ -70,7 +68,7 @@ fn repo_list(
     store: &Store,
     principal: &accounts::Principal,
     csrf: Option<&str>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     // Built from the repo directories and their tags, not from `Store::stats()`: stats
     // walks every blob and parses every manifest in the store under the shared store
     // lock, which is a whole-store scan per page load and contention against a `gc`.
@@ -185,7 +183,7 @@ fn tag_list(
     name: &str,
     principal: &accounts::Principal,
     csrf: Option<&str>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     // Out of scope reads as absent, not as forbidden: a 403 would confirm the repository
     // exists to someone who may not know that.
     if !valid_name(name) || !authorize(principal, Action::Read, name) {
@@ -296,7 +294,7 @@ fn manifest_detail(
     authz: &Authz<'_>,
     principal: &accounts::Principal,
     csrf: Option<&str>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<Body>> {
     if !valid_name(name) || !valid_reference(reference) || !authorize(principal, Action::Read, name)
     {
         return Ok(not_found(principal, csrf));
@@ -421,7 +419,7 @@ fn manifest_detail(
 /// A 404 a person can read, keeping the page chrome — which for a session carries a link
 /// back to the listing, and for an API key carries only who it is: a machine credential is
 /// not going to navigate.
-fn not_found(principal: &accounts::Principal, csrf: Option<&str>) -> Response<Full<Bytes>> {
+fn not_found(principal: &accounts::Principal, csrf: Option<&str>) -> Response<Body> {
     html::error(
         StatusCode::NOT_FOUND,
         Some(principal),
@@ -457,7 +455,7 @@ mod tests {
         accounts::Principal::Session(u)
     }
 
-    async fn body_of(res: Response<Full<Bytes>>) -> String {
+    async fn body_text(res: Response<Body>) -> String {
         String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap()
     }
 
@@ -474,7 +472,7 @@ mod tests {
         path: &str,
         principal: &accounts::Principal,
         csrf: Option<&str>,
-    ) -> Result<Response<Full<Bytes>>> {
+    ) -> Result<Response<Body>> {
         page_at_db(store, &Db::open_memory().unwrap(), path, principal, csrf)
     }
 
@@ -484,7 +482,7 @@ mod tests {
         path: &str,
         principal: &accounts::Principal,
         csrf: Option<&str>,
-    ) -> Result<Response<Full<Bytes>>> {
+    ) -> Result<Response<Body>> {
         let rest = path
             .strip_prefix("/browse")
             .expect("a /browse path")
@@ -511,7 +509,7 @@ mod tests {
         let (dir, store) = store_in("empty");
         let res = page_at(&store, "/browse", &session("Alice"), Some("csrf-token")).unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let html = body_of(res).await;
+        let html = body_text(res).await;
         assert!(html.contains("no repositories yet"), "{html}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -575,7 +573,7 @@ mod tests {
 
         let list = page_at(&store, "/browse", &session("Alice"), Some("csrf-token")).unwrap();
         assert_eq!(list.status(), StatusCode::OK);
-        let listing = body_of(list).await;
+        let listing = body_text(list).await;
         assert!(listing.contains("/browse/team-a/app"), "{listing}");
 
         let tags = page_at(
@@ -595,7 +593,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(detail.status(), StatusCode::OK);
-        let html = body_of(detail).await;
+        let html = body_text(detail).await;
         assert!(
             html.contains(&format!("/v2/team-a/app/blobs/{cfg_digest}")),
             "{html}"
@@ -639,7 +637,7 @@ mod tests {
                 &serde_json::to_vec(&manifest).unwrap(),
             )
             .unwrap();
-        let html = body_of(
+        let html = body_text(
             page_at(
                 &store,
                 "/browse/team-a/app/manifests/v1",
@@ -674,7 +672,7 @@ mod tests {
                 &serde_json::to_vec(&index).unwrap(),
             )
             .unwrap();
-        let html = body_of(
+        let html = body_text(
             page_at(
                 &store,
                 "/browse/team-a/multi/manifests/v1",
@@ -703,7 +701,7 @@ mod tests {
         std::fs::create_dir_all(&planted).unwrap();
         std::fs::write(planted.join("evil"), b"sha256:aa").unwrap();
 
-        let html = body_of(page_at(&store, "/browse", &session("A"), Some("t")).unwrap()).await;
+        let html = body_text(page_at(&store, "/browse", &session("A"), Some("t")).unwrap()).await;
         assert!(html.contains("/browse/team-a/app"), "{html}");
         assert!(
             !html.contains("script") && !html.contains("&lt;script&gt;"),
@@ -711,7 +709,8 @@ mod tests {
         );
 
         let tags =
-            body_of(page_at(&store, "/browse/team-a/app", &session("A"), Some("t")).unwrap()).await;
+            body_text(page_at(&store, "/browse/team-a/app", &session("A"), Some("t")).unwrap())
+                .await;
         assert!(tags.contains("v1.0_x-y"), "{tags}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -765,7 +764,7 @@ mod tests {
                 .put_manifest("team-a/build-cache", tag, MANIFEST_TYPE, b"{}")
                 .unwrap();
         }
-        let html = body_of(
+        let html = body_text(
             page_at(
                 &store,
                 "/browse/team-a/build-cache",
@@ -805,16 +804,17 @@ mod tests {
             store.put_manifest(repo, tag, MANIFEST_TYPE, b"{}").unwrap();
         }
         let theirs =
-            body_of(page_at(&store, "/browse/team-a/theirs", &session("A"), Some("t")).unwrap())
+            body_text(page_at(&store, "/browse/team-a/theirs", &session("A"), Some("t")).unwrap())
                 .await;
         assert!(
             theirs.contains(&format!("{other}</a></td><td>content-addressed entry</td>")),
             "{theirs}"
         );
         assert!(!theirs.contains("build cache"), "{theirs}");
-        let lookalike =
-            body_of(page_at(&store, "/browse/team-a/lookalike", &session("A"), Some("t")).unwrap())
-                .await;
+        let lookalike = body_text(
+            page_at(&store, "/browse/team-a/lookalike", &session("A"), Some("t")).unwrap(),
+        )
+        .await;
         assert!(
             lookalike.contains(&format!("{snap}</a></td><td>instruction snapshot</td>")),
             "{lookalike}"
@@ -838,7 +838,8 @@ mod tests {
                 .unwrap();
         }
         let html =
-            body_of(page_at(&store, "/browse/team-a/app", &session("A"), Some("t")).unwrap()).await;
+            body_text(page_at(&store, "/browse/team-a/app", &session("A"), Some("t")).unwrap())
+                .await;
         // the cache entry beside them is still labelled
         assert!(
             html.contains(&format!("{snap}</a></td><td>instruction snapshot</td>")),
@@ -861,7 +862,7 @@ mod tests {
                 .unwrap();
         }
         let plain =
-            body_of(page_at(&store, "/browse/team-a/plain", &session("A"), Some("t")).unwrap())
+            body_text(page_at(&store, "/browse/team-a/plain", &session("A"), Some("t")).unwrap())
                 .await;
         assert!(!plain.contains("Kind"), "{plain}");
         assert!(plain.contains("v1.2</a></td></tr>"), "{plain}");
@@ -869,7 +870,7 @@ mod tests {
         // nor does an empty repository, which has nothing to describe — and it is the
         // rendered listing saying so, not a page that never came back
         let empty =
-            body_of(page_at(&store, "/browse/nope", &session("A"), Some("t")).unwrap()).await;
+            body_text(page_at(&store, "/browse/nope", &session("A"), Some("t")).unwrap()).await;
         assert!(empty.contains("no tags"), "{empty}");
         assert!(!empty.contains("Kind"), "{empty}");
         assert!(!empty.contains("build cache"), "{empty}");
@@ -887,7 +888,7 @@ mod tests {
                 .put_manifest(&format!("repo-{i:04}"), "v1", MANIFEST_TYPE, b"{}")
                 .unwrap();
         }
-        let html = body_of(page_at(&store, "/browse", &session("A"), Some("t")).unwrap()).await;
+        let html = body_text(page_at(&store, "/browse", &session("A"), Some("t")).unwrap()).await;
         assert_eq!(
             html.matches("<a href=\"/browse/repo-").count(),
             MAX_ROWS,
@@ -906,7 +907,8 @@ mod tests {
                 .unwrap();
         }
         let html =
-            body_of(page_at(&store, "/browse/many-tags", &session("A"), Some("t")).unwrap()).await;
+            body_text(page_at(&store, "/browse/many-tags", &session("A"), Some("t")).unwrap())
+                .await;
         assert_eq!(
             html.matches("/manifests/v").count(),
             MAX_ROWS,
@@ -926,9 +928,10 @@ mod tests {
                 &serde_json::to_vec(&manifest).unwrap(),
             )
             .unwrap();
-        let html =
-            body_of(page_at(&store, "/browse/big/manifests/v1", &session("A"), Some("t")).unwrap())
-                .await;
+        let html = body_text(
+            page_at(&store, "/browse/big/manifests/v1", &session("A"), Some("t")).unwrap(),
+        )
+        .await;
         assert_eq!(
             html.matches("/blobs/sha256:").count(),
             MAX_ROWS,
@@ -954,7 +957,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let html = body_of(res).await;
+        let html = body_text(res).await;
         assert!(!html.contains("no referenced blobs"), "{html}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -964,7 +967,7 @@ mod tests {
     #[tokio::test]
     async fn the_sign_out_control_is_omitted_without_a_token() {
         let (dir, store) = store_in("nocsrf");
-        let html = body_of(page_at(&store, "/browse", &session("Alice"), None).unwrap()).await;
+        let html = body_text(page_at(&store, "/browse", &session("Alice"), None).unwrap()).await;
         assert!(html.contains("signed in as Alice"), "{html}");
         assert!(!html.contains("<form"), "{html}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -975,7 +978,7 @@ mod tests {
     #[tokio::test]
     async fn identity_claims_are_escaped_and_sign_out_is_a_guarded_post() {
         let (dir, store) = store_in("nav");
-        let html = body_of(
+        let html = body_text(
             page_at(
                 &store,
                 "/browse",
@@ -1013,7 +1016,7 @@ mod tests {
 
         // nothing stored: the built-in caption, because this repository is one this
         // server can name for itself
-        let html = body_of(
+        let html = body_text(
             page_at_db(
                 &store,
                 &db,
@@ -1031,7 +1034,7 @@ mod tests {
 
         db.set_repo_caption("team-a/build-cache", "task-rs <b>cache</b>")
             .unwrap();
-        let html = body_of(
+        let html = body_text(
             page_at_db(
                 &store,
                 &db,
@@ -1055,7 +1058,7 @@ mod tests {
         // cleared: the built-in one is back, so an admin can undo without knowing what it
         // said
         db.set_repo_caption("team-a/build-cache", "   ").unwrap();
-        let html = body_of(
+        let html = body_text(
             page_at_db(
                 &store,
                 &db,
@@ -1083,7 +1086,7 @@ mod tests {
             .put_manifest("team-a/app", "v1", MANIFEST_TYPE, b"{}")
             .unwrap();
         let page = async |principal, csrf| {
-            body_of(page_at_db(&store, &db, "/browse/team-a/app", principal, csrf).unwrap()).await
+            body_text(page_at_db(&store, &db, "/browse/team-a/app", principal, csrf).unwrap()).await
         };
 
         let (admin_p, plain_p) = (admin_session("A"), session("B"));

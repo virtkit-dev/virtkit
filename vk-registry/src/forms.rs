@@ -9,12 +9,12 @@
 
 use anyhow::Result;
 use bytes::Bytes;
-use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 
 use crate::accounts::{Db, Principal, User};
 use crate::html;
+use crate::{Body, body_of};
 use crate::{collect_capped, query_param};
 
 /// Cap on a form POSTed to a settings route — a handful of short fields.
@@ -32,12 +32,12 @@ pub(crate) async fn form_body(req: Request<Incoming>) -> Option<String> {
 
 /// A POST that changed something answers `303`, so a refresh re-fetches the page
 /// instead of re-submitting the form.
-pub(crate) fn see_other(location: &str) -> Result<Response<Full<Bytes>>> {
+pub(crate) fn see_other(location: &str) -> Result<Response<Body>> {
     Response::builder()
         .status(StatusCode::SEE_OTHER)
         .header(hyper::header::LOCATION, location)
         .header(hyper::header::CACHE_CONTROL, "no-store")
-        .body(Full::new(Bytes::new()))
+        .body(body_of(Bytes::new()))
         .map_err(Into::into)
 }
 
@@ -69,11 +69,7 @@ pub(crate) fn csrf_of(db: &Db, session_id: Option<&str>) -> Option<String> {
     }
 }
 
-pub(crate) fn csrf_rejected(
-    db: &Db,
-    user: &User,
-    session_id: Option<&str>,
-) -> Response<Full<Bytes>> {
+pub(crate) fn csrf_rejected(db: &Db, user: &User, session_id: Option<&str>) -> Response<Body> {
     html::error(
         StatusCode::FORBIDDEN,
         Some(&Principal::Session(user.clone())),
@@ -83,7 +79,7 @@ pub(crate) fn csrf_rejected(
     )
 }
 
-pub(crate) fn too_large(db: &Db, user: &User, session_id: Option<&str>) -> Response<Full<Bytes>> {
+pub(crate) fn too_large(db: &Db, user: &User, session_id: Option<&str>) -> Response<Body> {
     html::error(
         StatusCode::PAYLOAD_TOO_LARGE,
         Some(&Principal::Session(user.clone())),
@@ -93,11 +89,7 @@ pub(crate) fn too_large(db: &Db, user: &User, session_id: Option<&str>) -> Respo
     )
 }
 
-pub(crate) fn server_error(
-    db: &Db,
-    user: &User,
-    session_id: Option<&str>,
-) -> Response<Full<Bytes>> {
+pub(crate) fn server_error(db: &Db, user: &User, session_id: Option<&str>) -> Response<Body> {
     html::error(
         StatusCode::INTERNAL_SERVER_ERROR,
         Some(&Principal::Session(user.clone())),
