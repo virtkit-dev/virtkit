@@ -28,6 +28,9 @@ All notable changes to virtkit will be documented in this file.
   one. It rides a comment, so the file still builds with `docker build`, and the size
   never enters a cache key — tuning a stage throws no cache away.
   `--stage-mem NAME=SIZE` and `--stage-cpus NAME=N` provide per-run overrides.
+  A stage asking for more than the host can give one stage is held to what fits and
+  warned about, so a later out-of-memory kill inside that guest can be read back to the
+  size it did not get.
 
 ### Changed
 

@@ -220,6 +220,19 @@ impl Progress {
         }
     }
 
+    /// Emit one warning into the build's log. Like [`Progress::note`], but for something the
+    /// user is likely to be bitten by later in the build, so it is drawn to stand out rather
+    /// than dimmed.
+    pub fn warn(&self, line: &str) {
+        match &self.backend {
+            Backend::Tty(tty) => {
+                let _ = tty.println(self.paint(line, "\x1b[1;33m"));
+            }
+            Backend::Plain | Backend::Routed(_) => self.plain_line(format_args!("{line}")),
+            Backend::Disabled => {}
+        }
+    }
+
     fn new_backend(backend: Backend, color: bool) -> Self {
         Progress {
             backend,
@@ -1891,6 +1904,24 @@ mod tests {
         assert_eq!(
             lines.lock().unwrap().as_slice(),
             ["virtkit: build: up to 4 stage(s) at once"]
+        );
+    }
+
+    #[test]
+    fn a_warning_reaches_a_routed_build() {
+        // A warning is what the user needs in order to read a later failure — an oversized
+        // stage clamped down, and then killed out of memory. On a routed build it travels the
+        // same transport as every other line.
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let lines = Arc::clone(&lines);
+            Arc::new(move |l: &str| lines.lock().unwrap().push(l.to_string()))
+                as Arc<dyn Fn(&str) + Send + Sync>
+        };
+        Progress::routed(sink).warn("virtkit: warning: build: [big] mem=32G ...");
+        assert_eq!(
+            lines.lock().unwrap().as_slice(),
+            ["virtkit: warning: build: [big] mem=32G ..."]
         );
     }
 

@@ -2060,9 +2060,11 @@ fn build_stage(
         if let Some(mem) = &hint.mem
             && let Some(held_to) = clamp_stage_mem(mem, budget.mem.stage_cap_mib(), default_mib)
         {
-            progress.note(&format!(
-                "virtkit: build: [{name}] mem={mem} is more than this host can give one \
-                 stage; using {held_to}"
+            progress.warn(&format!(
+                "virtkit: warning: build: [{name}] mem={mem} is more than this host can give \
+                 one stage; using {held_to} instead. The stage runs with less RAM than it \
+                 asked for, so a step sized for {mem} may be killed out of memory inside the \
+                 guest."
             ));
             hint.mem = Some(held_to);
         }
