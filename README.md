@@ -1,331 +1,352 @@
 # virtkit
 
-virtkit builds and runs Docker images as lightweight virtual machines. It
-boots an OCI image as a microVM in about a second, each with its own kernel,
-so whatever runs inside is isolated from the host — and it builds Dockerfiles
-itself, no Docker needed, each `RUN` instruction executing in a microVM of its
-own. There's no daemon and nothing to install as root: it's a single static
-binary running as an ordinary user process, and the only thing it needs from
-the host is access to `/dev/kvm`.
+virtkit boots OCI images as rootless Linux microVMs and builds Dockerfiles without
+Docker. Each guest runs its own kernel; the host side is a single static binary with an
+embedded VMM, guest kernel, and agent.
 
-On top of that base you get docker-compose-style services running as real VMs
-(per run or long-lived) and a GitLab CI executor that hands every job a fresh,
-throwaway VM. The pieces underneath — image building, networking, the in-VM
-agent — also work on their own.
+`vk` runs as an ordinary user and needs read/write access to `/dev/kvm`. There is no
+host daemon in the local workflow and no requirement for tap devices, bridges, firewall
+rules, or `CAP_NET_ADMIN`.
 
-## A few examples
+Typical uses are:
+
+- running an OCI image as a disposable development or test machine;
+- building Dockerfiles without a Docker daemon, with each `RUN` isolated in a microVM;
+- running compose-style service fleets on a private guest network;
+- isolating GitLab custom-executor jobs in fresh VMs; and
+- producing raw disks, VMDKs, OVAs, and bootable ISOs from Dockerfile-driven builds.
+
+virtkit is Linux- and KVM-specific. Release artifacts are built for x86-64 Linux
+(`x86_64-unknown-linux-musl`); this is not a cross-platform Docker Desktop replacement.
+
+## Requirements
+
+- An x86-64 Linux host with KVM enabled.
+- Read/write access to `/dev/kvm` for the user running `vk`.
+- Network access when pulling images or using guest egress.
+- Docker or an existing `vk` binary only when building virtkit itself from source.
+
+Run the host preflight before debugging a failed boot:
 
 ```sh
-# boot an image and step inside
+vk check
+```
+
+It checks KVM access, the selected VMM backend, the guest kernel and agent, and the
+host-side requirements for configured features.
+
+## Quick start
+
+```sh
+# Pull Alpine and open an interactive shell in a fresh microVM.
 vk run alpine:latest --shell
 
-# compile the current tree in a throwaway microVM: /work is this directory,
-# so target/ lands back on the host
-vk run rust:1-alpine --workdir . --net --cpus host --mem 4G -- cargo build --release
+# Run one command and return its exit status.
+vk run debian:trixie-slim -- cat /etc/os-release
 
-# build a Dockerfile (each RUN in its own microVM, instruction-cached),
-# boot the resulting image and run a command in it
+# Compile the current checkout in a disposable VM. /work maps this directory,
+# so target/ remains on the host after the VM exits.
+vk run rust:1-alpine --workdir . --net --cpus host --mem 4G -- \
+  cargo build --release
+
+# Build the final Dockerfile stage, boot it, and run the test entrypoint.
 vk run -f Dockerfile --net -- ./run-tests.sh
 ```
 
-## What it does
+Image conversions and Dockerfile build results are content-addressed and reused on
+later runs. Use `vk help <command>` for full command documentation; short `-h` output is
+kept intentionally compact.
 
-Boot Docker images directly. `vk run alpine:latest --shell` pulls the image,
-converts it to a bootable disk, and drops you into a shell. Conversions are
-cached and only redone when the image actually changes.
+## Core workflows
 
-Build Dockerfiles without Docker. `vk build` runs each `RUN` instruction in its
-own microVM, caches per instruction, and produces an image you can boot straight
-away — `vk run -f Dockerfile` chains the two, build then boot, in one command.
-Independent stages build in parallel, and a stage that needs a bigger guest than
-the rest says so in a comment above its `FROM` — `# vk: mem=8G cpus=16` — which
-`docker build` reads as a comment and which never enters a cache key.
-`vk build --stage-mem`/`--stage-cpus NAME=VALUE` override it per run.
+### Run an OCI image
 
-Boot an image on its own kernel and init. By default virtkit boots every image
-on its embedded kernel with `vk-agent` as PID 1, but `vk run --kernel image
---init image` boots the image's own `/boot/vmlinuz` (with its modules) and hands
-PID 1 to the image's own init/systemd — so a stock distro image comes up as it
-would on real hardware. `--init entrypoint` hands PID 1 to the image's
-ENTRYPOINT+CMD instead, for an image whose entrypoint prepares the machine and
-only then execs the real init. `--kernel <path>` boots a kernel you supply. In
-compose, a service picks this per service with an `x-virtkit: { init:, kernel: }`
-marker.
+`vk run IMAGE` pulls the image, converts its root filesystem to a bootable ext4 disk,
+starts a microVM, and executes either the requested command or a shell. By default the
+guest uses virtkit's embedded kernel and runs `vk-agent` as PID 1.
 
-Give a VM internet access with a flag. Pass `--net` and the VM can reach the
-network. There are no bridges, tap devices, or firewall rules to set up on the
-host, and it doesn't need privileges.
+Use `--net` to allow guest egress. Networking is implemented by a userspace switch in
+the `vk` process, and outbound traffic leaves through ordinary host sockets. The host
+does not need a bridge, tap device, or firewall changes.
 
-Run microVMs inside a microVM. `vk run --nested` gives the guest its own
-`/dev/kvm`, so it can build and boot images instead of only compiling them. The
-host has to allow nesting (`kvm_intel.nested` / `kvm_amd.nested`), which the
-flag checks before pulling or building anything. Off by default and for trusted
-guests only — the guest reaches host KVM's nested paths. In compose, a service
-picks this per service with an `x-virtkit: { nested: true }` marker.
+For images intended to boot as full machines, `--kernel image --init image` loads the
+image's `/boot/vmlinuz`, modules, and init system. `--init entrypoint` instead runs the
+image's ENTRYPOINT and CMD as PID 1. A kernel supplied with `--kernel <path>` is also
+supported.
 
-Run compose services as VMs. `vk run --compose compose.yml` boots the services
-(redis, mysql, and so on) on a shared network where each one resolves by name.
-You can run them alongside your command, as the primary itself (`--primary`,
-like `docker compose run`), or on their own (compose up, until ctrl-c). A
-service sizes its own guest with `x-virtkit: { cpus:, mem: }` (default 2 vCPUs
-/ 1G), and `--service-cpus`/`--service-mem NAME=VALUE` override it per run. From
-inside the primary, `/run/vk/services/<name>/{state,ctl,log}` lets you read
-service state and start or stop services with plain shell writes. For a dev VM,
-`vk run --ssh` boots any image with SSH access, and VS Code Remote-SSH works
-against it out of the box.
+`--nested` exposes KVM to the guest so it can run microVMs of its own. The host must have
+KVM nesting enabled (`kvm_intel.nested=1` or `kvm_amd.nested=1`), which the flag checks
+before pulling or building anything. Treat this as a grant for trusted guests: nested
+virtualization reaches the host kernel's KVM paths.
 
-Ship a built disk as an appliance. A Dockerfile stage can partition and
-install a bootloader into a caller-owned raw disk (`vk build --disk`), and
-`vk export vmdk|ova` packages that disk as a streamOptimized VMDK or a full
-OVA appliance that ESXi/vCenter import directly, while `vk export iso` builds
-a bootable BIOS+UEFI (and USB-writable) ISO from a staged tree — the shape of
-an unattended image-based installer. All native — no qemu-img, ovftool or
-xorriso; see [the appliance guide](docs/appliance.md).
+### Build a Dockerfile
 
-Isolate GitLab CI jobs. The custom executor gives every job a fresh microVM and
-destroys it when the job ends. Concurrent jobs work, and Docker images from your
-`.gitlab-ci.yml` are converted on demand — or built on demand from a Dockerfile
-in the repo itself (`image: dockerfile:…`). See the
-[GitLab CI guide](docs/gitlab-ci.md) for job variables, per-phase egress control,
-and services.
+`vk build` evaluates Dockerfiles directly; it does not call Docker. Each `RUN` executes
+in a microVM, instruction snapshots are cached, and independent stages may build in
+parallel. `vk run -f Dockerfile` is the convenient build-and-run form.
 
-Know what the work cost. A build, a `vk run`, and a CI job each end with the CPU
-time, the peak memory, and the disk and network traffic they cost the host, the
-guests' own execution included. Read the CPU, memory and disk as a ceiling — those
-totals carry vk's own work and the host helpers alongside the guests — and the
-network as the guests' share alone, since vk's own image pulls never cross the
-switch that counts it. Size `--mem`/`--cpus` and their config equivalents from
-what the work costs rather than by guess.
-Where several guests run at once (concurrent build stages, a compose fleet) a
-build and a `vk run` also name the largest single process, which is the
-difference between giving each guest more memory and running fewer of them at a
-time. A CI job adds how full it filled the in-guest layer its writes land on,
-against what that layer holds — the wall behind an out-of-space failure no host
-disk can explain. A job's guest also records itself as it runs, a sample of its
-own CPU, memory, disk, network and processes every 10 seconds in the text format
-`atop -P` prints, so the shape of the job outlives the VM that is destroyed with
-it. See the [GitLab CI guide](docs/gitlab-ci.md#resource-usage) for what each
-figure covers.
+A stage can declare resources without making the Dockerfile incompatible with Docker:
 
-Carry one file around. The hypervisor, the guest kernel, and the guest agent are
-all embedded in `vk`, so you can copy it to any Linux machine with `/dev/kvm`
-and boot images. virtkit can even rebuild itself inside one of its own microVMs
-(`./build.sh --bootstrap-check`).
-
-## The binaries
-
-| Binary | Role |
-| --- | --- |
-| `vk` | The host-side tool. Boots and manages VMs, builds and converts images, runs the GitLab executor, and provides the guest network. Self-contained: the guest kernel and `vk-agent` are embedded. |
-| `vk-agent` | Runs inside the guest as PID 1. Brings the system up (mounts, networking, hostname, shared folders, optional SSH) and lets the host run commands inside the VM. |
-| `vk-registry` | Optional central OCI-distribution server, shared by every runner: build-once dedup (a lease/heartbeat lock so an image is built once, not per runner), a pull-through cache for upstream registries (digest-addressed content only), and a backend for the `task` build cache. Not needed for local use — `vk` keeps its own on-disk store by default. Updates itself like `vk` does (`vk-registry update`, `--check`), and, when it finds its unit running, names the restart that puts the new build in service. |
-| `vk-runnerctl` | Optional, and the only piece that runs as root: it sets gitlab-runner's `concurrent` from what `vk` measures, so a busy host stops taking work instead of overcommitting. It decides nothing and takes no arguments — see the [GitLab CI guide](docs/gitlab-ci.md#throttling-a-busy-runner). |
-
-## How it works
-
-You don't need any of this to use the tool, but if you're curious:
-
-Guests boot on an embedded [libkrun](https://github.com/containers/libkrun)
-VMM, so there's no external hypervisor to install; a stock kernel and stock KVM
-are enough. [Cloud Hypervisor](https://www.cloudhypervisor.org/) also works as
-an external backend (the `vmm` config key, or `VIRTKIT_VMM=cloud-hypervisor`).
-
-Guest networking is a userspace switch living inside the `vk` process. Traffic
-leaves through the host's regular sockets, which is why no privileged network
-setup is ever required.
-
-Images are converted to native ext4 disks entirely in userspace. Each disk is
-fingerprinted by its build inputs, so checking whether a cached image has gone
-stale is instant.
-
-The host talks to guests over `vsock`, and the same channel carries shells, CI
-job stages, and service control.
-
-The release binaries are static (musl), built from a fully pinned Alpine
-toolchain, so builds are byte-for-byte reproducible. `./update.sh` records the
-pins.
-
-## Build
-
-```sh
-./build-kernel.sh  # -> dist/vmlinux (the guest kernel; run this first)
-./build.sh         # -> dist/{vk, vk-agent, vk-registry, vk-runnerctl, *.sha256, build-info.txt}
+```dockerfile
+# vk: mem=8G cpus=16
+FROM rust:1-alpine AS build
+RUN cargo build --release
 ```
 
-Build the kernel first: `vk` embeds `dist/vmlinux`, so a `vk` without it cannot
-boot anything on its own and `build.sh` stops with an error when it is missing (pass
-`--no-kernel` for a `vk` that takes `--kernel` at runtime instead). The kernel
-changes only on a pin bump, so one `./build-kernel.sh` serves every later
-`./build.sh`.
+Per-run overrides take precedence:
 
-Both run inside a pinned `rust:*-alpine` container (Docker required), so the
-artifacts come out byte-reproducible regardless of the host. `./update.sh` bumps
-the Rust toolchain, the base-image digest, and the apk pins together.
+```sh
+vk build --stage-mem build=12G --stage-cpus build=8 -f Dockerfile --out rootfs.ext4
+```
 
-## Subcommands
+The resource hint is a comment and does not enter the instruction cache key. When a
+stage asks for more memory than the host can allocate to one guest, virtkit clamps the
+request and emits a warning explaining the effective size and OOM risk.
 
-The ones you'll actually type:
+### Run compose services
 
-- `run` — boot an image, a Dockerfile target (`-f`), or a compose file as
-  microVM(s) and run a command or an interactive shell (`--shell`, `-t`).
-  This is where most of the flags live: `--net`, `--workdir`, `--volume`,
-  `--ssh`, `--compose`, `--detach`, `--inactivity-timeout`, `--atop`, ...
-- `build` — build a Dockerfile into a bootable ext4 image, each stage's `RUN`s
-  executing in a microVM, instruction snapshots cached (`--build-cache`).
-  `--tag` publishes the result to the `[registry]` as a bootable bundle the CI
-  executor can pull.
-- `exec` — run a command (or an interactive shell with `-t`) in an
-  already-running guest over its agent channel, reproducing the command's own
-  exit status. Addressed by launch directory like `list`/`stop`/`status` (or by
-  a raw agent address); the command goes after `--` (`vk exec -- ls -la`), and
-  `--service NAME` targets a running compose sibling instead of the primary.
-- `list` / `stop` — discover and tear down background VMs. A `run --state-dir`
-  registers its VM, so `list` shows the running ones and their compose services
-  (with `--stale`, whether a fresh `run` would rebuild the image, services
-  included) and `stop` brings one down by the directory it was launched from
-  (or `--all`).
-- `status` — probe a running VM's guest agent and print its reply (or exit
-  non-zero if it does not answer): a liveness check that exercises the agent
-  protocol, addressed by launch directory like `list`/`stop`, or by a raw agent
-  address for plumbing. With `--stale`, skip the probe and print a single
-  `fresh` / `stale` / `unknown` word for the VM's root image instead.
-- `atop` — watch a running VM's guest, or read what a recorded one did. Pointed
-  at a directory a running VM matches (default: the current one, addressed like
-  `exec`/`status`), it starts sampling that guest on the spot and opens the
-  follow panel on the recording as it grows; `--summary` — or having no terminal
-  to draw on — records until Ctrl-C instead, and `--interval` sets the cadence.
-  A VM booted with `run --atop` is already recording itself, so its own recording
-  is read live rather than a second sampler started. Given a job id, part of a
-  job's name, or the path a job's trace printed, it reads that recording instead.
-  On either recording `--summary` accounts the whole thing, `--json` writes its
-  samples a line at a time, and `--view` / `--follow` walk it in a panel. With
-  no flag a finished recording's path is printed, so it composes with whatever
-  reads logs (`less $(vk atop 42137)`); a VM still recording itself opens the
-  live panel instead — or prints its path too, with no terminal to draw one.
-- `check` — preflight the host for the current user: `/dev/kvm` access, the VMM
-  backend, a guest kernel/agent, and the host side of each configured feature
-  (the CI-executor features only when named with `--feature`).
-- `gc` — reclaim the host caches: evict image bases no VM is using, remove
-  GitLab host checkouts no job is using, and drop unreferenced image-cache chunks.
-- `update` — replace this `vk` with a release build from GitHub: the latest, or a
-  version you name (an older one downgrades). It asks before replacing anything
-  (`--yes` to skip), verifies the download against the digest published with the
-  release so a corrupted or truncated transfer is never installed, and leaves
-  running VMs untouched. `--check` reports what is available and installs nothing,
-  exiting 1 when a newer release exists — enough for a cron or a login banner to
-  nag with.
-- `service up` / `service down` / `service status` — from inside the primary,
-  control the run's compose services (build on demand + boot, stop, or query state).
-- `gitlab config` / `gitlab prepare` / `gitlab run` / `gitlab cleanup` — the
-  GitLab custom-executor lifecycle (see the [GitLab CI guide](docs/gitlab-ci.md)).
-- `registry push` / `registry pull` / `registry inspect` — publish, fetch, and check
-  for guest bundles in an OCI store, with chunk-level deduplication to keep
-  transfers small.
-- `registry status` / `registry gc` — report on, and sweep, a store on this host:
-  the one `[build] cache_registry` puts the build cache in, or any other with
-  `--root` — required whenever that setting names a registry server, whose store
-  is on its host. Neither creates a store: a path with no store there is reported
-  as having none, not materialized.
+`vk run --compose compose.yml` boots services as separate VMs on a shared network. Each
+service resolves by name. Services can run alongside a primary command, as the primary
+with `--primary`, or as a standalone fleet until interrupted.
 
-The rest is plumbing the commands above spawn for themselves, or development
-tooling — listed by `vk help-all`, each documented in `vk help <cmd>`:
-`connect` (splice stdio to a running guest — the shape SSH's
-`ProxyCommand` wants), `paths` (print the effective host paths and how to
-override each), `switch`, `forward` and `ssh-agent-proxy` (the per-run network
-gateway and forwarders), and the image toolbox (`mkext`, `mkext-tar`,
-`mkext-oci`, `oci-pull`, `docker-hash`, `fingerprint`, `qcow2-verify`).
-`virtiofsd` (the bundled virtio-fs daemon for the Cloud Hypervisor backend)
-dispatches before the CLI and documents itself via `vk virtiofsd --help`
-instead.
+virtkit-specific service settings live under `x-virtkit`:
 
-`vk-agent` (embedded in `vk`; you rarely invoke it yourself): `init` is the
-guest's PID 1, `serve` is the in-VM command server that `vk exec` / `vk
-connect` / `vk status` dial, and `net` connects a guest NIC to the host's
-network switch.
+Services default to 2 vCPUs and 1 GiB of memory. Set `cpus` and `mem` when a service
+needs a different guest size:
+
+```yaml
+services:
+  database:
+    image: postgres:17
+    x-virtkit:
+      cpus: 2
+      mem: 2G
+  builder:
+    image: local/builder
+    x-virtkit:
+      nested: true
+```
+
+`--service-cpus NAME=N` and `--service-mem NAME=SIZE` override those values for one run.
+The same marker supports `init` and `kernel` for services that boot their own system.
+
+Inside the primary guest, `/run/vk/services/<name>/{state,ctl,log}` exposes service
+state, control, and logs through ordinary files. `vk service up|down|status` provides the
+corresponding command interface. `vk run --ssh` enables SSH access for development VMs,
+including VS Code Remote-SSH workflows.
+
+### Isolate GitLab jobs
+
+The GitLab custom executor creates a fresh microVM for each job and destroys it during
+cleanup. Job images from `.gitlab-ci.yml` are converted on demand. A repository can also
+use `image: dockerfile:…` to build its job image directly from a checked-in Dockerfile.
+
+The executor supports concurrent jobs, service VMs, per-phase egress policy, resource
+accounting, and optional host-load throttling through `vk-runnerctl`. Configuration and
+the security model are covered in the [GitLab CI guide](docs/gitlab-ci.md).
+
+### Build appliances
+
+`vk build --disk` lets a Dockerfile stage partition and install a bootloader into a
+caller-owned raw disk. That disk can then be packaged natively, without `qemu-img`,
+`ovftool`, or `xorriso` on the host:
+
+```sh
+vk export vmdk disk.raw appliance.vmdk
+vk export ova disk.raw appliance.ova
+vk export iso staged-root installer.iso \
+  --bios-boot boot/grub/eltorito.img \
+  --efi-boot boot/grub/efi.img \
+  --hybrid-mbr isohdpfx.bin
+```
+
+VMDK output uses VMware's streamOptimized format; OVA output is ready for ESXi/vCenter
+import. ISO output can include BIOS and UEFI boot images, plus an optional hybrid MBR for
+USB media. See the [appliance guide](docs/appliance.md) for the expected disk and
+staged-tree layouts.
+
+## Operational behavior
+
+### Isolation and privilege
+
+Each guest has its own kernel. The default local path is rootless and daemonless, but
+the isolation boundary still depends on KVM and the selected VMM. Guest networking is
+userspace-only on the host. Nested KVM should be reserved for trusted workloads.
+
+`vk-runnerctl` is the one optional component designed to run as root. It accepts no
+caller-controlled arguments or paths; it only applies the configured GitLab runner
+concurrency range. Local image execution and building do not require it.
+
+### Resource accounting
+
+Builds, `vk run`, and CI jobs report host CPU time, peak memory, disk traffic, and guest
+network traffic when they finish. Concurrent builds and compose fleets also identify the
+largest host process, which helps distinguish an oversized guest from excessive
+concurrency.
+
+Treat the CPU, memory, and disk figures as ceilings: they include `vk` and its host
+helpers alongside the guests. Network figures cover guest traffic alone because
+host-side image pulls do not cross the userspace switch that counts it.
+
+CI jobs also report how much of the guest's writable layer they filled. That layer can
+hit `ENOSPC` while the host still has free disk space.
+
+By default, each CI guest records an `atop -P`-compatible sample every 10 seconds,
+covering CPU, memory, disk, network, and process activity. `vk atop` follows a running
+recording or inspects one retained after the job VM has been removed. See the
+[resource-usage documentation](docs/gitlab-ci.md#resource-usage) for accounting
+boundaries and interpretation.
+
+### Caching and registries
+
+Local image conversion and build caches require no server. `vk-registry` is optional and
+is useful when several runners need a shared OCI store, pull-through cache, or build-once
+coordination. Its lease and heartbeat protocol prevents runners from independently
+building the same content while a healthy peer is already doing so.
+
+Use `vk registry push|pull|inspect` for guest bundles and `vk registry status|gc` for a
+local store. The central server and storage model are documented in
+[`vk-registry/DESIGN.md`](vk-registry/DESIGN.md).
+
+## Binaries
+
+| Binary | Purpose |
+| --- | --- |
+| `vk` | Host CLI, VMM, image builder, userspace network, compose runner, and GitLab executor. It embeds the default guest kernel and `vk-agent`. |
+| `vk-agent` | Guest PID 1 and command server. It configures mounts, networking, hostname, shared directories, optional SSH, and host-driven execution over vsock. |
+| `vk-registry` | Optional OCI-distribution server with a pull-through cache, shared build cache, and build-once locking. |
+| `vk-runnerctl` | Optional root-side helper that adjusts GitLab runner concurrency within an administrator-configured range. |
+
+## Architecture
+
+The default VMM is the embedded [libkrun](https://github.com/containers/libkrun). An
+external [Cloud Hypervisor](https://www.cloudhypervisor.org/) binary can be selected with
+the `vmm` configuration key or `VIRTKIT_VMM=cloud-hypervisor`.
+
+The host converts OCI layers to native ext4 images in userspace. Build inputs identify
+cached disks and instruction snapshots. Guests communicate with the host over vsock for
+command execution, service control, and CI lifecycle operations. Guest Ethernet frames
+are handled by the in-process userspace switch, which provides ARP, DHCP, DNS, and TCP/UDP
+egress through host sockets.
+
+Release binaries are static musl PIE executables. The Rust toolchain, Alpine build image,
+packages, guest kernel, and vendored libkrun source are pinned so release artifacts can be
+rebuilt byte-for-byte.
+
+## Command guide
+
+| Command | Use it for |
+| --- | --- |
+| `vk run` | Boot an image, Dockerfile target, or compose fleet; run a command or shell. |
+| `vk build` | Build Dockerfile stages into a bootable ext4 image or caller-owned disk. |
+| `vk exec` | Run a command in an existing guest and return the command's exit status. |
+| `vk list` | Discover registered background VMs and compose services. |
+| `vk stop` | Stop a VM selected by launch directory, or stop all registered VMs. |
+| `vk status` | Probe a guest agent, or report whether its root image is stale. |
+| `vk atop` | Follow or inspect guest resource recordings. |
+| `vk check` | Validate KVM, VMM, embedded assets, and configured host features. |
+| `vk gc` | Reclaim unused image bases, CI checkouts, and image-cache chunks. |
+| `vk update` | Check for or install a digest-verified GitHub release. |
+| `vk service up|down|status` | Control compose services from the primary guest. |
+| `vk registry ...` | Publish, fetch, inspect, report on, or sweep OCI stores. |
+| `vk gitlab ...` | Implement the GitLab custom-executor lifecycle. |
+| `vk export ...` | Package raw disks or staged files as VMDK, OVA, or ISO artifacts. |
+
+Advanced commands are listed by `vk help-all`. They include the stdio/vsock connector,
+network forwarding processes, SSH agent proxy, path inspection, OCI/ext4 conversion
+tools, image fingerprinting, and the bundled Cloud Hypervisor `virtiofsd`.
 
 ## Configuration
 
-`vk` reads a single optional TOML file — the first that exists of:
+`vk` uses the first configuration source that applies:
 
-1. `--config <path>` (a global flag, valid on any subcommand)
+1. `--config <path>`
 2. `$VIRTKIT_CONFIG`
-3. `~/.config/virtkit/config.toml` (`$XDG_CONFIG_HOME`)
+3. `$XDG_CONFIG_HOME/virtkit/config.toml`, or `~/.config/virtkit/config.toml`
 4. `/etc/virtkit/config.toml`
 
-An explicit path (flag or env var) that doesn't exist is an error; the user and
-system paths are skipped when absent. Every setting has a default, so with no
-file at all `vk` still runs — the file is only needed to point at a registry, a
-GitLab tools dir, egress rules, and the like. `vk-driver/config.example.toml` is
-the annotated reference for every key.
+An explicit path that does not exist is an error. Standard user and system paths are
+optional. With no configuration file, local `run` and `build` workflows use defaults.
 
-Inspect and bootstrap it with `vk config`:
+```sh
+vk config             # print the effective TOML and its source
+vk config --example   # print the annotated reference configuration
+vk config --path      # print the resolved configuration path
+vk paths              # print resolved state, cache, and registry paths
+```
 
-- `vk config` — the effective configuration as TOML, headed by which file it came from
-- `vk config --example` — the annotated template to copy into place
-- `vk config --path` — just the resolved config file path
-
-`vk check` also reports the file in use, and `vk paths` shows where each host
-path (state dir, image cache, registry store) resolves to.
-
-Most things live in the config file or in CLI flags. The handful of environment
-variables are:
+[`vk-driver/config.example.toml`](vk-driver/config.example.toml) documents every key.
+The small environment-variable surface is:
 
 | Variable | Effect |
 | --- | --- |
-| `VIRTKIT_CONFIG` | config file path (between `--config` and the user/system files) |
-| `VIRTKIT_VMM` | VMM backend (`cloud-hypervisor`); overrides the `vmm` config key |
-| `VIRTKIT_DEBUG=1` | verbose VMM/guest debug logging |
-| `VIRTKIT_TIMING=1` | per-phase build/boot timing breakdown |
-| `VIRTKIT_PROGRESS=plain` | plain build progress instead of the live dashboard (CI logs) |
-| `VIRTKIT_NO_TITLE` | suppress terminal-title updates (keeps the dashboard) |
+| `VIRTKIT_CONFIG` | Select a configuration file. |
+| `VIRTKIT_VMM` | Override the VMM backend; currently useful for `cloud-hypervisor`. |
+| `VIRTKIT_DEBUG=1` | Enable verbose VMM and guest logging. |
+| `VIRTKIT_TIMING=1` | Print per-phase build and boot timing. |
+| `VIRTKIT_PROGRESS=plain` | Use line-oriented build progress suitable for CI logs. |
+| `VIRTKIT_NO_TITLE` | Disable terminal-title updates without disabling the dashboard. |
 
-`vk-registry` reads three of its own, in a namespace kept separate because it is a
-different binary with a different config file, each standing in for the flag of the same
-name: `VK_REGISTRY_CONFIG` and `VK_REGISTRY_ROOT` on every subcommand that reads a store
-(`accounts`, `status`, `gc` — not `serve` or `install-service`, which take theirs on the
-command line), and `VK_REGISTRY_ADMIN_SOCKET` on `accounts` (see `vk-registry/DESIGN.md`).
+Two configuration values can point at the same content-addressed store:
 
-Two settings name a content-addressed store. They are not two kinds of store — one
-on-disk format, two destinations:
+- `[build] cache_registry` stores build stages and base snapshots in `build-cache`.
+- `[registry] repo` stores named bootable guest bundles.
 
-| Setting | Holds | Typical value |
-| --- | --- | --- |
-| `[build] cache_registry` | the build cache's stage and base snapshots, in a repo called `build-cache` | a path on this disk, or a registry shared by every runner |
-| `[registry] repo` | guest bundles, one repo per name | a registry others pull from, or a path on this disk |
+Each accepts either a registry endpoint or a local absolute path/`file://` URL. Pointing
+both local settings at one directory enables chunk deduplication across build cache and
+guest bundles. `cache_registry = "none"` disables future build-cache writes. Use
+`vk registry status` and `vk registry gc` to inspect and reclaim a local store.
 
-Either accepts a registry (`registry.example.com/team`, `127.0.0.1:5000` — a
-server, with its own TLS and credentials) or an absolute path / `file://` URL (a
-store on this disk, accessed in-process: no daemon, no port, no auth — though a
-bundle in one is pulled by name only through a `vk-registry` serving it);
-`cache_registry = "none"` turns the build cache off, leaving `status`/`gc` on the
-builtin store where what was cached before it still is. Nothing keeps them apart:
-when both are local, point them at the **same directory** and chunk deduplication
-spans build cache and bundles alike, one `vk registry gc` covers both (it expires
-tags idle past `--retention-days` in every repo, bundles included), and
-`vk registry status` lists `build-cache` beside your bundle repos. Two different
-paths just mean two stores to keep an eye on — `status`/`gc` then follow the cache
-store unless you pass `--root`; a `cache_registry` on a registry server keeps its
-store on that host, so they refuse until `--root` names one here. With no
-configuration at all there is a single store, `$XDG_DATA_HOME/virtkit/registry`,
-holding only the build cache — it shares that directory with the image cache's own
-`registry/` tier, whose layout is independent and which `vk gc` reclaims.
-`vk paths` names the store on this host each setting resolved to.
+`vk-registry` has a separate configuration namespace. Its store-oriented subcommands
+recognize `VK_REGISTRY_CONFIG`, `VK_REGISTRY_ROOT`, and
+`VK_REGISTRY_ADMIN_SOCKET` as documented in its design file and command help.
 
-## Layout
+## Build from source
 
+Build the pinned guest kernel first, then the static binaries:
+
+```sh
+./build-kernel.sh  # dist/vmlinux
+./build.sh         # dist/{vk,vk-agent,vk-registry,vk-runnerctl,...}
 ```
-vk-core/         shared host↔guest library (wire protocol + exec/pty/dockerignore)
-vk-driver/       host driver crate
-vk-agent/        guest agent crate (PID 1 + exec server)
-vk-registry/     optional central OCI-distribution server (build-once lock + pull-through cache)
-vk-runnerctl/    optional root-side setter for gitlab-runner's concurrent (see docs/gitlab-ci.md)
-vk-selfupdate/   vk / vk-registry update: install a release build over the running one
-third_party/     vendored libkrun (locally patched — see its VENDOR.md)
-kernel/          guest kernel build (Dockerfile + config fragment)
-build.sh         build the binaries -> dist/
-build-kernel.sh  build the guest kernel -> dist/vmlinux
-dev.sh           crate-scoped check/test plus a shell, in a dev VM that expires when idle
-update.sh        bump + re-pin toolchain / base image / apk versions
+
+The scripts use a `vk` found on `PATH` to build inside a microVM; otherwise they use
+Docker. Pass `--docker` to force Docker. `build.sh --use-virtkit=<dist>` selects a
+specific existing virtkit build.
+
+`vk` normally embeds `dist/vmlinux`, so `build.sh` refuses to proceed when the kernel is
+missing. `--no-kernel` produces a non-shippable binary that requires `--kernel` at
+runtime. The kernel changes less often than the Rust binaries, so one kernel build can be
+reused across normal edit/build cycles.
+
+For iteration, use the repository's scoped development commands:
+
+```sh
+./dev.sh check -p vk-core
+./dev.sh test -p vk-core --lib dockerignore::tests
+./build.sh --fast  # only when a runnable debug vk is needed
+```
+
+Release builds use the pinned toolchain and produce reproducible artifacts. `--fast`
+uses the unoptimized development profile and is not a release artifact.
+`./build.sh --bootstrap-check` performs a Docker build, rebuilds with the resulting `vk`,
+and compares the binaries byte-for-byte.
+
+## Repository layout
+
+```text
+vk-core/         shared host/guest protocol and runtime helpers
+vk-driver/       host driver, builder, VMM, networking, compose, and GitLab executor
+vk-agent/        guest PID 1 and exec server
+vk-registry/     optional central OCI store and distribution server
+vk-runnerctl/    optional root-side GitLab concurrency helper
+vk-selfupdate/   shared self-update implementation for vk and vk-registry
+third_party/     vendored libkrun and local patches
+kernel/          pinned guest-kernel configuration and build inputs
+docs/            operational guides
+build.sh         reproducible binary build
+build-kernel.sh  reproducible guest-kernel build
+dev.sh           scoped check/test environment in a reusable development VM
 ```
 
 ## License
