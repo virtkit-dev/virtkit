@@ -20,6 +20,10 @@
 //!   only stall its own caller; here it stalls every concurrent one, drivers included.
 //! - The runtime stays lazily built. `main` forks to detach (`detach::fork`) before any
 //!   caller reaches this module, and a tokio runtime must not straddle a fork.
+//!
+//! - Construct runtime-bound futures inside the `async` block passed to [`block_on`]. Tokio's
+//!   timeout, sleep, and interval futures capture the current runtime when constructed, while
+//!   synchronous callers may run on plain threads without one.
 
 use std::sync::OnceLock;
 
@@ -86,6 +90,32 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn works_from_inside_a_runtime() {
         assert_eq!(super::block_on(async { 42 }), 42);
+    }
+
+    /// Runtime-bound futures must be constructed inside the block entered by [`block_on`].
+    #[test]
+    fn a_timeout_must_be_built_inside_the_block() {
+        let got = super::block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async { 42 }).await
+        });
+        assert_eq!(
+            got.expect("the inner future finished well inside the timeout"),
+            42
+        );
+
+        let payload = std::panic::catch_unwind(|| {
+            drop(tokio::time::timeout(Duration::from_secs(5), async {}));
+        })
+        .expect_err("constructing a timeout off-runtime panics");
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("runtime"),
+            "expected tokio's missing-runtime panic, got {msg:?}"
+        );
     }
 
     /// A panic in the future reaches the caller with its payload intact, not as an

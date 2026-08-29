@@ -68,11 +68,7 @@ fn overlays() -> Vec<PathBuf> {
 /// The mark published for `base`, as `(used, total)`. `None` until the sampler has written
 /// one, or where the file is not the two figures [`publish`] writes.
 fn published(base: &Path) -> Option<(u64, u64)> {
-    let text = std::fs::read_to_string(base.join(MARK)).ok()?;
-    let mut figures = text.split_whitespace();
-    let used = figures.next()?.parse().ok()?;
-    let total = figures.next()?.parse().ok()?;
-    Some((used, total))
+    crate::mark::parse(&std::fs::read_to_string(base.join(MARK)).ok()?)
 }
 
 /// Record a new high-water mark for `base`. Best-effort: a mark that fails to land leaves the
@@ -92,7 +88,7 @@ fn publish(base: &Path, used: u64, total: u64) {
         .truncate(true)
         .mode(0o644)
         .open(&path)
-        .and_then(|mut f| f.write_all(format!("{used} {total}\n").as_bytes()));
+        .and_then(|mut f| f.write_all(crate::mark::render(used, total).as_bytes()));
     if let Err(e) = written {
         warn!("vk-agent fsmark: publishing {}: {e}", path.display());
     }

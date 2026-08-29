@@ -346,19 +346,7 @@ async fn overlay_mark(ctx: &JobCtx) -> Option<(u64, u64)> {
     if !(gitlab.host_checkout && gitlab.checkout_overlay) {
         return None;
     }
-    let out = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = {
-        let out = Arc::clone(&out);
-        OutputSink::Routed(Arc::new(move |fd, bytes: &[u8]| {
-            // stdout only: the subcommand explains itself on stderr when it has no layer to
-            // report, and that is prose, not a figure.
-            if matches!(fd, Fd::Stdout)
-                && let Ok(mut buf) = out.lock()
-            {
-                buf.extend_from_slice(bytes);
-            }
-        }))
-    };
+    let (out, sink) = stdout_capture();
     let asked = exec_script(
         &vsock_addr(ctx),
         &[crate::run::GUEST_AGENT.to_string(), "fsmark".to_string()],
@@ -374,14 +362,34 @@ async fn overlay_mark(ctx: &JobCtx) -> Option<(u64, u64)> {
     parse_mark(&out.lock().ok()?)
 }
 
-/// The two figures `vk-agent fsmark` prints, `<used> <total>` in bytes. `None` for anything
-/// else: a mark read short — or read from a guest answering something else entirely — is no
-/// measurement, and reporting half of one as a whole one would understate the layer.
-fn parse_mark(out: &[u8]) -> Option<(u64, u64)> {
+/// Capture a guest command's stdout into a shared buffer, discarding its stderr.
+///
+/// Agent mark commands return figures on stdout and diagnostics on stderr.
+pub(crate) fn stdout_capture() -> (Arc<std::sync::Mutex<Vec<u8>>>, OutputSink) {
+    let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = {
+        let out = Arc::clone(&out);
+        OutputSink::Routed(Arc::new(move |fd, bytes: &[u8]| {
+            if matches!(fd, Fd::Stdout)
+                && let Ok(mut buf) = out.lock()
+            {
+                buf.extend_from_slice(bytes);
+            }
+        }))
+    };
+    (out, sink)
+}
+
+/// Parse the exact `<used> <total>` byte pair printed by `vk-agent fsmark` and `memmark`.
+/// Anything else is not a measurement, preventing partial lines from understating demand.
+pub(crate) fn parse_mark(out: &[u8]) -> Option<(u64, u64)> {
     let text = std::str::from_utf8(out).ok()?;
     let mut figures = text.split_whitespace();
     let used = figures.next()?.parse().ok()?;
     let total = figures.next()?.parse().ok()?;
+    if figures.next().is_some() {
+        return None;
+    }
     Some((used, total))
 }
 
@@ -650,6 +658,7 @@ mod tests {
             b"nine 10737418240",
             b"/proc/self/exe: not found\n",
             b"-1 10737418240",
+            b"10431037440 10737418240 trailing",
         ] {
             assert_eq!(
                 parse_mark(out),

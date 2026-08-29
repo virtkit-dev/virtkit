@@ -32,6 +32,9 @@ All notable changes to virtkit will be documented in this file.
   warned about, so a later out-of-memory kill inside that guest can be read back to the
   size it did not get.
 
+- Builds now report each stage's peak guest memory as the stage finishes and in the final
+  timing breakdown, to size `# vk: mem=` hints against.
+
 ### Changed
 
 - A parallel build now waits for the host to have room for a stage's guest before

@@ -103,6 +103,20 @@ The resource hint is a comment and does not enter the instruction cache key. Whe
 stage asks for more memory than the host can allocate to one guest, virtkit clamps the
 request and emits a warning explaining the effective size and OOM risk.
 
+Builds report each stage's peak guest memory as the stage finishes and in a block under
+the final timing breakdown:
+
+```
+ Stage memory (peak demand / guest size)
+  [build]     3.1 GiB of 8.0 GiB
+  [runtime]   412 MiB of 4.0 GiB
+```
+
+The guest measures `MemTotal - MemAvailable`, excluding reclaimable page cache so the
+result reflects demand rather than every page touched. The per-stage line is printed as a
+stage finishes, so a stage that fails has none; the final block still lists whatever its
+guests had reported by then.
+
 ### Run compose services
 
 `vk run --compose compose.yml` boots services as separate VMs on a shared network. Each

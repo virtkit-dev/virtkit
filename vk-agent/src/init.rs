@@ -45,6 +45,10 @@
 //!                        read-write and fork the guest statistics sampler on it: one
 //!                        atop-parseable sample of this guest's /proc per interval,
 //!                        appended to <mountpoint>/atop.log (see the `atop` module)
+//!   VIRTKIT_MEMMARK=1    keep this guest's peak memory demand (MemTotal - MemAvailable)
+//!                        in a PID 1 sampler, for `vk-agent memmark` to read back at
+//!                        teardown (see the `memmark` module). Set by the build backend
+//!                        on stage guests; no other guest pays for the sampler
 //!   VIRTKIT_CTL=1        mount the compose control fs at /run/vk/services (a FUSE
 //!                        bridge to the host service manager over vsock). Honored on
 //!                        the full-VM path too, which claims /run as a tmpfs first so
@@ -178,10 +182,10 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     maybe_host_exec(&cmdline);
     maybe_ssh_agent(&cmdline);
     let serve = spawn_serve(socket, inactivity_timeout)?;
-    // After the last fork: the sampler is a thread, and forking with one running would leave a
-    // child holding a lock it can only drop by exec'ing. Nothing has run in the guest yet — the
-    // serve above only now begins accepting commands — so no writes go unwatched.
+    // Start thread samplers after the last fork to keep children from inheriting locked state.
+    // The server has not accepted commands yet, so all writes and memory demand remain covered.
     crate::fsmark::watch();
+    crate::memmark::watch(cmdline.get("VIRTKIT_MEMMARK").map(String::as_str) == Some("1"));
     install_term_handler();
     supervise(serve)
 }

@@ -223,6 +223,11 @@ fn main() {
         let rest: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(vk_agent::fsmark::main(&rest));
     }
+    // Peak guest memory without a socket, read by the host before stage teardown.
+    if std::env::args().nth(1).as_deref() == Some("memmark") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(vk_agent::memmark::main(&rest));
+    }
     // The guest statistics sampler (no socket): init forks `vk-agent atop <dir>
     // <interval_secs>` at boot when the cmdline asks for it, and it appends atop-parseable
     // samples of this guest's /proc to the host archive share until SIGUSR2.

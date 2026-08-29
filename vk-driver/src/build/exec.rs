@@ -1107,6 +1107,39 @@ impl MicroVm {
         &self.mem
     }
 
+    /// Ask the live guest agent for this stage's peak demand, excluding faulted page cache that
+    /// inflates host-side VMM memory figures.
+    ///
+    /// The bounded, best-effort query runs on both teardown paths; no memory figure warrants
+    /// blocking the build on an unresponsive guest, especially one that may be out of memory.
+    /// An old agent, failed exec, or timeout leaves the stage unmeasured instead of reporting
+    /// zero demand.
+    fn record_stage_mem(&self, label: &str, session: &crate::run::VmSession) {
+        let t = std::time::Instant::now();
+        let (out, sink) = crate::executor::stdout_capture();
+        let argv = [GUEST_AGENT.to_string(), "memmark".to_string()];
+        // Construct the timeout after entering the shared runtime; `run_dag` stage workers have
+        // no Tokio context in which to create it.
+        let asked = block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                session.exec(&argv, None, &sink),
+            )
+            .await
+        });
+        self.timings.probe("stage.memmark", t.elapsed());
+        if !matches!(asked, Ok(Ok(0))) {
+            return;
+        }
+        let Ok(buf) = out.lock() else { return };
+        // Discard the guest's MemTotal: hints target the slightly larger host-assigned size.
+        // Requiring both figures still rejects a half-written mark.
+        if let Some((peak, _)) = crate::executor::parse_mark(&buf) {
+            self.timings
+                .record_mem(label, peak, self.mem_mib().saturating_mul(1024 * 1024));
+        }
+    }
+
     /// A fresh per-stage worker that shares this executor's cross-stage state (the
     /// `images` / `stage_last_digest` maps and the cache registry) but
     /// starts with an empty per-stage working set (no session, sources, or in-flight
@@ -1204,6 +1237,8 @@ impl MicroVm {
 
         let subset = select_source_batch(&self.sources, needed, &fs.label, max_sources)?;
         if let Some(session) = self.session.take() {
+            // Read the mark before the final filesystem freeze while guest exec still works.
+            self.record_stage_mem(&fs.label, &session);
             // Carry this VM's dirty set across the reboot before it dies with the VM: the disk
             // persists, so a checkpoint after the reboot must still see writes from before it.
             // Freeze first so the guest flushes its page cache to the block device (the set only
@@ -2652,6 +2687,7 @@ impl Executor for MicroVm {
         // Shut the stage's guest down cleanly; its writes are already in the stage image
         // (the booted disk), so later stages / the export see them with no commit step.
         if let Some(session) = self.session.take() {
+            self.record_stage_mem(&fs.label, &session);
             let t_fin = std::time::Instant::now();
             block_on(session.finish())?;
             self.timings.probe("stage.finish", t_fin.elapsed());

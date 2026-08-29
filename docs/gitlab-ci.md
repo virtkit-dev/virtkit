@@ -550,6 +550,13 @@ must not make it unbuildable on a laptop. Anything the hint cannot mean — an u
 unreadable size, a `# vk:` line that precedes no `FROM` — fails the build rather than being
 ignored.
 
+Each stage reports its peak guest memory when it finishes and in the final timing breakdown,
+alongside the guest size. The guest measures `MemTotal - MemAvailable`, excluding reclaimable
+page cache that a host-side VMM measurement would include. The figure is read from each of a
+stage's guests as it goes, so a stage killed out of memory prints no completion line, and the
+final breakdown carries only what its earlier guests had reported — a lower bound on what it
+needed, or nothing at all if it died in its first.
+
 Back to the gate: a build's own guests are charged at their declared size from the moment they
 are admitted, never at what they have faulted in so far — a guest that booted seconds ago has
 touched almost none of its RAM, and a gate that believed `MemAvailable` would wave the next

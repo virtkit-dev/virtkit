@@ -11,6 +11,9 @@
 //! Because build stages run concurrently, the summed per-phase time ("busy") can
 //! exceed the wall-clock elapsed — the header reports both, so a build dominated
 //! by cache pushes reads differently from one bottlenecked on a single stage.
+//!
+//! Build stages also record peak guest memory ([`Timings::record_mem`]) in a separate block
+//! below the phases to guide `# vk: mem=…` sizing.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -82,6 +85,8 @@ struct Inner {
     rows: BTreeMap<Phase, BTreeMap<String, Duration>>,
     /// build concurrency, for the header note; 0 when unset (a serial `run`).
     jobs: usize,
+    /// stage name → (maximum demand across its guests, assigned size), in bytes.
+    mem: BTreeMap<String, (u64, u64)>,
     /// Fine-grained probe samples (`VIRTKIT_TIMING`), keyed by dotted label → (summed
     /// elapsed, sample count). Kept off the phase accounting so a probe that measures part
     /// of a coarse phase (e.g. `boot.spawn` within `boot`) never double-counts it; rendered
@@ -112,6 +117,19 @@ impl Timings {
             .or_default()
             .entry(stage.to_string())
             .or_default() += dur;
+    }
+
+    /// Record `stage`'s peak demand and assigned size in bytes, retaining the largest demand
+    /// across guest reboots.
+    pub fn record_mem(&self, stage: &str, peak: u64, declared: u64) {
+        let mut g = self.inner.lock().unwrap();
+        let e = g.mem.entry(stage.to_string()).or_insert((0, declared));
+        *e = (e.0.max(peak), declared);
+    }
+
+    /// Return `stage`'s peak demand and assigned size for its completion line.
+    pub fn stage_mem(&self, stage: &str) -> Option<(u64, u64)> {
+        self.inner.lock().unwrap().mem.get(stage).copied()
     }
 
     /// Note the build's concurrency, so the header can report "busy across N jobs".
@@ -174,7 +192,8 @@ impl Inner {
     /// or `None` when nothing was recorded. Pure over `wall` so the layout — the header
     /// branch and the right-aligned duration column — is testable without the clock.
     fn format(&self, wall: Duration) -> Option<String> {
-        if self.rows.is_empty() && self.probes.is_empty() {
+        // Render when any block has data, including memory alone.
+        if self.rows.is_empty() && self.mem.is_empty() && self.probes.is_empty() {
             return None;
         }
         let busy: Duration = self.rows.values().flat_map(|m| m.values()).copied().sum();
@@ -211,6 +230,29 @@ impl Inner {
                 "\n{label:<label_w$}   {dur:>dur_w$}",
                 dur = fmt_dur(*dur)
             );
+        }
+
+        // Memory is a stage-keyed byte count, not a timed phase.
+        if !self.mem.is_empty() {
+            // Sort by descending peak, then name for stable output.
+            let mut stages: Vec<(&String, &(u64, u64))> = self.mem.iter().collect();
+            stages.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(b.0)));
+            out.push_str("\n Stage memory (peak demand / guest size)");
+            let name_w = stages
+                .iter()
+                .map(|(name, _)| name.chars().count())
+                .max()
+                .unwrap_or(0);
+            for (name, (peak, declared)) in stages {
+                let label = format!("[{name}]");
+                let _ = write!(
+                    out,
+                    "\n  {label:<w$}   {} of {}",
+                    crate::usage::fmt_bytes(*peak),
+                    crate::usage::fmt_bytes(*declared),
+                    w = name_w + 2,
+                );
+            }
         }
 
         // Fine-grained probes (VIRTKIT_TIMING) as a trailing block: each dotted label with
@@ -338,6 +380,48 @@ mod tests {
         let rows: Vec<&str> = probe_block.lines().filter(|l| !l.is_empty()).collect();
         assert!(rows[0].contains("boot.spawn") && rows[0].ends_with("0.8s  (×2)"));
         assert!(rows[1].contains("cache.push") && rows[1].ends_with("3.2s  (×4)"));
+    }
+
+    /// Render stage memory below the phases, ordered by descending peak.
+    #[test]
+    fn stage_memory_renders_as_its_own_block() {
+        let t = Timings::new();
+        t.record(Phase::Instructions, "builder", Duration::from_secs(22));
+        t.record_mem("runtime", 612 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
+        t.record_mem("builder", 1_717_986_918, 4 * 1024 * 1024 * 1024);
+        // A smaller reading after a guest reboot does not lower the stage peak.
+        t.record_mem("builder", 512 * 1024 * 1024, 4 * 1024 * 1024 * 1024);
+        let text = t
+            .inner
+            .lock()
+            .unwrap()
+            .format(Duration::from_secs(40))
+            .unwrap();
+        let block: Vec<&str> = text
+            .split("Stage memory (peak demand / guest size)")
+            .nth(1)
+            .expect("the memory block")
+            .lines()
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert!(block[0].contains("[builder]") && block[0].ends_with("1.6 GiB of 4.0 GiB"));
+        assert!(block[1].contains("[runtime]") && block[1].ends_with("612 MiB of 2.0 GiB"));
+        // Memory does not affect phase accounting.
+        assert_eq!(text.lines().next().unwrap(), " Timing (wall 40.0s)");
+    }
+
+    /// Render memory even when no phase row exists.
+    #[test]
+    fn stage_memory_alone_still_renders() {
+        let t = Timings::new();
+        t.record_mem("builder", 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024);
+        let text = t
+            .inner
+            .lock()
+            .unwrap()
+            .format(Duration::from_secs(2))
+            .unwrap();
+        assert!(text.contains("[builder]   1.0 GiB of 4.0 GiB"), "{text}");
     }
 
     /// The header reports summed busy time and jobs when a build concurrency is set, and

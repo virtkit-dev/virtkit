@@ -3162,6 +3162,30 @@ pub(crate) fn build_scratch_disk(image: &Path) -> Result<PathBuf> {
     build_empty_disk(image, "scratchdisk")
 }
 
+/// The kernel cmdline every build stage guest boots with.
+///
+/// The kernel runs the initramfs `/init` (the agent); it then pivots into the ext4 named by
+/// `VIRTKIT_PIVOT`. No `init=`/`root=` for the kernel to mount — the agent does. The net,
+/// virtio-fs and vsock fragments are appended by the caller as it provisions each.
+///
+/// `VIRTKIT_MEMMARK=1` is limited to build guests, whose marks are read before source-batch
+/// reboots and at stage end.
+fn build_guest_cmdline(tmp_dev: Option<&str>, image_kernel: bool) -> String {
+    let mut cmdline = format!(
+        "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda \
+         VIRTKIT_HOSTNAME=vm VIRTKIT_VSOCK_PORT={VSOCK_PORT} VIRTKIT_MEMMARK=1"
+    );
+    if let Some(dev) = tmp_dev {
+        cmdline.push_str(&format!(" VIRTKIT_TMP_DEV=/dev/{dev}"));
+    }
+    // --kernel=image: a modular image kernel has no early hvc0 (console stays on ttyS0)
+    // and the preinit reads this to insmod the ride-along modules before the pivot.
+    if image_kernel {
+        cmdline.push_str(" VIRTKIT_KERNEL=image");
+    }
+    cmdline
+}
+
 /// Boot a stage guest on `image` (a rw qcow2, written in place) and wait for the in-guest
 /// agent. Unless `net` is `None`, a `vk switch` gives egress (DHCP + DNS + transparent
 /// proxy), restricted to `net`'s allowlist if it has one.
@@ -3303,20 +3327,7 @@ pub(crate) async fn boot_session(
         });
         format!("/dev/{dev}")
     });
-    // The kernel runs the initramfs `/init` (the agent); it then pivots into the ext4
-    // named by VIRTKIT_PIVOT. No `init=`/`root=` for the kernel to mount — the agent does.
-    let mut cmdline = format!(
-        "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda \
-         VIRTKIT_HOSTNAME=vm VIRTKIT_VSOCK_PORT={VSOCK_PORT}"
-    );
-    if let Some(dev) = &tmp_dev {
-        cmdline.push_str(&format!(" VIRTKIT_TMP_DEV=/dev/{dev}"));
-    }
-    // --kernel=image: a modular image kernel has no early hvc0 (console stays on ttyS0)
-    // and the preinit reads this to insmod the ride-along modules before the pivot.
-    if image_kernel.is_some() {
-        cmdline.push_str(" VIRTKIT_KERNEL=image");
-    }
+    let mut cmdline = build_guest_cmdline(tmp_dev.as_deref(), image_kernel.is_some());
     let vsock = work.join("vsock.sock");
     let console = work.join("console.log");
 
@@ -4328,5 +4339,24 @@ mod tests {
         }
         // A truncated line yields nothing rather than a wrong pid.
         assert_eq!(holder_pid("6: FLOCK  ADVISORY\n", want), None);
+    }
+
+    #[test]
+    fn every_build_stage_guest_is_asked_to_keep_its_memory_mark() {
+        // Pin the sampler gate in every build-guest cmdline shape.
+        for cmdline in [
+            build_guest_cmdline(None, false),
+            build_guest_cmdline(Some("vdb"), false),
+            build_guest_cmdline(Some("vdb"), true),
+        ] {
+            assert!(
+                cmdline.split_whitespace().any(|t| t == "VIRTKIT_MEMMARK=1"),
+                "{cmdline}"
+            );
+        }
+        let plain = build_guest_cmdline(None, false);
+        assert!(!plain.contains("VIRTKIT_TMP_DEV") && !plain.contains("VIRTKIT_KERNEL"));
+        assert!(build_guest_cmdline(Some("vdb"), true).contains(" VIRTKIT_TMP_DEV=/dev/vdb"));
+        assert!(build_guest_cmdline(None, true).contains(" VIRTKIT_KERNEL=image"));
     }
 }

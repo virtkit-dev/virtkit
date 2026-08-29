@@ -2213,6 +2213,15 @@ fn build_stage(
         let r = ex.stage_end(&final_fs, steps.last().map(|s| s.key.as_str()));
         progress.stage_finishing_done(display);
         r?;
+        // Report measured guest demand while the completed stage remains visible; unmeasured
+        // stages have no line. "Guest" distinguishes this from the run's host-RSS peak.
+        if let Some((peak, declared)) = timings.stage_mem(&name) {
+            progress.note(&format!(
+                "virtkit: build: [{name}] peak guest memory {} of {}",
+                crate::usage::fmt_bytes(peak),
+                crate::usage::fmt_bytes(declared)
+            ));
+        }
         Ok(final_fs)
     })();
     // Memoize a genuine failure against `final_key` so a peer in this pipeline fails fast
