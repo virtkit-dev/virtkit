@@ -284,6 +284,9 @@ pub struct RunArgs {
     /// of a fresh temp dir, so external tooling can attach to the running VM; the
     /// directory is reused across runs and never removed
     pub state_dir: Option<PathBuf>,
+    /// the run's workspace root, which a compose file reads as `${VK_WORKSPACE}`;
+    /// None = the launch cwd
+    pub workspace: Option<PathBuf>,
     /// extra host-dir bind mounts into the primary (beyond `workdir`), same
     /// semantics as a `--primary` primary's compose volumes
     pub volumes: Vec<crate::compose::Volume>,
@@ -807,8 +810,13 @@ async fn build_and_boot(
     // rendered when the run finishes. A `-f` Dockerfile build reports its own breakdown
     // separately (via the build pipeline).
     let timings = Timings::new();
+    // Supply run-specific `${VK_*}` values without storing host paths in the compose file.
     let mut compose_units: Vec<crate::compose::Unit> = match &args.compose {
-        Some(p) => crate::compose::load(p)?,
+        Some(p) => {
+            let builtins =
+                crate::compose::Builtins::resolve(args.workspace.as_deref(), Some(work))?;
+            crate::compose::load(p, Some(&builtins))?
+        }
         None => Vec::new(),
     };
     apply_service_sizes(&mut compose_units, &args.service_cpus, &args.service_mem)?;
@@ -2227,7 +2235,8 @@ async fn compose_up(
         .compose
         .as_ref()
         .expect("compose_up requires --compose");
-    let mut units = crate::compose::load(compose)?;
+    let builtins = crate::compose::Builtins::resolve(args.workspace.as_deref(), Some(work))?;
+    let mut units = crate::compose::load(compose, Some(&builtins))?;
     if units.is_empty() {
         bail!("{} declares no services", compose.display());
     }
@@ -3854,6 +3863,7 @@ mod tests {
             ssh_keys: vec![],
             ssh_user: String::new(),
             state_dir: None,
+            workspace: None,
             volumes: vec![],
             symlinks: vec![],
             extra_disks: vec![],
@@ -4029,7 +4039,7 @@ mod tests {
         let yaml = "services:\n\
              \x20 db:\n    image: d\n    x-virtkit: { cpus: 2, mem: 512M }\n\
              \x20 web:\n    image: w\n";
-        let mut units = crate::compose::parse(yaml, Path::new("/b"), &|_| None).unwrap();
+        let mut units = crate::compose::parse(yaml, Path::new("/b"), &|_| None, None).unwrap();
         // the flag wins over the marker where given, sets an unmarked service, and
         // leaves everything unnamed alone
         apply_service_sizes(
@@ -4061,6 +4071,7 @@ mod tests {
              \x20 web:\n    image: w\n",
             Path::new("/b"),
             &|_| None,
+            None,
         )
         .unwrap();
         let idx = |n: &str| Some(units.iter().position(|u| u.name == n).unwrap());
@@ -4089,7 +4100,7 @@ mod tests {
              \x20 d:\n    image: redis:7\n\
              \x20 e:\n    build:\n      context: ./ctx\n      target: sa\n\
              \x20     additional_contexts:\n        tools: ./tools\n";
-        let units = crate::compose::parse(yaml, Path::new("/base"), &|_| None).unwrap();
+        let units = crate::compose::parse(yaml, Path::new("/base"), &|_| None, None).unwrap();
         let selected: Vec<usize> = (0..units.len()).collect();
         let built = compose_build_units(&[], &units, &selected, |_| None);
         assert_eq!(built.len(), 4, "a+b merge; c, d and e stand alone");
@@ -4119,7 +4130,7 @@ mod tests {
              \x20 web:\n    build: ./web\n\
              \x20 extra:\n    build: ./extra\n    profiles: [debug]\n\
              \x20 img:\n    image: redis:7\n    profiles: [debug]\n";
-        let units = crate::compose::parse(yaml, Path::new("/base"), &|_| None).unwrap();
+        let units = crate::compose::parse(yaml, Path::new("/base"), &|_| None, None).unwrap();
         let idx = |n: &str| units.iter().position(|u| u.name == n).unwrap();
         let order = crate::compose::boot_order(&units).unwrap();
         // no active profiles, no --primary: the profile-enabled set boots.
@@ -4156,7 +4167,7 @@ mod tests {
              \x20 mysql:\n    build: ./mysql\n\
              \x20 runner:\n    build: ./runner\n    profiles: [runner]\n\
              \x20 cache:\n    image: redis:7\n    profiles: [debug]\n";
-        let units = crate::compose::parse(yaml, Path::new("/base"), &|_| None).unwrap();
+        let units = crate::compose::parse(yaml, Path::new("/base"), &|_| None, None).unwrap();
         let idx = |n: &str| units.iter().position(|u| u.name == n).unwrap();
         let names = |sel: Vec<usize>| {
             let mut v: Vec<&str> = sel.iter().map(|&i| units[i].name.as_str()).collect();

@@ -673,6 +673,7 @@ mod tests {
             "services:\n  redis:\n    image: redis:7\n",
             Path::new("."),
             &|_| None,
+            None,
         )
         .unwrap()
         .pop()
@@ -720,6 +721,7 @@ mod tests {
             "services:\n  s:\n    build:\n      context: .\n",
             &tmp,
             &|_| None,
+            None,
         )
         .unwrap()
         .pop()

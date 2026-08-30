@@ -479,6 +479,28 @@ enum Cmd {
             help_heading = "What to build"
         )]
         primary: Option<String>,
+        /// with --compose, the workspace root it reads as `${VK_WORKSPACE}` [default: the cwd]
+        ///
+        /// The same value the eventual `vk run --workspace` passes, so a prebuild resolves the
+        /// compose file exactly as the boot will.
+        #[arg(
+            long,
+            value_name = "DIR",
+            requires = "compose",
+            help_heading = "What to build"
+        )]
+        workspace: Option<PathBuf>,
+        /// with --compose, the run state dir it reads as `${VK_STATE_DIR}`
+        ///
+        /// A build keeps no state of its own; this only answers the builtin, so a compose file
+        /// naming the run's state dir resolves the same here as under `vk run --state-dir`.
+        #[arg(
+            long = "state-dir",
+            value_name = "DIR",
+            requires = "compose",
+            help_heading = "What to build"
+        )]
+        state_dir: Option<PathBuf>,
         /// build context for COPY
         ///
         /// Repeatable, zipped positionally with -f; default: each Dockerfile's own directory.
@@ -1186,6 +1208,10 @@ enum Cmd {
         /// declare `image:` or `build:` (`build.dockerfile` may be a list: the files merge into
         /// one stage namespace, `target` picks any stage across them). Alone (no
         /// image/-f/--primary) this is compose up: services only, held until ctrl-c.
+        ///
+        /// `${VAR}` interpolates from the environment over a sibling `.env`, and the reserved
+        /// `${VK_WORKSPACE}`, `${VK_STATE_DIR}`, `${VK_SELF}`, `${VK_UID}` and `${VK_GID}` from
+        /// the run itself — so the committed file needs no host paths or ids of its own.
         #[arg(long, value_name = "FILE", help_heading = "Compose services")]
         compose: Option<PathBuf>,
         /// activate a compose profile (repeatable)
@@ -1283,6 +1309,19 @@ enum Cmd {
             help_heading = "Mounts and disks"
         )]
         state_dir: Option<PathBuf>,
+        /// with --compose, the workspace root it reads as `${VK_WORKSPACE}` [default: the cwd]
+        ///
+        /// The project the run is about. Naming it here lets the committed file say
+        /// `${VK_WORKSPACE}` instead of carrying a host path, and lets a caller boot from
+        /// anywhere rather than having to cd first. It supplies the name and nothing else:
+        /// what the tree is bound as, if anything, is the compose file's own business.
+        #[arg(
+            long,
+            value_name = "DIR",
+            requires = "compose",
+            help_heading = "Compose services"
+        )]
+        workspace: Option<PathBuf>,
         /// bind-mount an extra host dir into the guest (repeatable)
         ///
         /// Beyond --workdir — e.g. persistent state a throwaway VM should keep on the host.
@@ -2281,6 +2320,7 @@ async fn cli_main() -> ExitCode {
         ssh_key,
         ssh_user,
         state_dir,
+        workspace,
         volume,
         symlink,
         disk,
@@ -2461,6 +2501,7 @@ async fn cli_main() -> ExitCode {
             ssh_keys: ssh_key.clone(),
             ssh_user: ssh_user.clone(),
             state_dir: state_dir.clone(),
+            workspace: workspace.clone(),
             volumes,
             symlinks,
             extra_disks,
@@ -2757,6 +2798,8 @@ async fn cli_main() -> ExitCode {
         compose,
         profile,
         primary,
+        workspace,
+        state_dir,
         context,
         build_context,
         out,
@@ -2932,7 +2975,14 @@ async fn cli_main() -> ExitCode {
                         2,
                     );
                 }
-                let cunits = match compose::load(path) {
+                // Match `vk run --compose` so prebuild and boot resolve the same cache keys.
+                // Invalid --workspace or --state-dir values are flag errors (exit 2).
+                let builtins =
+                    match compose::Builtins::resolve(workspace.as_deref(), state_dir.as_deref()) {
+                        Ok(b) => b,
+                        Err(e) => return fail(&e, 2),
+                    };
+                let cunits = match compose::load(path, Some(&builtins)) {
                     Ok(u) => u,
                     Err(e) => return fail(&e, 1),
                 };

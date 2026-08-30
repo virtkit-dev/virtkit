@@ -27,6 +27,10 @@
 //!     depends_on: [db, redis]
 //! ```
 //!
+//! Values interpolate `$VAR`, `${VAR}` and `${VAR:-default}` from the environment over a
+//! sibling `.env` ([`load`]). Local runs also supply reserved `${VK_*}` values
+//! ([`Builtins`]), keeping host paths and ids out of committed files.
+//!
 //! Runtime config follows the compose model: the image (its config sidecar / OCI
 //! config) carries the defaults, the service entries are start-time overrides —
 //! merged by [`merged_config`] and handed to the guest at boot. Changing an
@@ -255,14 +259,177 @@ pub fn dependency_closure(units: &[Unit], root: usize) -> Vec<bool> {
     on
 }
 
+/// Reserved `${VK_*}` interpolation values for a local run.
+///
+/// They expose the workspace, state directory, running `vk`, and effective uid/gid without
+/// a generated `.env`. The GitLab executor passes `None` for untrusted job-authored compose
+/// files, making every `${VK_*}` reference an error.
+#[derive(Debug, Clone)]
+pub struct Builtins {
+    /// `${VK_WORKSPACE}` — the run's workspace root (`--workspace`, else the launch cwd)
+    pub workspace: PathBuf,
+    /// `${VK_STATE_DIR}` — the run's state directory (`--state-dir`, else per-pid launch
+    /// scratch removed when the run ends). `None` for `vk build --compose` without
+    /// `--state-dir`; referencing it then fails instead of inventing a directory.
+    pub state_dir: Option<PathBuf>,
+    /// `${VK_SELF}` — the running `vk`, for the bind that hands a guest its own copy
+    pub vk_self: PathBuf,
+    /// `${VK_UID}` — the effective host uid, for a build arg that keeps a shared tree's
+    /// ownership coherent
+    pub uid: u32,
+    /// `${VK_GID}` — the effective host gid, as `uid`
+    pub gid: u32,
+}
+
+/// Every name [`Builtins`] answers. References reserve the entire `VK_` prefix so typos do
+/// not fall through to the environment. Definitions reserve only these five names, and only
+/// when builtins are supplied (see [`load_with_env`]).
+const BUILTIN_NAMES: [&str; 5] = [
+    "VK_WORKSPACE",
+    "VK_STATE_DIR",
+    "VK_SELF",
+    "VK_UID",
+    "VK_GID",
+];
+
+impl Builtins {
+    /// Resolve the builtins for this process: `workspace` (or the cwd) and `state_dir` as
+    /// absolute paths, the running executable, and the effective uid/gid.
+    pub fn resolve(workspace: Option<&Path>, state_dir: Option<&Path>) -> Result<Self> {
+        let workspace = match workspace {
+            // Check before `parse_volume` treats a missing source as a directory share and
+            // turns a flag typo into a later mount error.
+            Some(w) if !w.is_dir() => bail!("--workspace {} is not a directory", w.display()),
+            Some(w) => absolute(w)?,
+            None => std::env::current_dir().context("resolving the workspace (the cwd)")?,
+        };
+        Ok(Self {
+            workspace,
+            state_dir: state_dir.map(absolute).transpose()?,
+            vk_self: std::env::current_exe().context("resolving this vk executable")?,
+            // SAFETY: geteuid/getegid always succeed and touch no memory.
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+        })
+    }
+
+    /// The value of one reserved name. An unknown `VK_` name is an error naming the
+    /// supported set — the prefix never falls back to the environment.
+    fn value(&self, name: &str) -> Result<String> {
+        match name {
+            "VK_WORKSPACE" => path_value(name, &self.workspace),
+            "VK_STATE_DIR" => match &self.state_dir {
+                Some(dir) => path_value(name, dir),
+                None => bail!(
+                    "compose references ${{{name}}}, but this command has no run state dir — \
+                     pass `vk build --state-dir` to name the one the boot will use"
+                ),
+            },
+            // After replacement, `current_exe` can return a `… (deleted)` path that no longer
+            // opens. Refuse it instead of binding nothing into the guest.
+            "VK_SELF" if !self.vk_self.is_file() => bail!(
+                "compose references ${{{name}}}, but {} is gone — the running vk was \
+                 replaced or removed since it started",
+                self.vk_self.display()
+            ),
+            "VK_SELF" => path_value(name, &self.vk_self),
+            "VK_UID" => Ok(self.uid.to_string()),
+            "VK_GID" => Ok(self.gid.to_string()),
+            _ => bail!(
+                "compose references ${{{name}}}, but the VK_ namespace is reserved for the \
+                 builtins ({})",
+                BUILTIN_NAMES.join(", ")
+            ),
+        }
+    }
+}
+
+/// Validate a builtin path for interpolation. The short volume syntax reparses `:` as a
+/// field separator and newlines as additional binds, so paths containing either are unsafe.
+///
+/// The splitter also trims leading and trailing whitespace, which could change the bound
+/// path. Interior whitespace survives volume parsing, but references in `command:` or
+/// `entrypoint:` strings still need shell-style quoting.
+fn path_value(name: &str, p: &Path) -> Result<String> {
+    let s = p
+        .to_str()
+        .with_context(|| format!("${{{name}}} is {} — not valid UTF-8", p.display()))?;
+    if let Some(bad) = s.chars().find(|c| *c == ':' || *c == '\n') {
+        bail!(
+            "${{{name}}} is {s:?}: a {bad:?} in it cannot survive the `host:guest[:mode]` \
+             volume syntax — give the run a path without one"
+        );
+    }
+    if s != s.trim() {
+        bail!(
+            "${{{name}}} is {s:?}: the space around it is stripped when a volume entry is \
+             split, so the bind would name a different directory — give the run a path \
+             without one"
+        );
+    }
+    Ok(s.to_string())
+}
+
+/// Resolve `p` consistently before and after it exists by canonicalizing its deepest
+/// existing ancestor and appending missing components. A missing component later created
+/// as a symlink resolves to its target once present.
+///
+/// This keeps `${VK_STATE_DIR}` identical for `vk build`, which creates nothing, and
+/// `vk run`, which creates the directory first, so prebuild cache keys match the boot.
+fn absolute(p: &Path) -> Result<PathBuf> {
+    let joined = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .with_context(|| format!("resolving {} against the cwd", p.display()))?
+            .join(p)
+    };
+    // Normalize `.` and `..` lexically before canonicalizing the existing prefix; otherwise
+    // the result depends on how much of the path exists. A `..` after a symlink therefore
+    // names the lexical parent rather than the symlink target's parent.
+    let mut head = PathBuf::new();
+    for part in joined.components() {
+        match part {
+            std::path::Component::ParentDir if head.parent().is_some() => {
+                head.pop();
+            }
+            other => head.push(other),
+        }
+    }
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(&head) {
+            Ok(mut abs) => {
+                abs.extend(missing.iter().rev());
+                return Ok(abs);
+            }
+            // Anything but "not there yet" — a denied traversal, a symlink loop, a
+            // non-directory component — is a real failure, not a path to keep trimming.
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("resolving {}", head.display()));
+            }
+            Err(_) => {
+                let Some(name) = head.file_name().map(|n| n.to_os_string()) else {
+                    // Trimmed all the way to `/` (or to a `..` above it) and it still does
+                    // not resolve: there is nothing left to strip.
+                    return Ok(head);
+                };
+                missing.push(name);
+                head.pop();
+            }
+        }
+    }
+}
+
 /// Load + map a compose file. `base` (the file's directory) anchors every relative
 /// path: build contexts, Dockerfiles, and bind-mount sources. Variable references
 /// (`$VAR`, `${VAR}`, `${VAR:-default}`) are interpolated first, docker-compose
 /// style — from the process environment layered over a sibling `.env` (the process
 /// env wins) — so machine-specific values (a repo path, a uid) stay out of the
-/// committed file.
-pub fn load(path: &Path) -> Result<Vec<Unit>> {
-    load_with_env(path, &|name| std::env::var(name).ok())
+/// committed file. `builtins` additionally answers the reserved `${VK_*}` names (see
+/// [`Builtins`]); `None` makes any reference to one an error.
+pub fn load(path: &Path, builtins: Option<&Builtins>) -> Result<Vec<Unit>> {
+    load_with_env(path, &|name| std::env::var(name).ok(), builtins)
 }
 
 /// Like `load`, but the caller supplies how a `${VAR}` name resolves against the *ambient*
@@ -270,11 +437,32 @@ pub fn load(path: &Path) -> Result<Vec<Unit>> {
 /// precedence). The GitLab executor passes a resolver restricted to job (`CUSTOM_ENV_*`)
 /// variables, so an untrusted committed compose file cannot interpolate runner-level secrets
 /// out of the executor's process environment.
-pub fn load_with_env(path: &Path, ambient: &dyn Fn(&str) -> Option<String>) -> Result<Vec<Unit>> {
+pub fn load_with_env(
+    path: &Path,
+    ambient: &dyn Fn(&str) -> Option<String>,
+    builtins: Option<&Builtins>,
+) -> Result<Vec<Unit>> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     let dotenv = load_dotenv(base)?;
+    // Reject collisions instead of silently ignoring the user's value or letting it redirect
+    // a vk-owned mount. When builtins are withheld, references already fail, so definitions
+    // remain harmless. Reserve only the five names: unrelated `VK_` variables such as
+    // `VK_DEV_CPUS` and `VK_CACHE` may legitimately appear in a sibling `.env`.
+    if builtins.is_some() {
+        for name in BUILTIN_NAMES {
+            if ambient(name).is_some() {
+                bail!("{name} is reserved for vk's own value — unset it in the environment");
+            }
+            if dotenv.iter().any(|(k, _)| k == name) {
+                bail!(
+                    "{name} is reserved for vk's own value — remove it from {}",
+                    base.join(".env").display()
+                );
+            }
+        }
+    }
     let resolve = |name: &str| {
         // ambient environment first (docker precedence), then the sibling .env. A
         // set-but-empty ambient value wins over a .env value — and, being empty, is
@@ -286,7 +474,7 @@ pub fn load_with_env(path: &Path, ambient: &dyn Fn(&str) -> Option<String>) -> R
                 .map(|(_, v)| v.clone())
         })
     };
-    parse(&raw, base, &resolve).with_context(|| format!("in {}", path.display()))
+    parse(&raw, base, &resolve, builtins).with_context(|| format!("in {}", path.display()))
 }
 
 /// Load `KEY=VALUE` pairs from a `.env` beside the compose file — docker-compose's
@@ -332,10 +520,28 @@ fn load_dotenv(dir: &Path) -> Result<Vec<(String, String)>> {
 /// `:-default` is the only supported modifier: docker's `:?`, `:+` and the
 /// colon-less `${VAR-default}` forms are rejected as a bad reference. A default is
 /// taken literally (no nested references), so `${A:-${B}}` yields `${B}` verbatim.
-fn interpolate(text: &str, resolve: &dyn Fn(&str) -> Option<String>) -> Result<String> {
+///
+/// A `VK_`-prefixed name is answered by `builtins` alone (see [`Builtins`]) — never by
+/// `resolve`, and never by a `:-default`, since a builtin is either supplied or refused.
+fn interpolate(
+    text: &str,
+    resolve: &dyn Fn(&str) -> Option<String>,
+    builtins: Option<&Builtins>,
+) -> Result<String> {
     // set-and-non-empty; treated as unset otherwise so `:-default` and the
     // unset-error path both fire on an empty value.
     let value = |name: &str| resolve(name).filter(|v| !v.is_empty());
+    // Resolve the reserved namespace before consulting the environment. Withheld builtins
+    // must fail rather than pick up a runner variable with the same name.
+    let reserved = |name: &str| -> Result<String> {
+        match builtins {
+            Some(b) => b.value(name),
+            None => bail!(
+                "compose references ${{{name}}}: the VK_ builtins are supplied only to a local \
+                 `vk run --compose` / `vk build --compose`"
+            ),
+        }
+    };
     let is_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
 
     let mut out = String::with_capacity(text.len());
@@ -380,6 +586,16 @@ fn interpolate(text: &str, resolve: &dyn Fn(&str) -> Option<String>) -> Result<S
                 if name.is_empty() {
                     bail!("empty variable reference ${{}}");
                 }
+                if name.starts_with("VK_") {
+                    if default.is_some() {
+                        bail!(
+                            "${{{name}}} is a vk builtin and takes no `:-default`: it is \
+                             either supplied or refused, so a default could never be used"
+                        );
+                    }
+                    out.push_str(&reserved(&name)?);
+                    continue;
+                }
                 match value(&name).or(default) {
                     Some(v) => out.push_str(&v),
                     None => bail!(
@@ -397,6 +613,10 @@ fn interpolate(text: &str, resolve: &dyn Fn(&str) -> Option<String>) -> Result<S
                     } else {
                         break;
                     }
+                }
+                if name.starts_with("VK_") {
+                    out.push_str(&reserved(&name)?);
+                    continue;
                 }
                 match value(&name) {
                     Some(v) => out.push_str(&v),
@@ -418,12 +638,13 @@ pub fn parse(
     yaml: &str,
     base: &Path,
     resolve: &dyn Fn(&str) -> Option<String>,
+    builtins: Option<&Builtins>,
 ) -> Result<Vec<Unit>> {
     // Interpolate on the parsed YAML *values* (never keys), then deserialize: a
     // value may expand to embedded newlines (a volume-list variable) without
     // disturbing the document structure, and `deny_unknown_fields` still runs.
     let mut doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml)?;
-    interpolate_values(&mut doc, resolve)?;
+    interpolate_values(&mut doc, resolve, builtins)?;
     let file: ComposeFile = serde_yaml_ng::from_value(doc)?;
     if file.services.is_empty() {
         bail!("no services declared");
@@ -441,18 +662,19 @@ pub fn parse(
 fn interpolate_values(
     v: &mut serde_yaml_ng::Value,
     resolve: &dyn Fn(&str) -> Option<String>,
+    builtins: Option<&Builtins>,
 ) -> Result<()> {
     use serde_yaml_ng::Value;
     match v {
-        Value::String(s) => *s = interpolate(s, resolve)?,
+        Value::String(s) => *s = interpolate(s, resolve, builtins)?,
         Value::Sequence(seq) => {
             for e in seq {
-                interpolate_values(e, resolve)?;
+                interpolate_values(e, resolve, builtins)?;
             }
         }
         Value::Mapping(m) => {
             for (_k, val) in m.iter_mut() {
-                interpolate_values(val, resolve)?;
+                interpolate_values(val, resolve, builtins)?;
             }
         }
         _ => {}
@@ -1091,7 +1313,13 @@ mod tests {
     // the call sites stay two-arg. Tests exercising `${VAR}` call `super::parse`
     // with a real resolver.
     fn parse(yaml: &str, base: &Path) -> Result<Vec<Unit>> {
-        super::parse(yaml, base, &|_| None)
+        super::parse(yaml, base, &|_| None, None)
+    }
+
+    // As `parse`: the builtin-less form, so only the tests that exercise `${VK_*}` name
+    // a `Builtins`.
+    fn interpolate(text: &str, resolve: &dyn Fn(&str) -> Option<String>) -> Result<String> {
+        super::interpolate(text, resolve, None)
     }
 
     fn one(yaml: &str) -> Unit {
@@ -1610,6 +1838,7 @@ mod tests {
             "services:\n  s:\n    image: x\n    x-virtkit:\n      cpus: ${N}\n      mem: ${M}\n",
             Path::new("/b"),
             &vars(&[("N", "6"), ("M", "3G")]),
+            None,
         )
         .unwrap()
         .pop()
@@ -1646,6 +1875,7 @@ mod tests {
                 "services:\n  s:\n    image: x\n    x-virtkit:\n      nested: ${N}\n",
                 Path::new("/b"),
                 &vars(&[("N", value)]),
+                None,
             )
             .unwrap()
             .pop()
@@ -1758,6 +1988,135 @@ mod tests {
         assert_eq!(interpolate("${A:-${B}}", &r).unwrap(), "${B}");
     }
 
+    // Use the existing test binary because `${VK_SELF}` refuses missing files.
+    fn builtins(workspace: &str, state_dir: Option<&str>) -> Builtins {
+        Builtins {
+            workspace: PathBuf::from(workspace),
+            state_dir: state_dir.map(PathBuf::from),
+            vk_self: std::env::current_exe().unwrap(),
+            uid: 1000,
+            gid: 1001,
+        }
+    }
+
+    #[test]
+    fn builtins_answer_the_reserved_names() {
+        let b = builtins("/repo", Some("/state/repo"));
+        let r = vars(&[]);
+        let go = |t: &str| super::interpolate(t, &r, Some(&b)).unwrap();
+        assert_eq!(go("${VK_WORKSPACE}:/workdir"), "/repo:/workdir");
+        assert_eq!(go("$VK_STATE_DIR/vscode"), "/state/repo/vscode");
+        let me = b.vk_self.to_str().unwrap();
+        assert_eq!(
+            go("${VK_SELF}:/usr/local/bin/vk:ro"),
+            format!("{me}:/usr/local/bin/vk:ro")
+        );
+        assert_eq!(go("${VK_UID}:${VK_GID}"), "1000:1001");
+    }
+
+    #[test]
+    fn a_vk_that_is_no_longer_there_is_refused() {
+        // A self-update can leave `current_exe` pointing at a path that no longer opens.
+        let mut b = builtins("/repo", None);
+        b.vk_self = PathBuf::from("/nonexistent/vk (deleted)");
+        let err = super::interpolate("${VK_SELF}", &vars(&[]), Some(&b))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("was replaced or removed"), "{err}");
+    }
+
+    #[test]
+    fn the_vk_namespace_never_falls_back_to_the_environment() {
+        // Withheld builtins never fall through to a resolver that could expose runner paths.
+        let r = vars(&[("VK_WORKSPACE", "/runner/secrets")]);
+        assert!(super::interpolate("${VK_WORKSPACE}", &r, None).is_err());
+        assert!(super::interpolate("$VK_WORKSPACE", &r, None).is_err());
+        // Supplied: the builtin wins over the same name in the environment.
+        let b = builtins("/repo", None);
+        assert_eq!(
+            super::interpolate("${VK_WORKSPACE}", &r, Some(&b)).unwrap(),
+            "/repo"
+        );
+        // Only an exact `VK_` prefix is reserved; the lowercase spelling is an ordinary
+        // variable and still comes from the resolver.
+        let lower = vars(&[("vk_workspace", "/elsewhere")]);
+        assert_eq!(
+            super::interpolate("${vk_workspace}", &lower, Some(&b)).unwrap(),
+            "/elsewhere"
+        );
+    }
+
+    #[test]
+    fn a_builtin_takes_no_default() {
+        // A builtin is supplied or rejected, so a default can never apply.
+        let b = builtins("/repo", Some("/state"));
+        let r = vars(&[]);
+        for text in ["${VK_WORKSPACE:-/fallback}", "${VK_STATE_DIR:-/tmp/x}"] {
+            let err = super::interpolate(text, &r, Some(&b))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("takes no `:-default`"), "{text}: {err}");
+        }
+        // The colon-less form is a bad reference wherever it appears, builtin or not.
+        assert!(super::interpolate("${VK_WORKSPACE-/x}", &r, Some(&b)).is_err());
+    }
+
+    #[test]
+    fn the_reserved_prefix_survives_the_lexer_edges() {
+        let b = builtins("/repo", Some("/state"));
+        let r = vars(&[]);
+        let go = |t: &str| super::interpolate(t, &r, Some(&b));
+        // `$$` escapes before any name is read, so this is a literal, not a reference.
+        assert_eq!(go("$$VK_WORKSPACE").unwrap(), "$VK_WORKSPACE");
+        // Unbraced numeric builtins, and one immediately followed by a non-name character.
+        assert_eq!(go("$VK_UID:$VK_GID").unwrap(), "1000:1001");
+        // A bare prefix is an unknown reserved name, not an empty reference.
+        assert!(go("${VK_}").is_err());
+        assert!(go("${}").is_err());
+        assert!(go("${VK_WORKSPACE").is_err());
+    }
+
+    #[test]
+    fn an_unknown_reserved_name_is_reported_against_the_builtins() {
+        let b = builtins("/repo", Some("/state"));
+        let err = super::interpolate("${VK_WORKSPCE}", &vars(&[]), Some(&b))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("VK_WORKSPACE"),
+            "should list the builtins: {err}"
+        );
+    }
+
+    #[test]
+    fn a_builtin_path_that_breaks_the_volume_syntax_is_refused() {
+        // Volume parsing treats a colon as a field separator and a newline as another bind.
+        let r = vars(&[]);
+        for bad in ["/re:po", "/re\npo", " /repo", "/repo "] {
+            let b = builtins(bad, None);
+            assert!(
+                super::interpolate("${VK_WORKSPACE}:/workdir", &r, Some(&b)).is_err(),
+                "{bad:?} should be refused"
+            );
+        }
+        // Interior whitespace survives a volume entry intact, so it stays allowed.
+        let b = builtins("/re po", None);
+        assert_eq!(
+            super::interpolate("${VK_WORKSPACE}:/workdir", &r, Some(&b)).unwrap(),
+            "/re po:/workdir"
+        );
+    }
+
+    #[test]
+    fn a_state_dir_reference_needs_a_run_to_have_one() {
+        // A prebuild without --state-dir must not invent a path that differs from the boot.
+        let b = builtins("/repo", None);
+        let err = super::interpolate("${VK_STATE_DIR}", &vars(&[]), Some(&b))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--state-dir"), "should name the flag: {err}");
+    }
+
     // Removes its directory on drop, so a panicking assertion cannot leak it.
     struct TmpDir(PathBuf);
     impl Drop for TmpDir {
@@ -1800,6 +2159,7 @@ mod tests {
              \x20   environment:\n      PORT: ${PORT}\n    command: redis-server --port ${PORT}\n",
             Path::new("/base"),
             &r,
+            None,
         )
         .unwrap()
         .pop()
@@ -1817,7 +2177,7 @@ mod tests {
                     \x20     - ${WABDIR}:/workdir\n      - ${EXTRA:-}\n";
         // EXTRA expands to two newline-separated specs → one entry becomes two binds.
         let r = vars(&[("WABDIR", "/repo"), ("EXTRA", "/a:/x\n/b:/y:ro")]);
-        let u = super::parse(yaml, Path::new("/base"), &r)
+        let u = super::parse(yaml, Path::new("/base"), &r, None)
             .unwrap()
             .pop()
             .unwrap();
@@ -1829,7 +2189,7 @@ mod tests {
 
         // an unset list variable (via :-) contributes zero binds, not an error.
         let r2 = vars(&[("WABDIR", "/repo")]);
-        let u2 = super::parse(yaml, Path::new("/base"), &r2)
+        let u2 = super::parse(yaml, Path::new("/base"), &r2, None)
             .unwrap()
             .pop()
             .unwrap();
@@ -1852,7 +2212,7 @@ mod tests {
         std::fs::write(dir.join(".env"), "FROM_DOTENV=v1\nAMBIENT=dotenv-loses\n").unwrap();
 
         let ambient = |name: &str| (name == "AMBIENT").then(|| "reg".to_string());
-        let units = load_with_env(&dir.join("compose.yml"), &ambient).unwrap();
+        let units = load_with_env(&dir.join("compose.yml"), &ambient, None).unwrap();
         match &units[0].source {
             // AMBIENT came from the resolver (winning over .env), FROM_DOTENV from .env.
             Source::Image(img) => assert_eq!(img, "reg/img:v1"),
@@ -1866,8 +2226,81 @@ mod tests {
             "services:\n  app:\n    image: img:${PATH}\n",
         )
         .unwrap();
-        assert!(load_with_env(&dir.join("compose.yml"), &|_| None).is_err());
+        assert!(load_with_env(&dir.join("compose.yml"), &|_| None, None).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reserved_name_defined_outside_is_refused() {
+        let dir = std::env::temp_dir().join(format!("vk-reserved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = TmpDir(dir.clone());
+        let file = dir.join("compose.yml");
+        std::fs::write(
+            &file,
+            "services:\n  app:\n    image: x\n    volumes:\n      - ${VK_WORKSPACE}:/workdir\n",
+        )
+        .unwrap();
+        let b = builtins("/repo", None);
+
+        // Baseline: the builtin alone resolves the file.
+        let units = load_with_env(&file, &|_| None, Some(&b)).unwrap();
+        assert_eq!(units[0].volumes[0].host, Path::new("/repo"));
+
+        // Where the builtins are supplied, defining the same name outside is a hard error
+        // rather than one of the two values silently winning: from the environment …
+        let ambient = |name: &str| (name == "VK_WORKSPACE").then(|| "/elsewhere".to_string());
+        assert!(load_with_env(&file, &ambient, Some(&b)).is_err());
+
+        // … and from the sibling .env.
+        std::fs::write(dir.join(".env"), "VK_STATE_DIR=/elsewhere\n").unwrap();
+        let err = load_with_env(&file, &|_| None, Some(&b))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(".env"),
+            "should name where it came from: {err}"
+        );
+
+        // Withheld builtins cannot collide, so an unused definition remains valid.
+        let plain = dir.join("plain.yml");
+        std::fs::write(&plain, "services:\n  app:\n    image: x\n").unwrap();
+        assert!(load_with_env(&plain, &ambient, None).is_ok());
+
+        // Definitions reserve only builtin names, not the entire `VK_` prefix.
+        std::fs::write(dir.join(".env"), "VK_DEV_CPUS=4\n").unwrap();
+        assert!(load_with_env(&plain, &|_| None, Some(&b)).is_ok());
+    }
+
+    #[test]
+    fn resolve_rejects_a_workspace_that_is_not_a_directory() {
+        let err = Builtins::resolve(Some(Path::new("/nonexistent/tree")), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a directory"), "{err}");
+    }
+
+    #[test]
+    fn a_path_resolves_the_same_before_and_after_it_exists() {
+        // Build resolves the path before creation and run after creation; both must produce
+        // the same cache key.
+        let dir = std::env::temp_dir().join(format!("vk-absolute-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = TmpDir(dir.clone());
+
+        let target = dir.join("state");
+        let before = super::absolute(&target).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let after = super::absolute(&target).unwrap();
+        assert_eq!(before, after);
+
+        // Lexical noise also normalizes consistently before and after creation.
+        let noisy = dir.join("./sub/../state");
+        assert_eq!(super::absolute(&noisy).unwrap(), after);
+        std::fs::remove_dir(&target).unwrap();
+        assert_eq!(super::absolute(&noisy).unwrap(), after);
     }
 }

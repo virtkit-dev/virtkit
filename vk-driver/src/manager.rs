@@ -428,7 +428,7 @@ mod tests {
     /// would leave them: each addressed, neither built.
     fn manager_over_two_units() -> Manager {
         let compose = "services:\n  db:\n    build: ./db\n  cache:\n    image: redis:7\n";
-        let units = crate::compose::parse(compose, Path::new("/proj"), &|_| None).unwrap();
+        let units = crate::compose::parse(compose, Path::new("/proj"), &|_| None, None).unwrap();
         let gw: Ipv4Addr = "192.168.127.1".parse().unwrap();
         let provisioned: Vec<_> = units
             .iter()

@@ -6,6 +6,13 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- Compose files can use `${VK_WORKSPACE}`, `${VK_STATE_DIR}`, `${VK_SELF}` (the running
+  `vk`), `${VK_UID}` and `${VK_GID}` without a generated `.env`. These reserved values
+  come from the local `vk run` or `vk build`; environment and `.env` definitions are
+  rejected, and CI job compose files cannot access them.
+- `vk run --workspace DIR` and `vk build --workspace` / `--state-dir` with `--compose`
+  select the workspace and state directory. Runs need not start in the project directory,
+  and prebuilds resolve the same paths as the boot they prepare.
 - `vk stop` accepts the pid `vk list` prints or a launch directory, so a VM can be
   selected directly when several share a launch directory or the caller is elsewhere.
   An argument that is only digits is read as a pid, so a directory named that way now

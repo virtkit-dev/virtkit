@@ -797,9 +797,12 @@ fn load_compose_fleet(ctx: &JobCtx, spec: &str) -> Result<ComposeFleet> {
     // The compose file is job-authored (untrusted): interpolate only the job's own
     // `CUSTOM_ENV_*` variables (plus the committed `.env`), never the executor's ambient
     // process environment, so it cannot pull runner-level secrets into an image or sibling.
-    let mut units = crate::compose::load_with_env(&file, &|name| {
-        std::env::var(format!("CUSTOM_ENV_{name}")).ok()
-    })?;
+    // Withhold `${VK_*}` too because it exposes runner paths and ids.
+    let mut units = crate::compose::load_with_env(
+        &file,
+        &|name| std::env::var(format!("CUSTOM_ENV_{name}")).ok(),
+        None,
+    )?;
     let primary = units
         .iter()
         .position(|u| u.name == primary_name)
@@ -2658,6 +2661,7 @@ mod tests {
                 &format!("services:\n  db:\n    image: x\n{marker}"),
                 std::path::Path::new("/b"),
                 &|_| None,
+                None,
             )
             .unwrap()
             .pop()
@@ -2696,6 +2700,7 @@ mod tests {
                 &format!("services:\n  db:\n    image: x\n{marker}"),
                 std::path::Path::new("/b"),
                 &|_| None,
+                None,
             )
             .unwrap()
             .pop()
