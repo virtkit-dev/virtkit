@@ -23,6 +23,12 @@ All notable changes to virtkit will be documented in this file.
 - An optional bind mount such as `${HOME}/.gitconfig:/root/.gitconfig:ro,optional`
   (also supported by `vk run -v`) is skipped when its source does not exist. Sources vk
   cannot examine and dangling symlinks still fail the boot.
+- `vk run --ssh-client` creates a ready-to-use key, `ssh-config`, and `ssh` shim in the
+  run's state directory. Connect with `vk ssh <state-dir>`, with
+  `ssh -F <state-dir>/ssh-config <alias>`, or by putting
+  `<state-dir>/bin` first on PATH for a program that spawns bare `ssh` (VS Code's
+  Remote-SSH, Emacs's TRAMP); `vk ssh-config <state-dir>` prints the stanza. `--ssh-alias`
+  names the host, and a state directory the guest could write is refused.
 
 ### Fixed
 

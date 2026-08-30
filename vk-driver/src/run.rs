@@ -281,6 +281,11 @@ pub struct RunArgs {
     /// user `ssh` sessions log in as (root unless the image has better — a dev
     /// image's unprivileged user keeps shared-tree ownership coherent)
     pub ssh_user: String,
+    /// write the managed SSH client setup (key, config, `bin/ssh` shim) into the state
+    /// dir and authorise its key; implies `ssh` and requires `state_dir`
+    pub ssh_client: bool,
+    /// the `Host` alias the `ssh_client` config declares
+    pub ssh_alias: String,
     /// pin the run's scratch dir (sockets, console log) to a stable path instead
     /// of a fresh temp dir, so external tooling can attach to the running VM; the
     /// directory is reused across runs and never removed
@@ -1277,11 +1282,22 @@ async fn build_and_boot(
     // sessions run as --ssh-user (default root — the only user every image is
     // guaranteed to have).
     if args.ssh {
-        let keys = if args.ssh_keys.is_empty() {
+        // --ssh-client authorises only its managed key by default; loading ~/.ssh as well
+        // would grant more identities than requested. Explicit --ssh-key values still apply.
+        let mut keys = if args.ssh_keys.is_empty() && !args.ssh_client {
             default_ssh_pubkeys()?
         } else {
             args.ssh_keys.clone()
         };
+        if args.ssh_client {
+            keys.push(provision_ssh_client(
+                args,
+                work,
+                &vsock,
+                &compose_units,
+                &primary_volumes,
+            )?);
+        }
         cmdline.push_str(&format!(
             " VIRTKIT_SSH=1 VIRTKIT_SSH_KEYS={} VIRTKIT_SSH_USER={}",
             encode_ssh_keys(&keys)?,
@@ -1833,7 +1849,19 @@ async fn build_and_boot(
     // the hostname after `user@` is only a known_hosts label. The host key is
     // ephemeral (fresh per boot, reached over a private channel), hence the
     // relaxed checking options.
-    if args.ssh {
+    if args.ssh_client {
+        // The managed config replaces the standalone command printed for plain --ssh.
+        // Provisioning resolved this state dir before boot. If it has since disappeared,
+        // preserve the running VM and print the expected path.
+        let config = crate::sshclient::Managed::new(work)
+            .map_or_else(|_| work.join(crate::sshclient::CONFIG), |m| m.config());
+        println!(
+            "virtkit: ssh: vk ssh {} — or ssh -F {} {}",
+            work.display(),
+            config.display(),
+            args.ssh_alias
+        );
+    } else if args.ssh {
         // vsock-auto: the ProxyCommand picks the best path itself — the per-port
         // listener when the backend has one, else the CONNECT handshake.
         let target = format!("vsock-auto://{}:{SSH_VSOCK_PORT}", vsock.display());
@@ -2821,6 +2849,41 @@ fn status_poll_period(inactivity_timeout_secs: Option<u64>) -> Duration {
         inactivity_timeout_secs
             .filter(|secs| *secs > 0)
             .map_or(60, |secs| secs.min(10)),
+    )
+}
+
+/// Write the managed SSH client setup and return its public key.
+///
+/// An explicit `--state-dir` keeps the key and config addressable across runs.
+fn provision_ssh_client(
+    args: &RunArgs,
+    work: &Path,
+    vsock: &Path,
+    compose_units: &[crate::compose::Unit],
+    primary_volumes: &[crate::compose::Volume],
+) -> Result<String> {
+    if args.state_dir.is_none() {
+        bail!(
+            "--ssh-client needs --state-dir: its key, config and ssh shim live there and \
+             are meant to outlast the run"
+        );
+    }
+    crate::sshclient::check_state_dir_is_host_only(
+        work,
+        // A writable share from any service can compromise the host artifacts.
+        primary_volumes
+            .iter()
+            .chain(&args.volumes)
+            .chain(compose_units.iter().flat_map(|u| &u.volumes)),
+        // `--workdir` is a separate, always-writable share.
+        args.workdir.as_deref().map(|d| (d, WORKDIR_MOUNT)),
+    )?;
+    let managed = crate::sshclient::Managed::new(work)?;
+    managed.provision(
+        &args.ssh_alias,
+        &args.ssh_user,
+        &format!("vsock-auto://{}:{SSH_VSOCK_PORT}", vsock.display()),
+        std::env::var_os("PATH").as_deref(),
     )
 }
 
@@ -3935,6 +3998,8 @@ mod tests {
             ssh: false,
             ssh_keys: vec![],
             ssh_user: String::new(),
+            ssh_client: false,
+            ssh_alias: String::new(),
             state_dir: None,
             workspace: None,
             volumes: vec![],

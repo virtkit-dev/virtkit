@@ -66,6 +66,7 @@ mod sites;
 mod source;
 mod spawn;
 mod sshagent;
+mod sshclient;
 mod sshconf;
 mod switch;
 mod timing;
@@ -158,6 +159,13 @@ fn parse_named_cpus(s: &str) -> Result<(String, u32), String> {
         .filter(|n| *n > 0)
         .ok_or_else(|| format!("expected a positive vCPU count, got {n:?}"))?;
     Ok((name.to_string(), n))
+}
+
+/// Parse `--ssh-alias` before the image build starts.
+fn parse_ssh_alias(s: &str) -> Result<String, String> {
+    sshclient::validate_alias(s)
+        .map(|()| s.to_string())
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// clap value parser for `--service-mem` / `--stage-mem NAME=SIZE` (`<n>G`, `<n>M` or a
@@ -701,6 +709,34 @@ enum Cmd {
         /// Target each accepted connection is spliced to
         #[arg(long)]
         to: SocketAddr,
+    },
+    /// SSH into a VM booted with `run --ssh-client`
+    ///
+    /// Runs the system ssh against the client setup in the VM's state dir — that run's
+    /// config, key and alias — so none of your own identities are involved and there is
+    /// nothing to configure. Arguments after the directory reach ssh as given:
+    /// `vk ssh DIR -- uname -a`.
+    Ssh {
+        /// the run's state dir (`run --state-dir`)
+        #[arg(value_name = "DIR")]
+        state_dir: PathBuf,
+        /// arguments passed to ssh verbatim, after the host
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARG"
+        )]
+        args: Vec<String>,
+    },
+    /// Print the ssh_config stanza of a VM booted with `run --ssh-client`
+    ///
+    /// The file `vk ssh` itself uses — read it to point another tool at the VM: `ssh -F`,
+    /// an `Include` in your own config, Emacs TRAMP.
+    #[command(name = "ssh-config")]
+    SshConfig {
+        /// the run's state dir (`run --state-dir`)
+        #[arg(value_name = "DIR")]
+        state_dir: PathBuf,
     },
     /// plumbing: splice stdio to the target address — the SSH `ProxyCommand` shape
     ///
@@ -1271,6 +1307,28 @@ enum Cmd {
         /// Implies --ssh. Default: your standard ~/.ssh/id_*.pub keys.
         #[arg(long = "ssh-key", value_name = "PUBKEY", help_heading = "SSH")]
         ssh_key: Vec<String>,
+        /// Write a ready-to-use SSH client setup into the state dir
+        ///
+        /// Implies --ssh and needs --state-dir. Generates a keypair of its own (reused on
+        /// later boots, so nothing else is authorised by default), and writes `ssh-config`
+        /// plus a `bin/ssh` shim beside it: connect with `vk ssh <state-dir>`, `ssh -F
+        /// <state-dir>/ssh-config <alias>`, or by putting `<state-dir>/bin` first on PATH
+        /// for a program that spawns bare `ssh` (VS Code Remote-SSH, Emacs TRAMP).
+        #[arg(long = "ssh-client", requires = "state_dir", help_heading = "SSH")]
+        ssh_client: bool,
+        /// Host alias the --ssh-client config declares
+        ///
+        /// The name to `ssh` to, and the label in known_hosts terms. Letters, digits, '.',
+        /// '_' and '-' only — it is an ssh_config `Host` pattern.
+        #[arg(
+            long = "ssh-alias",
+            value_name = "ALIAS",
+            default_value = "vk-run",
+            requires = "ssh_client",
+            value_parser = parse_ssh_alias,
+            help_heading = "SSH"
+        )]
+        ssh_alias: String,
         /// user --ssh sessions log in as
         ///
         /// root is the only user every image is guaranteed to have, but a dev image's
@@ -2320,6 +2378,8 @@ async fn cli_main() -> ExitCode {
         ssh_host,
         ssh,
         ssh_key,
+        ssh_client,
+        ssh_alias,
         ssh_user,
         state_dir,
         workspace,
@@ -2500,8 +2560,10 @@ async fn cli_main() -> ExitCode {
             build_net: bnet,
             ssh_agent: *ssh_agent,
             ssh_hosts: ssh_host.clone(),
-            ssh: *ssh || !ssh_key.is_empty(),
+            ssh: *ssh || *ssh_client || !ssh_key.is_empty(),
             ssh_keys: ssh_key.clone(),
+            ssh_client: *ssh_client,
+            ssh_alias: ssh_alias.clone(),
             ssh_user: ssh_user.clone(),
             state_dir: state_dir.clone(),
             workspace: workspace.clone(),
@@ -3396,6 +3458,15 @@ async fn cli_main() -> ExitCode {
                     read_recording(&path, None, ReadAs::of(summary, json, view, follow, false))
                 }
             },
+        },
+        // Replace vk so the SSH session's exit status reaches the caller.
+        Cmd::Ssh { state_dir, args } => match sshclient::exec_ssh(&state_dir, &args) {
+            Ok(never) => match never {},
+            Err(e) => fail(&e, 1),
+        },
+        Cmd::SshConfig { state_dir } => match sshclient::print_config(&state_dir) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
         },
         // stdio↔socket splice for an SSH ProxyCommand; returns when either side closes.
         Cmd::Connect { addr } => match vk_core::forward::run_connect(&addr).await {
@@ -4361,8 +4432,20 @@ mod tests {
         assert_eq!(
             sorted,
             [
-                "atop", "build", "check", "exec", "export", "gc", "list", "publish", "run",
-                "status", "stop", "update"
+                "atop",
+                "build",
+                "check",
+                "exec",
+                "export",
+                "gc",
+                "list",
+                "publish",
+                "run",
+                "ssh",
+                "ssh-config",
+                "status",
+                "stop",
+                "update"
             ]
         );
     }
