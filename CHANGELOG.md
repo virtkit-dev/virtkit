@@ -56,6 +56,9 @@ All notable changes to virtkit will be documented in this file.
   alone — and `[build] ionice` the I/O part, which only bites where the host's block
   scheduler honours a priority (BFQ, mq-deadline); `nice = 0` with `ionice = "none"` is the
   old behaviour exactly. A `vk run` guest and a CI job's VM stay at full priority.
+- A `--ssh` run reports ready only after its SSH server accepts connections, so clients can
+  connect as soon as `vk run --detach` returns. If SSH never starts, the boot fails with the
+  guest's console log instead of leaving an unreachable VM.
 
 ## [0.45.0] - 2026-08-30
 

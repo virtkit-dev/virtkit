@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 use vk_core::addr::SocketAddr;
 
@@ -1907,9 +1908,14 @@ async fn build_and_boot(
 
     let (cmd_entrypoint, fallback_argv) =
         exec_channel_argv(eff_init, &image_entrypoint, primary.as_ref());
+    // Include the SSH server in the readiness check when it is requested.
+    let ssh_probe = args
+        .ssh
+        .then(|| crate::vmm::exec_addr(&vsock, SSH_VSOCK_PORT));
     let result = drive(
         &mut ch,
         &addr,
+        ssh_probe.as_ref(),
         &console,
         args,
         ssh_config.as_deref(),
@@ -2818,10 +2824,66 @@ fn status_poll_period(inactivity_timeout_secs: Option<u64>) -> Duration {
     )
 }
 
+/// Limit one probe, including its dial, so a silent peer cannot block the boot deadline.
+const SSH_PROBE_BUDGET: Duration = Duration::from_secs(2);
+
+/// Wait for the guest SSH server's identification string. RFC 4253 §4.2 requires the
+/// server to send it first, so `SSH-` proves the port is serving SSH where a successful
+/// connection alone would not. The probe opens a fresh connection directly and drops it
+/// without authentication.
+async fn wait_ssh_serving(
+    ch: &mut Child,
+    addr: &SocketAddr,
+    console: &Path,
+    deadline: Instant,
+    boot_timeout_secs: u64,
+) -> Result<()> {
+    loop {
+        // An exited VMM is a boot failure, not a slow listener.
+        if let Some(status) = ch.try_wait()? {
+            bail!("{}", boot_failure(console, status));
+        }
+        let last = match ssh_greets(addr, SSH_PROBE_BUDGET).await {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        if Instant::now() >= deadline {
+            bail!(
+                "the guest agent is up but its SSH server never started accepting after \
+                 {boot_timeout_secs}s: {last:#}\n{}",
+                tail(console, 20)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Dial the guest's SSH port and read the identification prefix. The timeout includes
+/// `raw_connect` because its mux handshake waits for the VMM's status line; a stalled VMM
+/// must not prevent the caller from reaching its deadline.
+async fn ssh_greets(addr: &SocketAddr, budget: Duration) -> Result<()> {
+    tokio::time::timeout(budget, async {
+        let mut conn = vk_core::net::raw_connect(addr).await?;
+        let mut banner = [0u8; 4];
+        conn.read_exact(&mut banner)
+            .await
+            .with_context(|| format!("reading the SSH greeting from {addr}"))?;
+        ensure!(
+            &banner == b"SSH-",
+            "the port answered \"{}\", which is not an SSH server",
+            banner.escape_ascii()
+        );
+        Ok(())
+    })
+    .await
+    .map_err(|_| anyhow!("no identification string within {budget:?}"))?
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive(
     ch: &mut Child,
     addr: &SocketAddr,
+    ssh_probe: Option<&SocketAddr>,
     console: &Path,
     args: &RunArgs,
     ssh_config: Option<&str>,
@@ -2848,6 +2910,11 @@ async fn drive(
             );
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // The agent reports ready before ssh-serve binds. Wait for SSH so readiness covers every
+    // service requested by this run.
+    if let Some(ssh) = ssh_probe {
+        wait_ssh_serving(ch, ssh, console, deadline, args.boot_timeout_secs).await?;
     }
     timings.record(Phase::Boot, "", t_boot.elapsed());
     if let Some(cfg) = ssh_config {
@@ -3918,6 +3985,119 @@ mod tests {
         carried(o.cache_registry.as_deref(), o.cache_insecure, &o.cache_auth);
         let o = service_build_options(&args, kernel, agent);
         carried(o.cache_registry.as_deref(), o.cache_insecure, &o.cache_auth);
+    }
+
+    // Exercise the real raw_connect path through a Unix socket. `serve` controls split
+    // writes, while an empty `serve` and long `hold` model a silent peer.
+    async fn probe_against(
+        name: &str,
+        serve: &'static [&'static [u8]],
+        hold: Duration,
+        budget: Duration,
+    ) -> Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("vk-sshprobe-{}-{name}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let accept = tokio::spawn(async move {
+            if let Ok((mut conn, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                for (i, chunk) in serve.iter().enumerate() {
+                    // Let split writes verify that the probe waits for all four bytes.
+                    if i > 0 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    let _ = conn.write_all(chunk).await;
+                }
+                // Keep the connection open so failure cannot come from EOF.
+                tokio::time::sleep(hold).await;
+            }
+        });
+        let result = ssh_greets(&SocketAddr::Unix(path.clone()), budget).await;
+        accept.abort();
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    #[tokio::test]
+    async fn the_ssh_probe_accepts_only_a_real_server_greeting() {
+        let hold = Duration::from_millis(300);
+        let budget = Duration::from_secs(2);
+        assert!(
+            probe_against("greeting", &[b"SSH-2.0-virtkit\r\n"], hold, budget)
+                .await
+                .is_ok()
+        );
+        assert!(
+            probe_against("split", &[b"SS", b"H-2.0-virtkit\r\n"], hold, budget)
+                .await
+                .is_ok()
+        );
+        let err = probe_against("http", &[b"HTTP/1.1 400\r\n"], hold, budget)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("answered \"HTTP\""), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn the_ssh_probe_gives_up_on_a_port_that_accepts_and_says_nothing() {
+        // A successful dial must not mark a silent peer ready.
+        let err = probe_against(
+            "silent",
+            &[],
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no identification string"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_ssh_probe_fails_when_nothing_listens() {
+        let path =
+            std::env::temp_dir().join(format!("vk-sshprobe-none-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            ssh_greets(&SocketAddr::Unix(path), Duration::from_secs(2))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_ssh_wait_reports_the_boot_failure_and_the_deadline() {
+        let console = std::env::temp_dir().join(format!("vk-sshwait-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&console);
+        let dead = std::env::temp_dir().join(format!("vk-sshwait-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&dead);
+        let addr = SocketAddr::Unix(dead);
+
+        // Report an exited VMM as a boot failure rather than waiting.
+        let mut gone = Command::new("true").spawn().unwrap();
+        gone.wait().unwrap();
+        let err = wait_ssh_serving(&mut gone, &addr, &console, Instant::now(), 120)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("exited during boot"),
+            "a dead VMM is the boot failing, not a slow listener: {err:#}"
+        );
+
+        // Report the configured deadline when a live VMM never serves SSH.
+        let mut alive = Command::new("sleep").arg("60").spawn().unwrap();
+        let waited = wait_ssh_serving(&mut alive, &addr, &console, Instant::now(), 120).await;
+        // Reap before asserting so failure does not leak the child.
+        let _ = alive.kill();
+        let _ = alive.wait();
+        let err = waited.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("never started accepting after 120s"),
+            "{err:#}"
+        );
     }
 
     #[test]
