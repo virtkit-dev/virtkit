@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-08-30
+
 ### Added
 
 - A host configured against a vk-registry now pulls job images through it by default. A
@@ -2134,7 +2136,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.44.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.45.0...HEAD
+[0.45.0]: https://github.com/virtkit-dev/virtkit/compare/v0.44.0...v0.45.0
 [0.44.0]: https://github.com/virtkit-dev/virtkit/compare/v0.43.0...v0.44.0
 [0.43.0]: https://github.com/virtkit-dev/virtkit/compare/v0.42.0...v0.43.0
 [0.42.0]: https://github.com/virtkit-dev/virtkit/compare/v0.41.0...v0.42.0
