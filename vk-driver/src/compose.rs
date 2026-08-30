@@ -6,10 +6,10 @@
 //! a vk extension merging the files into one stage namespace), target, args,
 //! additional_contexts (directories only)}`,
 //! `environment` (with `env_file` read under it), `command`, `entrypoint`, `user`,
-//! `hostname`, `depends_on` (start-ordering only), `volumes` (bind mounts) and
-//! `profiles` (a profiled service stays down at start-up unless activated or depended
-//! on). **Any other key is a hard error** — silently ignoring a compose key would
-//! silently change behavior.
+//! `hostname`, `depends_on` (start-ordering only), `volumes` (bind mounts; `,optional`
+//! skips an absent source) and `profiles` (a profiled service stays down at start-up
+//! unless activated or depended on). **Any other key is a hard error** — silently
+//! ignoring a compose key would silently change behavior.
 //!
 //! ```yaml
 //! services:
@@ -107,8 +107,8 @@ pub enum Source {
     },
 }
 
-/// A bind mount (`host:guest[:ro|:rw|:overlay|:disk[,size=SIZE]]`); named volumes are not
-/// supported.
+/// A bind mount (`host:guest[:(ro|rw|overlay)[,optional]|:disk[,size=SIZE]]`).
+/// Named volumes are not supported.
 #[derive(Debug, Clone)]
 pub struct Volume {
     pub host: PathBuf,
@@ -761,17 +761,15 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
         (Some(_), Some(_)) => bail!("give either image: or build:, not both"),
         (None, None) => bail!("needs image: or build:"),
     };
-    // Each entry may hold several specs separated by newlines: interpolation can
-    // expand one `${LIST}` entry into N binds (an empty/whitespace value → none),
-    // so a host-built volume list — including conditional mounts — is injected
-    // through a single variable.
+    // Interpolation can expand one `${LIST}` entry into several newline-separated binds;
+    // empty lines disappear. An `optional` bind with an absent source returns `None`.
     let volumes = svc
         .volumes
         .iter()
         .flat_map(|entry| entry.lines())
         .map(str::trim)
         .filter(|spec| !spec.is_empty())
-        .map(|spec| parse_volume(spec, base))
+        .filter_map(|spec| parse_volume(spec, base).transpose())
         .collect::<Result<_>>()?;
     let depends_on = match svc.depends_on {
         Some(d) => {
@@ -901,16 +899,19 @@ fn map_build(build: serde_yaml_ng::Value, base: &Path) -> Result<Source> {
     })
 }
 
-/// A bind-mount `host:guest[:ro|rw|overlay|disk[,size=SIZE]]`. A source that is not a path (a
-/// compose named volume) is rejected — there is no volume manager here. Public: `run -v/--volume`
-/// parses the same syntax, anchored at the caller's cwd instead of the compose
-/// file's directory.
-pub fn parse_volume(spec: &str, base: &Path) -> Result<Volume> {
+/// Parse a bind mount: `host:guest[:(ro|rw|overlay)[,optional]|:disk[,size=SIZE]]`.
+/// Named volumes are rejected because vk has no volume manager. `Ok(None)` means an
+/// `optional` bind's source is absent. `run -v/--volume` uses the same syntax, resolved
+/// from the caller's cwd rather than the compose file's directory.
+pub fn parse_volume(spec: &str, base: &Path) -> Result<Option<Volume>> {
     let parts: Vec<&str> = spec.split(':').collect();
     let (host, guest, mode_field) = match parts.as_slice() {
         [h, g] => (*h, *g, "rw"),
         [h, g, m] => (*h, *g, *m),
-        _ => bail!("bad volume {spec:?} (want host:guest[:ro|:rw|:overlay|:disk[,size=SIZE]])"),
+        _ => bail!(
+            "bad volume {spec:?} \
+             (want host:guest[:(ro|rw|overlay)[,optional]|:disk[,size=SIZE]])"
+        ),
     };
     if !(host.starts_with('/') || host.starts_with('.') || host.starts_with('~')) {
         bail!("volume {spec:?}: named volumes are not supported (bind-mount a path)");
@@ -931,44 +932,75 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Volume> {
         "overlay" => (true, true, false),
         // No `disk,ro` yet — a disk volume is always attached read-write.
         "disk" => (false, false, true),
-        other => {
-            bail!("volume {spec:?}: unsupported mode {other:?} (want ro, rw, overlay or disk)")
-        }
+        other => bail!(
+            "volume {spec:?}: unsupported mode {other:?} (want ro, rw, overlay or disk; \
+             an option follows the mode, as in rw,optional)"
+        ),
     };
     let mut disk_size_mib = None;
+    let mut optional = false;
     for opt in mode_parts {
-        if !disk {
-            bail!("volume {spec:?}: {opt:?} is only valid with disk mode");
+        match opt {
+            // A disk volume creates its backing file the first time it is used, so it has
+            // no absent source for `optional` to skip.
+            "optional" if disk => bail!(
+                "volume {spec:?}: optional does not apply to disk mode \
+                 (a missing backing file is created)"
+            ),
+            "optional" if optional => bail!("volume {spec:?}: optional given more than once"),
+            "optional" => optional = true,
+            _ if !disk => bail!(
+                "volume {spec:?}: unknown option {opt:?} (want optional; size= needs disk mode)"
+            ),
+            _ => {
+                let size = opt.strip_prefix("size=").with_context(|| {
+                    format!("volume {spec:?}: unknown disk option {opt:?} (want size=SIZE)")
+                })?;
+                if disk_size_mib.is_some() {
+                    bail!("volume {spec:?}: size= given more than once");
+                }
+                disk_size_mib = Some(crate::run::parse_mem_mib(size).with_context(|| {
+                    format!("volume {spec:?}: bad disk size {size:?} (want e.g. 10G, 512M)")
+                })?);
+            }
         }
-        let size = opt.strip_prefix("size=").with_context(|| {
-            format!("volume {spec:?}: unknown disk option {opt:?} (want size=SIZE)")
-        })?;
-        if disk_size_mib.is_some() {
-            bail!("volume {spec:?}: size= given more than once");
-        }
-        disk_size_mib = Some(crate::run::parse_mem_mib(size).with_context(|| {
-            format!("volume {spec:?}: bad disk size {size:?} (want e.g. 10G, 512M)")
-        })?);
     }
     if !guest.starts_with('/') {
         bail!("volume {spec:?}: the guest path must be absolute");
     }
     let host = base.join(host);
+    // One stat determines whether an `optional` source exists and whether it is a file.
+    let meta = std::fs::metadata(&host);
+    if optional {
+        match &meta {
+            Ok(_) => {}
+            // Skip a genuinely absent source.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(&host).is_err() =>
+            {
+                return Ok(None);
+            }
+            // A dangling symlink exists but points nowhere. Keep the bind so
+            // [`require_share_source`] reports it at boot.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // A denied lookup or symlink loop does not prove absence. Skipping it would hide
+            // a host misconfiguration.
+            Err(e) => bail!("volume {spec:?}: cannot stat {}: {e}", host.display()),
+        }
+    }
     // A single-file bind when the source resolves to a regular file (a missing/dir source
     // stays a directory share, the prior behavior). A disk volume's host path is its own
     // backing file, not a single-file bind — never virtiofs-shared, so this stays false even
     // once a previous boot's file is sitting there.
-    let is_file = !disk
-        && std::fs::metadata(&host)
-            .map(|m| m.is_file())
-            .unwrap_or(false);
+    let is_file = !disk && meta.as_ref().map(|m| m.is_file()).unwrap_or(false);
     if overlay && is_file {
         bail!("volume {spec:?}: overlay mode needs a directory source, not a single file");
     }
-    if disk && std::fs::metadata(&host).is_ok_and(|m| m.is_dir()) {
+    if disk && meta.as_ref().is_ok_and(|m| m.is_dir()) {
         bail!("volume {spec:?}: disk mode needs a file source (or none yet), not a directory");
     }
-    Ok(Volume {
+    Ok(Some(Volume {
         host,
         guest: guest.to_string(),
         read_only,
@@ -976,7 +1008,7 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Volume> {
         is_file,
         disk,
         disk_size_mib,
-    })
+    }))
 }
 
 /// Formatted capacity for a fresh `disk` volume with no explicit `size=` — generous because it
@@ -1092,7 +1124,8 @@ pub fn require_shareable(host: &Path) -> Result<bool> {
 ///
 /// Validate here instead of in [`parse_volume`]: `vk build --compose` parses the same
 /// volumes without mounting them, and the source need only exist at boot. Consequently, an
-/// invalid `-v` is reported after the image build.
+/// invalid `-v` is reported after the image build. An `optional` bind is the exception:
+/// its source must be checked while parsing to decide whether to keep it.
 ///
 /// Disk volumes are exempt because [`ensure_disk_backing`] creates their backing files on
 /// first use.
@@ -1534,6 +1567,11 @@ mod tests {
         super::interpolate(text, resolve, None)
     }
 
+    // Ordinary binds always produce a volume; optional-bind tests call the parser directly.
+    fn parse_volume(spec: &str, base: &Path) -> Result<Volume> {
+        Ok(super::parse_volume(spec, base)?.expect("a non-optional bind is never skipped"))
+    }
+
     fn one(yaml: &str) -> Unit {
         parse(yaml, Path::new("/base")).unwrap().pop().unwrap()
     }
@@ -1838,6 +1876,102 @@ mod tests {
     }
 
     #[test]
+    fn volume_option_optional_skips_only_an_absent_source() {
+        let dir = std::env::temp_dir().join(format!("vk-compose-optional-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cfgdir")).unwrap();
+        std::fs::write(dir.join("cfgfile"), "x").unwrap();
+        let _guard = TmpDir(dir.clone());
+        let vol = |spec: String| super::parse_volume(&spec, Path::new("/b")).unwrap();
+
+        // Present directory and file sources retain the mode before `optional`.
+        let d = vol(format!(
+            "{}/cfgdir:/home/dev/.cfg:rw,optional",
+            dir.display()
+        ))
+        .unwrap();
+        assert!(!d.is_file && !d.read_only);
+        let f = vol(format!(
+            "{}/cfgfile:/home/dev/.cfgrc:ro,optional",
+            dir.display()
+        ))
+        .unwrap();
+        assert!(f.is_file && f.read_only);
+
+        // An absent optional source contributes no mount and no error.
+        assert!(
+            vol(format!(
+                "{}/missing:/home/dev/.cfg:rw,optional",
+                dir.display()
+            ))
+            .is_none()
+        );
+        // Without the option, the same source remains a directory share.
+        assert!(vol(format!("{}/missing:/home/dev/.cfg", dir.display())).is_some());
+
+        // Repeated options are rejected rather than collapsed.
+        let err = super::parse_volume("/src:/dst:ro,optional,optional", Path::new("/b"))
+            .expect_err("a repeated option must not be silently accepted");
+        assert!(
+            format!("{err:#}").contains("optional given more than once"),
+            "{err:#}"
+        );
+
+        // A dangling symlink remains a bind and fails source validation at boot.
+        std::os::unix::fs::symlink(dir.join("gone"), dir.join("dangling")).unwrap();
+        let dangling = vol(format!(
+            "{}/dangling:/home/dev/.cfg:ro,optional",
+            dir.display()
+        ))
+        .expect("a broken link is a misconfiguration, not an absence");
+        assert!(super::require_share_source(&dangling).is_err());
+
+        // An inaccessible source is an error, not an absent optional source.
+        let walled = dir.join("walled");
+        std::fs::create_dir_all(walled.join("inner")).unwrap();
+        std::fs::set_permissions(&walled, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = super::parse_volume(
+            &format!("{}/inner:/home/dev/.cfg:rw,optional", walled.display()),
+            Path::new("/b"),
+        );
+        // Restore access before asserting so the guard can remove the directory on failure.
+        std::fs::set_permissions(&walled, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // SAFETY: geteuid always succeeds and touches no memory.
+        // Root ignores the mode bits, so only assert where the denial actually happens.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(
+                format!("{:#}", err.unwrap_err()).contains("cannot stat"),
+                "an unreadable source must not read as absent"
+            );
+        }
+    }
+
+    #[test]
+    fn volume_option_optional_is_rejected_for_a_disk() {
+        // Disk volumes create absent backing files, so `optional` cannot skip them.
+        let err = parse_volume("/data.ext4:/var/wab:disk,optional", Path::new("/b")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("optional does not apply to disk mode"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn optional_binds_drop_out_of_a_service() {
+        let dir = std::env::temp_dir().join(format!("vk-compose-optsvc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("here")).unwrap();
+        let _guard = TmpDir(dir.clone());
+        let u = one(&format!(
+            "services:\n  s:\n    image: x\n    volumes:\n\
+             \x20     - {0}/here:/here:rw,optional\n      - {0}/gone:/gone:ro,optional\n",
+            dir.display()
+        ));
+        assert_eq!(u.volumes.len(), 1, "only the present source is mounted");
+        assert_eq!(u.volumes[0].guest, "/here");
+    }
+
+    #[test]
     fn volume_mode_disk() {
         // A bare `disk`: read-write, no overlay/is_file, no explicit size.
         let d = parse_volume("/data.ext4:/var/wab:disk", Path::new("/b")).unwrap();
@@ -1852,7 +1986,7 @@ mod tests {
         // `size=` only makes sense alongside `disk`.
         let err = parse_volume("/src:/dst:ro,size=10G", Path::new("/b")).unwrap_err();
         assert!(
-            format!("{err:#}").contains("only valid with disk mode"),
+            format!("{err:#}").contains("size= needs disk mode"),
             "{err:#}"
         );
 

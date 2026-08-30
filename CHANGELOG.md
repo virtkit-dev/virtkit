@@ -20,6 +20,9 @@ All notable changes to virtkit will be documented in this file.
   selected directly when several share a launch directory or the caller is elsewhere.
   An argument that is only digits is read as a pid, so a directory named that way now
   needs a `./` in front of it.
+- An optional bind mount such as `${HOME}/.gitconfig:/root/.gitconfig:ro,optional`
+  (also supported by `vk run -v`) is skipped when its source does not exist. Sources vk
+  cannot examine and dangling symlinks still fail the boot.
 
 ### Fixed
 

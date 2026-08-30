@@ -1332,10 +1332,12 @@ enum Cmd {
         /// (arbitrary chown, device nodes, sockets) and content that survives across boots,
         /// for state a service needs to own outright; the file is created and formatted
         /// (sparse, `size=` capacity, default 64G) the first time it is used.
+        /// A share (not a disk) may add `,optional` to skip an absent source instead of
+        /// failing the boot.
         #[arg(
             short = 'v',
             long = "volume",
-            value_name = "HOST:GUEST[:ro|:rw|:overlay|:disk[,size=SIZE]]",
+            value_name = "HOST:GUEST[:(ro|rw|overlay)[,optional]|:disk[,size=SIZE]]",
             help_heading = "Mounts and disks"
         )]
         volume: Vec<String>,
@@ -2422,7 +2424,8 @@ async fn cli_main() -> ExitCode {
             };
             match volume
                 .iter()
-                .map(|v| compose::parse_volume(v, &cwd))
+                // `:optional` on an absent source contributes no mount.
+                .filter_map(|v| compose::parse_volume(v, &cwd).transpose())
                 .collect::<Result<Vec<_>, _>>()
             {
                 Ok(v) => v,
