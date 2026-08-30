@@ -1,13 +1,33 @@
-//! Minimal SSH server embedded in virtkit-agent (russh), so a microVM is reachable
-//! by a stock ssh client — and thus VS Code Remote-SSH — with no sshd in the
-//! guest image and no guest network: it listens on vsock, and the host dials it
-//! through the hybrid vsock-mux with `vk-agent connect` as the ssh ProxyCommand.
+//! Minimal russh SSH server embedded in virtkit-agent. It makes a microVM
+//! reachable by stock SSH clients, including VS Code Remote-SSH, without sshd
+//! or connecting through guest networking. It listens on vsock, and the host
+//! connects through the hybrid vsock mux with `vk connect` (or
+//! `vk-agent connect`) as ProxyCommand.
 //!
-//! Scope (POC): pubkey auth against an authorized_keys file, plus the two channel
-//! requests an interactive editor needs — `pty`+`shell` (terminals) and `exec`
-//! (the VS Code server bootstrap). sftp and port-forwarding (direct-tcpip) are
-//! not handled yet. The crypto/transport is russh's; we only wire the channels
-//! onto virtkit-agent's existing pty (`pty.rs`) and user-drop (`exec::server`) plumbing.
+//! It authenticates OpenSSH public keys passed to `ssh-serve` on the kernel
+//! command line; it does not read an authorized-keys file. It supports `pty` +
+//! `shell` with window resizing, `shell` without a pty (VS Code pipes its
+//! bootstrap script to `ssh -T`), `exec`, `sftp` (scp and VS Code's server
+//! copy), and `direct-tcpip` (VS Code's server connection and `ssh -L`/`-D`).
+//! Together these cover VS Code Remote-SSH.
+//!
+//! Russh's default handlers return `false` for remote forwarding (`ssh -R`) and
+//! agent forwarding. Virtkit instead provides guest-listener-to-host-target
+//! tunnels through the driver-managed `vk-agent forward` / `vk forward` pair.
+//! `vk run --ssh-agent` bridges the host agent to a separate guest socket, but
+//! only run stages inherit it: init starts this server before exporting
+//! `SSH_AUTH_SOCK`, so SSH sessions must name
+//! `/run/virtkit-ssh-agent.sock` explicitly.
+//!
+//! Russh's default handlers return `Ok(())` without replying to `env`, `signal`,
+//! or `x11-req`. OpenSSH does not request replies for `env` (distro
+//! `ssh_config` uses `SendEnv LANG LC_*`) or `signal`, but waits for an
+//! `x11-req` reply. The session still starts without X11, and its locale falls
+//! back to the guest default. Supporting `LANG` and `LC_*` requires a whitelist
+//! because client values enter the login shell's environment.
+//!
+//! Russh handles crypto and transport; virtkit-agent only connects channels to
+//! its existing pty (`pty.rs`) and user-drop (`exec::server`) plumbing.
 
 use std::collections::HashMap;
 use std::os::unix::process::ExitStatusExt;
@@ -143,8 +163,8 @@ impl Handler for ServerHandler {
     type Error = russh::Error;
 
     async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
-        // Compare the key material only: PublicKey's PartialEq also covers the
-        // comment, which the authorized_keys file carries but the wire key omits.
+        // Compare key material only: PublicKey's PartialEq includes comments,
+        // which OpenSSH key lines may carry but wire keys omit.
         if self
             .authorized
             .iter()
