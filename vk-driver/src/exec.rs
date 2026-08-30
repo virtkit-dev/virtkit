@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use anyhow::{Result, bail};
 use vk_core::addr::SocketAddr;
-use vk_core::exec::client::{client_run_cmd, client_run_tty};
+use vk_core::exec::client::{Stdin, client_run_cmd, client_run_tty};
 use vk_core::messages::{CmdExec, CmdResult, RunMode, Tty};
 use vk_core::net::connect;
 
@@ -24,6 +24,9 @@ fn check_env(env: &[String]) -> Result<()> {
 /// Connect to `addr` and run `cmd`/`args` on the guest, streaming stdio (or a pty
 /// when `tty`). Mirrors `vk-agent exec`: the same validation, tty negotiation, and
 /// message flow, against the same shared client.
+///
+/// `stdin` selects the command's input. A process running multiple commands must pass
+/// [`Stdin::Closed`]. TTY runs always consume this process's terminal and cannot use it.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     addr: SocketAddr,
@@ -35,8 +38,13 @@ pub async fn run(
     user: Option<String>,
     cmd: String,
     args: Vec<String>,
+    stdin: Stdin,
 ) -> Result<CmdResult> {
     check_env(&env)?;
+    // Check before negotiation so non-terminal callers see this error first.
+    if tty && stdin == Stdin::Closed {
+        bail!("--tty always reads this process's stdin");
+    }
     let mode = if background {
         RunMode::Background
     } else {
@@ -78,7 +86,7 @@ pub async fn run(
     if exec.tty.is_some() {
         client_run_tty(stream, sink, exec).await
     } else {
-        client_run_cmd(stream, sink, exec).await
+        client_run_cmd(stream, sink, exec, stdin).await
     }
 }
 
@@ -100,7 +108,8 @@ pub fn exit(result: CmdResult) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::check_env;
+    use super::{check_env, run};
+    use vk_core::exec::client::Stdin;
 
     #[test]
     fn check_env_requires_key_equals_value() {
@@ -111,5 +120,27 @@ mod tests {
         // An entry without '=' is rejected, and the message names the offender.
         let err = check_env(&["OK=1".into(), "NOPE".into()]).unwrap_err();
         assert!(err.to_string().contains("NOPE"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn tty_refuses_a_caller_that_keeps_its_stdin() {
+        // TTY mode always consumes local stdin, so reject the incompatible pairing before
+        // terminal validation. Non-terminal callers must receive this error too.
+        let err = run(
+            // The guard rejects the pairing before connecting.
+            "/nonexistent/vk-tty-guard.socket".parse().unwrap(),
+            false,
+            false,
+            vec![],
+            None,
+            true,
+            None,
+            "true".into(),
+            vec![],
+            Stdin::Closed,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("--tty"), "{err}");
     }
 }

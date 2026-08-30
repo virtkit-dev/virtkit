@@ -11,10 +11,28 @@ use log::{debug, error, info};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+/// Where a guest command's standard input comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stdin {
+    /// Forward this process's stdin so `vk exec … -- cat` receives piped input.
+    ///
+    /// Use only in a process that exits after one command. The detached reader thread blocks
+    /// in `read(0)` while holding std's stdin lock. [`client_run_cmd`] frees fd 0 when the
+    /// command ends, but `close` does not interrupt an in-flight read, so the thread outlives
+    /// the command. A subsequently opened file can reuse fd 0 and be read by that thread.
+    Forward,
+    /// Immediately send the guest end-of-input without touching fd 0. Use for callers that
+    /// run multiple commands or commands with nothing to read, such as lifecycle hooks and
+    /// probes.
+    Closed,
+}
+
+/// Run a guest command, streaming this process's stdio according to `stdin`.
 pub async fn client_run_cmd(
     mut stream: impl Stream<Item = Result<Message, std::io::Error>> + Unpin,
     mut sink: impl Sink<Message, Error = std::io::Error> + Unpin + Send + 'static,
     cmd: CmdExec,
+    stdin: Stdin,
 ) -> Result<CmdResult, anyhow::Error> {
     let background = cmd.mode == messages::RunMode::Background;
     sink.send(Message::CmdExec(cmd)).await?;
@@ -42,9 +60,24 @@ pub async fn client_run_cmd(
 
     let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(super::DATA_CHANNEL_CAPACITY);
 
-    let _copy_stdin = thread::spawn(move || {
-        read_stdin(&stdin_tx);
-    });
+    match stdin {
+        Stdin::Forward => {
+            thread::spawn(move || {
+                read_stdin(&stdin_tx);
+            });
+        }
+        Stdin::Closed => {
+            // The server holds the child's stdin pipe open until it receives Close. Without
+            // a reader thread, send Close directly or a guest stdin reader blocks forever;
+            // the forwarding task below only relays end-of-input from that thread.
+            sink.send(Message::Close {
+                fd: messages::Fd::Stdin,
+                error: None,
+            })
+            .await?;
+            drop(stdin_tx);
+        }
+    }
 
     // async task to write stdin
     let stdin_handle = tokio::spawn(async move {
@@ -162,8 +195,13 @@ pub async fn client_run_cmd(
                 drop(stdout_tx);
                 drop(stderr_tx);
                 stdin_handle.abort();
-                unsafe {
-                    libc::close(0);
+                if stdin == Stdin::Forward {
+                    // Aborting the task above cannot stop the detached OS thread blocked in
+                    // read(0). Freeing fd 0 is sound only because a forwarding process exits
+                    // after this command (see [`Stdin::Forward`]).
+                    unsafe {
+                        libc::close(0);
+                    }
                 }
                 exit_code = cr;
                 break;
@@ -182,6 +220,9 @@ pub async fn client_run_cmd(
 /// `exec --tty`: drive a remote pty from the local terminal. The local terminal is
 /// switched to raw mode for the whole session (restored on drop), terminal output
 /// arrives as a single Fd::Stdout stream, and SIGWINCH is relayed as Resize.
+///
+/// This always reads the local terminal and, like [`Stdin::Forward`], requires the
+/// process to exit after one command.
 pub async fn client_run_tty(
     mut stream: impl Stream<Item = Result<Message, std::io::Error>> + Unpin,
     mut sink: impl Sink<Message, Error = std::io::Error> + Unpin + Send + 'static,

@@ -10,7 +10,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
 use vk_core::addr::SocketAddr;
-use vk_core::exec::client::{client_run_cmd, client_run_tty};
+use vk_core::exec::client::{Stdin, client_run_cmd, client_run_tty};
 use vk_core::exec::server::run_server;
 use vk_core::messages::RunMode;
 use vk_core::messages::{CmdExec, CmdResult, Tty};
@@ -502,7 +502,7 @@ async fn execute(
     if exec.tty.is_some() {
         client_run_tty(stream, sink, exec).await
     } else {
-        client_run_cmd(stream, sink, exec).await
+        client_run_cmd(stream, sink, exec, Stdin::Forward).await
     }
 }
 

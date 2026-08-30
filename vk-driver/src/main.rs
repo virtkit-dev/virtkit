@@ -3416,7 +3416,20 @@ async fn cli_main() -> ExitCode {
             let mut command = command.into_iter();
             let cmd = command.next().expect("clap: required = true");
             let args: Vec<_> = command.collect();
-            match exec::run(addr, background, clear_env, env, dir, tty, user, cmd, args).await {
+            match exec::run(
+                addr,
+                background,
+                clear_env,
+                env,
+                dir,
+                tty,
+                user,
+                cmd,
+                args,
+                vk_core::exec::client::Stdin::Forward,
+            )
+            .await
+            {
                 Ok(result) => exec::exit(result),
                 Err(e) => fail(&e, 1),
             }

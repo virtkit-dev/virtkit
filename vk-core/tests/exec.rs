@@ -3,12 +3,13 @@
 //! module), so the vsock:// transport itself is not covered here.
 
 use futures::{SinkExt, StreamExt};
+use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
 use tokio::time::timeout;
 use vk_core::addr::SocketAddr;
-use vk_core::exec::client::client_run_connect;
+use vk_core::exec::client::{Stdin, client_run_connect};
 use vk_core::exec::server::run_server;
 use vk_core::framing::wrap_stream;
 use vk_core::messages::{CmdExec, Fd, Message, RunMode, Status, Tty};
@@ -613,4 +614,45 @@ async fn vsock_mux_refused() {
         .unwrap()
         .unwrap_err();
     assert!(err.to_string().contains("refused"), "got: {err}");
+}
+
+/// Exercise [`Stdin::Closed`] across multiple commands. The client must signal end-of-input
+/// and leave fd 0 open for later commands and files. [`Stdin::Forward`] closes fd 0 and is
+/// limited to an exiting process, so it cannot be covered by an in-process test.
+#[tokio::test]
+async fn commands_run_back_to_back_without_forwarding_stdin() {
+    let addr = start_server("exec-twice").await;
+    let run = async |script: &str| {
+        let (stream, sink) = connect(&addr).await.unwrap();
+        timeout(
+            Duration::from_secs(10),
+            vk_core::exec::client::client_run_cmd(
+                stream,
+                sink,
+                CmdExec {
+                    name: "sh".into(),
+                    args: vec!["-c".into(), script.into()],
+                    env: vec![],
+                    clear_env: false,
+                    mode: RunMode::Interactive,
+                    tty: None,
+                    dir: None,
+                    user: AMBIENT_USER,
+                },
+                Stdin::Closed,
+            ),
+        )
+        .await
+        .expect("command never finished")
+        .unwrap()
+    };
+
+    // With no writer, `cat` hangs unless the client tells the guest to close stdin.
+    assert_eq!(run("cat").await.code, Some(0));
+    assert_eq!(run("exit 7").await.code, Some(7));
+    // A new file must not reuse fd 0.
+    let opened = std::fs::File::open("/dev/null").unwrap();
+    assert_ne!(opened.as_raw_fd(), 0, "a run freed fd 0");
+    drop(opened);
+    assert_eq!(run("exit 0").await.code, Some(0));
 }
