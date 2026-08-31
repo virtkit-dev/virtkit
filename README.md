@@ -33,7 +33,8 @@ vk check
 ```
 
 It checks KVM access, the selected VMM backend, the guest kernel and agent, and the
-host-side requirements for configured features.
+host-side requirements for configured features. Scripts can require a release with
+`vk check --min-version 0.45`, which exits non-zero on an older `vk`.
 
 ## Quick start
 
@@ -258,7 +259,7 @@ rebuilt byte-for-byte.
 | `vk stop` | Stop a VM selected by pid or launch directory, or stop all registered VMs. |
 | `vk status` | Probe a guest agent, or report whether its root image is stale. |
 | `vk atop` | Follow or inspect guest resource recordings. |
-| `vk check` | Validate KVM, VMM, embedded assets, and configured host features. |
+| `vk check` | Validate KVM, VMM, embedded assets, configured host features, and an optional minimum `vk` version. |
 | `vk gc` | Reclaim unused image bases, CI checkouts, and image-cache chunks. |
 | `vk update` | Check for or install a digest-verified GitHub release. |
 | `vk service up|down|status` | Control compose services from the primary guest. |

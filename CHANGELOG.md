@@ -6,6 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- `vk check --min-version 0.45` exits non-zero when this `vk` is older, letting scripts
+  gate on a release rather than a feature name. It accepts a `v` prefix and an omitted
+  patch field (`v0.45`, `0.45`); a `vk` too old to recognize the flag rejects it. Used
+  alone, it skips config and all other checks; with `--feature`, it checks both.
 - Compose files can use `${VK_WORKSPACE}`, `${VK_STATE_DIR}`, `${VK_SELF}` (the running
   `vk`), `${VK_UID}` and `${VK_GID}` without a generated `.env`. These reserved values
   come from the local `vk run` or `vk build`; environment and `.env` definitions are

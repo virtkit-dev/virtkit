@@ -5,11 +5,14 @@
 //! are checked only when named with `--feature`: the CI-executor ones (gitlab,
 //! services), and the capability probes a script asks this build about (entrypoint,
 //! publish).
+//! `--min-version` lets scripts gate on this binary's release instead of a feature name.
 //! Prints one line per check; the caller turns "any check failed" into the exit code.
 
+use std::fmt;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use crate::config::Config;
 use crate::embed::Asset;
@@ -106,14 +109,111 @@ fn fail(detail: impl Into<String>) -> Outcome {
     }
 }
 
+/// A release number, optionally prefixed with the `v` used in git tags, compared field by
+/// field. Missing fields are zero, so `0.45` means `0.45.0`. `vk-selfupdate` deliberately
+/// does not zero-fill because an update must distinguish the `0.45` and `0.45.0` tags;
+/// a command-line version floor need not.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct Version([u64; 3]);
+
+impl FromStr for Version {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // clap prints the rejected value, so these errors say only what is wrong with it.
+        let stripped = s.strip_prefix('v').unwrap_or(s);
+        if stripped.is_empty() {
+            return Err("expected a release number such as 0.45.0".to_string());
+        }
+        let mut fields = [0u64; 3];
+        let max = fields.len();
+        for (n, part) in stripped.split('.').enumerate() {
+            // Accept only digits: `u64::from_str` accepts signs such as `+45`. Report an
+            // oversized numeric field differently from a non-number. Validate the field
+            // before the count so `1.2.3.` reports its trailing empty field, not a fourth.
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!("`{part}` is not a release-number field"));
+            }
+            let Some(field) = fields.get_mut(n) else {
+                return Err(format!("more than {max} fields"));
+            };
+            *field = part.parse().map_err(|_| format!("`{part}` is too large"))?;
+        }
+        Ok(Version(fields))
+    }
+}
+
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.0[0], self.0[1], self.0[2])
+    }
+}
+
+impl Version {
+    /// The release number `vk --version` prints before the git hash.
+    /// `the_build_version_parses` enforces the crate version's shape, so releases should
+    /// not reach the error. A suffix has no defined ordering and is rejected.
+    fn own() -> Result<Version, String> {
+        let raw = env!("CARGO_PKG_VERSION");
+        raw.parse()
+            .map_err(|_| format!("this build's version `{raw}` is not a release number"))
+    }
+}
+
+/// Whether this `vk` meets the requested release floor. This generalizes capability checks
+/// such as `entrypoint` and `publish` and covers behavior changes without feature names.
+/// A `vk` too old to support `--min-version` rejects the flag.
+fn min_version(have: Version, min: Version) -> Outcome {
+    if have >= min {
+        ok(format!("vk {have} (at least {min} required)"))
+    } else {
+        fail(format!("vk {have} is older than the {min} required"))
+    }
+}
+
+/// Run only `--min-version`, without loading a [`Config`]. An unreadable host config must
+/// not look like an old `vk`. `Err` means the build cannot identify its release, distinct
+/// from a version-floor failure and its exit code.
+pub fn min_version_only(min: Version) -> Result<bool, String> {
+    Ok(report("version", min_version(Version::own()?, min)))
+}
+
 /// Run the checks and print one line each; returns whether every check passed.
 /// No `--feature` = the default sweep (every feature except the CI-executor
 /// ones), where a feature the config leaves unconfigured is skipped; naming
 /// features checks exactly those, and one that turns out unconfigured fails
-/// (the caller asserted it should be usable).
-pub fn run(cfg: &Config, requested: &[Feature]) -> bool {
+/// (the caller asserted it should be usable). `--min-version` adds a version line, and
+/// on its own asserts only that.
+pub fn run(cfg: &Config, requested: &[Feature], min: Option<Version>) -> Result<bool, String> {
     let explicit = !requested.is_empty();
-    let features: Vec<Feature> = if explicit {
+    let features = selected(requested, min);
+
+    // Lead with the config file in use (informational — does not affect all_ok), so a
+    // surprising check result can be traced to the wrong or missing file at a glance.
+    match &cfg.source {
+        Some(p) => line("ok", "config", p.display()),
+        None => line("skip", "config", "no config file (built-in defaults)"),
+    }
+
+    let mut all_ok = true;
+    if let Some(min) = min {
+        all_ok &= report("version", min_version(Version::own()?, min));
+    }
+    for f in features {
+        let mut outcome = evaluate(cfg, f);
+        if explicit && outcome.status == Status::Skip {
+            outcome = fail(format!("{} — requested but not enabled", outcome.detail));
+        }
+        all_ok &= report(f.name(), outcome);
+    }
+    Ok(all_ok)
+}
+
+/// Select deduplicated named features or the default sweep. A version-only request selects
+/// none because it asks nothing about the host. `main` normally routes that case through
+/// [`min_version_only`]; this remains a backstop.
+fn selected(requested: &[Feature], min: Option<Version>) -> Vec<Feature> {
+    if !requested.is_empty() {
         let mut v = Vec::new();
         for f in requested {
             if !v.contains(f) {
@@ -121,35 +221,27 @@ pub fn run(cfg: &Config, requested: &[Feature]) -> bool {
             }
         }
         v
+    } else if min.is_some() {
+        Vec::new()
     } else {
         default_sweep()
+    }
+}
+
+/// Print one check's line; returns whether it passed.
+fn report(name: &str, outcome: Outcome) -> bool {
+    let label = match outcome.status {
+        Status::Ok => "ok",
+        Status::Skip => "skip",
+        Status::Fail => "FAIL",
     };
+    line(label, name, &outcome.detail);
+    outcome.status != Status::Fail
+}
 
-    // Lead with the config file in use (informational — does not affect all_ok), so a
-    // surprising check result can be traced to the wrong or missing file at a glance.
-    match &cfg.source {
-        Some(p) => println!("{:<4} {:<8} {}", "ok", "config", p.display()),
-        None => println!(
-            "{:<4} {:<8} no config file (built-in defaults)",
-            "skip", "config"
-        ),
-    }
-
-    let mut all_ok = true;
-    for f in features {
-        let mut outcome = evaluate(cfg, f);
-        if explicit && outcome.status == Status::Skip {
-            outcome = fail(format!("{} — requested but not enabled", outcome.detail));
-        }
-        let label = match outcome.status {
-            Status::Ok => "ok",
-            Status::Skip => "skip",
-            Status::Fail => "FAIL",
-        };
-        println!("{:<4} {:<8} {}", label, f.name(), outcome.detail);
-        all_ok &= outcome.status != Status::Fail;
-    }
-    all_ok
+/// Keep config and check line columns aligned.
+fn line(label: &str, name: &str, detail: impl fmt::Display) {
+    println!("{label:<4} {name:<8} {detail}");
 }
 
 /// The features checked when none are named.
@@ -621,6 +713,100 @@ fn dir_writable(dir: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::config::Gitlab;
+
+    /// Keep the crate version compatible with `Version::own`.
+    #[test]
+    fn the_build_version_parses() {
+        let raw = env!("CARGO_PKG_VERSION");
+        assert_eq!(
+            raw.parse::<Version>().map(|v| v.to_string()),
+            Ok(raw.to_string())
+        );
+        assert_eq!(Version::own().map(|v| v.to_string()), Ok(raw.to_string()));
+    }
+
+    /// Accept the tag's `v` prefix and zero-fill missing fields.
+    #[test]
+    fn versions_parse_and_order_field_by_field() {
+        let v = |s: &str| s.parse::<Version>().unwrap();
+        assert_eq!(v("0.45.0"), v("v0.45.0"));
+        assert_eq!(v("0.45"), v("0.45.0"));
+        assert_eq!(v("1"), v("1.0.0"));
+        // Field by field, not lexicographically: 0.9 is behind 0.10, and 0.45.1 behind 0.46.
+        assert!(v("0.10.0") > v("0.9.0"));
+        assert!(v("0.45.1") < v("0.46.0"));
+        assert!(v("0.45.0") >= v("0.45"));
+    }
+
+    /// Reject suffixes (as `vk-selfupdate` does), signs, whitespace, and oversized fields.
+    #[test]
+    fn versions_refuse_what_they_cannot_order() {
+        let bad = [
+            "",
+            "v",
+            "V0.45",
+            "0.x",
+            "1.2.3.4",
+            "0..1",
+            "-1",
+            "+1",
+            "0.+45",
+            "0.45.0-rc1",
+            "0.45.0-dev",
+            "0.45.0+build",
+            " 0.45",
+            "0.45 ",
+            "99999999999999999999",
+        ];
+        for s in bad {
+            assert!(s.parse::<Version>().is_err(), "{s} parsed");
+        }
+    }
+
+    /// Pass floors through the current version and fail above it, naming both versions.
+    #[test]
+    fn min_version_reports_both_versions_either_way() {
+        let have = Version([0, 45, 0]);
+        let names_both = |o: &Outcome, min: Version| {
+            o.detail.contains(&have.to_string()) && o.detail.contains(&min.to_string())
+        };
+
+        for min in [Version([0, 0, 0]), Version([0, 45, 0])] {
+            let outcome = min_version(have, min);
+            assert_eq!(outcome.status, Status::Ok, "{}", outcome.detail);
+            assert!(names_both(&outcome, min), "{}", outcome.detail);
+        }
+
+        // A patch field the caller left off is zero, so 0.45 is met and 0.45.1 is not.
+        let min = Version([0, 45, 1]);
+        let outcome = min_version(have, min);
+        assert_eq!(outcome.status, Status::Fail);
+        assert!(outcome.detail.contains("older than"), "{}", outcome.detail);
+        assert!(names_both(&outcome, min), "{}", outcome.detail);
+    }
+
+    /// A version-only check answers without config or feature evaluation.
+    #[test]
+    fn a_minimum_version_alone_answers_without_a_config() {
+        let Version([major, ..]) = Version::own().unwrap();
+        assert_eq!(min_version_only(Version([0, 0, 0])), Ok(true));
+        assert_eq!(min_version_only(Version([major + 1, 0, 0])), Ok(false));
+    }
+
+    /// A version floor never widens the selected feature set and alone empties it.
+    #[test]
+    fn a_minimum_version_never_widens_the_feature_set() {
+        let min = Some(Version([0, 45, 0]));
+        assert_eq!(selected(&[], None), default_sweep());
+        assert!(selected(&[], min).is_empty());
+        assert_eq!(selected(&[Feature::Gitlab], min), vec![Feature::Gitlab]);
+        assert_eq!(selected(&[Feature::Gitlab], None), vec![Feature::Gitlab]);
+        // Named twice is checked once, whether or not a version came with it.
+        assert_eq!(
+            selected(&[Feature::Gitlab, Feature::Gitlab], min),
+            vec![Feature::Gitlab]
+        );
+    }
 
     /// `[registry]` follows the same precedence as `[docker]`, because `registry::cred`
     /// does: a readable `token_file` settles the credential, so the `password_file` it

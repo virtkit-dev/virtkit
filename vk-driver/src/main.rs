@@ -429,7 +429,9 @@ enum Cmd {
     /// Checked only when named with --feature: the CI-executor features (gitlab,
     /// services), and two capability probes about this build rather than the host:
     /// `entrypoint` (can it hand PID 1 to an image's own entrypoint) and `publish`
-    /// (can it run `vk publish`). One line per check; exits non-zero if any fails.
+    /// (can it run `vk publish`). --min-version asserts the release this binary is,
+    /// for a capability a release added without gaining a feature name of its own.
+    /// One line per check; exits non-zero if any fails.
     #[command(display_order = 5)]
     Check {
         /// check only these features (repeatable)
@@ -437,6 +439,12 @@ enum Cmd {
         /// Any that turn out unconfigured fail instead of being skipped.
         #[arg(long = "feature", value_enum, value_name = "FEATURE")]
         feature: Vec<check::Feature>,
+        /// require this vk to be VERSION or newer (e.g. 0.45, 0.45.0, v0.45.0)
+        ///
+        /// A missing patch field is zero. Used alone it checks only the version, and
+        /// needs no config file; with --feature it checks both.
+        #[arg(long = "min-version", value_name = "VERSION")]
+        min_version: Option<check::Version>,
     },
     /// Reclaim the host caches — a cron or manual sweep
     ///
@@ -2328,6 +2336,20 @@ async fn cli_main() -> ExitCode {
         print!("{}", include_str!("../config.example.toml"));
         return ExitCode::SUCCESS;
     }
+    // Answer a version-only check before Config::load: it describes this binary, and an
+    // unreadable host config must not look like an old `vk` to a script.
+    if let Cmd::Check {
+        feature,
+        min_version: Some(min),
+    } = &cli.cmd
+        && feature.is_empty()
+    {
+        return match check::min_version_only(*min) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => exit_code(1),
+            Err(e) => fail(&anyhow::anyhow!(e), 2),
+        };
+    }
     let cfg = match Config::load(cli.config.as_deref()) {
         Ok(cfg) => cfg,
         Err(e) => return fail(&e, 2),
@@ -2343,11 +2365,15 @@ async fn cli_main() -> ExitCode {
     {
         return config_cmd(&cfg, *path);
     }
-    if let Cmd::Check { feature } = &cli.cmd {
-        return if check::run(&cfg, feature) {
-            ExitCode::SUCCESS
-        } else {
-            exit_code(1)
+    if let Cmd::Check {
+        feature,
+        min_version,
+    } = &cli.cmd
+    {
+        return match check::run(&cfg, feature, *min_version) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => exit_code(1),
+            Err(e) => fail(&anyhow::anyhow!(e), 2),
         };
     }
     if let Cmd::Paths { gitlab } = &cli.cmd {
@@ -4589,6 +4615,31 @@ mod tests {
         assert!(check);
 
         assert!(Cli::try_parse_from(["vk", "update", "--check", "--yes"]).is_err());
+    }
+
+    /// Reject an invalid minimum as a usage error, not a failed version check.
+    #[test]
+    fn check_cli_parses_the_minimum_version() {
+        let cli = Cli::try_parse_from(["vk", "check"]).unwrap();
+        let Cmd::Check {
+            feature,
+            min_version,
+        } = cli.cmd
+        else {
+            panic!("expected Cmd::Check")
+        };
+        assert!(feature.is_empty() && min_version.is_none());
+
+        let cli = Cli::try_parse_from(["vk", "check", "--min-version", "v0.45"]).unwrap();
+        let Cmd::Check { min_version, .. } = cli.cmd else {
+            panic!("expected Cmd::Check")
+        };
+        assert_eq!(
+            min_version.map(|v| v.to_string()).as_deref(),
+            Some("0.45.0")
+        );
+
+        assert!(Cli::try_parse_from(["vk", "check", "--min-version", "next"]).is_err());
     }
 
     /// An interval of zero would have the guest sampling without pause. Refused where every
