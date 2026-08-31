@@ -582,6 +582,7 @@ fn build_git_image(
     )
     .context("computing the git-defined image's stage fingerprint")?;
     let (net, audit) = effective_build_egress(cfg, ctx)?;
+    let cache = crate::build::CacheOpts::from_config(&cfg.build);
     let recipe = crate::ensure::BuildRecipe {
         dockerfiles,
         contexts,
@@ -590,14 +591,9 @@ fn build_git_image(
         kernel: cfg.build.kernel.clone(),
         cloud_hypervisor: Some(cfg.cloud_hypervisor().to_path_buf()),
         agent: cfg.build.agent.clone(),
-        cache_registry: cfg.build.cache_registry.clone(),
-        cache_insecure: cfg.build.cache_insecure,
-        cache_auth: crate::build::CacheAuth {
-            ca_file: cfg.build.cache_ca_file.clone(),
-            username: cfg.build.cache_username.clone(),
-            password_file: cfg.build.cache_password_file.clone(),
-            token_file: cfg.build.cache_token_file.clone(),
-        },
+        cache_registry: cache.registry,
+        cache_insecure: cache.insecure,
+        cache_auth: cache.auth,
         net,
         audit,
     };
@@ -950,6 +946,7 @@ fn build_compose_unit(
     // A compose `build:` service's RUN egress is the build phase — same `[egress.build]`
     // policy and audit as the git-defined primary.
     let (net, audit) = effective_build_egress(cfg, ctx)?;
+    let cache = crate::build::CacheOpts::from_config(&cfg.build);
     let build = crate::units::BuildOpts {
         // A compose unit's build args are its own (compose file / `.env`); there is no
         // executor-global build-arg channel.
@@ -957,14 +954,9 @@ fn build_compose_unit(
         kernel: kernel.path.clone(),
         cloud_hypervisor: cfg.cloud_hypervisor().to_path_buf(),
         agent: agent.path.clone(),
-        cache_registry: cfg.build.cache_registry.clone(),
-        cache_insecure: cfg.build.cache_insecure,
-        cache_auth: crate::build::CacheAuth {
-            ca_file: cfg.build.cache_ca_file.clone(),
-            username: cfg.build.cache_username.clone(),
-            password_file: cfg.build.cache_password_file.clone(),
-            token_file: cfg.build.cache_token_file.clone(),
-        },
+        cache_registry: cache.registry,
+        cache_insecure: cache.insecure,
+        cache_auth: cache.auth,
         net,
         audit,
     };

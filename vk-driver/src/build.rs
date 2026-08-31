@@ -202,6 +202,49 @@ pub struct CacheAuth {
     pub token_file: Option<PathBuf>,
 }
 
+impl CacheAuth {
+    /// The `[build]` cache credentials. They travel with the cache wherever it was resolved
+    /// to, including to a registry named by `--cache-registry` instead of the config: a host
+    /// configures one cache server, and the flag moves builds between its repos.
+    pub fn from_config(b: &crate::config::Build) -> Self {
+        Self {
+            ca_file: b.cache_ca_file.clone(),
+            username: b.cache_username.clone(),
+            password_file: b.cache_password_file.clone(),
+            token_file: b.cache_token_file.clone(),
+        }
+    }
+}
+
+/// Where a build's instruction cache lives and how it authenticates there: the command line
+/// first, then `[build]`.
+///
+/// Resolved once here so every entry point that builds reads the same answer, and the cache
+/// one of them warms is the cache the next one restores from.
+#[derive(Debug, Clone, Default)]
+pub struct CacheOpts {
+    pub registry: Option<String>,
+    pub insecure: bool,
+    pub auth: CacheAuth,
+}
+
+impl CacheOpts {
+    pub fn resolve(registry: Option<&str>, insecure: bool, b: &crate::config::Build) -> Self {
+        Self {
+            registry: registry
+                .map(str::to_string)
+                .or_else(|| b.cache_registry.clone()),
+            insecure: insecure || b.cache_insecure,
+            auth: CacheAuth::from_config(b),
+        }
+    }
+
+    /// The config's own cache, with no command line over it.
+    pub fn from_config(b: &crate::config::Build) -> Self {
+        Self::resolve(None, false, b)
+    }
+}
+
 /// What/how to build.
 pub struct Options {
     /// Dockerfile(s), merged into one stage namespace (see [`Plan::from_dockerfiles`]).
@@ -3879,6 +3922,66 @@ fn upsert(env: &mut Vec<(String, String)>, k: &str, v: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `[build]` section naming a gated remote cache.
+    fn gated_cache() -> crate::config::Build {
+        crate::config::Build {
+            cache_registry: Some("registry.example/cache".into()),
+            cache_insecure: true,
+            cache_ca_file: Some("/etc/vk/ca.pem".into()),
+            cache_username: "ci".into(),
+            cache_password_file: Some("/etc/vk/pass".into()),
+            cache_token_file: Some("/etc/vk/token".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_config_names_the_cache_until_the_command_line_overrides_it() {
+        let b = gated_cache();
+
+        let c = CacheOpts::resolve(None, false, &b);
+        assert_eq!(c.registry.as_deref(), Some("registry.example/cache"));
+        assert!(c.insecure);
+
+        // The flag is the last word on where; the credentials follow it there.
+        let c = CacheOpts::resolve(Some("/var/cache/vk"), false, &b);
+        assert_eq!(c.registry.as_deref(), Some("/var/cache/vk"));
+        assert_eq!(c.auth.username, "ci");
+
+        // `--cache-insecure` adds to the config's, and stands alone without it.
+        assert!(CacheOpts::resolve(None, true, &Default::default()).insecure);
+        assert!(!CacheOpts::resolve(None, false, &Default::default()).insecure);
+
+        // `none` gets no special case here; `cache_repo` reads it as caching off.
+        let c = CacheOpts::resolve(Some("none"), false, &b);
+        assert_eq!(c.registry.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn every_cache_credential_reaches_the_build() {
+        // All four move together: a build that authenticates with three of them and drops
+        // the fourth fails at the registry, not here.
+        let auth = CacheAuth::from_config(&gated_cache());
+        assert_eq!(auth.ca_file.as_deref(), Some(Path::new("/etc/vk/ca.pem")));
+        assert_eq!(auth.username, "ci");
+        assert_eq!(
+            auth.password_file.as_deref(),
+            Some(Path::new("/etc/vk/pass"))
+        );
+        assert_eq!(
+            auth.token_file.as_deref(),
+            Some(Path::new("/etc/vk/token")),
+            "the bearer token is the one credential with no Basic fallback"
+        );
+
+        // No `[build]` credentials at all is anonymous, which the local store wants.
+        let anon = CacheAuth::from_config(&Default::default());
+        assert!(
+            anon.ca_file.is_none() && anon.password_file.is_none() && anon.token_file.is_none()
+        );
+        assert_eq!(anon.username, "");
+    }
 
     /// A private directory for one test, removed and recreated so a rerun starts clean.
     /// Shared with the `exec` submodule's tests, so every temp dir the build tests take is

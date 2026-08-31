@@ -544,8 +544,8 @@ enum Cmd {
         /// instruction cache: a registry repo, a store directory path, or `none` to disable
         ///
         /// A registry repo is e.g. 127.0.0.1:5000 of a `vk-registry` server; an absolute store
-        /// directory path is accessed in-process. Default: the builtin local store
-        /// `vk-registry` also uses.
+        /// directory path is accessed in-process. Default: `[build] cache_registry`, else the
+        /// builtin local store `vk-registry` also uses.
         #[arg(
             long = "cache-registry",
             value_name = "REF|DIR|none",
@@ -2854,6 +2854,7 @@ async fn cli_main() -> ExitCode {
             );
         }
         let tag_out = tag_bundle.as_ref().map(|d| d.join("runner.ext4"));
+        let cache = build::CacheOpts::resolve(cache_registry.as_deref(), *cache_insecure, b);
         let opts = build::Options {
             dockerfiles: file.clone(),
             // build_units (the multi-target / --compose path) reads targets from its units;
@@ -2871,14 +2872,9 @@ async fn cli_main() -> ExitCode {
                 .or_else(|| cfg.cloud_hypervisor.clone()),
             kernel: kernel.clone().or_else(|| b.kernel.clone()),
             agent: agent.clone().or_else(|| b.agent.clone()),
-            cache_registry: cache_registry.clone().or_else(|| b.cache_registry.clone()),
-            cache_insecure: *cache_insecure || b.cache_insecure,
-            cache_auth: crate::build::CacheAuth {
-                ca_file: b.cache_ca_file.clone(),
-                username: b.cache_username.clone(),
-                password_file: b.cache_password_file.clone(),
-                token_file: b.cache_token_file.clone(),
-            },
+            cache_registry: cache.registry,
+            cache_insecure: cache.insecure,
+            cache_auth: cache.auth,
             build_cache,
             journal: journal_enabled(*no_journal, b.no_journal),
             tmp_tmpfs: *build_tmp_tmpfs || b.tmp_tmpfs,
