@@ -670,6 +670,69 @@ fn registry_key(work: &Path) -> PathBuf {
     crate::vms::canonical(work)
 }
 
+/// The VM's NAME in `vk list`: its compose primary, built Dockerfile with an optional target
+/// stage, or image ref.
+///
+/// A Dockerfile takes precedence over an image ref because it supplies the rootfs and the image
+/// is ignored. This follows [`unit_name`]'s source precedence, so the VMM and registry choose the
+/// same boot source.
+fn registry_label(
+    primary: Option<&str>,
+    image: &str,
+    dockerfiles: &[PathBuf],
+    target: Option<&str>,
+) -> String {
+    if let Some(primary) = primary {
+        return primary.to_string();
+    }
+    // Multiple files share one stage namespace in input order. `--target` may name a stage in
+    // any file, while the default is the last file's last stage; see `Plan::resolve_target`.
+    // Name the last file and append the number of additional inputs.
+    if let Some(built) = dockerfiles.last() {
+        let mut label = dockerfile_label(built);
+        if let Some(target) = target {
+            label.push(':');
+            label.push_str(target);
+        }
+        if dockerfiles.len() > 1 {
+            label.push_str(&format!(" +{}", dockerfiles.len() - 1));
+        }
+        return label;
+    }
+    if !image.is_empty() {
+        return image.to_string();
+    }
+    "vm".to_string()
+}
+
+/// Use the file name in a Dockerfile label. For a generic `Dockerfile` or `Containerfile`, prefix
+/// its directory to distinguish `.devcontainer/Dockerfile` from the repository's without using
+/// a full path.
+///
+/// Resolve the directory first so equivalent path spellings produce the same label; a bare
+/// `-f Dockerfile` has no parent until then. Conversion is lossy only at the final step because
+/// the registry stores a `String` and never interprets the label as a path.
+fn dockerfile_label(path: &Path) -> String {
+    let file = path
+        .file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
+    let generic = ["dockerfile", "containerfile"]
+        .iter()
+        .any(|g| file.eq_ignore_ascii_case(g));
+    if !generic {
+        return file.into_owned();
+    }
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    match crate::vms::canonical(parent).file_name() {
+        Some(dir) => format!("{}/{file}", dir.to_string_lossy()),
+        None => file.into_owned(),
+    }
+}
+
 async fn build_and_boot(
     args: &RunArgs,
     cfg: &crate::config::Config,
@@ -1699,15 +1762,12 @@ async fn build_and_boot(
     // liveness. The guard removes the entry on every exit path below — clean, error unwind,
     // or the detached child returning. Kept alive to the end of the function.
     let _vm_registration = args.state_dir.as_ref().map(|_| {
-        let label = if let Some(p) = &args.primary {
-            p.clone()
-        } else if !args.image.is_empty() {
-            args.image.clone()
-        } else if !args.dockerfiles.is_empty() {
-            format!("-f {}", args.target.as_deref().unwrap_or("(last stage)"))
-        } else {
-            "vm".to_string()
-        };
+        let label = registry_label(
+            args.primary.as_deref(),
+            &args.image,
+            &args.dockerfiles,
+            args.target.as_deref(),
+        );
         // Capture what the root image was built from, so `vk list --stale` can later tell
         // whether the working tree drifted. Mirror `compose_build_units` (compose --primary)
         // and the `-f` build options exactly, so a recomputed key matches the stamped one.
@@ -3724,6 +3784,63 @@ impl Drop for VmSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_registry_label_names_what_booted() {
+        let df = |p: &str| vec![PathBuf::from(p)];
+        // Compose-primary and image boots retain their requested names.
+        assert_eq!(registry_label(Some("api"), "", &[], None), "api");
+        assert_eq!(registry_label(None, "alpine:3", &[], None), "alpine:3");
+        // A `-f` boot uses its Dockerfile, including the directory for a generic name.
+        assert_eq!(
+            registry_label(None, "", &df("/repo/.devcontainer/Dockerfile"), None),
+            ".devcontainer/Dockerfile"
+        );
+        assert_eq!(
+            registry_label(None, "", &df("/repo/Dockerfile.ci"), None),
+            "Dockerfile.ci"
+        );
+        // Generic matching is case-insensitive and includes `Containerfile`.
+        assert_eq!(
+            registry_label(None, "", &df("/repo/DOCKERFILE"), None),
+            "repo/DOCKERFILE"
+        );
+        assert_eq!(
+            registry_label(None, "", &df("/repo/Containerfile"), None),
+            "repo/Containerfile"
+        );
+        // Append a named target and count additional files in the shared stage namespace.
+        assert_eq!(
+            registry_label(None, "", &df("/repo/Dockerfile"), Some("dev")),
+            "repo/Dockerfile:dev"
+        );
+        let two = [
+            PathBuf::from("/repo/base.dockerfile"),
+            PathBuf::from("/repo/app.dockerfile"),
+        ];
+        assert_eq!(registry_label(None, "", &two, None), "app.dockerfile +1");
+        assert_eq!(
+            registry_label(None, "", &two, Some("dev")),
+            "app.dockerfile:dev +1"
+        );
+        // When both are given, the Dockerfile supplies the rootfs and therefore the label.
+        assert_eq!(
+            registry_label(None, "alpine:3", &df("/repo/Dockerfile"), None),
+            "repo/Dockerfile"
+        );
+        // Equivalent path spellings name the same file after resolving the parent.
+        let cwd = std::env::current_dir().unwrap();
+        let here = cwd.file_name().unwrap().to_string_lossy().into_owned();
+        for spelling in ["Dockerfile", "./Dockerfile"] {
+            assert_eq!(
+                registry_label(None, "", &df(spelling), None),
+                format!("{here}/Dockerfile"),
+                "{spelling} must name the directory holding it"
+            );
+        }
+        // Preserve a fallback when no source is named.
+        assert_eq!(registry_label(None, "", &[], None), "vm");
+    }
 
     #[test]
     fn the_exec_channel_never_reruns_an_entrypoint_that_is_already_pid_1() {

@@ -34,7 +34,7 @@ pub struct VmEntry {
     /// PID of the managing `vk run`, which holds the state-dir lock. `vk list` displays it, and
     /// `vk stop` can select and signal it. On exit, it tears down the VM and compose siblings.
     pub pid: u32,
-    /// A short human label: the compose primary / image / `-f <target>` this VM boots.
+    /// A short human label: the compose primary, image ref, or Dockerfile this VM boots.
     pub label: String,
     /// Exec-channel address, e.g. `vsock-auto://<state_dir>/vsock.sock:4444`.
     pub exec_addr: String,

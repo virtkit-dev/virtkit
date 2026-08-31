@@ -24,6 +24,12 @@ All notable changes to virtkit will be documented in this file.
   reserving space for staging. Its parent must permit creating a directory; a shared
   non-sticky parent may retain an empty private directory.
 
+### Changed
+
+- `vk list` names Dockerfile boots by the built file, such as
+  `.devcontainer/Dockerfile`, and appends a named target stage. Previously,
+  every default-target build appeared as `-f (last stage)`.
+
 ## [0.45.0] - 2026-08-30
 
 ### Added
