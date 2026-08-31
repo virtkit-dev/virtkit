@@ -53,6 +53,7 @@ mod mkoci;
 mod net;
 mod oci;
 mod ova;
+mod prio;
 mod publish;
 mod qcow2;
 mod registry;

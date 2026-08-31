@@ -116,6 +116,13 @@
 # mem = "8G"             # per-stage build guest RAM (default: 4G; a stage overrides it
 #                        # with a `# vk: mem=…` comment above its FROM)
 # cache_checkpoint_secs = 20  # `auto` cache mode: seconds of run time before a checkpoint
+# nice = 10              # how far a build steps aside for the rest of the machine: the nice
+#                        # increment its stage guests, their helpers and vk's own stage
+#                        # workers start at, on top of whatever `vk` was started with
+#                        # (default: 10, capped at the kernel's 19). 0 = renice nothing
+# ionice = "best-effort" # I/O priority for that same work: "best-effort" at its lowest level
+#                        # (default), "idle", or "none" to leave it alone. Only a block
+#                        # scheduler that honours I/O priority acts on it (BFQ, mq-deadline)
 
 # [gitlab]               # host-side pieces of the GitLab custom executor
 # dir = "/usr/local/lib/vk/ci-tools"  # static tools shared read-only into job VMs

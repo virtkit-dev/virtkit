@@ -93,9 +93,13 @@ pub enum VmmBackend {
     CloudHypervisor,
 }
 
-/// Defaults for `vk build` (the experimental microVM Dockerfile builder). Every
-/// field backs a CLI flag; the flag wins when given, so this just sets a host's defaults
-/// (e.g. the shared instruction-cache registry and the build guest's kernel/agent).
+/// Defaults for `vk build` (the experimental microVM Dockerfile builder). Most fields back a
+/// CLI flag; the flag wins when given, so this just sets a host's defaults (e.g. the shared
+/// instruction-cache registry and the build guest's kernel/agent). The host-tuning keys —
+/// `cpus`, `mem`, `nice`, `ionice`, `cache_checkpoint_secs`, `no_mem_gate` — reach every
+/// build path as process-wide state (see `build::set_tuning`) rather than as a per-build
+/// argument; only `cpus` and `mem` have a flag, and it is per stage (`--stage-cpus`,
+/// `--stage-mem`).
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Build {
@@ -156,6 +160,35 @@ pub struct Build {
     /// intermediate snapshot is checkpointed. Unset = 20. Smaller = more snapshots (a late
     /// edit re-runs less), larger = fewer commits.
     pub cache_checkpoint_secs: Option<u64>,
+    /// How much a build defers to the rest of the machine: the `nice` increment its stage
+    /// guests, their helpers and its own worker threads start at, on top of whatever `vk`
+    /// itself was started with. Unset = 10, which leaves a contended CPU to whatever the
+    /// user is doing while the build still gets the whole machine when nothing else wants
+    /// it; `0` renices nothing. Only ever raises the nice value — coming back down needs
+    /// `RLIMIT_NICE` — and a value past the kernel's ceiling of 19 is clamped. See
+    /// [`crate::prio`].
+    pub nice: Option<u8>,
+    /// The I/O priority class the same work starts at: `best-effort` (at its lowest level,
+    /// the default), `idle`, or `none` to leave I/O priority alone. Only a block scheduler
+    /// that honours I/O priority acts on it — BFQ, and mq-deadline; the `none` scheduler,
+    /// what a host commonly leaves an NVMe on, ignores it, so this is no substitute for
+    /// `nice`.
+    pub ionice: Option<IoNice>,
+}
+
+/// `[build] ionice`: the I/O priority class a build's work runs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum IoNice {
+    /// The ordinary class, at its lowest level: the build still gets its turn, behind
+    /// everything asking at the default level.
+    #[default]
+    BestEffort,
+    /// Only when nothing else wants the disk. The most a desktop can be spared, and the
+    /// most a build can be starved by one.
+    Idle,
+    /// Leave the I/O priority as inherited.
+    None,
 }
 
 /// Memory admission for CI jobs. A runner takes as many jobs as its `concurrent` limit

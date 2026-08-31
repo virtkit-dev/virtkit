@@ -1454,7 +1454,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // The one VMM spawn shared with `vk run`/`vk build`: it clears CLOEXEC on the
     // embedded-kernel (and any pass-fd) so those fds survive the exec into the VMM
     // subprocess — open-coding a plain spawn here silently dropped them.
-    let mut vmm_child = crate::run::spawn_vmm(&*vmm, &spec)
+    let mut vmm_child = crate::run::spawn_vmm(&*vmm, &spec, crate::prio::Prio::Normal)
         .with_context(|| format!("spawning the {} VMM", vmm.name()))?;
 
     // Own the job until told to stop (SIGTERM: cleanup or a stale-state sweep) or
@@ -1703,6 +1703,8 @@ fn spawn_switch(
         // them for the run after the question was asked. The audit *summary* stays opt-in.
         audit_log: Some(ctx.egress_audit_log()),
         bytes_log: Some(ctx.net_bytes_log()),
+        // A CI job's own switch: the runner has nothing else to stay responsive for.
+        prio: crate::prio::Prio::Normal,
     })
     .context("spawning the per-job switch")
 }

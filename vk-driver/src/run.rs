@@ -1399,6 +1399,7 @@ async fn build_and_boot(
             Some(work.join(NET_BYTES)),
             // Dev `vk run` egress is unrestricted (no allowlist plumbed here).
             false,
+            crate::prio::Prio::Normal,
         )
         .await?;
         cmdline.push_str(&frag);
@@ -1472,6 +1473,7 @@ async fn build_and_boot(
                 false,
                 &[],
                 &[],
+                crate::prio::Prio::Normal,
             )?);
         }
         virtiofs.push_str(&format!("work:{WORKDIR_MOUNT}"));
@@ -1521,6 +1523,7 @@ async fn build_and_boot(
                 vol.read_only,
                 &[],
                 &[],
+                crate::prio::Prio::Normal,
             )?);
         }
         let mount_at = if vol.is_file {
@@ -1600,7 +1603,14 @@ async fn build_and_boot(
             _atop_lock = held;
             let sock = work.join("atop.fs.sock");
             if !crate::vmm::libkrun_selected() {
-                virtiofsds.push(crate::spawn::spawn_virtiofsd(&sock, &dir, false, &[], &[])?);
+                virtiofsds.push(crate::spawn::spawn_virtiofsd(
+                    &sock,
+                    &dir,
+                    false,
+                    &[],
+                    &[],
+                    crate::prio::Prio::Normal,
+                )?);
             }
             shares.push(crate::vmm::FsShare {
                 tag: vk_core::atop::TAG.into(),
@@ -1733,7 +1743,7 @@ async fn build_and_boot(
         });
     }
 
-    let mut ch = match spawn_vmm(vmm.as_ref(), &spec) {
+    let mut ch = match spawn_vmm(vmm.as_ref(), &spec, crate::prio::Prio::Normal) {
         Ok(ch) => ch,
         // The --net switch and the virtiofsds (--workdir plus any --primary compose
         // volumes) are already spawned; kill them so a failed boot does not leak
@@ -2279,6 +2289,7 @@ async fn compose_up(
         args.audit_egress.then(|| work.join(AUDIT_LOG)),
         Some(work.join(NET_BYTES)),
         false,
+        crate::prio::Prio::Normal,
     )
     .await?;
 
@@ -2988,7 +2999,11 @@ async fn run_shell(addr: &SocketAddr) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn spawn_vmm(vmm: &dyn Vmm, spec: &crate::vmm::VmSpec) -> Result<Child> {
+pub(crate) fn spawn_vmm(
+    vmm: &dyn Vmm,
+    spec: &crate::vmm::VmSpec,
+    prio: crate::prio::Prio,
+) -> Result<Child> {
     // Every boot funnels through here, so this is where a nesting request meets the host,
     // whichever spec asked and whichever backend serves it: libkrun would mask VMX/SVM
     // back out and cloud-hypervisor cannot mask it at all, so either would otherwise hand
@@ -3033,6 +3048,9 @@ pub(crate) fn spawn_vmm(vmm: &dyn Vmm, spec: &crate::vmm::VmSpec) -> Result<Chil
             });
         }
     }
+    // A build stage's guest is the heaviest thing a build runs, and the priority lands on
+    // the VMM's vCPU threads with it.
+    prio.apply(&mut cmd);
     // Self-reap the VM if virtkit dies before teardown — a leaked VMM is a whole
     // running guest, not just an idle helper (spawn_tied).
     crate::spawn::spawn_tied(cmd).context("spawning the VMM")
@@ -3147,6 +3165,8 @@ async fn spawn_vm_switch(
     // Force allowlist mode even with empty lists (deny-all) — the CI build phase sets this
     // for a restricted `[egress.build]`. Dev `vk run` passes `false` (unset = unrestricted).
     restrict: bool,
+    // Whether the VM this switch serves is a build stage (its downloads are the build's).
+    prio: crate::prio::Prio,
 ) -> Result<(Child, String)> {
     let (gw, prefix, guest_ip) = crate::net::switch_addrs(RUN_SUBNET)?;
     let mut listen = vsock.to_path_buf().into_os_string();
@@ -3177,6 +3197,7 @@ async fn spawn_vm_switch(
         // What the switch forwarded, for the phase's own resource line — into whichever
         // channel the caller reads at the end.
         bytes_log,
+        prio,
     })?;
     let frag = format!(
         " VIRTKIT_NET_PORT={net_port} VIRTKIT_VM_IP={guest_ip}/{prefix} \
@@ -3398,7 +3419,14 @@ pub(crate) async fn boot_session(
     if let Some(ctx) = context {
         let sock = work.join("context.fs.sock");
         if !crate::vmm::libkrun_selected() {
-            virtiofsd = Some(crate::spawn::spawn_virtiofsd(&sock, ctx, true, &[], &[])?);
+            virtiofsd = Some(crate::spawn::spawn_virtiofsd(
+                &sock,
+                ctx,
+                true,
+                &[],
+                &[],
+                crate::prio::Prio::Build,
+            )?);
         }
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS=context:{CONTEXT_MOUNT}"));
         shares.push(crate::vmm::FsShare {
@@ -3433,6 +3461,7 @@ pub(crate) async fn boot_session(
             // A restricted build policy (`BuildNet::Allow`, incl. empty = deny) forces
             // allowlist mode; `BuildNet::All` is unrestricted.
             matches!(net, crate::build::BuildNet::Allow { .. }),
+            crate::prio::Prio::Build,
         )
         .await?;
         switch = Some(child);
@@ -3476,7 +3505,7 @@ pub(crate) async fn boot_session(
     let vmm = crate::vmm::selected(cloud_hypervisor);
     let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
     let t_spawn = Instant::now();
-    let mut ch = spawn_vmm(vmm.as_ref(), &spec)?;
+    let mut ch = spawn_vmm(vmm.as_ref(), &spec, crate::prio::Prio::Build)?;
     timings.probe("boot.spawn", t_spawn.elapsed());
     let t_wait = Instant::now();
     let deadline = Instant::now() + Duration::from_secs(boot_timeout_secs);
@@ -4368,7 +4397,7 @@ mod tests {
             pass_fds: vec![medium.fd()],
             proc_name: "vk:test".into(),
         };
-        let mut child = spawn_vmm(&CatVmm, &spec).unwrap();
+        let mut child = spawn_vmm(&CatVmm, &spec, crate::prio::Prio::Normal).unwrap();
         assert!(child.wait().unwrap().success());
         let out = std::fs::read(spec.serial_log.with_extension("vmm.log")).unwrap();
         assert_eq!(out, b"boot medium");

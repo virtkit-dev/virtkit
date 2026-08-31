@@ -42,9 +42,6 @@ pub(crate) fn self_exe() -> PathBuf {
 /// process-lifetime thread, leaving the signal tied to a thread that lives exactly as long
 /// as virtkit. The caller configures `cmd` (args + stdio) first, then hands it over.
 pub(crate) fn spawn_tied(mut cmd: Command) -> std::io::Result<Child> {
-    use std::sync::OnceLock;
-    use std::sync::mpsc::{Sender, channel};
-
     // SAFETY: prctl(PR_SET_PDEATHSIG) is async-signal-safe, so it is valid in a pre-exec
     // hook (which runs in the forked child between fork and exec).
     unsafe {
@@ -55,11 +52,21 @@ pub(crate) fn spawn_tied(mut cmd: Command) -> std::io::Result<Child> {
             },
         );
     }
+    let (rtx, rrx) = std::sync::mpsc::channel();
+    spawner()
+        .send((cmd, rtx))
+        .expect("vk-helper-spawner thread alive");
+    rrx.recv().expect("vk-helper-spawner thread replied")
+}
 
-    type Reply = Sender<std::io::Result<Child>>;
-    static SPAWNER: OnceLock<Sender<(Command, Reply)>> = OnceLock::new();
-    let tx = SPAWNER.get_or_init(|| {
-        let (tx, rx) = channel::<(Command, Reply)>();
+type Reply = std::sync::mpsc::Sender<std::io::Result<Child>>;
+
+/// The one thread every tied helper is spawned from, created on first use.
+fn spawner() -> &'static std::sync::mpsc::Sender<(Command, Reply)> {
+    static SPAWNER: std::sync::OnceLock<std::sync::mpsc::Sender<(Command, Reply)>> =
+        std::sync::OnceLock::new();
+    SPAWNER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<(Command, Reply)>();
         std::thread::Builder::new()
             .name("vk-helper-spawner".into())
             .spawn(move || {
@@ -69,23 +76,32 @@ pub(crate) fn spawn_tied(mut cmd: Command) -> std::io::Result<Child> {
             })
             .expect("spawning the vk-helper-spawner thread");
         tx
-    });
-    let (rtx, rrx) = channel();
-    tx.send((cmd, rtx)).expect("vk-helper-spawner thread alive");
-    rrx.recv().expect("vk-helper-spawner thread replied")
+    })
+}
+
+/// Create the spawner thread now, from a caller still at the driver's own priority. Every
+/// helper is forked from it, so a child inherits its scheduling priority rather than the
+/// caller's — and a thread first created from inside a deferred build would hand that
+/// priority, unrecoverably, to the switch, virtiofsd and VMM of every `vk run` guest booted
+/// afterwards in the same process. Called from [`crate::prio::pin_shared_threads`].
+pub(crate) fn pin_spawner() {
+    let _ = spawner();
 }
 
 /// Start the bundled virtiofsd (this executable's `vk virtiofsd` subcommand) on
 /// `shared_dir` (optionally read-only) and wait for its socket to appear. A read-only
 /// share is a host-side guarantee the guest can never write back to the shared tree.
 /// `uid_maps` / `gid_maps` are soft_idmap spec strings (`type:from:to[:count]`) forwarded
-/// as `--uid-map` / `--gid-map` to virtiofsd; empty slices = identity (no remapping).
+/// as `--uid-map` / `--gid-map` to virtiofsd; empty slices = identity (no remapping). `prio`
+/// says whether the share serves a build stage, which only the cloud-hypervisor backend
+/// reaches — libkrun serves a build's context in-process.
 pub(crate) fn spawn_virtiofsd(
     sock: &Path,
     shared_dir: &Path,
     readonly: bool,
     uid_maps: &[String],
     gid_maps: &[String],
+    prio: crate::prio::Prio,
 ) -> Result<Child> {
     let _ = std::fs::remove_file(sock);
     let mut cmd = Command::new(self_exe());
@@ -117,6 +133,7 @@ pub(crate) fn spawn_virtiofsd(
         Err(_) => (Stdio::null(), Stdio::null()),
     };
     cmd.stdin(Stdio::null()).stdout(out).stderr(err);
+    prio.apply(&mut cmd);
     let child = spawn_tied(cmd).context("spawning the bundled virtiofsd (vk virtiofsd)")?;
     for _ in 0..50 {
         if sock.exists() {

@@ -29,6 +29,13 @@ All notable changes to virtkit will be documented in this file.
 - `vk list` names Dockerfile boots by the built file, such as
   `.devcontainer/Dockerfile`, and appends a named target stage. Previously,
   every default-target build appeared as `-f (last stage)`.
+- A build now gets out of the way of whatever else the machine is doing. Its stage VMs, the
+  helpers serving them, and the stage work `vk` itself does run at a lower CPU priority
+  (`nice` +10) and in the lowest ordinary I/O class, so a build in the background no longer
+  costs the desktop its responsiveness. `[build] nice` tunes the CPU part — `0` leaves it
+  alone — and `[build] ionice` the I/O part, which only bites where the host's block
+  scheduler honours a priority (BFQ, mq-deadline); `nice = 0` with `ionice = "none"` is the
+  old behaviour exactly. A `vk run` guest and a CI job's VM stay at full priority.
 
 ## [0.45.0] - 2026-08-30
 

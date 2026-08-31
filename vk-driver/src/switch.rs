@@ -588,6 +588,9 @@ pub struct Spawn {
     /// line. `None` = don't count, which only the standalone `vk switch` reaches: every
     /// switch a run or a build boots is given a channel.
     pub bytes_log: Option<PathBuf>,
+    /// Whether this switch serves a build stage, and so starts at the build's scheduling
+    /// priority: it proxies everything the stage downloads (see [`crate::prio`]).
+    pub prio: crate::prio::Prio,
 }
 
 /// How often the switch publishes what it has forwarded. Short, because a reader that cannot
@@ -658,6 +661,7 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
     cmd.stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
+    opts.prio.apply(&mut cmd);
     let mut child = crate::spawn::spawn_tied(cmd).context("spawning the switch subprocess")?;
     let deadline = Instant::now() + Duration::from_secs(5);
     for (l, _) in &opts.listen {

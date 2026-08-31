@@ -444,6 +444,7 @@ pub fn boot_unit(
                 vol.read_only,
                 &[],
                 &[],
+                crate::prio::Prio::Normal,
             )?);
         }
         let mount_at = if vol.is_file {
@@ -608,7 +609,8 @@ pub fn boot_unit(
         // The one VMM spawn shared with `vk run`/`vk build`/the job VM: tied (PDEATHSIG)
         // so a service VMM dies with its owner, and clears CLOEXEC on the embedded-kernel
         // and pass-fds so they survive the exec into the VMM subprocess.
-        crate::run::spawn_vmm(&*vmm, &spec).with_context(|| format!("spawning {}", vmm.name()))
+        crate::run::spawn_vmm(&*vmm, &spec, crate::prio::Prio::Normal)
+            .with_context(|| format!("spawning {}", vmm.name()))
     };
     match spawn_vmm() {
         Ok(child) => Ok((child, aux)),

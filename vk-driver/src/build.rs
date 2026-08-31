@@ -139,6 +139,9 @@ pub fn set_tuning(build: &crate::config::Build) {
     BUILD_CPUS.store(build.cpus.unwrap_or(0), Relaxed);
     BUILD_NO_MEM_GATE.store(build.no_mem_gate, Relaxed);
     *BUILD_MEM.lock().unwrap() = build.mem.clone();
+    // The scheduling priority a build's guests, helpers and worker threads start at, which
+    // the same `[build]` section configures.
+    crate::prio::set_policy(build);
 }
 
 /// `MemTotal` for the host-memory gate to measure against, or `None` when there is no gate:
@@ -2816,9 +2819,17 @@ where
     // Borrow the owned state under distinct names so the workers share it by reference
     // while `dag` stays owned for the `into_inner` below.
     let (dagref, cv, build, dependents) = (&dag, &cv, &build, &dependents);
+    // Still on the driver's own priority here, and the last moment that is true for a thread
+    // this build creates: give the shared spawner and blocking-escape runtime their threads
+    // now, so a `vk run` that boots after this build does not inherit its deferral.
+    crate::prio::pin_shared_threads();
     std::thread::scope(|s| {
         for _ in 0..jobs {
             s.spawn(move || {
+                // A worker exists to build stages, so it takes the build's scheduling
+                // priority for its whole life — and everything it spawns inherits it,
+                // `block_on`'s per-call thread included.
+                crate::prio::lower_this_thread();
                 loop {
                     // Claim the next ready node (or exit when the run is done / has failed),
                     // snapshotting the done map so the build reads its deps lock-free.

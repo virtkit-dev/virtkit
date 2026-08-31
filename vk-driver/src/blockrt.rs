@@ -21,6 +21,15 @@
 //! - The runtime stays lazily built. `main` forks to detach (`detach::fork`) before any
 //!   caller reaches this module, and a tokio runtime must not straddle a fork.
 //!
+//! Its worker pool stays at the driver's priority. It is shared with paths a user is
+//! waiting on — `vk registry pull`/`inspect`, a compose unit's `image:` resolution, a CI
+//! job's image pull — and a nice value cannot be lowered again, so deferring it would defer
+//! those for the life of the process. A build's work is deferred all the same: [`block_on`]
+//! runs the root future on a thread of the caller's own, which inherits the stage worker's
+//! priority (see [`crate::prio`]). Blocking-pool threads are the exception: tokio creates
+//! those inline from whichever caller needed one, so a build's `spawn_blocking` leaves one
+//! deferred until it is retired at the idle keep-alive.
+//!
 //! - Construct runtime-bound futures inside the `async` block passed to [`block_on`]. Tokio's
 //!   timeout, sleep, and interval futures capture the current runtime when constructed, while
 //!   synchronous callers may run on plain threads without one.
@@ -40,6 +49,14 @@ fn runtime() -> &'static tokio::runtime::Runtime {
             .build()
             .expect("building the shared blocking-escape tokio runtime")
     })
+}
+
+/// Build the shared runtime now, from a caller still at the driver's own priority. Its
+/// worker pool is created with it and outlives every caller, so a runtime first built from a
+/// deferred build thread would hand a permanently deferred pool to the interactive and CI
+/// callers above. Called from [`crate::prio::pin_shared_threads`].
+pub(crate) fn pin_runtime() {
+    let _ = runtime();
 }
 
 /// Drive `fut` to completion from a sync context, on a dedicated OS thread entering the
