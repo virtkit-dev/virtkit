@@ -9,6 +9,8 @@ license.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 libc.workspace = true
+# The private-bind primitive. vk-registry's admin socket still has its own copy.
+vk-fs = { path = "../vk-fs" }
 listenfd.workspace = true
 log.workspace = true
 serde.workspace = true

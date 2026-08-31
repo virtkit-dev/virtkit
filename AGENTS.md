@@ -31,7 +31,7 @@ The same codebase powers local compose-service VMs and a GitLab custom executor.
 
 ## Architecture
 
-A Cargo workspace (`Cargo.toml`, edition 2024) with six crates:
+A Cargo workspace (`Cargo.toml`, edition 2024) with seven crates:
 
 - **`vk-core/`** — the shared host↔guest library: the wire protocol (`messages`,
   `framing`, `addr`, `net`, `status`, `fleetctl`) plus the runtime helpers both sides
@@ -58,6 +58,11 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with six crates:
   and rename it over the running binary. Parameterized by tool so every one of them passes
   the same gates; the caller supplies only which asset it is and what version it was built
   as. `vk` and the `vk-registry` binary are the callers.
+- **`vk-fs/`** — filesystem objects created private and published whole: mode asked for at
+  creation rather than left to the process-wide umask, `rename` into place so a name never
+  leads nowhere, a directory resolved once and worked through its descriptor, and a name
+  acted on only where it cannot have become another user's. A leaf with no dependencies but
+  `libc` and `anyhow`, so every crate here can use it — `vk-runnerctl` included.
 - **`vk-runnerctl/`** — the only component that runs as root, and deliberately the smallest:
   it sets gitlab-runner's `concurrent` from a number unprivileged `vk` leaves in a file,
   clamped into a range only root can configure. It takes no arguments and no paths from its

@@ -355,6 +355,7 @@ vk-agent/        guest PID 1 and exec server
 vk-registry/     optional central OCI store and distribution server
 vk-runnerctl/    optional root-side GitLab concurrency helper
 vk-selfupdate/   shared self-update implementation for vk and vk-registry
+vk-fs/           filesystem objects created private and published whole
 third_party/     vendored libkrun and local patches
 kernel/          pinned guest-kernel configuration and build inputs
 docs/            operational guides

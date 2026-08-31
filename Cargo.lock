@@ -4546,6 +4546,7 @@ dependencies = [
  "tokio-serde",
  "tokio-util",
  "tokio-vsock",
+ "vk-fs",
 ]
 
 [[package]]
@@ -4596,6 +4597,14 @@ dependencies = [
  "vm-memory 0.18.0",
  "vmm-sys-util 0.15.0",
  "zstd",
+]
+
+[[package]]
+name = "vk-fs"
+version = "0.45.0"
+dependencies = [
+ "anyhow",
+ "libc",
 ]
 
 [[package]]

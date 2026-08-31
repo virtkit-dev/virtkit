@@ -1,0 +1,12 @@
+[package]
+name = "vk-fs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# Keep this crate free of runtimes and serialization so every workspace crate, including
+# root-running vk-runnerctl, can depend on it.
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
