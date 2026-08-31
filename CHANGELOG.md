@@ -8,6 +8,11 @@ All notable changes to virtkit will be documented in this file.
 
 - Resizing a terminal or multiplexer pane no longer joins build steps, output, and
   timing rows into one line during reflow.
+- Starting an agent no longer changes the process-wide umask while making its control socket
+  private, so files created concurrently keep their intended permissions. An overlong control
+  socket path is rejected before publishing an endpoint clients cannot reach through that
+  path. Its parent must permit creating a directory; a shared non-sticky parent may retain an
+  empty private directory.
 
 ## [0.45.0] - 2026-08-30
 
