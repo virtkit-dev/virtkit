@@ -60,6 +60,8 @@ pub fn to_units(services: Vec<Service>) -> Vec<crate::compose::Unit> {
             hostname: s.alias,
             source: crate::compose::Source::Image(s.name),
             environment: s.variables.into_iter().collect(),
+            // GitLab `services:` entries use `variables:` rather than environment files.
+            env_files: Vec::new(),
             entrypoint: (!s.entrypoint.is_empty()).then_some(s.entrypoint),
             command: (!s.command.is_empty()).then_some(s.command),
             user: None,

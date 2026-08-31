@@ -656,6 +656,50 @@ fn confine_under(root: &Path, path: &Path) -> Result<PathBuf> {
     Ok(canon)
 }
 
+/// Read a unit's job-authored `env_file`s, confining every path to the checkout first.
+///
+/// `compose::load_with_env` leaves them unread so a file naming runner secrets cannot be
+/// opened first. Keeping validation and reading together enforces that order.
+///
+/// Resolving and reading are separate operations. No job code can race them because this
+/// runs before any guest boots in a slot-private, freshly `git clean`ed checkout, as does
+/// [`confined_dockerfile`].
+fn resolve_job_env_files(root: &Path, unit: &mut crate::compose::Unit) -> Result<()> {
+    let mut vetted = Vec::new();
+    for (path, required) in std::mem::take(&mut unit.env_files) {
+        // Check confinement before existence so optional files cannot probe host paths.
+        let abs = crate::compose::absolute(&path)?;
+        if !abs.starts_with(root) {
+            bail!(
+                "compose service {:?}: env_file {} resolves outside the repo checkout",
+                unit.name,
+                path.display()
+            );
+        }
+        // Canonicalize paths inside the checkout to reject symlinks that escape it.
+        match abs.canonicalize() {
+            Ok(real) if real.starts_with(root) => vetted.push((real, required)),
+            Ok(_) => bail!(
+                "compose service {:?}: env_file {} resolves outside the repo checkout",
+                unit.name,
+                path.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "compose service {:?}: env_file {}",
+                        unit.name,
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    unit.env_files = vetted;
+    crate::compose::resolve_env_files(unit)
+}
+
 /// Resolve a git-defined image's build context against the checkout. It defaults to the
 /// (already-confined) Dockerfile's own directory — like `docker build <dir>`, so the
 /// Dockerfile's `COPY`/`.dockerignore` paths are relative to where it lives — and re-confines
@@ -831,15 +875,14 @@ fn load_compose_fleet(ctx: &JobCtx, spec: &str) -> Result<ComposeFleet> {
         enabled[i] |= on;
     }
     enabled[primary] = true;
-    // Confine every booting unit to the checkout: its `build:` context/Dockerfiles are
-    // job-authored paths resolved on the host (outside the microVM boundary), so — like the
-    // `dockerfile:` primary — they must not escape into another tenant's tree or the host. A
-    // `volumes:` bind mount would punch a host path straight through the boundary into an
-    // untrusted guest, so it is refused outright on the executor.
+    // Confine every booting unit's job-authored `build:` and `env_file` paths to the
+    // checkout before the host reads them. Reject `volumes:` because a bind mount would
+    // expose a host path to the untrusted guest.
     let root = checkout
         .canonicalize()
         .with_context(|| format!("resolving the checkout {}", checkout.display()))?;
     for (i, unit) in units.iter_mut().enumerate() {
+        // Leave disabled units' `env_files` unread.
         if !enabled[i] {
             continue;
         }
@@ -851,6 +894,7 @@ fn load_compose_fleet(ctx: &JobCtx, spec: &str) -> Result<ComposeFleet> {
             );
         }
         refuse_job_nesting(ctx.cfg.vm.nested, unit)?;
+        resolve_job_env_files(&root, unit)?;
         if let crate::compose::Source::Build {
             context,
             dockerfiles,
@@ -2863,6 +2907,76 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn a_job_env_file_cannot_reach_outside_the_checkout() {
+        let root = std::env::temp_dir().join(format!("vk-envconfine-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("app.env"), b"OK=1\n").unwrap();
+        let secrets = std::env::temp_dir().join(format!("vk-envsecret-{}", std::process::id()));
+        std::fs::write(&secrets, b"RUNNER_TOKEN=glrt-real\n").unwrap();
+
+        let unit = |files: Vec<(PathBuf, bool)>| {
+            let mut u = crate::services::to_units(vec![crate::services::Service {
+                name: "x".into(),
+                alias: "s".into(),
+                entrypoint: vec![],
+                command: vec![],
+                variables: Default::default(),
+            }])
+            .pop()
+            .unwrap();
+            u.env_files = files;
+            u
+        };
+
+        // Inside the checkout: read, with the paths consumed on the way.
+        let mut ok = unit(vec![(root.join("app.env"), true)]);
+        resolve_job_env_files(&root, &mut ok).unwrap();
+        assert_eq!(ok.environment, vec![("OK".to_string(), "1".to_string())]);
+        assert!(ok.env_files.is_empty());
+
+        // An absolute path (which `Path::join` honours, discarding the base), a `..`
+        // traversal, and a symlink that leaves the checkout are all refused — before the
+        // file is opened, so nothing leaks even into the error.
+        let link = root.join("out.env");
+        std::os::unix::fs::symlink(&secrets, &link).unwrap();
+        for escape in [secrets.clone(), root.join("../../etc/passwd"), link.clone()] {
+            let mut bad = unit(vec![(escape.clone(), true)]);
+            let msg = format!("{:#}", resolve_job_env_files(&root, &mut bad).unwrap_err());
+            assert!(
+                msg.contains("outside the repo checkout"),
+                "{escape:?}: {msg}"
+            );
+            assert!(!msg.contains("glrt-real"), "leaked the file: {msg}");
+        }
+
+        // Optional does not buy a way past the check: a path outside the checkout is
+        // refused whether or not it is there, so the error cannot be read as an answer to
+        // "does this host file exist?".
+        let outside_absent = std::env::temp_dir().join("vk-definitely-not-here.env");
+        for probe in [secrets.clone(), outside_absent] {
+            let mut bad = unit(vec![(probe.clone(), false)]);
+            let err = resolve_job_env_files(&root, &mut bad).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("outside the repo checkout"),
+                "{probe:?} should be refused the same way whether or not it exists"
+            );
+        }
+
+        // Inside the checkout, existence is the job's own business: optional and absent is
+        // skipped, required and absent is an error.
+        let mut absent = unit(vec![(root.join("nope.env"), false)]);
+        resolve_job_env_files(&root, &mut absent).unwrap();
+        assert!(absent.environment.is_empty());
+        let mut needed = unit(vec![(root.join("nope.env"), true)]);
+        assert!(resolve_job_env_files(&root, &mut needed).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&secrets);
     }
 
     #[test]

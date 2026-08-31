@@ -5,11 +5,11 @@
 //! Supported per service: `image` xor `build.{context, dockerfile (string or list —
 //! a vk extension merging the files into one stage namespace), target, args,
 //! additional_contexts (directories only)}`,
-//! `environment`, `command`, `entrypoint`, `user`, `hostname`, `depends_on`
-//! (start-ordering only), `volumes` (bind mounts) and `profiles` (a profiled
-//! service stays down at start-up unless activated or depended on). **Any other
-//! key is a hard error** — silently ignoring a compose key would silently change
-//! behavior.
+//! `environment` (with `env_file` read under it), `command`, `entrypoint`, `user`,
+//! `hostname`, `depends_on` (start-ordering only), `volumes` (bind mounts) and
+//! `profiles` (a profiled service stays down at start-up unless activated or depended
+//! on). **Any other key is a hard error** — silently ignoring a compose key would
+//! silently change behavior.
 //!
 //! ```yaml
 //! services:
@@ -51,8 +51,12 @@ pub struct Unit {
     /// guest hostname (compose `hostname`, default: the service name)
     pub hostname: String,
     pub source: Source,
-    /// start-time overrides, layered over the image's runtime config
+    /// Start-time overrides layered over the image's runtime config. Contains only
+    /// `environment:` entries until [`resolve_env_files`] adds `env_files` beneath them.
     pub environment: Vec<(String, String)>,
+    /// Compose `env_file` entries in declaration order as (anchored path, required).
+    /// [`resolve_env_files`] reads them after untrusted callers have vetted the paths.
+    pub env_files: Vec<(PathBuf, bool)>,
     pub entrypoint: Option<Vec<String>>,
     pub command: Option<Vec<String>>,
     pub user: Option<String>,
@@ -376,7 +380,7 @@ fn path_value(name: &str, p: &Path) -> Result<String> {
 ///
 /// This keeps `${VK_STATE_DIR}` identical for `vk build`, which creates nothing, and
 /// `vk run`, which creates the directory first, so prebuild cache keys match the boot.
-fn absolute(p: &Path) -> Result<PathBuf> {
+pub(crate) fn absolute(p: &Path) -> Result<PathBuf> {
     let joined = if p.is_absolute() {
         p.to_path_buf()
     } else {
@@ -422,14 +426,19 @@ fn absolute(p: &Path) -> Result<PathBuf> {
 }
 
 /// Load + map a compose file. `base` (the file's directory) anchors every relative
-/// path: build contexts, Dockerfiles, and bind-mount sources. Variable references
+/// path: build contexts, Dockerfiles, bind-mount sources, and `env_file`s. Variable references
 /// (`$VAR`, `${VAR}`, `${VAR:-default}`) are interpolated first, docker-compose
 /// style — from the process environment layered over a sibling `.env` (the process
 /// env wins) — so machine-specific values (a repo path, a uid) stay out of the
 /// committed file. `builtins` additionally answers the reserved `${VK_*}` names (see
 /// [`Builtins`]); `None` makes any reference to one an error.
 pub fn load(path: &Path, builtins: Option<&Builtins>) -> Result<Vec<Unit>> {
-    load_with_env(path, &|name| std::env::var(name).ok(), builtins)
+    let mut units = load_with_env(path, &|name| std::env::var(name).ok(), builtins)?;
+    // The file is the caller's own, so its `env_file` paths need no vetting.
+    for unit in &mut units {
+        resolve_env_files(unit)?;
+    }
+    Ok(units)
 }
 
 /// Like `load`, but the caller supplies how a `${VAR}` name resolves against the *ambient*
@@ -437,6 +446,9 @@ pub fn load(path: &Path, builtins: Option<&Builtins>) -> Result<Vec<Unit>> {
 /// precedence). The GitLab executor passes a resolver restricted to job (`CUSTOM_ENV_*`)
 /// variables, so an untrusted committed compose file cannot interpolate runner-level secrets
 /// out of the executor's process environment.
+///
+/// Leaves each unit's `env_file`s unread so the caller can vet their paths before calling
+/// [`resolve_env_files`].
 pub fn load_with_env(
     path: &Path,
     ambient: &dyn Fn(&str) -> Option<String>,
@@ -483,10 +495,46 @@ pub fn load_with_env(
 /// `--env-file`) past one matching pair of quotes stripped by
 /// `crate::strip_env_quotes` — no escape sequences, no `$VAR` expansion.
 fn load_dotenv(dir: &Path) -> Result<Vec<(String, String)>> {
-    let path = dir.join(".env");
-    let text = match std::fs::read_to_string(&path) {
+    read_env_file(&dir.join(".env"), false)
+}
+
+/// Add a unit's `env_file`s beneath its `environment:` entries. Later files override
+/// earlier files, while `environment:` overrides every file.
+///
+/// Parsing stays separate so untrusted callers can vet paths first; the GitLab executor
+/// confines them to the job checkout. [`load`] trusts its input and calls this immediately.
+/// A caller that omits this step gets an incomplete environment instead of an unsafe read.
+pub fn resolve_env_files(unit: &mut Unit) -> Result<()> {
+    let mut from_files: Vec<(String, String)> = Vec::new();
+    for (path, required) in std::mem::take(&mut unit.env_files) {
+        for (k, v) in read_env_file(&path, required)? {
+            from_files.retain(|(name, _)| name != &k);
+            from_files.push((k, v));
+        }
+    }
+    // `environment:` wins, so drop every name it already sets and keep the files underneath.
+    from_files.retain(|(k, _)| !unit.environment.iter().any(|(name, _)| name == k));
+    from_files.append(&mut unit.environment);
+    unit.environment = from_files;
+    Ok(())
+}
+
+/// A name a shell could export: a letter or `_`, then letters, digits and `_`.
+fn is_env_name(k: &str) -> bool {
+    let mut chars = k.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Read one `KEY=VALUE` file. `required` says whether its absence is an error; the parsing
+/// is the `.env` / `--env-file` convention — comments and blanks skipped, one matching pair
+/// of quotes stripped, no escapes and no `$VAR` expansion.
+fn read_env_file(path: &Path, required: bool) -> Result<Vec<(String, String)>> {
+    let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => return Ok(Vec::new()),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
     let mut vars = Vec::new();
@@ -497,15 +545,21 @@ fn load_dotenv(dir: &Path) -> Result<Vec<(String, String)>> {
         }
         let line = line.strip_prefix("export ").unwrap_or(line);
         match line.split_once('=') {
-            Some((k, v)) => vars.push((
-                k.trim().to_string(),
-                crate::strip_env_quotes(v).into_owned(),
-            )),
-            None => bail!(
-                "{}:{}: expected KEY=VALUE, got {line:?}",
-                path.display(),
-                n + 1
-            ),
+            Some((k, v)) => {
+                // These pairs now reach the guest environment, so reject names its shell
+                // cannot export instead of passing unusable entries through.
+                let k = k.trim();
+                if !is_env_name(k) {
+                    bail!(
+                        "{}:{}: {k:?} is not a usable variable name",
+                        path.display(),
+                        n + 1
+                    );
+                }
+                vars.push((k.to_string(), crate::strip_env_quotes(v).into_owned()));
+            }
+            // Do not quote a potentially secret line in a job log; `path:line` identifies it.
+            None => bail!("{}:{}: expected KEY=VALUE", path.display(), n + 1),
         }
     }
     Ok(vars)
@@ -748,11 +802,25 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
             false,
         ),
     };
+    // Resolve host paths but leave them unread so callers can vet untrusted compose input
+    // before calling `resolve_env_files`.
+    let env_files: Vec<(PathBuf, bool)> = svc
+        .env_file
+        .iter()
+        .flat_map(EnvFile::entries)
+        .map(|(file, required)| (base.join(file), required))
+        .collect();
+    let mut environment: Vec<(String, String)> = Vec::new();
+    for (k, v) in svc.environment.map(Env::into_pairs).unwrap_or_default() {
+        environment.retain(|(name, _)| name != &k);
+        environment.push((k, v));
+    }
     Ok(Unit {
         name: name.to_string(),
         hostname,
         source,
-        environment: svc.environment.map(Env::into_pairs).unwrap_or_default(),
+        environment,
+        env_files,
         entrypoint: svc.entrypoint.map(Cmd::into_argv).transpose()?,
         command: svc.command.map(Cmd::into_argv).transpose()?,
         user: svc.user,
@@ -1063,10 +1131,83 @@ struct ComposeFile {
     services: BTreeMap<String, ComposeService>,
 }
 
+/// A service's `env_file`: one path, or a list of paths and `{path, required}` entries.
+enum EnvFile {
+    One(String),
+    Many(Vec<EnvFileEntry>),
+}
+
+impl<'de> Deserialize<'de> for EnvFile {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // An untagged enum would swallow an entry's "unknown key" error and report only
+        // that no variant matched.
+        match serde_yaml_ng::Value::deserialize(d)? {
+            serde_yaml_ng::Value::String(p) => Ok(EnvFile::One(p)),
+            serde_yaml_ng::Value::Sequence(items) => items
+                .into_iter()
+                .map(|v| EnvFileEntry::deserialize(v).map_err(serde::de::Error::custom))
+                .collect::<Result<Vec<_>, _>>()
+                .map(EnvFile::Many),
+            other => Err(serde::de::Error::custom(format!(
+                "env_file wants a path or a list of them, got {other:?}"
+            ))),
+        }
+    }
+}
+
+/// One list entry: a path or `{path, required}`. Manual dispatch preserves errors for
+/// misspelled mapping keys instead of letting an untagged enum fall back to a string.
+enum EnvFileEntry {
+    Path(String),
+    Spec(EnvFileSpec),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvFileSpec {
+    path: String,
+    /// compose's default: a listed file that is not there is an error
+    #[serde(default = "default_true")]
+    required: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl<'de> Deserialize<'de> for EnvFileEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = serde_yaml_ng::Value::deserialize(d)?;
+        match value {
+            serde_yaml_ng::Value::String(p) => Ok(EnvFileEntry::Path(p)),
+            other => EnvFileSpec::deserialize(other)
+                .map(EnvFileEntry::Spec)
+                .map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+impl EnvFile {
+    /// The entries in order, as (path, required).
+    fn entries(&self) -> impl Iterator<Item = (&str, bool)> {
+        let (one, many) = match self {
+            EnvFile::One(p) => (Some((p.as_str(), true)), [].as_slice()),
+            EnvFile::Many(list) => (None, list.as_slice()),
+        };
+        one.into_iter().chain(many.iter().map(|e| match e {
+            EnvFileEntry::Path(p) => (p.as_str(), true),
+            EnvFileEntry::Spec(s) => (s.path.as_str(), s.required),
+        }))
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ComposeService {
     image: Option<String>,
+    /// `KEY=VALUE` files beneath `environment`. Empty `KEY:` and bare `- KEY` entries
+    /// override file values with empty strings rather than importing host values.
+    env_file: Option<EnvFile>,
     build: Option<serde_yaml_ng::Value>,
     environment: Option<Env>,
     command: Option<Cmd>,
@@ -1475,6 +1616,130 @@ mod tests {
         assert!(parse(both, Path::new("/b")).is_err());
         let neither = "services:\n  x:\n    user: root\n";
         assert!(parse(neither, Path::new("/b")).is_err());
+    }
+
+    #[test]
+    fn env_file_is_read_under_the_environment_that_overrides_it() {
+        let dir = std::env::temp_dir().join(format!("vk-compose-envfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = TmpDir(dir.clone());
+        std::fs::write(
+            dir.join("base.env"),
+            "# a comment\nPYTHONPATH=/workdir/src\nMODE=file\nTIER=base\nDUP=first\nDUP=second\n\
+             export QUOTED='keep $LITERAL'\n",
+        )
+        .unwrap();
+        // CRLF, because a file written on the other kind of machine still has to parse.
+        std::fs::write(dir.join("over.env"), "MODE=later-file\r\nTIER=over\r\n").unwrap();
+
+        let read = |yaml: &str| {
+            let mut u = super::parse(yaml, &dir, &|_| None, None)
+                .unwrap()
+                .pop()
+                .unwrap();
+            super::resolve_env_files(&mut u).unwrap();
+            u.environment
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let env = read(
+            "services:\n  dev:\n    image: x\n    env_file:\n      - base.env\n\
+             \x20     - over.env\n      - path: absent.env\n        required: false\n\
+             \x20   environment:\n      MODE: from-environment\n",
+        );
+        assert_eq!(env["PYTHONPATH"], "/workdir/src");
+        // `environment:` beats every file …
+        assert_eq!(env["MODE"], "from-environment");
+        // … and among the files alone, the later one wins.
+        assert_eq!(env["TIER"], "over");
+        // A name repeated inside one file: the last line wins, as in a shell.
+        assert_eq!(env["DUP"], "second");
+        // Values are taken as written: one quote pair off, no expansion.
+        assert_eq!(env["QUOTED"], "keep $LITERAL");
+
+        // The single-string form reads that one file, and `required: true` spelled out is
+        // the default rather than a different mode.
+        assert_eq!(
+            read("services:\n  dev:\n    image: x\n    env_file: base.env\n")["TIER"],
+            "base"
+        );
+        assert_eq!(
+            read(
+                "services:\n  dev:\n    image: x\n    env_file:\n      - path: base.env\n\
+                 \x20       required: true\n"
+            )["TIER"],
+            "base"
+        );
+
+        // An `environment:` entry with no value blanks what a file set, rather than
+        // deferring to it — the same rule as any other override, spelled out because the
+        // shorthand looks like an omission.
+        assert_eq!(
+            read(
+                "services:\n  dev:\n    image: x\n    env_file: base.env\n\
+                 \x20   environment:\n      TIER:\n"
+            )["TIER"],
+            ""
+        );
+    }
+
+    #[test]
+    fn a_bad_env_file_entry_is_reported_rather_than_quietly_dropped() {
+        let dir = std::env::temp_dir().join(format!("vk-compose-envbad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = TmpDir(dir.clone());
+
+        let go = |yaml: &str| -> Result<()> {
+            let mut u = super::parse(yaml, &dir, &|_| None, None)?.pop().unwrap();
+            super::resolve_env_files(&mut u)
+        };
+
+        // A listed file that is not there is an error unless it says otherwise — a typo in
+        // a path must not quietly leave the environment short.
+        let err = go("services:\n  dev:\n    image: x\n    env_file: missing.env\n").unwrap_err();
+        assert!(format!("{err:#}").contains("missing.env"), "{err:#}");
+
+        // A misspelled key in the mapping form is reported, not read as the plain path form
+        // with the default `required` silently back in force.
+        let err = go(
+            "services:\n  dev:\n    image: x\n    env_file:\n      - path: missing.env\n\
+                     \x20       requried: false\n",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("requried"), "{err:#}");
+
+        // A line that is not KEY=VALUE names the file and the line, and nothing else: these
+        // files hold credentials, and on the executor this error reaches a job log.
+        std::fs::write(dir.join("bad.env"), "OK=1\nsk-a-real-looking-secret\n").unwrap();
+        let err = go("services:\n  dev:\n    image: x\n    env_file: bad.env\n").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("bad.env:2"), "{msg}");
+        assert!(
+            !msg.contains("sk-a-real-looking-secret"),
+            "leaked the line: {msg}"
+        );
+
+        // A name the guest's shell could not export is rejected where it is written: these
+        // pairs are the guest's environment now, not just interpolation lookups.
+        for line in ["=orphan\n", "TWO WORDS=1\n", "9LIVES=1\n"] {
+            std::fs::write(dir.join("name.env"), line).unwrap();
+            let err = go("services:\n  dev:\n    image: x\n    env_file: name.env\n").unwrap_err();
+            assert!(
+                format!("{err:#}").contains("not a usable variable name"),
+                "{line:?}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_environment_name_keeps_only_its_last_value() {
+        // The list form used to reach the unit as two entries; layering it over `env_file`
+        // through the same upsert makes the later one win, as compose does.
+        let u =
+            one("services:\n  s:\n    image: x\n    environment:\n      - FOO=1\n      - FOO=2\n");
+        assert_eq!(u.environment, vec![("FOO".to_string(), "2".to_string())]);
     }
 
     #[test]

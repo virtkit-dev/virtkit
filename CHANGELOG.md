@@ -13,6 +13,9 @@ All notable changes to virtkit will be documented in this file.
 - `vk run --workspace DIR` and `vk build --workspace` / `--state-dir` with `--compose`
   select the workspace and state directory. Runs need not start in the project directory,
   and prebuilds resolve the same paths as the boot they prepare.
+- Compose services can load environment variables from `env_file:` using a path, list,
+  or optional `{path, required: false}` entry. Later files override earlier ones, and
+  `environment:` takes precedence, so projects need not duplicate file-based settings.
 - `vk stop` accepts the pid `vk list` prints or a launch directory, so a VM can be
   selected directly when several share a launch directory or the caller is elsewhere.
   An argument that is only digits is read as a pid, so a directory named that way now
