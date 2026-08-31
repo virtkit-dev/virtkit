@@ -4527,6 +4527,7 @@ dependencies = [
  "simplelog",
  "tokio",
  "vk-core",
+ "vk-fs",
 ]
 
 [[package]]

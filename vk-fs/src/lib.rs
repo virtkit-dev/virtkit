@@ -18,6 +18,9 @@
 //! [`bind_private`] applies all four to unix sockets, the only objects published here so far.
 //! `vk-core` uses it for the agent's exec channel and `vk-registry` for its admin socket; both
 //! require the published name to refer only to a socket already restricted to `0600`.
+//!
+//! [`open_dir`] and [`open_dir_nofollow`] expose the third rule to callers that anchor their
+//! own `*at()` operations.
 
 use anyhow::{Context, anyhow, bail};
 use std::ffi::{CString, OsStr};
@@ -245,18 +248,33 @@ fn cstr(name: &OsStr) -> Result<CString, anyhow::Error> {
 /// Open a directory as an `O_PATH` descriptor: a location to resolve from, whose own mode
 /// cannot refuse the open the way an `O_RDONLY` one would.
 ///
+/// A final symlink is followed to support caller-provided layouts such as `/var/run` → `/run`.
+/// Use [`open_dir_nofollow`] where such a link means something has gone wrong.
+///
 /// `O_PATH` cannot travel through `OpenOptions::custom_flags` on musl, which defines
 /// `O_ACCMODE` as `03|O_SEARCH` with `O_SEARCH == O_PATH`: std masks custom flags with
 /// `!O_ACCMODE`, dropping the bit, and what runs is an ordinary `O_RDONLY` open — the one
 /// thing a directory missing its read bit refuses.
-fn open_dir(dir: &Path) -> Result<OwnedFd, anyhow::Error> {
+pub fn open_dir(dir: &Path) -> Result<OwnedFd, anyhow::Error> {
+    open_dir_flags(dir, 0)
+}
+
+/// [`open_dir`], refusing a symlink at the final component.
+///
+/// `O_DIRECTORY` is what makes it refuse: `O_PATH | O_NOFOLLOW` alone would hand back a
+/// descriptor on the link itself rather than failing.
+pub fn open_dir_nofollow(dir: &Path) -> Result<OwnedFd, anyhow::Error> {
+    open_dir_flags(dir, libc::O_NOFOLLOW)
+}
+
+fn open_dir_flags(dir: &Path, extra: libc::c_int) -> Result<OwnedFd, anyhow::Error> {
     let c_dir = cstr(dir.as_os_str())?;
     // SAFETY: the pointer is NUL-terminated and outlives the call; the descriptor it returns
     // is handed straight to `OwnedFd`, which closes it.
     let fd = unsafe {
         libc::open(
             c_dir.as_ptr(),
-            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | extra,
         )
     };
     if fd < 0 {
@@ -293,6 +311,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// [`open_dir`] follows a symlinked directory; [`open_dir_nofollow`] refuses it.
+    #[test]
+    fn only_the_nofollow_open_refuses_a_symlinked_directory() {
+        let dir = scratch("open-dir-link");
+        let real = dir.join("real");
+        let link = dir.join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        open_dir(&link).expect("a link to a directory is a layout open_dir follows");
+        let err = open_dir_nofollow(&link).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Not a directory"),
+            "a symlink must be refused as one, not opened: {err:#}"
+        );
+
+        // The no-follow variant still opens the directory itself.
+        open_dir_nofollow(&real).expect("the directory itself still opens");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The rename publishes over whatever is at the path, so a socket a previous server

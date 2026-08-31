@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 # shared host↔guest protocol + runtime helpers (exec/pty/forward/dockerignore/…).
 vk-core = { path = "../vk-core" }
+# Descriptor-anchored directory opens shared with private-socket binding.
+vk-fs = { path = "../vk-fs" }
 anyhow.workspace = true
 clap = { workspace = true, features = ["string"] }
 fuser = { workspace = true }

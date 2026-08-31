@@ -12,9 +12,8 @@
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Seek, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
 use std::time::Duration;
 
@@ -90,20 +89,21 @@ impl Mark {
 /// The open parent directory and leaf name. Descriptor-relative creation and removal keep using
 /// the original directory even if another mount later covers `/run`.
 struct MarkDir {
-    dir: File,
+    dir: OwnedFd,
     name: CString,
 }
 
 impl MarkDir {
-    /// Open the mark's parent without following a symlink; failure leaves the stage unmeasured.
+    /// Open the mark's parent without following a final symlink; failure leaves it unmeasured.
+    ///
+    /// The descriptor is only an `*at()` anchor, so [`vk_fs::open_dir_nofollow`] uses `O_PATH`.
+    /// The agent mounts `/run` itself; a symlink there indicates an invalid layout.
     fn open(path: &Path) -> io::Result<Self> {
         let name = path
             .file_name()
             .ok_or_else(|| io::Error::other("the mark path names no file"))?;
-        let dir = File::options()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(path.parent().unwrap_or(Path::new("/")))?;
+        let dir = vk_fs::open_dir_nofollow(path.parent().unwrap_or(Path::new("/")))
+            .map_err(|e| io::Error::other(format!("{e:#}")))?;
         Ok(MarkDir {
             dir,
             name: CString::new(name.as_bytes()).map_err(io::Error::other)?,
@@ -196,7 +196,7 @@ pub(crate) fn watch(enabled: bool) {
     let at = match MarkDir::open(Path::new(MARK)) {
         Ok(at) => at,
         Err(e) => {
-            warn!("vk-agent memmark: opening the directory holding {MARK}: {e}");
+            warn!("vk-agent memmark: cannot open the directory holding {MARK}: {e}");
             return;
         }
     };
