@@ -255,7 +255,7 @@ rebuilt byte-for-byte.
 | `vk build` | Build Dockerfile stages into a bootable ext4 image or caller-owned disk. |
 | `vk exec` | Run a command in an existing guest and return the command's exit status. |
 | `vk list` | Discover registered background VMs and compose services. |
-| `vk stop` | Stop a VM selected by launch directory, or stop all registered VMs. |
+| `vk stop` | Stop a VM selected by pid or launch directory, or stop all registered VMs. |
 | `vk status` | Probe a guest agent, or report whether its root image is stale. |
 | `vk atop` | Follow or inspect guest resource recordings. |
 | `vk check` | Validate KVM, VMM, embedded assets, and configured host features. |

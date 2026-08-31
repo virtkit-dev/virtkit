@@ -1,17 +1,18 @@
 //! Host-side registry of running vk VMs.
 //!
-//! A `vk run --state-dir DIR` records an entry here once its VMM is spawned and removes it when
-//! the run exits, so `vk list` can discover running VMs and `vk stop` can bring one down by
-//! directory — no grepping the process table. Only pinned (`--state-dir`) runs are tracked:
-//! they expose a stable exec socket external tooling attaches to, and they hold an advisory
-//! `flock` on the state dir that gives a pid-reuse-proof liveness signal. Ephemeral runs (a
-//! temp state dir removed on exit, no attachable socket) are deliberately not recorded.
+//! A `vk run --state-dir DIR` records an entry after spawning its VMM and removes it on exit.
+//! `vk list` discovers running VMs from these entries, and `vk stop` selects one by directory or
+//! displayed pid without searching the process table. Only pinned (`--state-dir`) runs are
+//! tracked: they expose a stable exec socket for external tooling and hold an advisory `flock`
+//! on the state dir as a pid-reuse-proof liveness signal. Ephemeral runs have a temporary state
+//! dir and no attachable socket, so they are deliberately not recorded.
 //!
 //! The registry is advisory. An entry can outlive its VM if the run was `SIGKILL`ed before its
 //! removal ran, so readers reconcile liveness by probing the state-dir lock (`alive`) and prune
 //! entries whose owner is gone. Entries live under `<data base>/vms/` (the same
 //! `$XDG_DATA_HOME/virtkit` home `vk run`'s image cache uses), one JSON file per VM.
 
+use std::ffi::OsStr;
 use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
@@ -30,8 +31,8 @@ pub struct VmEntry {
     /// belongs to. `vk list DIR` / `vk stop DIR` match on this. `None` if it was unavailable.
     #[serde(default)]
     pub project_dir: Option<PathBuf>,
-    /// PID of the `vk run` process managing the VM (the one holding the state-dir lock).
-    /// `vk stop` signals it; it tears the VM and any compose siblings down on exit.
+    /// PID of the managing `vk run`, which holds the state-dir lock. `vk list` displays it, and
+    /// `vk stop` can select and signal it. On exit, it tears down the VM and compose siblings.
     pub pid: u32,
     /// A short human label: the compose primary / image / `-f <target>` this VM boots.
     pub label: String,
@@ -613,11 +614,13 @@ fn stop_one(entry: &VmEntry, timeout: u64) -> bool {
         }
         return true;
     }
-    // SAFETY: kill with a signal number is always safe; an ESRCH (already gone) is fine. We
-    // just confirmed the owner live via the state-dir lock, so the sub-millisecond window in
-    // which it could exit and its pid be recycled before this signal lands is negligible.
+    // The result is dropped because neither failure changes what to do: ESRCH means it went
+    // down between the check above and here, and EPERM means the pid is no longer the run we
+    // recorded — the wait below then reports it as still standing, which is the truth either
+    // way. The state-dir lock was just held, so that window is a handful of instructions.
+    // SAFETY: kill with a signal number is always safe.
     unsafe { libc::kill(entry.pid as i32, libc::SIGTERM) };
-    for _ in 0..(timeout * 2) {
+    for _ in 0..timeout.saturating_mul(2) {
         if !alive(entry) {
             if let Ok(dir) = registry_dir() {
                 remove_in(&dir, &entry.state_dir);
@@ -629,35 +632,80 @@ fn stop_one(entry: &VmEntry, timeout: u64) -> bool {
     false
 }
 
-/// Whether an empty selection counts as success. An explicit `vk stop DIR` naming a target
-/// that isn't running is a not-found the caller should see (exit 1), so a script can tell
-/// "stopped it" from "there was nothing there"; `--all` and the current-directory default
-/// treat "nothing to stop" as already done.
-fn empty_selection_ok(explicit_dir: bool) -> bool {
-    !explicit_dir
+/// Whether an empty selection succeeds. An explicit `vk stop TARGET` returns not-found (exit 1)
+/// so scripts can distinguish "stopped it" from "there was nothing there". `--all` and the
+/// current-directory default treat an empty selection as already done.
+fn empty_selection_ok(explicit_target: bool) -> bool {
+    !explicit_target
 }
 
-/// `vk stop`: stop the selected VMs. Selection is `--all`, else those under `dir`, else those
-/// matching the current directory. Returns the summary and whether every selected VM went down.
-pub fn stop_cmd(dir: Option<&Path>, all: bool, timeout: u64) -> Result<(String, bool)> {
+/// A `vk stop TARGET`: either the pid shown by `vk list` or a launch directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selector {
+    Pid(u32),
+    Dir(PathBuf),
+}
+
+impl Selector {
+    /// An all-digit argument that fits `u32` is a pid; anything else is a directory. Prefix a
+    /// digit-only directory such as `123` with `./`.
+    ///
+    /// Parse paths as bytes so non-UTF-8 names remain valid. The digit check prevents
+    /// `u32::from_str` from treating `+5` as a pid; digit strings larger than `u32` also remain
+    /// paths.
+    pub fn parse(arg: &OsStr) -> Result<Self> {
+        if arg.is_empty() {
+            bail!("no VM named — pass a pid, a launch directory, or --all");
+        }
+        if arg.as_bytes().iter().all(u8::is_ascii_digit)
+            && let Some(pid) = arg.to_str().and_then(|s| s.parse::<u32>().ok())
+        {
+            return Ok(Selector::Pid(pid));
+        }
+        Ok(Selector::Dir(PathBuf::from(arg)))
+    }
+
+    /// Resolve a directory once so every entry is matched against the same path.
+    fn resolved(self) -> Self {
+        match self {
+            Selector::Dir(dir) => Selector::Dir(canonical(&dir)),
+            pid => pid,
+        }
+    }
+
+    /// Whether this selector picks `entry`. The directory is already [`Selector::resolved`].
+    fn matches(&self, entry: &VmEntry) -> bool {
+        match self {
+            Selector::Pid(pid) => entry.pid == *pid,
+            Selector::Dir(dir) => matches_dir(entry, dir),
+        }
+    }
+
+    /// What to report when it picks nothing.
+    fn not_found(&self) -> String {
+        match self {
+            Selector::Pid(pid) => format!("no running vk VM with pid {pid}\n"),
+            Selector::Dir(dir) => format!("no running vk VM under {}\n", dir.display()),
+        }
+    }
+}
+
+/// Stop VMs selected by `--all`, a pid or launch directory, or the current directory by default.
+/// Returns the summary and whether every selected VM went down.
+pub fn stop_cmd(target: Option<Selector>, all: bool, timeout: u64) -> Result<(String, bool)> {
     let vms = running();
-    let selected: Vec<VmEntry> = if all {
-        vms
-    } else {
-        let target = match dir {
-            Some(d) => canonical(d),
-            None => std::env::current_dir().context("resolving the current directory")?,
-        };
-        vms.into_iter()
-            .filter(|e| matches_dir(e, &target))
-            .collect()
+    let target = target.map(Selector::resolved);
+    let selected: Vec<VmEntry> = match (all, &target) {
+        (true, _) => vms,
+        (false, Some(sel)) => vms.into_iter().filter(|e| sel.matches(e)).collect(),
+        (false, None) => {
+            let cwd = std::env::current_dir().context("resolving the current directory")?;
+            vms.into_iter().filter(|e| matches_dir(e, &cwd)).collect()
+        }
     };
     if selected.is_empty() {
-        return match dir {
-            Some(d) => Ok((
-                format!("no running vk VM under {}\n", canonical(d).display()),
-                empty_selection_ok(true),
-            )),
+        return match &target {
+            Some(sel) => Ok((sel.not_found(), empty_selection_ok(true))),
             None => Ok((
                 "no matching running vk VM\n".to_string(),
                 empty_selection_ok(false),
@@ -939,11 +987,71 @@ mod tests {
     }
 
     #[test]
-    fn empty_stop_is_success_only_without_an_explicit_dir() {
+    fn empty_stop_is_success_only_without_an_explicit_target() {
         // `vk stop` / `vk stop --all` with nothing running: success (nothing to do).
         assert!(empty_selection_ok(false));
-        // `vk stop DIR` naming a target that isn't running: not-found (exit 1).
+        // `vk stop PID|DIR` naming a target that isn't running: not-found (exit 1).
         assert!(!empty_selection_ok(true));
+    }
+
+    fn parse(arg: &str) -> Selector {
+        Selector::parse(OsStr::new(arg)).unwrap()
+    }
+
+    #[test]
+    fn a_stop_target_parses_digits_as_a_pid() {
+        // Digits that fit u32 select the pid shown by `vk list`; `./` makes a digit-only name a
+        // directory.
+        assert_eq!(parse("2144802"), Selector::Pid(2144802));
+        assert_eq!(parse("007"), Selector::Pid(7));
+        assert_eq!(
+            parse("/home/vince/repo"),
+            Selector::Dir(PathBuf::from("/home/vince/repo"))
+        );
+        assert_eq!(parse("./123"), Selector::Dir(PathBuf::from("./123")));
+        // A signed number and a value past u32 remain directories.
+        assert_eq!(parse("+5"), Selector::Dir(PathBuf::from("+5")));
+        assert_eq!(
+            parse("99999999999"),
+            Selector::Dir(PathBuf::from("99999999999"))
+        );
+        // A non-UTF-8 path still names a VM and cannot be mistaken for a pid.
+        let raw = OsStr::from_bytes(b"/tmp/\xff");
+        assert_eq!(
+            Selector::parse(raw).unwrap(),
+            Selector::Dir(PathBuf::from(raw))
+        );
+        // Refuse an empty argument because `Path::starts_with("")` accepts every path.
+        assert!(Selector::parse(OsStr::new("")).is_err());
+    }
+
+    #[test]
+    fn a_stop_target_selects_by_pid_or_by_directory() {
+        let e = entry(
+            PathBuf::from("/state/vm1"),
+            Some(PathBuf::from("/home/vince/repo")),
+        );
+        assert!(Selector::Pid(e.pid).matches(&e));
+        assert!(!Selector::Pid(e.pid.wrapping_add(1)).matches(&e));
+        // Directory selection matches `vk list DIR`: the project, its ancestor, or the state
+        // directory.
+        assert!(Selector::Dir(PathBuf::from("/home/vince")).matches(&e));
+        assert!(Selector::Dir(PathBuf::from("/state/vm1")).matches(&e));
+        assert!(!Selector::Dir(PathBuf::from("/home/other")).matches(&e));
+        // A pid selector never falls back to the directory that spells it; use `./123` for the
+        // directory.
+        let digits = entry(PathBuf::from("/state/vm2"), Some(PathBuf::from("/123")));
+        assert!(!Selector::Pid(123).matches(&digits));
+        assert!(Selector::Dir(PathBuf::from("/123")).matches(&digits));
+        // Each says what it looked for when it finds nothing.
+        assert_eq!(
+            Selector::Pid(4242).not_found(),
+            "no running vk VM with pid 4242\n"
+        );
+        assert_eq!(
+            Selector::Dir(PathBuf::from("/home/other")).not_found(),
+            "no running vk VM under /home/other\n"
+        );
     }
 
     #[test]

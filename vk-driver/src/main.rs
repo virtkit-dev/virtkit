@@ -1450,13 +1450,18 @@ enum Cmd {
     ///
     /// SIGTERMs the managing `vk run` (which tears down the VM and any compose siblings),
     /// then waits for it to exit. Selects the VM launched from the current directory by
-    /// default; pass a DIR to select by launch directory, or `--all`.
+    /// default; pass a pid or a launch directory to select one, or `--all`.
     #[command(display_order = 8)]
     Stop {
-        /// stop the VM(s) launched from DIR or below it (default: the current directory)
-        dir: Option<PathBuf>,
+        /// the VM to stop: a PID or a launch directory (default: the current directory)
+        ///
+        /// An all-digit argument is a pid, as `vk list` prints; anything else a directory —
+        /// whose VM(s), and those of every directory below it, are stopped. A directory
+        /// named only by digits therefore needs a `./` in front of it.
+        #[arg(value_name = "PID|DIR")]
+        target: Option<std::ffi::OsString>,
         /// stop every running vk VM
-        #[arg(long, conflicts_with = "dir")]
+        #[arg(long, conflicts_with = "target")]
         all: bool,
         /// seconds to wait for each VM to go down before reporting it stuck
         #[arg(long, default_value_t = 30, value_name = "SECS")]
@@ -2173,8 +2178,20 @@ async fn cli_main() -> ExitCode {
             Err(e) => fail(&e, 2),
         };
     }
-    if let Cmd::Stop { dir, all, timeout } = &cli.cmd {
-        return match vms::stop_cmd(dir.as_deref(), *all, *timeout) {
+    if let Cmd::Stop {
+        target,
+        all,
+        timeout,
+    } = &cli.cmd
+    {
+        let selector = match target.as_deref().map(vms::Selector::parse).transpose() {
+            Ok(sel) => sel,
+            Err(e) => {
+                eprintln!("vk: {e:#}");
+                return exit_code(2);
+            }
+        };
+        return match vms::stop_cmd(selector, *all, *timeout) {
             Ok((report, all_down)) => {
                 print!("{report}");
                 if all_down {

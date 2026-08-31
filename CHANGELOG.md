@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `vk stop` accepts the pid `vk list` prints or a launch directory, so a VM can be
+  selected directly when several share a launch directory or the caller is elsewhere.
+  An argument that is only digits is read as a pid, so a directory named that way now
+  needs a `./` in front of it.
+
 ### Fixed
 
 - Resizing a terminal or multiplexer pane no longer joins build steps, output, and
