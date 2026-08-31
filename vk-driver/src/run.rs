@@ -1442,6 +1442,11 @@ async fn build_and_boot(
     let mut virtiofsds: Vec<Child> = Vec::new();
     let mut virtiofs = String::new();
     if let Some(host_dir) = &args.workdir {
+        // Validate workdirs like directory volume sources: the guest mounts a tree, not one file.
+        let at = || format!("--workdir {}", host_dir.display());
+        if crate::compose::require_shareable(host_dir).with_context(at)? {
+            bail!("{}: the host path is a file, not a directory", at());
+        }
         let sock = work.join("workdir.fs.sock");
         // libkrun mounts host_dir directly (built-in virtio-fs); only cloud-hypervisor
         // needs the external virtiofsd on `sock`.
@@ -1480,6 +1485,7 @@ async fn build_and_boot(
     // handling for a compose sibling's own `disk` volumes.
     let mut disk_devices = String::new();
     for (i, vol) in primary_volumes.iter().chain(&args.volumes).enumerate() {
+        crate::compose::require_share_source(vol)?;
         if vol.disk {
             crate::compose::ensure_disk_backing(vol)?;
             let device = crate::build::vd_name(disks.len());

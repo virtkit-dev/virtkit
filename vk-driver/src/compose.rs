@@ -1044,6 +1044,77 @@ pub fn ensure_disk_backing(vol: &Volume) -> Result<()> {
     publish
 }
 
+/// Validate a virtio-fs share root and return which server it needs: `true` for the
+/// single-file server and `false` for the directory server.
+///
+/// A missing root mounts but returns `Connection refused` on every guest access. Other
+/// unsupported roots fail just as completely, so reject them before boot.
+pub fn require_shareable(host: &Path) -> Result<bool> {
+    // Inspect without following first so symlinks can be handled explicitly.
+    let link = match std::fs::symlink_metadata(host) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!("the host path does not exist"),
+        // Denied lookups and symlink loops are as unshareable as missing paths.
+        Err(e) => bail!("cannot stat the host path: {e}"),
+    };
+    let shape = |m: &std::fs::Metadata| -> Result<bool> {
+        if m.is_dir() {
+            Ok(false)
+        } else if m.is_file() {
+            Ok(true)
+        } else {
+            // Sockets, FIFOs, and device nodes open, but the guest kernel refuses to mount a
+            // non-directory share.
+            bail!("the host path is neither a file nor a directory")
+        }
+    };
+    if !link.is_symlink() {
+        return shape(&link);
+    }
+    // Both backends choose their server from symlink-following metadata, so a file symlink
+    // works as a single-file bind. A directory symlink fails because the directory server
+    // opens the root with `O_PATH | O_NOFOLLOW` and receives the link itself, making every
+    // lookup fail.
+    let target = match std::fs::metadata(host) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("the host path is a symlink that leads nowhere")
+        }
+        Err(e) => bail!("cannot follow the host path: {e}"),
+    };
+    if !target.is_file() {
+        bail!("the host path is a symlink to a directory, which cannot be a share root");
+    }
+    Ok(true)
+}
+
+/// Validate a volume immediately before it becomes a VMM share.
+///
+/// Validate here instead of in [`parse_volume`]: `vk build --compose` parses the same
+/// volumes without mounting them, and the source need only exist at boot. Consequently, an
+/// invalid `-v` is reported after the image build.
+///
+/// Disk volumes are exempt because [`ensure_disk_backing`] creates their backing files on
+/// first use.
+pub fn require_share_source(vol: &Volume) -> Result<()> {
+    if vol.disk {
+        return Ok(());
+    }
+    let at = || format!("volume {}:{}", vol.host.display(), vol.guest);
+    let is_file = require_shareable(&vol.host).with_context(at)?;
+    // Parsing records the source shape while it may not exist. Reject later changes because
+    // files and directories use different share servers.
+    if is_file != vol.is_file {
+        bail!(
+            "{}: the host path is {} — it was {} when the volume spec was read",
+            at(),
+            if is_file { "a file" } else { "a directory" },
+            if vol.is_file { "a file" } else { "a directory" },
+        );
+    }
+    Ok(())
+}
+
 /// Parse a `--symlink SRC:DST` spec: two absolute guest paths, split at the first
 /// colon (matching the agent's VIRTKIT_SYMLINKS parser, so a `:` in DST is fine).
 /// The spec rides the kernel cmdline, where ',' and whitespace are separators —
@@ -1868,6 +1939,63 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_share_source_that_cannot_be_served_is_refused_while_a_disk_backing_file_is_not() {
+        let dir = std::env::temp_dir().join(format!("vk-compose-sharesrc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("present")).unwrap();
+        std::fs::write(dir.join("conf"), b"x").unwrap();
+        let _guard = TmpDir(dir.clone());
+        let vol = |spec: String| parse_volume(&spec, Path::new("/b")).unwrap();
+        let at = |name: &str| format!("{}/{name}", dir.display());
+
+        require_share_source(&vol(format!("{}:/x", at("present")))).unwrap();
+        require_share_source(&vol(format!("{}:/etc/x", at("conf")))).unwrap();
+
+        // A missing source would yield a mount that fails every guest access. Reject every
+        // mode and name the bad path.
+        for mode in ["rw", "ro", "overlay"] {
+            let err = require_share_source(&vol(format!("{}:/x:{mode}", at("gone")))).unwrap_err();
+            let err = format!("{err:#}");
+            assert!(err.contains(&at("gone")), "{err}");
+            assert!(err.contains("does not exist"), "{err}");
+        }
+
+        // The single-file server follows file symlinks. Directory symlinks fail because the
+        // directory server opens the share root with `O_NOFOLLOW` and serves the link itself.
+        std::os::unix::fs::symlink(dir.join("conf"), dir.join("link-file")).unwrap();
+        std::os::unix::fs::symlink(dir.join("present"), dir.join("link-dir")).unwrap();
+        std::os::unix::fs::symlink(dir.join("gone"), dir.join("dangling")).unwrap();
+        require_share_source(&vol(format!("{}:/etc/x", at("link-file")))).unwrap();
+        let err = require_share_source(&vol(format!("{}:/x", at("link-dir")))).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("symlink to a directory"),
+            "{err:#}"
+        );
+        // A dangling link is reported as the broken link it is, not as a missing path.
+        let err = require_share_source(&vol(format!("{}:/x", at("dangling")))).unwrap_err();
+        assert!(format!("{err:#}").contains("leads nowhere"), "{err:#}");
+
+        let fifo = std::ffi::CString::new(at("pipe")).unwrap();
+        // SAFETY: mkfifo on a path in our own temp dir; no memory is touched.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let err = require_share_source(&vol(format!("{}:/x", at("pipe")))).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("neither a file nor a directory"),
+            "{err:#}"
+        );
+
+        // Reject sources whose shape changed after parsing; files and directories use
+        // different share servers.
+        let v = vol(format!("{}:/x", at("later")));
+        std::fs::write(dir.join("later"), b"").unwrap();
+        let err = require_share_source(&v).unwrap_err();
+        assert!(format!("{err:#}").contains("it was a directory"), "{err:#}");
+
+        // A missing disk backing file is valid because it is created and formatted on first use.
+        require_share_source(&vol(format!("{}:/data:disk", at("gone.ext4")))).unwrap();
     }
 
     #[test]

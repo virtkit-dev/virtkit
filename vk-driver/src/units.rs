@@ -430,6 +430,7 @@ pub fn boot_unit(
     // mirroring `run::build_and_boot`'s handling of the primary's own `disk` volumes.
     let mut disk_volumes: Vec<&crate::compose::Volume> = Vec::new();
     for (i, vol) in svc.volumes.iter().enumerate() {
+        crate::compose::require_share_source(vol)?;
         if vol.disk {
             crate::compose::ensure_disk_backing(vol)?;
             disk_volumes.push(vol);
