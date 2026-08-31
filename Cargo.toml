@@ -146,3 +146,9 @@ redb = "4"
 # robust across terminals and multiplexers (tmux/zellij). Pure Rust (console uses libc
 # termios, no C lib), so the musl-static build is unaffected.
 indicatif = "0.18"
+# display width of a char, for the dashboard's own right-margin break: indicatif lays its
+# lines out with the same crate (via console), so counting columns any other way would
+# desync the two. Already transitive through indicatif; pure Rust, tables only.
+unicode-width = "0.2"
+# Use indicatif's transitive ANSI classifier in dashboard layout tests.
+console = { version = "0.16", default-features = false, features = ["ansi-parsing"] }

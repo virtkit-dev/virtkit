@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle, TermLike};
+use unicode_width::UnicodeWidthChar;
 use vk_core::messages::Fd;
 use vk_core::pty::get_winsize;
 
@@ -792,6 +793,9 @@ impl Progress {
     /// Tty only: rendered as a width-truncated line ({wide_msg}) in the pinned block, so a
     /// carriage-return progress frame updates in place and never wraps — a wrapped line would
     /// break indicatif's line accounting, the very corruption this cell exists to avoid.
+    /// Tabs are flattened for that reason: nothing measuring the line counts one as more than
+    /// zero columns, while the terminal advances the cursor to the next tab stop, which is
+    /// exactly the width disagreement that wraps the line.
     /// Plain/routed backends have no in-place line, so a partial surfaces only when a newline
     /// (or [`flush_partial`](Self::flush_partial)) commits it.
     fn set_output_tail(&self, stage: StageId, text: Option<&str>) {
@@ -801,7 +805,7 @@ impl Progress {
         match text {
             Some(t) if !t.is_empty() => {
                 let prefix = self.dim(&format!("#{}", self.output_seq(stage)));
-                let msg = format!("{prefix} {t}");
+                let msg = format!("{prefix} {}", t.replace('\t', " "));
                 let mut bars = tty.bars.lock().unwrap();
                 bars.entry((stage, OUTPUT_TAIL_NUM))
                     .or_insert_with(|| {
@@ -957,8 +961,8 @@ impl Drop for Tty {
     }
 }
 
-/// The [`TermLike`] indicatif draws the pinned block through: stdout, plus the terminal-resize
-/// recovery indicatif does not do itself.
+/// The pinned block's [`TermLike`] target, adding resize recovery and explicit right-margin
+/// row breaks to stdout (see [`Frame::put`]).
 struct ResizeTerm {
     state: Mutex<Frame>,
     /// the terminal's `(columns, rows)` source — [`term_size`], swapped out by the tests.
@@ -1006,6 +1010,38 @@ struct Frame {
     open_row: bool,
     /// the open draw has emitted a line, so it leaves a frame on screen.
     wrote: bool,
+    /// Visible columns on the current row, used to break before terminal auto-wrap.
+    col: u16,
+    /// Escape scanner state, retained across `write_str` calls.
+    esc: Esc,
+}
+
+/// [`Frame`]'s escape-sequence scanner state: which part of a sequence the next character
+/// continues. Every state but [`Esc::Text`] also ends at a `\r` or `\n`, which no sequence can
+/// contain and a truncated one can be cut short before.
+///
+/// This follows what a terminal skips, which is what decides where the cursor is and so where
+/// the row has to break. indicatif's own measure (`console::AnsiCodeIterator`) is narrower —
+/// it takes an OSC, and a CSI outside its final-byte set, for text — so a line carrying one is
+/// laid out for more rows than it occupies. That predates the frame breaking its own rows: the
+/// terminal wrapped by the same count before, and matching indicatif here would only move the
+/// break away from where the cursor actually lands.
+#[derive(Debug, Default, Clone, Copy)]
+enum Esc {
+    /// not in a sequence — the next character is text.
+    #[default]
+    Text,
+    /// after `ESC`: the next character selects the sequence kind.
+    Start,
+    /// inside a CSI (`ESC [`), which ends at a character in `@`..=`~`.
+    Csi,
+    /// inside a sequence whose intermediates are still running (`ESC (`, `ESC #`, …), which
+    /// ends at the first character outside `\x20`..=`\x2f`. `tput sgr0` leads with `ESC ( B`.
+    Inter,
+    /// inside an OSC (`ESC ]`), which ends at `BEL` or `ESC \`.
+    Osc,
+    /// inside an OSC that has just read an `ESC`: `\` ends it, anything else does not.
+    OscTerm,
 }
 
 impl ResizeTerm {
@@ -1037,6 +1073,10 @@ impl ResizeTerm {
         f.wrote = false;
         f.recovering = f.drawn_width.is_some_and(|w| w != cols);
         f.open_row = f.recovering;
+        // The erase phase leaves the cursor at the start of a row, and a draw that skips it
+        // opens its own row, so either way this draw starts counting columns from zero.
+        f.col = 0;
+        f.esc = Esc::Text;
         // A width for `end_draw` to record even if indicatif never asks for one.
         f.render_width = cols;
     }
@@ -1049,7 +1089,7 @@ impl ResizeTerm {
         // cursor stays wherever the abandoned frame left it — mid-row, since that frame was
         // padded to the old width — and the next log line is glued onto its tail.
         if std::mem::take(&mut f.open_row) {
-            f.buf.extend_from_slice(b"\r\n");
+            f.break_row();
         }
         f.drawn_width = f.wrote.then_some(f.render_width);
         f.drawing = false;
@@ -1059,14 +1099,117 @@ impl ResizeTerm {
 }
 
 impl Frame {
-    /// Append `bytes` as part of a line, first opening the fresh row a resize recovery owes:
-    /// the stale frame is abandoned where it lies and this draw starts under it.
-    fn put(&mut self, bytes: &[u8]) {
+    /// Append `s` to a line, first opening the fresh row owed by resize recovery.
+    ///
+    /// Explicit `\r\n` breaks at the right margin avoid emulator-side continuation rows. They
+    /// land at the same cursor position without a continuation flag; otherwise resize reflow
+    /// can join the scrolling build log into one line.
+    fn put(&mut self, s: &str) {
         if std::mem::take(&mut self.open_row) {
-            self.buf.extend_from_slice(b"\r\n");
+            self.break_row();
         }
         self.wrote = true;
-        self.buf.extend_from_slice(bytes);
+        for c in s.chars() {
+            // A truncated `{wide_msg}` can split an OSC 8 hyperlink. End any open sequence at
+            // `\r` or `\n` so the rest of the frame retains its column count.
+            if !matches!(self.esc, Esc::Text) && matches!(c, '\r' | '\n') {
+                self.esc = Esc::Text;
+            }
+            match self.esc {
+                Esc::Text => self.put_text_char(c),
+                Esc::Start => {
+                    self.push_char(c);
+                    self.esc = match c {
+                        '[' => Esc::Csi,
+                        ']' => Esc::Osc,
+                        '\x20'..='\x2f' => Esc::Inter,
+                        _ => Esc::Text,
+                    };
+                }
+                Esc::Inter => {
+                    self.push_char(c);
+                    if !matches!(c, '\x20'..='\x2f') {
+                        self.esc = Esc::Text; // the final byte, and free like the rest
+                    }
+                }
+                Esc::Csi => {
+                    self.push_char(c);
+                    if matches!(c, '\x40'..='\x7e') {
+                        self.esc = Esc::Text;
+                    }
+                }
+                Esc::Osc => {
+                    self.push_char(c);
+                    self.esc = match c {
+                        '\x07' => Esc::Text,
+                        '\x1b' => Esc::OscTerm,
+                        _ => Esc::Osc,
+                    };
+                }
+                Esc::OscTerm => {
+                    self.push_char(c);
+                    self.esc = if c == '\\' { Esc::Text } else { Esc::Osc };
+                }
+            }
+        }
+    }
+
+    /// Append one text character, breaking first if its display width crosses the margin.
+    ///
+    /// Matching terminal auto-wrap keeps the visible height aligned with indicatif's cursor
+    /// arithmetic. Use `unicode-width` display columns to match indicatif's layout and the
+    /// terminal cursor.
+    fn put_text_char(&mut self, c: char) {
+        match c {
+            '\x1b' => {
+                self.esc = Esc::Start;
+                self.push_char(c);
+            }
+            // The 8-bit CSI introducer. A terminal in UTF-8 mode mostly prints it, but
+            // indicatif's measure takes it as a CSI, and following that is the safe way to
+            // disagree: a sequence counted free where indicatif counted text leaves the frame
+            // shorter than indicatif laid it out for, never longer.
+            '\u{9b}' => {
+                self.esc = Esc::Csi;
+                self.push_char(c);
+            }
+            // A cooked tty translates the `\n` to `\r\n`, so either way the cursor lands at
+            // column zero. The frame's own breaks are written `\r\n` and do not rely on that.
+            '\r' | '\n' => {
+                self.col = 0;
+                self.push_char(c);
+            }
+            _ => {
+                let width = u16::try_from(c.width().unwrap_or(0)).unwrap_or(u16::MAX);
+                // Zero-width characters never break: the count cannot pass the margin without
+                // one. A character too wide for a whole row does, spending an empty row —
+                // which is what indicatif counts for it too, so the two stay in step.
+                if self.col.saturating_add(width) > self.width() {
+                    self.break_row();
+                }
+                self.push_char(c);
+                self.col = self.col.saturating_add(width);
+            }
+        }
+    }
+
+    /// Append one character verbatim, costing no columns.
+    fn push_char(&mut self, c: char) {
+        self.buf
+            .extend_from_slice(c.encode_utf8(&mut [0u8; 4]).as_bytes());
+    }
+
+    /// End the current row and reset its column count and escape scanner. Input `\r` or `\n` is
+    /// the only other row-ending path.
+    fn break_row(&mut self) {
+        self.buf.extend_from_slice(b"\r\n");
+        self.col = 0;
+        self.esc = Esc::Text;
+    }
+
+    /// Return a nonzero layout width while preserving the reported width for resize detection.
+    fn width(&self) -> u16 {
+        self.render_width.max(1)
     }
 }
 
@@ -1103,7 +1246,8 @@ impl TermLike for ResizeTerm {
 
     /// Horizontal moves are neither erase nor content, so they neither suppress under a
     /// recovery nor open its fresh row — they only reposition within the row the draw is
-    /// already on. indicatif's own draws never emit one.
+    /// already on. They leave the column count alone, and so would move the frame's margin
+    /// off the terminal's; indicatif's own draws never emit one.
     fn move_cursor_right(&self, n: usize) -> io::Result<()> {
         let mut f = self.state.lock().unwrap();
         self.begin(&mut f);
@@ -1118,18 +1262,20 @@ impl TermLike for ResizeTerm {
         Ok(())
     }
 
+    /// indicatif calls this only for bottom-alignment shifts, which [`Tty`] never selects.
+    /// Keep its row ending consistent with [`write_str`](Self::write_str) regardless.
     fn write_line(&self, s: &str) -> io::Result<()> {
         let mut f = self.state.lock().unwrap();
         self.begin(&mut f);
-        f.put(s.as_bytes());
-        f.buf.push(b'\n');
+        f.put(s);
+        f.break_row();
         Ok(())
     }
 
     fn write_str(&self, s: &str) -> io::Result<()> {
         let mut f = self.state.lock().unwrap();
         self.begin(&mut f);
-        f.put(s.as_bytes());
+        f.put(s);
         Ok(())
     }
 
@@ -1140,6 +1286,9 @@ impl TermLike for ResizeTerm {
         if !f.recovering {
             f.buf.extend_from_slice(b"\r\x1b[2K");
         }
+        // Clearing or recovering starts the next write at column zero in text state.
+        f.col = 0;
+        f.esc = Esc::Text;
         Ok(())
     }
 
@@ -1397,9 +1546,7 @@ mod tests {
         t.width(); // indicatif samples the width to lay the frame out
     }
 
-    /// A whole draw: the erase phase, then `lines` written back to back the way indicatif
-    /// writes them (its own width padding between them is not what is under test here).
-    /// Returns what reached the screen.
+    /// Draw `lines` without indicatif's width padding and return the emitted bytes.
     fn draw(t: &ResizeTerm, screen: &Screen, rows: usize, lines: &[&str]) -> String {
         erase(t, rows);
         for line in lines {
@@ -1407,6 +1554,36 @@ mod tests {
         }
         t.flush().unwrap();
         screen.take()
+    }
+
+    /// Draw with indicatif's width padding so each fill reaches the next row.
+    fn draw_padded(t: &ResizeTerm, screen: &Screen, rows: usize, lines: &[&str]) -> String {
+        erase(t, rows);
+        let width = usize::from(t.width());
+        for line in lines {
+            t.write_str(line).unwrap();
+            t.write_str(&" ".repeat(width - last_row_width(line, width)))
+                .unwrap();
+        }
+        t.flush().unwrap();
+        screen.take()
+    }
+
+    /// Reproduce indicatif's `LineType::wrapped_metrics` width for a line's last row.
+    fn last_row_width(line: &str, width: usize) -> usize {
+        let mut column = 0;
+        for (text, is_ansi) in console::AnsiCodeIterator::new(line) {
+            if is_ansi {
+                continue;
+            }
+            for w in text.chars().filter_map(UnicodeWidthChar::width) {
+                column += w;
+                if column > width {
+                    column = w;
+                }
+            }
+        }
+        column
     }
 
     /// A draw that writes no line — `MultiProgress::clear`, and the first half of its
@@ -1447,6 +1624,134 @@ mod tests {
             // erases normally again.
             assert!(draw(&t, &screen, 1, &["settled"]).starts_with("\r\x1b[2K"));
         }
+    }
+
+    /// Full-width rows get explicit breaks, escape sequences cost no columns, and shorter rows
+    /// remain open. This avoids continuation rows that resize reflow can join to the build log.
+    #[test]
+    fn resize_term_breaks_a_full_width_row_itself() {
+        let (screen, t) = Screen::new();
+        screen.resize(10);
+        let colored = format!("\x1b[32m{}\x1b[0m", "b".repeat(10));
+        assert_eq!(
+            draw(
+                &t,
+                &screen,
+                0,
+                &["a".repeat(10).as_str(), &colored, "short"]
+            ),
+            // The colour prefix rides on the row it closes; the break precedes visible text.
+            "aaaaaaaaaa\x1b[32m\r\nbbbbbbbbbb\x1b[0m\r\nshort"
+        );
+        // Leave the last row open for indicatif's next draw.
+        assert_eq!(
+            draw(&t, &screen, 1, &["x".repeat(10).as_str()]),
+            "\r\x1b[2Kxxxxxxxxxx"
+        );
+    }
+
+    /// Over-wide lines break at every margin without terminal auto-wrap.
+    #[test]
+    fn resize_term_breaks_an_over_wide_line_at_every_margin() {
+        let (screen, t) = Screen::new();
+        screen.resize(4);
+        assert_eq!(draw(&t, &screen, 0, &["abcdefghij"]), "abcd\r\nefgh\r\nij");
+    }
+
+    /// Margins use indicatif's display columns: box drawing and spinner glyphs cost one, wide
+    /// characters cost two without straddling, and combining marks cost zero. All can reach the
+    /// pinned block through `{wide_msg}`.
+    #[test]
+    fn resize_term_counts_the_margin_in_display_columns() {
+        let (screen, t) = Screen::new();
+        screen.resize(4);
+        // Eight columns, with the combining acute costing zero: four per row.
+        let spinner = SPINNER_TICKS.chars().next().unwrap();
+        let acute = '\u{301}';
+        let line = format!("──{spinner}{spinner}e{acute}xyz");
+        assert_eq!(
+            draw(&t, &screen, 0, &[line.as_str()]),
+            format!("──{spinner}{spinner}\r\ne{acute}xyz")
+        );
+        // Each glyph costs two columns, so the third starts a new row.
+        assert_eq!(draw(&t, &screen, 1, &["日本語"]), "\r\x1b[2K日本\r\n語");
+    }
+
+    /// Escape scanner state survives across writes, so a split sequence costs no columns.
+    #[test]
+    fn resize_term_counts_a_split_escape_sequence_as_free() {
+        let (screen, t) = Screen::new();
+        screen.resize(4);
+        erase(&t, 0);
+        for chunk in ["ab\x1b[", "32mcdef"] {
+            t.write_str(chunk).unwrap();
+        }
+        t.flush().unwrap();
+        assert_eq!(screen.take(), "ab\x1b[32mcd\r\nef");
+    }
+
+    /// A sequence is free whatever shape it takes — not only the colour CSIs the dashboard
+    /// writes itself. Guest output brings the rest: `tput sgr0` leads with the charset escape
+    /// `ESC ( B`, and an 8-bit `CSI` introducer stands in for `ESC [`. Counting either as text
+    /// would break the row early and leave the frame a row taller than indicatif laid it out.
+    #[test]
+    fn resize_term_counts_every_sequence_shape_as_free() {
+        let (screen, t) = Screen::new();
+        screen.resize(4);
+        assert_eq!(
+            draw(&t, &screen, 0, &["ab\x1b(B\x1b[mcdef"]),
+            "ab\x1b(B\x1b[mcd\r\nef"
+        );
+        assert_eq!(
+            draw(&t, &screen, 1, &["ab\u{9b}32mcdef"]),
+            "\r\x1b[2Kab\u{9b}32mcd\r\nef"
+        );
+    }
+
+    /// A line break ends a truncated escape sequence so later text retains its width.
+    #[test]
+    fn resize_term_ends_a_truncated_sequence_at_the_line_break() {
+        let (screen, t) = Screen::new();
+        screen.resize(4);
+        assert_eq!(
+            draw(&t, &screen, 0, &["\x1b]8;;https://exa\nabcdef"]),
+            "\x1b]8;;https://exa\nabcd\r\nef"
+        );
+    }
+
+    /// `write_line` uses the frame's row-break path. Test it directly because [`Tty`] never
+    /// selects the bottom-alignment shift that calls it.
+    #[test]
+    fn resize_term_breaks_a_written_line_itself() {
+        let (screen, t) = Screen::new();
+        screen.resize(4);
+        erase(&t, 0);
+        t.write_line("abcdef").unwrap();
+        t.write_str("gh").unwrap();
+        t.flush().unwrap();
+        assert_eq!(screen.take(), "abcd\r\nef\r\ngh");
+    }
+
+    /// Match indicatif's padding exactly: one break per row, none inside the fill, so the next
+    /// draw's cursor arithmetic stays synchronized.
+    #[test]
+    fn resize_term_breaks_where_indicatif_ends_a_line() {
+        let (screen, t) = Screen::new();
+        screen.resize(8);
+        // A plain line, a coloured one, and one that takes two rows on its own.
+        let drawn = draw_padded(
+            &t,
+            &screen,
+            0,
+            &["rule", "\x1b[32mstep 1/2\x1b[0m", "日本語です"],
+        );
+        assert_eq!(
+            drawn,
+            // The colour prefix rides on the prior row; the break precedes visible text.
+            "rule    \x1b[32m\r\nstep 1/2\x1b[0m\r\n日本語で\r\nす      "
+        );
+        // One break per boundary, without blank rows.
+        assert!(!drawn.contains("\r\n\r\n"));
     }
 
     /// The fresh row a recovery starts on is opened once, ahead of the frame, however many
@@ -1823,6 +2128,27 @@ mod tests {
             tty.bars.lock().unwrap().is_empty(),
             "finish must drain the leftover output tail"
         );
+    }
+
+    /// A tab in guest output is flattened before it reaches the tail cell: everything that
+    /// measures the line costs it nothing while the terminal advances to the next tab stop, so
+    /// leaving it in is what pushes the cell past the margin and wraps it.
+    #[test]
+    fn output_tail_flattens_tabs() {
+        let p = Arc::new(Progress::new_backend(
+            Backend::Tty(Box::new(Tty::new())),
+            false,
+        ));
+        p.init(two_stages(), 1);
+        p.base_start(1);
+        p.base_done(1, Outcome::Ran);
+        p.step_start(1, 0);
+        p.emit(1, 1, b"pkg\tv1.2\tready\r");
+        let Backend::Tty(tty) = &p.backend else {
+            unreachable!()
+        };
+        let msg = tty.bars.lock().unwrap()[&(1, OUTPUT_TAIL_NUM)].message();
+        assert!(msg.ends_with("pkg v1.2 ready"), "got {msg:?}");
     }
 
     /// `clip` keeps a string within its character budget, ellipsizing only when it must, and

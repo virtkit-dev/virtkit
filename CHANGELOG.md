@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Resizing a terminal or multiplexer pane no longer joins build steps, output, and
+  timing rows into one line during reflow.
+
 ## [0.45.0] - 2026-08-30
 
 ### Added

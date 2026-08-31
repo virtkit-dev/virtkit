@@ -66,6 +66,7 @@ vmm-sys-util = { version = "0.15", optional = true }
 seccompiler = { version = "0.5", optional = true }
 log.workspace = true
 indicatif.workspace = true
+unicode-width.workspace = true
 
 # The vendored libkrun fs engine (FUSE server + passthrough + read-only wrapper),
 # locally patched to expose it (see third_party/libkrun/VENDOR.md). Shared with the
@@ -121,3 +122,7 @@ virtiofsd = [
 # vmm::libkrun_selected); VIRTKIT_VMM=cloud-hypervisor opts out, and jobs libkrun
 # cannot serve (e.g. uid/gid-mapped shares) refuse with a pointer to that switch.
 libkrun = ["dep:krun"]
+
+[dev-dependencies]
+# Match indicatif's line measurement in dashboard tests.
+console.workspace = true
