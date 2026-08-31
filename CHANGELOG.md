@@ -23,6 +23,9 @@ All notable changes to virtkit will be documented in this file.
 - A `vk-registry` `admin_socket` can now use the full Unix-socket path length instead of
   reserving space for staging. Its parent must permit creating a directory; a shared
   non-sticky parent may retain an empty private directory.
+- `vk run` now applies `[build] cache_registry` and its credentials to Dockerfile and
+  compose-service builds, so they restore from the same cache as `vk build`.
+  `--cache-registry` still takes precedence, and `cache_registry = "none"` disables caching.
 
 ### Changed
 

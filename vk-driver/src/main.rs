@@ -990,11 +990,12 @@ enum Cmd {
             help_heading = "Build (with -f or --compose)"
         )]
         build_context: Vec<String>,
-        /// instruction cache for the --file build
+        /// instruction cache for `-f` and `--compose` builds
         ///
         /// Pushes/pulls each stage's ext4 by content key, so a repeat boot restores instead of
         /// rebuilding: a registry repo, an absolute store directory path, or `none` to disable.
-        /// Default: the builtin local store `vk-registry` also uses.
+        /// Default: `[build] cache_registry`; otherwise, the builtin local store also used by
+        /// `vk-registry`.
         #[arg(
             long = "cache-registry",
             value_name = "REF|DIR|none",
@@ -2406,14 +2407,17 @@ async fn cli_main() -> ExitCode {
             Ok(v) => v,
             Err(e) => return fail(&e, 2),
         };
+        // Resolve the run's cache like `vk build`: CLI flags, then `[build]`. Doing this
+        // once keeps a prebuild and the run it warms on the same destination.
+        let cache =
+            build::CacheOpts::resolve(cache_registry.as_deref(), *cache_insecure, &cfg.build);
         let args = run::RunArgs {
             image: image.clone().unwrap_or_default(),
             dockerfiles: file.clone(),
             target: target.clone(),
             contexts: context.clone(),
             build_contexts,
-            cache_registry: cache_registry.clone(),
-            cache_insecure: *cache_insecure,
+            cache,
             build_args,
             workdir: workdir.clone(),
             kernel: kernel.clone(),
@@ -2422,7 +2426,8 @@ async fn cli_main() -> ExitCode {
             nested: *nested,
             agent: agent.clone(),
             // CLI flag wins; else the config's top-level cloud_hypervisor (bare
-            // "cloud-hypervisor" when unset). vk run has no [build] tier to consult.
+            // "cloud-hypervisor" when unset). `[build] cloud_hypervisor` sizes the build
+            // guest, not the run's.
             cloud_hypervisor: cloud_hypervisor
                 .clone()
                 .unwrap_or_else(|| cfg.cloud_hypervisor().to_path_buf()),

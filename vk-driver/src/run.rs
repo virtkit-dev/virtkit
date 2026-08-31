@@ -163,9 +163,9 @@ pub struct RunArgs {
     /// Image to boot (a docker ref or an OCI reference). Ignored when `dockerfile` is set
     /// — the rootfs is then built from the Dockerfile target.
     pub image: String,
-    /// Boot a Dockerfile target instead of an image: build (or cache-restore, with
-    /// `cache_registry`) the target into an ext4 and boot it — no explicit `--out`
-    /// ext4. Several files merge into one stage namespace; empty = an image boot.
+    /// Boot a Dockerfile target instead of an image: build (or cache-restore, via `cache`)
+    /// the target into an ext4 and boot it — no explicit `--out` ext4. Several files merge
+    /// into one stage namespace; empty = an image boot.
     pub dockerfiles: Vec<PathBuf>,
     /// Target stage to boot (AS name or index; default: the last stage), with `dockerfiles`.
     pub target: Option<String>,
@@ -175,13 +175,11 @@ pub struct RunArgs {
     /// Named build contexts (`--build-context <name>=<dir>`): extra directories a
     /// `COPY --from=<name>` may read, outside the Dockerfile's own context.
     pub build_contexts: Vec<(String, PathBuf)>,
-    /// Instruction cache for a Dockerfile boot: each stage's ext4 is pushed/pulled by
-    /// its content key, so a repeat boot restores instead of rebuilding. A registry
-    /// repo, an absolute store directory path, or `none` to disable; `None` = the
-    /// builtin local store (`vk_registry::default_root`).
-    pub cache_registry: Option<String>,
-    /// the cache registry speaks plain HTTP (a loopback vk-registry).
-    pub cache_insecure: bool,
+    /// Resolved instruction-cache settings for every Dockerfile and compose-service build
+    /// this run launches. Each stage's ext4 is pushed/pulled by content key, so repeat builds
+    /// restore instead of rebuilding. Keep the destination, transport, and credentials together
+    /// so each build path receives all three.
+    pub cache: crate::build::CacheOpts,
     /// `--build-arg NAME=VALUE` overrides for the Dockerfile build.
     pub build_args: Vec<(String, String)>,
     /// host dir shared read-write into the guest (at WORKDIR_MOUNT); the command runs
@@ -874,34 +872,7 @@ async fn build_and_boot(
         None
     } else {
         let out = work.join("root.ext4");
-        let opts = crate::build::Options {
-            dockerfiles: args.dockerfiles.clone(),
-            target: args.target.clone(),
-            stage_guests: Default::default(),
-            contexts: args.contexts.clone(),
-            build_contexts: args.build_contexts.clone(),
-            out: Some(out.clone()),
-            out_disk: None,
-            print_plan: false,
-            cloud_hypervisor: Some(args.cloud_hypervisor.clone()),
-            kernel: Some(kernel.to_path_buf()),
-            agent: Some(agent.to_path_buf()),
-            cache_registry: args.cache_registry.clone(),
-            cache_insecure: args.cache_insecure,
-            cache_auth: Default::default(),
-            build_cache: crate::build::BuildCache::default(),
-            journal: false,
-            tmp_tmpfs: false,
-            build_args: args.build_args.clone(),
-            net: args.build_net.clone(),
-            // `--build-audit-egress` audits this `-f` build's RUN egress; `--audit-egress`
-            // (handled below) audits the booted guest — the same split as --net/--build-net.
-            audit: args.build_audit_egress,
-            require_cached: args.require_cached,
-            build_jobs: cfg.build.jobs,
-            debug: false,
-            progress_sink: None,
-        };
+        let opts = dockerfile_build_options(args, kernel, agent, out.clone(), cfg.build.jobs);
         let built = crate::build::build(&opts)?;
         primary_user = built.config.user;
         image_env = built.config.env;
@@ -2364,9 +2335,9 @@ fn manager_build_opts(args: &RunArgs, kernel: &Path, agent: &Path) -> crate::uni
         kernel: kernel.to_path_buf(),
         cloud_hypervisor: args.cloud_hypervisor.clone(),
         agent: agent.to_path_buf(),
-        cache_registry: args.cache_registry.clone(),
-        cache_insecure: args.cache_insecure,
-        cache_auth: Default::default(),
+        cache_registry: args.cache.registry.clone(),
+        cache_insecure: args.cache.insecure,
+        cache_auth: args.cache.auth.clone(),
         // Dev `vk run --compose` service builds share the run's `--build-net` / build-audit.
         net: args.build_net.clone(),
         audit: args.build_audit_egress,
@@ -2394,9 +2365,9 @@ pub(crate) fn service_build_options(
         cloud_hypervisor: Some(args.cloud_hypervisor.clone()),
         kernel: Some(kernel.to_path_buf()),
         agent: Some(agent.to_path_buf()),
-        cache_registry: args.cache_registry.clone(),
-        cache_insecure: args.cache_insecure,
-        cache_auth: Default::default(),
+        cache_registry: args.cache.registry.clone(),
+        cache_insecure: args.cache.insecure,
+        cache_auth: args.cache.auth.clone(),
         build_cache: crate::build::BuildCache::default(),
         journal: false,
         tmp_tmpfs: false,
@@ -2407,6 +2378,28 @@ pub(crate) fn service_build_options(
         build_jobs: None,
         debug: false,
         progress_sink: None,
+    }
+}
+
+/// Build options for a `-f <Dockerfile>` boot. Override a service build's Dockerfiles,
+/// contexts, target, output, and job limit while retaining its cache, egress policy, and
+/// build arguments. `--build-audit-egress` audits this build's RUN egress;
+/// `--audit-egress` audits the booted guest, matching `--net`/`--build-net`.
+fn dockerfile_build_options(
+    args: &RunArgs,
+    kernel: &Path,
+    agent: &Path,
+    out: PathBuf,
+    build_jobs: Option<std::num::NonZeroUsize>,
+) -> crate::build::Options {
+    crate::build::Options {
+        dockerfiles: args.dockerfiles.clone(),
+        target: args.target.clone(),
+        contexts: args.contexts.clone(),
+        build_contexts: args.build_contexts.clone(),
+        out: Some(out),
+        build_jobs,
+        ..service_build_options(args, kernel, agent)
     }
 }
 
@@ -3813,6 +3806,103 @@ impl Drop for VmSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal `RunArgs` for option-builder tests. It is not bootable: the CLI normally fills
+    /// the VM name, boot timeout, and SSH user. Do not pass it to `run`.
+    fn bare_args() -> RunArgs {
+        RunArgs {
+            image: String::new(),
+            dockerfiles: vec![],
+            target: None,
+            contexts: vec![],
+            build_contexts: vec![],
+            cache: Default::default(),
+            build_args: vec![],
+            workdir: None,
+            kernel: KernelSource::Default,
+            console_serial: false,
+            pmu: false,
+            nested: false,
+            agent: None,
+            cloud_hypervisor: PathBuf::new(),
+            source: SourceMode::Oci,
+            ca: None,
+            username: None,
+            password: None,
+            insecure: false,
+            cpus: None,
+            mem: None,
+            service_cpus: vec![],
+            service_mem: vec![],
+            boot_timeout_secs: 0,
+            vm_name: String::new(),
+            ram: false,
+            init: InitSource::Default,
+            shell: false,
+            tty: false,
+            net: false,
+            audit_egress: false,
+            build_audit_egress: false,
+            registry_proxy: None,
+            compose: None,
+            profiles: vec![],
+            primary: None,
+            build_net: crate::build::BuildNet::All,
+            ssh_agent: false,
+            ssh_hosts: vec![],
+            ssh: false,
+            ssh_keys: vec![],
+            ssh_user: String::new(),
+            state_dir: None,
+            volumes: vec![],
+            symlinks: vec![],
+            extra_disks: vec![],
+            atop: None,
+            env: vec![],
+            host_exec: false,
+            host_exec_wrapper: None,
+            host_exec_env: vec![],
+            require_cached: false,
+            detach: false,
+            inactivity_timeout_secs: None,
+            detach_log: None,
+            command: vec![],
+        }
+    }
+
+    #[test]
+    fn every_build_a_run_launches_carries_the_whole_cache() {
+        let mut args = bare_args();
+        args.cache = crate::build::CacheOpts {
+            registry: Some("registry.example/cache".into()),
+            insecure: true,
+            auth: crate::build::CacheAuth {
+                username: "ci".into(),
+                password_file: Some("/etc/vk/pass".into()),
+                ..Default::default()
+            },
+        };
+        let kernel = Path::new("/vmlinux");
+        let agent = Path::new("/vk-agent");
+
+        // Destination and credentials together. Taking one and defaulting the other sends an
+        // authenticated host at a gated registry anonymously, and every build there misses.
+        let carried = |registry: Option<&str>, insecure: bool, auth: &crate::build::CacheAuth| {
+            assert_eq!(registry, Some("registry.example/cache"));
+            assert!(insecure);
+            assert_eq!(auth.username, "ci");
+            assert_eq!(
+                auth.password_file.as_deref(),
+                Some(Path::new("/etc/vk/pass"))
+            );
+        };
+        let o = dockerfile_build_options(&args, kernel, agent, PathBuf::from("/root.ext4"), None);
+        carried(o.cache_registry.as_deref(), o.cache_insecure, &o.cache_auth);
+        let o = manager_build_opts(&args, kernel, agent);
+        carried(o.cache_registry.as_deref(), o.cache_insecure, &o.cache_auth);
+        let o = service_build_options(&args, kernel, agent);
+        carried(o.cache_registry.as_deref(), o.cache_insecure, &o.cache_auth);
+    }
 
     #[test]
     fn a_registry_label_names_what_booted() {
