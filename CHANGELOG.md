@@ -13,6 +13,9 @@ All notable changes to virtkit will be documented in this file.
   socket path is rejected before publishing an endpoint clients cannot reach through that
   path. Its parent must permit creating a directory; a shared non-sticky parent may retain an
   empty private directory.
+- A `vk-registry` `admin_socket` can now use the full Unix-socket path length instead of
+  reserving space for staging. Its parent must permit creating a directory; a shared
+  non-sticky parent may retain an empty private directory.
 
 ## [0.45.0] - 2026-08-30
 

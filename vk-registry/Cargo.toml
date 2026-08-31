@@ -36,6 +36,8 @@ oci-client.workspace = true
 sha2.workspace = true
 zstd.workspace = true
 libc.workspace = true
+# Private admin-socket binding, shared with vk-core.
+vk-fs = { path = "../vk-fs" }
 futures.workspace = true
 redb.workspace = true
 rand.workspace = true

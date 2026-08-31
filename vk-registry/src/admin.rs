@@ -33,7 +33,7 @@
 //! and a protocol has different obligations than a file.
 
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -74,10 +74,6 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait after an `accept` that failed for a reason that may still hold —
 /// EMFILE, chiefly. Short enough that a transient failure costs an operator nothing.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
-
-/// `sockaddr_un::sun_path`, terminator included: the ceiling on a socket path, and low
-/// enough that a configured one can reach it.
-const SUN_PATH_MAX: usize = 108;
 
 /// One operation on the accounts db. The set the `vk-registry accounts` CLI needs, one
 /// variant per `Db` method it calls — the socket deliberately exposes nothing else, so it
@@ -267,12 +263,9 @@ fn from_epoch(secs: i64) -> SystemTime {
 /// this channel can do. Nor is `fchmod` on the listener's fd an escape: it changes the
 /// sockfs inode, not the directory entry anyone connects through.
 ///
-/// So the socket is bound inside a `0700` staging directory of its own, restricted to `0600`
-/// there — where nothing else can enter to reach it, or to swap the name for a symlink
-/// between the two calls — and only then `rename`d onto `path`. Nothing appears at `path`
-/// except a socket that is already private, replacing a dead one leaves no moment where the
-/// name is absent, and no process-global umask is touched to do it. The peer-uid check in
-/// [`serve_admin`] is the gate that depends on none of this.
+/// [`vk_fs::bind_private`] handles private atomic publication. This function decides what at
+/// `path` may be replaced and what must remain untouched. The peer-uid check in
+/// [`serve_admin`] depends on neither.
 ///
 /// A path that answers a connect is a *live* server: refused, because unlinking it would
 /// take a running server's channel away without stopping it. A socket nobody is listening
@@ -321,48 +314,9 @@ pub fn bind(path: &Path) -> Result<std::os::unix::net::UnixListener> {
             return Err(anyhow!(e).context(format!("inspecting {}", path.display())));
         }
     }
-    if path.file_name().is_none() {
-        bail!("{} is not a path a socket can be bound at", path.display());
-    }
-    // Deliberately short: it is bound at, so it spends `sun_path` budget the operator's own
-    // path needs. `.<pid>/s` costs the same ten bytes `admin.sock` does, so the default
-    // placement gives up nothing, and a leftover from a killed process carries our pid and
-    // is therefore ours to clear.
-    let staging_dir = path.with_file_name(format!(".{}", std::process::id()));
-    let staging = staging_dir.join("s");
-    // Both, since a path that only *binds* at its staging name would be published where no
-    // client can connect. Said here rather than as an `EINVAL` from `bind` on a path the
-    // operator can do nothing about from the error alone.
-    let longest = std::cmp::max(path.as_os_str().len(), staging.as_os_str().len());
-    if longest >= SUN_PATH_MAX {
-        bail!(
-            "{} is too long for a unix socket: {longest} bytes are needed to bind and \
-             publish it, and {SUN_PATH_MAX} is the limit — put the admin socket on a \
-             shorter path",
-            path.display(),
-        );
-    }
-    let _ = std::fs::remove_dir_all(&staging_dir);
-    let mut builder = std::fs::DirBuilder::new();
-    builder.mode(0o700);
-    builder
-        .create(&staging_dir)
-        .with_context(|| format!("creating {}", staging_dir.display()))?;
-    let published = std::os::unix::net::UnixListener::bind(&staging)
-        .with_context(|| format!("binding {}", staging.display()))
-        .and_then(|listener| {
-            // Safe from a swapped name and from a connect that beats it: only this process
-            // can enter the directory it is in.
-            std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("restricting {} to 0600", staging.display()))?;
-            std::fs::rename(&staging, path)
-                .with_context(|| format!("publishing the admin socket at {}", path.display()))?;
-            Ok(listener)
-        });
-    // Either the socket moved out of it or it never got there; either way the directory has
-    // done its job, and a name left behind would only confuse the next start.
-    let _ = std::fs::remove_dir_all(&staging_dir);
-    let listener = published?;
+    // Atomically replace the stale socket admitted above.
+    let listener = vk_fs::bind_private(path)
+        .with_context(|| format!("binding the admin socket at {}", path.display()))?;
     if let Some(dir) = path.parent() {
         crate::warn_if_mode(
             dir,
@@ -789,6 +743,7 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use crate::accounts::Action;
@@ -1040,40 +995,30 @@ mod tests {
     }
 
     #[test]
-    /// A socket path `sun_path` cannot hold is refused with that said, rather than as an
-    /// `EINVAL` on a path the operator can do nothing about from the error alone — whether
-    /// it is the operator's own name that overruns or only the name it is staged under.
+    /// Reject a path `sun_path` cannot hold with an actionable error. Descriptor-anchored
+    /// staging consumes none of the configured path budget, so the deepest fitting path
+    /// succeeds.
     fn a_path_too_long_to_bind_says_so() {
         let server = Server::start();
-        let room = SUN_PATH_MAX - server.dir.as_os_str().len() - 1;
+        let room = vk_fs::SUN_PATH_MAX - server.dir.as_os_str().len() - 1;
 
-        // Over the ceiling on its own.
         let long = server.dir.join("s".repeat(room));
-        assert!(long.as_os_str().len() >= SUN_PATH_MAX);
-        let err = bind(&long).unwrap_err().to_string();
+        assert!(long.as_os_str().len() >= vk_fs::SUN_PATH_MAX);
+        let err = format!("{:#}", bind(&long).unwrap_err());
         assert!(err.contains("too long for a unix socket"), "{err}");
 
-        // And a name that fits but cannot be *staged*: the staging length does not depend on
-        // the socket's own name, so a deep enough directory reaches the ceiling with a
-        // one-byte name still well under it.
-        let staging_cost = format!(".{}/s", std::process::id()).len();
-        let deep = {
-            let want = SUN_PATH_MAX - staging_cost;
-            let pad = want - server.dir.as_os_str().len() - 1;
-            server.dir.join("d".repeat(pad))
-        };
+        // A one-byte name on the last usable byte; staging used to push this over.
+        let deep = server
+            .dir
+            .join("d".repeat(vk_fs::SUN_PATH_MAX - 3 - server.dir.as_os_str().len() - 1));
         std::fs::create_dir_all(&deep).unwrap();
         let barely = deep.join("s");
-        assert!(
-            barely.as_os_str().len() < SUN_PATH_MAX,
-            "the operator's own name has to fit, or this proves nothing"
+        assert_eq!(barely.as_os_str().len(), vk_fs::SUN_PATH_MAX - 1);
+        drop(bind(&barely).unwrap());
+        assert_eq!(
+            std::fs::metadata(&barely).unwrap().permissions().mode() & 0o777,
+            0o600
         );
-        let err = bind(&barely).unwrap_err().to_string();
-        assert!(err.contains("too long for a unix socket"), "{err}");
-
-        // The default placement gives up nothing to staging: `.<pid>/s` is no longer than
-        // `admin.sock`, so every path that used to bind still does.
-        assert!(staging_cost <= "admin.sock".len(), "{staging_cost}");
     }
 
     #[test]

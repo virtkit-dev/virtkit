@@ -15,11 +15,9 @@
 //!   be established, leave the object rather than remove something unidentified —
 //!   [`dir_admits_only_us`] is the test, and it is the caller's directory that decides.
 //!
-//! [`bind_private`] applies all four to a unix socket, the only object published here so
-//! far: `vk-core` serves the agent's exec channel on one, and the guarantee it wants is that
-//! the name a client connects to only ever refers to a socket that is already `0600`.
-//! `vk-registry`'s admin socket (`vk-registry/src/admin.rs`) still binds its own way, with a
-//! pid-derived staging name and no descriptor anchoring, and should move here.
+//! [`bind_private`] applies all four to unix sockets, the only objects published here so far.
+//! `vk-core` uses it for the agent's exec channel and `vk-registry` for its admin socket; both
+//! require the published name to refer only to a socket already restricted to `0600`.
 
 use anyhow::{Context, anyhow, bail};
 use std::ffi::{CString, OsStr};
@@ -29,8 +27,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 
-/// `sockaddr_un::sun_path`, terminator included: the ceiling on a unix socket path.
-const SUN_PATH_MAX: usize = 108;
+/// The `sockaddr_un::sun_path` limit, including its terminator. Public so callers can test
+/// the boundary enforced here without duplicating the value.
+pub const SUN_PATH_MAX: usize = 108;
 
 /// Staging names to try before giving up. Each is picked afresh, so one being taken takes a
 /// remarkable coincidence — or someone who guessed it — and either way the way past is

@@ -4631,6 +4631,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "vk-fs",
  "vk-selfupdate",
  "zstd",
 ]
