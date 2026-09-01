@@ -583,9 +583,11 @@ async fn fetch_chunks_async(
 /// hashed and (if new) compressed/uploaded. When `parent_layers` is empty there is no
 /// safe parent to reuse, so the whole qcow2 backing chain is re-chunked. `dirty` is the set
 /// of cluster ranges the guest wrote (read from the overlay and pushed as data); `holes` is
-/// the set it freed (discard/trim) since the parent — represented as gaps that clear the
-/// parent's bytes there, never read. `total_size` is the parent's (the ext4 size is fixed
-/// across RUNs).
+/// the logically zero ranges: space freed by discard/trim since the parent, or the image's own
+/// explicit-zero clusters. Gaps represent them, clearing parent bytes without publishing
+/// chunks. The sets must be disjoint: a parent chunk spanning both is read whole, then only its
+/// hole sub-ranges are zeroed; an overlap would erase live bytes. `total_size` is the parent's
+/// because the ext4 size is fixed across RUNs.
 #[allow(clippy::too_many_arguments)]
 pub fn push_ext4_diff(
     rg: &Registry,
@@ -3716,6 +3718,57 @@ mod tests {
         assert_eq!(
             child, expected,
             "a hole must clear only the freed cluster, leaving every live byte intact"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The static push splits one image's clusters into `dirty` data and explicit-zero `holes`.
+    /// They are disjoint by construction. Pulling must preserve a dirty range while clearing an
+    /// adjacent hole, even when both share one content-defined parent chunk.
+    #[test]
+    fn local_diff_push_splits_one_image_into_dirty_and_holes() {
+        let root = std::env::temp_dir().join(format!("vk-localreg-split-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let rg = local_registry(&root);
+        let dir = root.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let base = dir.join("base.ext4");
+        std::fs::write(&base, pseudo_random(16 << 20, 0x7a1e)).unwrap();
+        push_ext4(&rg, "sp", "parent", &base, "generic-disk").unwrap();
+        let (parent_layers, total) = fetch_chunks(&rg, "sp", "parent").unwrap().unwrap();
+
+        // The overlay reads the base through its backing everywhere, so the pushed bytes are
+        // the base's — what matters is that the hole is cleared and the dirty range is not.
+        let overlay = dir.join("ovl.qcow2");
+        crate::qcow2::create_overlay(&overlay, &base).unwrap();
+        let dirty = (2u64 << 20, 64u64 << 10);
+        let hole = ((2u64 << 20) + (64 << 10), 64u64 << 10);
+        push_ext4_diff(
+            &rg,
+            "sp",
+            "child",
+            &overlay,
+            "generic-disk",
+            total,
+            &[dirty],
+            &[hole],
+            &parent_layers,
+        )
+        .unwrap();
+
+        let dest = dir.join("child.ext4");
+        try_pull_ext4(&rg, "sp", "child", &dest, "sp")
+            .unwrap()
+            .unwrap();
+        let child = std::fs::read(&dest).unwrap();
+        let mut expected = std::fs::read(&base).unwrap();
+        let (hs, hl) = (hole.0 as usize, hole.1 as usize);
+        assert!(expected[hs..hs + hl].iter().any(|&b| b != 0));
+        expected[hs..hs + hl].fill(0);
+        assert_eq!(
+            child, expected,
+            "the hole must clear only its own range, leaving the adjacent dirty range intact"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

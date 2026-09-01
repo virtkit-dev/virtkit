@@ -46,6 +46,10 @@ enum Backing {
     Lazy(Box<VkRoImg>),
 }
 
+/// A layer's own extents, split into stored-byte and logical-zero ranges.
+/// See [`Qcow2::own_extents`].
+type OwnExtents = (Vec<(u64, u64)>, Vec<(u64, u64)>);
+
 /// A read-only qcow2 image plus its backing chain.
 pub struct Qcow2 {
     file: File,
@@ -212,13 +216,24 @@ impl Qcow2 {
     /// explicit-zero clusters) — the qcow2-native equivalent of `qemu-img map` at depth 0,
     /// i.e. exactly what the overlay's guest wrote since the stage booted.
     pub fn data_extents(&mut self) -> Result<Vec<(u64, u64)>> {
+        let (mut data, zero) = self.own_extents()?;
+        data.extend(zero);
+        Ok(merge_extents(data))
+    }
+
+    /// [`Self::data_extents`] split into `(data, zero)`: ranges this layer stores and ranges it
+    /// marks as logical zero. A discard or `fstrim` over a backing leaves the latter behind.
+    /// Callers that read the extents need the split because a trim can mark the guest
+    /// filesystem's entire free space as zero, with no data there to read.
+    pub fn own_extents(&mut self) -> Result<OwnExtents> {
         let clusters = self.virtual_size.div_ceil(self.cluster_size);
-        let mut out: Vec<(u64, u64)> = Vec::new();
+        let (mut data, mut zero) = (Vec::new(), Vec::new());
         for c in 0..clusters {
-            let present = matches!(self.locate(c)?, Cluster::Data(_) | Cluster::Zero);
-            if !present {
-                continue;
-            }
+            let out: &mut Vec<(u64, u64)> = match self.locate(c)? {
+                Cluster::Data(_) => &mut data,
+                Cluster::Zero => &mut zero,
+                Cluster::Unallocated => continue,
+            };
             let start = c << self.cluster_bits;
             // clamp the last cluster to the virtual size
             let len = self.cluster_size.min(self.virtual_size - start);
@@ -227,15 +242,20 @@ impl Qcow2 {
                 _ => out.push((start, len)),
             }
         }
-        Ok(out)
+        Ok((data, zero))
     }
 
-    /// The logical data regions of the *whole chain*: this layer's own clusters merged
+    /// The logical data regions of the *whole chain*: this layer's own data clusters merged
     /// with everything its backing image contributes (recursively; a raw backing's data is
     /// found via `SEEK_DATA`/`SEEK_HOLE`). The set of regions that may hold non-zero bytes
     /// — what a flatten needs to read; everything else is a hole top to bottom.
+    ///
+    /// This excludes the layer's explicit-zero clusters because they hold no bytes to read. A
+    /// backing data region remains in the set but is masked during reads by the zero cluster.
+    /// Excluding zero clusters prevents a trimmed filesystem from making the walk cover the
+    /// disk's full virtual size.
     pub fn chain_data_extents(&mut self) -> Result<Vec<(u64, u64)>> {
-        let mut all = self.data_extents()?;
+        let mut all = self.own_extents()?.0;
         match &mut self.backing {
             Backing::None => {}
             Backing::Qcow2(b) => all.extend(b.chain_data_extents()?),
@@ -984,6 +1004,132 @@ mod tests {
         assert_eq!(got, want, "native read must match qemu-img convert");
         // the overlay owns exactly the overwritten cluster.
         assert_eq!(q.data_extents().unwrap(), vec![(65536, 65536)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build the shape left by `fstrim`: a six-cluster chain with a qcow2 base holding 0xAA in
+    /// clusters 0-2 and holes after them. Its overlay writes clusters 1 and 5 and zeroes cluster
+    /// 2 over base data and cluster 4 over a base hole. Return `None` when qemu is unavailable.
+    fn trimmed_overlay(dir: &Path) -> Option<PathBuf> {
+        if !have("qemu-img") || !have("qemu-io") {
+            eprintln!("skipping: qemu-img/qemu-io not available");
+            return None;
+        }
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let base = dir.join("base.qcow2");
+        let overlay = dir.join("ovl.qcow2");
+        assert!(
+            Command::new("qemu-img")
+                .args(["create", "-q", "-f", "qcow2"])
+                .arg(&base)
+                .arg("384k")
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("qemu-io")
+                .args(["-c", "write -P 0xAA 0 196608"])
+                .arg(&base)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("qemu-img")
+                .args(["create", "-q", "-f", "qcow2", "-F", "qcow2", "-b"])
+                .arg(&base)
+                .arg(&overlay)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("qemu-io")
+                .args([
+                    "-c",
+                    "write -P 0xBB 65536 65536",
+                    "-c",
+                    "write -z 131072 65536",
+                    "-c",
+                    "write -z 262144 65536",
+                    "-c",
+                    "write -P 0xCC 327680 65536",
+                ])
+                .arg(&overlay)
+                .status()
+                .unwrap()
+                .success()
+        );
+        Some(overlay)
+    }
+
+    // A trim over a backing leaves explicit-zero clusters. `own_extents` keeps them separate
+    // from stored data so the static cache push does not read ranges that are zero by definition.
+    // `data_extents` still reports the union, while the chain walk drops zero clusters over
+    // backing holes.
+    #[test]
+    fn own_extents_separates_zero_clusters_from_data() {
+        let dir = std::env::temp_dir().join(format!("vk-qcow2-own-{}", std::process::id()));
+        let Some(overlay) = trimmed_overlay(&dir) else {
+            return;
+        };
+
+        let mut q = Qcow2::open(&overlay).unwrap();
+        // Neither list coalesces across the other's clusters: cluster 5's data must not be
+        // absorbed by the zero extent that ends where it begins (cluster 4), and vice versa.
+        assert_eq!(
+            q.own_extents().unwrap(),
+            (
+                vec![(65536, 65536), (327680, 65536)],
+                vec![(131072, 65536), (262144, 65536)]
+            ),
+            "the written clusters are data, the zeroed ones holes"
+        );
+        assert_eq!(
+            q.data_extents().unwrap(),
+            vec![(65536, 131072), (262144, 131072)],
+            "data_extents must still report both kinds, coalesced"
+        );
+        // Cluster 2's zero masks base data, so the backing keeps that range in the chain set;
+        // cluster 4's has nothing under it and drops out — the saving this commit is about.
+        assert_eq!(
+            q.chain_data_extents().unwrap(),
+            vec![(0, 196608), (327680, 65536)],
+            "a zero cluster over a hole leaves the chain set, one over data does not"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The chain walk omits an overlay's zero clusters. Verify that flattening still masks the
+    // backing bytes beneath them, using qemu's conversion as the reference.
+    #[test]
+    fn flatten_masks_a_backing_under_a_zero_cluster() {
+        let dir = std::env::temp_dir().join(format!("vk-qcow2-mask-{}", std::process::id()));
+        let Some(overlay) = trimmed_overlay(&dir) else {
+            return;
+        };
+
+        let flat = dir.join("flat.raw");
+        let want = dir.join("want.raw");
+        flatten_to_raw(&overlay, &flat).unwrap();
+        assert!(
+            Command::new("qemu-img")
+                .args(["convert", "-O", "raw"])
+                .arg(&overlay)
+                .arg(&want)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            std::fs::read(&flat).unwrap(),
+            std::fs::read(&want).unwrap(),
+            "a flattened trimmed overlay must match qemu-img convert"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

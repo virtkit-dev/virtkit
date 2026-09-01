@@ -1705,11 +1705,11 @@ impl MicroVm {
         }
     }
 
-    /// Push `snap`'s `dirty` extents as this instruction's cache layer, chained onto the
-    /// stage's parent layers, and record the result as the new parent (or clear the pinned
-    /// parent on failure so the next push full-re-chunks rather than splicing stale bytes).
-    /// The synchronous commit shared by the no-guest path (a metadata-only instruction that
-    /// never booted a VM) and the libkrun dirty-tracked path; cloud-hypervisor pushes async.
+    /// Push `snap`'s `dirty` extents as this instruction's cache layer, clearing `holes` to zero
+    /// and chaining the result onto the stage's parent layers. Record the result as the new
+    /// parent. On failure, clear the pinned parent so the next push full-re-chunks instead of
+    /// splicing stale bytes. This synchronous path handles metadata-only instructions that never
+    /// booted a VM and `stage_end` re-pushes after the guest exits; live-guest paths push async.
     #[allow(clippy::too_many_arguments)]
     fn push_snapshot_sync(
         &mut self,
@@ -1719,11 +1719,10 @@ impl MicroVm {
         boot_kind: &str,
         snap: &Path,
         dirty: &[(u64, u64)],
+        holes: &[(u64, u64)],
         total_size: u64,
     ) -> Result<()> {
         let (parent_layers, parent_total) = self.parent_for_push(rg, total_size);
-        // A stable full image (no live guest, or cloud-hypervisor's write-through) carries no
-        // separate discard set — freed space shows up as zero content the chunker already drops.
         match crate::registry::push_ext4_diff(
             rg,
             CACHE_REPO,
@@ -1732,7 +1731,7 @@ impl MicroVm {
             boot_kind,
             parent_total,
             dirty,
-            &[],
+            holes,
             &parent_layers,
         ) {
             Ok((layers, total, digest)) => {
@@ -2476,25 +2475,22 @@ impl Executor for MicroVm {
         let boot_kind =
             crate::image::boot_kind_tag(crate::image::BootKind::GenericDisk).to_string();
 
-        // No live guest (rare: a metadata-only instruction never booted a VM). The static
-        // stage image is a stable qcow2, so push it synchronously — its whole data set is the
-        // "delta" (deduped against the parent chain), no freeze/copy needed.
+        // No live guest: either a metadata-only instruction that never booted one (rare), or a
+        // `stage_end` re-push after it exited (routine). The static stage image is stable, so push
+        // it synchronously without a freeze or copy. Its full data set is the delta, deduplicated
+        // against the parent chain. Send explicit-zero clusters as holes: after `fstrim` they span
+        // the filesystem's free space, and reading them would re-chunk the whole disk only for the
+        // store to drop the resulting zero chunks.
         if self.session.is_none() {
             let img = self.stage_image(fs)?;
             self.verify_snapshot(&img, &format!("snapshot of {key} (before upload)"))?;
-            let (cumulative, total_size) = {
+            let (data, holes, total_size) = {
                 let mut q = crate::qcow2::Qcow2::open(&img)?;
-                (q.data_extents()?, q.virtual_size())
+                let (data, zero) = q.own_extents()?;
+                (data, zero, q.virtual_size())
             };
-            return self.push_snapshot_sync(
-                &rg,
-                fs,
-                key,
-                &boot_kind,
-                &img,
-                &cumulative,
-                total_size,
-            );
+            return self
+                .push_snapshot_sync(&rg, fs, key, &boot_kind, &img, &data, &holes, total_size);
         }
 
         // Live guest with block-level dirty tracking (libkrun): freeze the fs, drain the clusters
@@ -2616,7 +2612,10 @@ impl Executor for MicroVm {
                 .capture(&snap, &self.timings),
         )?;
         self.verify_snapshot(&snap, &format!("snapshot of {key} (before upload)"))?;
-        // Native qcow2 read: the overlay's own clusters (cumulative dirty) + its size.
+        // Native qcow2 read: the overlay's own clusters (cumulative dirty) and its size. Unlike
+        // the libkrun path, this keeps explicit-zero clusters in the dirty set. Without a dirty
+        // log there is nothing to intersect them with, so a trimmed guest still makes this path
+        // walk its free space; the chunker drops the zero chunks it produces.
         let (cumulative, total_size) = {
             let mut q = crate::qcow2::Qcow2::open(&snap)?;
             (q.data_extents()?, q.virtual_size())

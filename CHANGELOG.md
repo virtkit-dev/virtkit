@@ -15,6 +15,9 @@ All notable changes to virtkit will be documented in this file.
 - Exporting or cache-pushing a stage restored from the build cache no longer takes time
   proportional to the disk size: a warm export of an Alpine stage on a 32 GiB disk takes
   0.2s instead of 13s, and the file it writes is sparser.
+- Committing a stage to the cache and exporting it now cost what the stage holds rather
+  than what its disk could hold: once the guest has trimmed its filesystem, a stage holding
+  30 MiB on a 32 GiB disk no longer walks 32 GiB.
 
 ## [0.46.0] - 2026-09-01
 
