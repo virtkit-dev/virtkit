@@ -87,8 +87,10 @@ fast edit loop below is deliberately `vk`-only and never invokes Docker.
 ./build-kernel.sh [--no-cache]      # guest kernel vmlinux -> dist/ (vk or Docker; slow) — run first
 ./build.sh                          # static-musl binaries -> dist/ (vk or Docker)
 ./build.sh --fast                   # same, but the debug profile -> much faster iteration
-./dev.sh check -p vk-core           # fast type/borrow checking for one affected crate
-./dev.sh clippy -p vk-core          # the lints CI gates on, for one crate
+./dev.sh check                      # type/borrow checking, whole workspace, every target
+./dev.sh clippy                     # the lints CI gates on, same scope
+./dev.sh test                       # the whole test suite, doctests included
+./dev.sh check -p vk-core           # the same, narrowed to one affected crate
 ./dev.sh test -p vk-core --lib …    # one module's unit tests (see below)
 ./dev.sh shell                      # interactive shell in that same VM
 ./audit.sh [--deny warnings]        # cargo-audit against the committed Cargo.lock
@@ -115,8 +117,7 @@ the embedded kernel instead (it then needs `--kernel` at runtime, and is not shi
 
 ### Fast edit/check/test loop
 
-During iterative edits, do not run `cargo build`, release builds, or broad test commands
-such as `cargo test --workspace` / `cargo test --all`. Start with
+During iterative edits, do not run `cargo build` or release builds. Start with
 `./dev.sh check -p <affected-crate>` for type and borrow checking. Then run only the test
 target and module affected by the change, for example:
 
@@ -126,22 +127,27 @@ target and module affected by the change, for example:
 ./dev.sh test -p vk-driver --bin vk atop_view::tests
 ```
 
-`./dev.sh clippy -p <crate> --all-targets` runs CI's Clippy gate for one crate. It
-rejects workspace-wide runs, defaults to `-- -D warnings`, and lets explicit `--` lint
-flags replace that default.
+`./dev.sh clippy -p <crate>` runs CI's Clippy gate for one crate. It defaults to
+`-- -D warnings`, and explicit `--` lint flags replace that default.
+
+With no arguments, each mode covers the whole workspace. `check` and `clippy` add
+`--all-targets`, so test code receives the same coverage as CI's Clippy run; `test`
+keeps Cargo's defaults to include doctests. Run the broader commands before committing.
+Keep the narrow forms for the edit loop itself — the wide ones take minutes where a
+scoped run takes seconds.
 
 `dev.sh` is Docker-free: on first use it boots the pinned build image as a shared
 `vk` development VM; later invocations use `vk exec`, avoiding another image build and
 boot. It reuses `target/` — its RUSTFLAGS match `build.sh`'s exactly, so it shares
-dependency artifacts with `./build.sh --fast` — and rejects workspace-wide or optimized
-invocations. The VM powers itself off after half an hour with no cargo command or open
-shell, so a forgotten one stops holding memory; `./dev.sh stop` ends it immediately. A
+dependency artifacts with `./build.sh --fast` — and rejects optimized invocations. The
+VM powers itself off after half an hour with no cargo command or open shell, so a
+forgotten one stops holding memory; `./dev.sh stop` ends it immediately. A
 `vk` and a `flock` on `PATH` are required and there is deliberately no Docker fallback.
 `VK_DEV_CPUS` and `VK_DEV_MEM` size the VM, `VK_DEV_IDLE_SECS` sets that idle window
 (`0` keeps the VM until it is stopped). Use `./build.sh --fast` only when an executable
 is actually needed for runtime testing. `./dev.sh shell` opens an interactive shell in
 that VM (same user, directory and cargo environment) and holds the VM for as long as
-the shell runs, for the odd cargo or toolchain command the scoped modes above refuse.
+the shell runs, for the odd cargo or toolchain command the modes above refuse.
 That VM boots with nested virtualization where the host allows it and the `vk` on
 `PATH` can ask for it, so the shell can also *run* what it builds: `./dist/vk run …`
 works inside it, as does `./build.sh --fast --use-virtkit=./dist`, their images and

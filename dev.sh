@@ -8,9 +8,12 @@
 # when you alternate the two.
 #
 # Examples:
+#   ./dev.sh check
+#   ./dev.sh clippy
+#   ./dev.sh test
 #   ./dev.sh check -p vk-core
-#   ./dev.sh check -p vk-driver --all-targets
-#   ./dev.sh clippy -p vk-driver --all-targets
+#   ./dev.sh clippy -p vk-driver --lib
+#   ./dev.sh test -p vk-core dockerignore::tests
 #   ./dev.sh test -p vk-core --lib dockerignore::tests
 #   ./dev.sh test -p vk-core --test exec disconnect_kills_remote_process
 #   ./dev.sh test -p vk-driver --bin vk atop_view::tests
@@ -30,24 +33,28 @@ ROOT=$PWD
 
 usage() {
   cat >&2 <<'EOF'
-usage: ./dev.sh check  -p <package> [cargo check arguments]
-       ./dev.sh clippy -p <package> [cargo clippy arguments] [-- <lint flags>]
-       ./dev.sh test   -p <package> <target> [test filter]
+usage: ./dev.sh check  [-p <package>] [cargo check arguments]
+       ./dev.sh clippy [-p <package>] [cargo clippy arguments] [-- <lint flags>]
+       ./dev.sh test   [-p <package>] [target] [test filter]
        ./dev.sh shell
        ./dev.sh stop
 
-The fast loop is deliberately scoped: --workspace/--all and optimized profiles are
-rejected. For tests, select exactly one target with --lib, --bin NAME or --test NAME
-(--doc and --example NAME also count) and normally pass the changed module or test
-name as a filter. `clippy` is `check` with the lints CI gates on: it defaults to
-`-- -D warnings`, so a warning fails the command as it would on a pull request, and
-your own `--` flags replace that default. `shell` opens an interactive shell in the
-same VM under the cargo commands' own environment, and holds the VM for as long as it
-runs; that VM nests where the host allows it and the vk on PATH can ask for it, so the
-shell can boot vk's own microVMs rather than only compile them, keeping their images
-and boot scratch on the guest's disk. The first command boots a vk development VM; by
-default it powers off after 1800 seconds without a cargo command. Set VK_DEV_IDLE_SECS to
-change the window, or to 0 to keep the VM until ./dev.sh stop.
+Bare `./dev.sh check`, `clippy` or `test` covers the whole workspace, every target, the
+way CI does it — so nothing hides in a crate or a test file you did not think to name.
+Narrow it when the change is small: `-p <package>` for one crate, and --lib, --bin NAME
+or --test NAME (--doc and --example NAME also count) for one target, plus the changed
+module or test name as a filter. `check` and `clippy` pass --all-targets unless you
+select a target, which excludes doctests — `test` does not need it, since cargo already
+runs every target and the doctests with it. Optimized profiles stay rejected: use
+./build.sh when shipping. `clippy` is `check` with the lints CI gates on: it defaults to
+`-- -D warnings`, so a warning fails the command as it would on a pull request, and your
+own `--` flags replace that default. `shell` opens an interactive shell in the same VM
+under the cargo commands' own environment, and holds the VM for as long as it runs; that
+VM nests where the host allows it and the vk on PATH can ask for it, so the shell can
+boot vk's own microVMs rather than only compile them, keeping their images and boot
+scratch on the guest's disk. The first command boots a vk development VM; by default it
+powers off after 1800 seconds without a cargo command. Set VK_DEV_IDLE_SECS to change
+the window, or to 0 to keep the VM until ./dev.sh stop.
 EOF
   exit 2
 }
@@ -83,7 +90,6 @@ MODE=${1:-}
 case "$MODE" in
   check | clippy | test)
     shift
-    [ "$#" -gt 0 ] || usage
     ;;
   shell)
     shift
@@ -114,20 +120,13 @@ case "$MODE" in
 esac
 args=("$@")
 
-# Keep accidental broad or optimized invocations out of the edit loop. CI and release
-# verification retain their existing workspace-wide commands.
-has_package=""
-has_test_target=""
+# Reject optimized profiles; broad validation is the default, and ./build.sh produces
+# shippable binaries.
+has_target=""
 
 reject() {
   echo "dev.sh: $1" >&2
   exit 2
-}
-# A glob spec (-p '*') selects every member, which is what --workspace is refused for.
-check_package_spec() {
-  case "$1" in
-    *[\*\?\[]*) reject "a glob package spec selects the whole workspace; name one package" ;;
-  esac
 }
 # cargo's `bench` profile inherits `release`, so both mean an optimized build.
 check_profile() {
@@ -135,15 +134,21 @@ check_profile() {
     release | bench) reject "the $1 profile is optimized and disabled here; use ./build.sh when shipping" ;;
   esac
 }
-note_test_target() {
-  [ "$MODE" = test ] || return 0
-  [ -z "$has_test_target" ] || reject "select exactly one test target, not several"
-  has_test_target=1
+# Insert an argument before libtest's bare `--` so Cargo receives it.
+insert_cargo_arg() {
+  local out=() arg spliced=""
+  for arg in ${args[@]+"${args[@]}"}; do
+    if [ -z "$spliced" ] && [ "$arg" = -- ]; then
+      out+=("$1")
+      spliced=1
+    fi
+    out+=("$arg")
+  done
+  [ -n "$spliced" ] || out+=("$1")
+  args=("${out[@]}")
 }
 
-# Vets one cargo invocation's arguments and exits non-zero on anything out of scope; reads
-# $MODE for the test-only rules and accumulates into has_package/has_test_target, so it is
-# called once per run.
+# Validate Cargo arguments and record whether the caller selected a target.
 check_cargo_args() {
   local argv=("$@") i arg
   for ((i = 0; i < ${#argv[@]}; i++)); do
@@ -154,9 +159,6 @@ check_cargo_args() {
       break
     fi
     case "$arg" in
-      --workspace | --all)
-        reject "$arg is intentionally disabled; select an affected package with -p"
-        ;;
       -r | --release)
         reject "release builds are intentionally disabled; use ./build.sh when shipping"
         ;;
@@ -165,41 +167,21 @@ check_cargo_args() {
         check_profile "${argv[$((i + 1))]}"
         ;;
       --profile=*) check_profile "${arg#--profile=}" ;;
-      -p | --package)
-        [ $((i + 1)) -lt ${#argv[@]} ] || usage
-        check_package_spec "${argv[$((i + 1))]}"
-        has_package=1
-        ;;
-      --package=*)
-        check_package_spec "${arg#--package=}"
-        has_package=1
-        ;;
-      # cargo's attached short form, e.g. -pvk-core.
-      -p?*)
-        check_package_spec "${arg#-p}"
-        has_package=1
-        ;;
-      --lib | --doc | --bin | --bin=* | --test | --test=* | --example | --example=*)
-        note_test_target
-        ;;
-      --all-targets | --bins | --tests | --benches | --examples)
-        if [ "$MODE" = test ]; then
-          reject "$arg is too broad for the edit loop; select one --lib, --bin or --test target"
-        fi
+      --lib | --doc | --bin | --bin=* | --test | --test=* | --example | --example=* | \
+        --all-targets | --bins | --tests | --benches | --examples)
+        has_target=1
         ;;
     esac
   done
-  [ -n "$has_package" ] || {
-    echo "dev.sh: select the affected package with -p/--package" >&2
-    exit 2
-  }
-  if [ "$MODE" = test ] && [ -z "$has_test_target" ]; then
-    echo "dev.sh: select one test target with --lib, --bin NAME, or --test NAME" >&2
-    exit 2
-  fi
 }
 # `shell` takes no cargo arguments to vet; every other mode is a cargo invocation.
-[ "$MODE" = shell ] || check_cargo_args "${args[@]}"
+[ "$MODE" = shell ] || check_cargo_args ${args[@]+"${args[@]}"}
+
+# Default check and clippy to --all-targets so local validation includes test code. Leave
+# test alone: Cargo already runs every target, and --all-targets would omit doctests.
+case "$MODE" in
+  check | clippy) [ -n "$has_target" ] || insert_cargo_arg --all-targets ;;
+esac
 
 # Match CI's `-D warnings` default unless the caller provides lint flags after a bare
 # `--`. The exact match avoids treating arguments that merely contain `--` as separators.
@@ -245,7 +227,7 @@ if [ "$MODE" = shell ]; then
   # in this branch only, so cargo's environment stays byte-identical to build.sh's.
   DEV_ENV+=(XDG_DATA_HOME=/var/tmp/vk/share XDG_CACHE_HOME=/var/tmp/vk/cache)
 else
-  guest_cmd=(cargo "$MODE" "${args[@]}")
+  guest_cmd=(cargo "$MODE" ${args[@]+"${args[@]}"})
   what="running cargo $MODE"
 fi
 

@@ -334,11 +334,12 @@ missing. `--no-kernel` produces a non-shippable binary that requires `--kernel` 
 runtime. The kernel changes less often than the Rust binaries, so one kernel build can be
 reused across normal edit/build cycles.
 
-For iteration, use the repository's scoped development commands:
+For iteration, use the repository's development commands:
 
 ```sh
-./dev.sh check -p vk-core
-./dev.sh test -p vk-core --lib dockerignore::tests
+./dev.sh check -p vk-core                          # one crate, while iterating
+./dev.sh test -p vk-core --lib dockerignore::tests # one module's tests
+./dev.sh check && ./dev.sh clippy && ./dev.sh test # the whole workspace, before committing
 ./build.sh --fast  # only when a runnable debug vk is needed
 ```
 
@@ -362,7 +363,7 @@ kernel/          pinned guest-kernel configuration and build inputs
 docs/            operational guides
 build.sh         reproducible binary build
 build-kernel.sh  reproducible guest-kernel build
-dev.sh           scoped check/test environment in a reusable development VM
+dev.sh           check/lint/test environment in a reusable development VM
 ```
 
 ## License
