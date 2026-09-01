@@ -790,6 +790,51 @@ fn stamp_stage_uuid(out: &Path, stage_key: &str) -> Result<()> {
     crate::ext4::set_uuid(out, &uuid)
 }
 
+/// Where an export is written before it is published at `out`: a `.tmp` sibling, so the
+/// rename that publishes it stays on one filesystem.
+fn export_tmp_path(out: &Path) -> PathBuf {
+    let mut s = out.as_os_str().to_os_string();
+    s.push(".tmp");
+    PathBuf::from(s)
+}
+
+/// Publish the image exported to `tmp` as `out`: stamp its content-freshness UUID (the
+/// fingerprint of `key`, what `vk fingerprint` and the freshness checks compare), journal
+/// it if asked, remove the previous config sidecar, rename it over `out`, then write the
+/// sidecar for this image. `ensure::unit_fresh` trusts a stamped image only beside its
+/// sidecar, so an export killed at any point here leaves either the previous image and
+/// sidecar intact or a stamped image with no sidecar — never a fresh-looking pair whose
+/// bytes or config belong to different builds.
+fn publish_export(
+    tmp: &Path,
+    out: &Path,
+    key: &str,
+    journal: bool,
+    config: &vk_core::runcfg::RunConfig,
+) -> Result<()> {
+    stamp_stage_uuid(tmp, key)?;
+    // Journal *after* the UUID stamp: `ext4::set_uuid` refuses an already-journaled image
+    // (the JBD2 superblock embeds the UUID at journal creation).
+    if journal {
+        crate::ext4::add_journal(tmp)?;
+    }
+    let sidecar = config_sidecar(out);
+    // The old sidecar must be gone before the rename, or a kill between the two would leave
+    // the new image beside a mismatched sidecar — the false-fresh pair this ordering exists
+    // to prevent. Its absence is fine; any other failure aborts rather than risk that pair.
+    match std::fs::remove_file(&sidecar) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("removing {}", sidecar.display())),
+    }
+    std::fs::rename(tmp, out)
+        .with_context(|| format!("publishing {} as {}", tmp.display(), out.display()))?;
+    // The sidecar persists the config the image itself deliberately does not carry
+    // (clean-image model: config is supplied at boot, never baked in).
+    std::fs::write(&sidecar, serde_json::to_vec_pretty(config)?)
+        .with_context(|| format!("writing {}", sidecar.display()))
+}
+
 /// [`build`] for a caller that already holds parsed [`PlanInput`]s — e.g. `vk run
 /// --compose` materializing an `image:` service as the synthetic single-`FROM`
 /// plan, with no Dockerfile on disk. `opts.dockerfiles`/`opts.contexts` are the
@@ -953,29 +998,21 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
         if let Some(out) = out {
             progress.export_start(0);
             let t_export = Instant::now();
-            ex.export_ext4(fs, out)?;
+            let tmp = export_tmp_path(out);
+            // Clear a leftover tmp from an interrupted export; a real failure resurfaces
+            // when `export_ext4` recreates the file.
+            let _ = std::fs::remove_file(&tmp);
+            ex.export_ext4(fs, &tmp)?;
             timings.record(Phase::Export, "", t_export.elapsed());
             progress.export_done(0);
-            // Stamp the exported image with its content-freshness UUID (fingerprint of the
-            // target's stage key) so `vk fingerprint` matches it. The keys are re-derived
-            // read-only via the drive backend (base digests/configs it already memoized).
+            // The keys are re-derived read-only via the drive backend (base digests/configs
+            // it already memoized).
             let key = resolve_stages(&plan, &order, &build_args, ex.as_mut(), None)?
                 .get(&target)
                 .context("internal: target stage not resolved")?
                 .final_key
                 .clone();
-            stamp_stage_uuid(out, &key)?;
-            // Journal *after* the UUID stamp: `ext4::set_uuid` refuses an already-journaled
-            // image (the JBD2 superblock embeds the UUID at journal creation), so this must
-            // stay ordered after `stamp_stage_uuid` above, never before.
-            if opts.journal {
-                crate::ext4::add_journal(out)?;
-            }
-            // The sidecar persists the config the image itself deliberately does not
-            // carry (clean-image model: config is supplied at boot, never baked in).
-            let sidecar = config_sidecar(out);
-            std::fs::write(&sidecar, serde_json::to_vec_pretty(&config)?)
-                .with_context(|| format!("writing {}", sidecar.display()))?;
+            publish_export(&tmp, out, &key, opts.journal, &config)?;
         }
         Ok(Built { config })
     })();
@@ -1133,6 +1170,9 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
             idx: usize,
             label: String,
             out: Option<PathBuf>,
+            /// `out` already holds this target: its UUID is the fingerprint of the target's
+            /// final key and its sidecar is beside it. Nothing is built or exported for it.
+            fresh: bool,
         }
         /// One resolved unit: its plan/keys, the needed subset, and the base offset that
         /// maps its local stage indices into the build-wide id space.
@@ -1181,7 +1221,7 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
             // separate Dockerfiles, and a name is wrong only if no unit has it at all.
             matched_overrides.extend(apply_stage_overrides(&mut plan, &opts.stage_guests));
             known_stages.extend(stage_names(&plan));
-            let targets: Vec<Tgt> = unit
+            let mut targets: Vec<Tgt> = unit
                 .targets
                 .iter()
                 .map(|t| {
@@ -1189,6 +1229,7 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
                         idx: plan.resolve_target(t.selector.as_deref())?,
                         label: t.label.clone(),
                         out: t.out.clone(),
+                        fresh: false,
                     })
                 })
                 .collect::<Result<_>>()
@@ -1198,13 +1239,34 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
             plan.check_reserved_names(&order)?;
             plan.check_tmp_sources(&order)?;
             let resolved = resolve_all(&plan, &order, &build_args, &mut probe, &target_idxs)?;
+            // A target whose export already carries its final key's fingerprint is this
+            // build's output: the key is the content identity of everything the stage is
+            // built from, and the exported image is only ever booted read-only under an
+            // overlay, so the file is what a fresh export would write. Such a target builds
+            // nothing, and neither do the stages only it needs — a dev VM restarted on
+            // unchanged sources does not rewrite its root image.
+            for t in &mut targets {
+                if let Some(out) = &t.out
+                    && let Some(r) = resolved.get(&t.idx)
+                    && crate::ensure::unit_fresh(out, &crate::ensure::fingerprint(&[&r.final_key]))
+                {
+                    t.fresh = true;
+                    progress.note(&format!(
+                        "virtkit: {}: {} already holds this build — nothing to do",
+                        t.label,
+                        out.display()
+                    ));
+                }
+            }
+            let build_targets: Vec<usize> =
+                targets.iter().filter(|t| !t.fresh).map(|t| t.idx).collect();
             let (needed, cached_final) = compute_needed(
                 &plan,
                 &order,
                 &resolved,
                 &mut probe,
                 opts.require_cached,
-                &target_idxs,
+                &build_targets,
             )
             .with_context(|| format!("build unit {:?}", unit.label))?;
             let stages = plan.stages.len();
@@ -1259,7 +1321,7 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
         let exports = resolved_units
             .iter()
             .flat_map(|u| &u.targets)
-            .filter(|t| t.out.is_some())
+            .filter(|t| t.out.is_some() && !t.fresh)
             .count();
         progress.init(inits, exports);
 
@@ -1351,51 +1413,35 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
         let mut export_i = 0usize;
         for u in &resolved_units {
             for t in &u.targets {
-                let fs = done
-                    .get(&(u.base + t.idx))
-                    .context("internal: target stage not committed")?;
-                if let Some(out) = &t.out {
+                let r = u
+                    .resolved
+                    .get(&t.idx)
+                    .context("internal: target stage not resolved")?;
+                let config = run_config(&r.final_state);
+                // A fresh target was neither built nor committed: `out` and its sidecar
+                // already are the export (see the freshness check above).
+                if let Some(out) = &t.out
+                    && !t.fresh
+                {
+                    let fs = done
+                        .get(&(u.base + t.idx))
+                        .context("internal: target stage not committed")?;
                     progress.export_start(export_i);
                     let t_export = Instant::now();
-                    mv.export_ext4(fs, out)
+                    let tmp = export_tmp_path(out);
+                    // Clear a leftover tmp from an interrupted export; a real failure
+                    // resurfaces when `export_ext4` recreates the file.
+                    let _ = std::fs::remove_file(&tmp);
+                    mv.export_ext4(fs, &tmp)
                         .with_context(|| format!("target {:?}", t.label))?;
                     timings.record(Phase::Export, &t.label, t_export.elapsed());
                     progress.export_done(export_i);
                     export_i += 1;
-                    // Stamp the content-freshness UUID (fingerprint of the target's stage key)
-                    // so `vk fingerprint` — and the dev-VM staleness check on the exported
-                    // root.ext4 — matches it; the export tail otherwise leaves the base UUID.
-                    let key = &u
-                        .resolved
-                        .get(&t.idx)
-                        .context("internal: target stage not resolved")?
-                        .final_key;
-                    stamp_stage_uuid(out, key)?;
-                    // Journal *after* the UUID stamp — see the single-target export path
-                    // above for why the order matters.
-                    if opts.journal {
-                        crate::ext4::add_journal(out)?;
-                    }
-                    let sidecar = config_sidecar(out);
-                    let st = u
-                        .resolved
-                        .get(&t.idx)
-                        .map(|r| r.final_state.clone())
-                        .unwrap_or_default();
-                    std::fs::write(&sidecar, serde_json::to_vec_pretty(&run_config(&st))?)
-                        .with_context(|| format!("writing {}", sidecar.display()))?;
+                    // The dev-VM staleness check reads the stamped UUID off the exported
+                    // root.ext4; the export tail otherwise leaves the base UUID.
+                    publish_export(&tmp, out, &r.final_key, opts.journal, &config)?;
                 }
-                let st = u
-                    .resolved
-                    .get(&t.idx)
-                    .map(|r| r.final_state.clone())
-                    .unwrap_or_default();
-                built.insert(
-                    t.label.clone(),
-                    Built {
-                        config: run_config(&st),
-                    },
-                );
+                built.insert(t.label.clone(), Built { config });
             }
         }
         Ok(built)
@@ -6151,6 +6197,76 @@ ENTRYPOINT run me
             Some(expected.as_str())
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // `publish_export` must leave a unit the freshness check trusts — the stamped image
+    // renamed into place and a sidecar carrying this build's config — and it must not let a
+    // previous build's sidecar survive beside the new image (the false-fresh pair the
+    // publish ordering exists to prevent).
+    #[test]
+    fn publish_export_leaves_a_fresh_unit_and_replaces_a_stale_sidecar() {
+        let dir = tmpdir("publish-export");
+        std::fs::write(dir.join("Dockerfile"), "FROM scratch\nCOPY Dockerfile /d\n").unwrap();
+        let out = dir.join("root.ext4");
+        let tmp = export_tmp_path(&out);
+        assert_eq!(
+            tmp,
+            dir.join("root.ext4.tmp"),
+            "export tmp is an `.tmp` sibling"
+        );
+        // Build a real ext4 to stand in for a freshly exported tmp.
+        build_host(&Options {
+            dockerfiles: vec![dir.join("Dockerfile")],
+            target: None,
+            stage_guests: Default::default(),
+            contexts: vec![],
+            build_contexts: Vec::new(),
+            out: Some(tmp.clone()),
+            out_disk: None,
+            print_plan: false,
+            cloud_hypervisor: None,
+            kernel: None,
+            agent: None,
+            cache_registry: Some("none".into()),
+            cache_insecure: false,
+            cache_auth: Default::default(),
+            build_cache: BuildCache::default(),
+            journal: false,
+            tmp_tmpfs: false,
+            build_args: vec![],
+            net: BuildNet::None,
+            audit: false,
+            require_cached: false,
+            build_jobs: None,
+            debug: false,
+            progress_sink: None,
+        })
+        .unwrap();
+        // A stale sidecar from a previous build sits beside `out`; publishing must overwrite it.
+        let sidecar = config_sidecar(&out);
+        std::fs::write(&sidecar, br#"{"stale":true}"#).unwrap();
+
+        let key = "publish-stage-key";
+        let config = vk_core::runcfg::RunConfig::default();
+        publish_export(&tmp, &out, key, false, &config).unwrap();
+
+        assert!(!tmp.exists(), "tmp is published by rename, not left behind");
+        let expected = crate::ensure::fingerprint(&[key]);
+        assert_eq!(
+            crate::ext4::fs_uuid(&out).as_deref(),
+            Some(expected.as_str())
+        );
+        assert!(
+            crate::ensure::unit_fresh(&out, &expected),
+            "published image reads as fresh"
+        );
+        assert_eq!(
+            serde_json::from_slice::<vk_core::runcfg::RunConfig>(&std::fs::read(&sidecar).unwrap())
+                .unwrap(),
+            config,
+            "stale sidecar replaced with this build's config"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Regression test: `ext4::set_uuid` (which `stamp_stage_uuid` calls) refuses an

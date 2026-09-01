@@ -11,6 +11,10 @@ All notable changes to virtkit will be documented in this file.
   which on a cold build of many stages added up to minutes.
 - Exporting a fully cached build stage is much faster: a 7 GiB dev-VM root image that took
   33 s is now bounded by disk write speed.
+- `vk run --compose --primary` and `vk build --compose --out` no longer re-export a target
+  whose image is already up to date: a dev VM restarted on unchanged sources boots in a few
+  seconds instead of rewriting its 7 GiB root image first. An interrupted rebuild also never
+  leaves a stale image looking up to date.
 
 ## [0.47.0] - 2026-09-01
 

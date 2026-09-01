@@ -80,8 +80,10 @@ pub struct BuildRecipe {
 }
 
 /// A unit image is fresh when its UUID is the expected fingerprint *and* its runtime
-/// config sidecar is present (a boot needs both).
-fn unit_fresh(out: &Path, expected_uuid: &str) -> bool {
+/// config sidecar is present (a boot needs both). The builder's export tail publishes the
+/// two in an order that makes this check trustworthy: the stamped image is renamed into
+/// place only after the previous sidecar is gone, and the new sidecar is written last.
+pub(crate) fn unit_fresh(out: &Path, expected_uuid: &str) -> bool {
     crate::ext4::fs_uuid(out).as_deref() == Some(expected_uuid)
         && crate::build::config_sidecar(out).exists()
 }
