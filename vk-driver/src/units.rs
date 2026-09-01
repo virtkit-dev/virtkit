@@ -311,17 +311,8 @@ pub fn nth_static_ip(gateway: Ipv4Addr, prefix: u8, n: u32) -> Result<Ipv4Addr> 
     Ok(Ipv4Addr::from(network | (hosts as u32 - n)))
 }
 
-/// A stable, locally-administered unicast MAC for a sibling from its run-assigned
-/// IPv4: `52:54:00:<octet2>:<octet3>:<octet4>`. The `52:54:00` prefix is the
-/// QEMU-style locally-administered unicast OUI; the last three octets carry the
-/// low three IPv4 octets, so every host on a /24 (up to a /8) LAN gets a distinct
-/// MAC. The switch keys a DHCP reservation on this MAC to hand the sibling its
-/// svc.ip (== the address the resolver advertises for its name), instead of a pool
-/// lease.
-pub fn mac_for_ip(ip: Ipv4Addr) -> String {
-    let o = ip.octets();
-    format!("52:54:00:{:02x}:{:02x}:{:02x}", o[1], o[2], o[3])
-}
+/// Re-export the shared guest MAC derivation to preserve existing driver call sites.
+pub use vk_core::net::mac_for_ip;
 
 /// First vsock CID handed to services — clear of the reserved CIDs (0-2) and the
 /// primary VM's default (3).

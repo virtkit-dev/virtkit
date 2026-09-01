@@ -3,6 +3,7 @@ use crate::framing::{DeSink, SerStream, wrap_stream};
 use anyhow::{Context, anyhow, bail};
 use listenfd::ListenFd;
 use log::{debug, info};
+use std::net::Ipv4Addr;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -49,6 +50,17 @@ pub fn hybrid_socket(base: &Path, port: u32) -> PathBuf {
     let mut socket = base.as_os_str().to_owned();
     socket.push(format!("_{port}"));
     socket.into()
+}
+
+/// Stable, locally-administered unicast MAC for a run-assigned guest IPv4 address:
+/// `52:54:00:<octet2>:<octet3>:<octet4>`. The prefix follows the QEMU convention; the
+/// low three IPv4 octets distinguish every address in subnets up to a /8.
+///
+/// The host keys the switch's DHCP reservation on this MAC, and the guest assigns it to
+/// the NIC's tap.
+pub fn mac_for_ip(ip: Ipv4Addr) -> String {
+    let o = ip.octets();
+    format!("52:54:00:{:02x}:{:02x}:{:02x}", o[1], o[2], o[3])
 }
 
 /// `vsock-auto://`: resolve the best host→guest path for a guest port at connect
@@ -470,6 +482,27 @@ impl RawListener {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// The MAC contains the QEMU-style prefix and low three IPv4 octets.
+    #[test]
+    fn mac_carries_the_low_three_ipv4_octets() {
+        assert_eq!(
+            mac_for_ip(Ipv4Addr::new(192, 168, 127, 2)),
+            "52:54:00:a8:7f:02"
+        );
+        assert_eq!(
+            mac_for_ip(Ipv4Addr::new(192, 168, 127, 254)),
+            "52:54:00:a8:7f:fe"
+        );
+        assert_ne!(
+            mac_for_ip(Ipv4Addr::new(192, 168, 127, 3)),
+            mac_for_ip(Ipv4Addr::new(192, 168, 127, 4))
+        );
+        assert_ne!(
+            mac_for_ip(Ipv4Addr::new(192, 168, 127, 2)),
+            mac_for_ip(Ipv4Addr::new(192, 168, 128, 2))
+        );
+    }
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("vk-net-{name}-{}", std::process::id()));
