@@ -20,6 +20,9 @@
 //!   VIRTKIT_NET_PORT     bring eth0 up: a tap bridged to the host switch over this
 //!                        vsock port; then DHCP (VIRTKIT_NET_DHCP=1) or a static
 //!                        VIRTKIT_VM_IP / VIRTKIT_VM_GW / VIRTKIT_VM_DNS
+//!   VIRTKIT_NET_EXTRA_IPS  ip/prefix[,ip/prefix] — additional NICs in order. Entry i
+//!                        configures eth{i+1} over VIRTKIT_NET_PORT + i + 1. Each NIC
+//!                        receives its address but no default route; that belongs to eth0
 //!   VIRTKIT_VIRTIOFS     tag:path[,tag:path] virtiofs shares to mount
 //!   VIRTKIT_VIRTIOFS_OVERLAY  tag[,tag] — mount these shares as the read-only lower
 //!                        layer of a tmpfs-backed overlayfs at their path, so every
@@ -1526,6 +1529,79 @@ fn net_args(port: &str, cmdline: &HashMap<String, String>) -> Vec<String> {
     args
 }
 
+/// Build `vk-agent net` arguments for an additional NIC. Its MAC follows the host's
+/// address-derived DHCP reservation, so an image DHCP client receives the assigned address.
+fn extra_net_args(port: u32, iface: &str, mac: &str) -> Vec<String> {
+    vec![
+        "--socket".into(),
+        format!("vsock://{port}"),
+        "net".into(),
+        "--iface".into(),
+        iface.into(),
+        "--mac".into(),
+        mac.into(),
+    ]
+}
+
+/// Map additional addresses to `(interface, vsock port, address)` in cmdline order.
+/// Entry `i` uses `eth{i+1}` and eth0's port + i + 1; blank entries are ignored.
+fn extra_nics(extra_ips: &str, base_port: u32) -> Vec<(String, u32, String)> {
+    extra_ips
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .enumerate()
+        .map(|(i, ip)| {
+            let n = i as u32 + 1;
+            (format!("eth{n}"), base_port + n, ip.to_string())
+        })
+        .collect()
+}
+
+/// Start a switch bridge for each NIC after eth0, then assign its address.
+///
+/// Leave default routing to eth0 to avoid ambiguous egress across the shared L2 segment.
+/// Callers may add routes for specific NICs. Warn and continue when one NIC fails so it
+/// does not prevent boot or disrupt working interfaces.
+fn configure_extra_nics(cmdline: &HashMap<String, String>, tag: &str) {
+    let Some(extra_ips) = cmdline.get("VIRTKIT_NET_EXTRA_IPS") else {
+        return;
+    };
+    let Some(base_port) = cmdline
+        .get("VIRTKIT_NET_PORT")
+        .and_then(|p| p.parse::<u32>().ok())
+    else {
+        warn!("vk-agent {tag}: VIRTKIT_NET_EXTRA_IPS without a numeric VIRTKIT_NET_PORT");
+        return;
+    };
+    for (iface, port, ip_cidr) in extra_nics(extra_ips, base_port) {
+        let ip = match ip_cidr.split('/').next().unwrap_or_default().parse() {
+            Ok(ip) => ip,
+            Err(e) => {
+                warn!("vk-agent {tag}: {iface} address {ip_cidr:?} is not an IPv4 address: {e}");
+                continue;
+            }
+        };
+        let mac = vk_core::net::mac_for_ip(ip);
+        if let Err(e) = fork_agent(&extra_net_args(port, &iface, &mac)) {
+            warn!("vk-agent {tag}: {iface} net bridge failed to start: {e}");
+            continue;
+        }
+        if !wait_for_iface(&iface, EXTRA_IFACE_TRIES) {
+            warn!("vk-agent {tag}: {iface} never appeared");
+            continue;
+        }
+        if let Err(e) = set_iface_addr(&iface, &ip_cidr) {
+            warn!("vk-agent {tag}: configuring {iface} {ip_cidr} failed: {e:#}");
+        } else {
+            info!("vk-agent {tag}: {iface} {ip_cidr} (no default route)");
+        }
+    }
+}
+
+/// Wait for a helper-created tap in 100 ms attempts; its absence indicates helper failure.
+const EXTRA_IFACE_TRIES: u32 = 100;
+
 /// The gateway to use when the run assigned an address but no `VIRTKIT_VM_GW` — the vk
 /// switch's own address in the default subnet. Every producer sets the param; this is the
 /// fallback both network paths share.
@@ -1573,6 +1649,8 @@ fn configure_network(cmdline: &HashMap<String, String>) {
             );
         }
     }
+    // Configure additional NICs after eth0 owns the default route.
+    configure_extra_nics(cmdline, "init");
     // DNS is written separately (write_resolv_conf) so it applies to the kernel `ip=`
     // pool net too, not just this vsock-bridge static path.
 }
@@ -1663,6 +1741,8 @@ fn configure_network_fullvm(cmdline: &HashMap<String, String>) {
             unsafe { libc::_exit(0) };
         }
     }
+    // Configure additional NICs before the PID 1 handoff so startup sees every interface.
+    configure_extra_nics(cmdline, "image-init");
     // Seed /etc/resolv.conf with the switch's resolver so name resolution works even
     // on images that DHCP an address but don't wire up DNS (no systemd-resolved).
     write_resolv_conf(cmdline);
@@ -1679,6 +1759,16 @@ fn iface_configured(iface: &str) -> bool {
                 .any(|l| l.split_whitespace().next() == Some(iface))
         })
         .unwrap_or(false)
+}
+
+/// Assign `ip_cidr` to `iface` and bring it up without adding a route.
+fn set_iface_addr(iface: &str, ip_cidr: &str) -> Result<()> {
+    let (ip_str, prefix) = match ip_cidr.split_once('/') {
+        Some((ip, p)) => (ip, p.parse::<u32>().context("parsing the IP prefix")?),
+        None => (ip_cidr, 24),
+    };
+    let ip: std::net::Ipv4Addr = ip_str.parse().context("parsing the NIC address")?;
+    crate::netcfg::set_addr(iface, ip, prefix)
 }
 
 /// Apply a static `VIRTKIT_VM_IP` (`a.b.c.d/prefix`) + `VIRTKIT_VM_GW` to eth0 via
@@ -2954,5 +3044,42 @@ mod tests {
                 .into_iter()
                 .collect();
         assert_eq!(guest_ip_from_cmdline(&m), None);
+    }
+
+    #[test]
+    fn extra_nics_number_ifaces_and_ports_from_position() {
+        assert_eq!(
+            extra_nics("192.168.127.254/24,192.168.127.253/24", 1024),
+            vec![
+                ("eth1".to_string(), 1025, "192.168.127.254/24".to_string()),
+                ("eth2".to_string(), 1026, "192.168.127.253/24".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn extra_nics_skips_blank_entries() {
+        assert_eq!(
+            extra_nics(" 10.0.0.5/24 ,", 1024),
+            vec![("eth1".to_string(), 1025, "10.0.0.5/24".to_string())]
+        );
+        assert!(extra_nics("", 1024).is_empty());
+    }
+
+    #[test]
+    fn extra_net_args_carry_the_derived_mac() {
+        let mac = vk_core::net::mac_for_ip("192.168.127.254".parse().unwrap());
+        assert_eq!(
+            extra_net_args(1025, "eth1", &mac),
+            vec![
+                "--socket",
+                "vsock://1025",
+                "net",
+                "--iface",
+                "eth1",
+                "--mac",
+                "52:54:00:a8:7f:fe",
+            ]
+        );
     }
 }
