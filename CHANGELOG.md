@@ -8,6 +8,8 @@ All notable changes to virtkit will be documented in this file.
 
 - A failed cache upload no longer lets later builds restore an image assembled from
   stale data.
+- Concurrent stages built from the same parent no longer race with its cache upload and
+  later restore an image that was never built.
 
 ## [0.46.0] - 2026-09-01
 

@@ -628,15 +628,24 @@ fn join_push(handle: std::thread::JoinHandle<PushOutput>) -> Result<PushResult, 
 /// drain runs once, when it drops at build end (before the scratch dir is removed).
 #[derive(Default)]
 struct PushPool {
-    inflight: Mutex<HashMap<String, PushInflight>>,
+    inflight: Mutex<HashMap<String, PushSlot>>,
 }
+
+/// A parked push or its empty slot. The slot outlives an adopted push so its lock remains
+/// a barrier for sibling stages.
+type PushSlot = Arc<Mutex<Option<PushInflight>>>;
 
 impl PushPool {
     fn insert(&self, label: String, inf: PushInflight) {
-        self.inflight.lock().unwrap().insert(label, inf);
+        self.inflight
+            .lock()
+            .unwrap()
+            .insert(label, Arc::new(Mutex::new(Some(inf))));
     }
-    fn take(&self, label: &str) -> Option<PushInflight> {
-        self.inflight.lock().unwrap().remove(label)
+    /// Return `label`'s permanent parked-push slot. The taker holds its lock through digest
+    /// recording, so a fork arriving mid-upload waits for the superseding digest.
+    fn slot(&self, label: &str) -> Option<PushSlot> {
+        self.inflight.lock().unwrap().get(label).cloned()
     }
 }
 
@@ -645,7 +654,17 @@ impl Drop for PushPool {
     /// exit and every snapshot raw is freed before the scratch dir is removed. A failed push is
     /// non-fatal (its instruction is simply left uncached), matching the intra-stage push path.
     fn drop(&mut self) {
-        for (_, inf) in self.inflight.get_mut().unwrap().drain() {
+        for (_, slot) in self
+            .inflight
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+        {
+            // Recover poison rather than panic in `Drop`, which could abort during unwinding.
+            // A panic changes neither whether the push remains nor whether it was taken.
+            let Some(inf) = slot.lock().unwrap_or_else(PoisonError::into_inner).take() else {
+                continue;
+            };
             if let Err(msg) = join_push(inf.handle) {
                 eprintln!("virtkit: {msg} — not cached");
             }
@@ -1770,15 +1789,19 @@ impl MicroVm {
         let _ = std::fs::remove_file(&inf.snap);
     }
 
-    /// Adopt a stage's parked terminal push (parked at its `stage_end`) before a `FROM <stage>`
-    /// fork's first diff push chains onto it: join the upload and record the stage's immutable
-    /// digest so `parent_for_push` can pin the parent's chunks. The fork must cross this
-    /// barrier — its first diff push fetches those chunks from the registry, so they must be
-    /// uploaded first. Idempotent: a stage forked by several children joins once (later calls find
-    /// it gone but the recorded digest already in place). A failed push leaves no digest, so the
-    /// fork full-pushes.
+    /// Resolve a stage's parked terminal push before a `FROM <stage>` fork pins its chunks.
+    /// The permanent slot serializes siblings through take, join, and digest update. Success
+    /// records the immutable digest before the first diff fetches chunks; failure leaves no
+    /// parent, forcing a full push.
     fn join_pending(&self, label: &str) {
-        let Some(inf) = self.pending.take(label) else {
+        let Some(slot) = self.pending.slot(label) else {
+            return;
+        };
+        // Hold the slot across take, join, and digest update so a sibling cannot pin the
+        // superseded parent. Recover poison because the contents survive a panic and cache
+        // failures remain non-fatal.
+        let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(inf) = slot.take() else {
             return;
         };
         match join_push(inf.handle) {
@@ -1788,6 +1811,8 @@ impl MicroVm {
                 self.forget_stage_digest(label);
             }
         }
+        // Release the barrier before unlinking; snapshot cleanup cannot affect parent selection.
+        drop(slot);
         let _ = std::fs::remove_file(&inf.snap);
     }
 
