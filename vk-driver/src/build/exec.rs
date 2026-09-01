@@ -1957,6 +1957,7 @@ impl Executor for MicroVm {
         self.wrap_base(stage, &ext4)?;
         // No cached parent snapshot (the base is empty, built locally); the first COPY
         // here falls back to a full push if caching is enabled.
+        self.parent_digest = None;
         self.parent_layers = None;
         Ok(Rootfs {
             label: stage.to_string(),
@@ -2740,8 +2741,9 @@ impl Executor for MicroVm {
         if let Some(scratch) = self.scratch_disk.take() {
             let _ = std::fs::remove_file(scratch);
         }
-        // the next stage starts a fresh cache lineage; clear its attached sources, its
-        // context, and the in-memory parent layers.
+        // The next stage starts a fresh cache lineage. Clear its attached sources, context,
+        // and both cached-parent components so its first push cannot chain onto this stage.
+        self.parent_digest = None;
         self.parent_layers = None;
         self.sources.clear();
         self.source_dev.clear();
