@@ -2441,15 +2441,26 @@ impl Executor for MicroVm {
         // Warm-rebuild fast path: a fully-cached stage is a restored raw ext4 wrapped in an
         // empty overlay (never booted, so no writes of its own). Its content IS the backing
         // raw, so move that out (a rename on the same fs) instead of flattening a full copy.
-        let moved = crate::qcow2::Qcow2::open(&image)?
+        let mut q = crate::qcow2::Qcow2::open(&image)?;
+        let moved = q
             .empty_raw_backing()?
             .filter(|raw| std::fs::rename(raw, out).is_ok())
             .is_some();
         if !moved {
-            // Otherwise flatten the qcow2 overlay chain natively into a raw ext4 (a base ext4
-            // plus the stage's CoW layers; sparse, like qemu-img convert).
-            crate::qcow2::flatten_to_raw(&image, out)
-                .with_context(|| format!("exporting {} -> {}", image.display(), out.display()))?;
+            if let Some(view) = q.empty_lazy_backing()? {
+                // The lazy form of the same case (the libkrun default): the content IS the
+                // cached chunks the view names, so reassemble them on every core rather than
+                // decode them one cluster at a time through the overlay reader.
+                crate::qcow2::materialize_lazy_parallel(&view, out).with_context(|| {
+                    format!("exporting {} -> {}", view.display(), out.display())
+                })?;
+            } else {
+                // Otherwise flatten the qcow2 overlay chain natively into a raw ext4 (a base
+                // ext4 plus the stage's CoW layers; sparse, like qemu-img convert).
+                crate::qcow2::flatten_to_raw(&image, out).with_context(|| {
+                    format!("exporting {} -> {}", image.display(), out.display())
+                })?;
+            }
         }
         self.images.lock().unwrap().remove(&fs.label);
         // Zero the superblock's volatile bookkeeping (write/mount/check times + the

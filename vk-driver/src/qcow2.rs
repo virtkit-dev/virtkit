@@ -165,6 +165,17 @@ impl Qcow2 {
         Ok(self.backing_path.clone())
     }
 
+    /// The lazy counterpart of [`Self::empty_raw_backing`]: the path of the `.vk_ro_img` view
+    /// this overlay sits on when it holds no data of its own, so an export can reassemble the
+    /// view's chunks in parallel (see [`materialize_lazy_parallel`]) instead of reading the
+    /// chain one cluster at a time.
+    pub fn empty_lazy_backing(&mut self) -> Result<Option<PathBuf>> {
+        if !matches!(self.backing, Backing::Lazy(_)) || !self.data_extents()?.is_empty() {
+            return Ok(None);
+        }
+        Ok(self.backing_path.clone())
+    }
+
     /// Read `buf.len()` logical bytes starting at `off`, following the backing chain for
     /// clusters this layer does not hold; bytes past the end of an image read as zero.
     pub fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<()> {
@@ -432,6 +443,13 @@ pub fn flatten_to_raw(src: &Path, out: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Write the image a `.vk_ro_img` `view` stands for into a sparse raw file at `out`, decoding
+/// its chunks on every core. For an export whose overlay holds nothing of its own (see
+/// [`Qcow2::empty_lazy_backing`]), where the view is the whole content.
+pub fn materialize_lazy_parallel(view: &Path, out: &Path) -> Result<()> {
+    VkRoImg::open(view)?.materialize_parallel(out)
 }
 
 /// Write the image `view` stands for into a raw file at `out`: a `.vk_ro_img` manifest (a lazy
@@ -742,29 +760,132 @@ impl VkRoImg {
         }
     }
 
+    /// Read and decode chunk `idx` from the cache directory, checked against its recorded
+    /// length. Takes `&self` so several threads can decode disjoint chunks at once.
+    fn load_chunk(&self, idx: usize) -> Result<Vec<u8>> {
+        let chunk = &self.chunks[idx];
+        let path = self.chunk_path(chunk);
+        let raw =
+            std::fs::read(&path).with_context(|| format!("reading chunk {}", path.display()))?;
+        let data = if chunk.codec == crate::registry::VK_RO_IMG_CODEC_ZSTD {
+            zstd::decode_all(&raw[..])
+                .with_context(|| format!("zstd-decompressing chunk {}", path.display()))?
+        } else {
+            raw
+        };
+        if data.len() != chunk.length as usize {
+            bail!(
+                "chunk {}: decompressed to {} bytes, expected {}",
+                path.display(),
+                data.len(),
+                chunk.length
+            );
+        }
+        Ok(data)
+    }
+
     fn decode_chunk(&mut self, idx: usize) -> Result<&[u8]> {
         if !matches!(&self.last, Some((i, _)) if *i == idx) {
-            let chunk = &self.chunks[idx];
-            let path = self.chunk_path(chunk);
-            let raw = std::fs::read(&path)
-                .with_context(|| format!("reading chunk {}", path.display()))?;
-            let data = if chunk.codec == crate::registry::VK_RO_IMG_CODEC_ZSTD {
-                zstd::decode_all(&raw[..])
-                    .with_context(|| format!("zstd-decompressing chunk {}", path.display()))?
-            } else {
-                raw
-            };
-            if data.len() != chunk.length as usize {
-                bail!(
-                    "chunk {}: decompressed to {} bytes, expected {}",
-                    path.display(),
-                    data.len(),
-                    chunk.length
-                );
-            }
+            let data = self.load_chunk(idx)?;
             self.last = Some((idx, data));
         }
         Ok(&self.last.as_ref().unwrap().1)
+    }
+
+    /// Write the whole image to `out` as a sparse raw file: chunks are decoded on every core,
+    /// and one thread writes them. The per-chunk zstd decode is what the cluster-at-a-time
+    /// `read_at` loop an export otherwise runs through spends its one thread on; the writes
+    /// stay on one thread because positioned writes to one file serialize on its inode lock,
+    /// so several writers only contend. Every gap and every all-zero 64 KiB block stays a
+    /// hole: a chunk is megabytes and spans plenty of free filesystem blocks, so writing it
+    /// whole would cost the export both time and disk. `out` is created or truncated.
+    fn materialize_parallel(&self, out: &Path) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const BLOCK: usize = 64 << 10;
+        let outf = File::create(out).with_context(|| format!("creating {}", out.display()))?;
+        outf.set_len(self.total_size)
+            .with_context(|| format!("sizing {}", out.display()))?;
+        let next = AtomicUsize::new(0);
+        let decode_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(self.chunks.len().max(1));
+        // Bounded: at most the channel's `workers` queued plus one blocked mid-`send` in
+        // each decoder, so decoded data in flight stays within ~2*workers chunks.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(workers);
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                let tx = tx.clone();
+                let next = &next;
+                let decode_err = &decode_err;
+                s.spawn(move || {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= self.chunks.len() {
+                            break;
+                        }
+                        match self.load_chunk(i) {
+                            // A closed channel means the writer gave up: stop too.
+                            Ok(data) => {
+                                if tx.send((self.chunks[i].offset, data)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                let mut slot = decode_err.lock().unwrap();
+                                if slot.is_none() {
+                                    *slot = Some(e);
+                                }
+                                // stop the other decoders from starting new chunks.
+                                next.store(self.chunks.len(), Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+            drop(tx);
+            // The writer: runs of non-zero blocks go out as one write each, zero blocks are
+            // skipped. Dropping `rx` on an error unblocks every decoder's next `send`.
+            let mut write_err = None;
+            for (base, data) in &rx {
+                let mut run: Option<usize> = None; // start of the current non-zero run
+                let flush = |start: usize, end: usize| -> Result<()> {
+                    outf.write_all_at(&data[start..end], base + start as u64)
+                        .with_context(|| format!("writing a chunk into {}", out.display()))
+                };
+                let mut result = Ok(());
+                for (n, block) in data.chunks(BLOCK).enumerate() {
+                    let start = n * BLOCK;
+                    if block.iter().any(|&b| b != 0) {
+                        run.get_or_insert(start);
+                    } else if let Some(s) = run.take() {
+                        result = flush(s, start);
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                }
+                if result.is_ok()
+                    && let Some(s) = run
+                {
+                    result = flush(s, data.len());
+                }
+                if let Err(e) = result {
+                    write_err = Some(e);
+                    break;
+                }
+            }
+            drop(rx);
+            write_err
+        })
+        .map_or(Ok(()), Err)?;
+        match decode_err.into_inner().unwrap() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Index of the first chunk that could contain or come after byte `pos` — either the
@@ -1689,6 +1810,79 @@ mod tests {
         assert_eq!(
             got, want,
             "gaps must read as zero, chunks reassembled exactly"
+        );
+
+        // The parallel export writes the same bytes, over a stale file of the wrong size, and
+        // an empty overlay over the view exposes it as its lazy backing.
+        let raw = dir.join("parallel.raw");
+        std::fs::write(&raw, vec![0xEEu8; 16]).unwrap();
+        materialize_lazy_parallel(&manifest, &raw).unwrap();
+        assert_eq!(std::fs::read(&raw).unwrap(), want, "parallel export");
+        let overlay = dir.join("empty.qcow2");
+        create_overlay(&overlay, &manifest).unwrap();
+        let mut q = Qcow2::open(&overlay).unwrap();
+        assert_eq!(q.empty_raw_backing().unwrap(), None);
+        assert_eq!(
+            q.empty_lazy_backing().unwrap().as_deref(),
+            Some(manifest.as_path())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `materialize_parallel` over a chunk larger than one 64 KiB block, with an interior
+    /// all-zero block: the two non-zero blocks before it must merge into one write, the zero
+    /// block must be punched to a hole (so the raw file stays sparse), and the trailing
+    /// partial block after it must flush on its own.
+    #[test]
+    fn materialize_parallel_punches_interior_zero_blocks() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("vk-ro-img-holes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        const BLOCK: usize = 64 << 10;
+        // Two non-zero blocks (a run to merge), one all-zero block (a hole), then a non-zero
+        // partial block (flushed at end of chunk).
+        let mut chunk = vec![0u8; 3 * BLOCK + 5000];
+        for (i, b) in chunk.iter_mut().enumerate() {
+            let block = i / BLOCK;
+            if block != 2 {
+                *b = ((i * 7 + 1) % 251 + 1) as u8; // never zero
+            }
+        }
+        let digest = fake_digest(1);
+        std::fs::write(dir.join(digest_hex(&digest)), &chunk).unwrap();
+
+        let total_size = chunk.len() as u64;
+        let manifest = dir.join("holes.vk_ro_img");
+        crate::registry::write_vk_ro_img(
+            &manifest,
+            total_size,
+            crate::registry::VK_RO_IMG_LAYOUT_FLAT,
+            &dir,
+            &[crate::registry::LazyChunk {
+                offset: 0,
+                length: chunk.len() as u32,
+                codec: crate::registry::VK_RO_IMG_CODEC_RAW,
+                digest,
+            }],
+        )
+        .unwrap();
+
+        let raw = dir.join("holes.raw");
+        materialize_lazy_parallel(&manifest, &raw).unwrap();
+        assert_eq!(
+            std::fs::read(&raw).unwrap(),
+            chunk,
+            "bytes reassembled exactly"
+        );
+        // The zero block was never written, so the file holds fewer bytes than its size.
+        let meta = std::fs::metadata(&raw).unwrap();
+        assert!(
+            meta.blocks() * 512 < total_size,
+            "interior zero block must stay a hole: {} allocated bytes, size {total_size}",
+            meta.blocks() * 512
         );
 
         let _ = std::fs::remove_dir_all(&dir);

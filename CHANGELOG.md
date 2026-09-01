@@ -9,6 +9,8 @@ All notable changes to virtkit will be documented in this file.
 - A guest with networking now reports ready as soon as its agent listens instead of about
   5 s later. Every `vk run --net`, compose service and build-stage boot loses that wait,
   which on a cold build of many stages added up to minutes.
+- Exporting a fully cached build stage is much faster: a 7 GiB dev-VM root image that took
+  33 s is now bounded by disk write speed.
 
 ## [0.47.0] - 2026-09-01
 
