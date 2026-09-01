@@ -222,10 +222,12 @@ pub struct RunArgs {
     /// `--primary` service's own `x-virtkit.nics`, else one — an explicit flag overrides
     /// the service's declaration, like `--cpus`/`--mem`. See [`effective_nics`].
     pub nics: Option<u32>,
-    /// Per-service sizing overrides (`--service-cpus`/`--service-mem NAME=VALUE`),
-    /// layered over each named compose service's `x-virtkit` declaration.
+    /// Per-service overrides (`--service-cpus NAME=N`, `--service-mem NAME=SIZE`, and
+    /// `--service-nics NAME=N`) layered over each named compose service's `x-virtkit`
+    /// declaration.
     pub service_cpus: Vec<(String, u32)>,
     pub service_mem: Vec<(String, String)>,
+    pub service_nics: Vec<(String, u32)>,
     pub boot_timeout_secs: u64,
     /// `--vm-name` template for the VMM process name, `{name}` expanding to the stage /
     /// image / service name (see [`crate::vmm::resolve_proc_name`]). Default `vk:{name}`.
@@ -864,7 +866,12 @@ async fn build_and_boot(
         }
         None => Vec::new(),
     };
-    apply_service_sizes(&mut compose_units, &args.service_cpus, &args.service_mem)?;
+    apply_service_overrides(
+        &mut compose_units,
+        &args.service_cpus,
+        &args.service_mem,
+        &args.service_nics,
+    )?;
     let mut image_env: Vec<(String, String)> = Vec::new();
     // The image's entrypoint, cmd and workdir, applied to the guest command like
     // `docker run`: the entrypoint is prepended to a trailing command, the workdir is
@@ -2141,13 +2148,14 @@ fn resolve_primary(units: &[crate::compose::Unit], name: &str) -> Result<usize> 
     })
 }
 
-/// Layer the CLI per-service sizing overrides (`--service-cpus`/`--service-mem
-/// NAME=VALUE`) over the loaded units' own `x-virtkit` sizing. A name matching no
-/// declared service is an error naming the declared set, like `--primary`.
-fn apply_service_sizes(
+/// Apply `--service-cpus`, `--service-mem`, and `--service-nics` to the loaded units'
+/// `x-virtkit` declarations. Reject an unknown name with the declared service set, as
+/// `--primary` does.
+fn apply_service_overrides(
     units: &mut [crate::compose::Unit],
     cpus: &[(String, u32)],
     mem: &[(String, String)],
+    nics: &[(String, u32)],
 ) -> Result<()> {
     let find = |units: &[crate::compose::Unit], flag: &str, name: &str| -> Result<usize> {
         units.iter().position(|u| u.name == name).with_context(|| {
@@ -2168,6 +2176,10 @@ fn apply_service_sizes(
     for (name, m) in mem {
         let i = find(units, "--service-mem", name)?;
         units[i].mem = Some(m.clone());
+    }
+    for (name, n) in nics {
+        let i = find(units, "--service-nics", name)?;
+        units[i].nics = *n;
     }
     Ok(())
 }
@@ -2389,7 +2401,12 @@ async fn compose_up(
     if units.is_empty() {
         bail!("{} declares no services", compose.display());
     }
-    apply_service_sizes(&mut units, &args.service_cpus, &args.service_mem)?;
+    apply_service_overrides(
+        &mut units,
+        &args.service_cpus,
+        &args.service_mem,
+        &args.service_nics,
+    )?;
     // What the fleet costs the host while it is up (see `usage`). Opened before
     // `plan_services`, which builds nothing but does resolve and materialize every `image:`
     // service — work that falls inside the window in the run above, so metering it here too
@@ -4134,6 +4151,7 @@ mod tests {
             service_cpus: vec![],
             nics: None,
             service_mem: vec![],
+            service_nics: vec![],
             boot_timeout_secs: 0,
             vm_name: String::new(),
             ram: false,
@@ -4441,17 +4459,18 @@ mod tests {
     }
 
     #[test]
-    fn service_size_overrides_layer_over_the_compose_declaration() {
+    fn service_overrides_layer_over_the_compose_declaration() {
         let yaml = "services:\n\
-             \x20 db:\n    image: d\n    x-virtkit: { cpus: 2, mem: 512M }\n\
+             \x20 db:\n    image: d\n    x-virtkit: { cpus: 2, mem: 512M, nics: 2 }\n\
              \x20 web:\n    image: w\n";
         let mut units = crate::compose::parse(yaml, Path::new("/b"), &|_| None, None).unwrap();
         // the flag wins over the marker where given, sets an unmarked service, and
         // leaves everything unnamed alone
-        apply_service_sizes(
+        apply_service_overrides(
             &mut units,
             &[("web".into(), 4)],
             &[("db".into(), "2G".into())],
+            &[("web".into(), 3)],
         )
         .unwrap();
         let by = |n: &str| units.iter().find(|u| u.name == n).unwrap();
@@ -4460,13 +4479,21 @@ mod tests {
             (Some(2), Some("2G"))
         );
         assert_eq!((by("web").cpus, by("web").mem.as_deref()), (Some(4), None));
+        // The unlisted service keeps its NIC declaration; the listed service gets an
+        // override despite having no declaration.
+        assert_eq!((by("db").nics, by("web").nics), (2, 3));
+        // An override can lower a declared count to the single-NIC default.
+        apply_service_overrides(&mut units, &[], &[], &[("db".into(), 1)]).unwrap();
+        assert_eq!(units.iter().find(|u| u.name == "db").unwrap().nics, 1);
         // a name matching no declared service is an error naming the declared set
-        let err = apply_service_sizes(&mut units, &[("nope".into(), 1)], &[]).unwrap_err();
+        let err = apply_service_overrides(&mut units, &[("nope".into(), 1)], &[], &[]).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("--service-cpus") && msg.contains("db, web"),
             "{msg}"
         );
+        let err = apply_service_overrides(&mut units, &[], &[], &[("nope".into(), 2)]).unwrap_err();
+        assert!(format!("{err:#}").contains("--service-nics"), "{err:#}");
     }
 
     #[test]

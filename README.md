@@ -157,6 +157,7 @@ services:
       nics: 3
 ```
 
+`--service-nics NAME=N` overrides that for one run, like `--service-cpus`/`--service-mem`.
 `vk run --nics N` does the same for the primary VM (it needs `--net`, which `--compose`
 implies). `eth0` keeps the default route and stays the address a service name resolves to;
 the extra interfaces are addressed but given no route, so egress leaves through `eth0`

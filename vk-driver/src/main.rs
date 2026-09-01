@@ -183,6 +183,27 @@ fn parse_named_mem(s: &str) -> Result<(String, String), String> {
     }
 }
 
+/// clap value parser for `--service-nics NAME=N`. Enforce the same bound as
+/// `x-virtkit.nics` does at load time, so a typo reports the limit instead of exhausting
+/// the LAN's static addresses.
+fn parse_named_nics(s: &str) -> Result<(String, u32), String> {
+    let (name, n) = s
+        .split_once('=')
+        .filter(|(name, _)| !name.is_empty())
+        .ok_or_else(|| format!("expected NAME=N, got {s:?}"))?;
+    let count: u32 = n
+        .parse()
+        .ok()
+        .filter(|c| (1..=units::MAX_NICS).contains(c))
+        .ok_or_else(|| {
+            format!(
+                "expected an interface count from 1 to {}, got {n:?}",
+                units::MAX_NICS
+            )
+        })?;
+    Ok((name.to_string(), count))
+}
+
 /// Boot OCI/Docker images as fast, rootless microVMs
 #[derive(Parser)]
 #[command(
@@ -1396,6 +1417,12 @@ enum Cmd {
         #[arg(long = "service-mem", value_name = "NAME=SIZE", requires = "compose",
               value_parser = parse_named_mem, help_heading = "Compose services")]
         service_mem: Vec<(String, String)>,
+        /// override how many NICs a compose service gets (repeatable, e.g. `appliance=3`)
+        ///
+        /// Wins over its x-virtkit.nics declaration.
+        #[arg(long = "service-nics", value_name = "NAME=N", requires = "compose",
+              value_parser = parse_named_nics, help_heading = "Compose services")]
+        service_nics: Vec<(String, u32)>,
         /// Forward the host SSH agent ($SSH_AUTH_SOCK) into the guest
         ///
         /// ssh and git in the guest then use the host's keys, without the keys ever
@@ -2502,6 +2529,7 @@ async fn cli_main() -> ExitCode {
         primary,
         service_cpus,
         service_mem,
+        service_nics,
         ssh_agent,
         ssh_host,
         ssh,
@@ -2672,6 +2700,7 @@ async fn cli_main() -> ExitCode {
             nics: *nics,
             service_cpus: service_cpus.clone(),
             service_mem: service_mem.clone(),
+            service_nics: service_nics.clone(),
             boot_timeout_secs: *boot_timeout,
             vm_name: vm_name.clone(),
             ram: *ram,

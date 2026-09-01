@@ -11,7 +11,8 @@ All notable changes to virtkit will be documented in this file.
   own address on the shared LAN — enough to develop against an appliance that segregates
   services across interfaces. `eth0` keeps the default route and stays the address a
   service name resolves to; the extra interfaces are addressed but routeless. Up to 8 per
-  guest. `vk check --feature nics` gates on it.
+  guest, overridable for one run with `--service-nics NAME=N`. `vk check --feature nics`
+  gates on it.
 
 ### Changed
 
