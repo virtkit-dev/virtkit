@@ -337,6 +337,88 @@ enum ServiceCmd {
     },
 }
 
+/// The background half of `vk publish` — publishers a run keeps, rather than one held
+/// open by a terminal. They are recorded under `<state-dir>/publish`, so a state dir is how
+/// each of these names the set it works on.
+#[derive(Subcommand)]
+enum PublishAction {
+    /// Publish a port in the background, or confirm it already is
+    ///
+    /// Returns once the address is bound, so the port is reachable the moment this exits.
+    /// A publisher of the same name already doing the same thing is success and nothing is
+    /// started; one doing something else is an error rather than a silent no-op. An address
+    /// already taken exits 4, so a caller that picks its own addresses can try another.
+    Ensure {
+        /// the VM's state dir (`run --state-dir`), which also holds the publisher records
+        #[arg(value_name = "DIR")]
+        state_dir: PathBuf,
+        /// what to call this publisher — how `list` and `stop` name it
+        #[arg(long, value_name = "NAME")]
+        name: String,
+        /// Local address to accept connections on (tcp://host:port, or a unix path)
+        #[arg(long)]
+        listen: SocketAddr,
+        /// Address the guest dials for each accepted connection
+        #[arg(long, value_parser = parse_publish_to)]
+        to: String,
+        /// ask this compose sibling's agent instead of the primary's
+        #[arg(long, value_name = "NAME")]
+        service: Option<String>,
+    },
+    /// List the publishers running for a state dir
+    ///
+    /// This is what is actually running: a record whose publisher is gone is dropped as it
+    /// is read, so callers need not inspect pids or listening sockets themselves.
+    List {
+        /// the VM's state dir
+        #[arg(value_name = "DIR")]
+        state_dir: PathBuf,
+        /// print the entries as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop a state dir's publishers and wait for them to go
+    Stop {
+        /// the VM's state dir
+        #[arg(value_name = "DIR")]
+        state_dir: PathBuf,
+        /// stop only this publisher (default: all of them)
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// seconds to wait for each to exit
+        #[arg(long, default_value_t = 10)]
+        timeout: u64,
+    },
+    /// plumbing: the publisher process `ensure` starts
+    ///
+    /// Serves an already-bound listener inherited by descriptor and holds the name's claim
+    /// for its lifetime; not useful to run by hand.
+    #[command(hide = true)]
+    Serve {
+        /// the VM's state dir
+        #[arg(value_name = "DIR")]
+        state_dir: PathBuf,
+        /// the publisher's name, whose record it removes when it stops
+        #[arg(long)]
+        name: String,
+        /// the address its inherited listener is bound to
+        #[arg(long)]
+        listen: SocketAddr,
+        /// address the guest dials for each accepted connection
+        #[arg(long, value_parser = parse_publish_to)]
+        to: String,
+        /// ask this compose sibling's agent instead of the primary's
+        #[arg(long, value_name = "NAME")]
+        service: Option<String>,
+        /// the inherited listening socket
+        #[arg(long = "listen-fd")]
+        listen_fd: i32,
+        /// the inherited lifetime lock
+        #[arg(long = "lock-fd")]
+        lock_fd: i32,
+    },
+}
+
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
@@ -822,6 +904,10 @@ enum Cmd {
     /// reaches — a LAN peer's own compose hostname included, resolved through that VM's
     /// own DNS:
     /// `vk publish --service devcontainer --listen tcp://127.0.0.1:8443 --to tcp://runner:443`.
+    ///
+    /// That form runs in the foreground and goes with the terminal; `vk publish ensure` and
+    /// its siblings keep one running in the background instead.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Publish {
         /// which VM's agent to ask: a directory, or a raw agent address
         ///
@@ -834,15 +920,18 @@ enum Cmd {
         #[arg(long, value_name = "NAME")]
         service: Option<String>,
         /// Local address to accept connections on (tcp://host:port, a unix path, ...)
-        #[arg(long)]
-        listen: SocketAddr,
+        #[arg(long, required = true)]
+        listen: Option<SocketAddr>,
         /// Address the guest dials for each accepted connection (tcp://host:port, ...)
         ///
         /// A `tcp://` host may be a name instead of an IP literal — resolved by the
         /// guest's own DNS (a compose sibling's hostname, say), not here, since only
         /// the guest's network can resolve those.
-        #[arg(long, value_parser = parse_publish_to)]
-        to: String,
+        #[arg(long, value_parser = parse_publish_to, required = true)]
+        to: Option<String>,
+        /// Manage background publishers instead of running one in the foreground
+        #[command(subcommand)]
+        action: Option<PublishAction>,
     },
     /// Watch a running VM's guest live, or read what a recorded one did
     ///
@@ -2293,14 +2382,10 @@ async fn cli_main() -> ExitCode {
             }
         };
         return match vms::stop_cmd(selector, *all, *timeout) {
-            Ok((report, all_down)) => {
-                print!("{report}");
-                if all_down {
-                    ExitCode::SUCCESS
-                } else {
-                    exit_code(1)
-                }
-            }
+            Ok((report, all_down)) => match write_report(&report) {
+                ExitCode::SUCCESS if !all_down => exit_code(1),
+                code => code,
+            },
             Err(e) => fail(&e, 2),
         };
     }
@@ -3566,6 +3651,10 @@ async fn cli_main() -> ExitCode {
                 Err(e) => fail(&e, 1),
             }
         }
+        Cmd::Publish {
+            action: Some(action),
+            ..
+        } => publish_action(action).await,
         // publish::run only returns on a bind error, like Cmd::Forward; the target VM is
         // selected the same way `vk exec` selects it.
         Cmd::Publish {
@@ -3573,7 +3662,12 @@ async fn cli_main() -> ExitCode {
             service,
             listen,
             to,
+            action: None,
         } => {
+            // clap requires both without a subcommand.
+            let (Some(listen), Some(to)) = (listen, to) else {
+                return fail(&anyhow::anyhow!("--listen and --to are required"), 2);
+            };
             let addr = match resolve_exec_addr(target.as_deref(), service.as_deref()) {
                 Ok(a) => a,
                 Err(e) => return fail(&e, 2),
@@ -3784,6 +3878,44 @@ fn resolve_agent_addr(target: Option<&str>) -> anyhow::Result<SocketAddr> {
 /// to dial: the primary VM (as `resolve_agent_addr`), or — with `--service` — a
 /// named sibling service of the VM selected by directory. A raw agent address can't
 /// name a service (it isn't a registry entry).
+/// Make each action's state dir absolute, so nothing downstream depends on the caller's
+/// working directory.
+fn resolve_state_dir(action: PublishAction) -> anyhow::Result<PublishAction> {
+    let at = |dir: PathBuf| -> anyhow::Result<PathBuf> {
+        std::fs::canonicalize(&dir).map_err(|e| anyhow::anyhow!("resolving {}: {e}", dir.display()))
+    };
+    Ok(match action {
+        PublishAction::Ensure {
+            state_dir,
+            name,
+            listen,
+            to,
+            service,
+        } => PublishAction::Ensure {
+            state_dir: at(state_dir)?,
+            name,
+            listen,
+            to,
+            service,
+        },
+        PublishAction::List { state_dir, json } => PublishAction::List {
+            state_dir: at(state_dir)?,
+            json,
+        },
+        PublishAction::Stop {
+            state_dir,
+            name,
+            timeout,
+        } => PublishAction::Stop {
+            state_dir: at(state_dir)?,
+            name,
+            timeout,
+        },
+        // Already absolute: `ensure` resolved it before spawning this process.
+        serve @ PublishAction::Serve { .. } => serve,
+    })
+}
+
 fn resolve_exec_addr(target: Option<&str>, service: Option<&str>) -> anyhow::Result<SocketAddr> {
     let Some(svc) = service else {
         return resolve_agent_addr(target);
@@ -3795,6 +3927,104 @@ fn resolve_exec_addr(target: Option<&str>, service: Option<&str>) -> anyhow::Res
     resolve_service_addr(&entry, svc)
 }
 
+/// As [`resolve_exec_addr`], for a caller that already holds a path. Kept apart from the
+/// `&str` form so a state dir that is not UTF-8 is an error here, rather than a `None`
+/// that would quietly resolve the current directory's VM instead of the one asked for.
+fn resolve_exec_addr_at(state_dir: &Path, service: Option<&str>) -> anyhow::Result<SocketAddr> {
+    let Some(target) = state_dir.to_str() else {
+        anyhow::bail!(
+            "the state directory {} is not valid UTF-8",
+            state_dir.display()
+        );
+    };
+    resolve_exec_addr(Some(target), service)
+}
+
+/// The managed half of `vk publish`. Each action names its VM by state dir — the same
+/// directory the publisher records live in — so `vk exec`'s directory resolution applies.
+async fn publish_action(action: PublishAction) -> ExitCode {
+    // Resolved once, here: `ensure` leaves a detached publisher that outlives this shell,
+    // and a relative state dir would leave it depending on a working directory nobody
+    // controls for both its own records and its VM lookup.
+    let action = match resolve_state_dir(action) {
+        Ok(a) => a,
+        Err(e) => return fail(&e, 2),
+    };
+    match action {
+        PublishAction::Ensure {
+            state_dir,
+            name,
+            listen,
+            to,
+            service,
+        } => {
+            let addr = match resolve_exec_addr_at(&state_dir, service.as_deref()) {
+                Ok(a) => a,
+                Err(e) => return fail(&e, 2),
+            };
+            match publish::ensure(&state_dir, &name, &addr, &listen, &to, service.as_deref()).await
+            {
+                Ok(publish::Ensured::Started(e)) => write_report(&format!(
+                    "published {} -> {} ({}, pid {})\n",
+                    e.listen, e.to, e.name, e.pid
+                )),
+                Ok(publish::Ensured::AlreadyRunning(e)) => write_report(&format!(
+                    "already published {} -> {} ({}, pid {})\n",
+                    e.listen, e.to, e.name, e.pid
+                )),
+                // A taken address is the one failure a caller choosing addresses can act
+                // on, so it gets a code of its own rather than the catch-all.
+                Err(e) if e.downcast_ref::<publish::AddressInUse>().is_some() => fail(&e, 4),
+                Err(e) => fail(&e, 1),
+            }
+        }
+        PublishAction::List { state_dir, json } => match publish::list_report(&state_dir, json) {
+            Ok(report) => write_report(&report),
+            Err(e) => fail(&e, 1),
+        },
+        PublishAction::Stop {
+            state_dir,
+            name,
+            timeout,
+            // Off the runtime: `stop` waits on a lock with a blocking sleep, for as long as
+            // `--timeout` allows, per publisher.
+        } => match tokio::task::spawn_blocking(move || {
+            publish::stop(
+                &state_dir,
+                name.as_deref(),
+                std::time::Duration::from_secs(timeout),
+            )
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("the stop task failed: {e}")))
+        {
+            Ok((report, all_down)) => match write_report(&report) {
+                ExitCode::SUCCESS if !all_down => exit_code(1),
+                code => code,
+            },
+            Err(e) => fail(&e, 1),
+        },
+        PublishAction::Serve {
+            state_dir,
+            name,
+            listen,
+            to,
+            service,
+            listen_fd,
+            lock_fd,
+        } => {
+            let addr = match resolve_exec_addr_at(&state_dir, service.as_deref()) {
+                Ok(a) => a,
+                Err(e) => return fail(&e, 2),
+            };
+            match publish::serve(&state_dir, &name, &addr, &listen, &to, listen_fd, lock_fd).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, 1),
+            }
+        }
+    }
+}
+
 /// `vk publish --to`: a `SocketAddr` as-is, or — the one shape `SocketAddr::from_str`
 /// rejects — a `tcp://host:port` whose host is a name rather than an IP literal.
 /// Accepted here only so a typo is a clap usage error, not a live-connection
@@ -3802,11 +4032,15 @@ fn resolve_exec_addr(target: Option<&str>, service: Option<&str>) -> anyhow::Res
 /// one place a compose sibling's hostname is actually reachable to resolve.
 fn parse_publish_to(s: &str) -> Result<String, String> {
     let parse_err = match s.parse::<SocketAddr>() {
-        Ok(_) => return Ok(s.to_string()),
+        // Re-rendered, not kept as typed: a managed publisher compares its target against
+        // the recorded one, and two spellings of one address must not read as a conflict.
+        Ok(parsed) => return Ok(parsed.to_string()),
         Err(e) => e,
     };
     match vk_core::addr::split_tcp_url(s) {
-        Some(Ok(_)) => Ok(s.to_string()),
+        // Lowercased like the SocketAddr branch is re-rendered: a hostname is
+        // case-insensitive, and a managed publisher compares its target as a string.
+        Some(Ok((host, port))) => Ok(format!("tcp://{}:{port}", host.to_ascii_lowercase())),
         Some(Err(e)) => Err(e.to_string()),
         None => Err(parse_err.to_string()),
     }
@@ -4077,8 +4311,15 @@ mod tests {
     }
 
     #[test]
-    fn publish_to_accepts_a_socket_addr_as_is() {
+    fn publish_to_normalizes_a_socket_addr() {
         assert_eq!(parse_publish_to("vsock://443").unwrap(), "vsock://443");
+        // Re-rendered, so a managed publisher's recorded target is one spelling of the
+        // address and comparing two `ensure` calls as strings is meaningful.
+        assert_eq!(parse_publish_to("vsock://2:443").unwrap(), "vsock://2:443");
+        for spelling in ["vsock://443", "tcp://127.0.0.1:80", "tcp://runner:443"] {
+            let once = parse_publish_to(spelling).unwrap();
+            assert_eq!(parse_publish_to(&once).unwrap(), once, "{spelling}");
+        }
     }
 
     #[test]
@@ -4192,6 +4433,91 @@ mod tests {
             err.contains("127.0.0.1:5000") && err.contains("--root"),
             "{err}"
         );
+    }
+
+    // `vk publish` CLI shape. The foreground form takes a positional target and requires
+    // --listen/--to; the managed forms are subcommands that negate those requirements. A
+    // positional that can look like a subcommand name is the part that silently changes
+    // meaning when a flag is added, so every shape is pinned here.
+    #[test]
+    fn publish_cli_separates_the_foreground_form_from_its_subcommands() {
+        let foreground = Cli::try_parse_from([
+            "vk",
+            "publish",
+            "/proj",
+            "--listen",
+            "tcp://127.0.0.1:8443",
+            "--to",
+            "tcp://runner:443",
+        ])
+        .unwrap();
+        let Cmd::Publish {
+            target,
+            listen,
+            action,
+            ..
+        } = foreground.cmd
+        else {
+            panic!("expected publish")
+        };
+        assert_eq!(target.as_deref(), Some("/proj"));
+        assert!(listen.is_some() && action.is_none());
+
+        // No target: the current directory's VM, still the foreground form.
+        let cli = Cli::try_parse_from([
+            "vk",
+            "publish",
+            "--listen",
+            "unix:///tmp/s",
+            "--to",
+            "vsock://80",
+        ])
+        .unwrap();
+        assert!(matches!(cli.cmd, Cmd::Publish { target: None, .. }));
+
+        // A subcommand takes its own state dir and does not want --listen/--to.
+        let cli = Cli::try_parse_from([
+            "vk",
+            "publish",
+            "ensure",
+            "/proj",
+            "--name",
+            "web",
+            "--listen",
+            "tcp://127.0.0.1:1",
+            "--to",
+            "vsock://80",
+        ])
+        .unwrap();
+        let Cmd::Publish {
+            action: Some(PublishAction::Ensure { name, .. }),
+            ..
+        } = cli.cmd
+        else {
+            panic!("expected publish ensure")
+        };
+        assert_eq!(name, "web");
+        assert!(matches!(
+            Cli::try_parse_from(["vk", "publish", "list", "/proj"])
+                .unwrap()
+                .cmd,
+            Cmd::Publish {
+                action: Some(PublishAction::List { .. }),
+                ..
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["vk", "publish", "stop", "/proj"])
+                .unwrap()
+                .cmd,
+            Cmd::Publish {
+                action: Some(PublishAction::Stop { .. }),
+                ..
+            }
+        ));
+
+        // Neither form on its own: a bare `vk publish` is missing what it needs.
+        assert!(Cli::try_parse_from(["vk", "publish"]).is_err());
     }
 
     // `vk exec` CLI shape: the optional target precedes `--`, the command trails it,

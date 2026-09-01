@@ -606,14 +606,24 @@ pub fn list_report(filter: Option<&Path>, json: bool, stale: bool) -> Result<Str
 
 /// SIGTERM the run managing `entry` and wait up to `timeout` seconds for it to exit (the
 /// state-dir lock frees). Prunes the entry once it is down. Returns whether it went down.
-/// A no-op-success if it was already dead.
+/// A no-op success if already dead. Stop managed publishers first on a separate short
+/// budget.
 fn stop_one(entry: &VmEntry, timeout: u64) -> bool {
     if !alive(entry) {
+        // Publishers detect an already-gone VM on their next probe. Do not signal here
+        // because the entry may only be stale.
         if let Ok(dir) = registry_dir() {
             remove_in(&dir, &entry.state_dir);
         }
         return true;
     }
+    // Stop publishers before their target disappears and they retain unusable bound
+    // addresses until the next probe. Give them at most five seconds each instead of the
+    // per-VM `--timeout`; publishers normally exit immediately on SIGTERM.
+    crate::publish::stop_all_quietly(
+        &entry.state_dir,
+        std::time::Duration::from_secs(timeout.min(5)),
+    );
     // The result is dropped because neither failure changes what to do: ESRCH means it went
     // down between the check above and here, and EPERM means the pid is no longer the run we
     // recorded — the wait below then reports it as still standing, which is the truth either

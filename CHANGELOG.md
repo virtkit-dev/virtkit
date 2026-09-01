@@ -29,6 +29,11 @@ All notable changes to virtkit will be documented in this file.
   `<state-dir>/bin` first on PATH for a program that spawns bare `ssh` (VS Code's
   Remote-SSH, Emacs's TRAMP); `vk ssh-config <state-dir>` prints the stanza. `--ssh-alias`
   names the host, and a state directory the guest could write is refused.
+- `vk publish ensure <state-dir> --name web --listen … --to …` keeps a port published
+  without an open terminal and returns once the address is bound. Repeating the command is
+  a no-op; `vk publish list` and `vk publish stop` inspect and end publishers, which also
+  stop with their VM. Conflicting names are refused, while an address already in use exits
+  4 so callers can try another.
 
 ### Fixed
 
