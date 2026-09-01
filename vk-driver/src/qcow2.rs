@@ -240,12 +240,11 @@ impl Qcow2 {
             Backing::None => {}
             Backing::Qcow2(b) => all.extend(b.chain_data_extents()?),
             Backing::Raw(f) => all.extend(raw_data_extents(f)?),
-            // No sparse-hole tracking exposed here for a `.vk_ro_img` manifest (its chunks may
-            // have gaps that read as zero, but nothing separates a real hole from a chunk that
-            // happens to decompress to all zeros) — treat the whole range as potential data.
-            // Conservative: a flatten may write real zero bytes where the source was actually a
-            // hole, never drop data.
-            Backing::Lazy(b) => all.push((0, b.total_size)),
+            // A `.vk_ro_img` manifest records each chunk's range, while `read_at` serves gaps
+            // as zero. Treat those ranges as data without reading the chunks. Keep all-zero
+            // chunks because detecting them requires decompression; push paths drop their zero
+            // buffers anyway.
+            Backing::Lazy(b) => all.extend(b.chunk_extents()),
         }
         Ok(merge_extents(all))
     }
@@ -670,6 +669,10 @@ impl VkRoImg {
             if offset < expect_offset {
                 bail!("{}: overlapping chunk at offset {offset}", path.display());
             }
+            // `chunk_extents` promises non-empty ranges, so reject empty chunks at load time.
+            if length == 0 {
+                bail!("{}: empty chunk at offset {offset}", path.display());
+            }
             expect_offset = offset
                 .checked_add(length as u64)
                 .with_context(|| format!("{}: chunk offset overflow", path.display()))?;
@@ -693,6 +696,16 @@ impl VkRoImg {
             chunks,
             last: None,
         })
+    }
+
+    /// Returns the sorted, non-overlapping, non-empty ranges this backing contributes to
+    /// [`Qcow2::chain_data_extents`]. `open` validates these invariants, and `read_at` serves
+    /// gaps as zero.
+    fn chunk_extents(&self) -> Vec<(u64, u64)> {
+        self.chunks
+            .iter()
+            .map(|c| (c.offset, u64::from(c.length)))
+            .collect()
     }
 
     fn chunk_path(&self, chunk: &VkRoChunk) -> PathBuf {
@@ -1558,10 +1571,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// End-to-end: a qcow2 overlay backed by a `.vk_ro_img` manifest (the shape `create_overlay`
-    /// produces for a stage restored lazily, see `build/exec.rs`) must read back through
-    /// `Qcow2::read_at`'s `Backing::Lazy` branch exactly like the flattened image would, and
-    /// `data_extents` must report the lazy backing's full range as backing-owned.
+    /// An overlay produced for a lazily restored stage must read through its `.vk_ro_img`
+    /// backing exactly as the flattened image would and report the manifest chunk from
+    /// `chain_data_extents`.
     #[test]
     fn qcow2_overlay_over_vk_ro_img_backing_reads_through() {
         let dir = std::env::temp_dir().join(format!("vk-ro-img-overlay-{}", std::process::id()));
@@ -1600,8 +1612,169 @@ mod tests {
         assert_eq!(
             q.chain_data_extents().unwrap(),
             vec![(0, chunk.len() as u64)],
-            "the chain's data extents must include the lazy backing's full range"
+            "the chain's data extents must include the lazy backing's chunk"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lazily restored stage can back a `FROM <stage>` fork whose cache push needs a full
+    /// re-chunk because it has no parent to diff against. Use the manifest's chunks as chain
+    /// extents instead of processing tens of gigabytes of holes to publish a few megabytes.
+    #[test]
+    fn qcow2_chain_data_extents_maps_a_lazy_backings_chunks() {
+        let dir = std::env::temp_dir().join(format!("vk-ro-img-extents-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Two 64 KiB chunks at the front of a 1 MiB image, one cluster of hole between them.
+        let cs = 65536usize;
+        let chunk_a = vec![1u8; cs];
+        let chunk_b = vec![2u8; cs];
+        let (digest_a, digest_b) = (fake_digest(11), fake_digest(12));
+        std::fs::write(dir.join(digest_hex(&digest_a)), &chunk_a).unwrap();
+        std::fs::write(dir.join(digest_hex(&digest_b)), &chunk_b).unwrap();
+        let total_size = 1 << 20;
+        let manifest = dir.join("base.vk_ro_img");
+        crate::registry::write_vk_ro_img(
+            &manifest,
+            total_size,
+            crate::registry::VK_RO_IMG_LAYOUT_FLAT,
+            &dir,
+            &[
+                crate::registry::LazyChunk {
+                    offset: 0,
+                    length: cs as u32,
+                    codec: crate::registry::VK_RO_IMG_CODEC_RAW,
+                    digest: digest_a,
+                },
+                crate::registry::LazyChunk {
+                    offset: (cs * 2) as u64,
+                    length: cs as u32,
+                    codec: crate::registry::VK_RO_IMG_CODEC_RAW,
+                    digest: digest_b,
+                },
+            ],
+        )
+        .unwrap();
+
+        let overlay = dir.join("ovl.qcow2");
+        create_overlay(&overlay, &manifest).unwrap();
+
+        let mut q = Qcow2::open(&overlay).unwrap();
+        assert_eq!(q.virtual_size(), total_size);
+        assert_eq!(
+            q.chain_data_extents().unwrap(),
+            vec![(0, cs as u64), ((cs * 2) as u64, cs as u64)],
+            "the chunks the manifest names, and neither the gap nor the tail"
+        );
+        // What the extents claim must hold: the chunks read back as their own bytes, and
+        // everything outside them reads as zero.
+        let mut got = vec![0xFFu8; cs];
+        q.read_at(0, &mut got).unwrap();
+        assert_eq!(got, chunk_a, "the first chunk reads back");
+        q.read_at((cs * 2) as u64, &mut got).unwrap();
+        assert_eq!(got, chunk_b, "the second chunk reads back");
+        q.read_at(cs as u64, &mut got).unwrap();
+        assert_eq!(got, vec![0u8; cs], "the gap between chunks reads as zero");
+        q.read_at((cs * 3) as u64, &mut got).unwrap();
+        assert_eq!(got, vec![0u8; cs], "the tail past the chunks reads as zero");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A chunkless manifest is all holes: it contributes no chain data extents and reads as
+    /// zero.
+    #[test]
+    fn qcow2_chain_data_extents_of_a_chunkless_lazy_backing_is_empty() {
+        let dir = std::env::temp_dir().join(format!("vk-ro-img-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let total_size = 1 << 20;
+        let manifest = dir.join("base.vk_ro_img");
+        crate::registry::write_vk_ro_img(
+            &manifest,
+            total_size,
+            crate::registry::VK_RO_IMG_LAYOUT_FLAT,
+            &dir,
+            &[],
+        )
+        .unwrap();
+        let overlay = dir.join("ovl.qcow2");
+        create_overlay(&overlay, &manifest).unwrap();
+
+        let mut q = Qcow2::open(&overlay).unwrap();
+        assert_eq!(q.virtual_size(), total_size);
+        assert!(
+            q.chain_data_extents().unwrap().is_empty(),
+            "a chunkless manifest contributes no data extents"
+        );
+        let mut got = vec![0xFFu8; 4096];
+        q.read_at(0, &mut got).unwrap();
+        assert_eq!(got, vec![0u8; 4096], "a chunkless manifest reads as zero");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `chunk_extents` returns manifest chunks verbatim, so `VkRoImg::open` must enforce its
+    /// sorted, non-overlapping, non-empty and in-image invariants.
+    #[test]
+    fn vk_ro_img_open_rejects_a_manifest_that_breaks_the_extent_invariants() {
+        let dir = std::env::temp_dir().join(format!("vk-ro-img-invalid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let chunk = |offset, length| crate::registry::LazyChunk {
+            offset,
+            length,
+            codec: crate::registry::VK_RO_IMG_CODEC_RAW,
+            digest: fake_digest(13),
+        };
+        let manifest = dir.join("base.vk_ro_img");
+        let write = |chunks: &[crate::registry::LazyChunk]| {
+            crate::registry::write_vk_ro_img(
+                &manifest,
+                1 << 20,
+                crate::registry::VK_RO_IMG_LAYOUT_FLAT,
+                &dir,
+                chunks,
+            )
+            .unwrap();
+        };
+
+        // Match each error to ensure the intended check rejects it. Unsorted chunks fail the
+        // overlap check because a chunk starts before the previous chunk's end.
+        for (name, chunks, want) in [
+            (
+                "overlapping",
+                vec![chunk(0, 65536), chunk(32768, 65536)],
+                "overlapping chunk at offset 32768",
+            ),
+            (
+                "unsorted",
+                vec![chunk(65536, 65536), chunk(0, 65536)],
+                "overlapping chunk at offset 0",
+            ),
+            ("empty", vec![chunk(0, 0)], "empty chunk at offset 0"),
+            (
+                "overflowing",
+                vec![chunk(u64::MAX, 65536)],
+                "chunk offset overflow",
+            ),
+            (
+                "out-of-image",
+                vec![chunk(1 << 20, 65536)],
+                "chunks cover 1114112 bytes, expected at most 1048576",
+            ),
+        ] {
+            write(&chunks);
+            let err = match VkRoImg::open(&manifest) {
+                Ok(_) => panic!("a manifest with an {name} chunk must not parse"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains(want), "{name}: expected {want:?}, got {err:?}");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

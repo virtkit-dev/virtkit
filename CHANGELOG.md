@@ -12,6 +12,9 @@ All notable changes to virtkit will be documented in this file.
   later restore an image that was never built.
 - Forking a cache-restored stage no longer makes the first build after an edit spend over
   a minute in `flushing cache`; it now finishes in seconds.
+- Exporting or cache-pushing a stage restored from the build cache no longer takes time
+  proportional to the disk size: a warm export of an Alpine stage on a 32 GiB disk takes
+  0.2s instead of 13s, and the file it writes is sparser.
 
 ## [0.46.0] - 2026-09-01
 
