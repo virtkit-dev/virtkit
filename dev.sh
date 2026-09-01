@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# dev.sh — fast, crate-scoped type checking, targeted tests and an interactive shell in a
-# shared vk development VM that powers itself off once left idle. The mold-linking
-# RUSTFLAGS and shared target/ directory match every build.sh invocation, and the dev
-# profile matches build.sh --fast, so dependency artifacts are reused between the two
-# workflows. The VK_EMBED_* vars build.sh sets are deliberately absent here (they must
-# name an already built agent), so vk-driver's own build script reruns when you alternate
-# the two.
+# dev.sh — fast, crate-scoped type checking, linting, targeted tests and an interactive
+# shell in a shared vk development VM that powers itself off once left idle. The
+# mold-linking RUSTFLAGS and shared target/ directory match every build.sh invocation,
+# and the dev profile matches build.sh --fast, so dependency artifacts are reused
+# between the two workflows. The VK_EMBED_* vars build.sh sets are deliberately absent
+# here (they must name an already built agent), so vk-driver's own build script reruns
+# when you alternate the two.
 #
 # Examples:
 #   ./dev.sh check -p vk-core
 #   ./dev.sh check -p vk-driver --all-targets
+#   ./dev.sh clippy -p vk-driver --all-targets
 #   ./dev.sh test -p vk-core --lib dockerignore::tests
 #   ./dev.sh test -p vk-core --test exec disconnect_kills_remote_process
 #   ./dev.sh test -p vk-driver --bin vk atop_view::tests
@@ -29,20 +30,23 @@ ROOT=$PWD
 
 usage() {
   cat >&2 <<'EOF'
-usage: ./dev.sh check -p <package> [cargo check arguments]
-       ./dev.sh test  -p <package> <target> [test filter]
+usage: ./dev.sh check  -p <package> [cargo check arguments]
+       ./dev.sh clippy -p <package> [cargo clippy arguments] [-- <lint flags>]
+       ./dev.sh test   -p <package> <target> [test filter]
        ./dev.sh shell
        ./dev.sh stop
 
 The fast loop is deliberately scoped: --workspace/--all and optimized profiles are
 rejected. For tests, select exactly one target with --lib, --bin NAME or --test NAME
 (--doc and --example NAME also count) and normally pass the changed module or test
-name as a filter. `shell` opens an interactive shell in the same VM under the cargo
-commands' own environment, and holds the VM for as long as it runs; that VM nests
-where the host allows it and the vk on PATH can ask for it, so the shell can boot
-vk's own microVMs rather than only compile them, keeping their images and boot
-scratch on the guest's disk. The first command boots a vk development VM; by default
-it powers off after 1800 seconds without a cargo command. Set VK_DEV_IDLE_SECS to
+name as a filter. `clippy` is `check` with the lints CI gates on: it defaults to
+`-- -D warnings`, so a warning fails the command as it would on a pull request, and
+your own `--` flags replace that default. `shell` opens an interactive shell in the
+same VM under the cargo commands' own environment, and holds the VM for as long as it
+runs; that VM nests where the host allows it and the vk on PATH can ask for it, so the
+shell can boot vk's own microVMs rather than only compile them, keeping their images
+and boot scratch on the guest's disk. The first command boots a vk development VM; by
+default it powers off after 1800 seconds without a cargo command. Set VK_DEV_IDLE_SECS to
 change the window, or to 0 to keep the VM until ./dev.sh stop.
 EOF
   exit 2
@@ -77,7 +81,7 @@ lock_state_dir() {
 
 MODE=${1:-}
 case "$MODE" in
-  check | test)
+  check | clippy | test)
     shift
     [ "$#" -gt 0 ] || usage
     ;;
@@ -196,6 +200,19 @@ check_cargo_args() {
 }
 # `shell` takes no cargo arguments to vet; every other mode is a cargo invocation.
 [ "$MODE" = shell ] || check_cargo_args "${args[@]}"
+
+# Match CI's `-D warnings` default unless the caller provides lint flags after a bare
+# `--`. The exact match avoids treating arguments that merely contain `--` as separators.
+if [ "$MODE" = clippy ]; then
+  has_lint_sep=""
+  for arg in "${args[@]}"; do
+    if [ "$arg" = -- ]; then
+      has_lint_sep=1
+      break
+    fi
+  done
+  [ -n "$has_lint_sep" ] || args+=(-- -D warnings)
+fi
 # Checked on every invocation, not just the one that boots: a typo should surface before it
 # has waited for the VM lock. `:-` already substituted for an empty value.
 idle_secs=${VK_DEV_IDLE_SECS:-1800}

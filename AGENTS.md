@@ -88,6 +88,7 @@ fast edit loop below is deliberately `vk`-only and never invokes Docker.
 ./build.sh                          # static-musl binaries -> dist/ (vk or Docker)
 ./build.sh --fast                   # same, but the debug profile -> much faster iteration
 ./dev.sh check -p vk-core           # fast type/borrow checking for one affected crate
+./dev.sh clippy -p vk-core          # the lints CI gates on, for one crate
 ./dev.sh test -p vk-core --lib …    # one module's unit tests (see below)
 ./dev.sh shell                      # interactive shell in that same VM
 ./audit.sh [--deny warnings]        # cargo-audit against the committed Cargo.lock
@@ -125,6 +126,10 @@ target and module affected by the change, for example:
 ./dev.sh test -p vk-driver --bin vk atop_view::tests
 ```
 
+`./dev.sh clippy -p <crate> --all-targets` runs CI's Clippy gate for one crate. It
+rejects workspace-wide runs, defaults to `-- -D warnings`, and lets explicit `--` lint
+flags replace that default.
+
 `dev.sh` is Docker-free: on first use it boots the pinned build image as a shared
 `vk` development VM; later invocations use `vk exec`, avoiding another image build and
 boot. It reuses `target/` — its RUSTFLAGS match `build.sh`'s exactly, so it shares
@@ -148,9 +153,9 @@ the image's `grep` and `find` are busybox applets.
 
 The toolchain is pinned in `rust-toolchain.toml` (musl target, clippy + rustfmt). Run
 cargo directly if you have it, or inside the devcontainer image to match CI exactly
-(clippy needs the static-FFI env — see `.github/workflows/quality.yml`). These are the
-CI-parity commands, run to verify a change; the edit loop above is what to use while
-iterating:
+(clippy compiles the workspace, so it needs `build.sh`'s writable cargo home — see
+`.github/workflows/quality.yml`). These are the CI-parity commands, run to verify a
+change; the edit loop above is what to use while iterating:
 
 ```bash
 cargo build --release --workspace
