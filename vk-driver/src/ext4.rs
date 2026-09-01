@@ -25,6 +25,45 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
+use crate::qcow2::Qcow2Writer;
+
+/// Positioned I/O into ext4 held in a raw file or open qcow2 writer. Export fix-ups use this
+/// abstraction before finalizing the container.
+pub trait BlockIo {
+    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<()>;
+    fn write_at(&mut self, off: u64, data: &[u8]) -> Result<()>;
+}
+
+impl BlockIo for std::fs::File {
+    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        Ok(self.read_exact_at(buf, off)?)
+    }
+    fn write_at(&mut self, off: u64, data: &[u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        Ok(self.write_all_at(data, off)?)
+    }
+}
+
+impl BlockIo for crate::qcow2::Qcow2Writer {
+    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<()> {
+        Qcow2Writer::read_at(self, off, buf)
+    }
+    fn write_at(&mut self, off: u64, data: &[u8]) -> Result<()> {
+        Qcow2Writer::write_at(self, off, data)
+    }
+}
+
+/// Open a raw image for test-only path-based fix-ups.
+#[cfg(test)]
+fn open_rw(image: &Path) -> Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(image)
+        .with_context(|| format!("opening {}", image.display()))
+}
+
 const BLOCK: u64 = 4096;
 const INODE_SIZE: u64 = 256;
 const INODES_PER_BLOCK: u64 = BLOCK / INODE_SIZE; // 16
@@ -273,17 +312,17 @@ pub fn fsck(image: &Path) -> FsckResult {
 /// settling the allocation would mean re-emitting the filesystem from its contents at export —
 /// which is what emitting from a staged tree ([`build_from_dir`], the tests-only host backend)
 /// gets for free and a guest-written image does not.
+#[cfg(test)]
 pub fn normalize_superblock(image: &Path) -> Result<()> {
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(image)
-        .with_context(|| format!("opening {}", image.display()))?;
+    normalize_superblock_in(&mut open_rw(image)?, &image.display().to_string())
+}
+
+/// Normalize an open image; `what` identifies it in errors.
+pub fn normalize_superblock_in(io: &mut dyn BlockIo, what: &str) -> Result<()> {
     let mut sb = [0u8; 1024];
-    f.seek(SeekFrom::Start(1024))?;
-    f.read_exact(&mut sb)?;
+    io.read_at(1024, &mut sb)?;
     if rd16(&sb, 0x38) != 0xEF53 {
-        bail!("{}: not an ext4 image (bad magic)", image.display());
+        bail!("{what}: not an ext4 image (bad magic)");
     }
     le32(&mut sb, 0x2c, 0); // s_mtime (last mount time)
     le32(&mut sb, 0x30, 0); // s_wtime (last write time)
@@ -291,9 +330,7 @@ pub fn normalize_superblock(image: &Path) -> Result<()> {
     le32(&mut sb, 0x40, 0); // s_lastcheck
     le32(&mut sb, 0x178, 0); // s_kbytes_written (lo)
     le32(&mut sb, 0x17c, 0); // s_kbytes_written (hi)
-    f.seek(SeekFrom::Start(1024))?;
-    f.write_all(&sb)?;
-    Ok(())
+    io.write_at(1024, &sb)
 }
 
 /// Stamp `image`'s filesystem UUID in place — the content-fingerprint identity the unit
@@ -303,37 +340,34 @@ pub fn normalize_superblock(image: &Path) -> Result<()> {
 /// mirroring the build path. Refuses a journaled image: the JBD2 superblock embeds the
 /// fs UUID at journal creation, so a restamp would desynchronize them — stamp first,
 /// [`add_journal`] after.
+#[cfg(test)]
 pub fn set_uuid(image: &Path, uuid: &[u8; 16]) -> Result<()> {
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(image)
-        .with_context(|| format!("opening {}", image.display()))?;
+    set_uuid_in(&mut open_rw(image)?, &image.display().to_string(), uuid)
+}
+
+/// Set an open image's UUID; `what` identifies it in errors.
+pub fn set_uuid_in(io: &mut dyn BlockIo, what: &str, uuid: &[u8; 16]) -> Result<()> {
     let mut sb = [0u8; 1024];
-    f.seek(SeekFrom::Start(1024))?;
-    f.read_exact(&mut sb)?;
+    io.read_at(1024, &mut sb)?;
     if rd16(&sb, 0x38) != 0xEF53 {
-        bail!("{}: not an ext4 image (bad magic)", image.display());
+        bail!("{what}: not an ext4 image (bad magic)");
     }
     if rd32(&sb, 0x5c) & EXT4_FEATURE_COMPAT_HAS_JOURNAL != 0 {
         bail!(
-            "{}: journaled image — the journal superblock embeds the fs UUID, \
-             so it must be stamped before add_journal",
-            image.display()
+            "{what}: journaled image — the journal superblock embeds the fs UUID, \
+             so it must be stamped before add_journal"
         );
     }
     sb[0x68..0x78].copy_from_slice(uuid);
     // Primary at byte 1024 (s_block_group_nr = 0), then the backups at the start of
     // each sparse_super group, each tagged with its own group number — the same
     // layout the build path writes.
-    f.seek(SeekFrom::Start(1024))?;
-    f.write_all(&sb)?;
+    io.write_at(1024, &sb)?;
     let groups = (rd32(&sb, 0x04) as u64).div_ceil(BLOCKS_PER_GROUP);
     for g in 1..groups {
         if sparse_super(g) {
             le16(&mut sb, 0x5a, g as u16); // s_block_group_nr
-            f.seek(SeekFrom::Start(g * BLOCKS_PER_GROUP * BLOCK))?;
-            f.write_all(&sb)?;
+            io.write_at(g * BLOCKS_PER_GROUP * BLOCK, &sb)?;
         }
     }
     Ok(())
@@ -346,27 +380,23 @@ pub fn set_uuid(image: &Path, uuid: &[u8; 16]) -> Result<()> {
 /// `JOURNAL_BLOCKS` run from free space, writes inode 8 + the JBD2 superblock, and
 /// updates the bitmap / free counts / `has_journal` feature. Idempotent. Assumes this
 /// module's feature set (no metadata_csum, no 64bit) — the only images it builds.
+#[cfg(test)]
 pub fn add_journal(image: &Path) -> Result<()> {
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(image)
-        .with_context(|| format!("opening {}", image.display()))?;
+    add_journal_in(&mut open_rw(image)?, &image.display().to_string())
+}
 
+/// Add a journal to an open image; `what` identifies it in errors.
+pub fn add_journal_in(io: &mut dyn BlockIo, what: &str) -> Result<()> {
     let mut sb = [0u8; 1024];
-    f.seek(SeekFrom::Start(1024))?;
-    f.read_exact(&mut sb)?;
+    io.read_at(1024, &mut sb)?;
     if rd16(&sb, 0x38) != 0xEF53 {
-        bail!("{}: not an ext4 image (bad magic)", image.display());
+        bail!("{what}: not an ext4 image (bad magic)");
     }
     if rd32(&sb, 0x5c) & EXT4_FEATURE_COMPAT_HAS_JOURNAL != 0 {
         return Ok(()); // already journaled
     }
     if rd16(&sb, 0x58) as u64 != INODE_SIZE || rd32(&sb, 0x20) as u64 != BLOCKS_PER_GROUP {
-        bail!(
-            "{}: unexpected ext4 geometry for add_journal",
-            image.display()
-        );
+        bail!("{what}: unexpected ext4 geometry for add_journal");
     }
     let blocks_count = rd32(&sb, 0x04) as u64;
     let free_blocks = rd32(&sb, 0x0c) as u64;
@@ -379,24 +409,21 @@ pub fn add_journal(image: &Path) -> Result<()> {
         gdt_blocks: round_up(blocks_count.div_ceil(BLOCKS_PER_GROUP) * 32, BLOCK) / BLOCK,
     };
     if free_blocks < JOURNAL_BLOCKS {
-        bail!(
-            "{}: not enough free space for a {JOURNAL_BLOCKS}-block journal",
-            image.display()
-        );
+        bail!("{what}: not enough free space for a {JOURNAL_BLOCKS}-block journal");
     }
 
     // Find a contiguous JOURNAL_BLOCKS-block free run in some group's data region
     // (the free space is large and mostly contiguous, so one run suffices).
-    let (run, group) = find_free_run(&mut f, &layout, blocks_count, JOURNAL_BLOCKS)?;
+    let (run, group) = find_free_run(io, &layout, blocks_count, JOURNAL_BLOCKS)?;
 
     // Mark the run used in its group's block bitmap.
     let (bb, _, _) = layout.group_meta_locs(group);
-    let mut bitmap = read_block(&mut f, bb)?;
+    let mut bitmap = read_block(io, bb)?;
     for blk in run.clone() {
         let i = (blk - group * BLOCKS_PER_GROUP) as usize;
         bitmap[i / 8] |= 1 << (i % 8);
     }
-    write_block(&mut f, bb, &bitmap)?;
+    write_block(io, bb, &bitmap)?;
 
     // Write the journal inode (inode 8, one inline extent).
     let jnode = Node {
@@ -422,8 +449,7 @@ pub fn add_journal(image: &Path) -> Result<()> {
     le16(&mut ino, 0x80, 32); // i_extra_isize
     le32(&mut ino, 0x20, EXTENTS_FL);
     write_inode_extents(&mut ino, &jnode);
-    f.seek(SeekFrom::Start(layout.inode_offset(JOURNAL_INO)))?;
-    f.write_all(&ino)?;
+    io.write_at(layout.inode_offset(JOURNAL_INO), &ino)?;
 
     // Write the (empty/clean) JBD2 superblock into the first journal block.
     let mut jb = vec![0u8; BLOCK as usize];
@@ -436,12 +462,11 @@ pub fn add_journal(image: &Path) -> Result<()> {
     jb[0x30..0x40].copy_from_slice(&uuid);
     be32(&mut jb, 0x40, 1); // s_nr_users
     jb[0x100..0x110].copy_from_slice(&uuid);
-    write_block(&mut f, run.start, &jb)?;
+    write_block(io, run.start, &jb)?;
 
     // Decrement the group's free-block count in the GDT (primary + sparse backups).
     let mut gdt = vec![0u8; (layout.groups * 32) as usize];
-    f.seek(SeekFrom::Start(BLOCK))?;
-    f.read_exact(&mut gdt)?;
+    io.read_at(BLOCK, &mut gdt)?;
     let goff = (group * 32) as usize;
     let gfree = rd16(&gdt, goff + 0x0c).saturating_sub(JOURNAL_BLOCKS as u16);
     le16(&mut gdt, goff + 0x0c, gfree);
@@ -450,8 +475,7 @@ pub fn add_journal(image: &Path) -> Result<()> {
     gdt_block.resize(gdt_padded, 0);
     for g in 0..layout.groups {
         if g == 0 || sparse_super(g) {
-            f.seek(SeekFrom::Start((g * BLOCKS_PER_GROUP + 1) * BLOCK))?;
-            f.write_all(&gdt_block)?;
+            io.write_at((g * BLOCKS_PER_GROUP + 1) * BLOCK, &gdt_block)?;
         }
     }
 
@@ -469,25 +493,23 @@ pub fn add_journal(image: &Path) -> Result<()> {
             } else {
                 g * BLOCKS_PER_GROUP * BLOCK
             };
-            f.seek(SeekFrom::Start(at))?;
-            f.write_all(&sb)?;
+            io.write_at(at, &sb)?;
         }
     }
-    f.flush()?;
     Ok(())
 }
 
 /// Scan group block bitmaps for a contiguous run of `need` free blocks in a data
 /// region; returns the absolute block range and its group.
 fn find_free_run(
-    f: &mut std::fs::File,
+    io: &mut dyn BlockIo,
     layout: &Layout,
     blocks_count: u64,
     need: u64,
 ) -> Result<(Range<u64>, u64)> {
     for g in 0..layout.groups {
         let (bb, _, _) = layout.group_meta_locs(g);
-        let bitmap = read_block(f, bb)?;
+        let bitmap = read_block(io, bb)?;
         let group_len = group_block_count(g, blocks_count);
         let data_start = layout.group_meta_count(g);
         let mut i = data_start;
@@ -509,17 +531,14 @@ fn find_free_run(
     bail!("no contiguous {need}-block free run for the journal (image too fragmented)")
 }
 
-fn read_block(f: &mut std::fs::File, blk: u64) -> Result<Vec<u8>> {
+fn read_block(io: &mut dyn BlockIo, blk: u64) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; BLOCK as usize];
-    f.seek(SeekFrom::Start(blk * BLOCK))?;
-    f.read_exact(&mut buf)?;
+    io.read_at(blk * BLOCK, &mut buf)?;
     Ok(buf)
 }
 
-fn write_block(f: &mut std::fs::File, blk: u64, buf: &[u8]) -> Result<()> {
-    f.seek(SeekFrom::Start(blk * BLOCK))?;
-    f.write_all(buf)?;
-    Ok(())
+fn write_block(io: &mut dyn BlockIo, blk: u64, buf: &[u8]) -> Result<()> {
+    io.write_at(blk * BLOCK, buf)
 }
 
 fn rd16(b: &[u8], o: usize) -> u16 {
@@ -1974,11 +1993,18 @@ fn be32(buf: &mut [u8], off: usize, v: u32) {
 /// never equals the fingerprint it is compared against. The musl images this ships in carry
 /// exactly that `blkid` and no `dumpe2fs` to fall back to. Rendered like
 /// `ensure::fingerprint`, the value it is compared against.
-pub(crate) fn fs_uuid(ext4: &Path) -> Option<String> {
-    let mut f = std::fs::File::open(ext4).ok()?;
+pub(crate) fn fs_uuid(image: &Path) -> Option<String> {
+    let mut f = std::fs::File::open(image).ok()?;
     let mut sb = [0u8; 1024];
-    f.seek(SeekFrom::Start(1024)).ok()?;
-    f.read_exact(&mut sb).ok()?;
+    // The filesystem may sit in a qcow2 (an exported root or unit image): read its
+    // superblock through the format layer then, off the raw bytes otherwise.
+    match crate::qcow2::sniff_kind(&f) {
+        crate::qcow2::ImageKind::Qcow2 => crate::qcow2::Qcow2::open(image)
+            .ok()?
+            .read_at(1024, &mut sb)
+            .ok()?,
+        _ => f.read_at(1024, &mut sb).ok()?,
+    }
     if rd16(&sb, 0x38) != 0xEF53 {
         return None;
     }
@@ -2506,6 +2532,76 @@ mod tests {
 
     // Build a journal-less image, add a journal natively, and verify e2fsck-clean +
     // has_journal. Run with: cargo test -- --ignored ext4::tests::add_journal_e2fsck
+    /// Export fix-ups work through an open qcow2 writer. After stamping, journaling, and
+    /// closing, `fs_uuid` reads the stamp; when installed, `qemu-img` and `e2fsck` verify it.
+    #[test]
+    fn fixups_through_a_qcow2_writer_match_the_raw_path() {
+        let base = std::env::temp_dir().join(format!("ext4qcow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let raw = base.join("fs.raw");
+        build_empty(&raw, 8192).expect("build");
+        let uuid = [0x42u8; 16];
+
+        let img = base.join("fs.qcow2");
+        let mut w = crate::qcow2::Qcow2Writer::create(&img, std::fs::metadata(&raw).unwrap().len())
+            .unwrap();
+        w.import_raw(&raw).unwrap();
+        normalize_superblock_in(&mut w, "fs.qcow2").unwrap();
+        set_uuid_in(&mut w, "fs.qcow2", &uuid).unwrap();
+        add_journal_in(&mut w, "fs.qcow2").unwrap();
+        w.finish().unwrap();
+        assert_eq!(
+            fs_uuid(&img).as_deref(),
+            Some("42424242-4242-4242-4242-424242424242")
+        );
+
+        // The same fix-ups on the raw copy give the same bytes.
+        normalize_superblock(&raw).unwrap();
+        set_uuid(&raw, &uuid).unwrap();
+        add_journal(&raw).unwrap();
+        let want = std::fs::read(&raw).unwrap();
+        let mut got = vec![0u8; want.len()];
+        crate::qcow2::Qcow2::open(&img)
+            .unwrap()
+            .read_at(0, &mut got)
+            .unwrap();
+        assert_eq!(
+            got, want,
+            "the qcow2 holds the filesystem the raw path produces"
+        );
+
+        let have = |t: &str| {
+            std::process::Command::new(t)
+                .arg("--version")
+                .output()
+                .is_ok()
+        };
+        if have("qemu-img") && have("e2fsck") {
+            let flat = base.join("flat.raw");
+            assert!(
+                std::process::Command::new("qemu-img")
+                    .args(["convert", "-O", "raw"])
+                    .arg(&img)
+                    .arg(&flat)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let out = std::process::Command::new("e2fsck")
+                .arg("-fn")
+                .arg(&flat)
+                .output()
+                .expect("run e2fsck");
+            assert!(
+                out.status.success(),
+                "e2fsck reported errors on the converted image:\n{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     #[ignore]
     fn add_journal_e2fsck() {

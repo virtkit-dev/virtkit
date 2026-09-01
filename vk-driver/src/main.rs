@@ -3101,6 +3101,9 @@ async fn cli_main() -> ExitCode {
             cache_auth: cache.auth,
             build_cache,
             journal: journal_enabled(*no_journal, b.no_journal),
+            // A `vk build --out` artifact stays a raw ext4: it is what gets mounted, packaged
+            // and pushed as a bundle.
+            out_format: build::ImageFormat::Raw,
             tmp_tmpfs: *build_tmp_tmpfs || b.tmp_tmpfs,
             build_args,
             net,

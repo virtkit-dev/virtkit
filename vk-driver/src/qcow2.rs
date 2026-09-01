@@ -445,11 +445,299 @@ pub fn flatten_to_raw(src: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
+const OFLAG_COPIED: u64 = 1 << 63;
+
+/// A qcow2 image written from scratch — the compact form an exported root image or a disk
+/// volume takes, so a mostly empty 32 GiB filesystem is a file of the size of its data
+/// rather than a sparse one whose apparent size every copy and backup tool trips over.
+///
+/// Guest clusters (64 KiB, like [`create_overlay`]'s) are appended to the file as they are
+/// first written; [`Qcow2Writer::read_at`] and [`Qcow2Writer::write_at`] serve any offset
+/// meanwhile, an unallocated cluster reading as zeros, so the ext4 fix-ups an export runs
+/// (superblock normalization, the UUID stamp, the journal) work on the image in place.
+/// [`Qcow2Writer::finish`] then lays the metadata (L2 tables, refcounts, L1, header) after
+/// the data and writes the header last, so an image cut short is never a valid qcow2.
+pub struct Qcow2Writer {
+    file: File,
+    path: PathBuf,
+    virtual_size: u64,
+    l1_size: u64,
+    /// Host offset of every guest cluster an L2 table maps (0 = unallocated), by L1 index;
+    /// a table exists once one of its clusters is written.
+    l2: std::collections::BTreeMap<u64, Vec<u64>>,
+    /// Where the next cluster is appended.
+    next: u64,
+}
+
+impl Qcow2Writer {
+    const CB: u32 = 16;
+    const CS: u64 = 1 << Self::CB;
+    const L2_ENTRIES: u64 = Self::CS / 8;
+    /// 16-bit refcounts (refcount_order 4): entries per refcount block.
+    const RC_PER_BLOCK: u64 = Self::CS / 2;
+
+    /// Create `path` as an image of `virtual_size` bytes with nothing allocated yet. The
+    /// path must not already exist (`create_new`): callers clear a leftover export tmp
+    /// first, so a surviving one — or a symlink planted at the path — is an error, not a
+    /// target to follow.
+    pub fn create(path: &Path, virtual_size: u64) -> Result<Self> {
+        let l1_size = virtual_size.div_ceil(Self::CS * Self::L2_ENTRIES).max(1);
+        let l1_clusters = (l1_size * 8).div_ceil(Self::CS);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        // Cluster 0 is the header, 1 the refcount table, then the L1 table; data follows.
+        let next = (2 + l1_clusters) * Self::CS;
+        file.set_len(next)
+            .with_context(|| format!("sizing {}", path.display()))?;
+        Ok(Qcow2Writer {
+            file,
+            path: path.to_path_buf(),
+            virtual_size,
+            l1_size,
+            l2: std::collections::BTreeMap::new(),
+            next,
+        })
+    }
+
+    fn host_offset(&self, cluster: u64) -> Option<u64> {
+        let table = self.l2.get(&(cluster / Self::L2_ENTRIES))?;
+        let host = table[(cluster % Self::L2_ENTRIES) as usize];
+        (host != 0).then_some(host)
+    }
+
+    /// Allocate guest `cluster` at the end of the file. The file is extended over it first,
+    /// so the part of the cluster a caller does not write reads back as zeros.
+    fn allocate(&mut self, cluster: u64) -> Result<u64> {
+        let table = self
+            .l2
+            .entry(cluster / Self::L2_ENTRIES)
+            .or_insert_with(|| vec![0u64; Self::L2_ENTRIES as usize]);
+        let host = self.next;
+        self.next += Self::CS;
+        table[(cluster % Self::L2_ENTRIES) as usize] = host;
+        self.file
+            .set_len(self.next)
+            .with_context(|| format!("extending {}", self.path.display()))?;
+        Ok(host)
+    }
+
+    /// Read `buf.len()` bytes at guest offset `off`; unallocated clusters and anything past
+    /// the virtual size read as zeros.
+    pub fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<()> {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let pos = off + done as u64;
+            let in_cluster = pos % Self::CS;
+            let n = ((Self::CS - in_cluster) as usize).min(buf.len() - done);
+            let dst = &mut buf[done..done + n];
+            match (pos < self.virtual_size).then(|| self.host_offset(pos / Self::CS)) {
+                Some(Some(host)) => self
+                    .file
+                    .read_exact_at(dst, host + in_cluster)
+                    .with_context(|| format!("reading {}", self.path.display()))?,
+                _ => dst.fill(0),
+            }
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// Write `data` at guest offset `off`, allocating the clusters it touches. A write past
+    /// the virtual size is an error.
+    pub fn write_at(&mut self, off: u64, data: &[u8]) -> Result<()> {
+        let end = off
+            .checked_add(data.len() as u64)
+            .filter(|&e| e <= self.virtual_size)
+            .with_context(|| {
+                format!(
+                    "{}: write of {} bytes at {off} exceeds the image size {}",
+                    self.path.display(),
+                    data.len(),
+                    self.virtual_size
+                )
+            })?;
+        let mut pos = off;
+        while pos < end {
+            let in_cluster = pos % Self::CS;
+            let n = ((Self::CS - in_cluster) as usize).min((end - pos) as usize);
+            let cluster = pos / Self::CS;
+            let host = match self.host_offset(cluster) {
+                Some(h) => h,
+                None => self.allocate(cluster)?,
+            };
+            let src = &data[(pos - off) as usize..(pos - off) as usize + n];
+            self.file
+                .write_all_at(src, host + in_cluster)
+                .with_context(|| format!("writing {}", self.path.display()))?;
+            pos += n as u64;
+        }
+        Ok(())
+    }
+
+    /// Copy the data extents of the raw image at `raw` in, 64 KiB block by block, leaving
+    /// all-zero blocks unallocated. The raw image must not be larger than this one.
+    pub fn import_raw(&mut self, raw: &Path) -> Result<()> {
+        let f = File::open(raw).with_context(|| format!("opening {}", raw.display()))?;
+        let raw_len = f
+            .metadata()
+            .with_context(|| format!("stat {}", raw.display()))?
+            .len();
+        if raw_len > self.virtual_size {
+            bail!(
+                "{}: raw image is {raw_len} bytes, larger than the {} byte qcow2 target",
+                raw.display(),
+                self.virtual_size
+            );
+        }
+        let mut buf = vec![0u8; 1 << 20];
+        for (off, len) in raw_data_extents(&f)? {
+            // Whole blocks, so a data run's zero tail stays a hole and a run straddling a
+            // block boundary is written once.
+            let start = off - off % Self::CS;
+            let end = (off + len)
+                .next_multiple_of(Self::CS)
+                .min(self.virtual_size);
+            let mut pos = start;
+            while pos < end {
+                let n = ((end - pos) as usize).min(buf.len());
+                read_at_or_zero(&f, pos, &mut buf[..n])
+                    .with_context(|| format!("reading {}", raw.display()))?;
+                for (i, block) in buf[..n].chunks(Self::CS as usize).enumerate() {
+                    if block.iter().any(|&b| b != 0) {
+                        self.write_at(pos + (i * Self::CS as usize) as u64, block)?;
+                    }
+                }
+                pos += n as u64;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the metadata and close the image. Every cluster the file holds ends up with
+    /// refcount 1 and the COPIED flag, the shape qemu-img expects of an image without
+    /// snapshots.
+    pub fn finish(self) -> Result<()> {
+        let cs = Self::CS as usize;
+        let mut next = self.next;
+        // L2 tables, after the data.
+        let mut l1 = vec![0u8; (self.l1_size * 8) as usize];
+        for (idx, table) in &self.l2 {
+            let mut buf = vec![0u8; cs];
+            for (i, &host) in table.iter().enumerate() {
+                if host != 0 {
+                    wbe64(&mut buf, i * 8, host | OFLAG_COPIED);
+                }
+            }
+            self.file
+                .write_all_at(&buf, next)
+                .with_context(|| format!("writing an L2 table of {}", self.path.display()))?;
+            wbe64(&mut l1, (*idx as usize) * 8, next | OFLAG_COPIED);
+            next += Self::CS;
+        }
+        // Refcount blocks, after the L2 tables. They count themselves too, so grow the
+        // block count until it covers every cluster including the blocks.
+        let clusters = next / Self::CS;
+        let mut blocks = 1u64;
+        loop {
+            let need = (clusters + blocks).div_ceil(Self::RC_PER_BLOCK);
+            if need <= blocks {
+                break;
+            }
+            blocks = need;
+        }
+        if blocks > Self::L2_ENTRIES {
+            bail!(
+                "{}: image too large for a one-cluster refcount table",
+                self.path.display()
+            );
+        }
+        let total = clusters + blocks;
+        let mut rct = vec![0u8; cs];
+        for b in 0..blocks {
+            let off = next + b * Self::CS;
+            wbe64(&mut rct, (b * 8) as usize, off);
+            let mut buf = vec![0u8; cs];
+            let first = b * Self::RC_PER_BLOCK;
+            let last = ((b + 1) * Self::RC_PER_BLOCK).min(total);
+            for c in first..last {
+                let i = ((c - first) * 2) as usize;
+                buf[i..i + 2].copy_from_slice(&1u16.to_be_bytes());
+            }
+            self.file
+                .write_all_at(&buf, off)
+                .with_context(|| format!("writing a refcount block of {}", self.path.display()))?;
+        }
+        self.file
+            .write_all_at(&rct, Self::CS)
+            .with_context(|| format!("writing the refcount table of {}", self.path.display()))?;
+        self.file
+            .write_all_at(&l1, 2 * Self::CS)
+            .with_context(|| format!("writing the L1 table of {}", self.path.display()))?;
+        // The header last: until now the file has no magic and opens as nothing.
+        let mut c0 = vec![0u8; cs];
+        c0[0..4].copy_from_slice(&MAGIC.to_be_bytes());
+        wbe32(&mut c0, 4, 3); // version 3
+        wbe32(&mut c0, 0x14, Self::CB); // cluster_bits
+        wbe64(&mut c0, 0x18, self.virtual_size);
+        wbe32(&mut c0, 0x24, self.l1_size as u32);
+        wbe64(&mut c0, 0x28, 2 * Self::CS); // l1_table_offset
+        wbe64(&mut c0, 0x30, Self::CS); // refcount_table_offset
+        wbe32(&mut c0, 0x38, 1); // refcount_table_clusters
+        wbe32(&mut c0, 0x60, 4); // refcount_order (16-bit refcounts)
+        wbe32(&mut c0, 0x64, 112); // header_length (v3); no extensions, the end marker is zero
+        self.file
+            .write_all_at(&c0, 0)
+            .with_context(|| format!("writing the header of {}", self.path.display()))?;
+        Ok(())
+    }
+}
+
 /// Write the image a `.vk_ro_img` `view` stands for into a sparse raw file at `out`, decoding
 /// its chunks on every core. For an export whose overlay holds nothing of its own (see
 /// [`Qcow2::empty_lazy_backing`]), where the view is the whole content.
 pub fn materialize_lazy_parallel(view: &Path, out: &Path) -> Result<()> {
-    VkRoImg::open(view)?.materialize_parallel(out)
+    let outf = File::create(out).with_context(|| format!("creating {}", out.display()))?;
+    let img = VkRoImg::open(view)?;
+    outf.set_len(img.total_size)
+        .with_context(|| format!("sizing {}", out.display()))?;
+    img.materialize_parallel(&mut |off, data| {
+        outf.write_all_at(data, off)
+            .with_context(|| format!("writing a chunk into {}", out.display()))
+    })
+}
+
+/// Materialize a lazy image into an open qcow2 writer.
+pub fn materialize_lazy_into(view: &Path, w: &mut Qcow2Writer) -> Result<()> {
+    VkRoImg::open(view)?.materialize_parallel(&mut |off, data| w.write_at(off, data))
+}
+
+/// Flatten a chain into an open qcow2 writer in 64 KiB blocks, leaving zeros unallocated.
+pub fn flatten_into(src: &Path, w: &mut Qcow2Writer) -> Result<()> {
+    const BLOCK: usize = 64 << 10;
+    let mut q = Qcow2::open(src)?;
+    let size = q.virtual_size();
+    let regions = q.chain_data_extents()?;
+    let mut buf = vec![0u8; 1 << 20];
+    for (off, len) in regions {
+        // Whole blocks, so a data run's zero tail stays a hole.
+        let mut pos = off - off % BLOCK as u64;
+        let end = (off + len).next_multiple_of(BLOCK as u64).min(size);
+        while pos < end {
+            let n = ((end - pos) as usize).min(buf.len());
+            q.read_at(pos, &mut buf[..n])?;
+            for (i, block) in buf[..n].chunks(BLOCK).enumerate() {
+                if block.iter().any(|&b| b != 0) {
+                    w.write_at(pos + (i * BLOCK) as u64, block)?;
+                }
+            }
+            pos += n as u64;
+        }
+    }
+    Ok(())
 }
 
 /// Write the image `view` stands for into a raw file at `out`: a `.vk_ro_img` manifest (a lazy
@@ -792,20 +1080,13 @@ impl VkRoImg {
         Ok(&self.last.as_ref().unwrap().1)
     }
 
-    /// Write the whole image to `out` as a sparse raw file: chunks are decoded on every core,
-    /// and one thread writes them. The per-chunk zstd decode is what the cluster-at-a-time
-    /// `read_at` loop an export otherwise runs through spends its one thread on; the writes
-    /// stay on one thread because positioned writes to one file serialize on its inode lock,
-    /// so several writers only contend. Every gap and every all-zero 64 KiB block stays a
-    /// hole: a chunk is megabytes and spans plenty of free filesystem blocks, so writing it
-    /// whole would cost the export both time and disk. `out` is created or truncated.
-    fn materialize_parallel(&self, out: &Path) -> Result<()> {
-        use std::os::unix::fs::FileExt;
+    /// Decode chunks on every core and feed 64 KiB nonzero blocks to `sink` on one thread.
+    /// Parallelism targets per-chunk zstd work; positioned writes to one inode serialize.
+    /// Chunks span many blocks, so skipping gaps and zeros preserves raw holes and
+    /// unallocated qcow2 clusters without writing whole chunks.
+    fn materialize_parallel(&self, sink: &mut dyn FnMut(u64, &[u8]) -> Result<()>) -> Result<()> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         const BLOCK: usize = 64 << 10;
-        let outf = File::create(out).with_context(|| format!("creating {}", out.display()))?;
-        outf.set_len(self.total_size)
-            .with_context(|| format!("sizing {}", out.display()))?;
         let next = AtomicUsize::new(0);
         let decode_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
         let workers = std::thread::available_parallelism()
@@ -852,9 +1133,8 @@ impl VkRoImg {
             let mut write_err = None;
             for (base, data) in &rx {
                 let mut run: Option<usize> = None; // start of the current non-zero run
-                let flush = |start: usize, end: usize| -> Result<()> {
-                    outf.write_all_at(&data[start..end], base + start as u64)
-                        .with_context(|| format!("writing a chunk into {}", out.display()))
+                let mut flush = |start: usize, end: usize| -> Result<()> {
+                    sink(base + start as u64, &data[start..end])
                 };
                 let mut result = Ok(());
                 for (n, block) in data.chunks(BLOCK).enumerate() {
@@ -1753,6 +2033,111 @@ mod tests {
         materialize_to_raw(&raw_in, &raw_out).unwrap();
         assert_eq!(std::fs::read(&raw_out).unwrap(), want, "raw -> raw");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Exercise out-of-order, partial, cross-cluster, replacement, and sparse-import writes.
+    /// Verify native reads and, when installed, `qemu-img` checks and conversion.
+    #[test]
+    fn qcow2_writer_images_read_back_and_satisfy_qemu() {
+        let dir = std::env::temp_dir().join(format!("vk-qcow2-writer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let vsize = 3u64 << 20;
+        let img = dir.join("w.qcow2");
+        let mut w = Qcow2Writer::create(&img, vsize).unwrap();
+        let mut want = vec![0u8; vsize as usize];
+        let mut put = |w: &mut Qcow2Writer, off: usize, data: &[u8]| {
+            w.write_at(off as u64, data).unwrap();
+            want[off..off + data.len()].copy_from_slice(data);
+        };
+        put(&mut w, 2 << 20, &[0xAA; 65536]);
+        put(&mut w, 100, &[0xBB; 3000]);
+        put(&mut w, 65536 * 5 - 10, &[0xCC; 20]);
+        put(&mut w, 100, &[0xDD; 10]);
+        let mut got = vec![0xFFu8; vsize as usize];
+        w.read_at(0, &mut got).unwrap();
+        assert_eq!(got, want, "reads through the open writer");
+        let mut tail = [7u8; 16];
+        w.read_at(vsize - 8, &mut tail).unwrap();
+        assert_eq!(
+            tail, [0u8; 16],
+            "unallocated and past-the-end bytes read as zero"
+        );
+        assert!(
+            w.write_at(vsize - 8, &[0u8; 16]).is_err(),
+            "no writes past the end"
+        );
+        assert_eq!(
+            std::fs::metadata(&img).unwrap().len(),
+            (3 + 4) * 65536,
+            "header, refcount table, L1 and the four clusters written, nothing else"
+        );
+        w.finish().unwrap();
+
+        let mut q = Qcow2::open(&img).unwrap();
+        assert_eq!(q.virtual_size(), vsize);
+        let mut got = vec![0xFFu8; vsize as usize];
+        q.read_at(0, &mut got).unwrap();
+        assert_eq!(
+            got, want,
+            "the finished image reads back through the native reader"
+        );
+
+        let raw = dir.join("in.raw");
+        let f = File::create(&raw).unwrap();
+        f.set_len(vsize).unwrap();
+        f.write_all_at(&[0x11; 4096], 65536 * 3 + 100).unwrap();
+        f.write_all_at(&[0x22; 70000], 65536 * 10).unwrap();
+        drop(f);
+        let img2 = dir.join("i.qcow2");
+        let mut w = Qcow2Writer::create(&img2, vsize).unwrap();
+        w.import_raw(&raw).unwrap();
+        assert_eq!(
+            std::fs::metadata(&img2).unwrap().len(),
+            (3 + 3) * 65536,
+            "three data clusters: the partial one and the two the 70000-byte run spans"
+        );
+        w.finish().unwrap();
+        let mut got = vec![0xFFu8; vsize as usize];
+        Qcow2::open(&img2).unwrap().read_at(0, &mut got).unwrap();
+        assert_eq!(
+            got,
+            std::fs::read(&raw).unwrap(),
+            "an imported raw reads back exactly"
+        );
+
+        if have("qemu-img") {
+            for (image, expect) in [(&img, &want), (&img2, &std::fs::read(&raw).unwrap())] {
+                assert!(
+                    Command::new("qemu-img")
+                        .arg("check")
+                        .arg(image)
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "qemu-img check must pass on {}",
+                    image.display()
+                );
+                let flat = image.with_extension("raw");
+                assert!(
+                    Command::new("qemu-img")
+                        .args(["convert", "-O", "raw"])
+                        .arg(image)
+                        .arg(&flat)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+                assert_eq!(
+                    &std::fs::read(&flat).unwrap(),
+                    expect,
+                    "qemu reads the same bytes"
+                );
+            }
+        } else {
+            eprintln!("skipping the qemu-img cross-check: not installed");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

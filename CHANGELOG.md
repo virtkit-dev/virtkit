@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Images stored for a run occupy space in proportion to their contents instead of exposing
+  the full filesystem size. `vk build --out` remains unchanged.
+
 ### Fixed
 
 - A guest with networking now reports ready as soon as its agent listens instead of about

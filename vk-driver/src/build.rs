@@ -56,6 +56,7 @@ use anyhow::{Context, Result, bail};
 use tokio_util::sync::CancellationToken;
 
 use exec::{DryRun, Executor, Host, MicroVm, ResolvedMount, Rootfs, ShellState};
+pub use exec::{Exported, ImageFormat};
 use interp::Vars;
 use parser::Instruction;
 use plan::{Base, Plan, PlanInput};
@@ -292,6 +293,8 @@ pub struct Options {
     pub build_cache: BuildCache,
     /// add an ext4 journal to the exported image (the build stays journal-less).
     pub journal: bool,
+    /// output image container (see [`ImageFormat`]).
+    pub out_format: ImageFormat,
     /// `--build-tmp-tmpfs`: use a RAM tmpfs for each stage guest's `/tmp` instead of the
     /// default disk-backed scratch. Disk-backed `/tmp` (the default) lifts the ½·guest-RAM cap
     /// on bulk `/tmp` writes (e.g. a large toolchain unpack) via a separate device that never
@@ -784,10 +787,15 @@ fn make_microvm(
 /// UUID untouched, so without this a freshly built/exported image never matches its own stage
 /// key. Both export paths ([`build_backend`] and [`build_units`]) call this on every exported
 /// image.
+#[cfg(test)]
 fn stamp_stage_uuid(out: &Path, stage_key: &str) -> Result<()> {
-    let uuid = crate::ensure::parse_uuid(&crate::ensure::fingerprint(&[stage_key]))
-        .expect("fingerprint is a canonical UUID");
-    crate::ext4::set_uuid(out, &uuid)
+    crate::ext4::set_uuid(out, &stage_uuid(stage_key))
+}
+
+/// Export UUID derived from the stage-key fingerprint.
+fn stage_uuid(stage_key: &str) -> [u8; 16] {
+    crate::ensure::parse_uuid(&crate::ensure::fingerprint(&[stage_key]))
+        .expect("fingerprint is a canonical UUID")
 }
 
 /// Where an export is written before it is published at `out`: a `.tmp` sibling, so the
@@ -806,18 +814,23 @@ fn export_tmp_path(out: &Path) -> PathBuf {
 /// sidecar intact or a stamped image with no sidecar — never a fresh-looking pair whose
 /// bytes or config belong to different builds.
 fn publish_export(
+    mut image: Exported,
     tmp: &Path,
     out: &Path,
     key: &str,
     journal: bool,
     config: &vk_core::runcfg::RunConfig,
 ) -> Result<()> {
-    stamp_stage_uuid(tmp, key)?;
-    // Journal *after* the UUID stamp: `ext4::set_uuid` refuses an already-journaled image
-    // (the JBD2 superblock embeds the UUID at journal creation).
-    if journal {
-        crate::ext4::add_journal(tmp)?;
+    if let Some(io) = image.io() {
+        let what = tmp.display().to_string();
+        crate::ext4::set_uuid_in(io, &what, &stage_uuid(key))?;
+        // Stamp before adding the journal: `set_uuid_in` rejects journaled images because
+        // JBD2 records the filesystem UUID when the journal is created.
+        if journal {
+            crate::ext4::add_journal_in(io, &what)?;
+        }
     }
+    image.finish()?;
     let sidecar = config_sidecar(out);
     // The old sidecar must be gone before the rename, or a kill between the two would leave
     // the new image beside a mismatched sidecar — the false-fresh pair this ordering exists
@@ -1002,7 +1015,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
             // Clear a leftover tmp from an interrupted export; a real failure resurfaces
             // when `export_ext4` recreates the file.
             let _ = std::fs::remove_file(&tmp);
-            ex.export_ext4(fs, &tmp)?;
+            let image = ex.export_ext4(fs, &tmp, opts.out_format)?;
             timings.record(Phase::Export, "", t_export.elapsed());
             progress.export_done(0);
             // The keys are re-derived read-only via the drive backend (base digests/configs
@@ -1012,7 +1025,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
                 .context("internal: target stage not resolved")?
                 .final_key
                 .clone();
-            publish_export(&tmp, out, &key, opts.journal, &config)?;
+            publish_export(image, &tmp, out, &key, opts.journal, &config)?;
         }
         Ok(Built { config })
     })();
@@ -1480,14 +1493,15 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
                     // Clear a leftover tmp from an interrupted export; a real failure
                     // resurfaces when `export_ext4` recreates the file.
                     let _ = std::fs::remove_file(&tmp);
-                    mv.export_ext4(fs, &tmp)
+                    let image = mv
+                        .export_ext4(fs, &tmp, opts.out_format)
                         .with_context(|| format!("target {:?}", t.label))?;
                     timings.record(Phase::Export, &t.label, t_export.elapsed());
                     progress.export_done(export_i);
                     export_i += 1;
-                    // The dev-VM staleness check reads the stamped UUID off the exported
-                    // root.ext4; the export tail otherwise leaves the base UUID.
-                    publish_export(&tmp, out, &r.final_key, opts.journal, &config)?;
+                    // The dev-VM staleness check reads the exported root's stamped UUID;
+                    // without this step, the base UUID remains.
+                    publish_export(image, &tmp, out, &r.final_key, opts.journal, &config)?;
                 }
                 built.insert(t.label.clone(), Built { config });
             }
@@ -4648,7 +4662,7 @@ mod tests {
             for ((tlabel, _, out), &idx) in targets.iter().zip(&tidx) {
                 if let Some(out) = out {
                     let fs = committed_global.get(&(base + idx)).unwrap();
-                    ex.export_ext4(fs, out).unwrap();
+                    ex.export_ext4(fs, out, ImageFormat::Raw).unwrap();
                     result.insert(tlabel.to_string(), out.clone());
                 }
             }
@@ -4871,8 +4885,13 @@ mod tests {
         ) -> Result<()> {
             self.inner.copy(fs, op, from, workdir)
         }
-        fn export_ext4(&mut self, fs: &Rootfs, out: &Path) -> Result<()> {
-            self.inner.export_ext4(fs, out)
+        fn export_ext4(
+            &mut self,
+            fs: &Rootfs,
+            out: &Path,
+            format: ImageFormat,
+        ) -> Result<Exported> {
+            self.inner.export_ext4(fs, out, format)
         }
         fn cache_has(&mut self, key: &str) -> bool {
             let hit = self.cache.contains(key);
@@ -5863,8 +5882,13 @@ RUN --mount=type=bind,from=build,source=/src,target=/s /usr/bin/out --selftest
         ) -> Result<()> {
             self.inner.run(fs, cmd, mounts, state)
         }
-        fn export_ext4(&mut self, fs: &Rootfs, out: &Path) -> Result<()> {
-            self.inner.export_ext4(fs, out)
+        fn export_ext4(
+            &mut self,
+            fs: &Rootfs,
+            out: &Path,
+            format: ImageFormat,
+        ) -> Result<Exported> {
+            self.inner.export_ext4(fs, out, format)
         }
     }
 
@@ -6082,6 +6106,7 @@ ENTRYPOINT run me
             cache_auth: Default::default(),
             build_cache: BuildCache::default(),
             journal: false,
+            out_format: ImageFormat::Raw,
             tmp_tmpfs: false,
             build_args: vec![],
             net: BuildNet::None,
@@ -6154,6 +6179,7 @@ ENTRYPOINT run me
             cache_auth: Default::default(),
             build_cache: BuildCache::default(),
             journal: false,
+            out_format: ImageFormat::Raw,
             tmp_tmpfs: false,
             build_args: vec![],
             net: BuildNet::None, // host backend: no RUN guests, no network
@@ -6205,6 +6231,7 @@ ENTRYPOINT run me
             cache_auth: Default::default(),
             build_cache: BuildCache::default(),
             journal: false,
+            out_format: ImageFormat::Raw,
             tmp_tmpfs: false,
             build_args: vec![],
             net: BuildNet::None,
@@ -6253,6 +6280,7 @@ ENTRYPOINT run me
             cache_auth: Default::default(),
             build_cache: BuildCache::default(),
             journal: false,
+            out_format: ImageFormat::Raw,
             tmp_tmpfs: false,
             build_args: vec![],
             net: BuildNet::None,
@@ -6316,6 +6344,7 @@ ENTRYPOINT run me
             build_jobs: None,
             debug: false,
             progress_sink: None,
+            out_format: ImageFormat::Raw,
         })
         .unwrap();
         // A stale sidecar from a previous build sits beside `out`; publishing must overwrite it.
@@ -6324,7 +6353,15 @@ ENTRYPOINT run me
 
         let key = "publish-stage-key";
         let config = vk_core::runcfg::RunConfig::default();
-        publish_export(&tmp, &out, key, false, &config).unwrap();
+        // Wrap the freshly exported raw ext4 for publication fix-ups.
+        let image = Exported::Raw(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&tmp)
+                .unwrap(),
+        );
+        publish_export(image, &tmp, &out, key, false, &config).unwrap();
 
         assert!(!tmp.exists(), "tmp is published by rename, not left behind");
         let expected = crate::ensure::fingerprint(&[key]);
@@ -6372,6 +6409,7 @@ ENTRYPOINT run me
             cache_auth: Default::default(),
             build_cache: BuildCache::default(),
             journal: true,
+            out_format: ImageFormat::Raw,
             tmp_tmpfs: false,
             build_args: vec![],
             net: BuildNet::None,
@@ -7462,6 +7500,7 @@ RUN ship
             cache_auth: Default::default(),
             build_cache: BuildCache::default(),
             journal: false,
+            out_format: ImageFormat::Raw,
             tmp_tmpfs: false,
             build_args: vec![],
             net: BuildNet::All,

@@ -73,6 +73,52 @@ pub struct ResolvedMount<'a> {
     pub from: Option<&'a Rootfs>,
 }
 
+/// Output container for an exported image.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImageFormat {
+    /// Sparse raw ext4 used by `vk build --out` and registry bundles. Its apparent size
+    /// equals the filesystem size.
+    #[default]
+    Raw,
+    /// Qcow2 allocating only written clusters, used for run roots and build-tier unit images.
+    Qcow2,
+}
+
+/// An open exported image awaiting publication. The caller applies UUID and journal fix-ups
+/// through [`Exported::io`], then finalizes it with [`Exported::finish`]. `Dry` represents
+/// a dry run with no output.
+pub enum Exported {
+    Raw(std::fs::File),
+    Qcow2(crate::qcow2::Qcow2Writer),
+    Dry,
+}
+
+impl Exported {
+    pub fn io(&mut self) -> Option<&mut dyn crate::ext4::BlockIo> {
+        match self {
+            Exported::Raw(f) => Some(f),
+            Exported::Qcow2(w) => Some(w),
+            Exported::Dry => None,
+        }
+    }
+    /// Close the image, writing qcow2 metadata when needed.
+    pub fn finish(self) -> Result<()> {
+        match self {
+            Exported::Qcow2(w) => w.finish(),
+            Exported::Raw(_) | Exported::Dry => Ok(()),
+        }
+    }
+    /// Open the raw image at `out` for fix-ups.
+    fn raw(out: &Path) -> Result<Exported> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(out)
+            .map(Exported::Raw)
+            .with_context(|| format!("opening {}", out.display()))
+    }
+}
+
 // from_image/from_scratch/from_stage take &mut self (they mutate backend state and
 // return a handle, not a constructor) — the `from_*` name reads best for "a rootfs
 // derived from X", so opt out of the wrong-self-convention lint.
@@ -143,8 +189,8 @@ pub trait Executor {
     fn resolve_base_digest(&mut self, _image: &str) -> Option<String> {
         None
     }
-    /// Export `fs` as a bootable ext4 image at `out`.
-    fn export_ext4(&mut self, fs: &Rootfs, out: &Path) -> Result<()>;
+    /// Export `fs` as bootable ext4 in `format`, leaving it open for caller fix-ups.
+    fn export_ext4(&mut self, fs: &Rootfs, out: &Path, format: ImageFormat) -> Result<Exported>;
 
     /// Instruction-level cache (default: no cache). `key` is the chained content hash
     /// up to and including an instruction; the backend stores/loads the resulting
@@ -293,10 +339,10 @@ impl Executor for DryRun {
             .push(format!("stage-context {}", context.display()));
         Ok(())
     }
-    fn export_ext4(&mut self, fs: &Rootfs, out: &Path) -> Result<()> {
+    fn export_ext4(&mut self, fs: &Rootfs, out: &Path, _format: ImageFormat) -> Result<Exported> {
         self.transcript
             .push(format!("export-ext4 {} -> {}", fs.label, out.display()));
-        Ok(())
+        Ok(Exported::Dry)
     }
 }
 
@@ -427,7 +473,7 @@ impl Executor for Planner {
     ) -> Result<()> {
         bail!("Planner backend does not run instructions")
     }
-    fn export_ext4(&mut self, _fs: &Rootfs, _out: &Path) -> Result<()> {
+    fn export_ext4(&mut self, _fs: &Rootfs, _out: &Path, _format: ImageFormat) -> Result<Exported> {
         bail!("Planner backend does not export")
     }
 }
@@ -2436,45 +2482,68 @@ impl Executor for MicroVm {
         }
         Ok(())
     }
-    fn export_ext4(&mut self, fs: &Rootfs, out: &Path) -> Result<()> {
+    fn export_ext4(&mut self, fs: &Rootfs, out: &Path, format: ImageFormat) -> Result<Exported> {
         let image = self.stage_image(fs)?;
-        // Warm-rebuild fast path: a fully-cached stage is a restored raw ext4 wrapped in an
-        // empty overlay (never booted, so no writes of its own). Its content IS the backing
-        // raw, so move that out (a rename on the same fs) instead of flattening a full copy.
         let mut q = crate::qcow2::Qcow2::open(&image)?;
-        let moved = q
-            .empty_raw_backing()?
-            .filter(|raw| std::fs::rename(raw, out).is_ok())
-            .is_some();
-        if !moved {
-            if let Some(view) = q.empty_lazy_backing()? {
-                // The lazy form of the same case (the libkrun default): the content IS the
-                // cached chunks the view names, so reassemble them on every core rather than
-                // decode them one cluster at a time through the overlay reader.
-                crate::qcow2::materialize_lazy_parallel(&view, out).with_context(|| {
-                    format!("exporting {} -> {}", view.display(), out.display())
-                })?;
-            } else {
-                // Otherwise flatten the qcow2 overlay chain natively into a raw ext4 (a base
-                // ext4 plus the stage's CoW layers; sparse, like qemu-img convert).
-                crate::qcow2::flatten_to_raw(&image, out).with_context(|| {
-                    format!("exporting {} -> {}", image.display(), out.display())
-                })?;
+        let what = out.display().to_string();
+        let mut exported = match format {
+            ImageFormat::Raw => {
+                // A fully cached stage is an untouched overlay over restored raw ext4. Rename
+                // its same-filesystem backing instead of flattening a full copy.
+                let moved = q
+                    .empty_raw_backing()?
+                    .filter(|raw| std::fs::rename(raw, out).is_ok())
+                    .is_some();
+                if !moved {
+                    if let Some(view) = q.empty_lazy_backing()? {
+                        // For the lazy form (libkrun's default), reassemble the cached chunks
+                        // on every core instead of decoding through the overlay reader.
+                        crate::qcow2::materialize_lazy_parallel(&view, out).with_context(|| {
+                            format!("exporting {} -> {}", view.display(), out.display())
+                        })?;
+                    } else {
+                        // Otherwise flatten the qcow2 overlay chain natively into a raw ext4
+                        // (a base ext4 plus the stage's CoW layers; sparse, like qemu-img
+                        // convert).
+                        crate::qcow2::flatten_to_raw(&image, out).with_context(|| {
+                            format!("exporting {} -> {}", image.display(), out.display())
+                        })?;
+                    }
+                }
+                Exported::raw(out)?
             }
-        }
+            ImageFormat::Qcow2 => {
+                // Write either source into fresh qcow2 clusters: decode cached chunks on
+                // every core, or read through the overlay chain.
+                let mut w = crate::qcow2::Qcow2Writer::create(out, q.virtual_size())?;
+                if let Some(view) = q.empty_lazy_backing()? {
+                    crate::qcow2::materialize_lazy_into(&view, &mut w).with_context(|| {
+                        format!("exporting {} -> {}", view.display(), out.display())
+                    })?;
+                } else {
+                    crate::qcow2::flatten_into(&image, &mut w).with_context(|| {
+                        format!("exporting {} -> {}", image.display(), out.display())
+                    })?;
+                }
+                Exported::Qcow2(w)
+            }
+        };
+        drop(q);
         self.images.lock().unwrap().remove(&fs.label);
         // Zero the superblock's volatile bookkeeping (write/mount/check times + the
         // kbytes-written/mount counters), so a fully-cached restore exports the same bytes as
         // the cold build that filled the cache. That is the whole guarantee: an uncached rebuild
         // of this stage does not reproduce the bytes (see `normalize_superblock`).
-        crate::ext4::normalize_superblock(out)?;
+        if let Some(io) = exported.io() {
+            crate::ext4::normalize_superblock_in(io, &what)?;
+        }
         // Left journal-less here deliberately (a journal is dead weight under the
         // rw-overlay build runtime and churns every snapshot): the caller stamps the
-        // content-freshness UUID next, and `ext4::set_uuid` refuses an already-journaled
+        // content-freshness UUID next, and `ext4::set_uuid_in` refuses an already-journaled
         // image (the JBD2 superblock embeds the UUID at journal creation), so `journal:
-        // true` in `Options` is applied by the caller, via `ext4::add_journal`, only after
+        // true` in `Options` is applied by the caller, via `ext4::add_journal_in`, only after
         // that stamp — never here.
-        Ok(())
+        Ok(exported)
     }
 
     fn cache_has(&mut self, key: &str) -> bool {
@@ -3051,7 +3120,7 @@ impl Executor for Host {
         }
         Ok(())
     }
-    fn export_ext4(&mut self, fs: &Rootfs, out: &Path) -> Result<()> {
+    fn export_ext4(&mut self, fs: &Rootfs, out: &Path, format: ImageFormat) -> Result<Exported> {
         let dir = self.stage_dir(fs)?;
         // The exported image has to be a function of the staged tree alone. `std::fs::copy`
         // does not carry an mtime across and a freshly created directory carries the clock,
@@ -3059,7 +3128,23 @@ impl Executor for Host {
         // timestamps (`build_from_dir` reads them from the tree) — making two builds of one
         // tree differ whenever they fall either side of a tick.
         stamp_epoch_tree(&dir)?;
-        crate::ext4::build_from_dir(&dir, out)
+        match format {
+            ImageFormat::Raw => {
+                crate::ext4::build_from_dir(&dir, out)?;
+                Exported::raw(out)
+            }
+            ImageFormat::Qcow2 => {
+                // The test-only host backend can afford to import the ext4 builder's raw file.
+                let raw = out.with_extension("raw.tmp");
+                crate::ext4::build_from_dir(&dir, &raw)?;
+                let size = std::fs::metadata(&raw)?.len();
+                let mut w = crate::qcow2::Qcow2Writer::create(out, size)?;
+                let imported = w.import_raw(&raw);
+                let _ = std::fs::remove_file(&raw);
+                imported?;
+                Ok(Exported::Qcow2(w))
+            }
+        }
     }
 }
 
@@ -3471,7 +3556,8 @@ mod tests {
             },
         )
         .unwrap();
-        ex.export_ext4(&base, Path::new("/tmp/out.ext4")).unwrap();
+        ex.export_ext4(&base, Path::new("/tmp/out.ext4"), ImageFormat::Raw)
+            .unwrap();
         assert_eq!(ex.transcript[0], "from-image build (debian:bookworm)");
         assert!(ex.transcript[1].contains("apt-get update"));
         assert!(ex.transcript[2].starts_with("export-ext4"));
@@ -3674,7 +3760,7 @@ mod tests {
         };
         h.copy(&fs, &op, None, "/").unwrap();
         let out = tmp.join("out.ext4");
-        h.export_ext4(&fs, &out).unwrap();
+        h.export_ext4(&fs, &out, ImageFormat::Raw).unwrap();
 
         let bytes = std::fs::read(&out).unwrap();
         assert!(bytes.len() > 4096, "ext4 image should be non-trivial");

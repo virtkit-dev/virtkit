@@ -856,7 +856,7 @@ async fn build_and_boot(
     }
 
     // Build every compose image the run needs in ONE unified build — the --primary primary
-    // (-> root.ext4) and every sibling (-> svc-<name>/image.ext4) — so stages shared across
+    // (-> root.qcow2) and every sibling (-> svc-<name>/image.ext4) — so stages shared across
     // the compose Dockerfile build or restore once for the whole set instead of once per
     // pass. Empty (and skipped) for a non-compose boot; the primary's config is read out of
     // it just below, the siblings' by plan_services further down.
@@ -881,11 +881,11 @@ async fn build_and_boot(
         primary_volumes = unit.volumes.clone();
         primary_axes = Some((unit.init, unit.kernel.clone()));
         primary = Some(cfg);
-        Some(work.join("root.ext4"))
+        Some(work.join("root.qcow2"))
     } else if args.dockerfiles.is_empty() {
         None
     } else {
-        let out = work.join("root.ext4");
+        let out = work.join("root.qcow2");
         let opts = dockerfile_build_options(args, kernel, agent, out.clone(), cfg.build.jobs);
         let built = crate::build::build(&opts)?;
         primary_user = built.config.user;
@@ -1140,7 +1140,7 @@ async fn build_and_boot(
                 &pinned_kernel,
             )?;
             boot_kernel = boot.kernel;
-            // throwaway rw qcow2 overlay over the ro raw ext4 (rw raw errors on tmpfs)
+            // Writable qcow2 overlay over the read-only backing; writable raw fails on tmpfs.
             let overlay = medium("overlay.qcow2")?;
             crate::qcow2::create_overlay(&overlay, &ext4)?;
             // Base handoff cmdline; the per-axis tokens are appended below so the guest
@@ -1178,7 +1178,7 @@ async fn build_and_boot(
                 ..Default::default()
             };
             crate::initramfs::build_agent_initramfs_with_config(agent, Some(&boot_cfg), &cpio)?;
-            // throwaway rw qcow2 overlay over the ro raw ext4 (rw raw errors on tmpfs)
+            // Writable qcow2 overlay over the read-only backing; writable raw fails on tmpfs.
             let overlay = medium("overlay.qcow2")?;
             crate::qcow2::create_overlay(&overlay, ext4)?;
             (
@@ -2144,7 +2144,7 @@ pub(crate) fn compose_build_selection(
     Ok(eager_build_selection(units, &order, primary_idx, &on))
 }
 
-/// Materialize the `--primary` primary up front, exported to the run's bootable `root.ext4`
+/// Materialize the `--primary` primary up front, exported to the run's bootable `root.qcow2`
 /// (it boots as the run VM, not a sibling). Sibling services are NOT built here: an `image:`
 /// sibling resolves through the shared image cache (`image::resolve_ref`) in `plan_services`,
 /// and a `build:` sibling materializes into the shared build tier on its first start (the
@@ -2162,8 +2162,9 @@ fn build_compose_images(
     let Some(primary_idx) = primary_idx else {
         return Ok(std::collections::HashMap::new());
     };
-    // Only the primary is selected; its target exports to root.ext4.
-    let out_of = |_unit: &crate::compose::Unit| -> Option<PathBuf> { Some(work.join("root.ext4")) };
+    // Only the primary is selected; its target exports to root.qcow2.
+    let out_of =
+        |_unit: &crate::compose::Unit| -> Option<PathBuf> { Some(work.join("root.qcow2")) };
     let units_to_build = compose_build_units(&args.build_args, units, &[primary_idx], out_of);
     let opts = service_build_options(args, kernel, agent);
     crate::build::build_units(units_to_build, &opts)
@@ -2419,6 +2420,8 @@ pub(crate) fn service_build_options(
         cache_auth: args.cache.auth.clone(),
         build_cache: crate::build::BuildCache::default(),
         journal: false,
+        // Run roots boot read-only under an overlay; qcow2 keeps the backing file compact.
+        out_format: crate::build::ImageFormat::Qcow2,
         tmp_tmpfs: false,
         build_args: args.build_args.clone(),
         net: args.build_net.clone(),

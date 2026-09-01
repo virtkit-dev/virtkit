@@ -153,7 +153,7 @@ pub fn build_unit_ext4(
     unit: &crate::compose::Unit,
 ) -> Result<PathBuf> {
     let (_recipe, _target, key) = build_recipe(unit, global_build_args, None)?;
-    Ok(crate::ensure::build_tier_dir(state_dir, &key).join("runner.ext4"))
+    Ok(crate::ensure::build_tier_dir(state_dir, &key).join(crate::ensure::UNIT_IMAGE))
 }
 
 /// Ensure a `build:` unit is materialized in the shared build tier synchronously — the
@@ -192,9 +192,9 @@ pub fn ensure_unit_build_sync(
         &unit.name,
         sink,
     )?;
-    let ext4 = dir.join("runner.ext4");
-    let config = read_merged_config(unit, &ext4)?;
-    Ok((ext4, config, guard))
+    let image = dir.join(crate::ensure::UNIT_IMAGE);
+    let config = read_merged_config(unit, &image)?;
+    Ok((image, config, guard))
 }
 
 /// Provision one service unit at address `slot`: resolve its clean image to a cache path and

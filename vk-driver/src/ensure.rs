@@ -129,6 +129,7 @@ pub fn ensure_unit_build(
         // precautionary consistency with the CLI default, not a fix for an unclean-shutdown
         // failure mode actually reachable on this specific path today.
         journal: true,
+        out_format: crate::build::ImageFormat::Qcow2,
         tmp_tmpfs: false,
         build_args: recipe.build_args.clone(),
         // Build-phase egress: the CI job's effective `[egress.build]` policy (unrestricted
@@ -149,6 +150,10 @@ pub fn ensure_unit_build(
 /// built once and shared across services, runs, and runners. Slots into the generic
 /// idle-eviction GC (`image::gc_idle`/`base_dirs`) like the pulled `registry/`/`docker/`
 /// tiers.
+/// Build-tier qcow2 image holding the unit's ext4, beside its `.json` config sidecar.
+/// Idle GC also recognizes legacy `runner.ext4` entries.
+pub const UNIT_IMAGE: &str = "runner.qcow2";
+
 pub fn build_tier_dir(state_dir: &Path, stage_key: &str) -> PathBuf {
     state_dir.join("build").join(fingerprint(&[stage_key]))
 }
@@ -165,7 +170,7 @@ fn reference_if_fresh(
     dir: &Path,
     expected: &str,
 ) -> Result<Option<crate::cachelock::Guard>> {
-    let out = dir.join("runner.ext4");
+    let out = dir.join(UNIT_IMAGE);
     if !unit_fresh(&out, expected) {
         return Ok(None);
     }
@@ -233,7 +238,7 @@ pub fn ensure_build_tier(
     // later sweep to notice. `ensure_unit_build`'s `?` runs this on the way out.
     let cleanup = crate::image::TmpGuard::new(&tmp);
     // ensure_unit_build writes the ext4 + config sidecar and stamps the UUID at the out path.
-    ensure_unit_build(recipe, target, stage_key, &tmp.join("runner.ext4"), sink)?;
+    ensure_unit_build(recipe, target, stage_key, &tmp.join(UNIT_IMAGE), sink)?;
     cleanup.keep(); // built successfully: the rename below takes ownership of `tmp`.
     // The one removal that ignores references — but by construction nobody holds one: a
     // holder found the entry fresh, and so would the two `reference_if_fresh` checks above,
@@ -245,7 +250,7 @@ pub fn ensure_build_tier(
     // no `.used` marker yet on the freshly promoted dir — so there is no instant, before this
     // returns, in which the idle GC could see the promoted dir as a reclaimable, unreferenced
     // entry.
-    let guard = crate::image::acquire_use_lock_for(state_dir, &dir.join("runner.ext4"))?
+    let guard = crate::image::acquire_use_lock_for(state_dir, &dir.join(UNIT_IMAGE))?
         .context("internal invariant: the build tier is one of the managed cache tiers")?;
     let build_root = state_dir.join("build");
     crate::image::gc_idle(&build_root, idle);
@@ -363,7 +368,7 @@ mod tests {
         let key = "already-fresh";
         let dir = build_tier_dir(&state_dir, key);
         std::fs::create_dir_all(&dir).unwrap();
-        let out = dir.join("runner.ext4");
+        let out = dir.join(UNIT_IMAGE);
         let tree = state_dir.join("tree");
         std::fs::create_dir_all(&tree).unwrap();
         crate::ext4::build_from_dir(&tree, &out).unwrap();
@@ -439,7 +444,7 @@ mod tests {
 
         // Present but stamped with another stage's fingerprint: still not fresh.
         std::fs::create_dir_all(&dir).unwrap();
-        let out = dir.join("runner.ext4");
+        let out = dir.join(UNIT_IMAGE);
         let tree = state_dir.join("tree");
         std::fs::create_dir_all(&tree).unwrap();
         crate::ext4::build_from_dir(&tree, &out).unwrap();

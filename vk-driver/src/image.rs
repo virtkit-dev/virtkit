@@ -378,11 +378,16 @@ pub(crate) fn gc_idle(root: &Path, idle: std::time::Duration) {
 /// also walks into a `.tmp` mid-build (it can already hold a `runner.ext4` before promotion)
 /// — harmless, since `gc_idle`'s `try_reclaim` bails out on that path's missing `.used`
 /// marker; a `.tmp`'s own cleanup is [`sweep_orphaned_build_tmp`]'s job, not this walk's.
+/// A promoted image: pulled-tier `runner.ext4` or the current or legacy build-tier name.
+fn is_base_dir(dir: &Path) -> bool {
+    dir.join("runner.ext4").is_file() || dir.join(crate::ensure::UNIT_IMAGE).is_file()
+}
+
 fn base_dirs(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        if dir.join("runner.ext4").is_file() {
+        if is_base_dir(&dir) {
             out.push(dir);
             continue;
         }
@@ -464,7 +469,7 @@ pub(crate) fn sweep_orphaned_build_tmp(root: &Path) {
                 reclaim_orphaned_tmp(&path);
                 continue;
             }
-            if path.join("runner.ext4").is_file() {
+            if is_base_dir(&path) {
                 continue; // a promoted base — nothing to sweep inside it
             }
             stack.push(path); // an intermediate name component (e.g. docker's `<name>`)
