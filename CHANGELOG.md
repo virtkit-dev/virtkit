@@ -15,6 +15,8 @@ All notable changes to virtkit will be documented in this file.
   whose image is already up to date: a dev VM restarted on unchanged sources boots in a few
   seconds instead of rewriting its 7 GiB root image first. An interrupted rebuild also never
   leaves a stale image looking up to date.
+- Compose builds now build an identical stage once across services, even when unrelated
+  build arguments differ. Later services reuse it, shown as `SHARED` in the build output.
 
 ## [0.47.0] - 2026-09-01
 

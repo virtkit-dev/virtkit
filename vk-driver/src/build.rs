@@ -1183,6 +1183,9 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
             resolved: HashMap<usize, Resolved>,
             needed: HashSet<usize>,
             cached_final: HashMap<usize, String>,
+            /// local stage → earlier unit's global stage with the same final key, whose
+            /// committed rootfs this unit adopts.
+            shared: HashMap<usize, usize>,
             targets: Vec<Tgt>,
             /// this unit occupies global ids `[base, base + plan.stages.len())`.
             base: usize,
@@ -1195,6 +1198,8 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
         let mut base = 0usize;
         let mut matched_overrides: HashSet<String> = HashSet::new();
         let mut known_stages: Vec<String> = Vec::new();
+        // final key → first earlier global stage that will build it.
+        let mut owners: HashMap<String, usize> = HashMap::new();
         for unit in &units {
             let build_args: Vars = unit.build_args.iter().cloned().collect();
             let inputs = match &unit.input {
@@ -1260,6 +1265,23 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
             }
             let build_targets: Vec<usize> =
                 targets.iter().filter(|t| !t.fresh).map(|t| t.idx).collect();
+            // Units can differ in build args while unaffected stages retain the same key,
+            // base, instructions, and inputs. The first unit builds each such stage; later
+            // units adopt its rootfs. Cold local builds otherwise have no cross-unit edges or
+            // build lock to deduplicate them. Targets stay private because export moves their
+            // images away from potential sharers.
+            let mut shared: HashMap<usize, usize> = HashMap::new();
+            for &idx in &order {
+                if target_idxs.contains(&idx) {
+                    continue;
+                }
+                if let Some(r) = resolved.get(&idx)
+                    && let Some(&owner) = owners.get(&r.final_key)
+                {
+                    shared.insert(idx, owner);
+                }
+            }
+            let shared_idxs: HashSet<usize> = shared.keys().copied().collect();
             let (needed, cached_final) = compute_needed(
                 &plan,
                 &order,
@@ -1267,8 +1289,22 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
                 &mut probe,
                 opts.require_cached,
                 &build_targets,
+                &shared_idxs,
             )
             .with_context(|| format!("build unit {:?}", unit.label))?;
+            // Register only stages this unit builds. Cached stages need no owner, and shared
+            // stages have no rootfs of their own to offer.
+            for &idx in &needed {
+                if cached_final.contains_key(&idx)
+                    || shared.contains_key(&idx)
+                    || target_idxs.contains(&idx)
+                {
+                    continue;
+                }
+                if let Some(r) = resolved.get(&idx) {
+                    owners.entry(r.final_key.clone()).or_insert(base + idx);
+                }
+            }
             let stages = plan.stages.len();
             resolved_units.push(Unit {
                 prefix: prefix_of(unit),
@@ -1277,6 +1313,7 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
                 resolved,
                 needed,
                 cached_final,
+                shared,
                 targets,
                 base,
             });
@@ -1325,9 +1362,8 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
             .count();
         progress.init(inits, exports);
 
-        // The build-wide DAG: each unit's needed stages as global-id nodes, with edges only
-        // among that unit's own stages (no cross-unit dependencies). A fully-cached stage
-        // restores standalone, so it gets no deps.
+        // Build-wide DAG: same-unit dependencies, except each shared node depends only on
+        // its owner. Fully cached nodes have no dependencies.
         let mut nodes: Vec<usize> = Vec::new();
         let mut deps: HashMap<usize, Vec<usize>> = HashMap::new();
         for u in &resolved_units {
@@ -1335,7 +1371,9 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
                 if !u.needed.contains(&idx) {
                     continue;
                 }
-                let d = if u.cached_final.contains_key(&idx) {
+                let d = if let Some(&owner) = u.shared.get(&idx) {
+                    vec![owner]
+                } else if u.cached_final.contains_key(&idx) {
                     Vec::new()
                 } else {
                     u.plan
@@ -1380,6 +1418,16 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
             |gid, done_global: &HashMap<usize, Rootfs>| {
                 let u = &resolved_units[unit_of(gid)];
                 let local = gid - u.base;
+                // Adopt the owner's committed rootfs. The cloned label and image let this
+                // unit's consumers fork or copy from it as from their own stage.
+                if let Some(&owner) = u.shared.get(&local) {
+                    let fs = done_global
+                        .get(&owner)
+                        .context("internal: shared stage scheduled before its owner")?
+                        .clone();
+                    progress.stage_shared(gid, &fs.label);
+                    return Ok(fs);
+                }
                 // The done map is build-wide; hand this stage only its own unit's committed
                 // rootfs, re-keyed to local indices (its deps are all same-unit).
                 let committed: HashMap<usize, Rootfs> = done_global
@@ -1942,11 +1990,17 @@ fn compute_needed(
     ex: &mut dyn Executor,
     require_cached: bool,
     targets: &[usize],
+    shared: &HashSet<usize>,
 ) -> Result<(HashSet<usize>, HashMap<usize, String>)> {
     let mut needed: HashSet<usize> = targets.iter().copied().collect();
     let mut cached_final: HashMap<usize, String> = HashMap::new();
     for &idx in order.iter().rev() {
         if !needed.contains(&idx) {
+            continue;
+        }
+        // A shared stage adopts another unit's rootfs, so like a full cache hit it adds no
+        // input dependencies.
+        if shared.contains(&idx) {
             continue;
         }
         let steps = &resolved
@@ -1971,7 +2025,7 @@ fn compute_needed(
     if require_cached {
         let missing: Vec<String> = order
             .iter()
-            .filter(|i| needed.contains(i) && !cached_final.contains_key(i))
+            .filter(|i| needed.contains(i) && !cached_final.contains_key(i) && !shared.contains(i))
             .map(|&i| {
                 plan.stages[i]
                     .name
@@ -2385,8 +2439,15 @@ fn drive(
     // Single-target driver: the target is the order's last stage.
     let targets = [*order.last().context("internal: empty build order")?];
     let resolved = resolve_all(plan, order, build_args, ex, &targets)?;
-    let (needed, cached_final) =
-        compute_needed(plan, order, &resolved, ex, require_cached, &targets)?;
+    let (needed, cached_final) = compute_needed(
+        plan,
+        order,
+        &resolved,
+        ex,
+        require_cached,
+        &targets,
+        &HashSet::new(),
+    )?;
     progress.init(stage_inits(plan, order, &resolved, &needed, 0, ""), 1);
     // Sequential driver: one stage at a time on the single `ex`, so neither the permit count
     // nor the memory gate has anything to hold back — they exist only to satisfy
@@ -3019,8 +3080,15 @@ fn drive_microvm(
         })
         .unwrap_or_default();
     probe.set_uncacheable(uncacheable.clone());
-    let (needed, cached_final) =
-        compute_needed(plan, order, &resolved, &mut probe, require_cached, &targets)?;
+    let (needed, cached_final) = compute_needed(
+        plan,
+        order,
+        &resolved,
+        &mut probe,
+        require_cached,
+        &targets,
+        &HashSet::new(),
+    )?;
     drop(probe);
     progress.init(stage_inits(plan, order, &resolved, &needed, 0, ""), 1);
 
@@ -4539,8 +4607,16 @@ mod tests {
                 .collect();
             let order = plan.build_order_multi(&tidx).unwrap();
             let resolved = resolve_all(&plan, &order, &ba, &mut ex, &tidx).unwrap();
-            let (needed, cached_final) =
-                compute_needed(&plan, &order, &resolved, &mut ex, false, &tidx).unwrap();
+            let (needed, cached_final) = compute_needed(
+                &plan,
+                &order,
+                &resolved,
+                &mut ex,
+                false,
+                &tidx,
+                &HashSet::new(),
+            )
+            .unwrap();
             // Build every needed stage in dependency order; hand each one only its own
             // unit's committed rootfs, re-keyed to local indices (as build_units does).
             let mut committed_local: HashMap<usize, Rootfs> = HashMap::new();
@@ -7033,6 +7109,43 @@ RUN ship
         assert!(gate_note(4, Some(32768)).is_some());
     }
 
+    /// A shared stage remains a node but adds no inputs, cache probes, or
+    /// `--require-cached` failures.
+    #[test]
+    fn compute_needed_treats_a_shared_stage_as_satisfied() {
+        let src = "FROM alpine AS base\nRUN one\nFROM base AS mid\nRUN two\n\
+                   FROM mid AS top\nRUN three\n";
+        let ba = Vars::new();
+        let mut ex = CachedDry::default();
+        let plan = plan_one(src, &ba);
+        let target = plan.resolve_target(None).unwrap();
+        let order = plan.build_order(target).unwrap();
+        let resolved = resolve_all(&plan, &order, &ba, &mut ex, &[target]).unwrap();
+        let (base, mid) = (
+            plan.stage_ref("base").unwrap(),
+            plan.stage_ref("mid").unwrap(),
+        );
+        let shared: HashSet<usize> = [mid].into_iter().collect();
+        let (needed, cached) =
+            compute_needed(&plan, &order, &resolved, &mut ex, false, &[target], &shared).unwrap();
+        assert!(needed.contains(&target) && needed.contains(&mid));
+        assert!(
+            !needed.contains(&base),
+            "the shared stage's inputs are its owner's to build"
+        );
+        assert!(cached.is_empty());
+        let probe = format!("cache-has {}", resolved[&mid].final_key);
+        assert!(
+            !ex.inner.transcript.iter().any(|l| l.starts_with(&probe)),
+            "a shared stage is not probed"
+        );
+        // --require-cached reports only stages this unit would build.
+        let err = compute_needed(&plan, &order, &resolved, &mut ex, true, &[target], &shared)
+            .unwrap_err();
+        let nc = err.downcast_ref::<NotCached>().expect("typed NotCached");
+        assert_eq!(nc.stages, ["top"]);
+    }
+
     // Regression test for the dispatch/build-cap decoupling: the fully-cached fast path
     // must return before ever touching `budget`, so it has to complete even with
     // the semaphore fully exhausted (0 permits) — a build-bound acquire here would block
@@ -7048,8 +7161,16 @@ RUN ship
         let resolved = resolve_all(&plan, &order, &ba, &mut ex, &[target]).unwrap();
         let key = resolved[&target].steps.last().unwrap().key.clone();
         ex.cache.insert(key);
-        let (_needed, cached_final) =
-            compute_needed(&plan, &order, &resolved, &mut ex, false, &[target]).unwrap();
+        let (_needed, cached_final) = compute_needed(
+            &plan,
+            &order,
+            &resolved,
+            &mut ex,
+            false,
+            &[target],
+            &HashSet::new(),
+        )
+        .unwrap();
         assert!(
             cached_final.contains_key(&target),
             "test setup: stage must be a full cache hit"
@@ -7095,8 +7216,16 @@ RUN ship
         let target = plan.resolve_target(None).unwrap();
         let order = plan.build_order(target).unwrap();
         let resolved = resolve_all(&plan, &order, &ba, &mut ex, &[target]).unwrap();
-        let (_needed, cached_final) =
-            compute_needed(&plan, &order, &resolved, &mut ex, false, &[target]).unwrap();
+        let (_needed, cached_final) = compute_needed(
+            &plan,
+            &order,
+            &resolved,
+            &mut ex,
+            false,
+            &[target],
+            &HashSet::new(),
+        )
+        .unwrap();
         ex.fail_check = Some(vk_registry::FailInfo {
             reason: "ENOSPC".into(),
             age: Duration::from_secs(5),
@@ -7147,8 +7276,16 @@ RUN ship
         let order = plan.build_order(target).unwrap();
         let resolved = resolve_all(&plan, &order, &ba, &mut ex, &[target]).unwrap();
         let key = resolved[&target].steps.last().unwrap().key.clone();
-        let (_needed, cached_final) =
-            compute_needed(&plan, &order, &resolved, &mut ex, false, &[target]).unwrap();
+        let (_needed, cached_final) = compute_needed(
+            &plan,
+            &order,
+            &resolved,
+            &mut ex,
+            false,
+            &[target],
+            &HashSet::new(),
+        )
+        .unwrap();
         let budget = BuildBudget::new(1, None);
         let result = build_stage(
             &plan,
@@ -7194,8 +7331,16 @@ RUN ship
         let target = plan.resolve_target(None).unwrap();
         let order = plan.build_order(target).unwrap();
         let resolved = resolve_all(&plan, &order, &ba, &mut ex, &[target]).unwrap();
-        let (_needed, cached_final) =
-            compute_needed(&plan, &order, &resolved, &mut ex, false, &[target]).unwrap();
+        let (_needed, cached_final) = compute_needed(
+            &plan,
+            &order,
+            &resolved,
+            &mut ex,
+            false,
+            &[target],
+            &HashSet::new(),
+        )
+        .unwrap();
         let budget = BuildBudget::new(1, None);
         let cancel = CancellationToken::new();
         let result = build_stage(
@@ -7241,8 +7386,16 @@ RUN ship
         let target = plan.resolve_target(None).unwrap();
         let order = plan.build_order(target).unwrap();
         let resolved = resolve_all(&plan, &order, &ba, &mut ex, &[target]).unwrap();
-        let (_needed, cached_final) =
-            compute_needed(&plan, &order, &resolved, &mut ex, false, &[target]).unwrap();
+        let (_needed, cached_final) = compute_needed(
+            &plan,
+            &order,
+            &resolved,
+            &mut ex,
+            false,
+            &[target],
+            &HashSet::new(),
+        )
+        .unwrap();
         let budget = BuildBudget::new(1, None);
         let result = build_stage(
             &plan,

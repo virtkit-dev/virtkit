@@ -393,6 +393,32 @@ impl Progress {
         self.refresh_header();
     }
 
+    /// Mark a stage shared by content key with another unit as complete without running it.
+    /// `owner` names the stage whose rootfs it adopts.
+    pub fn stage_shared(&self, stage: StageId, owner: &str) {
+        let Some(meta) = self.meta.get() else { return };
+        let Some(sm) = meta.stages.get(&stage) else {
+            return;
+        };
+        self.done.fetch_add(sm.total, Ordering::Relaxed);
+        match &self.backend {
+            Backend::Tty(tty) => {
+                let line = self.dim(&right_align(
+                    &format!(" => [{}] = [{owner}]", sm.name),
+                    "SHARED",
+                ));
+                let _ = tty.println(line);
+            }
+            Backend::Plain | Backend::Routed(_) => self.plain_line(format_args!(
+                "#{} SHARED [{}] = [{owner}]",
+                sm.seq(1),
+                sm.name
+            )),
+            Backend::Disabled => {}
+        }
+        self.refresh_header();
+    }
+
     /// Show a transient spinner while a stage's cached snapshot is pulled from the registry
     /// and reassembled — an otherwise silent, sometimes long gap that runs after the stage's
     /// cells are already marked CACHED (so the header advances with nothing visibly running).
