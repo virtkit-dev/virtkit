@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- A guest with networking now reports ready as soon as its agent listens instead of about
+  5 s later. Every `vk run --net`, compose service and build-stage boot loses that wait,
+  which on a cold build of many stages added up to minutes.
+
 ## [0.47.0] - 2026-09-01
 
 ### Fixed

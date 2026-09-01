@@ -372,7 +372,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
                 ctx.supervisor_log().display()
             );
         }
-        match vk_core::status::get_status(&addr).await {
+        match vk_core::status::get_status_within(&addr, vk_core::status::BOOT_PROBE_BUDGET).await {
             Ok(status) => {
                 // Fail fast on a wire-protocol skew (the guest bundle's virtkit-agent
                 // predates this virtkit, or vice versa): rmp_serde structs are
@@ -440,7 +440,9 @@ async fn wait_for_services(ctx: &JobCtx, names: &[String]) -> Result<()> {
         let dir = ctx.job_dir.join(format!("svc-{name}"));
         let addr = crate::vmm::exec_addr(&dir.join("vsock.sock"), crate::units::VSOCK_PORT);
         loop {
-            match vk_core::status::get_status(&addr).await {
+            match vk_core::status::get_status_within(&addr, vk_core::status::BOOT_PROBE_BUDGET)
+                .await
+            {
                 Ok(_) => {
                     println!(
                         "vk: service {name} ready in {:.1}s",

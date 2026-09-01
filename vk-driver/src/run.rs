@@ -2962,7 +2962,10 @@ async fn drive(
         if let Some(status) = ch.try_wait()? {
             bail!("{}", boot_failure(console, status));
         }
-        if vk_core::status::get_status(addr).await.is_ok() {
+        if vk_core::status::get_status_within(addr, vk_core::status::BOOT_PROBE_BUDGET)
+            .await
+            .is_ok()
+        {
             break;
         }
         if Instant::now() >= deadline {
@@ -3654,7 +3657,10 @@ pub(crate) async fn boot_session(
         if let Some(status) = ch.try_wait()? {
             bail!("{}", boot_failure(&console, status));
         }
-        if vk_core::status::get_status(&addr).await.is_ok() {
+        if vk_core::status::get_status_within(&addr, vk_core::status::BOOT_PROBE_BUDGET)
+            .await
+            .is_ok()
+        {
             break;
         }
         if Instant::now() >= deadline {
