@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- A failed cache upload no longer lets later builds restore an image assembled from
+  stale data.
+
 ## [0.46.0] - 2026-09-01
 
 ### Added

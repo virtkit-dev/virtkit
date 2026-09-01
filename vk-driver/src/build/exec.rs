@@ -593,7 +593,8 @@ pub struct MicroVm {
 /// A background cache push's layers, total size, and manifest digest. The next instruction
 /// diffs against the layers in memory; a `FROM <stage>` child pins the digest. Full pushes
 /// also return layers because `push_ext4_diff` re-chunks the whole image.
-type PushOutput = Result<((Vec<oci_client::manifest::OciDescriptor>, u64), String)>;
+type PushResult = ((Vec<oci_client::manifest::OciDescriptor>, u64), String);
+type PushOutput = Result<PushResult>;
 
 /// A checkpoint prepared under a freeze: the stable snapshot to push, the written extents to
 /// read and push as data, the discarded extents to represent as holes, and the image's virtual
@@ -605,6 +606,16 @@ struct PushInflight {
     /// the snapshot raw the push reads; freed after it is joined (and used as the next
     /// instruction's `content_diff` baseline).
     snap: PathBuf,
+}
+
+/// Join a background push and turn upload errors or thread panics into messages. Cache
+/// failures stay non-fatal: rebuilding an instruction is cheaper than aborting the run.
+fn join_push(handle: std::thread::JoinHandle<PushOutput>) -> Result<PushResult, String> {
+    match handle.join() {
+        Ok(Ok(out)) => Ok(out),
+        Ok(Err(e)) => Err(format!("build async push failed ({e:#})")),
+        Err(_) => Err("cache push thread panicked".to_string()),
+    }
 }
 
 /// Terminal cache pushes handed off at `stage_end` and awaiting their join, keyed by stage
@@ -635,12 +646,8 @@ impl Drop for PushPool {
     /// non-fatal (its instruction is simply left uncached), matching the intra-stage push path.
     fn drop(&mut self) {
         for (_, inf) in self.inflight.get_mut().unwrap().drain() {
-            match inf.handle.join() {
-                Ok(Err(e)) => {
-                    eprintln!("virtkit: build async push failed ({e:#}) — not cached")
-                }
-                Err(_) => eprintln!("virtkit: cache push thread panicked — not cached"),
-                Ok(Ok(_)) => {}
+            if let Err(msg) = join_push(inf.handle) {
+                eprintln!("virtkit: {msg} — not cached");
             }
             let _ = std::fs::remove_file(&inf.snap);
         }
@@ -1726,12 +1733,13 @@ impl MicroVm {
             }
             Err(e) => {
                 eprintln!("virtkit: build cache push of {key} failed ({e:#}) — not cached");
-                // Drop the pinned parent too: this push recorded no digest, so the next diff
-                // must not reuse the *previous* instruction's digest as its parent (that would
-                // splice stale bytes over what this instruction changed) — it has no known-safe
-                // parent left at all, so `parent_for_push` does a full re-chunk instead.
+                // This push published no digest. Clear the previous parent so the next diff
+                // cannot splice stale bytes over this instruction's changes;
+                // `parent_for_push` will re-chunk the full image. Also clear the stage map so
+                // forks cannot reuse the superseded digest.
                 self.parent_layers = None;
                 self.parent_digest = None;
+                self.forget_stage_digest(&fs.label);
             }
         }
         Ok(())
@@ -1746,16 +1754,17 @@ impl MicroVm {
         let Some(inf) = self.inflight.take() else {
             return;
         };
-        match inf.handle.join().expect("cache push thread panicked") {
+        match join_push(inf.handle) {
             Ok((layers, digest)) => {
                 self.parent_layers = Some(layers);
                 self.record_stage_digest(label, &digest);
                 self.parent_digest = Some(digest);
             }
-            Err(e) => {
-                eprintln!("virtkit: build async push failed ({e:#}) — not cached");
+            Err(msg) => {
+                eprintln!("virtkit: {msg} — not cached");
                 self.parent_layers = None;
                 self.parent_digest = None;
+                self.forget_stage_digest(label);
             }
         }
         let _ = std::fs::remove_file(&inf.snap);
@@ -1772,9 +1781,12 @@ impl MicroVm {
         let Some(inf) = self.pending.take(label) else {
             return;
         };
-        match inf.handle.join().expect("cache push thread panicked") {
+        match join_push(inf.handle) {
             Ok((_, digest)) => self.record_stage_digest(label, &digest),
-            Err(e) => eprintln!("virtkit: build async push failed ({e:#}) — not cached"),
+            Err(msg) => {
+                eprintln!("virtkit: {msg} — not cached");
+                self.forget_stage_digest(label);
+            }
         }
         let _ = std::fs::remove_file(&inf.snap);
     }
@@ -1786,6 +1798,13 @@ impl MicroVm {
             .lock()
             .unwrap()
             .insert(label.to_string(), digest.to_string());
+    }
+
+    /// Remove `label`'s digest after a push fails to publish its changes. The previous digest
+    /// is superseded; without a known registry parent, a `FROM <stage>` fork safely re-chunks
+    /// the full image.
+    fn forget_stage_digest(&self, label: &str) {
+        self.stage_last_digest.lock().unwrap().remove(label);
     }
 }
 
@@ -1805,7 +1824,9 @@ impl Drop for MicroVm {
             let _ = std::fs::remove_file(scratch);
         }
         if let Some(inf) = self.inflight.take() {
-            let _ = inf.handle.join();
+            if let Err(msg) = join_push(inf.handle) {
+                eprintln!("virtkit: {msg} — not cached");
+            }
             let _ = std::fs::remove_file(&inf.snap);
         }
     }
