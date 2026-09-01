@@ -8,3 +8,10 @@ target = "x86_64-unknown-linux-musl"
 # devcontainer doesn't have — its `gcc` is musl-native, so point cc-rs at it.
 [env]
 CC_x86_64_unknown_linux_musl = "gcc"
+# libtest runs each test on a spawned thread, which takes std's 2 MiB default rather than
+# the main thread's 8 MiB. Parsing `vk`'s CLI is recursive over a large clap tree, and
+# unoptimized that overflows 2 MiB — so the CLI tests abort with a stack overflow in a debug
+# build while the shipped binary, optimized and parsing on the main thread, is nowhere near
+# it. Give the test threads the main thread's budget. Not `force`d: an explicit
+# RUST_MIN_STACK still wins.
+RUST_MIN_STACK = "8388608"
