@@ -78,6 +78,12 @@ slice is now `subslice`d to the remaining count, matching the byte-copy `write()
 that already clamps. Covered by the `write_from_at_must_not_overread_past_count` test.
 Search for `subslice` in `consume`.
 
+`src/devices/src/virtio/vsock/unix.rs` — `UnixProxy::release` shuts the host socket down
+and stops polling it. A guest `OP_RST` on a host-initiated connection (its port has no
+listener yet, the usual case for a readiness probe during boot) only deferred the proxy's
+removal, so the host peer read EOF when the reaper dropped the proxy 5 s later; it now
+reads it at once. Search for `release: shutdown failed`.
+
 `src/devices/src/virtio/block/device.rs` + `src/devices/src/virtio/file_traits.rs` —
 serve reads from read-only raw disks out of an `mmap` of the backing file instead of a
 `pread` per request. Upstream reads every block through imago's positioned-I/O file

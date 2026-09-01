@@ -534,10 +534,18 @@ impl Proxy for UnixProxy {
             "release: id={}, tx_cnt={}, last_tx_cnt={}",
             self.id, self.tx_cnt, self.last_tx_cnt_sent
         );
-        let remove_proxy = ProxyRemoval::Deferred;
+        // The guest reset this connection — for a host-initiated one, typically because
+        // nothing listens on the port yet. Tell the host peer now: with the socket left open
+        // it would only read EOF once the reaper drops this proxy, 5 s from now, and a host
+        // polling a booting guest waited exactly that long on its first probe.
+        if let Err(e) = shutdown(self.fd.as_raw_fd(), Shutdown::Both) {
+            debug!("release: shutdown failed: {e}");
+        }
+        self.status = ProxyStatus::Closed;
 
         ProxyUpdate {
-            remove_proxy,
+            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::empty())),
+            remove_proxy: ProxyRemoval::Deferred,
             ..Default::default()
         }
     }
