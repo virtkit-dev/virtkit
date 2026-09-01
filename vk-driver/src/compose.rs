@@ -1026,11 +1026,14 @@ const DEFAULT_DISK_VOLUME_MIB: u64 = 65536; // 64 GiB
 /// Built into a same-directory temp file first, then published with a hard link — which
 /// fails with `AlreadyExists` rather than silently overwriting a file a racing boot already
 /// published — instead of writing `vol.host` directly, so a crash mid-format can never leave
-/// a half-written file behind for a later boot to wrongly trust as-is. The temp file is opened
-/// `0600` at creation (`create_new`, so it also can't follow a pre-planted symlink at the temp
-/// path) rather than chmod'd after the fact, since the volume may end up holding whatever a
-/// service stores in it (e.g. a database's data directory); `ext4::build_empty`'s own
-/// `File::create` on that same path only truncates and rewrites it, leaving the mode as-is.
+/// a half-written file behind for a later boot to wrongly trust as-is. The temp files can't
+/// follow a symlink planted at their path (`create_new`), and the published volume is `0600`
+/// before any filesystem bytes land, since it may end up holding whatever a service stores in
+/// it (e.g. a database's data directory).
+///
+/// New backing files are qcow2: they initially allocate only the formatted ext4 blocks and
+/// grow as the guest writes instead of allocating the full capacity. `Disk::for_image`
+/// detects and attaches legacy raw ext4 volumes.
 pub fn ensure_disk_backing(vol: &Volume) -> Result<()> {
     if !vol.disk || vol.host.exists() {
         return Ok(());
@@ -1053,16 +1056,31 @@ pub fn ensure_disk_backing(vol: &Volume) -> Result<()> {
         .and_then(|n| n.to_str())
         .with_context(|| format!("disk volume {}: bad file name", vol.host.display()))?;
     let tmp = parent.join(format!(".{file_name}.vk-disk-tmp-{}", std::process::id()));
+    let raw = parent.join(format!(".{file_name}.vk-disk-raw-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&raw);
     let publish = (|| -> Result<()> {
+        // The raw scratch is created 0600 (`create_new`, so it can't follow a symlink planted
+        // at the temp path); `build_empty`'s own `File::create` on it only truncates and
+        // rewrites, keeping the mode.
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
-        crate::ext4::build_empty(&tmp, free_blocks)
+            .open(&raw)
+            .with_context(|| format!("creating {}", raw.display()))?;
+        // Build raw ext4 scratch, then import its written blocks into qcow2.
+        crate::ext4::build_empty(&raw, free_blocks)
             .with_context(|| format!("formatting disk volume {}", vol.host.display()))?;
+        let size = std::fs::metadata(&raw)
+            .with_context(|| format!("sizing {}", raw.display()))?
+            .len();
+        // `Qcow2Writer::create` makes `tmp` itself (`create_new`, refusing a planted path),
+        // born 0600 — the volume may end up holding whatever a service stores in it.
+        let mut w = crate::qcow2::Qcow2Writer::create(&tmp, size, 0o600)?;
+        w.import_raw(&raw)?;
+        w.finish()
+            .with_context(|| format!("writing disk volume {}", vol.host.display()))?;
         match std::fs::hard_link(&tmp, &vol.host) {
             Ok(()) => Ok(()),
             // A racing boot published it first; its file is as good as ours would have been.
@@ -1073,6 +1091,7 @@ pub fn ensure_disk_backing(vol: &Volume) -> Result<()> {
         }
     })();
     let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&raw);
     publish
 }
 
@@ -2030,6 +2049,26 @@ mod tests {
         ensure_disk_backing(&vol).unwrap();
         assert!(vol.host.is_file(), "first call creates the backing file");
         let created_len = std::fs::metadata(&vol.host).unwrap().len();
+        assert!(
+            crate::qcow2::Qcow2::open(&vol.host).unwrap().virtual_size()
+                >= DEFAULT_DISK_VOLUME_MIB << 20,
+            "a qcow2 holding at least the volume's free space"
+        );
+        assert!(
+            created_len < 64 << 20,
+            "holding the fresh filesystem's metadata only, not the whole volume ({created_len} bytes)"
+        );
+        assert!(
+            crate::ext4::fs_uuid(&vol.host).is_some(),
+            "a formatted ext4 sits inside it"
+        );
+        assert!(
+            std::fs::read_dir(dir.join("nested"))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .all(|e| !e.file_name().to_string_lossy().contains("vk-disk-raw")),
+            "the raw scratch file must not be left behind"
+        );
         assert_eq!(
             std::fs::metadata(&vol.host).unwrap().permissions().mode() & 0o777,
             0o600,

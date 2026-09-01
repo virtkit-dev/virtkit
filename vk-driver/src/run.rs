@@ -1497,8 +1497,8 @@ async fn build_and_boot(
     let mut file_bind_links: Vec<(String, String)> = Vec::new();
     // Tags the agent should mount behind a tmpfs-backed overlay (`-v host:guest:overlay`).
     let mut overlay_tags: Vec<String> = Vec::new();
-    // `disk` volumes: a raw virtio-blk device per volume (backing file created and formatted
-    // on first use), named to the guest over the cmdline — see [`crate::units`]'s identical
+    // `disk` volumes: a virtio-blk device per volume (backing file created and formatted on
+    // first use), named to the guest over the cmdline — see [`crate::units`]'s identical
     // handling for a compose sibling's own `disk` volumes.
     let mut disk_devices = String::new();
     for (i, vol) in primary_volumes.iter().chain(&args.volumes).enumerate() {
@@ -1510,7 +1510,10 @@ async fn build_and_boot(
                 disk_devices.push(',');
             }
             disk_devices.push_str(&format!("/dev/{device}:{}", vol.guest));
-            disks.push(crate::vmm::Disk::raw(vol.host.clone(), vol.read_only));
+            disks.push(crate::vmm::Disk::for_image(
+                vol.host.clone(),
+                vol.read_only,
+            )?);
             continue;
         }
         let tag = format!("vol{i}");

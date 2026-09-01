@@ -110,15 +110,37 @@ impl Disk {
         }
     }
 
+    /// Attach a disk volume according to its header: new qcow2 or legacy raw ext4. Honor
+    /// `readonly` and reject `.vk_ro_img` chunk views, which are not disks.
+    pub fn for_image(path: PathBuf, readonly: bool) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let f = std::fs::File::open(&path)
+            .with_context(|| format!("opening disk {}", path.display()))?;
+        let format = match crate::qcow2::sniff_kind(&f) {
+            crate::qcow2::ImageKind::Qcow2 => DiskFormat::Qcow2,
+            crate::qcow2::ImageKind::Raw => DiskFormat::Raw,
+            crate::qcow2::ImageKind::Lazy => {
+                anyhow::bail!("{}: a chunk view is not a disk", path.display())
+            }
+        };
+        Ok(Disk {
+            path,
+            format,
+            readonly,
+            dirty_control_socket: None,
+        })
+    }
+
     /// Enable dirty-block tracking, serving the drain protocol on `socket` (libkrun only).
     pub fn with_dirty_control(mut self, socket: PathBuf) -> Self {
         self.dirty_control_socket = Some(socket);
         self
     }
 
-    /// cloud-hypervisor `--disk` value. qcow2 disks resolve their backing chain
-    /// (overlays/forked stages); a raw disk omits both keys (CH defaults to raw).
-    /// `VkLazyChunks` never reaches here — it is only ever attached under libkrun.
+    /// cloud-hypervisor `--disk` value. A qcow2 disk carries `image_type=qcow2,backing_files=on`
+    /// so CH resolves any backing chain (a root overlay's forked stages); a disk-volume qcow2
+    /// has no chain, and the flag is then a harmless no-op. A raw disk omits both keys (CH
+    /// defaults to raw). `VkLazyChunks` never reaches here — it is only attached under libkrun.
     fn ch_value(&self) -> String {
         let mut v = format!(
             "path={},readonly={}",
@@ -502,6 +524,49 @@ mod tests {
         write("kvm_amd", "1\n");
         assert!(nesting_enabled_in(&root));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Detect new qcow2 and legacy raw volume formats; reject lazy chunk views.
+    #[test]
+    fn for_image_attaches_by_sniffed_format_and_refuses_a_chunk_view() {
+        let dir = std::env::temp_dir().join(format!("vk-for-image-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Raw ext4 has no leading magic because its superblock starts at offset 1024. Attach
+        // it without Cloud Hypervisor image-type or backing-file keys for compatibility.
+        let raw = dir.join("old.ext4");
+        std::fs::write(&raw, [0u8; 4096]).unwrap();
+        let d = Disk::for_image(raw, false).unwrap();
+        assert!(d.format == DiskFormat::Raw, "a zero-magic file is raw");
+        assert!(!d.ch_value().contains("image_type"), "{}", d.ch_value());
+
+        // A new volume sniffs as qcow2 and takes the Cloud Hypervisor qcow2 path. It has no
+        // backing chain, so backing_files=on is a no-op.
+        let q = dir.join("vol.qcow2");
+        crate::qcow2::Qcow2Writer::create(&q, 1 << 20, 0o600)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let d = Disk::for_image(q, true).unwrap();
+        assert!(d.format == DiskFormat::Qcow2, "the qcow2 magic is qcow2");
+        assert!(
+            d.ch_value().contains("image_type=qcow2,backing_files=on"),
+            "{}",
+            d.ch_value()
+        );
+
+        // A lazy manifest is a chunk view, not a disk, and must not fall back to raw.
+        let lazy = dir.join("view.vk_ro_img");
+        let mut bytes = crate::registry::VK_RO_IMG_MAGIC.to_vec();
+        bytes.extend_from_slice(&[0u8; 64]);
+        std::fs::write(&lazy, bytes).unwrap();
+        let err = Disk::for_image(lazy, false)
+            .err()
+            .expect("a chunk view is refused");
+        assert!(format!("{err:#}").contains("not a disk"), "{err:#}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

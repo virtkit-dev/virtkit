@@ -2544,8 +2544,9 @@ mod tests {
         let uuid = [0x42u8; 16];
 
         let img = base.join("fs.qcow2");
-        let mut w = crate::qcow2::Qcow2Writer::create(&img, std::fs::metadata(&raw).unwrap().len())
-            .unwrap();
+        let mut w =
+            crate::qcow2::Qcow2Writer::create(&img, std::fs::metadata(&raw).unwrap().len(), 0o600)
+                .unwrap();
         w.import_raw(&raw).unwrap();
         normalize_superblock_in(&mut w, "fs.qcow2").unwrap();
         set_uuid_in(&mut w, "fs.qcow2", &uuid).unwrap();

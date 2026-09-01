@@ -2515,7 +2515,7 @@ impl Executor for MicroVm {
             ImageFormat::Qcow2 => {
                 // Write either source into fresh qcow2 clusters: decode cached chunks on
                 // every core, or read through the overlay chain.
-                let mut w = crate::qcow2::Qcow2Writer::create(out, q.virtual_size())?;
+                let mut w = crate::qcow2::Qcow2Writer::create(out, q.virtual_size(), 0o666)?;
                 if let Some(view) = q.empty_lazy_backing()? {
                     crate::qcow2::materialize_lazy_into(&view, &mut w).with_context(|| {
                         format!("exporting {} -> {}", view.display(), out.display())
@@ -3138,7 +3138,7 @@ impl Executor for Host {
                 let raw = out.with_extension("raw.tmp");
                 crate::ext4::build_from_dir(&dir, &raw)?;
                 let size = std::fs::metadata(&raw)?.len();
-                let mut w = crate::qcow2::Qcow2Writer::create(out, size)?;
+                let mut w = crate::qcow2::Qcow2Writer::create(out, size, 0o666)?;
                 let imported = w.import_raw(&raw);
                 let _ = std::fs::remove_file(&raw);
                 imported?;

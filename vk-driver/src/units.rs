@@ -482,13 +482,13 @@ pub fn boot_unit(
     // vda is the unit's own overlay disk, pushed below — so a disk volume's device is its
     // 1-based position here, exactly as `crate::build::vd_name`'s own Vec-position naming
     // resolves it.
-    let disks: Vec<crate::vmm::Disk> = std::iter::once(crate::vmm::Disk::overlay(overlay))
+    let disks: Vec<crate::vmm::Disk> = std::iter::once(Ok(crate::vmm::Disk::overlay(overlay)))
         .chain(
             disk_volumes
                 .iter()
-                .map(|vol| crate::vmm::Disk::raw(vol.host.clone(), vol.read_only)),
+                .map(|vol| crate::vmm::Disk::for_image(vol.host.clone(), vol.read_only)),
         )
-        .collect();
+        .collect::<Result<_>>()?;
     let disk_devices: String = disk_volumes
         .iter()
         .enumerate()

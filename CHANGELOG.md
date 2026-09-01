@@ -8,6 +8,9 @@ All notable changes to virtkit will be documented in this file.
 
 - Images stored for a run occupy space in proportion to their contents instead of exposing
   the full filesystem size. `vk build --out` remains unchanged.
+- New `disk` volumes store only the formatted filesystem at first and grow as the guest
+  writes instead of consuming their full declared size up front. Raw volumes created by
+  older vk versions remain compatible.
 
 ### Fixed
 

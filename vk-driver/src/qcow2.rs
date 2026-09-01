@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -476,17 +476,19 @@ impl Qcow2Writer {
     /// 16-bit refcounts (refcount_order 4): entries per refcount block.
     const RC_PER_BLOCK: u64 = Self::CS / 2;
 
-    /// Create `path` as an image of `virtual_size` bytes with nothing allocated yet. The
-    /// path must not already exist (`create_new`): callers clear a leftover export tmp
-    /// first, so a surviving one — or a symlink planted at the path — is an error, not a
-    /// target to follow.
-    pub fn create(path: &Path, virtual_size: u64) -> Result<Self> {
+    /// Create `path` as an image of `virtual_size` bytes with nothing allocated yet, its
+    /// permission bits `mode` (masked by umask, as any creation is). The path must not already
+    /// exist (`create_new`): callers clear a leftover export tmp first, so a surviving one — or
+    /// a symlink planted at the path — is an error, not a target to follow. Creating with the
+    /// mode rather than a later chmod leaves no window in which a disk volume is world-readable.
+    pub fn create(path: &Path, virtual_size: u64, mode: u32) -> Result<Self> {
         let l1_size = virtual_size.div_ceil(Self::CS * Self::L2_ENTRIES).max(1);
         let l1_clusters = (l1_size * 8).div_ceil(Self::CS);
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
+            .mode(mode)
             .open(path)
             .with_context(|| format!("creating {}", path.display()))?;
         // Cluster 0 is the header, 1 the refcount table, then the L1 table; data follows.
@@ -2045,7 +2047,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let vsize = 3u64 << 20;
         let img = dir.join("w.qcow2");
-        let mut w = Qcow2Writer::create(&img, vsize).unwrap();
+        let mut w = Qcow2Writer::create(&img, vsize, 0o600).unwrap();
         let mut want = vec![0u8; vsize as usize];
         let mut put = |w: &mut Qcow2Writer, off: usize, data: &[u8]| {
             w.write_at(off as u64, data).unwrap();
@@ -2091,7 +2093,7 @@ mod tests {
         f.write_all_at(&[0x22; 70000], 65536 * 10).unwrap();
         drop(f);
         let img2 = dir.join("i.qcow2");
-        let mut w = Qcow2Writer::create(&img2, vsize).unwrap();
+        let mut w = Qcow2Writer::create(&img2, vsize, 0o600).unwrap();
         w.import_raw(&raw).unwrap();
         assert_eq!(
             std::fs::metadata(&img2).unwrap().len(),
