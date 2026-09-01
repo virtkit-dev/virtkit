@@ -3,8 +3,7 @@ use crate::framing::{DeSink, SerStream, wrap_stream};
 use anyhow::{Context, anyhow, bail};
 use listenfd::ListenFd;
 use log::{debug, info};
-use std::os::fd::RawFd;
-use std::os::unix::prelude::FromRawFd;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
@@ -431,6 +430,40 @@ impl RawListener {
             RawListener::Vsock(l) => RawConn::Vsock(l.accept().await?.0),
         })
     }
+
+    /// Return the bound socket's descriptor for transfer across fork/exec.
+    ///
+    /// The socket remains bound and listening throughout the transfer.
+    pub fn as_raw_fd(&self) -> RawFd {
+        use std::os::fd::AsRawFd;
+        match self {
+            RawListener::Tcp(l) => l.as_raw_fd(),
+            RawListener::Unix(l) => l.as_raw_fd(),
+            RawListener::Vsock(l) => l.as_raw_fd(),
+        }
+    }
+
+    /// Adopt a listening descriptor inherited from a parent process.
+    ///
+    /// `bound` selects the socket type because the descriptor has no variant label.
+    /// [`OwnedFd`] transfers ownership on success and error, avoiding an ambiguous cleanup
+    /// contract and possible double-close. The caller must verify that the descriptor is a
+    /// listening socket of the expected family.
+    pub fn adopt(bound: &SocketAddr, fd: OwnedFd) -> Result<Self, anyhow::Error> {
+        Ok(match bound {
+            SocketAddr::Tcp(_) => {
+                let l = std::net::TcpListener::from(fd);
+                l.set_nonblocking(true).context("adopted tcp listener")?;
+                RawListener::Tcp(TcpListener::from_std(l)?)
+            }
+            SocketAddr::Unix(_) => {
+                let l = std::os::unix::net::UnixListener::from(fd);
+                l.set_nonblocking(true).context("adopted unix listener")?;
+                RawListener::Unix(UnixListener::from_std(l)?)
+            }
+            other => bail!("cannot adopt an inherited listener for {other}"),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -443,6 +476,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// `dup` stands in for fork: the address remains bound while ownership changes.
+    #[tokio::test]
+    async fn an_inherited_listener_is_adopted_still_bound() {
+        let listener = raw_listen(&"tcp://127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let RawListener::Tcp(ref l) = listener else {
+            panic!("expected a tcp listener")
+        };
+        let bound: SocketAddr = format!("tcp://{}", l.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        // SAFETY: dup returns a new descriptor for the same listening socket.
+        let dup = unsafe { libc::dup(listener.as_raw_fd()) };
+        assert!(dup >= 0, "dup: {}", std::io::Error::last_os_error());
+        drop(listener);
+
+        // SAFETY: `dup` is a fresh descriptor that nothing else owns.
+        let dup = unsafe { OwnedFd::from_raw_fd(dup) };
+        let adopted = RawListener::adopt(&bound, dup).unwrap();
+        let client = tokio::spawn(async move { raw_connect(&bound).await });
+        adopted
+            .accept()
+            .await
+            .expect("the adopted listener accepts");
+        client.await.unwrap().expect("the address stayed bound");
+    }
+
+    /// Reject vsock because `bound` is the only available socket-type label.
+    #[test]
+    fn adopting_refuses_an_address_it_cannot_label() {
+        // SAFETY: `adopt` rejects the address without using the owned descriptor, then
+        // closes it normally.
+        let fd = std::fs::File::open("/dev/null").unwrap().into();
+        let Err(err) = RawListener::adopt(&"vsock://443".parse().unwrap(), fd) else {
+            panic!("a vsock address must not be adoptable");
+        };
+        assert!(format!("{err:#}").contains("cannot adopt"), "{err:#}");
     }
 
     /// Binding a socket must not change how *other* work in the process creates files.
