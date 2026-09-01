@@ -590,11 +590,10 @@ pub struct MicroVm {
     last_saved_key: HashMap<String, String>,
 }
 
-/// What `cache_save` chunks + uploads in the background. The thread returns the pushed
-/// layer list + total size (so the next instruction diffs against it in memory) paired with
-/// the snapshot's manifest digest (recorded so a `FROM <stage>` child pins it) — `None` for
-/// a full push, which has no chainable layers.
-type PushOutput = Result<Option<((Vec<oci_client::manifest::OciDescriptor>, u64), String)>>;
+/// A background cache push's layers, total size, and manifest digest. The next instruction
+/// diffs against the layers in memory; a `FROM <stage>` child pins the digest. Full pushes
+/// also return layers because `push_ext4_diff` re-chunks the whole image.
+type PushOutput = Result<((Vec<oci_client::manifest::OciDescriptor>, u64), String)>;
 
 /// A checkpoint prepared under a freeze: the stable snapshot to push, the written extents to
 /// read and push as data, the discarded extents to represent as holes, and the image's virtual
@@ -1711,10 +1710,7 @@ impl MicroVm {
         ) {
             Ok((layers, total, digest)) => {
                 self.parent_layers = Some((layers, total));
-                self.stage_last_digest
-                    .lock()
-                    .unwrap()
-                    .insert(fs.label.clone(), digest.clone());
+                self.record_stage_digest(&fs.label, &digest);
                 self.parent_digest = Some(digest);
                 // Verify what actually got cached (parent + this delta), not just the frozen
                 // source — an incomplete delta reassembles to a corrupt ext4 that the source
@@ -1751,17 +1747,11 @@ impl MicroVm {
             return;
         };
         match inf.handle.join().expect("cache push thread panicked") {
-            Ok(out) => match out {
-                Some((layers, digest)) => {
-                    self.parent_layers = Some(layers);
-                    self.stage_last_digest
-                        .lock()
-                        .unwrap()
-                        .insert(label.to_string(), digest.clone());
-                    self.parent_digest = Some(digest);
-                }
-                None => self.parent_layers = None,
-            },
+            Ok((layers, digest)) => {
+                self.parent_layers = Some(layers);
+                self.record_stage_digest(label, &digest);
+                self.parent_digest = Some(digest);
+            }
             Err(e) => {
                 eprintln!("virtkit: build async push failed ({e:#}) — not cached");
                 self.parent_layers = None;
@@ -1783,17 +1773,19 @@ impl MicroVm {
             return;
         };
         match inf.handle.join().expect("cache push thread panicked") {
-            Ok(out) => {
-                if let Some((_, digest)) = out {
-                    self.stage_last_digest
-                        .lock()
-                        .unwrap()
-                        .insert(label.to_string(), digest);
-                }
-            }
+            Ok((_, digest)) => self.record_stage_digest(label, &digest),
             Err(e) => eprintln!("virtkit: build async push failed ({e:#}) — not cached"),
         }
         let _ = std::fs::remove_file(&inf.snap);
+    }
+
+    /// Record `digest` as the cache parent for a `FROM <stage>` fork of `label`.
+    /// Centralize writes because the map is shared across workers.
+    fn record_stage_digest(&self, label: &str, digest: &str) {
+        self.stage_last_digest
+            .lock()
+            .unwrap()
+            .insert(label.to_string(), digest.to_string());
     }
 }
 
@@ -2541,7 +2533,7 @@ impl Executor for MicroVm {
                     &parent_layers,
                 )?;
                 timings.probe("cache.push", t.elapsed());
-                Ok(Some(((layers, total), digest)))
+                Ok(((layers, total), digest))
             });
             self.inflight = Some(PushInflight { handle, snap });
             return Ok(());
@@ -2611,7 +2603,7 @@ impl Executor for MicroVm {
                 &parent_layers,
             )?;
             timings.probe("cache.push", t.elapsed());
-            Ok(Some(((layers, total), digest)))
+            Ok(((layers, total), digest))
         });
         self.inflight = Some(PushInflight { handle, snap });
         Ok(())
