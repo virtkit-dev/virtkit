@@ -554,9 +554,10 @@ pub struct MicroVm {
     /// monotonic counter for unique per-instruction snapshot filenames (several may exist
     /// at once: the live one plus the in-flight push's).
     push_seq: u64,
-    /// stage label → the immutable manifest digest of its last pushed snapshot (its committed
-    /// image). A `FROM <stage>` fork pins this so its first diff push reuses that stage's
-    /// exact chunks regardless of concurrent tag clobbering on the mutable cache-key tag.
+    /// stage label → immutable digest for the image the stage currently presents: its last
+    /// pushed snapshot, or its restored or base image before the next push. Removed after a
+    /// failed publish. A `FROM <stage>` fork pins it to reuse exact chunks despite concurrent
+    /// updates to the mutable cache-key tag.
     /// Shared across workers (same happens-before as `images`).
     stage_last_digest: Arc<Mutex<HashMap<String, String>>>,
     /// the previous diff push's layer list (+ total size), kept in memory so the next
@@ -1945,6 +1946,12 @@ impl Executor for MicroVm {
         // whose cache key + digest seed this stage's snapshot lineage.
         let (ext4, digest) = self.materialize_image(stage, image)?;
         self.wrap_base(stage, &ext4)?;
+        // A cached base is already published. Record it so a stage with no instructions can
+        // still provide a pinned parent to a `FROM <stage>` fork instead of forcing a full
+        // re-chunk.
+        if let Some(d) = &digest {
+            self.record_stage_digest(stage, d);
+        }
         self.parent_digest = digest;
         self.parent_layers = None;
         Ok(Rootfs {
@@ -2446,13 +2453,18 @@ impl Executor for MicroVm {
             (ext4, digest)
         };
         self.wrap_base(&fs.label, &base)?;
+        // Record the restored digest under the stage label; `parent_for_push` only checks this
+        // map. Restores are byte-exact and forks write to their own overlays, so these chunks
+        // exactly back the child's first diff.
+        self.record_stage_digest(&fs.label, &digest);
         // the restored snapshot is the parent the next save diffs against — pin its digest.
         self.parent_digest = Some(digest);
         Ok(())
     }
     fn cache_save(&mut self, fs: &Rootfs, key: &str) -> Result<()> {
-        // Don't cache a non-cacheable key (a `--disk` stage): a later build restoring it
-        // would skip the disk-writing RUNs.
+        // Don't cache a `--disk` key: restoring it would skip disk-writing RUNs. The stage map
+        // may retain an older digest, which is safe because `--disk` only marks target-stage
+        // keys and the target is last in build order, so nothing forks it.
         if self.uncacheable_keys.contains(key) {
             return Ok(());
         }

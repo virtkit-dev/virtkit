@@ -10,6 +10,8 @@ All notable changes to virtkit will be documented in this file.
   stale data.
 - Concurrent stages built from the same parent no longer race with its cache upload and
   later restore an image that was never built.
+- Forking a cache-restored stage no longer makes the first build after an edit spend over
+  a minute in `flushing cache`; it now finishes in seconds.
 
 ## [0.46.0] - 2026-09-01
 
