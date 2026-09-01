@@ -834,6 +834,37 @@ fn merge_dirty(base: DirtySet, newer: DirtySet) -> DirtySet {
     (written, discarded)
 }
 
+/// Build a shutdown delta from the finished image's extents (`data`/`zero`), the pinned
+/// parent's extents (`prev`), and the drained dirty log (`written`/`discarded`). The result
+/// contains live written clusters as data and freed clusters as holes. `Err(missed)` identifies
+/// allocations absent from the log; the caller must republish the whole image because the delta
+/// cannot describe those writes.
+///
+/// `dirty` is `written ∩ data`; zero extents add nothing because this path has no carried
+/// writes. A cluster written and then freed is `discarded`, so it becomes a hole that clears
+/// stale parent bytes. Subtracting `dirty` from the holes keeps the sets disjoint as
+/// `push_ext4_diff` requires.
+fn cleanup_delta(
+    data: &[(u64, u64)],
+    zero: &[(u64, u64)],
+    prev: &[(u64, u64)],
+    written: &[(u64, u64)],
+    discarded: &[(u64, u64)],
+) -> std::result::Result<DirtySet, Vec<(u64, u64)>> {
+    // Every cluster the image allocated since the parent must appear in the drained set: a
+    // write cannot reach the disk without allocating its cluster. One that does not is a
+    // write the log dropped, and a delta built from it would cache bytes the image lacks.
+    let cumulative = coalesce_ranges([data.to_vec(), zero.to_vec()].concat());
+    let touched = coalesce_ranges([written.to_vec(), discarded.to_vec()].concat());
+    let missed = subtract_ranges(&subtract_ranges(&cumulative, prev), &touched);
+    if !missed.is_empty() {
+        return Err(missed);
+    }
+    let dirty = intersect_ranges(written, data);
+    let holes = subtract_ranges(discarded, &dirty);
+    Ok((dirty, holes))
+}
+
 /// The Linux disk name for the `n`th virtio-blk device (0 = `vda`, 25 = `vdz`,
 /// 26 = `vdaa`, …) — matches the kernel's `disk_name` enumeration order.
 pub(crate) fn vd_name(n: usize) -> String {
@@ -1762,6 +1793,52 @@ impl MicroVm {
             }
         }
         Ok(())
+    }
+
+    /// Re-push `key` from the finished image using only the guest shutdown's changes. `drained`
+    /// contains the block device's dirty log since the last checkpoint, after all RUNs have
+    /// finished and `cleanup` has quiesced the guest.
+    ///
+    /// Returns `false` when the log omits a newly allocated cluster, requiring the caller to
+    /// republish everything the stage holds.
+    fn repush_cleanup_delta(&mut self, fs: &Rootfs, key: &str, drained: DirtySet) -> Result<bool> {
+        let Some(rg) = self.cache.clone() else {
+            return Ok(false);
+        };
+        if self.uncacheable_keys.contains(key) {
+            return Ok(false);
+        }
+        let img = self.stage_image(fs)?;
+        let (data, zero, total_size) = {
+            let mut q = crate::qcow2::Qcow2::open(&img)?;
+            let (data, zero) = q.own_extents()?;
+            (data, zero, q.virtual_size())
+        };
+        let (written, discarded) = drained;
+        // Apply the same guard as a mid-stage checkpoint: the log must cover every cluster
+        // allocated since the pinned parent. `stage_prev_extents` records that parent's extents
+        // when its checkpoint is published.
+        let prev = self
+            .stage_prev_extents
+            .get(&fs.label)
+            .cloned()
+            .unwrap_or_default();
+        let (dirty, holes) = match cleanup_delta(&data, &zero, &prev, &written, &discarded) {
+            Ok(delta) => delta,
+            Err(missed) => {
+                let bytes: u64 = missed.iter().map(|&(_, l)| l).sum();
+                eprintln!(
+                    "virtkit: build: the guest's shutdown left {bytes} bytes the block \
+                         device's dirty set does not report — re-pushing {key}'s whole image"
+                );
+                return Ok(false);
+            }
+        };
+        let boot_kind =
+            crate::image::boot_kind_tag(crate::image::BootKind::GenericDisk).to_string();
+        self.verify_snapshot(&img, &format!("snapshot of {key} (before upload)"))?;
+        self.push_snapshot_sync(&rg, fs, key, &boot_kind, &img, &dirty, &holes, total_size)?;
+        Ok(true)
     }
 
     /// Join the previous in-flight push (if any) and adopt its result as the parent for the
@@ -2734,11 +2811,27 @@ impl Executor for MicroVm {
         if let Some(inf) = self.inflight.take() {
             self.pending.insert(fs.label.clone(), inf);
         }
-        // Shut the stage's guest down cleanly; its writes are already in the stage image
-        // (the booted disk), so later stages / the export see them with no commit step.
-        if let Some(session) = self.session.take() {
+        // The booted disk is the stage image, so shutdown writes need no commit step. Run the
+        // guest shutdown steps while the VM is alive, then drain the dirty log. Because `cleanup`
+        // is the last image mutation, the log isolates its changes without scanning the whole
+        // image. Nothing runs after quiescence, so the drain needs no additional freeze.
+        let mut drained_dirty = None;
+        if let Some(mut session) = self.session.take() {
             self.record_stage_mem(&fs.label, &session);
             let t_fin = std::time::Instant::now();
+            block_on(session.quiesce_for_shutdown());
+            if cleanup_changes_image && session.supports_dirty() {
+                drained_dirty = session
+                    .drain_dirty()
+                    .inspect_err(|e| {
+                        // Only costs a whole-image re-push below, so report and carry on.
+                        eprintln!(
+                            "virtkit: build: could not read what the guest's shutdown changed \
+                             ({e:#}) — re-pushing this stage's whole image"
+                        )
+                    })
+                    .ok();
+            }
             block_on(session.finish())?;
             self.timings.probe("stage.finish", t_fin.elapsed());
         }
@@ -2763,12 +2856,22 @@ impl Executor for MicroVm {
                 .unwrap()
                 .get(&fs.label)
                 .cloned();
-            if pushed.is_some() {
-                self.parent_digest = pushed;
+            let replacing = pushed.is_some();
+            if let Some(digest) = pushed {
+                self.parent_digest = Some(digest);
             }
-            // The guest is gone, so `cache_save` takes its static-image path: the whole stage
-            // image, deduped against the parent chain, pushed synchronously.
-            self.cache_save(fs, key)?;
+            let t_repush = std::time::Instant::now();
+            // The drained set is a delta against the mid-stage push, so use it only while that
+            // push is pinned as the parent. Otherwise, or if the set is incomplete, `cache_save`
+            // republishes the stage's full contents against the available parent.
+            let published = match drained_dirty.filter(|_| replacing) {
+                Some(delta) => self.repush_cleanup_delta(fs, key, delta)?,
+                None => false,
+            };
+            if !published {
+                self.cache_save(fs, key)?;
+            }
+            self.timings.probe("cache.repush", t_repush.elapsed());
         }
         self.last_saved_key.remove(&fs.label);
         if let Some(tmp) = self.tmp_disk.take() {
@@ -3157,6 +3260,37 @@ mod tests {
         let base = (vec![], vec![(0, cl)]);
         let newer = (vec![(0, cl)], vec![]);
         assert_eq!(merge_dirty(base, newer), (vec![(0, cl)], vec![]));
+    }
+
+    #[test]
+    fn cleanup_delta_splits_writes_and_frees() {
+        let cl = 65536u64;
+        // The parent held clusters 0-1. Shutdown wrote cluster 2, then wrote and freed cluster 3.
+        let data = vec![(0, 3 * cl)]; // clusters 0,1,2 hold bytes
+        let zero = vec![(3 * cl, cl)]; // cluster 3 is an explicit hole
+        let prev = vec![(0, 2 * cl)]; // parent had 0,1
+        let written = vec![(2 * cl, cl)];
+        let discarded = vec![(3 * cl, cl)];
+        let (dirty, holes) = cleanup_delta(&data, &zero, &prev, &written, &discarded).unwrap();
+        // Cluster 2 is data; freed cluster 3 is a hole.
+        assert_eq!(dirty, vec![(2 * cl, cl)]);
+        assert_eq!(holes, vec![(3 * cl, cl)]);
+    }
+
+    #[test]
+    fn cleanup_delta_falls_back_on_an_unreported_allocation() {
+        let cl = 65536u64;
+        // The image allocated cluster 2, but the dirty log omits its write. Report the cluster
+        // so the caller republishes the whole image.
+        let data = vec![(0, 3 * cl)];
+        let zero = vec![];
+        let prev = vec![(0, 2 * cl)];
+        let written = vec![];
+        let discarded = vec![];
+        assert_eq!(
+            cleanup_delta(&data, &zero, &prev, &written, &discarded),
+            Err(vec![(2 * cl, cl)])
+        );
     }
 
     #[test]

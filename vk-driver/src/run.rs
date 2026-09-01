@@ -3276,6 +3276,9 @@ pub(crate) struct VmSession {
     /// a RUN still executing in this guest is interrupted rather than run to completion.
     /// `None` outside the parallel build (a plain `vk run`).
     cancel: Option<CancellationToken>,
+    /// Whether the guest shutdown steps have run, preventing [`Self::finish`] from repeating
+    /// work performed by an earlier [`Self::quiesce_for_shutdown`] call.
+    shutdown_quiesced: bool,
 }
 
 /// Guest mountpoint of the build-context virtiofs share (for `COPY` from the context).
@@ -3680,6 +3683,7 @@ pub(crate) async fn boot_session(
         scratch_dev,
         dirty_socket,
         cancel,
+        shutdown_quiesced: false,
     })
 }
 
@@ -3873,6 +3877,43 @@ impl VmSession {
         }
     }
 
+    /// Run the guest shutdown steps without stopping the VM: remove agent-created mountpoints
+    /// and stubs, quiesce, and flush the block device to the host image. [`Self::finish`] calls
+    /// this before killing the VM. The build calls it earlier when it must drain the dirty log
+    /// after `cleanup`. Guest steps run only once.
+    pub(crate) async fn quiesce_for_shutdown(&mut self) {
+        if !self.shutdown_quiesced {
+            // Native `cleanup` removes agent-created mountpoints and stubs, then quiesces even a
+            // shell-less `FROM scratch` stage. Older agents fall back to native fsfreeze, then
+            // shell `sync`. The guest is killed next, so no thaw is needed.
+            let cleaned = self.guest_ok(&[GUEST_AGENT, "cleanup"]).await;
+            if !cleaned {
+                // Without `cleanup`, the image can retain agent-created mountpoints, stubs, and
+                // their record; a later build would treat that record as its own. Report this so
+                // the stage is not mistaken for a clean one.
+                eprintln!(
+                    "virtkit: the guest's cleanup step did not run — an image committed from \
+                     this guest may keep the agent's ephemeral mountpoints"
+                );
+            }
+            let quiesced = cleaned || self.guest_ok(&[GUEST_AGENT, "fsfreeze", "-f", "/"]).await;
+            if !quiesced {
+                let _ = crate::executor::exec_script(
+                    &self.addr,
+                    &["sync".to_string()],
+                    Vec::new(),
+                    None,
+                    &crate::executor::OutputSink::Inherit,
+                    None,
+                )
+                .await;
+            }
+            self.shutdown_quiesced = true;
+        }
+        // Always flush to make writes durable before the kill; repeated flushes are cheap.
+        self.flush_disk();
+    }
+
     /// Shut the guest down and reclaim the VM. The stage image is the booted disk, so its writes
     /// are already persisted in place — there is nothing to commit, only to make durable before
     /// the kill.
@@ -3884,34 +3925,7 @@ impl VmSession {
     /// makes it durable first. cloud-hypervisor writes through and a plain run discards its image,
     /// so both have no control socket and the flush is a no-op.
     pub(crate) async fn finish(mut self) -> Result<()> {
-        // `cleanup` removes the agent-created ephemeral mountpoints/stubs (so they do not litter
-        // the image) and then quiesces — all native, so it works on a shell-less `FROM scratch`
-        // stage. Fall back to a native fsfreeze, then a shell `sync`, if an older agent lacks
-        // cleanup. The guest is killed right after, so no thaw is needed.
-        let cleaned = self.guest_ok(&[GUEST_AGENT, "cleanup"]).await;
-        if !cleaned {
-            // `cleanup` is what drops the agent-created mountpoints and stubs, and the in-image
-            // record naming them, so an image committed from this guest can keep both — and a
-            // build on top of it would then read that record as its own. Silence here is what
-            // used to make that indistinguishable from a clean stage.
-            eprintln!(
-                "virtkit: the guest's cleanup step did not run — an image committed from this \
-                 guest may keep the agent's ephemeral mountpoints"
-            );
-        }
-        let quiesced = cleaned || self.guest_ok(&[GUEST_AGENT, "fsfreeze", "-f", "/"]).await;
-        if !quiesced {
-            let _ = crate::executor::exec_script(
-                &self.addr,
-                &["sync".to_string()],
-                Vec::new(),
-                None,
-                &crate::executor::OutputSink::Inherit,
-                None,
-            )
-            .await;
-        }
-        self.flush_disk();
+        self.quiesce_for_shutdown().await;
         let _ = self.ch.kill();
         let _ = self.ch.wait();
         // The switch is stopped rather than killed, for the same reason a run stops its own:

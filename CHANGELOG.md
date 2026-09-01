@@ -18,6 +18,8 @@ All notable changes to virtkit will be documented in this file.
 - Committing a stage to the cache and exporting it now cost what the stage holds rather
   than what its disk could hold: once the guest has trimmed its filesystem, a stage holding
   30 MiB on a 32 GiB disk no longer walks 32 GiB.
+- Cache publication after guest shutdown now carries only the shutdown's changes instead of
+  rescanning the stage. A stage that wrote 800 MiB publishes in 0.3s instead of 14s.
 
 ## [0.46.0] - 2026-09-01
 
