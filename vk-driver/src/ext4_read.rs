@@ -5,11 +5,15 @@
 //! blocks, 256-byte inodes, extents, linear `filetype` directories, fast
 //! symlinks) and errors out cleanly on anything else, rather than being a
 //! general-purpose ext4 parser.
+//!
+//! The reader accepts a raw filesystem or one inside an exported qcow2 root or unit
+//! image. It detects the format and reads through the qcow2 layer when needed.
 
 // This module provides a self-contained reader API; it is exercised by its own
 // tests and consumed by callers wiring it into commands.
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
@@ -83,10 +87,34 @@ impl InodeInfo {
 }
 
 pub struct Ext4Reader {
-    file: std::fs::File,
+    source: Source,
     inodes_per_group: u32,
     /// Physical block of each group's inode table (`bg_inode_table_lo`).
     inode_tables: Vec<u64>,
+}
+
+/// Filesystem source. `Qcow2::read_at` requires `&mut self` to cache L2 tables, while
+/// the reader API takes `&self`, so qcow2 uses interior mutability.
+enum Source {
+    Raw(std::fs::File),
+    Qcow2(RefCell<crate::qcow2::Qcow2>),
+}
+
+impl Source {
+    fn read_exact_at(&self, buf: &mut [u8], off: u64) -> Result<()> {
+        match self {
+            Source::Raw(f) => Ok(f.read_exact_at(buf, off)?),
+            Source::Qcow2(q) => q.borrow_mut().read_at(off, buf),
+        }
+    }
+
+    /// Logical image size: the raw file's length or the qcow2's virtual size.
+    fn len(&self) -> Result<u64> {
+        match self {
+            Source::Raw(f) => Ok(f.metadata().context("stat image for size check")?.len()),
+            Source::Qcow2(q) => Ok(q.borrow().virtual_size()),
+        }
+    }
 }
 
 fn rd16(b: &[u8], o: usize) -> u16 {
@@ -103,9 +131,18 @@ impl Ext4Reader {
     pub fn open(path: &Path) -> Result<Self> {
         let file =
             std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        // A `.vk_ro_img` is a lazy chunk manifest, not a filesystem. Treating it as raw
+        // lets the ext4 magic check reject it like any other non-ext4 input.
+        let source = match crate::qcow2::sniff_kind(&file) {
+            crate::qcow2::ImageKind::Qcow2 => {
+                Source::Qcow2(RefCell::new(crate::qcow2::Qcow2::open(path)?))
+            }
+            crate::qcow2::ImageKind::Raw | crate::qcow2::ImageKind::Lazy => Source::Raw(file),
+        };
 
         let mut sb = [0u8; 1024];
-        file.read_exact_at(&mut sb, SB_OFFSET)
+        source
+            .read_exact_at(&mut sb, SB_OFFSET)
             .with_context(|| format!("reading superblock of {}", path.display()))?;
 
         if rd16(&sb, 0x38) != EXT4_MAGIC {
@@ -142,21 +179,22 @@ impl Ext4Reader {
         // s_first_data_block is 0 and the descriptors follow the superblock's block).
         // Descriptors are 32 bytes (no 64bit feature).
         let mut gdt = vec![0u8; (groups * 32) as usize];
-        file.read_exact_at(&mut gdt, BLOCK)
+        source
+            .read_exact_at(&mut gdt, BLOCK)
             .with_context(|| format!("reading group descriptors of {}", path.display()))?;
         let inode_tables: Vec<u64> = (0..groups as usize)
             .map(|g| rd32(&gdt, g * 32 + 0x08) as u64)
             .collect();
 
         Ok(Ext4Reader {
-            file,
+            source,
             inodes_per_group,
             inode_tables,
         })
     }
 
     fn read_block(&self, blk: u64, buf: &mut [u8; BLOCK as usize]) -> Result<()> {
-        self.file
+        self.source
             .read_exact_at(buf, blk * BLOCK)
             .with_context(|| format!("reading block {blk}"))?;
         Ok(())
@@ -179,7 +217,7 @@ impl Ext4Reader {
     fn read_inode(&self, n: u32) -> Result<InodeInfo> {
         let off = self.inode_offset(n)?;
         let mut raw = [0u8; INODE_SIZE as usize];
-        self.file
+        self.source
             .read_exact_at(&mut raw, off)
             .with_context(|| format!("reading inode {n}"))?;
 
@@ -262,13 +300,10 @@ impl Ext4Reader {
     }
 
     fn read_inode_data(&self, info: &InodeInfo) -> Result<Vec<u8>> {
-        // A file cannot be larger than the image that holds it; reject a corrupt
-        // `i_size` before allocating so it can't request gigabytes.
-        let image_len = self
-            .file
-            .metadata()
-            .context("stat image for size check")?
-            .len();
+        // Reject a corrupt `i_size` larger than the logical image before it can request a
+        // gigabyte-scale allocation. For qcow2, use the virtual size rather than the
+        // smaller host file; this bound is only as tight as the run-controlled geometry.
+        let image_len = self.source.len()?;
         if info.size > image_len {
             bail!("inode size {} exceeds image size {image_len}", info.size);
         }
@@ -649,5 +684,33 @@ mod tests {
             .unwrap();
         drop(f);
         assert!(Ext4Reader::open(&img).is_err());
+    }
+
+    #[test]
+    fn open_reads_through_qcow2() {
+        // Exported root and unit images wrap ext4 in qcow2. Verify that the reader uses
+        // the format layer instead of parsing the qcow2 header as a superblock.
+        let scratch = Scratch::new();
+        let src = scratch.path.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let top = b"hello through qcow2\n";
+        std::fs::write(src.join("top.txt"), top).unwrap();
+        // Cross qcow2 cluster boundaries.
+        let big = pseudo_bytes(300 * 1024);
+        std::fs::write(src.join("big.bin"), &big).unwrap();
+        let raw = scratch.path.join("fs.img");
+        crate::ext4::build_from_dir(&src, &raw).unwrap();
+
+        let qcow = scratch.path.join("fs.qcow2");
+        let size = std::fs::metadata(&raw).unwrap().len();
+        let mut w = crate::qcow2::Qcow2Writer::create(&qcow, size, 0o644).unwrap();
+        w.import_raw(&raw).unwrap();
+        w.finish().unwrap();
+        std::fs::remove_file(&raw).unwrap();
+
+        let r = Ext4Reader::open(&qcow).unwrap();
+        assert_eq!(r.read_file("/top.txt").unwrap(), top);
+        assert_eq!(r.read_file("/big.bin").unwrap(), big);
+        assert_eq!(r.file_type("/top.txt").unwrap(), Some(FileType::Regular));
     }
 }

@@ -9,6 +9,12 @@ All notable changes to virtkit will be documented in this file.
 - `vk list` now shows only the compose services a VM is actually running, not every
   declared one — idle on-demand services drop out of both the NAME column and `--json`.
 
+### Fixed
+
+- Compose services configured with `x-virtkit: { kernel: image }` or `init: image` start
+  again. Since 0.48.0, their space-efficient images were read as plain filesystems, so
+  startup failed with `not an ext4 image (bad magic)`.
+
 ## [0.48.0] - 2026-09-02
 
 ### Added
