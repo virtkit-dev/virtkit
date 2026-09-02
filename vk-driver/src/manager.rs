@@ -438,9 +438,12 @@ mod tests {
                     unit,
                     PathBuf::from(format!("/tier/predicted-{}/runner.ext4", unit.name)),
                     Default::default(),
-                    gw,
-                    24,
-                    slot as u32,
+                    crate::units::Siting {
+                        gateway: gw,
+                        prefix: 24,
+                        slot: slot as u32,
+                        extra_ips: Vec::new(),
+                    },
                 )
                 .unwrap();
                 (svc, PathBuf::from("/run/svc"), unit.clone())

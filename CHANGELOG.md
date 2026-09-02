@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- A guest can have more than one NIC. `x-virtkit: { nics: N }` on a compose service, or
+  `vk run --nics N` for the primary VM, adds `eth1` upward alongside `eth0`, each with its
+  own address on the shared LAN — enough to develop against an appliance that segregates
+  services across interfaces. `eth0` keeps the default route and stays the address a
+  service name resolves to; the extra interfaces are addressed but routeless. Up to 8 per
+  guest. `vk check --feature nics` gates on it.
+
 ### Changed
 
 - Images stored for a run occupy space in proportion to their contents instead of exposing

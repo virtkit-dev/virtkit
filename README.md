@@ -145,6 +145,26 @@ services:
 `--service-cpus NAME=N` and `--service-mem NAME=SIZE` override those values for one run.
 The same marker supports `init` and `kernel` for services that boot their own system.
 
+A guest gets one interface, `eth0`, by default. `nics` gives it more — `eth1` upward, each
+with its own address on the same LAN — for an appliance that assigns services to separate
+interfaces:
+
+```yaml
+services:
+  appliance:
+    image: local/appliance
+    x-virtkit:
+      nics: 3
+```
+
+`vk run --nics N` does the same for the primary VM (it needs `--net`, which `--compose`
+implies). `eth0` keeps the default route and stays the address a service name resolves to;
+the extra interfaces are addressed but given no route, so egress leaves through `eth0`
+unless the guest routes it elsewhere. Every interface is a real port on the LAN: each has
+its own MAC, answers ARP, and can carry its own listening services — which is what an
+appliance separating admin from user traffic needs. Up to 8 per guest;
+`vk check --feature nics` reports whether a `vk` supports them.
+
 Inside the primary guest, `/run/vk/services/<name>/{state,ctl,log}` exposes service
 state, control, and logs through ordinary files. `vk service up|down|status` provides the
 corresponding command interface. `vk run --ssh` enables SSH access for development VMs,

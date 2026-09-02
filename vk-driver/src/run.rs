@@ -218,6 +218,10 @@ pub struct RunArgs {
     /// an explicit flag overrides the service's declaration, like `--init`/`--kernel`.
     pub cpus: Option<u32>,
     pub mem: Option<String>,
+    /// How many NICs the primary VM gets on the run LAN (`vk run --nics`). `None` = a
+    /// `--primary` service's own `x-virtkit.nics`, else one — an explicit flag overrides
+    /// the service's declaration, like `--cpus`/`--mem`. See [`effective_nics`].
+    pub nics: Option<u32>,
     /// Per-service sizing overrides (`--service-cpus`/`--service-mem NAME=VALUE`),
     /// layered over each named compose service's `x-virtkit` declaration.
     pub service_cpus: Vec<(String, u32)>,
@@ -659,6 +663,38 @@ async fn resolve_source(args: &RunArgs) -> Result<Source> {
 /// the executor (`crate::vm`) so one rule decides it on both paths.
 pub(crate) fn effective_nested(requested: bool, primary_marker: bool) -> bool {
     requested || primary_marker
+}
+
+/// How many NICs the VM booted as the primary gets: `vk run --nics`, else the
+/// `x-virtkit.nics` of the unit booting as the primary, else one. Ranked like the sizing
+/// axes — an explicit flag overrides the service's declaration — rather than ORed like
+/// nesting, because a NIC count is a setting with a default and not a capability.
+fn effective_nics(
+    requested: Option<u32>,
+    compose_units: &[crate::compose::Unit],
+    primary_idx: Option<usize>,
+) -> u32 {
+    requested
+        .or_else(|| {
+            primary_idx
+                .and_then(|i| compose_units.get(i))
+                .map(|u| u.nics)
+        })
+        .unwrap_or(1)
+}
+
+/// The `VIRTKIT_NET_EXTRA_IPS` cmdline fragment for the primary's NICs after eth0: each
+/// address as `ip/prefix`, comma-joined in interface order — the spelling `vk-agent` splits
+/// back apart. `None` (no fragment) when eth0 is the only NIC.
+fn net_extra_ips_env(extra_ips: &[std::net::Ipv4Addr], prefix: u8) -> Option<String> {
+    if extra_ips.is_empty() {
+        return None;
+    }
+    let specs: Vec<String> = extra_ips
+        .iter()
+        .map(|ip| format!("{ip}/{prefix}"))
+        .collect();
+    Some(format!(" VIRTKIT_NET_EXTRA_IPS={}", specs.join(",")))
 }
 
 /// The `x-virtkit.nested` of the unit booting as the primary, or `false` when no unit is
@@ -1391,6 +1427,7 @@ async fn build_and_boot(
             &[],
             &[],
             &planned.listen,
+            &planned.primary_extra_ips,
             &hosts,
             &planned.reservations,
             registry_proxy,
@@ -1671,6 +1708,11 @@ async fn build_and_boot(
     let mut vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
     if args.net {
         vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, NET_VSOCK_PORT));
+        // One bridge per NIC after eth0, numbered as the switch bound its ports and as the
+        // guest reads VIRTKIT_NET_EXTRA_IPS: interface i dials NET_VSOCK_PORT + i.
+        for i in 1..=planned.primary_extra_ips.len() as u32 {
+            vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, NET_VSOCK_PORT + i));
+        }
     }
     if ssh.is_some() {
         vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, SSH_AGENT_VSOCK_PORT));
@@ -2047,8 +2089,8 @@ struct PlannedServices {
     /// names to boot eagerly: the profile-enabled set, or the primary's
     /// dependency closure
     start: Vec<String>,
-    /// per-unit switch sockets, each paired with its assigned address and VM id; the socket
-    /// remains available while the unit is down so an on-demand start can join the LAN
+    /// per-NIC switch sockets, available while units are down for on-demand LAN joins; each is
+    /// paired with its assigned address and sibling VM id to enforce source ownership
     listen: Vec<(PathBuf, std::net::Ipv4Addr, u32)>,
     /// alias -> ip for the gateway resolver
     hosts: Vec<(String, String)>,
@@ -2056,6 +2098,10 @@ struct PlannedServices {
     /// its run-assigned IP, so an image-init sibling that DHCPs eth0 lands on the
     /// address the resolver advertises for its name
     reservations: Vec<(String, String)>,
+    /// Addresses for the primary VM's NICs after eth0, in interface order. Allocated here
+    /// because they come from the same LAN-wide region as the siblings' and must not
+    /// collide with them; consumed by the primary boot, not by the manager.
+    primary_extra_ips: Vec<std::net::Ipv4Addr>,
 }
 
 /// The units in `order` a `--compose` selection materializes up front: the primary plus the
@@ -2197,8 +2243,30 @@ fn plan_services(
         listen: Vec::new(),
         hosts: Vec::new(),
         reservations: Vec::new(),
+        primary_extra_ips: Vec::new(),
     };
+    let (gw, prefix, _) = crate::net::switch_addrs(RUN_SUBNET)?;
+    let primary_nics = effective_nics(args.nics, units, primary_idx);
+    // Every NIC is a port on the run's switch, so there is nothing to attach one to without
+    // the LAN. Refuse here rather than booting a guest whose extra interfaces silently never
+    // appear. (`--compose` turns the LAN on by itself, so only a bare `vk run` can hit this.)
+    if primary_nics > 1 && !args.net {
+        bail!("--nics {primary_nics} needs the run LAN: pass --net (or --compose)");
+    }
+    if primary_nics > crate::units::MAX_NICS {
+        bail!(
+            "--nics {primary_nics} exceeds the maximum of {}",
+            crate::units::MAX_NICS
+        );
+    }
     if args.compose.is_none() {
+        // No fleet, so no service slots: the primary's extra NICs take the region's first
+        // addresses.
+        planned.primary_extra_ips = crate::units::ExtraNics::after_slots(0).take(
+            gw,
+            prefix,
+            primary_nics.saturating_sub(1),
+        )?;
         return Ok(planned);
     }
     let order = crate::compose::boot_order(units)?;
@@ -2208,7 +2276,6 @@ fn plan_services(
         Some(idx) => crate::compose::dependency_closure(units, idx),
         None => crate::compose::enabled(units, &args.profiles),
     };
-    let (gw, prefix, _) = crate::net::switch_addrs(RUN_SUBNET)?;
     // Site each sibling (its runtime dir + address slot), excluding the primary (it boots as
     // the run VM, not a sibling). Kept in boot order so the eager `start` list and slot/IP
     // assignment stay stable.
@@ -2232,13 +2299,34 @@ fn plan_services(
         slot += 1;
     }
 
+    // One allocator for every extra NIC on this LAN, started past the service slots so the
+    // static addresses the slots own stay untouched. The primary draws first, so `--nics`
+    // gives it the same addresses whatever the fleet around it declares.
+    let mut extra = crate::units::ExtraNics::after_slots(slot);
+    planned.primary_extra_ips = extra.take(gw, prefix, primary_nics.saturating_sub(1))?;
+
     // Resolve + address each service through the shared provisioning path (the same one the
     // CI executor uses for its `image:` services), then derive the switch's per-unit listen
     // socket, resolver aliases and DHCP reservation from it.
+    //
+    // Extra NIC addresses come from one LAN-wide allocator started past the service slots,
+    // so no two guests — nor the primary, which draws from the same one — can be handed the
+    // same address, and every service's eth0 keeps the address its slot alone decides.
     for s in sited {
         let unit = &units[s.unit];
-        let prov =
-            crate::units::provision(cfg, state_dir, &args.build_args, unit, gw, prefix, s.slot)?;
+        let extra_ips = extra.take(gw, prefix, unit.nics.saturating_sub(1))?;
+        let prov = crate::units::provision(
+            cfg,
+            state_dir,
+            &args.build_args,
+            unit,
+            crate::units::Siting {
+                gateway: gw,
+                prefix,
+                slot: s.slot,
+                extra_ips,
+            },
+        )?;
         let ip = prov.addr.to_string();
         // Sibling slots start above `PRIMARY_VM`; all NICs of a sibling reuse its slot id.
         let vm = PRIMARY_VM + 1 + s.slot;
@@ -2260,6 +2348,18 @@ fn plan_services(
         planned
             .reservations
             .push((crate::units::mac_for_ip(prov.addr), ip.clone()));
+        // Each NIC after eth0 is its own switch port: its own socket under the service's
+        // dir, bound to its own address, with the same per-MAC reservation as eth0. Only
+        // eth0 is named in the resolver — a service name resolves to one address.
+        for (i, extra) in prov.extra_ips.iter().enumerate() {
+            let port = NET_VSOCK_PORT + i as u32 + 1;
+            planned
+                .listen
+                .push((s.dir.join(format!("vsock.sock_{port}")), *extra, vm));
+            planned
+                .reservations
+                .push((crate::units::mac_for_ip(*extra), extra.to_string()));
+        }
         let starts = on[s.unit];
         let name = prov.name.clone();
         planned.units.push((prov, s.dir, unit.clone()));
@@ -2312,6 +2412,8 @@ async fn compose_up(
         &[],
         &[],
         &planned.listen,
+        // compose up has no primary VM, so no primary NICs to attach.
+        &[],
         &planned.hosts,
         &planned.reservations,
         None,
@@ -3309,6 +3411,10 @@ async fn spawn_vm_switch(
     allow_ip: &[String],
     allow_name: &[String],
     extra_listen: &[(PathBuf, std::net::Ipv4Addr, u32)],
+    // Addresses for the primary VM's own NICs after eth0 (`--nics`, or a `--primary`
+    // service's `x-virtkit.nics`). Each becomes another switch port on the primary's vsock,
+    // and they ride out on the cmdline fragment so the guest numbers them the same way.
+    primary_extra_ips: &[std::net::Ipv4Addr],
     hosts: &[(String, String)],
     reservations: &[(String, String)],
     registry_proxy: Option<(std::net::Ipv4Addr, std::net::SocketAddr)>,
@@ -3324,17 +3430,28 @@ async fn spawn_vm_switch(
     prio: crate::prio::Prio,
 ) -> Result<(Child, String)> {
     let (gw, prefix, guest_ip) = crate::net::switch_addrs(RUN_SUBNET)?;
-    let mut listen = vsock.to_path_buf().into_os_string();
-    listen.push(format!("_{net_port}"));
-    // Bind the primary and each sibling to their assigned address and VM id.
-    let mut all_listen = vec![(PathBuf::from(listen), guest_ip, PRIMARY_VM)];
+    // Bind every primary NIC to its assigned address and the shared primary VM id.
+    let mut all_listen = vec![(
+        vk_core::net::hybrid_socket(vsock, net_port),
+        guest_ip,
+        PRIMARY_VM,
+    )];
+    // One more port per NIC after the primary's eth0, on `net_port` + the interface index —
+    // the same numbering the guest bridges over, and the same per-MAC reservation siblings
+    // get, so an image running its own DHCP client on one lands on its assigned address.
+    let mut reservations = reservations.to_vec();
+    for (i, extra) in primary_extra_ips.iter().enumerate() {
+        let port = net_port + i as u32 + 1;
+        all_listen.push((vk_core::net::hybrid_socket(vsock, port), *extra, PRIMARY_VM));
+        reservations.push((crate::units::mac_for_ip(*extra), extra.to_string()));
+    }
     all_listen.extend(extra_listen.iter().cloned());
     let child = crate::switch::spawn(&crate::switch::Spawn {
         listen: all_listen,
         gateway: gw,
         prefix,
         hosts: hosts.to_vec(),
-        reservations: reservations.to_vec(),
+        reservations,
         allow_ip: allow_ip.to_vec(),
         allow_name: allow_name.to_vec(),
         restrict,
@@ -3354,10 +3471,13 @@ async fn spawn_vm_switch(
         bytes_log,
         prio,
     })?;
-    let frag = format!(
+    let mut frag = format!(
         " VIRTKIT_NET_PORT={net_port} VIRTKIT_VM_IP={guest_ip}/{prefix} \
          VIRTKIT_VM_GW={gw} VIRTKIT_VM_DNS={gw}"
     );
+    if let Some(extra) = net_extra_ips_env(primary_extra_ips, prefix) {
+        frag.push_str(&extra);
+    }
     Ok((child, frag))
 }
 
@@ -3607,6 +3727,9 @@ pub(crate) async fn boot_session(
             NET_VSOCK_PORT,
             allow_ip,
             allow_name,
+            &[],
+            // A build stage guest is one NIC: nothing declares otherwise, and a RUN step
+            // has no interface layout to satisfy.
             &[],
             &[],
             &[],
@@ -4009,6 +4132,7 @@ mod tests {
             cpus: None,
             mem: None,
             service_cpus: vec![],
+            nics: None,
             service_mem: vec![],
             boot_timeout_secs: 0,
             vm_name: String::new(),
@@ -4367,6 +4491,49 @@ mod tests {
         // primary spec's — this is the case a refactor is likeliest to conflate
         assert!(!marker(None));
         assert!(!effective_nested(false, marker(None)));
+    }
+
+    #[test]
+    fn nics_ranks_the_flag_over_the_primary_service_marker() {
+        let units = crate::compose::parse(
+            "services:\n\
+             \x20 appliance:\n    image: a\n    x-virtkit: { nics: 3 }\n\
+             \x20 web:\n    image: w\n",
+            Path::new("/b"),
+            &|_| None,
+            None,
+        )
+        .unwrap();
+        let idx = |n: &str| Some(units.iter().position(|u| u.name == n).unwrap());
+        // the primary service's declaration when the flag is silent
+        assert_eq!(effective_nics(None, &units, idx("appliance")), 3);
+        assert_eq!(effective_nics(None, &units, idx("web")), 1);
+        // ranked, not ORed: an explicit flag wins in both directions
+        assert_eq!(effective_nics(Some(2), &units, idx("appliance")), 2);
+        assert_eq!(effective_nics(Some(1), &units, idx("appliance")), 1);
+        assert_eq!(effective_nics(Some(4), &units, idx("web")), 4);
+        // no primary (a bare `vk run`, or compose up): one NIC unless the flag says more
+        assert_eq!(effective_nics(None, &units, None), 1);
+        assert_eq!(effective_nics(Some(2), &units, None), 2);
+    }
+
+    #[test]
+    fn net_extra_ips_env_is_the_comma_joined_wire_string() {
+        // eth0 alone carries no fragment.
+        assert_eq!(net_extra_ips_env(&[], 24), None);
+        // Each NIC after eth0 as `ip/prefix`, comma-joined in interface order — the exact
+        // spelling `vk-agent`'s `extra_nics` splits back apart.
+        assert_eq!(
+            net_extra_ips_env(
+                &[
+                    "192.168.127.254".parse().unwrap(),
+                    "192.168.127.253".parse().unwrap()
+                ],
+                24
+            )
+            .as_deref(),
+            Some(" VIRTKIT_NET_EXTRA_IPS=192.168.127.254/24,192.168.127.253/24")
+        );
     }
 
     #[test]

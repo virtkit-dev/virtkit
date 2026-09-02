@@ -86,6 +86,11 @@ pub struct Unit {
     /// applied identically primary or sibling — a service that is itself a hypervisor
     /// (a vk builder, a nested test runner). `false` = no nesting, the default.
     pub nested: bool,
+    /// How many NICs this unit's guest gets on the run LAN (compose `x-virtkit.nics`),
+    /// applied identically primary or sibling. `1` (the default) is eth0 alone; more adds
+    /// eth1 upward, each with its own address on the same segment — what an appliance that
+    /// segregates services across interfaces needs.
+    pub nics: u32,
 }
 
 /// Where a unit's image comes from.
@@ -790,14 +795,22 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
     };
     // The per-service axes (compose `x-virtkit`): absent key/subkey = the defaults,
     // so an unmarked service keeps today's agent-as-PID1 pinned-kernel 2-vCPU/1G boot.
-    let (init, kernel, cpus, mem, nested) = match svc.x_virtkit {
-        Some(x) => (x.init()?, x.kernel()?, x.cpus()?, x.mem()?, x.nested()?),
+    let (init, kernel, cpus, mem, nested, nics) = match svc.x_virtkit {
+        Some(x) => (
+            x.init()?,
+            x.kernel()?,
+            x.cpus()?,
+            x.mem()?,
+            x.nested()?,
+            x.nics()?,
+        ),
         None => (
             crate::run::InitSource::Default,
             crate::run::KernelSource::Default,
             None,
             None,
             false,
+            1,
         ),
     };
     // Resolve host paths but leave them unread so callers can vet untrusted compose input
@@ -830,6 +843,7 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
         cpus,
         mem,
         nested,
+        nics,
     })
 }
 
@@ -1369,6 +1383,9 @@ struct XVirtkit {
     /// into a string, and both spellings must reach the same parse
     #[serde(default)]
     nested: Option<Scalar>,
+    /// scalar, not u32: a `${VAR}` reference interpolates into a YAML string
+    #[serde(default)]
+    nics: Option<Scalar>,
 }
 
 impl XVirtkit {
@@ -1425,6 +1442,26 @@ impl XVirtkit {
                 Ok(s)
             })
             .transpose()
+    }
+
+    /// `nics: <n>` → how many interfaces the guest gets on the run LAN (absent = 1,
+    /// eth0 alone). Capped at [`crate::units::MAX_NICS`] so a typo fails the compose load
+    /// with the limit named, rather than exhausting the LAN's static addresses at boot.
+    fn nics(&self) -> Result<u32> {
+        let Some(n) = self.nics.clone().map(Scalar::into_string) else {
+            return Ok(1);
+        };
+        let count = n
+            .parse::<u32>()
+            .ok()
+            .filter(|c| (1..=crate::units::MAX_NICS).contains(c))
+            .with_context(|| {
+                format!(
+                    "x-virtkit.nics: expected a count from 1 to {}, got {n:?}",
+                    crate::units::MAX_NICS
+                )
+            })?;
+        Ok(count)
     }
 
     /// `nested: true|false` → whether the guest can run microVMs of its own
@@ -2452,6 +2489,52 @@ mod tests {
         assert!(!one("services:\n  s:\n    image: x\n    x-virtkit: { nested: }\n").nested);
         // anything else fails the load, not a later boot
         for marker in ["{ nested: yes }", "{ nested: 1 }", "{ nested: maybe }"] {
+            assert!(
+                parse(
+                    &format!("services:\n  s:\n    image: x\n    x-virtkit: {marker}\n"),
+                    Path::new("/b")
+                )
+                .is_err(),
+                "{marker} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn x_virtkit_nics_counts_the_interfaces() {
+        // absent = one NIC: an unmarked service keeps eth0 alone
+        assert_eq!(one("services:\n  s:\n    image: x\n").nics, 1);
+        assert_eq!(
+            one("services:\n  s:\n    image: x\n    x-virtkit: { cpus: 2 }\n").nics,
+            1
+        );
+        assert_eq!(
+            one("services:\n  s:\n    image: x\n    x-virtkit: { nics: 3 }\n").nics,
+            3
+        );
+        // a null value is an unset key, not a bad one
+        assert_eq!(
+            one("services:\n  s:\n    image: x\n    x-virtkit: { nics: }\n").nics,
+            1
+        );
+        // ${VAR} arrives as a string, so it must reach the same parse as the YAML int
+        let u = super::parse(
+            "services:\n  s:\n    image: x\n    x-virtkit:\n      nics: ${N}\n",
+            Path::new("/b"),
+            &vars(&[("N", "2")]),
+            None,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        assert_eq!(u.nics, 2);
+        // zero, a non-count and anything past the cap fail the load, not a later boot
+        for marker in [
+            "{ nics: 0 }",
+            "{ nics: -1 }",
+            "{ nics: many }",
+            "{ nics: 99 }",
+        ] {
             assert!(
                 parse(
                     &format!("services:\n  s:\n    image: x\n    x-virtkit: {marker}\n"),

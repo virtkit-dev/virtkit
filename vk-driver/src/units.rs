@@ -60,6 +60,22 @@ pub struct Provisioned {
     /// Whether this service's guest gets VMX/SVM and so a `/dev/kvm` of its own (its
     /// compose `x-virtkit.nested`). Uniform with the primary path.
     pub nested: bool,
+    /// Addresses of this service's NICs after eth0 (its compose `x-virtkit.nics`), in
+    /// interface order — eth1 first. Empty for the one-NIC default. The owner allocates
+    /// them from the LAN's static region ([`ExtraNics`]) because they have to be unique
+    /// across every guest on it, not just within this one.
+    pub extra_ips: Vec<Ipv4Addr>,
+}
+
+/// Where a unit sits on the owner's LAN: the subnet's gateway and prefix, the address slot
+/// that decides its eth0, and the addresses of its NICs after eth0 (empty for the one-NIC
+/// default). Grouped because every provisioning path passes the four together, and because
+/// eth0's address and the extra ones must come from one consistent layout of the subnet.
+pub struct Siting {
+    pub gateway: Ipv4Addr,
+    pub prefix: u8,
+    pub slot: u32,
+    pub extra_ips: Vec<Ipv4Addr>,
 }
 
 /// What a service guest gets when its unit declares no size — the shape every
@@ -212,9 +228,7 @@ pub fn provision(
     state_dir: &Path,
     global_build_args: &[(String, String)],
     unit: &crate::compose::Unit,
-    gateway: Ipv4Addr,
-    prefix: u8,
-    slot: u32,
+    siting: Siting,
 ) -> Result<Provisioned> {
     let (ext4, config) = match &unit.source {
         crate::compose::Source::Image(image) => {
@@ -245,7 +259,7 @@ pub fn provision(
             )
         }
     };
-    provisioned(unit, ext4, config, gateway, prefix, slot)
+    provisioned(unit, ext4, config, siting)
 }
 
 /// Assemble a [`Provisioned`] from an already-resolved image + merged config: assign the
@@ -256,11 +270,26 @@ pub fn provisioned(
     unit: &crate::compose::Unit,
     ext4: PathBuf,
     config: RunConfig,
-    gateway: Ipv4Addr,
-    prefix: u8,
-    slot: u32,
+    siting: Siting,
 ) -> Result<Provisioned> {
+    let Siting {
+        gateway,
+        prefix,
+        slot,
+        extra_ips,
+    } = siting;
     let ip = nth_static_ip(gateway, prefix, slot)?;
+    // The owner allocates the extra addresses (they are LAN-wide), so this is the one place
+    // that can catch it handing over a different number than the unit asked for.
+    let want = unit.nics.saturating_sub(1) as usize;
+    if extra_ips.len() != want {
+        bail!(
+            "service {}: x-virtkit.nics {} needs {want} address(es) after eth0, got {}",
+            unit.name,
+            unit.nics,
+            extra_ips.len()
+        );
+    }
     Ok(Provisioned {
         name: unit.name.clone(),
         hostname: unit.hostname.clone(),
@@ -277,6 +306,7 @@ pub fn provisioned(
         cpus: unit.cpus,
         mem: unit.mem.clone(),
         nested: unit.nested,
+        extra_ips,
     })
 }
 
@@ -313,6 +343,45 @@ pub fn nth_static_ip(gateway: Ipv4Addr, prefix: u8, n: u32) -> Result<Ipv4Addr> 
 
 /// Re-export the shared guest MAC derivation to preserve existing driver call sites.
 pub use vk_core::net::mac_for_ip;
+
+/// The most NICs one guest may ask for (compose `x-virtkit.nics`, `vk run --nics`).
+/// A ceiling at all because every NIC costs a static address, a vsock port and a switch
+/// port; this high because no appliance layout here has wanted more, and a typo should
+/// fail naming the limit rather than exhausting the LAN.
+pub const MAX_NICS: u32 = 8;
+
+/// Hands out the static addresses of the NICs after eth0, continuing the same top-down
+/// region the service addresses come from ([`nth_static_ip`]) so an extra NIC never lands
+/// in the DHCP pool that grows from the bottom.
+///
+/// Started past the last service slot, so every service's eth0 keeps the address it had
+/// before anything on the LAN grew a second NIC — service names resolve to that address,
+/// and a published port is written against it. The addresses handed out here are ordered
+/// but not otherwise stable: adding a service or changing a NIC count re-lays them out,
+/// which is why only eth0 is name-resolvable.
+pub struct ExtraNics {
+    next: u32,
+}
+
+impl ExtraNics {
+    /// Allocate above `slots` static addresses already spoken for (the LAN's service
+    /// count — 0 when the run has no siblings).
+    pub fn after_slots(slots: u32) -> Self {
+        ExtraNics { next: slots }
+    }
+
+    /// The addresses for one guest's NICs after eth0 — `count` of them, in interface
+    /// order (eth1 first). `count` 0 yields none and consumes nothing.
+    pub fn take(&mut self, gateway: Ipv4Addr, prefix: u8, count: u32) -> Result<Vec<Ipv4Addr>> {
+        (0..count)
+            .map(|_| {
+                let ip = nth_static_ip(gateway, prefix, self.next)?;
+                self.next += 1;
+                Ok(ip)
+            })
+            .collect()
+    }
+}
 
 /// First vsock CID handed to services — clear of the reserved CIDs (0-2) and the
 /// primary VM's default (3).
@@ -500,6 +569,17 @@ pub fn boot_unit(
         .and_then(|s| s.parse::<Ipv4Addr>().ok())
         .map(mac_for_ip);
 
+    // The NICs after eth0 share eth0's prefix — one segment, one subnet — so the guest
+    // gets `ip/prefix` per NIC and derives each tap's MAC from its own address.
+    let prefix = svc.ip.split('/').nth(1).unwrap_or("24").to_string();
+    let extra_nic_count = svc.extra_ips.len() as u32;
+    let extra_ip_specs = svc
+        .extra_ips
+        .iter()
+        .map(|ip| format!("{ip}/{prefix}"))
+        .collect::<Vec<_>>()
+        .join(",");
+
     // Build and spawn the VMM. On any failure, kill the virtiofsd children already
     // spawned above before returning — Child's Drop does not kill, so a soft error
     // return would otherwise orphan them for the owner's lifetime.
@@ -559,16 +639,28 @@ pub fn boot_unit(
         if !disk_devices.is_empty() {
             cmdline.push_str(&format!(" VIRTKIT_DISKS={disk_devices}"));
         }
+        // The NICs after eth0: the agent numbers them eth1 upward in this order and
+        // bridges each over `net_port` + its index, matching the vsock ports below.
+        if !extra_ip_specs.is_empty() {
+            cmdline.push_str(&format!(" VIRTKIT_NET_EXTRA_IPS={extra_ip_specs}"));
+        }
 
         // The guest→host switch bridge, plus a host→guest exec channel: the agent
         // serves it (a preinit boot's reparented serve, or the default boot's
         // VIRTKIT_SERVE=1 above), and the job supervisor's prepare polls it to gate on
         // the service's readiness. libkrun needs the explicit per-port listener;
         // cloud-hypervisor derives it from the base socket and ignores the entry.
-        let vsock_ports = vec![
+        //
+        // One bridge per NIC, on `net_port` + the interface index: each is a separate L2
+        // port on the switch, which is what makes them independent interfaces on the
+        // segment rather than one interface seen twice.
+        let mut vsock_ports = vec![
             crate::vmm::VsockPort::bridge(&vsock, net_port),
             crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT),
         ];
+        for i in 1..=extra_nic_count {
+            vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, net_port + i));
+        }
         let spec = crate::vmm::VmSpec {
             kernel: boot_kernel,
             cmdline,
@@ -772,5 +864,51 @@ mod tests {
             "the switch's own bridge socket must survive"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Extra NIC addresses continue the static region past the slots they are told about,
+    /// so a service's eth0 keeps the address its slot alone decides.
+    #[test]
+    fn extra_nics_allocate_past_the_service_slots() {
+        let gw: Ipv4Addr = "192.168.127.1".parse().unwrap();
+        // Two services own the first two static addresses (.254, .253).
+        assert_eq!(
+            nth_static_ip(gw, 24, 0).unwrap().to_string(),
+            "192.168.127.254"
+        );
+        assert_eq!(
+            nth_static_ip(gw, 24, 1).unwrap().to_string(),
+            "192.168.127.253"
+        );
+        let mut extra = ExtraNics::after_slots(2);
+        assert_eq!(
+            extra.take(gw, 24, 2).unwrap(),
+            vec![
+                "192.168.127.252".parse::<Ipv4Addr>().unwrap(),
+                "192.168.127.251".parse().unwrap()
+            ]
+        );
+        // The next guest continues where the last left off — no address is handed out twice.
+        assert_eq!(
+            extra.take(gw, 24, 1).unwrap(),
+            vec!["192.168.127.250".parse::<Ipv4Addr>().unwrap()]
+        );
+        // A one-NIC guest asks for none and consumes nothing.
+        assert!(extra.take(gw, 24, 0).unwrap().is_empty());
+        assert_eq!(
+            extra.take(gw, 24, 1).unwrap(),
+            vec!["192.168.127.249".parse::<Ipv4Addr>().unwrap()]
+        );
+    }
+
+    /// The static region is finite, so exhausting it is an error naming the subnet rather
+    /// than an address that collides with the DHCP pool.
+    #[test]
+    fn extra_nics_run_out_with_the_static_region() {
+        let gw: Ipv4Addr = "192.168.127.1".parse().unwrap();
+        let mut extra = ExtraNics::after_slots(0);
+        // /24: 254 hosts, the top half static — so 127 addresses, then it fails.
+        assert!(extra.take(gw, 24, 127).is_ok());
+        assert!(extra.take(gw, 24, 1).is_err());
     }
 }

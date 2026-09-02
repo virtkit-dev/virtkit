@@ -43,19 +43,25 @@ pub enum Feature {
     Entrypoint,
     /// this build can relay a local connection into a guest's network (`vk publish`)
     Publish,
+    /// this build can give a guest more than one NIC (`vk run --nics`, `x-virtkit.nics`)
+    Nics,
 }
 
 impl Feature {
     /// Features the default sweep leaves out, each for its own reason. The CI-executor
     /// ones (the gitlab runner and its sibling service VMs) probe state dirs under a
     /// root-owned default path, so sweeping them would fail every host that just boots
-    /// VMs without running CI. `Entrypoint` and `Publish` answer a question about this
-    /// build rather than about the host, so they belong where a script asks for them
+    /// VMs without running CI. `Entrypoint`, `Publish` and `Nics` answer a question about
+    /// this build rather than about the host, so they belong where a script asks for them
     /// and nowhere else.
     fn on_request_only(self) -> bool {
         matches!(
             self,
-            Feature::Gitlab | Feature::Services | Feature::Entrypoint | Feature::Publish
+            Feature::Gitlab
+                | Feature::Services
+                | Feature::Entrypoint
+                | Feature::Publish
+                | Feature::Nics
         )
     }
 
@@ -73,6 +79,7 @@ impl Feature {
             Feature::Usage => "usage",
             Feature::Entrypoint => "entrypoint",
             Feature::Publish => "publish",
+            Feature::Nics => "nics",
         }
     }
 }
@@ -267,6 +274,7 @@ fn evaluate(cfg: &Config, feature: Feature) -> Outcome {
         Feature::Usage => usage(),
         Feature::Entrypoint => entrypoint(),
         Feature::Publish => publish(),
+        Feature::Nics => nics(),
     }
 }
 
@@ -309,6 +317,27 @@ fn publish() -> Outcome {
         Some(src) => ok(format!("agent {src} understands `vk publish` (CmdConnect)")),
         None => fail(format!(
             "no agent to ask: nothing embedded and {} missing",
+            Asset::Agent.default_path()
+        )),
+    }
+}
+
+/// Whether this `vk` can give a guest more than one NIC (`vk run --nics`, or a compose
+/// `x-virtkit: { nics: N }`). Asked for by name and never swept, for the same reason as
+/// `entrypoint`/`publish`: it is a property of the binary, and a `vk` too old to have the
+/// axis rejects the feature name outright rather than reaching here.
+///
+/// The host side is again the agent: the extra interfaces are taps *it* creates and
+/// addresses from `VIRTKIT_NET_EXTRA_IPS`, so a `vk` with no agent to embed or find has
+/// nothing to bring them up with, whatever the caller asks for.
+fn nics() -> Outcome {
+    match asset_source(Asset::Agent) {
+        Some(src) => ok(format!(
+            "up to {} NICs per guest; agent {src} creates and addresses them",
+            crate::units::MAX_NICS
+        )),
+        None => fail(format!(
+            "no agent to bring the extra NICs up: nothing embedded and {} missing",
             Asset::Agent.default_path()
         )),
     }

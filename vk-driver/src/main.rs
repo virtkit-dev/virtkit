@@ -1261,6 +1261,18 @@ enum Cmd {
         /// Default 1G, or the --primary service's own x-virtkit.mem.
         #[arg(long, value_name = "SIZE", help_heading = "Guest")]
         mem: Option<String>,
+        /// interfaces the guest gets on the run LAN
+        ///
+        /// Default 1 (eth0 alone), or the --primary service's own x-virtkit.nics. More adds
+        /// eth1 upward, each with its own address on the same segment; eth0 keeps the
+        /// default route. Needs --net (or --compose, which implies it).
+        #[arg(
+            long,
+            value_name = "N",
+            help_heading = "Network",
+            value_parser = clap::value_parser!(u32).range(1..)
+        )]
+        nics: Option<u32>,
         /// seconds to wait for the guest agent to answer before giving up on the boot
         #[arg(
             long,
@@ -2474,6 +2486,7 @@ async fn cli_main() -> ExitCode {
         cloud_hypervisor,
         cpus,
         mem,
+        nics,
         boot_timeout,
         vm_name,
         ram,
@@ -2656,6 +2669,7 @@ async fn cli_main() -> ExitCode {
             insecure: *insecure,
             cpus: *cpus,
             mem: mem.clone(),
+            nics: *nics,
             service_cpus: service_cpus.clone(),
             service_mem: service_mem.clone(),
             boot_timeout_secs: *boot_timeout,

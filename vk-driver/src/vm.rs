@@ -1632,16 +1632,28 @@ fn plan_services(
         None => crate::services::to_units(crate::services::from_env()?),
     };
     let mut out = Vec::new();
+    // Addresses for the NICs after eth0, from the static region past the service slots — one
+    // allocator for the job's whole LAN, so no two services are handed the same address. The
+    // job VM itself stays on one NIC: the executor has no axis to ask for more.
+    let mut extra = crate::units::ExtraNics::after_slots(units.len() as u32);
     for (slot, mut unit) in units.into_iter().enumerate() {
         // A compose service's declared sizing obeys the same host ceilings as the job's own.
         clamp_service_size(&ctx.cfg, &mut unit)?;
+        let extra_ips = extra.take(gateway, prefix, unit.nics.saturating_sub(1))?;
+        // The three media paths resolve the image differently but site the unit identically.
+        let siting = |slot: usize, extra_ips: Vec<Ipv4Addr>| crate::units::Siting {
+            gateway,
+            prefix,
+            slot: slot as u32,
+            extra_ips,
+        };
         let prov = match service_media(&unit.source) {
             ServiceMedia::Git(spec) => {
                 let (ext4, config, guard) =
                     build_git_image(ctx, spec).with_context(|| format!("service {}", unit.name))?;
                 guards.push(guard);
                 let merged = crate::compose::merged_config(&config.unwrap_or_default(), &unit);
-                crate::units::provisioned(&unit, ext4, merged, gateway, prefix, slot as u32)?
+                crate::units::provisioned(&unit, ext4, merged, siting(slot, extra_ips))?
             }
             // Ask the build where it put the image, as the primary does (`resolve_media` ->
             // `compose_unit_media`), rather than predicting the address: normally a fingerprint
@@ -1655,7 +1667,7 @@ fn plan_services(
                 let (ext4, config, guard) = build_compose_unit(ctx, &unit)
                     .with_context(|| format!("service {}", unit.name))?;
                 guards.push(guard);
-                crate::units::provisioned(&unit, ext4, config, gateway, prefix, slot as u32)?
+                crate::units::provisioned(&unit, ext4, config, siting(slot, extra_ips))?
             }
             ServiceMedia::Image => {
                 let prov = crate::units::provision(
@@ -1663,9 +1675,7 @@ fn plan_services(
                     ctx.cfg.state_dir(),
                     &[],
                     &unit,
-                    gateway,
-                    prefix,
-                    slot as u32,
+                    siting(slot, extra_ips),
                 )?;
                 if let Some(g) =
                     crate::image::acquire_use_lock_for(ctx.cfg.state_dir(), &prov.ext4)?
@@ -1692,23 +1702,33 @@ fn spawn_switch(
     services: &[crate::units::Provisioned],
 ) -> Result<std::process::Child> {
     let cfg = &ctx.cfg;
-    // Bind every socket to its assigned address and VM id. The job uses 0, each service uses
-    // its position, and all NICs of one guest share an id so its addresses work on any port.
+    // Bind every socket to its assigned address and VM id. The job uses 0, services use their
+    // position, and all NICs of a service share its id so its addresses work on any port.
     const JOB_VM: u32 = 0;
     let mut listen = vec![(ctx.net_vsock_sock(cfg.net.net_port), guest_ip, JOB_VM)];
     let mut hosts = Vec::new();
     let mut reservations = Vec::new();
     for (i, svc) in services.iter().enumerate() {
         let vm = JOB_VM + 1 + i as u32;
-        let socket = ctx
-            .job_dir
-            .join(format!("svc-{}", svc.name))
-            .join(format!("vsock.sock_{}", cfg.net.net_port));
-        listen.push((socket, svc.addr, vm));
+        let svc_dir = ctx.job_dir.join(format!("svc-{}", svc.name));
+        listen.push((
+            svc_dir.join(format!("vsock.sock_{}", cfg.net.net_port)),
+            svc.addr,
+            vm,
+        ));
         let ip = svc.ip.split('/').next().unwrap_or_default();
         hosts.push((svc.hostname.clone(), ip.to_string()));
         if let Ok(ip4) = ip.parse::<Ipv4Addr>() {
             reservations.push((crate::units::mac_for_ip(ip4), ip.to_string()));
+        }
+        // Each NIC after eth0 is its own port on the switch: its own socket (net_port + the
+        // interface index, matching the bridge ports `boot_unit` gives the guest), bound to
+        // its own address, with the same per-MAC reservation. The resolver still names only
+        // eth0 — a service name is one address.
+        for (i, extra) in svc.extra_ips.iter().enumerate() {
+            let port = cfg.net.net_port + i as u32 + 1;
+            listen.push((svc_dir.join(format!("vsock.sock_{port}")), *extra, vm));
+            reservations.push((crate::units::mac_for_ip(*extra), extra.to_string()));
         }
     }
     // Opt-in credential proxy: expose the runner's `[registry]` to the job at
