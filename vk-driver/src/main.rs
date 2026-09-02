@@ -1022,12 +1022,16 @@ enum Cmd {
     /// host privileges, multi-VM on one LAN.
     #[command(hide = true)]
     Switch {
-        /// VM qemu socket to accept on, as `<vsock.sock>_<port>=<ip>`
+        /// NIC socket to accept on, as `<vsock.sock>_<port>=<ip>[=<vm>]`
         ///
-        /// Cloud Hypervisor's socket, paired with the VM's assigned address; repeatable — one
-        /// per VM on the shared LAN. The switch binds the address to the socket so the VM can
-        /// only source its own IP.
-        #[arg(long = "listen", required = true, value_name = "SOCKET=IP")]
+        /// The guest's qemu socket, paired with the address the run assigned that NIC;
+        /// repeatable — one per NIC on the shared LAN. The switch binds the address to the
+        /// socket so a guest can only source addresses of its own. `<vm>` groups the NICs of
+        /// one multi-homed guest, which may then source any of its addresses from any of
+        /// them; omitted, each socket is its own guest, keyed off its position. Don't mix
+        /// omitted and explicit `<vm>` in one invocation — a position could collide with an
+        /// explicit id and merge two guests. The driver always emits explicit ids.
+        #[arg(long = "listen", required = true, value_name = "SOCKET=IP[=VM]")]
         listen: Vec<String>,
         /// Gateway IPv4 — also the DHCP server and DNS address
         #[arg(long, default_value = "192.168.127.1")]
@@ -3334,14 +3338,35 @@ async fn cli_main() -> ExitCode {
     } = &cli.cmd
     {
         let mut listen_bind = Vec::with_capacity(listen.len());
-        for l in listen {
-            // `<socket-path>=<ip>`; split from the right since a socket path may contain '='
-            // but an IPv4 address never does.
-            match l.rsplit_once('=').and_then(|(path, ip)| {
-                Some((PathBuf::from(path), ip.parse::<std::net::Ipv4Addr>().ok()?))
-            }) {
-                Some(pair) => listen_bind.push(pair),
+        for (i, l) in listen.iter().enumerate() {
+            // Split from the right: paths may contain '=', but IPv4 addresses and VM ids do
+            // not. Legacy entries without a VM id use their position to remain distinct.
+            let (head, last) = match l.rsplit_once('=') {
+                Some(parts) => parts,
                 None => return fail(&anyhow::anyhow!("bad --listen {l:?} (want socket=ip)"), 2),
+            };
+            let parsed = match last.parse::<u32>() {
+                // An explicit VM id leaves the address in the preceding field.
+                Ok(vm) => head.rsplit_once('=').and_then(|(path, ip)| {
+                    Some((
+                        PathBuf::from(path),
+                        ip.parse::<std::net::Ipv4Addr>().ok()?,
+                        vm,
+                    ))
+                }),
+                Err(_) => last
+                    .parse::<std::net::Ipv4Addr>()
+                    .ok()
+                    .map(|ip| (PathBuf::from(head), ip, i as u32)),
+            };
+            match parsed {
+                Some(entry) => listen_bind.push(entry),
+                None => {
+                    return fail(
+                        &anyhow::anyhow!("bad --listen {l:?} (want socket=ip[=vm])"),
+                        2,
+                    );
+                }
             }
         }
         let mut hosts = std::collections::HashMap::new();

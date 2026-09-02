@@ -116,6 +116,9 @@ pub(crate) const SSH_AGENT_VSOCK_PORT: u32 = 2223;
 const SSH_VSOCK_PORT: u32 = 2222;
 /// vsock port the guest's tap bridge dials to reach the userspace switch.
 const NET_VSOCK_PORT: u32 = 1024;
+/// Switch VM id for the primary guest. Siblings use higher ids, and all NICs of a guest share
+/// one id so `switch::handle_frame` accepts its addresses on any of its interfaces.
+const PRIMARY_VM: u32 = 0;
 /// vsock port the guest's host-exec forwarder dials (`--host-exec`); the host side
 /// is a `vk-agent serve` on the bridged per-port socket, so guest tooling can run
 /// host commands through its allowlist wrapper. Sits next to the control port (1099).
@@ -2044,10 +2047,9 @@ struct PlannedServices {
     /// names to boot eagerly: the profile-enabled set, or the primary's
     /// dependency closure
     start: Vec<String>,
-    /// per-unit switch sockets (up or down — an on-demand start dials a
-    /// listening LAN), each paired with the sibling's assigned address so the
-    /// switch binds the socket to it (a sibling can only source its own IP)
-    listen: Vec<(PathBuf, std::net::Ipv4Addr)>,
+    /// per-unit switch sockets, each paired with its assigned address and VM id; the socket
+    /// remains available while the unit is down so an on-demand start can join the LAN
+    listen: Vec<(PathBuf, std::net::Ipv4Addr, u32)>,
     /// alias -> ip for the gateway resolver
     hosts: Vec<(String, String)>,
     /// per-sibling DHCP reservations (mac, ip): a sibling's deterministic MAC ->
@@ -2238,9 +2240,12 @@ fn plan_services(
         let prov =
             crate::units::provision(cfg, state_dir, &args.build_args, unit, gw, prefix, s.slot)?;
         let ip = prov.addr.to_string();
+        // Sibling slots start above `PRIMARY_VM`; all NICs of a sibling reuse its slot id.
+        let vm = PRIMARY_VM + 1 + s.slot;
         planned.listen.push((
             s.dir.join(format!("vsock.sock_{NET_VSOCK_PORT}")),
             prov.addr,
+            vm,
         ));
         planned
             .hosts
@@ -3303,7 +3308,7 @@ async fn spawn_vm_switch(
     net_port: u32,
     allow_ip: &[String],
     allow_name: &[String],
-    extra_listen: &[(PathBuf, std::net::Ipv4Addr)],
+    extra_listen: &[(PathBuf, std::net::Ipv4Addr, u32)],
     hosts: &[(String, String)],
     reservations: &[(String, String)],
     registry_proxy: Option<(std::net::Ipv4Addr, std::net::SocketAddr)>,
@@ -3321,8 +3326,8 @@ async fn spawn_vm_switch(
     let (gw, prefix, guest_ip) = crate::net::switch_addrs(RUN_SUBNET)?;
     let mut listen = vsock.to_path_buf().into_os_string();
     listen.push(format!("_{net_port}"));
-    // The primary VM's socket is bound to its own address; each sibling's to its assigned IP.
-    let mut all_listen = vec![(PathBuf::from(listen), guest_ip)];
+    // Bind the primary and each sibling to their assigned address and VM id.
+    let mut all_listen = vec![(PathBuf::from(listen), guest_ip, PRIMARY_VM)];
     all_listen.extend(extra_listen.iter().cloned());
     let child = crate::switch::spawn(&crate::switch::Spawn {
         listen: all_listen,

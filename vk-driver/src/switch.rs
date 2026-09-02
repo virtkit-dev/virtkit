@@ -63,6 +63,8 @@ struct Cfg {
 
 type Mac = [u8; 6];
 type PortId = u32;
+/// Groups the ports and addresses owned by one VM.
+type VmId = u32;
 
 /// Parse a colon-separated MAC (`aa:bb:cc:dd:ee:ff`) into 6 bytes; None if it is
 /// not six hex octets.
@@ -525,6 +527,10 @@ struct Inner {
     /// policy on ingress and routes egress replies on return — neither trusts a guest-supplied
     /// address.
     ip_port: HashMap<Ipv4Addr, PortId>,
+    /// address -> owning VM, from the run's listen configuration
+    ip_vm: HashMap<Ipv4Addr, VmId>,
+    /// connected port -> owning VM, paired with `ip_vm` for anti-spoofing
+    port_vm: HashMap<PortId, VmId>,
     /// DHCP: stable lease per client MAC
     leases: HashMap<Mac, Ipv4Addr>,
     /// DHCP: per-MAC address reservations (run-assigned svc.ips). A reserved MAC
@@ -551,10 +557,9 @@ struct Switch {
 /// the gateway identity, the resolver's local names, the egress allowlists
 /// (empty = unrestricted), and where the log goes.
 pub struct Spawn {
-    /// One socket per VM on the LAN, each paired with the address the executor assigned that
-    /// VM. The switch binds the address to the socket's port so a guest can only source its
-    /// own IP (see `handle_frame`).
-    pub listen: Vec<(PathBuf, Ipv4Addr)>,
+    /// One `(socket, address, VM)` tuple per NIC. Shared VM ids let a multi-homed guest source
+    /// any of its addresses on any of its ports without admitting another guest's addresses.
+    pub listen: Vec<(PathBuf, Ipv4Addr, u32)>,
     pub gateway: Ipv4Addr,
     pub prefix: u8,
     /// resolver entries served over the gateway DNS (`name=ip`)
@@ -617,11 +622,12 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
         .arg(opts.gateway.to_string())
         .arg("--prefix")
         .arg(opts.prefix.to_string());
-    for (l, ip) in &opts.listen {
+    for (l, ip, vm) in &opts.listen {
         let _ = std::fs::remove_file(l);
-        // `<socket-path>=<ip>`: the switch binds the socket's port to this address. The path
-        // comes first (an IPv4 address never contains `=`), so it is split off from the right.
-        cmd.arg("--listen").arg(format!("{}={ip}", l.display()));
+        // Keep the path first so the parser can split the IP and VM id from the right even
+        // when the path contains '='.
+        cmd.arg("--listen")
+            .arg(format!("{}={ip}={vm}", l.display()));
     }
     for (name, ip) in &opts.hosts {
         cmd.arg("--host").arg(format!("{name}={ip}"));
@@ -664,7 +670,7 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
     opts.prio.apply(&mut cmd);
     let mut child = crate::spawn::spawn_tied(cmd).context("spawning the switch subprocess")?;
     let deadline = Instant::now() + Duration::from_secs(5);
-    for (l, _) in &opts.listen {
+    for (l, _, _) in &opts.listen {
         while !l.exists() {
             if Instant::now() >= deadline {
                 let _ = child.kill();
@@ -679,7 +685,7 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
-    listen: &[(PathBuf, Ipv4Addr)],
+    listen: &[(PathBuf, Ipv4Addr, VmId)],
     gateway: Ipv4Addr,
     prefix: u8,
     hosts: HashMap<String, Ipv4Addr>,
@@ -758,6 +764,9 @@ pub async fn run(
         inner: Mutex::new(Inner {
             next_idx: FIRST_LEASE,
             reservations,
+            // Record ownership before any NIC connects so admission does not depend on
+            // connection order.
+            ip_vm: listen.iter().map(|(_, ip, vm)| (*ip, *vm)).collect(),
             ..Inner::default()
         }),
         egress_tx,
@@ -800,18 +809,19 @@ pub async fn run(
         },
     );
     let mut accepts = Vec::new();
-    for (path, bound_ip) in listen {
+    for (path, bound_ip, vm) in listen {
         let _ = std::fs::remove_file(path);
         let listener =
             UnixListener::bind(path).with_context(|| format!("switch: bind {}", path.display()))?;
         let sw = sw.clone();
         let bound_ip = *bound_ip;
+        let vm = *vm;
         accepts.push(tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((conn, _)) => {
                         let sw = sw.clone();
-                        tokio::spawn(async move { sw.serve_port(conn, bound_ip).await });
+                        tokio::spawn(async move { sw.serve_port(conn, bound_ip, vm).await });
                     }
                     Err(e) => {
                         eprintln!("switch: accept: {e}");
@@ -830,7 +840,7 @@ pub async fn run(
 impl Switch {
     /// One connected VM: register a port, pump its frames into the switch, and
     /// drain queued frames back to it, until it disconnects.
-    async fn serve_port(self: Arc<Self>, conn: UnixStream, bound_ip: Ipv4Addr) {
+    async fn serve_port(self: Arc<Self>, conn: UnixStream, bound_ip: Ipv4Addr, vm: VmId) {
         let port = self.next_port.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = unbounded_channel::<Vec<u8>>();
         {
@@ -840,6 +850,8 @@ impl Switch {
             // the same socket rebinds to the new port). This is the only trustworthy source
             // identity — the guest picks its frames' addresses, not its socket.
             inner.ip_port.insert(bound_ip, port);
+            // The socket supplies the VM identity; guest frames cannot choose it.
+            inner.port_vm.insert(port, vm);
         }
 
         let (rd, wr) = conn.into_split();
@@ -871,15 +883,18 @@ impl Switch {
         let sip = (ethertype == ETHERTYPE_IPV4)
             .then(|| ipv4_src(&frame[14..]))
             .flatten();
-        // Anti-spoofing: a guest may only source IPv4 from the address bound to its port.
-        // Drop a frame whose source is neither unspecified (pre-config, e.g. a DHCP DISCOVER
-        // from 0.0.0.0) nor its port's bound address. This is what lets the switch trust the
-        // source to select the egress policy (`policy_for`) and to route egress replies
-        // (`route_in`): a VM cannot forge a sibling's address to borrow its policy or steal
-        // its replies, since it cannot choose which socket its frames arrive on.
+        // Admit only unspecified pre-configuration sources (such as DHCP's 0.0.0.0) or an
+        // address owned by this port's VM. The socket supplies the VM identity, so accepted
+        // sources are safe inputs to `policy_for` and `route_in`; a guest cannot borrow a
+        // sibling's policy or steal its replies.
+        //
+        // Scope ownership by VM rather than port because Linux owns addresses at host scope:
+        // it may answer ARP for one NIC through another and route the reply through either.
+        // Per-port ownership would reject valid multi-homed traffic, and guest configuration
+        // cannot be trusted to prevent it.
         if let Some(sip) = sip
             && !sip.is_unspecified()
-            && inner.ip_port.get(&sip) != Some(&port)
+            && inner.ip_vm.get(&sip) != inner.port_vm.get(&port)
         {
             return;
         }
@@ -983,6 +998,7 @@ impl Switch {
         // Drop this port's authoritative address binding; a reconnect on the same socket
         // rebinds it. leases/ip_mac are kept: the VM keeps its address across a reconnect.
         inner.ip_port.retain(|_, p| *p != port);
+        inner.port_vm.remove(&port);
     }
 }
 
@@ -2215,7 +2231,8 @@ mod tests {
             Ipv4Addr::new(192, 168, 127, 2),
             Ipv4Addr::new(192, 168, 127, 3),
         );
-        let listen = vec![(sa.clone(), ip_a), (sb.clone(), ip_b)];
+        // Two separate guests, so a frame sourcing the other's address is a spoof.
+        let listen = vec![(sa.clone(), ip_a, 0), (sb.clone(), ip_b, 1)];
         tokio::spawn(async move {
             let _ = run(
                 &listen,
@@ -2281,7 +2298,8 @@ mod tests {
             Ipv4Addr::new(192, 168, 127, 2),
             Ipv4Addr::new(192, 168, 127, 3),
         );
-        let listen = vec![(sa.clone(), ip_a), (sb.clone(), ip_b)];
+        // Two separate guests, so a frame sourcing the other's address is a spoof.
+        let listen = vec![(sa.clone(), ip_a, 0), (sb.clone(), ip_b, 1)];
         tokio::spawn(async move {
             let _ = run(
                 &listen,
@@ -2337,6 +2355,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, honest);
+    }
+
+    /// A multi-homed guest may use any of its addresses on any of its ports, while addresses
+    /// owned by another guest remain blocked.
+    #[tokio::test]
+    async fn a_multi_nic_guest_may_source_any_of_its_own_addresses() {
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("switchmultinic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (s0, s1, s_other) = (
+            dir.join("eth0.sock"),
+            dir.join("eth1.sock"),
+            dir.join("other.sock"),
+        );
+        let (ip0, ip1, ip_other) = (
+            Ipv4Addr::new(192, 168, 127, 2),
+            Ipv4Addr::new(192, 168, 127, 254),
+            Ipv4Addr::new(192, 168, 127, 3),
+        );
+        // eth0 and eth1 share VM 0; the observer belongs to VM 1.
+        let listen = vec![
+            (s0.clone(), ip0, 0),
+            (s1.clone(), ip1, 0),
+            (s_other.clone(), ip_other, 1),
+        ];
+        tokio::spawn(async move {
+            let _ = run(
+                &listen,
+                Ipv4Addr::new(192, 168, 127, 1),
+                24,
+                HashMap::new(),
+                HashMap::new(),
+                Egress::AllowAll,
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        });
+        for _ in 0..100 {
+            if s0.exists() && s1.exists() && s_other.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut eth0 = UnixStream::connect(&s0).await.unwrap();
+        let mut other = UnixStream::connect(&s_other).await.unwrap();
+        let mac0 = [2, 0, 0, 0, 0, 0x01];
+
+        // Cross-NIC traffic within one VM must be forwarded.
+        let cross = eth(
+            BCAST_MAC,
+            mac0,
+            ETHERTYPE_IPV4,
+            &ipv4_payload(ip1, b"cross-nic"),
+        );
+        send(&mut eth0, &cross).await;
+        let got = tokio::time::timeout(Duration::from_secs(2), recv(&mut other))
+            .await
+            .unwrap();
+        assert_eq!(got, cross);
+
+        // The same port still cannot source another VM's address.
+        let spoofed = eth(
+            BCAST_MAC,
+            mac0,
+            ETHERTYPE_IPV4,
+            &ipv4_payload(ip_other, b"spoof"),
+        );
+        send(&mut eth0, &spoofed).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), recv(&mut other))
+                .await
+                .is_err(),
+            "another guest's address must still be refused"
+        );
     }
 
     /// Build a minimal DNS query for `name` with the given qtype.

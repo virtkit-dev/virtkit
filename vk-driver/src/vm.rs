@@ -1692,17 +1692,19 @@ fn spawn_switch(
     services: &[crate::units::Provisioned],
 ) -> Result<std::process::Child> {
     let cfg = &ctx.cfg;
-    // Each listen socket is bound to its VM's assigned address so the switch can trust the
-    // source of a frame (see switch.rs): the primary at `guest_ip`, each service at its addr.
-    let mut listen = vec![(ctx.net_vsock_sock(cfg.net.net_port), guest_ip)];
+    // Bind every socket to its assigned address and VM id. The job uses 0, each service uses
+    // its position, and all NICs of one guest share an id so its addresses work on any port.
+    const JOB_VM: u32 = 0;
+    let mut listen = vec![(ctx.net_vsock_sock(cfg.net.net_port), guest_ip, JOB_VM)];
     let mut hosts = Vec::new();
     let mut reservations = Vec::new();
-    for svc in services {
+    for (i, svc) in services.iter().enumerate() {
+        let vm = JOB_VM + 1 + i as u32;
         let socket = ctx
             .job_dir
             .join(format!("svc-{}", svc.name))
             .join(format!("vsock.sock_{}", cfg.net.net_port));
-        listen.push((socket, svc.addr));
+        listen.push((socket, svc.addr, vm));
         let ip = svc.ip.split('/').next().unwrap_or_default();
         hosts.push((svc.hostname.clone(), ip.to_string()));
         if let Ok(ip4) = ip.parse::<Ipv4Addr>() {
