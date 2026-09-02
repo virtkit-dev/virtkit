@@ -21,7 +21,7 @@ sed -i -E "s/^channel = \".*\"/channel = \"$LATEST\"/" rust-toolchain.toml
 # Resolve the matching Rust Alpine image digest so the FROM line stays pinned, not
 # just tagged. ALPINE_TAG fixes the Alpine minor; bump it deliberately (a new Alpine
 # minor can change the toolchain the vendored C is built with).
-ALPINE_TAG="${ALPINE_TAG:-alpine3.21}"
+ALPINE_TAG="${ALPINE_TAG:-alpine3.24}"
 IMG="rust:${LATEST}-${ALPINE_TAG}"
 docker pull -q "$IMG" >/dev/null
 DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMG" | sed -E 's/.*@//')
