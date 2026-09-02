@@ -12,15 +12,20 @@
 //! entries whose owner is gone. Entries live under `<data base>/vms/` (the same
 //! `$XDG_DATA_HOME/virtkit` home `vk run`'s image cache uses), one JSON file per VM.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use vk_core::fleetctl::{Frame, Request};
 
 /// One running VM's record. Serialized as `<slug(state_dir)>.json` in the registry dir.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -486,7 +491,12 @@ struct ServiceView<'a> {
     exec_addr: &'a str,
 }
 
-fn view(entry: &VmEntry, freshness: Freshness, stale: bool) -> VmView<'_> {
+fn view<'a>(
+    entry: &'a VmEntry,
+    running: Option<&HashSet<String>>,
+    freshness: Freshness,
+    stale: bool,
+) -> VmView<'a> {
     VmView {
         state_dir: &entry.state_dir,
         project_dir: entry.project_dir.as_deref(),
@@ -500,6 +510,7 @@ fn view(entry: &VmEntry, freshness: Freshness, stale: bool) -> VmView<'_> {
         services: entry
             .services
             .iter()
+            .filter(|service| running.is_none_or(|r| r.contains(&service.name)))
             .map(|service| ServiceView {
                 name: &service.name,
                 exec_addr: &service.exec_addr,
@@ -508,15 +519,69 @@ fn view(entry: &VmEntry, freshness: Freshness, stale: bool) -> VmView<'_> {
     }
 }
 
-fn display_name(entry: &VmEntry) -> String {
+/// Return services reported as running, or `None` to use the registry's declared set.
+fn running_services(entry: &VmEntry) -> Option<HashSet<String>> {
     if entry.services.is_empty() {
+        return None;
+    }
+    let path = match vk_core::addr::SocketAddr::from_str(&entry.exec_addr) {
+        Ok(vk_core::addr::SocketAddr::VsockAuto { path, .. }) => path,
+        _ => return None,
+    };
+    let ctl = vk_core::net::hybrid_socket(&path, vk_core::fleetctl::CONTROL_PORT);
+    match query_running(&ctl) {
+        Ok(running) => Some(running),
+        // Report the failure before falling back to declared services.
+        Err(e) => {
+            eprintln!("virtkit: {}: querying running services: {e:#}", entry.label);
+            None
+        }
+    }
+}
+
+/// Query with `Request::List`, ignoring progress frames until `Done`.
+/// Two-second I/O timeouts keep `vk list` from blocking on a wedged VMM.
+fn query_running(ctl: &Path) -> Result<HashSet<String>> {
+    use std::io::{BufRead, BufReader};
+    let timeout = Some(Duration::from_secs(2));
+    let mut stream =
+        UnixStream::connect(ctl).with_context(|| format!("control: connect {}", ctl.display()))?;
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
+    let mut req = serde_json::to_string(&Request::List).context("encoding List request")?;
+    req.push('\n');
+    stream.write_all(req.as_bytes())?;
+    let mut rd = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if rd.read_line(&mut line)? == 0 {
+            bail!("control peer closed before Done");
+        }
+        match serde_json::from_str::<Frame>(line.trim_end()).context("decoding control frame")? {
+            Frame::Progress(_) => continue,
+            Frame::Done(reply) => {
+                return Ok(reply
+                    .units
+                    .into_iter()
+                    .filter(|u| u.state == "running")
+                    .map(|u| u.name)
+                    .collect());
+            }
+        }
+    }
+}
+
+fn display_name(entry: &VmEntry, running: Option<&HashSet<String>>) -> String {
+    let services: Vec<&str> = entry
+        .services
+        .iter()
+        .map(|service| service.name.as_str())
+        .filter(|name| running.is_none_or(|r| r.contains(*name)))
+        .collect();
+    if services.is_empty() {
         entry.label.clone()
     } else {
-        let services: Vec<&str> = entry
-            .services
-            .iter()
-            .map(|service| service.name.as_str())
-            .collect();
         format!("{} (+{})", entry.label, services.join(", "))
     }
 }
@@ -539,12 +604,14 @@ pub fn list_report(filter: Option<&Path>, json: bool, stale: bool) -> Result<Str
             }
         })
         .collect();
+    let running_by_vm: Vec<Option<HashSet<String>>> = vms.iter().map(running_services).collect();
 
     if json {
         let views: Vec<VmView> = vms
             .iter()
+            .zip(&running_by_vm)
             .zip(&fresh)
-            .map(|(entry, freshness)| view(entry, *freshness, stale))
+            .map(|((entry, run), freshness)| view(entry, run.as_ref(), *freshness, stale))
             .collect();
         return Ok(serde_json::to_string_pretty(&views).context("serializing VM list")? + "\n");
     }
@@ -558,13 +625,13 @@ pub fn list_report(filter: Option<&Path>, json: bool, stale: bool) -> Result<Str
     }
     let rows: Vec<Vec<String>> = vms
         .iter()
+        .zip(&running_by_vm)
         .zip(&fresh)
-        .map(|(e, f)| {
-            // NAME shows the primary plus its sibling services: `devcontainer (+redis, mysql)`.
+        .map(|((e, run), f)| {
             let mut row = vec![
                 e.pid.to_string(),
                 uptime(e.created_secs),
-                display_name(e),
+                display_name(e, run.as_ref()),
                 e.project_dir
                     .as_deref()
                     .map(|p| p.display().to_string())
@@ -1124,14 +1191,114 @@ mod tests {
             },
         ];
 
-        assert_eq!(display_name(&e), "app (+db, redis)");
-        let json = serde_json::to_value(view(&e, Freshness::Unknown, false)).unwrap();
+        // Unknown running state falls back to every recorded service.
+        assert_eq!(display_name(&e, None), "app (+db, redis)");
+        let json = serde_json::to_value(view(&e, None, Freshness::Unknown, false)).unwrap();
         assert_eq!(json["services"][0]["name"], "db");
         assert_eq!(
             json["services"][0]["exec_addr"],
             "vsock-auto:///state/app/svc-db/vsock.sock:4444"
         );
         assert_eq!(json["services"][1]["name"], "redis");
+    }
+
+    #[test]
+    fn list_view_names_only_running_services() {
+        let mut e = entry(PathBuf::from("/state/app"), Some(PathBuf::from("/project")));
+        e.label = "app".into();
+        e.services = vec![
+            ServiceEntry {
+                name: "db".into(),
+                exec_addr: "vsock-auto:///state/app/svc-db/vsock.sock:4444".into(),
+                stale_recipe: None,
+            },
+            ServiceEntry {
+                name: "redis".into(),
+                exec_addr: "vsock-auto:///state/app/svc-redis/vsock.sock:4444".into(),
+                stale_recipe: None,
+            },
+        ];
+
+        let running: HashSet<String> = ["db".to_string()].into_iter().collect();
+        assert_eq!(display_name(&e, Some(&running)), "app (+db)");
+        let json =
+            serde_json::to_value(view(&e, Some(&running), Freshness::Unknown, false)).unwrap();
+        assert_eq!(json["services"].as_array().unwrap().len(), 1);
+        assert_eq!(json["services"][0]["name"], "db");
+
+        let none: HashSet<String> = HashSet::new();
+        assert_eq!(display_name(&e, Some(&none)), "app");
+    }
+
+    #[test]
+    fn query_running_reads_through_progress_to_done() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use vk_core::fleetctl::{Frame, Reply, UnitStatus};
+
+        let sock = std::env::temp_dir().join(format!(
+            "vk-vms-ctl-{}-{:?}.sock",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_file(&sock).ok();
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut rd = BufReader::new(stream.try_clone().unwrap());
+            let mut req = String::new();
+            rd.read_line(&mut req).unwrap();
+            let mut w = stream;
+            for frame in [
+                Frame::Progress("building svc-db".into()),
+                Frame::Done(Reply::list(vec![
+                    UnitStatus {
+                        name: "db".into(),
+                        state: "running".into(),
+                        ip: "10.0.0.2".into(),
+                    },
+                    UnitStatus {
+                        name: "redis".into(),
+                        state: "stopped".into(),
+                        ip: "10.0.0.3".into(),
+                    },
+                ])),
+            ] {
+                let mut line = serde_json::to_string(&frame).unwrap();
+                line.push('\n');
+                w.write_all(line.as_bytes()).unwrap();
+            }
+        });
+
+        let running = query_running(&sock).unwrap();
+        server.join().unwrap();
+        std::fs::remove_file(&sock).ok();
+
+        assert_eq!(running, ["db".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn query_running_errors_when_peer_closes_early() {
+        use std::os::unix::net::UnixListener;
+
+        let sock = std::env::temp_dir().join(format!(
+            "vk-vms-ctl-early-{}-{:?}.sock",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_file(&sock).ok();
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let server = std::thread::spawn(move || {
+            let _ = listener.accept().unwrap();
+        });
+
+        let res = query_running(&sock);
+        server.join().unwrap();
+        std::fs::remove_file(&sock).ok();
+
+        assert!(res.is_err());
     }
 
     #[test]

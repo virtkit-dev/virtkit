@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- `vk list` now shows only the compose services a VM is actually running, not every
+  declared one — idle on-demand services drop out of both the NAME column and `--json`.
+
 ## [0.48.0] - 2026-09-02
 
 ### Added
