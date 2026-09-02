@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.49.0] - 2026-09-02
+
 ### Changed
 
 - `vk list` now shows only the compose services a VM is actually running, not every
@@ -2273,7 +2275,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.48.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.49.0...HEAD
+[0.49.0]: https://github.com/virtkit-dev/virtkit/compare/v0.48.0...v0.49.0
 [0.48.0]: https://github.com/virtkit-dev/virtkit/compare/v0.47.0...v0.48.0
 [0.47.0]: https://github.com/virtkit-dev/virtkit/compare/v0.46.0...v0.47.0
 [0.46.0]: https://github.com/virtkit-dev/virtkit/compare/v0.45.0...v0.46.0
