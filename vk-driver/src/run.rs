@@ -1795,6 +1795,8 @@ async fn build_and_boot(
         api_socket: None,
         pass_fds,
         proc_name: crate::vmm::resolve_proc_name(&unit_name),
+        // A `vk run` session reboots in place on a guest reset (see keep()).
+        reboot: true,
     };
     // Control server on the primary's hybrid-vsock control socket — only the
     // primary's guest can reach it, so the control plane is scoped to this run.
@@ -1825,6 +1827,23 @@ async fn build_and_boot(
             return Err(e);
         }
     };
+
+    // `vk reboot --force` SIGUSR1s this managing process; forward it to the VMM keeper,
+    // which hard-resets the guest and relaunches it in place. The keeper pid is stable
+    // across reboots, so one forwarder covers the whole run.
+    if let (true, Ok(keeper_pid)) = (spec.reboot, i32::try_from(ch.id())) {
+        tokio::spawn(async move {
+            let Ok(mut sig) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+            else {
+                return;
+            };
+            while sig.recv().await.is_some() {
+                // SAFETY: kill(2) with a plain signal number; worst case ESRCH if the pid is gone.
+                unsafe { libc::kill(keeper_pid, libc::SIGUSR1) };
+            }
+        });
+    }
 
     // Pre-declared so every post-VMM error site can route through teardown_run,
     // which needs these even when the ssh / host-exec steps have not run.
@@ -3127,126 +3146,163 @@ async fn drive(
     fallback_argv: &[String],
     timings: &Timings,
 ) -> Result<()> {
-    let t_boot = Instant::now();
-    let deadline = t_boot + Duration::from_secs(args.boot_timeout_secs);
+    // A reboot-capable guest can reset mid-run: the keeper stays alive and brings it back on
+    // the same disks. Each pass waits for the agent, re-applies the ssh config, and re-runs
+    // the workload; a keeper-alive transport error is a reboot. Ends when the command
+    // finishes without a reboot, or the VMM exits.
+    let mut first_pass = true;
     loop {
-        if let Some(status) = ch.try_wait()? {
-            bail!("{}", boot_failure(console, status));
-        }
-        if vk_core::status::get_status_within(addr, vk_core::status::BOOT_PROBE_BUDGET)
-            .await
-            .is_ok()
-        {
-            break;
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "VM not ready after {}s\n{}",
-                args.boot_timeout_secs,
-                tail(console, 20)
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    // The agent reports ready before ssh-serve binds. Wait for SSH so readiness covers every
-    // service requested by this run.
-    if let Some(ssh) = ssh_probe {
-        wait_ssh_serving(ch, ssh, console, deadline, args.boot_timeout_secs).await?;
-    }
-    timings.record(Phase::Boot, "", t_boot.elapsed());
-    if let Some(cfg) = ssh_config {
-        write_guest_ssh_config(addr, cfg).await?;
-    }
-    // The guest has answered its status probe (booted, agent serving) and its ssh config is
-    // in place. For a `--detach` run this is the moment to daemonize: redirect output to the
-    // log and wake the foreground parent, which returns to the shell while this process holds
-    // the VM below. A boot failure above bails before here, so it surfaces in the foreground.
-    // A no-op unless this process is the forked `--detach` child.
-    if args.detach {
-        crate::detach::signal_ready(args.detach_log.as_deref());
-    }
-    if args.shell {
-        return run_shell(addr).await;
-    }
-    let body = guest_command_body(
-        &args.command,
-        image_entrypoint,
-        image_workdir,
-        args.workdir.is_some(),
-        fallback_argv,
-    );
-    // Apply the built image's environment first (PATH etc.), so the command runs like
-    // `docker run` — the base image's PATH puts toolchains in scope. The command's own
-    // exports (if any) come after and win.
-    let mut script = String::new();
-    for (k, v) in image_env {
-        // Only emit valid shell identifiers: a crafted image `Config.Env` key with shell
-        // metacharacters would otherwise inject into this `sh -c` body (the value is already
-        // quoted by sh_quote; the name is not).
-        if k.is_empty()
-            || !k
-                .bytes()
-                .enumerate()
-                .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()))
-        {
-            eprintln!("virtkit: skipping image env var with non-identifier name {k:?}");
-            continue;
-        }
-        script.push_str(&format!("export {k}={}; ", sh_quote(v)));
-    }
-    script.push_str(&body);
-    let t_exec = Instant::now();
-    // `-t`: run the command interactively under a remote pty wired to the local terminal
-    // (`docker run -t`); otherwise relay its stdout/stderr straight through.
-    let result = if args.tty {
-        run_tty(addr, "sh", vec!["-c".into(), script])
-            .await
-            .context("running the command in the guest (tty)")?
-    } else {
-        let command = vec!["sh".into(), "-c".into(), script];
-        crate::executor::exec_script(
-            addr,
-            &command,
-            Vec::new(),
-            None,
-            &crate::executor::OutputSink::Inherit,
-            None,
-        )
-        .await
-        .context("running the command in the guest")?
-    };
-    timings.record(Phase::Exec, "", t_exec.elapsed());
-    match result.code {
-        Some(0) | None => {}
-        Some(c) => bail!("guest command exited {c}"),
-    }
-    // Ordinarily the startup command owns the run lifetime. An inactivity-managed detached
-    // run instead leaves the exec server available for later `vk exec` calls. Its status
-    // requests do not count as activity, so they can also detect the watchdog exiting and
-    // route through the normal host teardown. The VMM usually exits on guest poweroff, but
-    // not every libkrun version reports it promptly; accepting either signal avoids a leak.
-    if args.inactivity_timeout_secs.is_some() {
-        // Only the rare VMM that misses its guest's poweroff needs these probes at all —
-        // `try_wait` above catches the ordinary case within one poll — so they can afford to
-        // be slow, and a starved guest must not be mistaken for one that is gone and torn
-        // down under whatever `vk exec` is running. Probe failures do not decorrelate (the
-        // load causing them is still there a poll later), so insist on a long streak.
-        const PROBE_FAILURES_BEFORE_GONE: u32 = 6;
-        let status_poll = status_poll_period(args.inactivity_timeout_secs);
-        let mut failures = 0;
-        while ch.try_wait()?.is_none() {
-            if vk_core::status::get_status(addr).await.is_err() {
-                failures += 1;
-                if failures >= PROBE_FAILURES_BEFORE_GONE {
-                    break;
+        let t_boot = Instant::now();
+        let deadline = t_boot + Duration::from_secs(args.boot_timeout_secs);
+        loop {
+            if let Some(status) = ch.try_wait()? {
+                // First boot: the VMM died before serving — a boot failure. On a later pass
+                // it means the guest powered off during the reboot wait; end cleanly.
+                if first_pass {
+                    bail!("{}", boot_failure(console, status));
                 }
-            } else {
-                failures = 0;
+                return Ok(());
             }
-            tokio::time::sleep(status_poll).await;
+            if vk_core::status::get_status_within(addr, vk_core::status::BOOT_PROBE_BUDGET)
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "VM not ready after {}s\n{}",
+                    args.boot_timeout_secs,
+                    tail(console, 20)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
+        // The agent reports ready before ssh-serve binds. Wait for SSH so readiness covers
+        // every service requested by this run.
+        if let Some(ssh) = ssh_probe {
+            wait_ssh_serving(ch, ssh, console, deadline, args.boot_timeout_secs).await?;
+        }
+        if first_pass {
+            timings.record(Phase::Boot, "", t_boot.elapsed());
+        }
+        if let Some(cfg) = ssh_config {
+            write_guest_ssh_config(addr, cfg).await?;
+        }
+        // The guest has answered its status probe (booted, agent serving) and its ssh config
+        // is in place. For a `--detach` run this is the moment to daemonize: redirect output
+        // to the log and wake the foreground parent, which returns to the shell while this
+        // process holds the VM below. A boot failure above bails before here, so it surfaces
+        // in the foreground. A no-op unless this is the forked `--detach` child; only on the
+        // first boot (the parent is long gone by a later reboot).
+        if first_pass && args.detach {
+            crate::detach::signal_ready(args.detach_log.as_deref());
+        }
+        if args.shell {
+            match run_shell(addr).await {
+                Ok(()) => return Ok(()),
+                Err(_) if ch.try_wait()?.is_none() => {
+                    eprintln!("virtkit: guest rebooted — reconnecting");
+                    first_pass = false;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let body = guest_command_body(
+            &args.command,
+            image_entrypoint,
+            image_workdir,
+            args.workdir.is_some(),
+            fallback_argv,
+        );
+        // Apply the built image's environment first (PATH etc.), so the command runs like
+        // `docker run` — the base image's PATH puts toolchains in scope. The command's own
+        // exports (if any) come after and win.
+        let mut script = String::new();
+        for (k, v) in image_env {
+            // Only emit valid shell identifiers: a crafted image `Config.Env` key with shell
+            // metacharacters would otherwise inject into this `sh -c` body (the value is
+            // already quoted by sh_quote; the name is not).
+            if k.is_empty()
+                || !k.bytes().enumerate().all(|(i, b)| {
+                    b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit())
+                })
+            {
+                eprintln!("virtkit: skipping image env var with non-identifier name {k:?}");
+                continue;
+            }
+            script.push_str(&format!("export {k}={}; ", sh_quote(v)));
+        }
+        script.push_str(&body);
+        let t_exec = Instant::now();
+        // `-t`: run the command interactively under a remote pty wired to the local terminal
+        // (`docker run -t`); otherwise relay its stdout/stderr straight through.
+        let outcome = if args.tty {
+            run_tty(addr, "sh", vec!["-c".into(), script]).await
+        } else {
+            let command = vec!["sh".into(), "-c".into(), script];
+            crate::executor::exec_script(
+                addr,
+                &command,
+                Vec::new(),
+                None,
+                &crate::executor::OutputSink::Inherit,
+                None,
+            )
+            .await
+        };
+        let result = match outcome {
+            Ok(result) => result,
+            // A dropped exec channel with a live keeper is a reboot: wait and re-run. A transient
+            // vsock error is indistinguishable and re-runs a non-idempotent command; the boot loop
+            // bounds it by `boot_timeout_secs`.
+            Err(_) if ch.try_wait()?.is_none() => {
+                eprintln!("virtkit: guest rebooted — re-running the command");
+                first_pass = false;
+                continue;
+            }
+            Err(e) => {
+                return Err(e).context(if args.tty {
+                    "running the command in the guest (tty)"
+                } else {
+                    "running the command in the guest"
+                });
+            }
+        };
+        timings.record(Phase::Exec, "", t_exec.elapsed());
+        match result.code {
+            Some(0) | None => {}
+            Some(c) => bail!("guest command exited {c}"),
+        }
+        // Ordinarily the startup command owns the run lifetime. An inactivity-managed detached
+        // run instead leaves the exec server available for later `vk exec` calls. Its status
+        // requests do not count as activity, so they can also detect the watchdog exiting and
+        // route through the normal host teardown. The VMM usually exits on guest poweroff, but
+        // not every libkrun version reports it promptly; accepting either signal avoids a leak.
+        if args.inactivity_timeout_secs.is_some() {
+            // Only the rare VMM that misses its guest's poweroff needs these probes at all —
+            // `try_wait` above catches the ordinary case within one poll — so they can afford
+            // to be slow, and a starved guest must not be mistaken for one that is gone and
+            // torn down under whatever `vk exec` is running. Probe failures do not decorrelate
+            // (the load causing them is still there a poll later), so insist on a long streak.
+            const PROBE_FAILURES_BEFORE_GONE: u32 = 6;
+            let status_poll = status_poll_period(args.inactivity_timeout_secs);
+            let mut failures = 0;
+            while ch.try_wait()?.is_none() {
+                if vk_core::status::get_status(addr).await.is_err() {
+                    failures += 1;
+                    if failures >= PROBE_FAILURES_BEFORE_GONE {
+                        break;
+                    }
+                } else {
+                    failures = 0;
+                }
+                tokio::time::sleep(status_poll).await;
+            }
+        }
+        return Ok(());
     }
-    Ok(())
 }
 
 /// Write the `--ssh-host` stanzas into the guest's `~/.ssh/config` (0600, dir 0700) so
@@ -3837,6 +3893,8 @@ pub(crate) async fn boot_session(
         pass_fds,
         // `stem` is the stage ext4's name — the closest identity this build VM has.
         proc_name: crate::vmm::resolve_proc_name(stem),
+        // A build stage VM ends on a guest reset rather than rebooting in place.
+        reboot: false,
     };
     let vmm = crate::vmm::selected(cloud_hypervisor);
     let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
@@ -5014,6 +5072,7 @@ mod tests {
             api_socket: None,
             pass_fds: vec![medium.fd()],
             proc_name: "vk:test".into(),
+            reboot: false,
         };
         let mut child = spawn_vmm(&CatVmm, &spec, crate::prio::Prio::Normal).unwrap();
         assert!(child.wait().unwrap().success());

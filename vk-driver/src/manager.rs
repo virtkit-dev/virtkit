@@ -125,6 +125,7 @@ impl Manager {
                 let _ = self.stop(&unit);
                 self.start(&unit)
             }
+            Request::Reboot { unit } => self.reboot(&unit),
             Request::Logs { unit, lines } => self.logs(&unit, lines),
         }
     }
@@ -306,6 +307,28 @@ impl Manager {
             (true, true) => format!("stopped {name}"),
             (true, false) => format!("stopped {name} (killed: the guest did not power off)"),
         })
+    }
+
+    /// Reboot a unit's guest in place: ask its agent to reboot (over vsock), else hard-reset
+    /// through the VMM keeper (SIGUSR1). The VM process — and so the unit's pid — stays put;
+    /// the guest comes back on the same disks. Unlike `Restart`, no image rebuild.
+    fn reboot(&self, name: &str) -> Reply {
+        let mut u = self.units.lock().unwrap();
+        let Some(st) = u.get_mut(name) else {
+            return Reply::err(format!("no such unit {name:?}"));
+        };
+        if state_of(st) != "running" {
+            return Reply::err(format!("{name} not running"));
+        }
+        let Some(child) = st.child.as_ref() else {
+            return Reply::err(format!("{name} not running"));
+        };
+        if crate::shutdown::request_reboot(&unit_addr(&st.dir)) {
+            Reply::ok(format!("rebooting {name}"))
+        } else {
+            crate::shutdown::hard_reset(child);
+            Reply::ok(format!("hard-resetting {name} (agent unreachable)"))
+        }
     }
 
     /// Power off all guests concurrently within one `shutdown::STOP_GRACE`, then kill and reap their

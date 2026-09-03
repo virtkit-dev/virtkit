@@ -352,6 +352,11 @@ enum ServiceCmd {
         /// service name
         name: String,
     },
+    /// Reboot a running service's guest in place (same VM, no image rebuild)
+    Reboot {
+        /// service name
+        name: String,
+    },
     /// Print a service's state and address, or every service when no name is given
     Status {
         /// service name; omit to list all services
@@ -1712,6 +1717,24 @@ enum Cmd {
         #[arg(long, default_value_t = 90, value_name = "SECS")]
         timeout: u64,
     },
+    /// Reboot running vk VM(s) in place
+    ///
+    /// Asks the guest to reboot (`vk-agent reboot` over vsock); the VM comes back on the
+    /// same disks, keeping its pid. Selects the VM launched from the current directory by
+    /// default; pass a pid or a launch directory, or `--all`. `--force` skips the agent and
+    /// hard-resets through the VMM (for a hung or agent-less guest).
+    #[command(display_order = 8)]
+    Reboot {
+        /// the VM to reboot: a PID or a launch directory (default: the current directory)
+        #[arg(value_name = "PID|DIR")]
+        target: Option<std::ffi::OsString>,
+        /// reboot every running vk VM
+        #[arg(long, conflicts_with = "target")]
+        all: bool,
+        /// hard-reset without waiting for the guest agent (a power-cycle, not a clean reboot)
+        #[arg(long)]
+        force: bool,
+    },
     /// Replace this `vk` with a GitHub release build
     ///
     /// Installs the latest release, or the VERSION given. Prints what it is about to
@@ -1973,8 +1996,8 @@ fn main() -> ExitCode {
             Ok(spec) => spec,
             Err(e) => return fail(&anyhow::anyhow!("libkrun boot: bad spec: {e}"), 2),
         };
-        return match libkrun_sys::boot(&spec) {
-            Ok(()) => ExitCode::SUCCESS,
+        return match libkrun_sys::keep(&spec) {
+            Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
             Err(e) => fail(&e, 1),
         };
     }
@@ -2038,6 +2061,11 @@ async fn service_cmd(cmd: &ServiceCmd) -> ExitCode {
                 .await
         }
         ServiceCmd::Down { name } => client.request(&Request::Stop { unit: name.clone() }).await,
+        ServiceCmd::Reboot { name } => {
+            client
+                .request(&Request::Reboot { unit: name.clone() })
+                .await
+        }
         ServiceCmd::Status { name: Some(n) } => {
             client.request(&Request::Status { unit: n.clone() }).await
         }
@@ -2458,6 +2486,22 @@ async fn cli_main() -> ExitCode {
         return match vms::stop_cmd(selector, *all, *timeout) {
             Ok((report, all_down)) => match write_report(&report) {
                 ExitCode::SUCCESS if !all_down => exit_code(1),
+                code => code,
+            },
+            Err(e) => fail(&e, 2),
+        };
+    }
+    if let Cmd::Reboot { target, all, force } = &cli.cmd {
+        let selector = match target.as_deref().map(vms::Selector::parse).transpose() {
+            Ok(sel) => sel,
+            Err(e) => {
+                eprintln!("vk: {e:#}");
+                return exit_code(2);
+            }
+        };
+        return match vms::reboot_cmd(selector, *all, *force) {
+            Ok((report, all_ok)) => match write_report(&report) {
+                ExitCode::SUCCESS if !all_ok => exit_code(1),
                 code => code,
             },
             Err(e) => fail(&e, 2),
@@ -3809,6 +3853,7 @@ async fn cli_main() -> ExitCode {
         | Cmd::Fingerprint { .. }
         | Cmd::List { .. }
         | Cmd::Stop { .. }
+        | Cmd::Reboot { .. }
         | Cmd::Update { .. }
         | Cmd::Service { .. } => {
             unreachable!()
@@ -4893,6 +4938,7 @@ mod tests {
                 "gc",
                 "list",
                 "publish",
+                "reboot",
                 "run",
                 "ssh",
                 "ssh-config",

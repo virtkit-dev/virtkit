@@ -15,11 +15,14 @@
 //!
 //! With ACPI now present on x86_64 (vendored patch), the boot child installs a SIGTERM
 //! handler that presses the guest's ACPI power button (`krun_get_shutdown_eventfd`), so
-//! a host `SIGTERM` becomes an orderly guest power-off.
+//! a host `SIGTERM` becomes an orderly guest power-off. When the spec allows reboot,
+//! [`keep`] wraps the boot in a relaunch loop so a guest reset (`KRUN_EXIT_GUEST_RESET`)
+//! reboots the VM in place — same pid and vsock socket for the supervisor.
 
 use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -27,10 +30,10 @@ use anyhow::{Context, Result, bail};
 // (rlib -> shares virtkit's std; compiler-checked signatures). Every call returns
 // >= 0 on success, a negative errno on failure.
 use krun::{
-    krun_add_disk2, krun_add_net_tap, krun_add_virtiofs4, krun_add_vsock_port2, krun_create_ctx,
-    krun_disable_balloon, krun_disable_implicit_init, krun_get_shutdown_eventfd, krun_init_log,
-    krun_set_block_dirty_socket, krun_set_console_output, krun_set_kernel, krun_set_nested_virt,
-    krun_set_pmu, krun_set_vm_config, krun_start_enter,
+    KRUN_EXIT_GUEST_RESET, krun_add_disk2, krun_add_net_tap, krun_add_virtiofs4,
+    krun_add_vsock_port2, krun_create_ctx, krun_disable_balloon, krun_disable_implicit_init,
+    krun_get_shutdown_eventfd, krun_init_log, krun_set_block_dirty_socket, krun_set_console_output,
+    krun_set_kernel, krun_set_nested_virt, krun_set_pmu, krun_set_vm_config, krun_start_enter,
 };
 
 use crate::vmm::{Disk, Net, VmSpec};
@@ -289,7 +292,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         // orderly-shutdown-on-SIGTERM path and the host's SIGKILL still stops the VM.
         install_power_button_on_sigterm(ctx);
 
-        // blocks until the guest powers off.
+        // blocks until the guest powers off or resets.
         ck("krun_start_enter", krun_start_enter(ctx))?;
     }
     Ok(())
@@ -298,9 +301,9 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
 /// Fd the SIGTERM handler writes to press the guest's ACPI power button. -1 until set.
 static SHUTDOWN_FD: AtomicI32 = AtomicI32::new(-1);
 
-/// Seconds the guest gets to act on the power button before the boot child gives up and lets
-/// SIGALRM terminate it — a backstop for a guest that ignores the button, so the child never
-/// hangs. The host escalates to SIGKILL well before.
+/// Seconds the guest gets to act on the power button before the boot child gives up
+/// and lets SIGALRM terminate it — a backstop for a guest that ignores the button, so
+/// the child never outlives whatever spawned it. The host escalates to SIGKILL well before.
 const POWER_BUTTON_GRACE_SECS: libc::c_uint = 70;
 
 /// SIGTERM handler: press the ACPI power button and arm a backstop alarm. Async-signal-safe
@@ -332,6 +335,184 @@ unsafe fn install_power_button_on_sigterm(ctx: u32) {
             libc::SIGTERM,
             press_power_button as *const () as libc::sighandler_t,
         );
+    }
+}
+
+/// Boot `spec`, relaunching the VM in place on a guest reset when `spec.reboot` is set.
+///
+/// Runs in the libkrun boot process (before any Tokio runtime, so `fork` is safe). The
+/// forked child runs [`boot`], which execs into libkrun and never returns; this parent
+/// waits for it and, on a guest reset ([`KRUN_EXIT_GUEST_RESET`]) or a host-driven hard
+/// reset (SIGUSR1), boots it again. A host SIGTERM is forwarded to the child (its ACPI
+/// power button) and stops the loop. Returns the process exit code to use.
+pub fn keep(spec: &VmSpec) -> Result<i32> {
+    if !spec.reboot {
+        // No in-place reboot: boot once. `boot` execs libkrun and never returns on a
+        // normal end (libkrun `_exit`s with the guest's code), so this is effectively
+        // the whole process; a return here means setup failed before the guest ran.
+        boot(spec)?;
+        return Ok(0);
+    }
+
+    install_keeper_signals();
+    let mut short_boots = 0u32;
+    loop {
+        // Stale listen sockets from the previous boot make libkrun's vsock bind fail
+        // (EEXIST). Remove exactly the ones libkrun rebinds (listen=true) — never the
+        // host-owned sockets it only dials (the switch, ssh-agent bridges).
+        for vp in &spec.vsock_ports {
+            if vp.listen {
+                // A missing socket (first boot) is the normal case, so ignore the error;
+                // if it survives, the bind below fails loudly.
+                let _ = std::fs::remove_file(&vp.socket);
+            }
+        }
+        let started = Instant::now();
+
+        // Block the keeper's signals across the fork so the child never runs the keeper's
+        // handlers and the parent records the child pid before any signal is delivered.
+        let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGTERM);
+            libc::sigaddset(&mut set, libc::SIGUSR1);
+            libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        }
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            let e = std::io::Error::last_os_error();
+            unsafe { libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
+            bail!("fork for VM boot: {e}");
+        }
+        if pid == 0 {
+            // Child: drop the keeper's handlers, tie our life to the keeper, unblock, boot.
+            unsafe {
+                libc::signal(libc::SIGTERM, libc::SIG_DFL);
+                libc::signal(libc::SIGUSR1, libc::SIG_DFL);
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            }
+            let code = match boot(spec) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("virtkit: libkrun boot: {e:#}");
+                    1
+                }
+            };
+            unsafe { libc::_exit(code) };
+        }
+
+        CHILD_PID.store(pid, Ordering::SeqCst);
+        unsafe { libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
+
+        let status = wait_for(pid);
+        CHILD_PID.store(0, Ordering::SeqCst);
+
+        // A graceful stop (SIGTERM to the keeper) always ends the loop, whatever the child
+        // reported.
+        if STOP_REQUESTED.load(Ordering::SeqCst) {
+            return Ok(status.code().unwrap_or(0));
+        }
+
+        let reboot = match status {
+            Wait::Exited(code) => code == i32::from(KRUN_EXIT_GUEST_RESET),
+            // We only SIGKILL the child for a host-driven hard reset.
+            Wait::Signaled(_) => HARD_RESET.swap(false, Ordering::SeqCst),
+        };
+        if !reboot {
+            return Ok(status.code().unwrap_or(1));
+        }
+
+        // Storm guard: a guest wedged in a reboot loop must not spin forever.
+        if started.elapsed() < Duration::from_secs(10) {
+            short_boots += 1;
+            if short_boots >= 3 {
+                bail!("guest reset 3 times in under 10s — not rebooting again");
+            }
+        } else {
+            short_boots = 0;
+        }
+        eprintln!("virtkit: guest reset — rebooting");
+    }
+}
+
+/// The current boot child's pid, for the keeper's signal handlers. 0 = none.
+static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+/// Set by SIGTERM: end the relaunch loop after the child stops.
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set by SIGUSR1 (hard reset): the child was SIGKILLed on purpose, so relaunch it.
+static HARD_RESET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// SIGTERM to the keeper: forward it to the child (its ACPI power button) and stop looping.
+extern "C" fn keeper_sigterm(_sig: libc::c_int) {
+    STOP_REQUESTED.store(true, Ordering::SeqCst);
+    let pid = CHILD_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        // SAFETY: kill(2) is async-signal-safe.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+}
+
+/// SIGUSR1 to the keeper: hard-reset — SIGKILL the child and let the loop relaunch it.
+extern "C" fn keeper_sigusr1(_sig: libc::c_int) {
+    HARD_RESET.store(true, Ordering::SeqCst);
+    let pid = CHILD_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        // SAFETY: kill(2) is async-signal-safe.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+}
+
+fn install_keeper_signals() {
+    // SAFETY: the handlers only touch atomics and call kill(2), all async-signal-safe.
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            keeper_sigterm as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGUSR1,
+            keeper_sigusr1 as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+/// The outcome of waiting on the boot child.
+enum Wait {
+    Exited(i32),
+    Signaled(i32),
+}
+
+impl Wait {
+    /// The process exit code to propagate: the child's own, or 128+signal.
+    fn code(&self) -> Option<i32> {
+        match self {
+            Wait::Exited(c) => Some(*c),
+            Wait::Signaled(s) => Some(128 + s),
+        }
+    }
+}
+
+/// `waitpid` the child, retrying across EINTR (our own signal handlers interrupt it).
+fn wait_for(pid: i32) -> Wait {
+    loop {
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if r < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            // Unwaitable child: treat as a generic failure, don't relaunch.
+            return Wait::Exited(1);
+        }
+        if libc::WIFEXITED(status) {
+            return Wait::Exited(libc::WEXITSTATUS(status));
+        }
+        if libc::WIFSIGNALED(status) {
+            return Wait::Signaled(libc::WTERMSIG(status));
+        }
+        // Stopped/continued: keep waiting.
     }
 }
 

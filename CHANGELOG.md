@@ -6,6 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- In-guest reboot now brings the guest back on the same disks instead of ending the VM.
+  `vk reboot` reboots a running VM through the guest (or power-cycles it with `--force`);
+  `vk service reboot NAME` does the same for services. `vk run` re-runs its command after
+  the guest returns.
 - Stopping a VM now shuts down even a hung guest or one whose agent is unresponsive, via
   an ACPI power button, instead of cutting its power.
 

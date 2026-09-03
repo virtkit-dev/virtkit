@@ -767,9 +767,16 @@ impl Selector {
     }
 }
 
-/// Stop VMs selected by `--all`, a pid or launch directory, or the current directory by default.
-/// Returns the summary and whether every selected VM went down.
-pub fn stop_cmd(target: Option<Selector>, all: bool, timeout: u64) -> Result<(String, bool)> {
+/// The VMs a stop/reboot command should act on: either a non-empty selection, or the summary
+/// and exit status to report when nothing matched.
+enum Selection {
+    Matched(Vec<VmEntry>),
+    Empty(String, bool),
+}
+
+/// Resolve `--all`, a pid or launch directory, or the current directory (the default) into the
+/// running VMs to act on. Shared by [`stop_cmd`] and [`reboot_cmd`].
+fn select_vms(target: Option<Selector>, all: bool) -> Result<Selection> {
     let vms = running();
     let target = target.map(Selector::resolved);
     let selected: Vec<VmEntry> = match (all, &target) {
@@ -781,14 +788,24 @@ pub fn stop_cmd(target: Option<Selector>, all: bool, timeout: u64) -> Result<(St
         }
     };
     if selected.is_empty() {
-        return match &target {
-            Some(sel) => Ok((sel.not_found(), empty_selection_ok(true))),
-            None => Ok((
+        return Ok(match &target {
+            Some(sel) => Selection::Empty(sel.not_found(), empty_selection_ok(true)),
+            None => Selection::Empty(
                 "no matching running vk VM\n".to_string(),
                 empty_selection_ok(false),
-            )),
-        };
+            ),
+        });
     }
+    Ok(Selection::Matched(selected))
+}
+
+/// Stop VMs selected by `--all`, a pid or launch directory, or the current directory by default.
+/// Returns the summary and whether every selected VM went down.
+pub fn stop_cmd(target: Option<Selector>, all: bool, timeout: u64) -> Result<(String, bool)> {
+    let selected = match select_vms(target, all)? {
+        Selection::Matched(v) => v,
+        Selection::Empty(out, ok) => return Ok((out, ok)),
+    };
     let mut out = String::new();
     let mut ok = true;
     for e in &selected {
@@ -800,6 +817,60 @@ pub fn stop_cmd(target: Option<Selector>, all: bool, timeout: u64) -> Result<(St
                 e.label, e.pid
             ));
             ok = false;
+        }
+    }
+    Ok((out, ok))
+}
+
+/// How a VM was rebooted, or why it was not.
+enum Rebooted {
+    /// Clean reboot through the guest agent.
+    Agent,
+    /// Power-cycled through the VMM keeper: `--force`, or the agent was unreachable.
+    HardReset,
+    NotRunning,
+}
+
+/// Reboot the guest managed by `entry` in place. Unless `force`, ask its agent to reboot
+/// (over vsock); on `force` or an unreachable agent, SIGUSR1 the managing `vk run`, which
+/// hard-resets the VM through its keeper.
+fn reboot_one(entry: &VmEntry, force: bool) -> Rebooted {
+    if !alive(entry) {
+        return Rebooted::NotRunning;
+    }
+    if !force
+        && let Ok(addr) = vk_core::addr::SocketAddr::from_str(&entry.exec_addr)
+        && crate::shutdown::request_reboot(&addr)
+    {
+        return Rebooted::Agent;
+    }
+    // Hard reset: the managing `vk run` forwards SIGUSR1 to the VMM keeper (see run.rs).
+    if let Ok(pid) = i32::try_from(entry.pid) {
+        // SAFETY: kill(2) with a plain signal number; worst case ESRCH if the pid is gone.
+        unsafe { libc::kill(pid, libc::SIGUSR1) };
+    }
+    Rebooted::HardReset
+}
+
+/// Reboot VMs selected by `--all`, a pid or launch directory, or the current directory by
+/// default. Returns the summary and whether every selected VM was rebooted.
+pub fn reboot_cmd(target: Option<Selector>, all: bool, force: bool) -> Result<(String, bool)> {
+    let selected = match select_vms(target, all)? {
+        Selection::Matched(v) => v,
+        Selection::Empty(out, ok) => return Ok((out, ok)),
+    };
+    let mut out = String::new();
+    let mut ok = true;
+    for e in &selected {
+        match reboot_one(e, force) {
+            Rebooted::Agent => out.push_str(&format!("rebooting {} (pid {})\n", e.label, e.pid)),
+            Rebooted::HardReset => {
+                out.push_str(&format!("hard-resetting {} (pid {})\n", e.label, e.pid));
+            }
+            Rebooted::NotRunning => {
+                out.push_str(&format!("{} (pid {}) is not running\n", e.label, e.pid));
+                ok = false;
+            }
         }
     }
     Ok((out, ok))

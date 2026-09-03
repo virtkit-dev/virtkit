@@ -295,6 +295,12 @@ pub struct VmSpec {
     /// its own binary name.
     #[serde(default = "default_proc_name")]
     pub proc_name: String,
+    /// Reboot the VM in place on a guest reset instead of ending the process. The
+    /// libkrun boot child ([`crate::libkrun_sys::keep`]) then relaunches the VM on the
+    /// same disks, keeping its pid and vsock socket. Set for long-lived guests (compose
+    /// services, `vk run` sessions); left off for build/job VMs, which end on reset.
+    #[serde(default)]
+    pub reboot: bool,
 }
 
 /// A virtual machine monitor that can boot a [`VmSpec`]. `Send` so a boxed `dyn Vmm`
@@ -618,6 +624,7 @@ mod tests {
             api_socket: Some("/job/api.sock".into()),
             pass_fds: Vec::new(),
             proc_name: "vk:ci".into(),
+            reboot: false,
         };
         assert_eq!(
             args(&ch.command(&spec)),
@@ -687,6 +694,7 @@ mod tests {
             api_socket: None,
             pass_fds: Vec::new(),
             proc_name: "vk:build".into(),
+            reboot: false,
         };
         assert_eq!(
             args(&ch.command(&spec)),

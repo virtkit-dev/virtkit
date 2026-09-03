@@ -5,6 +5,8 @@
 //!
 //! A guest whose agent cannot be reached still gets an orderly stop: [`press_power_button`]
 //! SIGTERMs the VMM, whose libkrun boot child turns that into an ACPI power-button press.
+//! [`request_reboot`] and [`hard_reset`] are the reboot equivalents — the agent over vsock, or
+//! SIGUSR1 to the boot child's keeper, which relaunches the VM in place (see `libkrun_sys::keep`).
 
 use std::process::Child;
 use std::time::{Duration, Instant};
@@ -148,11 +150,46 @@ pub(crate) async fn terminate_signal() {
     }
 }
 
+/// Ask the guest at `addr` to reboot (`vk-agent reboot` over the exec channel) and report
+/// whether it accepted. The guest resets in place; the boot child's keeper relaunches it. A
+/// refusal means the caller falls back to a hard reset. Runs on a dedicated thread for the
+/// same reason as [`spawn_poweroff_request`].
+pub(crate) fn request_reboot(addr: &SocketAddr) -> bool {
+    let addr = addr.clone();
+    let handle = std::thread::Builder::new().spawn(move || -> Result<bool> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let result = rt.block_on(async {
+            tokio::time::timeout(
+                REQUEST_BUDGET,
+                crate::executor::exec_script(
+                    &addr,
+                    &[crate::run::GUEST_AGENT.to_string(), "reboot".to_string()],
+                    Vec::new(),
+                    None,
+                    &crate::executor::OutputSink::Inherit,
+                    None,
+                ),
+            )
+            .await
+        })??;
+        Ok(result.code == Some(0))
+    });
+    matches!(handle.map(std::thread::JoinHandle::join), Ok(Ok(Ok(true))))
+}
+
 /// SIGTERM the VMM `child`: its libkrun boot child presses the guest's ACPI power button (an
 /// orderly power-off) rather than dying. The stop fallback when the agent is
 /// unreachable. Returns false only if the pid is unusable.
 pub(crate) fn press_power_button(child: &Child) -> bool {
     signal_child(child, libc::SIGTERM)
+}
+
+/// SIGUSR1 the VMM `child`: its keeper hard-resets the guest (SIGKILL) and relaunches it in
+/// place — the reboot equivalent of the power button, for an unreachable agent.
+pub(crate) fn hard_reset(child: &Child) -> bool {
+    signal_child(child, libc::SIGUSR1)
 }
 
 fn signal_child(child: &Child, sig: libc::c_int) -> bool {

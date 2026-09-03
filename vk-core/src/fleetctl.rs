@@ -15,11 +15,27 @@ pub const CONTROL_PORT: u32 = 1099;
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
     List,
-    Status { unit: String },
-    Start { unit: String },
-    Stop { unit: String },
-    Restart { unit: String },
-    Logs { unit: String, lines: usize },
+    Status {
+        unit: String,
+    },
+    Start {
+        unit: String,
+    },
+    Stop {
+        unit: String,
+    },
+    Restart {
+        unit: String,
+    },
+    /// Reboot the guest in place (keeping the VM process), as opposed to `Restart`,
+    /// which stops the unit and starts it again (and may rebuild the image).
+    Reboot {
+        unit: String,
+    },
+    Logs {
+        unit: String,
+        lines: usize,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

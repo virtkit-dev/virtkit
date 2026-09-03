@@ -688,6 +688,8 @@ pub fn boot_unit(
             api_socket: None,
             pass_fds: Vec::new(),
             proc_name: crate::vmm::resolve_proc_name(&svc.name),
+            // A compose service reboots in place on a guest reset (see keep()).
+            reboot: true,
         };
         let vmm = crate::vmm::selected(cloud_hypervisor);
         // The one VMM spawn shared with `vk run`/`vk build`/the job VM: tied (PDEATHSIG)
