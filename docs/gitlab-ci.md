@@ -154,7 +154,12 @@ job's plain GitLab `image:` is read the same way):
   those job variables. `x-virtkit: { nested: true }` needs the runner to have set
   [`[vm] nested`](#nested-virtualization) and is refused when the fleet loads
   otherwise: nesting reaches host KVM, so it is the runner's decision rather than
-  a job's, the same way the executor never hands a job the guest PMU.
+  a job's, the same way the executor never hands a job the guest PMU. A service's
+  persistent state — `x-virtkit: { persist_root: true }`, `overlay,persist` volumes
+  (see the README's *Volumes and persistent state*) — lives under `.virtkit/` beside
+  the compose file, inside the checkout that every job starts by cleaning: it lasts
+  for the job, across a service being stopped and started within it, and never from
+  one job to the next.
 
 ```yaml
 my-job:

@@ -143,7 +143,9 @@ services:
 ```
 
 `--service-cpus NAME=N` and `--service-mem NAME=SIZE` override those values for one run.
-The same marker supports `init` and `kernel` for services that boot their own system.
+The same marker supports `init` and `kernel` for services that boot their own system, and
+`persist_root` for a service whose root filesystem must outlive a restart (see
+[Volumes and persistent state](#volumes-and-persistent-state)).
 
 A guest gets one interface, `eth0`, by default. `nics` gives it more — `eth1` upward, each
 with its own address on the same LAN — for an appliance that assigns services to separate
@@ -165,6 +167,57 @@ unless the guest routes it elsewhere. Every interface is a real port on the LAN:
 its own MAC, answers ARP, and can carry its own listening services — which is what an
 appliance separating admin from user traffic needs. Up to 8 per guest;
 `vk check --feature nics` reports whether a `vk` supports them.
+
+#### Volumes and persistent state
+
+A service starts from a clean copy of its image every time: its root filesystem is a
+throwaway layer over the image, and `volumes:` bind host paths into the guest. A bind is
+`host:guest[:mode]`, with the host path relative to the compose file:
+
+| mode | the guest sees | writes go |
+|------|----------------|-----------|
+| `rw` (default), `ro` | the host directory or file, live | to the host (`rw`), or are refused (`ro`) |
+| `overlay` | the host tree, read-only underneath | to guest RAM — fast, gone at reboot |
+| `overlay,persist[,size=SIZE]` | the host tree, read-only underneath | to a disk kept next to the compose file |
+| `disk[,size=SIZE]` | a private filesystem of its own | to that disk; the host path is its image |
+
+`overlay` is for build trees and checkouts: reads come from the host, every write lands
+in guest memory and never touches the host tree. Add `persist` to keep those writes on
+disk instead. `disk` is for data that needs real filesystem semantics (ownership, sockets,
+device nodes) a shared directory cannot offer — a database's data directory, say. Shares
+take `,optional` to skip a bind whose source is absent; `size=` (`10G`, `512M`) sets a new
+disk's capacity and is ignored once it exists.
+
+Set `persist_root` when the whole root must persist — an appliance whose state is not
+confined to a few directories:
+
+```yaml
+services:
+  appliance:
+    build: ./appliance
+    x-virtkit:
+      persist_root: true                       # / survives restart and down/up
+    volumes:
+      - ./config:/etc/appliance:ro
+  database:
+    image: postgres:17
+    volumes:
+      - ./pgdata.qcow2:/var/lib/postgresql:disk,size=20G
+  builder:
+    image: local/builder
+    volumes:
+      - ./src:/workspace:overlay                # scratch: reads from the host, writes in RAM
+      - ./cache:/root/.cache:overlay,persist    # keeps its writes across restarts
+```
+
+Persistent state — a `persist_root` root, an `overlay,persist` layer — survives an in-guest
+reboot, `vk service down`/`up`, and stopping and later restarting the run. It lives under
+`.virtkit/` beside the compose file (add it to `.gitignore`), and is reset when what it
+was built on changes: a new image rebuilds a persistent root from scratch, and a new image
+or a changed host tree discards a persistent overlay's writes. A `disk` volume persists
+unconditionally; delete its file to start over. All of this applies alike to a service
+booted with `--primary` and to its siblings; ad-hoc `-v` binds on `vk run` accept every
+mode but `overlay,persist`, which has no compose file to keep its state beside.
 
 Inside the primary guest, `/run/vk/services/<name>/{state,ctl,log}` exposes service
 state, control, and logs through ordinary files. `vk service up|down|status` provides the
