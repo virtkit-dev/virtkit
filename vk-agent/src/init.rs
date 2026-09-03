@@ -163,8 +163,11 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     export_default_run_user(); // so served stages drop to the image's USER
     apply_boot_config(boot_config.as_ref()); // the boot config wins over any capture
     materialize_env(boot_config.as_ref()); // persist the merged env for login shells
-    mount_virtiofs(&cmdline)?;
-    mount_disks(&cmdline)?;
+    // Filesystems to freeze clean at poweroff: disk volumes and any persistent overlay uppers
+    // (both host-backed ext4); see [`DISK_MOUNTS`].
+    let mut disk_freeze = mount_virtiofs(&cmdline)?;
+    disk_freeze.extend(mount_disks(&cmdline)?);
+    let _ = DISK_MOUNTS.set(disk_freeze);
     apply_symlinks(&cmdline);
     link_ci_tools(&cmdline); // host CI tools (git/git-lfs/…) onto PATH, if the image lacks them
     maybe_atop(&cmdline); // record this guest's own stats, before anything else runs in it
@@ -307,8 +310,9 @@ fn run_full_vm(
     apply_boot_config(cfg);
     materialize_env(cfg);
     claim_run_tmpfs(cmdline); // before the shares: a volume under /run must land on that tmpfs
-    mount_virtiofs(cmdline)?;
-    mount_disks(cmdline)?;
+    let mut disk_freeze = mount_virtiofs(cmdline)?;
+    disk_freeze.extend(mount_disks(cmdline)?);
+    let _ = DISK_MOUNTS.set(disk_freeze);
     apply_symlinks(cmdline);
     configure_network_fullvm(cmdline);
 
@@ -1080,9 +1084,22 @@ fn materialize_env(cfg: Option<&RunConfig>) {
 /// create/write/unlink round-trip costs 50–90µs vs ~2µs on tmpfs). An overlay share
 /// that fails to mount fails the boot: falling back to the direct mount would silently
 /// run the workload 15–50× slower.
-fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<()> {
+///
+/// Returns the ext4 mountpoints (persistent overlay uppers) to freeze at poweroff — empty
+/// unless a share used `overlay,persist`.
+fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<Vec<CString>> {
     let mut overlay = overlay_tags(cmdline)?;
     let size = overlay_size(cmdline)?;
+    let overlay_disks = overlay_disk_devices(cmdline)?;
+    // Each overlay-upper disk names a tag; that tag must be one of the overlay shares, or the
+    // disk would attach unused and its writes would silently stay in RAM.
+    for tag in overlay_disks.keys() {
+        if !overlay.contains(tag) {
+            bail!("VIRTKIT_VIRTIOFS_OVERLAY_DISK names {tag:?}, which is not an overlay share");
+        }
+    }
+    // Persistent overlay uppers (host-backed ext4) to freeze at poweroff.
+    let mut freeze: Vec<CString> = Vec::new();
     let Some(spec) = cmdline.get("VIRTKIT_VIRTIOFS") else {
         if !overlay.is_empty() {
             bail!(
@@ -1090,7 +1107,7 @@ fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<()> {
                 sorted_join(&overlay)
             );
         }
-        return Ok(());
+        return Ok(freeze);
     };
     let _ = run_cmd("modprobe", &["virtiofs"]); // built-in on our kernel; harmless
     let mut overlaid: HashSet<String> = HashSet::new();
@@ -1100,8 +1117,10 @@ fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<()> {
             continue;
         };
         if overlay.remove(tag) {
-            mount_share_overlay(tag, path, size)
-                .with_context(|| format!("overlay-mounting virtiofs share {tag} at {path}"))?;
+            let upper =
+                mount_share_overlay(tag, path, size, overlay_disks.get(tag).map(String::as_str))
+                    .with_context(|| format!("overlay-mounting virtiofs share {tag} at {path}"))?;
+            freeze.extend(upper);
             overlaid.insert(tag.to_string());
             continue;
         }
@@ -1136,7 +1155,32 @@ fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<()> {
             sorted_join(&overlay)
         );
     }
-    Ok(())
+    Ok(freeze)
+}
+
+/// Parse VIRTKIT_VIRTIOFS_OVERLAY_DISK=tag:/dev/vdX[,tag:/dev/vdY]: the persistent ext4 disk
+/// backing each `overlay,persist` upper. The agent mounts it as the overlay's writable upper
+/// layer in place of a tmpfs, so overlay writes survive across boots.
+fn overlay_disk_devices(cmdline: &HashMap<String, String>) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    let Some(spec) = cmdline.get("VIRTKIT_VIRTIOFS_OVERLAY_DISK") else {
+        return Ok(map);
+    };
+    for entry in spec.split(',').filter(|e| !e.is_empty()) {
+        let Some((tag, device)) = entry.split_once(':') else {
+            bail!("bad VIRTKIT_VIRTIOFS_OVERLAY_DISK entry {entry:?} (want tag:/dev/vdX)");
+        };
+        if tag.is_empty() || tag.contains('/') {
+            bail!("VIRTKIT_VIRTIOFS_OVERLAY_DISK tag {tag:?} is not a valid share tag");
+        }
+        if !device.starts_with("/dev/") {
+            bail!("VIRTKIT_VIRTIOFS_OVERLAY_DISK device {device:?} is not a /dev path");
+        }
+        if map.insert(tag.to_string(), device.to_string()).is_some() {
+            bail!("VIRTKIT_VIRTIOFS_OVERLAY_DISK lists tag {tag:?} more than once");
+        }
+    }
+    Ok(map)
 }
 
 /// Mount each `VIRTKIT_DISKS=/dev/vdX:path[,/dev/vdX:path]` entry — a compose/`-v` `disk`
@@ -1146,9 +1190,12 @@ fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<()> {
 /// file, not a tmpfs layer — its content persists across boots. A disk that fails to mount
 /// fails the boot: the volume is why the service exists, so silently starting without it is
 /// worse than not starting.
-fn mount_disks(cmdline: &HashMap<String, String>) -> Result<()> {
+///
+/// Returns the mounted paths so the caller can hand them, together with any persistent overlay
+/// uppers, to [`DISK_MOUNTS`] for the poweroff freeze.
+fn mount_disks(cmdline: &HashMap<String, String>) -> Result<Vec<CString>> {
     let Some(spec) = cmdline.get("VIRTKIT_DISKS") else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let mut mounted = Vec::new();
     for entry in spec.split(',').filter(|e| !e.is_empty()) {
@@ -1163,19 +1210,17 @@ fn mount_disks(cmdline: &HashMap<String, String>) -> Result<()> {
         chown_created_mount_parents(target, &created_parents);
         mounted.push(cstr(path));
     }
-    // `mount_disks` currently runs on one boot path. If a second call is ever added, a
-    // duplicate set leaves only that call's volumes unfrozen rather than failing boot.
-    let _ = DISK_MOUNTS.set(mounted);
-    Ok(())
+    Ok(mounted)
 }
 
-/// Disk-volume mount paths retained for [`poweroff`]. Their host-backed ext4 files outlive
-/// the guest and must be frozen clean; virtiofs shares have no guest-visible superblock.
-/// Paths, rather than file descriptors, allow guest unmounts, which open descriptors would
-/// block with `EBUSY`. An overmount skips the affected volume; after an unmount, opening its
-/// path reaches `/`, which is frozen separately. `CString` avoids allocation in the signal
-/// handler. Only supervising PID 1 reads the list; `run_full_vm` execs the real init before
-/// this path can run.
+/// Host-backed ext4 mount paths retained for [`poweroff`]: `disk` volumes and persistent
+/// overlay (`overlay,persist`) uppers. Their files outlive the guest and must be frozen clean;
+/// virtiofs shares and tmpfs overlay uppers have no host-visible superblock to flush. Paths,
+/// rather than file descriptors, allow guest unmounts, which open descriptors would block with
+/// `EBUSY`. An overmount skips the affected mount; after an unmount, opening its path reaches
+/// `/`, which is frozen separately. `CString` avoids allocation in the signal handler. Set once
+/// per boot from `mount_virtiofs` + `mount_disks`; only supervising PID 1 reads the list, and
+/// `run_full_vm` execs the real init before this path can run.
 static DISK_MOUNTS: OnceLock<Vec<CString>> = OnceLock::new();
 
 /// Root under which overlay-backed shares keep their private lower/upper/work mounts.
@@ -1275,11 +1320,20 @@ fn overlay_tmpfs_data(size: Option<&str>) -> String {
     }
 }
 
-/// Mount the virtiofs share `tag` at `path` behind an overlayfs: the share is the
-/// read-only lower layer, upper/work live on a dedicated guest tmpfs of `size` (`None` =
-/// the kernel's own default). Only first-touch reads of lower files cross virtio-fs (and
-/// then stay in the guest page cache); the host never sees guest writes.
-fn mount_share_overlay(tag: &str, path: &str, size: Option<&str>) -> Result<()> {
+/// Mount the virtiofs share `tag` at `path` behind an overlayfs: the share is the read-only
+/// lower layer. The writable upper/work live either on a persistent host-backed ext4 disk
+/// (`upper_device`, from `overlay,persist`) or, by default, on a dedicated guest tmpfs of `size`
+/// (`None` = the kernel's own default). Only first-touch reads of lower files cross virtio-fs
+/// (and then stay in the guest page cache); the host never sees guest writes.
+///
+/// Returns the upper's ext4 mountpoint to freeze at poweroff on the persistent path, `None` on
+/// the tmpfs path (nothing on the host to flush).
+fn mount_share_overlay(
+    tag: &str,
+    path: &str,
+    size: Option<&str>,
+    upper_device: Option<&str>,
+) -> Result<Option<CString>> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let OverlayDirs {
         lower,
@@ -1290,32 +1344,48 @@ fn mount_share_overlay(tag: &str, path: &str, size: Option<&str>) -> Result<()> 
     std::fs::create_dir_all(&lower).with_context(|| format!("creating {lower}"))?;
     mount(tag, &lower, "virtiofs", libc::MS_RDONLY)
         .with_context(|| format!("mounting virtiofs {tag} (lower layer) at {lower}"))?;
-    // A dedicated tmpfs (not the shared /run) keeps bulk build writes away from the
-    // agent's runtime dirs. Its size is what a build tree has to fit under, so the host
-    // states it (`[gitlab] checkout_overlay_size`); told nothing, the kernel's own tmpfs
-    // default of half the RAM applies, and the VM memory size is the lever either way.
+    // The upper+work layer, on its own mount (not the shared /run) to keep bulk writes off the
+    // agent's runtime dirs. Persistent: a host-backed ext4 whose contents (and the upper/work
+    // dirs) survive across boots. Default: a fresh per-boot tmpfs whose size is what a build
+    // tree must fit under — the host states it (`[gitlab] checkout_overlay_size`), else the
+    // kernel's own default of half the RAM applies, with VM memory as the lever either way.
     std::fs::create_dir_all(&rw).with_context(|| format!("creating {rw}"))?;
-    mount_data(
-        "tmpfs",
-        &rw,
-        "tmpfs",
-        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOATIME,
-        &overlay_tmpfs_data(size),
-    )
-    .with_context(|| format!("mounting the overlay upper tmpfs at {rw}"))?;
-    std::fs::create_dir(&upper).with_context(|| format!("creating {upper}"))?;
-    std::fs::create_dir(&work).with_context(|| format!("creating {work}"))?;
-    // A dir present in both layers takes its merged metadata from the UPPER one: the
-    // upper root must replicate the lower root's ownership/mode, or the merged tree
-    // would appear root-owned 0755 and the mapped job user could not create files in it.
-    let meta = std::fs::metadata(&lower).with_context(|| format!("stat {lower}"))?;
-    std::os::unix::fs::chown(&upper, Some(meta.uid()), Some(meta.gid()))
-        .with_context(|| format!("chown {upper} to the share owner"))?;
-    std::fs::set_permissions(
-        &upper,
-        std::fs::Permissions::from_mode(meta.mode() & 0o7777),
-    )
-    .with_context(|| format!("chmod {upper} to the share mode"))?;
+    match upper_device {
+        Some(device) => mount(
+            device,
+            &rw,
+            "ext4",
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOATIME,
+        )
+        .with_context(|| format!("mounting the overlay upper disk {device} at {rw}"))?,
+        None => mount_data(
+            "tmpfs",
+            &rw,
+            "tmpfs",
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOATIME,
+            &overlay_tmpfs_data(size),
+        )
+        .with_context(|| format!("mounting the overlay upper tmpfs at {rw}"))?,
+    }
+    // A persistent upper keeps its dirs (and their contents) from the previous boot; a tmpfs one
+    // starts empty. `created_upper` is true only when this boot made the dir, gating the reseed.
+    let created_upper =
+        create_overlay_layer_dir(&upper).with_context(|| format!("creating {upper}"))?;
+    create_overlay_layer_dir(&work).with_context(|| format!("creating {work}"))?;
+    // A dir present in both layers takes its merged metadata from the UPPER one: a freshly
+    // created upper root must replicate the lower root's ownership/mode, or the merged tree
+    // would appear root-owned 0755 and the mapped job user could not create files in it. A
+    // reused persistent upper already carries whatever the workload left, so leave it.
+    if created_upper {
+        let meta = std::fs::metadata(&lower).with_context(|| format!("stat {lower}"))?;
+        std::os::unix::fs::chown(&upper, Some(meta.uid()), Some(meta.gid()))
+            .with_context(|| format!("chown {upper} to the share owner"))?;
+        std::fs::set_permissions(
+            &upper,
+            std::fs::Permissions::from_mode(meta.mode() & 0o7777),
+        )
+        .with_context(|| format!("chmod {upper} to the share mode"))?;
+    }
     let mountpoint = Path::new(path);
     let created_parents = create_mountpoint(mountpoint)
         .with_context(|| format!("creating overlay mountpoint {path}"))?;
@@ -1328,7 +1398,17 @@ fn mount_share_overlay(tag: &str, path: &str, size: Option<&str>) -> Result<()> 
     )
     .with_context(|| format!("mounting the overlay at {path}"))?;
     chown_created_mount_parents(mountpoint, &created_parents);
-    Ok(())
+    Ok(upper_device.is_some().then(|| cstr(&rw)))
+}
+
+/// Create an overlay layer dir, reporting whether this call made it. A persistent upper's dirs
+/// already exist from a previous boot (`false`); a tmpfs upper's never do (`true`).
+fn create_overlay_layer_dir(path: &str) -> io::Result<bool> {
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Create a mountpoint without losing which parent directories were synthesized.
@@ -2695,7 +2775,45 @@ mod tests {
 
     #[test]
     fn mount_disks_is_a_noop_without_the_cmdline_key() {
-        mount_disks(&HashMap::new()).unwrap();
+        assert!(mount_disks(&HashMap::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn overlay_disk_devices_parses_and_validates() {
+        assert!(overlay_disk_devices(&HashMap::new()).unwrap().is_empty());
+
+        let m = HashMap::from([(
+            "VIRTKIT_VIRTIOFS_OVERLAY_DISK".to_string(),
+            "vol1:/dev/vdb,vol2:/dev/vdc".to_string(),
+        )]);
+        let got = overlay_disk_devices(&m).unwrap();
+        assert_eq!(got.get("vol1").map(String::as_str), Some("/dev/vdb"));
+        assert_eq!(got.get("vol2").map(String::as_str), Some("/dev/vdc"));
+
+        let bad = |v: &str| {
+            let m = HashMap::from([("VIRTKIT_VIRTIOFS_OVERLAY_DISK".to_string(), v.to_string())]);
+            overlay_disk_devices(&m).unwrap_err().to_string()
+        };
+        assert!(bad("vol1").contains("want tag:/dev/vdX"));
+        assert!(bad("vol1:sda").contains("is not a /dev path"));
+        assert!(bad("vol1:/dev/vdb,vol1:/dev/vdc").contains("more than once"));
+        // An empty tag, or a tag with a `/`, is not a valid share tag.
+        assert!(bad(":/dev/vdb").contains("is not a valid share tag"));
+        assert!(bad("vo/l:/dev/vdb").contains("is not a valid share tag"));
+    }
+
+    #[test]
+    fn mount_virtiofs_rejects_an_overlay_disk_for_a_non_overlay_share() {
+        // A named upper disk whose tag is not an overlay share would attach unused; fail loud.
+        let m = HashMap::from([
+            ("VIRTKIT_VIRTIOFS".to_string(), "vol1:/mnt".to_string()),
+            (
+                "VIRTKIT_VIRTIOFS_OVERLAY_DISK".to_string(),
+                "vol1:/dev/vdb".to_string(),
+            ),
+        ]);
+        let err = mount_virtiofs(&m).unwrap_err().to_string();
+        assert!(err.contains("not an overlay share"), "{err}");
     }
 
     #[test]

@@ -742,6 +742,57 @@ pub fn flatten_into(src: &Path, w: &mut Qcow2Writer) -> Result<()> {
     Ok(())
 }
 
+/// Write the image `view` stands for into a **standalone** sparse qcow2 at `out` — no backing
+/// chain, so the result outlives whatever `view` was — created with `mode` (must not exist), and
+/// hand back the still-open writer: the caller applies any fix-ups (an exported image gets its
+/// journal this way) and then finishes it. A `.vk_ro_img` manifest is wrapped in an empty
+/// overlay and flattened, a qcow2 chain is flattened, a raw image is imported; zero blocks stay
+/// unallocated in every case. For a persistent root disk, which must not reference a tier
+/// entry or per-run base that can go away.
+///
+/// As with [`materialize_to_raw`], a manifest's `out` must be a sibling of `view` unless `view`
+/// is absolute: the scratch overlay is written beside `out`.
+pub fn materialize_standalone_open(view: &Path, out: &Path, mode: u32) -> Result<Qcow2Writer> {
+    let f = File::open(view).with_context(|| format!("opening {}", view.display()))?;
+    // A manifest has no shape a reader takes directly; it is wrapped in an empty overlay and that
+    // is flattened. The wrap path is fixed here but created inside the closure below (like
+    // `materialize_to_raw`) so the cleanup runs even when `create_overlay` half-writes it.
+    let wrap = matches!(sniff_kind(&f), ImageKind::Lazy).then(|| out.with_extension("wrap.qcow2"));
+    let result = (|| -> Result<Qcow2Writer> {
+        let src = match &wrap {
+            Some(wrap) => {
+                create_overlay(wrap, view)?;
+                wrap.as_path()
+            }
+            None => view,
+        };
+        let sf = File::open(src).with_context(|| format!("opening {}", src.display()))?;
+        match sniff_kind(&sf) {
+            ImageKind::Raw => {
+                let size = sf
+                    .metadata()
+                    .with_context(|| format!("sizing {}", src.display()))?
+                    .len();
+                let mut w = Qcow2Writer::create(out, size, mode)?;
+                w.import_raw(src)?;
+                Ok(w)
+            }
+            // A qcow2, or the overlay wrapped around a manifest: the chain reader flattens it.
+            ImageKind::Qcow2 | ImageKind::Lazy => {
+                let size = Qcow2::open(src)?.virtual_size();
+                let mut w = Qcow2Writer::create(out, size, mode)?;
+                flatten_into(src, &mut w)?;
+                Ok(w)
+            }
+        }
+    })();
+    // The wrap is scratch either way, including after a half-written `create_overlay`.
+    if let Some(wrap) = wrap {
+        let _ = std::fs::remove_file(wrap);
+    }
+    result
+}
+
 /// Write the image `view` stands for into a raw file at `out`: a `.vk_ro_img` manifest (a lazy
 /// chunk view of a cached stage) is wrapped in an empty overlay and flattened through the same
 /// reader an export uses, a qcow2 is flattened directly, and a raw image is copied. For a caller
@@ -2342,6 +2393,95 @@ mod tests {
             "the chain's data extents must include the lazy backing's chunk"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `materialize_standalone_open` on a qcow2-with-backing flattens the whole chain into a
+    /// standalone qcow2 that keeps reading after its entire source chain is deleted — the property
+    /// a persistent root relies on. (The Raw branch is exercised by compose's `ensure_persist_root`
+    /// test; this covers the Qcow2 branch.)
+    #[test]
+    fn materialize_standalone_open_qcow2_is_independent_of_its_source() {
+        let dir = std::env::temp_dir().join(format!("vk-mso-qcow2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A raw ext4 backing under a qcow2 overlay — the same shape a throwaway CoW root has.
+        let raw = dir.join("base.ext4");
+        crate::ext4::build_empty(&raw, 8192).unwrap();
+        let overlay = dir.join("ovl.qcow2");
+        create_overlay(&overlay, &raw).unwrap();
+
+        let want = {
+            let mut q = Qcow2::open(&overlay).unwrap();
+            let mut b = vec![0u8; 8192];
+            q.read_at(0, &mut b).unwrap();
+            b
+        };
+
+        let out = dir.join("root.qcow2");
+        materialize_standalone_open(&overlay, &out, 0o600)
+            .unwrap()
+            .finish()
+            .unwrap();
+        assert_eq!(
+            Qcow2::open(&out).unwrap().virtual_size(),
+            Qcow2::open(&overlay).unwrap().virtual_size()
+        );
+
+        // Delete the whole source chain: a standalone image must not depend on any of it.
+        std::fs::remove_file(&overlay).unwrap();
+        std::fs::remove_file(&raw).unwrap();
+        let mut q = Qcow2::open(&out).unwrap();
+        let mut got = vec![0u8; 8192];
+        q.read_at(0, &mut got).unwrap();
+        assert_eq!(
+            got, want,
+            "the standalone image must carry the chain's bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Lazy branch: a `.vk_ro_img` manifest is wrapped and flattened into a standalone qcow2,
+    /// leaving no scratch `*.wrap.qcow2` behind (the wrap cleanup runs on the success path).
+    #[test]
+    fn materialize_standalone_open_manifest_flattens_and_leaves_no_wrap() {
+        let dir = std::env::temp_dir().join(format!("vk-mso-lazy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let chunk: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
+        let digest = fake_digest(7);
+        std::fs::write(dir.join(digest_hex(&digest)), &chunk).unwrap();
+        let manifest = dir.join("base.vk_ro_img");
+        crate::registry::write_vk_ro_img(
+            &manifest,
+            chunk.len() as u64,
+            crate::registry::VK_RO_IMG_LAYOUT_FLAT,
+            &dir,
+            &[crate::registry::LazyChunk {
+                offset: 0,
+                length: chunk.len() as u32,
+                codec: crate::registry::VK_RO_IMG_CODEC_RAW,
+                digest,
+            }],
+        )
+        .unwrap();
+
+        let out = dir.join("root.qcow2");
+        materialize_standalone_open(&manifest, &out, 0o600)
+            .unwrap()
+            .finish()
+            .unwrap();
+        // No leftover scratch overlay beside the output.
+        assert!(!out.with_extension("wrap.qcow2").exists());
+
+        // Standalone: reads the manifest's bytes even after the manifest and its chunk are gone.
+        std::fs::remove_file(&manifest).unwrap();
+        std::fs::remove_file(dir.join(digest_hex(&fake_digest(7)))).unwrap();
+        let mut q = Qcow2::open(&out).unwrap();
+        let mut got = vec![0u8; chunk.len()];
+        q.read_at(0, &mut got).unwrap();
+        assert_eq!(got, chunk);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

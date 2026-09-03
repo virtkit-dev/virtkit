@@ -65,6 +65,10 @@ pub struct Provisioned {
     /// them from the LAN's static region ([`ExtraNics`]) because they have to be unique
     /// across every guest on it, not just within this one.
     pub extra_ips: Vec<Ipv4Addr>,
+    /// Where this unit's `/` persists (its compose `x-virtkit.persist_root`): `Some` = a
+    /// standalone qcow2 kept across restart and down/up, `None` = a throwaway CoW over `ext4`
+    /// every start. Uniform with the primary path.
+    pub persist_root_backing: Option<PathBuf>,
 }
 
 /// Where a unit sits on the owner's LAN: the subnet's gateway and prefix, the address slot
@@ -170,6 +174,32 @@ pub fn build_unit_ext4(
 ) -> Result<PathBuf> {
     let (_recipe, _target, key) = build_recipe(unit, global_build_args, None)?;
     Ok(crate::ensure::build_tier_dir(state_dir, &key).join(crate::ensure::UNIT_IMAGE))
+}
+
+/// The content identity of a unit's clean image: the content-addressed cache path it resolves
+/// to — the digest-keyed image-tier rootfs for an `image:` unit, the stage-fingerprint-keyed
+/// build-tier entry for a `build:` one. This is exactly the `ext4` a sibling boots
+/// (`Provisioned::ext4`), so keying a persistent root or overlay upper on it makes the primary
+/// reset on the same image changes a sibling does. Pure for a `build:` unit; an `image:` unit
+/// resolves through the shared cache (a hit whenever the image has already been fetched).
+pub fn unit_image_id(
+    cfg: &Config,
+    state_dir: &Path,
+    global_build_args: &[(String, String)],
+    unit: &crate::compose::Unit,
+) -> Result<String> {
+    let path = match &unit.source {
+        crate::compose::Source::Image(image) => {
+            let crate::image::ResolvedImage::Disk { rootfs, .. } =
+                crate::image::resolve_ref(cfg, state_dir, image)
+                    .with_context(|| format!("service {}", unit.name))?;
+            rootfs
+        }
+        crate::compose::Source::Build { .. } => {
+            build_unit_ext4(state_dir, global_build_args, unit)?
+        }
+    };
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Ensure a `build:` unit is materialized in the shared build tier synchronously — the
@@ -307,6 +337,7 @@ pub fn provisioned(
         mem: unit.mem.clone(),
         nested: unit.nested,
         extra_ips,
+        persist_root_backing: unit.persist_root_backing.clone(),
     })
 }
 
@@ -420,12 +451,26 @@ pub fn boot_unit(
             svc.name
         );
     }
-    let overlay = dir.join(format!("{}-overlay.qcow2", svc.name));
     let vsock = dir.join("vsock.sock");
     let console = dir.join("console.log");
 
-    let _ = std::fs::remove_file(&overlay);
-    create_overlay(&svc.ext4, &overlay)?;
+    // The image's content identity keys every persistence this unit opted into (its root, its
+    // `overlay,persist` uppers): a new image resets them. `ext4` is content-addressed, so its
+    // path is that identity — see `unit_image_id`, which derives the same for the primary.
+    let root_image_id = svc.ext4.to_string_lossy().into_owned();
+    // The root disk (vda). Default: a throwaway CoW over the clean image, fresh every start.
+    // `persist_root`: a standalone persistent qcow2, kept across starts and reset only when the
+    // image changes — the same disk the primary path boots for a `persist_root` primary.
+    let overlay = match &svc.persist_root_backing {
+        Some(backing) => crate::compose::ensure_persist_root(backing, &svc.ext4, &root_image_id)
+            .with_context(|| format!("service {}: persistent root", svc.name))?,
+        None => {
+            let overlay = dir.join(format!("{}-overlay.qcow2", svc.name));
+            let _ = std::fs::remove_file(&overlay);
+            create_overlay(&svc.ext4, &overlay)?;
+            overlay
+        }
+    };
     remove_stale_exec_socket(&vsock);
 
     // The init/kernel axes are a uniform per-unit property (from the unit's compose
@@ -484,16 +529,30 @@ pub fn boot_unit(
     // VIRTKIT_SYMLINKS below. Without this, a sibling's single-file volume mounted the
     // share directly at the guest path, turning what should be a file into a directory.
     let mut file_bind_links: Vec<(String, String)> = Vec::new();
-    // `disk` volumes: a raw virtio-blk device per volume (the backing file created and
-    // formatted on first use), attached after the unit's own overlay disk (vda) — so vdb,
-    // vdc, … in declaration order — and named to the guest over the cmdline the same way,
-    // mirroring `run::build_and_boot`'s handling of the primary's own `disk` volumes.
-    let mut disk_volumes: Vec<&crate::compose::Volume> = Vec::new();
+    // Disk-backed devices attached after the unit's own overlay disk (vda) — so vdb, vdc, … in
+    // the order pushed here: each `disk` volume, and each `overlay,persist` upper (whose write
+    // layer is a persistent ext4 rather than tmpfs). `disks` starts with vda so
+    // `vd_name(disks.len())` names the next device correctly whatever the interleaving, exactly
+    // as `run::build_and_boot` names the primary's own such devices.
+    let mut disks: Vec<crate::vmm::Disk> = vec![crate::vmm::Disk::overlay(overlay)];
+    let mut disk_devices = String::new();
+    // `tag:/dev/vdN` for each `overlay,persist` volume: the agent mounts that ext4 as the
+    // overlay's upper layer instead of a fresh tmpfs. The base image's identity, which keys the
+    // upper's coherence (a stale upper is reset when it changes).
+    let mut overlay_disk_pairs: Vec<String> = Vec::new();
     for (i, vol) in svc.volumes.iter().enumerate() {
         crate::compose::require_share_source(vol)?;
         if vol.disk {
             crate::compose::ensure_disk_backing(vol)?;
-            disk_volumes.push(vol);
+            let device = crate::build::vd_name(disks.len());
+            if !disk_devices.is_empty() {
+                disk_devices.push(',');
+            }
+            disk_devices.push_str(&format!("/dev/{device}:{}", vol.guest));
+            disks.push(crate::vmm::Disk::for_image(
+                vol.host.clone(),
+                vol.read_only,
+            )?);
             continue;
         }
         let tag = format!("vol{i}");
@@ -528,6 +587,15 @@ pub fn boot_unit(
         virtiofs.push_str(&format!("{tag}:{mount_at}"));
         if vol.overlay {
             overlay_tags.push(tag.clone());
+            if vol.persist {
+                // The upper is a host-backed ext4 disk (reset when the base image or lower tree
+                // changes), attached after vda like a disk volume; the agent uses it in place of
+                // the default tmpfs so overlay writes survive across boots.
+                let backing = crate::compose::ensure_persist_overlay_backing(vol, &root_image_id)?;
+                let device = crate::build::vd_name(disks.len());
+                overlay_disk_pairs.push(format!("{tag}:/dev/{device}"));
+                disks.push(crate::vmm::Disk::for_image(backing, false)?);
+            }
         }
         shares.push(crate::vmm::FsShare {
             tag,
@@ -539,22 +607,6 @@ pub fn boot_unit(
         });
     }
     let shared_mem = !shares.is_empty();
-    // vda is the unit's own overlay disk, pushed below — so a disk volume's device is its
-    // 1-based position here, exactly as `crate::build::vd_name`'s own Vec-position naming
-    // resolves it.
-    let disks: Vec<crate::vmm::Disk> = std::iter::once(Ok(crate::vmm::Disk::overlay(overlay)))
-        .chain(
-            disk_volumes
-                .iter()
-                .map(|vol| crate::vmm::Disk::for_image(vol.host.clone(), vol.read_only)),
-        )
-        .collect::<Result<_>>()?;
-    let disk_devices: String = disk_volumes
-        .iter()
-        .enumerate()
-        .map(|(i, vol)| format!("/dev/{}:{}", crate::build::vd_name(1 + i), vol.guest))
-        .collect::<Vec<_>>()
-        .join(",");
 
     // The sibling's deterministic MAC, derived from its run-assigned IP. Passed on
     // the cmdline so the agent sets the tap's hardware address to it, letting the
@@ -627,6 +679,12 @@ pub fn boot_unit(
             cmdline.push_str(&format!(
                 " VIRTKIT_VIRTIOFS_OVERLAY={}",
                 overlay_tags.join(",")
+            ));
+        }
+        if !overlay_disk_pairs.is_empty() {
+            cmdline.push_str(&format!(
+                " VIRTKIT_VIRTIOFS_OVERLAY_DISK={}",
+                overlay_disk_pairs.join(",")
             ));
         }
         if !file_bind_links.is_empty() {

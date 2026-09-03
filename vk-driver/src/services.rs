@@ -68,17 +68,19 @@ pub fn to_units(services: Vec<Service>) -> Vec<crate::compose::Unit> {
             depends_on: Vec::new(),
             volumes: Vec::new(),
             profiles: Vec::new(),
-            // The GitLab `services:` model has no init/kernel/sizing/nesting/NIC axes:
-            // every executor service keeps the default agent-as-PID1 pinned-kernel
-            // boot at the default size, not nesting, on one NIC. Declare a service in a
-            // compose fleet (`MICROVM_IMAGE: compose:...`) to size it, to give it more
-            // interfaces, or to let it nest on a runner that set `[vm] nested`.
+            // The GitLab `services:` model has no init/kernel/sizing/nesting/NIC/persistence
+            // axes: every executor service keeps the default agent-as-PID1 pinned-kernel
+            // boot at the default size, not nesting, on one NIC, with a throwaway root (a CI
+            // job's services are as ephemeral as the job). Declare a service in a compose
+            // fleet (`MICROVM_IMAGE: compose:...`) to size it, to give it more interfaces, to
+            // let it nest on a runner that set `[vm] nested`, or to persist its root.
             init: crate::run::InitSource::Default,
             kernel: crate::run::KernelSource::Default,
             cpus: None,
             mem: None,
             nested: false,
             nics: 1,
+            persist_root_backing: None,
         })
         .collect()
 }

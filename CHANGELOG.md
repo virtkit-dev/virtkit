@@ -12,6 +12,14 @@ All notable changes to virtkit will be documented in this file.
   the guest returns.
 - Stopping a VM now shuts down even a hung guest or one whose agent is unresponsive, via
   an ACPI power button, instead of cutting its power.
+- Compose services can keep state across restarts. `x-virtkit: persist_root: true` makes a
+  service's root filesystem persistent — it survives reboot, restart and `down`/`up`, and
+  is rebuilt from the image only when the image changes. An `overlay` volume can likewise
+  be made persistent with `overlay,persist[,size=SIZE]`: the host tree stays read-only
+  underneath while the service's writes to it are kept on disk instead of in RAM, and are
+  reset when the image or the host tree changes. Both work the same whether the service
+  is the run's primary or a sibling; the state lives under `.virtkit/` next to the compose
+  file (add it to `.gitignore`).
 
 ## [0.50.0] - 2026-09-03
 

@@ -900,6 +900,28 @@ async fn build_and_boot(
     if let Some(name) = &args.primary {
         primary_idx = Some(resolve_primary(&compose_units, name)?);
     }
+    // The primary's image identity and root persistence, read off its compose unit exactly as
+    // a sibling's are off its `Provisioned` — so `persist_root` and `overlay,persist` key on,
+    // and reset with, the same image changes whichever role the service boots in.
+    let primary_image_id: Option<String> = match primary_idx {
+        Some(i) => Some(crate::units::unit_image_id(
+            cfg,
+            state_dir,
+            &args.build_args,
+            &compose_units[i],
+        )?),
+        None => None,
+    };
+    let primary_persist_root: Option<PathBuf> =
+        primary_idx.and_then(|i| compose_units[i].persist_root_backing.clone());
+    if primary_persist_root.is_some() && args.ram {
+        bail!(
+            "x-virtkit.persist_root needs a root disk; --ram boots the rootfs from RAM with none"
+        );
+    }
+    // `overlay,persist` is deliberately not refused under `--ram`: its upper is its own disk, so
+    // an ephemeral RAM root with a persistent data volume is a coherent combination, unlike
+    // `persist_root`, which is the root disk `--ram` removes.
 
     // Build every compose image the run needs in ONE unified build — the --primary primary
     // (-> root.qcow2) and every sibling (-> svc-<name>/image.ext4) — so stages shared across
@@ -1186,9 +1208,21 @@ async fn build_and_boot(
                 &pinned_kernel,
             )?;
             boot_kernel = boot.kernel;
-            // Writable qcow2 overlay over the read-only backing; writable raw fails on tmpfs.
-            let overlay = medium("overlay.qcow2")?;
-            crate::qcow2::create_overlay(&overlay, &ext4)?;
+            // The root disk: a `persist_root` primary boots its standalone persistent qcow2 —
+            // the very disk a `persist_root` sibling boots, kept across starts and reset when
+            // the image changes. Otherwise a throwaway qcow2 CoW over the read-only backing
+            // (writable raw fails on tmpfs), fresh every run.
+            let overlay = match (&primary_persist_root, &primary_image_id) {
+                (Some(backing), Some(id)) => {
+                    crate::compose::ensure_persist_root(backing, &ext4, id)
+                        .context("persistent root")?
+                }
+                _ => {
+                    let overlay = medium("overlay.qcow2")?;
+                    crate::qcow2::create_overlay(&overlay, &ext4)?;
+                    overlay
+                }
+            };
             // Base handoff cmdline; the per-axis tokens are appended below so the guest
             // agent and the console gating can each read the axis that concerns them.
             let mut kcmd = format!(
@@ -1224,9 +1258,18 @@ async fn build_and_boot(
                 ..Default::default()
             };
             crate::initramfs::build_agent_initramfs_with_config(agent, Some(&boot_cfg), &cpio)?;
-            // Writable qcow2 overlay over the read-only backing; writable raw fails on tmpfs.
-            let overlay = medium("overlay.qcow2")?;
-            crate::qcow2::create_overlay(&overlay, ext4)?;
+            // The root disk, as on the image-axis path above: persistent for a `persist_root`
+            // primary, else a throwaway qcow2 CoW over the read-only backing (writable raw
+            // fails on tmpfs).
+            let overlay = match (&primary_persist_root, &primary_image_id) {
+                (Some(backing), Some(id)) => crate::compose::ensure_persist_root(backing, ext4, id)
+                    .context("persistent root")?,
+                _ => {
+                    let overlay = medium("overlay.qcow2")?;
+                    crate::qcow2::create_overlay(&overlay, ext4)?;
+                    overlay
+                }
+            };
             (
                 vec![crate::vmm::Disk::overlay(overlay)],
                 Some(cpio),
@@ -1544,12 +1587,27 @@ async fn build_and_boot(
     let mut file_bind_links: Vec<(String, String)> = Vec::new();
     // Tags the agent should mount behind a tmpfs-backed overlay (`-v host:guest:overlay`).
     let mut overlay_tags: Vec<String> = Vec::new();
+    // `tag:/dev/vdN` per `overlay,persist` volume: the agent mounts that qcow2 disk as the
+    // overlay's upper in place of a fresh tmpfs — as `units::boot_unit` does for a sibling.
+    let mut overlay_disk_pairs: Vec<String> = Vec::new();
     // `disk` volumes: a virtio-blk device per volume (backing file created and formatted on
     // first use), named to the guest over the cmdline — see [`crate::units`]'s identical
     // handling for a compose sibling's own `disk` volumes.
     let mut disk_devices = String::new();
     for (i, vol) in primary_volumes.iter().chain(&args.volumes).enumerate() {
         crate::compose::require_share_source(vol)?;
+        // A persistent overlay's backing is auto-managed under the compose file's directory,
+        // keyed by service — settled only for a compose service's volumes (the primary's
+        // included). An ad-hoc `-v` bind has no such anchor, so persist there is refused rather
+        // than given a surprising home. A plain `:overlay` (tmpfs) works on either.
+        if vol.overlay && vol.persist && vol.persist_backing.is_none() {
+            bail!(
+                "volume {}:{}: overlay,persist is only supported on compose services, not an \
+                 ad-hoc `-v` bind — declare it in the service's compose `volumes:`",
+                vol.host.display(),
+                vol.guest
+            );
+        }
         if vol.disk {
             crate::compose::ensure_disk_backing(vol)?;
             let device = crate::build::vd_name(disks.len());
@@ -1600,6 +1658,17 @@ async fn build_and_boot(
         virtiofs.push_str(&format!("{tag}:{mount_at}"));
         if vol.overlay {
             overlay_tags.push(tag.clone());
+            if vol.persist {
+                // The upper is a host-backed qcow2 disk (reset when the image or lower tree
+                // changes), attached after vda like a disk volume — exactly a sibling's wiring.
+                let id = primary_image_id
+                    .as_deref()
+                    .context("overlay,persist volume without a compose primary")?;
+                let backing = crate::compose::ensure_persist_overlay_backing(vol, id)?;
+                let device = crate::build::vd_name(disks.len());
+                overlay_disk_pairs.push(format!("{tag}:/dev/{device}"));
+                disks.push(crate::vmm::Disk::for_image(backing, false)?);
+            }
         }
         shares.push(crate::vmm::FsShare {
             tag,
@@ -1687,6 +1756,12 @@ async fn build_and_boot(
         cmdline.push_str(&format!(
             " VIRTKIT_VIRTIOFS_OVERLAY={}",
             overlay_tags.join(",")
+        ));
+    }
+    if !overlay_disk_pairs.is_empty() {
+        cmdline.push_str(&format!(
+            " VIRTKIT_VIRTIOFS_OVERLAY_DISK={}",
+            overlay_disk_pairs.join(",")
         ));
     }
     if !disk_devices.is_empty() {

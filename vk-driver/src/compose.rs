@@ -90,6 +90,16 @@ pub struct Unit {
     /// eth1 upward, each with its own address on the same segment — what an appliance that
     /// segregates services across interfaces needs.
     pub nics: u32,
+    /// Whether, and where, this unit's `/` persists across restart and down/up (compose
+    /// `x-virtkit.persist_root`), applied identically primary or sibling. `None` (the default)
+    /// is today's throwaway CoW over the image, fresh every start. `Some` makes the root a
+    /// standalone persistent qcow2 at this path — auto-managed under the compose file's
+    /// `.virtkit/roots/`, keyed by service name — materialized from the image on first use and
+    /// re-materialized when the image changes: the whole-disk counterpart of an
+    /// `overlay,persist` volume, for a stateful appliance whose state is not confined to a few
+    /// directories. Settled in [`map_service`], the one place that knows both the compose dir
+    /// and the service name.
+    pub persist_root_backing: Option<PathBuf>,
 }
 
 /// Where a unit's image comes from.
@@ -111,7 +121,7 @@ pub enum Source {
     },
 }
 
-/// A bind mount (`host:guest[:(ro|rw|overlay)[,optional]|:disk[,size=SIZE]]`).
+/// A bind mount (`host:guest[:(ro|rw|overlay[,persist])[,optional]|:disk[,size=SIZE]]`).
 /// Named volumes are not supported.
 #[derive(Debug, Clone)]
 pub struct Volume {
@@ -121,8 +131,17 @@ pub struct Volume {
     /// Mount the share as the read-only lower layer of a tmpfs-backed overlayfs at `guest`,
     /// instead of mounting it directly: the guest reads the host tree but every write lands in
     /// guest RAM and never crosses back. Implies `read_only` for the share itself. Directory
-    /// binds only (a single-file bind has nothing to overlay).
+    /// binds only (a single-file bind has nothing to overlay). With `persist` (below) the upper
+    /// layer moves off tmpfs onto a host-backed ext4 disk, so writes survive across boots.
     pub overlay: bool,
+    /// `overlay,persist`: back the overlay's writable upper layer with a persistent qcow2 disk
+    /// (an ext4 formatted on first use, sized by `size=`) instead of a per-boot tmpfs, so
+    /// overlay writes survive reboot, restart and down/up — the disk-based counterpart of the
+    /// default RAM overlay. The backing file is auto-managed at [`Volume::persist_backing`]. The
+    /// upper is reset (discarding its writes) when the service's base image or the overlay's
+    /// lower tree changes, since a stale upper's whiteouts and copy-ups no longer match the
+    /// layer beneath. Requires `overlay`.
+    pub persist: bool,
     /// The host path is a regular file (not a directory): a single-file bind. Virtio-fs shares
     /// a directory, so this is served by a single-file fs (root = just this file) and linked
     /// into place in the guest, rather than mounted at `guest` directly.
@@ -135,10 +154,15 @@ pub struct Volume {
     /// (the file does not exist yet); an existing file is trusted as-is, whatever a previous
     /// boot left in it. Mutually exclusive with `overlay`/`is_file`.
     pub disk: bool,
-    /// Formatted capacity for a freshly created `disk` volume, from its `size=` suffix.
-    /// Ignored once the backing file already exists — its own capacity applies, since this ext4
-    /// writer has no resize. `None` uses a generous built-in default.
+    /// Formatted capacity for a freshly created `disk` volume or `overlay,persist` upper, from
+    /// its `size=` suffix. Ignored once the backing file already exists — its own capacity
+    /// applies, since this ext4 writer has no resize. `None` uses a generous built-in default.
     pub disk_size_mib: Option<u64>,
+    /// Host backing file for an `overlay,persist` upper layer, auto-managed under the compose
+    /// file's `.virtkit/overlays/` directory and keyed by service + guest path. `None` on a
+    /// plain (tmpfs) overlay and on every non-overlay volume; filled in by [`map_service`],
+    /// which alone knows the owning service's name. See [`ensure_persist_overlay_backing`].
+    pub persist_backing: Option<PathBuf>,
 }
 
 /// The service's start-time config layered over the image's defaults, compose
@@ -767,7 +791,7 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
     };
     // Interpolation can expand one `${LIST}` entry into several newline-separated binds;
     // empty lines disappear. An `optional` bind with an absent source returns `None`.
-    let volumes = svc
+    let mut volumes: Vec<Volume> = svc
         .volumes
         .iter()
         .flat_map(|entry| entry.lines())
@@ -775,6 +799,13 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
         .filter(|spec| !spec.is_empty())
         .filter_map(|spec| parse_volume(spec, base).transpose())
         .collect::<Result<_>>()?;
+    // Settle each `overlay,persist` upper's auto-managed backing file — anchored on the compose
+    // file and keyed by this service's name, which `parse_volume` (shared with `run -v`) lacks.
+    for vol in &mut volumes {
+        if vol.overlay && vol.persist {
+            vol.persist_backing = Some(persist_backing_path(base, name, &vol.guest));
+        }
+    }
     let depends_on = match svc.depends_on {
         Some(d) => {
             d.validate()?;
@@ -794,7 +825,7 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
     };
     // The per-service axes (compose `x-virtkit`): absent key/subkey = the defaults,
     // so an unmarked service keeps today's agent-as-PID1 pinned-kernel 2-vCPU/1G boot.
-    let (init, kernel, cpus, mem, nested, nics) = match svc.x_virtkit {
+    let (init, kernel, cpus, mem, nested, nics, persist_root) = match svc.x_virtkit {
         Some(x) => (
             x.init()?,
             x.kernel()?,
@@ -802,6 +833,7 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
             x.mem()?,
             x.nested()?,
             x.nics()?,
+            x.persist_root()?,
         ),
         None => (
             crate::run::InitSource::Default,
@@ -810,8 +842,12 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
             None,
             false,
             1,
+            false,
         ),
     };
+    // Settled here, like a persistent overlay's backing above: anchored on the compose dir and
+    // keyed by service name, so the primary and a sibling read the same stable path.
+    let persist_root_backing = persist_root.then(|| persist_root_path(base, name));
     // Resolve host paths but leave them unread so callers can vet untrusted compose input
     // before calling `resolve_env_files`.
     let env_files: Vec<(PathBuf, bool)> = svc
@@ -843,6 +879,7 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
         mem,
         nested,
         nics,
+        persist_root_backing,
     })
 }
 
@@ -912,10 +949,11 @@ fn map_build(build: serde_yaml_ng::Value, base: &Path) -> Result<Source> {
     })
 }
 
-/// Parse a bind mount: `host:guest[:(ro|rw|overlay)[,optional]|:disk[,size=SIZE]]`.
+/// Parse a bind mount: `host:guest[:(ro|rw|overlay[,persist])[,optional]|:disk[,size=SIZE]]`.
 /// Named volumes are rejected because vk has no volume manager. `Ok(None)` means an
 /// `optional` bind's source is absent. `run -v/--volume` uses the same syntax, resolved
-/// from the caller's cwd rather than the compose file's directory.
+/// from the caller's cwd rather than the compose file's directory. `size=` also sizes an
+/// `overlay,persist` upper's backing ext4.
 pub fn parse_volume(spec: &str, base: &Path) -> Result<Option<Volume>> {
     let parts: Vec<&str> = spec.split(':').collect();
     let (host, guest, mode_field) = match parts.as_slice() {
@@ -923,7 +961,7 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Option<Volume>> {
         [h, g, m] => (*h, *g, *m),
         _ => bail!(
             "bad volume {spec:?} \
-             (want host:guest[:(ro|rw|overlay)[,optional]|:disk[,size=SIZE]])"
+             (want host:guest[:(ro|rw|overlay[,persist])[,optional]|:disk[,size=SIZE]])"
         ),
     };
     if !(host.starts_with('/') || host.starts_with('.') || host.starts_with('~')) {
@@ -952,7 +990,21 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Option<Volume>> {
     };
     let mut disk_size_mib = None;
     let mut optional = false;
+    let mut persist = false;
+    let mut saw_size = false;
     for opt in mode_parts {
+        // Parsed regardless of order (`overlay,persist,size=` and `overlay,size=,persist` both
+        // mean the same); applicability is checked once, after the flags are all known.
+        if let Some(size) = opt.strip_prefix("size=") {
+            if saw_size {
+                bail!("volume {spec:?}: size= given more than once");
+            }
+            saw_size = true;
+            disk_size_mib = Some(crate::run::parse_mem_mib(size).with_context(|| {
+                format!("volume {spec:?}: bad disk size {size:?} (want e.g. 10G, 512M)")
+            })?);
+            continue;
+        }
         match opt {
             // A disk volume creates its backing file the first time it is used, so it has
             // no absent source for `optional` to skip.
@@ -962,21 +1014,24 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Option<Volume>> {
             ),
             "optional" if optional => bail!("volume {spec:?}: optional given more than once"),
             "optional" => optional = true,
-            _ if !disk => bail!(
-                "volume {spec:?}: unknown option {opt:?} (want optional; size= needs disk mode)"
+            // `persist` moves an overlay's writable upper onto disk; nothing to persist without
+            // an overlay, so it is an overlay-only refinement.
+            "persist" if !overlay => bail!(
+                "volume {spec:?}: persist applies to overlay mode only \
+                 (it makes an overlay's writable upper survive across boots)"
             ),
-            _ => {
-                let size = opt.strip_prefix("size=").with_context(|| {
-                    format!("volume {spec:?}: unknown disk option {opt:?} (want size=SIZE)")
-                })?;
-                if disk_size_mib.is_some() {
-                    bail!("volume {spec:?}: size= given more than once");
-                }
-                disk_size_mib = Some(crate::run::parse_mem_mib(size).with_context(|| {
-                    format!("volume {spec:?}: bad disk size {size:?} (want e.g. 10G, 512M)")
-                })?);
-            }
+            "persist" if persist => bail!("volume {spec:?}: persist given more than once"),
+            "persist" => persist = true,
+            other => bail!(
+                "volume {spec:?}: unknown option {other:?} (want optional, persist, or size=SIZE)"
+            ),
         }
+    }
+    // `size=` sizes a freshly created backing disk, which only `disk` and `overlay,persist` have.
+    if saw_size && !(disk || persist) {
+        bail!(
+            "volume {spec:?}: size= applies to disk or overlay,persist mode (it sizes the backing disk)"
+        );
     }
     if !guest.starts_with('/') {
         bail!("volume {spec:?}: the guest path must be absolute");
@@ -1018,9 +1073,13 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Option<Volume>> {
         guest: guest.to_string(),
         read_only,
         overlay,
+        persist,
         is_file,
         disk,
         disk_size_mib,
+        // Anchored on the compose file and keyed by service name, so it can only be settled
+        // once the owning service is known — [`map_service`] fills it in.
+        persist_backing: None,
     }))
 }
 
@@ -1035,55 +1094,310 @@ const DEFAULT_DISK_VOLUME_MIB: u64 = 65536; // 64 GiB
 /// volume's content survives across runs; only a missing file gets sized (from
 /// `disk_size_mib`, else [`DEFAULT_DISK_VOLUME_MIB`]) and formatted. No-op, and no-ops safely,
 /// on a non-`disk` volume.
-///
-/// Built into a same-directory temp file first, then published with a hard link — which
-/// fails with `AlreadyExists` rather than silently overwriting a file a racing boot already
-/// published — instead of writing `vol.host` directly, so a crash mid-format can never leave
-/// a half-written file behind for a later boot to wrongly trust as-is. The temp file can't
-/// follow a symlink planted at its path (`create_new`), and the published volume is `0600`
-/// before any filesystem bytes land, since it may end up holding whatever a service stores in
-/// it (e.g. a database's data directory).
-///
-/// Backing files are qcow2, formatted in place: only the filesystem's own clusters get
-/// allocated and the file grows as the guest writes, with no raw image — and so no reliance on
-/// sparse files — at any point. `Disk::for_image` detects and attaches legacy raw ext4 volumes.
 pub fn ensure_disk_backing(vol: &Volume) -> Result<()> {
     if !vol.disk || vol.host.exists() {
         return Ok(());
     }
-    let parent = vol
-        .host
+    create_qcow2_ext4(&vol.host, vol.disk_size_mib)
+        .with_context(|| format!("disk volume {}", vol.host.display()))
+}
+
+/// Create and format a fresh qcow2-backed ext4 at `target`, sized `size_mib` (else
+/// [`DEFAULT_DISK_VOLUME_MIB`]). Shared by `disk` volumes and `overlay,persist` uppers; the
+/// caller guarantees `target` does not exist yet.
+///
+/// Built into a same-directory temp file first, then published with a hard link — which fails
+/// with `AlreadyExists` rather than silently overwriting a file a racing boot already
+/// published — instead of writing `target` directly, so a crash mid-format can never leave a
+/// half-written file behind for a later boot to wrongly trust as-is. The temp file can't
+/// follow a symlink planted at its path (`create_new`), and the published file is `0600`
+/// before any filesystem bytes land, since it may end up holding whatever a service writes into
+/// it (e.g. a database's data directory).
+///
+/// Backing files are qcow2, formatted in place: only the filesystem's own clusters get
+/// allocated and the file grows as the guest writes, with no raw image — and so no reliance on
+/// sparse files — at any point. `Disk::for_image` detects and attaches legacy raw ext4 files.
+fn create_qcow2_ext4(target: &Path, size_mib: Option<u64>) -> Result<()> {
+    let parent = target
         .parent()
-        .with_context(|| format!("disk volume {}: no parent directory", vol.host.display()))?;
+        .with_context(|| format!("backing file {}: no parent directory", target.display()))?;
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
 
-    let mib = vol.disk_size_mib.unwrap_or(DEFAULT_DISK_VOLUME_MIB);
+    let mib = size_mib.unwrap_or(DEFAULT_DISK_VOLUME_MIB);
     // ext4.rs's writer works in fixed 4 KiB blocks.
     let free_blocks = mib
         .checked_mul(1024 * 1024 / 4096)
-        .with_context(|| format!("disk volume {}: size={mib}M overflows", vol.host.display()))?;
+        .with_context(|| format!("backing file {}: size={mib}M overflows", target.display()))?;
 
-    let file_name = vol
-        .host
+    let file_name = target
         .file_name()
         .and_then(|n| n.to_str())
-        .with_context(|| format!("disk volume {}: bad file name", vol.host.display()))?;
+        .with_context(|| format!("backing file {}: bad file name", target.display()))?;
     let tmp = parent.join(format!(".{file_name}.vk-disk-tmp-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     // `Qcow2Writer::create` makes `tmp` itself (`create_new`, refusing a planted path), born
-    // 0600 — the volume may end up holding whatever a service stores in it.
+    // 0600 — the file may end up holding whatever a service stores in it.
     let publish = crate::ext4::build_empty_journaled_qcow2(&tmp, free_blocks, 0o600)
-        .with_context(|| format!("formatting disk volume {}", vol.host.display()))
-        .and_then(|()| match std::fs::hard_link(&tmp, &vol.host) {
+        .with_context(|| format!("formatting backing file {}", target.display()))
+        .and_then(|()| match std::fs::hard_link(&tmp, target) {
             Ok(()) => Ok(()),
             // A racing boot published it first; its file is as good as ours would have been.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
             Err(e) => {
-                Err(e).with_context(|| format!("publishing disk volume {}", vol.host.display()))
+                Err(e).with_context(|| format!("publishing backing file {}", target.display()))
             }
         });
     let _ = std::fs::remove_file(&tmp);
     publish
+}
+
+/// The auto-managed backing file for one service's `overlay,persist` upper: under the compose
+/// file's `.virtkit/overlays/<service>/`, named `<guest-slug>-<hash>.qcow2`. The service is its
+/// own path component (a DNS label, so unique and collision-free) rather than a `<service>-`
+/// prefix, so a hyphenated name can't collide with a sibling's slug (`db-primary` with `/data`
+/// vs `db` with `/primary/data`); the guest-path hash disambiguates two paths that fold to the
+/// same lossy slug within one service (`/a/b` vs `/a-b`). Lives in the (stable) compose directory
+/// rather than the per-boot job dir so it survives restart and down/up.
+fn persist_backing_path(base: &Path, service: &str, guest: &str) -> PathBuf {
+    base.join(".virtkit")
+        .join("overlays")
+        .join(service)
+        .join(format!("{}-{}.qcow2", guest_slug(guest), short_hash(guest)))
+}
+
+/// A short hex hash of `s`, appended to a lossy [`guest_slug`] so two distinct guest paths that
+/// slug to the same string still get distinct backing files. 32 bits is ample to keep the
+/// handful of mount points in one service apart.
+fn short_hash(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(s.as_bytes())
+        .iter()
+        .take(4)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The auto-managed backing file for one service's `persist_root` root: under the compose
+/// file's `.virtkit/roots/`, named `<service>.qcow2`. Same stable anchor as
+/// [`persist_backing_path`], for the same reason.
+fn persist_root_path(base: &Path, service: &str) -> PathBuf {
+    base.join(".virtkit")
+        .join("roots")
+        .join(format!("{service}.qcow2"))
+}
+
+/// Fold a guest mount path to one filesystem-safe path component: every run of characters
+/// outside `[A-Za-z0-9._-]` (the leading `/` and each separator included) collapses to a single
+/// `-`, so `/var/lib/pgsql` becomes `var-lib-pgsql`. A path that folds to nothing is `root`.
+fn guest_slug(guest: &str) -> String {
+    let mut s = String::new();
+    for c in guest.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            s.push(c);
+        } else if !s.ends_with('-') {
+            s.push('-');
+        }
+    }
+    let s = s.trim_matches('-');
+    if s.is_empty() {
+        "root".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Ensure the backing ext4 for an `overlay,persist` upper exists and is coherent with the layer
+/// beneath it, returning its path. The upper is reset — recreated empty — when `root_image_id`
+/// (the service's base image) or the overlay's lower tree has changed since it was written,
+/// because a stale upper's whiteouts and copied-up files no longer match the tree they were
+/// layered on. Otherwise the existing file is kept, so overlay writes survive across restarts.
+///
+/// The coherence key is recorded in a sibling `<backing>.baseid` sentinel. This runs only at a
+/// service (re)start, never on a reboot-in-place — the keeper re-forks the same `VmSpec`, so the
+/// same backing disk re-attaches and the upper's contents carry over untouched.
+pub fn ensure_persist_overlay_backing(vol: &Volume, root_image_id: &str) -> Result<PathBuf> {
+    let backing = vol.persist_backing.as_ref().with_context(|| {
+        format!(
+            "persistent overlay {}: backing path was not settled (internal error)",
+            vol.guest
+        )
+    })?;
+    let sentinel = sentinel_path(backing);
+    let want = persist_coherence_key(root_image_id, &vol.host);
+    let have = std::fs::read_to_string(&sentinel).ok();
+    if have.as_deref() != Some(want.as_str()) {
+        // Base image or lower tree changed: discard the now-incoherent upper before reuse.
+        if let Err(e) = std::fs::remove_file(backing)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(e)
+                .with_context(|| format!("resetting stale overlay upper {}", backing.display()));
+        }
+        let _ = std::fs::remove_file(&sentinel);
+    }
+    if !backing.exists() {
+        create_qcow2_ext4(backing, vol.disk_size_mib)
+            .with_context(|| format!("overlay upper backing {}", backing.display()))?;
+        write_sentinel(&sentinel, &want)
+            .with_context(|| format!("recording overlay coherence key {}", sentinel.display()))?;
+    }
+    Ok(backing.clone())
+}
+
+/// The sibling sentinel recording an overlay upper's coherence key: `<backing>.baseid`.
+fn sentinel_path(backing: &Path) -> PathBuf {
+    let mut s = backing.as_os_str().to_os_string();
+    s.push(".baseid");
+    PathBuf::from(s)
+}
+
+/// Ensure a `persist_root` root disk exists at `backing` and matches the image it was
+/// materialized from, returning its path. A **standalone** qcow2 — the image flattened into it,
+/// no backing chain — rather than a CoW over the image: a root that outlives the run holds no
+/// use-guard on the image tier, so a CoW's base could be evicted (or, for the primary, rebuilt
+/// at another path) from under it. Independence costs one flatten per image version and buys
+/// a root that survives restart and down/up on every boot path alike.
+///
+/// The image's content identity (`root_image_id`) is recorded in a sibling `<backing>.baseid`
+/// sentinel; a mismatch means the image changed, so the stale root is discarded and
+/// re-materialized. Like [`ensure_persist_overlay_backing`], this runs at a (re)start only —
+/// a reboot-in-place re-forks the same `VmSpec` and keeps the disk as is.
+pub fn ensure_persist_root(backing: &Path, image: &Path, root_image_id: &str) -> Result<PathBuf> {
+    let sentinel = sentinel_path(backing);
+    let want = root_coherence_key(root_image_id);
+    let have = std::fs::read_to_string(&sentinel).ok();
+    if have.as_deref() != Some(want.as_str()) {
+        // The image changed: a root materialized from the old one is no longer this service.
+        if let Err(e) = std::fs::remove_file(backing)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(e)
+                .with_context(|| format!("resetting stale persistent root {}", backing.display()));
+        }
+        let _ = std::fs::remove_file(&sentinel);
+    }
+    if !backing.exists() {
+        let parent = backing.parent().with_context(|| {
+            format!("persistent root {}: no parent directory", backing.display())
+        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+        // Flatten into a same-directory temp and publish with a hard link, exactly as a disk
+        // volume is created: a crash mid-flatten leaves no half image for a later boot to trust,
+        // and a racing start that published first wins (`AlreadyExists`).
+        let mut tmp = backing.as_os_str().to_os_string();
+        tmp.push(format!(".vk-root-tmp-{}", std::process::id()));
+        let tmp = PathBuf::from(tmp);
+        let _ = std::fs::remove_file(&tmp);
+        let publish = (|| -> Result<()> {
+            let mut w = crate::qcow2::materialize_standalone_open(image, &tmp, 0o600)
+                .with_context(|| format!("materializing the root from {}", image.display()))?;
+            // Build stages are journal-less: the throwaway root only ever read them. This root
+            // is written in place and outlives the run, so it gets a journal — the fix-up an
+            // exported image receives — and a killed guest leaves a recoverable filesystem
+            // instead of one needing a check. A no-op on an image that already has one.
+            crate::ext4::add_journal_in(&mut w, &tmp.display().to_string())?;
+            w.finish()
+                .with_context(|| format!("writing persistent root {}", tmp.display()))?;
+            match std::fs::hard_link(&tmp, backing) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                Err(e) => Err(e)
+                    .with_context(|| format!("publishing persistent root {}", backing.display())),
+            }
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        publish?;
+        write_sentinel(&sentinel, &want)
+            .with_context(|| format!("recording root coherence key {}", sentinel.display()))?;
+    }
+    Ok(backing.to_path_buf())
+}
+
+/// The coherence key for a persistent root: the image's content identity alone (a root has no
+/// lower tree), hex-hashed so the sentinel never carries a host path.
+fn root_coherence_key(root_image_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(root_image_id.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Write the sentinel atomically (same-dir temp + rename), so a crash cannot leave a truncated
+/// key that would match neither the old key nor a future one.
+fn write_sentinel(sentinel: &Path, key: &str) -> std::io::Result<()> {
+    let mut tmp = sentinel.as_os_str().to_os_string();
+    tmp.push(format!(".tmp-{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, key)?;
+    std::fs::rename(&tmp, sentinel)
+}
+
+/// The coherence key for a persistent overlay upper: a hash of the base image identity and a
+/// fingerprint of the lower tree. Any change to the base image, or a structural or metadata
+/// change in the lower tree (see [`fingerprint_tree`] for exactly what is hashed — path, mode,
+/// size, mtime and symlink target, not file contents), yields a new key that resets the upper on
+/// the next start. The walk cost falls only on (re)starts, never on reboots-in-place.
+fn persist_coherence_key(root_image_id: &str, lower: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(root_image_id.as_bytes());
+    h.update([0]);
+    fingerprint_tree(lower, &mut h);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Fold the lower tree into `h`: for every entry in sorted order, its relative path, mode, size,
+/// mtime and (for symlinks) target — metadata only, not file contents (the lower is a
+/// host-controlled read-only tree, so mode+size+mtime is enough to notice a rebuild). Directories
+/// are descended; symlinks are hashed by target, not followed. Best-effort but total — an
+/// unreadable directory or entry contributes its error code in place of its metadata rather than
+/// vanishing from the hash, so a change that flips an entry unreadable still resets the upper, and
+/// a transient blip does not silently drop it. A NUL terminator after each entry (paths hold no
+/// interior NUL) keeps the encoding unambiguous.
+fn fingerprint_tree(root: &Path, h: &mut impl sha2::Digest) {
+    fn walk(dir: &Path, rel: &Path, h: &mut impl sha2::Digest) {
+        use std::os::unix::fs::MetadataExt;
+        let mut entries: Vec<_> = match std::fs::read_dir(dir) {
+            Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
+            Err(e) => {
+                h.update(rel.as_os_str().as_encoded_bytes());
+                h.update(format!("!readdir:{}", e.raw_os_error().unwrap_or(-1)).as_bytes());
+                h.update([0]);
+                return;
+            }
+        };
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let child = dir.join(e.file_name());
+            let child_rel = rel.join(e.file_name());
+            h.update(child_rel.as_os_str().as_encoded_bytes());
+            let md = match std::fs::symlink_metadata(&child) {
+                Ok(md) => md,
+                Err(e) => {
+                    h.update(format!("!stat:{}", e.raw_os_error().unwrap_or(-1)).as_bytes());
+                    h.update([0]);
+                    continue;
+                }
+            };
+            h.update(md.mode().to_le_bytes());
+            h.update(md.size().to_le_bytes());
+            h.update(md.mtime().to_le_bytes());
+            h.update(md.mtime_nsec().to_le_bytes());
+            let ft = md.file_type();
+            if ft.is_symlink()
+                && let Ok(t) = std::fs::read_link(&child)
+            {
+                h.update(t.as_os_str().as_encoded_bytes());
+            }
+            h.update([0]);
+            if ft.is_dir() {
+                walk(&child, &child_rel, h);
+            }
+        }
+    }
+    walk(root, Path::new(""), h);
 }
 
 /// Validate a virtio-fs share root and return which server it needs: `true` for the
@@ -1342,8 +1656,8 @@ struct ComposeService {
 
 /// The `x-virtkit` per-service marker: the init/kernel axes as compose strings,
 /// parsed into [`crate::run::InitSource`] / [`crate::run::KernelSource`], plus the
-/// guest sizing (`cpus`/`mem`) and nested virtualization (`nested`). An absent
-/// subkey defaults to `Default`/unset/off.
+/// guest sizing (`cpus`/`mem`), nested virtualization (`nested`), NIC count (`nics`) and
+/// root persistence (`persist_root`). An absent subkey defaults to `Default`/unset/off.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct XVirtkit {
@@ -1363,6 +1677,9 @@ struct XVirtkit {
     /// scalar, not u32: a `${VAR}` reference interpolates into a YAML string
     #[serde(default)]
     nics: Option<Scalar>,
+    /// scalar, not bool, for the same reason as `nested`
+    #[serde(default)]
+    persist_root: Option<Scalar>,
 }
 
 impl XVirtkit {
@@ -1454,6 +1771,20 @@ impl XVirtkit {
                 "true" => Ok(true),
                 "false" => Ok(false),
                 _ => bail!("x-virtkit.nested: expected true or false, got {s:?}"),
+            },
+        }
+    }
+
+    /// `persist_root: true|false` → whether the guest's `/` is a persistent standalone disk
+    /// that survives restart and down/up (absent = off: a throwaway CoW over the image, fresh
+    /// every start). Same case folding as `nested`.
+    fn persist_root(&self) -> Result<bool> {
+        match self.persist_root.clone().map(Scalar::into_string) {
+            None => Ok(false),
+            Some(s) => match s.to_ascii_lowercase().as_str() {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => bail!("x-virtkit.persist_root: expected true or false, got {s:?}"),
             },
         }
     }
@@ -1629,6 +1960,203 @@ mod tests {
             ["redis-server", "--port", "6380"]
         );
         assert_eq!(u.user.as_deref(), Some("redis"));
+    }
+
+    #[test]
+    fn map_service_settles_persist_overlay_backing() {
+        let u = one(
+            "services:\n  db:\n    image: pg\n    volumes:\n      - ./data:/var/lib/pgsql:overlay,persist\n",
+        );
+        let vol = &u.volumes[0];
+        assert!(vol.overlay && vol.persist);
+        // Under a per-service subdir, named by the guest slug plus a disambiguating hash.
+        let backing = vol.persist_backing.as_deref().unwrap();
+        assert_eq!(
+            backing,
+            persist_backing_path(Path::new("/base"), "db", "/var/lib/pgsql")
+        );
+        assert_eq!(
+            backing.parent(),
+            Some(Path::new("/base/.virtkit/overlays/db"))
+        );
+        let name = backing.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with("var-lib-pgsql-") && name.ends_with(".qcow2"),
+            "{name}"
+        );
+        // A plain (tmpfs) overlay gets no backing.
+        let u = one(
+            "services:\n  db:\n    image: pg\n    volumes:\n      - ./data:/var/lib/pgsql:overlay\n",
+        );
+        assert_eq!(u.volumes[0].persist_backing, None);
+    }
+
+    #[test]
+    fn x_virtkit_persist_root_settles_the_root_backing() {
+        let u = one("services:\n  db:\n    image: pg\n    x-virtkit:\n      persist_root: true\n");
+        assert_eq!(
+            u.persist_root_backing.as_deref(),
+            Some(Path::new("/base/.virtkit/roots/db.qcow2"))
+        );
+        // Off by default, and an explicit `false` is the same as absent.
+        let u = one("services:\n  db:\n    image: pg\n");
+        assert!(u.persist_root_backing.is_none());
+        let u = one("services:\n  db:\n    image: pg\n    x-virtkit:\n      persist_root: false\n");
+        assert!(u.persist_root_backing.is_none());
+        // Anything but true/false is rejected, naming the key (`yes` is not a YAML 1.2 bool).
+        let err = parse(
+            "services:\n  db:\n    image: pg\n    x-virtkit:\n      persist_root: yes\n",
+            Path::new("/base"),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("x-virtkit.persist_root"),
+            "{err:#}"
+        );
+    }
+
+    /// The stop → later start path: the same image keeps the very same root file (its writes
+    /// with it), a changed image resets it, and the root carries a journal even though the
+    /// build stage it came from had none — so a killed guest leaves a recoverable filesystem.
+    #[test]
+    fn ensure_persist_root_reuses_until_the_image_changes() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("vk-persist-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A journal-less raw ext4 stands in for a build stage's image.
+        let image = dir.join("image.ext4");
+        crate::ext4::build_empty(&image, 8192).unwrap();
+        let backing = dir.join("roots").join("svc.qcow2");
+
+        assert_eq!(
+            ensure_persist_root(&backing, &image, "image-v1").unwrap(),
+            backing
+        );
+        let flat = dir.join("flat.raw");
+        crate::qcow2::flatten_to_raw(&backing, &flat).unwrap();
+        assert_eq!(crate::ext4::has_journal(&flat), Some(true));
+
+        // Stand-in for the guest's writes: bytes that must survive a same-image restart.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&backing)
+            .unwrap()
+            .write_all(b"guest-writes")
+            .unwrap();
+        ensure_persist_root(&backing, &image, "image-v1").unwrap();
+        assert!(std::fs::read(&backing).unwrap().ends_with(b"guest-writes"));
+
+        // A new image discards the old root and materializes a fresh one.
+        ensure_persist_root(&backing, &image, "image-v2").unwrap();
+        assert!(!std::fs::read(&backing).unwrap().ends_with(b"guest-writes"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The overlay-upper counterpart of the root test: the same image + unchanged lower tree keeps
+    /// the very same upper (and its writes), while a change to either the base image or the lower
+    /// tree resets it — a stale upper's whiteouts no longer match the layer beneath.
+    #[test]
+    fn ensure_persist_overlay_backing_resets_on_image_or_lower_change() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("vk-persist-ov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lower = dir.join("lower");
+        std::fs::create_dir_all(&lower).unwrap();
+        std::fs::write(lower.join("f"), b"lower-v1").unwrap();
+        let backing = dir.join("overlays").join("svc").join("x.qcow2");
+        let vol = Volume {
+            host: lower.clone(),
+            guest: "/x".to_string(),
+            read_only: true,
+            overlay: true,
+            persist: true,
+            is_file: false,
+            disk: false,
+            disk_size_mib: Some(32),
+            persist_backing: Some(backing.clone()),
+        };
+        // A marker appended to the qcow2 stands in for the guest's overlay writes; a reset
+        // recreates the file, so the marker survives reuse and disappears on reset.
+        let mark = || {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&backing)
+                .unwrap()
+                .write_all(b"upper-writes")
+                .unwrap()
+        };
+        let kept = || std::fs::read(&backing).unwrap().ends_with(b"upper-writes");
+
+        assert_eq!(
+            ensure_persist_overlay_backing(&vol, "img-v1").unwrap(),
+            backing
+        );
+        assert!(sentinel_path(&backing).exists());
+        mark();
+        // Same image, same lower tree: reused untouched.
+        ensure_persist_overlay_backing(&vol, "img-v1").unwrap();
+        assert!(kept());
+
+        // The lower tree changes: the upper is reset.
+        std::fs::write(lower.join("f"), b"lower-v2-longer").unwrap();
+        ensure_persist_overlay_backing(&vol, "img-v1").unwrap();
+        assert!(!kept());
+        mark();
+
+        // The base image changes: the upper is reset.
+        ensure_persist_overlay_backing(&vol, "img-v2").unwrap();
+        assert!(!kept());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `fingerprint_tree` is stable for an unchanged tree and moves for any metadata change it
+    /// tracks — size, mode, symlink target — and does not panic on an unreadable root.
+    #[test]
+    fn fingerprint_tree_tracks_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        let fp = |root: &Path| -> String {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            fingerprint_tree(root, &mut h);
+            h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+        };
+        let dir = std::env::temp_dir().join(format!("vk-fp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tree = dir.join("tree");
+        std::fs::create_dir_all(tree.join("d")).unwrap();
+        std::fs::write(tree.join("d").join("f"), b"x").unwrap();
+        std::os::unix::fs::symlink("target", tree.join("l")).unwrap();
+        let base = fp(&tree);
+        assert_eq!(fp(&tree), base, "stable for an unchanged tree");
+
+        // A size change moves the key; restoring the size restores it as a fresh baseline.
+        std::fs::write(tree.join("d").join("f"), b"xy").unwrap();
+        assert_ne!(fp(&tree), base);
+        std::fs::write(tree.join("d").join("f"), b"x").unwrap();
+        let restored = fp(&tree);
+
+        // A mode change moves the key (chmod touches ctime, not mtime, so this isolates mode).
+        std::fs::set_permissions(
+            tree.join("d").join("f"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert_ne!(fp(&tree), restored);
+
+        // A symlink retarget moves the key.
+        let sized = fp(&tree);
+        std::fs::remove_file(tree.join("l")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", tree.join("l")).unwrap();
+        assert_ne!(fp(&tree), sized);
+
+        // A missing root is folded in (readdir error) rather than panicking, and reads distinctly
+        // from an existing empty directory.
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_ne!(fp(&dir.join("nope")), fp(&empty));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1903,9 +2431,66 @@ mod tests {
         assert!(ro.read_only && !ro.overlay);
         // overlay implies a read-only share plus the guest-side overlay flag.
         let ov = parse_volume("/src:/dst:overlay", Path::new("/b")).unwrap();
-        assert!(ov.read_only && ov.overlay);
+        assert!(ov.read_only && ov.overlay && !ov.persist);
         let bad = parse_volume("/src:/dst:rox", Path::new("/b")).unwrap_err();
         assert!(format!("{bad:#}").contains("unsupported mode"), "{bad:#}");
+    }
+
+    #[test]
+    fn volume_overlay_persist() {
+        // `persist` keeps the overlay semantics and adds the disk-backed upper flag; the backing
+        // path stays None until `map_service` (which knows the service name) settles it.
+        let p = parse_volume("/src:/dst:overlay,persist", Path::new("/b")).unwrap();
+        assert!(p.read_only && p.overlay && p.persist);
+        assert_eq!(p.persist_backing, None);
+        assert_eq!(p.disk_size_mib, None);
+
+        // `size=` sizes the upper's backing ext4, in either order relative to `persist`.
+        let sized = parse_volume("/src:/dst:overlay,persist,size=10G", Path::new("/b")).unwrap();
+        assert_eq!(sized.disk_size_mib, Some(10 * 1024));
+        let reordered =
+            parse_volume("/src:/dst:overlay,size=10G,persist", Path::new("/b")).unwrap();
+        assert!(reordered.persist);
+        assert_eq!(reordered.disk_size_mib, Some(10 * 1024));
+
+        // `persist` is an overlay-only refinement.
+        for spec in ["/src:/dst:rw,persist", "/src:/dst:ro,persist"] {
+            let err = parse_volume(spec, Path::new("/b")).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("persist applies to overlay mode only"),
+                "{err:#}"
+            );
+        }
+
+        // A repeated `persist` is rejected rather than silently accepted.
+        let err = parse_volume("/src:/dst:overlay,persist,persist", Path::new("/b")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("persist given more than once"),
+            "{err:#}"
+        );
+
+        // `map_service` settles the auto-managed backing path, keyed by service + guest: a
+        // per-service subdir, and a filename of the guest slug plus a disambiguating hash.
+        let p = persist_backing_path(Path::new("/proj"), "db", "/var/lib/pgsql");
+        assert_eq!(p.parent(), Some(Path::new("/proj/.virtkit/overlays/db")));
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with("var-lib-pgsql-") && name.ends_with(".qcow2"),
+            "{name}"
+        );
+        assert_eq!(
+            persist_root_path(Path::new("/proj"), "db"),
+            Path::new("/proj/.virtkit/roots/db.qcow2")
+        );
+        assert_eq!(guest_slug("/var/lib/pgsql"), "var-lib-pgsql");
+        assert_eq!(guest_slug("/"), "root");
+
+        // No two distinct (service, guest) pairs share a backing file. A hyphenated service name
+        // can't collide with another service's slug, and two guest paths that fold to the same
+        // slug within one service stay distinct via the hash.
+        let path = |svc, guest| persist_backing_path(Path::new("/proj"), svc, guest);
+        assert_ne!(path("db", "/primary/data"), path("db-primary", "/data"));
+        assert_ne!(path("db", "/a/b"), path("db", "/a-b"));
     }
 
     #[test]
@@ -2016,19 +2601,16 @@ mod tests {
         assert!(sized.disk);
         assert_eq!(sized.disk_size_mib, Some(10 * 1024));
 
-        // `size=` only makes sense alongside `disk`.
+        // `size=` only makes sense where a backing ext4 is created (disk or overlay,persist).
         let err = parse_volume("/src:/dst:ro,size=10G", Path::new("/b")).unwrap_err();
         assert!(
-            format!("{err:#}").contains("size= needs disk mode"),
+            format!("{err:#}").contains("size= applies to disk or overlay,persist mode"),
             "{err:#}"
         );
 
-        // An unrecognized disk option is rejected rather than silently ignored.
+        // An unrecognized option is rejected rather than silently ignored.
         let err = parse_volume("/data.ext4:/var/wab:disk,bogus=1", Path::new("/b")).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("unknown disk option"),
-            "{err:#}"
-        );
+        assert!(format!("{err:#}").contains("unknown option"), "{err:#}");
 
         // A repeated `size=` is rejected rather than letting the last one silently win.
         let err =
