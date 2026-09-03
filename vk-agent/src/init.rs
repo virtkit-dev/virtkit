@@ -2157,7 +2157,8 @@ fn run_service(cmdline: &HashMap<String, String>, config: Option<&RunConfig>) ->
         argv
     );
 
-    // VIRTKIT_DEBUG=1: fork+wait, then hold for post-mortem inspection.
+    // VIRTKIT_DEBUG=1: fork, wait, then hold for inspection. This path installs no signal
+    // handler, so `vk-agent poweroff` reports success but the hold lasts until host teardown.
     if cmdline.get("VIRTKIT_DEBUG").map(String::as_str) == Some("1") {
         match fork_exec_wait(&argv) {
             Ok(code) => {
@@ -2173,6 +2174,7 @@ fn run_service(cmdline: &HashMap<String, String>, config: Option<&RunConfig>) ->
     // Fork the service as a child — the agent (PID 1) stays to reap orphans.
     let service_pid = fork_exec(&argv)?;
     info!("vk-agent init: service pid {service_pid}");
+    SERVICE_PID.store(service_pid, std::sync::atomic::Ordering::Relaxed);
 
     // Power off on a forwarded shutdown even while the readiness gate below is still waiting.
     install_term_handler();
@@ -2464,16 +2466,28 @@ fn fork_exec_wait(argv: &[String]) -> Result<i32> {
     }
 }
 
-/// On SIGTERM/SIGINT (e.g. a forwarded shutdown), power the VM off.
+/// Power off immediately on SIGTERM/SIGINT. For the systemd-compatible power-off request,
+/// first SIGTERM the service and wait up to [`SERVICE_STOP_GRACE_SECS`] so applications such
+/// as databases can flush state.
 fn install_term_handler() {
     // SAFETY: `poweroff` never returns and is async-signal-safe enough for this handler: it
     // uses `sync`, atomic `DISK_MOUNTS`/`HAS_ACPI` reads, raw open/ioctl/close, and `reboot`.
+    // `handle_poweroff_request` only calls kill(2) and alarm(2) — or, with no service,
+    // `poweroff`.
     unsafe {
         libc::signal(
             libc::SIGTERM,
             handle_term as *const () as libc::sighandler_t,
         );
         libc::signal(libc::SIGINT, handle_term as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGALRM,
+            handle_term as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            crate::poweroff::SIG_POWEROFF,
+            handle_poweroff_request as *const () as libc::sighandler_t,
+        );
     }
 }
 
@@ -2481,10 +2495,37 @@ extern "C" fn handle_term(_sig: libc::c_int) {
     poweroff();
 }
 
+/// Service process to terminate before shutdown. Zero means an agent-only boot, which shuts
+/// down immediately.
+static SERVICE_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 /// Cached ACPI presence for choosing the shutdown request. Initialized after mounting sysfs
 /// and before enabling any shutdown path; the default `false` would reset and reboot an ACPI
 /// machine.
 static HAS_ACPI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Prevent repeated requests from re-signalling the service or extending the grace period.
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Service grace period after SIGTERM. systemd allows units 90 seconds; this single-service
+/// guest stays well below the host's own VMM shutdown grace period.
+const SERVICE_STOP_GRACE_SECS: libc::c_uint = 20;
+
+extern "C" fn handle_poweroff_request(_sig: libc::c_int) {
+    let service = SERVICE_PID.load(std::sync::atomic::Ordering::Relaxed);
+    if service <= 0 {
+        poweroff()
+    } else if STOP_REQUESTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    // Service exit reaches supervision and powers off; the alarm bounds an ignored SIGTERM.
+    // Like `docker stop`, signal only the service process, so wrappers must forward SIGTERM.
+    // SAFETY: kill(2) and alarm(2) are async-signal-safe.
+    unsafe {
+        libc::kill(service, libc::SIGTERM);
+        libc::alarm(SERVICE_STOP_GRACE_SECS);
+    }
+}
 
 /// Reap reparented orphans; when the serve child exits, power off.
 fn supervise(serve_pid: libc::pid_t) -> Result<()> {
@@ -2507,8 +2548,8 @@ fn supervise(serve_pid: libc::pid_t) -> Result<()> {
     poweroff();
 }
 
-/// Flush and power the VM off (the executor's cleanup also force-stops the VMM,
-/// but a clean poweroff on serve exit is tidier). Never returns.
+/// Flush and power off. Host cleanup can still force-stop the VMM, but this path preserves a
+/// clean guest shutdown. Never returns.
 fn poweroff() -> ! {
     // SAFETY: async-signal-safe syscall (poweroff also runs from the SIGTERM handler).
     unsafe {

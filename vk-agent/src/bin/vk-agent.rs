@@ -210,6 +210,12 @@ fn main() {
         let rest: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(vk_agent::fsfreeze::main(&rest));
     }
+    // Clean shutdown (no socket): the host runs `vk-agent poweroff` in the guest before it
+    // would otherwise kill the VMM, so the guest's filesystems reach the disk intact.
+    if std::env::args().nth(1).as_deref() == Some("poweroff") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(vk_agent::poweroff::main(&rest));
+    }
     // Local free-block discard (no socket): the host runs `vk-agent fstrim <mountpoint>` in
     // the guest before a checkpoint so the snapshot's allocation map lists only live data.
     if std::env::args().nth(1).as_deref() == Some("fstrim") {
