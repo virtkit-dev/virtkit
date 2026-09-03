@@ -155,6 +155,16 @@ impl MMIODeviceManager {
         }
     }
 
+    /// Advance the IOAPIC-pin cursor, skipping the pin reserved for the ACPI SCI
+    /// (x86_64 only).
+    fn advance_irq(&mut self) {
+        self.irq += 1;
+        #[cfg(target_arch = "x86_64")]
+        if self.irq == arch::x86_64::layout::SCI_GSI {
+            self.irq += 1;
+        }
+    }
+
     /// PCI INTx routing table collected during device registration, as
     /// (device number, interrupt pin, GSI). Consumed when building the MP table.
     #[cfg(target_arch = "x86_64")]
@@ -218,7 +228,7 @@ impl MMIODeviceManager {
             },
         );
         self.mmio_base += MMIO_LEN;
-        self.irq += 1;
+        self.advance_irq();
 
         Ok(ret)
     }
@@ -270,7 +280,7 @@ impl MMIODeviceManager {
                     return Err(Error::IrqsExhausted);
                 }
                 let gsi = self.irq;
-                self.irq += 1;
+                self.advance_irq();
                 self.pci_intx_gsi = Some(gsi);
                 gsi
             }
@@ -399,7 +409,7 @@ impl MMIODeviceManager {
         );
 
         self.mmio_base += MMIO_LEN;
-        self.irq += 1;
+        self.advance_irq();
 
         Ok(())
     }
@@ -432,7 +442,7 @@ impl MMIODeviceManager {
         );
 
         self.mmio_base += MMIO_LEN;
-        self.irq += 1;
+        self.advance_irq();
 
         Ok(())
     }
@@ -618,7 +628,13 @@ mod tests {
 
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
 
-        for _i in arch::IRQ_BASE..=arch::IRQ_MAX {
+        // x86_64 reserves one IOAPIC pin for the ACPI SCI (see advance_irq), so one
+        // fewer virtio IRQ is allocatable than the raw IRQ_BASE..=IRQ_MAX span.
+        let available = arch::IRQ_MAX - arch::IRQ_BASE + 1;
+        #[cfg(target_arch = "x86_64")]
+        let available = available - 1;
+
+        for _i in 0..available {
             device_manager
                 .register_virtio_device(
                     vm.fd(),

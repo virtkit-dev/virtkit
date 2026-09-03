@@ -39,6 +39,28 @@ pub const IRQ_MAX: u32 = IOAPIC_NUM_PINS - 1;
 /// Address for the TSS setup.
 pub const KVM_TSS_ADDRESS: u64 = 0xfffb_d000;
 
+/// Where the ACPI tables (RSDP, XSDT, FADT, FACS, MADT, DSDT) are written. This
+/// sits in the legacy 0xA0000-0xFFFFF segment: backed by guest RAM region 0 but
+/// outside the E820 RAM map, the conventional home for firmware tables. The RSDP
+/// is both pointed to by `boot_params.acpi_rsdp_addr` and findable by the legacy
+/// 0xE0000-0xFFFFF scan.
+pub const ACPI_TABLES_START: u64 = 0xe0000;
+/// Highest address available to the ACPI tables (end of the 1 MiB segment).
+pub const ACPI_TABLES_END: u64 = 0x100000;
+
+/// Base of the ACPI PM1 register block (PM1a_EVT at +0, PM1a_CNT at +4) and the
+/// ACPI reset register (+0xC), served by the `AcpiPm` PIO device.
+pub const ACPI_PM_BASE: u16 = 0x600;
+/// Length of the `AcpiPm` PIO window.
+pub const ACPI_PM_LEN: u64 = 0x10;
+/// ACPI reset register, as an offset from `ACPI_PM_BASE` and as an absolute port.
+pub const ACPI_RESET_REG: u16 = ACPI_PM_BASE + 0x0c;
+/// Value the guest writes to `ACPI_RESET_REG` to request a reset.
+pub const ACPI_RESET_VALUE: u8 = 1;
+/// IOAPIC GSI carrying the ACPI SCI (power-button events). Fixed; skipped by
+/// the virtio IRQ allocator.
+pub const SCI_GSI: u32 = 9;
+
 /// The 'zero page', a.k.a linux kernel bootparams.
 pub const ZERO_PAGE_START: u64 = 0x7000;
 

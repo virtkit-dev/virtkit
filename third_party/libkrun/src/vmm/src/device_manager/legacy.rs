@@ -7,8 +7,10 @@
 #![cfg(target_arch = "x86_64")]
 
 use std::fmt;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use arch::x86_64::layout::{ACPI_PM_BASE, ACPI_PM_LEN};
 use devices;
 use utils::eventfd::EventFd;
 
@@ -42,6 +44,7 @@ pub struct PortIODeviceManager {
     pub cmos: Arc<Mutex<devices::legacy::Cmos>>,
     pub stdio_serial: Vec<Arc<Mutex<devices::legacy::Serial>>>,
     pub i8042: Arc<Mutex<devices::legacy::I8042Device>>,
+    pub acpi_pm: Arc<Mutex<devices::legacy::AcpiPm>>,
     pub pci_config_io: Arc<Mutex<devices::legacy::PciConfigIo>>,
 
     pub com_evt_1: EventFd,
@@ -52,11 +55,19 @@ pub struct PortIODeviceManager {
 }
 
 impl PortIODeviceManager {
-    /// Create a new DeviceManager handling legacy devices (uart, i8042).
+    /// Create a new DeviceManager handling legacy devices (uart, i8042, ACPI PM).
+    ///
+    /// `exit_evt` is the Vmm exit event, fired by the i8042 CPU-reset command and
+    /// by the ACPI power-off / reset registers. `reset_flag` is shared with those
+    /// devices and the Vmm so a reset is distinguished from a clean power-off.
+    /// `sci_evt` raises the ACPI SCI, and `shutdown_efd` is the host power button.
     pub fn new(
         cmos: Arc<Mutex<devices::legacy::Cmos>>,
         stdio_serial: Vec<Arc<Mutex<devices::legacy::Serial>>>,
-        i8042_reset_evfd: EventFd,
+        exit_evt: EventFd,
+        reset_flag: Arc<AtomicBool>,
+        sci_evt: EventFd,
+        shutdown_efd: Option<EventFd>,
     ) -> Result<Self> {
         let io_bus = devices::Bus::new();
         let mut evts: Vec<EventFd> = Vec::new();
@@ -76,8 +87,16 @@ impl PortIODeviceManager {
         let kbd_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
 
         let i8042 = Arc::new(Mutex::new(devices::legacy::I8042Device::new(
-            i8042_reset_evfd,
+            exit_evt.try_clone().map_err(Error::EventFd)?,
+            reset_flag.clone(),
             kbd_evt.try_clone().map_err(Error::EventFd)?,
+        )));
+
+        let acpi_pm = Arc::new(Mutex::new(devices::legacy::AcpiPm::new(
+            exit_evt,
+            reset_flag,
+            sci_evt,
+            shutdown_efd,
         )));
 
         // Legacy PCI: a single host bridge at 00:00.0 reachable via the type-1
@@ -98,6 +117,7 @@ impl PortIODeviceManager {
             cmos,
             stdio_serial,
             i8042,
+            acpi_pm,
             pci_config_io,
             com_evt_1: evts[0].try_clone().map_err(Error::EventFd)?,
             com_evt_2: evts[1].try_clone().map_err(Error::EventFd)?,
@@ -157,6 +177,10 @@ impl PortIODeviceManager {
         self.io_bus
             .insert(self.i8042.clone(), 0x060, 0x5)
             .map_err(Error::BusError)?;
+        // ACPI PM1 block and reset register.
+        self.io_bus
+            .insert(self.acpi_pm.clone(), u64::from(ACPI_PM_BASE), ACPI_PM_LEN)
+            .map_err(Error::BusError)?;
         // Type-1 PCI config: CONFIG_ADDRESS at 0xcf8, CONFIG_DATA at 0xcfc.
         self.io_bus
             .insert(self.pci_config_io.clone(), 0xcf8, 0x8)
@@ -178,6 +202,9 @@ mod tests {
             Arc::new(Mutex::new(cmos)),
             vec![Arc::new(Mutex::new(serial))],
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            Arc::new(AtomicBool::new(false)),
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            None,
         );
         assert!(ldm.is_ok());
         assert!(&ldm.unwrap().register_devices().is_ok());

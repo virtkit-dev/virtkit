@@ -56,6 +56,9 @@ use vmm::vmm_config::machine_config::VmConfig;
 #[cfg(feature = "net")]
 use vmm::vmm_config::net::NetworkInterfaceConfig;
 use vmm::vmm_config::vsock::VsockDeviceConfig;
+/// Re-exported so the host driver can recognise a guest-reset exit from the boot
+/// child and relaunch the VM in place. See the constant's definition in `vmm`.
+pub use vmm::KRUN_EXIT_GUEST_RESET;
 
 #[cfg(feature = "aws-nitro")]
 use aws_nitro::enclave::NitroEnclave;
@@ -552,7 +555,11 @@ pub unsafe extern "C" fn krun_init_log(target: RawFd, level: u32, style: u32, op
 
 #[no_mangle]
 pub extern "C" fn krun_create_ctx() -> i32 {
-    let shutdown_efd = if cfg!(target_arch = "aarch64") && cfg!(target_os = "macos") {
+    // A host-driven power button exists where a device consumes this eventfd:
+    // the PL061 GPIO on aarch64/macOS, and the ACPI PM device on x86_64/Linux.
+    let shutdown_efd = if (cfg!(target_arch = "aarch64") && cfg!(target_os = "macos"))
+        || (cfg!(target_arch = "x86_64") && cfg!(target_os = "linux"))
+    {
         Some(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap())
     } else {
         None

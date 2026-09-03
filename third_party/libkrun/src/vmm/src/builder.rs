@@ -15,7 +15,7 @@ use std::io::{self, IsTerminal, Read};
 use std::os::fd::AsRawFd;
 use std::os::fd::{BorrowedFd, FromRawFd};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::{Arc, Mutex};
 
 use super::{Error, Vmm};
@@ -563,7 +563,7 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
 pub fn build_microvm(
     vm_resources: &super::resources::VmResources,
     event_manager: &mut EventManager,
-    _shutdown_efd: Option<EventFd>,
+    shutdown_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     let payload = choose_payload(vm_resources)?;
@@ -799,22 +799,41 @@ pub fn build_microvm(
         .map_err(Error::EventFd)
         .map_err(StartMicrovmError::Internal)?;
 
+    // Shared reset flag: set by the i8042 CPU-reset command and the ACPI reset register
+    // before they fire `exit_evt`, so the Vmm can tell a guest reset from a clean
+    // power-off (S5 fires the exit without the flag). Stays false on the aarch64 path.
+    let reset_flag = Arc::new(AtomicBool::new(false));
+
     #[cfg(target_arch = "x86_64")]
     // Safe to unwrap 'serial_device' as it's always 'Some' on x86_64.
     // x86_64 uses the i8042 reset event as the Vmm exit event.
-    let mut pio_device_manager = PortIODeviceManager::new(
-        Arc::new(Mutex::new(Cmos::new(
-            arch_memory_info.ram_below_gap,
-            arch_memory_info.ram_above_gap,
-        ))),
-        serial_devices,
-        exit_evt
-            .try_clone()
+    let (mut pio_device_manager, sci_evt) = {
+        // ACPI SCI: an eventfd registered as an irqfd on SCI_GSI (below). The
+        // AcpiPm device writes it to deliver a power-button event to the guest.
+        let sci_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK)
             .map_err(Error::EventFd)
-            .map_err(StartMicrovmError::Internal)?,
-    )
-    .map_err(Error::CreateLegacyDevice)
-    .map_err(StartMicrovmError::Internal)?;
+            .map_err(StartMicrovmError::Internal)?;
+        let pio = PortIODeviceManager::new(
+            Arc::new(Mutex::new(Cmos::new(
+                arch_memory_info.ram_below_gap,
+                arch_memory_info.ram_above_gap,
+            ))),
+            serial_devices,
+            exit_evt
+                .try_clone()
+                .map_err(Error::EventFd)
+                .map_err(StartMicrovmError::Internal)?,
+            reset_flag.clone(),
+            sci_evt
+                .try_clone()
+                .map_err(Error::EventFd)
+                .map_err(StartMicrovmError::Internal)?,
+            shutdown_efd,
+        )
+        .map_err(Error::CreateLegacyDevice)
+        .map_err(StartMicrovmError::Internal)?;
+        (pio, sci_evt)
+    };
 
     // Instantiate the MMIO device manager.
     // 'mmio_base' address has to be an address which is protected by the kernel
@@ -862,6 +881,8 @@ pub fn build_microvm(
             &mut pio_device_manager,
             &mut mmio_device_manager,
             Some(intc.clone()),
+            event_manager,
+            &sci_evt,
         )?;
 
         let kernel_boot = vm_resources.firmware_config.is_none() && !cfg!(feature = "tee");
@@ -958,7 +979,7 @@ pub fn build_microvm(
             intc.clone(),
             serial_devices,
             event_manager,
-            _shutdown_efd,
+            shutdown_efd,
         )?;
     }
 
@@ -997,6 +1018,7 @@ pub fn build_microvm(
         exit_evt,
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
+        reset_flag,
         vm,
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
@@ -1670,6 +1692,8 @@ fn attach_legacy_devices(
     pio_device_manager: &mut PortIODeviceManager,
     mmio_device_manager: &mut MMIODeviceManager,
     intc: Option<Arc<Mutex<IrqChipDevice>>>,
+    event_manager: &mut EventManager,
+    sci_evt: &EventFd,
 ) -> std::result::Result<(), StartMicrovmError> {
     pio_device_manager
         .register_devices()
@@ -1701,6 +1725,20 @@ fn attach_legacy_devices(
     register_irqfd_evt!(com_evt_3, 4);
     register_irqfd_evt!(com_evt_4, 3);
     register_irqfd_evt!(kbd_evt, 1);
+
+    // ACPI SCI on a fixed GSI, delivering power-button events to the guest.
+    vm.fd()
+        .register_irqfd(sci_evt, arch::x86_64::layout::SCI_GSI)
+        .map_err(|e| {
+            Error::LegacyIOBus(device_manager::legacy::Error::EventFd(
+                io::Error::from_raw_os_error(e.errno()),
+            ))
+        })
+        .map_err(StartMicrovmError::Internal)?;
+    // The ACPI PM device also listens for the host power-button eventfd.
+    event_manager
+        .add_subscriber(pio_device_manager.acpi_pm.clone())
+        .map_err(StartMicrovmError::RegisterEvent)?;
     Ok(())
 }
 

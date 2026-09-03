@@ -27,7 +27,7 @@ use std::thread;
 #[cfg(target_arch = "x86_64")]
 use std::time::Duration;
 
-use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
+use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK, KRUN_EXIT_GUEST_RESET};
 
 #[cfg(feature = "amd-sev")]
 use super::tee::amdsnp::{AmdSnp, Error as SnpError};
@@ -1527,8 +1527,12 @@ impl Vcpu {
                     Ok(VcpuEmulation::Stopped)
                 }
                 VcpuExit::Shutdown => {
+                    // virtkit: a triple fault — the guest's own reset path (reboot=triple),
+                    // or the last resort when reboot=acpi/kbd could not be taken. Report it
+                    // as a reset (was Stopped) so a supervisor can reboot in place. Shared by
+                    // aarch64 Linux too; see VENDOR.md (KRUN_EXIT_GUEST_RESET).
                     info!("Received KVM_EXIT_SHUTDOWN signal");
-                    Ok(VcpuEmulation::Stopped)
+                    Ok(VcpuEmulation::Reset)
                 }
                 // Documentation specifies that below kvm exits are considered
                 // errors.
@@ -1540,14 +1544,22 @@ impl Vcpu {
                     error!("Received KVM_EXIT_INTERNAL_ERROR signal");
                     Err(Error::VcpuUnhandledKvmExit)
                 }
-                VcpuExit::SystemEvent(event, _reason) => {
-                    match event {
-                        KVM_SYSTEM_EVENT_SHUTDOWN => info!("Received KVM_SYSTEM_EVENT_SHUTDOWN"),
-                        KVM_SYSTEM_EVENT_RESET => info!("Received KVM_SYSTEM_EVENT_RESET"),
-                        _ => error!("Received an unexpected System Event: {event}"),
+                VcpuExit::SystemEvent(event, _reason) => match event {
+                    KVM_SYSTEM_EVENT_SHUTDOWN => {
+                        info!("Received KVM_SYSTEM_EVENT_SHUTDOWN");
+                        Ok(VcpuEmulation::Stopped)
                     }
-                    Ok(VcpuEmulation::Stopped)
-                }
+                    KVM_SYSTEM_EVENT_RESET => {
+                        // virtkit: report a reset (was Stopped) so the host can reboot in
+                        // place; shared by aarch64 Linux too. See VENDOR.md.
+                        info!("Received KVM_SYSTEM_EVENT_RESET");
+                        Ok(VcpuEmulation::Reset)
+                    }
+                    _ => {
+                        error!("Received an unexpected System Event: {event}");
+                        Ok(VcpuEmulation::Stopped)
+                    }
+                },
                 r => {
                     // TODO: Are we sure we want to finish running a vcpu upon
                     // receiving a vm exit that is not necessarily an error?
@@ -1602,6 +1614,9 @@ impl Vcpu {
                 // seccomp failure because musl calls `sigprocmask` as part of `pthread_exit`.
                 // So we pause vCPU0 and send a signal to the emulation thread to stop the VMM.
                 Ok(VcpuEmulation::Stopped) => return self.exit(FC_EXIT_CODE_OK),
+                // The guest asked to reset: exit with a code the supervisor can
+                // relaunch on. Same rendezvous as Stopped (see above).
+                Ok(VcpuEmulation::Reset) => return self.exit(KRUN_EXIT_GUEST_RESET),
                 // Emulation errors lead to vCPU exit.
                 Err(_) => return self.exit(FC_EXIT_CODE_GENERIC_ERROR),
             }
@@ -1796,6 +1811,8 @@ enum VcpuEmulation {
     Handled,
     Interrupted,
     Stopped,
+    /// The guest requested a reset (reboot), as opposed to a halt/power-off.
+    Reset,
 }
 
 #[cfg(test)]

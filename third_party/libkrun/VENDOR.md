@@ -192,3 +192,24 @@ libkrun; the crate gains `zstd`, `lru` and `maybe-async` for it. Additive — no
 behaviour changes for a disk that is not a manifest and has none in its chain. Covered by
 `block::lazy_chunk_storage::tests` and the backing-chain tests in `block::device::tests`.
 Search for `LazyChunkStorage`.
+
+`src/arch/src/x86_64/{acpi.rs (new),dsdt.asl (new),mod.rs,layout.rs}` +
+`src/arch_gen/src/x86/bootparam.rs` + `src/devices/src/legacy/{acpi_pm.rs (new),mod.rs,i8042.rs}` +
+`src/vmm/src/device_manager/{legacy.rs,kvm/mmio.rs}` + `src/vmm/src/{builder.rs,lib.rs,linux/vstate.rs}` +
+`src/libkrun/src/lib.rs` — minimal ACPI on x86_64, so a guest can power off, take a host power
+button, and reboot. `acpi::setup_acpi` writes an RSDP/XSDT/FADT/FACS/MADT and a precompiled DSDT
+(`dsdt.asl`, `iasl`-compiled: `\_S5` + a PCI0 root bridge) into low RAM and points the guest at it
+via `boot_params.acpi_rsdp_addr` (the old bindgen's `_pad3` is split to expose that field). A new
+`AcpiPm` PIO device at `0x600` serves the PM1 block (S5 power-off fires the Vmm exit event), the
+FADT reset register (`0x60C`), and a fixed-feature power button raised over the SCI (GSI 9, an
+irqfd kept out of the virtio IRQ allocator's range); its host trigger is the existing
+`shutdown_efd`, now created on x86_64/Linux too and reachable through `krun_get_shutdown_eventfd`.
+A guest reset — triple fault, `KVM_SYSTEM_EVENT_RESET`, the i8042 `0xFE` command, or the ACPI reset
+register — now exits with `KRUN_EXIT_GUEST_RESET` (154) instead of 0, so a supervisor can tell a
+reboot from a power-off and relaunch the VM; a shared reset flag carries the distinction for the
+device-driven paths. The ACPI tables and the `AcpiPm`/i8042 paths are x86_64 only, but the
+triple-fault and `KVM_SYSTEM_EVENT_RESET` handling lives in the shared `linux/vstate.rs`, so an
+aarch64 Linux guest reset now exits 154 as well. No caller consumes 154 yet, so a reboot currently
+surfaces as a non-zero exit until the host wires it in. The MP table is retained (used with
+`acpi=off`); additive — a guest that ignores ACPI still boots via the MP table. Covered by
+`x86_64::acpi::tests`. Search for `setup_acpi`, `AcpiPm`, `reset_flag`, and `KRUN_EXIT_GUEST_RESET`.

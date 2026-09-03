@@ -3318,7 +3318,8 @@ pub struct boot_params {
     pub _pad2: [__u8; 4usize],
     pub tboot_addr: __u64,
     pub ist_info: ist_info,
-    pub _pad3: [__u8; 16usize],
+    pub acpi_rsdp_addr: __u64,
+    pub _pad3: [__u8; 8usize],
     pub hd0_info: [__u8; 16usize],
     pub hd1_info: [__u8; 16usize],
     pub sys_desc_table: sys_desc_table,
@@ -3412,8 +3413,18 @@ fn bindgen_test_layout_boot_params() {
         )
     );
     assert_eq!(
-        unsafe { ::std::ptr::addr_of!((*ptr)._pad3) as usize - ptr as usize },
+        unsafe { ::std::ptr::addr_of!((*ptr).acpi_rsdp_addr) as usize - ptr as usize },
         112usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(boot_params),
+            "::",
+            stringify!(acpi_rsdp_addr)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr)._pad3) as usize - ptr as usize },
+        120usize,
         concat!(
             "Offset of field: ",
             stringify!(boot_params),

@@ -7,6 +7,8 @@
 
 use std::fmt;
 use std::num::Wrapping;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::{io, result};
 use utils::eventfd::EventFd;
 
@@ -74,6 +76,10 @@ pub struct I8042Device {
     /// CPU reset eventfd. We will set this event when the guest issues CMD_RESET_CPU.
     reset_evt: EventFd,
 
+    /// Shared with the Vmm and the ACPI PM device: set before firing `reset_evt`
+    /// so a guest `reboot=kbd` is reported as a reset, not a clean power-off.
+    reset_flag: Arc<AtomicBool>,
+
     /// Keyboard interrupt event (IRQ 1).
     kbd_interrupt_evt: EventFd,
 
@@ -97,9 +103,14 @@ pub struct I8042Device {
 
 impl I8042Device {
     /// Constructs an i8042 device that will signal the given event when the guest requests it.
-    pub fn new(reset_evt: EventFd, kbd_interrupt_evt: EventFd) -> I8042Device {
+    pub fn new(
+        reset_evt: EventFd,
+        reset_flag: Arc<AtomicBool>,
+        kbd_interrupt_evt: EventFd,
+    ) -> I8042Device {
         I8042Device {
             reset_evt,
+            reset_flag,
             kbd_interrupt_evt,
             control: CB_POST_OK | CB_KBD_INT,
             cmd: 0,
@@ -230,6 +241,9 @@ impl BusDevice for I8042Device {
                 // The guest wants to assert the CPU reset line. We handle that by triggering
                 // our exit event fd. Meaning Firecracker will be exiting as soon as the VMM
                 // thread wakes up to handle this event.
+                // virtkit: flag it as a reset first, so the Vmm reports a guest reset rather
+                // than a clean exit (reset_flag, see VENDOR.md).
+                self.reset_flag.store(true, Ordering::SeqCst);
                 if let Err(e) = self.reset_evt.write(1) {
                     error!("Failed to trigger i8042 reset event: {e:?}");
                 }
@@ -313,6 +327,7 @@ mod tests {
     fn test_i8042_read_write_and_event() {
         let mut i8042 = I8042Device::new(
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            Arc::new(AtomicBool::new(false)),
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
         );
         let reset_evt = i8042.get_reset_evt_clone().unwrap();
@@ -341,6 +356,7 @@ mod tests {
     fn test_i8042_commands() {
         let mut i8042 = I8042Device::new(
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            Arc::new(AtomicBool::new(false)),
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
         );
         let mut data = [1];
@@ -381,6 +397,7 @@ mod tests {
     fn test_i8042_buffer() {
         let mut i8042 = I8042Device::new(
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            Arc::new(AtomicBool::new(false)),
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
         );
 
@@ -405,6 +422,7 @@ mod tests {
     fn test_i8042_kbd() {
         let mut i8042 = I8042Device::new(
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            Arc::new(AtomicBool::new(false)),
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
         );
 

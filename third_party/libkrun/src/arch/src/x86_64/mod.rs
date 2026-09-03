@@ -5,6 +5,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+/// ACPI table construction (RSDP/XSDT/FADT/FACS/MADT/DSDT).
+#[cfg(not(feature = "tee"))]
+mod acpi;
 mod gdt;
 /// Contains logic for setting up Advanced Programmable Interrupt Controller (local version).
 pub mod interrupts;
@@ -45,6 +48,9 @@ pub enum Error {
     /// Error writing MP table to memory.
     #[cfg(not(feature = "tee"))]
     MpTableSetup(mptable::Error),
+    /// Error writing the ACPI tables to memory.
+    #[cfg(not(feature = "tee"))]
+    AcpiSetup(acpi::Error),
     /// Error writing the zero page of guest memory.
     ZeroPageSetup,
     /// Failed to compute initrd address.
@@ -274,7 +280,17 @@ pub fn configure_system(
     #[cfg(not(feature = "tee"))]
     mptable::setup_mptable(guest_mem, num_cpus, pci_irqs).map_err(Error::MpTableSetup)?;
 
+    // ACPI tables. Linux prefers the MADT to the MP table once it finds an RSDP,
+    // so both are kept in sync (same CPU count, same IOAPIC).
+    #[cfg(not(feature = "tee"))]
+    let rsdp_addr = acpi::setup_acpi(guest_mem, num_cpus).map_err(Error::AcpiSetup)?;
+
     let mut params: BootParamsWrapper = BootParamsWrapper(boot_params::default());
+
+    #[cfg(not(feature = "tee"))]
+    {
+        params.0.acpi_rsdp_addr = rsdp_addr;
+    }
 
     params.0.hdr.type_of_loader = KERNEL_LOADER_OTHER;
     params.0.hdr.boot_flag = KERNEL_BOOT_FLAG_MAGIC;
