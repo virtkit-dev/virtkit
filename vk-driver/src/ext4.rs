@@ -6,9 +6,9 @@
 //!
 //! Feature set, all of which the ext4 kernel driver mounts and e2fsck accepts:
 //! 4 KiB blocks, 256-byte inodes, **extents**, `filetype`, `sparse_super`,
-//! `large_file`, optional **journal** (JBD2, inode 8, 4 MiB, enabled on the
-//! export paths via [`FsId::with_journal`]). No metadata_csum, no 64bit, no
-//! flex_bg.
+//! `large_file`, optional **journal** (JBD2, inode 8, 4 MiB, enabled for exported
+//! images and `disk` volumes via [`FsId::with_journal`]). No metadata_csum, no 64bit,
+//! no flex_bg.
 //!
 //! Multi-block-group: standard per-group layout (each group carries its own block
 //! bitmap, inode bitmap and inode-table slice; sparse_super groups also hold a
@@ -151,8 +151,8 @@ pub fn build_from_dir(src_dir: &Path, out: &Path) -> Result<()> {
 pub struct FsId {
     pub uuid: Option<[u8; 16]>,
     pub label: Option<String>,
-    /// Embed a 4 MiB JBD2 journal (inode 8). Enables crash recovery when the
-    /// image is mounted read-write via a CoW overlay.
+    /// Embed a 4 MiB JBD2 journal in inode 8 for crash recovery on read-write CoW overlays
+    /// and persistent `disk` volumes.
     pub with_journal: bool,
 }
 
@@ -243,6 +243,18 @@ pub fn build_from_tar_injecting(
 /// (holes), so a large capacity is nearly free to create and store. No journal: the fs is
 /// throwaway.
 pub fn build_empty(out: &Path, extra_free_blocks: u64) -> Result<()> {
+    build_empty_with(out, extra_free_blocks, false)
+}
+
+/// Build an empty ext4 with a 4 MiB JBD2 journal for a persistent `disk` volume. It keeps
+/// metadata consistent when power loss interrupts writes; [`build_empty`] would require
+/// e2fsck. The fixed journal may checkpoint frequently on large, metadata-heavy volumes;
+/// unlike this writer, mke2fs sizes its journal from filesystem capacity.
+pub fn build_empty_journaled(out: &Path, extra_free_blocks: u64) -> Result<()> {
+    build_empty_with(out, extra_free_blocks, true)
+}
+
+fn build_empty_with(out: &Path, extra_free_blocks: u64, with_journal: bool) -> Result<()> {
     // A valid empty tar is two 512-byte end-of-archive zero records.
     let tar = out.with_extension("empty.tar");
     std::fs::write(&tar, [0u8; 1024]).with_context(|| format!("writing {}", tar.display()))?;
@@ -251,7 +263,7 @@ pub fn build_empty(out: &Path, extra_free_blocks: u64) -> Result<()> {
         &[],
         extra_free_blocks,
         &FsId {
-            with_journal: false,
+            with_journal,
             ..Default::default()
         },
         out,
@@ -1983,6 +1995,30 @@ fn be32(buf: &mut [u8], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
 }
 
+/// Read `image`'s ext4 superblock, returning `None` if it has none. Read qcow2 files
+/// (exported roots, unit images, and disk volumes) through the format layer and other files
+/// as raw bytes.
+fn read_superblock(image: &Path) -> Option<[u8; 1024]> {
+    let mut f = std::fs::File::open(image).ok()?;
+    let mut sb = [0u8; 1024];
+    match crate::qcow2::sniff_kind(&f) {
+        crate::qcow2::ImageKind::Qcow2 => crate::qcow2::Qcow2::open(image)
+            .ok()?
+            .read_at(1024, &mut sb)
+            .ok()?,
+        _ => f.read_at(1024, &mut sb).ok()?,
+    }
+    (rd16(&sb, 0x38) == 0xEF53).then_some(sb)
+}
+
+/// Return whether `image` contains a journaled ext4, reading raw and qcow2 images. Return
+/// `None` if it contains no ext4.
+#[cfg(test)]
+pub(crate) fn has_journal(image: &Path) -> Option<bool> {
+    let sb = read_superblock(image)?;
+    Some(rd32(&sb, 0x5c) & EXT4_FEATURE_COMPAT_HAS_JOURNAL != 0)
+}
+
 /// The base ext4's filesystem UUID, read from the superblock's `s_uuid` — the read
 /// counterpart of [`set_uuid`]. Used to name the overlay so a rebuilt base never reuses a
 /// stale overlay, and (via ensure) as the content fingerprint that decides a rebuild.
@@ -1994,20 +2030,7 @@ fn be32(buf: &mut [u8], off: usize, v: u32) {
 /// exactly that `blkid` and no `dumpe2fs` to fall back to. Rendered like
 /// `ensure::fingerprint`, the value it is compared against.
 pub(crate) fn fs_uuid(image: &Path) -> Option<String> {
-    let mut f = std::fs::File::open(image).ok()?;
-    let mut sb = [0u8; 1024];
-    // The filesystem may sit in a qcow2 (an exported root or unit image): read its
-    // superblock through the format layer then, off the raw bytes otherwise.
-    match crate::qcow2::sniff_kind(&f) {
-        crate::qcow2::ImageKind::Qcow2 => crate::qcow2::Qcow2::open(image)
-            .ok()?
-            .read_at(1024, &mut sb)
-            .ok()?,
-        _ => f.read_at(1024, &mut sb).ok()?,
-    }
-    if rd16(&sb, 0x38) != 0xEF53 {
-        return None;
-    }
+    let sb = read_superblock(image)?;
     // All-zero is an image nothing has stamped yet, not a UUID of zeros.
     if sb[0x68..0x78] == [0u8; 16] {
         return None;
@@ -2530,8 +2553,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // Build a journal-less image, add a journal natively, and verify e2fsck-clean +
-    // has_journal. Run with: cargo test -- --ignored ext4::tests::add_journal_e2fsck
+    /// A journaled empty image has the journal feature, inode 8, and JBD2 magic; a plain image
+    /// has none. `has_journal` rejects non-ext4 input, and e2fsck validates the journaled image
+    /// when available.
+    #[test]
+    fn build_empty_journaled_adds_a_journal() {
+        let base = std::env::temp_dir().join(format!("ext4-emptyj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let journaled = base.join("journaled.raw");
+        let plain = base.join("plain.raw");
+        let other = base.join("other");
+        build_empty_journaled(&journaled, 8192).expect("build journaled");
+        build_empty(&plain, 8192).expect("build plain");
+        std::fs::write(&other, b"not a filesystem").unwrap();
+
+        assert_eq!(has_journal(&journaled), Some(true));
+        assert_eq!(has_journal(&plain), Some(false));
+        assert_eq!(has_journal(&other), None);
+        assert_eq!(has_journal(&base.join("missing")), None);
+
+        // The journal does not consume the requested free space. Block-group padding makes
+        // the exact free-block counts differ.
+        let sb_j = read_superblock(&journaled).unwrap();
+        assert!(
+            rd32(&sb_j, 0x0c) >= 8192,
+            "s_free_blocks_count below the headroom"
+        );
+
+        // The journal inode's first block starts with the JBD2 superblock.
+        assert_eq!(rd32(&sb_j, 0xe0), JOURNAL_INO, "s_journal_inum");
+        let bytes = std::fs::read(&journaled).unwrap();
+        let magic = JBD2_MAGIC.to_be_bytes();
+        assert!(
+            bytes.chunks(BLOCK as usize).any(|b| b.starts_with(&magic)),
+            "no block starts with the JBD2 magic"
+        );
+
+        match fsck(&journaled) {
+            FsckResult::Clean => {}
+            FsckResult::Corrupt(out) => panic!("e2fsck rejected the journaled image:\n{out}"),
+            FsckResult::Skipped(_) => {}
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Export fix-ups work through an open qcow2 writer. After stamping, journaling, and
     /// closing, `fs_uuid` reads the stamp; when installed, `qemu-img` and `e2fsck` verify it.
     #[test]
@@ -2603,6 +2669,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    // Build a journal-less image, add a journal natively, and verify e2fsck-clean +
+    // has_journal. Run with: cargo test -- --ignored ext4::tests::add_journal_e2fsck
     #[test]
     #[ignore]
     fn add_journal_e2fsck() {

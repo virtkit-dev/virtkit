@@ -10,6 +10,8 @@ All notable changes to virtkit will be documented in this file.
   The guest has up to a minute to power off while systemd stops its units or a plain service
   handles SIGTERM. A `disk` volume retains its final writes and remounts with a clean
   filesystem.
+- New `disk` volumes use a journal, so they mount consistently without a filesystem check
+  if the host process or machine stops unexpectedly. Existing volumes keep their format.
 
 ## [0.49.0] - 2026-09-02
 

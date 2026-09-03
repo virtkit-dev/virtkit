@@ -1075,16 +1075,17 @@ pub fn ensure_disk_backing(vol: &Volume) -> Result<()> {
     let _ = std::fs::remove_file(&raw);
     let publish = (|| -> Result<()> {
         // The raw scratch is created 0600 (`create_new`, so it can't follow a symlink planted
-        // at the temp path); `build_empty`'s own `File::create` on it only truncates and
-        // rewrites, keeping the mode.
+        // at the temp path); `build_empty_journaled`'s own `File::create` on it only truncates
+        // and rewrites, keeping the mode.
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&raw)
             .with_context(|| format!("creating {}", raw.display()))?;
-        // Build raw ext4 scratch, then import its written blocks into qcow2.
-        crate::ext4::build_empty(&raw, free_blocks)
+        // Build a journaled raw ext4 for the persistent volume, then import its written blocks
+        // into qcow2.
+        crate::ext4::build_empty_journaled(&raw, free_blocks)
             .with_context(|| format!("formatting disk volume {}", vol.host.display()))?;
         let size = std::fs::metadata(&raw)
             .with_context(|| format!("sizing {}", raw.display()))?
@@ -2098,6 +2099,11 @@ mod tests {
         assert!(
             crate::ext4::fs_uuid(&vol.host).is_some(),
             "a formatted ext4 sits inside it"
+        );
+        assert_eq!(
+            crate::ext4::has_journal(&vol.host),
+            Some(true),
+            "a persistent volume carries a journal"
         );
         assert!(
             std::fs::read_dir(dir.join("nested"))
