@@ -1,24 +1,24 @@
-//! `vk-agent poweroff` — shut the guest down cleanly. The host runs it over the exec channel
-//! where it would otherwise kill the VMM outright, which for the guest is a power cut: every
-//! filesystem loses what its page cache still held and is left dirty on disk. What the
-//! command does depends on who is PID 1:
+//! `vk-agent poweroff` / `vk-agent reboot` — end or restart the guest cleanly. The host runs
+//! these over the exec channel where it would otherwise kill the VMM outright, which for the
+//! guest is a power cut: every filesystem loses what its page cache still held and is left
+//! dirty on disk. What the command does depends on who is PID 1:
 //!
-//! - systemd gets its poweroff request ([`SIG_POWEROFF`]): units stop, filesystems unmount.
-//! - `vk-agent init` gets the same signal: it terminates its service, then powers off with
-//!   every filesystem frozen clean (`init::poweroff`).
+//! - systemd gets its poweroff/reboot request ([`SIG_POWEROFF`]/[`SIG_REBOOT`]): units stop,
+//!   filesystems unmount.
+//! - `vk-agent init` gets the same signal: it terminates its service, then ends the machine
+//!   with every filesystem frozen clean (`init`'s shutdown path).
 //! - Anything else — an entrypoint holding PID 1 — has no shutdown of its own, so it is done
 //!   from here: the other processes are terminated and given a moment to exit, then `sync`,
-//!   freeze every writable disk filesystem, and power off. An init that exits along with its
-//!   child (tini, a `sh -c` wrapper) ends the guest before the freeze — PID 1 exiting is a
+//!   freeze every writable disk filesystem, and end the machine. An init that exits along with
+//!   its child (tini, a `sh -c` wrapper) ends the guest before the freeze — PID 1 exiting is a
 //!   kernel panic — which leaves things as a kill would have.
 //!
 //! The command returns as soon as the shutdown is under way; the host waits for the VMM to
 //! exit, and kills it after a grace period when it does not.
 //!
-//! The shutdown request depends on the VMM (see [`power_off_machine`]). libkrun has no ACPI,
-//! so power-off only halts its vCPUs and leaves the VMM running; reset exits the VMM. With
-//! ACPI (cloud-hypervisor), power-off exits and reset reboots the VM. systemd receives the
-//! corresponding request.
+//! Every guest now has ACPI (cloud-hypervisor always did; libkrun gained it), so a power-off
+//! (ACPI S5) ends the VM and a reset (ACPI reset register) restarts it — which the host's VMM
+//! keeper relaunches in place. See [`end_machine`].
 
 use std::ffi::CString;
 use std::os::unix::fs::MetadataExt;
@@ -31,24 +31,32 @@ use std::time::{Duration, Instant};
 /// systemd. `vk-agent init` handles 38 too, giving the host one request for either init.
 pub const SIG_POWEROFF: libc::c_int = 38;
 
-/// systemd's reboot request, `SIGRTMIN+5` — what ends a systemd guest on a machine with no
-/// ACPI (see [`power_off_machine`]).
-const SIG_REBOOT: libc::c_int = 39;
+/// systemd's reboot request, `SIGRTMIN+5`. `vk-agent init` handles it too.
+pub const SIG_REBOOT: libc::c_int = 39;
 
-/// Whether this machine has ACPI and therefore supports power-off. In libkrun guests the
-/// firmware directory contains only the memory map.
-pub(crate) fn machine_has_acpi() -> bool {
-    Path::new("/sys/firmware/acpi").is_dir()
+/// What the caller asked the guest to do.
+#[derive(Clone, Copy)]
+pub enum Action {
+    PowerOff,
+    Reboot,
 }
 
-/// End the VM with its supported `reboot(2)` request: power-off with ACPI, reset otherwise.
-/// The caller samples [`machine_has_acpi`] beforehand so this remains safe for
-/// `init::poweroff`'s signal-handler path. Never returns.
-pub(crate) fn power_off_machine(acpi: bool) -> ! {
-    let cmd = if acpi {
-        libc::LINUX_REBOOT_CMD_POWER_OFF
-    } else {
-        libc::LINUX_REBOOT_CMD_RESTART
+impl Action {
+    fn signal(self) -> libc::c_int {
+        match self {
+            Action::PowerOff => SIG_POWEROFF,
+            Action::Reboot => SIG_REBOOT,
+        }
+    }
+}
+
+/// End the VM with `reboot(2)`: ACPI power-off (S5) ends it, ACPI reset restarts it (the host
+/// keeper then relaunches the VM in place). Async-signal-safe, so `init` can call it from a
+/// signal handler. Never returns.
+pub(crate) fn end_machine(action: Action) -> ! {
+    let cmd = match action {
+        Action::PowerOff => libc::LINUX_REBOOT_CMD_POWER_OFF,
+        Action::Reboot => libc::LINUX_REBOOT_CMD_RESTART,
     };
     // SAFETY: reboot(2) has no memory-safety preconditions.
     unsafe { libc::reboot(cmd) };
@@ -61,24 +69,17 @@ pub(crate) fn power_off_machine(acpi: bool) -> ! {
 /// seconds because no init arranged an orderly stop for these processes.
 const TERM_GRACE: Duration = Duration::from_secs(10);
 
-/// CLI entry for `vk-agent poweroff`. Returns the process exit code.
-pub fn main(args: &[String]) -> i32 {
+/// CLI entry for `vk-agent poweroff` / `vk-agent reboot`. Returns the process exit code.
+pub fn main(action: Action, args: &[String]) -> i32 {
     if !args.is_empty() {
-        eprintln!("usage: vk-agent poweroff");
+        eprintln!("usage: vk-agent poweroff|reboot");
         return 2;
     }
-    let systemd = pid1_is_systemd();
-    if systemd || pid1_is_this_agent() {
-        // Tell systemd how to end the machine; vk-agent init chooses for itself.
-        let sig = if systemd && !machine_has_acpi() {
-            SIG_REBOOT
-        } else {
-            SIG_POWEROFF
-        };
+    if pid1_is_systemd() || pid1_is_this_agent() {
         // SAFETY: plain kill(2).
-        if unsafe { libc::kill(1, sig) } != 0 {
+        if unsafe { libc::kill(1, action.signal()) } != 0 {
             eprintln!(
-                "poweroff: signalling PID 1: {}",
+                "shutdown: signalling PID 1: {}",
                 std::io::Error::last_os_error()
             );
             return 1;
@@ -95,7 +96,7 @@ pub fn main(args: &[String]) -> i32 {
     // own, and `shutdown_here` never returns.
     match unsafe { libc::fork() } {
         -1 => {
-            eprintln!("poweroff: fork: {}", std::io::Error::last_os_error());
+            eprintln!("shutdown: fork: {}", std::io::Error::last_os_error());
             1
         }
         0 => {
@@ -110,7 +111,7 @@ pub fn main(args: &[String]) -> i32 {
                     libc::close(null);
                 }
             }
-            shutdown_here(&spare)
+            shutdown_here(action, &spare)
         }
         _ => 0,
     }
@@ -152,8 +153,8 @@ fn ancestors() -> Vec<libc::pid_t> {
 }
 
 /// Terminate every process except `spare` and this one, wait up to [`TERM_GRACE`], sync and
-/// freeze filesystems, then power off. Never returns.
-fn shutdown_here(spare: &[libc::pid_t]) -> ! {
+/// freeze filesystems, then end the machine. Never returns.
+fn shutdown_here(action: Action, spare: &[libc::pid_t]) -> ! {
     // SAFETY: getpid(2).
     let me = unsafe { libc::getpid() };
     let spare: Vec<libc::pid_t> = spare.iter().copied().chain([me]).collect();
@@ -165,14 +166,13 @@ fn shutdown_here(spare: &[libc::pid_t]) -> ! {
     while Instant::now() < deadline && !user_pids(&spare).is_empty() {
         std::thread::sleep(Duration::from_millis(100));
     }
-    let acpi = machine_has_acpi();
     // SAFETY: sync(2).
     unsafe { libc::sync() };
     for mnt in writable_disk_mounts() {
         crate::fsfreeze::freeze_for_poweroff(&mnt);
     }
     crate::fsfreeze::freeze_for_poweroff(c"/");
-    power_off_machine(acpi)
+    end_machine(action)
 }
 
 /// Live userspace processes except `spare`. Exclude PID 2, its kernel-thread children, and
@@ -266,7 +266,14 @@ mod tests {
 
     #[test]
     fn usage_error_on_arguments() {
-        assert_eq!(main(&["now".to_string()]), 2);
+        assert_eq!(main(Action::PowerOff, &["now".to_string()]), 2);
+        assert_eq!(main(Action::Reboot, &["now".to_string()]), 2);
+    }
+
+    #[test]
+    fn action_maps_to_its_pid1_signal() {
+        assert_eq!(Action::PowerOff.signal(), SIG_POWEROFF);
+        assert_eq!(Action::Reboot.signal(), SIG_REBOOT);
     }
 
     #[test]

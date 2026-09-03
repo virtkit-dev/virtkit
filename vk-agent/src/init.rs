@@ -155,12 +155,6 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     }
 
     mount_api_filesystems()?;
-    // Cache ACPI presence after mounting sysfs and before enabling any shutdown path. Signal
-    // handlers cannot read sysfs.
-    HAS_ACPI.store(
-        crate::poweroff::machine_has_acpi(),
-        std::sync::atomic::Ordering::Relaxed,
-    );
     apply_sysctls(); // honor /etc/sysctl.d/*.conf — there is no systemd-sysctl here
     bring_up_loopback();
     set_hostname(&cmdline);
@@ -197,6 +191,8 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     crate::fsmark::watch();
     crate::memmark::watch(cmdline.get("VIRTKIT_MEMMARK").map(String::as_str) == Some("1"));
     install_term_handler();
+    // Catch a host power-button press (the stop fallback when the exec channel is gone).
+    crate::button::watch_power_button();
     supervise(serve)
 }
 
@@ -2176,7 +2172,8 @@ fn run_service(cmdline: &HashMap<String, String>, config: Option<&RunConfig>) ->
     info!("vk-agent init: service pid {service_pid}");
     SERVICE_PID.store(service_pid, std::sync::atomic::Ordering::Relaxed);
 
-    // Power off on a forwarded shutdown even while the readiness gate below is still waiting.
+    // Handle a forwarded shutdown (poweroff or reboot) even while the readiness gate below is
+    // still waiting.
     install_term_handler();
 
     // Gate readiness on the image's EXPOSEd ports before advertising the guest as up: the host
@@ -2201,6 +2198,10 @@ fn run_service(cmdline: &HashMap<String, String>, config: Option<&RunConfig>) ->
     } else {
         None
     };
+
+    // Watch the power button after the last fork, so the forked children never inherit these
+    // threads (matching `run_init`).
+    crate::button::watch_power_button();
 
     supervise_service(service_pid, serve_pid)
 }
@@ -2292,7 +2293,7 @@ fn supervise_service(service_pid: libc::pid_t, serve_pid: Option<libc::pid_t>) -
             -libc::WTERMSIG(status)
         };
         if pid == service_pid {
-            info!("vk-agent init: service exited (code {code}); powering off");
+            info!("vk-agent init: service exited (code {code}); ending the machine");
             break;
         }
         if Some(pid) == serve_pid {
@@ -2466,18 +2467,21 @@ fn fork_exec_wait(argv: &[String]) -> Result<i32> {
     }
 }
 
-/// Power off immediately on SIGTERM/SIGINT. For the systemd-compatible power-off request,
-/// first SIGTERM the service and wait up to [`SERVICE_STOP_GRACE_SECS`] so applications such
-/// as databases can flush state.
+/// Wire the shutdown signals: SIGTERM and the reboot request reboot; SIGINT, the service-stop
+/// alarm, and the power-off request end the machine, rebooting if a reboot was already
+/// requested. When a service runs, first SIGTERM it and wait up to [`SERVICE_STOP_GRACE_SECS`]
+/// so applications such as databases can flush state.
 fn install_term_handler() {
     // SAFETY: `poweroff` never returns and is async-signal-safe enough for this handler: it
-    // uses `sync`, atomic `DISK_MOUNTS`/`HAS_ACPI` reads, raw open/ioctl/close, and `reboot`.
-    // `handle_poweroff_request` only calls kill(2) and alarm(2) — or, with no service,
-    // `poweroff`.
+    // uses `sync`, atomic `DISK_MOUNTS`/`REBOOT_REQUESTED` reads, raw open/ioctl/close, and
+    // `reboot`. The request handlers only store an atomic and call kill(2) and alarm(2) — or,
+    // with no service, `poweroff`.
     unsafe {
+        // SIGTERM is how busybox's `reboot` signals PID 1, so treat it as a reboot request
+        // (the host never SIGTERMs guest init — it uses SIG_POWEROFF or the ACPI button).
         libc::signal(
             libc::SIGTERM,
-            handle_term as *const () as libc::sighandler_t,
+            handle_reboot_request as *const () as libc::sighandler_t,
         );
         libc::signal(libc::SIGINT, handle_term as *const () as libc::sighandler_t);
         libc::signal(
@@ -2488,9 +2492,15 @@ fn install_term_handler() {
             crate::poweroff::SIG_POWEROFF,
             handle_poweroff_request as *const () as libc::sighandler_t,
         );
+        libc::signal(
+            crate::poweroff::SIG_REBOOT,
+            handle_reboot_request as *const () as libc::sighandler_t,
+        );
     }
 }
 
+/// SIGINT (console interrupt) or SIGALRM (the service-stop grace elapsed): power off, or
+/// reboot if a reboot was already requested (`poweroff` reads `REBOOT_REQUESTED`).
 extern "C" fn handle_term(_sig: libc::c_int) {
     poweroff();
 }
@@ -2499,10 +2509,9 @@ extern "C" fn handle_term(_sig: libc::c_int) {
 /// down immediately.
 static SERVICE_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
-/// Cached ACPI presence for choosing the shutdown request. Initialized after mounting sysfs
-/// and before enabling any shutdown path; the default `false` would reset and reboot an ACPI
-/// machine.
-static HAS_ACPI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set by a reboot request so the shutdown path ([`poweroff`]) restarts the guest (ACPI reset)
+/// instead of powering it off (ACPI S5); the host's VMM keeper then relaunches it in place.
+static REBOOT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Prevent repeated requests from re-signalling the service or extending the grace period.
 static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2512,15 +2521,29 @@ static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 const SERVICE_STOP_GRACE_SECS: libc::c_uint = 20;
 
 extern "C" fn handle_poweroff_request(_sig: libc::c_int) {
+    begin_shutdown();
+}
+
+/// A reboot request: same orderly shutdown as a poweroff, but the machine restarts (ACPI
+/// reset) so the host keeper relaunches the VM in place.
+extern "C" fn handle_reboot_request(_sig: libc::c_int) {
+    REBOOT_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    begin_shutdown();
+}
+
+/// Stop the service (if any), then end the machine. With no service, end it now; otherwise
+/// SIGTERM the service and let its exit reach supervision, which ends the machine — the alarm
+/// bounds a service that ignores SIGTERM.
+fn begin_shutdown() {
     let service = SERVICE_PID.load(std::sync::atomic::Ordering::Relaxed);
     if service <= 0 {
         poweroff()
     } else if STOP_REQUESTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    // Service exit reaches supervision and powers off; the alarm bounds an ignored SIGTERM.
-    // Like `docker stop`, signal only the service process, so wrappers must forward SIGTERM.
-    // SAFETY: kill(2) and alarm(2) are async-signal-safe.
+    // Service exit reaches supervision and ends the machine; the alarm bounds an ignored
+    // SIGTERM. Like `docker stop`, signal only the service process, so wrappers must forward
+    // SIGTERM. SAFETY: kill(2) and alarm(2) are async-signal-safe.
     unsafe {
         libc::kill(service, libc::SIGTERM);
         libc::alarm(SERVICE_STOP_GRACE_SECS);
@@ -2540,7 +2563,7 @@ fn supervise(serve_pid: libc::pid_t) -> Result<()> {
             }
         }
         if pid == serve_pid {
-            info!("vk-agent init: serve exited (status {status}); powering off");
+            info!("vk-agent init: serve exited (status {status}); ending the machine");
             break;
         }
         // an orphan (or the net/ssh child) was reaped — keep supervising
@@ -2548,10 +2571,11 @@ fn supervise(serve_pid: libc::pid_t) -> Result<()> {
     poweroff();
 }
 
-/// Flush and power off. Host cleanup can still force-stop the VMM, but this path preserves a
-/// clean guest shutdown. Never returns.
+/// Flush, then end the machine — power off, or reboot if [`REBOOT_REQUESTED`] is set. Host
+/// cleanup can still force-stop the VMM, but this path preserves a clean guest shutdown.
+/// Never returns.
 fn poweroff() -> ! {
-    // SAFETY: async-signal-safe syscall (poweroff also runs from the SIGTERM handler).
+    // SAFETY: async-signal-safe syscall (poweroff also runs from a signal handler).
     unsafe {
         libc::sync();
     }
@@ -2563,7 +2587,12 @@ fn poweroff() -> ! {
         crate::fsfreeze::freeze_for_poweroff(mnt);
     }
     crate::fsfreeze::freeze_for_poweroff(c"/");
-    crate::poweroff::power_off_machine(HAS_ACPI.load(std::sync::atomic::Ordering::Relaxed))
+    let action = if REBOOT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::poweroff::Action::Reboot
+    } else {
+        crate::poweroff::Action::PowerOff
+    };
+    crate::poweroff::end_machine(action)
 }
 
 /// Run a helper command, output discarded; true on exit 0. Used for the few

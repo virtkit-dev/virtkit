@@ -7,6 +7,7 @@
 //! runtime helpers live in the `vk-core` crate.
 
 pub mod atop;
+pub mod button;
 pub mod ctlfs;
 pub mod diskmount;
 pub mod fsfreeze;
