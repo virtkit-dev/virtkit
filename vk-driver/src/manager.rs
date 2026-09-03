@@ -10,9 +10,9 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use vk_core::addr::SocketAddr;
 use vk_core::fleetctl::{Frame, Reply, Request, UnitStatus};
 
 /// A declared service unit, its runtime dir (sockets/overlay/console), its running
@@ -45,7 +45,7 @@ pub struct ManagerDirs {
 
 /// The manager owns the declared service units. Because `units::boot_unit` is synchronous,
 /// the lock is held only during synchronous boot and stop operations, never across an await.
-/// A stop can hold it for [`STOP_GRACE`], so requests run outside the runtime threads.
+/// A stop can hold it for `shutdown::STOP_GRACE`, so requests run outside the runtime threads.
 pub struct Manager {
     kernel: PathBuf,
     cloud_hypervisor: PathBuf,
@@ -278,7 +278,7 @@ impl Manager {
     }
 
     /// Power off a unit's guest, then kill and reap its VMM and helpers. Hold the units lock
-    /// for up to [`STOP_GRACE`] so another start cannot race the stopping guest for its
+    /// for up to `shutdown::STOP_GRACE` so another start cannot race the stopping guest for its
     /// overlay and sockets.
     pub fn stop(&self, name: &str) -> Reply {
         let mut u = self.units.lock().unwrap();
@@ -288,7 +288,11 @@ impl Manager {
         let was_running = state_of(st) == "running";
         let mut killed = Vec::new();
         if let Some(mut child) = st.child.take() {
-            killed = power_off_then_kill(&mut [(name, &st.dir, &mut child)]);
+            killed = crate::shutdown::power_off_then_kill(&mut [(
+                name,
+                &unit_addr(&st.dir),
+                &mut child,
+            )]);
         }
         // tear down the unit's virtiofsd backers (workdir units), if any
         for mut a in st.aux.drain(..) {
@@ -304,20 +308,22 @@ impl Manager {
         })
     }
 
-    /// Power off all guests concurrently within one [`STOP_GRACE`], then kill and reap their
+    /// Power off all guests concurrently within one `shutdown::STOP_GRACE`, then kill and reap their
     /// VMMs and helpers.
     pub fn stop_all(&self) {
         let mut units = self.units.lock().unwrap();
-        let mut vmms: Vec<(&str, &Path, &mut Child)> = units
+        // Compute addresses while borrowing the map immutably. It is unchanged before `iter_mut`,
+        // so both iterators have the same order and `zip` aligns.
+        let addrs: Vec<_> = units.values().map(|st| unit_addr(&st.dir)).collect();
+        let mut vmms: Vec<(&str, &SocketAddr, &mut Child)> = units
             .iter_mut()
-            .filter_map(|(name, UnitState { dir, child, .. })| {
-                child.as_mut().map(|c| (name.as_str(), dir.as_path(), c))
-            })
+            .zip(&addrs)
+            .filter_map(|((name, st), addr)| st.child.as_mut().map(|c| (name.as_str(), addr, c)))
             .collect();
-        for name in power_off_then_kill(&mut vmms) {
+        for name in crate::shutdown::power_off_then_kill(&mut vmms) {
             eprintln!(
                 "virtkit: service {name}: did not power off within {} s — killed",
-                STOP_GRACE.as_secs()
+                crate::shutdown::STOP_GRACE.as_secs()
             );
         }
         for st in units.values_mut() {
@@ -347,135 +353,9 @@ impl Manager {
     }
 }
 
-/// How long a guest gets to power itself off before its VMM is killed, the poweroff request
-/// included. A systemd guest stops its units within this (its own per-unit default is 90 s,
-/// but a service unit rarely nears it); `vk-agent init` gives its service
-/// `SERVICE_STOP_GRACE_SECS` (20 s, in `vk-agent/src/init.rs`), then powers off regardless.
-const STOP_GRACE: Duration = Duration::from_secs(60);
-
-/// How long the poweroff request itself may take to reach the guest. It returns as soon as
-/// the shutdown is under way, so anything longer is a guest that cannot answer.
-const REQUEST_BUDGET: Duration = Duration::from_secs(10);
-
-/// Request poweroff concurrently from every live guest. Guests that accept share one
-/// [`STOP_GRACE`] deadline; rejected requests cause an immediate kill. Kill and reap all
-/// remaining VMMs, returning the names still alive when killed. Those guests suffered a
-/// power cut.
-fn power_off_then_kill(vmms: &mut [(&str, &Path, &mut Child)]) -> Vec<String> {
-    let deadline = Instant::now() + STOP_GRACE;
-    let requests: Vec<_> = vmms
-        .iter_mut()
-        .map(|(_, dir, child)| {
-            // An unreadable status counts as alive; the kill below settles it.
-            let alive = child.try_wait().ok().flatten().is_none();
-            alive.then(|| spawn_poweroff_request(dir))
-        })
-        .collect();
-    let mut killed = Vec::new();
-    let mut powering_off = Vec::new();
-    for (i, ((name, _, child), request)) in vmms.iter_mut().zip(requests).enumerate() {
-        if request.is_some_and(|request| poweroff_accepted(name, request)) {
-            powering_off.push(i);
-            continue;
-        }
-        // Refused or already exited: nothing to wait for. A VMM still alive here suffered a
-        // power cut; one that exited meanwhile stopped on its own.
-        if child.try_wait().ok().flatten().is_none() {
-            killed.push(name.to_string());
-        }
-        kill_and_reap(child);
-    }
-    for i in powering_off {
-        let Some((name, _, child)) = vmms.get_mut(i) else {
-            continue;
-        };
-        wait_exit(child, deadline);
-        // As above: a status that cannot be read is taken as alive.
-        if child.try_wait().ok().flatten().is_none() {
-            killed.push(name.to_string());
-        }
-        kill_and_reap(child);
-    }
-    killed
-}
-
-fn kill_and_reap(child: &mut Child) {
-    // A child that already exited makes kill fail; wait then just returns its status.
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-/// Ask the guest at `dir` to power off by running `vk-agent poweroff` over its exec channel.
-/// Use a dedicated thread because synchronous callers may run on the owner's runtime;
-/// [`poweroff_accepted`] collects the result without blocking that runtime on its own futures.
-fn spawn_poweroff_request(dir: &Path) -> std::io::Result<std::thread::JoinHandle<Result<bool>>> {
-    let addr = crate::vmm::exec_addr(&dir.join("vsock.sock"), crate::units::VSOCK_PORT);
-    let request = move || -> Result<bool> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let result = rt.block_on(async {
-            tokio::time::timeout(
-                REQUEST_BUDGET,
-                crate::executor::exec_script(
-                    &addr,
-                    &[crate::run::GUEST_AGENT.to_string(), "poweroff".to_string()],
-                    Vec::new(),
-                    None,
-                    &crate::executor::OutputSink::Inherit,
-                    None,
-                ),
-            )
-            .await
-        })??;
-        Ok(result.code == Some(0))
-    };
-    // Treat thread-creation failure as refusal instead of panicking while holding and
-    // poisoning the units lock.
-    std::thread::Builder::new().spawn(request)
-}
-
-/// Return whether unit `name` accepted the poweroff `request`. If the guest is unreachable,
-/// the caller kills its VMM immediately and the guest suffers a power cut.
-fn poweroff_accepted(
-    name: &str,
-    request: std::io::Result<std::thread::JoinHandle<Result<bool>>>,
-) -> bool {
-    let request = match request {
-        Ok(request) => request,
-        Err(e) => {
-            eprintln!(
-                "virtkit: service {name}: no thread for the poweroff request ({e}) — killing the VM instead"
-            );
-            return false;
-        }
-    };
-    match request.join() {
-        Ok(Ok(accepted)) => accepted,
-        Ok(Err(e)) => {
-            eprintln!(
-                "virtkit: service {name}: poweroff request failed ({e:#}) — killing the VM instead"
-            );
-            false
-        }
-        Err(_) => {
-            eprintln!(
-                "virtkit: service {name}: poweroff request panicked — killing the VM instead"
-            );
-            false
-        }
-    }
-}
-
-/// Wait for the VMM `child` to exit, until `deadline`.
-fn wait_exit(child: &mut Child, deadline: Instant) {
-    while Instant::now() < deadline {
-        // An unreadable status is taken as alive: keep waiting, the deadline bounds it.
-        if child.try_wait().ok().flatten().is_some() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+/// Build a unit's agent exec address from its runtime directory.
+fn unit_addr(dir: &Path) -> SocketAddr {
+    crate::vmm::exec_addr(&dir.join("vsock.sock"), crate::units::VSOCK_PORT)
 }
 
 /// "running" if the unit's child is alive, else "stopped". Reaps a child that has
@@ -665,48 +545,5 @@ mod tests {
         // An `image:` service carries no recipe, and an unknown name must not panic.
         assert!(entries[1].stale_recipe.is_none());
         mgr.refresh_service_images(&mut [entry("absent", true)]);
-    }
-
-    fn spawn(cmd: &str, args: &[&str]) -> Child {
-        std::process::Command::new(cmd).args(args).spawn().unwrap()
-    }
-
-    #[test]
-    fn wait_exit_returns_once_the_child_is_gone() {
-        let mut child = spawn("true", &[]);
-        let started = Instant::now();
-        wait_exit(&mut child, started + Duration::from_secs(30));
-        assert!(started.elapsed() < Duration::from_secs(10));
-        assert!(child.try_wait().unwrap().is_some());
-    }
-
-    #[test]
-    fn wait_exit_gives_up_at_the_deadline() {
-        let mut child = spawn("sleep", &["30"]);
-        let started = Instant::now();
-        wait_exit(&mut child, started + Duration::from_millis(200));
-        assert!(started.elapsed() >= Duration::from_millis(200));
-        assert!(child.try_wait().unwrap().is_none());
-        kill_and_reap(&mut child);
-    }
-
-    #[test]
-    fn power_off_then_kill_reports_a_guest_that_could_not_be_asked() {
-        // No VMM socket under the dir: the request is refused at once and the VMM killed.
-        let dir = std::env::temp_dir().join(format!("vk-manager-test-{}", std::process::id()));
-        let mut child = spawn("sleep", &["30"]);
-        let started = Instant::now();
-        let killed = power_off_then_kill(&mut [("db", dir.as_path(), &mut child)]);
-        assert_eq!(killed, ["db"]);
-        assert!(started.elapsed() < REQUEST_BUDGET);
-        assert!(child.try_wait().unwrap().is_some());
-    }
-
-    #[test]
-    fn power_off_then_kill_leaves_an_exited_vmm_out_of_the_killed() {
-        let dir = std::env::temp_dir();
-        let mut child = spawn("true", &[]);
-        let _ = child.wait();
-        assert!(power_off_then_kill(&mut [("db", dir.as_path(), &mut child)]).is_empty());
     }
 }
