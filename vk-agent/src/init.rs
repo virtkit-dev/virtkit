@@ -155,6 +155,12 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     }
 
     mount_api_filesystems()?;
+    // Cache ACPI presence after mounting sysfs and before enabling any shutdown path. Signal
+    // handlers cannot read sysfs.
+    HAS_ACPI.store(
+        crate::poweroff::machine_has_acpi(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     apply_sysctls(); // honor /etc/sysctl.d/*.conf — there is no systemd-sysctl here
     bring_up_loopback();
     set_hostname(&cmdline);
@@ -2461,7 +2467,7 @@ fn fork_exec_wait(argv: &[String]) -> Result<i32> {
 /// On SIGTERM/SIGINT (e.g. a forwarded shutdown), power the VM off.
 fn install_term_handler() {
     // SAFETY: `poweroff` never returns and is async-signal-safe enough for this handler: it
-    // uses `sync`, an atomic `DISK_MOUNTS` read, raw open/ioctl/close, and `reboot`.
+    // uses `sync`, atomic `DISK_MOUNTS`/`HAS_ACPI` reads, raw open/ioctl/close, and `reboot`.
     unsafe {
         libc::signal(
             libc::SIGTERM,
@@ -2474,6 +2480,11 @@ fn install_term_handler() {
 extern "C" fn handle_term(_sig: libc::c_int) {
     poweroff();
 }
+
+/// Cached ACPI presence for choosing the shutdown request. Initialized after mounting sysfs
+/// and before enabling any shutdown path; the default `false` would reset and reboot an ACPI
+/// machine.
+static HAS_ACPI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Reap reparented orphans; when the serve child exits, power off.
 fn supervise(serve_pid: libc::pid_t) -> Result<()> {
@@ -2511,13 +2522,7 @@ fn poweroff() -> ! {
         crate::fsfreeze::freeze_for_poweroff(mnt);
     }
     crate::fsfreeze::freeze_for_poweroff(c"/");
-    // SAFETY: async-signal-safe syscall.
-    unsafe {
-        libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
-    }
-    // reboot() should not return for PID 1; if it does, exit so the kernel panics
-    // visibly rather than hanging.
-    std::process::exit(0);
+    crate::poweroff::power_off_machine(HAS_ACPI.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Run a helper command, output discarded; true on exit 0. Used for the few
