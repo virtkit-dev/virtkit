@@ -37,7 +37,6 @@
 //! override never rebuilds an image.
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -1025,10 +1024,10 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Option<Volume>> {
     }))
 }
 
-/// Formatted capacity for a fresh `disk` volume with no explicit `size=` — generous because it
-/// is sparse (real host disk cost is only what gets written): double
-/// `run::SCRATCH_DISK_FREE_BLOCKS`'s 32 GiB, since a `disk` volume's content is meant to
-/// survive indefinitely rather than get discarded after one build.
+/// Formatted capacity for a fresh `disk` volume with no explicit `size=` — generous because
+/// only written clusters cost host disk: double `run::SCRATCH_DISK_FREE_BLOCKS`'s 32 GiB,
+/// since a `disk` volume's content is meant to survive indefinitely rather than get discarded
+/// after one build.
 const DEFAULT_DISK_VOLUME_MIB: u64 = 65536; // 64 GiB
 
 /// Resolve a `disk` volume's backing file, creating and formatting it if this is the first
@@ -1040,14 +1039,14 @@ const DEFAULT_DISK_VOLUME_MIB: u64 = 65536; // 64 GiB
 /// Built into a same-directory temp file first, then published with a hard link — which
 /// fails with `AlreadyExists` rather than silently overwriting a file a racing boot already
 /// published — instead of writing `vol.host` directly, so a crash mid-format can never leave
-/// a half-written file behind for a later boot to wrongly trust as-is. The temp files can't
-/// follow a symlink planted at their path (`create_new`), and the published volume is `0600`
+/// a half-written file behind for a later boot to wrongly trust as-is. The temp file can't
+/// follow a symlink planted at its path (`create_new`), and the published volume is `0600`
 /// before any filesystem bytes land, since it may end up holding whatever a service stores in
 /// it (e.g. a database's data directory).
 ///
-/// New backing files are qcow2: they initially allocate only the formatted ext4 blocks and
-/// grow as the guest writes instead of allocating the full capacity. `Disk::for_image`
-/// detects and attaches legacy raw ext4 volumes.
+/// Backing files are qcow2, formatted in place: only the filesystem's own clusters get
+/// allocated and the file grows as the guest writes, with no raw image — and so no reliance on
+/// sparse files — at any point. `Disk::for_image` detects and attaches legacy raw ext4 volumes.
 pub fn ensure_disk_backing(vol: &Volume) -> Result<()> {
     if !vol.disk || vol.host.exists() {
         return Ok(());
@@ -1070,43 +1069,20 @@ pub fn ensure_disk_backing(vol: &Volume) -> Result<()> {
         .and_then(|n| n.to_str())
         .with_context(|| format!("disk volume {}: bad file name", vol.host.display()))?;
     let tmp = parent.join(format!(".{file_name}.vk-disk-tmp-{}", std::process::id()));
-    let raw = parent.join(format!(".{file_name}.vk-disk-raw-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&raw);
-    let publish = (|| -> Result<()> {
-        // The raw scratch is created 0600 (`create_new`, so it can't follow a symlink planted
-        // at the temp path); `build_empty_journaled`'s own `File::create` on it only truncates
-        // and rewrites, keeping the mode.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&raw)
-            .with_context(|| format!("creating {}", raw.display()))?;
-        // Build a journaled raw ext4 for the persistent volume, then import its written blocks
-        // into qcow2.
-        crate::ext4::build_empty_journaled(&raw, free_blocks)
-            .with_context(|| format!("formatting disk volume {}", vol.host.display()))?;
-        let size = std::fs::metadata(&raw)
-            .with_context(|| format!("sizing {}", raw.display()))?
-            .len();
-        // `Qcow2Writer::create` makes `tmp` itself (`create_new`, refusing a planted path),
-        // born 0600 — the volume may end up holding whatever a service stores in it.
-        let mut w = crate::qcow2::Qcow2Writer::create(&tmp, size, 0o600)?;
-        w.import_raw(&raw)?;
-        w.finish()
-            .with_context(|| format!("writing disk volume {}", vol.host.display()))?;
-        match std::fs::hard_link(&tmp, &vol.host) {
+    // `Qcow2Writer::create` makes `tmp` itself (`create_new`, refusing a planted path), born
+    // 0600 — the volume may end up holding whatever a service stores in it.
+    let publish = crate::ext4::build_empty_journaled_qcow2(&tmp, free_blocks, 0o600)
+        .with_context(|| format!("formatting disk volume {}", vol.host.display()))
+        .and_then(|()| match std::fs::hard_link(&tmp, &vol.host) {
             Ok(()) => Ok(()),
             // A racing boot published it first; its file is as good as ours would have been.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
             Err(e) => {
                 Err(e).with_context(|| format!("publishing disk volume {}", vol.host.display()))
             }
-        }
-    })();
+        });
     let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&raw);
     publish
 }
 

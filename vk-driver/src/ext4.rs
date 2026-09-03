@@ -17,7 +17,7 @@
 //! in the inode (≤4) or, beyond that, in a single extent-tree leaf block.
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -27,8 +27,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::qcow2::Qcow2Writer;
 
-/// Positioned I/O into ext4 held in a raw file or open qcow2 writer. Export fix-ups use this
-/// abstraction before finalizing the container.
+/// Positioned I/O into ext4 held in a raw file or open qcow2 writer. The builder writes the
+/// whole filesystem through it, and export fix-ups patch it, before finalizing the container.
 pub trait BlockIo {
     fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<()>;
     fn write_at(&mut self, off: u64, data: &[u8]) -> Result<()>;
@@ -140,7 +140,7 @@ pub fn build_from_dir(src_dir: &Path, out: &Path) -> Result<()> {
     b.add_reserved();
     let root = b.walk(src_dir)?;
     debug_assert_eq!(root, ROOT_INO);
-    b.write(out, 0)
+    b.write_into(0, |size| raw_image_file(out, size)).map(drop)
 }
 
 /// Filesystem identity stamped into the superblock. `uuid` (None = random) is set
@@ -170,6 +170,22 @@ pub fn build_from_tar_injecting(
     fsid: &FsId,
     out: &Path,
 ) -> Result<()> {
+    build_from_tar_injecting_into(tar_path, injects, extra_free_blocks, fsid, |size| {
+        raw_image_file(out, size)
+    })
+    .map(drop)
+}
+
+/// [`build_from_tar_injecting`] into the container `make` opens once the image size is known
+/// (a qcow2 writer, or the raw file that function wraps), handing it back for the caller to
+/// finish.
+fn build_from_tar_injecting_into<W: BlockIo>(
+    tar_path: &Path,
+    injects: &[(&str, &Path, u16)],
+    extra_free_blocks: u64,
+    fsid: &FsId,
+    make: impl FnOnce(u64) -> Result<W>,
+) -> Result<W> {
     let mut t = Tree::default();
     t.add_reserved();
     t.tar_path = Some(tar_path.to_path_buf());
@@ -235,7 +251,7 @@ pub fn build_from_tar_injecting(
     for (guest, host, mode) in injects {
         t.add_host_file(guest, host, *mode)?;
     }
-    t.write(out, extra_free_blocks)
+    t.write_into(extra_free_blocks, make)
 }
 
 /// Build an empty ext4 at `out` with `extra_free_blocks` of spare capacity — a contentless
@@ -243,22 +259,38 @@ pub fn build_from_tar_injecting(
 /// (holes), so a large capacity is nearly free to create and store. No journal: the fs is
 /// throwaway.
 pub fn build_empty(out: &Path, extra_free_blocks: u64) -> Result<()> {
-    build_empty_with(out, extra_free_blocks, false)
+    build_empty_into(out, extra_free_blocks, false, |size| {
+        raw_image_file(out, size)
+    })
+    .map(drop)
 }
 
-/// Build an empty ext4 with a 4 MiB JBD2 journal for a persistent `disk` volume. It keeps
-/// metadata consistent when power loss interrupts writes; [`build_empty`] would require
-/// e2fsck. The fixed journal may checkpoint frequently on large, metadata-heavy volumes;
-/// unlike this writer, mke2fs sizes its journal from filesystem capacity.
-pub fn build_empty_journaled(out: &Path, extra_free_blocks: u64) -> Result<()> {
-    build_empty_with(out, extra_free_blocks, true)
+/// Build an empty ext4 with a 4 MiB JBD2 journal straight into a new qcow2 at `out` (created
+/// with `mode`; must not exist) — the persistent `disk`-volume format. The journal keeps
+/// metadata consistent when power loss interrupts writes, where [`build_empty`] would need
+/// e2fsck; being fixed-size it may checkpoint often on large, metadata-heavy volumes (mke2fs
+/// sizes its journal from capacity). Only the filesystem's own clusters get allocated, so the
+/// free capacity costs nothing without any reliance on sparse files — no raw scratch is
+/// formatted and imported first.
+pub fn build_empty_journaled_qcow2(out: &Path, extra_free_blocks: u64, mode: u32) -> Result<()> {
+    build_empty_into(out, extra_free_blocks, true, |size| {
+        Qcow2Writer::create(out, size, mode)
+    })?
+    .finish()
 }
 
-fn build_empty_with(out: &Path, extra_free_blocks: u64, with_journal: bool) -> Result<()> {
+/// The empty-filesystem builder behind [`build_empty`] and [`build_empty_journaled_qcow2`],
+/// into the container `make` opens. The scratch empty tar is written beside `out`.
+fn build_empty_into<W: BlockIo>(
+    out: &Path,
+    extra_free_blocks: u64,
+    with_journal: bool,
+    make: impl FnOnce(u64) -> Result<W>,
+) -> Result<W> {
     // A valid empty tar is two 512-byte end-of-archive zero records.
     let tar = out.with_extension("empty.tar");
     std::fs::write(&tar, [0u8; 1024]).with_context(|| format!("writing {}", tar.display()))?;
-    let r = build_from_tar_injecting(
+    let r = build_from_tar_injecting_into(
         &tar,
         &[],
         extra_free_blocks,
@@ -266,7 +298,7 @@ fn build_empty_with(out: &Path, extra_free_blocks: u64, with_journal: bool) -> R
             with_journal,
             ..Default::default()
         },
-        out,
+        make,
     );
     let _ = std::fs::remove_file(&tar);
     r
@@ -587,9 +619,8 @@ pub fn build_from_tar_stream(
     let (layout, total_blocks, inodes_count) =
         plan_layout(data_est + journal_reserve, want_inodes, extra_free_blocks);
 
-    let file = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
-    file.set_len(total_blocks * BLOCK)?;
-    let mut w = ImageWriter { file };
+    let mut file = raw_image_file(out, total_blocks * BLOCK)?;
+    let mut w = ImageWriter { io: &mut file };
     let mut alloc = Allocator::new(&layout, total_blocks);
 
     // Allocate journal blocks before any file data so they land at a fixed,
@@ -611,6 +642,8 @@ pub fn build_from_tar_stream(
     t.ensure_dir("")?;
 
     let mut ar = tar::Archive::new(reader);
+    // One bounce buffer reused for every entry's data, not one allocated per file.
+    let mut io_buf = vec![0u8; 1 << 20];
     for entry in ar.entries()? {
         let mut e = entry?;
         let xattrs = tar_xattrs(&mut e);
@@ -654,7 +687,7 @@ pub fn build_from_tar_stream(
                     leaf = Some(alloc.take(1)?[0].start);
                 }
                 // stream the data straight into the allocated blocks
-                write_runs(&mut w, &runs, &mut e)?;
+                write_runs(&mut w, &mut io_buf, &runs, &mut e)?;
             }
             t.add_file_streamed(&name, mode, uid, gid, mtime, size, runs, leaf, xattrs)?;
             if u64::from(t.next_ino - 1) > inodes_count {
@@ -1103,7 +1136,13 @@ impl Tree {
         });
     }
 
-    fn write(mut self, out: &Path, extra_free_blocks: u64) -> Result<()> {
+    /// Plan, allocate and write the filesystem into the container `make` opens once the image
+    /// size is known — a raw file or a qcow2 writer — and hand that container back.
+    fn write_into<W: BlockIo>(
+        mut self,
+        extra_free_blocks: u64,
+        make: impl FnOnce(u64) -> Result<W>,
+    ) -> Result<W> {
         self.nodes.sort_by_key(|n| n.ino);
         let used_inodes = u64::from(self.next_ino - 1);
 
@@ -1171,11 +1210,10 @@ impl Tree {
         }
 
         let _ = groups;
-        let file =
-            std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
-        file.set_len(total_blocks * BLOCK)?;
-        let mut w = ImageWriter { file };
-        self.finalize(&mut w, &layout, total_blocks, inodes_count, used_inodes)
+        let mut io = make(total_blocks * BLOCK)?;
+        let mut w = ImageWriter { io: &mut io };
+        self.finalize(&mut w, &layout, total_blocks, inodes_count, used_inodes)?;
+        Ok(io)
     }
 
     /// Write all of the on-disk structures once every inode's runs/leaf are
@@ -1242,7 +1280,6 @@ impl Tree {
             self.write_journal_inode(w, layout)?;
             self.write_journal_data(w, &fs_uuid)?;
         }
-        w.file.flush()?;
         Ok(())
     }
 
@@ -1302,13 +1339,11 @@ impl Tree {
 
         // Primary at byte 1024; backups at the start of each sparse_super group,
         // with s_block_group_nr set to that group.
-        w.file.seek(SeekFrom::Start(1024))?;
-        w.file.write_all(&sb)?;
+        w.write_at(1024, &sb)?;
         for g in 1..layout.groups {
             if sparse_super(g) {
                 le16(&mut sb, 0x5a, g as u16); // s_block_group_nr
-                w.file.seek(SeekFrom::Start(g * BLOCKS_PER_GROUP * BLOCK))?;
-                w.file.write_all(&sb)?;
+                w.write_at(g * BLOCKS_PER_GROUP * BLOCK, &sb)?;
             }
         }
         Ok(())
@@ -1346,13 +1381,10 @@ impl Tree {
         let gdt_padded = round_up(gdt.len() as u64, layout.gdt_blocks * BLOCK) as usize;
         let mut padded = gdt.clone();
         padded.resize(gdt_padded, 0);
-        w.file.seek(SeekFrom::Start(BLOCK))?;
-        w.file.write_all(&padded)?;
+        w.write_at(BLOCK, &padded)?;
         for g in 1..layout.groups {
             if sparse_super(g) {
-                w.file
-                    .seek(SeekFrom::Start((g * BLOCKS_PER_GROUP + 1) * BLOCK))?;
-                w.file.write_all(&padded)?;
+                w.write_at((g * BLOCKS_PER_GROUP + 1) * BLOCK, &padded)?;
             }
         }
         Ok(())
@@ -1374,8 +1406,7 @@ impl Tree {
                 }
             }
             let (bb, _, _) = layout.group_meta_locs(g);
-            w.file.seek(SeekFrom::Start(bb * BLOCK))?;
-            w.file.write_all(&bm)?;
+            w.write_at(bb * BLOCK, &bm)?;
         }
         Ok(())
     }
@@ -1397,8 +1428,7 @@ impl Tree {
                 }
             }
             let (_, ib, _) = layout.group_meta_locs(g);
-            w.file.seek(SeekFrom::Start(ib * BLOCK))?;
-            w.file.write_all(&bm)?;
+            w.write_at(ib * BLOCK, &bm)?;
         }
         Ok(())
     }
@@ -1434,8 +1464,7 @@ impl Tree {
             {
                 eprintln!("ext4: inode {} xattrs don't fit in-inode, dropped", n.ino);
             }
-            w.file.seek(SeekFrom::Start(layout.inode_offset(n.ino)))?;
-            w.file.write_all(&ino)?;
+            w.write_at(layout.inode_offset(n.ino), &ino)?;
         }
         Ok(())
     }
@@ -1447,18 +1476,19 @@ impl Tree {
             }
             None => None,
         };
+        // One bounce buffer reused for every node's file/dir/symlink data.
+        let mut io_buf = vec![0u8; 1 << 20];
         for n in &self.nodes {
             // Extent-tree leaf (when runs don't fit inline): a depth-0 header + the runs.
             if let Some(leaf) = n.leaf {
                 let mut buf = vec![0u8; BLOCK as usize];
                 write_extent_entries(&mut buf, 0, &n.runs);
-                w.file.seek(SeekFrom::Start(leaf * BLOCK))?;
-                w.file.write_all(&buf)?;
+                w.write_at(leaf * BLOCK, &buf)?;
             }
             match &n.kind {
                 Kind::Dir { entries } => {
                     let buf = dir_data(n.ino, n.parent, entries);
-                    write_runs(w, &n.runs, &mut std::io::Cursor::new(buf))?;
+                    write_runs(w, &mut io_buf, &n.runs, &mut std::io::Cursor::new(buf))?;
                 }
                 Kind::File { size, .. } if *size == 0 => {}
                 Kind::File {
@@ -1469,7 +1499,7 @@ impl Tree {
                 } => {
                     let mut f = std::fs::File::open(p)
                         .with_context(|| format!("opening {}", p.display()))?;
-                    write_runs(w, &n.runs, &mut f)?;
+                    write_runs(w, &mut io_buf, &n.runs, &mut f)?;
                 }
                 Kind::File {
                     src: Src::Tar { off, len },
@@ -1477,10 +1507,15 @@ impl Tree {
                 } => {
                     let tar = tar.as_mut().expect("tar_path set for tar-sourced files");
                     tar.seek(SeekFrom::Start(*off))?;
-                    write_runs(w, &n.runs, &mut tar.take(*len))?;
+                    write_runs(w, &mut io_buf, &n.runs, &mut tar.take(*len))?;
                 }
                 Kind::Symlink { target } if target.len() >= 60 => {
-                    write_runs(w, &n.runs, &mut std::io::Cursor::new(target.clone()))?;
+                    write_runs(
+                        w,
+                        &mut io_buf,
+                        &n.runs,
+                        &mut std::io::Cursor::new(target.clone()),
+                    )?;
                 }
                 _ => {}
             }
@@ -1522,9 +1557,7 @@ impl Tree {
         };
         write_inode_extents(&mut ino, &jnode);
 
-        w.file
-            .seek(SeekFrom::Start(layout.inode_offset(JOURNAL_INO)))?;
-        w.file.write_all(&ino)?;
+        w.write_at(layout.inode_offset(JOURNAL_INO), &ino)?;
         Ok(())
     }
 
@@ -1550,14 +1583,12 @@ impl Tree {
         // s_users[0..16]: filesystem UUID (links the journal back to its owner)
         jb[0x100..0x110].copy_from_slice(uuid);
 
-        w.file.seek(SeekFrom::Start(first_block * BLOCK))?;
-        w.file.write_all(&jb)?;
+        w.write_at(first_block * BLOCK, &jb)?;
 
         if let Some(leaf) = self.journal_leaf {
             let mut buf = vec![0u8; BLOCK as usize];
             write_extent_entries(&mut buf, 0, &self.journal_runs);
-            w.file.seek(SeekFrom::Start(leaf * BLOCK))?;
-            w.file.write_all(&buf)?;
+            w.write_at(leaf * BLOCK, &buf)?;
         }
         Ok(())
     }
@@ -1730,8 +1761,28 @@ impl<'a> Allocator<'a> {
     }
 }
 
-struct ImageWriter {
-    file: std::fs::File,
+/// Positioned writes into the image being built — a raw file or an open qcow2 writer — via
+/// [`BlockIo`], so one builder produces either container. Unwritten space reads as zero in
+/// both (a raw file's holes, a qcow2's unallocated clusters), which every short-final-block
+/// path relies on.
+struct ImageWriter<'a> {
+    io: &'a mut dyn BlockIo,
+}
+
+impl ImageWriter<'_> {
+    fn write_at(&mut self, off: u64, data: &[u8]) -> Result<()> {
+        self.io.write_at(off, data)
+    }
+}
+
+/// Open `out` as a raw image of `size` bytes: its free space is holes, so a large capacity
+/// costs little only where the filesystem supports sparse files. The one place that contract
+/// lives; the qcow2 container has no such dependence.
+fn raw_image_file(out: &Path, size: u64) -> Result<std::fs::File> {
+    let file = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
+    file.set_len(size)
+        .with_context(|| format!("sizing {}", out.display()))?;
+    Ok(file)
 }
 
 struct BitVec {
@@ -1824,13 +1875,27 @@ fn write_extent_entries(buf: &mut [u8], off: usize, runs: &[Range<u64>]) {
     }
 }
 
-/// Copy `src` into the image across the inode's physical runs, in order.
-fn write_runs(w: &mut ImageWriter, runs: &[Range<u64>], src: &mut impl Read) -> Result<()> {
+/// Copy `src` into the image across the inode's physical runs, in order, bouncing through the
+/// caller's `buf` — one buffer reused across every node rather than one allocated per file.
+fn write_runs(
+    w: &mut ImageWriter,
+    buf: &mut [u8],
+    runs: &[Range<u64>],
+    src: &mut impl Read,
+) -> Result<()> {
     for r in runs {
-        w.file.seek(SeekFrom::Start(r.start * BLOCK))?;
-        let len = (r.end - r.start) * BLOCK;
-        let copied = std::io::copy(&mut src.take(len), &mut w.file)?;
-        let _ = copied; // a short final block is fine (rest stays zero from set_len)
+        let mut pos = r.start * BLOCK;
+        let mut left = (r.end - r.start) * BLOCK;
+        while left > 0 {
+            let want = buf.len().min(left as usize);
+            let n = src.read(&mut buf[..want])?;
+            if n == 0 {
+                break; // a short final block is fine (the rest reads back as zero)
+            }
+            w.write_at(pos, &buf[..n])?;
+            pos += n as u64;
+            left -= n as u64;
+        }
     }
     Ok(())
 }
@@ -2555,18 +2620,29 @@ mod tests {
 
     /// A journaled empty image has the journal feature, inode 8, and JBD2 magic; a plain image
     /// has none. `has_journal` rejects non-ext4 input, and e2fsck validates the journaled image
-    /// when available.
+    /// when available. The journaled image is formatted straight into a qcow2 and flattened
+    /// for the byte-level checks; the qcow2 must stay far below the raw's apparent size, which
+    /// is the whole point of not relying on a sparse raw.
     #[test]
     fn build_empty_journaled_adds_a_journal() {
         let base = std::env::temp_dir().join(format!("ext4-emptyj-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
+        let journaled_qcow2 = base.join("journaled.qcow2");
         let journaled = base.join("journaled.raw");
         let plain = base.join("plain.raw");
         let other = base.join("other");
-        build_empty_journaled(&journaled, 8192).expect("build journaled");
+        build_empty_journaled_qcow2(&journaled_qcow2, 8192, 0o600).expect("build journaled");
+        crate::qcow2::flatten_to_raw(&journaled_qcow2, &journaled).expect("flatten journaled");
         build_empty(&plain, 8192).expect("build plain");
         std::fs::write(&other, b"not a filesystem").unwrap();
+
+        let qcow2_bytes = std::fs::metadata(&journaled_qcow2).unwrap().len();
+        let raw_bytes = std::fs::metadata(&journaled).unwrap().len();
+        assert!(
+            qcow2_bytes * 4 < raw_bytes,
+            "qcow2 {qcow2_bytes} B is not well below the raw's apparent {raw_bytes} B"
+        );
 
         assert_eq!(has_journal(&journaled), Some(true));
         assert_eq!(has_journal(&plain), Some(false));
