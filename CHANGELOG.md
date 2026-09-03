@@ -17,6 +17,9 @@ All notable changes to virtkit will be documented in this file.
   run and its VMs immediately.
 - New `disk` volumes use a journal, so they mount consistently without a filesystem check
   if the host process or machine stops unexpectedly. Existing volumes keep their format.
+- A file bound into a VM on its own (a single-file volume) now receives the guest's writes
+  as they happen, like a directory does. The guest used to buffer them, so a VM that was
+  killed rather than powered off could lose the last writes to, say, a bound config file.
 
 ## [0.49.0] - 2026-09-02
 

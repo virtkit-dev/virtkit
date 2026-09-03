@@ -30,7 +30,7 @@ use std::io;
 use std::mem;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -78,9 +78,6 @@ pub struct SingleFileFs {
     /// file is a same-directory (atomic) `renameat`.
     parent: PathBuf,
     read_only: bool,
-    /// Set in `init` when the peer negotiates writeback caching. With writeback the guest kernel
-    /// owns append semantics, so an `O_APPEND` host fd must be cleared (see `open`).
-    writeback: AtomicBool,
     handles: RwLock<HashMap<Handle, File>>,
     next_handle: AtomicU64,
     /// Guest-created scratch files, keyed by their fuse inode.
@@ -126,7 +123,6 @@ impl SingleFileFs {
             path,
             parent,
             read_only,
-            writeback: AtomicBool::new(false),
             handles: RwLock::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
             temps: RwLock::new(HashMap::new()),
@@ -262,7 +258,7 @@ impl SingleFileFs {
     /// Create a fresh, empty backing file in the parent dir under a vk-controlled name. `O_EXCL`
     /// guarantees a brand-new file — so a guest `create` never opens a pre-existing sibling — and
     /// the (vanishingly unlikely) name collision is retried. Returns the host path and an `O_RDWR`
-    /// handle (RDWR so the read path works under writeback caching, matching `open`).
+    /// handle (RDWR, matching `open`).
     fn create_temp_backing(&self, mode: u32) -> io::Result<(PathBuf, File)> {
         use std::os::fd::FromRawFd;
         let pid = std::process::id();
@@ -334,16 +330,13 @@ impl FileSystem for SingleFileFs {
     type Inode = Inode;
     type Handle = Handle;
 
-    fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+    fn init(&self, _capable: FsOptions) -> io::Result<FsOptions> {
         // Negotiate the same core features a passthrough share does; readdirplus resolves the
         // root's entries in a single round (and IS implemented below — advertising it without an
         // implementation is what made `ls` on the mount fail with ENOSYS).
-        let mut opts = FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO;
-        if capable.contains(FsOptions::WRITEBACK_CACHE) {
-            opts |= FsOptions::WRITEBACK_CACHE;
-            self.writeback.store(true, Ordering::Relaxed);
-        }
-        Ok(opts)
+        // No WRITEBACK_CACHE: every guest write reaches the host file as it happens, so a VM
+        // killed rather than powered off keeps its last writes.
+        Ok(FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO)
     }
 
     fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
@@ -427,13 +420,9 @@ impl FileSystem for SingleFileFs {
         // Open read-write when writable so the read path can pread the shared fd; carry the
         // guest's O_TRUNC.
         let acc = if write { libc::O_RDWR } else { libc::O_RDONLY };
-        let mut extra = flags as i32 & (libc::O_APPEND | libc::O_TRUNC);
-        // With writeback caching the guest kernel owns append: it tracks the size and sends
-        // positioned writes, but an O_APPEND host fd would (on Linux) ignore that offset and pwrite
-        // at EOF, corrupting the file. Clear it, matching PassthroughFs::open_inode.
-        if self.writeback.load(Ordering::Relaxed) {
-            extra &= !libc::O_APPEND;
-        }
+        // Without writeback the host fd's O_APPEND provides append semantics. Under writeback
+        // a host O_APPEND would ignore the guest's offset and append at EOF; refused in `init`.
+        let extra = flags as i32 & (libc::O_APPEND | libc::O_TRUNC);
         let file = Self::open_at(&path, acc | extra)?;
         let h = self.next_handle.fetch_add(1, Ordering::Relaxed);
         self.handles.write().unwrap().insert(h, file);
@@ -1203,29 +1192,22 @@ mod tests {
     }
 
     #[test]
-    fn writeback_clears_o_append_on_the_host_fd() {
-        // With writeback the guest kernel sends positioned writes; an O_APPEND host fd would
-        // (on Linux) ignore the offset and pwrite at EOF, so `open` must strip it.
-        let p = tmp_with(b"log");
+    fn init_refuses_writeback_caching() {
+        // Writes must reach the host as they happen: the guest gets no writeback cache to hold
+        // them in, however capable it declares itself.
+        let p = tmp_with(b"cfg");
         let fs = SingleFileFs::new(p.clone(), false).unwrap();
-        fs.init(FsOptions::WRITEBACK_CACHE).unwrap();
-        let (h, _) = fs
-            .open(
-                ctx(),
-                FILE_INODE,
-                false,
-                (libc::O_RDWR | libc::O_APPEND) as u32,
-            )
-            .unwrap();
-        assert_eq!(handle_fd_flags(&fs, h.unwrap()) & libc::O_APPEND, 0);
+        let opts = fs.init(FsOptions::WRITEBACK_CACHE).unwrap();
+        assert!(!opts.contains(FsOptions::WRITEBACK_CACHE));
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
     #[test]
-    fn without_writeback_o_append_is_preserved() {
-        // No writeback negotiated: the host fd's O_APPEND is what provides append semantics.
+    fn o_append_is_preserved_on_the_host_fd() {
+        // Without writeback the host fd's O_APPEND is what provides append semantics.
         let p = tmp_with(b"log");
         let fs = SingleFileFs::new(p.clone(), false).unwrap();
+        fs.init(FsOptions::WRITEBACK_CACHE).unwrap();
         let (h, _) = fs
             .open(
                 ctx(),
