@@ -89,6 +89,7 @@ use std::ffi::CString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -1147,6 +1148,7 @@ fn mount_disks(cmdline: &HashMap<String, String>) -> Result<()> {
     let Some(spec) = cmdline.get("VIRTKIT_DISKS") else {
         return Ok(());
     };
+    let mut mounted = Vec::new();
     for entry in spec.split(',').filter(|e| !e.is_empty()) {
         let Some((device, path)) = entry.split_once(':') else {
             bail!("bad VIRTKIT_DISKS entry {entry:?} (want /dev/vdX:path)");
@@ -1157,9 +1159,22 @@ fn mount_disks(cmdline: &HashMap<String, String>) -> Result<()> {
         mount(device, path, "ext4", libc::MS_NOSUID | libc::MS_NODEV)
             .with_context(|| format!("mounting disk {device} at {}", target.display()))?;
         chown_created_mount_parents(target, &created_parents);
+        mounted.push(cstr(path));
     }
+    // `mount_disks` currently runs on one boot path. If a second call is ever added, a
+    // duplicate set leaves only that call's volumes unfrozen rather than failing boot.
+    let _ = DISK_MOUNTS.set(mounted);
     Ok(())
 }
+
+/// Disk-volume mount paths retained for [`poweroff`]. Their host-backed ext4 files outlive
+/// the guest and must be frozen clean; virtiofs shares have no guest-visible superblock.
+/// Paths, rather than file descriptors, allow guest unmounts, which open descriptors would
+/// block with `EBUSY`. An overmount skips the affected volume; after an unmount, opening its
+/// path reaches `/`, which is frozen separately. `CString` avoids allocation in the signal
+/// handler. Only supervising PID 1 reads the list; `run_full_vm` execs the real init before
+/// this path can run.
+static DISK_MOUNTS: OnceLock<Vec<CString>> = OnceLock::new();
 
 /// Root under which overlay-backed shares keep their private lower/upper/work mounts.
 pub(crate) const OVERLAY_ROOT: &str = "/run/virtkit-overlay";
@@ -2445,8 +2460,8 @@ fn fork_exec_wait(argv: &[String]) -> Result<i32> {
 
 /// On SIGTERM/SIGINT (e.g. a forwarded shutdown), power the VM off.
 fn install_term_handler() {
-    // SAFETY: poweroff() is async-signal-safe enough for our purpose (sync +
-    // FIFREEZE via raw open/ioctl + reboot syscalls); we never return from it.
+    // SAFETY: `poweroff` never returns and is async-signal-safe enough for this handler: it
+    // uses `sync`, an atomic `DISK_MOUNTS` read, raw open/ioctl/close, and `reboot`.
     unsafe {
         libc::signal(
             libc::SIGTERM,
@@ -2488,10 +2503,13 @@ fn poweroff() -> ! {
     unsafe {
         libc::sync();
     }
-    // Freeze the root fs before power-off so its ext4 journal is checkpointed and the next
-    // mount runs no journal recovery; see `fsfreeze::freeze_for_poweroff`. `sync()` alone
-    // flushes dirty pages but leaves the journal open. Best-effort and no thaw: we are
-    // powering off.
+    // Freeze disk volumes before `/` so each ext4 journal is checkpointed, its counters
+    // written, and its superblock marked clean for the next mount. `sync()` flushes dirty
+    // pages but leaves superblocks dirty. See `fsfreeze::freeze_for_poweroff`. Best-effort;
+    // power-off needs no thaw.
+    for mnt in DISK_MOUNTS.get().into_iter().flatten() {
+        crate::fsfreeze::freeze_for_poweroff(mnt);
+    }
     crate::fsfreeze::freeze_for_poweroff(c"/");
     // SAFETY: async-signal-safe syscall.
     unsafe {
