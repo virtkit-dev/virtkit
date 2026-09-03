@@ -11,11 +11,15 @@
 //!
 //! Boots a disk/initramfs guest with our kernel + cmdline-`init=` (PID 1): virtio-blk
 //! disks (qcow2 backing chains), built-in virtio-fs shares, per-port vsock, optional
-//! tap networking, and the console on the serial-log file. The shutdown eventfd stays
-//! unwired (as upstream leaves it on x86_64); teardown is process-kill — see
-//! `vm::graceful_vmm_stop`.
+//! tap networking, and the console on the serial-log file.
+//!
+//! With ACPI now present on x86_64 (vendored patch), the boot child installs a SIGTERM
+//! handler that presses the guest's ACPI power button (`krun_get_shutdown_eventfd`), so
+//! a host `SIGTERM` becomes an orderly guest power-off.
 
 use std::ffi::CString;
+use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use anyhow::{Context, Result, bail};
 
@@ -24,9 +28,9 @@ use anyhow::{Context, Result, bail};
 // >= 0 on success, a negative errno on failure.
 use krun::{
     krun_add_disk2, krun_add_net_tap, krun_add_virtiofs4, krun_add_vsock_port2, krun_create_ctx,
-    krun_disable_balloon, krun_disable_implicit_init, krun_init_log, krun_set_block_dirty_socket,
-    krun_set_console_output, krun_set_kernel, krun_set_nested_virt, krun_set_pmu,
-    krun_set_vm_config, krun_start_enter,
+    krun_disable_balloon, krun_disable_implicit_init, krun_get_shutdown_eventfd, krun_init_log,
+    krun_set_block_dirty_socket, krun_set_console_output, krun_set_kernel, krun_set_nested_virt,
+    krun_set_pmu, krun_set_vm_config, krun_start_enter,
 };
 
 use crate::vmm::{Disk, Net, VmSpec};
@@ -280,10 +284,55 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
             krun_disable_implicit_init(ctx),
         )?;
 
+        // A host SIGTERM presses the ACPI power button (see the module docs) rather
+        // than cutting power. Best-effort: if the fd is unavailable, we just lose the
+        // orderly-shutdown-on-SIGTERM path and the host's SIGKILL still stops the VM.
+        install_power_button_on_sigterm(ctx);
+
         // blocks until the guest powers off.
         ck("krun_start_enter", krun_start_enter(ctx))?;
     }
     Ok(())
+}
+
+/// Fd the SIGTERM handler writes to press the guest's ACPI power button. -1 until set.
+static SHUTDOWN_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Seconds the guest gets to act on the power button before the boot child gives up and lets
+/// SIGALRM terminate it — a backstop for a guest that ignores the button, so the child never
+/// hangs. The host escalates to SIGKILL well before.
+const POWER_BUTTON_GRACE_SECS: libc::c_uint = 70;
+
+/// SIGTERM handler: press the ACPI power button and arm a backstop alarm. Async-signal-safe
+/// (an eventfd `write` of 8 bytes and `alarm`).
+extern "C" fn press_power_button(_sig: libc::c_int) {
+    let fd = SHUTDOWN_FD.load(Ordering::SeqCst);
+    if fd >= 0 {
+        let one: u64 = 1;
+        // SAFETY: write(2) is async-signal-safe; an 8-byte write to an eventfd.
+        unsafe {
+            libc::write(fd, &one as *const u64 as *const libc::c_void, 8);
+            libc::alarm(POWER_BUTTON_GRACE_SECS);
+        }
+    }
+}
+
+/// Install the SIGTERM power-button handler, if libkrun exposes a shutdown eventfd.
+///
+/// # Safety
+/// Call once, before `krun_start_enter`, with a valid `ctx`.
+unsafe fn install_power_button_on_sigterm(ctx: u32) {
+    let fd = krun_get_shutdown_eventfd(ctx);
+    if fd < 0 {
+        return;
+    }
+    SHUTDOWN_FD.store(fd as RawFd, Ordering::SeqCst);
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            press_power_button as *const () as libc::sighandler_t,
+        );
+    }
 }
 
 unsafe fn add_disk(ctx: u32, index: usize, disk: &Disk) -> Result<()> {

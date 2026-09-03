@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Stopping a VM now shuts down even a hung guest or one whose agent is unresponsive, via
+  an ACPI power button, instead of cutting its power.
+
 ## [0.50.0] - 2026-09-03
 
 ### Fixed

@@ -2088,7 +2088,10 @@ fn teardown_run(
     let deadline = Instant::now() + crate::shutdown::STOP_GRACE;
     let powering_off = match guest {
         Some(addr) if ch.try_wait().ok().flatten().is_none() => {
-            crate::shutdown::request_poweroff(addr)
+            // Ask the guest's agent to power off; if it cannot be reached, press the ACPI
+            // power button (SIGTERM to the VMM) so even a hung or agent-less guest still
+            // shuts down cleanly instead of being cut. Either way, wait for the VMM below.
+            crate::shutdown::request_poweroff(addr) || crate::shutdown::press_power_button(ch)
         }
         _ => false,
     };

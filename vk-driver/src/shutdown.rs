@@ -2,6 +2,9 @@
 //! filesystem dirty. When guest state persists in a `disk` volume or `--disk` image, the owner
 //! first runs `vk-agent poweroff`, then waits up to [`STOP_GRACE`] for the VMM to exit before
 //! killing it. See the agent's `poweroff` module for init-specific behavior.
+//!
+//! A guest whose agent cannot be reached still gets an orderly stop: [`press_power_button`]
+//! SIGTERMs the VMM, whose libkrun boot child turns that into an ACPI power-button press.
 
 use std::process::Child;
 use std::time::{Duration, Instant};
@@ -142,6 +145,24 @@ pub(crate) async fn terminate_signal() {
             sig.recv().await;
         }
         Err(_) => std::future::pending().await,
+    }
+}
+
+/// SIGTERM the VMM `child`: its libkrun boot child presses the guest's ACPI power button (an
+/// orderly power-off) rather than dying. The stop fallback when the agent is
+/// unreachable. Returns false only if the pid is unusable.
+pub(crate) fn press_power_button(child: &Child) -> bool {
+    signal_child(child, libc::SIGTERM)
+}
+
+fn signal_child(child: &Child, sig: libc::c_int) -> bool {
+    match i32::try_from(child.id()) {
+        // SAFETY: kill(2); the worst case is ESRCH if the child already exited.
+        Ok(pid) => {
+            unsafe { libc::kill(pid, sig) };
+            true
+        }
+        Err(_) => false,
     }
 }
 
