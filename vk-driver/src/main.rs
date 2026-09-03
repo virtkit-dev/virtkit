@@ -215,6 +215,7 @@ Examples:
   vk run alpine -- cat /etc/os-release   run one command, exit with its status
   vk run debian:trixie-slim --mem 2G --cpus 4
   vk run -f Dockerfile                   build the last stage and boot it
+  vk run --compose compose.yaml          boot the file's services as a fleet
   vk check                               preflight this host
 
 Every command's -h is a one-line summary per flag; --help adds the full detail.
@@ -342,17 +343,25 @@ enum ServiceCmd {
     /// Bring a service up, building its image on first use
     ///
     /// The first-use build is a profiled-down service build and streams its progress
-    /// live. A no-op when the service is already running.
+    /// live. A no-op when the service is already running. Persistent state an earlier
+    /// `down` left behind — `x-virtkit.persist_root`, `overlay,persist` uppers and `disk`
+    /// volumes — comes back with it; the rest of the guest starts clean from the image.
     Up {
         /// service name (as declared in the compose file)
         name: String,
     },
     /// Stop a running service (a no-op if already stopped)
+    ///
+    /// Powers the guest off cleanly. Its persistent state, if it declares any, waits for
+    /// the next `up`; the rest of the guest is discarded.
     Down {
         /// service name
         name: String,
     },
     /// Reboot a running service's guest in place (same VM, no image rebuild)
+    ///
+    /// The guest comes back on the same disks, so even a throwaway root keeps its
+    /// changes across a reboot; only a stop or restart starts it over.
     Reboot {
         /// service name
         name: String,
@@ -1388,6 +1397,15 @@ enum Cmd {
         /// `${VAR}` interpolates from the environment over a sibling `.env`, and the reserved
         /// `${VK_WORKSPACE}`, `${VK_STATE_DIR}`, `${VK_SELF}`, `${VK_UID}` and `${VK_GID}` from
         /// the run itself — so the committed file needs no host paths or ids of its own.
+        ///
+        /// Per-service `x-virtkit:` sets `cpus`, `mem`, `nested`, `nics`, `init`
+        /// (default|image|entrypoint), `kernel` (default|image|<path>) and `persist_root`
+        /// (keep `/` across restarts). Volume modes: `ro`, `rw`, `overlay` (writes in RAM),
+        /// `overlay,persist[,size=]` (writes kept on disk) and `disk[,size=]` (a private
+        /// filesystem). Persistent state lives under `.virtkit/` beside the compose file and
+        /// is reset when the image (or, for an overlay, its shared host tree) changes.
+        /// `examples/compose.yaml` in the source tree shows every compose feature a service
+        /// can use.
         #[arg(long, value_name = "FILE", help_heading = "Compose services")]
         compose: Option<PathBuf>,
         /// activate a compose profile (repeatable)
@@ -1532,12 +1550,14 @@ enum Cmd {
         /// `:ro` shares read-only, `:rw` (the default) read-write; `:overlay` shares
         /// read-only behind a tmpfs-backed overlay (the guest reads the host tree but writes
         /// stay in guest RAM, never touching it). `:disk[,size=SIZE]` instead attaches a whole
-        /// ext4 filesystem in a host file as a real block device — full POSIX semantics
+        /// filesystem in a host qcow2 as a real block device — full POSIX semantics
         /// (arbitrary chown, device nodes, sockets) and content that survives across boots,
-        /// for state a service needs to own outright; the file is created and formatted
-        /// (sparse, `size=` capacity, default 64G) the first time it is used.
-        /// A share (not a disk) may add `,optional` to skip an absent source instead of
-        /// failing the boot.
+        /// for state a service needs to own outright; the file is created and formatted the
+        /// first time it is used (`size=` capacity, default 64G; only written blocks cost
+        /// host disk). A share (not a disk) may add `,optional` to skip an absent source
+        /// instead of failing the boot. `overlay,persist` (an overlay whose writes are kept
+        /// on disk) and `x-virtkit.persist_root` belong to compose services, which have a
+        /// file to keep that state beside — see --compose.
         #[arg(
             short = 'v',
             long = "volume",
