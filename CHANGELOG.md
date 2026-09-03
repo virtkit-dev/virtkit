@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Compose services now shut down cleanly on `vk service down`, restart, and the end of a run.
+  The guest has up to a minute to power off while systemd stops its units or a plain service
+  handles SIGTERM. A `disk` volume retains its final writes and remounts with a clean
+  filesystem.
+
 ## [0.49.0] - 2026-09-02
 
 ### Changed

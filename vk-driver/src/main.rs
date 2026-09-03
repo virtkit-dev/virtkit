@@ -2020,7 +2020,8 @@ fn raise_nofile() {
 
 /// Drive a `vk service` subcommand against the host service manager over the vsock control
 /// plane. `up` streams the on-demand build's progress to stderr as it arrives, then prints
-/// the final reply; `down`/`status` are single round-trips.
+/// the final reply. `down` and `status` are single round-trips, but `down` may take up to a
+/// minute while the guest powers off.
 async fn service_cmd(cmd: &ServiceCmd) -> ExitCode {
     use vk_core::fleetctl::{Client, Request};
     let mut client = Client::new();
