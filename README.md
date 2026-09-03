@@ -124,10 +124,69 @@ guests had reported by then.
 service resolves by name. Services can run alongside a primary command, as the primary
 with `--primary`, or as a standalone fleet until interrupted.
 
-virtkit-specific service settings live under `x-virtkit`:
+[`examples/compose.yaml`](examples/compose.yaml) exercises everything below in one
+annotated file; it is parsed by the test suite, so it always matches what `vk` accepts.
 
-Services default to 2 vCPUs and 1 GiB of memory. Set `cpus` and `mem` when a service
-needs a different guest size:
+#### The file
+
+A compose file is `services:` and nothing else (a deprecated `version:` is accepted and
+ignored). vk parses it strictly: an unknown key anywhere is an error, so a docker `volumes:`
+or `networks:` section is refused rather than skipped, and named volumes are not supported —
+bind a path. A service uses `image:` or `build:`, plus any of `environment`, `env_file`,
+`command`, `entrypoint`, `user`, `hostname`, `depends_on`, `volumes`, `profiles` and the
+`x-virtkit` marker. Every host path is relative to the compose file.
+
+#### Images and builds
+
+`image:` names an OCI image, pulled and converted host-side and shared across runs.
+`build:` is a directory (`build: ./app`) or a mapping:
+
+```yaml
+services:
+  app:
+    build:
+      context: ./app
+      dockerfile: [Dockerfile, Dockerfile.dev]   # several files merge into one stage namespace
+      target: runtime                            # any stage across them
+      args:
+        UID: "$VK_UID"                           # bare and braced both interpolate; keeps a
+        GID: "${VK_GID}"                         # shared tree's ownership coherent
+      additional_contexts:
+        assets: ./assets                         # `COPY --from=assets`; local directories only
+```
+
+Built images are content-addressed and reused; a `build:` sibling is built on its first
+start (`vk service up` streams the build), the `--primary` service up front.
+
+#### Environment and interpolation
+
+`environment:` (map or list) upserts over the image's own environment; `env_file:` is a
+path, a list of paths, or `{path, required: false}` entries, layered beneath it.
+`entrypoint:` replaces the image's entrypoint *and* drops its command; `command:` alone
+replaces only the command; `user:` replaces the user. `hostname:` (a DNS label) defaults to
+the service name and is what other services resolve.
+
+Values interpolate `$VAR`, `${VAR}` and `${VAR:-default}` from the environment over a
+sibling `.env`; `$$` is a literal `$`. An unset variable with no default **fails the load**
+— an empty image tag or bind path is always a bug — and the other docker modifiers (`:?`,
+`:+`, `${VAR-default}`) are rejected. Five reserved names come from the run itself, so a
+committed file needs no host paths or ids: `${VK_WORKSPACE}` (`--workspace`, else the
+cwd), `${VK_STATE_DIR}` (`--state-dir`, else the run's scratch), `${VK_SELF}` (the running
+`vk`, to hand a guest its own copy), `${VK_UID}` and `${VK_GID}`. A variable holding several
+newline-separated binds expands into several `volumes:` entries.
+
+#### Start order and profiles
+
+`depends_on` (a list, or a map whose only accepted `condition:` is `service_started`)
+orders starts; there is no readiness wait, so retry a first connection. Services with
+`profiles:` stay declared but down unless a profile is activated (`--profile NAME`,
+repeatable) or an enabled service depends on them; `vk service up NAME` starts one anyway.
+
+#### Guest size, init, kernel and NICs
+
+virtkit-specific settings live under `x-virtkit`. Services default to 2 vCPUs and 1 GiB of
+memory; set `cpus` and `mem` when a service needs a different guest size, and `nested: true`
+for a service that runs microVMs of its own (the host must allow nesting):
 
 ```yaml
 services:
@@ -140,12 +199,16 @@ services:
     image: local/builder
     x-virtkit:
       nested: true
+    volumes:
+      - ${VK_SELF}:/usr/local/bin/vk:ro          # the host's own vk, for nested builds
 ```
 
 `--service-cpus NAME=N` and `--service-mem NAME=SIZE` override those values for one run.
-The same marker supports `init` and `kernel` for services that boot their own system, and
-`persist_root` for a service whose root filesystem must outlive a restart (see
-[Volumes and persistent state](#volumes-and-persistent-state)).
+`init` chooses PID 1 — `default` (the vk agent), `image` (the image's own `/sbin/init`) or
+`entrypoint` (its ENTRYPOINT+CMD) — and `kernel` the kernel: `default` (the pinned guest
+kernel), `image` (the image's own kernel and modules) or a kernel file path. Together they
+boot a systemd or otherwise self-booting image as a service. `persist_root` keeps the root
+filesystem across restarts (see [Volumes and persistent state](#volumes-and-persistent-state)).
 
 A guest gets one interface, `eth0`, by default. `nics` gives it more — `eth1` upward, each
 with its own address on the same LAN — for an appliance that assigns services to separate
@@ -219,10 +282,22 @@ unconditionally; delete its file to start over. All of this applies alike to a s
 booted with `--primary` and to its siblings; ad-hoc `-v` binds on `vk run` accept every
 mode but `overlay,persist`, which has no compose file to keep its state beside.
 
+#### Running the fleet
+
+`vk run --compose FILE` with an image or `-f` boots that as the primary VM and the services
+beside it, torn down when the run exits. `--primary NAME` boots a compose service as the
+primary instead — `docker compose run` semantics: its image is the rootfs, its config the
+command's environment, with no trailing command its entrypoint and command run, and only
+its `depends_on` chain boots alongside. With neither, `--compose` alone is compose up: the
+services only, held until Ctrl-C.
+
 Inside the primary guest, `/run/vk/services/<name>/{state,ctl,log}` exposes service
-state, control, and logs through ordinary files. `vk service up|down|status` provides the
-corresponding command interface. `vk run --ssh` enables SSH access for development VMs,
-including VS Code Remote-SSH workflows.
+state, control, and logs through ordinary files. `vk service up|down|reboot|status` is the
+corresponding command interface: `up` starts a declared (or profiled-down) service, building
+it on first use; `down` powers it off; `reboot` restarts its guest in place on the same
+disks; `status` reports one or all. `vk run --ssh` enables SSH access for development VMs,
+including VS Code Remote-SSH workflows. In a CI fleet a service's `environment:` may also
+carry its own egress allowlist — see [Per-service egress](docs/gitlab-ci.md#per-service-egress).
 
 ### Isolate GitLab jobs
 
@@ -331,12 +406,13 @@ rebuilt byte-for-byte.
 | `vk exec` | Run a command in an existing guest and return the command's exit status. |
 | `vk list` | Discover registered background VMs and compose services. |
 | `vk stop` | Stop a VM selected by pid or launch directory, or stop all registered VMs. |
+| `vk reboot` | Reboot a running VM in place through its guest, or power-cycle it with `--force`. |
 | `vk status` | Probe a guest agent, or report whether its root image is stale. |
 | `vk atop` | Follow or inspect guest resource recordings. |
 | `vk check` | Validate KVM, VMM, embedded assets, configured host features, and an optional minimum `vk` version. |
 | `vk gc` | Reclaim unused image bases, CI checkouts, and image-cache chunks. |
 | `vk update` | Check for or install a digest-verified GitHub release. |
-| `vk service up|down|status` | Control compose services from the primary guest. |
+| `vk service up|down|reboot|status` | Control compose services from the primary guest. |
 | `vk registry ...` | Publish, fetch, inspect, report on, or sweep OCI stores. |
 | `vk gitlab ...` | Implement the GitLab custom-executor lifecycle. |
 | `vk export ...` | Package raw disks or staged files as VMDK, OVA, or ISO artifacts. |
@@ -435,6 +511,7 @@ vk-fs/           filesystem objects created private and published whole
 third_party/     vendored libkrun and local patches
 kernel/          pinned guest-kernel configuration and build inputs
 docs/            operational guides
+examples/        annotated compose file exercising every compose feature
 build.sh         reproducible binary build
 build-kernel.sh  reproducible guest-kernel build
 dev.sh           check/lint/test environment in a reusable development VM

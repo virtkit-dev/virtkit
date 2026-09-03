@@ -1,0 +1,90 @@
+# A compose file for `vk run --compose`, exercising every compose feature a service can use.
+#
+#   vk run --compose examples/compose.yaml                       # the fleet, until ctrl-c
+#   vk run --compose examples/compose.yaml --primary app -- sh   # `app` as the run VM
+#   vk run --compose examples/compose.yaml --profile tools       # also the profiled tool
+#
+# vk parses the file strictly: only `services:` (and a deprecated, ignored `version:`) may
+# appear at the top level, and a service may only use the keys shown here. A docker
+# `volumes:` or `networks:` section is an error, as are named volumes — bind a path instead.
+# Every service is its own microVM on a private LAN and resolves the others by name.
+#
+# `${VAR}`, `$VAR` and `${VAR:-default}` interpolate from the environment over a sibling
+# `.env`; an unset variable with no default fails the load rather than expanding to "". The
+# reserved `${VK_WORKSPACE}`, `${VK_STATE_DIR}`, `${VK_SELF}`, `${VK_UID}` and `${VK_GID}`
+# come from the run itself, so this file carries no host paths or ids. `$$` is a literal `$`.
+services:
+  # ---- a stateful appliance: a full-OS image with its own init and kernel, root persistent --
+  app:
+    build:
+      context: ./app                     # relative to this file
+      dockerfile:                        # one file, or several merged into one stage namespace
+        - Dockerfile
+        - Dockerfile.dev
+      target: runtime                    # any stage across them
+      args:                              # build args; `$VK_UID` (bare) and `${VK_GID}` (braced)
+        UID: "$VK_UID"                   # are both accepted — keep a shared tree's ownership
+        GID: "${VK_GID}"                 # coherent with the host user
+      additional_contexts:               # `COPY --from=<name>`; local directories only
+        assets: ./assets
+    hostname: appliance                  # DNS label; defaults to the service name
+    x-virtkit:
+      init: image                        # PID 1: default (vk-agent) | image (needs its own init) | entrypoint
+      kernel: image                      # default (pinned) | image (needs a kernel in the image) | <path>
+      cpus: 4
+      mem: 4G
+      nics: 2                            # eth0 + eth1, each its own address on the LAN
+      persist_root: true                 # / survives reboot, restart and down/up
+    volumes:
+      - ./config:/etc/appliance:ro
+      - ./secrets.env:/etc/appliance/secrets.env:ro,optional   # skipped when absent
+    depends_on:
+      - db
+      - cache
+
+  # ---- a database on a private disk with real filesystem semantics --------------------
+  db:
+    image: postgres:17
+    env_file:                            # `KEY=VALUE` files beneath `environment`
+      - ./db.env
+      - path: ./db.local.env
+        required: false
+    environment:                         # upserts over the image's own env (map or list)
+      POSTGRES_DB: appliance
+      PGDATA: /var/lib/postgresql/data
+    user: postgres
+    x-virtkit:
+      mem: 2G
+    volumes:
+      # A `disk` volume is a filesystem of its own (ownership, sockets, device nodes all
+      # work), created and formatted on first use; the file persists until deleted.
+      - ./pgdata.qcow2:/var/lib/postgresql/data:disk,size=20G
+
+  # ---- a cache whose config is templated from the environment -------------------------
+  cache:
+    image: redis:7
+    command: redis-server --maxmemory ${CACHE_MEM:-256mb}   # replaces the image's cmd
+
+  # ---- a builder that runs vk itself: nested virtualization + the host's own `vk` -------
+  builder:
+    image: local/builder
+    entrypoint: ["/bin/sh", "-c"]        # replaces the entrypoint AND drops the image's cmd
+    command: ["vk build -f Dockerfile"]
+    x-virtkit:
+      nested: true                       # needs the host to allow nesting
+      cpus: 8
+      mem: 8G
+    volumes:
+      - ${VK_SELF}:/usr/local/bin/vk:ro                # a single-file bind
+      - ${VK_WORKSPACE}:/workspace:overlay             # reads from the host, writes in RAM
+      - ${VK_WORKSPACE}/.cache:/root/.cache:overlay,persist,size=10G   # writes kept on disk
+      - ${VK_STATE_DIR}/artifacts:/out                 # rw: writes land on the host
+
+  # ---- a one-off tool, declared but down until `--profile tools` or `vk service up` ------
+  shell:
+    image: alpine:3
+    profiles: [tools]
+    command: sleep infinity
+    depends_on:
+      db:
+        condition: service_started       # the only condition: start ordering, no readiness wait

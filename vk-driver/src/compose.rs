@@ -3212,6 +3212,130 @@ mod tests {
         }
     }
 
+    /// The shipped example is the reference readers copy from, and the parser rejects any
+    /// key it does not know — so the sample is parsed here, and a key the parser drops or a
+    /// feature the sample misuses fails the build rather than misleading a reader.
+    #[test]
+    fn the_shipped_example_compose_file_parses() {
+        let yaml = include_str!("../../examples/compose.yaml");
+        let units = super::parse(
+            yaml,
+            Path::new("/proj"),
+            &|_| None,
+            Some(&builtins("/ws", Some("/state"))),
+        )
+        .unwrap();
+        let by_name = |n: &str| units.iter().find(|u| u.name == n).unwrap();
+        assert_eq!(units.len(), 5);
+
+        let app = by_name("app");
+        assert_eq!(app.hostname, "appliance");
+        assert_eq!(app.init, crate::run::InitSource::Image);
+        assert_eq!(app.kernel, crate::run::KernelSource::Image);
+        assert_eq!((app.cpus, app.nics), (Some(4), 2));
+        assert_eq!(
+            app.persist_root_backing.as_deref(),
+            Some(Path::new("/proj/.virtkit/roots/app.qcow2"))
+        );
+        assert_eq!(app.depends_on, ["db", "cache"]);
+        assert_eq!(app.mem.as_deref(), Some("4G"));
+        // The optional bind's source is absent, so only the `ro` config bind remains.
+        assert_eq!(app.volumes.len(), 1);
+        // The build block: context + both dockerfiles anchored on the compose dir, the target,
+        // args (bare `$VK_UID` and braced `${VK_GID}` both resolved from the builtins), and the
+        // named additional context.
+        match &app.source {
+            Source::Build {
+                context,
+                dockerfiles,
+                target,
+                args,
+                build_contexts,
+            } => {
+                assert_eq!(context, Path::new("/proj/./app"));
+                assert_eq!(
+                    dockerfiles,
+                    &[
+                        PathBuf::from("/proj/./app/Dockerfile"),
+                        PathBuf::from("/proj/./app/Dockerfile.dev"),
+                    ]
+                );
+                assert_eq!(target.as_deref(), Some("runtime"));
+                // `$VK_UID` (bare) → 1000 and `${VK_GID}` (braced) → 1001, both from the builtins.
+                assert!(args.contains(&("UID".to_string(), "1000".to_string())));
+                assert!(args.contains(&("GID".to_string(), "1001".to_string())));
+                assert_eq!(build_contexts.len(), 1);
+                assert_eq!(build_contexts[0].0, "assets");
+            }
+            other => panic!("app must be a build, got {other:?}"),
+        }
+
+        let db = by_name("db");
+        assert!(db.volumes[0].disk);
+        assert_eq!(db.volumes[0].disk_size_mib, Some(20 * 1024));
+        assert_eq!(db.user.as_deref(), Some("postgres"));
+        assert_eq!(db.mem.as_deref(), Some("2G"));
+        assert_eq!(db.env_files.len(), 2);
+        assert!(!db.env_files[1].1, "db.local.env is optional");
+        assert!(
+            db.environment
+                .contains(&("POSTGRES_DB".to_string(), "appliance".to_string()))
+        );
+        assert!(
+            db.environment
+                .contains(&("PGDATA".to_string(), "/var/lib/postgresql/data".to_string()))
+        );
+
+        // `${CACHE_MEM:-256mb}` took its default: nothing resolved it.
+        assert!(
+            by_name("cache")
+                .command
+                .as_ref()
+                .unwrap()
+                .contains(&"256mb".to_string())
+        );
+
+        let builder = by_name("builder");
+        assert!(builder.nested);
+        assert_eq!(
+            (builder.cpus, builder.mem.as_deref()),
+            (Some(8), Some("8G"))
+        );
+        // The list forms: an explicit entrypoint (which also drops the image's cmd) plus a command.
+        assert_eq!(
+            builder.entrypoint,
+            Some(vec!["/bin/sh".to_string(), "-c".to_string()])
+        );
+        assert_eq!(
+            builder.command,
+            Some(vec!["vk build -f Dockerfile".to_string()])
+        );
+        assert!(
+            builder.volumes[0].is_file,
+            "${{VK_SELF}} is a single-file bind"
+        );
+        let cache = builder
+            .volumes
+            .iter()
+            .find(|v| v.guest == "/root/.cache")
+            .unwrap();
+        assert!(cache.overlay && cache.persist && cache.persist_backing.is_some());
+        assert_eq!(cache.disk_size_mib, Some(10 * 1024));
+        // A plain (RAM) overlay, and a default `rw` bind whose writes reach the host.
+        let ws = builder
+            .volumes
+            .iter()
+            .find(|v| v.guest == "/workspace")
+            .unwrap();
+        assert!(ws.overlay && !ws.persist);
+        let out = builder.volumes.iter().find(|v| v.guest == "/out").unwrap();
+        assert!(!out.overlay && !out.read_only && !out.disk);
+
+        let shell = by_name("shell");
+        assert_eq!(shell.profiles, ["tools"]);
+        assert_eq!(shell.depends_on, ["db"]);
+    }
+
     #[test]
     fn builtins_answer_the_reserved_names() {
         let b = builtins("/repo", Some("/state/repo"));
