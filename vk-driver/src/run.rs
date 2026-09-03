@@ -1766,6 +1766,14 @@ async fn build_and_boot(
             .with_context(|| format!("--disk {}: cannot access", path.display()))?;
         disks.push(crate::vmm::Disk::raw(abs, *readonly));
     }
+    // Writable `disk` volumes and `--disk` images outlive the VM, so request guest poweroff
+    // before killing it. Runs backed only by the throwaway overlay or host shares retain
+    // immediate teardown; overlay writes are discarded and share writes are already host-owned.
+    let persistent = primary_volumes
+        .iter()
+        .chain(&args.volumes)
+        .any(|v| v.disk && !v.read_only)
+        || args.extra_disks.iter().any(|(_, readonly)| !readonly);
     let spec = crate::vmm::VmSpec {
         kernel: boot_kernel,
         cmdline,
@@ -1925,6 +1933,7 @@ async fn build_and_boot(
             Err(e) => {
                 teardown_run(
                     &mut ch,
+                    persistent.then_some(&addr),
                     &manager,
                     &mut virtiofsds,
                     &mut switch,
@@ -1957,6 +1966,7 @@ async fn build_and_boot(
         Err(e) => {
             teardown_run(
                 &mut ch,
+                persistent.then_some(&addr),
                 &manager,
                 &mut virtiofsds,
                 &mut switch,
@@ -1978,6 +1988,7 @@ async fn build_and_boot(
             Err(e) => {
                 teardown_run(
                     &mut ch,
+                    persistent.then_some(&addr),
                     &manager,
                     &mut virtiofsds,
                     &mut switch,
@@ -2019,6 +2030,7 @@ async fn build_and_boot(
     };
     teardown_run(
         &mut ch,
+        persistent.then_some(&addr),
         &manager,
         &mut virtiofsds,
         &mut switch,
@@ -2056,8 +2068,13 @@ async fn build_and_boot(
 /// --net switch and virtiofsds, and the ssh-agent / host-exec forwards.
 /// Used on both a clean exit and any error after the VMM is live, so a failed run leaks no
 /// children (a leaked `vk virtiofsd` would hold this binary's file busy for the next build).
+///
+/// When `guest` supplies the primary's exec address, request its poweroff and wait until the
+/// `shutdown::STOP_GRACE` deadline before killing it. The manager powers off services during
+/// the same teardown. `None` skips the request and wait.
 fn teardown_run(
     ch: &mut Child,
+    guest: Option<&SocketAddr>,
     manager: &Option<std::sync::Arc<crate::manager::Manager>>,
     virtiofsds: &mut Vec<Child>,
     switch: &mut Option<Child>,
@@ -2068,11 +2085,21 @@ fn teardown_run(
         let _ = f.kill();
         let _ = f.wait();
     }
-    let _ = ch.kill();
-    let _ = ch.wait();
+    let deadline = Instant::now() + crate::shutdown::STOP_GRACE;
+    let powering_off = match guest {
+        Some(addr) if ch.try_wait().ok().flatten().is_none() => {
+            crate::shutdown::request_poweroff(addr)
+        }
+        _ => false,
+    };
     if let Some(mgr) = manager {
         mgr.stop_all();
     }
+    if powering_off {
+        crate::shutdown::wait_exit(ch, deadline);
+    }
+    let _ = ch.kill();
+    let _ = ch.wait();
     for mut child in virtiofsds.drain(..) {
         let _ = child.kill();
         let _ = child.wait();

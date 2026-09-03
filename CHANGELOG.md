@@ -10,6 +10,9 @@ All notable changes to virtkit will be documented in this file.
   The guest has up to a minute to power off while systemd stops its units or a plain service
   handles SIGTERM. A `disk` volume retains its final writes and remounts with a clean
   filesystem.
+- `vk run` now powers off its VM when its command ends or `vk stop` stops it if it has a
+  writable `disk` volume or `--disk` image. Runs backed only by the throwaway root or shared
+  host directories still end immediately, preserving one-shot exit speed.
 - `vk stop` now shuts down every VM gracefully, matching Ctrl-C instead of terminating the
   run and its VMs immediately.
 - New `disk` volumes use a journal, so they mount consistently without a filesystem check

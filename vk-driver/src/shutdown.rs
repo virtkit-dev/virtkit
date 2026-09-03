@@ -35,7 +35,8 @@ pub(crate) fn power_off_then_kill(vmms: &mut [(&str, &SocketAddr, &mut Child)]) 
     let mut killed = Vec::new();
     let mut powering_off = Vec::new();
     for (i, ((name, _, child), request)) in vmms.iter_mut().zip(requests).enumerate() {
-        if request.is_some_and(|request| poweroff_accepted(name, request)) {
+        if request.is_some_and(|request| poweroff_accepted(format_args!("service {name}"), request))
+        {
             powering_off.push(i);
             continue;
         }
@@ -97,17 +98,24 @@ pub(crate) fn spawn_poweroff_request(
     std::thread::Builder::new().spawn(request)
 }
 
-/// Return whether unit `name` accepted the poweroff `request`. An unreachable guest triggers an
-/// immediate VMM kill and suffers a power cut.
+/// Ask the guest at `addr` to power off and report whether it accepted — for a single guest,
+/// such as a `vk run` VM. A refusal (unreachable guest, no thread) means the caller kills the
+/// VMM, the power cut this exists to avoid.
+pub(crate) fn request_poweroff(addr: &SocketAddr) -> bool {
+    poweroff_accepted("run VM", spawn_poweroff_request(addr))
+}
+
+/// Return whether the guest labelled `who` accepted the poweroff `request`. A refusal is
+/// logged and the caller kills the VMM, which the guest takes as a power cut.
 pub(crate) fn poweroff_accepted(
-    name: &str,
+    who: impl std::fmt::Display,
     request: std::io::Result<std::thread::JoinHandle<Result<bool>>>,
 ) -> bool {
     let request = match request {
         Ok(request) => request,
         Err(e) => {
             eprintln!(
-                "virtkit: service {name}: no thread for the poweroff request ({e}) — killing the VM instead"
+                "virtkit: {who}: no thread for the poweroff request ({e}) — killing the VM instead"
             );
             return false;
         }
@@ -115,15 +123,11 @@ pub(crate) fn poweroff_accepted(
     match request.join() {
         Ok(Ok(accepted)) => accepted,
         Ok(Err(e)) => {
-            eprintln!(
-                "virtkit: service {name}: poweroff request failed ({e:#}) — killing the VM instead"
-            );
+            eprintln!("virtkit: {who}: poweroff request failed ({e:#}) — killing the VM instead");
             false
         }
         Err(_) => {
-            eprintln!(
-                "virtkit: service {name}: poweroff request panicked — killing the VM instead"
-            );
+            eprintln!("virtkit: {who}: poweroff request panicked — killing the VM instead");
             false
         }
     }
