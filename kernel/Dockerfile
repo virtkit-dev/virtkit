@@ -86,6 +86,7 @@ RUN export ARCH=x86_64 \
                   CONFIG_VIRTIO_FS CONFIG_FUSE_FS CONFIG_IP_PNP CONFIG_OVERLAY_FS \
                   CONFIG_BLK_DEV_INITRD CONFIG_DEVTMPFS_MOUNT \
                   CONFIG_KVM CONFIG_KVM_INTEL CONFIG_KVM_AMD CONFIG_KVM_IOAPIC \
+                  CONFIG_ACPI CONFIG_ACPI_BUTTON CONFIG_INPUT_EVDEV \
                   CONFIG_DUMMY CONFIG_IPV6 CONFIG_WIREGUARD; do \
            grep -q "^${opt}=y" .config || { echo "missing ${opt}=y in .config"; exit 1; }; \
        done \
