@@ -1995,20 +1995,28 @@ async fn build_and_boot(
     let ssh_probe = args
         .ssh
         .then(|| crate::vmm::exec_addr(&vsock, SSH_VSOCK_PORT));
-    let result = drive(
-        &mut ch,
-        &addr,
-        ssh_probe.as_ref(),
-        &console,
-        args,
-        ssh_config.as_deref(),
-        &image_env,
-        cmd_entrypoint,
-        &image_workdir,
-        &fallback_argv,
-        &timings,
-    )
-    .await;
+    // `vk stop` and an abort relayed by a `--detach` parent send SIGTERM. Its default action
+    // would terminate the run and let the VMM parent-death signal cut guest power. Route it
+    // through teardown so the guests power off cleanly.
+    let result = tokio::select! {
+        r = drive(
+            &mut ch,
+            &addr,
+            ssh_probe.as_ref(),
+            &console,
+            args,
+            ssh_config.as_deref(),
+            &image_env,
+            cmd_entrypoint,
+            &image_workdir,
+            &fallback_argv,
+            &timings,
+        ) => r,
+        _ = crate::shutdown::terminate_signal() => {
+            println!("virtkit: stopping ...");
+            Ok(())
+        }
+    };
     teardown_run(
         &mut ch,
         &manager,
@@ -2477,7 +2485,10 @@ async fn compose_up(
     if args.detach {
         crate::detach::signal_ready(args.detach_log.as_deref());
     }
-    tokio::signal::ctrl_c().await.ok();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = crate::shutdown::terminate_signal() => {}
+    }
     println!("virtkit: stopping ...");
     mgr.stop_all();
     stop_switch(switch);

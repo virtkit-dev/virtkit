@@ -598,7 +598,7 @@ pub async fn serve(
             info!("publish {name}: its VM stopped answering — stopping too");
             Ok(())
         }
-        () = terminate_signal() => {
+        () = crate::shutdown::terminate_signal() => {
             info!("publish {name}: stopping on SIGTERM");
             Ok(())
         }
@@ -628,17 +628,6 @@ async fn vm_gone(agent_addr: &SocketAddr) {
             return;
         }
     }
-}
-
-/// Resolves on SIGTERM — what `vk publish stop` and `vk stop` send.
-async fn terminate_signal() {
-    let Ok(mut sig) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    else {
-        // The default SIGTERM action still exits; only record cleanup is lost.
-        std::future::pending::<()>().await;
-        return;
-    };
-    sig.recv().await;
 }
 
 /// `vk publish list`: what is published for this state dir, dead records pruned.

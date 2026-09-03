@@ -129,6 +129,18 @@ pub(crate) fn poweroff_accepted(
     }
 }
 
+/// Wait for SIGTERM, as sent by `vk stop` and `vk publish stop`.
+/// If the handler cannot be installed, wait forever and leave SIGTERM's default termination
+/// in place.
+pub(crate) async fn terminate_signal() {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut sig) => {
+            sig.recv().await;
+        }
+        Err(_) => std::future::pending().await,
+    }
+}
+
 /// Wait until `deadline` for the VMM `child` to exit.
 pub(crate) fn wait_exit(child: &mut Child, deadline: Instant) {
     while Instant::now() < deadline {

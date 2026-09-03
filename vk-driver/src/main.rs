@@ -1706,7 +1706,10 @@ enum Cmd {
         #[arg(long, conflicts_with = "target")]
         all: bool,
         /// seconds to wait for each VM to go down before reporting it stuck
-        #[arg(long, default_value_t = 30, value_name = "SECS")]
+        ///
+        /// A run allows its guests one minute to power off; the default leaves time for the
+        /// run to exit without reporting an orderly shutdown as stuck.
+        #[arg(long, default_value_t = 90, value_name = "SECS")]
         timeout: u64,
     },
     /// Replace this `vk` with a GitHub release build
