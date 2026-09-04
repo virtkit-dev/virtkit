@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `vk list --json` reports the path of a VM's `--atop` recording as `atop_log` (`null`
+  without `--atop`).
+
 ### Changed
 
 - Release artifacts are now built from a Nix-pinned toolchain instead of an Alpine image:

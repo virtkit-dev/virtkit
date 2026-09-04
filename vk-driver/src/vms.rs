@@ -473,6 +473,7 @@ struct VmView<'a> {
     label: &'a str,
     exec_addr: &'a str,
     ssh_addr: Option<&'a str>,
+    atop_log: Option<&'a Path>,
     created_secs: u64,
     uptime_secs: u64,
     /// A double option so `--stale` is self-describing: the outer `None` (no `--stale`) omits
@@ -510,6 +511,7 @@ fn view<'a>(
         label: &entry.label,
         exec_addr: &entry.exec_addr,
         ssh_addr: entry.ssh_addr.as_deref(),
+        atop_log: entry.atop_log.as_deref(),
         created_secs: entry.created_secs,
         uptime_secs: unix_now().saturating_sub(entry.created_secs),
         stale: if stale { Some(freshness.json()) } else { None },
@@ -1471,6 +1473,7 @@ mod tests {
             label: "x",
             exec_addr: "a",
             ssh_addr: None,
+            atop_log: None,
             created_secs: 0,
             uptime_secs: 0,
             stale,
@@ -1494,13 +1497,24 @@ mod tests {
     }
 
     // An entry written before `atop_log` existed still loads: `load_all_in` skips what it
-    // cannot parse, so a required field would drop a live VM out of the registry.
+    // cannot parse, so a required field would drop a live VM out of the registry. The view
+    // then reports the recording as an explicit `null`.
     #[test]
     fn vm_entry_loads_without_atop_log() {
         let json =
             r#"{"state_dir":"/state/x","pid":1,"label":"x","exec_addr":"a","created_secs":0}"#;
         let e: VmEntry = serde_json::from_str(json).unwrap();
         assert!(e.atop_log.is_none());
+        let json = serde_json::to_value(view(&e, None, Freshness::Unknown, false)).unwrap();
+        assert_eq!(json.get("atop_log"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn list_view_reports_the_atop_log_path() {
+        let mut e = entry(PathBuf::from("/state/app"), None);
+        e.atop_log = Some(PathBuf::from("/state/app/atop/atop.log"));
+        let json = serde_json::to_value(view(&e, None, Freshness::Unknown, false)).unwrap();
+        assert_eq!(json["atop_log"], "/state/app/atop/atop.log");
     }
 
     // An entry written before `build_contexts` existed has to keep loading: `load_all_in` skips
