@@ -47,7 +47,7 @@
         # cannot read `..` outside its own dir in pure eval — so with the flake under
         # .devcontainer/nix/ the channel is inline. Moving flake.nix to the repo root would
         # let it be single-sourced from rust-toolchain.toml.
-        rustToolchain = pkgs.rust-bin.stable."1.98.0".default.override {
+        rustToolchain = pkgs.rust-bin.stable."1.98.1".default.override {
           extensions = [ "clippy" "rustfmt" ];
           targets = [ muslTarget ];
         };
