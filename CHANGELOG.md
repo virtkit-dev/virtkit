@@ -17,6 +17,10 @@ All notable changes to virtkit will be documented in this file.
   output. Filter by severity or source, read a compose sibling's console, or follow new
   lines live. Logs remain readable after the VM exits.
 - Boot failure reports show agent and kernel problems before the last twenty console lines.
+- `vk list PID` selects a VM by pid, the way `vk stop` does. A selector that matches nothing
+  now names the pid or directory it looked for instead of saying only that nothing is
+  running, and `vk list`, `vk stop` and `vk reboot` refuse an empty argument rather than
+  taking it for every VM.
 
 ### Changed
 

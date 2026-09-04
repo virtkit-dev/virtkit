@@ -1,8 +1,8 @@
 //! Host-side registry of running vk VMs.
 //!
 //! A `vk run --state-dir DIR` records an entry after spawning its VMM and removes it on exit.
-//! `vk list` discovers running VMs from these entries, and `vk stop` selects one by directory or
-//! displayed pid without searching the process table. Only pinned (`--state-dir`) runs are
+//! `vk list` discovers running VMs from these entries; it, `vk stop` and `vk reboot` select one
+//! by directory or displayed pid without searching the process table. Only pinned (`--state-dir`) runs are
 //! tracked: they expose a stable exec socket for external tooling and hold an advisory `flock`
 //! on the state dir as a pid-reuse-proof liveness signal. Ephemeral runs have a temporary state
 //! dir and no attachable socket, so they are deliberately not recorded.
@@ -862,23 +862,23 @@ fn fields_report(views: &[serde_json::Value], fields: &[String], json: bool) -> 
     Ok(out)
 }
 
-/// `vk list`: the running VMs (optionally only those under `filter`) as a table, or JSON. With
-/// `stale`, each VM's freshness is computed (network I/O — see `freshness_all`) and shown.
-/// With `fields`, only those fields of each VM (see `fields_report`). The table folds
+/// `vk list`: the running VMs (optionally only those `target` selects) as a table, or JSON.
+/// With `stale`, each VM's freshness is computed (network I/O — see `freshness_all`) and
+/// shown. With `fields`, only those fields of each VM (see `fields_report`). The table folds
 /// `$HOME` to `~`, names at most `SERVICES_SHOWN` services and leaves out EXEC ADDRESS
 /// unless `wide`; `--json` and `--field` are unaffected.
 pub fn list_report(
-    filter: Option<&Path>,
+    target: Option<Selector>,
     json: bool,
     stale: bool,
     fields: &[String],
     wide: bool,
 ) -> Result<String> {
     check_fields(fields)?;
+    let target = target.map(Selector::resolved);
     let mut vms = running();
-    if let Some(f) = filter {
-        let f = canonical(f);
-        vms.retain(|e| matches_dir(e, &f));
+    if let Some(sel) = &target {
+        vms.retain(|e| sel.matches(e));
     }
     let fresh: Vec<Freshness> = vms
         .iter()
@@ -913,7 +913,11 @@ pub fn list_report(
         return Ok(serde_json::to_string_pretty(&views).context("serializing VM list")? + "\n");
     }
     if vms.is_empty() {
-        return Ok("no running vk VMs\n".to_string());
+        // Name the unmatched target when one was given.
+        return Ok(match &target {
+            Some(sel) => sel.not_found(),
+            None => "no running vk VMs\n".to_string(),
+        });
     }
     // `tilde` matches against a canonical `project_dir`, so canonicalize `$HOME` as well;
     // only the narrow table folds it.
@@ -1052,7 +1056,8 @@ fn empty_selection_ok(explicit_target: bool) -> bool {
     !explicit_target
 }
 
-/// A `vk stop TARGET`: either the pid shown by `vk list` or a project directory.
+/// A `vk list`/`vk stop`/`vk reboot` TARGET: either the pid shown by `vk list` or a project
+/// directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selector {
     Pid(u32),
@@ -1068,7 +1073,8 @@ impl Selector {
     /// paths.
     pub fn parse(arg: &OsStr) -> Result<Self> {
         if arg.is_empty() {
-            bail!("no VM named — pass a pid, a project directory, or --all");
+            // Omit `--all`: this parser also serves `vk list`, which has no such flag.
+            bail!("empty target — pass a pid or a project directory");
         }
         if arg.as_bytes().iter().all(u8::is_ascii_digit)
             && let Some(pid) = arg.to_str().and_then(|s| s.parse::<u32>().ok())
@@ -1517,7 +1523,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_target_parses_digits_as_a_pid() {
+    fn a_target_parses_digits_as_a_pid() {
         // Digits that fit u32 select the pid shown by `vk list`; `./` makes a digit-only name a
         // directory.
         assert_eq!(parse("2144802"), Selector::Pid(2144802));
@@ -1539,12 +1545,14 @@ mod tests {
             Selector::parse(raw).unwrap(),
             Selector::Dir(PathBuf::from(raw))
         );
-        // Refuse an empty argument because `Path::starts_with("")` accepts every path.
-        assert!(Selector::parse(OsStr::new("")).is_err());
+        // Refuse an empty argument because `Path::starts_with("")` accepts every path. The
+        // advice names no flag, since `vk list` shares this parser and has no `--all`.
+        let empty = Selector::parse(OsStr::new("")).unwrap_err().to_string();
+        assert!(!empty.contains("--all"), "{empty}");
     }
 
     #[test]
-    fn a_stop_target_selects_by_pid_or_by_directory() {
+    fn a_target_selects_by_pid_or_by_directory() {
         let e = entry(
             PathBuf::from("/state/vm1"),
             Some(PathBuf::from("/home/vince/repo")),

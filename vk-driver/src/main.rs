@@ -1752,13 +1752,18 @@ enum Cmd {
     /// project directory (`--workspace`, then `--workdir`, then launch directory) and
     /// published ports (`listen->to`; `@service` when a compose sibling dials). The table
     /// folds `$HOME` to `~` and names at most three services; `--wide` shows every service,
-    /// the project directory in full and the exec-channel address. With DIR, only VMs whose
-    /// project is DIR or below it. Use `--json` or `--field` for scripts; neither takes
-    /// `--wide`, since both already report every field.
+    /// the project directory in full and the exec-channel address. With PID or DIR, only the
+    /// VM with that pid, or the VMs whose project is DIR or below it (or whose state dir is
+    /// DIR). Use `--json` or `--field` for scripts; neither takes `--wide`, since both
+    /// already report every field.
     #[command(display_order = 6)]
     List {
-        /// only VMs whose project directory is DIR or below it (default: all)
-        dir: Option<PathBuf>,
+        /// which VMs: a PID, or those whose project is DIR or below it (default: all)
+        ///
+        /// An all-digit argument is a pid, as the PID column prints; anything else a
+        /// directory (a digit-only name needs a `./`).
+        #[arg(value_name = "PID|DIR")]
+        target: Option<std::ffi::OsString>,
         /// the full table: every service named, the project path in full, and EXEC ADDRESS
         #[arg(short = 'w', long, conflicts_with_all = ["json", "field"])]
         wide: bool,
@@ -2550,14 +2555,18 @@ async fn cli_main() -> ExitCode {
         };
     }
     if let Cmd::List {
-        dir,
+        target,
         wide,
         json,
         field,
         stale,
     } = &cli.cmd
     {
-        return match vms::list_report(dir.as_deref(), *json, *stale, field, *wide) {
+        let target = match target.as_deref().map(vms::Selector::parse).transpose() {
+            Ok(sel) => sel,
+            Err(e) => return fail(&e, 2),
+        };
+        return match vms::list_report(target, *json, *stale, field, *wide) {
             Ok(report) => write_report(&report),
             Err(e) => fail(&e, 2),
         };
