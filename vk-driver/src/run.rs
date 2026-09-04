@@ -3581,8 +3581,27 @@ fn boot_failure(console: &Path, status: std::process::ExitStatus) -> String {
         "cloud-hypervisor"
     };
     let vmm_log = console.with_extension("vmm.log");
-    let serial = tail(console, 20);
+    // Read once for both the tail and the complaints to avoid rereading a large guest log
+    // when reporting a boot failure.
+    let console_text = read_lossy(console);
+    let serial = tail_of(&console_text, 20);
     let vmm_out = tail(&vmm_log, 20);
+    // What the agent and kernel complained about, first: a boot usually fails on one
+    // WARN/ERROR line that the last twenty lines of console may have scrolled past.
+    let (complaints, dropped) = crate::consolelog::problems(&console_text);
+    let problems = if complaints.is_empty() {
+        String::new()
+    } else {
+        let more = if dropped == 0 {
+            String::new()
+        } else {
+            format!("… and {dropped} earlier\n")
+        };
+        format!(
+            "--- agent/kernel problems ---\n{more}{}\n",
+            complaints.join("\n")
+        )
+    };
     // A silent death means the guest never brought its console up — almost always a
     // boot-medium/resource problem rather than a VMM one; say so instead of showing
     // two empty tails.
@@ -3593,7 +3612,7 @@ fn boot_failure(console: &Path, status: std::process::ExitStatus) -> String {
         ""
     };
     format!(
-        "{vmm} exited during boot ({status})\n--- serial ({}) ---\n{}\n--- vmm ({}) ---\n{}{hint}",
+        "{vmm} exited during boot ({status})\n{problems}--- serial ({}) ---\n{}\n--- vmm ({}) ---\n{}{hint}",
         console.display(),
         serial,
         vmm_log.display(),
@@ -3620,7 +3639,19 @@ pub(crate) fn parse_mem_mib(mem: &str) -> Option<u64> {
 pub(crate) const CONSOLE_LOG: &str = "console.log";
 
 fn tail(path: &Path, lines: usize) -> String {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    tail_of(&read_lossy(path), lines)
+}
+
+/// Read a log as text, or return an empty string on read failure. Replace invalid UTF-8
+/// so a non-text byte from the guest or VMM does not discard the whole tail.
+fn read_lossy(path: &Path) -> String {
+    match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
+fn tail_of(text: &str, lines: usize) -> String {
     let all: Vec<&str> = text.lines().collect();
     all[all.len().saturating_sub(lines)..].join("\n")
 }

@@ -211,6 +211,31 @@ pub fn select<'a>(
     })
 }
 
+/// The most complaints [`problems`] returns. A boot failure is spliced into an error string
+/// that reaches a CI trace; an oops or a chatty agent can produce hundreds of lines, and the
+/// tails it precedes are capped at twenty for the same reason.
+pub const MAX_PROBLEMS: usize = 20;
+
+/// Return the last [`MAX_PROBLEMS`] distinct agent WARN/ERROR lines and kernel alarms
+/// in order, with the count of earlier entries dropped. Show these before the boot failure
+/// tail so errors remain visible after they scroll past its last twenty lines.
+pub fn problems(text: &str) -> (Vec<String>, usize) {
+    let mut seen = std::collections::HashSet::new();
+    let mut kept: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut dropped = 0usize;
+    for line in select(text, &[Source::Agent, Source::Kernel], Some(Level::Warn)) {
+        if !seen.insert(line.text.clone()) {
+            continue;
+        }
+        kept.push_back(line.text);
+        if kept.len() > MAX_PROBLEMS {
+            kept.pop_front();
+            dropped += 1;
+        }
+    }
+    (kept.into(), dropped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +341,34 @@ mod tests {
                 "13:46:41 [ERROR] vk-agent init: boot config unreadable",
             ]
         );
+    }
+
+    #[test]
+    fn problems_keeps_each_complaint_once_and_in_order() {
+        let text = "13:46:40 [WARN] a\n\
+                    hello\n\
+                    [   1.000000] Kernel panic - not syncing\n\
+                    13:46:41 [ERROR] b\n";
+        let (lines, dropped) = problems(&format!("{text}{text}"));
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            lines,
+            vec![
+                "13:46:40 [WARN] a",
+                "[   1.000000] Kernel panic - not syncing",
+                "13:46:41 [ERROR] b",
+            ]
+        );
+    }
+
+    #[test]
+    fn problems_keeps_the_last_of_a_flood_and_counts_the_rest() {
+        // An oops walks the whole stack; the report it lands in must stay legible.
+        let text: String = (0..MAX_PROBLEMS + 5)
+            .map(|i| format!("13:46:40 [WARN] complaint {i}\n"))
+            .collect();
+        let (lines, dropped) = problems(&text);
+        assert_eq!((lines.len(), dropped), (MAX_PROBLEMS, 5));
+        assert_eq!(lines[0], "13:46:40 [WARN] complaint 5");
     }
 }

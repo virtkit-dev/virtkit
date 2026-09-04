@@ -16,6 +16,7 @@ All notable changes to virtkit will be documented in this file.
 - `vk logs [DIR]` shows a VM's console log, distinguishing kernel, vk-agent and guest
   output. Filter by severity or source, read a compose sibling's console, or follow new
   lines live. Logs remain readable after the VM exits.
+- Boot failure reports show agent and kernel problems before the last twenty console lines.
 
 ### Changed
 
