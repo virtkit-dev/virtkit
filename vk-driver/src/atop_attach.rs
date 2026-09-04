@@ -315,6 +315,12 @@ mod tests {
             ssh_addr: None,
             atop_log: None,
             created_secs: 0,
+            vmm: None,
+            vmm_pid: None,
+            cpus: None,
+            mem: None,
+            nested: None,
+            guest_ip: None,
             stale_recipe: None,
             services: Vec::new(),
         }

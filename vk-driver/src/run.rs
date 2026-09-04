@@ -1454,6 +1454,9 @@ async fn build_and_boot(
     // Networking: a userspace `vk switch` over vsock gives the guest egress (the agent
     // forks a tap bridged to it and takes the static address from the cmdline fragment).
     // With services it also pre-listens on their sockets and answers their aliases.
+    // The subnet fixes the gateway and the primary's eth0 address; `spawn_vm_switch` derives
+    // the same pair, so `vk list` can report the address straight from the registry.
+    let (gw, _, primary_ip) = crate::net::switch_addrs(RUN_SUBNET)?;
     let mut switch = if args.net {
         // Opt-in credential proxy: run a host-local proxy that injects the runner's
         // registry credentials, and redirect the guest's `registry.vk` (a sentinel
@@ -1507,7 +1510,6 @@ async fn build_and_boot(
     let manager = if planned.units.is_empty() {
         None
     } else {
-        let (gw, _, _) = crate::net::switch_addrs(RUN_SUBNET)?;
         Some(std::sync::Arc::new(crate::manager::Manager::new(
             kernel.to_path_buf(),
             args.cloud_hypervisor.clone(),
@@ -1997,6 +1999,12 @@ async fn build_and_boot(
                 .ssh
                 .then(|| format!("vsock-auto://{}:{SSH_VSOCK_PORT}", vsock.display())),
             created_secs: crate::vms::unix_now(),
+            vmm: Some(vmm.name().to_string()),
+            vmm_pid: Some(ch.id()),
+            cpus: Some(cpus),
+            mem: Some(mem.clone()),
+            nested: Some(nested),
+            guest_ip: args.net.then_some(primary_ip),
             stale_recipe,
             services: service_entries,
         })

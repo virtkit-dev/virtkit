@@ -6,6 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- `vk list --json` reports more about each VM: the VMM backend and its process id, the
+  cpus and memory it booted with, whether nested virtualization is on, and its eth0 address
+  on the `--net` LAN. A field is `null` when the VM was started by an older `vk`, or has no
+  such thing (no `--net`).
 - `vk list --json` reports the path of a VM's `--atop` recording as `atop_log` (`null`
   without `--atop`).
 

@@ -51,6 +51,31 @@ pub struct VmEntry {
     pub atop_log: Option<PathBuf>,
     /// Unix time (seconds) the entry was recorded — the VM's start, for an uptime column.
     pub created_secs: u64,
+    /// The VMM backend hosting the guest: `libkrun` or `cloud-hypervisor`. This and the
+    /// fields down to `guest_ip` are boot-time facts `vk run` files; each is `None` on an
+    /// entry recorded before the field existed.
+    #[serde(default)]
+    pub vmm: Option<String>,
+    /// The pid to inspect or signal when the managing `vk run` itself is unresponsive: the
+    /// libkrun boot subprocess (with `--reboot`, the keeper that relaunches the guest in
+    /// place, so the pid is stable across reboots) or the external `cloud-hypervisor` process.
+    #[serde(default)]
+    pub vmm_pid: Option<u32>,
+    /// The vCPU count the guest booted with: `--cpus`, a `--primary` service's marker, or
+    /// the run default.
+    #[serde(default)]
+    pub cpus: Option<u32>,
+    /// The memory size token handed to the VMM verbatim (`8G`, `512M`, ...), from `--mem`,
+    /// a `--primary` service's marker, or the run default. Not normalized to bytes.
+    #[serde(default)]
+    pub mem: Option<String>,
+    /// Whether the guest sees VMX/SVM (`--nested`), i.e. can run `vk` itself.
+    #[serde(default)]
+    pub nested: Option<bool>,
+    /// The primary's eth0 address on the run's `--net` LAN; `None` without `--net`. Extra
+    /// NICs (`--nics`, `x-virtkit.nics`) are not recorded.
+    #[serde(default)]
+    pub guest_ip: Option<std::net::Ipv4Addr>,
     /// Inputs to recompute the root image's build key against the working tree, so `vk list
     /// --stale` can tell whether a fresh `vk run` would rebuild it. `None` for an image boot
     /// (nothing is built from a Dockerfile, so there is no working tree to drift from).
@@ -464,15 +489,22 @@ pub(crate) fn fmt_uptime(s: u64) -> String {
 
 /// The public shape of a VM in `vk list --json`: the user-facing fields plus a computed
 /// `uptime_secs` and (with `--stale`) `stale`. Deliberately omits the internal `stale_recipe`,
-/// so the JSON stays a stable contract for scripts.
+/// so the JSON stays a stable contract for scripts. Fields an older `vk run` did not record
+/// serialize as `null`.
 #[derive(Serialize)]
 struct VmView<'a> {
     state_dir: &'a Path,
     project_dir: Option<&'a Path>,
     pid: u32,
+    vmm: Option<&'a str>,
+    vmm_pid: Option<u32>,
     label: &'a str,
     exec_addr: &'a str,
     ssh_addr: Option<&'a str>,
+    guest_ip: Option<std::net::Ipv4Addr>,
+    cpus: Option<u32>,
+    mem: Option<&'a str>,
+    nested: Option<bool>,
     atop_log: Option<&'a Path>,
     created_secs: u64,
     uptime_secs: u64,
@@ -508,9 +540,15 @@ fn view<'a>(
         state_dir: &entry.state_dir,
         project_dir: entry.project_dir.as_deref(),
         pid: entry.pid,
+        vmm: entry.vmm.as_deref(),
+        vmm_pid: entry.vmm_pid,
         label: &entry.label,
         exec_addr: &entry.exec_addr,
         ssh_addr: entry.ssh_addr.as_deref(),
+        guest_ip: entry.guest_ip,
+        cpus: entry.cpus,
+        mem: entry.mem.as_deref(),
+        nested: entry.nested,
         atop_log: entry.atop_log.as_deref(),
         created_secs: entry.created_secs,
         uptime_secs: unix_now().saturating_sub(entry.created_secs),
@@ -930,6 +968,12 @@ mod tests {
             ssh_addr: None,
             atop_log: None,
             created_secs: unix_now(),
+            vmm: None,
+            vmm_pid: None,
+            cpus: None,
+            mem: None,
+            nested: None,
+            guest_ip: None,
             stale_recipe: None,
             services: Vec::new(),
         }
@@ -1464,15 +1508,45 @@ mod tests {
     }
 
     #[test]
+    fn list_view_reports_boot_time_fields() {
+        let mut e = entry(PathBuf::from("/state/app"), None);
+        e.vmm = Some("libkrun".into());
+        e.vmm_pid = Some(4242);
+        e.cpus = Some(4);
+        e.mem = Some("8G".into());
+        e.nested = Some(true);
+        e.guest_ip = Some(std::net::Ipv4Addr::new(10, 42, 0, 2));
+        let json = serde_json::to_value(view(&e, None, Freshness::Unknown, false)).unwrap();
+        assert_eq!(json["vmm"], "libkrun");
+        assert_eq!(json["vmm_pid"], 4242);
+        assert_eq!(json["cpus"], 4);
+        assert_eq!(json["mem"], "8G");
+        assert_eq!(json["nested"], true);
+        assert_eq!(json["guest_ip"], "10.42.0.2");
+
+        // A run without `--net` has no address: an explicit null, not an absent key, so
+        // scripts can tell it from a field this `vk` never emitted.
+        let e = entry(PathBuf::from("/state/app"), None);
+        let json = serde_json::to_value(view(&e, None, Freshness::Unknown, false)).unwrap();
+        assert_eq!(json.get("guest_ip"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
     fn json_stale_field_distinguishes_absent_unknown_and_known() {
         let dir = PathBuf::from("/state/x");
         let view = |stale: Option<Option<bool>>| VmView {
             state_dir: &dir,
             project_dir: None,
             pid: 1,
+            vmm: None,
+            vmm_pid: None,
             label: "x",
             exec_addr: "a",
             ssh_addr: None,
+            guest_ip: None,
+            cpus: None,
+            mem: None,
+            nested: None,
             atop_log: None,
             created_secs: 0,
             uptime_secs: 0,
@@ -1496,17 +1570,27 @@ mod tests {
         );
     }
 
-    // An entry written before `atop_log` existed still loads: `load_all_in` skips what it
-    // cannot parse, so a required field would drop a live VM out of the registry. The view
-    // then reports the recording as an explicit `null`.
+    // An entry written before `atop_log` and the boot-time fields existed still loads:
+    // `load_all_in` skips what it cannot parse, so a required field would drop a live VM out
+    // of the registry. The view then reports each missing fact as an explicit `null`.
     #[test]
-    fn vm_entry_loads_without_atop_log() {
+    fn vm_entry_loads_without_optional_fields() {
         let json =
             r#"{"state_dir":"/state/x","pid":1,"label":"x","exec_addr":"a","created_secs":0}"#;
         let e: VmEntry = serde_json::from_str(json).unwrap();
         assert!(e.atop_log.is_none());
+        assert_eq!(e.vmm, None);
+        assert_eq!(e.vmm_pid, None);
+        assert_eq!(e.cpus, None);
+        assert_eq!(e.mem, None);
+        assert_eq!(e.nested, None);
+        assert_eq!(e.guest_ip, None);
         let json = serde_json::to_value(view(&e, None, Freshness::Unknown, false)).unwrap();
-        assert_eq!(json.get("atop_log"), Some(&serde_json::Value::Null));
+        for key in [
+            "atop_log", "vmm", "vmm_pid", "cpus", "mem", "nested", "guest_ip",
+        ] {
+            assert_eq!(json.get(key), Some(&serde_json::Value::Null), "{key}");
+        }
     }
 
     #[test]
