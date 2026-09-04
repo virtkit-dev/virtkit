@@ -3636,6 +3636,9 @@ async fn spawn_vm_switch(
     // the same numbering the guest bridges over, and the same per-MAC reservation siblings
     // get, so an image running its own DHCP client on one lands on its assigned address.
     let mut reservations = reservations.to_vec();
+    // Reserve eth0 by its attach-assigned MAC so an `--init image` guest's DHCP client
+    // receives the run-assigned address, not a pool lease. Extra NICs follow below.
+    reservations.push((crate::units::mac_for_ip(guest_ip), guest_ip.to_string()));
     for (i, extra) in primary_extra_ips.iter().enumerate() {
         let port = net_port + i as u32 + 1;
         all_listen.push((vk_core::net::hybrid_socket(vsock, port), *extra, PRIMARY_VM));

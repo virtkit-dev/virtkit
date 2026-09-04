@@ -611,14 +611,6 @@ pub fn boot_unit(
     }
     let shared_mem = !shares.is_empty();
 
-    // The sibling's deterministic MAC, derived from its run-assigned IP. Passed on
-    // the cmdline so the agent sets the tap's hardware address to it, letting the
-    // switch honor its per-MAC DHCP reservation and hand back this exact IP (== the
-    // address the resolver advertises for the sibling's name). Harmless for the
-    // static path (it sets its address directly); required for the image-init path,
-    // whose own systemd DHCPs eth0.
-    let mac = mac_for_ip(svc.addr);
-
     // How this sibling joins the switch: eth0 then its NICs after it, on `net_port` + the
     // interface index (the ports the switch bound for it), all sharing eth0's prefix — one
     // segment, one subnet.
@@ -662,7 +654,6 @@ pub fn boot_unit(
         // The switch attach: static address, the gateway as default route and resolver (its
         // DNS answers the service names and forwards the rest), and the NICs after eth0.
         cmdline.push_str(&attach.cmdline);
-        cmdline.push_str(&format!(" VIRTKIT_VM_MAC={mac}"));
         if !virtiofs.is_empty() {
             cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS={virtiofs}"));
         }

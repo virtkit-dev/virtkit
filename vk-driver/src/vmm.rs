@@ -14,6 +14,9 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use vk_core::addr::SocketAddr;
+// The deterministic MAC for a switch address (`52:54:00` + the low three octets), the
+// identity the switch's per-MAC DHCP reservations and the guest's eth0 agree on.
+use vk_core::net::mac_for_ip;
 
 /// Env var carrying the JSON `VmSpec` to a libkrun boot child. It rides the environment
 /// (not argv) so `ps aux` shows just the VM's process name; its presence also selects the
@@ -204,7 +207,9 @@ impl SwitchAttach {
 ///
 /// Each NIC gets a guest→host vsock bridge on its port: the guest agent forks a tap per
 /// NIC and carries its frames over that bridge (`VIRTKIT_NET_PORT`), then takes the static
-/// address, gateway and resolver from the tokens on the same cmdline.
+/// address, gateway and resolver from the tokens on the same cmdline. eth0's tap takes the
+/// MAC its address derives from (`VIRTKIT_VM_MAC`), so a guest that DHCPs it instead hits
+/// the switch's reservation for that address rather than drawing from the pool.
 ///
 /// `net_port + i` is unchecked: `net_port` is the host's own (`[net] net_port`, or the
 /// `vk run` constant) and the same sum already named the sockets the switch was told to
@@ -228,8 +233,9 @@ pub fn switch_attach(
         out.vsock_ports.push(VsockPort::bridge(vsock, net_port + i));
     }
     out.cmdline.push_str(&format!(
-        " VIRTKIT_NET_PORT={net_port} VIRTKIT_VM_IP={eth0}/{prefix} \
-         VIRTKIT_VM_GW={gateway} VIRTKIT_VM_DNS={gateway}"
+        " VIRTKIT_NET_PORT={net_port} VIRTKIT_VM_MAC={} VIRTKIT_VM_IP={eth0}/{prefix} \
+         VIRTKIT_VM_GW={gateway} VIRTKIT_VM_DNS={gateway}",
+        mac_for_ip(*eth0)
     ));
     if let Some(extra) = net_extra_ips_env(extra, prefix) {
         out.cmdline.push_str(&extra);
@@ -595,9 +601,9 @@ mod tests {
         );
         assert_eq!(
             a.cmdline,
-            " VIRTKIT_NET_PORT=1024 VIRTKIT_VM_IP=192.168.127.2/24 \
-             VIRTKIT_VM_GW=192.168.127.1 VIRTKIT_VM_DNS=192.168.127.1 \
-             VIRTKIT_NET_EXTRA_IPS=192.168.127.254/24"
+            " VIRTKIT_NET_PORT=1024 VIRTKIT_VM_MAC=52:54:00:a8:7f:02 \
+             VIRTKIT_VM_IP=192.168.127.2/24 VIRTKIT_VM_GW=192.168.127.1 \
+             VIRTKIT_VM_DNS=192.168.127.1 VIRTKIT_NET_EXTRA_IPS=192.168.127.254/24"
         );
     }
 

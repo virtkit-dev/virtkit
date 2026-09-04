@@ -1712,7 +1712,9 @@ fn spawn_switch(
     const JOB_VM: u32 = 0;
     let mut listen = vec![(ctx.net_vsock_sock(cfg.net.net_port), guest_ip, JOB_VM)];
     let mut hosts = Vec::new();
-    let mut reservations = Vec::new();
+    // Reserve the job VM's eth0 by its attach-assigned MAC so image-init DHCP receives the
+    // job-assigned address, not a pool lease. Services follow the same rule below.
+    let mut reservations = vec![(crate::units::mac_for_ip(guest_ip), guest_ip.to_string())];
     for (i, svc) in services.iter().enumerate() {
         let vm = JOB_VM + 1 + i as u32;
         let svc_dir = ctx.job_dir.join(format!("svc-{}", svc.name));

@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- A guest that runs its own DHCP client on eth0 now gets the address `vk` assigned it,
+  instead of whatever the LAN's pool handed out first. Compose services and a guest's
+  extra interfaces already behaved this way.
+
 ## [0.60.0] - 2026-09-04
 
 ### Added
