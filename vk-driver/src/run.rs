@@ -124,6 +124,26 @@ const PRIMARY_VM: u32 = 0;
 /// is a `vk-agent serve` on the bridged per-port socket, so guest tooling can run
 /// host commands through its allowlist wrapper. Sits next to the control port (1099).
 const HOST_EXEC_PORT: u32 = 1100;
+/// First vsock port of the `socket` volumes: the i-th one is bridged on `+ i`, each dialed by
+/// the guest agent's forwarder for that guest path and spliced host-side to the host socket
+/// by `spawn_socket_forward`. Sits above the NIC range (1024 + up to 8) and the control and
+/// host-exec ports, and [`MAX_SOCKET_VOLUMES`] keeps it below ssh (2222).
+pub(crate) const SOCKET_VOLUME_PORT_BASE: u32 = 1300;
+/// The most `socket` volumes one guest may declare. A ceiling at all because the ports run
+/// upward from [`SOCKET_VOLUME_PORT_BASE`] and would eventually reach the ssh (2222) and
+/// exec (4444) ports; this high because nothing here has wanted a fraction of it, and a
+/// compose file that asks for more should be told the limit rather than boot a guest whose
+/// ssh channel is somebody's docker socket.
+pub(crate) const MAX_SOCKET_VOLUMES: usize = 64;
+
+/// The vsock port bridging the `n`-th `socket` volume of one guest, refusing a guest that
+/// declared more than [`MAX_SOCKET_VOLUMES`]. `guest` names the volume in the error.
+pub(crate) fn socket_volume_port(n: usize, guest: &str) -> Result<u32> {
+    if n >= MAX_SOCKET_VOLUMES {
+        bail!("socket volume {guest}: at most {MAX_SOCKET_VOLUMES} socket volumes per guest");
+    }
+    Ok(SOCKET_VOLUME_PORT_BASE + n as u32)
+}
 /// The run LAN: gateway .1, the run VM .2, services from the top down.
 const RUN_SUBNET: &str = "192.168.127.0/24";
 
@@ -1553,7 +1573,8 @@ async fn build_and_boot(
     // host. The command then runs with its cwd there (see `drive`). virtio-fs needs shared
     // guest memory, so `mem` gains `shared=on`.
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
-    let mut virtiofsds: Vec<Child> = Vec::new();
+    // Host-side helpers killed by `teardown_run`: virtiofsd and socket forwarders.
+    let mut aux_children: Vec<Child> = Vec::new();
     let mut virtiofs = String::new();
     if let Some(host_dir) = &args.workdir {
         // Validate workdirs like directory volume sources: the guest mounts a tree, not one file.
@@ -1565,7 +1586,7 @@ async fn build_and_boot(
         // libkrun mounts host_dir directly (built-in virtio-fs); only cloud-hypervisor
         // needs the external virtiofsd on `sock`.
         if !crate::vmm::libkrun_selected() {
-            virtiofsds.push(crate::spawn::spawn_virtiofsd(
+            aux_children.push(crate::spawn::spawn_virtiofsd(
                 &sock,
                 host_dir,
                 false,
@@ -1601,8 +1622,30 @@ async fn build_and_boot(
     // first use), named to the guest over the cmdline — see [`crate::units`]'s identical
     // handling for a compose sibling's own `disk` volumes.
     let mut disk_devices = String::new();
+    // Give each socket volume a bridged vsock port and a tied host-side forwarder.
+    let mut socket_specs: Vec<String> = Vec::new();
+    let mut socket_ports: Vec<u32> = Vec::new();
+    let mut socket_guests: Vec<PathBuf> = Vec::new();
     for (i, vol) in primary_volumes.iter().chain(&args.volumes).enumerate() {
         crate::compose::require_share_source(vol)?;
+        if vol.socket {
+            // Reject a second forwarder whose bind would orphan the first socket inode.
+            let guest = crate::compose::normalized_guest(&vol.guest);
+            if socket_guests.contains(&guest) {
+                bail!("socket volume {}: declared twice", vol.guest);
+            }
+            let port = socket_volume_port(socket_ports.len(), &vol.guest)?;
+            aux_children.push(crate::spawn::spawn_socket_forward(
+                &vsock,
+                port,
+                &vol.host,
+                &work.join(format!("socket-fwd-{port}.log")),
+            )?);
+            socket_specs.push(format!("{}:{port}", vol.guest));
+            socket_ports.push(port);
+            socket_guests.push(guest);
+            continue;
+        }
         // A persistent overlay's backing is auto-managed under the compose file's directory,
         // keyed by service — settled only for a compose service's volumes (the primary's
         // included). An ad-hoc `-v` bind has no such anchor, so persist there is refused rather
@@ -1634,7 +1677,7 @@ async fn build_and_boot(
         // process). Single-file binds work on both: the single-file fs runs in-process under
         // libkrun and inside `vk virtiofsd` over vhost-user under cloud-hypervisor.
         if !crate::vmm::libkrun_selected() {
-            virtiofsds.push(crate::spawn::spawn_virtiofsd(
+            aux_children.push(crate::spawn::spawn_virtiofsd(
                 &sock,
                 &vol.host,
                 vol.read_only,
@@ -1731,7 +1774,7 @@ async fn build_and_boot(
             _atop_lock = held;
             let sock = work.join("atop.fs.sock");
             if !crate::vmm::libkrun_selected() {
-                virtiofsds.push(crate::spawn::spawn_virtiofsd(
+                aux_children.push(crate::spawn::spawn_virtiofsd(
                     &sock,
                     &dir,
                     false,
@@ -1786,6 +1829,9 @@ async fn build_and_boot(
     if !symlink_specs.is_empty() {
         cmdline.push_str(&format!(" VIRTKIT_SYMLINKS={}", symlink_specs.join(",")));
     }
+    if !socket_specs.is_empty() {
+        cmdline.push_str(&format!(" VIRTKIT_SOCKETS={}", socket_specs.join(",")));
+    }
     let shared_mem = !shares.is_empty();
 
     // 3. boot
@@ -1799,6 +1845,10 @@ async fn build_and_boot(
     let nics = net_attach
         .map(|attach| attach.apply(&mut vsock_ports))
         .unwrap_or_default();
+    // Bridge each guest forwarder to its host-side `vk forward`.
+    for port in &socket_ports {
+        vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, *port));
+    }
     if ssh.is_some() {
         vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, SSH_AGENT_VSOCK_PORT));
     }
@@ -1891,7 +1941,7 @@ async fn build_and_boot(
 
     let mut ch = match spawn_vmm(vmm.as_ref(), &spec, crate::prio::Prio::Normal) {
         Ok(ch) => ch,
-        // The --net switch and the virtiofsds (--workdir plus any --primary compose
+        // The --net switch and the aux children (--workdir plus any --primary compose
         // volumes) are already spawned; kill them so a failed boot does not leak
         // host-side children (a leaked `vk virtiofsd` would, e.g., hold this binary's
         // file busy for the next build).
@@ -1899,7 +1949,7 @@ async fn build_and_boot(
             if let Some(mgr) = &manager {
                 mgr.stop_all();
             }
-            for mut child in virtiofsds.drain(..).chain(switch.take()) {
+            for mut child in aux_children.drain(..).chain(switch.take()) {
                 let _ = child.kill();
                 let _ = child.wait();
             }
@@ -2038,7 +2088,7 @@ async fn build_and_boot(
                     &mut ch,
                     persistent.then_some(&addr),
                     &manager,
-                    &mut virtiofsds,
+                    &mut aux_children,
                     &mut switch,
                     &mut ssh_forward,
                     &mut host_exec_serve,
@@ -2071,7 +2121,7 @@ async fn build_and_boot(
                 &mut ch,
                 persistent.then_some(&addr),
                 &manager,
-                &mut virtiofsds,
+                &mut aux_children,
                 &mut switch,
                 &mut ssh_forward,
                 &mut host_exec_serve,
@@ -2093,7 +2143,7 @@ async fn build_and_boot(
                     &mut ch,
                     persistent.then_some(&addr),
                     &manager,
-                    &mut virtiofsds,
+                    &mut aux_children,
                     &mut switch,
                     &mut ssh_forward,
                     &mut host_exec_serve,
@@ -2135,7 +2185,7 @@ async fn build_and_boot(
         &mut ch,
         persistent.then_some(&addr),
         &manager,
-        &mut virtiofsds,
+        &mut aux_children,
         &mut switch,
         &mut ssh_forward,
         &mut host_exec_serve,
@@ -2168,7 +2218,7 @@ async fn build_and_boot(
 }
 
 /// Tear down every host-side child a run spawned — the VMM, the service manager, the
-/// --net switch and virtiofsds, and the ssh-agent / host-exec forwards.
+/// --net switch and the aux children, and the ssh-agent / host-exec forwards.
 /// Used on both a clean exit and any error after the VMM is live, so a failed run leaks no
 /// children (a leaked `vk virtiofsd` would hold this binary's file busy for the next build).
 ///
@@ -2179,7 +2229,7 @@ fn teardown_run(
     ch: &mut Child,
     guest: Option<&SocketAddr>,
     manager: &Option<std::sync::Arc<crate::manager::Manager>>,
-    virtiofsds: &mut Vec<Child>,
+    aux_children: &mut Vec<Child>,
     switch: &mut Option<Child>,
     ssh_forward: &mut Option<Child>,
     host_exec_serve: &mut Option<Child>,
@@ -2206,7 +2256,7 @@ fn teardown_run(
     }
     let _ = ch.kill();
     let _ = ch.wait();
-    for mut child in virtiofsds.drain(..) {
+    for mut child in aux_children.drain(..) {
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -4749,6 +4799,22 @@ mod tests {
         // no primary (a bare `vk run`, or compose up): one NIC unless the flag says more
         assert_eq!(effective_nics(None, &units, None), 1);
         assert_eq!(effective_nics(Some(2), &units, None), 2);
+    }
+
+    #[test]
+    fn socket_volume_ports_run_up_from_the_base_and_stop_at_the_cap() {
+        // The agent specification and VMM bridge share this port calculation.
+        assert_eq!(socket_volume_port(0, "/g.sock").unwrap(), 1300);
+        assert_eq!(socket_volume_port(1, "/g.sock").unwrap(), 1301);
+        assert_eq!(
+            socket_volume_port(MAX_SOCKET_VOLUMES - 1, "/g.sock").unwrap(),
+            SOCKET_VOLUME_PORT_BASE + MAX_SOCKET_VOLUMES as u32 - 1
+        );
+        // The capped range ends below SSH (2222).
+        assert!(SOCKET_VOLUME_PORT_BASE + MAX_SOCKET_VOLUMES as u32 <= SSH_VSOCK_PORT);
+        // Reject indices beyond the cap.
+        let err = socket_volume_port(MAX_SOCKET_VOLUMES, "/g.sock").unwrap_err();
+        assert!(format!("{err:#}").contains("at most"), "{err:#}");
     }
 
     #[test]

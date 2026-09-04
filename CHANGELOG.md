@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Volume mode `:socket` forwards a host unix socket to the guest path for `-v` and compose
+  `volumes:`. It is implied when the host path is a socket, and `,optional` skips an absent
+  socket. Only bytes cross, so the guest never learns the host path, but it receives every
+  capability the socket grants. A forwarded Docker socket is host-root-equivalent.
+
 ### Changed
 
 - Under libkrun, `--net` interfaces now come from the VMM instead of an in-guest relay.

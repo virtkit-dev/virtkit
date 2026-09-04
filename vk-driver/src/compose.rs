@@ -121,7 +121,8 @@ pub enum Source {
     },
 }
 
-/// A bind mount (`host:guest[:(ro|rw|overlay[,persist])[,optional]|:disk[,size=SIZE]]`).
+/// A bind mount
+/// (`host:guest[:(ro|rw|overlay[,persist]|socket)[,optional]|:disk[,size=SIZE]]`).
 /// Named volumes are not supported.
 #[derive(Debug, Clone)]
 pub struct Volume {
@@ -154,6 +155,10 @@ pub struct Volume {
     /// (the file does not exist yet); an existing file is trusted as-is, whatever a previous
     /// boot left in it. Mutually exclusive with `overlay`/`is_file`.
     pub disk: bool,
+    /// Forward the host unix socket rather than sharing it. The guest listens at `guest` and
+    /// relays each connection over vsock to `host`; only bytes cross. Explicit `:socket` and
+    /// an automatically detected socket source are equivalent. Excludes every other mode.
+    pub socket: bool,
     /// Formatted capacity for a freshly created `disk` volume or `overlay,persist` upper, from
     /// its `size=` suffix. Ignored once the backing file already exists — its own capacity
     /// applies, since this ext4 writer has no resize. `None` uses a generous built-in default.
@@ -949,7 +954,21 @@ fn map_build(build: serde_yaml_ng::Value, base: &Path) -> Result<Source> {
     })
 }
 
-/// Parse a bind mount: `host:guest[:(ro|rw|overlay[,persist])[,optional]|:disk[,size=SIZE]]`.
+/// A guest path with its `.` and redundant separators collapsed, for comparing two of them.
+/// The guest filesystem cannot be canonicalized from the host; this handles plausible
+/// compose spellings, not adversarial `..` components.
+pub fn normalized_guest(path: &str) -> PathBuf {
+    Path::new(path).components().collect()
+}
+
+/// Whether a value fits in a comma-joined, whitespace-delimited kernel-cmdline field.
+/// Callers validate ':' according to their field format.
+fn cmdline_safe(s: &str) -> bool {
+    !s.contains(',') && !s.contains(char::is_whitespace)
+}
+
+/// Parse a bind mount:
+/// `host:guest[:(ro|rw|overlay[,persist]|socket)[,optional]|:disk[,size=SIZE]]`.
 /// Named volumes are rejected because vk has no volume manager. `Ok(None)` means an
 /// `optional` bind's source is absent. `run -v/--volume` uses the same syntax, resolved
 /// from the caller's cwd rather than the compose file's directory. `size=` also sizes an
@@ -961,7 +980,7 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Option<Volume>> {
         [h, g, m] => (*h, *g, *m),
         _ => bail!(
             "bad volume {spec:?} \
-             (want host:guest[:(ro|rw|overlay[,persist])[,optional]|:disk[,size=SIZE]])"
+             (want host:guest[:(ro|rw|overlay[,persist]|socket)[,optional]|:disk[,size=SIZE]])"
         ),
     };
     if !(host.starts_with('/') || host.starts_with('.') || host.starts_with('~')) {
@@ -974,18 +993,19 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Option<Volume>> {
     // `docker run --mount`'s style for the one case (disk's `size=`) where a bare flag isn't
     // enough. `overlay` exports the share read-only and mounts it as an overlayfs lower layer
     // guest-side (writes go to a guest tmpfs, never back to the host tree). `disk` skips
-    // virtiofs entirely — see [`Volume::disk`].
+    // virtiofs entirely — see [`Volume::disk`]; so does `socket` — see [`Volume::socket`].
     let mut mode_parts = mode_field.split(',');
     let mode = mode_parts.next().unwrap_or("rw");
-    let (read_only, overlay, disk) = match mode {
-        "ro" => (true, false, false),
-        "rw" => (false, false, false),
-        "overlay" => (true, true, false),
+    let (read_only, overlay, disk, mut socket) = match mode {
+        "ro" => (true, false, false, false),
+        "rw" => (false, false, false, false),
+        "overlay" => (true, true, false, false),
         // No `disk,ro` yet — a disk volume is always attached read-write.
-        "disk" => (false, false, true),
+        "disk" => (false, false, true, false),
+        "socket" => (false, false, false, true),
         other => bail!(
-            "volume {spec:?}: unsupported mode {other:?} (want ro, rw, overlay or disk; \
-             an option follows the mode, as in rw,optional)"
+            "volume {spec:?}: unsupported mode {other:?} (want ro, rw, overlay, disk or \
+             socket; an option follows the mode, as in rw,optional)"
         ),
     };
     let mut disk_size_mib = None;
@@ -1057,6 +1077,35 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Option<Volume>> {
             Err(e) => bail!("volume {spec:?}: cannot stat {}: {e}", host.display()),
         }
     }
+    // A host socket cannot be mounted or meaningfully shared, so a bare socket source implies
+    // `:socket`. Reject explicit incompatible modes instead of attempting a share.
+    use std::os::unix::fs::FileTypeExt;
+    let is_socket = meta.as_ref().is_ok_and(|m| m.file_type().is_socket());
+    if is_socket && !socket {
+        // `rw` denotes a bare `host:guest` here; every other mode was explicit. `optional`
+        // is orthogonal and has already been removed from `mode`.
+        if mode == "rw" {
+            socket = true;
+        } else {
+            bail!(
+                "volume {spec:?}: the host path is a unix socket, which is forwarded, not \
+                 shared — use mode `socket` (it takes no ro/overlay/disk)"
+            );
+        }
+    }
+    if socket {
+        if meta.as_ref().is_ok_and(|m| !m.file_type().is_socket()) {
+            bail!("volume {spec:?}: socket mode needs a unix socket as its host path");
+        }
+        // The guest path occupies one `guest:port` cmdline entry and cannot contain its
+        // separators. The three-way split above already rejects ':'.
+        if !cmdline_safe(guest) || guest.contains(':') {
+            bail!(
+                "volume {spec:?}: a socket volume's guest path may not contain ',', ':' or \
+                 whitespace"
+            );
+        }
+    }
     // A single-file bind when the source resolves to a regular file (a missing/dir source
     // stays a directory share, the prior behavior). A disk volume's host path is its own
     // backing file, not a single-file bind — never virtiofs-shared, so this stays false even
@@ -1076,6 +1125,7 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Option<Volume>> {
         persist,
         is_file,
         disk,
+        socket,
         disk_size_mib,
         // Anchored on the compose file and keyed by service name, so it can only be settled
         // once the owning service is known — [`map_service`] fills it in.
@@ -1458,7 +1508,26 @@ pub fn require_share_source(vol: &Volume) -> Result<()> {
         return Ok(());
     }
     let at = || format!("volume {}:{}", vol.host.display(), vol.guest);
-    let is_file = require_shareable(&vol.host).with_context(at)?;
+    if vol.socket {
+        // This boot-time stat catches misconfiguration. `vk forward --to` resolves the path
+        // per connection, so later removal or replacement is observed on the next dial.
+        use std::os::unix::fs::FileTypeExt;
+        return match std::fs::metadata(&vol.host) {
+            Ok(m) if m.file_type().is_socket() => Ok(()),
+            Ok(_) => bail!("{}: the host path is not a unix socket", at()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                bail!("{}: the host socket does not exist", at())
+            }
+            Err(e) => bail!("{}: cannot stat the host socket: {e}", at()),
+        };
+    }
+    let is_file =
+        require_shareable(&vol.host).with_context(|| match std::fs::metadata(&vol.host) {
+            Ok(m) if std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()) => {
+                format!("{} (a unix socket: use mode `socket`)", at())
+            }
+            _ => at(),
+        })?;
     // Parsing records the source shape while it may not exist. Reject later changes because
     // files and directories use different share servers.
     if is_file != vol.is_file {
@@ -1478,12 +1547,7 @@ pub fn require_share_source(vol: &Volume) -> Result<()> {
 /// paths containing them are rejected rather than silently corrupting the format.
 pub fn parse_symlink(spec: &str) -> Result<(String, String)> {
     match spec.split_once(':') {
-        Some((src, dst))
-            if src.starts_with('/')
-                && dst.starts_with('/')
-                && !spec.contains(',')
-                && !spec.chars().any(char::is_whitespace) =>
-        {
+        Some((src, dst)) if src.starts_with('/') && dst.starts_with('/') && cmdline_safe(spec) => {
             Ok((src.to_string(), dst.to_string()))
         }
         _ => bail!(
@@ -2074,6 +2138,7 @@ mod tests {
             persist: true,
             is_file: false,
             disk: false,
+            socket: false,
             disk_size_mib: Some(32),
             persist_backing: Some(backing.clone()),
         };
@@ -2434,6 +2499,71 @@ mod tests {
         assert!(ov.read_only && ov.overlay && !ov.persist);
         let bad = parse_volume("/src:/dst:rox", Path::new("/b")).unwrap_err();
         assert!(format!("{bad:#}").contains("unsupported mode"), "{bad:#}");
+    }
+
+    /// Create a per-test unix socket directory so these tests can run concurrently.
+    fn socket_dir(name: &str) -> (PathBuf, PathBuf, std::os::unix::net::UnixListener) {
+        let dir = std::env::temp_dir().join(format!("vk-sockvol-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("d.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        (dir, sock, listener)
+    }
+
+    #[test]
+    fn volume_socket_mode_explicit_and_detected() {
+        let (dir, sock, _listener) = socket_dir("detect");
+        let spec = format!("{}:/var/run/docker.sock", sock.display());
+
+        // A bare socket source implies a socket forward.
+        let detected = parse_volume(&spec, Path::new("/b")).unwrap();
+        assert!(detected.socket && !detected.is_file && !detected.disk && !detected.read_only);
+        // Explicit mode permits a missing source, which is checked at boot.
+        let explicit = parse_volume(&format!("{spec}:socket"), Path::new("/b")).unwrap();
+        assert!(explicit.socket);
+        let later = parse_volume("/not/yet.sock:/g.sock:socket", Path::new("/b")).unwrap();
+        assert!(later.socket);
+        assert!(require_share_source(&later).is_err());
+        assert!(require_share_source(&explicit).is_ok());
+        // `optional` skips an absent socket like an absent bind source.
+        assert!(
+            super::parse_volume("/gone.sock:/g.sock:socket,optional", Path::new("/b"))
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn volume_socket_mode_rejects_what_cannot_be_forwarded() {
+        let (dir, sock, _listener) = socket_dir("reject");
+        let spec = format!("{}:/var/run/docker.sock", sock.display());
+
+        // A socket cannot be shared read-only, overlaid or attached as a disk.
+        for mode in ["ro", "overlay", "disk"] {
+            let err = parse_volume(&format!("{spec}:{mode}"), Path::new("/b")).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("unix socket"),
+                "{mode}: {err:#}"
+            );
+        }
+        // Nor can socket mode name a directory, or a guest path the cmdline cannot carry.
+        let err = parse_volume(
+            &format!("{}:/g.sock:socket", dir.display()),
+            Path::new("/b"),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("needs a unix socket"),
+            "{err:#}"
+        );
+        let err = parse_volume("/x.sock:/a,b.sock:socket", Path::new("/b")).unwrap_err();
+        assert!(format!("{err:#}").contains("may not contain"), "{err:#}");
+        // A read-write directory remains a share.
+        let plain = parse_volume(&format!("{}:/g", dir.display()), Path::new("/b")).unwrap();
+        assert!(!plain.socket);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

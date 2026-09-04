@@ -1554,14 +1554,17 @@ enum Cmd {
         /// (arbitrary chown, device nodes, sockets) and content that survives across boots,
         /// for state a service needs to own outright; the file is created and formatted the
         /// first time it is used (`size=` capacity, default 64G; only written blocks cost
-        /// host disk). A share (not a disk) may add `,optional` to skip an absent source
-        /// instead of failing the boot. `overlay,persist` (an overlay whose writes are kept
-        /// on disk) and `x-virtkit.persist_root` belong to compose services, which have a
-        /// file to keep that state beside — see --compose.
+        /// host disk). `:socket` forwards a host unix socket (`/var/run/docker.sock`) to
+        /// the guest path — implied when HOST is one, and it hands the guest whatever that
+        /// socket grants (a Docker socket is host-root-equivalent). A share (not a disk)
+        /// may add `,optional` to skip an absent source instead of failing the boot.
+        /// `overlay,persist` (an overlay whose writes are kept on disk) and
+        /// `x-virtkit.persist_root` belong to compose services, which have a file to keep
+        /// that state beside — see --compose.
         #[arg(
             short = 'v',
             long = "volume",
-            value_name = "HOST:GUEST[:(ro|rw|overlay)[,optional]|:disk[,size=SIZE]]",
+            value_name = "HOST:GUEST[:(ro|rw|overlay|socket)[,optional]|:disk[,size=SIZE]]",
             help_heading = "Mounts and disks"
         )]
         volume: Vec<String>,

@@ -243,13 +243,18 @@ throwaway layer over the image, and `volumes:` bind host paths into the guest. A
 | `overlay` | the host tree, read-only underneath | to guest RAM — fast, gone at reboot |
 | `overlay,persist[,size=SIZE]` | the host tree, read-only underneath | to a disk kept next to the compose file |
 | `disk[,size=SIZE]` | a private filesystem of its own | to that disk; the host path is its image |
+| `socket` | a unix socket at the guest path | each connection is relayed to the host socket |
 
 `overlay` is for build trees and checkouts: reads come from the host, every write lands
 in guest memory and never touches the host tree. Add `persist` to keep those writes on
 disk instead. `disk` is for data that needs real filesystem semantics (ownership, sockets,
-device nodes) a shared directory cannot offer — a database's data directory, say. Shares
-take `,optional` to skip a bind whose source is absent; `size=` (`10G`, `512M`) sets a new
-disk's capacity and is ignored once it exists.
+device nodes) a shared directory cannot offer — a database's data directory, say. `socket`
+forwards a host service's unix socket and is implied when the host path is one — for
+example, `/var/run/docker.sock:/var/run/docker.sock` lets the guest drive the host's Docker.
+Only bytes cross over vsock, so the guest never learns the host path, but it receives
+everything the socket grants: a Docker socket is host-root-equivalent, so grant it
+deliberately. Shares take `,optional` to skip a bind whose source is absent; `size=` (`10G`,
+`512M`) sets a new disk's capacity and is ignored once it exists.
 
 Set `persist_root` when the whole root must persist — an appliance whose state is not
 confined to a few directories:

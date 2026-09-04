@@ -42,6 +42,9 @@
 //!                        it. Unlike a virtiofs share, this is a real block device: full POSIX
 //!                        semantics (arbitrary chown, mknod, sockets), and content that
 //!                        persists in the backing file across boots
+//!   VIRTKIT_SOCKETS      path:port[,path:port] — present each `socket` volume at its guest
+//!                        path and relay connections over vsock to the host socket. Only
+//!                        bytes cross; the host path never enters the guest
 //!   VIRTKIT_SYMLINKS     src:dest[,src:dest] — after virtiofs mounts, create each
 //!                        `dest` as a symlink pointing to `src`. Entries where `src`
 //!                        does not exist are silently skipped.
@@ -179,6 +182,8 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     configure_network(&cmdline);
     write_resolv_conf(&cmdline); // DNS for every net mode (kernel `ip=` pool + static bridge)
     apply_tmpfs(&cmdline); // RAM scratch dirs (e.g. CI /builds) before the payload starts
+    // Start `socket` volumes before the mode split so an entrypoint can use one immediately.
+    maybe_socket_volumes(&cmdline);
     // orphans reparent to PID 1 (this process): reap them.
     set_child_subreaper();
 
@@ -321,13 +326,12 @@ fn run_full_vm(
     apply_symlinks(cmdline);
     configure_network_fullvm(cmdline);
 
-    // The vsock services the run exposes, forked before the exec so they reparent to
-    // systemd and keep serving: ssh-serve (`--ssh`), the host-agent forwarder
-    // (`--ssh-agent`), the compose control fs at /run/vk/services (`--compose`), and the
-    // exec channel that carries `-- <cmd>`. All but the last are gated on their cmdline
-    // params.
+    // Fork vsock services before exec so they reparent to systemd and keep serving:
+    // ssh-serve, host-agent and socket forwarders, the compose control fs, and exec.
+    // Each optional service is gated on its cmdline parameter.
     maybe_ssh_serve(cmdline);
     maybe_ssh_agent(cmdline);
+    maybe_socket_volumes(cmdline);
     maybe_ctlfs(cmdline);
     let _serve = spawn_serve(socket, None)?;
 
@@ -2069,8 +2073,12 @@ const RUN_TMPFS_DATA: &str = "mode=0755,size=20%,nr_inodes=800k";
 ///
 /// The default path needs none of this: `mount_api_filesystems` already put /run on a
 /// tmpfs and no image init follows it.
+///
+/// Both the compose control fs and `socket` volumes under /run require this claim. The
+/// warning therefore refers to anything this boot placed there.
 fn claim_run_tmpfs(cmdline: &HashMap<String, String>) {
-    if !ctl_enabled(cmdline) {
+    // An image init that replaces /run would hide a socket bound there before exec.
+    if !ctl_enabled(cmdline) && !socket_volume_under_run(cmdline) {
         return;
     }
     // As `mount_api_filesystems` does: an image that ships no /run (FROM scratch) has
@@ -2080,8 +2088,8 @@ fn claim_run_tmpfs(cmdline: &HashMap<String, String>) {
         // Mount the control fs anyway: an image whose init leaves /run alone still gets a
         // working one, and one that does not is no worse off than before.
         warn!(
-            "vk-agent image-init: mounting /run failed: {e} — the control fs may not \
-             survive the image's own init"
+            "vk-agent image-init: mounting /run failed: {e} — what this boot puts \
+             under /run may not survive the image's own init"
         );
     }
 }
@@ -2096,18 +2104,125 @@ const HOST_EXEC_SOCK: &str = "/run/vk/host.sock";
 /// a non-root run user is given, the socket is chowned to it so a job stage running
 /// as that user can reach the host channel (`vk-agent -s /run/vk/host.sock exec …`).
 fn host_exec_forward_args(port: &str, run_user: Option<&str>) -> Vec<String> {
+    unix_forward_args(HOST_EXEC_SOCK, port, run_user)
+}
+
+/// Build argv for the common SSH-agent, host-exec and `socket`-volume forwarder. It listens
+/// on `listen`, relays over vsock `port`, and chowns the socket to a non-root run user.
+fn unix_forward_args(listen: &str, port: &str, run_user: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "--socket".into(),
         format!("vsock://{port}"),
         "forward".into(),
         "--listen".into(),
-        HOST_EXEC_SOCK.into(),
+        listen.into(),
     ];
     if let Some(user) = run_user {
         args.push("--chown".into());
         args.push(user.into());
     }
     args
+}
+
+/// Parse `VIRTKIT_SOCKETS=path:port[,…]` into guest paths and vsock ports. The driver
+/// excludes ':' from guest paths, so splitting at the last one is exact. Ignore blanks;
+/// warn and skip malformed entries without failing the boot.
+fn socket_volume_specs(raw: &str) -> Vec<(String, u32)> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .filter_map(|e| match e.rsplit_once(':') {
+            Some((path, port)) if path.starts_with('/') => match port.parse::<u32>() {
+                Ok(port) => Some((path.to_string(), port)),
+                Err(err) => {
+                    warn!("vk-agent init: VIRTKIT_SOCKETS entry {e:?}: bad port: {err}");
+                    None
+                }
+            },
+            _ => {
+                warn!("vk-agent init: VIRTKIT_SOCKETS entry {e:?}: want /guest/path:port");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Whether a `socket` volume requires /run to be claimed before image init. `/var/run`
+/// counts because images commonly link it to /run; the claim is redundant when it is real.
+fn socket_volume_under_run(cmdline: &HashMap<String, String>) -> bool {
+    cmdline
+        .get("VIRTKIT_SOCKETS")
+        .map(|raw| {
+            socket_volume_specs(raw)
+                .iter()
+                .any(|(p, _)| p.starts_with("/run/") || p.starts_with("/var/run/"))
+        })
+        .unwrap_or(false)
+}
+
+/// Wait this long for all socket forwarders to exec and bind before the entrypoint or image
+/// init can race them and see ENOENT. One deadline bounds the whole set.
+const SOCKET_VOLUME_WAIT: Duration = Duration::from_secs(2);
+/// How often to look, waiting out [`SOCKET_VOLUME_WAIT`].
+const SOCKET_VOLUME_POLL: Duration = Duration::from_millis(10);
+
+/// Present each `socket` volume through a guest-side forwarder at its guest path. Create
+/// parent directories and give the socket to the run user so non-root entrypoints can
+/// connect. Binding replaces any existing guest-path inode, so callers must use guest-owned
+/// paths. Fail entries independently, then wait once for all that started.
+fn maybe_socket_volumes(cmdline: &HashMap<String, String>) {
+    let Some(raw) = cmdline.get("VIRTKIT_SOCKETS") else {
+        return;
+    };
+    use std::os::unix::fs::DirBuilderExt;
+    let run_user = std::env::var("VIRTKIT_DEFAULT_RUN_USER").ok();
+    let mut started = Vec::new();
+    for (path, port) in socket_volume_specs(raw) {
+        if let Some(parent) = Path::new(&path).parent()
+            && let Err(e) = std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o755)
+                .create(parent)
+        {
+            warn!(
+                "vk-agent init: socket volume {path}: creating {}: {e}",
+                parent.display()
+            );
+            continue;
+        }
+        let args = unix_forward_args(&path, &port.to_string(), run_user.as_deref());
+        match fork_agent(&args) {
+            Ok(_) => {
+                info!("vk-agent init: socket volume {path} -> host (vsock {port})");
+                started.push(path);
+            }
+            Err(e) => warn!("vk-agent init: socket volume {path}: forwarder failed to start: {e}"),
+        }
+    }
+    let deadline = std::time::Instant::now() + SOCKET_VOLUME_WAIT;
+    for path in started {
+        if !wait_for_socket(&path, deadline) {
+            warn!(
+                "vk-agent init: socket volume {path}: no socket within \
+                 {SOCKET_VOLUME_WAIT:?}; whatever opens it first may see ENOENT"
+            );
+        }
+    }
+}
+
+/// Poll for a unix socket at `path` until `deadline`. A stale file or directory does not
+/// satisfy the wait. Check once even when the deadline has passed.
+fn wait_for_socket(path: &str, deadline: std::time::Instant) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    loop {
+        if std::fs::metadata(path).is_ok_and(|m| m.file_type().is_socket()) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(SOCKET_VOLUME_POLL);
+    }
 }
 
 /// Optionally expose the host command channel (`VIRTKIT_HOST_EXEC_PORT`): a
@@ -2203,18 +2318,7 @@ fn maybe_ssh_serve(cmdline: &HashMap<String, String>) {
 /// When a non-root run user is given, the socket is chowned to it so that user's
 /// ssh/git (a served/exec'd stage) can open it.
 fn ssh_agent_forward_args(port: &str, run_user: Option<&str>) -> Vec<String> {
-    let mut args = vec![
-        "--socket".into(),
-        format!("vsock://{port}"),
-        "forward".into(),
-        "--listen".into(),
-        SSH_AGENT_SOCK.into(),
-    ];
-    if let Some(user) = run_user {
-        args.push("--chown".into());
-        args.push(user.into());
-    }
-    args
+    unix_forward_args(SSH_AGENT_SOCK, port, run_user)
 }
 
 /// Optionally forward the host's SSH agent (`VIRTKIT_SSH_AGENT_PORT`): start the guest-side
@@ -3296,6 +3400,38 @@ mod tests {
             vec![(1, "eth1".to_string(), "10.0.0.5/24".to_string())]
         );
         assert!(extra_nics("").is_empty());
+    }
+
+    #[test]
+    fn socket_volume_specs_split_at_the_last_colon_and_skip_malformed_entries() {
+        assert_eq!(
+            socket_volume_specs("/var/run/docker.sock:1300, /run/x.sock:1301,"),
+            vec![
+                ("/var/run/docker.sock".to_string(), 1300),
+                ("/run/x.sock".to_string(), 1301),
+            ]
+        );
+        // A relative path, a missing port and a non-numeric port are each dropped alone.
+        assert_eq!(
+            socket_volume_specs("rel.sock:1300,/no-port,/x.sock:abc,/ok.sock:7"),
+            vec![("/ok.sock".to_string(), 7)]
+        );
+        assert!(socket_volume_specs("").is_empty());
+    }
+
+    #[test]
+    fn socket_volume_under_run_sees_var_run_too() {
+        let m = |raw: &str| -> HashMap<String, String> {
+            [("VIRTKIT_SOCKETS".to_string(), raw.to_string())]
+                .into_iter()
+                .collect()
+        };
+        assert!(socket_volume_under_run(&m("/var/run/docker.sock:1300")));
+        assert!(socket_volume_under_run(&m(
+            "/tmp/a.sock:1300,/run/b.sock:1301"
+        )));
+        assert!(!socket_volume_under_run(&m("/tmp/a.sock:1300")));
+        assert!(!socket_volume_under_run(&HashMap::new()));
     }
 
     #[test]

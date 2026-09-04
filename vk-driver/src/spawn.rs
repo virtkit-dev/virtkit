@@ -28,6 +28,32 @@ pub(crate) fn self_exe() -> PathBuf {
     PathBuf::from("/proc/self/exe")
 }
 
+/// Spawn a tied `vk forward` from the VMM's per-port vsock socket to `host_sock`. The host
+/// path stays outside the guest. Both primary and sibling VMs use this shared helper; their
+/// owners kill it on teardown. The guest dials only after its agent boots, so no bind wait
+/// is needed here.
+pub(crate) fn spawn_socket_forward(
+    vsock: &Path,
+    port: u32,
+    host_sock: &Path,
+    log: &Path,
+) -> Result<Child> {
+    let listen = vk_core::net::hybrid_socket(vsock, port);
+    let logfile = std::fs::File::create(log)
+        .with_context(|| format!("creating the socket forward log {}", log.display()))?;
+    let mut cmd = Command::new(self_exe());
+    cmd.arg("forward")
+        .arg("--listen")
+        .arg(&listen)
+        .arg("--to")
+        .arg(host_sock)
+        .stdin(Stdio::null())
+        .stdout(logfile.try_clone()?)
+        .stderr(logfile);
+    spawn_tied(cmd)
+        .with_context(|| format!("spawning the forward for socket {}", host_sock.display()))
+}
+
 /// Spawn a foreground-owned helper tied to this process: a pre-exec hook asks the kernel to
 /// SIGTERM the child when its parent dies, so a crashed or `kill -9`'d virtkit cannot leak it
 /// (a stuck virtiofsd would, e.g., keep this binary's file busy for the next build). For any

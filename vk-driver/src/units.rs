@@ -545,8 +545,30 @@ pub fn boot_unit(
     // overlay's upper layer instead of a fresh tmpfs. The base image's identity, which keys the
     // upper's coherence (a stale upper is reset when it changes).
     let mut overlay_disk_pairs: Vec<String> = Vec::new();
+    // Give each socket volume a bridged vsock port and a tied host-side forwarder.
+    let mut socket_specs: Vec<String> = Vec::new();
+    let mut socket_ports: Vec<u32> = Vec::new();
+    let mut socket_guests: Vec<PathBuf> = Vec::new();
     for (i, vol) in svc.volumes.iter().enumerate() {
         crate::compose::require_share_source(vol)?;
+        if vol.socket {
+            // Reject a second forwarder whose bind would orphan the first socket inode.
+            let guest = crate::compose::normalized_guest(&vol.guest);
+            if socket_guests.contains(&guest) {
+                bail!("socket volume {}: declared twice", vol.guest);
+            }
+            let port = crate::run::socket_volume_port(socket_ports.len(), &vol.guest)?;
+            aux.push(crate::spawn::spawn_socket_forward(
+                &vsock,
+                port,
+                &vol.host,
+                &dir.join(format!("socket-fwd-{port}.log")),
+            )?);
+            socket_specs.push(format!("{}:{port}", vol.guest));
+            socket_ports.push(port);
+            socket_guests.push(guest);
+            continue;
+        }
         if vol.disk {
             crate::compose::ensure_disk_backing(vol)?;
             let device = crate::build::vd_name(disks.len());
@@ -690,14 +712,18 @@ pub fn boot_unit(
         if !disk_devices.is_empty() {
             cmdline.push_str(&format!(" VIRTKIT_DISKS={disk_devices}"));
         }
+        if !socket_specs.is_empty() {
+            cmdline.push_str(&format!(" VIRTKIT_SOCKETS={}", socket_specs.join(",")));
+        }
 
-        // The switch attach (virtio-net NICs, or one vsock bridge per NIC), plus a
-        // host→guest exec channel: the agent serves it (a preinit boot's reparented serve,
-        // or the default boot's VIRTKIT_SERVE=1 above), and the job supervisor's prepare
-        // polls it to gate on the service's readiness. libkrun needs the explicit per-port
-        // listener; cloud-hypervisor derives it from the base socket and ignores the entry.
+        // Attach network and socket-volume bridges plus the exec channel polled for service
+        // readiness. libkrun needs explicit per-port listeners; cloud-hypervisor derives
+        // them from the base socket and ignores these entries.
         let mut vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
         let nics = attach.apply(&mut vsock_ports);
+        for port in &socket_ports {
+            vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, *port));
+        }
         let spec = crate::vmm::VmSpec {
             kernel: boot_kernel,
             cmdline,

@@ -299,8 +299,9 @@ pub fn check_state_dir_is_host_only<'a>(
         dir.join(SHIM_DIR),
     ];
     let from_volumes = volumes.into_iter().filter_map(|v| {
-        // Read-only, overlay, and disk volumes cannot modify the host tree.
-        (!(v.read_only || v.overlay || v.disk)).then_some((v.host.as_path(), v.guest.as_str()))
+        // These modes cannot modify a shared host tree; socket volumes expose only bytes.
+        (!(v.read_only || v.overlay || v.disk || v.socket))
+            .then_some((v.host.as_path(), v.guest.as_str()))
     });
     for (host, guest) in from_volumes.chain(extra_rw) {
         let host = resolve(host)?;
