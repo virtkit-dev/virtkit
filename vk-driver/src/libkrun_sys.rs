@@ -10,8 +10,9 @@
 //! `.so` is neither linked nor needed.
 //!
 //! Boots a disk/initramfs guest with our kernel + cmdline-`init=` (PID 1): virtio-blk
-//! disks (qcow2 backing chains), built-in virtio-fs shares, per-port vsock, optional
-//! tap networking, and the console on the serial-log file.
+//! disks (qcow2 backing chains), built-in virtio-fs shares, per-port vsock, switch NICs
+//! as unixstream-backed virtio-net devices, optional tap networking, and the console on
+//! the serial-log file.
 //!
 //! With ACPI now present on x86_64 (vendored patch), the boot child installs a SIGTERM
 //! handler that presses the guest's ACPI power button (`krun_get_shutdown_eventfd`), so
@@ -30,10 +31,11 @@ use anyhow::{Context, Result, bail};
 // (rlib -> shares virtkit's std; compiler-checked signatures). Every call returns
 // >= 0 on success, a negative errno on failure.
 use krun::{
-    KRUN_EXIT_GUEST_RESET, krun_add_disk2, krun_add_net_tap, krun_add_virtiofs4,
-    krun_add_vsock_port2, krun_create_ctx, krun_disable_balloon, krun_disable_implicit_init,
-    krun_get_shutdown_eventfd, krun_init_log, krun_set_block_dirty_socket, krun_set_console_output,
-    krun_set_kernel, krun_set_nested_virt, krun_set_pmu, krun_set_vm_config, krun_start_enter,
+    KRUN_EXIT_GUEST_RESET, krun_add_disk2, krun_add_net_tap, krun_add_net_unixstream,
+    krun_add_virtiofs4, krun_add_vsock_port2, krun_create_ctx, krun_disable_balloon,
+    krun_disable_implicit_init, krun_get_shutdown_eventfd, krun_init_log,
+    krun_set_block_dirty_socket, krun_set_console_output, krun_set_kernel, krun_set_nested_virt,
+    krun_set_pmu, krun_set_vm_config, krun_start_enter,
 };
 
 use crate::vmm::{Disk, Net, VmSpec};
@@ -251,8 +253,8 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         }
 
         // Networking. Net::Tap attaches a host tap by name (like CH's `--net tap=,mac=`);
-        // the guest gets a static address from the cmdline. Net::None is switch-mode: the
-        // guest agent bridges eth0 over the vsock net port, so no VMM net device is added.
+        // the guest gets a static address from the cmdline. Switch-mode guests carry no
+        // `Net` device but one `Nic` per switch port below.
         match &spec.net {
             Net::None => {}
             Net::Tap { tap, mac } => {
@@ -264,6 +266,26 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
                     krun_add_net_tap(ctx, tap_c.as_ptr(), mac.as_ptr(), 0, 0),
                 )?;
             }
+        }
+        // Switch NICs: one virtio-net device per switch port, libkrun dialing the host
+        // socket the switch already listens on (fd -1 = connect to `path`) and speaking the
+        // switch's own 4-byte-length framing. No offload features and no flags: the switch
+        // terminates TCP itself and expects complete checksums, and the guest is addressed
+        // from the cmdline, not by libkrun's DHCP client. Attach order is the guest's
+        // interface order (eth0, eth1, …): virtio-pci probes the slots in the order they
+        // were added, so `nics[i]` is `eth<i>`. The agent never has to trust that — every
+        // NIC carries the MAC its address derives from, so an interface can always be
+        // matched back to its address.
+        for (i, nic) in spec.nics.iter().enumerate() {
+            let path = cstr(&nic.socket.to_string_lossy());
+            let (socket, want) = (nic.socket.display(), &nic.mac);
+            let mac = crate::switch::parse_mac(want).ok_or_else(|| {
+                anyhow::anyhow!("switch nic {i} ({socket}): invalid MAC {want:?}")
+            })?;
+            ck(
+                "krun_add_net_unixstream",
+                krun_add_net_unixstream(ctx, path.as_ptr(), -1, mac.as_ptr(), 0, 0),
+            )?;
         }
 
         // vsock ports, each on its own `<base>_<port>` host socket. listen=true:

@@ -937,15 +937,14 @@ fn source_dev_path(index: usize, has_out_disk: bool) -> String {
 /// it is what `vk registry status` and a shared registry's listings show.
 const CACHE_REPO: &str = "build-cache";
 
-/// Conservative virtio-pci source-disk budget for a build guest. libkrun puts every virtio
-/// device on PCI bus 0, whose 31 usable slots (slot 0 is the host bridge) — not the scarce
-/// IOAPIC pins of the old MMIO/INTx transport — are now the limit. A build guest always
-/// spends slots on rootfs, context-fs, vsock, console, rng, and balloon (6), plus one reserved
-/// ephemeral scratch slot (`/tmp` and/or `--mount=from=scratch`); that leaves 24, held back to
-/// 22 for headroom. (Build-guest egress rides an extra vsock port, not a virtio-net device, so
-/// `--net` costs no PCI slot.) When a boot attaches *both* a `/tmp` disk and a scratch disk, the caller
-/// drops the effective budget by one (see `ensure_session_with`). The batching/reboot path is
-/// kept as the backstop for the rare instruction that still needs more sources than fit.
+/// Source-disk budget for a build guest. libkrun has 31 usable PCI bus 0 slots (slot 0 is
+/// the host bridge), replacing the old MMIO/INTx IOAPIC limit. Six fixed devices (rootfs,
+/// context-fs, vsock, console, rng, and balloon), one reserved scratch slot (`/tmp` or
+/// `--mount=from=scratch`), and one switch-NIC slot leave 23; cap at 22 for headroom.
+/// Reserve those slots regardless of scratch/network use or backend so the budget stays
+/// constant. A boot with both `/tmp` and scratch disks subtracts one in
+/// `ensure_session_with`.
+/// Batching and rebooting handle instructions whose sources still exceed the budget.
 const MAX_SOURCE_DISKS: usize = 22;
 
 /// Pick the source disks for one guest boot (at most `max`). The common case is a forward

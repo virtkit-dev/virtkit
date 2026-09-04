@@ -348,9 +348,10 @@ impl JobCtx {
     pub fn egress_build_audit(&self) -> bool {
         self.cfg.egress.build.audit || self.egress_build_audit_req
     }
-    /// The host unix socket Cloud Hypervisor surfaces a guest connection to host
-    /// vsock port `port` on (`<vsock.sock>_<port>`) — where the switch listens
-    /// for the in-guest agent's eth0 bridge.
+    /// The host unix socket the switch listens on for host vsock port `port`
+    /// (`<vsock.sock>_<port>`). Under libkrun the guest's virtio-net backend dials
+    /// it directly; under Cloud Hypervisor it is where CH surfaces the in-guest
+    /// agent's eth0 bridge.
     pub fn net_vsock_sock(&self, port: u32) -> PathBuf {
         let mut p = self.vsock_sock().into_os_string();
         p.push(format!("_{port}"));

@@ -647,16 +647,16 @@ fn default_true() -> bool {
 pub struct Net {
     /// "none"; "tap" (pre-created persistent tap; one VM at a time per tap);
     /// "pool" (a leased tap from the host pool — the hardened host networking);
-    /// or "switch" (a per-job userspace switch over vsock, no host privileges
-    /// and no virtio-net device — the in-guest agent bridges eth0 to it, and the
-    /// `[egress]` allowlist gates egress in-switch).
+    /// or "switch" (an unprivileged per-job userspace switch: a socket-backed virtio-net
+    /// device under libkrun or an agent-bridged vsock tap under cloud-hypervisor, with
+    /// `[egress]` enforced by the switch).
     pub mode: String,
     pub tap: String,
     pub mac: String,
-    /// mode = "switch": vsock port the in-guest agent bridges eth0 to the
-    /// per-job switch over (the guest dials host CID 2 on this port; Cloud
-    /// Hypervisor surfaces it as `<vsock.sock>_<net_port>`, where the switch
-    /// listens). Must differ from the services port.
+    /// mode = "switch": base of the per-NIC port range. Interface i uses `net_port + i`
+    /// at `<vsock.sock>_<net_port + i>`: libkrun backs its virtio-net device with that
+    /// socket; under cloud-hypervisor the agent dials host CID 2 and CH surfaces the
+    /// bridge there. Must differ from the services port.
     pub net_port: u32,
     /// Static guest config passed on the kernel command line (the kernel `ip=`
     /// autoconfig param + VIRTKIT_VM_DNS); ip is CIDR ("172.18.0.250/16")

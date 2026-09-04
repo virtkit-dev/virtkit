@@ -327,13 +327,14 @@ fn publish() -> Outcome {
 /// `entrypoint`/`publish`: it is a property of the binary, and a `vk` too old to have the
 /// axis rejects the feature name outright rather than reaching here.
 ///
-/// The host side is again the agent: the extra interfaces are taps *it* creates and
-/// addresses from `VIRTKIT_NET_EXTRA_IPS`, so a `vk` with no agent to embed or find has
-/// nothing to bring them up with, whatever the caller asks for.
+/// Extra NICs still require the agent. The VMM creates them under libkrun; the agent creates
+/// taps under cloud-hypervisor. In both cases the agent addresses them from
+/// `VIRTKIT_NET_EXTRA_IPS`, so `vk` cannot bring them up without an embedded or external
+/// agent.
 fn nics() -> Outcome {
     match asset_source(Asset::Agent) {
         Some(src) => ok(format!(
-            "up to {} NICs per guest; agent {src} creates and addresses them",
+            "up to {} NICs per guest; agent {src} addresses them",
             crate::units::MAX_NICS
         )),
         None => fail(format!(

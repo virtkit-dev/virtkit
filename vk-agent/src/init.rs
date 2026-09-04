@@ -17,12 +17,17 @@
 //! Cmdline params (all VIRTKIT_*):
 //!   VIRTKIT_VSOCK_PORT   serve agent's vsock port (default 4444)
 //!   VIRTKIT_HOSTNAME     hostname (+ a 127.0.1.1 self-entry in /etc/hosts)
-//!   VIRTKIT_NET_PORT     bring eth0 up: a tap bridged to the host switch over this
-//!                        vsock port; then DHCP (VIRTKIT_NET_DHCP=1) or a static
-//!                        VIRTKIT_VM_IP / VIRTKIT_VM_GW / VIRTKIT_VM_DNS
+//!   VIRTKIT_NET_VIRTIO=1 bring eth0 up: the VMM attached it as a virtio-net device on
+//!                        the host switch (libkrun), so it exists from kernel boot; then
+//!                        DHCP (VIRTKIT_NET_DHCP=1) or a static VIRTKIT_VM_IP /
+//!                        VIRTKIT_VM_GW / VIRTKIT_VM_DNS
+//!   VIRTKIT_NET_PORT     the same, for a VMM without that device (cloud-hypervisor):
+//!                        eth0 is a tap this agent creates and bridges to the switch over
+//!                        this vsock port, with VIRTKIT_VM_MAC as its hardware address
 //!   VIRTKIT_NET_EXTRA_IPS  ip/prefix[,ip/prefix] — additional NICs in order. Entry i
-//!                        configures eth{i+1} over VIRTKIT_NET_PORT + i + 1. Each NIC
-//!                        receives its address but no default route; that belongs to eth0
+//!                        configures eth{i+1} (over VIRTKIT_NET_PORT + i + 1 when bridged).
+//!                        Each NIC receives its address but no default route; that
+//!                        belongs to eth0
 //!   VIRTKIT_VIRTIOFS     tag:path[,tag:path] virtiofs shares to mount
 //!   VIRTKIT_VIRTIOFS_OVERLAY  tag[,tag] — mount these shares as the read-only lower
 //!                        layer of a tmpfs-backed overlayfs at their path, so every
@@ -1605,44 +1610,69 @@ fn maybe_atop(cmdline: &HashMap<String, String>) {
     }
 }
 
-/// Bring eth0 up on the shared LAN: fork the tap bridge (`net`) to the host
-/// switch over VIRTKIT_NET_PORT, then DHCP or a static address.
-/// Argv for the `vk-agent net` tap bridge: the vsock backend + eth0, plus the
-/// run-assigned `--mac` when `VIRTKIT_VM_MAC` is set (so an image-init sibling that
-/// DHCPs eth0 matches the switch's per-MAC reservation and lands on its advertised
-/// IP). Absent the var, the tap keeps a kernel-random MAC — today's behavior.
-fn net_args(port: &str, cmdline: &HashMap<String, String>) -> Vec<String> {
+/// How the cmdline connects this guest's NICs to the host switch.
+#[derive(Debug, PartialEq, Eq)]
+enum NetAttach {
+    /// `VIRTKIT_NET_VIRTIO=1`: the VMM attached each NIC as a virtio-net device backed by
+    /// its switch port, so `eth<i>` exists from kernel boot and only needs an address.
+    Virtio,
+    /// `VIRTKIT_NET_PORT=<p>`: no device — this agent creates a tap per NIC and bridges
+    /// it over vsock port `p` + the interface index (`vk-agent net`).
+    Bridge { base_port: u32 },
+}
+
+/// Parse the cmdline's switch attachment. Report an invalid `VIRTKIT_NET_PORT` and disable
+/// networking because no bridge can be dialed and no NIC exists to address.
+fn net_attach(cmdline: &HashMap<String, String>, tag: &str) -> Option<NetAttach> {
+    if cmdline.get("VIRTKIT_NET_VIRTIO").map(String::as_str) == Some("1") {
+        return Some(NetAttach::Virtio);
+    }
+    let port = cmdline.get("VIRTKIT_NET_PORT")?;
+    match port.parse::<u32>() {
+        Ok(base_port) => Some(NetAttach::Bridge { base_port }),
+        Err(e) => {
+            warn!("vk-agent {tag}: VIRTKIT_NET_PORT={port:?} is not a port number: {e}");
+            None
+        }
+    }
+}
+
+/// Build argv for an interface's `vk-agent net` tap bridge. A known MAC—eth0's
+/// `VIRTKIT_VM_MAC` or an extra NIC's address-derived value—matches the switch reservation,
+/// so DHCP returns its advertised IP. Without one, the tap keeps its random kernel MAC.
+fn net_args(port: u32, iface: &str, mac: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "--socket".into(),
         format!("vsock://{port}"),
         "net".into(),
         "--iface".into(),
-        "eth0".into(),
+        iface.into(),
     ];
-    if let Some(mac) = cmdline.get("VIRTKIT_VM_MAC") {
+    if let Some(mac) = mac {
         args.push("--mac".into());
-        args.push(mac.clone());
+        args.push(mac.into());
     }
     args
 }
 
-/// Build `vk-agent net` arguments for an additional NIC. Its MAC follows the host's
-/// address-derived DHCP reservation, so an image DHCP client receives the assigned address.
-fn extra_net_args(port: u32, iface: &str, mac: &str) -> Vec<String> {
-    vec![
-        "--socket".into(),
-        format!("vsock://{port}"),
-        "net".into(),
-        "--iface".into(),
-        iface.into(),
-        "--mac".into(),
-        mac.into(),
-    ]
+/// Ensure interface `index` exists. Virtio NICs are already attached; otherwise fork a
+/// long-running, unprivileged vsock/tap bridge that supervise reaps or a service inherits.
+fn attach_nic(attach: &NetAttach, index: u32, iface: &str, mac: Option<&str>) -> Result<()> {
+    match attach {
+        NetAttach::Virtio => Ok(()),
+        NetAttach::Bridge { base_port } => {
+            // Reject wraparound into another channel's socket.
+            let port = base_port
+                .checked_add(index)
+                .with_context(|| format!("VIRTKIT_NET_PORT={base_port} + {index} overflows"))?;
+            fork_agent(&net_args(port, iface, mac)).map(|_pid| ())
+        }
+    }
 }
 
-/// Map additional addresses to `(interface, vsock port, address)` in cmdline order.
-/// Entry `i` uses `eth{i+1}` and eth0's port + i + 1; blank entries are ignored.
-fn extra_nics(extra_ips: &str, base_port: u32) -> Vec<(String, u32, String)> {
+/// Map additional addresses to `(interface index, interface, address)` in cmdline order.
+/// Entry `i` is `eth{i+1}`; blank entries are ignored.
+fn extra_nics(extra_ips: &str) -> Vec<(u32, String, String)> {
     extra_ips
         .split(',')
         .map(str::trim)
@@ -1650,28 +1680,21 @@ fn extra_nics(extra_ips: &str, base_port: u32) -> Vec<(String, u32, String)> {
         .enumerate()
         .map(|(i, ip)| {
             let n = i as u32 + 1;
-            (format!("eth{n}"), base_port + n, ip.to_string())
+            (n, format!("eth{n}"), ip.to_string())
         })
         .collect()
 }
 
-/// Start a switch bridge for each NIC after eth0, then assign its address.
+/// Bring up each NIC after eth0 (a switch bridge when not virtio), then assign its address.
 ///
 /// Leave default routing to eth0 to avoid ambiguous egress across the shared L2 segment.
 /// Callers may add routes for specific NICs. Warn and continue when one NIC fails so it
 /// does not prevent boot or disrupt working interfaces.
-fn configure_extra_nics(cmdline: &HashMap<String, String>, tag: &str) {
+fn configure_extra_nics(attach: &NetAttach, cmdline: &HashMap<String, String>, tag: &str) {
     let Some(extra_ips) = cmdline.get("VIRTKIT_NET_EXTRA_IPS") else {
         return;
     };
-    let Some(base_port) = cmdline
-        .get("VIRTKIT_NET_PORT")
-        .and_then(|p| p.parse::<u32>().ok())
-    else {
-        warn!("vk-agent {tag}: VIRTKIT_NET_EXTRA_IPS without a numeric VIRTKIT_NET_PORT");
-        return;
-    };
-    for (iface, port, ip_cidr) in extra_nics(extra_ips, base_port) {
+    for (index, iface, ip_cidr) in extra_nics(extra_ips) {
         let ip = match ip_cidr.split('/').next().unwrap_or_default().parse() {
             Ok(ip) => ip,
             Err(e) => {
@@ -1680,8 +1703,8 @@ fn configure_extra_nics(cmdline: &HashMap<String, String>, tag: &str) {
             }
         };
         let mac = vk_core::net::mac_for_ip(ip);
-        if let Err(e) = fork_agent(&extra_net_args(port, &iface, &mac)) {
-            warn!("vk-agent {tag}: {iface} net bridge failed to start: {e}");
+        if let Err(e) = attach_nic(attach, index, &iface, Some(&mac)) {
+            warn!("vk-agent {tag}: attaching {iface} failed: {e}");
             continue;
         }
         if !wait_for_iface(&iface, EXTRA_IFACE_TRIES) {
@@ -1696,7 +1719,7 @@ fn configure_extra_nics(cmdline: &HashMap<String, String>, tag: &str) {
     }
 }
 
-/// Wait for a helper-created tap in 100 ms attempts; its absence indicates helper failure.
+/// Wait for an interface in 100 ms attempts; its absence indicates helper failure.
 const EXTRA_IFACE_TRIES: u32 = 100;
 
 /// The gateway to use when the run assigned an address but no `VIRTKIT_VM_GW` — the vk
@@ -1704,21 +1727,20 @@ const EXTRA_IFACE_TRIES: u32 = 100;
 /// fallback both network paths share.
 const DEFAULT_GATEWAY: &str = "192.168.127.1";
 
-/// How long to wait for the switch to answer ARP for the gateway, in 100 ms tries. The ioctl
-/// sets the address instantly, but the forked bridge still has to dial the host switch before
-/// frames flow: a first DNS query dropped into a not-yet-forwarding bridge fails name
-/// resolution outright (getaddrinfo exhausts its retries). The switch itself answers ARP for
-/// the gateway, so the probe works under any egress policy.
+/// Wait in 100 ms attempts for the gateway's ARP reply. Static addressing is immediate,
+/// but a forked bridge must connect before its first DNS query or getaddrinfo can exhaust
+/// its retries. Virtio is connected by probe time, and the switch answers ARP under every
+/// egress policy.
 const GATEWAY_TRIES: u32 = 100;
 
+/// Bring eth0 up on the shared LAN (see [`NetAttach`]), then DHCP or a static address.
 fn configure_network(cmdline: &HashMap<String, String>) {
-    let Some(port) = cmdline.get("VIRTKIT_NET_PORT") else {
+    let Some(attach) = net_attach(cmdline, "init") else {
         return;
     };
-    // The bridge is long-running (reaped by supervise; inherited by the service on
-    // exec). It carries ethernet frames over vsock with no host privileges.
-    if let Err(e) = fork_agent(&net_args(port, cmdline)) {
-        warn!("vk-agent init: net bridge failed to start: {e}");
+    let mac = cmdline.get("VIRTKIT_VM_MAC").map(String::as_str);
+    if let Err(e) = attach_nic(&attach, 0, "eth0", mac) {
+        warn!("vk-agent init: attaching eth0 failed: {e}");
         return;
     }
     if !wait_for_iface("eth0", 50) {
@@ -1747,33 +1769,33 @@ fn configure_network(cmdline: &HashMap<String, String>) {
         }
     }
     // Configure additional NICs after eth0 owns the default route.
-    configure_extra_nics(cmdline, "init");
+    configure_extra_nics(&attach, cmdline, "init");
     // DNS is written separately (write_resolv_conf) so it applies to the kernel `ip=`
-    // pool net too, not just this vsock-bridge static path.
+    // pool net too, not just this static path.
 }
 
-/// Full-VM networking: create the eth0 tap bridged to the vk switch over vsock, bring
-/// its link up, and give it the address the run assigned this guest
-/// (`VIRTKIT_VM_IP`/`VIRTKIT_VM_GW`) — the same one the switch's DHCP would hand back,
-/// so applying it directly settles the address instead of waiting to see whether the
-/// image does. A run without an assigned address keeps the old behaviour: give the
-/// image's own client a grace period, then fall back to `dhclient`.
+/// Full-VM networking: bring eth0 up on the vk switch (see [`NetAttach`]) and give it the
+/// address the run assigned this guest (`VIRTKIT_VM_IP`/`VIRTKIT_VM_GW`) — the same one
+/// the switch's DHCP would hand back, so applying it directly settles the address instead
+/// of waiting to see whether the image does. A run without an assigned address keeps the
+/// old behaviour: give the image's own client a grace period, then fall back to `dhclient`.
 ///
 /// The assigned address is applied before the exec; only the DHCP fallback waits in a forked
-/// child, which reparents to the image's init after the exec — as the bridge itself does.
+/// child, which reparents to the image's init after the exec — as a tap bridge itself does.
 fn configure_network_fullvm(cmdline: &HashMap<String, String>) {
-    // How long to wait for eth0 to appear, in 100 ms tries. The interface is the tap the
-    // agent creates itself, visible in /sys the moment the bridge helper makes it, so this
-    // is a guard against that helper failing to start — not a race to lose. The inline wait
-    // is paid before PID 1 is handed over, so it is the shorter of the two; the fallback
-    // child blocks nothing and keeps the 15 s it always waited.
+    // How long to wait for eth0 to appear, in 100 ms tries. A virtio NIC is there from
+    // boot; a tap is visible in /sys the moment the bridge helper makes it, so this is a
+    // guard against that helper failing to start — not a race to lose. The inline wait is
+    // paid before PID 1 is handed over, so it is the shorter of the two; the fallback child
+    // blocks nothing and keeps the 15 s it always waited.
     const IFACE_TRIES: u32 = 100;
     const IFACE_TRIES_FALLBACK: u32 = 150;
-    let Some(port) = cmdline.get("VIRTKIT_NET_PORT") else {
+    let Some(attach) = net_attach(cmdline, "image-init") else {
         return;
     };
-    if let Err(e) = fork_agent(&net_args(port, cmdline)) {
-        warn!("vk-agent image-init: net bridge failed to start: {e}");
+    let mac = cmdline.get("VIRTKIT_VM_MAC").map(String::as_str);
+    if let Err(e) = attach_nic(&attach, 0, "eth0", mac) {
+        warn!("vk-agent image-init: attaching eth0 failed: {e}");
         return;
     }
     if let Some(ip) = cmdline.get("VIRTKIT_VM_IP") {
@@ -1782,20 +1804,19 @@ fn configure_network_fullvm(cmdline: &HashMap<String, String>) {
             .map_or(DEFAULT_GATEWAY, String::as_str);
         // Addressed here, before PID 1 is handed over: whatever runs next may need the
         // network in its first seconds — an appliance that configures itself from the
-        // running interface does — and a child racing it cannot promise that. The tap is
-        // ours, so it appears as soon as the bridge helper above creates it.
+        // running interface does — and a child racing it cannot promise that. eth0 is the
+        // VMM's device or our own tap, so nothing outside this guest has to make it appear.
         //
         // ioctls, not `ip`: minimal images ship no iproute2. An image client that DHCPs
-        // later lands on this same address — the switch's first pool lease is this guest's
-        // own index, and a sibling holds a per-MAC reservation — so this cannot disagree
-        // with what the image believes.
+        // later lands on this same address — every guest holds a per-MAC reservation for
+        // the one assigned to it — so this cannot disagree with what the image believes.
         if !wait_for_iface("eth0", IFACE_TRIES) {
             warn!("vk-agent image-init: eth0 never appeared — leaving it to the image");
         } else if let Err(e) = set_static_network(ip, gw) {
             warn!("vk-agent image-init: configuring eth0 {ip} via {gw} failed: {e:#}");
         } else {
             info!("vk-agent image-init: eth0 {ip} via {gw}");
-            // Wait for the gateway as the default path does: the address is instant, the
+            // Wait for the gateway as the default path does: the address is instant, a
             // forked bridge's dial to the switch is not, and what takes PID 1 next should
             // not lose its first DNS query into a bridge that is not forwarding yet.
             if !wait_for_gateway(gw, GATEWAY_TRIES) {
@@ -1839,7 +1860,7 @@ fn configure_network_fullvm(cmdline: &HashMap<String, String>) {
         }
     }
     // Configure additional NICs before the PID 1 handoff so startup sees every interface.
-    configure_extra_nics(cmdline, "image-init");
+    configure_extra_nics(&attach, cmdline, "image-init");
     // Seed /etc/resolv.conf with the switch's resolver so name resolution works even
     // on images that DHCP an address but don't wire up DNS (no systemd-resolved).
     write_resolv_conf(cmdline);
@@ -3258,12 +3279,12 @@ mod tests {
     }
 
     #[test]
-    fn extra_nics_number_ifaces_and_ports_from_position() {
+    fn extra_nics_number_ifaces_from_position() {
         assert_eq!(
-            extra_nics("192.168.127.254/24,192.168.127.253/24", 1024),
+            extra_nics("192.168.127.254/24,192.168.127.253/24"),
             vec![
-                ("eth1".to_string(), 1025, "192.168.127.254/24".to_string()),
-                ("eth2".to_string(), 1026, "192.168.127.253/24".to_string()),
+                (1, "eth1".to_string(), "192.168.127.254/24".to_string()),
+                (2, "eth2".to_string(), "192.168.127.253/24".to_string()),
             ]
         );
     }
@@ -3271,17 +3292,49 @@ mod tests {
     #[test]
     fn extra_nics_skips_blank_entries() {
         assert_eq!(
-            extra_nics(" 10.0.0.5/24 ,", 1024),
-            vec![("eth1".to_string(), 1025, "10.0.0.5/24".to_string())]
+            extra_nics(" 10.0.0.5/24 ,"),
+            vec![(1, "eth1".to_string(), "10.0.0.5/24".to_string())]
         );
-        assert!(extra_nics("", 1024).is_empty());
+        assert!(extra_nics("").is_empty());
     }
 
     #[test]
-    fn extra_net_args_carry_the_derived_mac() {
-        let mac = vk_core::net::mac_for_ip("192.168.127.254".parse().unwrap());
+    fn net_attach_prefers_virtio_then_a_numeric_bridge_port() {
+        let m = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        // The libkrun cmdline: the device exists, no port to dial.
         assert_eq!(
-            extra_net_args(1025, "eth1", &mac),
+            net_attach(&m(&[("VIRTKIT_NET_VIRTIO", "1")]), "init"),
+            Some(NetAttach::Virtio)
+        );
+        // The cloud-hypervisor cmdline: a tap bridged over this vsock port.
+        assert_eq!(
+            net_attach(&m(&[("VIRTKIT_NET_PORT", "1024")]), "init"),
+            Some(NetAttach::Bridge { base_port: 1024 })
+        );
+        // Both present: the device wins — nothing to bridge when the VMM attached the NIC.
+        assert_eq!(
+            net_attach(
+                &m(&[("VIRTKIT_NET_VIRTIO", "1"), ("VIRTKIT_NET_PORT", "1024")]),
+                "init"
+            ),
+            Some(NetAttach::Virtio)
+        );
+        // No LAN at all, or a port that cannot be dialed.
+        assert_eq!(net_attach(&m(&[]), "init"), None);
+        assert_eq!(net_attach(&m(&[("VIRTKIT_NET_PORT", "x")]), "init"), None);
+    }
+
+    #[test]
+    fn net_args_carry_the_port_and_the_derived_mac() {
+        let mac = vk_core::net::mac_for_ip("192.168.127.254".parse().unwrap());
+        // eth1's switch port, with its address-derived MAC.
+        assert_eq!(
+            net_args(1025, "eth1", Some(&mac)),
             vec![
                 "--socket",
                 "vsock://1025",
@@ -3292,5 +3345,22 @@ mod tests {
                 "52:54:00:a8:7f:fe",
             ]
         );
+        // eth0 without a run-assigned MAC keeps the kernel's random one.
+        assert_eq!(
+            net_args(1024, "eth0", None),
+            vec!["--socket", "vsock://1024", "net", "--iface", "eth0"]
+        );
+    }
+
+    #[test]
+    fn attach_nic_offsets_the_port_and_refuses_to_wrap_it() {
+        // A virtio NIC is the VMM's: nothing to fork, whatever the index.
+        assert!(attach_nic(&NetAttach::Virtio, 3, "eth3", None).is_ok());
+        // A bridge whose port would wrap is refused rather than dialed somewhere else.
+        let attach = NetAttach::Bridge {
+            base_port: u32::MAX,
+        };
+        let err = attach_nic(&attach, 1, "eth1", None).unwrap_err();
+        assert!(err.to_string().contains("overflows"), "{err}");
     }
 }

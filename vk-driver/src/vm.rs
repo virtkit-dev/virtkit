@@ -1307,7 +1307,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // (ip, prefix, gw, dns) once a tap is wired, rendered onto the cmdline below
     // in the form the chosen init understands.
     let mut net_info: Option<(String, u32, String, String)> = None;
-    // The job VM's switch attach (`net.mode = switch`): its vsock bridge.
+    // The job VM's switch attach (`net.mode = switch`): its NICs or vsock bridge.
     let mut job_attach: Option<crate::vmm::SwitchAttach> = None;
     match cfg.net.mode.as_str() {
         "none" => {}
@@ -1333,12 +1333,12 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             net_info = Some((lease.ip, lease.prefix.into(), lease.gw, lease.dns));
         }
         "switch" => {
-            // Per-job userspace switch: no virtio-net device and no kernel `ip=`
-            // (eth0 does not exist at kernel init) — the in-guest agent forks a
-            // tap bridged to the switch over vsock, then sets a static address.
-            // Spawn the switch (with the egress allowlist) so it is listening
-            // before the guest dials it; then point the agent at it. The same
-            // shared LAN/egress core `run --compose` uses.
+            // Per-job userspace switch, no kernel `ip=`: the agent sets the static
+            // address on eth0 — a virtio-net device backed by the switch's socket under
+            // libkrun, a tap the agent bridges over vsock under cloud-hypervisor. Spawn
+            // the switch (with the egress allowlist) so it is listening before the VMM or
+            // the guest dials it; then point the agent at it. The same shared LAN/egress
+            // core `run --compose` uses.
             let (gateway, prefix, guest_ip) = crate::net::switch_addrs(&cfg.net.subnet)?;
             // Every service's guard lands directly in `use_guards` inside `plan_services`: a
             // git-defined/`build:` service's the moment its build promotes it, an `image:`
@@ -1373,6 +1373,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                 &[guest_ip],
                 prefix,
                 gateway,
+                crate::vmm::libkrun_selected(),
             );
             cmdline.push_str(&attach.cmdline);
             job_attach = Some(attach);
@@ -1443,9 +1444,9 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         &ctx.vsock_sock(),
         cfg.vm.vsock_port,
     )];
-    if let Some(attach) = job_attach {
-        attach.apply(&mut vsock_ports);
-    }
+    let nics = job_attach
+        .map(|attach| attach.apply(&mut vsock_ports))
+        .unwrap_or_default();
     if ssh_agent_forwarding(cfg) {
         vsock_ports.push(crate::vmm::VsockPort::bridge(
             &ctx.vsock_sock(),
@@ -1466,6 +1467,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         mem: mem.clone(),
         shared_mem: true,
         net,
+        nics,
         balloon: cfg.vm.balloon,
         serial_log: ctx.console_log(),
         // an image (stock) kernel keeps serial via the VIRTKIT_KERNEL=image cmdline token;

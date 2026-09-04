@@ -41,7 +41,14 @@ const WANTED_MODULES: &[&str] = &[
     // compose control fs (--compose).
     "fuse",
     "virtiofs",
-    // tun so the preinit can create the eth0 tap bridged to the vk switch (--net).
+    // eth0 for --net, whichever backend provides it: virtio_net (with its failover
+    // dependencies, in load order) for the device libkrun attaches, tun for the tap the
+    // preinit creates and bridges to the switch under cloud-hypervisor. This list is the
+    // literal load order — nothing here follows modules.dep — so a dependency only arrives
+    // by being named.
+    "failover",
+    "net_failover",
+    "virtio_net",
     "tun",
     "vsock",
     "vmw_vsock_virtio_transport_common",

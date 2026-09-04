@@ -114,8 +114,8 @@ pub(crate) const SSH_AGENT_VSOCK_PORT: u32 = 2223;
 /// Guest vsock port the agent's ssh-serve listens on (`--ssh`); mirrors the
 /// agent's `SSH_VSOCK_PORT`.
 const SSH_VSOCK_PORT: u32 = 2222;
-/// Base of the switch's per-NIC port range: the tap bridge for interface i dials
-/// `NET_VSOCK_PORT + i` to reach the userspace switch.
+/// Base of the switch's per-NIC port range: interface i is served on `NET_VSOCK_PORT + i`,
+/// backing its virtio-net device (libkrun) or dialed by its tap bridge (cloud-hypervisor).
 const NET_VSOCK_PORT: u32 = 1024;
 /// Switch VM id for the primary guest. Siblings use higher ids, and all NICs of a guest share
 /// one id so `switch::handle_frame` accepts its addresses on any of its interfaces.
@@ -1453,8 +1453,9 @@ async fn build_and_boot(
         cmdline.push_str(&format!(" VIRTKIT_HOST_EXEC_PORT={HOST_EXEC_PORT}"));
     }
 
-    // Networking: a userspace `vk switch` over vsock gives the guest egress (the agent
-    // forks a tap bridged to it and takes the static address from the cmdline fragment).
+    // Networking: a userspace `vk switch` gives the guest egress — attached as virtio-net
+    // NICs under libkrun, or a vsock bridge the agent's tap rides under cloud-hypervisor;
+    // the agent takes the static address from the cmdline fragment either way.
     // With services it also pre-listens on their sockets and answers their aliases.
     // The subnet fixes the gateway and the primary's eth0 address; `spawn_vm_switch` derives
     // the same pair, so `vk list` can report the address straight from the registry.
@@ -1792,11 +1793,12 @@ async fn build_and_boot(
     let vmm = crate::vmm::selected(&args.cloud_hypervisor);
     let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
     println!("virtkit: booting {} (cpus={cpus}, mem={mem})", vmm.name());
-    // exec channel always; the switch and ssh-agent bridges only when set up above.
+    // exec channel always; the switch NICs/bridges and the ssh-agent bridge only when set
+    // up above.
     let mut vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
-    if let Some(attach) = net_attach {
-        attach.apply(&mut vsock_ports);
-    }
+    let nics = net_attach
+        .map(|attach| attach.apply(&mut vsock_ports))
+        .unwrap_or_default();
     if ssh.is_some() {
         vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, SSH_AGENT_VSOCK_PORT));
     }
@@ -1863,6 +1865,7 @@ async fn build_and_boot(
         mem: mem.clone(),
         shared_mem,
         net: crate::vmm::Net::None,
+        nics,
         balloon: true,
         serial_log: console.clone(),
         console_serial: args.console_serial,
@@ -3597,8 +3600,8 @@ pub(crate) const CONTEXT_MOUNT: &str = "/run/virtkit-context";
 
 /// Spawn a `vk switch` giving one VM a userspace LAN + egress over `vsock` (DHCP +
 /// DNS + transparent proxy, unrestricted). Returns the switch child and how the guest
-/// attaches to it (its vsock bridges, plus the agent's cmdline fragment). Waits for the
-/// switch to bind.
+/// attaches to it (its NICs or vsock bridges, plus the agent's cmdline fragment). Waits for
+/// the switch to bind.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_vm_switch(
     vsock: &Path,
@@ -3673,7 +3676,14 @@ async fn spawn_vm_switch(
     // eth0 first, then the NICs after it, in the order the switch ports were bound above.
     let mut addrs = vec![guest_ip];
     addrs.extend_from_slice(primary_extra_ips);
-    let attach = crate::vmm::switch_attach(vsock, net_port, &addrs, prefix, gw);
+    let attach = crate::vmm::switch_attach(
+        vsock,
+        net_port,
+        &addrs,
+        prefix,
+        gw,
+        crate::vmm::libkrun_selected(),
+    );
     Ok((child, attach))
 }
 
@@ -3945,9 +3955,9 @@ pub(crate) async fn boot_session(
     }
 
     let mut vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
-    if let Some(attach) = net_attach {
-        attach.apply(&mut vsock_ports);
-    }
+    let nics = net_attach
+        .map(|attach| attach.apply(&mut vsock_ports))
+        .unwrap_or_default();
     // virtio-fs (the context share) requires shared guest memory (shared_mem).
     // --kernel=image boots the extracted image kernel; otherwise the pinned build kernel.
     let boot_kernel = image_kernel.map(|(k, _)| k).unwrap_or(kernel);
@@ -3964,6 +3974,8 @@ pub(crate) async fn boot_session(
         mem: mem.to_string(),
         shared_mem: context.is_some(),
         net: crate::vmm::Net::None,
+        // The switch NIC (libkrun): a PCI slot MAX_SOURCE_DISKS accounts for.
+        nics,
         // A stage's RUN can free a lot at once (a package cache, an unpacked tree):
         // report those pages back rather than hold the guest's peak until poweroff.
         // The PCI slot this spends is already counted into MAX_SOURCE_DISKS.
@@ -5141,6 +5153,7 @@ mod tests {
             mem: "1G".into(),
             shared_mem: false,
             net: crate::vmm::Net::None,
+            nics: Vec::new(),
             balloon: false,
             serial_log: dir.join("console.log"),
             console_serial: false,

@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 
 use vk_core::addr::SocketAddr;
 // The deterministic MAC for a switch address (`52:54:00` + the low three octets), the
-// identity the switch's per-MAC DHCP reservations and the guest's eth0 agree on.
+// identity the switch's per-MAC DHCP reservations and this module's NICs agree on.
 use vk_core::net::mac_for_ip;
 
 /// Env var carrying the JSON `VmSpec` to a libkrun boot child. It rides the environment
@@ -178,26 +178,40 @@ pub struct FsShare {
 }
 
 /// Guest networking outside the switch: a host tap by name (CI `net.mode = tap|pool`), or
-/// nothing. Switch-mode guests use [`Net::None`] here and attach through [`switch_attach`],
-/// which rides a vsock bridge rather than a VMM net device.
+/// nothing. Switch-mode guests use [`Net::None`] here and attach through [`switch_attach`]
+/// — [`VmSpec::nics`] under libkrun, a vsock bridge under cloud-hypervisor.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum Net {
     None,
     Tap { tap: String, mac: String },
 }
 
+/// A libkrun virtio-net device backed by one switch-port unix stream. The switch natively
+/// speaks its qemu/passt framing: a 4-byte big-endian length followed by one ethernet frame.
+/// Attached with `krun_add_net_unixstream`; cloud-hypervisor uses the vsock/tap path in
+/// [`switch_attach`] instead. Attach order sets interface order.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Nic {
+    pub socket: PathBuf,
+    /// `aa:bb:cc:dd:ee:ff`, the switch's per-MAC identity for this NIC ([`mac_for_ip`]).
+    pub mac: String,
+}
+
 /// How one guest joins the switch, in the form the VMM and the guest agent each read.
 /// Built by [`switch_attach`]; the caller appends `cmdline` to the guest's and folds the
-/// bridges into its [`VmSpec`] with [`SwitchAttach::apply`].
+/// devices into its [`VmSpec`] with [`SwitchAttach::apply`].
 pub struct SwitchAttach {
     pub vsock_ports: Vec<VsockPort>,
+    pub nics: Vec<Nic>,
     pub cmdline: String,
 }
 
 impl SwitchAttach {
-    /// Fold this attach into a boot: append its vsock bridges to the spec's `vsock_ports`.
-    pub fn apply(self, vsock_ports: &mut Vec<VsockPort>) {
+    /// Append any vsock bridges and return the [`VmSpec::nics`]. Only one collection is
+    /// populated, so callers need not branch on the backend.
+    pub fn apply(self, vsock_ports: &mut Vec<VsockPort>) -> Vec<Nic> {
         vsock_ports.extend(self.vsock_ports);
+        self.nics
     }
 }
 
@@ -205,37 +219,55 @@ impl SwitchAttach {
 /// (eth0's first, then each NIC after it in interface order; all share `prefix`). The
 /// switch must already listen on `hybrid_socket(vsock, net_port + i)` for each.
 ///
-/// Each NIC gets a guest→host vsock bridge on its port: the guest agent forks a tap per
-/// NIC and carries its frames over that bridge (`VIRTKIT_NET_PORT`), then takes the static
-/// address, gateway and resolver from the tokens on the same cmdline. eth0's tap takes the
-/// MAC its address derives from (`VIRTKIT_VM_MAC`), so a guest that DHCPs it instead hits
-/// the switch's reservation for that address rather than drawing from the pool.
+/// Under libkrun, each socket backs a [`Nic`]; `net.ifnames=0` preserves `eth<i>`, and
+/// `VIRTKIT_NET_VIRTIO=1` tells the agent only to address it. Under cloud-hypervisor, the
+/// agent creates one tap per NIC and bridges it over `VIRTKIT_NET_PORT`. Both paths use the
+/// same static address, gateway, and resolver tokens. Address-derived MACs match the
+/// switch's per-MAC reservation to the same IP.
 ///
-/// `net_port + i` is unchecked: `net_port` is the host's own (`[net] net_port`, or the
-/// `vk run` constant) and the same sum already named the sockets the switch was told to
-/// listen on, so a value that overflowed would have failed to bind long before a guest
-/// saw it.
+/// `libkrun` is the selected backend: every boot site passes [`libkrun_selected`], and it
+/// is a parameter only because that reads process-global state a test cannot set.
+///
+/// `net_port + i` is unchecked here, unlike the guest side's: `net_port` is the host's own
+/// (`[net] net_port`, or the `vk run` constant) and the same sum already named the sockets
+/// the switch was told to listen on, so a value that overflowed would have failed to bind
+/// long before a guest saw it.
 pub fn switch_attach(
     vsock: &Path,
     net_port: u32,
     addrs: &[std::net::Ipv4Addr],
     prefix: u8,
     gateway: std::net::Ipv4Addr,
+    libkrun: bool,
 ) -> SwitchAttach {
     let mut out = SwitchAttach {
         vsock_ports: Vec::new(),
+        nics: Vec::new(),
         cmdline: String::new(),
     };
     let Some((eth0, extra)) = addrs.split_first() else {
         return out;
     };
-    for i in 0..addrs.len() as u32 {
-        out.vsock_ports.push(VsockPort::bridge(vsock, net_port + i));
+    if libkrun {
+        for (i, ip) in addrs.iter().enumerate() {
+            out.nics.push(Nic {
+                socket: hybrid_socket(vsock, net_port + i as u32),
+                mac: mac_for_ip(*ip),
+            });
+        }
+        out.cmdline
+            .push_str(" VIRTKIT_NET_VIRTIO=1 net.ifnames=0 biosdevname=0");
+    } else {
+        for i in 0..addrs.len() as u32 {
+            out.vsock_ports.push(VsockPort::bridge(vsock, net_port + i));
+        }
+        out.cmdline.push_str(&format!(
+            " VIRTKIT_NET_PORT={net_port} VIRTKIT_VM_MAC={}",
+            mac_for_ip(*eth0)
+        ));
     }
     out.cmdline.push_str(&format!(
-        " VIRTKIT_NET_PORT={net_port} VIRTKIT_VM_MAC={} VIRTKIT_VM_IP={eth0}/{prefix} \
-         VIRTKIT_VM_GW={gateway} VIRTKIT_VM_DNS={gateway}",
-        mac_for_ip(*eth0)
+        " VIRTKIT_VM_IP={eth0}/{prefix} VIRTKIT_VM_GW={gateway} VIRTKIT_VM_DNS={gateway}"
     ));
     if let Some(extra) = net_extra_ips_env(extra, prefix) {
         out.cmdline.push_str(&extra);
@@ -325,6 +357,10 @@ pub struct VmSpec {
     pub mem: String,
     pub shared_mem: bool,
     pub net: Net,
+    /// Switch-mode NICs as virtio-net devices (libkrun; see [`switch_attach`]). Empty for
+    /// cloud-hypervisor, whose switch guests ride a vsock bridge in `vsock_ports` instead.
+    #[serde(default)]
+    pub nics: Vec<Nic>,
     /// virtio-balloon with free-page reporting: the guest hands pages it frees back to
     /// the host mid-run, so concurrent VMs can overcommit safely. Honored by both
     /// backends — cloud-hypervisor gates its `--balloon` argument on it, and the libkrun
@@ -447,6 +483,13 @@ impl Vmm for CloudHypervisor {
         if let Net::Tap { tap, mac } = &spec.net {
             cmd.arg("--net").arg(format!("tap={tap},mac={mac}"));
         }
+        // `nics` is a libkrun-only attach; the boot sites build a cloud-hypervisor spec
+        // with the vsock bridge instead (`switch_attach(.., libkrun = false)`), so a
+        // populated list here is a caller bug, not a configuration a user can reach.
+        debug_assert!(
+            spec.nics.is_empty(),
+            "cloud-hypervisor attaches the switch over vsock, not as virtio-net devices"
+        );
         if spec.balloon {
             // size=0: no static balloon, just give freed guest pages back to the
             // host so concurrent jobs overcommit safely (guest CONFIG_PAGE_REPORTING).
@@ -577,16 +620,57 @@ mod tests {
     }
 
     #[test]
-    fn switch_attach_bridges_each_nic_over_its_own_vsock_port() {
+    fn switch_attach_libkrun_is_one_nic_per_port_addressed_from_the_cmdline() {
         let vsock = Path::new("/w/vsock.sock");
         let gw: std::net::Ipv4Addr = "192.168.127.1".parse().unwrap();
         let addrs: Vec<std::net::Ipv4Addr> = ["192.168.127.2", "192.168.127.254"]
             .iter()
             .map(|a| a.parse().unwrap())
             .collect();
-        let a = switch_attach(vsock, 1024, &addrs, 24, gw);
-        // One guest→host bridge per NIC on 1024 + the interface index; the agent forks a
-        // tap per NIC and reads its address off the cmdline.
+        let a = switch_attach(vsock, 1024, &addrs, 24, gw, true);
+        // No vsock bridge: the NICs are virtio-net devices on the switch's per-port
+        // sockets, eth0 on 1024 and eth1 on 1025, each with its address-derived MAC.
+        assert!(a.vsock_ports.is_empty());
+        let nics: Vec<(String, String)> = a
+            .nics
+            .iter()
+            .map(|n| (n.socket.display().to_string(), n.mac.clone()))
+            .collect();
+        assert_eq!(
+            nics,
+            vec![
+                (
+                    "/w/vsock.sock_1024".to_string(),
+                    "52:54:00:a8:7f:02".to_string()
+                ),
+                (
+                    "/w/vsock.sock_1025".to_string(),
+                    "52:54:00:a8:7f:fe".to_string()
+                ),
+            ]
+        );
+        // The agent addresses what the kernel brought up; `net.ifnames=0` keeps an image's
+        // systemd from renaming eth0 under it.
+        assert_eq!(
+            a.cmdline,
+            " VIRTKIT_NET_VIRTIO=1 net.ifnames=0 biosdevname=0 \
+             VIRTKIT_VM_IP=192.168.127.2/24 VIRTKIT_VM_GW=192.168.127.1 \
+             VIRTKIT_VM_DNS=192.168.127.1 VIRTKIT_NET_EXTRA_IPS=192.168.127.254/24"
+        );
+    }
+
+    #[test]
+    fn switch_attach_cloud_hypervisor_bridges_each_nic_over_vsock() {
+        let vsock = Path::new("/w/vsock.sock");
+        let gw: std::net::Ipv4Addr = "192.168.127.1".parse().unwrap();
+        let addrs: Vec<std::net::Ipv4Addr> = ["192.168.127.2", "192.168.127.254"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        let a = switch_attach(vsock, 1024, &addrs, 24, gw, false);
+        // One guest→host bridge per NIC on 1024 + the interface index, no virtio device;
+        // the agent forks a tap per NIC, eth0's with the run-assigned MAC.
+        assert!(a.nics.is_empty());
         let ports: Vec<(u32, String, bool)> = a
             .vsock_ports
             .iter()
@@ -612,19 +696,24 @@ mod tests {
         let vsock = Path::new("/w/vsock.sock");
         let gw: std::net::Ipv4Addr = "192.168.127.1".parse().unwrap();
         let eth0: std::net::Ipv4Addr = "192.168.127.2".parse().unwrap();
-        // eth0 alone carries no VIRTKIT_NET_EXTRA_IPS.
-        let one = switch_attach(vsock, 1024, &[eth0], 24, gw);
-        assert!(!one.cmdline.contains("VIRTKIT_NET_EXTRA_IPS"));
-        assert_eq!(one.vsock_ports.len(), 1);
+        // eth0 alone carries no VIRTKIT_NET_EXTRA_IPS, on either backend.
+        for libkrun in [true, false] {
+            let one = switch_attach(vsock, 1024, &[eth0], 24, gw, libkrun);
+            assert!(!one.cmdline.contains("VIRTKIT_NET_EXTRA_IPS"));
+            assert_eq!(one.nics.len() + one.vsock_ports.len(), 1);
+        }
         // No address at all attaches nothing and says nothing on the cmdline: `--net` is
         // off, and a guest with no port on the switch must not be told it has one.
-        let none = switch_attach(vsock, 1024, &[], 24, gw);
-        assert!(none.vsock_ports.is_empty());
-        assert!(none.cmdline.is_empty());
+        for libkrun in [true, false] {
+            let none = switch_attach(vsock, 1024, &[], 24, gw, libkrun);
+            assert!(none.nics.is_empty());
+            assert!(none.vsock_ports.is_empty());
+            assert!(none.cmdline.is_empty());
+        }
     }
 
     #[test]
-    fn switch_attach_apply_appends_to_the_boot_sites_own_ports() {
+    fn switch_attach_apply_moves_the_devices_into_the_boot() {
         let vsock = Path::new("/w/vsock.sock");
         let gw: std::net::Ipv4Addr = "192.168.127.1".parse().unwrap();
         let addrs: Vec<std::net::Ipv4Addr> = ["192.168.127.2", "192.168.127.254"]
@@ -632,9 +721,16 @@ mod tests {
             .map(|a| a.parse().unwrap())
             .collect();
         // A boot site starts from its own ports (here the exec channel) and folds the
-        // attach in after them.
+        // attach in: under libkrun that adds NICs and no port, under cloud-hypervisor one
+        // bridge per NIC and no NIC. Either way the site's own ports keep their place.
         let mut ports = vec![VsockPort::exec(vsock, 4444)];
-        switch_attach(vsock, 1024, &addrs, 24, gw).apply(&mut ports);
+        let nics = switch_attach(vsock, 1024, &addrs, 24, gw, true).apply(&mut ports);
+        assert_eq!(nics.len(), 2);
+        assert_eq!(ports.iter().map(|p| p.port).collect::<Vec<_>>(), vec![4444]);
+
+        let mut ports = vec![VsockPort::exec(vsock, 4444)];
+        let nics = switch_attach(vsock, 1024, &addrs, 24, gw, false).apply(&mut ports);
+        assert!(nics.is_empty());
         assert_eq!(
             ports.iter().map(|p| p.port).collect::<Vec<_>>(),
             vec![4444, 1024, 1025]
@@ -752,6 +848,7 @@ mod tests {
             cpus: 4,
             mem: "8G".into(),
             shared_mem: true,
+            nics: Vec::new(),
             net: Net::Tap {
                 tap: "civtap0".into(),
                 mac: "52:54:00:d2:f0:01".into(),
@@ -825,6 +922,7 @@ mod tests {
             cpus: 2,
             mem: "2G".into(),
             shared_mem: false,
+            nics: Vec::new(),
             net: Net::None,
             balloon: false,
             serial_log: "/w/console.log".into(),

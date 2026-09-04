@@ -56,8 +56,8 @@ pub fn hybrid_socket(base: &Path, port: u32) -> PathBuf {
 /// `52:54:00:<octet2>:<octet3>:<octet4>`. The prefix follows the QEMU convention; the
 /// low three IPv4 octets distinguish every address in subnets up to a /8.
 ///
-/// The host keys the switch's DHCP reservation on this MAC, and the guest assigns it to
-/// the NIC's tap.
+/// The host keys the switch's DHCP reservation on this MAC, and it is the NIC's hardware
+/// address either way: the VMM sets it on a virtio-net device, the guest agent on a tap.
 pub fn mac_for_ip(ip: Ipv4Addr) -> String {
     let o = ip.octets();
     format!("52:54:00:{:02x}:{:02x}:{:02x}", o[1], o[2], o[3])

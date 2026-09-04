@@ -379,9 +379,11 @@ pub fn nth_static_ip(gateway: Ipv4Addr, prefix: u8, n: u32) -> Result<Ipv4Addr> 
 pub use vk_core::net::mac_for_ip;
 
 /// The most NICs one guest may ask for (compose `x-virtkit.nics`, `vk run --nics`).
-/// A ceiling at all because every NIC costs a static address, a vsock port and a switch
-/// port; this high because no appliance layout here has wanted more, and a typo should
-/// fail naming the limit rather than exhausting the LAN.
+/// Each NIC consumes a static address, switch port, and either a libkrun virtio-pci slot or
+/// a cloud-hypervisor vsock port and tap process. Eight NICs plus a service guest's fixed
+/// devices (rootfs, console, vsock, rng, and balloon) leave 18 of PCI bus 0's 31 usable
+/// slots for virtiofs shares and disks. No current appliance needs more; reject larger
+/// values explicitly instead of exhausting the LAN.
 pub const MAX_NICS: u32 = 8;
 
 /// Hands out the static addresses of the NICs after eth0, continuing the same top-down
@@ -613,10 +615,19 @@ pub fn boot_unit(
 
     // How this sibling joins the switch: eth0 then its NICs after it, on `net_port` + the
     // interface index (the ports the switch bound for it), all sharing eth0's prefix — one
-    // segment, one subnet.
+    // segment, one subnet. Each NIC's MAC derives from its address, so the switch's per-MAC
+    // DHCP reservation hands back this exact IP (== the address the resolver advertises for
+    // the sibling's name) to an image whose own systemd DHCPs eth0.
     let mut addrs = vec![svc.addr];
     addrs.extend_from_slice(&svc.extra_ips);
-    let attach = crate::vmm::switch_attach(&vsock, net_port, &addrs, svc.prefix, gateway);
+    let attach = crate::vmm::switch_attach(
+        &vsock,
+        net_port,
+        &addrs,
+        svc.prefix,
+        gateway,
+        crate::vmm::libkrun_selected(),
+    );
 
     // Build and spawn the VMM. On any failure, kill the virtiofsd children already
     // spawned above before returning — Child's Drop does not kill, so a soft error
@@ -680,13 +691,13 @@ pub fn boot_unit(
             cmdline.push_str(&format!(" VIRTKIT_DISKS={disk_devices}"));
         }
 
-        // The switch attach (one guest→host bridge per NIC), plus a host→guest exec
-        // channel: the agent serves it (a preinit boot's reparented serve, or the default
-        // boot's VIRTKIT_SERVE=1 above), and the job supervisor's prepare polls it to gate
-        // on the service's readiness. libkrun needs the explicit per-port listener;
-        // cloud-hypervisor derives it from the base socket and ignores the entry.
+        // The switch attach (virtio-net NICs, or one vsock bridge per NIC), plus a
+        // host→guest exec channel: the agent serves it (a preinit boot's reparented serve,
+        // or the default boot's VIRTKIT_SERVE=1 above), and the job supervisor's prepare
+        // polls it to gate on the service's readiness. libkrun needs the explicit per-port
+        // listener; cloud-hypervisor derives it from the base socket and ignores the entry.
         let mut vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
-        attach.apply(&mut vsock_ports);
+        let nics = attach.apply(&mut vsock_ports);
         let spec = crate::vmm::VmSpec {
             kernel: boot_kernel,
             cmdline,
@@ -700,6 +711,7 @@ pub fn boot_unit(
             mem: svc.mem.clone().unwrap_or_else(|| DEFAULT_MEM.into()),
             shared_mem,
             net: crate::vmm::Net::None,
+            nics,
             // Like the job VM: freed guest pages go back to the host, so a service
             // that idles between jobs stops holding its peak RAM against the ones
             // sharing the box.
