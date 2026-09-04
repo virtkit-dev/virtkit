@@ -313,19 +313,19 @@ vk list
 ```
 
 ```
-PID    UPTIME  NAME                PROJECT        EXEC ADDRESS                                    PUBLISHED
-41230  2h14m   app/Dockerfile:dev  /home/me/app   vsock-auto:///home/me/app/.vk/vsock.sock:4444   127.0.0.1:8443->localhost:443
-41877  35m     shop (+db, redis)   /home/me/shop  vsock-auto:///home/me/shop/.vk/vsock.sock:4444  127.0.0.1:5432->127.0.0.1:5432@db
+PID    UPTIME  NAME                SERVICES   PROJECT        EXEC ADDRESS                                    PUBLISHED
+41230  2h14m   app/Dockerfile:dev  -          /home/me/app   vsock-auto:///home/me/app/.vk/vsock.sock:4444   127.0.0.1:8443->localhost:443
+41877  35m     shop                db, redis  /home/me/shop  vsock-auto:///home/me/shop/.vk/vsock.sock:4444  127.0.0.1:5432->127.0.0.1:5432@db
 ```
 
-NAME is the built Dockerfile with its target stage, the compose primary, or the image ref;
-a compose VM appends the services it is currently running, or every declared one when
-the VM cannot be asked. PROJECT is the run's `--workspace`, then its `--workdir`, then its
-launch directory. EXEC ADDRESS is recorded as given, so a relative `--state-dir` lists a
-relative path. PUBLISHED is every port `vk publish ensure` holds open on the host for the
-VM, as `listen->to`, with `@service` when a compose sibling rather than the primary dials
-the target and `(unconfirmed)` when the publisher's liveness could not be checked; `-`
-when nothing is published.
+NAME is the built Dockerfile with its target stage, the compose primary, or the image ref.
+SERVICES lists the compose services running beside the primary, or every declared one when
+the VM cannot be asked; `-` for none. PROJECT is the run's `--workspace`, then its
+`--workdir`, then its launch directory. EXEC ADDRESS is recorded as given, so a relative
+`--state-dir` lists a relative path. PUBLISHED is every port `vk publish ensure` holds open
+on the host for the VM, as `listen->to`, with `@service` when a compose sibling rather than
+the primary dials the target and `(unconfirmed)` when the publisher's liveness could not be
+checked; `-` when nothing is published.
 
 An optional directory scopes the list to the VMs whose project is that directory or one
 below it, or to the one whose state dir it is exactly:

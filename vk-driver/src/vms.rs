@@ -713,7 +713,9 @@ fn query_units(ctl: &Path) -> Result<Vec<UnitStatus>> {
     }
 }
 
-fn display_name(entry: &VmEntry, units: Option<&[UnitStatus]>) -> String {
+/// The SERVICES column: the compose siblings running beside the primary (see
+/// `named_in_text`), comma-separated; `-` for none.
+fn services_cell(entry: &VmEntry, units: Option<&[UnitStatus]>) -> String {
     let services: Vec<&str> = entry
         .services
         .iter()
@@ -721,9 +723,9 @@ fn display_name(entry: &VmEntry, units: Option<&[UnitStatus]>) -> String {
         .filter(|name| named_in_text(units, name))
         .collect();
     if services.is_empty() {
-        entry.label.clone()
+        "-".to_string()
     } else {
-        format!("{} (+{})", entry.label, services.join(", "))
+        services.join(", ")
     }
 }
 
@@ -865,6 +867,7 @@ pub fn list_report(
         "PID",
         "UPTIME",
         "NAME",
+        "SERVICES",
         "PROJECT",
         "EXEC ADDRESS",
         "PUBLISHED",
@@ -881,7 +884,8 @@ pub fn list_report(
             let mut row = vec![
                 e.pid.to_string(),
                 uptime(e.created_secs),
-                display_name(e, units.as_deref()),
+                e.label.clone(),
+                services_cell(e, units.as_deref()),
                 e.project_dir
                     .as_deref()
                     .map(|p| p.display().to_string())
@@ -1549,7 +1553,7 @@ mod tests {
         let e = compose_entry();
         // No answer from the VM: the text view names every recorded service and the JSON
         // carries an explicit null state and ip for each.
-        assert_eq!(display_name(&e, None), "app (+db, redis)");
+        assert_eq!(services_cell(&e, None), "db, redis");
         assert_eq!(
             services_json(&e, None),
             serde_json::json!([
@@ -1566,8 +1570,8 @@ mod tests {
             unit("db", "running", "10.0.0.2/24"),
             unit("redis", "stopped", "10.0.0.3/24"),
         ];
-        assert_eq!(display_name(&e, Some(&units)), "app (+db)");
-        assert_eq!(display_name(&e, Some(&[])), "app");
+        assert_eq!(services_cell(&e, Some(&units)), "db");
+        assert_eq!(services_cell(&e, Some(&[])), "-");
     }
 
     #[test]
@@ -1591,7 +1595,7 @@ mod tests {
         let e = compose_entry();
         // The VM answered but knows nothing of `redis` (registry/manager drift).
         let units = [unit("db", "running", "10.0.0.2/24")];
-        assert_eq!(display_name(&e, Some(&units)), "app (+db)");
+        assert_eq!(services_cell(&e, Some(&units)), "db");
         assert_eq!(
             services_json(&e, Some(&units)),
             serde_json::json!([

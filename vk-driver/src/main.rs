@@ -1696,10 +1696,11 @@ enum Cmd {
     },
     /// List the running vk VMs
     ///
-    /// VMs started with `--state-dir`, with their pid, uptime, name, project directory
-    /// (`--workspace`, then `--workdir`, then launch directory), exec-channel address, and
-    /// published ports (`listen->to`; `@service` when a compose sibling dials). With DIR,
-    /// only VMs whose project is DIR or below it. Use `--json` or `--field` for scripts.
+    /// VMs started with `--state-dir`, with their pid, uptime, name, compose services,
+    /// project directory (`--workspace`, then `--workdir`, then launch directory),
+    /// exec-channel address, and published ports (`listen->to`; `@service` when a compose
+    /// sibling dials). With DIR, only VMs whose project is DIR or below it. Use `--json` or
+    /// `--field` for scripts.
     #[command(display_order = 6)]
     List {
         /// only VMs whose project directory is DIR or below it (default: all)

@@ -23,6 +23,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- `vk list` shows a compose VM's running services in their own SERVICES column instead of
+  appending them to its name as `app (+db, redis)`.
 - A VM's project directory — shown in `vk list` and used by `vk list DIR`, `vk exec`,
   `vk stop` and `vk reboot` — now comes from `--workspace`, then `--workdir`, then the
   `vk run` launch directory, so a VM booted by a script from elsewhere lists under its
