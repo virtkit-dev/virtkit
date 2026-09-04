@@ -6,11 +6,13 @@
 # Pass --stable to track the latest stable release instead.
 #
 # Rewrites KERNEL_VERSION + KERNEL_SHA256 in kernel/Dockerfile (and the vN.x download
-# path, so a new major stays consistent) from kernel.org's published values. Review the
-# diff, then run ./build-kernel.sh — the Dockerfile re-verifies the sha256 at build time,
-# so a bad pin fails the build loudly. Idempotent: a no-op when already current. Requires
-# curl. Kept separate from update.sh (the Rust toolchain) since the kernel moves on its
-# own cadence.
+# path, so a new major stays consistent) from kernel.org's published values, and
+# KERNEL_COMMIT — the commit the signed tag v<version> points to on the gregkh/linux
+# mirror, which the Dockerfile's fallback path checks the tag against. Review the diff,
+# then run ./build-kernel.sh — the Dockerfile re-verifies the sha256 at build time, so a
+# bad pin fails the build loudly. Idempotent: a no-op when already current. Requires curl
+# and git. Kept separate from update.sh (the Rust toolchain) since the kernel moves on
+# its own cadence.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -57,9 +59,20 @@ if ! [[ "$SHA" =~ ^[0-9a-f]{64}$ ]]; then
     exit 1
 fi
 
+# The commit the signed tag resolves to, for the Dockerfile's git fallback. `^{}` peels
+# the tag object to its commit — the value `git rev-parse HEAD` yields after the clone.
+MIRROR="https://github.com/gregkh/linux.git"
+echo "resolving the commit of tag v${LATEST} on ${MIRROR} ..."
+COMMIT=$(git ls-remote "$MIRROR" "refs/tags/v${LATEST}^{}" | awk '{ print $1 }')
+if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+    echo >&2 "ERROR: could not resolve tag v${LATEST} on ${MIRROR} (got '$COMMIT')"
+    exit 1
+fi
+
 sed -i -E \
     -e "s/^ARG KERNEL_VERSION=.*/ARG KERNEL_VERSION=${LATEST}/" \
     -e "s/^ARG KERNEL_SHA256=.*/ARG KERNEL_SHA256=${SHA}/" \
+    -e "s/^ARG KERNEL_COMMIT=.*/ARG KERNEL_COMMIT=${COMMIT}/" \
     -e "s#/v[0-9]+\.x/#/${VDIR}/#g" \
     kernel/Dockerfile
 
