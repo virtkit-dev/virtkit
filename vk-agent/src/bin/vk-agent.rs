@@ -6,7 +6,6 @@ use clap::{Parser, Subcommand};
 use log::{LevelFilter, error, info};
 use simplelog::{ColorChoice, Config, TermLogger, TerminalMode, WriteLogger};
 use std::fs::File;
-use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
 use vk_core::addr::SocketAddr;
@@ -282,18 +281,27 @@ fn main() {
         .block_on(async_main(socket, cli_args.command));
 }
 
-fn init_main(socket: SocketAddr, inactivity_timeout: Option<u64>) {
+/// Configure logging for PID 1 and the long-running `serve`, `forward`, `net`, and
+/// `ssh-serve` subcommands. They write to stdout: the guest console is captured in the
+/// host's `console.log`, while the host-side `--host-exec` server writes to a dedicated log.
+///
+/// The default format starts with `HH:MM:SS [LEVEL] ` in UTC. Debug records then add the
+/// thread ID and module. Force uncoloured output because the guest console is a terminal but
+/// its output is consumed as a file. Keep this prefix stable for `console.log` consumers.
+fn install_console_logger(level: LevelFilter) {
+    // Initialization fails only if another logger is already registered. Each process calls
+    // this once; PID 1 should keep running if that invariant breaks.
     TermLogger::init(
-        LevelFilter::Info,
+        level,
         Config::default(),
         TerminalMode::Stdout,
-        if std::io::stdout().is_terminal() {
-            ColorChoice::Auto
-        } else {
-            ColorChoice::Never
-        },
+        ColorChoice::Never,
     )
     .ok();
+}
+
+fn init_main(socket: SocketAddr, inactivity_timeout: Option<u64>) {
+    install_console_logger(LevelFilter::Info);
     // Zero (no watchdog) is resolved inside run_init, together with the kernel-cmdline
     // fallback it takes precedence over: filtering it here would instead let the cmdline win.
     if let Err(e) = vk_agent::init::run_init(&socket, inactivity_timeout) {
@@ -392,17 +400,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
             } else {
                 LevelFilter::Info
             };
-            TermLogger::init(
-                log_level,
-                Config::default(),
-                TerminalMode::Stdout,
-                if std::io::stdout().is_terminal() {
-                    ColorChoice::Auto
-                } else {
-                    ColorChoice::Never
-                },
-            )
-            .unwrap();
+            install_console_logger(log_level);
             // run_server reads a zero timeout as no timeout, so it needs no filtering here.
             let duration = inactivity_timeout.map(Duration::from_secs);
             if let Err(e) = run_server(&socket, duration, exec_wrapper, exec_wrapper_env).await {
@@ -411,17 +409,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
             };
         }
         Commands::Forward { listen, chown } => {
-            TermLogger::init(
-                LevelFilter::Info,
-                Config::default(),
-                TerminalMode::Stdout,
-                if std::io::stdout().is_terminal() {
-                    ColorChoice::Auto
-                } else {
-                    ColorChoice::Never
-                },
-            )
-            .unwrap();
+            install_console_logger(LevelFilter::Info);
             let chown = match chown.as_deref().map(vk_agent::diskmount::parse_chown) {
                 Some(Ok(ids)) => Some(ids),
                 Some(Err(e)) => {
@@ -445,17 +433,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
             }
         }
         Commands::Net { iface, mac } => {
-            TermLogger::init(
-                LevelFilter::Info,
-                Config::default(),
-                TerminalMode::Stdout,
-                if std::io::stdout().is_terminal() {
-                    ColorChoice::Auto
-                } else {
-                    ColorChoice::Never
-                },
-            )
-            .unwrap();
+            install_console_logger(LevelFilter::Info);
             if let Err(e) = vk_agent::tap::run_net(&socket, &iface, mac.as_deref()).await {
                 error!("net: {e:#}");
                 std::process::exit(1)
@@ -466,17 +444,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
             authorized_keys,
             user,
         } => {
-            TermLogger::init(
-                LevelFilter::Info,
-                Config::default(),
-                TerminalMode::Stdout,
-                if std::io::stdout().is_terminal() {
-                    ColorChoice::Auto
-                } else {
-                    ColorChoice::Never
-                },
-            )
-            .unwrap();
+            install_console_logger(LevelFilter::Info);
             let keys = vk_agent::ssh::parse_authorized_keys(authorized_keys.as_slice());
             if let Err(e) = vk_agent::ssh::run_ssh_server(&socket, &keys, user).await {
                 error!("ssh-serve: {e:#}");

@@ -17,6 +17,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- Guest-agent console output is now uncoloured
+  `HH:MM:SS [LEVEL] message`, keeping `console.log` and service logs free of
+  terminal escapes.
 - Under libkrun, `--net` interfaces now come from the VMM instead of an in-guest relay.
   eth0 is available at kernel boot, so an `--init image` guest joins the LAN before its
   init runs. `VIRTKIT_VMM=cloud-hypervisor` is unchanged.
