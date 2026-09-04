@@ -114,7 +114,8 @@ pub(crate) const SSH_AGENT_VSOCK_PORT: u32 = 2223;
 /// Guest vsock port the agent's ssh-serve listens on (`--ssh`); mirrors the
 /// agent's `SSH_VSOCK_PORT`.
 const SSH_VSOCK_PORT: u32 = 2222;
-/// vsock port the guest's tap bridge dials to reach the userspace switch.
+/// Base of the switch's per-NIC port range: the tap bridge for interface i dials
+/// `NET_VSOCK_PORT + i` to reach the userspace switch.
 const NET_VSOCK_PORT: u32 = 1024;
 /// Switch VM id for the primary guest. Siblings use higher ids, and all NICs of a guest share
 /// one id so `switch::handle_frame` accepts its addresses on any of its interfaces.
@@ -683,20 +684,6 @@ fn effective_nics(
                 .map(|u| u.nics)
         })
         .unwrap_or(1)
-}
-
-/// The `VIRTKIT_NET_EXTRA_IPS` cmdline fragment for the primary's NICs after eth0: each
-/// address as `ip/prefix`, comma-joined in interface order — the spelling `vk-agent` splits
-/// back apart. `None` (no fragment) when eth0 is the only NIC.
-fn net_extra_ips_env(extra_ips: &[std::net::Ipv4Addr], prefix: u8) -> Option<String> {
-    if extra_ips.is_empty() {
-        return None;
-    }
-    let specs: Vec<String> = extra_ips
-        .iter()
-        .map(|ip| format!("{ip}/{prefix}"))
-        .collect();
-    Some(format!(" VIRTKIT_NET_EXTRA_IPS={}", specs.join(",")))
 }
 
 /// The `x-virtkit.nested` of the unit booting as the primary, or `false` when no unit is
@@ -1472,6 +1459,7 @@ async fn build_and_boot(
     // The subnet fixes the gateway and the primary's eth0 address; `spawn_vm_switch` derives
     // the same pair, so `vk list` can report the address straight from the registry.
     let (gw, _, primary_ip) = crate::net::switch_addrs(RUN_SUBNET)?;
+    let mut net_attach: Option<crate::vmm::SwitchAttach> = None;
     let mut switch = if args.net {
         // Opt-in credential proxy: run a host-local proxy that injects the runner's
         // registry credentials, and redirect the guest's `registry.vk` (a sentinel
@@ -1488,7 +1476,7 @@ async fn build_and_boot(
             }
             None => None,
         };
-        let (child, frag) = spawn_vm_switch(
+        let (child, attach) = spawn_vm_switch(
             &vsock,
             work,
             NET_VSOCK_PORT,
@@ -1506,7 +1494,8 @@ async fn build_and_boot(
             crate::prio::Prio::Normal,
         )
         .await?;
-        cmdline.push_str(&frag);
+        cmdline.push_str(&attach.cmdline);
+        net_attach = Some(attach);
         Some(child)
     } else {
         if args.registry_proxy.is_some() {
@@ -1805,13 +1794,8 @@ async fn build_and_boot(
     println!("virtkit: booting {} (cpus={cpus}, mem={mem})", vmm.name());
     // exec channel always; the switch and ssh-agent bridges only when set up above.
     let mut vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
-    if args.net {
-        vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, NET_VSOCK_PORT));
-        // One bridge per NIC after eth0, numbered as the switch bound its ports and as the
-        // guest reads VIRTKIT_NET_EXTRA_IPS: interface i dials NET_VSOCK_PORT + i.
-        for i in 1..=planned.primary_extra_ips.len() as u32 {
-            vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, NET_VSOCK_PORT + i));
-        }
+    if let Some(attach) = net_attach {
+        attach.apply(&mut vsock_ports);
     }
     if ssh.is_some() {
         vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, SSH_AGENT_VSOCK_PORT));
@@ -2576,7 +2560,7 @@ async fn compose_up(
     // The switch binds every unit's socket; no VM ever dials the base socket
     // (there is no primary), it is just the switch's canonical listen path.
     let vsock = work.join("vsock.sock");
-    let (mut switch, _frag) = spawn_vm_switch(
+    let (mut switch, _attach) = spawn_vm_switch(
         &vsock,
         work,
         NET_VSOCK_PORT,
@@ -3612,8 +3596,9 @@ pub(crate) struct VmSession {
 pub(crate) const CONTEXT_MOUNT: &str = "/run/virtkit-context";
 
 /// Spawn a `vk switch` giving one VM a userspace LAN + egress over `vsock` (DHCP +
-/// DNS + transparent proxy, unrestricted). Returns the switch child and the cmdline
-/// fragment the guest agent needs to bring up its tap. Waits for the switch to bind.
+/// DNS + transparent proxy, unrestricted). Returns the switch child and how the guest
+/// attaches to it (its vsock bridges, plus the agent's cmdline fragment). Waits for the
+/// switch to bind.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_vm_switch(
     vsock: &Path,
@@ -3639,7 +3624,7 @@ async fn spawn_vm_switch(
     restrict: bool,
     // Whether the VM this switch serves is a build stage (its downloads are the build's).
     prio: crate::prio::Prio,
-) -> Result<(Child, String)> {
+) -> Result<(Child, crate::vmm::SwitchAttach)> {
     let (gw, prefix, guest_ip) = crate::net::switch_addrs(RUN_SUBNET)?;
     // Bind every primary NIC to its assigned address and the shared primary VM id.
     let mut all_listen = vec![(
@@ -3682,14 +3667,11 @@ async fn spawn_vm_switch(
         bytes_log,
         prio,
     })?;
-    let mut frag = format!(
-        " VIRTKIT_NET_PORT={net_port} VIRTKIT_VM_IP={guest_ip}/{prefix} \
-         VIRTKIT_VM_GW={gw} VIRTKIT_VM_DNS={gw}"
-    );
-    if let Some(extra) = net_extra_ips_env(primary_extra_ips, prefix) {
-        frag.push_str(&extra);
-    }
-    Ok((child, frag))
+    // eth0 first, then the NICs after it, in the order the switch ports were bound above.
+    let mut addrs = vec![guest_ip];
+    addrs.extend_from_slice(primary_extra_ips);
+    let attach = crate::vmm::switch_attach(vsock, net_port, &addrs, prefix, gw);
+    Ok((child, attach))
 }
 
 /// The qemu/cloud-hypervisor disk format of a stage image, by extension: forked stages
@@ -3926,13 +3908,14 @@ pub(crate) async fn boot_session(
     }
 
     let mut switch: Option<Child> = None;
+    let mut net_attach: Option<crate::vmm::SwitchAttach> = None;
     let net_on = !matches!(net, crate::build::BuildNet::None);
     if net_on {
         let (allow_ip, allow_name): (&[String], &[String]) = match net {
             crate::build::BuildNet::Allow { ips, names } => (ips, names),
             _ => (&[], &[]),
         };
-        let (child, frag) = spawn_vm_switch(
+        let (child, attach) = spawn_vm_switch(
             &vsock,
             &work,
             NET_VSOCK_PORT,
@@ -3954,12 +3937,13 @@ pub(crate) async fn boot_session(
         )
         .await?;
         switch = Some(child);
-        cmdline.push_str(&frag);
+        cmdline.push_str(&attach.cmdline);
+        net_attach = Some(attach);
     }
 
     let mut vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
-    if net_on {
-        vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, NET_VSOCK_PORT));
+    if let Some(attach) = net_attach {
+        attach.apply(&mut vsock_ports);
     }
     // virtio-fs (the context share) requires shared guest memory (shared_mem).
     // --kernel=image boots the extracted image kernel; otherwise the pinned build kernel.
@@ -4750,25 +4734,6 @@ mod tests {
         // no primary (a bare `vk run`, or compose up): one NIC unless the flag says more
         assert_eq!(effective_nics(None, &units, None), 1);
         assert_eq!(effective_nics(Some(2), &units, None), 2);
-    }
-
-    #[test]
-    fn net_extra_ips_env_is_the_comma_joined_wire_string() {
-        // eth0 alone carries no fragment.
-        assert_eq!(net_extra_ips_env(&[], 24), None);
-        // Each NIC after eth0 as `ip/prefix`, comma-joined in interface order — the exact
-        // spelling `vk-agent`'s `extra_nics` splits back apart.
-        assert_eq!(
-            net_extra_ips_env(
-                &[
-                    "192.168.127.254".parse().unwrap(),
-                    "192.168.127.253".parse().unwrap()
-                ],
-                24
-            )
-            .as_deref(),
-            Some(" VIRTKIT_NET_EXTRA_IPS=192.168.127.254/24,192.168.127.253/24")
-        );
     }
 
     #[test]

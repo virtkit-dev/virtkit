@@ -1307,6 +1307,8 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // (ip, prefix, gw, dns) once a tap is wired, rendered onto the cmdline below
     // in the form the chosen init understands.
     let mut net_info: Option<(String, u32, String, String)> = None;
+    // The job VM's switch attach (`net.mode = switch`): its vsock bridge.
+    let mut job_attach: Option<crate::vmm::SwitchAttach> = None;
     match cfg.net.mode.as_str() {
         "none" => {}
         "tap" => {
@@ -1365,11 +1367,15 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                 children.push(child);
                 children.extend(aux);
             }
-            cmdline.push_str(&format!(
-                " VIRTKIT_NET_PORT={} VIRTKIT_VM_IP={guest_ip}/{prefix} \
-                 VIRTKIT_VM_GW={gateway} VIRTKIT_VM_DNS={gateway}",
-                cfg.net.net_port
-            ));
+            let attach = crate::vmm::switch_attach(
+                &ctx.vsock_sock(),
+                cfg.net.net_port,
+                &[guest_ip],
+                prefix,
+                gateway,
+            );
+            cmdline.push_str(&attach.cmdline);
+            job_attach = Some(attach);
         }
         other => bail!("unsupported net.mode {other:?} (none|tap|pool|switch)"),
     }
@@ -1437,11 +1443,8 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         &ctx.vsock_sock(),
         cfg.vm.vsock_port,
     )];
-    if cfg.net.mode == "switch" {
-        vsock_ports.push(crate::vmm::VsockPort::bridge(
-            &ctx.vsock_sock(),
-            cfg.net.net_port,
-        ));
+    if let Some(attach) = job_attach {
+        attach.apply(&mut vsock_ports);
     }
     if ssh_agent_forwarding(cfg) {
         vsock_ports.push(crate::vmm::VsockPort::bridge(

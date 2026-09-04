@@ -174,12 +174,81 @@ pub struct FsShare {
     pub gid_map: Vec<String>,
 }
 
-/// Guest networking. `switch`-mode guests add no device here — the in-guest agent
-/// bridges eth0 to the userspace switch over vsock — so they use [`Net::None`].
+/// Guest networking outside the switch: a host tap by name (CI `net.mode = tap|pool`), or
+/// nothing. Switch-mode guests use [`Net::None`] here and attach through [`switch_attach`],
+/// which rides a vsock bridge rather than a VMM net device.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum Net {
     None,
     Tap { tap: String, mac: String },
+}
+
+/// How one guest joins the switch, in the form the VMM and the guest agent each read.
+/// Built by [`switch_attach`]; the caller appends `cmdline` to the guest's and folds the
+/// bridges into its [`VmSpec`] with [`SwitchAttach::apply`].
+pub struct SwitchAttach {
+    pub vsock_ports: Vec<VsockPort>,
+    pub cmdline: String,
+}
+
+impl SwitchAttach {
+    /// Fold this attach into a boot: append its vsock bridges to the spec's `vsock_ports`.
+    pub fn apply(self, vsock_ports: &mut Vec<VsockPort>) {
+        vsock_ports.extend(self.vsock_ports);
+    }
+}
+
+/// Wire a guest's NICs to the switch ports `net_port + i`, one per address in `addrs`
+/// (eth0's first, then each NIC after it in interface order; all share `prefix`). The
+/// switch must already listen on `hybrid_socket(vsock, net_port + i)` for each.
+///
+/// Each NIC gets a guest→host vsock bridge on its port: the guest agent forks a tap per
+/// NIC and carries its frames over that bridge (`VIRTKIT_NET_PORT`), then takes the static
+/// address, gateway and resolver from the tokens on the same cmdline.
+///
+/// `net_port + i` is unchecked: `net_port` is the host's own (`[net] net_port`, or the
+/// `vk run` constant) and the same sum already named the sockets the switch was told to
+/// listen on, so a value that overflowed would have failed to bind long before a guest
+/// saw it.
+pub fn switch_attach(
+    vsock: &Path,
+    net_port: u32,
+    addrs: &[std::net::Ipv4Addr],
+    prefix: u8,
+    gateway: std::net::Ipv4Addr,
+) -> SwitchAttach {
+    let mut out = SwitchAttach {
+        vsock_ports: Vec::new(),
+        cmdline: String::new(),
+    };
+    let Some((eth0, extra)) = addrs.split_first() else {
+        return out;
+    };
+    for i in 0..addrs.len() as u32 {
+        out.vsock_ports.push(VsockPort::bridge(vsock, net_port + i));
+    }
+    out.cmdline.push_str(&format!(
+        " VIRTKIT_NET_PORT={net_port} VIRTKIT_VM_IP={eth0}/{prefix} \
+         VIRTKIT_VM_GW={gateway} VIRTKIT_VM_DNS={gateway}"
+    ));
+    if let Some(extra) = net_extra_ips_env(extra, prefix) {
+        out.cmdline.push_str(&extra);
+    }
+    out
+}
+
+/// The `VIRTKIT_NET_EXTRA_IPS` cmdline fragment for a guest's NICs after eth0: each address
+/// as `ip/prefix`, comma-joined in interface order — the spelling `vk-agent` splits back
+/// apart. `None` (no fragment) when eth0 is the only NIC.
+fn net_extra_ips_env(extra_ips: &[std::net::Ipv4Addr], prefix: u8) -> Option<String> {
+    if extra_ips.is_empty() {
+        return None;
+    }
+    let specs: Vec<String> = extra_ips
+        .iter()
+        .map(|ip| format!("{ip}/{prefix}"))
+        .collect();
+    Some(format!(" VIRTKIT_NET_EXTRA_IPS={}", specs.join(",")))
 }
 
 /// A guest vsock port mapped to a host-side unix socket. This is how the libkrun
@@ -499,6 +568,71 @@ mod tests {
         cmd.get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn switch_attach_bridges_each_nic_over_its_own_vsock_port() {
+        let vsock = Path::new("/w/vsock.sock");
+        let gw: std::net::Ipv4Addr = "192.168.127.1".parse().unwrap();
+        let addrs: Vec<std::net::Ipv4Addr> = ["192.168.127.2", "192.168.127.254"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        let a = switch_attach(vsock, 1024, &addrs, 24, gw);
+        // One guest→host bridge per NIC on 1024 + the interface index; the agent forks a
+        // tap per NIC and reads its address off the cmdline.
+        let ports: Vec<(u32, String, bool)> = a
+            .vsock_ports
+            .iter()
+            .map(|p| (p.port, p.socket.display().to_string(), p.listen))
+            .collect();
+        assert_eq!(
+            ports,
+            vec![
+                (1024, "/w/vsock.sock_1024".to_string(), false),
+                (1025, "/w/vsock.sock_1025".to_string(), false),
+            ]
+        );
+        assert_eq!(
+            a.cmdline,
+            " VIRTKIT_NET_PORT=1024 VIRTKIT_VM_IP=192.168.127.2/24 \
+             VIRTKIT_VM_GW=192.168.127.1 VIRTKIT_VM_DNS=192.168.127.1 \
+             VIRTKIT_NET_EXTRA_IPS=192.168.127.254/24"
+        );
+    }
+
+    #[test]
+    fn switch_attach_degenerate_nic_counts() {
+        let vsock = Path::new("/w/vsock.sock");
+        let gw: std::net::Ipv4Addr = "192.168.127.1".parse().unwrap();
+        let eth0: std::net::Ipv4Addr = "192.168.127.2".parse().unwrap();
+        // eth0 alone carries no VIRTKIT_NET_EXTRA_IPS.
+        let one = switch_attach(vsock, 1024, &[eth0], 24, gw);
+        assert!(!one.cmdline.contains("VIRTKIT_NET_EXTRA_IPS"));
+        assert_eq!(one.vsock_ports.len(), 1);
+        // No address at all attaches nothing and says nothing on the cmdline: `--net` is
+        // off, and a guest with no port on the switch must not be told it has one.
+        let none = switch_attach(vsock, 1024, &[], 24, gw);
+        assert!(none.vsock_ports.is_empty());
+        assert!(none.cmdline.is_empty());
+    }
+
+    #[test]
+    fn switch_attach_apply_appends_to_the_boot_sites_own_ports() {
+        let vsock = Path::new("/w/vsock.sock");
+        let gw: std::net::Ipv4Addr = "192.168.127.1".parse().unwrap();
+        let addrs: Vec<std::net::Ipv4Addr> = ["192.168.127.2", "192.168.127.254"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        // A boot site starts from its own ports (here the exec channel) and folds the
+        // attach in after them.
+        let mut ports = vec![VsockPort::exec(vsock, 4444)];
+        switch_attach(vsock, 1024, &addrs, 24, gw).apply(&mut ports);
+        assert_eq!(
+            ports.iter().map(|p| p.port).collect::<Vec<_>>(),
+            vec![4444, 1024, 1025]
+        );
     }
 
     #[test]

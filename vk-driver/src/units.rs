@@ -34,6 +34,8 @@ pub struct Provisioned {
     pub ip: String,
     /// the same address without the prefix, for deriving the MAC / DHCP reservation.
     pub addr: Ipv4Addr,
+    /// Prefix from [`Self::ip`], shared by every NIC on the LAN.
+    pub prefix: u8,
     pub cid: u32,
     pub config: RunConfig,
     pub volumes: Vec<crate::compose::Volume>,
@@ -326,6 +328,7 @@ pub fn provisioned(
         ext4,
         ip: format!("{ip}/{prefix}"),
         addr: ip,
+        prefix,
         cid: FIRST_SERVICE_CID + slot,
         config,
         volumes: unit.volumes.clone(),
@@ -614,23 +617,14 @@ pub fn boot_unit(
     // address the resolver advertises for the sibling's name). Harmless for the
     // static path (it sets its address directly); required for the image-init path,
     // whose own systemd DHCPs eth0.
-    let mac = svc
-        .ip
-        .split('/')
-        .next()
-        .and_then(|s| s.parse::<Ipv4Addr>().ok())
-        .map(mac_for_ip);
+    let mac = mac_for_ip(svc.addr);
 
-    // The NICs after eth0 share eth0's prefix — one segment, one subnet — so the guest
-    // gets `ip/prefix` per NIC and derives each tap's MAC from its own address.
-    let prefix = svc.ip.split('/').nth(1).unwrap_or("24").to_string();
-    let extra_nic_count = svc.extra_ips.len() as u32;
-    let extra_ip_specs = svc
-        .extra_ips
-        .iter()
-        .map(|ip| format!("{ip}/{prefix}"))
-        .collect::<Vec<_>>()
-        .join(",");
+    // How this sibling joins the switch: eth0 then its NICs after it, on `net_port` + the
+    // interface index (the ports the switch bound for it), all sharing eth0's prefix — one
+    // segment, one subnet.
+    let mut addrs = vec![svc.addr];
+    addrs.extend_from_slice(&svc.extra_ips);
+    let attach = crate::vmm::switch_attach(&vsock, net_port, &addrs, svc.prefix, gateway);
 
     // Build and spawn the VMM. On any failure, kill the virtiofsd children already
     // spawned above before returning — Child's Drop does not kill, so a soft error
@@ -649,10 +643,8 @@ pub fn boot_unit(
             // (VIRTKIT_KERNEL/VIRTKIT_INIT) were computed above.
             format!(
                 "console=ttyS0 pci=conf1 VIRTKIT_PIVOT=/dev/vda \
-                 VIRTKIT_VSOCK_PORT={VSOCK_PORT} VIRTKIT_HOSTNAME={} \
-                 VIRTKIT_NET_PORT={net_port} VIRTKIT_VM_IP={} VIRTKIT_VM_GW={gateway} \
-                 VIRTKIT_VM_DNS={gateway}{handoff_frag}",
-                svc.hostname, svc.ip
+                 VIRTKIT_VSOCK_PORT={VSOCK_PORT} VIRTKIT_HOSTNAME={}{handoff_frag}",
+                svc.hostname
             )
         } else {
             // Default agent-service boot: the agent stays PID 1 and forks the unit's
@@ -663,15 +655,14 @@ pub fn boot_unit(
             // server (on VSOCK_PORT) so prepare can poll readiness.
             format!(
                 "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda VIRTKIT_MODE=service \
-                 VIRTKIT_SERVE=1 VIRTKIT_VSOCK_PORT={VSOCK_PORT} \
-                 VIRTKIT_HOSTNAME={} VIRTKIT_NET_PORT={net_port} \
-                 VIRTKIT_VM_IP={} VIRTKIT_VM_GW={gateway} VIRTKIT_VM_DNS={gateway}",
-                svc.hostname, svc.ip
+                 VIRTKIT_SERVE=1 VIRTKIT_VSOCK_PORT={VSOCK_PORT} VIRTKIT_HOSTNAME={}",
+                svc.hostname
             )
         };
-        if let Some(mac) = &mac {
-            cmdline.push_str(&format!(" VIRTKIT_VM_MAC={mac}"));
-        }
+        // The switch attach: static address, the gateway as default route and resolver (its
+        // DNS answers the service names and forwards the rest), and the NICs after eth0.
+        cmdline.push_str(&attach.cmdline);
+        cmdline.push_str(&format!(" VIRTKIT_VM_MAC={mac}"));
         if !virtiofs.is_empty() {
             cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS={virtiofs}"));
         }
@@ -697,28 +688,14 @@ pub fn boot_unit(
         if !disk_devices.is_empty() {
             cmdline.push_str(&format!(" VIRTKIT_DISKS={disk_devices}"));
         }
-        // The NICs after eth0: the agent numbers them eth1 upward in this order and
-        // bridges each over `net_port` + its index, matching the vsock ports below.
-        if !extra_ip_specs.is_empty() {
-            cmdline.push_str(&format!(" VIRTKIT_NET_EXTRA_IPS={extra_ip_specs}"));
-        }
 
-        // The guest→host switch bridge, plus a host→guest exec channel: the agent
-        // serves it (a preinit boot's reparented serve, or the default boot's
-        // VIRTKIT_SERVE=1 above), and the job supervisor's prepare polls it to gate on
-        // the service's readiness. libkrun needs the explicit per-port listener;
+        // The switch attach (one guest→host bridge per NIC), plus a host→guest exec
+        // channel: the agent serves it (a preinit boot's reparented serve, or the default
+        // boot's VIRTKIT_SERVE=1 above), and the job supervisor's prepare polls it to gate
+        // on the service's readiness. libkrun needs the explicit per-port listener;
         // cloud-hypervisor derives it from the base socket and ignores the entry.
-        //
-        // One bridge per NIC, on `net_port` + the interface index: each is a separate L2
-        // port on the switch, which is what makes them independent interfaces on the
-        // segment rather than one interface seen twice.
-        let mut vsock_ports = vec![
-            crate::vmm::VsockPort::bridge(&vsock, net_port),
-            crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT),
-        ];
-        for i in 1..=extra_nic_count {
-            vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, net_port + i));
-        }
+        let mut vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
+        attach.apply(&mut vsock_ports);
         let spec = crate::vmm::VmSpec {
             kernel: boot_kernel,
             cmdline,
