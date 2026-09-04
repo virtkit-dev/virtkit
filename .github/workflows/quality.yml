@@ -52,9 +52,9 @@ jobs:
         run: docker build -t virtkit-build -f .devcontainer/Dockerfile .devcontainer
 
       # audit.sh runs cargo audit (baked into the image) and reads .cargo/audit.toml.
-      # --deny warnings fails the job on any advisory. Invoked via `sh` because the Alpine
-      # image has no bash for the script's shebang; audit.sh is POSIX-clean so busybox sh
-      # runs it fine, and finds no vk/docker in the container so it audits directly.
+      # --deny warnings fails the job on any advisory. Invoked via `sh`: audit.sh is
+      # POSIX-clean, so it needs nothing beyond the image's sh, and it finds no vk/docker in
+      # the container so it audits directly.
       - name: cargo audit
         run: |
           docker run --rm \
