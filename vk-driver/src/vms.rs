@@ -32,8 +32,8 @@ use vk_core::fleetctl::{Frame, Request, UnitStatus};
 pub struct VmEntry {
     /// The run's `--state-dir`, canonicalized — the VM's identity and the file's key.
     pub state_dir: PathBuf,
-    /// The directory `vk run` was invoked from (canonicalized), i.e. the project this VM
-    /// belongs to. `vk list DIR` / `vk stop DIR` match on this. `None` if it was unavailable.
+    /// Canonical project directory: `--workspace`, then `--workdir`, then the `vk run`
+    /// launch directory. `vk list DIR` and `vk stop DIR` match it; `None` when unavailable.
     #[serde(default)]
     pub project_dir: Option<PathBuf>,
     /// PID of the managing `vk run`, which holds the state-dir lock. `vk list` displays it, and
@@ -967,7 +967,7 @@ fn empty_selection_ok(explicit_target: bool) -> bool {
     !explicit_target
 }
 
-/// A `vk stop TARGET`: either the pid shown by `vk list` or a launch directory.
+/// A `vk stop TARGET`: either the pid shown by `vk list` or a project directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selector {
     Pid(u32),
@@ -983,7 +983,7 @@ impl Selector {
     /// paths.
     pub fn parse(arg: &OsStr) -> Result<Self> {
         if arg.is_empty() {
-            bail!("no VM named — pass a pid, a launch directory, or --all");
+            bail!("no VM named — pass a pid, a project directory, or --all");
         }
         if arg.as_bytes().iter().all(u8::is_ascii_digit)
             && let Some(pid) = arg.to_str().and_then(|s| s.parse::<u32>().ok())
@@ -1025,8 +1025,8 @@ enum Selection {
     Empty(String, bool),
 }
 
-/// Resolve `--all`, a pid or launch directory, or the current directory (the default) into the
-/// running VMs to act on. Shared by [`stop_cmd`] and [`reboot_cmd`].
+/// Resolve `--all`, a pid or project directory, or the current directory (the default) into
+/// the running VMs to act on. Shared by [`stop_cmd`] and [`reboot_cmd`].
 fn select_vms(target: Option<Selector>, all: bool) -> Result<Selection> {
     let vms = running();
     let target = target.map(Selector::resolved);
@@ -1050,8 +1050,8 @@ fn select_vms(target: Option<Selector>, all: bool) -> Result<Selection> {
     Ok(Selection::Matched(selected))
 }
 
-/// Stop VMs selected by `--all`, a pid or launch directory, or the current directory by default.
-/// Returns the summary and whether every selected VM went down.
+/// Stop VMs selected by `--all`, a pid or project directory, or the current directory by
+/// default. Returns the summary and whether every selected VM went down.
 pub fn stop_cmd(target: Option<Selector>, all: bool, timeout: u64) -> Result<(String, bool)> {
     let selected = match select_vms(target, all)? {
         Selection::Matched(v) => v,
@@ -1103,7 +1103,7 @@ fn reboot_one(entry: &VmEntry, force: bool) -> Rebooted {
     Rebooted::HardReset
 }
 
-/// Reboot VMs selected by `--all`, a pid or launch directory, or the current directory by
+/// Reboot VMs selected by `--all`, a pid or project directory, or the current directory by
 /// default. Returns the summary and whether every selected VM was rebooted.
 pub fn reboot_cmd(target: Option<Selector>, all: bool, force: bool) -> Result<(String, bool)> {
     let selected = match select_vms(target, all)? {

@@ -877,8 +877,8 @@ enum Cmd {
     /// Probe a running VM's guest agent
     ///
     /// Prints its reply, or exits non-zero if it does not answer — a liveness check that
-    /// exercises the agent protocol, stronger than a socket stat. Selects the VM launched
-    /// from the current directory by default; pass a DIR to select by launch directory. A
+    /// exercises the agent protocol, stronger than a socket stat. Selects the VM whose project
+    /// is the current directory by default; pass a DIR to select by project directory. A
     /// raw agent address (`vsock-auto://DIR/vsock.sock:4444`) probes it directly, for
     /// plumbing that already knows the socket.
     #[command(display_order = 7)]
@@ -1696,14 +1696,13 @@ enum Cmd {
     },
     /// List the running vk VMs
     ///
-    /// The VMs started with `--state-dir`: their pid, uptime, name, the directory each was
-    /// launched from, its exec-channel address, and the ports `vk publish ensure` holds open
-    /// for it on the host (`listen->to`, `@service` when a compose sibling dials). With a DIR
-    /// argument, only VMs launched from DIR or a subdirectory. `--json` or `--field` for
-    /// scripting.
+    /// VMs started with `--state-dir`, with their pid, uptime, name, project directory
+    /// (`--workspace`, then `--workdir`, then launch directory), exec-channel address, and
+    /// published ports (`listen->to`; `@service` when a compose sibling dials). With DIR,
+    /// only VMs whose project is DIR or below it. Use `--json` or `--field` for scripts.
     #[command(display_order = 6)]
     List {
-        /// only VMs whose launch directory is DIR or below it (default: all)
+        /// only VMs whose project directory is DIR or below it (default: all)
         dir: Option<PathBuf>,
         /// emit the entries as a JSON array instead of a table
         #[arg(long)]
@@ -1727,11 +1726,11 @@ enum Cmd {
     /// Stop running vk VM(s)
     ///
     /// SIGTERMs the managing `vk run` (which tears down the VM and any compose siblings),
-    /// then waits for it to exit. Selects the VM launched from the current directory by
-    /// default; pass a pid or a launch directory to select one, or `--all`.
+    /// then waits for it to exit. Selects the VM whose project is the current directory by
+    /// default; pass a pid or a project directory to select one, or `--all`.
     #[command(display_order = 8)]
     Stop {
-        /// the VM to stop: a PID or a launch directory (default: the current directory)
+        /// the VM to stop: a PID or a project directory (default: the current directory)
         ///
         /// An all-digit argument is a pid, as `vk list` prints; anything else a directory —
         /// whose VM(s), and those of every directory below it, are stopped. A directory
@@ -1751,12 +1750,12 @@ enum Cmd {
     /// Reboot running vk VM(s) in place
     ///
     /// Asks the guest to reboot (`vk-agent reboot` over vsock); the VM comes back on the
-    /// same disks, keeping its pid. Selects the VM launched from the current directory by
-    /// default; pass a pid or a launch directory, or `--all`. `--force` skips the agent and
+    /// same disks, keeping its pid. Selects the VM whose project is the current directory by
+    /// default; pass a pid or a project directory, or `--all`. `--force` skips the agent and
     /// hard-resets through the VMM (for a hung or agent-less guest).
     #[command(display_order = 8)]
     Reboot {
-        /// the VM to reboot: a PID or a launch directory (default: the current directory)
+        /// the VM to reboot: a PID or a project directory (default: the current directory)
         #[arg(value_name = "PID|DIR")]
         target: Option<std::ffi::OsString>,
         /// reboot every running vk VM

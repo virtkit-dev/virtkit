@@ -23,6 +23,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- A VM's project directory — shown in `vk list` and used by `vk list DIR`, `vk exec`,
+  `vk stop` and `vk reboot` — now comes from `--workspace`, then `--workdir`, then the
+  `vk run` launch directory, so a VM booted by a script from elsewhere lists under its
+  checkout.
 - Release artifacts are now built from a Nix-pinned toolchain instead of an Alpine image:
   every input behind a release is locked to content-addressed sources that stay
   rebuildable indefinitely, where Alpine's package archive let pinned versions vanish. The

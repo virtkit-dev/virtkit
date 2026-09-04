@@ -320,18 +320,18 @@ PID    UPTIME  NAME                PROJECT        EXEC ADDRESS                  
 
 NAME is the built Dockerfile with its target stage, the compose primary, or the image ref;
 a compose VM appends the services it is currently running, or every declared one when
-the VM cannot be asked. PROJECT is the directory the run was launched from. EXEC ADDRESS
-is recorded as given, so a relative `--state-dir` lists a relative path. PUBLISHED is
-every port `vk publish ensure` holds open on the host for the VM, as `listen->to`, with
-`@service` when a compose sibling rather than the primary dials the target and
-`(unconfirmed)` when the publisher's liveness could not be checked; `-` when nothing is
-published.
+the VM cannot be asked. PROJECT is the run's `--workspace`, then its `--workdir`, then its
+launch directory. EXEC ADDRESS is recorded as given, so a relative `--state-dir` lists a
+relative path. PUBLISHED is every port `vk publish ensure` holds open on the host for the
+VM, as `listen->to`, with `@service` when a compose sibling rather than the primary dials
+the target and `(unconfirmed)` when the publisher's liveness could not be checked; `-`
+when nothing is published.
 
-An optional directory scopes the list to the VMs launched from it or a subdirectory, or to
-the one whose state dir it is exactly:
+An optional directory scopes the list to the VMs whose project is that directory or one
+below it, or to the one whose state dir it is exactly:
 
 ```sh
-vk list .                    # VMs launched from here or below
+vk list .                    # VMs for this tree or below
 vk list ~/work               # every VM under a tree
 vk list /home/me/app/.vk     # one VM, by its state dir
 ```
@@ -465,7 +465,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk build` | Build Dockerfile stages into a bootable ext4 image or caller-owned disk. |
 | `vk exec` | Run a command in an existing guest and return the command's exit status. |
 | `vk list` | List running `--state-dir` VMs and their compose services; scope by directory, `--json`/`--field` for scripts. |
-| `vk stop` | Stop a VM selected by pid or launch directory, or stop all registered VMs. |
+| `vk stop` | Stop a VM selected by pid or project directory, or stop all registered VMs. |
 | `vk reboot` | Reboot a running VM in place through its guest, or power-cycle it with `--force`. |
 | `vk status` | Probe a guest agent, or report whether its root image is stale. |
 | `vk atop` | Follow or inspect guest resource recordings. |

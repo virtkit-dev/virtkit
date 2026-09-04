@@ -295,24 +295,20 @@ if [ -z "$agent_up" ]; then
     echo "        (./build.sh --fast, then install dist/vk) to get the idle timeout" >&2
     lifetime_args=(-- sleep infinity)
   fi
-  # Launch from the state dir so the VM's registry entry points there and not at the
-  # repo: `vk list`/`vk stop` select by launch directory or below, so a bare `vk stop`
-  # in the checkout would otherwise sweep up this VM along with build.sh's.
+  # --workdir associates this VM with the checkout, so list, stop and reboot from the tree
+  # include it like any other VM in the project.
   #
   # fd 9 is closed for the child: --detach daemonizes with fork+setsid and inherits open
   # descriptors, so the VM would hold this lock for its whole lifetime — an flock lives on
   # the open file description, so our own close would not release it, and every later
   # dev.sh (./dev.sh stop included) would block on it.
-  (
-    cd "$STATE_DIR"
-    "$VK" run \
-      --file "$ROOT/.devcontainer/Dockerfile" \
-      --context "$ROOT/.devcontainer" \
-      --workdir "$ROOT" \
-      --state-dir "$STATE_DIR" \
-      --net --cpus "${VK_DEV_CPUS:-host}" --mem "${VK_DEV_MEM:-8G}" --detach \
-      "${nested_args[@]}" "${lifetime_args[@]}"
-  ) 9>&- || {
+  "$VK" run \
+    --file "$ROOT/.devcontainer/Dockerfile" \
+    --context "$ROOT/.devcontainer" \
+    --workdir "$ROOT" \
+    --state-dir "$STATE_DIR" \
+    --net --cpus "${VK_DEV_CPUS:-host}" --mem "${VK_DEV_MEM:-8G}" --detach \
+    "${nested_args[@]}" "${lifetime_args[@]}" 9>&- || {
     echo "dev.sh: the development VM did not start; if a previous one is stuck holding" >&2
     echo "        $STATE_DIR — or one just expired and has not let go yet — clear it" >&2
     echo "        with ./dev.sh stop and retry" >&2

@@ -718,6 +718,21 @@ fn registry_key(work: &Path) -> PathBuf {
     crate::vms::canonical(work)
 }
 
+/// Canonical project directory used by `vk list` and directory selectors: `--workspace`,
+/// then `--workdir`, then the launch directory. `None` only when the cwd is unavailable.
+fn project_dir(args: &RunArgs) -> Option<PathBuf> {
+    args.workspace
+        .as_deref()
+        .or(args.workdir.as_deref())
+        .map(crate::vms::canonical)
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .as_deref()
+                .map(crate::vms::canonical)
+        })
+}
+
 /// The VM's NAME in `vk list`: its compose primary, built Dockerfile with an optional target
 /// stage, or image ref.
 ///
@@ -1927,11 +1942,10 @@ async fn build_and_boot(
     let mut ssh_forward: Option<Child> = None;
     let mut host_exec_serve: Option<Child> = None;
 
-    // Record the VM in the host-side registry so `vk list`/`vk stop` can find it by the
-    // directory it was launched from. Only pinned (`--state-dir`) runs are tracked: they
-    // expose this stable exec socket and hold the state-dir lock the registry probes for
-    // liveness. The guard removes the entry on every exit path below — clean, error unwind,
-    // or the detached child returning. Kept alive to the end of the function.
+    // Register pinned (`--state-dir`) runs so `vk list`/`vk stop` can find them by project.
+    // Their stable exec socket and state-dir lock support attachment and liveness checks.
+    // The guard stays alive through the function and removes the entry after a clean exit,
+    // error unwind, or detached-child return.
     let _vm_registration = args.state_dir.as_ref().map(|_| {
         let label = registry_label(
             args.primary.as_deref(),
@@ -1991,7 +2005,7 @@ async fn build_and_boot(
                 .is_some()
                 .then(|| state_dir.join("atop").join(vk_core::atop::LOG_NAME)),
             state_dir,
-            project_dir: std::env::current_dir().ok(),
+            project_dir: project_dir(args),
             pid: std::process::id(),
             label,
             exec_addr: format!("vsock-auto://{}:{VSOCK_PORT}", vsock.display()),
@@ -4371,6 +4385,18 @@ mod tests {
             detach_log: None,
             command: vec![],
         }
+    }
+
+    #[test]
+    fn project_dir_prefers_workspace_then_workdir_then_cwd() {
+        let mut args = bare_args();
+        let cwd = std::fs::canonicalize(".").unwrap();
+        assert_eq!(project_dir(&args), Some(cwd.clone()));
+        // Canonicalize a relative --workdir like `vk list DIR`.
+        args.workdir = Some(PathBuf::from("."));
+        assert_eq!(project_dir(&args), Some(cwd));
+        args.workspace = Some(PathBuf::from("/"));
+        assert_eq!(project_dir(&args), Some(PathBuf::from("/")));
     }
 
     #[test]
