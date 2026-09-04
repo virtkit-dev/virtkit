@@ -10,6 +10,8 @@ All notable changes to virtkit will be documented in this file.
   every input behind a release is locked to content-addressed sources that stay
   rebuildable indefinitely, where Alpine's package archive let pinned versions vanish. The
   artifact hashes are re-baselined once as a result.
+- Each release is now attested: the binaries are rebuilt from scratch in a virtkit microVM
+  and must match the release build byte-for-byte before it is published.
 
 ## [0.51.0] - 2026-09-04
 

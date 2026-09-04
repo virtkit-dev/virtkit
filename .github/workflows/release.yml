@@ -2,15 +2,17 @@ name: Release
 
 # Publish a GitHub release whenever a version tag (v*) is pushed.
 #
-# virtkit's artifacts are produced by the same reproducible, Docker-based scripts
-# we use locally — build.sh (the static-musl binaries) and build-kernel.sh (the
-# guest vmlinux). GitHub-hosted ubuntu runners ship Docker, so the workflow just
-# runs those two scripts and uploads everything they drop in dist/. The pinned
-# toolchain lives in the images, not here, so the runner needs no Rust setup.
+# virtkit's artifacts are produced by the same reproducible scripts we use locally —
+# build.sh (the static-musl binaries) and build-kernel.sh (the guest vmlinux). GitHub-hosted
+# ubuntu runners ship Docker and KVM, so the workflow just runs those scripts and uploads
+# everything they drop in dist/. The pinned toolchain lives in the image, not here, so the
+# runner needs no Rust setup.
 #
-# build runs in parallel with quality (lint + audit); the kernel is built in the
-# same job as the binaries so the published vk has it embedded. release publishes
-# once both quality and build pass. Each binary ships with its own .sha256 sidecar
+# build runs in parallel with quality (lint + audit); the kernel is built in the same job
+# as the binaries so the published vk has it embedded, and the build runs as
+# `build.sh --bootstrap-check`: the released bytes are attested by rebuilding them from
+# scratch in a vk microVM and requiring an exact match. release publishes once both
+# quality and build pass. Each binary ships with its own .sha256 sidecar
 # (vk.sha256, vk-agent.sha256, vk-registry.sha256, vk-runnerctl.sha256,
 # vmlinux.sha256) so users can verify just the file they downloaded without
 # fetching a combined manifest.
@@ -35,6 +37,7 @@ jobs:
     with:
       artifact-prefix: release
       build-kernel: true
+      bootstrap-check: true
       retention-days: 1
 
   release:

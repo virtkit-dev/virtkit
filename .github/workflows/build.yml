@@ -12,6 +12,11 @@ name: Build
 #   artifact-prefix  — prefix for uploaded artifact names; callers set this to
 #                      avoid collisions between CI and release runs on the same SHA.
 #   build-kernel     — whether to build the guest kernel and embed it (default: false).
+#   bootstrap-check  — after the Docker build, rebuild from scratch in a vk microVM with the
+#                      vk just built and fail unless the binaries are byte-identical
+#                      (build.sh --bootstrap-check). Needs build-kernel: the rebuild boots
+#                      the kernel embedded in that vk. Roughly doubles the job, so release
+#                      only (default: false).
 
 on:
   workflow_call:
@@ -20,6 +25,9 @@ on:
         type: string
         required: true
       build-kernel:
+        type: boolean
+        default: false
+      bootstrap-check:
         type: boolean
         default: false
       retention-days:
@@ -48,7 +56,27 @@ jobs:
       # '' has to stay the last operand: it is falsy, so swapping the arms would make
       # `||` always fire and hand --no-kernel to the release build too.
       - name: Build binaries (vk, vk-agent, vk-registry, vk-runnerctl)
+        if: ${{ !inputs.bootstrap-check }}
         run: ./build.sh ${{ !inputs.build-kernel && '--no-kernel' || '' }}
+
+      # The reproducibility attestation. build.sh --bootstrap-check does the Docker build,
+      # then rebuilds a clean copy of the tree from scratch inside a vk microVM — booted by
+      # the vk it just produced, on the kernel embedded in it — and fails unless both
+      # backends yield byte-identical binaries. Only the runner's KVM stands between the
+      # Docker build and that microVM: GitHub's Linux runners have /dev/kvm, but root-only,
+      # so open it to the runner user the way GitHub documents for hardware-accelerated
+      # emulators. No vk install is needed — the check boots the freshly built dist/vk.
+      - name: Enable KVM for the runner user
+        if: inputs.bootstrap-check
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"'             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm -a -w /dev/kvm
+
+      - name: Build binaries and attest reproducibility (Docker == vk microVM)
+        if: inputs.bootstrap-check
+        run: ./build.sh --bootstrap-check
 
       - name: Upload binary artifacts
         uses: actions/upload-artifact@v7
