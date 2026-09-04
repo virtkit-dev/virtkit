@@ -1698,7 +1698,7 @@ enum Cmd {
     ///
     /// The VMs started with `--state-dir`: their pid, uptime, name, the directory each was
     /// launched from, and its exec-channel address. With a DIR argument, only VMs launched
-    /// from DIR or a subdirectory. `--json` for scripting.
+    /// from DIR or a subdirectory. `--json` or `--field` for scripting.
     #[command(display_order = 6)]
     List {
         /// only VMs whose launch directory is DIR or below it (default: all)
@@ -1706,6 +1706,15 @@ enum Cmd {
         /// emit the entries as a JSON array instead of a table
         #[arg(long)]
         json: bool,
+        /// print only this field of each VM (repeatable)
+        ///
+        /// A `--json` key, or a dotted path into one: `guest_ip`, `services.0.ip`. One line
+        /// per VM, the fields tab-separated, each as `jq -r` would print it: a string bare,
+        /// anything else as JSON; as text, nothing running prints nothing. Values are not
+        /// escaped, so a path holding a tab or newline needs `--json`, which gives an array of
+        /// objects holding only those fields.
+        #[arg(long, value_name = "FIELD")]
+        field: Vec<String>,
         /// also report, per VM, whether a fresh `vk run` would rebuild its image
         ///
         /// The report says whether the working tree drifted from what booted. It resolves
@@ -2481,12 +2490,15 @@ async fn cli_main() -> ExitCode {
             Err(e) => fail(&e, 2),
         };
     }
-    if let Cmd::List { dir, json, stale } = &cli.cmd {
-        return match vms::list_report(dir.as_deref(), *json, *stale) {
-            Ok(report) => {
-                print!("{report}");
-                ExitCode::SUCCESS
-            }
+    if let Cmd::List {
+        dir,
+        json,
+        field,
+        stale,
+    } = &cli.cmd
+    {
+        return match vms::list_report(dir.as_deref(), *json, *stale, field) {
+            Ok(report) => write_report(&report),
             Err(e) => fail(&e, 2),
         };
     }

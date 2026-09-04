@@ -12,6 +12,9 @@ All notable changes to virtkit will be documented in this file.
   such thing (no `--net`).
 - `vk list --json` reports the path of a VM's `--atop` recording as `atop_log` (`null`
   without `--atop`).
+- `vk list --field FIELD` prints the named fields of each VM, one line per VM and
+  tab-separated, bare, so a script can read `guest_ip` or `services.0.ip` without jq. With
+  `--json`, the objects hold only those fields.
 
 ### Changed
 

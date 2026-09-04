@@ -12,6 +12,7 @@
 //! entries whose owner is gone. Entries live under `<data base>/vms/` (the same
 //! `$XDG_DATA_HOME/virtkit` home `vk run`'s image cache uses), one JSON file per VM.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt;
@@ -651,9 +652,99 @@ fn display_name(entry: &VmEntry, units: Option<&[UnitStatus]>) -> String {
     }
 }
 
+/// Reject `--field` paths that no view could satisfy, before any VM is asked: an empty
+/// segment (`guest_ip.`), a segment with a JSON-pointer metacharacter (`/`, `~`), or a path
+/// given twice (the `--json` object could hold it only once, and the text would silently
+/// disagree). Unknown names are checked per view by `select`.
+fn check_fields(fields: &[String]) -> Result<()> {
+    for path in fields {
+        if path.split('.').any(str::is_empty) {
+            bail!("--field {path}: empty path segment");
+        }
+        if path.contains(['/', '~']) {
+            bail!("--field {path}: no such field ('/' and '~' never occur in a field name)");
+        }
+    }
+    let mut seen = HashSet::new();
+    if let Some(dup) = fields.iter().find(|f| !seen.insert(f.as_str())) {
+        bail!("--field {dup}: given twice");
+    }
+    Ok(())
+}
+
+/// One `--field` of a VM view. `path` is dotted (`guest_ip`, `services.0.ip`) and resolved as
+/// a JSON pointer, so a missing branch below the first segment is `null` (a non-compose VM has
+/// no `services.0`). An unknown first segment is an error naming the fields there are.
+fn select(view: &serde_json::Value, path: &str) -> Result<serde_json::Value> {
+    let head = path.split_once('.').map_or(path, |(head, _)| head);
+    let fields = view.as_object().context("VM view is not a JSON object")?;
+    if !fields.contains_key(head) {
+        let hint = if head == "stale" {
+            " (pass --stale)"
+        } else {
+            ""
+        };
+        let known = fields
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("--field {path}: no field {head:?}{hint}; the fields are: {known}");
+    }
+    let pointer = format!("/{}", path.replace('.', "/"));
+    Ok(view
+        .pointer(&pointer)
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
+}
+
+/// A value the way `jq -r` prints it: a string bare, anything else as compact JSON.
+fn bare(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// `vk list --field`: only `fields` (already past `check_fields`) of each view. As text, one
+/// line per VM with the values tab-separated (see `bare`); as JSON, an array of objects
+/// holding just those fields, keyed by the path as given.
+fn fields_report(views: &[serde_json::Value], fields: &[String], json: bool) -> Result<String> {
+    if json {
+        let rows = views
+            .iter()
+            .map(|view| {
+                fields
+                    .iter()
+                    .map(|f| Ok((f.clone(), select(view, f)?)))
+                    .collect::<Result<serde_json::Map<_, _>>>()
+                    .map(serde_json::Value::Object)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(serde_json::to_string_pretty(&rows).context("serializing VM fields")? + "\n");
+    }
+    let mut out = String::new();
+    for view in views {
+        let cells = fields
+            .iter()
+            .map(|f| select(view, f).map(|v| bare(&v)))
+            .collect::<Result<Vec<_>>>()?;
+        out.push_str(&cells.join("\t"));
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 /// `vk list`: the running VMs (optionally only those under `filter`) as a table, or JSON. With
 /// `stale`, each VM's freshness is computed (network I/O — see `freshness_all`) and shown.
-pub fn list_report(filter: Option<&Path>, json: bool, stale: bool) -> Result<String> {
+/// With `fields`, only those fields of each VM (see `fields_report`).
+pub fn list_report(
+    filter: Option<&Path>,
+    json: bool,
+    stale: bool,
+    fields: &[String],
+) -> Result<String> {
+    check_fields(fields)?;
     let mut vms = running();
     if let Some(f) = filter {
         let f = canonical(f);
@@ -671,13 +762,20 @@ pub fn list_report(filter: Option<&Path>, json: bool, stale: bool) -> Result<Str
         .collect();
     let units_by_vm: Vec<Option<Vec<UnitStatus>>> = vms.iter().map(service_units).collect();
 
-    if json {
+    if json || !fields.is_empty() {
         let views: Vec<VmView> = vms
             .iter()
             .zip(&units_by_vm)
             .zip(&fresh)
             .map(|((entry, units), freshness)| view(entry, units.as_deref(), *freshness, stale))
             .collect();
+        if !fields.is_empty() {
+            let views = views
+                .iter()
+                .map(|v| serde_json::to_value(v).context("serializing VM view"))
+                .collect::<Result<Vec<_>>>()?;
+            return fields_report(&views, fields, json);
+        }
         return Ok(serde_json::to_string_pretty(&views).context("serializing VM list")? + "\n");
     }
     if vms.is_empty() {
@@ -1411,6 +1509,96 @@ mod tests {
                 service_json("redis", None, None),
             ])
         );
+    }
+
+    /// A compose VM with one running service and a plain VM, as `--field` sees them.
+    fn field_views() -> Vec<serde_json::Value> {
+        let mut e = compose_entry();
+        e.pid = 4242;
+        e.nested = Some(true);
+        let units = [unit("db", "running", "10.0.0.2/24")];
+        let mut plain = entry(PathBuf::from("/state/plain"), None);
+        plain.label = "plain".into();
+        plain.pid = 7;
+        vec![
+            serde_json::to_value(view(&e, Some(&units), Freshness::Unknown, false)).unwrap(),
+            serde_json::to_value(view(&plain, None, Freshness::Unknown, false)).unwrap(),
+        ]
+    }
+
+    fn fields(views: &[serde_json::Value], names: &[&str], json: bool) -> Result<String> {
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        fields_report(views, &names, json)
+    }
+
+    #[test]
+    fn field_text_prints_bare_like_jq_r() {
+        let views = field_views();
+        // One line per VM; strings bare, numbers, bools and nulls as JSON, tab-separated in
+        // the order asked.
+        assert_eq!(fields(&views, &["label"], false).unwrap(), "app\nplain\n");
+        assert_eq!(
+            fields(
+                &views,
+                &["pid", "nested", "guest_ip", "services.0.ip"],
+                false
+            )
+            .unwrap(),
+            "4242\ttrue\tnull\t10.0.0.2\n7\tnull\tnull\tnull\n"
+        );
+        // A non-scalar prints as compact JSON on the one line.
+        assert_eq!(
+            fields(&views, &["services"], false).unwrap(),
+            "[{\"exec_addr\":\"vsock-auto:///state/app/svc-db/vsock.sock:4444\",\"ip\":\"10.0.0.2\",\
+             \"name\":\"db\",\"state\":\"running\"},{\"exec_addr\":\"vsock-auto:///state/app/svc-redis/\
+             vsock.sock:4444\",\"ip\":null,\"name\":\"redis\",\"state\":null}]\n[]\n"
+        );
+        // A branch below a known field that does not exist is null, not an error.
+        assert_eq!(
+            fields(&views, &["services.1.ip"], false).unwrap(),
+            "null\nnull\n"
+        );
+        // Nothing running: nothing printed, whatever was asked.
+        assert_eq!(fields(&[], &["nope"], false).unwrap(), "");
+    }
+
+    #[test]
+    fn field_json_holds_only_the_fields_asked() {
+        let views = field_views();
+        assert_eq!(
+            fields(&views, &["label", "services.0.state"], true).unwrap(),
+            "[\n  {\n    \"label\": \"app\",\n    \"services.0.state\": \"running\"\n  },\n  {\n    \
+             \"label\": \"plain\",\n    \"services.0.state\": null\n  }\n]\n"
+        );
+        assert_eq!(fields(&[], &["nope"], true).unwrap(), "[]\n");
+    }
+
+    #[test]
+    fn field_errors_name_the_fields_and_reject_malformed_paths() {
+        let views = field_views();
+        // An unknown field is an error that names the fields there are; `stale` is only there
+        // with --stale, so the error says how to get it.
+        let err = fields(&views, &["guest-ip"], false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no field \"guest-ip\""), "{err}");
+        assert!(err.contains("guest_ip, label"), "{err}");
+        let err = fields(&views, &["stale"], false).unwrap_err().to_string();
+        assert!(err.contains("(pass --stale)"), "{err}");
+        let plain = entry(PathBuf::from("/state/plain"), None);
+        let with_stale =
+            [serde_json::to_value(view(&plain, None, Freshness::Unknown, true)).unwrap()];
+        assert_eq!(fields(&with_stale, &["stale"], false).unwrap(), "null\n");
+
+        // Malformed paths and repeats are rejected up front, even with nothing running.
+        let check = |names: &[&str]| {
+            let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+            check_fields(&names).unwrap_err().to_string()
+        };
+        assert!(check(&["guest_ip."]).contains("empty path segment"));
+        assert!(check(&["services.0/ip"]).contains("no such field"));
+        assert!(check(&["pid", "label", "pid"]).contains("--field pid: given twice"));
+        check_fields(&["pid".to_string(), "services.0.ip".to_string()]).unwrap();
     }
 
     #[test]
