@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.51.0] - 2026-09-04
+
 ### Added
 
 - In-guest reboot now brings the guest back on the same disks instead of ending the VM.
@@ -2311,7 +2313,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.50.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.51.0...HEAD
+[0.51.0]: https://github.com/virtkit-dev/virtkit/compare/v0.50.0...v0.51.0
 [0.50.0]: https://github.com/virtkit-dev/virtkit/compare/v0.49.0...v0.50.0
 [0.49.0]: https://github.com/virtkit-dev/virtkit/compare/v0.48.0...v0.49.0
 [0.48.0]: https://github.com/virtkit-dev/virtkit/compare/v0.47.0...v0.48.0
