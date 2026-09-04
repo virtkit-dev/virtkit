@@ -1,95 +1,53 @@
 #!/usr/bin/env bash
-# Bump the pinned Rust toolchain to the latest stable release and re-pin the build
-# inputs.
+# Bump the pinned Rust toolchain to the latest stable release and re-pin the build inputs.
 #
-# Rewrites the channel in rust-toolchain.toml, the base image (tag + digest) in the
-# devcontainer Dockerfile, the pinned cargo-audit version, and the apk package versions
-# in apk-pins.txt, keeping the pin reproducible. Review the diff, then run ./build.sh.
-# Idempotent: a no-op when already current. Requires docker (resolves the image digest +
-# apk versions).
+# Rewrites the channel in rust-toolchain.toml and in .devcontainer/nix/flake.nix (the flake
+# pins it inline — it cannot read rust-toolchain.toml from inside the .devcontainer build
+# context), re-locks .devcontainer/nix/flake.lock (nixpkgs + rust-overlay, so the new channel
+# is known and the packages move with it), and re-pins the nixos/nix base image digest in
+# .devcontainer/Dockerfile. Review the diff, then run ./build-kernel.sh and ./build.sh — a
+# toolchain bump re-baselines every artifact hash. Idempotent: a no-op when already current.
+# Requires docker: it resolves the base digest, and Nix runs in the nixos/nix image, never
+# on the host.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# Ask the local rustup for the latest stable version rather than scraping
-# release pages.
+# Ask the local rustup for the latest stable version rather than scraping release pages.
 rustup update stable
 LATEST=$(rustup run stable rustc --version | awk '{print $2}')
 echo "latest stable: $LATEST"
 
 sed -i -E "s/^channel = \".*\"/channel = \"$LATEST\"/" rust-toolchain.toml
+sed -i -E "s/rust-bin\.stable\.\"[0-9.]+\"/rust-bin.stable.\"$LATEST\"/" .devcontainer/nix/flake.nix
 
-# Resolve the matching Rust Alpine image digest so the FROM line stays pinned, not
-# just tagged. ALPINE_TAG fixes the Alpine minor; bump it deliberately (a new Alpine
-# minor can change the toolchain the vendored C is built with).
-ALPINE_TAG="${ALPINE_TAG:-alpine3.24}"
-IMG="rust:${LATEST}-${ALPINE_TAG}"
-docker pull -q "$IMG" >/dev/null
-DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMG" | sed -E 's/.*@//')
-sed -i -E "s#^FROM rust:[^ ]*#FROM ${IMG}@${DIGEST}#" .devcontainer/Dockerfile
-
-# Re-pin cargo-audit (baked into the image for audit.sh) to its latest release. Ask the
-# registry rather than scraping — the first "cargo-audit = " line is the crate itself.
-AUDIT=$(cargo search cargo-audit | grep -E '^cargo-audit = ' | head -1 | sed -E 's/^cargo-audit = "([^"]+)".*/\1/')
-case "$AUDIT" in
-    [0-9]*) ;; # a version starts with a digit
-    *) echo >&2 "ERROR: could not resolve latest cargo-audit version (got '$AUDIT')"; exit 1 ;;
+# Base image: NIX_TAG fixes the nixos/nix release; bump it deliberately (it is only the Nix
+# that realizes the flake — the toolchain itself comes from nixpkgs). Pin its manifest-list
+# digest so the FROM line stays a digest, not a tag.
+NIX_TAG="${NIX_TAG:-2.35.2}"
+IMG="nixos/nix:${NIX_TAG}"
+DIGEST=$(docker buildx imagetools inspect "$IMG" | sed -nE 's/^Digest:[[:space:]]+//p' | head -1)
+case "$DIGEST" in
+    sha256:*) ;;
+    *) echo >&2 "ERROR: could not resolve the digest of $IMG (got '$DIGEST')"; exit 1 ;;
 esac
-sed -i -E "s#(cargo install cargo-audit --locked --version )[0-9.]+#\1${AUDIT}#" .devcontainer/Dockerfile
+sed -i -E "s#^FROM nixos/nix:[^ ]*#FROM ${IMG}@${DIGEST}#" .devcontainer/Dockerfile
 
-# Re-pin the apk packages to the versions the (digest-pinned) base image resolves —
-# Alpine has no snapshot service, so the image digest freezes the toolchain but
-# `apk add` would otherwise float the package versions. Done for both pin files: the
-# build image's packages (.devcontainer/apk-pins.txt) and the kernel build's extra deps
-# (kernel/apk-pins.txt) — both resolve from the same Alpine repos as $IMG.
-pin_apk() {
-    local pins=$1 header=$2 names resolved
-    # space-separated (single line) so it injects cleanly into the `sh -c` script below
-    names=$(grep -vE '^[[:space:]]*(#|$)' "$pins" | sed 's/=.*//' | tr '\n' ' ')
-    echo "resolving apk versions for $pins in $IMG ..."
-    # Install the packages, then read each one's installed version from `apk list
-    # --installed` (lines "<name>-<version> <arch> …"): grep the package's line
-    # (anchored, version starts with a digit so a package and its -dev variant
-    # don't collide), take the first field, strip the "<name>-" prefix.
-    resolved=$(docker run --rm "$IMG" sh -ec '
-        apk add --no-cache -q '"$names"' >/dev/null 2>&1 || true
-        for p in '"$names"'; do
-            v=$(apk list --installed "$p" 2>/dev/null \
-                | grep -E "^${p}-[0-9]" | head -1 | cut -d" " -f1 | sed "s/^${p}-//")
-            printf "%s=%s\n" "$p" "$v"
-        done')
-    {
-        printf '%s\n' "$header"
-        local p v
-        for p in $names; do
-            v=$(printf '%s\n' "$resolved" | sed -nE "s/^${p}=(.+)$/\1/p" | head -1)
-            case "$v" in
-                [0-9]*) ;; # a version starts with a digit
-                *)
-                    echo >&2 "ERROR: resolved apk version for '$p' looks wrong: '${v}' (in $IMG)"
-                    exit 1
-                    ;;
-            esac
-            echo "$p=$v"
-        done
-    } >"$pins.new" && mv "$pins.new" "$pins"
-}
-pin_apk .devcontainer/apk-pins.txt \
-    '# apk packages for the virtkit build image, pinned to exact versions for
-# byte-reproducible builds (Alpine has no snapshot service). Add or drop a package by name
-# here, keeping the list sorted; ./update.sh regenerates the versions against the pinned
-# base image and rewrites this header, so change its wording in update.sh.'
-pin_apk kernel/apk-pins.txt \
-    '# Kernel-build apk packages (added on top of virtkit-build), pinned to exact
-# versions for byte-reproducible builds. Add or drop a package by name here, keeping the
-# list sorted; ./update.sh regenerates the versions and rewrites this header, so change
-# its wording in update.sh. (gcc/musl-dev/ca-certificates come from the base; coreutils &
-# friends replace the busybox applets the kernel build trips over.)'
+# Re-lock the flake inside that (pinned) image. `flake update` moves every input: rust-overlay
+# must be current for the new channel to exist at all, and nixpkgs moves with it. Then
+# evaluate the toolchain closure once so an unknown channel fails here, not in the first
+# ./build.sh. The lock is written back through the bind mount as root; hand it back.
+NIX="nix --extra-experimental-features nix-command --extra-experimental-features flakes"
+docker run --rm -v "$PWD/.devcontainer/nix:/flake" "${IMG}@${DIGEST}" sh -ec "
+    $NIX flake update --flake path:/flake
+    $NIX eval --raw 'path:/flake#packages.x86_64-linux.buildEnv.drvPath' >/dev/null
+    chown $(id -u):$(id -g) /flake/flake.lock"
 
 echo "updated:"
 grep -E '^channel' rust-toolchain.toml
-grep -E '^FROM'    .devcontainer/Dockerfile
-grep -E 'cargo install cargo-audit' .devcontainer/Dockerfile
-for pins in .devcontainer/apk-pins.txt kernel/apk-pins.txt; do
-    echo "apk pins ($pins):"
-    grep -vE '^[[:space:]]*(#|$)' "$pins" | sed 's/^/  /'
+grep -oE 'rust-bin\.stable\."[0-9.]+"' .devcontainer/nix/flake.nix
+grep -E '^FROM' .devcontainer/Dockerfile
+for k in nixpkgs rust-overlay; do
+    printf '%s: %s\n' "$k" "$(awk -v n="\"$k\": {" \
+        'index($0, n) { f = 1 } f && /"rev":/ { gsub(/[",]/, "", $2); print $2; exit }' \
+        .devcontainer/nix/flake.lock)"
 done

@@ -217,8 +217,8 @@ DEV_ENV=(
   "VK_GIT_COMMIT=$commit"
 )
 if [ "$MODE" = shell ]; then
-  # Not a login shell: Alpine's /etc/profile overwrites PATH with the system default,
-  # which drops the image's cargo/rustup bin directory out of the interactive shell.
+  # Not a login shell: a login shell would run the image's profile scripts, which can reset
+  # the PATH that puts the toolchain (/opt/toolchain/bin) in front.
   guest_cmd=(/bin/sh)
   what="opening a shell"
   # A vk run from the shell keeps its image cache and boot scratch on the guest's own
@@ -254,15 +254,16 @@ fi
 
 # Reboot only when the build image's inputs, the toolchain its base tag tracks, or whether
 # the VM nests, change — a resize (VK_DEV_CPUS/VK_DEV_MEM) deliberately waits for the next
-# boot instead. rust-toolchain.toml is never COPYed into the image, but
-# update.sh keeps the pinned base tag in sync with it, and the guest toolchain follows it.
+# boot instead. rust-toolchain.toml is never COPYed into the image, but update.sh keeps
+# the flake's inline channel in sync with it, and the guest toolchain follows it.
 # Source and Cargo manifest edits are shared live at /work and never require a reboot.
 # The boot shape is in the stamp so installing a vk that can nest restarts the VM instead
 # of leaving the next shell without a /dev/kvm. It restarts on losing nesting too — the
 # rule is "the shape changed", which is simpler than ranking the two directions.
 image_inputs=$(sha256sum \
   .devcontainer/Dockerfile \
-  .devcontainer/apk-pins.txt \
+  .devcontainer/nix/flake.nix \
+  .devcontainer/nix/flake.lock \
   rust-toolchain.toml | sha256sum | cut -d ' ' -f 1)
 vm_stamp=$(printf '%s %s\n' "$image_inputs" "${nested_args[*]}" | sha256sum | cut -d ' ' -f 1)
 stamp_file="$STATE_DIR/vm.stamp"

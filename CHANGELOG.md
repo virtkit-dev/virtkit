@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Release artifacts are now built from a Nix-pinned toolchain instead of an Alpine image:
+  every input behind a release is locked to content-addressed sources that stay
+  rebuildable indefinitely, where Alpine's package archive let pinned versions vanish. The
+  artifact hashes are re-baselined once as a result.
+
 ## [0.51.0] - 2026-09-04
 
 ### Added

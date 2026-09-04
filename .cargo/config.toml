@@ -3,11 +3,15 @@
 [build]
 target = "x86_64-unknown-linux-musl"
 
-# ring (rustls' crypto backend, pulled via oci-client) compiles C in its build
-# script; cc-rs looks for `x86_64-linux-musl-gcc` by default, which the Alpine
-# devcontainer doesn't have — its `gcc` is musl-native, so point cc-rs at it.
+# ring (rustls' crypto backend, pulled via oci-client), zstd and jemalloc compile C in
+# their build scripts. The build image (.devcontainer/Dockerfile) carries two compilers:
+# the host glibc gcc cargo needs for build scripts and proc-macros, and a musl cross gcc for
+# the target. cc-rs would look for `x86_64-linux-musl-gcc`; name the cross tools it should
+# use instead, and (below) make the same cross gcc rustc's linker driver so no musl link
+# ever goes through the host cc.
 [env]
-CC_x86_64_unknown_linux_musl = "gcc"
+CC_x86_64_unknown_linux_musl = "x86_64-unknown-linux-musl-cc"
+AR_x86_64_unknown_linux_musl = "x86_64-unknown-linux-musl-ar"
 # libtest runs each test on a spawned thread, which takes std's 2 MiB default rather than
 # the main thread's 8 MiB. Parsing `vk`'s CLI is recursive over a large clap tree, and
 # unoptimized that overflows 2 MiB — so the CLI tests abort with a stack overflow in a debug
@@ -15,3 +19,6 @@ CC_x86_64_unknown_linux_musl = "gcc"
 # it. Give the test threads the main thread's budget. Not `force`d: an explicit
 # RUST_MIN_STACK still wins.
 RUST_MIN_STACK = "8388608"
+
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-unknown-linux-musl-cc"

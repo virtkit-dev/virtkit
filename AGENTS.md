@@ -77,9 +77,10 @@ The guest kernel is a vanilla Linux `vmlinux` built from a vendored config fragm
 ## Development Environment
 
 The release artifacts are built reproducibly inside a pinned devcontainer image
-(`.devcontainer/Dockerfile`, `rust:<ver>-alpine`, digest- and apk-pinned). Alpine
-supplies a musl-native gcc for the C our deps vendor (ring, zstd, jemalloc); no
-system C libraries are linked.
+(`.devcontainer/Dockerfile`: the `nixos/nix` base by digest, the toolchain from
+`.devcontainer/nix/flake.nix` pinned by `flake.lock`). Nix runs only inside that image at
+build time — no Nix on the host. A musl cross gcc compiles the C our deps vendor (ring,
+zstd, jemalloc) and links the static-musl binaries; no system C libraries are linked.
 Release build scripts can use Docker or `vk`, so no local Rust setup is needed. The
 fast edit loop below is deliberately `vk`-only and never invokes Docker.
 
@@ -95,7 +96,7 @@ fast edit loop below is deliberately `vk`-only and never invokes Docker.
 ./dev.sh shell                      # interactive shell in that same VM
 ./audit.sh [--deny warnings]        # cargo-audit against the committed Cargo.lock
 ./sweep.sh [--time 15]              # cargo-sweep stale target/ artifacts (default --installed)
-./update.sh                         # bump the pinned Rust toolchain + re-pin apk deps
+./update.sh                         # bump the pinned Rust toolchain + re-lock the flake
 ./update-kernel.sh [--lts|--stable] # bump the pinned guest kernel (defaults to LTS)
 ```
 
@@ -174,8 +175,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 - **Rust:** rustfmt + clippy, pinned via `rust-toolchain.toml` (edition 2024). CI runs
   `cargo fmt --check` and `cargo clippy ... -D warnings`.
-- **Shell:** Bash, `set -euo pipefail`. Scripts that also run inside the Alpine image
-  (e.g. `audit.sh` under CI) must stay POSIX-compatible — that image has no `bash`.
+- **Shell:** Bash, `set -euo pipefail`. Scripts that also run inside the build image
+  (e.g. `audit.sh` under CI) must stay POSIX-compatible — assume only `sh` there.
 - **Dependency audit:** `cargo-audit` with the RUSTSEC ignore list in `.cargo/audit.toml`
   (each entry documented with rationale + residual risk).
 

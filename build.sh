@@ -127,7 +127,7 @@ fi
 # produce identical bytes. The repo is always mounted at /work, so these /work-relative
 # values hold for both backends. Stripping is done by the release profile, not the host
 # strip.
-# One linker for every build: mold, pinned in the build image via apk-pins.txt, instead of
+# One linker for every build: mold, pinned in the build image via the flake, instead of
 # the GNU ld gcc defaults to. It is deterministic, so the reproducible release link is
 # unaffected, and it keeps this string identical to dev.sh's RUSTFLAGS — the two share
 # target/, and any divergence silently stops them reusing each other's artifacts. The time
@@ -259,7 +259,16 @@ done
 #     ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-runnerctl.sha256 )
 # The sidecars name the binaries bare, so the check runs from inside dist/.
 ( cd "$OUT" && sha256sum vk > vk.sha256 && sha256sum vk-agent > vk-agent.sha256 && sha256sum vk-registry > vk-registry.sha256 && sha256sum vk-runnerctl > vk-runnerctl.sha256 )
-base_image=$(sed -nE 's/^FROM (rust:[^ ]*).*$/\1/p' .devcontainer/Dockerfile)
+# The inputs that fix the bytes: the base image digest (.devcontainer/Dockerfile's FROM) and
+# the flake.lock revs of nixpkgs / rust-overlay.
+# The rev flake.lock pins for one input: the first "rev" inside that input's node.
+lock_rev() {
+  awk -v n="\"$1\": {" 'index($0, n) { f = 1 } f && /"rev":/ { gsub(/[",]/, "", $2); print $2; exit }' \
+    .devcontainer/nix/flake.lock
+}
+base_image=$(sed -nE 's/^FROM ([^ ]+).*$/\1/p' .devcontainer/Dockerfile | head -1)
+nix_pins="nixpkgs:         $(lock_rev nixpkgs)
+rust_overlay:    $(lock_rev rust-overlay)"
 toolchain=$(sed -nE 's/^channel = "(.*)"$/\1/p' rust-toolchain.toml)
 # $commit was resolved above (before the compile) and threaded into the build as
 # VK_GIT_COMMIT, so the embedded `vk --version` stamp and this manifest agree.
@@ -285,6 +294,7 @@ ${manifest_header}
 git_commit:      ${commit}
 rust_toolchain:  ${toolchain}
 base_image:      ${base_image}
+${nix_pins}
 
 $(cat "$OUT/vk.sha256")
 $(cat "$OUT/vk-agent.sha256")

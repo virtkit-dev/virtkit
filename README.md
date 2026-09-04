@@ -393,9 +393,9 @@ command execution, service control, and CI lifecycle operations. Guest Ethernet 
 are handled by the in-process userspace switch, which provides ARP, DHCP, DNS, and TCP/UDP
 egress through host sockets.
 
-Release binaries are static musl PIE executables. The Rust toolchain, Alpine build image,
+Release binaries are static musl PIE executables. The Rust toolchain, build image, its
 packages, guest kernel, and vendored libkrun source are pinned so release artifacts can be
-rebuilt byte-for-byte.
+rebuilt byte-for-byte — see [Build from source](#build-from-source).
 
 ## Command guide
 
@@ -493,10 +493,26 @@ For iteration, use the repository's development commands:
 ./build.sh --fast  # only when a runnable debug vk is needed
 ```
 
-Release builds use the pinned toolchain and produce reproducible artifacts. `--fast`
-uses the unoptimized development profile and is not a release artifact.
-`./build.sh --bootstrap-check` performs a Docker build, rebuilds with the resulting `vk`,
-and compares the binaries byte-for-byte.
+### Reproducible builds
+
+Release builds produce byte-for-byte reproducible artifacts, and every input that fixes
+those bytes is pinned to something that stays fetchable:
+
+- the build image (`.devcontainer/Dockerfile`) is the official `nixos/nix` image by
+  digest, and its toolchain — Rust, a musl cross gcc for the vendored C, mold, and the
+  kernel build tools — comes from `.devcontainer/nix/flake.nix` locked to exact nixpkgs
+  commits in `flake.lock`. Nix runs only inside the image while it is built; no host needs
+  Nix, and nothing is pushed to any registry;
+- the guest kernel is a pinned vanilla release, checked against its published sha256 (with
+  a signed-tag fallback), and libkrun is vendored;
+- `dist/build-info.txt` and `dist/kernel-build-info.txt` record the commit, base image
+  digest, locked nixpkgs revision, and the sha256 of every artifact, with the exact
+  command that rebuilds and verifies them.
+
+`./build.sh --bootstrap-check` is the proof: it performs the Docker build, rebuilds a clean
+copy of the tree from scratch in a microVM booted by the `vk` it just produced, and fails
+unless the binaries are identical. `--fast` uses the unoptimized development profile and
+is not a release artifact.
 
 ## Repository layout
 
@@ -509,6 +525,7 @@ vk-runnerctl/    optional root-side GitLab concurrency helper
 vk-selfupdate/   shared self-update implementation for vk and vk-registry
 vk-fs/           filesystem objects created private and published whole
 third_party/     vendored libkrun and local patches
+.devcontainer/   pinned build image (nixos/nix base + nix/flake.nix and flake.lock toolchain)
 kernel/          pinned guest-kernel configuration and build inputs
 docs/            operational guides
 examples/        annotated compose file exercising every compose feature
