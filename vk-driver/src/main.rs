@@ -52,6 +52,7 @@ mod manager;
 mod mkoci;
 mod net;
 mod oci;
+mod oomkills;
 mod ova;
 mod prio;
 mod publish;
@@ -3777,6 +3778,12 @@ async fn cli_main() -> ExitCode {
             match vk_core::status::get_status(&addr).await {
                 Ok(status) => {
                     println!("{status}");
+                    // Append OOM kills when the guest can report any.
+                    if let Some(line) =
+                        oomkills::line(oomkills::fetch(&addr, None).await.as_deref(), "raise --mem")
+                    {
+                        eprintln!("virtkit: {line}");
+                    }
                     ExitCode::SUCCESS
                 }
                 // get_status yields a boxed std error; wrap it for the anyhow-typed reporter.

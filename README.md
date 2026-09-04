@@ -420,6 +420,16 @@ host-side image pulls do not cross the userspace switch that counts it.
 CI jobs also report how much of the guest's writable layer they filled. That layer can
 hit `ENOSPC` while the host still has free disk space.
 
+The guest agent records processes killed by the guest kernel's OOM killer. The host reports
+them alongside memory figures in build-stage completion output, CI traces, completed
+`vk run` output, and `vk status` for a live VM. Each line identifies the victim, the
+anonymous RSS reclaimed, its guest uptime at death, and the setting that raises the memory
+limit. This can explain a command that exited with signal 9.
+
+```
+virtkit: guest OOM: the kernel killed cc1plus (pid 1234, 1.9 GiB RSS) at +48s (raise --mem)
+```
+
 By default, each CI guest records an `atop -P`-compatible sample every 10 seconds,
 covering CPU, memory, disk, network, and process activity. `vk atop` follows a running
 recording or inspects one retained after the job VM has been removed. See the

@@ -1209,14 +1209,13 @@ impl MicroVm {
         &self.mem
     }
 
-    /// Ask the live guest agent for this stage's peak demand, excluding faulted page cache that
-    /// inflates host-side VMM memory figures.
+    /// Ask the live guest for peak demand and kernel OOM kills. Peak demand excludes faulted
+    /// page cache, which inflates host-side VMM memory figures.
     ///
-    /// The bounded, best-effort query runs on both teardown paths; no memory figure warrants
-    /// blocking the build on an unresponsive guest, especially one that may be out of memory.
-    /// An old agent, failed exec, or timeout leaves the stage unmeasured instead of reporting
-    /// zero demand.
-    fn record_stage_mem(&self, label: &str, session: &crate::run::VmSession) {
+    /// Both bounded, best-effort queries run on both teardown paths. An old or unresponsive
+    /// agent leaves the stage unmeasured instead of reporting zero. Fetch OOM kills even when
+    /// the memory-mark query fails because memory pressure can prevent that first response.
+    fn record_stage_usage(&self, label: &str, session: &crate::run::VmSession) {
         let t = std::time::Instant::now();
         let (out, sink) = crate::executor::stdout_capture();
         let argv = [GUEST_AGENT.to_string(), "memmark".to_string()];
@@ -1230,15 +1229,22 @@ impl MicroVm {
             .await
         });
         self.timings.probe("stage.memmark", t.elapsed());
-        if !matches!(asked, Ok(Ok(0))) {
-            return;
+        if matches!(asked, Ok(Ok(0)))
+            && let Ok(buf) = out.lock()
+        {
+            // Discard the guest's MemTotal: hints target the slightly larger host-assigned
+            // size. Requiring both figures still rejects a half-written mark.
+            if let Some((peak, _)) = crate::executor::parse_mark(&buf) {
+                self.timings
+                    .record_mem(label, peak, self.mem_mib().saturating_mul(1024 * 1024));
+            }
         }
-        let Ok(buf) = out.lock() else { return };
-        // Discard the guest's MemTotal: hints target the slightly larger host-assigned size.
-        // Requiring both figures still rejects a half-written mark.
-        if let Some((peak, _)) = crate::executor::parse_mark(&buf) {
-            self.timings
-                .record_mem(label, peak, self.mem_mib().saturating_mul(1024 * 1024));
+        // Fetch kills independently because memory pressure can prevent the mark response.
+        let t = std::time::Instant::now();
+        let kills = block_on(session.oomkills());
+        self.timings.probe("stage.oomkills", t.elapsed());
+        if let Some(kills) = kills {
+            self.timings.record_oom(label, kills);
         }
     }
 
@@ -1340,7 +1346,7 @@ impl MicroVm {
         let subset = select_source_batch(&self.sources, needed, &fs.label, max_sources)?;
         if let Some(session) = self.session.take() {
             // Read the mark before the final filesystem freeze while guest exec still works.
-            self.record_stage_mem(&fs.label, &session);
+            self.record_stage_usage(&fs.label, &session);
             // Carry this VM's dirty set across the reboot before it dies with the VM: the disk
             // persists, so a checkpoint after the reboot must still see writes from before it.
             // Freeze first so the guest flushes its page cache to the block device (the set only
@@ -2896,7 +2902,7 @@ impl Executor for MicroVm {
         // image. Nothing runs after quiescence, so the drain needs no additional freeze.
         let mut drained_dirty = None;
         if let Some(mut session) = self.session.take() {
-            self.record_stage_mem(&fs.label, &session);
+            self.record_stage_usage(&fs.label, &session);
             let t_fin = std::time::Instant::now();
             block_on(session.quiesce_for_shutdown());
             if cleanup_changes_image && session.supports_dirty() {

@@ -87,6 +87,8 @@ struct Inner {
     jobs: usize,
     /// stage name → (maximum demand across its guests, assigned size), in bytes.
     mem: BTreeMap<String, (u64, u64)>,
+    /// stage name → the OOM kills its guests reported, in the order asked.
+    oom: BTreeMap<String, Vec<vk_core::oomkills::Kill>>,
     /// Fine-grained probe samples (`VIRTKIT_TIMING`), keyed by dotted label → (summed
     /// elapsed, sample count). Kept off the phase accounting so a probe that measures part
     /// of a coarse phase (e.g. `boot.spawn` within `boot`) never double-counts it; rendered
@@ -130,6 +132,26 @@ impl Timings {
     /// Return `stage`'s peak demand and assigned size for its completion line.
     pub fn stage_mem(&self, stage: &str) -> Option<(u64, u64)> {
         self.inner.lock().unwrap().mem.get(stage).copied()
+    }
+
+    /// Append a stage guest's OOM kills; one stage may boot several guests.
+    pub fn record_oom(&self, stage: &str, kills: Vec<vk_core::oomkills::Kill>) {
+        if kills.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        g.oom.entry(stage.to_string()).or_default().extend(kills);
+    }
+
+    /// The OOM kills recorded for `stage`, for its completion line; empty when none.
+    pub fn stage_oom(&self, stage: &str) -> Vec<vk_core::oomkills::Kill> {
+        self.inner
+            .lock()
+            .unwrap()
+            .oom
+            .get(stage)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Note the build's concurrency, so the header can report "busy across N jobs".

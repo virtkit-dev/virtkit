@@ -295,7 +295,8 @@ fn report_contacted_names(ctx: &JobCtx) {
 /// rather than at cleanup because this is the last stage whose output the trace still keeps,
 /// and the job's processes are all still alive to be read: it therefore covers everything but
 /// the guest's own shutdown. Best-effort: a job whose supervisor is already gone (the guest
-/// died) reports nothing.
+/// died) reports no usage figures, but its OOM report remains independent of that host-side
+/// measurement.
 ///
 /// The same figure is what the next run of this job is admitted against where the host
 /// reserves from history (`[schedule] from_history`), so it is recorded here too.
@@ -303,6 +304,12 @@ async fn report_resource_usage(ctx: &JobCtx) {
     // Asked of the guest before the tree is read, so the memory marks stay the last thing
     // measured and cover as much of the job as they can.
     let overlay = overlay_mark(ctx).await;
+    // Fetch while the guest is alive to explain signal 9 exits in the trace.
+    let oom = crate::oomkills::fetch(&vsock_addr(ctx), None).await;
+    // Report independently of the host-side supervisor measurement below.
+    if let Some(line) = crate::oomkills::line(oom.as_deref(), "raise MICROVM_MEM") {
+        eprintln!("virtkit: {line}");
+    }
     if let Some(pid) = crate::vm::live_supervisor_pid(ctx)
         && let Some(usage) = crate::usage::tree(pid)
             .map(|u| u.with_network(&ctx.net_bytes_log()).with_overlay(overlay))

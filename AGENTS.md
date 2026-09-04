@@ -34,9 +34,10 @@ The same codebase powers local compose-service VMs and a GitLab custom executor.
 A Cargo workspace (`Cargo.toml`, edition 2024) with seven crates:
 
 - **`vk-core/`** — the shared host↔guest library: the wire protocol (`messages`,
-  `framing`, `addr`, `net`, `status`, `fleetctl`) plus the runtime helpers both sides
-  build on (`exec`, `forward`, `pty`, `dockerignore`). Deliberately free of guest-only
-  concerns and of russh, so the host links none of that.
+  `framing`, `addr`, `net`, `status`, `fleetctl`), the formats both sides speak (`atop`,
+  `oomkills`), plus the runtime helpers both sides build on (`exec`, `forward`, `pty`,
+  `dockerignore`). Deliberately free of guest-only concerns and of russh, so the host
+  links none of that.
 - **`vk-driver/`** — the host driver (depends on `vk-core`): image building/conversion
   (OCI → ext4/initramfs), the compose service runner + control plane, the GitLab executor,
   the userspace L2 network switch (ARP/DHCP/DNS + transparent TCP/UDP egress via

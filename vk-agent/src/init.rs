@@ -203,6 +203,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     // The server has not accepted commands yet, so all writes and memory demand remain covered.
     crate::fsmark::watch();
     crate::memmark::watch(cmdline.get("VIRTKIT_MEMMARK").map(String::as_str) == Some("1"));
+    crate::oomkills::watch(); // Record guest kernel OOM kills for the host.
     install_term_handler();
     // Catch a host power-button press (the stop fallback when the exec channel is gone).
     crate::button::watch_power_button();
@@ -2404,9 +2405,10 @@ fn run_service(cmdline: &HashMap<String, String>, config: Option<&RunConfig>) ->
         None
     };
 
-    // Watch the power button after the last fork, so the forked children never inherit these
-    // threads (matching `run_init`).
+    // Watch the power button and the kernel's OOM kills after the last fork, so the forked
+    // children never inherit these threads (matching `run_init`).
     crate::button::watch_power_button();
+    crate::oomkills::watch();
 
     supervise_service(service_pid, serve_pid)
 }

@@ -2162,6 +2162,7 @@ async fn build_and_boot(
     // `vk stop` and an abort relayed by a `--detach` parent send SIGTERM. Its default action
     // would terminate the run and let the VMM parent-death signal cut guest power. Route it
     // through teardown so the guests power off cleanly.
+    let mut stopped = false;
     let result = tokio::select! {
         r = drive(
             &mut ch,
@@ -2178,9 +2179,20 @@ async fn build_and_boot(
         ) => r,
         _ = crate::shutdown::terminate_signal() => {
             println!("virtkit: stopping ...");
+            stopped = true;
             Ok(())
         }
     };
+    // Fetch kills before power-off. Skip the bounded diagnostic after an explicit stop so an
+    // unresponsive guest cannot delay teardown.
+    if !stopped
+        && let Some(line) = crate::oomkills::line(
+            crate::oomkills::fetch(&addr, None).await.as_deref(),
+            "raise --mem",
+        )
+    {
+        eprintln!("virtkit: {line}");
+    }
     teardown_run(
         &mut ch,
         persistent.then_some(&addr),
@@ -4114,6 +4126,12 @@ impl VmSession {
         .await
         .context("running the command in the guest")?;
         Ok(r.code.unwrap_or(0))
+    }
+
+    /// Fetch this stage guest's OOM kills through the session so cancellation also stops the
+    /// diagnostic.
+    pub(crate) async fn oomkills(&self) -> Option<Vec<crate::oomkills::Kill>> {
+        crate::oomkills::fetch(&self.addr, self.cancel.as_ref()).await
     }
 
     /// Run a guest command (as root) and report whether it exited 0 — for best-effort

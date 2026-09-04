@@ -238,6 +238,11 @@ fn main() {
         let rest: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(vk_agent::memmark::main(&rest));
     }
+    // Expose recorded OOM kills to the host without opening a socket.
+    if std::env::args().nth(1).as_deref() == Some("oomkills") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(vk_agent::oomkills::main(&rest));
+    }
     // The guest statistics sampler (no socket): init forks `vk-agent atop <dir>
     // <interval_secs>` at boot when the cmdline asks for it, and it appends atop-parseable
     // samples of this guest's /proc to the host archive share until SIGUSR2.

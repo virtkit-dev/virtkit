@@ -166,8 +166,9 @@ fn sample(mark: &mut Mark) {
 }
 
 /// Return whether `path` and `/` have different filesystem device IDs, or `false` if either
-/// cannot be stat'd.
-fn is_own_mount(path: &Path) -> bool {
+/// cannot be stat'd. Shared with [`crate::oomkills`], which needs the same answer about
+/// `/run` before it writes there.
+pub(crate) fn is_own_mount(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     match (std::fs::metadata(path), std::fs::metadata("/")) {
         (Ok(m), Ok(root)) => m.dev() != root.dev(),

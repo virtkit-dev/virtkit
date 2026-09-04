@@ -2384,6 +2384,17 @@ fn build_stage(
         }
         Ok(final_fs)
     })();
+    // Report OOM kills beside peak memory, including for a stage that just failed with
+    // signal 9. Keep this outside the closure so failure does not suppress the diagnostic.
+    // `base_name`, not `name`: a unified multi-service build prefixes the label with its
+    // service, but `--stage-mem` matches the bare stage name, so the prefixed form would be
+    // rejected by the suggested command.
+    if let Some(line) = crate::oomkills::summary(
+        &timings.stage_oom(&name),
+        &format!("raise it with `# vk: mem=`, --stage-mem {base_name}=SIZE or [build] mem"),
+    ) {
+        progress.warn(&format!("virtkit: build: [{name}] {line}"));
+    }
     // Memoize a genuine failure against `final_key` so a peer in this pipeline fails fast
     // instead of repeating it — but only a genuine one:
     //  - a cascaded cancellation (a sibling stage failed; this one aborted mid-flight,

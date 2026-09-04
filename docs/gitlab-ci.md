@@ -194,6 +194,18 @@ virtio-fs daemons, any service VM). Against the phase's own duration it gives th
 parallelism it reached: a ceiling for sizing one guest's vCPUs, since the total also
 carries the host helpers and every sibling VM.
 
+When the guest kernel's OOM killer terminates a process, a line identifies each victim
+before the figures above:
+
+```
+virtkit: guest OOM: the kernel killed cc1plus (pid 1234, 1.9 GiB RSS) at +48s (raise MICROVM_MEM)
+```
+
+The size is the victim's reclaimed anonymous RSS, and `+48s` is its guest uptime at death.
+A step that exits with signal 9 and no message often indicates an OOM kill; raise
+`MICROVM_MEM`. No line means either that no process was killed or that the guest was too old
+or unresponsive to report it.
+
 `peak memory` is the most the phase held at one time, not the memory left at the end: a
 guest hands freed RAM straight back to the host, so its live figure says little about the
 peak it passed through. A build reports its largest single process as well, because the
