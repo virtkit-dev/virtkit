@@ -516,6 +516,27 @@ struct VmView<'a> {
     stale: Option<Option<bool>>,
     /// Every declared compose service (empty for a non-compose VM), each with its state.
     services: Vec<ServiceView<'a>>,
+    /// The ports `vk publish ensure` holds open on the host for this VM.
+    published: Vec<PublishedView<'a>>,
+}
+
+/// A managed publisher's record and whether it was shown to be running.
+type Published = (crate::publish::Entry, crate::publish::Liveness);
+
+/// One managed publisher (`<state dir>/publish/<name>.json`) as `vk list --json` shows it.
+#[derive(Serialize)]
+struct PublishedView<'a> {
+    name: &'a str,
+    /// The host address it accepts connections on.
+    listen: &'a str,
+    /// The address the guest dials for each connection.
+    to: &'a str,
+    /// The compose sibling that dials, or `null` for the primary.
+    service: Option<&'a str>,
+    pid: u32,
+    /// `false` when its lock could not be tested (see `vk publish list`), so the pid is not
+    /// to be trusted.
+    confirmed: bool,
 }
 
 #[derive(Serialize)]
@@ -534,6 +555,7 @@ struct ServiceView<'a> {
 fn view<'a>(
     entry: &'a VmEntry,
     units: Option<&'a [UnitStatus]>,
+    published: &'a [Published],
     freshness: Freshness,
     stale: bool,
 ) -> VmView<'a> {
@@ -565,6 +587,17 @@ fn view<'a>(
                     state: unit.map(|u| u.state.as_str()),
                     ip: unit.map(|u| bare_ip(&u.ip)),
                 }
+            })
+            .collect(),
+        published: published
+            .iter()
+            .map(|(e, liveness)| PublishedView {
+                name: &e.name,
+                listen: &e.listen,
+                to: &e.to,
+                service: e.service.as_deref(),
+                pid: e.pid,
+                confirmed: *liveness == crate::publish::Liveness::Held,
             })
             .collect(),
     }
@@ -605,6 +638,48 @@ fn service_units(entry: &VmEntry) -> Option<Vec<UnitStatus>> {
             None
         }
     }
+}
+
+/// The VM's managed publishers (`vk publish ensure`), or none if its records cannot be read.
+/// Like `vk publish list`, this prunes the records of publishers that have exited.
+fn published(entry: &VmEntry) -> Vec<Published> {
+    match crate::publish::live(&entry.state_dir) {
+        Ok(published) => published,
+        // Report the failure; the VM is still listed, just without its ports.
+        Err(e) => {
+            eprintln!("virtkit: {}: reading publishers: {e:#}", entry.label);
+            Vec::new()
+        }
+    }
+}
+
+/// The PUBLISHED column: each publisher as `listen->to`, `@service` appended when a compose
+/// sibling dials, comma-separated; `-` when nothing is published. `tcp://` is dropped from
+/// both ends since it is the common case; any other scheme stays spelled out. A publisher
+/// whose lock could not be tested is marked `(unconfirmed)`, as `vk publish list` marks it.
+fn published_cell(published: &[Published]) -> String {
+    if published.is_empty() {
+        return "-".to_string();
+    }
+    published
+        .iter()
+        .map(|(e, liveness)| {
+            let mut cell = format!("{}->{}", bare_tcp(&e.listen), bare_tcp(&e.to));
+            if let Some(service) = &e.service {
+                cell.push('@');
+                cell.push_str(service);
+            }
+            if *liveness == crate::publish::Liveness::Unknown {
+                cell.push_str(" (unconfirmed)");
+            }
+            cell
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn bare_tcp(addr: &str) -> &str {
+    addr.strip_prefix("tcp://").unwrap_or(addr)
 }
 
 /// Query with `Request::List`, ignoring progress frames until `Done`; an error reply is an
@@ -761,13 +836,17 @@ pub fn list_report(
         })
         .collect();
     let units_by_vm: Vec<Option<Vec<UnitStatus>>> = vms.iter().map(service_units).collect();
+    let published_by_vm: Vec<Vec<Published>> = vms.iter().map(published).collect();
 
     if json || !fields.is_empty() {
         let views: Vec<VmView> = vms
             .iter()
             .zip(&units_by_vm)
+            .zip(&published_by_vm)
             .zip(&fresh)
-            .map(|((entry, units), freshness)| view(entry, units.as_deref(), *freshness, stale))
+            .map(|(((entry, units), published), freshness)| {
+                view(entry, units.as_deref(), published, *freshness, stale)
+            })
             .collect();
         if !fields.is_empty() {
             let views = views
@@ -782,15 +861,23 @@ pub fn list_report(
         return Ok("no running vk VMs\n".to_string());
     }
     // Columns: the STALE column is only added with `--stale`.
-    let mut headers: Vec<&str> = vec!["PID", "UPTIME", "NAME", "PROJECT", "EXEC ADDRESS"];
+    let mut headers: Vec<&str> = vec![
+        "PID",
+        "UPTIME",
+        "NAME",
+        "PROJECT",
+        "EXEC ADDRESS",
+        "PUBLISHED",
+    ];
     if stale {
         headers.push("STALE");
     }
     let rows: Vec<Vec<String>> = vms
         .iter()
         .zip(&units_by_vm)
+        .zip(&published_by_vm)
         .zip(&fresh)
-        .map(|((e, units), f)| {
+        .map(|(((e, units), published), f)| {
             let mut row = vec![
                 e.pid.to_string(),
                 uptime(e.created_secs),
@@ -800,6 +887,7 @@ pub fn list_report(
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "-".to_string()),
                 e.exec_addr.clone(),
+                published_cell(published),
             ];
             if stale {
                 row.push(f.cell().to_string());
@@ -1042,6 +1130,7 @@ pub fn reboot_cmd(target: Option<Selector>, all: bool, force: bool) -> Result<(S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::publish::Liveness;
 
     fn tmpdir(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1451,7 +1540,8 @@ mod tests {
     }
 
     fn services_json(e: &VmEntry, units: Option<&[UnitStatus]>) -> serde_json::Value {
-        serde_json::to_value(view(e, units, Freshness::Unknown, false)).unwrap()["services"].take()
+        serde_json::to_value(view(e, units, &[], Freshness::Unknown, false)).unwrap()["services"]
+            .take()
     }
 
     #[test]
@@ -1521,8 +1611,8 @@ mod tests {
         plain.label = "plain".into();
         plain.pid = 7;
         vec![
-            serde_json::to_value(view(&e, Some(&units), Freshness::Unknown, false)).unwrap(),
-            serde_json::to_value(view(&plain, None, Freshness::Unknown, false)).unwrap(),
+            serde_json::to_value(view(&e, Some(&units), &[], Freshness::Unknown, false)).unwrap(),
+            serde_json::to_value(view(&plain, None, &[], Freshness::Unknown, false)).unwrap(),
         ]
     }
 
@@ -1587,7 +1677,7 @@ mod tests {
         assert!(err.contains("(pass --stale)"), "{err}");
         let plain = entry(PathBuf::from("/state/plain"), None);
         let with_stale =
-            [serde_json::to_value(view(&plain, None, Freshness::Unknown, true)).unwrap()];
+            [serde_json::to_value(view(&plain, None, &[], Freshness::Unknown, true)).unwrap()];
         assert_eq!(fields(&with_stale, &["stale"], false).unwrap(), "null\n");
 
         // Malformed paths and repeats are rejected up front, even with nothing running.
@@ -1695,6 +1785,92 @@ mod tests {
         assert!(res.is_err());
     }
 
+    fn publisher(
+        name: &str,
+        listen: &str,
+        to: &str,
+        service: Option<&str>,
+    ) -> crate::publish::Entry {
+        crate::publish::Entry {
+            name: name.into(),
+            listen: listen.into(),
+            to: to.into(),
+            service: service.map(str::to_string),
+            pid: 4242,
+            created_secs: 0,
+        }
+    }
+
+    #[test]
+    fn published_cell_maps_listen_to_target_and_marks_the_dialing_service_and_unconfirmed() {
+        assert_eq!(published_cell(&[]), "-");
+        let published = [
+            (
+                publisher("web", "tcp://127.0.0.1:8443", "tcp://runner:443", None),
+                Liveness::Held,
+            ),
+            (
+                publisher("db", "/tmp/pg.sock", "tcp://127.0.0.1:5432", Some("db")),
+                Liveness::Unknown,
+            ),
+        ];
+        assert_eq!(
+            published_cell(&published),
+            "127.0.0.1:8443->runner:443, /tmp/pg.sock->127.0.0.1:5432@db (unconfirmed)"
+        );
+    }
+
+    #[test]
+    fn json_view_lists_publishers_with_service_and_confirmation() {
+        let e = entry(PathBuf::from("/state/app"), None);
+        let published = [
+            (
+                publisher("web", "tcp://127.0.0.1:8443", "tcp://runner:443", None),
+                Liveness::Held,
+            ),
+            (
+                publisher(
+                    "db",
+                    "tcp://127.0.0.1:5432",
+                    "tcp://127.0.0.1:5432",
+                    Some("db"),
+                ),
+                Liveness::Unknown,
+            ),
+        ];
+        let json =
+            serde_json::to_value(view(&e, None, &published, Freshness::Unknown, false)).unwrap();
+        assert_eq!(
+            json["published"],
+            serde_json::json!([
+                {
+                    "name": "web",
+                    "listen": "tcp://127.0.0.1:8443",
+                    "to": "tcp://runner:443",
+                    "service": null,
+                    "pid": 4242,
+                    "confirmed": true,
+                },
+                {
+                    "name": "db",
+                    "listen": "tcp://127.0.0.1:5432",
+                    "to": "tcp://127.0.0.1:5432",
+                    "service": "db",
+                    "pid": 4242,
+                    "confirmed": false,
+                },
+            ])
+        );
+        // Nothing published is an empty array, not an absent key, so `--field` into it reads
+        // null rather than failing.
+        let none = serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false)).unwrap();
+        assert_eq!(none["published"], serde_json::json!([]));
+        assert_eq!(
+            fields(&[json, none], &["published.0.listen"], false).unwrap(),
+            "tcp://127.0.0.1:8443\nnull\n"
+        );
+    }
+
     #[test]
     fn list_view_reports_boot_time_fields() {
         let mut e = entry(PathBuf::from("/state/app"), None);
@@ -1704,7 +1880,7 @@ mod tests {
         e.mem = Some("8G".into());
         e.nested = Some(true);
         e.guest_ip = Some(std::net::Ipv4Addr::new(10, 42, 0, 2));
-        let json = serde_json::to_value(view(&e, None, Freshness::Unknown, false)).unwrap();
+        let json = serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false)).unwrap();
         assert_eq!(json["vmm"], "libkrun");
         assert_eq!(json["vmm_pid"], 4242);
         assert_eq!(json["cpus"], 4);
@@ -1715,7 +1891,7 @@ mod tests {
         // A run without `--net` has no address: an explicit null, not an absent key, so
         // scripts can tell it from a field this `vk` never emitted.
         let e = entry(PathBuf::from("/state/app"), None);
-        let json = serde_json::to_value(view(&e, None, Freshness::Unknown, false)).unwrap();
+        let json = serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false)).unwrap();
         assert_eq!(json.get("guest_ip"), Some(&serde_json::Value::Null));
     }
 
@@ -1740,6 +1916,7 @@ mod tests {
             uptime_secs: 0,
             stale,
             services: vec![],
+            published: vec![],
         };
         // No `--stale`: the field is omitted entirely.
         let j = serde_json::to_string(&view(None)).unwrap();
@@ -1773,7 +1950,7 @@ mod tests {
         assert_eq!(e.mem, None);
         assert_eq!(e.nested, None);
         assert_eq!(e.guest_ip, None);
-        let json = serde_json::to_value(view(&e, None, Freshness::Unknown, false)).unwrap();
+        let json = serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false)).unwrap();
         for key in [
             "atop_log", "vmm", "vmm_pid", "cpus", "mem", "nested", "guest_ip",
         ] {
@@ -1785,7 +1962,7 @@ mod tests {
     fn list_view_reports_the_atop_log_path() {
         let mut e = entry(PathBuf::from("/state/app"), None);
         e.atop_log = Some(PathBuf::from("/state/app/atop/atop.log"));
-        let json = serde_json::to_value(view(&e, None, Freshness::Unknown, false)).unwrap();
+        let json = serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false)).unwrap();
         assert_eq!(json["atop_log"], "/state/app/atop/atop.log");
     }
 

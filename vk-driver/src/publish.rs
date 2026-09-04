@@ -276,7 +276,7 @@ fn forget_entry(state_dir: &Path, name: &str) {
 
 /// Whether a record's publisher was shown to be running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Liveness {
+pub enum Liveness {
     /// Its lifetime lock is held, so the process behind the recorded pid is that publisher.
     Held,
     /// The lock could not be tested, for example because of a symlink or NFS `ENOLCK`.
@@ -630,12 +630,20 @@ async fn vm_gone(agent_addr: &SocketAddr) {
     }
 }
 
-/// `vk publish list`: what is published for this state dir, dead records pruned.
-pub fn list_report(state_dir: &Path, json: bool) -> Result<String> {
-    let entries = match op_lock_existing(state_dir)? {
+/// The publishers running for a state dir, dead records pruned, each with whether it was
+/// shown to hold its lock. A state dir that never published has none, and nothing is
+/// created for it. Blocks behind a `vk publish ensure|stop` in flight on the same state
+/// dir: roughly `stop`'s timeout per publisher it waits on.
+pub fn live(state_dir: &Path) -> Result<Vec<(Entry, Liveness)>> {
+    Ok(match op_lock_existing(state_dir)? {
         Some(_op) => live_entries(state_dir),
         None => Vec::new(),
-    };
+    })
+}
+
+/// `vk publish list`: what is published for this state dir, dead records pruned.
+pub fn list_report(state_dir: &Path, json: bool) -> Result<String> {
+    let entries = live(state_dir)?;
     if json {
         // Mirror the text list's "(unconfirmed)" so JSON consumers do not trust an
         // unverified pid.
@@ -1294,6 +1302,29 @@ mod tests {
         let (report, all_down) = stop(&t.0, Some("ghost"), Duration::from_secs(1)).unwrap();
         assert!(all_down, "{report}");
         assert!(!entry_path(&t.0, "ghost").exists());
+    }
+
+    /// `vk list` reads publishers through `live`: none for a state dir that never published
+    /// (and no `publish/` dir appears for asking), the held ones once it has.
+    #[test]
+    fn live_lists_the_held_publishers_and_creates_nothing() {
+        let t = state("live");
+        assert!(live(&t.0).unwrap().is_empty());
+        assert!(
+            !dir_of(&t.0).exists(),
+            "listing must not create the publish dir"
+        );
+        let _held = fake_publisher(
+            &t.0,
+            "runner",
+            "tcp://127.0.0.1:8443",
+            "tcp://runner:443",
+            7,
+        );
+        let live = live(&t.0).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].0.name, "runner");
+        assert_eq!(live[0].1, Liveness::Held);
     }
 
     #[test]

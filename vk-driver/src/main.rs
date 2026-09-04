@@ -1697,8 +1697,10 @@ enum Cmd {
     /// List the running vk VMs
     ///
     /// The VMs started with `--state-dir`: their pid, uptime, name, the directory each was
-    /// launched from, and its exec-channel address. With a DIR argument, only VMs launched
-    /// from DIR or a subdirectory. `--json` or `--field` for scripting.
+    /// launched from, its exec-channel address, and the ports `vk publish ensure` holds open
+    /// for it on the host (`listen->to`, `@service` when a compose sibling dials). With a DIR
+    /// argument, only VMs launched from DIR or a subdirectory. `--json` or `--field` for
+    /// scripting.
     #[command(display_order = 6)]
     List {
         /// only VMs whose launch directory is DIR or below it (default: all)

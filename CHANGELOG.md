@@ -15,6 +15,11 @@ All notable changes to virtkit will be documented in this file.
 - `vk list --field FIELD` prints the named fields of each VM, one line per VM and
   tab-separated, bare, so a script can read `guest_ip` or `services.0.ip` without jq. With
   `--json`, the objects hold only those fields.
+- `vk list` shows the ports `vk publish ensure` holds open on the host for each VM: a
+  PUBLISHED column of `listen->to` mappings (`@service` when a compose sibling dials,
+  `(unconfirmed)` when the publisher could not be checked), and a `published` array in
+  `--json` with each publisher's name, addresses, service, pid and whether it was
+  confirmed alive.
 
 ### Changed
 

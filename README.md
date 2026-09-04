@@ -313,15 +313,19 @@ vk list
 ```
 
 ```
-PID    UPTIME  NAME                PROJECT        EXEC ADDRESS
-41230  2h14m   app/Dockerfile:dev  /home/me/app   vsock-auto:///home/me/app/.vk/vsock.sock:4444
-41877  35m     shop (+db, redis)   /home/me/shop  vsock-auto:///home/me/shop/.vk/vsock.sock:4444
+PID    UPTIME  NAME                PROJECT        EXEC ADDRESS                                    PUBLISHED
+41230  2h14m   app/Dockerfile:dev  /home/me/app   vsock-auto:///home/me/app/.vk/vsock.sock:4444   127.0.0.1:8443->localhost:443
+41877  35m     shop (+db, redis)   /home/me/shop  vsock-auto:///home/me/shop/.vk/vsock.sock:4444  127.0.0.1:5432->127.0.0.1:5432@db
 ```
 
 NAME is the built Dockerfile with its target stage, the compose primary, or the image ref;
 a compose VM appends the services it is currently running, or every declared one when
 the VM cannot be asked. PROJECT is the directory the run was launched from. EXEC ADDRESS
-is recorded as given, so a relative `--state-dir` lists a relative path.
+is recorded as given, so a relative `--state-dir` lists a relative path. PUBLISHED is
+every port `vk publish ensure` holds open on the host for the VM, as `listen->to`, with
+`@service` when a compose sibling rather than the primary dials the target and
+`(unconfirmed)` when the publisher's liveness could not be checked; `-` when nothing is
+published.
 
 An optional directory scopes the list to the VMs launched from it or a subdirectory, or to
 the one whose state dir it is exactly:
@@ -334,15 +338,18 @@ vk list /home/me/app/.vk     # one VM, by its state dir
 
 `--json` gives an array of objects, one per VM, with `pid`, `label`, `project_dir`,
 `exec_addr`, `state_dir`, `vmm`, `vmm_pid`, `cpus`, `mem`, `nested`, `guest_ip` (the eth0
-address on a `--net` LAN), `ssh_addr`, `atop_log`, `created_secs`, `uptime_secs`, and
+address on a `--net` LAN), `ssh_addr`, `atop_log`, `created_secs`, `uptime_secs`,
 `services` (every declared compose service with its `name`, `exec_addr`, `state` and LAN
-`ip`). `--field` picks fields without jq: one line per VM and tab-separated, or with
-`--json` objects holding only those fields; a dotted path reaches into nested values:
+`ip`), and `published` (each publisher's `name`, `listen`, `to`, `service`, `pid`, and
+whether its liveness was `confirmed`). `--field` picks fields without jq: one line per VM
+and tab-separated, or with `--json` objects holding only those fields; a dotted path
+reaches into nested values:
 
 ```sh
 vk list . --field pid                   # the pid to hand to vk stop
 vk list . --field guest_ip              # the VM's address on the --net LAN
 vk list . --field label --field services.0.ip
+vk list . --field published.0.listen    # where the first published port listens
 vk list --json | jq '.[] | select(.vmm == "cloud-hypervisor")'
 ```
 
