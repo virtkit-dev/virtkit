@@ -299,6 +299,59 @@ disks; `status` reports one or all. `vk run --ssh` enables SSH access for develo
 including VS Code Remote-SSH workflows. In a CI fleet a service's `environment:` may also
 carry its own egress allowlist — see [Per-service egress](docs/gitlab-ci.md#per-service-egress).
 
+### Manage running VMs
+
+A `vk run --state-dir DIR` boots a VM that outlives a single command: its sockets and
+console log live in DIR, and the run is recorded in a host-side registry. `vk list` reads
+that registry, dropping entries whose run has died, and is what `vk exec`, `vk status`,
+`vk stop` and `vk reboot` resolve a directory against. A run without `--state-dir` is not
+listed; pair `--state-dir` with `--detach` for a background VM.
+
+```sh
+vk run --state-dir "$PWD/.vk" --detach --ssh -f Dockerfile --target dev
+vk list
+```
+
+```
+PID    UPTIME  NAME                PROJECT        EXEC ADDRESS
+41230  2h14m   app/Dockerfile:dev  /home/me/app   vsock-auto:///home/me/app/.vk/vsock.sock:4444
+41877  35m     shop (+db, redis)   /home/me/shop  vsock-auto:///home/me/shop/.vk/vsock.sock:4444
+```
+
+NAME is the built Dockerfile with its target stage, the compose primary, or the image ref;
+a compose VM appends the services it is currently running, or every declared one when
+the VM cannot be asked. PROJECT is the directory the run was launched from. EXEC ADDRESS
+is recorded as given, so a relative `--state-dir` lists a relative path.
+
+An optional directory scopes the list to the VMs launched from it or a subdirectory, or to
+the one whose state dir it is exactly:
+
+```sh
+vk list .                    # VMs launched from here or below
+vk list ~/work               # every VM under a tree
+vk list /home/me/app/.vk     # one VM, by its state dir
+```
+
+`--json` gives an array of objects, one per VM, with `pid`, `label`, `project_dir`,
+`exec_addr`, `state_dir`, `vmm`, `vmm_pid`, `cpus`, `mem`, `nested`, `guest_ip` (the eth0
+address on a `--net` LAN), `ssh_addr`, `atop_log`, `created_secs`, `uptime_secs`, and
+`services` (every declared compose service with its `name`, `exec_addr`, `state` and LAN
+`ip`). `--field` picks fields without jq: one line per VM and tab-separated, or with
+`--json` objects holding only those fields; a dotted path reaches into nested values:
+
+```sh
+vk list . --field pid                   # the pid to hand to vk stop
+vk list . --field guest_ip              # the VM's address on the --net LAN
+vk list . --field label --field services.0.ip
+vk list --json | jq '.[] | select(.vmm == "cloud-hypervisor")'
+```
+
+`--stale` adds a column (`yes`, `no`, or `-` when unknown, as for an image boot) saying
+whether a fresh `vk run` would rebuild the VM's image because the Dockerfile, build
+context or base image of the VM or of one of its `build:` services changed since it
+booted. It resolves base image digests over the network, so it is opt-in; `--json` then
+carries `stale` too.
+
 ### Isolate GitLab jobs
 
 The GitLab custom executor creates a fresh microVM for each job and destroys it during
@@ -404,7 +457,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk run` | Boot an image, Dockerfile target, or compose fleet; run a command or shell. |
 | `vk build` | Build Dockerfile stages into a bootable ext4 image or caller-owned disk. |
 | `vk exec` | Run a command in an existing guest and return the command's exit status. |
-| `vk list` | Discover registered background VMs and compose services. |
+| `vk list` | List running `--state-dir` VMs and their compose services; scope by directory, `--json`/`--field` for scripts. |
 | `vk stop` | Stop a VM selected by pid or launch directory, or stop all registered VMs. |
 | `vk reboot` | Reboot a running VM in place through its guest, or power-cycle it with `--force`. |
 | `vk status` | Probe a guest agent, or report whether its root image is stale. |
