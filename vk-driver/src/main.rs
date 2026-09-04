@@ -960,7 +960,7 @@ enum Cmd {
         target: Option<String>,
         /// run in this compose sibling service instead of the primary
         ///
-        /// By name, as `vk list` shows it; the service must be running.
+        /// By name, as `vk list --wide` shows it; the service must be running.
         #[arg(long, value_name = "NAME")]
         service: Option<String>,
         /// Background mode: no stdio, do not wait for the command to exit
@@ -1009,7 +1009,7 @@ enum Cmd {
         target: Option<String>,
         /// ask this compose sibling's agent instead of the primary's
         ///
-        /// By name, as `vk list` shows it; the service must be running.
+        /// By name, as `vk list --wide` shows it; the service must be running.
         #[arg(long, value_name = "NAME")]
         service: Option<String>,
         /// Local address to accept connections on (tcp://host:port, a unix path, ...)
@@ -1749,14 +1749,19 @@ enum Cmd {
     /// List the running vk VMs
     ///
     /// VMs started with `--state-dir`, with their pid, uptime, name, compose services,
-    /// project directory (`--workspace`, then `--workdir`, then launch directory),
-    /// exec-channel address, and published ports (`listen->to`; `@service` when a compose
-    /// sibling dials). With DIR, only VMs whose project is DIR or below it. Use `--json` or
-    /// `--field` for scripts.
+    /// project directory (`--workspace`, then `--workdir`, then launch directory) and
+    /// published ports (`listen->to`; `@service` when a compose sibling dials). The table
+    /// folds `$HOME` to `~` and names at most three services; `--wide` shows every service,
+    /// the project directory in full and the exec-channel address. With DIR, only VMs whose
+    /// project is DIR or below it. Use `--json` or `--field` for scripts; neither takes
+    /// `--wide`, since both already report every field.
     #[command(display_order = 6)]
     List {
         /// only VMs whose project directory is DIR or below it (default: all)
         dir: Option<PathBuf>,
+        /// the full table: every service named, the project path in full, and EXEC ADDRESS
+        #[arg(short = 'w', long, conflicts_with_all = ["json", "field"])]
+        wide: bool,
         /// emit the entries as a JSON array instead of a table
         #[arg(long)]
         json: bool,
@@ -2546,12 +2551,13 @@ async fn cli_main() -> ExitCode {
     }
     if let Cmd::List {
         dir,
+        wide,
         json,
         field,
         stale,
     } = &cli.cmd
     {
-        return match vms::list_report(dir.as_deref(), *json, *stale, field) {
+        return match vms::list_report(dir.as_deref(), *json, *stale, field, *wide) {
             Ok(report) => write_report(&report),
             Err(e) => fail(&e, 2),
         };

@@ -29,6 +29,9 @@ All notable changes to virtkit will be documented in this file.
 - A guest that runs its own DHCP client on eth0 now gets the address `vk` assigned it,
   instead of whatever the LAN's pool handed out first. Compose services and a guest's
   extra interfaces already behaved this way.
+- `vk list`'s table is narrower by default: EXEC ADDRESS is gone, `$HOME` in PROJECT is
+  written `~`, and SERVICES names three services and counts the rest (`db, redis, web, +4`).
+  `vk list --wide` (`-w`) is the old table, and `--json` still reports every field.
 
 ## [0.60.0] - 2026-09-04
 

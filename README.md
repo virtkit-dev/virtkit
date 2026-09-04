@@ -319,19 +319,21 @@ vk list
 ```
 
 ```
-PID    UPTIME  NAME                SERVICES   PROJECT        EXEC ADDRESS                                    PUBLISHED
-41230  2h14m   app/Dockerfile:dev  -          /home/me/app   vsock-auto:///home/me/app/.vk/vsock.sock:4444   127.0.0.1:8443->localhost:443
-41877  35m     shop                db, redis  /home/me/shop  vsock-auto:///home/me/shop/.vk/vsock.sock:4444  127.0.0.1:5432->127.0.0.1:5432@db
+PID    UPTIME  NAME                SERVICES            PROJECT  PUBLISHED
+41230  2h14m   app/Dockerfile:dev  -                   ~/app    127.0.0.1:8443->localhost:443
+41877  35m     shop                db, redis, web, +4  ~/shop   127.0.0.1:5432->127.0.0.1:5432@db
 ```
 
 NAME is the built Dockerfile with its target stage, the compose primary, or the image ref.
 SERVICES lists the compose services running beside the primary, or every declared one when
-the VM cannot be asked; `-` for none. PROJECT is the run's `--workspace`, then its
-`--workdir`, then its launch directory. EXEC ADDRESS is recorded as given, so a relative
-`--state-dir` lists a relative path. PUBLISHED is every port `vk publish ensure` holds open
-on the host for the VM, as `listen->to`, with `@service` when a compose sibling rather than
-the primary dials the target and `(unconfirmed)` when the publisher's liveness could not be
-checked; `-` when nothing is published.
+the VM cannot be asked; `-` for none. Past three names, the rest are counted (`+4`).
+PROJECT is the run's `--workspace`, then its `--workdir`, then its launch directory, with
+`$HOME` shown as `~`. PUBLISHED is every port `vk publish ensure` holds open on the host
+for the VM, as `listen->to`, with `@service` when a compose sibling rather than the primary
+dials the target and `(unconfirmed)` when the publisher's liveness could not be checked;
+`-` when nothing is published. `--wide` (`-w`) names every service, prints the project
+directory in full and adds EXEC ADDRESS, recorded as given (a relative `--state-dir` lists a
+relative path). `--json` and `--field` already report every field, so neither takes `--wide`.
 
 An optional directory scopes the list to the VMs whose project is that directory or one
 below it, or to the one whose state dir it is exactly:
@@ -480,7 +482,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk run` | Boot an image, Dockerfile target, or compose fleet; run a command or shell. |
 | `vk build` | Build Dockerfile stages into a bootable ext4 image or caller-owned disk. |
 | `vk exec` | Run a command in an existing guest and return the command's exit status. |
-| `vk list` | List running `--state-dir` VMs and their compose services; scope by directory, `--json`/`--field` for scripts. |
+| `vk list` | List running `--state-dir` VMs and their compose services; scope by directory, `-w` for the full table, `--json`/`--field` for scripts. |
 | `vk stop` | Stop a VM selected by pid or project directory, or stop all registered VMs. |
 | `vk reboot` | Reboot a running VM in place through its guest, or power-cycle it with `--force`. |
 | `vk status` | Probe a guest agent, or report whether its root image is stale. |

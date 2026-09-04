@@ -720,9 +720,16 @@ fn query_units(ctl: &Path) -> Result<Vec<UnitStatus>> {
     }
 }
 
+/// How many compose siblings the default table names before folding the rest into `+N`.
+/// Keep in sync with the `vk list` help in `main.rs` and the table description in
+/// `README.md`, which both spell the number out.
+const SERVICES_SHOWN: usize = 3;
+
 /// The SERVICES column: the compose siblings running beside the primary (see
-/// `named_in_text`), comma-separated; `-` for none.
-fn services_cell(entry: &VmEntry, units: Option<&[UnitStatus]>) -> String {
+/// `named_in_text`), comma-separated; `-` for none. Unless `wide`, only the first
+/// `SERVICES_SHOWN` are named and the rest counted (`db, redis, web, +4`), so a compose
+/// project with a dozen services does not push the table off the screen.
+fn services_cell(entry: &VmEntry, units: Option<&[UnitStatus]>, wide: bool) -> String {
     let services: Vec<&str> = entry
         .services
         .iter()
@@ -730,9 +737,45 @@ fn services_cell(entry: &VmEntry, units: Option<&[UnitStatus]>) -> String {
         .filter(|name| named_in_text(units, name))
         .collect();
     if services.is_empty() {
-        "-".to_string()
-    } else {
-        services.join(", ")
+        return "-".to_string();
+    }
+    if wide || services.len() <= SERVICES_SHOWN {
+        return services.join(", ");
+    }
+    format!(
+        "{}, +{}",
+        services[..SERVICES_SHOWN].join(", "),
+        services.len() - SERVICES_SHOWN
+    )
+}
+
+/// The PROJECT column: the directory as recorded, or with `$HOME` folded to `~` unless
+/// `wide`. `-` when the run recorded none.
+fn project_cell(project_dir: Option<&Path>, home: Option<&Path>, wide: bool) -> String {
+    let Some(dir) = project_dir else {
+        return "-".to_string();
+    };
+    if wide {
+        return dir.display().to_string();
+    }
+    tilde(dir, home)
+}
+
+/// `dir` with `home` replaced by `~`, when `home` is a whole leading component of it.
+///
+/// Both sides must already be canonical for the prefix to match: `project_dir` is recorded
+/// canonicalized, so callers canonicalize `$HOME` too — otherwise a symlinked or
+/// automounted home (`/home/me` -> `/data/me`) would silently never fold. `/` is rejected
+/// along with a relative or empty `home`: folding it would make every path longer
+/// (`~/home/me/app`), not shorter.
+fn tilde(dir: &Path, home: Option<&Path>) -> String {
+    let Some(home) = home.filter(|h| h.is_absolute() && h.parent().is_some()) else {
+        return dir.display().to_string();
+    };
+    match dir.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => dir.display().to_string(),
     }
 }
 
@@ -821,12 +864,15 @@ fn fields_report(views: &[serde_json::Value], fields: &[String], json: bool) -> 
 
 /// `vk list`: the running VMs (optionally only those under `filter`) as a table, or JSON. With
 /// `stale`, each VM's freshness is computed (network I/O — see `freshness_all`) and shown.
-/// With `fields`, only those fields of each VM (see `fields_report`).
+/// With `fields`, only those fields of each VM (see `fields_report`). The table folds
+/// `$HOME` to `~`, names at most `SERVICES_SHOWN` services and leaves out EXEC ADDRESS
+/// unless `wide`; `--json` and `--field` are unaffected.
 pub fn list_report(
     filter: Option<&Path>,
     json: bool,
     stale: bool,
     fields: &[String],
+    wide: bool,
 ) -> Result<String> {
     check_fields(fields)?;
     let mut vms = running();
@@ -869,47 +915,75 @@ pub fn list_report(
     if vms.is_empty() {
         return Ok("no running vk VMs\n".to_string());
     }
-    // Columns: the STALE column is only added with `--stale`.
-    let mut headers: Vec<&str> = vec![
-        "PID",
-        "UPTIME",
-        "NAME",
-        "SERVICES",
-        "PROJECT",
-        "EXEC ADDRESS",
-        "PUBLISHED",
-    ];
+    // `tilde` matches against a canonical `project_dir`, so canonicalize `$HOME` as well;
+    // only the narrow table folds it.
+    let home = (!wide)
+        .then(|| std::env::var_os("HOME").map(|h| canonical(Path::new(&h))))
+        .flatten();
+    Ok(table(
+        &vms,
+        &units_by_vm,
+        &published_by_vm,
+        &fresh,
+        home.as_deref(),
+        stale,
+        wide,
+    ))
+}
+
+/// The `vk list` table: one header row and one row per VM, with columns padded to their
+/// widest cell and separated by two spaces. EXEC ADDRESS requires `wide`; STALE requires
+/// `stale`. All four combinations must keep header and row columns in the same order
+/// because padding uses column positions.
+///
+/// Per-VM slices come from `list_report`, in `vms` order.
+fn table(
+    vms: &[VmEntry],
+    units_by_vm: &[Option<Vec<UnitStatus>>],
+    published_by_vm: &[Vec<Published>],
+    fresh: &[Freshness],
+    home: Option<&Path>,
+    stale: bool,
+    wide: bool,
+) -> String {
+    let mut headers: Vec<&str> = vec!["PID", "UPTIME", "NAME", "SERVICES", "PROJECT"];
+    if wide {
+        headers.push("EXEC ADDRESS");
+    }
+    headers.push("PUBLISHED");
     if stale {
         headers.push("STALE");
     }
     let rows: Vec<Vec<String>> = vms
         .iter()
-        .zip(&units_by_vm)
-        .zip(&published_by_vm)
-        .zip(&fresh)
+        .zip(units_by_vm)
+        .zip(published_by_vm)
+        .zip(fresh)
         .map(|(((e, units), published), f)| {
             let mut row = vec![
                 e.pid.to_string(),
                 uptime(e.created_secs),
                 e.label.clone(),
-                services_cell(e, units.as_deref()),
-                e.project_dir
-                    .as_deref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-                e.exec_addr.clone(),
-                published_cell(published),
+                services_cell(e, units.as_deref(), wide),
+                project_cell(e.project_dir.as_deref(), home, wide),
             ];
+            if wide {
+                row.push(e.exec_addr.clone());
+            }
+            row.push(published_cell(published));
             if stale {
                 row.push(f.cell().to_string());
             }
             row
         })
         .collect();
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    // Widths are counted in characters, not bytes, to match how the formatter pads: a
+    // non-ASCII project path or service name would otherwise reserve one blank column per
+    // extra UTF-8 byte, making the table wider than it needs to be.
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
     for row in &rows {
         for (i, cell) in row.iter().enumerate() {
-            widths[i] = widths[i].max(cell.len());
+            widths[i] = widths[i].max(cell.chars().count());
         }
     }
     let mut out = String::new();
@@ -930,7 +1004,7 @@ pub fn list_report(
     for row in &rows {
         fmt_row(row, &mut out);
     }
-    Ok(out)
+    out
 }
 
 /// SIGTERM the run managing `entry` and wait up to `timeout` seconds for it to exit (the
@@ -1560,7 +1634,7 @@ mod tests {
         let e = compose_entry();
         // No answer from the VM: the text view names every recorded service and the JSON
         // carries an explicit null state and ip for each.
-        assert_eq!(services_cell(&e, None), "db, redis");
+        assert_eq!(services_cell(&e, None, false), "db, redis");
         assert_eq!(
             services_json(&e, None),
             serde_json::json!([
@@ -1577,8 +1651,162 @@ mod tests {
             unit("db", "running", "10.0.0.2/24"),
             unit("redis", "stopped", "10.0.0.3/24"),
         ];
-        assert_eq!(services_cell(&e, Some(&units)), "db");
-        assert_eq!(services_cell(&e, Some(&[])), "-");
+        assert_eq!(services_cell(&e, Some(&units), false), "db");
+        assert_eq!(services_cell(&e, Some(&[]), false), "-");
+    }
+
+    /// `compose_entry` plus `extra` further services, in order.
+    fn compose_entry_with(extra: &[&str]) -> VmEntry {
+        let mut e = compose_entry();
+        for name in extra {
+            e.services.push(ServiceEntry {
+                name: (*name).to_string(),
+                exec_addr: format!("vsock-auto:///state/app/svc-{name}/vsock.sock:4444"),
+                stale_recipe: None,
+            });
+        }
+        e
+    }
+
+    #[test]
+    fn services_cell_folds_the_tail_unless_wide() {
+        let mut e = compose_entry_with(&["web", "cache", "queue", "mail"]);
+        assert_eq!(services_cell(&e, None, false), "db, redis, web, +3");
+        assert_eq!(
+            services_cell(&e, None, true),
+            "db, redis, web, cache, queue, mail"
+        );
+        // One past the shown count still folds, so the column never names a fourth.
+        e.services.truncate(SERVICES_SHOWN + 1);
+        assert_eq!(services_cell(&e, None, false), "db, redis, web, +1");
+        // Exactly the shown count is not folded: `+0` would say nothing.
+        e.services.truncate(SERVICES_SHOWN);
+        assert_eq!(services_cell(&e, None, false), "db, redis, web");
+    }
+
+    #[test]
+    fn project_cell_folds_home_to_tilde_unless_wide() {
+        let home = Path::new("/home/me");
+        let dir = Path::new("/home/me/app");
+        assert_eq!(project_cell(Some(dir), Some(home), false), "~/app");
+        assert_eq!(project_cell(Some(dir), Some(home), true), "/home/me/app");
+        assert_eq!(project_cell(Some(home), Some(home), false), "~");
+        // Only a whole leading component folds: /home/meow is not under /home/me.
+        assert_eq!(
+            project_cell(Some(Path::new("/home/meow/x")), Some(home), false),
+            "/home/meow/x"
+        );
+        assert_eq!(project_cell(Some(dir), None, false), "/home/me/app");
+        assert_eq!(
+            project_cell(Some(dir), Some(Path::new("")), false),
+            "/home/me/app"
+        );
+        // A relative or root home folds nothing: `~/home/me/app` is longer than the path
+        // it replaces, and `/` itself is not the home directory in any useful sense.
+        assert_eq!(
+            project_cell(Some(dir), Some(Path::new("home")), false),
+            "/home/me/app"
+        );
+        assert_eq!(
+            project_cell(Some(dir), Some(Path::new("/")), false),
+            "/home/me/app"
+        );
+        assert_eq!(
+            project_cell(Some(Path::new("/")), Some(Path::new("/")), false),
+            "/"
+        );
+        assert_eq!(project_cell(None, Some(home), false), "-");
+    }
+
+    #[test]
+    fn tilde_folds_a_symlinked_home_once_both_sides_are_canonical() {
+        let real = canonical(&tmpdir("tilde-home"));
+        let link = real.with_extension("link");
+        let _ = std::fs::remove_file(&link); // best-effort: a leftover from an earlier run
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let dir = real.join("app");
+        // `$HOME` as the environment spells it does not match the canonical project dir.
+        assert_eq!(tilde(&dir, Some(&link)), dir.display().to_string());
+        // Canonicalized the way `list_report` does, it folds.
+        assert_eq!(tilde(&dir, Some(&canonical(&link))), "~/app");
+        // Best-effort cleanup: a leaked temp dir fails no assertion.
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&real);
+    }
+
+    /// One VM per row, with no publishers and unknown freshness — enough to check which
+    /// columns the table emits.
+    fn table_of(vms: &[VmEntry], home: Option<&Path>, stale: bool, wide: bool) -> String {
+        let units: Vec<Option<Vec<UnitStatus>>> = vms.iter().map(|_| None).collect();
+        let published: Vec<Vec<Published>> = vms.iter().map(|_| Vec::new()).collect();
+        let fresh: Vec<Freshness> = vms.iter().map(|_| Freshness::Unknown).collect();
+        table(vms, &units, &published, &fresh, home, stale, wide)
+    }
+
+    /// The cells of one table line. No cell holds two consecutive spaces, so the padding
+    /// between columns is the only place a line can split.
+    fn cells(line: &str) -> Vec<&str> {
+        line.split("  ")
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn the_table_shows_exec_address_only_with_wide() {
+        let vms = [compose_entry()];
+        let narrow = table_of(&vms, None, false, false);
+        assert!(narrow.contains("PID"), "{narrow}");
+        assert!(!narrow.contains("EXEC ADDRESS"), "{narrow}");
+        assert!(!narrow.contains(&vms[0].exec_addr), "{narrow}");
+        let wide = table_of(&vms, None, false, true);
+        assert!(wide.contains("EXEC ADDRESS"), "{wide}");
+        assert!(wide.contains(&vms[0].exec_addr), "{wide}");
+    }
+
+    #[test]
+    fn every_table_row_has_the_header_s_columns_in_its_order() {
+        let vms = [
+            compose_entry_with(&["web", "cache", "queue", "mail"]),
+            entry(PathBuf::from("/state/solo"), None),
+        ];
+        for (stale, wide) in [(false, false), (false, true), (true, false), (true, true)] {
+            let text = table_of(&vms, Some(Path::new("/home/me")), stale, wide);
+            let mut expected = vec!["PID", "UPTIME", "NAME", "SERVICES", "PROJECT"];
+            if wide {
+                expected.push("EXEC ADDRESS");
+            }
+            expected.push("PUBLISHED");
+            if stale {
+                expected.push("STALE");
+            }
+            let mut lines = text.lines();
+            assert_eq!(cells(lines.next().unwrap()), expected, "{text}");
+            let rows: Vec<&str> = lines.collect();
+            assert_eq!(rows.len(), vms.len(), "{text}");
+            for row in &rows {
+                assert_eq!(cells(row).len(), expected.len(), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_table_measures_width_in_characters_not_bytes() {
+        // "caf\u{e9}" has four characters but five UTF-8 bytes. Byte widths would add one
+        // extra space compared with an ASCII label of the same character count.
+        let labelled = |label: &str| {
+            let mut e = entry(PathBuf::from("/state/cafe"), None);
+            e.label = label.to_string();
+            table_of(&[e], None, false, false)
+        };
+        let widths = |text: &str| {
+            text.lines()
+                .map(|line| line.chars().count())
+                .collect::<Vec<_>>()
+        };
+        let accented = labelled("caf\u{e9}");
+        let ascii = labelled("cafe");
+        assert_eq!(widths(&accented), widths(&ascii), "{accented}");
     }
 
     #[test]
@@ -1602,7 +1830,7 @@ mod tests {
         let e = compose_entry();
         // The VM answered but knows nothing of `redis` (registry/manager drift).
         let units = [unit("db", "running", "10.0.0.2/24")];
-        assert_eq!(services_cell(&e, Some(&units)), "db");
+        assert_eq!(services_cell(&e, Some(&units), false), "db");
         assert_eq!(
             services_json(&e, Some(&units)),
             serde_json::json!([
