@@ -457,7 +457,7 @@ pub fn boot_unit(
         );
     }
     let vsock = dir.join("vsock.sock");
-    let console = dir.join("console.log");
+    let console = dir.join(crate::run::CONSOLE_LOG);
 
     // The image's content identity keys every persistence this unit opted into (its root, its
     // `overlay,persist` uppers): a new image resets them. `ext4` is content-addressed, so its

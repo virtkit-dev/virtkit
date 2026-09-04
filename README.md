@@ -309,8 +309,9 @@ carry its own egress allowlist — see [Per-service egress](docs/gitlab-ci.md#pe
 A `vk run --state-dir DIR` boots a VM that outlives a single command: its sockets and
 console log live in DIR, and the run is recorded in a host-side registry. `vk list` reads
 that registry, dropping entries whose run has died, and is what `vk exec`, `vk status`,
-`vk stop` and `vk reboot` resolve a directory against. A run without `--state-dir` is not
-listed; pair `--state-dir` with `--detach` for a background VM.
+`vk logs`, `vk stop` and `vk reboot` resolve a directory against — `vk logs` also reads the
+console of a VM the registry has already dropped, since DIR keeps it. A run without
+`--state-dir` is not listed; pair `--state-dir` with `--detach` for a background VM.
 
 ```sh
 vk run --state-dir "$PWD/.vk" --detach --ssh -f Dockerfile --target dev
@@ -483,6 +484,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk stop` | Stop a VM selected by pid or project directory, or stop all registered VMs. |
 | `vk reboot` | Reboot a running VM in place through its guest, or power-cycle it with `--force`. |
 | `vk status` | Probe a guest agent, or report whether its root image is stale. |
+| `vk logs` | Show a VM's console log, telling kernel, agent and guest output apart; `--level warn`, `--agent`, `--service NAME`, `-f`. |
 | `vk atop` | Follow or inspect guest resource recordings. |
 | `vk check` | Validate KVM, VMM, embedded assets, configured host features, and an optional minimum `vk` version. |
 | `vk gc` | Reclaim unused image bases, CI checkouts, and image-cache chunks. |

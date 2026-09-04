@@ -1835,7 +1835,7 @@ async fn build_and_boot(
     let shared_mem = !shares.is_empty();
 
     // 3. boot
-    let console = work.join("console.log");
+    let console = work.join(CONSOLE_LOG);
     let vmm = crate::vmm::selected(&args.cloud_hypervisor);
     let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
     println!("virtkit: booting {} (cpus={cpus}, mem={mem})", vmm.name());
@@ -3615,6 +3615,10 @@ pub(crate) fn parse_mem_mib(mem: &str) -> Option<u64> {
     mem.parse().ok()
 }
 
+/// Guest serial console filename within its state directory, shared by the VMM writers
+/// and `vk logs`.
+pub(crate) const CONSOLE_LOG: &str = "console.log";
+
 fn tail(path: &Path, lines: usize) -> String {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let all: Vec<&str> = text.lines().collect();
@@ -3953,7 +3957,7 @@ pub(crate) async fn boot_session(
     });
     let mut cmdline = build_guest_cmdline(tmp_dev.as_deref(), image_kernel.is_some());
     let vsock = work.join("vsock.sock");
-    let console = work.join("console.log");
+    let console = work.join(CONSOLE_LOG);
 
     // Build context for COPY from the context: served read-only over virtiofs and
     // mounted by the agent at CONTEXT_MOUNT (it reads VIRTKIT_VIRTIOFS at boot).
@@ -5239,7 +5243,7 @@ mod tests {
             net: crate::vmm::Net::None,
             nics: Vec::new(),
             balloon: false,
-            serial_log: dir.join("console.log"),
+            serial_log: dir.join(CONSOLE_LOG),
             console_serial: false,
             pmu: false,
             nested: false,

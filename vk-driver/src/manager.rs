@@ -364,7 +364,7 @@ impl Manager {
         let Some(st) = u.get(name) else {
             return Reply::err(format!("no such unit {name:?}"));
         };
-        let console = st.dir.join("console.log");
+        let console = st.dir.join(crate::run::CONSOLE_LOG);
         match std::fs::read_to_string(&console) {
             Ok(text) => {
                 let mut tail: Vec<&str> = text.lines().rev().take(lines).collect();

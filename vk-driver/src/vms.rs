@@ -469,6 +469,13 @@ pub fn resolve_one(dir: Option<&Path>) -> Result<VmEntry> {
     }
 }
 
+/// Whether a VM still answers to `dir`. Anything short of a definite "nothing matches" —
+/// an unreadable registry, two VMs matching — counts as still there, because the one caller
+/// (`vk logs -f`) ends its stream on a `false` and must not do that over a transient.
+pub fn still_registered(dir: Option<&Path>) -> bool {
+    !matches!(matching(dir), Ok((_, m)) if m.is_empty())
+}
+
 fn uptime(created_secs: u64) -> String {
     fmt_uptime(unix_now().saturating_sub(created_secs))
 }

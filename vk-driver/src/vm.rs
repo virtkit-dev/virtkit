@@ -452,7 +452,7 @@ async fn wait_for_services(ctx: &JobCtx, names: &[String]) -> Result<()> {
                 }
                 Err(e) => {
                     if Instant::now() >= deadline {
-                        log_tail(&dir.join("console.log"), 30);
+                        log_tail(&dir.join(crate::run::CONSOLE_LOG), 30);
                         bail!(
                             "service {name} not ready after {}s ({e}) — console tail above",
                             cfg.vm.boot_timeout_secs

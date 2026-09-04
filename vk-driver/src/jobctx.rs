@@ -262,7 +262,7 @@ impl JobCtx {
         self.job_dir.join("supervisor.log")
     }
     pub fn console_log(&self) -> PathBuf {
-        self.job_dir.join("console.log")
+        self.job_dir.join(crate::run::CONSOLE_LOG)
     }
     /// The VMM subprocess's own stdout/stderr (vk's boot errors), written by `spawn_vmm`
     /// next to the guest serial console.

@@ -10,10 +10,12 @@ All notable changes to virtkit will be documented in this file.
   `volumes:`. It is implied when the host path is a socket, and `,optional` skips an absent
   socket. Only bytes cross, so the guest never learns the host path, but it receives every
   capability the socket grants. A forwarded Docker socket is host-root-equivalent.
-
 - Report guest OOM kills in build-stage completion output, CI traces, `vk run`, and
   `vk status`. Each report identifies the victims, their anonymous RSS, kill time, and the
   setting that raises the guest's memory limit. This explains memory-related signal 9 exits.
+- `vk logs [DIR]` shows a VM's console log, distinguishing kernel, vk-agent and guest
+  output. Filter by severity or source, read a compose sibling's console, or follow new
+  lines live. Logs remain readable after the VM exits.
 
 ### Changed
 

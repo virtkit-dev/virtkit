@@ -29,6 +29,7 @@ mod check;
 mod checkout;
 mod compose;
 mod config;
+mod consolelog;
 mod cpio;
 mod detach;
 mod dockerhash;
@@ -896,6 +897,53 @@ enum Cmd {
         /// by directory (a raw address has no build recipe).
         #[arg(long)]
         stale: bool,
+    },
+    /// Show a VM's console log: kernel, agent and guest output, filterable
+    ///
+    /// Reads the run's `console.log` — one serial console carrying the guest kernel's
+    /// messages, the agent's `HH:MM:SS [LEVEL] vk-agent …` lines and whatever the guest's
+    /// programs print — and tells the three apart, so `--level warn` shows only what went
+    /// wrong and `--agent` only what vk-agent did. The source flags combine as a union
+    /// (`--kernel --agent` shows both), and `--level` drops everything that carries no level
+    /// — every guest program's line, and every routine kernel one. Selects the VM whose
+    /// project is the current directory by default; `--service` reads a compose sibling's
+    /// console instead.
+    #[command(display_order = 7)]
+    Logs {
+        /// which VM: a project directory (default: the current directory)
+        ///
+        /// Resolves via the VM registry `vk list` uses. After the VM has exited it is no
+        /// longer registered — name the run's `--state-dir` itself and its console is read
+        /// straight from there.
+        target: Option<PathBuf>,
+        /// read this compose sibling's console instead of the primary's
+        #[arg(long, value_name = "NAME")]
+        service: Option<String>,
+        /// show the last N lines (after filtering); 0 streams the whole log
+        ///
+        /// The log is read a line at a time and only N are held, so a bound costs no more
+        /// memory on a console that has grown for days than on a fresh one.
+        #[arg(short = 'n', long, default_value_t = 50, value_name = "N")]
+        lines: usize,
+        /// only lines at least this severe: error, warn, info, debug, trace
+        ///
+        /// Agent lines carry a level; a kernel panic, oops, BUG or OOM kill counts as error;
+        /// other kernel lines and everything the guest's programs print have none and are
+        /// dropped whenever a level is asked.
+        #[arg(long, value_name = "LEVEL")]
+        level: Option<consolelog::Level>,
+        /// only the guest kernel's lines
+        #[arg(long)]
+        kernel: bool,
+        /// only vk-agent's lines
+        #[arg(long)]
+        agent: bool,
+        /// only what the guest's programs printed
+        #[arg(long)]
+        guest: bool,
+        /// keep printing new lines as the guest writes them (until Ctrl-C or the VM ends)
+        #[arg(short = 'f', long)]
+        follow: bool,
     },
     /// Run a command in a live guest, or open an interactive shell in it
     ///
@@ -3790,6 +3838,38 @@ async fn cli_main() -> ExitCode {
                 Err(e) => fail(&anyhow::anyhow!("{e}"), 1),
             }
         }
+        Cmd::Logs {
+            target,
+            service,
+            lines,
+            level,
+            kernel,
+            agent,
+            guest,
+            follow,
+        } => {
+            let mut sources = Vec::new();
+            if kernel {
+                sources.push(consolelog::Source::Kernel);
+            }
+            if agent {
+                sources.push(consolelog::Source::Agent);
+            }
+            if guest {
+                sources.push(consolelog::Source::Guest);
+            }
+            match console_log_path(target.as_deref(), service.as_deref()) {
+                Ok(path) => {
+                    match show_console_log(&path, target.as_deref(), &sources, level, lines, follow)
+                        .await
+                    {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(e) => fail(&e, 1),
+                    }
+                }
+                Err(e) => fail(&e, 2),
+            }
+        }
         // Run a command in a live guest, reproducing its exit status as our own. The target
         // selects the VM the same way `vk status` does (directory via the registry, default cwd,
         // or a raw agent address); the command is the trailing `-- …` group.
@@ -4050,6 +4130,190 @@ fn is_agent_addr(s: &str) -> bool {
     ]
     .iter()
     .any(|scheme| s.starts_with(scheme))
+}
+
+/// The console log of the VM `target` selects (a project directory, default cwd), or of its
+/// compose sibling `service`: `<state dir>/console.log` — the file the run's VMM writes the
+/// serial console to. A sibling's runtime dir is what its exec address names.
+fn console_log_path(target: Option<&Path>, service: Option<&str>) -> anyhow::Result<PathBuf> {
+    use anyhow::Context;
+    let dir = match vms::resolve_one(target) {
+        Ok(entry) => match service {
+            None => entry.state_dir,
+            // `vsock-auto://<svc-dir>/vsock.sock:4444`: the directory is the socket's parent.
+            Some(name) => match resolve_service_addr(&entry, name)? {
+                SocketAddr::VsockAuto { path, .. } | SocketAddr::VsockMux { path, .. } => path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .ok_or_else(|| anyhow::anyhow!("service {name:?}: odd exec address"))?,
+                other => anyhow::bail!("service {name:?}: exec address {other} names no directory"),
+            },
+        },
+        // The registry only lists live VMs, but the console of one that just died is exactly
+        // what a reader reaches for, and `--state-dir` keeps it. Fall back to reading the
+        // target as a state directory when it holds a console — but only for the primary's:
+        // a sibling's directory is named by an exec address the registry no longer has.
+        Err(e) => {
+            let dir = match target {
+                Some(t) => t.to_path_buf(),
+                None => std::env::current_dir().context("resolving the current directory")?,
+            };
+            if service.is_none() && dir.join(run::CONSOLE_LOG).is_file() {
+                dir
+            } else {
+                return Err(e);
+            }
+        }
+    };
+    Ok(dir.join(run::CONSOLE_LOG))
+}
+
+/// How often a follow looks for appended bytes, and how long a partial line may sit
+/// unprinted before its newline arrives.
+const FOLLOW_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How often a follow asks whether its VM is still registered. Slower than [`FOLLOW_POLL`]
+/// because the answer costs a walk over every registered VM's state dir, taking each one's
+/// lock — a run starting up under the same directory races that.
+const REGISTRY_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The longest run of bytes a follow will hold waiting for a newline. A guest that never
+/// writes one must not grow this process without bound; past it the partial line is printed
+/// as it stands.
+const MAX_PARTIAL_LINE: usize = 1 << 20;
+
+/// Print `path`'s console lines from `sources` (all when empty) at least `level` severe, the
+/// last `lines` of them (all when 0); with `follow`, keep printing what is appended until
+/// Ctrl-C, until the VM this console belongs to leaves the registry, or until the reader
+/// stops listening (`… | head`).
+async fn show_console_log(
+    path: &Path,
+    target: Option<&Path>,
+    sources: &[consolelog::Source],
+    level: Option<consolelog::Level>,
+    lines: usize,
+    follow: bool,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::io::{BufRead, Write};
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    // Streamed, not slurped: a long-lived guest's console grows without bound and nothing
+    // rotates it, while all that is printed is the last `lines` of it. Read a line at a time
+    // as bytes — the console is written by whatever the guest runs, so it is not text — and
+    // decoded lossily per line, for the reason `vk atop` reads its own log lossily: one
+    // stray byte must not cost the reader the whole log.
+    let mut reader = std::io::BufReader::new(&mut file);
+    let mut offset = 0u64;
+    let mut raw = Vec::new();
+    let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut out = std::io::stdout().lock();
+    loop {
+        raw.clear();
+        let n = reader
+            .read_until(b'\n', &mut raw)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        offset = offset.saturating_add(n as u64);
+        let Some(line) = consolelog::select(&String::from_utf8_lossy(&raw), sources, level).next()
+        else {
+            continue;
+        };
+        // With no bound asked for, print as we go and hold nothing.
+        if lines == 0 {
+            if broken_pipe(writeln!(out, "{}", line.text))? {
+                return Ok(());
+            }
+            continue;
+        }
+        if tail.len() == lines {
+            tail.pop_front();
+        }
+        tail.push_back(line.text);
+    }
+    for l in &tail {
+        if broken_pipe(writeln!(out, "{l}"))? {
+            return Ok(());
+        }
+    }
+    drop(tail);
+    if !follow {
+        return broken_pipe(out.flush()).map(|_| ());
+    }
+    // A fresh `ctrl_c()` future per iteration would miss a signal delivered while the loop
+    // was reading or writing; one stream, polled every pass, does not.
+    // Registering this replaces SIGINT's default disposition for the rest of the process,
+    // and it is only observed at the top of the loop — so a Ctrl-C during a write to a
+    // reader that has stopped draining waits for that write to complete.
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("watching for Ctrl-C")?;
+    let mut pending = String::new();
+    let mut registry_check = std::time::Instant::now();
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(FOLLOW_POLL) => {}
+            _ = interrupt.recv() => return Ok(()),
+        }
+        // The console outlives its VM, so the file going quiet says nothing: the registry is
+        // what says the writer is gone for good. Checked on its own slower beat — resolving
+        // walks and locks every registered VM's state dir, which a run starting up races
+        // against.
+        if registry_check.elapsed() >= REGISTRY_POLL {
+            registry_check = std::time::Instant::now();
+            if !vms::still_registered(target) {
+                eprintln!("virtkit: the VM ended");
+                return Ok(());
+            }
+        }
+        // On the descriptor already held, not the path: a console swapped for another file
+        // would otherwise be followed at an offset that means nothing in it.
+        let Ok(len) = file.metadata().map(|m| m.len()) else {
+            // A stat that failed says nothing about the file; look again next pass rather
+            // than treat it as a truncation and re-print the whole log.
+            continue;
+        };
+        if len < offset {
+            // Truncated (a reboot in place rewrites it): start over from the top.
+            offset = 0;
+            pending.clear();
+        }
+        if len == offset {
+            continue;
+        }
+        use std::io::{Read, Seek};
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        let mut chunk = Vec::new();
+        file.read_to_end(&mut chunk)?;
+        offset = offset.saturating_add(chunk.len() as u64);
+        pending.push_str(&String::from_utf8_lossy(&chunk));
+        // A whole line is what can be classified, so a torn tail waits for its newline —
+        // unless the guest is writing one long enough to hold this process hostage.
+        let complete = match pending.rfind('\n') {
+            Some(i) => pending.drain(..=i).collect::<String>(),
+            None if pending.len() >= MAX_PARTIAL_LINE => std::mem::take(&mut pending),
+            None => continue,
+        };
+        for l in consolelog::select(&complete, sources, level) {
+            if broken_pipe(writeln!(out, "{}", l.text))? {
+                return Ok(());
+            }
+        }
+        if broken_pipe(out.flush())? {
+            return Ok(());
+        }
+    }
+}
+
+/// Return `Ok(true)` for a closed reader (`vk logs | head`), a normal command exit.
+/// Propagate other write errors.
+fn broken_pipe(r: std::io::Result<()>) -> anyhow::Result<bool> {
+    match r {
+        Ok(()) => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(true),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Resolve a `vk status`/`vk exec` target to the agent address to dial: a raw `scheme://…`
@@ -4965,6 +5229,37 @@ mod tests {
         assert!(err.to_string().contains("not a raw agent address"), "{err}");
     }
 
+    // A closed reader (`vk logs | head`) is the reader having seen enough, not this
+    // command's failure; anything else is.
+    #[test]
+    fn a_closed_pipe_is_not_a_failure() {
+        assert!(!broken_pipe(Ok(())).unwrap());
+        assert!(broken_pipe(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))).unwrap());
+        assert!(broken_pipe(Err(std::io::Error::from(std::io::ErrorKind::StorageFull))).is_err());
+    }
+
+    // `vk logs` on a directory the registry does not know reads its console anyway — a VM
+    // that just exited is exactly the one whose console is wanted, and --state-dir keeps it.
+    #[test]
+    fn a_console_is_read_from_a_state_dir_the_registry_has_dropped() {
+        let dir = std::env::temp_dir().join(format!("vk-logs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Nothing there yet: the registry's own error is what the caller gets.
+        let err = console_log_path(Some(&dir), None).unwrap_err();
+        assert!(err.to_string().contains("no running vk VM"), "{err}");
+        // With a console in it, the directory is read as the state dir it is.
+        std::fs::write(dir.join(run::CONSOLE_LOG), b"13:46:39 [INFO] hi\n").unwrap();
+        assert_eq!(
+            console_log_path(Some(&dir), None).unwrap(),
+            dir.join(run::CONSOLE_LOG)
+        );
+        // A sibling's directory is named by an exec address the registry no longer has, so
+        // the fallback does not apply to `--service`.
+        assert!(console_log_path(Some(&dir), Some("db")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     // `vk --help` is a curated list: a new Cmd variant must either join it
     // deliberately or carry #[command(hide = true)].
     #[test]
@@ -4987,6 +5282,7 @@ mod tests {
                 "export",
                 "gc",
                 "list",
+                "logs",
                 "publish",
                 "reboot",
                 "run",
