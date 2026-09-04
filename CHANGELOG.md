@@ -13,6 +13,7 @@ All notable changes to virtkit will be documented in this file.
 - Each release is now attested: the binaries are rebuilt from scratch in a virtkit microVM
   and must match the release build byte-for-byte before it is published.
 - Rust toolchain upgraded to 1.98.1.
+- The pinned guest kernel is bumped to 6.18.49.
 
 ## [0.51.0] - 2026-09-04
 

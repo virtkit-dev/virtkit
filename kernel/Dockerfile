@@ -14,15 +14,15 @@
 FROM virtkit-build AS build
 USER root
 
-ARG KERNEL_VERSION=6.18.39
+ARG KERNEL_VERSION=6.18.49
 # Primary source: the pinned tarball from cdn.kernel.org, integrity-checked against this
 # sha256. https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc
-ARG KERNEL_SHA256=a7a7e3d2ae9d95e74197223a8d4eb5f6be7aac21b6e6de27e9685d001c1f8cb0
+ARG KERNEL_SHA256=ae826f33111fea6f1d279dde7299d7463c8dfd204aeb75a8fb5432bc60a28191
 # Fallback source (used automatically when the CDN is unavailable): the PGP-signed stable
 # git tag v${KERNEL_VERSION} on the gregkh/linux GitHub mirror. KERNEL_COMMIT is the
 # immutable commit that signed tag resolves to; verified below against Greg KH's vendored
 # signing key (kernel-signing-key.asc).
-ARG KERNEL_COMMIT=0c503cf3dde2e53614f05261ece12f9d3d4c3c20
+ARG KERNEL_COMMIT=1c732c6b94f0faee1526bd375add2fe10cba2e26
 
 # Kernel build deps on top of the shared image: the `kernelBuildEnv` closure of the same
 # flake (already at /src/nix in the base stage; `nix` is on its PATH). gcc/binutils here are
