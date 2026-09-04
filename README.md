@@ -412,7 +412,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk check` | Validate KVM, VMM, embedded assets, configured host features, and an optional minimum `vk` version. |
 | `vk gc` | Reclaim unused image bases, CI checkouts, and image-cache chunks. |
 | `vk update` | Check for or install a digest-verified GitHub release. |
-| `vk service up|down|reboot|status` | Control compose services from the primary guest. |
+| `vk service up\|down\|reboot\|status` | Control compose services from the primary guest. |
 | `vk registry ...` | Publish, fetch, inspect, report on, or sweep OCI stores. |
 | `vk gitlab ...` | Implement the GitLab custom-executor lifecycle. |
 | `vk export ...` | Package raw disks or staged files as VMDK, OVA, or ISO artifacts. |
