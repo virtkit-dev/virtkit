@@ -14,6 +14,10 @@ All notable changes to virtkit will be documented in this file.
   and must match the release build byte-for-byte before it is published.
 - Rust toolchain upgraded to 1.98.1.
 - The pinned guest kernel is bumped to 6.18.49.
+- `vk list --json` now lists every declared compose service of a VM, each with its `state`
+  (`running`/`stopped`) and LAN `ip`, instead of only the running ones; both are `null` when
+  the VM cannot be queried or does not report the service. The text view still names only
+  the running services.
 
 ## [0.51.0] - 2026-09-04
 
