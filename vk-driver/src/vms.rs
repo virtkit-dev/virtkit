@@ -671,11 +671,7 @@ fn published_cell(published: &[Published]) -> String {
     published
         .iter()
         .map(|(e, liveness)| {
-            let mut cell = format!("{}->{}", bare_tcp(&e.listen), bare_tcp(&e.to));
-            if let Some(service) = &e.service {
-                cell.push('@');
-                cell.push_str(service);
-            }
+            let mut cell = published_addr(e);
             if *liveness == crate::publish::Liveness::Unknown {
                 cell.push_str(" (unconfirmed)");
             }
@@ -683,6 +679,17 @@ fn published_cell(published: &[Published]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// One publisher as `listen->to`, with `@service` when a compose sibling rather than the
+/// primary dials the target.
+fn published_addr(e: &crate::publish::Entry) -> String {
+    let mut addr = format!("{}->{}", bare_tcp(&e.listen), bare_tcp(&e.to));
+    if let Some(service) = &e.service {
+        addr.push('@');
+        addr.push_str(service);
+    }
+    addr
 }
 
 fn bare_tcp(addr: &str) -> &str {
@@ -866,7 +873,8 @@ fn fields_report(views: &[serde_json::Value], fields: &[String], json: bool) -> 
 /// With `stale`, each VM's freshness is computed (network I/O — see `freshness_all`) and
 /// shown. With `fields`, only those fields of each VM (see `fields_report`). The table folds
 /// `$HOME` to `~`, names at most `SERVICES_SHOWN` services and leaves out EXEC ADDRESS
-/// unless `wide`; `--json` and `--field` are unaffected.
+/// unless `wide`; a `target` that selects exactly one VM gets that VM's full record instead
+/// (see `detail`). `--json` and `--field` are unaffected by either.
 pub fn list_report(
     target: Option<Selector>,
     json: bool,
@@ -918,6 +926,16 @@ pub fn list_report(
             Some(sel) => sel.not_found(),
             None => "no running vk VMs\n".to_string(),
         });
+    }
+    if full_record(target.as_ref(), vms.len())
+        && let ([e], [units], [published], [f]) = (
+            vms.as_slice(),
+            units_by_vm.as_slice(),
+            published_by_vm.as_slice(),
+            fresh.as_slice(),
+        )
+    {
+        return Ok(detail(e, units.as_deref(), published, *f, stale));
     }
     // `tilde` matches against a canonical `project_dir`, so canonicalize `$HOME` as well;
     // only the narrow table folds it.
@@ -1009,6 +1027,138 @@ fn table(
         fmt_row(row, &mut out);
     }
     out
+}
+
+/// `vk list PID|DIR` when it names exactly one VM: every recorded fact about it as
+/// `KEY  value` lines — what `--json` carries, laid out to read — then one line per compose
+/// service (name, state, LAN address, exec address) and per published port. Nothing is
+/// folded or left out here, so `--wide` has nothing to add. A field the run did not record
+/// (an older `vk`, no `--ssh`, no `--net`) reads `-`; a service's state reads `-` when the
+/// VM could not be asked, or did not report it.
+fn detail(
+    e: &VmEntry,
+    units: Option<&[UnitStatus]>,
+    published: &[Published],
+    freshness: Freshness,
+    stale: bool,
+) -> String {
+    let dash = || "-".to_string();
+    let opt = |v: Option<String>| v.unwrap_or_else(dash);
+    let path = |p: Option<&Path>| opt(p.map(|p| p.display().to_string()));
+    let (date, time) = vk_core::atop::date_time(i64::try_from(e.created_secs).unwrap_or(i64::MAX));
+    let vmm = match (&e.vmm, e.vmm_pid) {
+        (Some(vmm), Some(pid)) => format!("{vmm} (pid {pid})"),
+        (Some(vmm), None) => vmm.clone(),
+        (None, _) => dash(),
+    };
+    let yes_no = |b: Option<bool>| opt(b.map(|b| if b { "yes" } else { "no" }.to_string()));
+    let mut rows: Vec<(&str, String)> = vec![
+        ("NAME", e.label.clone()),
+        ("PID", e.pid.to_string()),
+        (
+            "UPTIME",
+            format!("{} (since {date} {time} UTC)", uptime(e.created_secs)),
+        ),
+        ("PROJECT", path(e.project_dir.as_deref())),
+        ("STATE DIR", e.state_dir.display().to_string()),
+        ("EXEC ADDRESS", e.exec_addr.clone()),
+        ("SSH", opt(e.ssh_addr.clone())),
+        ("GUEST IP", opt(e.guest_ip.map(|ip| ip.to_string()))),
+        ("VMM", vmm),
+        ("CPUS", opt(e.cpus.map(|n| n.to_string()))),
+        ("MEM", opt(e.mem.clone())),
+        ("NESTED", yes_no(e.nested)),
+        ("ATOP LOG", path(e.atop_log.as_deref())),
+    ];
+    if stale {
+        rows.push(("STALE", freshness.cell().to_string()));
+    }
+    let services: Vec<[String; 4]> = e
+        .services
+        .iter()
+        .map(|s| {
+            let unit = find_unit(units, &s.name);
+            [
+                s.name.clone(),
+                opt(unit.map(|u| u.state.clone())),
+                opt(unit.map(|u| bare_ip(&u.ip).to_string())),
+                s.exec_addr.clone(),
+            ]
+        })
+        .collect();
+    let published_rows: Vec<[String; 3]> = published
+        .iter()
+        .map(|(p, liveness)| {
+            let mut pid = format!("pid {}", p.pid);
+            if *liveness == crate::publish::Liveness::Unknown {
+                // The lock could not be tested: mark the unconfirmed pid, not the address.
+                pid.push_str(" (unconfirmed)");
+            }
+            [p.name.clone(), published_addr(p), pid]
+        })
+        .collect();
+    rows.push(("SERVICES", block(&aligned(&services))));
+    rows.push(("PUBLISHED", block(&aligned(&published_rows))));
+
+    let width = rows
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    for (key, value) in &rows {
+        let mut lines = value.lines();
+        out.push_str(&format!(
+            "{key:<width$}  {}\n",
+            lines.next().unwrap_or_default()
+        ));
+        for line in lines {
+            out.push_str(&format!("{:<width$}  {line}\n", ""));
+        }
+    }
+    out
+}
+
+/// Pad columns to their widest cell, one line per row, with no padding on the last column.
+/// Count characters to match the formatter; byte widths add an unwanted space for each
+/// extra UTF-8 byte in a non-ASCII service name.
+fn aligned<const N: usize>(rows: &[[String; N]]) -> Vec<String> {
+    let mut widths = [0usize; N];
+    for row in rows {
+        for (w, cell) in widths.iter_mut().zip(row) {
+            *w = (*w).max(cell.chars().count());
+        }
+    }
+    rows.iter()
+        .map(|row| {
+            let mut line = String::new();
+            let mut cells = row.iter().zip(&widths).peekable();
+            while let Some((cell, width)) = cells.next() {
+                if cells.peek().is_none() {
+                    line.push_str(cell);
+                } else {
+                    line.push_str(&format!("{cell:<width$}  "));
+                }
+            }
+            line
+        })
+        .collect()
+}
+
+/// Show a full record only when an explicit target matches exactly one VM.
+/// A bare `vk list` keeps its table even for one VM, so its shape stays stable as VMs
+/// come and go.
+fn full_record(target: Option<&Selector>, matched: usize) -> bool {
+    target.is_some() && matched == 1
+}
+
+/// A multi-line detail value: the lines joined, or `-` for none.
+fn block(lines: &[String]) -> String {
+    if lines.is_empty() {
+        "-".to_string()
+    } else {
+        lines.join("\n")
+    }
 }
 
 /// SIGTERM the run managing `entry` and wait up to `timeout` seconds for it to exit (the
@@ -1815,6 +1965,184 @@ mod tests {
         let accented = labelled("caf\u{e9}");
         let ascii = labelled("cafe");
         assert_eq!(widths(&accented), widths(&ascii), "{accented}");
+    }
+
+    #[test]
+    fn detail_lays_out_every_recorded_fact_with_services_and_ports() {
+        let mut e = compose_entry();
+        e.pid = 41877;
+        e.created_secs = 1_756_972_800; // 2025-09-04 08:00:00 UTC
+        e.ssh_addr = Some("127.0.0.1:2222".into());
+        e.atop_log = Some(PathBuf::from("/state/app/atop.log"));
+        e.vmm = Some("libkrun".into());
+        e.vmm_pid = Some(4242);
+        e.cpus = Some(4);
+        e.mem = Some("8G".into());
+        e.nested = Some(true);
+        e.guest_ip = Some("10.0.0.2".parse().unwrap());
+        let units = [
+            unit("db", "running", "10.0.0.3/24"),
+            unit("redis", "stopped", "10.0.0.4/24"),
+        ];
+        let published = [(
+            publisher(
+                "pg",
+                "tcp://127.0.0.1:5432",
+                "tcp://127.0.0.1:5432",
+                Some("db"),
+            ),
+            Liveness::Held,
+        )];
+        // Only the uptime moves with the clock; every other line is fixed by the entry.
+        let expected = format!(
+            "\
+NAME          app
+PID           41877
+UPTIME        {up} (since 2025/09/04 08:00:00 UTC)
+PROJECT       /project
+STATE DIR     /state/app
+EXEC ADDRESS  vsock-auto:///tmp/x/vsock.sock:4444
+SSH           127.0.0.1:2222
+GUEST IP      10.0.0.2
+VMM           libkrun (pid 4242)
+CPUS          4
+MEM           8G
+NESTED        yes
+ATOP LOG      /state/app/atop.log
+STALE         yes
+SERVICES      db     running  10.0.0.3  vsock-auto:///state/app/svc-db/vsock.sock:4444
+              redis  stopped  10.0.0.4  vsock-auto:///state/app/svc-redis/vsock.sock:4444
+PUBLISHED     pg  127.0.0.1:5432->127.0.0.1:5432@db  pid 4242
+",
+            up = uptime(e.created_secs)
+        );
+        assert_eq!(
+            detail(&e, Some(&units), &published, Freshness::Stale, true),
+            expected
+        );
+    }
+
+    #[test]
+    fn detail_dashes_every_fact_a_plain_run_did_not_record() {
+        let mut plain = entry(PathBuf::from("/state/x"), None);
+        plain.pid = 7;
+        plain.created_secs = 1_756_972_800;
+        let expected = format!(
+            "\
+NAME          devcontainer
+PID           7
+UPTIME        {up} (since 2025/09/04 08:00:00 UTC)
+PROJECT       -
+STATE DIR     /state/x
+EXEC ADDRESS  vsock-auto:///tmp/x/vsock.sock:4444
+SSH           -
+GUEST IP      -
+VMM           -
+CPUS          -
+MEM           -
+NESTED        -
+ATOP LOG      -
+SERVICES      -
+PUBLISHED     -
+",
+            up = uptime(plain.created_secs)
+        );
+        // Without --stale the STALE row is absent entirely, not reported as unknown.
+        assert_eq!(
+            detail(&plain, None, &[], Freshness::Unknown, false),
+            expected
+        );
+    }
+
+    #[test]
+    fn detail_reads_the_other_side_of_every_recorded_fact() {
+        let mut e = compose_entry();
+        e.nested = Some(false);
+        // A VMM the run named but whose pid it did not record prints bare.
+        e.vmm = Some("cloud-hypervisor".into());
+        let text = detail(&e, None, &[], Freshness::Fresh, true);
+        assert!(
+            text.contains("\nVMM           cloud-hypervisor\n"),
+            "{text}"
+        );
+        assert!(text.contains("\nNESTED        no\n"), "{text}");
+        assert!(text.contains("\nSTALE         no\n"), "{text}");
+    }
+
+    #[test]
+    fn detail_dashes_a_service_the_vm_did_not_report_but_keeps_its_exec_address() {
+        // The VM answered and knows of neither service, so only the recorded facts remain.
+        let text = detail(&compose_entry(), Some(&[]), &[], Freshness::Unknown, true);
+        assert!(
+            text.contains(
+                "SERVICES      db     -  -  vsock-auto:///state/app/svc-db/vsock.sock:4444\n"
+            ),
+            "{text}"
+        );
+        // Asked for but not determinable prints `-`, in the cell a fresh or stale answer
+        // would fill.
+        assert!(text.contains("\nSTALE         -\n"), "{text}");
+    }
+
+    #[test]
+    fn detail_aligns_several_publishers_and_marks_the_pid_it_cannot_vouch_for() {
+        let published = [
+            (
+                publisher(
+                    "pg",
+                    "tcp://127.0.0.1:5432",
+                    "tcp://127.0.0.1:5432",
+                    Some("db"),
+                ),
+                Liveness::Held,
+            ),
+            (
+                publisher("web", "tcp://127.0.0.1:8443", "tcp://runner:443", None),
+                Liveness::Unknown,
+            ),
+        ];
+        let text = detail(
+            &compose_entry(),
+            None,
+            &published,
+            Freshness::Unknown,
+            false,
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        let published_at = lines
+            .iter()
+            .position(|l| l.starts_with("PUBLISHED"))
+            .unwrap();
+        assert_eq!(
+            lines[published_at],
+            "PUBLISHED     pg   127.0.0.1:5432->127.0.0.1:5432@db  pid 4242"
+        );
+        // The name column is padded to `web`, and the marker sits on the pid it discredits
+        // rather than on the address, which is recorded and trustworthy either way.
+        assert_eq!(
+            lines[published_at + 1],
+            "              web  127.0.0.1:8443->runner:443         pid 4242 (unconfirmed)"
+        );
+    }
+
+    #[test]
+    fn aligned_measures_width_in_characters_not_bytes() {
+        // "caf\u{e9}" is four characters in five UTF-8 bytes; measured in bytes the first
+        // column would reserve a blank it does not need and push the second one over.
+        let accented = aligned(&[["caf\u{e9}".to_string(), "x".to_string()]]);
+        let ascii = aligned(&[["cafe".to_string(), "x".to_string()]]);
+        assert_eq!(accented[0].chars().count(), ascii[0].chars().count());
+        assert_eq!(accented[0], "caf\u{e9}  x");
+    }
+
+    #[test]
+    fn a_full_record_needs_a_target_and_exactly_one_match() {
+        let sel = Selector::Pid(41877);
+        assert!(full_record(Some(&sel), 1));
+        // A bare `vk list` keeps its table, so a one-VM host does not change shape.
+        assert!(!full_record(None, 1));
+        assert!(!full_record(Some(&sel), 0));
+        assert!(!full_record(Some(&sel), 2));
     }
 
     #[test]

@@ -340,11 +340,43 @@ A directory selects VMs whose project is that directory or below it, or whose st
 matches it exactly. If no VM matches, the message names the target:
 `no running vk VM with pid 99999`, or `no running vk VM under <dir>`.
 
+When a selector names exactly one VM, `vk list` prints its full record instead of a table
+row: every field `--json` carries, then each compose service as name, state, LAN address and
+exec address, and each published port as name, `listen->to` (with `@service` when a compose
+sibling dials) and the publisher's pid. When liveness is unconfirmed, `(unconfirmed)`
+marks the pid; in the table it marks the address. Nothing is folded in a full record,
+so `--wide` has no effect.
+
 ```sh
-vk list .                    # VMs for this tree or below
-vk list ~/work               # every VM under a tree
+vk list ~/work               # every VM under a tree (a table when several match)
+vk list .                    # VMs for this tree or below; one VM prints in full
 vk list 41877                # one VM, by pid
 vk list /home/me/app/.vk     # one VM, by its state dir
+```
+
+```
+NAME          shop
+PID           41877
+UPTIME        35m (since 2026/09/04 08:12:03 UTC)
+PROJECT       /home/me/shop
+STATE DIR     /home/me/shop/.vk
+EXEC ADDRESS  vsock-auto:///home/me/shop/.vk/vsock.sock:4444
+SSH           127.0.0.1:2222
+GUEST IP      10.0.0.2
+VMM           libkrun (pid 41902)
+CPUS          4
+MEM           8G
+NESTED        no
+ATOP LOG      -
+SERVICES      db      running  10.0.0.3   vsock-auto:///home/me/shop/.vk/svc-db/vsock.sock:4444
+              redis   running  10.0.0.4   vsock-auto:///home/me/shop/.vk/svc-redis/vsock.sock:4444
+              web     running  10.0.0.5   vsock-auto:///home/me/shop/.vk/svc-web/vsock.sock:4444
+              worker  running  10.0.0.6   vsock-auto:///home/me/shop/.vk/svc-worker/vsock.sock:4444
+              mailer  running  10.0.0.7   vsock-auto:///home/me/shop/.vk/svc-mailer/vsock.sock:4444
+              queue   running  10.0.0.8   vsock-auto:///home/me/shop/.vk/svc-queue/vsock.sock:4444
+              minio   running  10.0.0.9   vsock-auto:///home/me/shop/.vk/svc-minio/vsock.sock:4444
+              search  stopped  10.0.0.10  vsock-auto:///home/me/shop/.vk/svc-search/vsock.sock:4444
+PUBLISHED     pg  127.0.0.1:5432->127.0.0.1:5432@db  pid 42011
 ```
 
 `--json` gives an array of objects, one per VM, with `pid`, `label`, `project_dir`,
@@ -364,11 +396,11 @@ vk list . --field published.0.listen    # where the first published port listens
 vk list --json | jq '.[] | select(.vmm == "cloud-hypervisor")'
 ```
 
-`--stale` adds a column (`yes`, `no`, or `-` when unknown, as for an image boot) saying
-whether a fresh `vk run` would rebuild the VM's image because the Dockerfile, build
-context or base image of the VM or of one of its `build:` services changed since it
-booted. It resolves base image digests over the network, so it is opt-in; `--json` then
-carries `stale` too.
+`--stale` adds a column to the table, and a `STALE` row to a full record, reading `yes`,
+`no`, or `-` when unknown (as for an image boot). It says whether a fresh `vk run` would
+rebuild the VM's image because the Dockerfile, build context or base image of the VM or of
+one of its `build:` services changed since it booted. It resolves base image digests over
+the network, so it is opt-in; `--json` then carries `stale` too.
 
 ### Isolate GitLab jobs
 

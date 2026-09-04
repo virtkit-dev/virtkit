@@ -1754,14 +1754,16 @@ enum Cmd {
     /// folds `$HOME` to `~` and names at most three services; `--wide` shows every service,
     /// the project directory in full and the exec-channel address. With PID or DIR, only the
     /// VM with that pid, or the VMs whose project is DIR or below it (or whose state dir is
-    /// DIR). Use `--json` or `--field` for scripts; neither takes `--wide`, since both
-    /// already report every field.
+    /// DIR); a selector that names exactly one VM prints its full record instead of a table
+    /// row. The record folds nothing, so `--wide` has nothing to add there. Use `--json` or
+    /// `--field` for scripts; neither takes `--wide`, since both already report every field.
     #[command(display_order = 6)]
     List {
         /// which VMs: a PID, or those whose project is DIR or below it (default: all)
         ///
         /// An all-digit argument is a pid, as the PID column prints; anything else a
-        /// directory (a digit-only name needs a `./`).
+        /// directory (a digit-only name needs a `./`). Exactly one match is shown in full,
+        /// several as a table.
         #[arg(value_name = "PID|DIR")]
         target: Option<std::ffi::OsString>,
         /// the full table: every service named, the project path in full, and EXEC ADDRESS
