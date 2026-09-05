@@ -553,7 +553,8 @@ fn spawn_publisher(
     listener: &RawListener,
     lock: &std::fs::File,
 ) -> Result<u32> {
-    let exe = std::env::current_exe().context("locating this vk binary")?;
+    // /proc/self/exe: `ensure` and the `serve` it spawns must be the same build, or they
+    // disagree on this argv (see spawn::self_exe).
     let log_path = dir_of(state_dir).join(format!("{name}.log"));
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -564,7 +565,7 @@ fn spawn_publisher(
         .with_context(|| format!("opening {}", log_path.display()))?;
     let listen_fd = listener.as_raw_fd();
     let lock_fd = lock.as_raw_fd();
-    let mut cmd = std::process::Command::new(&exe);
+    let mut cmd = std::process::Command::new(crate::spawn::self_exe());
     cmd.args(serve_argv(
         state_dir, name, listen, to, service, listen_fd, lock_fd,
     ))
@@ -589,7 +590,7 @@ fn spawn_publisher(
     }
     let child = cmd
         .spawn()
-        .with_context(|| format!("spawning {}", exe.display()))?;
+        .context("spawning the publisher (vk publish serve)")?;
     Ok(child.id())
 }
 
