@@ -39,6 +39,11 @@ All notable changes to virtkit will be documented in this file.
 - `vk list --field` rejects multiple names in one flag and advises repeating the flag.
   Previously, they were treated as one path, printing `null`, an unknown-field error for
   a name containing a space, or nothing when no VM was running.
+- `vk list --json` and `vk publish list --json` no longer put a `confirmed` flag on every
+  published port, nor a `service` of `null`. A port whose publisher could not be checked
+  carries `"unconfirmed": true`, and the compose sibling that dials is now named `via`,
+  present only when there is one. A script reading `confirmed` or `service` must read
+  `unconfirmed` or `via`; through `vk list --field`, either old name now reads `null`.
 - `vk list`'s table is narrower by default: EXEC ADDRESS is gone, `$HOME` in PROJECT is
   written `~`, and SERVICES names three services and counts the rest (`db, redis, web, +4`).
   `vk list --wide` (`-w`) is the old table, and `--json` still reports every field.

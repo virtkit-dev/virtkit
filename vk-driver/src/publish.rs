@@ -102,7 +102,15 @@ pub struct Entry {
     /// Normalized so equivalent address spellings compare equal.
     pub listen: String,
     pub to: String,
-    #[serde(default)]
+    /// The compose sibling whose agent dials `to` (`--service`); absent when the primary
+    /// dials. Old `service` records still load; older `vk` versions ignore `via` and treat
+    /// the publisher as dialing through the primary.
+    #[serde(
+        default,
+        rename = "via",
+        alias = "service",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub service: Option<String>,
     pub pid: u32,
     #[serde(default)]
@@ -282,6 +290,14 @@ pub enum Liveness {
     /// The lock could not be tested, for example because of a symlink or NFS `ENOLCK`.
     /// Retain the record, but trust neither its liveness nor its pid.
     Unknown,
+}
+
+impl Liveness {
+    /// Whether the recorded pid is untrusted. Only `Held` grants trust, so future variants
+    /// withhold it by default.
+    pub fn unconfirmed(self) -> bool {
+        self != Liveness::Held
+    }
 }
 
 /// Return publishers not known to be gone and remove stale records.
@@ -646,13 +662,16 @@ pub fn list_report(state_dir: &Path, json: bool) -> Result<String> {
     let entries = live(state_dir)?;
     if json {
         // Mirror the text list's "(unconfirmed)" so JSON consumers do not trust an
-        // unverified pid.
+        // unverified pid. The key matches `vms::PublishedView::unconfirmed`, so both JSON
+        // producers spell this marker the same way.
         let records: Vec<serde_json::Value> = entries
             .iter()
             .map(|(e, live)| {
                 let mut v = serde_json::to_value(e).context("serializing a publisher entry")?;
-                if let Some(o) = v.as_object_mut() {
-                    o.insert("confirmed".into(), (*live == Liveness::Held).into());
+                if live.unconfirmed()
+                    && let Some(o) = v.as_object_mut()
+                {
+                    o.insert("unconfirmed".into(), true.into());
                 }
                 Ok(v)
             })
@@ -737,7 +756,7 @@ pub fn stop(state_dir: &Path, name: Option<&str>, timeout: Duration) -> Result<(
     for (e, live) in &selected {
         // Signal only when the held lock proves that the recorded pid belongs to this
         // publisher. An unconfirmed number may now belong to another process.
-        if *live == Liveness::Unknown {
+        if live.unconfirmed() {
             out.push_str(&format!(
                 "{}: cannot confirm it is running, so it was not signalled — check {}\n",
                 e.name,
@@ -1095,6 +1114,7 @@ mod tests {
             "tcp://127.0.0.1:8500",
             "tcp://svc:80",
             victim.id(),
+            None,
         );
         drop(lock);
         let lock_path = dir_of(&t.0).join("opaque.lock");
@@ -1106,6 +1126,9 @@ mod tests {
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].1, Liveness::Unknown);
         assert!(list_report(&t.0, false).unwrap().contains("unconfirmed"));
+        let json = list_report(&t.0, true).unwrap();
+        let raw: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(raw[0]["unconfirmed"], serde_json::json!(true), "{json}");
 
         // Do not trust or signal its unconfirmed pid.
         let (report, all_down) = stop(&t.0, Some("opaque"), Duration::from_millis(50)).unwrap();
@@ -1133,6 +1156,7 @@ mod tests {
             "tcp://127.0.0.1:8600",
             "vsock://80",
             victim.id(),
+            None,
         );
         // The test holds the publisher's lock and drops it to model process exit.
         std::thread::spawn(move || {
@@ -1153,13 +1177,15 @@ mod tests {
         let _ = victim.wait();
     }
 
-    /// Model a live publisher by holding its lifetime lock beside its record.
+    /// Model a live publisher by holding its lifetime lock beside its record. `service`
+    /// names the compose sibling that dials, as `--service` does; `None` is the primary.
     fn fake_publisher(
         state_dir: &Path,
         name: &str,
         listen: &str,
         to: &str,
         pid: u32,
+        service: Option<&str>,
     ) -> std::fs::File {
         let lock = claim(state_dir, name).unwrap().expect("nothing held it");
         write_entry(
@@ -1168,7 +1194,7 @@ mod tests {
                 name: name.to_string(),
                 listen: listen.to_string(),
                 to: to.to_string(),
-                service: None,
+                service: service.map(str::to_string),
                 pid,
                 created_secs: 0,
             },
@@ -1217,6 +1243,7 @@ mod tests {
             "tcp://127.0.0.1:8443",
             "tcp://runner:443",
             4242,
+            None,
         );
         let live = live_entries(&t.0);
         assert_eq!(live.len(), 1);
@@ -1240,6 +1267,7 @@ mod tests {
             &listen.to_string(),
             "tcp://runner:443",
             4242,
+            None,
         );
 
         // An equivalent live publisher satisfies concurrent `ensure` calls without
@@ -1320,6 +1348,7 @@ mod tests {
             "tcp://127.0.0.1:8443",
             "tcp://runner:443",
             7,
+            None,
         );
         let live = live(&t.0).unwrap();
         assert_eq!(live.len(), 1);
@@ -1336,6 +1365,7 @@ mod tests {
             "tcp://127.0.0.1:8443",
             "tcp://runner:443",
             7,
+            None,
         );
         let text = list_report(&t.0, false).unwrap();
         assert!(
@@ -1346,5 +1376,50 @@ mod tests {
         let parsed: Vec<Entry> = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].to, "tcp://runner:443");
+        // Inspect raw keys: `Entry` ignores unknown keys and cannot detect an unwanted marker.
+        let raw: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        let record = raw[0].as_object().unwrap();
+        assert!(!record.contains_key("unconfirmed"), "{json}");
+        // The primary dials, so there is no sibling to name — under either key, since the
+        // old one is only an alias for reading.
+        assert!(!record.contains_key("via"), "{json}");
+        assert!(!record.contains_key("service"), "{json}");
+
+        // A sibling-dialled publisher names it, under the new key only.
+        let _dialled = fake_publisher(
+            &t.0,
+            "pg",
+            "tcp://127.0.0.1:5432",
+            "tcp://127.0.0.1:5432",
+            8,
+            Some("db"),
+        );
+        let json = list_report(&t.0, true).unwrap();
+        let raw: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        let dialled = raw
+            .iter()
+            .find(|r| r["name"] == "pg")
+            .and_then(|r| r.as_object())
+            .expect("the sibling-dialled record is listed");
+        assert_eq!(dialled["via"], "db", "{json}");
+        assert!(!dialled.contains_key("service"), "{json}");
+    }
+
+    #[test]
+    fn a_record_written_before_the_rename_still_names_its_sibling() {
+        // `via` used to be `service`; a state dir surviving an upgrade holds the old key.
+        let old: Entry = serde_json::from_str(
+            r#"{"name":"pg","listen":"tcp://127.0.0.1:5432","to":"tcp://127.0.0.1:5432",
+                "service":"db","pid":7}"#,
+        )
+        .unwrap();
+        assert_eq!(old.service.as_deref(), Some("db"));
+        // Written back under the new key only.
+        let round = serde_json::to_value(&old).unwrap();
+        assert_eq!(round["via"], "db");
+        assert!(
+            !round.as_object().unwrap().contains_key("service"),
+            "{round}"
+        );
     }
 }

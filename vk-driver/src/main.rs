@@ -399,7 +399,7 @@ enum PublishAction {
         /// Address the guest dials for each accepted connection
         #[arg(long, value_parser = parse_publish_to)]
         to: String,
-        /// ask this compose sibling's agent instead of the primary's
+        /// ask this compose sibling's agent instead of the primary's (`via` in --json)
         #[arg(long, value_name = "NAME")]
         service: Option<String>,
     },

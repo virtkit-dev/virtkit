@@ -498,7 +498,8 @@ pub(crate) fn fmt_uptime(s: u64) -> String {
 /// The public shape of a VM in `vk list --json`: the user-facing fields plus a computed
 /// `uptime_secs` and (with `--stale`) `stale`. Deliberately omits the internal `stale_recipe`,
 /// so the JSON stays a stable contract for scripts. Fields an older `vk run` did not record
-/// serialize as `null`.
+/// serialize as `null`; inside `published`, `via` and `unconfirmed` are omitted rather than
+/// `null`/`false` when they do not apply.
 #[derive(Serialize)]
 struct VmView<'a> {
     state_dir: &'a Path,
@@ -538,12 +539,19 @@ struct PublishedView<'a> {
     listen: &'a str,
     /// The address the guest dials for each connection.
     to: &'a str,
-    /// The compose sibling that dials, or `null` for the primary.
-    service: Option<&'a str>,
+    /// The compose sibling whose agent dials `to`; absent when the primary dials.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    via: Option<&'a str>,
     pid: u32,
-    /// `false` when its lock could not be tested (see `vk publish list`), so the pid is not
-    /// to be trusted.
-    confirmed: bool,
+    /// Serialized only when the lock could not be tested (see `vk publish list`); the pid is
+    /// then not to be trusted.
+    #[serde(skip_serializing_if = "is_false")]
+    unconfirmed: bool,
+}
+
+/// `skip_serializing_if` for a flag that means something only when set.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Serialize)]
@@ -602,9 +610,9 @@ fn view<'a>(
                 name: &e.name,
                 listen: &e.listen,
                 to: &e.to,
-                service: e.service.as_deref(),
+                via: e.service.as_deref(),
                 pid: e.pid,
-                confirmed: *liveness == crate::publish::Liveness::Held,
+                unconfirmed: liveness.unconfirmed(),
             })
             .collect(),
     }
@@ -672,7 +680,7 @@ fn published_cell(published: &[Published]) -> String {
         .iter()
         .map(|(e, liveness)| {
             let mut cell = published_addr(e);
-            if *liveness == crate::publish::Liveness::Unknown {
+            if liveness.unconfirmed() {
                 cell.push_str(" (unconfirmed)");
             }
             cell
@@ -819,8 +827,9 @@ fn check_fields(fields: &[String]) -> Result<()> {
 }
 
 /// One `--field` of a VM view. `path` is dotted (`guest_ip`, `services.0.ip`) and resolved as
-/// a JSON pointer, so a missing branch below the first segment is `null` (a non-compose VM has
-/// no `services.0`). An unknown first segment is an error naming the fields there are.
+/// a JSON pointer, so a missing branch below the first segment is `null` — a non-compose VM
+/// has no `services.0`, and a record omits a key that does not apply. An unknown first
+/// segment is an error naming the fields there are.
 fn select(view: &serde_json::Value, path: &str) -> Result<serde_json::Value> {
     let head = path.split_once('.').map_or(path, |(head, _)| head);
     let fields = view.as_object().context("VM view is not a JSON object")?;
@@ -1102,7 +1111,7 @@ fn detail(
         .iter()
         .map(|(p, liveness)| {
             let mut pid = format!("pid {}", p.pid);
-            if *liveness == crate::publish::Liveness::Unknown {
+            if liveness.unconfirmed() {
                 // The lock could not be tested: mark the unconfirmed pid, not the address.
                 pid.push_str(" (unconfirmed)");
             }
@@ -2429,7 +2438,7 @@ PUBLISHED     -
     }
 
     #[test]
-    fn json_view_lists_publishers_with_service_and_confirmation() {
+    fn json_view_marks_a_publisher_via_sibling_and_unconfirmed_pid_only_when_they_apply() {
         let e = entry(PathBuf::from("/state/app"), None);
         let published = [
             (
@@ -2455,17 +2464,15 @@ PUBLISHED     -
                     "name": "web",
                     "listen": "tcp://127.0.0.1:8443",
                     "to": "tcp://runner:443",
-                    "service": null,
                     "pid": 4242,
-                    "confirmed": true,
                 },
                 {
                     "name": "db",
                     "listen": "tcp://127.0.0.1:5432",
                     "to": "tcp://127.0.0.1:5432",
-                    "service": "db",
+                    "via": "db",
                     "pid": 4242,
-                    "confirmed": false,
+                    "unconfirmed": true,
                 },
             ])
         );
@@ -2474,8 +2481,33 @@ PUBLISHED     -
         let none = serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false)).unwrap();
         assert_eq!(none["published"], serde_json::json!([]));
         assert_eq!(
-            fields(&[json, none], &["published.0.listen"], false).unwrap(),
+            fields(&[json.clone(), none], &["published.0.listen"], false).unwrap(),
             "tcp://127.0.0.1:8443\nnull\n"
+        );
+        // An omitted key on a record that *is* there reads null too. `published.1` is the
+        // telling one: it used to carry `"confirmed": false` and `"service": "db"`, and a
+        // script reading either old name now gets null and must read the new one.
+        assert_eq!(
+            fields(
+                std::slice::from_ref(&json),
+                &["published.1.confirmed", "published.1.service"],
+                false
+            )
+            .unwrap(),
+            "null\tnull\n"
+        );
+        assert_eq!(
+            fields(
+                std::slice::from_ref(&json),
+                &[
+                    "published.1.via",
+                    "published.1.unconfirmed",
+                    "published.0.via"
+                ],
+                false
+            )
+            .unwrap(),
+            "db\ttrue\tnull\n"
         );
     }
 

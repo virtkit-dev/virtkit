@@ -329,7 +329,7 @@ SERVICES lists the compose services running beside the primary, or every declare
 the VM cannot be asked; `-` for none. Past three names, the rest are counted (`+4`).
 PROJECT is the run's `--workspace`, then its `--workdir`, then its launch directory, with
 `$HOME` shown as `~`. PUBLISHED is every port `vk publish ensure` holds open on the host
-for the VM, as `listen->to`, with `@service` when a compose sibling rather than the primary
+for the VM, as `listen->to`, with `@NAME` when a compose sibling rather than the primary
 dials the target and `(unconfirmed)` when the publisher's liveness could not be checked;
 `-` when nothing is published. `--wide` (`-w`) names every service, prints the project
 directory in full and adds EXEC ADDRESS, recorded as given (a relative `--state-dir` lists a
@@ -342,7 +342,7 @@ matches it exactly. If no VM matches, the message names the target:
 
 When a selector names exactly one VM, `vk list` prints its full record instead of a table
 row: every field `--json` carries, then each compose service as name, state, LAN address and
-exec address, and each published port as name, `listen->to` (with `@service` when a compose
+exec address, and each published port as name, `listen->to` (with `@NAME` when a compose
 sibling dials) and the publisher's pid. When liveness is unconfirmed, `(unconfirmed)`
 marks the pid; in the table it marks the address. Nothing is folded in a full record,
 so `--wide` has no effect.
@@ -383,10 +383,12 @@ PUBLISHED     pg  127.0.0.1:5432->127.0.0.1:5432@db  pid 42011
 `exec_addr`, `state_dir`, `vmm`, `vmm_pid`, `cpus`, `mem`, `nested`, `guest_ip` (the eth0
 address on a `--net` LAN), `ssh_addr`, `atop_log`, `created_secs`, `uptime_secs`,
 `services` (every declared compose service with its `name`, `exec_addr`, `state` and LAN
-`ip`), and `published` (each publisher's `name`, `listen`, `to`, `service`, `pid`, and
-whether its liveness was `confirmed`). `--field` picks fields without jq, one `--field` per
-field: one line per VM and tab-separated in flag order, or with `--json` objects holding
-only those fields; a dotted path reaches into nested values:
+`ip`), and `published` (each publisher's `name`, `listen`, `to` and `pid`, plus `via` when
+a compose sibling dials — the one `vk publish ensure --service` named — and `"unconfirmed":
+true` when its liveness could not be checked). `--field` picks fields without jq, one
+`--field` per field: one line per VM and tab-separated in flag order, or with `--json`
+objects holding only those fields; a dotted path reaches into nested values, and a key a
+record omits reads `null`:
 
 ```sh
 vk list . --field pid                   # the pid to hand to vk stop
