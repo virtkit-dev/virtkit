@@ -646,6 +646,7 @@ third_party/     vendored libkrun and local patches
 kernel/          pinned guest-kernel configuration and build inputs
 docs/            operational guides
 examples/        annotated compose file exercising every compose feature
+tests/           end-to-end scripts run against a built vk; release-e2e.sh gates a release
 build.sh         reproducible binary build
 build-kernel.sh  reproducible guest-kernel build
 dev.sh           check/lint/test environment in a reusable development VM

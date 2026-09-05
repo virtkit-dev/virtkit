@@ -8,11 +8,12 @@ name: Release
 # everything they drop in dist/. The pinned toolchain lives in the image, not here, so the
 # runner needs no Rust setup.
 #
-# build runs in parallel with quality (lint + test + audit); the kernel is built in
-# the same job as the binaries so the published vk has it embedded, and the build runs as
+# build runs in parallel with quality (lint + test + audit); the kernel is built in the
+# same job as the binaries so the published vk has it embedded, and the build runs as
 # `build.sh --bootstrap-check`: the released bytes are attested by rebuilding them from
-# scratch in a vk microVM and requiring an exact match. release publishes once both
-# quality and build pass. Each binary ships with its own .sha256 sidecar
+# scratch in a vk microVM and requiring an exact match. e2e then boots microVMs with the
+# vk that build produced (tests/release-e2e.sh), and release publishes once quality,
+# build and e2e have all passed. Each binary ships with its own .sha256 sidecar
 # (vk.sha256, vk-agent.sha256, vk-registry.sha256, vk-runnerctl.sha256,
 # vmlinux.sha256) so users can verify just the file they downloaded without
 # fetching a combined manifest.
@@ -27,8 +28,8 @@ permissions:
   contents: read
 
 jobs:
-  # Gate: run the same lint + test + audit checks as CI against the tagged commit. Runs in
-  # parallel with build; the release job below waits on both.
+  # Gate: run the same lint + test + audit checks as CI against the tagged commit. Runs
+  # in parallel with build; the release job below waits on every gate.
   quality:
     uses: ./.github/workflows/quality.yml
 
@@ -40,8 +41,48 @@ jobs:
       bootstrap-check: true
       retention-days: 1
 
-  release:
+  # Gate: the end-to-end suite, on the very binaries the release job publishes. The
+  # artifact build uploaded is downloaded rather than rebuilt, and the script checks them
+  # against their sha256 sidecars and the tag's version before booting anything. The tests
+  # pull images and boot microVMs, so the job needs the runner's KVM like the bootstrap
+  # rebuild does, and network. E2E_BUDGET keeps the run inside timeout-minutes, so a suite
+  # that overruns still prints its results table instead of being killed mid-script.
+  e2e:
     needs: [quality, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: release-binaries-${{ github.sha }}
+          path: dist
+
+      - name: Enable KVM for the runner user
+        uses: ./.github/actions/enable-kvm
+
+      # An artifact keeps no permission bits, so the downloaded binaries are not executable
+      # until told so; the sidecar check inside the script proves they are still the built
+      # ones.
+      - name: Run the end-to-end suite against the built vk
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          E2E_BUDGET: 6300
+        run: |
+          chmod +x dist/vk dist/vk-agent dist/vk-registry dist/vk-runnerctl
+          df -h /
+          VK=dist/vk tests/release-e2e.sh
+
+      # The suite fills the runner's disk with images and boot scratch; on a failed run
+      # ENOSPC otherwise surfaces as an opaque per-script failure.
+      - name: Free space after the suite
+        if: always()
+        run: df -h /
+
+  release:
+    needs: [quality, build, e2e]
     runs-on: ubuntu-latest
     # gh release create needs write access to the repo's releases.
     permissions:

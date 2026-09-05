@@ -183,9 +183,14 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 ## CI
 
-- **GitHub Actions** (`.github/workflows/`): `ci.yml` (lint + test + audit + build on push/PR),
-  `release.yml` (publish a GitHub release on `v*` tag), with reusable `quality.yml`
+- **GitHub Actions** (`.github/workflows/`): `ci.yml` (lint + test + audit + build on
+  push/PR), `release.yml` (publish a GitHub release on `v*` tag, gated on the end-to-end
+  suite `tests/release-e2e.sh` run against the built `vk`), with reusable `quality.yml`
   (lint + test + audit) and `build.yml`.
+- **End-to-end suite** (`tests/`): `VK=./dist/vk tests/release-e2e.sh` runs it against a
+  local build — it needs KVM, e2fsprogs and network — and naming scripts narrows the run.
+  Every other `tests/*.sh` is picked up by its glob, so adding one gates the next release
+  with no registration step.
 - **GitLab** (`.gitlab-ci.yml`): reproducible build + independent rebuild attestation +
   keyless Sigstore signing.
 
