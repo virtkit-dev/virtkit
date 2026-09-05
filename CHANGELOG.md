@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.61.0] - 2026-09-05
+
 ### Added
 
 - Volume mode `:socket` forwards a host unix socket to the guest path for `-v` and compose
@@ -2400,7 +2402,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.60.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.61.0...HEAD
+[0.61.0]: https://github.com/virtkit-dev/virtkit/compare/v0.60.0...v0.61.0
 [0.60.0]: https://github.com/virtkit-dev/virtkit/compare/v0.51.0...v0.60.0
 [0.51.0]: https://github.com/virtkit-dev/virtkit/compare/v0.50.0...v0.51.0
 [0.50.0]: https://github.com/virtkit-dev/virtkit/compare/v0.49.0...v0.50.0
