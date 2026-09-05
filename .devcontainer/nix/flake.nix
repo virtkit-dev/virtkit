@@ -9,7 +9,8 @@
   #     see the note at rustToolchain) with the x86_64-unknown-linux-musl target + clippy/rustfmt;
   #   - a musl cross gcc for the vendored C in ring / zstd-sys / jemalloc-sys, and a host gcc
   #     for build scripts and proc-macros (.cargo/config.toml names which is used where);
-  #   - mold, make, git, ca-certificates, file, cargo-audit, cargo-sweep, the dev search tools.
+  #   - mold, make, git, ca-certificates, file, cargo-audit, cargo-sweep, the dev search tools;
+  #   - qemu-utils and e2fsprogs for qcow2/ext4 test cross-checks.
   #
   # Everything is pinned by flake.lock (nixpkgs by git rev), so the inputs are
   # rebuildable-from-source years later. cache.nixos.org serves the binaries; if it ever
@@ -76,6 +77,10 @@
           busybox
           cargo-audit   # audit.sh (RUSTSEC scan)
           cargo-sweep   # sweep.sh (reclaim stale target/)
+          # Without these tools, qcow2 and ext4 cross-checks skip and CI still passes.
+          # Compilation neither links nor invokes them.
+          qemu-utils    # qemu-img/qemu-io: the qcow2 reader/writer is checked against qemu
+          e2fsprogs     # e2fsck/debugfs/dumpe2fs: the ext4 builder is checked against them
           # clippy + rustfmt come with rustToolchain.
           # The musl cross cc: `x86_64-unknown-linux-musl-{cc,gcc,ar,...}` land in the merged
           # /bin. .cargo/config.toml points CC_<triple> (the vendored C in ring/zstd/jemalloc)

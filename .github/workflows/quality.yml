@@ -55,9 +55,9 @@ jobs:
       - name: Build toolchain image
         run: docker build -t virtkit-build -f .devcontainer/Dockerfile .devcontainer
 
-      # Run the workspace suite as ./dev.sh test does locally. Coverage excludes
-      # #[ignore]d tests and checks that skip without qemu-img/qemu-io/e2fsck
-      # (absent from the build image) or root (the container uses the host uid).
+      # Run the workspace suite as ./dev.sh test does locally. The image includes
+      # qemu-img/qemu-io/e2fsck so qcow2 and ext4 cross-checks run. Coverage excludes
+      # #[ignore]d tests and checks requiring root (the container uses the host uid).
       # The built vk itself is attested by build.sh --bootstrap-check on release.
       #
       # Tests compile the workspace, so use the same writable cargo home as build.sh

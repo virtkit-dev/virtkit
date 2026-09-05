@@ -2123,7 +2123,7 @@ mod tests {
     }
 
     /// `fsck` passes a freshly built ext4 and flags a trashed one. Skipped when `e2fsck`
-    /// is not installed (the check is best-effort), so CI without e2fsprogs still passes.
+    /// is not installed (the check is best-effort), so a host without e2fsprogs still passes.
     #[test]
     fn fsck_passes_clean_and_flags_corrupt() {
         use std::io::{Seek, SeekFrom, Write};
