@@ -1,6 +1,7 @@
 name: Quality
 
-# Reusable lint + audit checks, called by ci.yml (push/PR) and release.yml (tag gate).
+# Reusable lint + test + audit checks, called by ci.yml (push/PR) and release.yml
+# (tag gate).
 #
 # Everything runs inside the pinned virtkit-build devcontainer image (same one
 # build.sh uses), so clippy/rustfmt are the exact versions from rust-toolchain.toml
@@ -17,6 +18,7 @@ permissions:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
@@ -41,10 +43,38 @@ jobs:
             -e CARGO_TARGET_DIR=/work/target \
             -v "$PWD":/work -w /work \
             virtkit-build \
-            cargo clippy --workspace --all-targets -- -D warnings
+            cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # Run tests in parallel with lint and audit. CI builds wait for all three.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build toolchain image
+        run: docker build -t virtkit-build -f .devcontainer/Dockerfile .devcontainer
+
+      # Run the workspace suite as ./dev.sh test does locally. Coverage excludes
+      # #[ignore]d tests and checks that skip without qemu-img/qemu-io/e2fsck
+      # (absent from the build image) or root (the container uses the host uid).
+      # The built vk itself is attested by build.sh --bootstrap-check on release.
+      #
+      # Tests compile the workspace, so use the same writable cargo home as build.sh
+      # and clippy. --locked prevents changes to the committed Cargo.lock.
+      - name: cargo test
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -e CARGO_HOME=/work/target/.cargo-home \
+            -e CARGO_TARGET_DIR=/work/target \
+            -v "$PWD":/work -w /work \
+            virtkit-build \
+            cargo test --workspace --locked
 
   audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 

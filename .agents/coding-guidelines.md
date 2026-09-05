@@ -15,7 +15,7 @@ Generated code **must** pass CI's formatting and lint checks (`.github/workflows
 
 | Language | Formatter / Linter | Check command | Fix command |
 |----------|--------------------|---------------|-------------|
-| Rust | rustfmt + clippy | `cargo fmt --check --all` && `cargo clippy --workspace --all-targets -- -D warnings` | `cargo fmt --all` |
+| Rust | rustfmt + clippy | `cargo fmt --check --all` && `cargo clippy --workspace --all-targets --locked -- -D warnings` | `cargo fmt --all` |
 | Shell (*.sh) | — (no formatter configured) | `bash -n <file>` (and POSIX `sh -n` for in-image scripts) | — |
 
 ## Area-Specific Conventions

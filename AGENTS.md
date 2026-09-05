@@ -169,7 +169,7 @@ change; the edit loop above is what to use while iterating:
 cargo build --release --workspace
 cargo test --workspace                              # tests, e.g. vk-core/tests/exec.rs
 cargo fmt --all                                     # format (check: --check)
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 ## Code Quality Config
@@ -183,9 +183,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## CI
 
-- **GitHub Actions** (`.github/workflows/`): `ci.yml` (lint + audit + build on push/PR),
+- **GitHub Actions** (`.github/workflows/`): `ci.yml` (lint + test + audit + build on push/PR),
   `release.yml` (publish a GitHub release on `v*` tag), with reusable `quality.yml`
-  (lint + audit) and `build.yml`.
+  (lint + test + audit) and `build.yml`.
 - **GitLab** (`.gitlab-ci.yml`): reproducible build + independent rebuild attestation +
   keyless Sigstore signing.
 

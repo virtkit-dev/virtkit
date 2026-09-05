@@ -8,8 +8,8 @@ name: Release
 # everything they drop in dist/. The pinned toolchain lives in the image, not here, so the
 # runner needs no Rust setup.
 #
-# build runs in parallel with quality (lint + audit); the kernel is built in the same job
-# as the binaries so the published vk has it embedded, and the build runs as
+# build runs in parallel with quality (lint + test + audit); the kernel is built in
+# the same job as the binaries so the published vk has it embedded, and the build runs as
 # `build.sh --bootstrap-check`: the released bytes are attested by rebuilding them from
 # scratch in a vk microVM and requiring an exact match. release publishes once both
 # quality and build pass. Each binary ships with its own .sha256 sidecar
@@ -27,7 +27,7 @@ permissions:
   contents: read
 
 jobs:
-  # Gate: run the same lint + audit checks as CI against the tagged commit. Runs in
+  # Gate: run the same lint + test + audit checks as CI against the tagged commit. Runs in
   # parallel with build; the release job below waits on both.
   quality:
     uses: ./.github/workflows/quality.yml
