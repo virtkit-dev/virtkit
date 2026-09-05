@@ -1,13 +1,15 @@
 name: CI
 
-# Lint + test + audit on every branch push and pull request. Tag pushes are
-# excluded (branches: '**' matches branches, not tags) — release.yml runs the same
-# checks as a gate before publishing, so a tag build does not double-run them here.
+# Lint + test + audit on every branch push and pull request, except pushes to the
+# `release` branch: release.yml runs the same checks there as a gate before publishing,
+# so a candidate does not double-run them here. Tag pushes never match (branches: '**'
+# matches branches, not tags), and release.yml's own pushes of `main` and the tag
+# are made with the workflow token, which triggers no workflow at all.
 #
-# A build job runs after quality — deliberately gated on lint, test and audit, so
-# a push that cannot pass them never spends a build — and uploads the binaries as
-# a GitHub Actions artifact (retention: 1 day). This lets you grab a build from any commit
-# without waiting for a release tag. The guest kernel is excluded — it compiles
+# A build job runs after quality — deliberately gated on lint, test and audit, so a
+# push that cannot pass them never spends a build — and uploads the binaries as a
+# GitHub Actions artifact (retention: 1 day). This lets you grab a build from any
+# commit without waiting for a release. The guest kernel is excluded — it compiles
 # a full Linux kernel (tens of minutes) and changes infrequently; use release.yml
 # or build-kernel.sh locally when you need a new vmlinux.
 #
@@ -19,6 +21,7 @@ on:
   push:
     branches:
       - '**'
+      - '!release'
   pull_request:
   workflow_dispatch:
 

@@ -1,7 +1,7 @@
 name: Quality
 
 # Reusable lint + test + audit checks, called by ci.yml (push/PR) and release.yml
-# (tag gate).
+# (release gate).
 #
 # Everything runs inside the pinned virtkit-build devcontainer image (same one
 # build.sh uses), so clippy/rustfmt are the exact versions from rust-toolchain.toml

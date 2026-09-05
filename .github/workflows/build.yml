@@ -1,7 +1,7 @@
 name: Build
 
 # Reusable workflow: build the binaries, optionally with the guest kernel.
-# Called by ci.yml (on push/PR/dispatch) and release.yml (on tag).
+# Called by ci.yml (on push/PR/dispatch) and release.yml (on a push to `release`).
 #
 # The kernel is built first, in the same job as the binaries: build.sh embeds
 # dist/vmlinux into vk when it is present, so building both on one runner is what

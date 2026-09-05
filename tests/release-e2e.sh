@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Release end-to-end gate, run against one built `vk`.
 #
-# release.yml runs this on the binary build.yml produced and the release job publishes, so
+# release.yml runs this on the binary build.yml produced and the publish job releases, so
 # what is tested is what ships. Two identity checks come first and are preconditions — the
 # sha256 sidecars beside the binaries, and vk's version against the release tag (`vk update`
 # compares the two, so a mismatch breaks self-update); neither is worth booting a microVM

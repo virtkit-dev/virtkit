@@ -1,6 +1,15 @@
 name: Release
 
-# Publish a GitHub release whenever a version tag (v*) is pushed.
+# Cut a release from the `release` branch, tagging it only once everything has passed.
+#
+# `release` is the integration branch: push the candidate there — its tip being the
+# `all: release X.Y.Z` commit that bumps Cargo.toml and dates the CHANGELOG section — and
+# this workflow gates it, then does the writes a human used to do by hand: fast-forward
+# `main` to it, push the `vX.Y.Z` tag, publish the GitHub release. A failed candidate is
+# fixed and pushed to `release` again; no tag existed for it, so no tag is ever moved or
+# force-pushed. Only the newest candidate runs (concurrency below), and `main` is checked
+# against the sha it had when the pipeline started, so a push there mid-pipeline fails the
+# publish instead of being silently rebased over.
 #
 # virtkit's artifacts are produced by the same reproducible scripts we use locally —
 # build.sh (the static-musl binaries) and build-kernel.sh (the guest vmlinux). GitHub-hosted
@@ -8,32 +17,98 @@ name: Release
 # everything they drop in dist/. The pinned toolchain lives in the image, not here, so the
 # runner needs no Rust setup.
 #
+# prepare derives the tag from Cargo.toml and refuses a candidate that is already released,
+# has no CHANGELOG section, or does not contain main — in seconds, before anything compiles.
 # build runs in parallel with quality (lint + test + audit); the kernel is built in the
 # same job as the binaries so the published vk has it embedded, and the build runs as
 # `build.sh --bootstrap-check`: the released bytes are attested by rebuilding them from
 # scratch in a vk microVM and requiring an exact match. e2e then boots microVMs with the
-# vk that build produced (tests/release-e2e.sh), and release publishes once quality,
-# build and e2e have all passed. Each binary ships with its own .sha256 sidecar
-# (vk.sha256, vk-agent.sha256, vk-registry.sha256, vk-runnerctl.sha256,
-# vmlinux.sha256) so users can verify just the file they downloaded without
-# fetching a combined manifest.
+# vk that build produced (tests/release-e2e.sh). publish runs once all of them have
+# passed. Each binary ships with its own .sha256 sidecar (vk.sha256, vk-agent.sha256,
+# vk-registry.sha256, vk-runnerctl.sha256, vmlinux.sha256) so users can verify just the
+# file they downloaded without fetching a combined manifest.
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - release
 
-# Default to read-only; the release job opts up to contents: write below.
+# One candidate at a time, the newest: a second push to `release` while a pipeline runs
+# supersedes it, so two pipelines never race for the same tag or for `main`. The write
+# phase is not exempt: a cancel landing in publish's few seconds can leave the tag pushed
+# with no release. Every step there is idempotent, so the fix is to re-run the cancelled
+# run's failed jobs — docs/releasing.md says so.
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+# Default to read-only; the publish job opts up to contents: write below.
 permissions:
   contents: read
 
 jobs:
-  # Gate: run the same lint + test + audit checks as CI against the tagged commit. Runs
-  # in parallel with build; the release job below waits on every gate.
+  # Gate: is this a releasable candidate at all? Cheap, so a mistake surfaces before the
+  # long jobs start. The tag is derived from the version the binaries are built as, which
+  # is what `vk update` compares a release's tag against.
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.candidate.outputs.tag }}
+      version: ${{ steps.candidate.outputs.version }}
+      main-sha: ${{ steps.candidate.outputs.main-sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check the candidate
+        id: candidate
+        shell: bash
+        run: |
+          version=$(awk '/^\[workspace\.package\]/ { p = 1; next }
+                          /^\[/ { p = 0 }
+                          p && sub(/^version = "/, "") { sub(/".*/, ""); print; exit }' Cargo.toml)
+          [ -n "$version" ] || { echo "no [workspace.package] version in Cargo.toml"; exit 1; }
+          tag="v$version"
+          echo "candidate: $tag at $GITHUB_SHA"
+          # --exit-code is 2 for "no such tag" but 128 for a transport error, and only the
+          # first means the tag is free.
+          rc=0
+          git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null || rc=$?
+          case $rc in
+            0) echo "$tag is already released; bump the version in Cargo.toml for a new release"; exit 1 ;;
+            2) ;;
+            *) echo "cannot reach origin to check $tag (git ls-remote exit $rc)"; exit 1 ;;
+          esac
+          grep -qE "^## \[$(echo "$version" | sed 's/\./\\./g')\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md || {
+            echo "CHANGELOG.md has no dated '## [$version] - YYYY-MM-DD' section"
+            exit 1
+          }
+          # Reject an empty section before building, using publish's release-body extractor.
+          awk -v v="$version" -f .github/release-notes.awk CHANGELOG.md | grep -q '[^[:space:]]' || {
+            echo "the '## [$version]' CHANGELOG section is empty"
+            exit 1
+          }
+          git fetch --quiet origin +refs/heads/main:refs/remotes/origin/main
+          main_sha=$(git rev-parse origin/main)
+          git merge-base --is-ancestor "$main_sha" HEAD || {
+            echo "the candidate does not contain main ($main_sha); rebase it onto main"
+            exit 1
+          }
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "main-sha=$main_sha"
+          } >> "$GITHUB_OUTPUT"
+
+  # Gate: the same lint + test + audit checks as CI, against the candidate.
   quality:
+    needs: [prepare]
     uses: ./.github/workflows/quality.yml
 
   build:
+    needs: [prepare]
     uses: ./.github/workflows/build.yml
     with:
       artifact-prefix: release
@@ -41,14 +116,14 @@ jobs:
       bootstrap-check: true
       retention-days: 1
 
-  # Gate: the end-to-end suite, on the very binaries the release job publishes. The
-  # artifact build uploaded is downloaded rather than rebuilt, and the script checks them
-  # against their sha256 sidecars and the tag's version before booting anything. The tests
-  # pull images and boot microVMs, so the job needs the runner's KVM like the bootstrap
-  # rebuild does, and network. E2E_BUDGET keeps the run inside timeout-minutes, so a suite
-  # that overruns still prints its results table instead of being killed mid-script.
+  # Gate: the end-to-end suite, on the very binaries publish uploads. The artifact build
+  # uploaded is downloaded rather than rebuilt, and the script checks them against their
+  # sha256 sidecars and the tag's version before booting anything. The tests pull images
+  # and boot microVMs, so the job needs the runner's KVM like the bootstrap rebuild does,
+  # and network. E2E_BUDGET keeps the run inside timeout-minutes, so a suite that overruns
+  # still prints its results table instead of being killed mid-script.
   e2e:
-    needs: [quality, build]
+    needs: [prepare, quality, build]
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -68,26 +143,42 @@ jobs:
       # ones.
       - name: Run the end-to-end suite against the built vk
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           E2E_BUDGET: 6300
         run: |
           chmod +x dist/vk dist/vk-agent dist/vk-registry dist/vk-runnerctl
           df -h /
           VK=dist/vk tests/release-e2e.sh
 
-      # The suite fills the runner's disk with images and boot scratch; on a failed run
-      # ENOSPC otherwise surfaces as an opaque per-script failure.
+      # The suite fills the runner's disk with images and boot scratch, so bracket it with
+      # the free space; on a failed run ENOSPC otherwise surfaces as an opaque per-script
+      # failure.
       - name: Free space after the suite
         if: always()
         run: df -h /
 
-  release:
-    needs: [quality, build, e2e]
+  # The writes, in the order that never produces a wrong tag: main first — a refused
+  # fast-forward means main moved and nothing has been published — then the tag, then the
+  # release. A failure after the first write leaves main advanced with no release yet;
+  # every step is idempotent, so re-running this job from the Actions UI finishes it.
+  publish:
+    needs: [prepare, quality, build, e2e]
     runs-on: ubuntu-latest
-    # gh release create needs write access to the repo's releases.
+    timeout-minutes: 20
+    # git push and gh release create need write access to the repo's refs and releases.
     permissions:
       contents: write
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      MAIN_SHA: ${{ needs.prepare.outputs.main-sha }}
     steps:
+      # The full history: a fast-forward push has to prove to the server that main's tip is
+      # an ancestor of the candidate.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
       - name: Download binary artifacts
         uses: actions/download-artifact@v7
         with:
@@ -100,13 +191,63 @@ jobs:
           name: release-kernel-${{ github.sha }}
           path: dist
 
-      - name: Create release
+      # The CHANGELOG section for this version is the release body, plus the compare link
+      # --generate-notes used to add. The previous release is the newest tag reachable from
+      # the candidate, before this one exists. prepare has already rejected an empty
+      # section; the check stays as the guard on what actually gets published.
+      - name: Write the release notes
+        shell: bash
+        run: |
+          awk -v v="$VERSION" -f .github/release-notes.awk CHANGELOG.md \
+            | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' > "$RUNNER_TEMP/notes.md"
+          [ -s "$RUNNER_TEMP/notes.md" ] || { echo "empty CHANGELOG section for $VERSION"; exit 1; }
+          prev=$(git describe --tags --abbrev=0 --match 'v*' --exclude "$TAG" HEAD 2>/dev/null || true)
+          if [ -n "$prev" ]; then
+            printf '\n**Full Changelog**: %s/%s/compare/%s...%s\n' \
+              "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$prev" "$TAG" >> "$RUNNER_TEMP/notes.md"
+          fi
+          cat "$RUNNER_TEMP/notes.md"
+
+      # Refused unless main is still where prepare saw it — a push there mid-pipeline means
+      # the candidate no longer contains main, and the fast-forward below would fail anyway;
+      # this names the cause. A re-run after a successful publish sees main already at HEAD.
+      - name: Fast-forward main to the candidate
+        run: |
+          git fetch --quiet origin +refs/heads/main:refs/remotes/origin/main
+          now=$(git rev-parse origin/main)
+          if [ "$now" != "$MAIN_SHA" ] && [ "$now" != "$GITHUB_SHA" ]; then
+            echo "main moved from $MAIN_SHA to $now since the pipeline started; rebase and push release again"
+            exit 1
+          fi
+          git push origin "HEAD:refs/heads/main"
+
+      # A lightweight tag, so what ls-remote returns on a re-run is the commit itself
+      # rather than a tag object, and comparing it against the candidate is enough.
+      - name: Push the tag
+        shell: bash
+        run: |
+          # Same exit-code care as prepare: a transport error must not read as "no tag".
+          rc=0
+          existing=$(git ls-remote --exit-code --tags origin "refs/tags/$TAG" | cut -f1) || rc=$?
+          [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ] || { echo "cannot reach origin to check $TAG (git ls-remote exit $rc)"; exit 1; }
+          if [ -n "$existing" ]; then
+            [ "$existing" = "$GITHUB_SHA" ] || { echo "$TAG already exists at $existing"; exit 1; }
+            echo "$TAG already at $GITHUB_SHA"
+            exit 0
+          fi
+          git tag "$TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG"
+
+      - name: Create the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
-          tag="${GITHUB_REF#refs/tags/}"
-          gh release create "$tag" \
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists"
+            exit 0
+          fi
+          gh release create "$TAG" \
             dist/vk \
             dist/vk.sha256 \
             dist/vk-agent \
@@ -119,5 +260,6 @@ jobs:
             dist/vmlinux.sha256 \
             dist/build-info.txt \
             dist/kernel-build-info.txt \
-            --title "$tag" \
-            --generate-notes
+            --title "$TAG" \
+            --verify-tag \
+            --notes-file "$RUNNER_TEMP/notes.md"
