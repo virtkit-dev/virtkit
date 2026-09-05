@@ -32,7 +32,7 @@ async fn serve_on(
     listen: &SocketAddr,
     to: &str,
 ) -> Result<()> {
-    info!("publish: {listen} -> {to} (via {agent_addr})");
+    info!("publish: {listen} -> {to} (agent {agent_addr})");
     // Retry transient errors such as a disappearing peer or momentary EMFILE, but stop
     // persistent errors before the process spins and floods its unattended log.
     let mut failures = 0;
@@ -102,7 +102,7 @@ pub struct Entry {
     /// Normalized so equivalent address spellings compare equal.
     pub listen: String,
     pub to: String,
-    /// The compose sibling whose agent dials `to` (`--service`); absent when the primary
+    /// The compose sibling whose agent dials `to` (`--via`); absent when the primary
     /// dials. Old `service` records still load; older `vk` versions ignore `via` and treat
     /// the publisher as dialing through the primary.
     #[serde(
@@ -412,13 +412,11 @@ pub async fn ensure(
                 running
                     .service
                     .as_deref()
-                    .map(|s| format!(" (service {s})"))
+                    .map(|s| format!(" (via {s})"))
                     .unwrap_or_default(),
                 wanted.listen,
                 wanted.to,
-                service
-                    .map(|s| format!(" (service {s})"))
-                    .unwrap_or_default(),
+                service.map(|s| format!(" (via {s})")).unwrap_or_default(),
                 state_dir.display(),
             );
         }
@@ -510,6 +508,40 @@ fn is_addr_in_use(e: &anyhow::Error) -> bool {
     })
 }
 
+/// Arguments `ensure` passes to `vk publish serve`, excluding the program name. Kept
+/// separate so a CLI parsing test catches flags renamed on only one side.
+pub(crate) fn serve_argv(
+    state_dir: &Path,
+    name: &str,
+    listen: &SocketAddr,
+    to: &str,
+    service: Option<&str>,
+    listen_fd: RawFd,
+    lock_fd: RawFd,
+) -> Vec<std::ffi::OsString> {
+    let mut argv: Vec<std::ffi::OsString> =
+        vec!["publish".into(), "serve".into(), state_dir.into()];
+    for arg in [
+        "--name",
+        name,
+        "--listen",
+        &listen.to_string(),
+        "--to",
+        to,
+        "--listen-fd",
+        &listen_fd.to_string(),
+        "--lock-fd",
+        &lock_fd.to_string(),
+    ] {
+        argv.push(arg.into());
+    }
+    if let Some(s) = service {
+        argv.push("--via".into());
+        argv.push(s.into());
+    }
+    argv
+}
+
 /// Spawn a detached `vk publish serve`, passing the listener and lock at their existing
 /// descriptor numbers by clearing close-on-exec in the child.
 fn spawn_publisher(
@@ -533,20 +565,12 @@ fn spawn_publisher(
     let listen_fd = listener.as_raw_fd();
     let lock_fd = lock.as_raw_fd();
     let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("publish")
-        .arg("serve")
-        .arg(state_dir)
-        .args(["--name", name])
-        .args(["--listen", &listen.to_string()])
-        .args(["--to", to])
-        .args(["--listen-fd", &listen_fd.to_string()])
-        .args(["--lock-fd", &lock_fd.to_string()])
-        .stdin(std::process::Stdio::null())
-        .stderr(log.try_clone().context("duplicating the publisher log")?)
-        .stdout(log);
-    if let Some(s) = service {
-        cmd.args(["--service", s]);
-    }
+    cmd.args(serve_argv(
+        state_dir, name, listen, to, service, listen_fd, lock_fd,
+    ))
+    .stdin(std::process::Stdio::null())
+    .stderr(log.try_clone().context("duplicating the publisher log")?)
+    .stdout(log);
     // SAFETY: `pre_exec` runs after fork; `setsid` and `fcntl(F_SETFD)` are async-signal-safe.
     // `setsid` detaches the child, and clearing FD_CLOEXEC transfers both descriptors.
     unsafe {
@@ -1178,7 +1202,7 @@ mod tests {
     }
 
     /// Model a live publisher by holding its lifetime lock beside its record. `service`
-    /// names the compose sibling that dials, as `--service` does; `None` is the primary.
+    /// names the compose sibling that dials, as `--via` does; `None` is the primary.
     fn fake_publisher(
         state_dir: &Path,
         name: &str,
@@ -1286,6 +1310,38 @@ mod tests {
             msg.contains("already runs") && msg.contains("tcp://other:443"),
             "{msg}"
         );
+
+        // A different dialer is a different route too, and the message names it as the
+        // flag does.
+        let err = ensure(
+            &t.0,
+            "runner",
+            &agent,
+            &listen,
+            "tcp://runner:443",
+            Some("db"),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("(via db)"), "{msg}");
+
+        // And the running publisher's own sibling is named the same way when the request
+        // drops it.
+        let t = state("ensure-via");
+        let _dialled = fake_publisher(
+            &t.0,
+            "runner",
+            &listen.to_string(),
+            "tcp://runner:443",
+            4242,
+            Some("db"),
+        );
+        let err = ensure(&t.0, "runner", &agent, &listen, "tcp://runner:443", None)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("(via db)"), "{msg}");
     }
 
     #[tokio::test]

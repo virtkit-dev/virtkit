@@ -39,6 +39,9 @@ All notable changes to virtkit will be documented in this file.
 - `vk list --field` rejects multiple names in one flag and advises repeating the flag.
   Previously, they were treated as one path, printing `null`, an unknown-field error for
   a name containing a space, or nothing when no VM was running.
+- `vk publish` and `vk publish ensure` take `--via` for the compose sibling that dials,
+  named after the `via` key `vk publish list --json` reports for the publishers `ensure`
+  keeps. `--service` goes on working as an alias and is not going away.
 - `vk list --json` and `vk publish list --json` no longer put a `confirmed` flag on every
   published port, nor a `service` of `null`. A port whose publisher could not be checked
   carries `"unconfirmed": true`, and the compose sibling that dials is now named `via`,

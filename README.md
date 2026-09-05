@@ -384,7 +384,7 @@ PUBLISHED     pg  127.0.0.1:5432->127.0.0.1:5432@db  pid 42011
 address on a `--net` LAN), `ssh_addr`, `atop_log`, `created_secs`, `uptime_secs`,
 `services` (every declared compose service with its `name`, `exec_addr`, `state` and LAN
 `ip`), and `published` (each publisher's `name`, `listen`, `to` and `pid`, plus `via` when
-a compose sibling dials — the one `vk publish ensure --service` named — and `"unconfirmed":
+a compose sibling dials — the one `vk publish ensure --via` named — and `"unconfirmed":
 true` when its liveness could not be checked). `--field` picks fields without jq, one
 `--field` per field: one line per VM and tab-separated in flag order, or with `--json`
 objects holding only those fields; a dotted path reaches into nested values, and a key a

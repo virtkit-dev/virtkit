@@ -399,9 +399,12 @@ enum PublishAction {
         /// Address the guest dials for each accepted connection
         #[arg(long, value_parser = parse_publish_to)]
         to: String,
-        /// ask this compose sibling's agent instead of the primary's (`via` in --json)
-        #[arg(long, value_name = "NAME")]
-        service: Option<String>,
+        /// have this compose sibling's agent dial instead of the primary's
+        ///
+        /// By name, as `vk list --wide` shows it; the service must be running. Reported as
+        /// `via` by `vk publish list --json` and in `vk list --json`'s `published`.
+        #[arg(long, visible_alias = "service", value_name = "NAME")]
+        via: Option<String>,
     },
     /// List the publishers running for a state dir
     ///
@@ -445,9 +448,11 @@ enum PublishAction {
         /// address the guest dials for each accepted connection
         #[arg(long, value_parser = parse_publish_to)]
         to: String,
-        /// ask this compose sibling's agent instead of the primary's
-        #[arg(long, value_name = "NAME")]
-        service: Option<String>,
+        /// have this compose sibling's agent dial instead of the primary's
+        // Keep the alias hidden for this internal command; another build of `ensure` may
+        // still spawn it with the old spelling.
+        #[arg(long, alias = "service", value_name = "NAME")]
+        via: Option<String>,
         /// the inherited listening socket
         #[arg(long = "listen-fd")]
         listen_fd: i32,
@@ -992,11 +997,11 @@ enum Cmd {
     /// Accepts connections on `--listen` and, for each one, asks the target VM's agent —
     /// over the same exec control channel `vk exec`/`vk status` use — to dial `--to` and
     /// splice raw bytes back, reusing that already-open channel for the relay. The VM is
-    /// selected as `vk exec` selects it (a directory or a raw agent address, `--service`
-    /// for a compose sibling), and `--to` can name any address that VM's own network
-    /// reaches — a LAN peer's own compose hostname included, resolved through that VM's
-    /// own DNS:
-    /// `vk publish --service devcontainer --listen tcp://127.0.0.1:8443 --to tcp://runner:443`.
+    /// selected as `vk exec` selects it (a directory or a raw agent address; a compose
+    /// sibling is `--via` here, where `vk exec` says `--service`), and `--to` can name any
+    /// address that VM's own network reaches — a
+    /// LAN peer's own compose hostname included, resolved through that VM's own DNS:
+    /// `vk publish --via devcontainer --listen tcp://127.0.0.1:8443 --to tcp://runner:443`.
     ///
     /// That form runs in the foreground and goes with the terminal; `vk publish ensure` and
     /// its siblings keep one running in the background instead.
@@ -1007,11 +1012,13 @@ enum Cmd {
         /// A directory (default: the current directory) resolves via the VM registry `vk list`
         /// uses; a raw agent address (`scheme://…`) is dialed directly.
         target: Option<String>,
-        /// ask this compose sibling's agent instead of the primary's
+        /// have this compose sibling's agent dial instead of the primary's
         ///
-        /// By name, as `vk list --wide` shows it; the service must be running.
-        #[arg(long, value_name = "NAME")]
-        service: Option<String>,
+        /// By name, as `vk list --wide` shows it; the service must be running. This form
+        /// records nothing, so nothing reports it; `vk publish ensure --via` is reported as
+        /// `via`.
+        #[arg(long, visible_alias = "service", value_name = "NAME")]
+        via: Option<String>,
         /// Local address to accept connections on (tcp://host:port, a unix path, ...)
         #[arg(long, required = true)]
         listen: Option<SocketAddr>,
@@ -3906,7 +3913,7 @@ async fn cli_main() -> ExitCode {
             // clap's own usage-error exit. Any vk-chosen code can collide with the remote
             // command's status vk reproduces below; 2 matches what the old CLI returned
             // when the positional address failed to parse.
-            let addr = match resolve_exec_addr(target.as_deref(), service.as_deref()) {
+            let addr = match resolve_exec_addr(target.as_deref(), service.as_deref(), "--service") {
                 Ok(a) => a,
                 Err(e) => return fail(&e, 2),
             };
@@ -3947,7 +3954,7 @@ async fn cli_main() -> ExitCode {
         // selected the same way `vk exec` selects it.
         Cmd::Publish {
             target,
-            service,
+            via,
             listen,
             to,
             action: None,
@@ -3956,7 +3963,7 @@ async fn cli_main() -> ExitCode {
             let (Some(listen), Some(to)) = (listen, to) else {
                 return fail(&anyhow::anyhow!("--listen and --to are required"), 2);
             };
-            let addr = match resolve_exec_addr(target.as_deref(), service.as_deref()) {
+            let addr = match resolve_exec_addr(target.as_deref(), via.as_deref(), "--via") {
                 Ok(a) => a,
                 Err(e) => return fail(&e, 2),
             };
@@ -4347,10 +4354,6 @@ fn resolve_agent_addr(target: Option<&str>) -> anyhow::Result<SocketAddr> {
     }
 }
 
-/// Resolve a target VM (shared by `vk exec` and `vk publish`) to the agent address
-/// to dial: the primary VM (as `resolve_agent_addr`), or — with `--service` — a
-/// named sibling service of the VM selected by directory. A raw agent address can't
-/// name a service (it isn't a registry entry).
 /// Make each action's state dir absolute, so nothing downstream depends on the caller's
 /// working directory.
 fn resolve_state_dir(action: PublishAction) -> anyhow::Result<PublishAction> {
@@ -4363,13 +4366,13 @@ fn resolve_state_dir(action: PublishAction) -> anyhow::Result<PublishAction> {
             name,
             listen,
             to,
-            service,
+            via,
         } => PublishAction::Ensure {
             state_dir: at(state_dir)?,
             name,
             listen,
             to,
-            service,
+            via,
         },
         PublishAction::List { state_dir, json } => PublishAction::List {
             state_dir: at(state_dir)?,
@@ -4389,12 +4392,19 @@ fn resolve_state_dir(action: PublishAction) -> anyhow::Result<PublishAction> {
     })
 }
 
-fn resolve_exec_addr(target: Option<&str>, service: Option<&str>) -> anyhow::Result<SocketAddr> {
-    let Some(svc) = service else {
+/// The agent to speak to: a compose sibling's when `sibling` names one, else the target's
+/// own. `flag` is the option the name came from (`--service` for `vk exec`, `--via` for
+/// `vk publish`), so the error names what the caller actually typed.
+fn resolve_exec_addr(
+    target: Option<&str>,
+    sibling: Option<&str>,
+    flag: &str,
+) -> anyhow::Result<SocketAddr> {
+    let Some(svc) = sibling else {
         return resolve_agent_addr(target);
     };
     if target.is_some_and(is_agent_addr) {
-        anyhow::bail!("--service selects a VM by directory, not a raw agent address");
+        anyhow::bail!("{flag} selects a VM by directory, not a raw agent address");
     }
     let entry = vms::resolve_one(target.map(Path::new))?;
     resolve_service_addr(&entry, svc)
@@ -4403,14 +4413,16 @@ fn resolve_exec_addr(target: Option<&str>, service: Option<&str>) -> anyhow::Res
 /// As [`resolve_exec_addr`], for a caller that already holds a path. Kept apart from the
 /// `&str` form so a state dir that is not UTF-8 is an error here, rather than a `None`
 /// that would quietly resolve the current directory's VM instead of the one asked for.
-fn resolve_exec_addr_at(state_dir: &Path, service: Option<&str>) -> anyhow::Result<SocketAddr> {
+fn resolve_exec_addr_at(state_dir: &Path, via: Option<&str>) -> anyhow::Result<SocketAddr> {
     let Some(target) = state_dir.to_str() else {
         anyhow::bail!(
             "the state directory {} is not valid UTF-8",
             state_dir.display()
         );
     };
-    resolve_exec_addr(Some(target), service)
+    // `ensure` canonicalizes the state dir, so only a hand-run `serve` reaches this
+    // message — and `--via` is the right name there too.
+    resolve_exec_addr(Some(target), via, "--via")
 }
 
 /// The managed half of `vk publish`. Each action names its VM by state dir — the same
@@ -4429,14 +4441,13 @@ async fn publish_action(action: PublishAction) -> ExitCode {
             name,
             listen,
             to,
-            service,
+            via,
         } => {
-            let addr = match resolve_exec_addr_at(&state_dir, service.as_deref()) {
+            let addr = match resolve_exec_addr_at(&state_dir, via.as_deref()) {
                 Ok(a) => a,
                 Err(e) => return fail(&e, 2),
             };
-            match publish::ensure(&state_dir, &name, &addr, &listen, &to, service.as_deref()).await
-            {
+            match publish::ensure(&state_dir, &name, &addr, &listen, &to, via.as_deref()).await {
                 Ok(publish::Ensured::Started(e)) => write_report(&format!(
                     "published {} -> {} ({}, pid {})\n",
                     e.listen, e.to, e.name, e.pid
@@ -4482,11 +4493,11 @@ async fn publish_action(action: PublishAction) -> ExitCode {
             name,
             listen,
             to,
-            service,
+            via,
             listen_fd,
             lock_fd,
         } => {
-            let addr = match resolve_exec_addr_at(&state_dir, service.as_deref()) {
+            let addr = match resolve_exec_addr_at(&state_dir, via.as_deref()) {
                 Ok(a) => a,
                 Err(e) => return fail(&e, 2),
             };
@@ -5030,6 +5041,80 @@ mod tests {
         assert!(Cli::try_parse_from(["vk", "exec", "ls", "-la"]).is_err());
     }
 
+    /// `vk publish` names the dialing sibling `--via`, and still answers to `--service`.
+    #[test]
+    fn publish_takes_via_under_either_spelling() {
+        let via = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).unwrap();
+            match cli.cmd {
+                Cmd::Publish {
+                    via, action: None, ..
+                } => via,
+                Cmd::Publish {
+                    action: Some(PublishAction::Ensure { via, .. }),
+                    ..
+                } => via,
+                _ => panic!("expected Cmd::Publish"),
+            }
+        };
+        let addrs = [
+            "--listen",
+            "tcp://127.0.0.1:8443",
+            "--to",
+            "tcp://runner:443",
+        ];
+        let foreground = |flag: &str| {
+            let mut args = vec!["vk", "publish", flag, "db"];
+            args.extend(addrs);
+            via(&args)
+        };
+        assert_eq!(foreground("--via").as_deref(), Some("db"));
+        assert_eq!(foreground("--service").as_deref(), Some("db"));
+
+        let ensure = |flag: &str| {
+            let mut args = vec![
+                "vk", "publish", "ensure", "/state", "--name", "pg", flag, "db",
+            ];
+            args.extend(addrs);
+            via(&args)
+        };
+        assert_eq!(ensure("--via").as_deref(), Some("db"));
+        assert_eq!(ensure("--service").as_deref(), Some("db"));
+
+        // The primary dials when neither is given.
+        let mut bare = vec!["vk", "publish", "ensure", "/state", "--name", "pg"];
+        bare.extend(addrs);
+        assert_eq!(via(&bare), None);
+    }
+
+    /// Check that `serve` parses the argv from `ensure`. This internal command needs
+    /// a test to catch flags renamed on only one side.
+    #[test]
+    fn the_spawned_publisher_argv_parses_as_serve() {
+        let listen = "tcp://127.0.0.1:8443".parse().unwrap();
+        for sibling in [Some("db"), None] {
+            let argv = crate::publish::serve_argv(
+                Path::new("/state/app"),
+                "pg",
+                &listen,
+                "tcp://runner:443",
+                sibling,
+                3,
+                4,
+            );
+            let cli = Cli::try_parse_from(std::iter::once("vk".into()).chain(argv)).unwrap();
+            let Cmd::Publish {
+                action: Some(PublishAction::Serve { name, via, .. }),
+                ..
+            } = cli.cmd
+            else {
+                panic!("expected `publish serve`")
+            };
+            assert_eq!(name, "pg");
+            assert_eq!(via.as_deref(), sibling);
+        }
+    }
+
     // `vk update` CLI shape: the version is an optional positional (absent = latest),
     // `-y` is a flag rather than the version, and `--check` (which installs nothing)
     // cannot be combined with the flag that skips the install prompt.
@@ -5243,8 +5328,11 @@ mod tests {
                 .unwrap()
         );
 
-        let err = resolve_exec_addr(Some("vsock://3:4444"), Some("db")).unwrap_err();
-        assert!(err.to_string().contains("not a raw agent address"), "{err}");
+        // The error names the flag the caller typed, not whichever one the helper prefers.
+        let err = resolve_exec_addr(Some("vsock://3:4444"), Some("db"), "--service").unwrap_err();
+        assert!(err.to_string().starts_with("--service selects"), "{err}");
+        let err = resolve_exec_addr(Some("vsock://3:4444"), Some("db"), "--via").unwrap_err();
+        assert!(err.to_string().starts_with("--via selects"), "{err}");
     }
 
     // A closed reader (`vk logs | head`) is the reader having seen enough, not this
