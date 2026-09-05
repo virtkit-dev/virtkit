@@ -573,12 +573,19 @@ mod tests {
     use super::*;
 
     /// Where a coreutils tool lives on this host — `reload` takes absolute paths only.
+    /// Search `PATH` before the usual directories: the development VM has both
+    /// `/usr/bin` and `/bin`, and neither holds `true`.
+    /// Skip relative `PATH` entries because `reload` requires an absolute path.
     fn absolute_tool(name: &str) -> String {
-        ["/usr/bin", "/bin"]
-            .iter()
-            .map(|d| format!("{d}/{name}"))
-            .find(|p| Path::new(p).is_file())
-            .unwrap_or_else(|| panic!("no {name} in /usr/bin or /bin"))
+        let path = std::env::var("PATH").unwrap_or_default();
+        path.split(':')
+            .map(PathBuf::from)
+            .chain(["/usr/bin", "/bin"].iter().map(PathBuf::from))
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join(name))
+            .find(|p| p.is_file())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| panic!("no {name} on PATH, in /usr/bin or in /bin"))
     }
 
     fn settings(dir: &Path, min: u32, max: u32) -> Settings {
