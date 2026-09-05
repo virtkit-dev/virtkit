@@ -36,6 +36,9 @@ All notable changes to virtkit will be documented in this file.
 - `vk list PID|DIR` that names exactly one VM prints that VM's full record instead of a
   one-row table: every `--json` field as `KEY  value` lines, then each compose service with
   its state and addresses and each published port.
+- `vk list --field` rejects multiple names in one flag and advises repeating the flag.
+  Previously, they were treated as one path, printing `null`, an unknown-field error for
+  a name containing a space, or nothing when no VM was running.
 - `vk list`'s table is narrower by default: EXEC ADDRESS is gone, `$HOME` in PROJECT is
   written `~`, and SERVICES names three services and counts the rest (`db, redis, web, +4`).
   `vk list --wide` (`-w`) is the old table, and `--json` still reports every field.

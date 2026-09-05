@@ -786,22 +786,34 @@ fn tilde(dir: &Path, home: Option<&Path>) -> String {
     }
 }
 
-/// Reject `--field` paths that no view could satisfy, before any VM is asked: an empty
-/// segment (`guest_ip.`), a segment with a JSON-pointer metacharacter (`/`, `~`), or a path
-/// given twice (the `--json` object could hold it only once, and the text would silently
-/// disagree). Unknown names are checked per view by `select`.
+/// Reject `--field` paths that no view could satisfy, before any VM is asked: several names
+/// in one flag (any whitespace or a comma — every segment is a field name or an array index,
+/// so neither can occur in a valid path), an empty segment (`guest_ip.`), a segment with a
+/// JSON-pointer metacharacter (`/`, `~`), or a path given twice (the `--json` object could
+/// hold it only once, and the text would silently disagree). Unknown names are checked per
+/// view by `select`.
+///
+/// Paths are quoted in every message, so a stray space or tab shows.
 fn check_fields(fields: &[String]) -> Result<()> {
     for path in fields {
+        // Check multiple names first so `"pid label."` gets the more useful diagnosis
+        // instead of an empty-segment error.
+        if path.contains(',') || path.chars().any(char::is_whitespace) {
+            bail!(
+                "--field {path:?}: a field name holds no whitespace or comma; \
+                 repeat --field for several fields"
+            );
+        }
         if path.split('.').any(str::is_empty) {
-            bail!("--field {path}: empty path segment");
+            bail!("--field {path:?}: empty path segment");
         }
         if path.contains(['/', '~']) {
-            bail!("--field {path}: no such field ('/' and '~' never occur in a field name)");
+            bail!("--field {path:?}: no such field ('/' and '~' never occur in a field name)");
         }
     }
     let mut seen = HashSet::new();
     if let Some(dup) = fields.iter().find(|f| !seen.insert(f.as_str())) {
-        bail!("--field {dup}: given twice");
+        bail!("--field {dup:?}: given twice");
     }
     Ok(())
 }
@@ -823,7 +835,7 @@ fn select(view: &serde_json::Value, path: &str) -> Result<serde_json::Value> {
             .map(String::as_str)
             .collect::<Vec<_>>()
             .join(", ");
-        bail!("--field {path}: no field {head:?}{hint}; the fields are: {known}");
+        bail!("--field {path:?}: no field {head:?}{hint}; the fields are: {known}");
     }
     let pointer = format!("/{}", path.replace('.', "/"));
     Ok(view
@@ -2247,6 +2259,7 @@ PUBLISHED     -
             .unwrap_err()
             .to_string();
         assert!(err.contains("no field \"guest-ip\""), "{err}");
+        assert!(err.contains(r#"--field "guest-ip""#), "{err}");
         assert!(err.contains("guest_ip, label"), "{err}");
         let err = fields(&views, &["stale"], false).unwrap_err().to_string();
         assert!(err.contains("(pass --stale)"), "{err}");
@@ -2261,8 +2274,28 @@ PUBLISHED     -
             check_fields(&names).unwrap_err().to_string()
         };
         assert!(check(&["guest_ip."]).contains("empty path segment"));
+        // Several names in one flag, however spelled. Only a dotted first name reached the
+        // JSON pointer and printed `null`; the rest erred with a VM running, just less
+        // helpfully, and printed nothing without one.
+        for several in [
+            "pid label",
+            "pid,label",
+            "pid, label",
+            "pid\tlabel",
+            "pid\nlabel",
+            "services.0.ip pid",
+            "pid label.",
+        ] {
+            let err = check(&[several]);
+            assert!(
+                err.contains("repeat --field for several"),
+                "{several:?}: {err}"
+            );
+            // Quoted, so a stray space shows and a tab or newline reads as an escape.
+            assert!(err.contains(&format!("--field {several:?}")), "{err}");
+        }
         assert!(check(&["services.0/ip"]).contains("no such field"));
-        assert!(check(&["pid", "label", "pid"]).contains("--field pid: given twice"));
+        assert!(check(&["pid", "label", "pid"]).contains(r#"--field "pid": given twice"#));
         check_fields(&["pid".to_string(), "services.0.ip".to_string()]).unwrap();
     }
 

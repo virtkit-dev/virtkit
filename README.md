@@ -384,9 +384,9 @@ PUBLISHED     pg  127.0.0.1:5432->127.0.0.1:5432@db  pid 42011
 address on a `--net` LAN), `ssh_addr`, `atop_log`, `created_secs`, `uptime_secs`,
 `services` (every declared compose service with its `name`, `exec_addr`, `state` and LAN
 `ip`), and `published` (each publisher's `name`, `listen`, `to`, `service`, `pid`, and
-whether its liveness was `confirmed`). `--field` picks fields without jq: one line per VM
-and tab-separated, or with `--json` objects holding only those fields; a dotted path
-reaches into nested values:
+whether its liveness was `confirmed`). `--field` picks fields without jq, one `--field` per
+field: one line per VM and tab-separated in flag order, or with `--json` objects holding
+only those fields; a dotted path reaches into nested values:
 
 ```sh
 vk list . --field pid                   # the pid to hand to vk stop

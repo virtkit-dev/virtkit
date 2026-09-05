@@ -1772,13 +1772,14 @@ enum Cmd {
         /// emit the entries as a JSON array instead of a table
         #[arg(long)]
         json: bool,
-        /// print only this field of each VM (repeatable)
+        /// print only this field of each VM (repeatable, one field per flag)
         ///
-        /// A `--json` key, or a dotted path into one: `guest_ip`, `services.0.ip`. One line
-        /// per VM, the fields tab-separated, each as `jq -r` would print it: a string bare,
-        /// anything else as JSON; as text, nothing running prints nothing. Values are not
-        /// escaped, so a path holding a tab or newline needs `--json`, which gives an array of
-        /// objects holding only those fields.
+        /// A `--json` key, or a dotted path into one: `guest_ip`, `services.0.ip`. Several
+        /// fields take one `--field` each, not a list. One line per VM, the fields
+        /// tab-separated, each as `jq -r` would print it: a string bare, anything else as
+        /// JSON; as text, nothing running prints nothing. Values are not escaped, so a value
+        /// holding a tab or newline needs `--json`, which gives an array of objects holding
+        /// only those fields.
         #[arg(long, value_name = "FIELD")]
         field: Vec<String>,
         /// also report, per VM, whether a fresh `vk run` would rebuild its image
