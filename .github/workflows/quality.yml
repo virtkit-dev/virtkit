@@ -61,10 +61,12 @@ jobs:
       # The built vk itself is attested by build.sh --bootstrap-check on release.
       #
       # Tests compile the workspace, so use the same writable cargo home as build.sh
-      # and clippy. --locked prevents changes to the committed Cargo.lock.
+      # and clippy. --locked prevents changes to the committed Cargo.lock. --init gives
+      # the container a PID 1 that reaps orphans, as the dev VM and any normal system
+      # do; without it cargo is PID 1 and adopted zombies pile up for the whole run.
       - name: cargo test
         run: |
-          docker run --rm \
+          docker run --rm --init \
             --user "$(id -u):$(id -g)" -e HOME=/tmp \
             -e CARGO_HOME=/work/target/.cargo-home \
             -e CARGO_TARGET_DIR=/work/target \
