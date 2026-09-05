@@ -63,16 +63,11 @@ jobs:
       # then rebuilds a clean copy of the tree from scratch inside a vk microVM — booted by
       # the vk it just produced, on the kernel embedded in it — and fails unless both
       # backends yield byte-identical binaries. Only the runner's KVM stands between the
-      # Docker build and that microVM: GitHub's Linux runners have /dev/kvm, but root-only,
-      # so open it to the runner user the way GitHub documents for hardware-accelerated
-      # emulators. No vk install is needed — the check boots the freshly built dist/vk.
+      # Docker build and that microVM, so the step below opens it to the runner user. No vk
+      # install is needed — the check boots the freshly built dist/vk.
       - name: Enable KVM for the runner user
         if: inputs.bootstrap-check
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"'             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          test -r /dev/kvm -a -w /dev/kvm
+        uses: ./.github/actions/enable-kvm
 
       - name: Build binaries and attest reproducibility (Docker == vk microVM)
         if: inputs.bootstrap-check

@@ -1,0 +1,19 @@
+name: Enable KVM
+description: Open /dev/kvm to the runner user.
+
+# GitHub's Linux runners have KVM, but root-only; this is the udev rule GitHub documents
+# for hardware-accelerated emulators. Any step that boots a vk microVM on the runner runs
+# this first. `trigger --settle` waits for the rule to be applied, so the access check
+# below is not racing udev.
+runs:
+  using: composite
+  steps:
+    - name: Install the kvm udev rule
+      shell: bash
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+          | sudo tee /etc/udev/rules.d/99-kvm4all.rules > /dev/null
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm --settle
+        test -r /dev/kvm
+        test -w /dev/kvm
