@@ -410,6 +410,20 @@ async fn large_output_roundtrip() {
     assert_eq!(received, SIZE);
 }
 
+/// Has `pid` stopped running? The killed grandchild is orphaned when its `sh` dies, so
+/// it lingers as a zombie unless whoever adopts it reaps: PID 1 does that on a normal
+/// system, but not when the suite runs as PID 1 of a bare container (`docker run`
+/// without `--init`). A zombie has been killed, which is all this asserts on.
+fn reaped_or_zombie(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return true; // gone entirely: reaped by whoever adopted it
+    };
+    // the state field follows the comm field, which is parenthesised and may itself
+    // contain ')' and spaces
+    stat.rsplit_once(") ")
+        .is_some_and(|(_, rest)| rest.starts_with('Z'))
+}
+
 #[tokio::test]
 async fn disconnect_kills_remote_process() {
     let addr = start_server("kill").await;
@@ -457,12 +471,11 @@ async fn disconnect_kills_remote_process() {
     .unwrap();
 
     // disconnect mid-run: the server must kill the command instead of letting the
-    // 30s sleep finish unattended (kill(pid, 0) probes existence; the server reaps
-    // the child via wait(), so the pid disappears once killed)
+    // 30s sleep finish unattended
     drop(stream);
     drop(sink);
     timeout(Duration::from_secs(10), async {
-        while unsafe { libc::kill(pid, 0) } == 0 {
+        while !reaped_or_zombie(pid) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
