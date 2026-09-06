@@ -41,9 +41,10 @@ RUN nix build "path:/src/nix#buildEnv" --out-link /opt/toolchain
 ENV PATH=/opt/toolchain/bin:/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/nix/var/nix/profiles/default/sbin \
     SSL_CERT_FILE=/opt/toolchain/etc/ssl/certs/ca-bundle.crt
 
-# `dev` (uid 1000, the usual first host user): dev.sh execs into its VM as this user and
-# devcontainer.json opens the workspace as it. The base ships no adduser; a passwd line is
-# all a user is. /tmp is world-writable for the HOME=/tmp the scripts pass.
+# `dev` (uid 1000, the usual first host user): devcontainer.json opens the workspace as it.
+# dev.sh does not use it — it execs as the host user's own ids, the only ones the rootless
+# virtio-fs share lets create files. The base ships no adduser; a passwd line is all a user
+# is. /tmp is world-writable for the HOME=/tmp the scripts pass.
 RUN printf 'dev:x:1000:1000:dev:/home/dev:/bin/sh\n' >> /etc/passwd \
  && printf 'dev:x:1000:\n' >> /etc/group \
  && mkdir -p /home/dev && chown 1000:1000 /home/dev \

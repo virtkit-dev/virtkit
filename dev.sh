@@ -333,10 +333,16 @@ if [ -z "$agent_up" ]; then
 fi
 exec 9>&-
 
+# The guest command runs with the host user's own uid and gid, not as the image's `dev`
+# (uid 1000): vk's rootless virtio-fs server can create files in /work only as the host
+# owner or as root, so any other guest uid gets EPERM on the first write to target/ —
+# which is exactly what happens on a host whose first user is not 1000. HOME is /tmp
+# above, so no passwd entry is needed.
+#
 # -t keeps cargo's colour and progress rendering, and is what makes the shell usable at
 # all; vk exec requires both local stdin and stdout to be terminals for it, which `shell`
 # has already insisted on.
-exec_args=(--user dev --dir /work)
+exec_args=(--user "$(id -u):$(id -g)" --dir /work)
 if [ -t 0 ] && [ -t 1 ]; then
   exec_args+=(-t)
 fi
