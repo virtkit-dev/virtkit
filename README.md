@@ -615,7 +615,7 @@ For iteration, use the repository's development commands:
 ```sh
 ./dev.sh check -p vk-core                          # one crate, while iterating
 ./dev.sh test -p vk-core --lib dockerignore::tests # one module's tests
-./dev.sh check && ./dev.sh clippy && ./dev.sh test # the whole workspace, before committing
+./dev.sh fmt --check && ./dev.sh check && ./dev.sh clippy && ./dev.sh test # before committing
 ./build.sh --fast  # only when a runnable debug vk is needed
 ```
 
@@ -659,7 +659,7 @@ examples/        annotated compose file exercising every compose feature
 tests/           end-to-end scripts run against a built vk; release-e2e.sh gates a release
 build.sh         reproducible binary build
 build-kernel.sh  reproducible guest-kernel build
-dev.sh           check/lint/test environment in a reusable development VM
+dev.sh           check/fmt/lint/test environment in a reusable development VM
 ```
 
 ## License

@@ -89,7 +89,7 @@ fn embed(src_var: &str, path_var: &str) {
             // Only warn for a release build: a non-embedded release artifact is a
             // shippable-binary footgun worth flagging. In debug (dev iteration, and
             // `cargo check`/`clippy`) the fallback to --kernel/--agent is the norm, so
-            // the warning is pure noise — notably it cluttered every `lint.sh` run.
+            // the warning is pure noise — notably it cluttered every `./dev.sh clippy` run.
             if std::env::var_os("PROFILE").as_deref() == Some(std::ffi::OsStr::new("release")) {
                 println!(
                     "cargo::warning={src_var} unset — `vk` built without an embedded \

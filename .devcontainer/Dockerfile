@@ -1,5 +1,5 @@
-# The build image: the pinned toolchain every release build, lint, audit and dev VM runs in.
-# build.sh / build-kernel.sh / dev.sh / lint.sh / audit.sh / fmt.sh / sweep.sh build this file
+# The build image: the pinned toolchain every release build, CI lint, audit and dev VM runs in.
+# build.sh / build-kernel.sh / dev.sh / audit.sh / sweep.sh build this file
 # (docker build, or `vk run --file`) and run their command inside it.
 #
 # Two pins freeze the inputs, and both are archival:

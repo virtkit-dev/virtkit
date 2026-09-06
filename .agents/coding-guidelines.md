@@ -11,11 +11,16 @@
 
 ## Formatting Requirements
 
-Generated code **must** pass CI's formatting and lint checks (`.github/workflows/quality.yml`). Format per language:
+Generated code **must** pass CI's formatting and lint checks. `.github/workflows/quality.yml`
+runs `cargo fmt --all -- --check` and
+`cargo clippy --workspace --all-targets --locked -- -D warnings` in the devcontainer.
+Use the wrappers below to match `rust-toolchain.toml`; a host rustfmt may differ.
+They require `vk` on `PATH`; build it with `./build.sh`, which supports Docker for bootstrapping.
+`./dev.sh clippy` omits CI's `--locked`: a lockfile update allowed locally fails in CI.
 
 | Language | Formatter / Linter | Check command | Fix command |
 |----------|--------------------|---------------|-------------|
-| Rust | rustfmt + clippy | `cargo fmt --check --all` && `cargo clippy --workspace --all-targets --locked -- -D warnings` | `cargo fmt --all` |
+| Rust | rustfmt + clippy | `./dev.sh fmt --check` && `./dev.sh clippy` | `./dev.sh fmt` |
 | Shell (*.sh) | — (no formatter configured) | `bash -n <file>` (and POSIX `sh -n` for in-image scripts) | — |
 
 ## Area-Specific Conventions

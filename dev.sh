@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# dev.sh — fast, crate-scoped type checking, linting, targeted tests and an interactive
-# shell in a shared vk development VM that powers itself off once left idle. The
+# dev.sh — fast, crate-scoped type checking, linting, formatting and targeted tests, plus
+# an interactive shell in a shared vk development VM that shuts down when idle. The
 # mold-linking RUSTFLAGS and shared target/ directory match every build.sh invocation,
 # and the dev profile matches build.sh --fast, so dependency artifacts are reused
 # between the two workflows. The VK_EMBED_* vars build.sh sets are deliberately absent
@@ -10,6 +10,8 @@
 # Examples:
 #   ./dev.sh check
 #   ./dev.sh clippy
+#   ./dev.sh fmt
+#   ./dev.sh fmt --check
 #   ./dev.sh test
 #   ./dev.sh check -p vk-core
 #   ./dev.sh clippy -p vk-driver --lib
@@ -35,6 +37,7 @@ usage() {
   cat >&2 <<'EOF'
 usage: ./dev.sh check  [-p <package>] [cargo check arguments]
        ./dev.sh clippy [-p <package>] [cargo clippy arguments] [-- <lint flags>]
+       ./dev.sh fmt    [-p <package>] [cargo fmt arguments] [-- <rustfmt flags>]
        ./dev.sh test   [-p <package>] [target] [test filter]
        ./dev.sh shell
        ./dev.sh stop
@@ -48,13 +51,15 @@ select a target, which excludes doctests — `test` does not need it, since carg
 runs every target and the doctests with it. Optimized profiles stay rejected: use
 ./build.sh when shipping. `clippy` is `check` with the lints CI gates on: it defaults to
 `-- -D warnings`, so a warning fails the command as it would on a pull request, and your
-own `--` flags replace that default. `shell` opens an interactive shell in the same VM
-under the cargo commands' own environment, and holds the VM for as long as it runs; that
-VM nests where the host allows it and the vk on PATH can ask for it, so the shell can
-boot vk's own microVMs rather than only compile them, keeping their images and boot
-scratch on the guest's disk. The first command boots a vk development VM; by default it
-powers off after 1800 seconds without a cargo command. Set VK_DEV_IDLE_SECS to change
-the window, or to 0 to keep the VM until ./dev.sh stop.
+own `--` flags replace that default. `fmt` uses the pinned toolchain's rustfmt to match
+CI; a different host rustfmt may disagree. `--check` reports without writing. With no
+`-p` or `--all`, it formats the whole workspace. `shell` opens an interactive shell in
+the same VM under the cargo commands' own environment, and holds the VM for as long as
+it runs; that VM nests where the host allows it and the vk on PATH can ask for it, so
+the shell can boot vk's own microVMs rather than only compile them, keeping their images
+and boot scratch on the guest's disk. The first command boots a vk development VM; by
+default it powers off after 1800 seconds without a cargo command. Set VK_DEV_IDLE_SECS
+to change the window, or to 0 to keep the VM until ./dev.sh stop.
 EOF
   exit 2
 }
@@ -88,7 +93,7 @@ lock_state_dir() {
 
 MODE=${1:-}
 case "$MODE" in
-  check | clippy | test)
+  check | clippy | fmt | test)
     shift
     ;;
   shell)
@@ -123,6 +128,9 @@ args=("$@")
 # Reject optimized profiles; broad validation is the default, and ./build.sh produces
 # shippable binaries.
 has_target=""
+# Only fmt uses this to preserve an explicit scope (`--all`, `-p`). The shared parser
+# also recognizes scope flags that cargo fmt does not use.
+has_scope=""
 
 reject() {
   echo "dev.sh: $1" >&2
@@ -134,7 +142,7 @@ check_profile() {
     release | bench) reject "the $1 profile is optimized and disabled here; use ./build.sh when shipping" ;;
   esac
 }
-# Insert an argument before libtest's bare `--` so Cargo receives it.
+# Insert before a bare `--` to pass the argument to Cargo, not the invoked program.
 insert_cargo_arg() {
   local out=() arg spliced=""
   for arg in ${args[@]+"${args[@]}"}; do
@@ -153,8 +161,8 @@ check_cargo_args() {
   local argv=("$@") i arg
   for ((i = 0; i < ${#argv[@]}; i++)); do
     arg=${argv[$i]}
-    # Everything past a bare `--` is the test binary's own argv, not cargo's: libtest
-    # has flags of its own (`--test`, `--lib`) that must not read as target selection.
+    # After `--`, arguments belong to libtest or rustfmt, not Cargo. Libtest's
+    # `--test` and `--lib` must not count as Cargo target selection.
     if [ "$arg" = -- ]; then
       break
     fi
@@ -171,16 +179,23 @@ check_cargo_args() {
         --all-targets | --bins | --tests | --benches | --examples)
         has_target=1
         ;;
+      # `-p?*` covers both the attached (`-pvk-core`) and the `=` (`-p=vk-core`) forms.
+      --all | --workspace | -p | -p?* | --package | --package=*)
+        has_scope=1
+        ;;
     esac
   done
 }
 # `shell` takes no cargo arguments to vet; every other mode is a cargo invocation.
 [ "$MODE" = shell ] || check_cargo_args ${args[@]+"${args[@]}"}
 
-# Default check and clippy to --all-targets so local validation includes test code. Leave
-# test alone: Cargo already runs every target, and --all-targets would omit doctests.
+# Default check/clippy to --all-targets to include test code, and fmt to --all to match
+# CI's workspace scope. Leave test alone: Cargo runs every target; --all-targets omits doctests.
 case "$MODE" in
   check | clippy) [ -n "$has_target" ] || insert_cargo_arg --all-targets ;;
+  # Insert before `--` to support both Cargo's `./dev.sh fmt --check` and
+  # rustfmt's `./dev.sh fmt -- --check`.
+  fmt) [ -n "$has_scope" ] || insert_cargo_arg --all ;;
 esac
 
 # Match CI's `-D warnings` default unless the caller provides lint flags after a bare

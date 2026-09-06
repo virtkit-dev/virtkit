@@ -91,6 +91,7 @@ fast edit loop below is deliberately `vk`-only and never invokes Docker.
 ./build.sh --fast                   # same, but the debug profile -> much faster iteration
 ./dev.sh check                      # type/borrow checking, whole workspace, every target
 ./dev.sh clippy                     # the lints CI gates on, same scope
+./dev.sh fmt [--check]              # rustfmt the workspace with the pinned toolchain
 ./dev.sh test                       # the whole test suite, doctests included
 ./dev.sh check -p vk-core           # the same, narrowed to one affected crate
 ./dev.sh test -p vk-core --lib …    # one module's unit tests (see below)
@@ -133,10 +134,10 @@ target and module affected by the change, for example:
 `-- -D warnings`, and explicit `--` lint flags replace that default.
 
 With no arguments, each mode covers the whole workspace. `check` and `clippy` add
-`--all-targets`, so test code receives the same coverage as CI's Clippy run; `test`
-keeps Cargo's defaults to include doctests. Run the broader commands before committing.
-Keep the narrow forms for the edit loop itself — the wide ones take minutes where a
-scoped run takes seconds.
+`--all-targets`, so test code receives the same coverage as CI's Clippy run; `fmt` adds
+`--all`; `test` keeps Cargo's defaults to include doctests. Run the broader commands
+before committing. Keep the narrow forms for the edit loop itself — the wide ones take
+minutes where a scoped run takes seconds.
 
 `dev.sh` is Docker-free: on first use it boots the pinned build image as a shared
 `vk` development VM; later invocations use `vk exec`, avoiding another image build and
@@ -168,7 +169,7 @@ change; the edit loop above is what to use while iterating:
 ```bash
 cargo build --release --workspace
 cargo test --workspace                              # tests, e.g. vk-core/tests/exec.rs
-cargo fmt --all                                     # format (check: --check)
+cargo fmt --all                                     # prefer ./dev.sh fmt: pinned rustfmt
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 

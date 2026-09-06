@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # sweep.sh — reclaim stale build artifacts from target/ with cargo-sweep, inside the
 # devcontainer so it matches artifacts against the same pinned toolchain that produced
-# them (build.sh/lint.sh compile in this image, writing to /work/target = the host's
+# them (build.sh/dev.sh compile in this image, writing to /work/target = the host's
 # target/). Running sweep anywhere else would compare against a different rustc and could
 # delete artifacts the real build toolchain still uses.
 #
