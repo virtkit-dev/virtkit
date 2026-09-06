@@ -93,12 +93,13 @@ RUN export ARCH=x86_64 \
                   CONFIG_BLK_DEV_INITRD CONFIG_DEVTMPFS_MOUNT \
                   CONFIG_KVM CONFIG_KVM_INTEL CONFIG_KVM_AMD CONFIG_KVM_IOAPIC \
                   CONFIG_ACPI CONFIG_ACPI_BUTTON CONFIG_INPUT_EVDEV \
-                  CONFIG_DUMMY CONFIG_IPV6 CONFIG_WIREGUARD; do \
+                  CONFIG_DUMMY CONFIG_IPV6 CONFIG_WIREGUARD \
+                  CONFIG_DEBUG_FS CONFIG_LRU_GEN; do \
            grep -q "^${opt}=y" .config || { echo "missing ${opt}=y in .config"; exit 1; }; \
        done \
     && for opt in CONFIG_MLX5_CORE CONFIG_VFIO CONFIG_X86_SGX CONFIG_VIRTIO_PMEM \
                   CONFIG_CIFS CONFIG_NET_9P CONFIG_XFS_FS CONFIG_CRYPTO_FIPS \
-                  CONFIG_SCSI CONFIG_DEBUG_FS CONFIG_IP_VS CONFIG_IP_SET \
+                  CONFIG_SCSI CONFIG_IP_VS CONFIG_IP_SET \
                   CONFIG_NETFILTER_XT_MATCH_RECENT CONFIG_CPU_FREQ \
                   CONFIG_NUMA CONFIG_VIRTIO_MEM CONFIG_XFRM \
                   CONFIG_VXLAN; do \
