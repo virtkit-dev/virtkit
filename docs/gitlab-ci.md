@@ -620,6 +620,26 @@ free-page reporting the trimmed pages never reach the host, and the job would lo
 for nothing. Compose services attach a balloon of their own whatever `[vm] balloon` says, so
 they go on trimming under the setting they inherited.
 
+### Sharing the host page cache with the guests
+
+Job virtio-fs shares — the checkout (`host_checkout`), tools tree and `[vm] share` — use
+DAX windows to read the host page cache directly. Previously, each guest cached its own
+copy: ten concurrent job VMs reading a tools tree held eleven copies on the host.
+`[vm] dax` sets the window size:
+
+```toml
+[vm]
+dax = "8G"            # per share; the default
+```
+
+The window reserves guest address space, not memory, and costs nothing until mapped.
+`"off"` disables it. Each guest supports 64G of windows — eight at the default size, with
+further shares served without DAX. Guests with more than 63.25G of RAM have no room for
+windows and receive none. Mappings are 4 KiB-granular, so the benefit is avoiding a tools
+tree's memory cost per VM, not per-fault latency. Compose services inherit the job VM's
+setting unless they declare `x-virtkit.dax`. DAX requires the built-in VMM;
+cloud-hypervisor has no DAX path and serves shares the ordinary way whatever this says.
+
 ### Keeping the host inside its memory
 
 gitlab-runner decides how many jobs to take with `concurrent`, a count that knows nothing

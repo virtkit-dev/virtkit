@@ -84,6 +84,9 @@ pub struct Unit {
     /// How this unit's guest trims idle file cache (compose `x-virtkit.reclaim`); `None` =
     /// the consumer's default (`--reclaim`, `[vm] reclaim`, else `auto`).
     pub reclaim: Option<vk_core::reclaim::Policy>,
+    /// The DAX window this unit's virtio-fs shares get (compose `x-virtkit.dax`); `None` =
+    /// the consumer's default (`--dax`, `[vm] dax`, else 8G).
+    pub dax: Option<crate::vmm::Dax>,
     /// Whether this unit's guest runs microVMs of its own (compose `x-virtkit.nested`),
     /// applied identically primary or sibling — a service that is itself a hypervisor
     /// (a vk builder, a nested test runner). `false` = no nesting, the default.
@@ -833,13 +836,14 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
     };
     // The per-service axes (compose `x-virtkit`): absent key/subkey = the defaults,
     // so an unmarked service keeps today's agent-as-PID1 pinned-kernel 2-vCPU/1G boot.
-    let (init, kernel, cpus, mem, reclaim, nested, nics, persist_root) = match svc.x_virtkit {
+    let (init, kernel, cpus, mem, reclaim, dax, nested, nics, persist_root) = match svc.x_virtkit {
         Some(x) => (
             x.init()?,
             x.kernel()?,
             x.cpus()?,
             x.mem()?,
             x.reclaim()?,
+            x.dax()?,
             x.nested()?,
             x.nics()?,
             x.persist_root()?,
@@ -847,6 +851,7 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
         None => (
             crate::run::InitSource::Default,
             crate::run::KernelSource::Default,
+            None,
             None,
             None,
             None,
@@ -888,6 +893,7 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
         cpus,
         mem,
         reclaim,
+        dax,
         nested,
         nics,
         persist_root_backing,
@@ -1726,8 +1732,9 @@ struct ComposeService {
 
 /// The `x-virtkit` per-service marker: the init/kernel axes as compose strings,
 /// parsed into [`crate::run::InitSource`] / [`crate::run::KernelSource`], plus the
-/// guest sizing (`cpus`/`mem`), nested virtualization (`nested`), NIC count (`nics`) and
-/// root persistence (`persist_root`). An absent subkey defaults to `Default`/unset/off.
+/// guest sizing (`cpus`/`mem`), idle page-cache trimming (`reclaim`), the DAX window its
+/// shares get (`dax`), nested virtualization (`nested`), NIC count (`nics`) and root
+/// persistence (`persist_root`). An absent subkey defaults to `Default`/unset/off.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct XVirtkit {
@@ -1742,6 +1749,8 @@ struct XVirtkit {
     mem: Option<Scalar>,
     #[serde(default)]
     reclaim: Option<Scalar>,
+    #[serde(default)]
+    dax: Option<Scalar>,
     /// scalar, not bool: `nested: true` is a YAML bool but `${VAR}` interpolates
     /// into a string, and both spellings must reach the same parse
     #[serde(default)]
@@ -1819,6 +1828,19 @@ impl XVirtkit {
                 let s = r.into_string();
                 s.parse::<vk_core::reclaim::Policy>()
                     .map_err(|e| anyhow::anyhow!("x-virtkit.reclaim: {e}"))
+            })
+            .transpose()
+    }
+
+    /// `dax: off|<size>` → the DAX window this guest's virtio-fs shares get (absent = the
+    /// consumer's default). Validated here so a typo fails the compose load.
+    fn dax(&self) -> Result<Option<crate::vmm::Dax>> {
+        self.dax
+            .clone()
+            .map(|d| {
+                let s = d.into_string();
+                s.parse::<crate::vmm::Dax>()
+                    .map_err(|e| anyhow::anyhow!("x-virtkit.dax: {e}"))
             })
             .transpose()
     }
@@ -3177,6 +3199,22 @@ mod tests {
             )
             .is_err()
         );
+        // dax rides it too: absent = the consumer's default, else a window or off
+        assert_eq!(u.dax, None);
+        let u = one("services:\n  s:\n    image: x\n    x-virtkit: { dax: off }\n");
+        assert_eq!(u.dax, Some(crate::vmm::Dax::Off));
+        let u = one("services:\n  s:\n    image: x\n    x-virtkit: { dax: 2G }\n");
+        assert_eq!(u.dax, Some(crate::vmm::Dax::Window(2 << 30)));
+        for bad in ["lots", "1M", "1023K"] {
+            assert!(
+                parse(
+                    &format!("services:\n  s:\n    image: x\n    x-virtkit: {{ dax: {bad} }}\n"),
+                    Path::new("/b")
+                )
+                .is_err(),
+                "dax: {bad} should be rejected"
+            );
+        }
         // zero and garbage fail the load, not a later boot
         for marker in ["{ cpus: 0 }", "{ cpus: two }", "{ mem: 0 }", "{ mem: big }"] {
             assert!(

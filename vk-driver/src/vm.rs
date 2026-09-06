@@ -1125,6 +1125,10 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     };
 
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
+    // `[vm] dax`: the window each directory share gets, so the guest reads a shared tree
+    // out of the host page cache rather than copying it into its own. Same window for every
+    // share here — the tools tree is the one several job VMs read at once.
+    let dax = crate::run::dax_window(vm_dax(cfg)?, None, crate::vmm::libkrun_selected());
     if let Some(share) = &cfg.share {
         let vfsd_sock = ctx.vfsd_sock();
         // libkrun mounts the host dir directly (built-in virtio-fs); only
@@ -1146,6 +1150,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             socket: vfsd_sock,
             host_dir: share.dir.clone(),
             read_only: share.readonly,
+            dax,
             uid_map: Vec::new(),
             gid_map: Vec::new(),
         });
@@ -1175,6 +1180,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             socket: sock,
             host_dir: dir.clone(),
             read_only: true,
+            dax,
             uid_map: Vec::new(),
             gid_map: Vec::new(),
         });
@@ -1239,6 +1245,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             socket: sock,
             host_dir,
             read_only: overlay,
+            dax,
             uid_map,
             gid_map,
         });
@@ -1286,6 +1293,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                 socket: sock,
                 host_dir: dir,
                 read_only: false,
+                dax: None,
                 uid_map: Vec::new(),
                 gid_map: Vec::new(),
             });
@@ -1294,6 +1302,14 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                 &vk_core::atop::cmdline_knob(crate::atop::interval_secs(cfg)?),
             );
         }
+    }
+
+    // Charged before the tag list is built: a share whose window will not fit must not be
+    // named to the agent, which would mount it `dax=always` and be refused every boot.
+    crate::vmm::apply_dax_budget(&mut shares, &mem);
+    let dax_tags = crate::run::dax_tags(&shares);
+    if !dax_tags.is_empty() {
+        cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS_DAX={dax_tags}"));
     }
 
     // Idle page-cache trimming (`[vm] reclaim`): the job guest gives file cache it stopped
@@ -1657,11 +1673,14 @@ fn plan_services(
     // job VM itself stays on one NIC: the executor has no axis to ask for more.
     let mut extra = crate::units::ExtraNics::after_slots(units.len() as u32);
     let reclaim = vm_reclaim(&ctx.cfg)?;
+    let dax = vm_dax(&ctx.cfg)?;
     for (slot, mut unit) in units.into_iter().enumerate() {
         // A compose service's declared sizing obeys the same host ceilings as the job's own.
         clamp_service_size(&ctx.cfg, &mut unit)?;
         // A service without an x-virtkit.reclaim of its own trims like the job guest does.
         unit.reclaim = unit.reclaim.or(Some(reclaim));
+        // Likewise for its shares' DAX window.
+        unit.dax = unit.dax.or(dax);
         let extra_ips = extra.take(gateway, prefix, unit.nics.saturating_sub(1))?;
         // The three media paths resolve the image differently but site the unit identically.
         let siting = |slot: usize, extra_ips: Vec<Ipv4Addr>| crate::units::Siting {
@@ -1981,6 +2000,16 @@ fn narrow_ips(cap: Option<&[String]>, req: &str, var: &str) -> Result<Vec<String
         }
     }
     Ok(requested)
+}
+
+/// `[vm] dax` as a policy, `None` where the host set none; a misspelt value fails naming
+/// the key.
+fn vm_dax(cfg: &crate::config::Config) -> Result<Option<crate::vmm::Dax>> {
+    cfg.vm
+        .dax
+        .as_deref()
+        .map(|s| s.parse().map_err(|e| anyhow!("[vm] dax: {e}")))
+        .transpose()
 }
 
 /// `[vm] reclaim` as a policy; a misspelt value fails prepare naming the key.
@@ -2432,6 +2461,24 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::jobctx::JobCtx;
+
+    /// Unset is not "8G": the cloud-hypervisor backend warns only about a window the host
+    /// asked for, so "left alone" has to be distinguishable from the default.
+    #[test]
+    fn vm_dax_is_unset_by_default_and_names_its_key_when_misspelt() {
+        let mut cfg = Config::default();
+        assert_eq!(vm_dax(&cfg).unwrap(), None);
+        cfg.vm.dax = Some("4G".into());
+        assert_eq!(
+            vm_dax(&cfg).unwrap(),
+            Some(crate::vmm::Dax::Window(4 << 30))
+        );
+        cfg.vm.dax = Some("off".into());
+        assert_eq!(vm_dax(&cfg).unwrap(), Some(crate::vmm::Dax::Off));
+        cfg.vm.dax = Some("lots".into());
+        let err = vm_dax(&cfg).unwrap_err().to_string();
+        assert!(err.contains("[vm] dax"), "{err}");
+    }
 
     fn ctx(cpus_req: Option<&str>, mem_req: Option<&str>) -> JobCtx {
         let mut cfg = Config::default();

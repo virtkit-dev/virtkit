@@ -252,6 +252,9 @@ pub struct RunArgs {
     /// How the guests trim idle file cache (`--reclaim`): the primary's policy, and the
     /// default for every service without an `x-virtkit.reclaim` of its own. `None` = `auto`.
     pub reclaim: Option<vk_core::reclaim::Policy>,
+    /// The DAX window virtio-fs shares get (`--dax`): the primary's policy, and the default
+    /// for every service without an `x-virtkit.dax` of its own. `None` = the default window.
+    pub dax: Option<crate::vmm::Dax>,
     pub boot_timeout_secs: u64,
     /// `--vm-name` template for the VMM process name, `{name}` expanding to the stage /
     /// image / service name (see [`crate::vmm::resolve_proc_name`]). Default `vk:{name}`.
@@ -898,6 +901,7 @@ async fn build_and_boot(
         &args.service_nics,
     )?;
     default_reclaim(&mut compose_units, args.reclaim);
+    default_dax(&mut compose_units, args.dax);
     let mut image_env: Vec<(String, String)> = Vec::new();
     // The image's entrypoint, cmd and workdir, applied to the guest command like
     // `docker run`: the entrypoint is prepended to a trailing command, the workdir is
@@ -1024,15 +1028,16 @@ async fn build_and_boot(
     // Effective primary sizing, same precedence as the axes: an explicit --cpus/--mem
     // overrides the --primary service's own x-virtkit sizing (which already carries
     // any --service-cpus/--service-mem override); absent both, the run defaults.
-    let (marker_cpus, marker_mem, marker_reclaim) = primary_idx
+    let (marker_cpus, marker_mem, marker_reclaim, marker_dax) = primary_idx
         .map(|i| {
             (
                 compose_units[i].cpus,
                 compose_units[i].mem.clone(),
                 compose_units[i].reclaim,
+                compose_units[i].dax,
             )
         })
-        .unwrap_or((None, None, None));
+        .unwrap_or((None, None, None, None));
     let cpus = args
         .cpus
         .or(marker_cpus)
@@ -1594,6 +1599,9 @@ async fn build_and_boot(
     // host. The command then runs with its cwd there (see `drive`). virtio-fs needs shared
     // guest memory, so `mem` gains `shared=on`.
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
+    // The DAX window each directory share gets: the guest maps the host page cache through
+    // it instead of copying file data into its own, so a tree read twice is read once.
+    let dax = dax_window(marker_dax, args.dax, crate::vmm::libkrun_selected());
     // Host-side helpers killed by `teardown_run`: virtiofsd and socket forwarders.
     let mut aux_children: Vec<Child> = Vec::new();
     let mut virtiofs = String::new();
@@ -1622,6 +1630,7 @@ async fn build_and_boot(
             socket: sock,
             host_dir: host_dir.clone(),
             read_only: false,
+            dax,
             uid_map: Vec::new(),
             gid_map: Vec::new(),
         });
@@ -1746,6 +1755,8 @@ async fn build_and_boot(
             socket: sock,
             host_dir: vol.host.clone(),
             read_only: vol.read_only,
+            // A single-file bind is served by a filesystem with no DAX path of its own.
+            dax: if vol.is_file { None } else { dax },
             uid_map: Vec::new(),
             gid_map: Vec::new(),
         });
@@ -1809,6 +1820,9 @@ async fn build_and_boot(
                 socket: sock,
                 host_dir: dir,
                 read_only: false,
+                // The atop archive is a write log the guest appends to, not a tree it reads;
+                // a DAX window would map host pages nothing here reads back.
+                dax: None,
                 uid_map: Vec::new(),
                 gid_map: Vec::new(),
             });
@@ -1822,6 +1836,13 @@ async fn build_and_boot(
     };
     if !virtiofs.is_empty() {
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS={virtiofs}"));
+    }
+    // Charged before the tag list is built: a share whose window will not fit must not be
+    // named to the agent, which would mount it `dax=always` and be refused every boot.
+    crate::vmm::apply_dax_budget(&mut shares, &mem);
+    let dax_tags = dax_tags(&shares);
+    if !dax_tags.is_empty() {
+        cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS_DAX={dax_tags}"));
     }
     if !overlay_tags.is_empty() {
         cmdline.push_str(&format!(
@@ -2365,6 +2386,61 @@ fn default_reclaim(units: &mut [crate::compose::Unit], policy: Option<vk_core::r
     }
 }
 
+/// Give every unit without an `x-virtkit.dax` of its own the run's `--dax` policy
+/// (`None` leaves them to the boot-time default).
+fn default_dax(units: &mut [crate::compose::Unit], policy: Option<crate::vmm::Dax>) {
+    for unit in units {
+        unit.dax = unit.dax.or(policy);
+    }
+}
+
+/// Prefer the guest's `x-virtkit.dax`, then the run's `--dax` / `[vm] dax`, then the
+/// default window.
+pub(crate) fn effective_dax(
+    declared: Option<crate::vmm::Dax>,
+    fallback: Option<crate::vmm::Dax>,
+) -> crate::vmm::Dax {
+    declared.or(fallback).unwrap_or(crate::vmm::DAX_DEFAULT)
+}
+
+/// DAX window per guest directory share, in bytes; `None` for no window.
+///
+/// Only libkrun supports DAX; cloud-hypervisor serves shares the ordinary way. Warn once
+/// for an explicit window request so the unsupported setting is visible; defaults stay
+/// silent.
+/// Pass `libkrun` explicitly because tests cannot set the process-global backend selection.
+pub(crate) fn dax_window(
+    declared: Option<crate::vmm::Dax>,
+    fallback: Option<crate::vmm::Dax>,
+    libkrun: bool,
+) -> Option<u64> {
+    let window = effective_dax(declared, fallback).window();
+    if libkrun {
+        return window;
+    }
+    if window.is_some() && declared.or(fallback).is_some() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            eprintln!(
+                "virtkit: warning: DAX windows are not supported by the cloud-hypervisor \
+                 backend; virtio-fs shares are served without one"
+            );
+        });
+    }
+    None
+}
+
+/// The `VIRTKIT_VIRTIOFS_DAX` value for these shares: the tags that got a window, which is
+/// what tells the agent to mount them `dax=always`. Empty when none did.
+pub(crate) fn dax_tags(shares: &[crate::vmm::FsShare]) -> String {
+    shares
+        .iter()
+        .filter(|s| s.dax.is_some())
+        .map(|s| s.tag.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Enable trimming only with agent PID 1 and a balloon. `run_init` reads the knob;
 /// `image`/`entrypoint` init execs the image's PID 1, leaving an unused `VIRTKIT_RECLAIM`
 /// environment variable and `psi=1`. An image *kernel* keeps the agent and remains eligible.
@@ -2678,6 +2754,7 @@ async fn compose_up(
         &args.service_nics,
     )?;
     default_reclaim(&mut units, args.reclaim);
+    default_dax(&mut units, args.dax);
     // What the fleet costs the host while it is up (see `usage`). Opened before
     // `plan_services`, which builds nothing but does resolve and materialize every `image:`
     // service — work that falls inside the window in the run above, so metering it here too
@@ -4082,6 +4159,9 @@ pub(crate) async fn boot_session(
             socket: sock,
             host_dir: ctx.to_path_buf(),
             read_only: true,
+            // Build stages are left out, as they are for reclaim: a stage guest reads the
+            // context once and dies, so the window would be paid for and never reused.
+            dax: None,
             uid_map: Vec::new(),
             gid_map: Vec::new(),
         });
@@ -4521,6 +4601,7 @@ mod tests {
             service_mem: vec![],
             service_nics: vec![],
             reclaim: None,
+            dax: None,
             boot_timeout_secs: 0,
             vm_name: String::new(),
             ram: false,
@@ -4610,6 +4691,80 @@ mod tests {
         assert!(!wants_reclaim(InitSource::Image, true));
         assert!(!wants_reclaim(InitSource::Entrypoint, true));
         assert!(!wants_reclaim(InitSource::Default, false));
+    }
+
+    /// `x-virtkit.dax` wins, then the run's `--dax`; a service that declared neither is
+    /// left to the boot-time default rather than being pinned here.
+    #[test]
+    fn default_dax_fills_in_only_the_services_that_declared_nothing() {
+        use crate::vmm::Dax;
+        let yaml = "services:\n  a:\n    image: x\n    x-virtkit: { dax: off }\n\
+                    \x20 b:\n    image: y\n";
+        let units = || crate::compose::parse(yaml, Path::new("/base"), &|_| None, None).unwrap();
+        let policy = |units: &[crate::compose::Unit], name: &str| {
+            units.iter().find(|u| u.name == name).unwrap().dax
+        };
+
+        let mut u = units();
+        default_dax(&mut u, None);
+        assert_eq!(policy(&u, "a"), Some(Dax::Off));
+        assert_eq!(policy(&u, "b"), None);
+
+        let mut u = units();
+        default_dax(&mut u, Some(Dax::Window(1 << 30)));
+        assert_eq!(policy(&u, "a"), Some(Dax::Off));
+        assert_eq!(policy(&u, "b"), Some(Dax::Window(1 << 30)));
+    }
+
+    #[test]
+    fn dax_precedence_and_the_tag_list_the_agent_reads() {
+        use crate::vmm::Dax;
+        // A service's own window wins over the run's, which wins over the default.
+        assert_eq!(
+            effective_dax(Some(Dax::Off), Some(Dax::Window(1 << 30))),
+            Dax::Off
+        );
+        assert_eq!(
+            effective_dax(None, Some(Dax::Window(1 << 30))),
+            Dax::Window(1 << 30)
+        );
+        assert_eq!(effective_dax(None, None), crate::vmm::DAX_DEFAULT);
+
+        // The agent is told the tags that actually got a window, and nothing else — a
+        // share mounted `dax=always` without one would fall back on every boot.
+        let share = |tag: &str, dax| crate::vmm::FsShare {
+            tag: tag.into(),
+            socket: PathBuf::new(),
+            host_dir: PathBuf::new(),
+            read_only: false,
+            dax,
+            uid_map: Vec::new(),
+            gid_map: Vec::new(),
+        };
+        assert_eq!(
+            dax_tags(&[
+                share("work", Some(8 << 30)),
+                share("atop", None),
+                share("vol1", Some(8 << 30)),
+            ]),
+            "work,vol1"
+        );
+        assert_eq!(dax_tags(&[share("atop", None)]), "");
+        assert_eq!(dax_tags(&[]), "");
+
+        // The window exists only under the built-in VMM; cloud-hypervisor's virtio-fs has
+        // no DAX path, so every share there is served the ordinary way whatever was asked.
+        assert_eq!(
+            dax_window(None, None, true),
+            crate::vmm::DAX_DEFAULT.window()
+        );
+        assert_eq!(dax_window(Some(Dax::Off), None, true), None);
+        assert_eq!(
+            dax_window(Some(Dax::Window(1 << 30)), None, true),
+            Some(1 << 30)
+        );
+        assert_eq!(dax_window(None, None, false), None);
+        assert_eq!(dax_window(Some(Dax::Window(1 << 30)), None, false), None);
     }
 
     #[test]

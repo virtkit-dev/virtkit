@@ -62,6 +62,9 @@ pub struct Provisioned {
     /// How the guest trims idle file cache (its compose `x-virtkit.reclaim`, else the
     /// consumer's default filled in before provisioning); `None` = `auto`.
     pub reclaim: Option<vk_core::reclaim::Policy>,
+    /// The DAX window this service's virtio-fs shares get (its compose `x-virtkit.dax`,
+    /// else the consumer's default filled in before provisioning); `None` = 8G.
+    pub dax: Option<crate::vmm::Dax>,
     /// Whether this service's guest gets VMX/SVM and so a `/dev/kvm` of its own (its
     /// compose `x-virtkit.nested`). Uniform with the primary path.
     pub nested: bool,
@@ -342,6 +345,7 @@ pub fn provisioned(
         cpus: unit.cpus,
         mem: unit.mem.clone(),
         reclaim: unit.reclaim,
+        dax: unit.dax,
         nested: unit.nested,
         extra_ips,
         persist_root_backing: unit.persist_root_backing.clone(),
@@ -526,6 +530,9 @@ pub fn boot_unit(
     // below), which never touch virtiofs at all.
     let mut aux: Vec<Child> = Vec::new();
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
+    // The DAX window each of this service's shares gets (its own `x-virtkit.dax`, else the
+    // run-wide default already folded in before provisioning).
+    let dax = crate::run::dax_window(svc.dax, None, crate::vmm::libkrun_selected());
     let mut virtiofs = String::new();
     // Tags the agent should mount behind a tmpfs-backed overlay (`host:guest:overlay`),
     // exactly as the primary's own `-v`/compose volumes do in `run::build_and_boot` — a
@@ -633,6 +640,8 @@ pub fn boot_unit(
             socket: sock,
             host_dir: vol.host.clone(),
             read_only: vol.read_only,
+            // A single-file bind is served by a filesystem with no DAX path of its own.
+            dax: if vol.is_file { None } else { dax },
             uid_map: Vec::new(),
             gid_map: Vec::new(),
         });
@@ -694,11 +703,18 @@ pub fn boot_unit(
         if !virtiofs.is_empty() {
             cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS={virtiofs}"));
         }
+        // Charged before the tag list is built: a share whose window will not fit must not
+        // be named to the agent, which would mount it `dax=always` and be refused every boot.
+        let mem = svc.mem.clone().unwrap_or_else(|| DEFAULT_MEM.into());
+        crate::vmm::apply_dax_budget(&mut shares, &mem);
+        let dax_tags = crate::run::dax_tags(&shares);
+        if !dax_tags.is_empty() {
+            cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS_DAX={dax_tags}"));
+        }
         // Idle page-cache trimming: a service that idles between requests gives the file
         // cache it piled up back to the host, not just the pages its processes freed. A
         // service always gets a balloon of its own (below), so only its init axis can take
         // the knob away.
-        let mem = svc.mem.clone().unwrap_or_else(|| DEFAULT_MEM.into());
         if crate::run::wants_reclaim(svc.init, true) {
             crate::run::push_knob(
                 &mut cmdline,

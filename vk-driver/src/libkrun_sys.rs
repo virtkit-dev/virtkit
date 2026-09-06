@@ -230,7 +230,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
 
         // virtio-fs shares. libkrun has no external vhost-user-fs, so it mounts the host
         // directory directly with its built-in virtio-fs; no separate virtiofsd runs
-        // (the boot sites skip it when libkrun is selected). shm_size 0 = no DAX window.
+        // (the boot sites skip it when libkrun is selected).
         for share in &spec.shares {
             let tag = cstr(&share.tag);
             let dir = cstr(&share.host_dir.to_string_lossy());
@@ -238,13 +238,17 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
             // an empty map yields an empty string, which the FFI treats as an identity map.
             let uid_map = cstr(&share.uid_map.join(","));
             let gid_map = cstr(&share.gid_map.join(","));
+            // shm_size is the share's DAX window, guest address space reserved above RAM
+            // (0 = none). `vmm::apply_dax_budget` has already dropped the windows that do
+            // not fit the guest's span, so whatever is here is placeable.
+            let shm_size = share.dax.unwrap_or(0);
             ck(
                 "krun_add_virtiofs4",
                 krun_add_virtiofs4(
                     ctx,
                     tag.as_ptr(),
                     dir.as_ptr(),
-                    0,
+                    shm_size,
                     share.read_only,
                     uid_map.as_ptr(),
                     gid_map.as_ptr(),

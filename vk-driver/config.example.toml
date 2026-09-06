@@ -21,6 +21,12 @@
 #                      # "2G" or "5%" keep that much cache as a fixed floor; "off" keeps all.
 #                      # Rides on the balloon, so `balloon = false` stops the job VM trimming;
 #                      # its services keep a balloon of their own and go on trimming
+# dax = "8G"           # DAX window per virtio-fs share (the default). Maps the host page
+#                      # cache into the guest, so several VMs cache a shared tree once.
+#                      # Reserves guest address space, not memory. At most 64G per guest:
+#                      # eight windows at this size; further shares work without DAX.
+#                      # Guests above 63.25G RAM get none. "off" disables it; ignored by
+#                      # cloud-hypervisor, which has no DAX path
 # max_cpus = 32        # ceilings for the per-job MICROVM_CPUS/MICROVM_MEM
 # max_mem = "128G"     # variables (unset = jobs cannot exceed cpus/mem above)
 # nested = false       # let jobs boot microVMs of their own (vk inside vk); needs

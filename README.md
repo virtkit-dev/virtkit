@@ -220,6 +220,21 @@ primary and any service without its own, `[vm] reclaim` for the GitLab executor.
 agent as PID 1, so an `init` of `image` or `entrypoint` opts out; `vk build` stage guests are
 left alone as well, since trimming would move the peak-memory mark they are measured by.
 
+Directory virtio-fs shares — `--workdir`, `-v` directory binds and compose volumes — use
+DAX windows to read the host page cache directly. The host maps shared files into guest
+address space, avoiding a second copy through the filesystem protocol. Several VMs cache a
+shared tree once; host-side content edits are visible without a re-read, and reopening a
+file no longer re-reads it. Mappings are 4 KiB-granular, so the win is in memory rather than
+in per-fault latency.
+
+The window reserves address space, not memory, and costs nothing until mapped. It defaults
+to 8G per share; `vk run --dax`, a service's `x-virtkit.dax` and the executor's `[vm] dax`
+resize it or turn it `off`. Each guest supports 64G of windows — eight at the default size,
+with further shares served without DAX. Guests with more than 63.25G of RAM have no room
+for windows and receive none. DAX requires the built-in VMM. Under
+`VIRTKIT_VMM=cloud-hypervisor`, and for single-file binds and `vk build` stage guests,
+shares are served the ordinary way.
+
 A guest gets one interface, `eth0`, by default. `nics` gives it more — `eth1` upward, each
 with its own address on the same LAN — for an appliance that assigns services to separate
 interfaces:

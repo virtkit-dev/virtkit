@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Virtio-fs directory shares use the host page cache.** Guests no longer cache a shared
+  tree once per VM, miss host-side content edits, or re-read files on reopening them.
+  `vk run --dax`, a service's `x-virtkit.dax` and the executor's `[vm] dax` set the window
+  size (8G per share by default) or turn it `off`. Each guest supports 64G of windows;
+  further shares work without DAX. Requires the built-in VMM.
+
 ## [0.62.0] - 2026-09-06
 
 ### Added

@@ -157,6 +157,92 @@ impl Disk {
     }
 }
 
+/// A virtio-fs DAX window maps shared files into guest address space for direct access to
+/// the host page cache, avoiding a second copy through FUSE. `off` disables the window.
+///
+/// Only the libkrun backend has a window; cloud-hypervisor's virtio-fs has no DAX path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dax {
+    /// No window: file data is copied into the guest's page cache on every read.
+    Off,
+    /// A window this many bytes wide, per share.
+    Window(u64),
+}
+
+/// Default per-share window. Reserves address space, not memory: the host maps and unmaps
+/// file ranges on demand, so it costs nothing until used. Sized for a working tree, not RAM.
+pub const DAX_DEFAULT: Dax = Dax::Window(8 << 30);
+
+/// Smallest useful window: the guest's FUSE DAX layer hands out 2 MiB ranges.
+const DAX_MIN: u64 = 2 << 20;
+
+/// Ceiling on the windows one guest is given in total: the span the guest's DSDT declares
+/// as a PCI host-bridge window, which is the only place a window's BAR survives Linux's
+/// enumeration. Kept in step with `SHM_MEM_SIZE` in
+/// `third_party/libkrun/src/arch/src/x86_64/layout.rs`, which fixes the span; a share past
+/// the ceiling boots without a window rather than off the end of it.
+pub const DAX_TOTAL_MAX: u64 = 64 << 30;
+
+/// Most guest RAM, in MiB, that still leaves the span reachable. The span starts at a fixed
+/// `SHM_MEM_START` (64 GiB, same layout file as [`DAX_TOTAL_MAX`]) and a guest whose RAM
+/// reaches into it is given no span at all — its RAM would be where the windows go. The
+/// 512 MiB below 64 GiB is the 32-bit MMIO hole libkrun leaves under 4 GiB, which the guest's
+/// RAM is pushed above.
+pub const DAX_MAX_GUEST_MIB: u64 = 64768;
+
+impl Dax {
+    /// The window in bytes, or `None` when off.
+    pub fn window(self) -> Option<u64> {
+        match self {
+            Dax::Off => None,
+            Dax::Window(bytes) => Some(bytes),
+        }
+    }
+}
+
+impl std::str::FromStr for Dax {
+    type Err = String;
+
+    /// `off`, or a window size: `<n>G`, `<n>M`, or a bare MiB count.
+    fn from_str(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        // The spellings a YAML or TOML scalar turns "no" into; they are not sizes, so `0M`
+        // stays an error rather than a fourth way to write it.
+        if matches!(s, "off" | "false" | "0" | "no") {
+            return Ok(Dax::Off);
+        }
+        let (digits, scale) = match s.strip_suffix(['G', 'g']) {
+            Some(d) => (d, 1 << 30),
+            None => (s.strip_suffix(['M', 'm']).unwrap_or(s), 1 << 20),
+        };
+        digits
+            .parse::<u64>()
+            .ok()
+            .and_then(|n| n.checked_mul(scale))
+            .filter(|bytes| (DAX_MIN..=DAX_TOTAL_MAX).contains(bytes))
+            .map(Dax::Window)
+            .ok_or_else(|| {
+                format!(
+                    "expected off, or a window of 2M..{}G written <n>G, <n>M or a MiB count, \
+                     got {s:?}",
+                    DAX_TOTAL_MAX >> 30
+                )
+            })
+    }
+}
+
+impl std::fmt::Display for Dax {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Dax::Off => f.write_str("off"),
+            // Whole gibibytes as `8G`, the spelling the docs and the CLI use; anything
+            // else in MiB, which every size this parser takes can be written in.
+            Dax::Window(bytes) if bytes.is_multiple_of(1 << 30) => write!(f, "{}G", bytes >> 30),
+            Dax::Window(bytes) => write!(f, "{}M", bytes >> 20),
+        }
+    }
+}
+
 /// A virtio-fs share: the tag the guest mounts by, plus the two ways a backend
 /// serves it. cloud-hypervisor connects to an external virtiofsd on `socket`; libkrun
 /// has no external vhost-user-fs, so it mounts `host_dir` directly with its built-in
@@ -167,6 +253,10 @@ pub struct FsShare {
     pub socket: PathBuf,
     pub host_dir: PathBuf,
     pub read_only: bool,
+    /// Bytes of guest address space for this share's DAX window; `None` = no window.
+    /// libkrun passes it to `krun_add_virtiofs4` as its `shm_size`.
+    #[serde(default)]
+    pub dax: Option<u64>,
     /// virtiofsd-style UID id-map spec strings (`type:from:to[:count]`) applied at the
     /// guest↔host boundary; empty = identity. Under cloud-hypervisor these become
     /// `--uid-map` args to the bundled virtiofsd; under libkrun they go to
@@ -175,6 +265,53 @@ pub struct FsShare {
     pub uid_map: Vec<String>,
     #[serde(default)]
     pub gid_map: Vec<String>,
+}
+
+/// Drop windows that do not fit the guest's DAX span so the agent receives only usable tags.
+///
+/// Match libkrun's placement within [`DAX_TOTAL_MAX`]: PCI memory BARs require power-of-two
+/// sizes and bases aligned to those sizes. Naming a share without a window in
+/// `VIRTKIT_VIRTIOFS_DAX` causes a refused `dax=always` mount on every boot. Shares that
+/// do not fit use slower ordinary mounts without failing the boot.
+pub fn apply_dax_budget(shares: &mut [FsShare], mem: &str) {
+    // A guest whose RAM reaches into the span is given no span at all, so every window is
+    // refused rather than the ones past the ceiling. An unparseable size is a
+    // cloud-hypervisor one, where no share has a window to lose.
+    if crate::run::parse_mem_mib(mem).is_some_and(|mib| mib > DAX_MAX_GUEST_MIB) {
+        if shares.iter().any(|s| s.dax.is_some()) {
+            eprintln!(
+                "virtkit: a guest with more than {} GiB of RAM has no room for DAX windows; \
+                 serving its virtio-fs shares without one",
+                DAX_MAX_GUEST_MIB >> 10
+            );
+        }
+        for share in shares.iter_mut() {
+            share.dax = None;
+        }
+        return;
+    }
+    let mut next = 0u64;
+    for share in shares.iter_mut() {
+        let Some(window) = share.dax else { continue };
+        let placed = window
+            .checked_next_power_of_two()
+            .map(|size| size.max(DAX_MIN))
+            .and_then(|size| Some((size, next.checked_next_multiple_of(size)?)))
+            .and_then(|(size, base)| base.checked_add(size))
+            .filter(|end| *end <= DAX_TOTAL_MAX);
+        match placed {
+            Some(end) => next = end,
+            None => {
+                eprintln!(
+                    "virtkit: virtio-fs share {:?} would take the guest past its {} GiB of \
+                     DAX window space; serving it without one",
+                    share.tag,
+                    DAX_TOTAL_MAX >> 30
+                );
+                share.dax = None;
+            }
+        }
+    }
 }
 
 /// Guest networking outside the switch: a host tap by name (CI `net.mode = tap|pool`), or
@@ -822,6 +959,102 @@ mod tests {
         assert_eq!(expand_vm_name("my-vm", "web"), "my-vm");
     }
 
+    #[test]
+    fn dax_policy_parses_sizes_and_the_spellings_of_off() {
+        use std::str::FromStr;
+        assert_eq!(Dax::from_str("8G").unwrap(), Dax::Window(8 << 30));
+        assert_eq!(Dax::from_str("512M").unwrap(), Dax::Window(512 << 20));
+        // A bare count is MiB, like every other size this CLI takes.
+        assert_eq!(Dax::from_str("64").unwrap(), Dax::Window(64 << 20));
+        // What a YAML or TOML scalar turns "no" into all mean off.
+        for off in ["off", "false", "0", "no", " off "] {
+            assert_eq!(Dax::from_str(off).unwrap(), Dax::Off, "{off}");
+        }
+        // Under one FUSE DAX range the window could hold no mapping at all.
+        assert!(Dax::from_str("1M").is_err());
+        assert!(Dax::from_str("lots").is_err());
+        // Past the guest's whole span there is nowhere to put it: refused here rather than
+        // taken and then silently dropped at boot.
+        assert!(Dax::from_str("128G").is_err());
+        assert_eq!(
+            Dax::from_str(&format!("{}G", DAX_TOTAL_MAX >> 30)).unwrap(),
+            Dax::Window(DAX_TOTAL_MAX)
+        );
+        // Round-trips through the config file, which stores the policy as a string.
+        assert_eq!(DAX_DEFAULT.to_string(), "8G");
+        assert_eq!(Dax::Window(512 << 20).to_string(), "512M");
+        assert_eq!(
+            Dax::from_str(&DAX_DEFAULT.to_string()).unwrap(),
+            DAX_DEFAULT
+        );
+        assert_eq!(Dax::Off.to_string(), "off");
+        assert_eq!(Dax::Off.window(), None);
+        assert_eq!(DAX_DEFAULT.window(), Some(8 << 30));
+    }
+
+    fn dax_share(tag: &str, dax: Option<u64>) -> FsShare {
+        FsShare {
+            tag: tag.into(),
+            socket: PathBuf::new(),
+            host_dir: PathBuf::new(),
+            read_only: false,
+            dax,
+            uid_map: Vec::new(),
+            gid_map: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_dax_budget_drops_the_windows_that_do_not_fit() {
+        // Eight default windows fill the span exactly; the ninth gets none, and a share
+        // that asked for nothing is charged nothing.
+        let mut shares: Vec<FsShare> = (0..9)
+            .map(|i| dax_share(&format!("s{i}"), DAX_DEFAULT.window()))
+            .collect();
+        shares.push(dax_share("atop", None));
+        apply_dax_budget(&mut shares, "4G");
+        assert!(shares[..8].iter().all(|s| s.dax == DAX_DEFAULT.window()));
+        assert_eq!(shares[8].dax, None);
+        assert_eq!(shares[9].dax, None);
+    }
+
+    #[test]
+    fn the_dax_budget_charges_what_libkrun_will_actually_place() {
+        // libkrun rounds a window up to a power of two at a base aligned to it, so a 3G
+        // request occupies 4G: sixteen fit in the span, not the twenty a raw sum allows.
+        let mut shares: Vec<FsShare> = (0..20)
+            .map(|i| dax_share(&format!("s{i}"), Some(3 << 30)))
+            .collect();
+        apply_dax_budget(&mut shares, "4G");
+        assert_eq!(shares.iter().filter(|s| s.dax.is_some()).count(), 16);
+        // The alignment is what keeps this cursor equal to libkrun's; it cannot change how
+        // many fit, since every charged size and the span itself are powers of two, so the
+        // gap an alignment leaves is always smaller than the window that follows it.
+        let mut shares = vec![dax_share("small", Some(2 << 20))];
+        shares.extend((0..8).map(|i| dax_share(&format!("s{i}"), Some(8 << 30))));
+        apply_dax_budget(&mut shares, "4G");
+        assert_eq!(shares.iter().filter(|s| s.dax.is_some()).count(), 8);
+        assert_eq!(shares.last().unwrap().dax, None);
+    }
+
+    /// A guest whose RAM reaches the span's base is given no span, so telling its agent
+    /// about a window would earn a refused mount on every boot.
+    #[test]
+    fn a_guest_too_large_for_the_span_gets_no_windows_at_all() {
+        let shares = || vec![dax_share("work", DAX_DEFAULT.window())];
+        let mut s = shares();
+        apply_dax_budget(&mut s, &format!("{DAX_MAX_GUEST_MIB}M"));
+        assert_eq!(s[0].dax, DAX_DEFAULT.window());
+        let mut s = shares();
+        apply_dax_budget(&mut s, &format!("{}M", DAX_MAX_GUEST_MIB + 1));
+        assert_eq!(s[0].dax, None);
+        // A size this parser does not know is cloud-hypervisor's, where no share has a
+        // window to lose anyway.
+        let mut s = shares();
+        apply_dax_budget(&mut s, "64G@0");
+        assert_eq!(s[0].dax, DAX_DEFAULT.window());
+    }
+
     /// The CI path: API socket (graceful shutdown), a rw qcow2 overlay root,
     /// a virtio-fs share, a leased tap, balloon, shared memory.
     #[test]
@@ -839,6 +1072,7 @@ mod tests {
                 socket: "/job/vfsd.sock".into(),
                 host_dir: "/host/workdir".into(),
                 read_only: false,
+                dax: None,
                 uid_map: Vec::new(),
                 gid_map: Vec::new(),
             }],

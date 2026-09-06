@@ -394,6 +394,11 @@ pub struct Vm {
     /// a minute or two (multi-gen LRU); `"512M"`/`"2G"` or `"5%"` keep that much as a fixed
     /// floor; `"off"` keeps everything. What goes returns to the host through the balloon.
     pub reclaim: String,
+    /// DAX window per virtio-fs share in job and service VMs: a size (default `"8G"`) or
+    /// `"off"`. Maps the host page cache into guest address space, avoiding a copy per VM.
+    /// Reserves address space, not memory; libkrun only. Unset by default so cloud-hypervisor
+    /// can distinguish an explicit request for unsupported DAX from the default.
+    pub dax: Option<String>,
     /// Ceilings for the per-job MICROVM_CPUS/MICROVM_MEM variables; unset =
     /// jobs cannot request more than the cpus/mem defaults above
     pub max_cpus: Option<u32>,
@@ -421,6 +426,7 @@ impl Default for Vm {
             vsock_port: 4444,
             balloon: true,
             reclaim: "auto".into(),
+            dax: None,
             max_cpus: None,
             max_mem: None,
             nested: false,
