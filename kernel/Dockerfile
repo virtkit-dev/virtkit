@@ -2,7 +2,7 @@
 # (kernel-fragment.config — kata's non-confidential x86_64 set: virtio blk/net/vsock/pci
 # + ext4 + virtio-fs/FUSE + IP autoconfig, all built in, CONFIG_MODULES off) + virtkit's
 # removals overlay (kernel-removals.config — drops options virtkit never uses:
-# Mellanox/VFIO/SGX/NVDIMM/CIFS/9p/XFS/SCSI/FIPS, debug, exotic netfilter, CPU-freq/
+# Mellanox/VFIO/SGX/NVDIMM-pmem/CIFS/9p/XFS/SCSI/FIPS, debug, exotic netfilter, CPU-freq/
 # thermal/NUMA, and WireGuard/IPsec/VXLAN/tunnels — networking is host-side via the
 # switch, and jobs needing those ship their own per-bundle kernel). The result is the
 # pinned vmlinux a generic guest boots — no per-image kernel, initrd or modules.
@@ -90,6 +90,7 @@ RUN export ARCH=x86_64 \
     && for opt in CONFIG_64BIT CONFIG_SMP CONFIG_EXT4_FS CONFIG_VIRTIO_BLK \
                   CONFIG_VIRTIO_NET CONFIG_VIRTIO_PCI CONFIG_VIRTIO_VSOCKETS \
                   CONFIG_VIRTIO_FS CONFIG_FUSE_FS CONFIG_IP_PNP CONFIG_OVERLAY_FS \
+                  CONFIG_DAX CONFIG_FS_DAX CONFIG_FUSE_DAX \
                   CONFIG_BLK_DEV_INITRD CONFIG_DEVTMPFS_MOUNT \
                   CONFIG_KVM CONFIG_KVM_INTEL CONFIG_KVM_AMD CONFIG_KVM_IOAPIC \
                   CONFIG_ACPI CONFIG_ACPI_BUTTON CONFIG_INPUT_EVDEV \
