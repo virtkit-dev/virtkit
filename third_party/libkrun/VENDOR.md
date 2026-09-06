@@ -154,6 +154,29 @@ config-write path. x86_64 only; additive — the virtio-mmio transport, other ar
 INTx path when the guest leaves MSI-X disabled are unchanged. Covered by `virtio::msix`,
 `legacy::gsi`, and `legacy::pci` unit tests. Search for `MsixConfig` and `GsiRoutes`.
 
+`src/devices/src/virtio/pci.rs` + `src/devices/src/legacy/pci.rs` +
+`src/vmm/src/device_manager/shm.rs` + `src/vmm/src/builder.rs` +
+`src/arch/src/x86_64/{layout.rs,mod.rs,acpi.rs,dsdt.asl}` — advertise a device's shared-memory
+region over virtio-pci, so virtio-fs DAX works on x86_64. The transport carried only BAR0 and
+the capabilities pointing into it, and the region was reachable only through the virtio-mmio
+transport (which x86_64 never uses), so a guest saw no DAX window however large a `shm_size`
+the caller asked for. A device that has a region now also gets a 64-bit memory BAR2/BAR3 at it
+plus a `virtio_pci_cap64` shared-memory capability (cfg_type 8, shmid 0). The window is guest
+memory registered with KVM at a fixed address, not an emulated MMIO range, so the BAR cannot
+follow a write: the guest has to leave it where it is, and nothing enforces that. Two things
+make it — `SHM_MEM_START` fixes the regions' base at 64 GiB and the DSDT's `_CRS` declares
+exactly that 64 GiB span as a PCI host-bridge window (Linux drops a BAR no bridge window
+covers, and reassigns nothing inside one), and `place_fs_region` rounds each region to a power
+of two at a naturally aligned base, 2 MiB at the least, so the BAR describes it exactly. A
+virtio-fs window that does not fit the span (a guest whose RAM reaches into it, or one share
+too many) costs that share its DAX, not the boot; a gpu region that does not fit still fails
+the boot, as upstream has it. Additive — a device with no shm region gets the same
+config space as before, and the sizing, the alignment and the span are all x86_64-only, so the
+virtio-mmio transport is untouched. `set_memory_bar_64` now takes the BAR *number* the
+capability names rather than a pair index, so BAR2 is register 6 and not register 8. Covered by
+`arch::x86_64::acpi`, `vmm::device_manager::shm`, `virtio::pci` and `legacy::pci` tests. Search
+for `VIRTIO_PCI_CAP_SHARED_MEMORY_CFG` and `SHM_MEM_START`.
+
 `src/cpuid/src/transformer/{mod.rs,intel.rs}` + `src/vmm/src/linux/vstate.rs` +
 `src/vmm/src/resources.rs` + `src/vmm/src/builder.rs` + `src/libkrun/src/lib.rs` —
 opt-in guest PMU: `krun_set_pmu(ctx, enabled)` (mirroring `krun_set_nested_virt`)

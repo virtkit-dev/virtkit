@@ -1560,9 +1560,12 @@ pub fn create_guest_memory(
     #[cfg(not(feature = "tee"))]
     for (index, fs) in vm_resources.fs.iter().enumerate() {
         if let Some(shm_size) = fs.shm_size {
-            shm_manager
-                .create_fs_region(index, shm_size)
-                .map_err(StartMicrovmError::ShmCreate)?;
+            // A window that will not fit the guest-physical span reserved for them costs the
+            // share its DAX, not the boot: the device is attached with no shm region and the
+            // guest mounts it the ordinary way. (Local patch — see ../../VENDOR.md.)
+            if let Err(e) = shm_manager.create_fs_region(index, shm_size) {
+                warn!("virtio-fs {}: no DAX window: {e:?}", fs.fs_id);
+            }
         }
     }
     if vm_resources.gpu_virgl_flags.is_some() {

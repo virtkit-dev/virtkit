@@ -90,6 +90,17 @@ pub const FIRMWARE_START: u64 = 0xffff_0000;
 /// The size of the firmware.
 pub const FIRMWARE_SIZE: u64 = 65536;
 
+/// Base of the guest-physical span virtio-fs DAX windows are carved from, and its size.
+///
+/// Fixed, and far above any guest's RAM, so the DSDT can declare exactly this span as a
+/// 64-bit PCI host-bridge memory window: the virtio-pci transport exposes each window as a
+/// memory BAR, and Linux keeps a BAR only where a bridge window covers it. It ends at
+/// 128 GiB, so reaching it needs 37 physical address bits — libkrun passes the host's
+/// MAXPHYADDR through unmodified, so that is what the guest has to have.
+/// (Local patch — see ../../../VENDOR.md.)
+pub const SHM_MEM_START: u64 = 64 << 30;
+pub const SHM_MEM_SIZE: u64 = 64 << 30;
+
 /// The start of the memory area reserved for MMIO devices.
 pub const FIRST_ADDR_PAST_32BITS: u64 = 1 << 32;
 pub const MEM_32BIT_GAP_SIZE: u64 = 768 << 20;

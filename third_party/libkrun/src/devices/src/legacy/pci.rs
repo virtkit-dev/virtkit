@@ -136,14 +136,20 @@ impl PciDevice {
         dev
     }
 
-    /// Program a 64-bit memory BAR at `bar_index` (0 => BAR0/BAR1 pair).
+    /// Program a 64-bit memory BAR as the pair starting at `bar` (0 => BAR0/BAR1,
+    /// 2 => BAR2/BAR3). `bar` is the BAR number a capability's `bar` field names,
+    /// so it must be even.
     ///
     /// `base` is the assigned guest-physical base; `size` the region size (power
     /// of two). The low dword carries the memory-type bits (64-bit, non-prefetch)
     /// and lets the driver read back the size mask while probing; both dwords are
     /// writable so a standard BAR write-then-restore leaves the assigned base.
-    pub fn set_memory_bar_64(&mut self, bar_index: usize, base: u64, size: u64) {
-        let lo = BAR0_REGISTER + bar_index * 2;
+    pub fn set_memory_bar_64(&mut self, bar: usize, base: u64, size: u64) {
+        // An odd `bar` inverts the lo/hi parity test the size probe uses, so the low dword
+        // would report the high size mask.
+        debug_assert_eq!(bar % 2, 0, "a 64-bit BAR starts on an even BAR number");
+
+        let lo = BAR0_REGISTER + bar;
         let hi = lo + 1;
 
         // Low dword: base bits | 0b100 (64-bit memory, non-prefetchable).
@@ -176,7 +182,13 @@ impl PciDevice {
             bytes.push(0);
         }
 
-        // Write the capability bytes into the register array.
+        // Write the capability bytes into the register array. The list is statically built
+        // — six capabilities ending at 0xa8, inside the 0x100 bytes of config space — so
+        // this only has to name the limit for whoever adds the seventh.
+        debug_assert!(
+            cap_offset + bytes.len() <= NUM_CONFIG_REGISTERS * 4,
+            "capability list overflows config space"
+        );
         for (i, chunk) in bytes.chunks(4).enumerate() {
             let mut word = 0u32;
             for (b, byte) in chunk.iter().enumerate() {
@@ -620,6 +632,47 @@ mod tests {
         // Restore base.
         write_reg(&mut cfg, 1, 4, 0xd000_0000);
         assert_eq!(read_reg(&mut cfg, 1, 4) & 0xffff_fff0, 0xd000_0000);
+    }
+
+    /// A second 64-bit BAR lands on the BAR *number* it is given (BAR2 == register 6,
+    /// byte 0x18), which is what a virtio capability's `bar` field names. Getting this
+    /// wrong points the capability at an unprogrammed BAR and the guest sees no region.
+    #[test]
+    fn a_second_64_bit_bar_lands_on_the_bar_it_names() {
+        let mut ep = PciDevice::new_endpoint(0x1af4, 0x105a, 0xff, 0x00, 0x00, 1, 11);
+        ep.set_memory_bar_64(0, 0xe000_0000, 0x8_0000);
+        ep.set_memory_bar_64(2, 0x10_0000_0000, 8 << 30);
+        let mut bus = PciBus::new();
+        bus.add_device(1, Arc::new(Mutex::new(ep)));
+        let mut cfg = PciConfigIo::new(Arc::new(Mutex::new(bus)));
+
+        // BAR0/BAR1 (registers 4, 5) still hold the capability window.
+        assert_eq!(read_reg(&mut cfg, 1, 4), 0xe000_0000 | 0b100);
+        assert_eq!(read_reg(&mut cfg, 1, 5), 0);
+        // BAR2/BAR3 (registers 6, 7) hold the shared-memory window: the low dword keeps
+        // the 64-bit memory type bits, the high dword the address above 4 GiB.
+        assert_eq!(read_reg(&mut cfg, 1, 6), 0b100);
+        assert_eq!(read_reg(&mut cfg, 1, 7), 0x10);
+        // And it sizes as its own region, not BAR0's — low dword keeping its type bits,
+        // high dword carrying the rest of the mask.
+        write_reg(&mut cfg, 1, 6, 0xffff_ffff);
+        write_reg(&mut cfg, 1, 7, 0xffff_ffff);
+        let sized = read_reg(&mut cfg, 1, 6);
+        assert_eq!(
+            sized & 0xffff_fff0,
+            (!((8u64 << 30) - 1)) as u32 & 0xffff_fff0
+        );
+        assert_eq!(sized & 0xf, 0b100);
+        assert_eq!(
+            read_reg(&mut cfg, 1, 7),
+            ((!((8u64 << 30) - 1)) >> 32) as u32
+        );
+
+        // The write-back Linux performs after probing restores the assigned base.
+        write_reg(&mut cfg, 1, 6, 0);
+        write_reg(&mut cfg, 1, 7, 0x10);
+        assert_eq!(read_reg(&mut cfg, 1, 6), 0b100);
+        assert_eq!(read_reg(&mut cfg, 1, 7), 0x10);
     }
 
     #[test]

@@ -10,11 +10,15 @@
 //   device config @ 0x4000   (delegated to VirtioDevice::read_config/write_config)
 //   notify        @ 0x6000   (write kicks the selected queue's eventfd)
 //
+// A device that exposes a shared-memory region (virtio-fs's DAX window) also
+// gets a second 64-bit memory BAR (BAR2) covering it, advertised by a
+// `virtio_pci_cap64` shared-memory capability.
+//
 // Interrupts are delivered over the device's INTx line: on a used-queue the ISR
 // bit 0 is set and the INTx GSI asserted (reusing `InterruptTransport`, which
 // already sets the status word and pokes the irqchip via an eventfd registered
-// against the GSI with `register_irqfd`). MSI-X is deliberately not implemented
-// here; the guest's `virtio_pci` driver falls back to INTx.
+// against the GSI with `register_irqfd`). A guest that enables MSI-X instead gets
+// per-vector delivery; INTx is the fallback when it does not.
 //
 // The companion legacy PCI config space (header, BARs, capabilities pointing
 // into this BAR) is built by `pci_config_space()` and lives on the `PciBus`.
@@ -66,6 +70,14 @@ const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
 const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
 const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
+const VIRTIO_PCI_CAP_SHARED_MEMORY_CFG: u8 = 8;
+
+/// BAR number holding a device's shared-memory region (a 64-bit pair, so BAR2 + BAR3).
+/// BAR0/BAR1 are the capability window.
+const SHM_BAR: usize = 2;
+/// virtio-fs shared-memory id of the DAX window (virtio spec 5.11.2). The only
+/// shared-memory region any device here exposes.
+const VIRTIO_FS_SHMCAP_ID_CACHE: u8 = 0;
 
 /// Modern virtio-pci common configuration negotiation state (virtio spec
 /// 4.1.4.3). Semantics adapted from cloud-hypervisor's `VirtioPciCommonConfig`,
@@ -247,9 +259,10 @@ impl VirtioPciDevice {
         self.msix.lock().unwrap().set_routes(routes);
     }
 
-    /// Build the legacy PCI config space (header + BAR0 + virtio capabilities)
+    /// Build the legacy PCI config space (header + BARs + virtio capabilities)
     /// describing this transport. `bar_base` is the assigned BAR0 guest-physical
-    /// base; `interrupt_line` the INTx GSI the guest wires to the IOAPIC.
+    /// base; `interrupt_line` the INTx GSI the guest wires to the IOAPIC. A
+    /// device with a shared-memory region also gets BAR2 pinned at that region.
     pub fn pci_config_space(&self, bar_base: u64, interrupt_line: u8) -> PciDevice {
         let device_type = self.device.lock().unwrap().device_type();
         let device_id = VIRTIO_PCI_DEVICE_ID_BASE + device_type as u16;
@@ -304,6 +317,28 @@ impl VirtioPciDevice {
             NUM_VECTORS,
             self.msix.clone(),
         );
+
+        // Shared-memory region (virtio-fs's DAX window), if the device has one:
+        // a second 64-bit memory BAR covering it plus the capability pointing
+        // there. The BAR carries the guest-physical address the region was
+        // registered with KVM at, and the guest is expected to leave it there —
+        // the window is guest memory, not an emulated MMIO range, so a BAR write
+        // that moved it would hand the fuse driver an address with no memslot
+        // behind it. Nothing enforces that; the DSDT declaring the span as a
+        // host-bridge window is what keeps Linux from reassigning it, and
+        // `ShmManager` sizes and aligns the region so it is a valid BAR (power
+        // of two, naturally aligned).
+        if let Some(shm) = self.device.lock().unwrap().shm_region() {
+            let size = shm.size as u64;
+            dev.set_memory_bar_64(SHM_BAR, shm.guest_addr, size);
+            dev.add_vendor_capability(&virtio_pci_cap64(
+                VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
+                SHM_BAR as u8,
+                VIRTIO_FS_SHMCAP_ID_CACHE,
+                0,
+                size,
+            ));
+        }
 
         dev
     }
@@ -605,34 +640,95 @@ fn write_value(data: &mut [u8], v: u64) {
     }
 }
 
-/// Serialise a `struct virtio_pci_cap` body (from `cap_len` onwards). The 16
-/// bytes are: cap_len, cfg_type, bar, id, padding[2], offset (le32), length
-/// (le32). `add_vendor_capability` prepends the id + next bytes.
-fn virtio_pci_cap(cfg_type: u8, offset: u32, length: u32) -> Vec<u8> {
-    let cap_len: u8 = 16; // includes the id+next bytes prepended by the caller
+/// Serialise a `struct virtio_pci_cap` body (from `cap_len` onwards): the 14 bytes
+/// cap_len, cfg_type, bar, id, padding[2], offset (le32), length (le32).
+/// `add_vendor_capability` prepends the id + next bytes, making the capability 16
+/// bytes, which is what `cap_len` reports.
+fn virtio_pci_cap_body(cfg_type: u8, bar: u8, id: u8, offset: u32, length: u32) -> Vec<u8> {
     let mut b = Vec::with_capacity(14);
-    b.push(cap_len);
+    b.push(16); // cap_len
     b.push(cfg_type);
-    b.push(0); // pci_bar = BAR0
-    b.push(0); // id
+    b.push(bar);
+    b.push(id);
     b.extend_from_slice(&[0, 0]); // padding
     b.extend_from_slice(&offset.to_le_bytes());
     b.extend_from_slice(&length.to_le_bytes());
     b
 }
 
+/// Serialise a `struct virtio_pci_cap` body for a region in BAR0.
+fn virtio_pci_cap(cfg_type: u8, offset: u32, length: u32) -> Vec<u8> {
+    virtio_pci_cap_body(cfg_type, 0, 0, offset, length)
+}
+
 /// Serialise a `struct virtio_pci_notify_cap` body (the common cap fields plus a
 /// trailing le32 `notify_off_multiplier`).
 fn virtio_pci_notify_cap(offset: u32, length: u32, multiplier: u32) -> Vec<u8> {
-    let cap_len: u8 = 20;
-    let mut b = Vec::with_capacity(18);
-    b.push(cap_len);
-    b.push(VIRTIO_PCI_CAP_NOTIFY_CFG);
-    b.push(0); // pci_bar = BAR0
-    b.push(0); // id
-    b.extend_from_slice(&[0, 0]); // padding
-    b.extend_from_slice(&offset.to_le_bytes());
-    b.extend_from_slice(&length.to_le_bytes());
+    let mut b = virtio_pci_cap(VIRTIO_PCI_CAP_NOTIFY_CFG, offset, length);
+    b[0] = 20; // cap_len
     b.extend_from_slice(&multiplier.to_le_bytes());
     b
+}
+
+/// Serialise a `struct virtio_pci_cap64` body: the common cap fields (whose
+/// `offset`/`length` carry the low 32 bits) followed by le32 `offset_hi` and
+/// `length_hi`. Used for the shared-memory capability, whose region can exceed
+/// 4 GiB.
+fn virtio_pci_cap64(cfg_type: u8, bar: u8, id: u8, offset: u64, length: u64) -> Vec<u8> {
+    let mut b = virtio_pci_cap_body(cfg_type, bar, id, offset as u32, length as u32);
+    b[0] = 24; // cap_len
+    b.extend_from_slice(&((offset >> 32) as u32).to_le_bytes());
+    b.extend_from_slice(&((length >> 32) as u32).to_le_bytes());
+    b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `struct virtio_pci_cap` body, as the spec lays it out from `cap_len`.
+    #[test]
+    fn cap_body_layout() {
+        let b = virtio_pci_cap(VIRTIO_PCI_CAP_COMMON_CFG, 0x1234, 56);
+        assert_eq!(b.len(), 14);
+        assert_eq!(b[0], 16); // cap_len, counting the id+next bytes
+        assert_eq!(b[1], VIRTIO_PCI_CAP_COMMON_CFG);
+        assert_eq!(b[2], 0); // BAR0
+        assert_eq!(&b[6..10], &0x1234u32.to_le_bytes());
+        assert_eq!(&b[10..14], &56u32.to_le_bytes());
+    }
+
+    /// The notify capability appends `notify_off_multiplier` and grows `cap_len`.
+    #[test]
+    fn notify_cap_appends_multiplier() {
+        let b = virtio_pci_notify_cap(NOTIFICATION_BAR_OFFSET as u32, 0x1000, 4);
+        assert_eq!(b.len(), 18);
+        assert_eq!(b[0], 20);
+        assert_eq!(b[1], VIRTIO_PCI_CAP_NOTIFY_CFG);
+        assert_eq!(&b[14..18], &4u32.to_le_bytes());
+    }
+
+    /// The shared-memory capability is a `virtio_pci_cap64`: the high halves of
+    /// offset and length follow the common fields, so a window larger than 4 GiB
+    /// is described exactly.
+    #[test]
+    fn shm_cap64_carries_high_halves() {
+        let size: u64 = 8 << 30;
+        let b = virtio_pci_cap64(
+            VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
+            SHM_BAR as u8,
+            VIRTIO_FS_SHMCAP_ID_CACHE,
+            0,
+            size,
+        );
+        assert_eq!(b.len(), 22);
+        assert_eq!(b[0], 24); // cap_len
+        assert_eq!(b[1], VIRTIO_PCI_CAP_SHARED_MEMORY_CFG);
+        assert_eq!(b[2], 2); // BAR2
+        assert_eq!(b[3], VIRTIO_FS_SHMCAP_ID_CACHE);
+        assert_eq!(&b[6..10], &0u32.to_le_bytes()); // offset lo
+        assert_eq!(&b[10..14], &(size as u32).to_le_bytes()); // length lo
+        assert_eq!(&b[14..18], &0u32.to_le_bytes()); // offset hi
+        assert_eq!(&b[18..22], &((size >> 32) as u32).to_le_bytes()); // length hi
+    }
 }

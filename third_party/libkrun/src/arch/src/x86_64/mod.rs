@@ -79,7 +79,7 @@ pub fn arch_memory_regions(
         match size.checked_sub(MMIO_MEM_START as usize) {
             // case1: guest memory fits before the gap
             None | Some(0) => {
-                let shm_start_addr = FIRST_ADDR_PAST_32BITS;
+                let shm_start_addr = layout::SHM_MEM_START;
 
                 let (ram_last_addr, mut regions) = if let Some(kernel_load_addr) = kernel_load_addr
                 {
@@ -121,7 +121,14 @@ pub fn arch_memory_regions(
             // case2: guest memory extends beyond the gap
             Some(remaining) => {
                 let ram_last_addr = FIRST_ADDR_PAST_32BITS + remaining as u64;
-                let shm_start_addr = ((ram_last_addr / 0x4000_0000) + 1) * 0x4000_0000;
+                // Shared-memory regions live in the fixed span the DSDT declares as a PCI
+                // host-bridge window (see layout::SHM_MEM_START). A guest whose RAM reaches
+                // into it gets no span at all rather than one the guest would discard.
+                let shm_start_addr = if ram_last_addr <= layout::SHM_MEM_START {
+                    layout::SHM_MEM_START
+                } else {
+                    0
+                };
 
                 let mut regions = if let Some(kernel_load_addr) = kernel_load_addr {
                     vec![

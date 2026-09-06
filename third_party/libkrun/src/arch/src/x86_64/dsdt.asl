@@ -2,7 +2,12 @@
  * Minimal DSDT for libkrun x86_64 guests. Two jobs only:
  *  - \_S5 so Linux wires up ACPI power-off (writes SLP_TYP=5|SLP_EN to PM1a_CNT).
  *  - \_SB.PCI0, a PNP0A03 host bridge with a _CRS, so the guest enumerates the
- *    virtio-pci bus through ACPI instead of the legacy MP-table path.
+ *    virtio-pci bus through ACPI instead of the legacy MP-table path. Its _CRS declares
+ *    the 32-bit window the virtio BAR0s are placed in, and a 64-bit window covering
+ *    layout::SHM_MEM_START..+SHM_MEM_SIZE, where virtio-fs DAX windows live: Linux keeps
+ *    a BAR only where a bridge window covers it. The 64-bit window is unconditional while
+ *    the span is not — a guest with more than SHM_MEM_START of RAM gets no span, and Linux
+ *    then drops the window as conflicting with System RAM. It has no DAX windows to lose.
  * No _PRT: virtio uses MSI-X, and an INTx fallback lands on interrupt_line (GSI 5),
  * matching libkrun's edge/high one-shot KVM_IRQFD delivery. No PM/GPE methods:
  * the power button is a fixed-feature button (FADT PWR_BUTTON flag clear).
@@ -40,6 +45,10 @@ DefinitionBlock ("", "DSDT", 2, "KRUN  ", "KRUNVKIT", 0x00000001)
                 DWordMemory (ResourceProducer, PosDecode, MinFixed, MaxFixed,
                     NonCacheable, ReadWrite,
                     0x00000000, 0xE0000000, 0xFEBFFFFF, 0x00000000, 0x1EC00000)
+                QWordMemory (ResourceProducer, PosDecode, MinFixed, MaxFixed,
+                    NonCacheable, ReadWrite,
+                    0x0000000000000000, 0x0000001000000000, 0x0000001FFFFFFFFF,
+                    0x0000000000000000, 0x0000001000000000)
             })
         }
     }
