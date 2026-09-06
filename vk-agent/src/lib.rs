@@ -19,6 +19,7 @@ pub mod memmark;
 pub mod netcfg;
 pub mod oomkills;
 pub mod poweroff;
+pub mod reclaim;
 #[cfg(feature = "ssh")]
 pub mod sftp;
 #[cfg(feature = "ssh")]

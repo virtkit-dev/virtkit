@@ -4,6 +4,16 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Idle guests give their file cache back to the host.** A VM that read a few gigabytes used
+  to hold that memory for good, duplicated in the host's page cache or, on a busy host, its
+  swap. A guest that is not under memory pressure now returns the file cache it has stopped
+  using and keeps what it is still re-reading — on an 8G dev VM holding 5G of cache, the VMM's
+  host footprint fell from 7.7G to 1.3G. `vk run --reclaim`, a service's `x-virtkit.reclaim`
+  and the executor's `[vm] reclaim` default to `auto` and also take `off`, or a size or share
+  of RAM to keep cached.
+
 ## [0.61.0] - 2026-09-05
 
 ### Added

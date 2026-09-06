@@ -292,7 +292,9 @@ pub struct Gitlab {
     /// share — one directory, its own, which it can write anything and any amount into and
     /// leave symlinks in, so a reader of the log opens it without following them; and the
     /// guest kernel is booted with `psi=1`, which the guest's own scheduler pays for in
-    /// exchange for the pressure figures. `false` gives up the recording and both.
+    /// exchange for the pressure figures. `false` gives up the recording and the share; idle
+    /// page-cache trimming asks for `psi=1` as well, so the guest keeps paying for it unless
+    /// `[vm] reclaim` is `"off"` (or `[vm] balloon` is, which stops the trimming too).
     pub atop: bool,
     /// Seconds between samples. Must be at least 1. Default 30, matching the interval the
     /// runner hosts' own atop uses, so the two logs read at the same resolution.
@@ -387,6 +389,11 @@ pub struct Vm {
     /// virtio-balloon with free_page_reporting: memory freed by the guest
     /// returns to the host mid-job, making overcommit safe (like containers)
     pub balloon: bool,
+    /// Idle page-cache trimming in every guest this host boots (job and service VMs), done
+    /// while the guest is not under memory pressure. `"auto"` evicts file cache untouched for
+    /// a minute or two (multi-gen LRU); `"512M"`/`"2G"` or `"5%"` keep that much as a fixed
+    /// floor; `"off"` keeps everything. What goes returns to the host through the balloon.
+    pub reclaim: String,
     /// Ceilings for the per-job MICROVM_CPUS/MICROVM_MEM variables; unset =
     /// jobs cannot request more than the cpus/mem defaults above
     pub max_cpus: Option<u32>,
@@ -413,6 +420,7 @@ impl Default for Vm {
             hostname: "runner".into(),
             vsock_port: 4444,
             balloon: true,
+            reclaim: "auto".into(),
             max_cpus: None,
             max_mem: None,
             nested: false,

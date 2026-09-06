@@ -16,6 +16,11 @@
 # hostname = "runner"
 # vsock_port = 4444
 # balloon = true       # free_page_reporting: freed guest RAM returns to the host
+# reclaim = "auto"     # idle file cache a guest gives back to the host: "auto" evicts what
+#                      # it has not touched for a minute or two (multi-gen LRU); "512M",
+#                      # "2G" or "5%" keep that much cache as a fixed floor; "off" keeps all.
+#                      # Rides on the balloon, so `balloon = false` stops the job VM trimming;
+#                      # its services keep a balloon of their own and go on trimming
 # max_cpus = 32        # ceilings for the per-job MICROVM_CPUS/MICROVM_MEM
 # max_mem = "128G"     # variables (unset = jobs cannot exceed cpus/mem above)
 # nested = false       # let jobs boot microVMs of their own (vk inside vk); needs

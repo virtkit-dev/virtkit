@@ -1289,10 +1289,23 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                 uid_map: Vec::new(),
                 gid_map: Vec::new(),
             });
-            cmdline.push_str(&vk_core::atop::cmdline_knob(crate::atop::interval_secs(
-                cfg,
-            )?));
+            crate::run::push_knob(
+                &mut cmdline,
+                &vk_core::atop::cmdline_knob(crate::atop::interval_secs(cfg)?),
+            );
         }
+    }
+
+    // Idle page-cache trimming (`[vm] reclaim`): the job guest gives file cache it stopped
+    // using back to the host whenever it is not under memory pressure, so a job's read-once
+    // trees stop counting against the box once it moves on. The job guest always keeps the
+    // agent as PID 1, so `[vm] balloon` is the only axis that can take the knob away —
+    // without free-page reporting the job would lose its cache and the host would gain
+    // nothing. Its services keep a balloon of their own whatever this says, so `plan_services`
+    // hands them `[vm] reclaim` regardless.
+    let reclaim = vm_reclaim(cfg)?;
+    if crate::run::wants_reclaim(crate::run::InitSource::Default, cfg.vm.balloon) {
+        crate::run::push_knob(&mut cmdline, &crate::run::reclaim_cmdline(reclaim, &mem)?);
     }
 
     let mut net = crate::vmm::Net::None;
@@ -1643,9 +1656,12 @@ fn plan_services(
     // allocator for the job's whole LAN, so no two services are handed the same address. The
     // job VM itself stays on one NIC: the executor has no axis to ask for more.
     let mut extra = crate::units::ExtraNics::after_slots(units.len() as u32);
+    let reclaim = vm_reclaim(&ctx.cfg)?;
     for (slot, mut unit) in units.into_iter().enumerate() {
         // A compose service's declared sizing obeys the same host ceilings as the job's own.
         clamp_service_size(&ctx.cfg, &mut unit)?;
+        // A service without an x-virtkit.reclaim of its own trims like the job guest does.
+        unit.reclaim = unit.reclaim.or(Some(reclaim));
         let extra_ips = extra.take(gateway, prefix, unit.nics.saturating_sub(1))?;
         // The three media paths resolve the image differently but site the unit identically.
         let siting = |slot: usize, extra_ips: Vec<Ipv4Addr>| crate::units::Siting {
@@ -1965,6 +1981,14 @@ fn narrow_ips(cap: Option<&[String]>, req: &str, var: &str) -> Result<Vec<String
         }
     }
     Ok(requested)
+}
+
+/// `[vm] reclaim` as a policy; a misspelt value fails prepare naming the key.
+fn vm_reclaim(cfg: &crate::config::Config) -> Result<vk_core::reclaim::Policy> {
+    cfg.vm
+        .reclaim
+        .parse()
+        .map_err(|e| anyhow!("[vm] reclaim: {e}"))
 }
 
 /// Effective vCPU count and memory size: the job's MICROVM_CPUS/MICROVM_MEM

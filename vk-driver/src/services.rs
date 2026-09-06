@@ -78,6 +78,7 @@ pub fn to_units(services: Vec<Service>) -> Vec<crate::compose::Unit> {
             kernel: crate::run::KernelSource::Default,
             cpus: None,
             mem: None,
+            reclaim: None,
             nested: false,
             nics: 1,
             persist_root_backing: None,

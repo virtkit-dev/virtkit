@@ -56,6 +56,13 @@
 //!                        read-write and fork the guest statistics sampler on it: one
 //!                        atop-parseable sample of this guest's /proc per interval,
 //!                        appended to <mountpoint>/atop.log (see the `atop` module)
+//!   VIRTKIT_RECLAIM      auto:<floor_mib> | <floor_mib> — fork the page-cache trimmer:
+//!                        while this guest is not under memory pressure, file cache it has
+//!                        not touched for a while (`auto`, via the multi-gen LRU) or above
+//!                        the floor is reclaimed and reported back to the host. The trimmer
+//!                        mounts what its mode needs — debugfs, or cgroup2 for the floor
+//!                        (the `reclaim` module). Agent-as-PID-1 boots only; the host sends
+//!                        it to no other
 //!   VIRTKIT_MEMMARK=1    keep this guest's peak memory demand (MemTotal - MemAvailable)
 //!                        in a PID 1 sampler, for `vk-agent memmark` to read back at
 //!                        teardown (see the `memmark` module). Set by the build backend
@@ -179,6 +186,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     apply_symlinks(&cmdline);
     link_ci_tools(&cmdline); // host CI tools (git/git-lfs/…) onto PATH, if the image lacks them
     maybe_atop(&cmdline); // record this guest's own stats, before anything else runs in it
+    maybe_reclaim(&cmdline); // give idle file cache back to the host, in every agent-init mode
     configure_network(&cmdline);
     write_resolv_conf(&cmdline); // DNS for every net mode (kernel `ip=` pool + static bridge)
     apply_tmpfs(&cmdline); // RAM scratch dirs (e.g. CI /builds) before the payload starts
@@ -769,7 +777,7 @@ fn mount_tmpfs_keep_dirs(target: &str, flags: libc::c_ulong, data: &str) -> io::
 }
 
 /// `mount(2)` wrapper (source/target/fstype, no data).
-fn mount(src: &str, target: &str, fstype: &str, flags: libc::c_ulong) -> io::Result<()> {
+pub(crate) fn mount(src: &str, target: &str, fstype: &str, flags: libc::c_ulong) -> io::Result<()> {
     let (c_src, c_tgt, c_fs) = (cstr(src), cstr(target), cstr(fstype));
     let rc = unsafe {
         libc::mount(
@@ -1574,6 +1582,26 @@ fn link_ci_tools(cmdline: &HashMap<String, String>) {
             unsafe { std::env::set_var("GIT_SSL_CAINFO", ca) };
             info!("vk-agent init: GIT_SSL_CAINFO={ca}");
         }
+    }
+}
+
+/// `VIRTKIT_RECLAIM=[auto:]<floor_mib>`: fork the page-cache trimmer (the `reclaim` module).
+/// Mounts are mode-specific: age-based trimming does not add a cgroup2 hierarchy.
+/// Best effort: a guest that cannot trim still runs.
+fn maybe_reclaim(cmdline: &HashMap<String, String>) {
+    let Some(spec) = cmdline.get(vk_core::reclaim::CMDLINE_KEY) else {
+        return;
+    };
+    if vk_core::reclaim::parse_cmdline_value(spec).is_none() {
+        warn!(
+            "vk-agent init: bad {} {spec:?} (want [auto:]<floor_mib>)",
+            vk_core::reclaim::CMDLINE_KEY
+        );
+        return;
+    }
+    // The trimmer re-parses the same spec (validated above).
+    if let Err(e) = fork_agent(&["reclaim".into(), spec.clone()]) {
+        warn!("vk-agent init: page-cache trimmer failed to start: {e}");
     }
 }
 

@@ -242,6 +242,14 @@ fn main() {
         let rest: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(vk_agent::oomkills::main(&rest));
     }
+    // The idle page-cache trimmer (no socket): init forks `vk-agent reclaim <spec>` at boot
+    // when the cmdline asks for it, and it gives file cache this guest stopped using back to
+    // the host whenever the guest is not under memory pressure.
+    if std::env::args().nth(1).as_deref() == Some("reclaim") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        install_console_logger(LevelFilter::Info); // its reports land beside init's own lines
+        std::process::exit(vk_agent::reclaim::main(&rest));
+    }
     // The guest statistics sampler (no socket): init forks `vk-agent atop <dir>
     // <interval_secs>` at boot when the cmdline asks for it, and it appends atop-parseable
     // samples of this guest's /proc to the host archive share until SIGUSR2.

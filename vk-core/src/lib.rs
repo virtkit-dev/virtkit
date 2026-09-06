@@ -15,5 +15,6 @@ pub mod messages;
 pub mod net;
 pub mod oomkills;
 pub mod pty;
+pub mod reclaim;
 pub mod runcfg;
 pub mod status;

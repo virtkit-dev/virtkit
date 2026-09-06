@@ -249,6 +249,9 @@ pub struct RunArgs {
     pub service_cpus: Vec<(String, u32)>,
     pub service_mem: Vec<(String, String)>,
     pub service_nics: Vec<(String, u32)>,
+    /// How the guests trim idle file cache (`--reclaim`): the primary's policy, and the
+    /// default for every service without an `x-virtkit.reclaim` of its own. `None` = `auto`.
+    pub reclaim: Option<vk_core::reclaim::Policy>,
     pub boot_timeout_secs: u64,
     /// `--vm-name` template for the VMM process name, `{name}` expanding to the stage /
     /// image / service name (see [`crate::vmm::resolve_proc_name`]). Default `vk:{name}`.
@@ -894,6 +897,7 @@ async fn build_and_boot(
         &args.service_mem,
         &args.service_nics,
     )?;
+    default_reclaim(&mut compose_units, args.reclaim);
     let mut image_env: Vec<(String, String)> = Vec::new();
     // The image's entrypoint, cmd and workdir, applied to the guest command like
     // `docker run`: the entrypoint is prepended to a trailing command, the workdir is
@@ -1020,9 +1024,15 @@ async fn build_and_boot(
     // Effective primary sizing, same precedence as the axes: an explicit --cpus/--mem
     // overrides the --primary service's own x-virtkit sizing (which already carries
     // any --service-cpus/--service-mem override); absent both, the run defaults.
-    let (marker_cpus, marker_mem) = primary_idx
-        .map(|i| (compose_units[i].cpus, compose_units[i].mem.clone()))
-        .unwrap_or((None, None));
+    let (marker_cpus, marker_mem, marker_reclaim) = primary_idx
+        .map(|i| {
+            (
+                compose_units[i].cpus,
+                compose_units[i].mem.clone(),
+                compose_units[i].reclaim,
+            )
+        })
+        .unwrap_or((None, None, None));
     let cpus = args
         .cpus
         .or(marker_cpus)
@@ -1371,6 +1381,17 @@ async fn build_and_boot(
             )
         };
     timings.record(Phase::BootMedia, "", t_media.elapsed());
+
+    // Idle page-cache trimming: the --primary service's own x-virtkit.reclaim (already
+    // carrying --reclaim, which default_reclaim pushed into every marker-less unit), else
+    // auto. The guest gives file cache it stopped using back to the host whenever it is not
+    // under memory pressure. `vk run` always attaches a balloon.
+    if wants_reclaim(eff_init, true) {
+        push_knob(
+            &mut cmdline,
+            &reclaim_cmdline(effective_reclaim(marker_reclaim, args.reclaim), &mem)?,
+        );
+    }
 
     // The agent is PID 1 and receives no usable argv, so its exec-idle watchdog is
     // configured through the kernel cmdline. Zero deliberately adds no watchdog while
@@ -1791,7 +1812,7 @@ async fn build_and_boot(
                 uid_map: Vec::new(),
                 gid_map: Vec::new(),
             });
-            cmdline.push_str(&vk_core::atop::cmdline_knob(secs));
+            push_knob(&mut cmdline, &vk_core::atop::cmdline_knob(secs));
             println!(
                 "virtkit: recording guest stats every {secs}s -> {} (`vk atop` to watch)",
                 log.display()
@@ -2336,6 +2357,52 @@ fn eager_build_selection(
         .collect()
 }
 
+/// Give every unit without an `x-virtkit.reclaim` of its own the run's `--reclaim` policy
+/// (`None` leaves them to the boot-time default, `auto`).
+fn default_reclaim(units: &mut [crate::compose::Unit], policy: Option<vk_core::reclaim::Policy>) {
+    for unit in units {
+        unit.reclaim = unit.reclaim.or(policy);
+    }
+}
+
+/// Enable trimming only with agent PID 1 and a balloon. `run_init` reads the knob;
+/// `image`/`entrypoint` init execs the image's PID 1, leaving an unused `VIRTKIT_RECLAIM`
+/// environment variable and `psi=1`. An image *kernel* keeps the agent and remains eligible.
+/// Without balloon free-page reporting, trimming loses guest cache without freeing host RAM.
+pub(crate) fn wants_reclaim(init: InitSource, balloon: bool) -> bool {
+    !init.is_image() && balloon
+}
+
+/// Prefer the guest's `x-virtkit.reclaim`, then the run's `--reclaim` / `[vm] reclaim`,
+/// then `auto`.
+pub(crate) fn effective_reclaim(
+    declared: Option<vk_core::reclaim::Policy>,
+    fallback: Option<vk_core::reclaim::Policy>,
+) -> vk_core::reclaim::Policy {
+    declared
+        .or(fallback)
+        .unwrap_or(vk_core::reclaim::Policy::Auto)
+}
+
+/// The cmdline fragment for a guest's idle page-cache trimming under `policy`, its floor sized
+/// against the guest RAM `mem` (`<n>G`, `<n>M` or MiB). Empty when the policy is `off`.
+pub(crate) fn reclaim_cmdline(policy: vk_core::reclaim::Policy, mem: &str) -> Result<String> {
+    let mem_mib = parse_mem_mib(mem).with_context(|| format!("invalid guest RAM {mem:?}"))?;
+    Ok(vk_core::reclaim::cmdline_knob(policy, mem_mib))
+}
+
+/// Append a knob, dropping a `psi=1` the cmdline already carries. Both the atop knob and the
+/// reclaim knob ask the kernel for pressure stall information, and a guest that records and
+/// trims wants it asked for once — a repeated parameter is harmless to the kernel and
+/// confusing in `vk logs`.
+pub(crate) fn push_knob(cmdline: &mut String, knob: &str) {
+    if cmdline.contains(" psi=1") {
+        cmdline.push_str(&knob.replace(" psi=1", ""));
+    } else {
+        cmdline.push_str(knob);
+    }
+}
+
 /// Resolve a `--primary` service name to its index in `units`, erroring with the list of
 /// declared services when it isn't found — so the build and run paths report the same message.
 fn resolve_primary(units: &[crate::compose::Unit], name: &str) -> Result<usize> {
@@ -2610,6 +2677,7 @@ async fn compose_up(
         &args.service_mem,
         &args.service_nics,
     )?;
+    default_reclaim(&mut units, args.reclaim);
     // What the fleet costs the host while it is up (see `usage`). Opened before
     // `plan_services`, which builds nothing but does resolve and materialize every `image:`
     // service — work that falls inside the window in the run above, so metering it here too
@@ -3828,7 +3896,9 @@ pub(crate) fn build_scratch_disk(image: &Path) -> Result<PathBuf> {
 /// virtio-fs and vsock fragments are appended by the caller as it provisions each.
 ///
 /// `VIRTKIT_MEMMARK=1` is limited to build guests, whose marks are read before source-batch
-/// reboots and at stage end.
+/// reboots and at stage end. It is also why no `VIRTKIT_RECLAIM` rides here: trimming raises
+/// `MemAvailable`, which is the very thing the mark measures against, and a stage guest is
+/// torn down at the end of the stage anyway.
 fn build_guest_cmdline(tmp_dev: Option<&str>, image_kernel: bool) -> String {
     let mut cmdline = format!(
         "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda \
@@ -4450,6 +4520,7 @@ mod tests {
             nics: None,
             service_mem: vec![],
             service_nics: vec![],
+            reclaim: None,
             boot_timeout_secs: 0,
             vm_name: String::new(),
             ram: false,
@@ -4487,6 +4558,99 @@ mod tests {
             detach_log: None,
             command: vec![],
         }
+    }
+
+    // The three reclaim knobs resolve in one order everywhere: a service's own
+    // `x-virtkit.reclaim` wins, then the run's `--reclaim`, then `auto`. The primary's
+    // marker is what a `--reclaim`-less run gives the primary guest.
+    #[test]
+    fn reclaim_precedence_runs_service_marker_then_flag_then_auto() {
+        use vk_core::reclaim::Policy;
+        let units =
+            |yaml: &str| crate::compose::parse(yaml, Path::new("/base"), &|_| None, None).unwrap();
+        let yaml = "services:\n  a:\n    image: x\n    x-virtkit: { reclaim: off }\n\
+                    \x20 b:\n    image: y\n";
+        let policy = |units: &[crate::compose::Unit], name: &str| {
+            units.iter().find(|u| u.name == name).unwrap().reclaim
+        };
+
+        // No --reclaim: the declaring service keeps its own, the other is left to the
+        // boot-time default rather than being pinned here.
+        let mut u = units(yaml);
+        default_reclaim(&mut u, None);
+        assert_eq!(policy(&u, "a"), Some(Policy::Off));
+        assert_eq!(policy(&u, "b"), None);
+
+        // --reclaim fills in only the services that declared nothing.
+        let mut u = units(yaml);
+        default_reclaim(&mut u, Some(Policy::Percent(5)));
+        assert_eq!(policy(&u, "a"), Some(Policy::Off));
+        assert_eq!(policy(&u, "b"), Some(Policy::Percent(5)));
+
+        // Both guest kinds resolve their own policy through the same helper: what the
+        // service declared wins, then the run-wide flag, then auto.
+        assert_eq!(effective_reclaim(None, None), Policy::Auto);
+        assert_eq!(
+            effective_reclaim(None, Some(Policy::Percent(5))),
+            Policy::Percent(5)
+        );
+        assert_eq!(effective_reclaim(Some(Policy::Off), None), Policy::Off);
+        assert_eq!(
+            effective_reclaim(Some(Policy::Off), Some(Policy::Floor(64))),
+            Policy::Off
+        );
+    }
+
+    // Who gets the knob at all: the agent has to stay PID 1 to read it, and the balloon has
+    // to be there to carry what it frees.
+    #[test]
+    fn only_an_agent_init_guest_with_a_balloon_gets_the_reclaim_knob() {
+        assert!(wants_reclaim(InitSource::Default, true));
+        // An image kernel still keeps the agent as PID 1; only the init axis takes it away.
+        assert!(!wants_reclaim(InitSource::Image, true));
+        assert!(!wants_reclaim(InitSource::Entrypoint, true));
+        assert!(!wants_reclaim(InitSource::Default, false));
+    }
+
+    #[test]
+    fn reclaim_cmdline_sizes_the_floor_and_says_nothing_when_off() {
+        use vk_core::reclaim::Policy;
+        assert_eq!(
+            reclaim_cmdline(Policy::Auto, "4G").unwrap(),
+            " VIRTKIT_RECLAIM=auto:256 psi=1"
+        );
+        assert_eq!(
+            reclaim_cmdline(Policy::Percent(25), "4G").unwrap(),
+            " VIRTKIT_RECLAIM=1024 psi=1"
+        );
+        assert_eq!(reclaim_cmdline(Policy::Off, "4G").unwrap(), "");
+        // A guest RAM the sizer cannot read is an error naming it, not a silent floor.
+        let e = reclaim_cmdline(Policy::Auto, "lots")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("lots"), "{e}");
+    }
+
+    // Both the atop knob and the reclaim knob want psi=1; a guest that records and trims
+    // asks for it once, whichever of the two lands first.
+    #[test]
+    fn push_knob_asks_for_psi_once() {
+        let mut cmdline = String::from("console=ttyS0");
+        push_knob(&mut cmdline, " VIRTKIT_ATOP=a:/m:30 psi=1");
+        push_knob(&mut cmdline, " VIRTKIT_RECLAIM=auto:256 psi=1");
+        assert_eq!(
+            cmdline,
+            "console=ttyS0 VIRTKIT_ATOP=a:/m:30 psi=1 VIRTKIT_RECLAIM=auto:256"
+        );
+        // Either order, and an empty knob adds nothing.
+        let mut cmdline = String::from("console=ttyS0");
+        push_knob(&mut cmdline, " VIRTKIT_RECLAIM=auto:256 psi=1");
+        push_knob(&mut cmdline, "");
+        push_knob(&mut cmdline, " VIRTKIT_ATOP=a:/m:30 psi=1");
+        assert_eq!(
+            cmdline,
+            "console=ttyS0 VIRTKIT_RECLAIM=auto:256 psi=1 VIRTKIT_ATOP=a:/m:30"
+        );
     }
 
     #[test]

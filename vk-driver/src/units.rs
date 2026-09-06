@@ -59,6 +59,9 @@ pub struct Provisioned {
     /// `[vm] max_*` ceilings by the executor before it reaches here.
     pub cpus: Option<u32>,
     pub mem: Option<String>,
+    /// How the guest trims idle file cache (its compose `x-virtkit.reclaim`, else the
+    /// consumer's default filled in before provisioning); `None` = `auto`.
+    pub reclaim: Option<vk_core::reclaim::Policy>,
     /// Whether this service's guest gets VMX/SVM and so a `/dev/kvm` of its own (its
     /// compose `x-virtkit.nested`). Uniform with the primary path.
     pub nested: bool,
@@ -338,6 +341,7 @@ pub fn provisioned(
         egress_allow_name_req: service_egress_req(&unit.environment, "MICROVM_EGRESS_ALLOW_NAME"),
         cpus: unit.cpus,
         mem: unit.mem.clone(),
+        reclaim: unit.reclaim,
         nested: unit.nested,
         extra_ips,
         persist_root_backing: unit.persist_root_backing.clone(),
@@ -690,6 +694,20 @@ pub fn boot_unit(
         if !virtiofs.is_empty() {
             cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS={virtiofs}"));
         }
+        // Idle page-cache trimming: a service that idles between requests gives the file
+        // cache it piled up back to the host, not just the pages its processes freed. A
+        // service always gets a balloon of its own (below), so only its init axis can take
+        // the knob away.
+        let mem = svc.mem.clone().unwrap_or_else(|| DEFAULT_MEM.into());
+        if crate::run::wants_reclaim(svc.init, true) {
+            crate::run::push_knob(
+                &mut cmdline,
+                &crate::run::reclaim_cmdline(
+                    crate::run::effective_reclaim(svc.reclaim, None),
+                    &mem,
+                )?,
+            );
+        }
         if !overlay_tags.is_empty() {
             cmdline.push_str(&format!(
                 " VIRTKIT_VIRTIOFS_OVERLAY={}",
@@ -734,7 +752,7 @@ pub fn boot_unit(
             vsock_socket: vsock,
             vsock_ports,
             cpus: svc.cpus.unwrap_or(DEFAULT_CPUS),
-            mem: svc.mem.clone().unwrap_or_else(|| DEFAULT_MEM.into()),
+            mem,
             shared_mem,
             net: crate::vmm::Net::None,
             nics,

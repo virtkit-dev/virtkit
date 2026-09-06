@@ -210,6 +210,16 @@ kernel), `image` (the image's own kernel and modules) or a kernel file path. Tog
 boot a systemd or otherwise self-booting image as a service. `persist_root` keeps the root
 filesystem across restarts (see [Volumes and persistent state](#volumes-and-persistent-state)).
 
+Guests give idle memory back. Pages one frees return to the host through the balloon, and a
+guest not under memory pressure also evicts the file cache it has not touched for a minute or
+two (by age, through the kernel's multi-gen LRU) and hands those pages back, so a dev VM that
+read a few gigabytes while building stops holding them once it idles, while what a running
+build keeps re-reading stays cached. That is `reclaim: auto`; `off` keeps everything, a size
+(`512M`) or share (`5%`) keeps that much as a fixed floor. `vk run --reclaim` sets it for the
+primary and any service without its own, `[vm] reclaim` for the GitLab executor. It needs the
+agent as PID 1, so an `init` of `image` or `entrypoint` opts out; `vk build` stage guests are
+left alone as well, since trimming would move the peak-memory mark they are measured by.
+
 A guest gets one interface, `eth0`, by default. `nics` gives it more — `eth1` upward, each
 with its own address on the same LAN — for an appliance that assigns services to separate
 interfaces:

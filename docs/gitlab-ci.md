@@ -480,7 +480,9 @@ Worth knowing before reading a log:
 Recording is not free, and it is on by default. Each job's guest gets a read-write virtio-fs
 share of its own archive directory — the one directory it can write, and it can write anything
 and any amount into it until the job ends — and it boots with `psi=1`, which its own scheduler
-pays for in exchange for the `PSI` label. `atop = false` gives up all three.
+pays for in exchange for the `PSI` label. `atop = false` gives up the recording and the share;
+the guest still boots with `psi=1`, since idle page-cache trimming asks for the same figures —
+only turning that off as well (`[vm] reclaim` or `[vm] balloon`) gives the scheduler it back.
 
 Set `[gitlab] atop_interval_secs` for a finer or coarser resolution, and `atop = false` to
 record nothing:
@@ -590,6 +592,33 @@ gate avoids for the build's own guests, one level out. Where jobs and builds sha
 that is a reason to bound both up front rather than to rely on the gate alone. Set
 `[build] no_mem_gate` to switch the gate off entirely and let `jobs` bound the build by
 itself.
+
+### Giving idle memory back
+
+A guest holds every file page it ever read until something in it needs the memory, so a job
+that untarred a source tree and built it goes on holding that tree long after the stage that
+read it — duplicated in the host's own page cache, or, on a busy runner, in its swap. Pages a
+guest *frees* already come back through the balloon's free-page reporting; the file cache
+does not.
+
+`[vm] reclaim` makes it come back too:
+
+```toml
+[vm]
+reclaim = "auto"      # the default
+```
+
+`auto` evicts, whenever the guest is not under memory pressure, the file cache it has not
+touched for a minute or two — by age, through the kernel's multi-gen LRU, so what a build is
+still re-reading stays and what it read once goes. A size (`"512M"`, `"2G"`) or a share of the
+guest's RAM (`"5%"`) keeps that much cache as a fixed floor instead, and `"off"` leaves the
+guest alone. Compose services follow the job VM's setting unless they declare their own
+`x-virtkit.reclaim`.
+
+It rides on the balloon, so `[vm] balloon = false` stops the **job VM** trimming: without
+free-page reporting the trimmed pages never reach the host, and the job would lose its cache
+for nothing. Compose services attach a balloon of their own whatever `[vm] balloon` says, so
+they go on trimming under the setting they inherited.
 
 ### Keeping the host inside its memory
 

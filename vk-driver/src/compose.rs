@@ -81,6 +81,9 @@ pub struct Unit {
     /// This unit's guest RAM (compose `x-virtkit.mem`, `<n>G`/`<n>M`/MiB), applied
     /// identically primary or sibling; `None` = the consumer's default.
     pub mem: Option<String>,
+    /// How this unit's guest trims idle file cache (compose `x-virtkit.reclaim`); `None` =
+    /// the consumer's default (`--reclaim`, `[vm] reclaim`, else `auto`).
+    pub reclaim: Option<vk_core::reclaim::Policy>,
     /// Whether this unit's guest runs microVMs of its own (compose `x-virtkit.nested`),
     /// applied identically primary or sibling — a service that is itself a hypervisor
     /// (a vk builder, a nested test runner). `false` = no nesting, the default.
@@ -830,12 +833,13 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
     };
     // The per-service axes (compose `x-virtkit`): absent key/subkey = the defaults,
     // so an unmarked service keeps today's agent-as-PID1 pinned-kernel 2-vCPU/1G boot.
-    let (init, kernel, cpus, mem, nested, nics, persist_root) = match svc.x_virtkit {
+    let (init, kernel, cpus, mem, reclaim, nested, nics, persist_root) = match svc.x_virtkit {
         Some(x) => (
             x.init()?,
             x.kernel()?,
             x.cpus()?,
             x.mem()?,
+            x.reclaim()?,
             x.nested()?,
             x.nics()?,
             x.persist_root()?,
@@ -843,6 +847,7 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
         None => (
             crate::run::InitSource::Default,
             crate::run::KernelSource::Default,
+            None,
             None,
             None,
             false,
@@ -882,6 +887,7 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
         kernel,
         cpus,
         mem,
+        reclaim,
         nested,
         nics,
         persist_root_backing,
@@ -1734,6 +1740,8 @@ struct XVirtkit {
     cpus: Option<Scalar>,
     #[serde(default)]
     mem: Option<Scalar>,
+    #[serde(default)]
+    reclaim: Option<Scalar>,
     /// scalar, not bool: `nested: true` is a YAML bool but `${VAR}` interpolates
     /// into a string, and both spellings must reach the same parse
     #[serde(default)]
@@ -1798,6 +1806,19 @@ impl XVirtkit {
                         format!("x-virtkit.mem: expected a non-zero <n>G, <n>M or MiB, got {s:?}")
                     })?;
                 Ok(s)
+            })
+            .transpose()
+    }
+
+    /// `reclaim: auto|off|<n>%|<size>` → how the guest trims idle file cache (absent = the
+    /// consumer's default). Validated here so a typo fails the compose load.
+    fn reclaim(&self) -> Result<Option<vk_core::reclaim::Policy>> {
+        self.reclaim
+            .clone()
+            .map(|r| {
+                let s = r.into_string();
+                s.parse::<vk_core::reclaim::Policy>()
+                    .map_err(|e| anyhow::anyhow!("x-virtkit.reclaim: {e}"))
             })
             .transpose()
     }
@@ -3141,6 +3162,21 @@ mod tests {
         .pop()
         .unwrap();
         assert_eq!((u.cpus, u.mem.as_deref()), (Some(6), Some("3G")));
+        // reclaim rides the same marker: absent = the consumer's default, else a policy
+        assert_eq!(u.reclaim, None);
+        let u = one("services:\n  s:\n    image: x\n    x-virtkit: { reclaim: off }\n");
+        assert_eq!(u.reclaim, Some(vk_core::reclaim::Policy::Off));
+        let u = one("services:\n  s:\n    image: x\n    x-virtkit: { reclaim: 10% }\n");
+        assert_eq!(u.reclaim, Some(vk_core::reclaim::Policy::Percent(10)));
+        let u = one("services:\n  s:\n    image: x\n    x-virtkit: { reclaim: 256M }\n");
+        assert_eq!(u.reclaim, Some(vk_core::reclaim::Policy::Floor(256)));
+        assert!(
+            parse(
+                "services:\n  s:\n    image: x\n    x-virtkit: { reclaim: lots }\n",
+                Path::new("/b")
+            )
+            .is_err()
+        );
         // zero and garbage fail the load, not a later boot
         for marker in ["{ cpus: 0 }", "{ cpus: two }", "{ mem: 0 }", "{ mem: big }"] {
             assert!(

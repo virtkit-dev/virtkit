@@ -1503,6 +1503,15 @@ enum Cmd {
         #[arg(long = "service-nics", value_name = "NAME=N", requires = "compose",
               value_parser = parse_named_nics, help_heading = "Compose services")]
         service_nics: Vec<(String, u32)>,
+        /// idle file cache the guests give back to the host: auto, off, a size or a share
+        ///
+        /// `auto` (the default) evicts what a guest has not touched for a minute or two,
+        /// through the multi-gen LRU; a size (512M, 2G) or a share of RAM (5%) keeps that
+        /// much cache as a fixed floor instead; `off` keeps all of it. Only ever while the
+        /// guest is not under memory pressure. Applies to the primary and, unless a service
+        /// declares its own `x-virtkit.reclaim`, to every service.
+        #[arg(long, value_name = "POLICY")]
+        reclaim: Option<vk_core::reclaim::Policy>,
         /// Forward the host SSH agent ($SSH_AUTH_SOCK) into the guest
         ///
         /// ssh and git in the guest then use the host's keys, without the keys ever
@@ -2689,6 +2698,7 @@ async fn cli_main() -> ExitCode {
         primary,
         service_cpus,
         service_mem,
+        reclaim,
         service_nics,
         ssh_agent,
         ssh_host,
@@ -2860,6 +2870,7 @@ async fn cli_main() -> ExitCode {
             nics: *nics,
             service_cpus: service_cpus.clone(),
             service_mem: service_mem.clone(),
+            reclaim: *reclaim,
             service_nics: service_nics.clone(),
             boot_timeout_secs: *boot_timeout,
             vm_name: vm_name.clone(),
