@@ -29,6 +29,11 @@
 //!                        Each NIC receives its address but no default route; that
 //!                        belongs to eth0
 //!   VIRTKIT_VIRTIOFS     tag:path[,tag:path] virtiofs shares to mount
+//!   VIRTKIT_VIRTIOFS_DAX tag[,tag] — these shares have a DAX window, so mount them
+//!                        `dax=always`: file data is read straight out of the host page
+//!                        cache through the window instead of being copied into this
+//!                        guest's own. A share whose DAX mount fails is mounted without
+//!                        it (a slower share, not a failed boot)
 //!   VIRTKIT_VIRTIOFS_OVERLAY  tag[,tag] — mount these shares as the read-only lower
 //!                        layer of a tmpfs-backed overlayfs at their path, so every
 //!                        write under the mountpoint runs at guest-native speed. A
@@ -1101,12 +1106,14 @@ fn materialize_env(cfg: Option<&RunConfig>) {
 /// guest tmpfs, so writes under the path never cross virtio-fs (each synchronous
 /// create/write/unlink round-trip costs 50–90µs vs ~2µs on tmpfs). An overlay share
 /// that fails to mount fails the boot: falling back to the direct mount would silently
-/// run the workload 15–50× slower.
+/// run the workload 15–50× slower. Tags listed in VIRTKIT_VIRTIOFS_DAX are mounted through
+/// their DAX window, overlay lower layers included.
 ///
 /// Returns the ext4 mountpoints (persistent overlay uppers) to freeze at poweroff — empty
 /// unless a share used `overlay,persist`.
 fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<Vec<CString>> {
     let mut overlay = overlay_tags(cmdline)?;
+    let dax = share_tags(cmdline, "VIRTKIT_VIRTIOFS_DAX")?;
     let size = overlay_size(cmdline)?;
     let overlay_disks = overlay_disk_devices(cmdline)?;
     // Each overlay-upper disk names a tag; that tag must be one of the overlay shares, or the
@@ -1125,19 +1132,27 @@ fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<Vec<CString>> {
                 sorted_join(&overlay)
             );
         }
+        warn_unused_dax_tags(&dax, &HashSet::new());
         return Ok(freeze);
     };
     let _ = run_cmd("modprobe", &["virtiofs"]); // built-in on our kernel; harmless
     let mut overlaid: HashSet<String> = HashSet::new();
+    let mut mounted: HashSet<&str> = HashSet::new();
     for entry in spec.split(',').filter(|e| !e.is_empty()) {
         let Some((tag, path)) = entry.split_once(':') else {
             warn!("vk-agent init: bad VIRTKIT_VIRTIOFS entry {entry:?} (want tag:path)");
             continue;
         };
+        mounted.insert(tag);
         if overlay.remove(tag) {
-            let upper =
-                mount_share_overlay(tag, path, size, overlay_disks.get(tag).map(String::as_str))
-                    .with_context(|| format!("overlay-mounting virtiofs share {tag} at {path}"))?;
+            let upper = mount_share_overlay(
+                tag,
+                path,
+                size,
+                overlay_disks.get(tag).map(String::as_str),
+                dax.contains(tag),
+            )
+            .with_context(|| format!("overlay-mounting virtiofs share {tag} at {path}"))?;
             freeze.extend(upper);
             overlaid.insert(tag.to_string());
             continue;
@@ -1158,7 +1173,7 @@ fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<Vec<CString>> {
                 continue;
             }
         };
-        if let Err(e) = mount(tag, path, "virtiofs", 0) {
+        if let Err(e) = mount_share(tag, path, 0, dax.contains(tag)) {
             warn!(
                 "vk-agent init: mount virtiofs {tag} at {} failed: {e}",
                 mountpoint.display()
@@ -1173,7 +1188,26 @@ fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<Vec<CString>> {
             sorted_join(&overlay)
         );
     }
+    warn_unused_dax_tags(&dax, &mounted);
     Ok(freeze)
+}
+
+/// Report DAX tags that named no virtio-fs share: the host and the guest disagree about what
+/// is shared, and whatever the host meant is quietly running without its window. A warning
+/// rather than the `bail!` the overlay knobs use, because a missing window costs speed, not
+/// correctness — the shares that were declared are mounted either way.
+fn warn_unused_dax_tags(dax: &HashSet<String>, mounted: &HashSet<&str>) {
+    let unused: HashSet<String> = dax
+        .iter()
+        .filter(|tag| !mounted.contains(tag.as_str()))
+        .cloned()
+        .collect();
+    if !unused.is_empty() {
+        warn!(
+            "vk-agent init: VIRTKIT_VIRTIOFS_DAX names {}, which is not a virtiofs share",
+            sorted_join(&unused)
+        );
+    }
 }
 
 /// Parse VIRTKIT_VIRTIOFS_OVERLAY_DISK=tag:/dev/vdX[,tag:/dev/vdY]: the persistent ext4 disk
@@ -1254,17 +1288,55 @@ pub(crate) const OVERLAY_RW: &str = "rw";
 /// A tag becomes a path component under OVERLAY_ROOT, so anything that would escape it
 /// (`/`, `.`, `..`) is rejected rather than resolved outside the private root.
 fn overlay_tags(cmdline: &HashMap<String, String>) -> Result<HashSet<String>> {
-    let Some(spec) = cmdline.get("VIRTKIT_VIRTIOFS_OVERLAY") else {
+    share_tags(cmdline, "VIRTKIT_VIRTIOFS_OVERLAY")
+}
+
+/// Parse and validate the comma-separated share tags in `key`. A tag names a virtio-fs mount
+/// source and, for overlays, a directory under the agent's private root, so one carrying a
+/// path separator is refused rather than followed.
+fn share_tags(cmdline: &HashMap<String, String>, key: &str) -> Result<HashSet<String>> {
+    let Some(spec) = cmdline.get(key) else {
         return Ok(HashSet::new());
     };
     let mut tags = HashSet::new();
     for tag in spec.split(',').filter(|t| !t.is_empty()) {
         if tag.contains('/') || tag == "." || tag == ".." {
-            bail!("VIRTKIT_VIRTIOFS_OVERLAY tag {tag:?} is not a valid share tag");
+            bail!("{key} tag {tag:?} is not a valid share tag");
         }
         tags.insert(tag.to_string());
     }
     Ok(tags)
+}
+
+/// A virtio-fs share's mount options: `dax=always` where the share has a DAX window, none
+/// otherwise. `always` and not `inode`, so a kernel or a device that cannot honour it says
+/// so (`inode` would quietly mount without the window and leave nothing to fall back from).
+fn virtiofs_data(dax: bool) -> Option<&'static str> {
+    dax.then_some("dax=always")
+}
+
+/// Mount virtio-fs share `tag` at `path`, through its DAX window when it has one.
+///
+/// With a window the guest maps the host's own page cache for the file data it reads, so the
+/// data is never copied into a second cache here and a host-side edit is visible at once.
+/// A failed DAX mount falls back to an ordinary one — the share is then slower, which is not
+/// a reason to fail the boot. The fallback is unconditional rather than keyed on the errno:
+/// a mount that fails for some other reason fails again and reports itself properly, which
+/// beats guessing which errnos mean "no DAX here".
+fn mount_share(tag: &str, path: &str, flags: libc::c_ulong, dax: bool) -> io::Result<()> {
+    if let Some(data) = virtiofs_data(dax) {
+        match mount_data(tag, path, "virtiofs", flags, data) {
+            Ok(()) => {
+                info!("vk-agent init: mounted virtiofs {tag} at {path} with {data}");
+                return Ok(());
+            }
+            Err(e) => warn!(
+                "vk-agent init: mounting virtiofs {tag} at {path} with {data} failed ({e}); \
+                 retrying without the DAX window"
+            ),
+        }
+    }
+    mount(tag, path, "virtiofs", flags)
 }
 
 /// How much of this VM's memory an overlay layer may take, from
@@ -1342,7 +1414,8 @@ fn overlay_tmpfs_data(size: Option<&str>) -> String {
 /// lower layer. The writable upper/work live either on a persistent host-backed ext4 disk
 /// (`upper_device`, from `overlay,persist`) or, by default, on a dedicated guest tmpfs of `size`
 /// (`None` = the kernel's own default). Only first-touch reads of lower files cross virtio-fs
-/// (and then stay in the guest page cache); the host never sees guest writes.
+/// and then stay in the guest page cache — or, with `dax`, are mapped from the host's own and
+/// never cached twice; the host never sees guest writes.
 ///
 /// Returns the upper's ext4 mountpoint to freeze at poweroff on the persistent path, `None` on
 /// the tmpfs path (nothing on the host to flush).
@@ -1351,6 +1424,7 @@ fn mount_share_overlay(
     path: &str,
     size: Option<&str>,
     upper_device: Option<&str>,
+    dax: bool,
 ) -> Result<Option<CString>> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let OverlayDirs {
@@ -1360,7 +1434,7 @@ fn mount_share_overlay(
         work,
     } = overlay_dirs(tag);
     std::fs::create_dir_all(&lower).with_context(|| format!("creating {lower}"))?;
-    mount(tag, &lower, "virtiofs", libc::MS_RDONLY)
+    mount_share(tag, &lower, libc::MS_RDONLY, dax)
         .with_context(|| format!("mounting virtiofs {tag} (lower layer) at {lower}"))?;
     // The upper+work layer, on its own mount (not the shared /run) to keep bulk writes off the
     // agent's runtime dirs. Persistent: a host-backed ext4 whose contents (and the upper/work
@@ -2910,10 +2984,58 @@ mod tests {
     }
 
     #[test]
+    fn dax_tags_name_the_shares_with_a_window() {
+        assert!(
+            share_tags(&HashMap::new(), "VIRTKIT_VIRTIOFS_DAX")
+                .unwrap()
+                .is_empty()
+        );
+        let m = HashMap::from([("VIRTKIT_VIRTIOFS_DAX".to_string(), "work,vol1".to_string())]);
+        assert_eq!(
+            share_tags(&m, "VIRTKIT_VIRTIOFS_DAX").unwrap(),
+            HashSet::from(["work".to_string(), "vol1".to_string()])
+        );
+        // The error names the key to fix.
+        for bad in ["a/b", "/abs", ".", ".."] {
+            let m = HashMap::from([("VIRTKIT_VIRTIOFS_DAX".to_string(), bad.to_string())]);
+            let err = share_tags(&m, "VIRTKIT_VIRTIOFS_DAX")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("VIRTKIT_VIRTIOFS_DAX"), "{bad}: {err}");
+            assert!(err.contains(&format!("{bad:?}")), "{bad}: {err}");
+        }
+    }
+
+    /// Invalid tags are host configuration errors even when no shares are declared.
+    #[test]
+    fn mount_virtiofs_rejects_a_bad_dax_tag_with_no_shares_declared() {
+        let m = HashMap::from([("VIRTKIT_VIRTIOFS_DAX".to_string(), "a/b".to_string())]);
+        let err = mount_virtiofs(&m).unwrap_err().to_string();
+        assert!(err.contains("VIRTKIT_VIRTIOFS_DAX"), "{err}");
+    }
+
+    /// A DAX tag naming no share is a host/guest disagreement, but it costs speed rather than
+    /// correctness, so it warns and the declared shares still mount.
+    #[test]
+    fn mount_virtiofs_tolerates_a_dax_tag_for_no_share() {
+        let m = HashMap::from([("VIRTKIT_VIRTIOFS_DAX".to_string(), "gone".to_string())]);
+        assert!(mount_virtiofs(&m).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_dax_share_asks_for_the_window_and_the_others_ask_for_nothing() {
+        // `always` and not `inode`: a kernel that cannot honour the option must fail the mount
+        // so mount_share can retry without it, which `inode` would not do.
+        assert_eq!(virtiofs_data(true), Some("dax=always"));
+        assert_eq!(virtiofs_data(false), None);
+    }
+
+    #[test]
     fn overlay_tags_reject_path_escapes() {
         for bad in ["a/b", "/abs", ".", ".."] {
             let m = HashMap::from([("VIRTKIT_VIRTIOFS_OVERLAY".to_string(), bad.to_string())]);
             let err = overlay_tags(&m).unwrap_err().to_string();
+            assert!(err.contains("VIRTKIT_VIRTIOFS_OVERLAY"), "{bad}: {err}");
             assert!(err.contains(&format!("{bad:?}")), "{bad}: {err}");
         }
     }
