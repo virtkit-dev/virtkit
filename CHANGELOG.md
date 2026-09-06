@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.62.0] - 2026-09-06
+
 ### Added
 
 - **Idle guests give their file cache back to the host.** A VM that read a few gigabytes used
@@ -2412,7 +2414,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.61.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.62.0...HEAD
+[0.62.0]: https://github.com/virtkit-dev/virtkit/compare/v0.61.0...v0.62.0
 [0.61.0]: https://github.com/virtkit-dev/virtkit/compare/v0.60.0...v0.61.0
 [0.60.0]: https://github.com/virtkit-dev/virtkit/compare/v0.51.0...v0.60.0
 [0.51.0]: https://github.com/virtkit-dev/virtkit/compare/v0.50.0...v0.51.0
