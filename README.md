@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/assets/logo.svg" alt="virtkit" width="480"></p>
+
 # virtkit
 
 virtkit boots OCI images as rootless Linux microVMs and builds Dockerfiles without

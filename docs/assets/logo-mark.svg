@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-label="virtkit">
+  <title>virtkit</title>
+  <defs>
+    <linearGradient id="vk-g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#6366f1"/>
+    </linearGradient>
+    <linearGradient id="vk-chip" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e293b"/>
+      <stop offset="1" stop-color="#0f172a"/>
+    </linearGradient>
+    <clipPath id="vk-clip"><rect x="44" y="44" width="112" height="112" rx="16"/></clipPath>
+  </defs>
+  <g fill="#64748b">
+    <rect x="64" y="22" width="10" height="14" rx="2"/><rect x="95" y="22" width="10" height="14" rx="2"/><rect x="126" y="22" width="10" height="14" rx="2"/>
+    <rect x="64" y="164" width="10" height="14" rx="2"/><rect x="95" y="164" width="10" height="14" rx="2"/><rect x="126" y="164" width="10" height="14" rx="2"/>
+    <rect x="22" y="64" width="14" height="10" rx="2"/><rect x="22" y="95" width="14" height="10" rx="2"/><rect x="22" y="126" width="14" height="10" rx="2"/>
+    <rect x="164" y="64" width="14" height="10" rx="2"/><rect x="164" y="95" width="14" height="10" rx="2"/><rect x="164" y="126" width="14" height="10" rx="2"/>
+  </g>
+  <rect x="36" y="36" width="128" height="128" rx="22" fill="url(#vk-chip)"/>
+  <rect x="44" y="44" width="112" height="112" rx="16" fill="none" stroke="#334155" stroke-width="2"/>
+  <g clip-path="url(#vk-clip)">
+    <path d="M56 60 L82 60 L112 148 L86 148 Z" fill="url(#vk-g)" opacity="0.75"/>
+    <path d="M144 60 L118 60 L88 148 L114 148 Z" fill="url(#vk-g)" stroke="#0f172a" stroke-width="3" stroke-linejoin="round"/>
+  </g>
+  <circle cx="100" cy="72" r="6" fill="#0f172a"/>
+  <circle cx="100" cy="72" r="3" fill="#a5f3fc"/>
+</svg>
