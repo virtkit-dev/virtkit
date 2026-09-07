@@ -15,9 +15,10 @@
 //!   be established, leave the object rather than remove something unidentified —
 //!   [`dir_admits_only_us`] is the test, and it is the caller's directory that decides.
 //!
-//! [`bind_private`] applies all four to unix sockets, the only objects published here so far.
-//! `vk-core` uses it for the agent's exec channel and `vk-registry` for its admin socket; both
-//! require the published name to refer only to a socket already restricted to `0600`.
+//! [`bind_private`] applies all four to unix sockets; [`write_atomic`] applies the first
+//! three to files. `vk-core` uses `bind_private` for the agent's exec channel and
+//! `vk-registry` for its admin socket; both require the published name to refer only to a
+//! socket already restricted to `0600`.
 //!
 //! [`open_dir`] and [`open_dir_nofollow`] expose the third rule to callers that anchor their
 //! own `*at()` operations.
@@ -284,6 +285,87 @@ fn open_dir_flags(dir: &Path, extra: libc::c_int) -> Result<OwnedFd, anyhow::Err
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// Write `contents` at `path` through a private staging file in the same directory and
+/// publish it by `rename`: a reader sees the previous file or the whole new one, never a
+/// half-written one, and the mode is right from the moment the file exists.
+///
+/// All operations use one directory descriptor, so path changes cannot redirect them.
+/// Each staging name comes from `/dev/urandom`; `O_EXCL` skips occupied names without
+/// removing them, as in [`bind_private`]. On failure, cleanup unlinks the staging name
+/// without [`dir_admits_only_us`]: it runs only on errors, and callers here own the directory.
+///
+/// The directory is not fsynced: the file's own contents are, so a crash between the two
+/// costs the rename, not the data. Callers that need the name itself to survive a power cut
+/// want more than this.
+pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<(), anyhow::Error> {
+    write_atomic_from(path, contents, mode, staging_names())
+}
+
+fn write_atomic_from(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+    mut next_name: impl FnMut() -> Result<String, anyhow::Error>,
+) -> Result<(), anyhow::Error> {
+    let Some(final_name) = path.file_name() else {
+        bail!("{path:?} is not a path a file can be written at");
+    };
+    let final_name = cstr(final_name)?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent_fd = open_dir(parent.unwrap_or(Path::new(".")))?;
+    for _ in 0..STAGING_ATTEMPTS {
+        let name = cstr(OsStr::new(&next_name()?))?;
+        // SAFETY: the descriptor is live and the name is NUL-terminated and outlives the
+        // call. `O_EXCL` is what makes the file this call's own — a symlink included.
+        let fd = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                libc::c_uint::from(mode),
+            )
+        };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            // Skip existing names without removing them.
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(anyhow!(e).context(format!("staging a file for {path:?}")));
+        }
+        // SAFETY: `fd` is a fresh descriptor this call owns.
+        let mut staged = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        let written = std::io::Write::write_all(&mut staged, contents)
+            .and_then(|()| staged.sync_all())
+            .map_err(|e| anyhow!(e).context(format!("writing the staged file for {path:?}")))
+            .and_then(|()| {
+                // SAFETY: both descriptors are live and both names are NUL-terminated.
+                let rc = unsafe {
+                    libc::renameat(
+                        parent_fd.as_raw_fd(),
+                        name.as_ptr(),
+                        parent_fd.as_raw_fd(),
+                        final_name.as_ptr(),
+                    )
+                };
+                match rc {
+                    0 => Ok(()),
+                    _ => Err(anyhow!(std::io::Error::last_os_error())
+                        .context(format!("publishing {path:?}"))),
+                }
+            });
+        if written.is_err() {
+            // Best effort on the error path, through the descriptor this call opened the
+            // directory with. It removes by name, which is safe here because the callers own
+            // the directory; a shared one would want the `dir_admits_only_us` guard.
+            // SAFETY: the descriptor is live and the name is NUL-terminated.
+            let _ = unsafe { libc::unlinkat(parent_fd.as_raw_fd(), name.as_ptr(), 0) };
+        }
+        return written;
+    }
+    bail!("found no free staging name beside {path:?} in {STAGING_ATTEMPTS} tries")
+}
+
 /// [`open_dir`] for a name under an already-open directory, so the parent is not re-resolved.
 fn openat_dir(parent: BorrowedFd<'_>, name: &CString) -> Result<OwnedFd, anyhow::Error> {
     // SAFETY: the descriptor is live and the name is NUL-terminated and outlives the call.
@@ -331,6 +413,101 @@ mod tests {
 
         // The no-follow variant still opens the directory itself.
         open_dir_nofollow(&real).expect("the directory itself still opens");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The file is created with the mode asked for, published whole over what was there,
+    /// and leaves no staging name behind.
+    #[test]
+    fn writing_publishes_the_whole_file_at_the_mode_asked_for() {
+        let dir = scratch("write-atomic");
+        let path = dir.join("ssh-config");
+
+        write_atomic(&path, b"first", 0o600).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        write_atomic(&path, b"second", 0o600).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, [std::ffi::OsString::from("ssh-config")], "{left:?}");
+
+        // A directory that does not exist is reported as such, and nothing is published.
+        let err = write_atomic(&dir.join("gone/x"), b"", 0o600).unwrap_err();
+        assert!(format!("{err:#}").contains("No such file"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rename replaces an existing symlink without following it.
+    #[test]
+    fn writing_replaces_a_symlink_rather_than_following_it() {
+        let dir = scratch("write-atomic-symlink");
+        let decoy = dir.join("decoy");
+        std::fs::write(&decoy, b"untouched").unwrap();
+        let path = dir.join("ssh-config");
+        std::os::unix::fs::symlink(&decoy, &path).unwrap();
+
+        write_atomic(&path, b"published", 0o600).unwrap();
+        assert_eq!(std::fs::read(&decoy).unwrap(), b"untouched");
+        assert!(!path.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&path).unwrap(), b"published");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Skip occupied staging names. If all candidates are taken, fail without changing
+    /// existing entries or publishing the file.
+    #[test]
+    fn a_taken_staging_name_is_stepped_over_then_exhausted() {
+        let dir = scratch("write-atomic-staging");
+        let path = dir.join("ssh-config");
+
+        // First candidate collides, the second is free: the write takes the second.
+        std::fs::write(dir.join(".taken"), b"squatter").unwrap();
+        let mut names = [".taken", ".free"].into_iter();
+        let retry = move || Ok::<_, anyhow::Error>(names.next().unwrap().to_string());
+        write_atomic_from(&path, b"x", 0o600, retry).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"x");
+        assert_eq!(std::fs::read(dir.join(".taken")).unwrap(), b"squatter");
+
+        // Every candidate taken: no free name, and the squatter is left as it was.
+        std::fs::remove_file(&path).unwrap();
+        let fixed = || Ok::<_, anyhow::Error>(".taken".to_string());
+        let err = write_atomic_from(&path, b"y", 0o600, fixed).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no free staging name"),
+            "{err:#}"
+        );
+        assert_eq!(std::fs::read(dir.join(".taken")).unwrap(), b"squatter");
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rename that fails removes the staging file and leaves the destination untouched.
+    #[test]
+    fn a_failed_publish_removes_its_staging_file() {
+        let dir = scratch("write-atomic-rename-fail");
+        // The destination is a non-empty directory, so renaming a file onto it fails; the
+        // write must still not leave its staging file behind.
+        let target = dir.join("ssh-config");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), b"keep").unwrap();
+
+        let fixed = || Ok::<_, anyhow::Error>(".stage".to_string());
+        let err = write_atomic_from(&target, b"x", 0o600, fixed).unwrap_err();
+        assert!(format!("{err:#}").contains("publishing"), "{err:#}");
+        assert!(target.is_dir());
+        assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"keep");
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, [std::ffi::OsString::from("ssh-config")], "{left:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

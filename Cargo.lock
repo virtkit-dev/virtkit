@@ -4592,6 +4592,7 @@ dependencies = [
  "virtio-bindings",
  "virtio-queue",
  "vk-core",
+ "vk-fs",
  "vk-registry",
  "vk-selfupdate",
  "vm-memory 0.17.1",
