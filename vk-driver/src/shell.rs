@@ -16,6 +16,19 @@ pub fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// [`quote`], except that a word no shell would treat specially is left as it is: for a
+/// command line meant to be read rather than parsed.
+pub fn quote_word(value: &str) -> String {
+    match !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "@%+=:,./-_".contains(c))
+    {
+        true => value.to_string(),
+        false => quote(value),
+    }
+}
+
 /// Every `name` on `path` that a shell would run, in `PATH` order, skipping anything in
 /// `skip_dir` — compared by filesystem identity, so an alias of that directory is skipped
 /// too. Lazy: a caller that wants the first one stops there, and one that needs a path it
@@ -46,9 +59,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_value_is_quoted_losslessly_whatever_it_holds() {
+    fn a_word_is_quoted_only_where_a_shell_would_read_it_otherwise() {
+        assert_eq!(quote_word("plain/path-1.2"), "plain/path-1.2");
+        assert_eq!(quote_word("two words"), "'two words'");
+        assert_eq!(quote_word(""), "''");
+        // Lossless whatever it holds: the quote is closed, escaped and reopened.
+        assert_eq!(quote_word("a'b"), "'a'\\''b'");
+        // `quote` always quotes, for output that is parsed back.
         assert_eq!(quote("plain"), "'plain'");
-        // The quote of its own is closed, escaped and reopened.
         assert_eq!(quote("a'b"), "'a'\\''b'");
     }
 

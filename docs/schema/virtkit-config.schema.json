@@ -1,0 +1,456 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/virtkit-dev/virtkit/main/docs/schema/virtkit-config.schema.json",
+  "title": "virtkit development environment",
+  "description": "`.virtkit/config.toml`: a project's development environments, and the machine-local `.virtkit/local.toml` layer over it. Every key is checked; an unknown one is an error. The tracked file states `schema` and gives each environment exactly one source — `compose` (with `service`), `image` or `build`; a local layer states neither, since it only overrides what the tracked file says.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema"],
+  "properties": {
+    "schema": {
+      "description": "the schema version; required in the tracked file",
+      "type": "integer",
+      "const": 1
+    },
+    "remove": {
+      "description": "local overrides only: dotted paths to drop from the inherited config before this layer applies, such as `dev.compose`",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "env-files": {
+      "description": "local overrides only: further env files, read after `local.env`, relative to the workspace root",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "requires": { "$ref": "#/$defs/requires" },
+    "dev": {
+      "description": "the development environment",
+      "$ref": "#/$defs/environment"
+    },
+    "environments": {
+      "description": "further named environments, selected with `--environment`; each stands alone and inherits nothing from `dev`",
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/environment" }
+    }
+  },
+  "$defs": {
+    "requires": {
+      "title": "requires",
+      "description": "what this project needs of the `vk` reading it",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "min-version": {
+          "description": "the oldest release that implements everything the config uses",
+          "type": "string"
+        },
+        "features": {
+          "description": "`vk check --feature` names the build must answer for",
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "environment": {
+      "title": "environment",
+      "description": "one environment: exactly one source — `compose` with `service`, `image`, or `build` — and how to be in it",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "compose": {
+          "description": "a compose file, relative to the workspace root; the environment is one of its services",
+          "type": "string"
+        },
+        "service": {
+          "description": "the compose service to work in — the primary VM",
+          "type": "string"
+        },
+        "image": {
+          "description": "an image reference, for an environment with no service LAN",
+          "type": "string"
+        },
+        "build": {
+          "description": "a Dockerfile target, for an environment built from the project",
+          "$ref": "#/$defs/build"
+        },
+        "cached-only": {
+          "description": "take the image from the build cache and never build it; with `fallback`, a cache miss runs the fallback target instead. A `build` source only.",
+          "type": "boolean"
+        },
+        "fallback": {
+          "description": "what to build when `cached-only` misses the cache",
+          "$ref": "#/$defs/fallback"
+        },
+        "workspace": {
+          "description": "where the workspace is mounted in the guest (an absolute guest path)",
+          "type": "string"
+        },
+        "user": {
+          "description": "the user exec, shell and SSH sessions run as",
+          "type": "string"
+        },
+        "freshness": {
+          "description": "what to do when the running environment no longer matches the config",
+          "$ref": "#/$defs/freshness"
+        },
+        "profiles": {
+          "description": "compose profiles activated eagerly, besides the primary's dependencies",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "cpus": {
+          "description": "vCPUs for the primary: a count, or `\"host\"` for as many as the host has. Unset inherits the compose service's `x-virtkit.cpus`, then vk's default.",
+          "$ref": "#/$defs/cpus"
+        },
+        "mem": {
+          "description": "memory for the primary (`16G`); unset inherits like `cpus`",
+          "type": "string"
+        },
+        "exec-env": {
+          "description": "environment for development sessions: exec, shell, SSH and editor processes",
+          "$ref": "#/$defs/string-map"
+        },
+        "container-env": {
+          "description": "environment for the guest's own processes, set at boot",
+          "$ref": "#/$defs/string-map"
+        },
+        "mounts": {
+          "description": "extra host directories or files in the guest, by name",
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/mount" }
+        },
+        "editor": { "$ref": "#/$defs/editor" },
+        "host": { "$ref": "#/$defs/host" },
+        "cache": { "$ref": "#/$defs/cache" },
+        "endpoints": {
+          "description": "guest ports published on the host, by name",
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/endpoint" }
+        },
+        "network": { "$ref": "#/$defs/network" },
+        "hooks": { "$ref": "#/$defs/hooks" },
+        "tasks": {
+          "description": "project commands `vk dev task <name>` runs, by name",
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/task" }
+        }
+      }
+    },
+    "build": {
+      "title": "build",
+      "description": "`build = { context = \"docker/x\", dockerfile = \"Dockerfile\", target = \"dev\" }`",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "context": {
+          "description": "the build context, relative to the workspace root; required once layered",
+          "type": "string"
+        },
+        "dockerfile": {
+          "description": "the Dockerfile, relative to the context (default `Dockerfile`)",
+          "type": "string"
+        },
+        "target": {
+          "description": "the stage to boot (default: the last one)",
+          "type": "string"
+        },
+        "args": {
+          "description": "`--build-arg` values for the build, by name",
+          "$ref": "#/$defs/string-map"
+        }
+      }
+    },
+    "fallback": {
+      "title": "fallback",
+      "description": "the smaller stage a `cached-only` environment builds when its own is not in the cache",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "description": "the Dockerfile stage to build instead; required once layered",
+          "type": "string"
+        }
+      }
+    },
+    "task": {
+      "title": "task",
+      "description": "`[dev.tasks.<name>]`: a project command, and where and how it is executed",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "run": {
+          "description": "a shell string or an argv list, run in the workspace folder; required once layered",
+          "$ref": "#/$defs/command"
+        },
+        "environment": {
+          "description": "where it runs: `dev` (default), or a name under `[environments]`",
+          "type": "string"
+        },
+        "reuse": {
+          "description": "which running environment the reusing policies attach to, when that is not the one an ephemeral run would boot (default: `environment`)",
+          "type": "string"
+        },
+        "policy": {
+          "description": "how the environment is obtained (default `reuse-or-ephemeral`)",
+          "$ref": "#/$defs/policy"
+        },
+        "checkout": {
+          "description": "how the checkout reaches the guest for this task",
+          "$ref": "#/$defs/checkout-mode"
+        },
+        "env": {
+          "description": "added to the environment's `exec-env` for this task",
+          "$ref": "#/$defs/string-map"
+        },
+        "enabled": {
+          "description": "`false` in a local layer switches an inherited task off",
+          "type": "boolean"
+        }
+      }
+    },
+    "policy": {
+      "description": "what a task does about the environment it needs: `reuse` attaches to a running one and fails when none runs, `require` boots it first, `ephemeral` boots a throwaway VM, `reuse-or-ephemeral` takes the running one when there is one",
+      "type": "string",
+      "enum": ["reuse", "require", "ephemeral", "reuse-or-ephemeral"]
+    },
+    "checkout-mode": {
+      "description": "what a task sees of the checkout: `shared` is the host's tree written through (the default), `overlay` a tmpfs over it whose writes go with the VM",
+      "type": "string",
+      "enum": ["shared", "overlay"]
+    },
+    "freshness": {
+      "description": "`ask` offers a refresh on a terminal, `reuse` attaches and reports the differences, `refresh` rebuilds and replaces, `require-current` fails naming them",
+      "type": "string",
+      "enum": ["ask", "reuse", "refresh", "require-current"]
+    },
+    "cpus": {
+      "description": "`cpus = 4` or `cpus = \"host\"`",
+      "anyOf": [
+        { "type": "integer", "minimum": 1 },
+        { "type": "string", "const": "host" }
+      ]
+    },
+    "mount": {
+      "title": "mount",
+      "description": "`[dev.mounts.<name>]`: a host path in the guest",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "description": "the host path; `~`, `${HOME}`, `${workspace}`, `${state}`, `${VK_UID}`, `${VK_GID}` and `${localEnv:NAME}` (or `${localEnv:NAME:default}`) are expanded. Required once layered.",
+          "type": "string"
+        },
+        "to": {
+          "description": "the guest path (absolute); required once layered",
+          "type": "string"
+        },
+        "read-only": { "type": "boolean" },
+        "optional": {
+          "description": "skip the mount when the source does not exist, rather than failing the boot",
+          "type": "boolean"
+        },
+        "enabled": {
+          "description": "`false` in a local layer switches an inherited mount off",
+          "type": "boolean"
+        }
+      }
+    },
+    "editor": {
+      "title": "editor",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "vscode": { "$ref": "#/$defs/vscode" }
+      }
+    },
+    "vscode": {
+      "title": "vscode",
+      "description": "`[dev.editor.vscode]`: the managed VS Code server state and how it is reconciled",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "description": "`persistent` keeps the server and its extensions across refreshes in managed storage; `ephemeral` lets them go with the environment generation",
+          "type": "string",
+          "enum": ["persistent", "ephemeral"]
+        },
+        "home": {
+          "description": "the user's home in the guest, where the server data directory lives; default `/root` for root and `/home/<user>` otherwise",
+          "type": "string"
+        },
+        "reconcile": {
+          "description": "a project command run in the guest once the editor server is up, after the imported settings and extensions are applied",
+          "$ref": "#/$defs/hook"
+        },
+        "extensions": {
+          "description": "extensions to install in the remote",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "settings": {
+          "description": "remote settings to apply, without touching unrelated user preferences",
+          "type": "object"
+        }
+      }
+    },
+    "host": {
+      "title": "host",
+      "description": "`[dev.host]`: what the guest may reach on the host. Everything here is off by default.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "git-gui": {
+          "description": "the built-in Git GUI policy: `gitk` and `git gui` on the host, over the mapped workspace, with their arguments and environment filtered",
+          "type": "boolean"
+        },
+        "ssh-agent": {
+          "description": "forward the host's SSH agent into the guest",
+          "type": "boolean"
+        },
+        "wrapper": {
+          "description": "a project's own host-command dispatcher, relative to the workspace root — the escape hatch for what the built-in policies do not cover",
+          "type": "string"
+        },
+        "wrapper-env": {
+          "description": "environment variable patterns passed through to the wrapper",
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "cache": {
+      "title": "cache",
+      "description": "`[dev.cache]`: where built stages are cached",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "registry": { "type": "string" },
+        "insecure": { "type": "boolean" }
+      }
+    },
+    "endpoint": {
+      "title": "endpoint",
+      "description": "`[dev.endpoints.<name>]`: one guest port, published on the host",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "service": {
+          "description": "the compose service that listens (default: the primary)",
+          "type": "string"
+        },
+        "target": {
+          "description": "the guest port; required once layered",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "host-port": {
+          "description": "the preferred host port (default: the same number)",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "address": {
+          "description": "the host address: `auto` for a stable loopback allocation, or an address",
+          "type": "string"
+        },
+        "scheme": {
+          "description": "for `vk dev open`: the URL scheme …",
+          "type": "string"
+        },
+        "path": {
+          "description": "… and path",
+          "type": "string"
+        },
+        "required": {
+          "description": "the environment is not ready until this is published",
+          "type": "boolean"
+        },
+        "enabled": {
+          "description": "`false` in a local layer switches an inherited endpoint off",
+          "type": "boolean"
+        }
+      }
+    },
+    "network": {
+      "title": "network",
+      "description": "`[dev.network]`",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "egress": {
+          "description": "`unrestricted` (default): the guest reaches what the host reaches; restricting it is not implemented",
+          "type": "string",
+          "enum": ["unrestricted"]
+        }
+      }
+    },
+    "hooks": {
+      "title": "hooks",
+      "description": "`[dev.hooks]`: when project commands run around the environment",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "init": {
+          "description": "on the host, from the workspace, before every build or start attempt",
+          "$ref": "#/$defs/hook"
+        },
+        "create": {
+          "description": "in the guest, once per materialized environment generation",
+          "$ref": "#/$defs/hook"
+        },
+        "start": {
+          "description": "in the guest, on each actual start — not on a reused attachment",
+          "$ref": "#/$defs/hook"
+        }
+      }
+    },
+    "hook": {
+      "description": "a hook in any of its forms: a shell string, an argv array, a table with `run` and its options, or a table of named hooks that run as a group (in turn; the group fails if any required member does). A named member cannot be called `run`, `cwd`, `timeout` or `required`.",
+      "anyOf": [
+        { "title": "shell", "type": "string" },
+        { "title": "argv", "type": "array", "items": { "type": "string" } },
+        { "$ref": "#/$defs/hook-spec" },
+        {
+          "title": "named hooks",
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/hook" }
+        }
+      ]
+    },
+    "hook-spec": {
+      "title": "hook with options",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "run": {
+          "description": "a shell string or an argv array; required once layered",
+          "$ref": "#/$defs/command"
+        },
+        "cwd": {
+          "description": "the working directory (default: the workspace)",
+          "type": "string"
+        },
+        "timeout": {
+          "description": "how long it may take (`10m`, `90s`)",
+          "type": "string"
+        },
+        "required": {
+          "description": "a failure fails the operation (default), or is reported and lets it continue",
+          "type": "boolean"
+        }
+      }
+    },
+    "command": {
+      "description": "a shell string, or an argv list run directly",
+      "anyOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "type": "string" } }
+      ]
+    },
+    "string-map": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    }
+  }
+}

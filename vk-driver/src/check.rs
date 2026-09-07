@@ -65,6 +65,14 @@ impl Feature {
         )
     }
 
+    /// The feature `name` names, as `--feature` spells it.
+    pub fn from_name(name: &str) -> Option<Feature> {
+        <Feature as clap::ValueEnum>::value_variants()
+            .iter()
+            .copied()
+            .find(|f| f.name() == name)
+    }
+
     fn name(self) -> &'static str {
         match self {
             Feature::Kvm => "kvm",

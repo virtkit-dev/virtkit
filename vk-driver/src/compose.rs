@@ -569,7 +569,13 @@ fn is_env_name(k: &str) -> bool {
 
 /// Read one `KEY=VALUE` file. `required` says whether its absence is an error; the parsing
 /// is the `.env` / `--env-file` convention — comments and blanks skipped, one matching pair
-/// of quotes stripped, no escapes and no `$VAR` expansion.
+/// of quotes stripped, no escapes and no `$VAR` expansion. A `#` inside a value is part of
+/// the value, as docker reads it.
+///
+/// Deliberately not the rules [`crate::dev::config::read_env_file`] applies to
+/// `.virtkit/local.env`: that file is vk's own, so ` #` starts a comment there, quotes take
+/// escapes, and text after a closing quote is refused. These files belong to a compose
+/// project, where reading them differently from docker would be the bug.
 fn read_env_file(path: &Path, required: bool) -> Result<Vec<(String, String)>> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
