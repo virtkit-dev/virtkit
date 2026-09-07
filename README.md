@@ -362,67 +362,19 @@ vk dev code                         # VS Code over Remote-SSH, extensions and se
 vk dev service up runner            # a profiled compose service, built on first use
 vk dev endpoints                    # the stable host addresses its ports are published on
 vk dev task pre-commit -- "$@"      # a project command under its declared execution policy
-vk dev status | plan | doctor       # what is running, what the config resolves to, host checks
+vk dev status                       # what is running and whether its configuration matches
+vk dev plan                         # inspect the resolved configuration without running it
+vk dev doctor                       # check the host and configuration requirements
 vk dev refresh                      # rebuild and restart into the current config
 vk dev stop
 vk dev list                         # every environment this host keeps state for, from anywhere
-vk dev gc --all-stale               # drop the state of deleted checkouts and throwaway runs
+vk dev gc --all-stale               # review/remove stale state; asks on a terminal
 ```
 
-```toml
-# .virtkit/config.toml — tracked; .virtkit/local.toml and local.env hold machine overrides
-schema = 1
-
-[requires]
-min-version = "0.64.0"
-
-[dev]
-compose = ".virtkit/compose.yaml"   # or image = "…", or build = { context, dockerfile, target }
-service = "devcontainer"
-workspace = "/workdir"
-user = "dev"
-freshness = "ask"                   # a running VM that no longer matches: ask | reuse | refresh | require-current
-
-[dev.exec-env]                      # sessions, hooks and editor terminals
-GITLAB_TOKEN = "${localEnv:GITLAB_TOKEN:}"
-
-[dev.mounts.vscode-server]
-source = "${state}/vscode-server"   # managed storage under the environment's state directory
-to = "/home/dev/.vscode-server"
-
-[dev.endpoints."runner.https"]
-service = "runner"
-target = 443
-host-port = 8443
-address = "auto"                    # one loopback block per environment, an octet per service
-scheme = "https"
-path = "/ui"
-
-[dev.editor.vscode]
-state = "persistent"
-reconcile = ["./.devcontainer/install-extensions.sh"]
-
-[dev.host]
-git-gui = true                      # gitk and git gui from the guest run on the host, filtered
-
-[dev.tasks.pre-commit]
-run = ["./hooks/pre-commit"]
-environment = "hook"                # an [environments.hook] built on demand
-policy = "ephemeral"                # a throwaway VM, one per run
-checkout = "overlay"                # its writes never reach the checkout
-
-[environments.hook]                 # the task's own environment, with state of its own
-build = { context = ".", dockerfile = "Dockerfile", target = "hook" }
-```
-
-Unknown keys are errors. `vk dev init` adds a `#:schema` line at the top of the file for
-completion and validation as you type in JSON Schema-aware editors
-(taplo, VS Code's Even Better TOML).
-The schema is [`docs/schema/virtkit-config.schema.json`](docs/schema/virtkit-config.schema.json);
-`vk dev schema` prints it for checkouts that vendor a copy. State lives outside the
-checkout, in a directory per worktree and environment, giving worktrees distinct SSH
-identities, endpoint addresses and storage. `vk dev storage list|reset` names the durable data
-(`disk` volumes, managed directories) and is the only thing that removes any of it.
+Configuration, local overrides, compose services, endpoints, persistent storage, editor
+setup, lifecycle hooks and isolated tasks are covered in the
+[project development guide](docs/dev.md). It includes a complete workflow and a
+service layout with on-demand test appliances.
 
 ### Manage running VMs
 
