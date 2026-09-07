@@ -294,6 +294,101 @@ fn run_args(
     Ok(args)
 }
 
+/// Where an ephemeral task's VM keeps its sockets and scratch: `<environment state
+/// dir>-task-<name>-<token>`, created here and removed by the caller once the run ends.
+///
+/// Created rather than merely named, and named with a token instead of this pid: a run that
+/// leaked its directory — killed before it could clean up — used to be inherited whole by
+/// the next run the operating system gave that pid to, stale sockets, logs and root image
+/// included.
+fn task_state_dir(plan: &Plan, task: &crate::dev::plan::TaskPlan) -> Result<PathBuf> {
+    let base = plan.state_dir.display().to_string();
+    let name = task.name.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+    for _ in 0..8 {
+        // Eight hex digits: the directory name goes into the VM's vsock socket path, which
+        // must stay under the 108-byte `sun_path` limit; the full token would overrun it.
+        let token: String = generation_token().chars().take(8).collect();
+        let dir = PathBuf::from(format!("{base}-task-{name}-{token}"));
+        // Fails if anything is already there, symlink included, so this run's directory is
+        // one it made itself.
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+        }
+    }
+    bail!(
+        "no free state directory for task {} next to {base}",
+        task.name
+    )
+}
+
+/// The `vk run` an ephemeral task is: the environment's own arguments, minus everything that
+/// belongs to an environment somebody works in — no SSH or managed client, no host command
+/// channel, no endpoints, nothing detached and no idle wait — plus the command itself. The
+/// VM lives exactly as long as that command, and the task's environment is added to the
+/// guest's own, since the run has no session to carry `exec-env`.
+///
+/// The command runs as the image's own user: an ephemeral VM has no session, and the plan's
+/// `user` is what sessions in a running environment log in as.
+pub fn task_args(
+    plan: &Plan,
+    over: &Overrides,
+    cfg: &crate::config::Config,
+    task: &crate::dev::plan::TaskPlan,
+    extra: &[String],
+    target: Option<&str>,
+    state_dir: Option<&Path>,
+) -> Result<crate::run::RunArgs> {
+    let mut args = run_args(plan, None, over, cfg, task.checkout)?;
+    // A VM of its own needs a state directory of its own: the environment's may hold a live
+    // run (an ephemeral task while the dev environment is up), and a throwaway must leave
+    // nothing behind. A sibling of the environment's directory, so `vk dev list` shows one
+    // that leaked as `ephemeral` and `vk dev gc` removes it.
+    args.state_dir = Some(match state_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => task_state_dir(plan, task)?,
+    });
+    args.ssh = false;
+    args.ssh_client = false;
+    args.ssh_agent = false;
+    args.host_exec = false;
+    args.host_exec_wrapper = None;
+    args.host_exec_env.clear();
+    args.detach = false;
+    args.detach_log = None;
+    args.inactivity_timeout_secs = None;
+    if let Some(t) = target {
+        // The fallback stage, built because the configured one was not cached.
+        args.target = Some(t.to_string());
+        args.require_cached = false;
+    }
+    args.env.extend(
+        plan.exec_env
+            .iter()
+            .chain(&task.env)
+            .map(|e| (e.name.clone(), e.value.clone())),
+    );
+    let mut argv = task.argv.clone();
+    argv.extend_from_slice(extra);
+    // `vk run` has no working directory of its own for the guest command, so the task's is
+    // spelled out — the workspace folder, as a session would get.
+    args.command = match &plan.workspace_folder {
+        Some(folder) => {
+            let mut c = vec![
+                "sh".to_string(),
+                "-c".into(),
+                format!("cd {} && exec \"$@\"", crate::shell::quote_word(folder)),
+                "sh".into(),
+            ];
+            c.extend(argv);
+            c
+        }
+        None => argv,
+    };
+    Ok(args)
+}
+
 /// The git directory a linked worktree points at, when the workspace is one and that
 /// directory lies outside it. `None` for a main checkout — whose `.git` is inside the
 /// workspace and already shared — and for anything git does not call a repository.
@@ -1233,6 +1328,41 @@ mod tests {
         // …and it is gone, so nothing else picks it up either.
         assert!(!transition_path(&plan.state_dir, 4242).exists());
     }
+
+    #[test]
+    fn each_ephemeral_task_run_gets_a_directory_of_its_own() {
+        let t = scratch("task-state");
+        let plan = plan_in(&t.0);
+        ensure_state_dir(&plan).unwrap();
+        let task = crate::dev::plan::TaskPlan {
+            name: "pre commit".into(),
+            argv: vec!["true".into()],
+            env: vec![],
+            policy: crate::dev::config::Policy::Ephemeral,
+            environment: "dev".into(),
+            reuse: "dev".into(),
+            checkout: CheckoutMode::Shared,
+        };
+
+        let first = task_state_dir(&plan, &task).unwrap();
+        let second = task_state_dir(&plan, &task).unwrap();
+        assert_ne!(first, second, "a leaked directory is never inherited");
+        let suffix = first.to_str().unwrap().rsplit('-').next().unwrap();
+        assert_eq!(suffix.len(), 8, "short enough for the vsock socket path");
+        for dir in [&first, &second] {
+            assert!(dir.is_dir(), "created, not merely named");
+            assert_eq!(
+                std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            // A sibling of the environment's, so `vk dev list` shows one that leaked and
+            // `vk dev gc` removes it.
+            assert_eq!(dir.parent(), plan.state_dir.parent());
+            let name = dir.file_name().unwrap().to_string_lossy().to_string();
+            assert!(name.starts_with("state-task-pre-commit-"), "{name}");
+        }
+    }
+
     #[test]
     fn a_managed_directorys_generation_marker_is_written_once() {
         let t = scratch("marker");

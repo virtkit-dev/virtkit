@@ -184,6 +184,33 @@ pub enum SourceMode {
     Auto,
 }
 
+/// The guest command's own non-zero exit, as the run's error. A run stands for the command
+/// it was given, so the status is carried out rather than flattened: `vk dev task` exits
+/// with it, and `vk run` reports it as any other failure.
+#[derive(Debug)]
+pub struct GuestExit(pub vk_core::messages::CmdResult);
+
+impl std::fmt::Display for GuestExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.0.code, self.0.signal) {
+            (Some(code), _) => write!(f, "guest command exited {code}"),
+            // A signalled command has no status of its own; saying it exited 0 read as a
+            // success in the one message that reports the failure.
+            (None, Some(signal)) => write!(f, "guest command was killed by signal {signal}"),
+            (None, None) => write!(f, "guest command ended without a status"),
+        }
+    }
+}
+
+impl std::error::Error for GuestExit {}
+
+/// The guest command's exit carried by `e`, when that is what failed the run.
+pub fn guest_exit(e: &anyhow::Error) -> Option<vk_core::messages::CmdResult> {
+    e.root_cause()
+        .downcast_ref::<GuestExit>()
+        .map(|g| g.0.clone())
+}
+
 pub struct RunArgs {
     /// Image to boot (a docker ref or an OCI reference). Ignored when `dockerfile` is set
     /// — the rootfs is then built from the Dockerfile target.
@@ -3655,7 +3682,9 @@ async fn drive(
         timings.record(Phase::Exec, "", t_exec.elapsed());
         match result.code {
             Some(0) | None => {}
-            Some(c) => bail!("guest command exited {c}"),
+            // Typed, so a caller that stands for the guest command — `vk dev task` — can
+            // reproduce its status instead of turning it into a bare failure.
+            Some(_) => return Err(GuestExit(result).into()),
         }
         // Ordinarily the startup command owns the run lifetime. An inactivity-managed detached
         // run instead leaves the exec server available for later `vk exec` calls. Its status
