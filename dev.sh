@@ -333,10 +333,16 @@ if [ -z "$agent_up" ]; then
 fi
 exec 9>&-
 
+# Run guest commands as the host uid/gid: rootless virtio-fs creates files in /work only as
+# the host owner (or root). Explicit gid too, so an entry-less uid does not fall to gid 0
+# (HOME is in DEV_ENV); one substitution per assignment so set -e catches either `id` failing.
+host_uid=$(id -u)
+host_gid=$(id -g)
+exec_args=(--user "$host_uid:$host_gid" --dir /work)
+
 # -t keeps cargo's colour and progress rendering, and is what makes the shell usable at
 # all; vk exec requires both local stdin and stdout to be terminals for it, which `shell`
 # has already insisted on.
-exec_args=(--user dev --dir /work)
 if [ -t 0 ] && [ -t 1 ]; then
   exec_args+=(-t)
 fi
