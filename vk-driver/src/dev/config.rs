@@ -1,0 +1,2294 @@
+//! `.virtkit/config.toml`: a project's description of its development environments, and
+//! the machine-local layer over it.
+//!
+//! A project states its environment once, in a tracked file, and every `vk dev` command works
+//! from that. Compose stays the description of a service LAN; the config names which service
+//! is the one you work in, or an image or Dockerfile when there is no LAN, and adds what
+//! compose cannot say — who you are inside, what the host mounts and publishes, which hooks
+//! run and when.
+//!
+//! ```text
+//! .virtkit/
+//!   config.toml   # tracked: the environment and its project integration
+//!   local.toml    # gitignored: this machine's overrides
+//!   local.env     # gitignored, optional: local values, read as data rather than shell
+//! ```
+//!
+//! The versioned schema rejects unknown keys in either file: ignoring a key would silently
+//! change the environment. Hook tables allow group members as well as options; see
+//! [`HOOK_OPTIONS`].
+//!
+//! `local.toml` overrides `config.toml`: tables merge; scalars and arrays replace. An empty
+//! array clears an inherited list, allowing an allowlist to be narrowed. `enabled = false`
+//! disables named entries such as mounts and endpoints. A top-level `remove` list drops
+//! inherited fields before applying the remaining overrides. Only the local layer accepts
+//! `remove` and `env-files`.
+//!
+//! Substitutions, wherever a path or a value is written — mounts, `exec-env`,
+//! `container-env`, `build.args`, hook working directories: `~`, `${HOME}`, `${workspace}`,
+//! `${state}`, `${VK_UID}`, `${VK_GID}` and `${localEnv:NAME}` (or
+//! `${localEnv:NAME:default}`) are expanded, and anything else in `${…}` is an error.
+//!
+//! `config.toml` is tracked, so a clone brings whatever it says: `hooks.init` and
+//! `host.wrapper` name commands that run on the host. The schema is strict, not a sandbox.
+//!
+//! This module reads, layers and validates; resolving the result against a host — expanding
+//! paths and variables, deriving state — is a separate step.
+
+use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+
+use crate::compose::absolute;
+
+/// The tracked config, relative to the workspace root.
+pub const CONFIG_FILE: &str = ".virtkit/config.toml";
+/// This machine's overrides, under the workspace root. Gitignored.
+pub const LOCAL_FILE: &str = ".virtkit/local.toml";
+/// Local values for `${localEnv:…}`, under the workspace root. Gitignored.
+pub const LOCAL_ENV_FILE: &str = ".virtkit/local.env";
+/// The schema version this build reads.
+pub const SCHEMA: i64 = 1;
+
+// ---------------------------------------------------------------------------
+// The schema
+// ---------------------------------------------------------------------------
+
+/// A tracked or local config layer. Every field, including a mount's `source`, is optional
+/// so partial layers can report unknown keys and type errors in their own files.
+/// [`Schema::validate`] checks required fields after merging.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Schema {
+    /// the schema version; required in the tracked file
+    pub schema: Option<i64>,
+    /// local overrides only: dotted paths to drop from the inherited config before this
+    /// layer applies, such as `dev.compose`
+    #[serde(default)]
+    pub remove: Vec<String>,
+    /// local overrides only: further env files, read after `local.env`, relative to the
+    /// workspace root
+    #[serde(default)]
+    pub env_files: Vec<String>,
+    #[serde(default)]
+    pub requires: Requires,
+    /// the development environment
+    pub dev: Option<Environment>,
+    /// further named environments, selected with `--environment`; each stands alone and
+    /// inherits nothing from `dev`
+    #[serde(default)]
+    pub environments: BTreeMap<String, Environment>,
+}
+
+/// What this project needs of the `vk` reading it.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Requires {
+    /// the oldest release that implements everything the config uses
+    pub min_version: Option<String>,
+    /// `vk check --feature` names the build must answer for
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+/// One environment: exactly one source, and how to be in it.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Environment {
+    // --- the source: exactly one ---------------------------------------------------------
+    /// a compose file, relative to the workspace root; the environment is one of its services
+    pub compose: Option<String>,
+    /// the compose service to work in — the primary VM
+    pub service: Option<String>,
+    /// an image reference, for an environment with no service LAN
+    pub image: Option<String>,
+    /// a Dockerfile target, for an environment built from the project
+    pub build: Option<Build>,
+    /// take the image from the build cache and never build it; with `fallback`, a cache miss
+    /// runs the fallback target instead. A `build` source only.
+    #[serde(default)]
+    pub cached_only: bool,
+    /// what to build when `cached-only` misses the cache
+    pub fallback: Option<Fallback>,
+
+    // --- being in it ------------------------------------------------------------------
+    /// where the workspace is mounted in the guest
+    pub workspace: Option<String>,
+    /// the user exec, shell and SSH sessions run as
+    pub user: Option<String>,
+    /// what to do when the running environment no longer matches the config
+    pub freshness: Option<Freshness>,
+    /// compose profiles activated eagerly, besides the primary's dependencies
+    #[serde(default)]
+    pub profiles: Vec<String>,
+    /// vCPUs for the primary: a count, or `"host"` for as many as the host has. Unset
+    /// inherits the compose service's `x-virtkit.cpus`, then vk's default.
+    pub cpus: Option<Cpus>,
+    /// memory for the primary (`16G`); unset inherits like `cpus`
+    pub mem: Option<String>,
+    /// environment for development sessions: exec, shell, SSH and editor processes
+    #[serde(default)]
+    pub exec_env: BTreeMap<String, String>,
+    /// environment for the guest's own processes, set at boot
+    #[serde(default)]
+    pub container_env: BTreeMap<String, String>,
+    /// extra host directories or files in the guest, by name
+    #[serde(default)]
+    pub mounts: BTreeMap<String, Mount>,
+    #[serde(default)]
+    pub editor: Editor,
+    #[serde(default)]
+    pub host: Host,
+    #[serde(default)]
+    pub cache: Cache,
+    /// guest ports published on the host, by name
+    #[serde(default)]
+    pub endpoints: BTreeMap<String, Endpoint>,
+    #[serde(default)]
+    pub network: Network,
+    #[serde(default)]
+    pub hooks: Hooks,
+    /// project commands `vk dev task <name>` runs, by name
+    #[serde(default)]
+    pub tasks: BTreeMap<String, Task>,
+}
+
+/// `build = { context = "docker/x", dockerfile = "Dockerfile", target = "dev" }`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Build {
+    /// the build context, relative to the workspace root; required once layered
+    pub context: Option<String>,
+    /// the Dockerfile, relative to the context (default `Dockerfile`)
+    pub dockerfile: Option<String>,
+    /// the stage to boot (default: the last one)
+    pub target: Option<String>,
+    /// `--build-arg` values for the build, by name
+    #[serde(default)]
+    pub args: BTreeMap<String, String>,
+}
+
+/// `fallback = { target = "hook" }`: the smaller stage a `cached-only` environment builds
+/// when its own is not in the cache.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Fallback {
+    /// the Dockerfile stage to build instead; required once layered
+    pub target: Option<String>,
+}
+
+/// `[dev.tasks.<name>]`: a project command, and where and how it is executed.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Task {
+    /// a shell string or an argv list, run in the workspace folder; required once layered
+    pub run: Option<Command>,
+    /// where it runs: `dev` (default), or a name under `[environments]`
+    pub environment: Option<String>,
+    /// which running environment the reusing policies attach to, when that is not the one
+    /// an ephemeral run would boot (default: `environment`)
+    pub reuse: Option<String>,
+    /// how the environment is obtained (default `reuse-or-ephemeral`)
+    pub policy: Option<Policy>,
+    /// how the checkout reaches the guest for this task
+    pub checkout: Option<CheckoutMode>,
+    /// added to the environment's `exec-env` for this task
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// `false` in a local layer switches an inherited task off
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+/// What a task does about the environment it needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Policy {
+    /// attach to a running environment, and fail when none runs
+    Reuse,
+    /// boot it first
+    Require,
+    /// boot a throwaway VM for the command and tear it down
+    Ephemeral,
+    /// the running one when there is one, a throwaway otherwise
+    ReuseOrEphemeral,
+}
+
+impl Policy {
+    /// The spelling the config uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Policy::Reuse => "reuse",
+            Policy::Require => "require",
+            Policy::Ephemeral => "ephemeral",
+            Policy::ReuseOrEphemeral => "reuse-or-ephemeral",
+        }
+    }
+}
+
+/// What a task sees of the checkout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CheckoutMode {
+    /// the host's tree, written through
+    #[default]
+    Shared,
+    /// a tmpfs overlay over it: the task's writes go with the VM
+    Overlay,
+}
+
+/// What `vk dev` does when the environment that is running was booted from something other
+/// than what the config now says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum Freshness {
+    /// offer a refresh on a terminal; declining, or having no terminal, reuses with a note
+    Ask,
+    /// attach to the recorded running environment and report the differences
+    Reuse,
+    /// rebuild and replace it
+    Refresh,
+    /// fail, naming the differences and the command that reconciles them
+    RequireCurrent,
+}
+
+/// `cpus = 4` or `cpus = "host"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cpus {
+    Count(u32),
+    /// as many as the host has
+    Host,
+}
+
+impl std::fmt::Display for Cpus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Cpus::Count(n) => write!(f, "{n}"),
+            Cpus::Host => f.write_str("host"),
+        }
+    }
+}
+
+/// Hand-written so `cpus = 1.5` says `a whole number of vCPUs or "host"` rather than
+/// `untagged`'s "did not match any variant".
+impl<'de> Deserialize<'de> for Cpus {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = Cpus;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a whole number of vCPUs or \"host\"")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, n: u64) -> Result<Cpus, E> {
+                u32::try_from(n)
+                    .map(Cpus::Count)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Unsigned(n), &self))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, n: i64) -> Result<Cpus, E> {
+                u32::try_from(n)
+                    .map(Cpus::Count)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(n), &self))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Cpus, E> {
+                match s {
+                    "host" => Ok(Cpus::Host),
+                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(s), &self)),
+                }
+            }
+        }
+        de.deserialize_any(Visitor)
+    }
+}
+
+/// Serialized as the config spells it: a count, or `"host"`.
+impl Serialize for Cpus {
+    fn serialize<S: serde::Serializer>(&self, se: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Cpus::Count(n) => se.serialize_u32(*n),
+            Cpus::Host => se.serialize_str("host"),
+        }
+    }
+}
+
+/// `[dev.mounts.<name>]`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Mount {
+    /// the host path; `~`, `${HOME}`, `${workspace}`, `${state}`, `${VK_UID}`, `${VK_GID}`
+    /// and `${localEnv:NAME}` (or `${localEnv:NAME:default}`) are expanded. Required once
+    /// layered.
+    pub source: Option<String>,
+    /// the guest path; required once layered
+    pub to: Option<String>,
+    #[serde(default)]
+    pub read_only: bool,
+    /// skip the mount when the source does not exist, rather than failing the boot
+    #[serde(default)]
+    pub optional: bool,
+    /// `false` in a local layer switches an inherited mount off
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Editor {
+    pub vscode: Option<VsCode>,
+}
+
+/// `[dev.editor.vscode]`: the managed VS Code server state and how it is reconciled.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct VsCode {
+    /// `persistent` keeps the server and its extensions across refreshes in managed storage;
+    /// `ephemeral` lets them go with the environment generation
+    pub state: Option<EditorState>,
+    /// the user's home in the guest, where the server data directory lives; default `/root`
+    /// for root and `/home/<user>` otherwise
+    pub home: Option<String>,
+    /// a project command run in the guest once the editor server is up, after the imported
+    /// settings and extensions are applied
+    pub reconcile: Option<Hook>,
+    /// extensions to install in the remote
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    /// remote settings to apply, without touching unrelated user preferences
+    #[serde(default)]
+    pub settings: toml::Table,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EditorState {
+    #[default]
+    Persistent,
+    Ephemeral,
+}
+
+/// `[dev.host]`: what the guest may reach on the host. Everything here is off by default.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Host {
+    /// the built-in Git GUI policy: `gitk` and `git gui` on the host, over the mapped
+    /// workspace, with their arguments and environment filtered
+    #[serde(default)]
+    pub git_gui: bool,
+    /// forward the host's SSH agent into the guest
+    #[serde(default)]
+    pub ssh_agent: bool,
+    /// a project's own host-command dispatcher, relative to the workspace root — the escape
+    /// hatch for what the built-in policies do not cover
+    pub wrapper: Option<String>,
+    /// environment variable patterns passed through to the wrapper
+    #[serde(default)]
+    pub wrapper_env: Vec<String>,
+}
+
+/// `[dev.cache]`: where built stages are cached.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Cache {
+    pub registry: Option<String>,
+    #[serde(default)]
+    pub insecure: bool,
+}
+
+/// `[dev.endpoints.<name>]`: one guest port, published on the host.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Endpoint {
+    /// the compose service that listens (default: the primary)
+    pub service: Option<String>,
+    /// the guest port; required once layered
+    pub target: Option<u16>,
+    /// the preferred host port (default: the same number)
+    pub host_port: Option<u16>,
+    /// the host address: `auto` for a stable loopback allocation, or an address
+    pub address: Option<String>,
+    /// for `vk dev open`: the URL scheme …
+    pub scheme: Option<String>,
+    /// … and path
+    pub path: Option<String>,
+    /// the environment is not ready until this is published
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+/// `[dev.network]`.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Network {
+    /// `unrestricted` (default)
+    pub egress: Option<Egress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Egress {
+    Unrestricted,
+    /// Not implemented; parsed only so a config asking for it is refused by name.
+    Restricted,
+}
+
+/// `[dev.hooks]`: when project commands run around the environment.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Hooks {
+    /// on the host, from the workspace, before every build or start attempt
+    pub init: Option<Hook>,
+    /// in the guest, once per materialized environment generation
+    pub create: Option<Hook>,
+    /// in the guest, on each actual start — not on a reused attachment
+    pub start: Option<Hook>,
+}
+
+/// A hook in any of its forms: a shell string, an argv array, a table with `run` and its
+/// options, or a table of named hooks that run as a group.
+///
+/// A table holding any of [`HOOK_OPTIONS`] is the option form; anything else is a group, so
+/// a member cannot be called `run`, `cwd`, `timeout` or `required`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Hook {
+    /// through a shell
+    Shell(String),
+    /// argv, run directly
+    Argv(Vec<String>),
+    /// a command with options
+    Detailed(HookSpec),
+    /// the named hooks run in turn; the group fails if any required member does
+    Group(BTreeMap<String, Hook>),
+}
+
+/// The keys that make a table the option form rather than a group. A table holding none of
+/// them is a group, so `init = { rnu = "make" }` is a group with a member `rnu` rather than a
+/// misspelled `run` — the one unknown key the schema cannot refuse.
+const HOOK_OPTIONS: [&str; 4] = ["run", "cwd", "timeout", "required"];
+
+/// Dispatched on the keys: a table holding any of [`HOOK_OPTIONS`] is the option form, so a
+/// typo in an option is "unknown field `timout`" and not "did not match any variant".
+impl<'de> Deserialize<'de> for Hook {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        Ok(match toml::Value::deserialize(de)? {
+            toml::Value::String(s) => Hook::Shell(s),
+            v @ toml::Value::Array(_) => Hook::Argv(Vec::deserialize(v).map_err(D::Error::custom)?),
+            toml::Value::Table(t) => match t.keys().any(|k| HOOK_OPTIONS.contains(&k.as_str())) {
+                true => Hook::Detailed(
+                    HookSpec::deserialize(toml::Value::Table(t)).map_err(D::Error::custom)?,
+                ),
+                false => Hook::Group(
+                    BTreeMap::deserialize(toml::Value::Table(t)).map_err(D::Error::custom)?,
+                ),
+            },
+            other => {
+                return Err(D::Error::custom(format!(
+                    "a hook is a command string, an argv list, a table with `run`, or a table \
+                     of named hooks, not {}",
+                    other.type_str()
+                )));
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct HookSpec {
+    /// a shell string or an argv array; required once layered
+    pub run: Option<Command>,
+    /// the working directory (default: the workspace)
+    pub cwd: Option<String>,
+    /// how long it may take (`10m`, `90s`)
+    pub timeout: Option<String>,
+    /// a failure fails the operation (default), or is reported and lets it continue
+    #[serde(default = "yes")]
+    pub required: bool,
+}
+
+/// `run = "make test"`, or `run = ["make", "test"]`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum Command {
+    Shell(String),
+    Argv(Vec<String>),
+}
+
+/// Dispatched on the value's type, so `run = 3` says what a command is rather than
+/// `untagged`'s "did not match any variant".
+impl<'de> Deserialize<'de> for Command {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        Ok(match toml::Value::deserialize(de)? {
+            toml::Value::String(s) => Command::Shell(s),
+            v @ toml::Value::Array(_) => {
+                Command::Argv(Vec::deserialize(v).map_err(D::Error::custom)?)
+            }
+            other => {
+                return Err(D::Error::custom(format!(
+                    "a command is a shell string or an argv list, not {}",
+                    other.type_str()
+                )));
+            }
+        })
+    }
+}
+
+fn yes() -> bool {
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Validation and description
+// ---------------------------------------------------------------------------
+
+impl Schema {
+    /// Check the merged config's source count, schema version and values. Each layer has
+    /// already rejected unknown keys with their locations.
+    pub fn validate(&self) -> Result<()> {
+        match self.schema {
+            None => bail!("`schema = {SCHEMA}` is required at the top of config.toml"),
+            Some(SCHEMA) => {}
+            Some(n) => bail!("schema {n} is not one this vk reads (it reads {SCHEMA})"),
+        }
+        if let Some(v) = &self.requires.min_version {
+            v.parse::<crate::check::Version>()
+                .map_err(|e| anyhow::anyhow!("requires.min-version {v:?}: {e}"))?;
+        }
+        for f in &self.requires.features {
+            if crate::check::Feature::from_name(f).is_none() {
+                bail!(
+                    "requires.features names {f:?}, which is not a feature `vk check` knows \
+                     (see `vk check --help`)"
+                );
+            }
+        }
+        let Some(dev) = &self.dev else {
+            bail!("config.toml has no [dev] table: which environment is the one you work in?");
+        };
+        dev.validate("dev")?;
+        for (name, env) in &self.environments {
+            if name == "dev" {
+                bail!("[environments.dev] clashes with [dev]: name it something else");
+            }
+            valid_name(name).with_context(|| format!("[environments.{name}]"))?;
+            env.validate(&format!("environments.{name}"))?;
+        }
+        // Check task references in every environment, including unselected ones, so typos
+        // naming undeclared environments are reported when the config is loaded.
+        for (at, env) in [("dev".to_string(), dev)].into_iter().chain(
+            self.environments
+                .iter()
+                .map(|(n, e)| (format!("environments.{n}"), e)),
+        ) {
+            for (task, t) in env.tasks.iter().filter(|(_, t)| t.enabled) {
+                for (key, named) in [("environment", &t.environment), ("reuse", &t.reuse)] {
+                    let Some(name) = named else { continue };
+                    if name != "dev" && !self.environments.contains_key(name) {
+                        let mut known: Vec<&str> = vec!["dev"];
+                        known.extend(self.environments.keys().map(String::as_str));
+                        bail!(
+                            "[{at}.tasks.{task}] {key} names no [environments.{name}] (there \
+                             is {})",
+                            known.join(", ")
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A name a shell can export: one holding `=` reaches the guest as a different variable, and
+/// one holding a newline is dropped without a word.
+fn valid_env_name(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !ok {
+        bail!("{name:?} is not a variable name (a letter or `_`, then letters, digits and `_`)");
+    }
+    Ok(())
+}
+
+/// A name usable in a file name and an ssh alias: letters, digits, `.`, `_`, `-`; not `.`,
+/// `..` or a leading `-`, which a path or a command line reads as something else.
+fn valid_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        bail!("{name:?} is not a name (letters, digits, `.`, `_` and `-` only)");
+    }
+    if matches!(name, "." | "..") || name.starts_with('-') {
+        bail!("{name:?} is not a name (not `.` or `..`, and not starting with `-`)");
+    }
+    Ok(())
+}
+
+/// A path a config may name under the workspace root. `config.toml` is tracked, so a clone
+/// writes these: an absolute one would replace the root the join gives it, and a `..` would
+/// climb out of the checkout it arrived in.
+fn workspace_relative(path: &str) -> Result<()> {
+    if path.is_empty() {
+        bail!("the path is empty");
+    }
+    let rel = Path::new(path);
+    if rel.is_absolute() {
+        bail!("{path:?} must be relative to the workspace root");
+    }
+    if rel.components().any(|c| c == Component::ParentDir) {
+        bail!("{path:?} leaves the workspace root");
+    }
+    Ok(())
+}
+
+impl Environment {
+    /// Validate an environment. Mounts, endpoints and tasks disabled by a local layer need
+    /// valid names but may omit fields required by enabled entries.
+    fn validate(&self, at: &str) -> Result<()> {
+        let sources = [
+            self.compose.is_some(),
+            self.image.is_some(),
+            self.build.is_some(),
+        ]
+        .iter()
+        .filter(|s| **s)
+        .count();
+        match sources {
+            0 => bail!("[{at}] names no source: set one of compose, image or build"),
+            1 => {}
+            _ => bail!(
+                "[{at}] names more than one source; set exactly one of compose, image or \
+                 build (a local layer switching source must `remove` the inherited one)"
+            ),
+        }
+        match (&self.compose, &self.service) {
+            (Some(_), None) => bail!("[{at}] compose needs `service`: which one you work in"),
+            (_, Some(s)) => valid_name(s).with_context(|| format!("[{at}] service"))?,
+            (None, None) => {}
+        }
+        if self.compose.is_none() {
+            if self.service.is_some() {
+                bail!("[{at}] service only applies to a compose source");
+            }
+            if !self.profiles.is_empty() {
+                bail!("[{at}] profiles are compose profiles, and this is not a compose source");
+            }
+            for (name, e) in self.endpoints.iter().filter(|(_, e)| e.enabled) {
+                if e.service.is_some() {
+                    bail!(
+                        "[{at}.endpoints.{name}] names a service, and this is not a compose \
+                         source"
+                    );
+                }
+            }
+        }
+        if let Some(b) = &self.build {
+            if b.context.as_deref().unwrap_or_default().is_empty() {
+                bail!("[{at}] build needs `context`: the directory it builds from");
+            }
+            // Empty is not "the last stage": it is what `vk dev init` writes for a
+            // multi-stage Dockerfile, and `--target ""` builds nothing.
+            if b.target.as_deref().is_some_and(str::is_empty) {
+                bail!("[{at}] build target is empty: name the stage to boot, or drop the key");
+            }
+        }
+        // Both are about which Dockerfile stage is materialized, so both need one to talk
+        // about: a compose service's image is compose's business, and an image is already built.
+        if self.build.is_none() {
+            if self.cached_only {
+                bail!(
+                    "[{at}] cached-only applies to a build source: there is no stage to take from the cache"
+                );
+            }
+            if self.fallback.is_some() {
+                bail!("[{at}] fallback names a build target, and this is not a build source");
+            }
+        }
+        if let Some(f) = &self.fallback {
+            if !self.cached_only {
+                bail!(
+                    "[{at}] fallback is what `cached-only` builds on a cache miss; set \
+                     cached-only = true or drop it"
+                );
+            }
+            if f.target.as_deref().unwrap_or_default().is_empty() {
+                bail!("[{at}.fallback] needs `target`: the stage a cache miss builds instead");
+            }
+        }
+        // A name is checked whether or not the entry runs: it is what a file, an ssh alias
+        // or a command line will carry, and `enabled = false` does not change that.
+        for (scope, name) in self
+            .mounts
+            .keys()
+            .map(|n| ("mounts", n))
+            .chain(self.endpoints.keys().map(|n| ("endpoints", n)))
+            .chain(self.tasks.keys().map(|n| ("tasks", n)))
+        {
+            valid_name(name).with_context(|| format!("[{at}.{scope}]"))?;
+        }
+        for (name, t) in self.tasks.iter().filter(|(_, t)| t.enabled) {
+            match &t.run {
+                Some(Command::Shell(s)) if s.trim().is_empty() => {
+                    bail!("[{at}.tasks.{name}] the command is empty")
+                }
+                Some(Command::Argv(a)) if a.is_empty() => {
+                    bail!("[{at}.tasks.{name}] the argv list is empty")
+                }
+                Some(_) => {}
+                None => bail!("[{at}.tasks.{name}] needs `run`: the command"),
+            }
+            for var in t.env.keys() {
+                valid_env_name(var).with_context(|| format!("[{at}.tasks.{name}.env]"))?;
+            }
+        }
+        if let Some(w) = &self.workspace
+            && !w.starts_with('/')
+        {
+            bail!("[{at}] workspace {w:?} is a guest path and must be absolute");
+        }
+        // The identity exec and SSH sessions run as, and the owner of `/home/<user>`.
+        if let Some(u) = &self.user {
+            valid_name(u).with_context(|| format!("[{at}] user"))?;
+        }
+        // A host executable named by a tracked file, so it must be the project's own.
+        if let Some(w) = &self.host.wrapper {
+            workspace_relative(w).with_context(|| format!("[{at}.host] wrapper"))?;
+        }
+        if self.cpus == Some(Cpus::Count(0)) {
+            bail!("[{at}] cpus must be at least 1");
+        }
+        if let Some(m) = &self.mem
+            && crate::run::parse_mem_mib(m).is_none()
+        {
+            bail!("[{at}] mem {m:?}: expected a non-zero <n>G, <n>M or MiB");
+        }
+        for (scope, env) in [
+            ("exec-env", &self.exec_env),
+            ("container-env", &self.container_env),
+        ] {
+            for name in env.keys() {
+                valid_env_name(name).with_context(|| format!("[{at}.{scope}]"))?;
+            }
+        }
+        for (name, m) in self.mounts.iter().filter(|(_, m)| m.enabled) {
+            if m.source.as_deref().unwrap_or_default().is_empty() {
+                bail!("[{at}.mounts.{name}] needs `source`: the host path");
+            }
+            match &m.to {
+                Some(to) if to.starts_with('/') => {}
+                Some(to) => bail!("[{at}.mounts.{name}] to {to:?} must be an absolute guest path"),
+                None => bail!("[{at}.mounts.{name}] needs `to`: the guest path"),
+            }
+        }
+        for (name, e) in self.endpoints.iter().filter(|(_, e)| e.enabled) {
+            // A published endpoint's service becomes the host of a `tcp://` target.
+            if let Some(s) = &e.service {
+                valid_name(s).with_context(|| format!("[{at}.endpoints.{name}] service"))?;
+            }
+            match e.target {
+                Some(1..) => {}
+                Some(0) => bail!("[{at}.endpoints.{name}] target 0 is not a port"),
+                None => bail!("[{at}.endpoints.{name}] needs `target`: the guest port"),
+            }
+            if e.host_port == Some(0) {
+                bail!("[{at}.endpoints.{name}] host-port 0 is not a port");
+            }
+            if let Some(a) = &e.address
+                && a != "auto"
+                && a.parse::<std::net::IpAddr>().is_err()
+            {
+                bail!("[{at}.endpoints.{name}] address {a:?}: expected \"auto\" or an IP address");
+            }
+        }
+        if self.network.egress == Some(Egress::Restricted) {
+            bail!(
+                "[{at}.network] egress = \"restricted\" is not implemented: the guest reaches \
+                 what the host reaches"
+            );
+        }
+        for (hook, cmd) in [
+            ("init", &self.hooks.init),
+            ("create", &self.hooks.create),
+            ("start", &self.hooks.start),
+        ] {
+            if let Some(c) = cmd {
+                c.validate()
+                    .with_context(|| format!("[{at}.hooks] {hook}"))?;
+            }
+        }
+        if let Some(vs) = &self.editor.vscode {
+            if let Some(r) = &vs.reconcile {
+                r.validate()
+                    .with_context(|| format!("[{at}.editor.vscode] reconcile"))?;
+            }
+            if let Some(h) = &vs.home
+                && !h.starts_with('/')
+            {
+                bail!("[{at}.editor.vscode] home {h:?} must be an absolute guest path");
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Hook {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Hook::Shell(s) if s.trim().is_empty() => bail!("the command is empty"),
+            Hook::Shell(_) => Ok(()),
+            Hook::Argv(a)
+            | Hook::Detailed(HookSpec {
+                run: Some(Command::Argv(a)),
+                ..
+            }) if a.is_empty() => {
+                bail!("the argv list is empty")
+            }
+            Hook::Detailed(HookSpec {
+                run: Some(Command::Shell(s)),
+                ..
+            }) if s.trim().is_empty() => {
+                bail!("the command is empty")
+            }
+            Hook::Detailed(HookSpec { run: None, .. }) => bail!("needs `run`: the command"),
+            Hook::Argv(_) => Ok(()),
+            Hook::Detailed(spec) => {
+                if let Some(t) = &spec.timeout {
+                    parse_duration(t).with_context(|| format!("timeout {t:?}"))?;
+                }
+                Ok(())
+            }
+            Hook::Group(group) => {
+                if group.is_empty() {
+                    bail!("the group is empty");
+                }
+                for (name, member) in group {
+                    valid_name(name)?;
+                    member.validate().with_context(|| name.clone())?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// `90s`, `10m`, `1h`, or a bare number of seconds.
+pub fn parse_duration(text: &str) -> Result<std::time::Duration> {
+    let (digits, unit) = match text.find(|c: char| !c.is_ascii_digit()) {
+        Some(i) => text.split_at(i),
+        None => (text, "s"),
+    };
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| anyhow::anyhow!("expected a duration such as 90s, 10m or 1h"))?;
+    let secs = match unit {
+        "s" => n,
+        "m" => n.saturating_mul(60),
+        "h" => n.saturating_mul(3600),
+        _ => bail!("expected a duration such as 90s, 10m or 1h"),
+    };
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+// ---------------------------------------------------------------------------
+// Discovery
+// ---------------------------------------------------------------------------
+
+/// The files one environment description is read from. The local layers are named whether or
+/// not they exist; the open that reads them is what decides.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Files {
+    /// the project root: what paths in the config are relative to
+    pub workspace: PathBuf,
+    pub config: PathBuf,
+    pub local: PathBuf,
+    pub local_env: PathBuf,
+}
+
+/// The root of the checkout `dir` is in: the nearest ancestor (or `dir` itself) holding a
+/// `.git` entry of any kind — a directory, a linked worktree's file, or a symlink to either,
+/// all of which git honours. `None` outside any checkout.
+pub fn worktree_root(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .find(|d| std::fs::symlink_metadata(d.join(".git")).is_ok())
+        .map(Path::to_path_buf)
+}
+
+/// Find the config for a caller in `from`, failing when the project has none. `--workspace`
+/// names the root outright and `--dev-config` names the file, whose own directory's parent
+/// is then the workspace unless `--workspace` says otherwise.
+pub fn discover(from: &Path, workspace: Option<&Path>, config: Option<&Path>) -> Result<Files> {
+    let (workspace, config) = match (workspace, config) {
+        (Some(w), Some(c)) => (absolute(w)?, absolute(c)?),
+        (Some(w), None) => {
+            let w = absolute(w)?;
+            (w.clone(), w.join(CONFIG_FILE))
+        }
+        (None, Some(c)) => {
+            let c = absolute(c)?;
+            // `.virtkit/config.toml` under the project; an arbitrary file's own directory
+            // otherwise, which `--workspace` corrects when that is wrong.
+            let dir = c.parent().unwrap_or(Path::new("/"));
+            let ws = match dir.file_name() {
+                Some(n) if n == ".virtkit" => dir.parent().unwrap_or(dir),
+                _ => dir,
+            };
+            (ws.to_path_buf(), c)
+        }
+        (None, None) => {
+            let from = absolute(from)?;
+            let Some(files) = search(&from)? else {
+                let looked = match worktree_root(&from) {
+                    Some(root) if root != from => {
+                        format!("{} up to {}", from.display(), root.display())
+                    }
+                    _ => from.display().to_string(),
+                };
+                bail!(
+                    "no {CONFIG_FILE} in {looked} — `vk dev init` writes one, --workspace names \
+                     the project, --dev-config names the file"
+                );
+            };
+            return Ok(files);
+        }
+    };
+    // A better error than the read's, nothing more: the open in `load` is what decides.
+    if open_regular(&config)?.is_none() {
+        bail!("{} is not a file", config.display());
+    }
+    Ok(files_of(workspace, config))
+}
+
+/// `.virtkit/config.toml` in `from` or an ancestor, no further up than the checkout root —
+/// and no further than `from` itself outside a checkout, where the walk would otherwise
+/// reach `$HOME` and adopt a config written for another project.
+fn search(from: &Path) -> Result<Option<Files>> {
+    let Some(root) = worktree_root(from) else {
+        let config = from.join(CONFIG_FILE);
+        return Ok(open_regular(&config)?.map(|_| files_of(from.to_path_buf(), config)));
+    };
+    for dir in from.ancestors() {
+        let config = dir.join(CONFIG_FILE);
+        if open_regular(&config)?.is_some() {
+            return Ok(Some(files_of(dir.to_path_buf(), config)));
+        }
+        if dir == root {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+/// The config and the local layers over it. The local files are the workspace's own, at
+/// `workspace/.virtkit/`, wherever `--dev-config` took the tracked file from.
+fn files_of(workspace: PathBuf, config: PathBuf) -> Files {
+    Files {
+        local: workspace.join(LOCAL_FILE),
+        local_env: workspace.join(LOCAL_ENV_FILE),
+        workspace,
+        config,
+    }
+}
+
+/// Open `path` for reading as a regular file, following no symlink. `Ok(None)` when it is not
+/// there.
+///
+/// The type comes from the descriptor, so nothing can be swapped in between the check and the
+/// read, and `O_NOFOLLOW` keeps a tracked `config.toml` from naming which host file vk reads
+/// and quotes back in an error. Only `NotFound` is absent: a symlink (`ELOOP`), a denied
+/// traversal, a directory and a device are all reported.
+fn open_regular(path: &Path) -> Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+    };
+    let meta = file
+        .metadata()
+        .with_context(|| format!("reading {}", path.display()))?;
+    if !meta.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    Ok(Some(file))
+}
+
+/// The contents of a regular `path`, or `None` when it is not there. See [`open_regular`].
+fn read_regular(path: &Path) -> Result<Option<String>> {
+    use std::io::Read;
+    let Some(mut file) = open_regular(path)? else {
+        return Ok(None);
+    };
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(Some(text))
+}
+
+/// Fold `.` and `..` without filesystem access, including in paths that do not yet exist.
+/// Keep leading `..` in relative paths; discard it at `/`, which is its own parent.
+pub fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            // `pop` on a trailing `..` would succeed and eat it, so stack them explicitly.
+            Component::ParentDir => {
+                if out.components().next_back() == Some(Component::ParentDir)
+                    || (!out.pop() && !out.has_root())
+                {
+                    out.push("..");
+                }
+            }
+            Component::CurDir => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `base/rel`, folded by [`lexical_normalize`].
+pub fn lexical_join(base: &Path, rel: &Path) -> PathBuf {
+    lexical_normalize(&base.join(rel))
+}
+
+// ---------------------------------------------------------------------------
+// Loading and layering
+// ---------------------------------------------------------------------------
+
+/// Where a configured value came from, for `plan --explain`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer {
+    Project,
+    Local,
+}
+
+/// A config read, layered and validated, with its layers kept for attribution.
+#[derive(Debug, Clone)]
+pub struct Loaded {
+    pub files: Files,
+    pub schema: Schema,
+    /// `local.env` and the local layer's `env-files`, later files winning
+    pub env_file: BTreeMap<String, String>,
+    merged: toml::Table,
+    local: Option<toml::Table>,
+}
+
+/// Read, layer and validate the files [`discover`] found.
+pub fn load(files: Files) -> Result<Loaded> {
+    let Some((project_schema, project)) = parse_layer(&files.config)? else {
+        bail!(
+            "{} is not there — `vk dev init` writes one",
+            files.config.display()
+        );
+    };
+    if !project_schema.remove.is_empty() {
+        bail!(
+            "{}: `remove` belongs in {LOCAL_FILE}, which is what has something to remove",
+            files.config.display()
+        );
+    }
+    if !project_schema.env_files.is_empty() {
+        bail!(
+            "{}: `env-files` belongs in {LOCAL_FILE}: which files a machine reads is that \
+             machine's business",
+            files.config.display()
+        );
+    }
+    let (local_schema, local) = match parse_layer(&files.local)? {
+        Some((s, t)) => (Some(s), Some(t)),
+        None => (None, None),
+    };
+    let mut merged = project;
+    let mut local_applied = None;
+    if let (Some(schema), Some(mut table)) = (&local_schema, local) {
+        for path in &schema.remove {
+            remove_path(&mut merged, path)
+                .with_context(|| format!("{}: remove {path:?}", files.local.display()))?;
+        }
+        // Layer directives, not configuration: applied above, and not part of the tree.
+        table.remove("remove");
+        table.remove("env-files");
+        merge_tables(&mut merged, table.clone());
+        local_applied = Some(table);
+    }
+    let schema: Schema = merged
+        .clone()
+        .try_into()
+        .with_context(|| format!("reading the layered {}", files.config.display()))?;
+    // The merged tree, so either file may be what a semantic error is about.
+    schema.validate().with_context(|| match &local_applied {
+        Some(_) => format!(
+            "in {} (with {} layered over it)",
+            files.config.display(),
+            files.local.display()
+        ),
+        None => format!("in {}", files.config.display()),
+    })?;
+
+    let mut env_file = BTreeMap::new();
+    env_file.extend(read_env_file(&files.local_env)?);
+    for name in local_schema.iter().flat_map(|s| &s.env_files) {
+        let path = env_file_path(&files.workspace, name)
+            .with_context(|| format!("{}: env-files", files.local.display()))?;
+        env_file.extend(read_env_file(&path)?);
+    }
+    Ok(Loaded {
+        files,
+        schema,
+        env_file,
+        merged,
+        local: local_applied,
+    })
+}
+
+/// An `env-files` entry as the path it names, held to the workspace root the key documents.
+/// Not [`Schema::validate`]'s: a layer directive is stripped before the merge that validates.
+fn env_file_path(workspace: &Path, name: &str) -> Result<PathBuf> {
+    workspace_relative(name)?;
+    let path = lexical_join(workspace, Path::new(name));
+    if !path.starts_with(workspace) {
+        bail!("{name:?} is not under the workspace root");
+    }
+    Ok(path)
+}
+
+/// One configured value and where it came from, as `plan --explain` reports them.
+pub struct Origin {
+    /// the dotted path, quoted where a segment needs it
+    pub key: String,
+    pub value: toml::Value,
+    pub layer: Layer,
+    /// a value the config hands to a command, an image or the editor — an environment
+    /// variable, a build argument, a setting — which `plan --explain` prints only with
+    /// `--show-secrets`
+    pub secret: bool,
+}
+
+/// Whether a key path names a value handed to a command, an image or the editor. Any of them
+/// may carry a token, wherever it was written.
+fn secret_key(keys: &[String]) -> bool {
+    let nth_last = |n: usize| keys.len().checked_sub(n).and_then(|i| keys.get(i));
+    let at = |n: usize, name: &str| nth_last(n).map(String::as_str) == Some(name);
+    matches!(
+        nth_last(2).map(String::as_str),
+        Some("exec-env" | "container-env" | "env")
+    ) || (at(3, "build") && at(2, "args"))
+        || (at(2, "host") && at(1, "wrapper-env"))
+        // Editor settings nest freely, so any depth under them counts.
+        || keys.windows(3).any(|w| w == ["editor", "vscode", "settings"])
+}
+
+impl Loaded {
+    /// Every configured value with the layer that last set it, as `plan --explain` reports
+    /// them: dotted paths in file order, the local layer winning where both speak.
+    pub fn origins(&self) -> Vec<Origin> {
+        let mut out = Vec::new();
+        leaves(&self.merged, &mut Vec::new(), &mut out);
+        out.into_iter()
+            .map(|(keys, value)| Origin {
+                layer: match &self.local {
+                    Some(local) if lookup(local, &keys).is_some() => Layer::Local,
+                    _ => Layer::Project,
+                },
+                secret: secret_key(&keys),
+                key: join_path(&keys),
+                value,
+            })
+            .collect()
+    }
+
+    /// The environment `name` selects: `dev`, or one under `[environments]`.
+    pub fn environment(&self, name: &str) -> Result<&Environment> {
+        if name == "dev" {
+            return self
+                .schema
+                .dev
+                .as_ref()
+                .context("config.toml has no [dev] table");
+        }
+        self.schema.environments.get(name).with_context(|| {
+            let mut known: Vec<&str> = vec!["dev"];
+            known.extend(self.schema.environments.keys().map(String::as_str));
+            format!(
+                "no [environments.{name}] in {} (there is {})",
+                self.files.config.display(),
+                known.join(", ")
+            )
+        })
+    }
+}
+
+/// Parse a file as a typed layer for located key/type errors and as a tree for merging.
+/// Return `None` if the file is absent.
+fn parse_layer(path: &Path) -> Result<Option<(Schema, toml::Table)>> {
+    let Some(text) = read_regular(path)? else {
+        return Ok(None);
+    };
+    let schema: Schema =
+        toml::from_str(&text).map_err(|e| anyhow::anyhow!("{}:\n{e}", path.display()))?;
+    let table: toml::Table =
+        toml::from_str(&text).map_err(|e| anyhow::anyhow!("{}:\n{e}", path.display()))?;
+    Ok(Some((schema, table)))
+}
+
+/// Layer `over` onto `base`: tables merge key by key, everything else — scalars and arrays
+/// alike — replaces.
+fn merge_tables(base: &mut toml::Table, over: toml::Table) {
+    for (key, value) in over {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(b)), toml::Value::Table(o)) => merge_tables(b, o),
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
+
+/// Remove a value by dotted `path`. Reject missing values to catch typos and stale overrides.
+fn remove_path(table: &mut toml::Table, path: &str) -> Result<()> {
+    let keys = split_path(path)?;
+    let Some((last, parents)) = keys.split_last() else {
+        bail!("empty path");
+    };
+    let mut cur = table;
+    for k in parents {
+        cur = match cur.get_mut(k) {
+            Some(toml::Value::Table(t)) => t,
+            Some(_) => bail!("{k:?} is not a table"),
+            None => bail!("nothing at {k:?}"),
+        };
+    }
+    if cur.remove(last).is_none() {
+        bail!("nothing to remove");
+    }
+    Ok(())
+}
+
+/// Collect scalars and arrays with their key paths, recursing through tables. Keep empty
+/// tables as values so an empty `[dev.exec-env]` still has an origin.
+fn leaves(table: &toml::Table, path: &mut Vec<String>, out: &mut Vec<(Vec<String>, toml::Value)>) {
+    for (k, v) in table {
+        path.push(k.clone());
+        match v {
+            toml::Value::Table(t) if !t.is_empty() => leaves(t, path, out),
+            v => out.push((path.clone(), v.clone())),
+        }
+        path.pop();
+    }
+}
+
+/// A key path back in its dotted spelling, quoting a key a bare dotted path could not carry.
+fn join_path(keys: &[String]) -> String {
+    keys.iter()
+        .map(|k| quote_key(k))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn lookup<'a>(table: &'a toml::Table, keys: &[String]) -> Option<&'a toml::Value> {
+    let (first, rest) = keys.split_first()?;
+    let mut cur = table.get(first)?;
+    for k in rest {
+        cur = cur.as_table()?.get(k)?;
+    }
+    Some(cur)
+}
+
+/// `dev.endpoints."runner.https".target` → its keys, with TOML's quoting for a key that
+/// contains a dot. A quoted key spans its whole segment, as it does in TOML: `a"b"c` is a
+/// typo, not the key `abc`.
+fn split_path(path: &str) -> Result<Vec<String>> {
+    let mut keys = Vec::new();
+    for segment in split_segments(path) {
+        let key = match segment.strip_prefix('"') {
+            Some(rest) => match rest.strip_suffix('"') {
+                Some(inner) if !inner.contains('"') => inner,
+                _ => bail!("{path:?}: {segment:?} is not a quoted key"),
+            },
+            None if segment.contains('"') => {
+                bail!("{path:?}: {segment:?} quotes part of a key")
+            }
+            None => segment,
+        };
+        if key.is_empty() {
+            bail!("{path:?}: empty key");
+        }
+        keys.push(key.to_string());
+    }
+    if keys.is_empty() {
+        bail!("{path:?}: empty key");
+    }
+    Ok(keys)
+}
+
+/// The dot-separated segments of `path`, with dots inside a quoted key left alone.
+fn split_segments(path: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut quoted) = (0, false);
+    for (i, c) in path.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '.' if !quoted => {
+                out.push(&path[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&path[start..]);
+    out
+}
+
+/// Read `NAME=value` lines as data: no expansion, no command substitution, no sourcing. A
+/// leading `export ` is accepted, ` #` starts a comment, and a value may be single- or
+/// double-quoted — inside double quotes `\"` and `\\` are the only escapes, and text after
+/// the closing quote is an error.
+///
+/// Deliberately not docker's `.env` rules, which [`crate::compose`] reads for a compose
+/// project: there a value is raw to the end of the line (`#` included) and one matching pair
+/// of quotes is stripped with no escapes.
+///
+/// A file that is not there is no values; one that is not a regular file is an error.
+pub fn read_env_file(path: &Path) -> Result<BTreeMap<String, String>> {
+    let Some(text) = read_regular(path)? else {
+        return Ok(BTreeMap::new());
+    };
+    parse_env_file(&text).with_context(|| format!("in {}", path.display()))
+}
+
+fn parse_env_file(text: &str) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for (i, raw) in text.lines().enumerate() {
+        let n = i + 1;
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line
+            .strip_prefix("export ")
+            .map(str::trim_start)
+            .unwrap_or(line);
+        let (name, value) = line
+            .split_once('=')
+            .with_context(|| format!("line {n}: expected NAME=value, got {raw:?}"))?;
+        let name = name.trim_end();
+        valid_env_name(name).with_context(|| format!("line {n}"))?;
+        let value = value.trim_start();
+        let value = match value.chars().next() {
+            Some('\'') => {
+                let inner = &value[1..];
+                let end = inner
+                    .find('\'')
+                    .with_context(|| format!("line {n}: unterminated quote"))?;
+                trailing_ok(&inner[end + 1..], n)?;
+                inner[..end].to_string()
+            }
+            Some('"') => {
+                let mut s = String::new();
+                let mut chars = value[1..].chars();
+                let mut closed = false;
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => match chars.next() {
+                            Some(e @ ('"' | '\\')) => s.push(e),
+                            Some(other) => {
+                                s.push('\\');
+                                s.push(other);
+                            }
+                            None => s.push('\\'),
+                        },
+                        '"' => {
+                            closed = true;
+                            break;
+                        }
+                        c => s.push(c),
+                    }
+                }
+                if !closed {
+                    bail!("line {n}: unterminated quote");
+                }
+                trailing_ok(chars.as_str(), n)?;
+                s
+            }
+            // Unquoted: to the end of the line, minus a trailing comment.
+            _ => match value.find(" #") {
+                Some(at) => value[..at].trim_end().to_string(),
+                None => value.trim_end().to_string(),
+            },
+        };
+        out.insert(name.to_string(), value);
+    }
+    Ok(out)
+}
+
+fn trailing_ok(rest: &str, line: usize) -> Result<()> {
+    let rest = rest.trim_start();
+    if rest.is_empty() || rest.starts_with('#') {
+        return Ok(());
+    }
+    bail!("line {line}: unexpected {rest:?} after the closing quote")
+}
+
+/// A TOML key, quoted when it is not bare.
+fn quote_key(key: &str) -> String {
+    if !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return key.to_string();
+    }
+    toml::Value::String(key.to_string()).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixture(PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    fn workspace(tag: &str) -> Fixture {
+        let root = std::env::temp_dir().join(format!("vk-devconfig-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".virtkit")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        Fixture(root)
+    }
+
+    const WAB: &str = r#"
+schema = 1
+
+[requires]
+features = ["entrypoint", "publish"]
+
+[dev]
+compose = ".virtkit/compose.yaml"
+service = "devcontainer"
+workspace = "/workdir"
+user = "dev"
+freshness = "ask"
+profiles = []
+
+[dev.exec-env]
+GITLAB_WORKFLOW_INSTANCE_URL = "https://gitlab.corp.wallix.com"
+
+[dev.mounts.gitconfig]
+source = "~/.gitconfig"
+to = "/home/dev/.gitconfig"
+read-only = true
+optional = true
+
+[dev.editor.vscode]
+state = "persistent"
+reconcile = ["/workdir/.devcontainer/install-extensions.sh", "-postcreate"]
+
+[dev.host]
+git-gui = true
+ssh-agent = false
+
+[dev.cache]
+registry = "https://vk-registry.corp:5000"
+insecure = false
+
+[dev.endpoints."runner.https"]
+service = "runner"
+target = 443
+host-port = 8443
+address = "auto"
+scheme = "https"
+path = "/ui"
+required = true
+
+[dev.endpoints."runner.ssh"]
+service = "runner"
+target = 22
+host-port = 8022
+address = "auto"
+
+[dev.network]
+egress = "unrestricted"
+
+[dev.hooks]
+init = "./scripts/prepare.sh"
+create = { run = ["make", "fixtures"], timeout = "10m", required = false }
+start = { redis = "redis-cli ping", db = ["mysqladmin", "ping"] }
+"#;
+
+    fn write(f: &Fixture, name: &str, text: &str) {
+        std::fs::write(f.0.join(name), text).unwrap();
+    }
+
+    fn load_in(f: &Fixture) -> Result<Loaded> {
+        load(discover(&f.0, None, None)?)
+    }
+
+    fn dev_of(l: &Loaded) -> &Environment {
+        l.schema.dev.as_ref().unwrap()
+    }
+
+    #[test]
+    fn the_illustrative_config_reads_as_written() {
+        let f = workspace("wab");
+        write(&f, CONFIG_FILE, WAB);
+        let l = load_in(&f).unwrap();
+        let dev = dev_of(&l);
+        assert_eq!(dev.compose.as_deref(), Some(".virtkit/compose.yaml"));
+        assert_eq!(dev.service.as_deref(), Some("devcontainer"));
+        assert_eq!(dev.freshness, Some(Freshness::Ask));
+        assert_eq!(l.schema.requires.features, ["entrypoint", "publish"]);
+        let m = &dev.mounts["gitconfig"];
+        assert!(m.read_only && m.optional && m.enabled);
+        let e = &dev.endpoints["runner.https"];
+        assert_eq!(
+            (e.target, e.host_port, e.required),
+            (Some(443), Some(8443), true)
+        );
+        assert!(dev.host.git_gui);
+        assert_eq!(
+            dev.hooks.init,
+            Some(Hook::Shell("./scripts/prepare.sh".into()))
+        );
+        match &dev.hooks.create {
+            Some(Hook::Detailed(spec)) => {
+                assert_eq!(
+                    spec.run,
+                    Some(Command::Argv(vec!["make".into(), "fixtures".into()]))
+                );
+                assert_eq!(spec.timeout.as_deref(), Some("10m"));
+                assert!(!spec.required);
+            }
+            other => panic!("{other:?}"),
+        }
+        match &dev.hooks.start {
+            Some(Hook::Group(group)) => assert_eq!(group.len(), 2),
+            other => panic!("{other:?}"),
+        }
+        match &dev.editor.vscode.as_ref().unwrap().reconcile {
+            Some(Hook::Argv(argv)) => assert_eq!(argv[1], "-postcreate"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_is_refused_with_its_location() {
+        let f = workspace("unknown");
+        write(
+            &f,
+            CONFIG_FILE,
+            "schema = 1\n[dev]\nimage = \"x\"\nworkspce = \"/w\"\n",
+        );
+        let err = load_in(&f).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("workspce"), "{msg}");
+        assert!(msg.contains("config.toml"), "{msg}");
+        assert!(msg.contains("line 4"), "{msg}");
+        // …in the local layer too, naming that file.
+        write(&f, CONFIG_FILE, "schema = 1\n[dev]\nimage = \"x\"\n");
+        write(&f, LOCAL_FILE, "[dev]\nmemory = \"8G\"\n");
+        let msg = format!("{:#}", load_in(&f).unwrap_err());
+        assert!(
+            msg.contains("memory") && msg.contains("local.toml"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn the_schema_version_and_a_source_are_required() {
+        let f = workspace("schema");
+        write(&f, CONFIG_FILE, "[dev]\nimage = \"x\"\n");
+        assert!(format!("{:#}", load_in(&f).unwrap_err()).contains("schema = 1"));
+        write(&f, CONFIG_FILE, "schema = 2\n[dev]\nimage = \"x\"\n");
+        assert!(format!("{:#}", load_in(&f).unwrap_err()).contains("schema 2"));
+        write(&f, CONFIG_FILE, "schema = 1\n");
+        assert!(format!("{:#}", load_in(&f).unwrap_err()).contains("[dev]"));
+        write(&f, CONFIG_FILE, "schema = 1\n[dev]\nworkspace = \"/w\"\n");
+        assert!(format!("{:#}", load_in(&f).unwrap_err()).contains("no source"));
+        write(&f, CONFIG_FILE, "schema = 1\n[dev]\ncompose = \"c.yaml\"\n");
+        assert!(format!("{:#}", load_in(&f).unwrap_err()).contains("service"));
+        write(
+            &f,
+            CONFIG_FILE,
+            "schema = 1\n[dev]\nimage = \"x\"\nservice = \"s\"\n",
+        );
+        assert!(format!("{:#}", load_in(&f).unwrap_err()).contains("compose source"));
+    }
+
+    #[test]
+    fn local_overrides_layer_scalars_tables_and_arrays_as_documented() {
+        let f = workspace("layer");
+        write(&f, CONFIG_FILE, WAB);
+        write(
+            &f,
+            LOCAL_FILE,
+            r#"
+[dev]
+mem = "32G"
+profiles = ["runner"]
+
+[dev.exec-env]
+EXTRA = "1"
+
+[dev.mounts.gitconfig]
+enabled = false
+
+[dev.mounts.ssh]
+source = "~/.ssh"
+to = "/home/dev/.ssh"
+
+[dev.endpoints."runner.https"]
+host-port = 9443
+"#,
+        );
+        let l = load_in(&f).unwrap();
+        let dev = dev_of(&l);
+        // Scalars replace.
+        assert_eq!(dev.mem.as_deref(), Some("32G"));
+        assert_eq!(dev.freshness, Some(Freshness::Ask), "untouched");
+        // Arrays replace.
+        assert_eq!(dev.profiles, ["runner"]);
+        // Tables merge: the inherited key stays, the new one joins.
+        assert_eq!(dev.exec_env.len(), 2);
+        assert_eq!(dev.exec_env["EXTRA"], "1");
+        // A named entry merges field by field, and can be switched off.
+        assert!(!dev.mounts["gitconfig"].enabled);
+        assert_eq!(
+            dev.mounts["gitconfig"].to.as_deref(),
+            Some("/home/dev/.gitconfig")
+        );
+        assert_eq!(dev.mounts["ssh"].to.as_deref(), Some("/home/dev/.ssh"));
+        let e = &dev.endpoints["runner.https"];
+        assert_eq!(e.host_port, Some(9443));
+        assert_eq!(e.target, Some(443), "the rest of the entry is inherited");
+
+        // Each value knows its layer, down to one field of a merged entry.
+        let origins: BTreeMap<String, Layer> =
+            l.origins().into_iter().map(|o| (o.key, o.layer)).collect();
+        assert_eq!(origins["dev.mem"], Layer::Local);
+        assert_eq!(origins["dev.service"], Layer::Project);
+        assert_eq!(origins["dev.mounts.gitconfig.to"], Layer::Project);
+        assert_eq!(origins["dev.mounts.gitconfig.enabled"], Layer::Local);
+        assert_eq!(
+            origins["dev.endpoints.\"runner.https\".host-port"],
+            Layer::Local
+        );
+        assert_eq!(
+            origins["dev.endpoints.\"runner.https\".target"],
+            Layer::Project
+        );
+        assert_eq!(origins["dev.exec-env.EXTRA"], Layer::Local);
+        assert!(!origins.contains_key("remove"), "a directive, not a value");
+
+        // What a config hands to a command or an image is marked, so `plan --explain`
+        // prints it only when asked.
+        let secret: BTreeMap<String, bool> =
+            l.origins().into_iter().map(|o| (o.key, o.secret)).collect();
+        assert!(secret["dev.exec-env.EXTRA"]);
+        assert!(!secret["dev.mem"] && !secret["dev.service"]);
+    }
+
+    #[test]
+    fn a_value_whose_type_changes_across_layers_is_replaced_whole() {
+        let f = workspace("retype");
+        let hook = |body: &str| format!("schema = 1\n[dev]\nimage = \"x\"\n[dev.hooks]\n{body}");
+        // A shell string under a table of options …
+        write(&f, CONFIG_FILE, &hook("init = \"project\"\n"));
+        write(&f, LOCAL_FILE, "[dev.hooks]\ninit = { run = \"local\" }\n");
+        match &dev_of(&load_in(&f).unwrap()).hooks.init {
+            Some(Hook::Detailed(spec)) => {
+                assert_eq!(spec.run, Some(Command::Shell("local".into())))
+            }
+            other => panic!("{other:?}"),
+        }
+        // … and a table of options under a shell string.
+        write(&f, CONFIG_FILE, &hook("init = { run = \"project\" }\n"));
+        write(&f, LOCAL_FILE, "[dev.hooks]\ninit = \"local\"\n");
+        assert_eq!(
+            dev_of(&load_in(&f).unwrap()).hooks.init,
+            Some(Hook::Shell("local".into()))
+        );
+    }
+
+    #[test]
+    fn a_disabled_entry_is_not_held_to_the_rules_of_one_that_runs() {
+        let f = workspace("disabled");
+        write(&f, CONFIG_FILE, WAB);
+        // Off is off: an entry this machine does not have needs neither the fields a live
+        // one needs nor a project entry to switch off.
+        write(
+            &f,
+            LOCAL_FILE,
+            "[dev.mounts.gitconfig]\nenabled = false\nsource = \"\"\n\
+             [dev.mounts.nothing]\nenabled = false\n\
+             [dev.endpoints.gone]\nenabled = false\n\
+             [dev.tasks.gone]\nenabled = false\n",
+        );
+        let l = load_in(&f).unwrap();
+        let dev = dev_of(&l);
+        assert!(!dev.mounts["nothing"].enabled && !dev.endpoints["gone"].enabled);
+        // A name is not one of those rules: it is carried by a file and a command line
+        // whether the entry runs or not.
+        write(&f, LOCAL_FILE, "[dev.mounts.\"..\"]\nenabled = false\n");
+        assert!(format!("{:#}", load_in(&f).unwrap_err()).contains("not a name"));
+    }
+
+    #[test]
+    fn an_empty_array_clears_and_remove_drops_before_the_layer_applies() {
+        let f = workspace("remove");
+        write(&f, CONFIG_FILE, WAB);
+        // Switching source locally: the inherited compose must go, or two sources remain.
+        write(&f, LOCAL_FILE, "[dev]\nimage = \"debian:13\"\n");
+        let msg = format!("{:#}", load_in(&f).unwrap_err());
+        assert!(msg.contains("more than one source"), "{msg}");
+
+        write(
+            &f,
+            LOCAL_FILE,
+            "remove = [\"dev.compose\", \"dev.service\", \"dev.endpoints\"]\n\
+             [dev]\nimage = \"debian:13\"\n\n[requires]\nfeatures = []\n",
+        );
+        let l = load_in(&f).unwrap();
+        let dev = dev_of(&l);
+        assert_eq!(dev.image.as_deref(), Some("debian:13"));
+        assert!(dev.compose.is_none() && dev.service.is_none());
+        assert!(dev.endpoints.is_empty(), "a whole table can go");
+        assert!(
+            l.schema.requires.features.is_empty(),
+            "an empty array clears"
+        );
+
+        // A remove that names nothing is a stale override, and says so.
+        write(&f, LOCAL_FILE, "remove = [\"dev.nope\"]\n");
+        let msg = format!("{:#}", load_in(&f).unwrap_err());
+        assert!(
+            msg.contains("dev.nope") && msg.contains("local.toml"),
+            "{msg}"
+        );
+        // A quoted key with a dot in it is one key.
+        write(
+            &f,
+            LOCAL_FILE,
+            "remove = ['dev.endpoints.\"runner.ssh\"']\n",
+        );
+        let l = load_in(&f).unwrap();
+        let dev = dev_of(&l);
+        assert_eq!(dev.endpoints.len(), 1);
+        assert!(dev.endpoints.contains_key("runner.https"));
+
+        // The directives belong to the local layer.
+        write(&f, CONFIG_FILE, &format!("remove = [\"x\"]\n{WAB}"));
+        std::fs::remove_file(f.0.join(LOCAL_FILE)).unwrap();
+        let msg = format!("{:#}", load_in(&f).unwrap_err());
+        assert!(
+            msg.contains("remove") && msg.contains("local.toml"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn named_environments_stand_alone_and_are_named_carefully() {
+        let f = workspace("envs");
+        write(
+            &f,
+            CONFIG_FILE,
+            "schema = 1\n[dev]\nimage = \"a\"\nuser = \"dev\"\n\
+             [environments.ci]\nimage = \"b\"\n",
+        );
+        let l = load_in(&f).unwrap();
+        let ci = l.environment("ci").unwrap();
+        assert_eq!(ci.image.as_deref(), Some("b"));
+        assert!(ci.user.is_none(), "nothing is inherited from [dev]");
+        let msg = format!("{:#}", l.environment("qa").unwrap_err());
+        assert!(msg.contains("dev, ci"), "{msg}");
+
+        write(
+            &f,
+            CONFIG_FILE,
+            "schema = 1\n[dev]\nimage = \"a\"\n[environments.dev]\nimage = \"b\"\n",
+        );
+        assert!(format!("{:#}", load_in(&f).unwrap_err()).contains("clashes"));
+        for name in ["a b", "..", ".", "-ci"] {
+            write(
+                &f,
+                CONFIG_FILE,
+                &format!(
+                    "schema = 1\n[dev]\nimage = \"a\"\n[environments.\"{name}\"]\nimage = \"b\"\n"
+                ),
+            );
+            let msg = format!("{:#}", load_in(&f).unwrap_err());
+            assert!(msg.contains("not a name"), "{name}: {msg}");
+        }
+    }
+
+    #[test]
+    fn values_are_checked_for_meaning_not_only_for_shape() {
+        let f = workspace("values");
+        let bad = [
+            ("cpus = 0", "at least 1"),
+            ("cpus = \"many\"", "\"host\""),
+            ("cpus = -1", "\"host\""),
+            ("cpus = 1.5", "\"host\""),
+            ("mem = \"lots\"", "mem"),
+            ("workspace = \"workdir\"", "absolute"),
+            ("[dev.mounts.x]\nsource = \"/a\"\nto = \"b\"", "absolute"),
+            ("[dev.mounts.x]\nsource = \"/a\"", "needs `to`"),
+            ("[dev.mounts.x]\nto = \"/a\"", "needs `source`"),
+            ("[dev.endpoints.x]\ntarget = 0", "not a port"),
+            ("[dev.endpoints.x]\nhost-port = 80", "needs `target`"),
+            ("[dev.hooks]\ninit = { cwd = \"x\" }", "needs `run`"),
+            (
+                "[dev.endpoints.x]\ntarget = 80\naddress = \"lo\"",
+                "IP address",
+            ),
+            ("[dev.network]\negress = \"restricted\"", "not implemented"),
+            ("[dev.network]\nallow = [\"a\"]", "allow"),
+            ("[dev.exec-env]\n\"A=B\" = \"x\"", "not a variable name"),
+            ("[dev.container-env]\nA-B = \"x\"", "not a variable name"),
+            (
+                "[dev.tasks.t]\nrun = \"true\"\n[dev.tasks.t.env]\n\"1\" = \"x\"",
+                "not a variable name",
+            ),
+            ("[dev.hooks]\ninit = \"\"", "empty"),
+            ("[dev.hooks]\ninit = []", "empty"),
+            (
+                "[dev.hooks]\ninit = { run = \"x\", timeout = \"soon\" }",
+                "timeout",
+            ),
+            // A typo in an option is an unknown key of the option form, not a hook group
+            // whose member happens to be misspelled.
+            (
+                "[dev.hooks]\ninit = { run = \"x\", timout = \"1m\" }",
+                "timout",
+            ),
+            ("[dev.hooks]\ninit = 3", "a hook is"),
+            (
+                "[dev.tasks.t]\nrun = \"true\"\nenvironment = \"qa\"",
+                "names no [environments.qa]",
+            ),
+            (
+                "[dev.tasks.t]\nrun = \"true\"\nreuse = \"qa\"",
+                "names no [environments.qa]",
+            ),
+            ("[dev.tasks.t]\nrun = 3", "a command is"),
+            (
+                "[dev.mounts.\"..\"]\nsource = \"/a\"\nto = \"/b\"",
+                "not a name",
+            ),
+            (
+                "[dev.mounts.\".\"]\nsource = \"/a\"\nto = \"/b\"",
+                "not a name",
+            ),
+            ("[dev.tasks.\"-x\"]\nrun = \"true\"", "not a name"),
+            ("user = \"a/b\"", "not a name"),
+            (
+                "[dev.host]\nwrapper = \"/bin/sh\"",
+                "relative to the workspace root",
+            ),
+            (
+                "[dev.host]\nwrapper = \"../x.sh\"",
+                "leaves the workspace root",
+            ),
+            ("[dev.hooks]\ninit = { a = { run = \"\" } }", "empty"),
+            ("[requires]\nmin-version = \"latest\"", "min-version"),
+            ("[requires]\nfeatures = [\"warp\"]", "warp"),
+        ];
+        for (body, expect) in bad {
+            let (top, rest) = match body.starts_with("[requires]") {
+                true => (body, ""),
+                false => ("", body),
+            };
+            write(
+                &f,
+                CONFIG_FILE,
+                &format!("schema = 1\n{top}\n[dev]\nimage = \"x\"\n{rest}\n"),
+            );
+            let msg = format!("{:#}", load_in(&f).unwrap_err());
+            assert!(msg.contains(expect), "{body}: {msg}");
+        }
+        // A build source, whose keys are checked against each other rather than against
+        // `image` above.
+        for (body, expect) in [
+            ("build = { target = \"x\" }", "needs `context`"),
+            (
+                "build = { context = \".\", target = \"\" }",
+                "target is empty",
+            ),
+            (
+                "build = { context = \".\" }\nfallback = { target = \"x\" }",
+                "cached-only",
+            ),
+            // The same rule from the other side: no build source, so nothing to cache.
+            (
+                "image = \"x\"\ncached-only = true",
+                "cached-only applies to a build source",
+            ),
+            (
+                "image = \"x\"\nfallback = { target = \"x\" }",
+                "fallback names a build target",
+            ),
+            (
+                "build = { context = \".\" }\ncached-only = true\nfallback = { target = \"\" }",
+                "needs `target`",
+            ),
+        ] {
+            write(&f, CONFIG_FILE, &format!("schema = 1\n[dev]\n{body}\n"));
+            let msg = format!("{:#}", load_in(&f).unwrap_err());
+            assert!(msg.contains(expect), "{body}: {msg}");
+        }
+        write(
+            &f,
+            CONFIG_FILE,
+            "schema = 1\n[requires]\nmin-version = \"0.61.0\"\nfeatures = [\"publish\"]\n\
+             [dev]\nimage = \"x\"\ncpus = \"host\"\nmem = \"8G\"\n",
+        );
+        load_in(&f).unwrap();
+    }
+
+    #[test]
+    fn discovery_walks_up_to_the_checkout_root_and_no_further() {
+        let f = workspace("discover");
+        write(&f, CONFIG_FILE, "schema = 1\n[dev]\nimage = \"x\"\n");
+        let deep = f.0.join("src/a/b");
+        std::fs::create_dir_all(&deep).unwrap();
+        let files = discover(&deep, None, None).unwrap();
+        assert_eq!(files.workspace, absolute(&f.0).unwrap());
+        assert_eq!(files.config, absolute(&f.0).unwrap().join(CONFIG_FILE));
+        let root = absolute(&f.0).unwrap();
+        assert_eq!(files.local, root.join(LOCAL_FILE));
+        assert_eq!(files.local_env, root.join(LOCAL_ENV_FILE));
+
+        // A nested checkout is its own project: the search stops at its `.git`.
+        let sub = f.0.join("vendor/other");
+        std::fs::create_dir_all(sub.join(".git")).unwrap();
+        let msg = format!("{:#}", discover(&sub, None, None).unwrap_err());
+        assert!(msg.contains("vk dev init"), "{msg}");
+
+        // A linked worktree or a submodule has a `.git` file, and a `.git` symlink is
+        // honoured by git as well: the search stops at either, as at a directory.
+        let linked = f.0.join("vendor/linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked.join(".git"), "gitdir: /nowhere/worktrees/x\n").unwrap();
+        assert!(discover(&linked, None, None).is_err(), "a .git file");
+        let symlinked = f.0.join("vendor/symlinked");
+        std::fs::create_dir_all(&symlinked).unwrap();
+        std::os::unix::fs::symlink("../../.git", symlinked.join(".git")).unwrap();
+        assert!(discover(&symlinked, None, None).is_err(), "a .git symlink");
+
+        // Explicit forms.
+        let files = discover(&sub, Some(&f.0), None).unwrap();
+        assert_eq!(files.workspace, absolute(&f.0).unwrap());
+        let files = discover(&sub, None, Some(&f.0.join(CONFIG_FILE))).unwrap();
+        assert_eq!(
+            files.workspace,
+            absolute(&f.0).unwrap(),
+            "from the file's .virtkit/"
+        );
+        assert!(discover(&sub, None, Some(&f.0.join("nope.toml"))).is_err());
+
+        // Outside any checkout the walk stops where it started: an ancestor's config
+        // belongs to that project, not to this directory.
+        let outside = std::env::temp_dir().join(format!("vk-devdiscover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(outside.join("a/b")).unwrap();
+        std::fs::create_dir_all(outside.join(".virtkit")).unwrap();
+        std::fs::write(
+            outside.join(CONFIG_FILE),
+            "schema = 1\n[dev]\nimage = \"x\"\n",
+        )
+        .unwrap();
+        assert!(discover(&outside.join("a/b"), None, None).is_err());
+        assert!(discover(&outside, None, None).is_ok(), "its own directory");
+        let _ = std::fs::remove_dir_all(&outside);
+
+        // The local layers are read from beside the config, whether or not they were there
+        // when the search ran.
+        write(&f, LOCAL_FILE, "");
+        write(&f, LOCAL_ENV_FILE, "TOKEN=x\n");
+        let l = load(discover(&deep, None, None).unwrap()).unwrap();
+        assert_eq!(l.env_file["TOKEN"], "x");
+    }
+
+    #[test]
+    fn env_files_are_data_not_shell() {
+        let parsed = parse_env_file(
+            "# comment\n\
+             PLAIN=value with spaces # trailing comment\n\
+             export EXPORTED=1\n\
+             SINGLE='a \"b\" $(rm -rf /) ${HOME}'\n\
+             DOUBLE=\"say \\\"hi\\\" \\\\ $HOME\"\n\
+             EMPTY=\n\
+             \n\
+             URL=https://example.com/#anchor\n",
+        )
+        .unwrap();
+        assert_eq!(parsed["PLAIN"], "value with spaces");
+        assert_eq!(parsed["EXPORTED"], "1");
+        assert_eq!(parsed["SINGLE"], "a \"b\" $(rm -rf /) ${HOME}");
+        assert_eq!(parsed["DOUBLE"], "say \"hi\" \\ $HOME", "no expansion");
+        assert_eq!(parsed["EMPTY"], "");
+        assert_eq!(
+            parsed["URL"], "https://example.com/#anchor",
+            "`#` needs a space before it"
+        );
+        for bad in [
+            "novalue\n",
+            "1BAD=x\n",
+            "A='open\n",
+            "B=\"open\n",
+            "C='x' junk\n",
+        ] {
+            assert!(parse_env_file(bad).is_err(), "{bad:?}");
+        }
+        // Later files win; the local layer names them.
+        let f = workspace("envfiles");
+        write(&f, CONFIG_FILE, "schema = 1\n[dev]\nimage = \"x\"\n");
+        write(&f, LOCAL_ENV_FILE, "A=1\nB=1\n");
+        write(&f, "extra.env", "B=2\nC=2\n");
+        write(&f, LOCAL_FILE, "env-files = [\"extra.env\"]\n");
+        let l = load_in(&f).unwrap();
+        assert_eq!(
+            (
+                l.env_file["A"].as_str(),
+                l.env_file["B"].as_str(),
+                l.env_file["C"].as_str()
+            ),
+            ("1", "2", "2")
+        );
+        // …and only the local layer.
+        write(
+            &f,
+            CONFIG_FILE,
+            "schema = 1\nenv-files = [\"extra.env\"]\n[dev]\nimage = \"x\"\n",
+        );
+        assert!(format!("{:#}", load_in(&f).unwrap_err()).contains("env-files"));
+    }
+
+    #[test]
+    fn an_unknown_key_is_refused_at_every_level_of_the_schema() {
+        let f = workspace("unknown-levels");
+        for body in [
+            "nope = 1\n[dev]\nimage = \"x\"\n",
+            "[requires]\nnope = 1\n[dev]\nimage = \"x\"\n",
+            "[dev]\nimage = \"x\"\nnope = 1\n",
+            "[dev]\nimage = \"x\"\n[dev.network]\nnope = 1\n",
+            "[dev]\nimage = \"x\"\n[dev.mounts.x]\nsource = \"/a\"\nto = \"/b\"\nnope = 1\n",
+            "[dev]\nimage = \"x\"\n[dev.endpoints.x]\ntarget = 80\nnope = 1\n",
+            "[dev]\nimage = \"x\"\n[dev.tasks.x]\nrun = \"true\"\nnope = 1\n",
+            "[dev]\nimage = \"x\"\n[dev.editor.vscode]\nnope = 1\n",
+            "[dev]\nimage = \"x\"\n[dev.host]\nnope = 1\n",
+            "[dev]\nimage = \"x\"\n[dev.cache]\nnope = 1\n",
+            "[dev.build]\ncontext = \".\"\nnope = 1\n",
+            "[dev]\nimage = \"x\"\n[environments.x]\nimage = \"y\"\nnope = 1\n",
+        ] {
+            write(&f, CONFIG_FILE, &format!("schema = 1\n{body}"));
+            let msg = format!("{:#}", load_in(&f).unwrap_err());
+            assert!(msg.contains("unknown field `nope`"), "{body}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_value_outside_an_enum_names_what_was_written() {
+        let f = workspace("variants");
+        for (body, bad) in [
+            ("freshness = \"sometimes\"", "sometimes"),
+            ("[dev.editor.vscode]\nstate = \"x\"", "x"),
+            ("[dev.tasks.t]\nrun = \"true\"\npolicy = \"maybe\"", "maybe"),
+            ("[dev.tasks.t]\nrun = \"true\"\ncheckout = \"cow\"", "cow"),
+        ] {
+            write(
+                &f,
+                CONFIG_FILE,
+                &format!("schema = 1\n[dev]\nimage = \"x\"\n{body}\n"),
+            );
+            let msg = format!("{:#}", load_in(&f).unwrap_err());
+            assert!(msg.contains(&format!("unknown variant `{bad}`")), "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_hook_table_is_the_option_form_or_a_group_by_its_keys() {
+        let f = workspace("hookform");
+        let hooks = |body: &str| format!("schema = 1\n[dev]\nimage = \"x\"\n[dev.hooks]\n{body}");
+        // Pinned, not endorsed: a table holding none of `HOOK_OPTIONS` is a group, so a
+        // misspelled option is a member name — the one unknown key the schema cannot refuse.
+        write(&f, CONFIG_FILE, &hooks("init = { rnu = \"make\" }\n"));
+        match &dev_of(&load_in(&f).unwrap()).hooks.init {
+            Some(Hook::Group(g)) => assert_eq!(g["rnu"], Hook::Shell("make".into())),
+            other => panic!("{other:?}"),
+        }
+        // Layering can turn a group into the option form, and then its member is an unknown
+        // key of that — reported against the file the layered value is read from.
+        write(&f, CONFIG_FILE, &hooks("init = { a = \"x\" }\n"));
+        write(&f, LOCAL_FILE, "[dev.hooks]\ninit = { run = \"y\" }\n");
+        let msg = format!("{:#}", load_in(&f).unwrap_err());
+        assert!(
+            msg.contains("unknown field `a`") && msg.contains("config.toml"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_semantic_error_the_local_layer_caused_names_that_file() {
+        let f = workspace("local-semantics");
+        write(
+            &f,
+            CONFIG_FILE,
+            "schema = 1\n[dev]\nimage = \"x\"\ncpus = 4\n",
+        );
+        write(&f, LOCAL_FILE, "[dev]\ncpus = 0\n");
+        let msg = format!("{:#}", load_in(&f).unwrap_err());
+        assert!(
+            msg.contains("at least 1") && msg.contains("local.toml"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_remove_that_cannot_be_done_says_so() {
+        let f = workspace("remove-bad");
+        write(&f, CONFIG_FILE, "schema = 1\n[dev]\nimage = \"x\"\n");
+        for (spec, expect) in [
+            ("remove = [\"\"]\n", "empty key"),
+            ("remove = [\"dev.image.x\"]\n", "is not a table"),
+        ] {
+            write(&f, LOCAL_FILE, spec);
+            let msg = format!("{:#}", load_in(&f).unwrap_err());
+            assert!(msg.contains(expect), "{spec}: {msg}");
+        }
+        // A whole environment can go, and then there is none to work in.
+        write(&f, LOCAL_FILE, "remove = [\"dev\"]\n");
+        let msg = format!("{:#}", load_in(&f).unwrap_err());
+        assert!(msg.contains("no [dev] table"), "{msg}");
+    }
+
+    #[test]
+    fn an_env_files_entry_stays_under_the_workspace_root() {
+        let f = workspace("envfiles-bound");
+        write(&f, CONFIG_FILE, "schema = 1\n[dev]\nimage = \"x\"\n");
+        for (spec, expect) in [
+            (
+                "env-files = [\"/etc/shadow\"]\n",
+                "relative to the workspace root",
+            ),
+            ("env-files = [\"../outside.env\"]\n", "leaves the workspace"),
+            ("env-files = [\"a/../../b.env\"]\n", "leaves the workspace"),
+            ("env-files = [\"\"]\n", "empty"),
+        ] {
+            write(&f, LOCAL_FILE, spec);
+            let msg = format!("{:#}", load_in(&f).unwrap_err());
+            assert!(msg.contains(expect), "{spec}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_file_that_is_not_there_is_absent_and_one_that_is_not_a_file_is_refused() {
+        let f = workspace("open");
+        assert!(read_env_file(&f.0.join("nothing.env")).unwrap().is_empty());
+        std::fs::create_dir(f.0.join("dir.env")).unwrap();
+        let msg = format!("{:#}", read_env_file(&f.0.join("dir.env")).unwrap_err());
+        assert!(msg.contains("not a regular file"), "{msg}");
+        // Not what a config is: a tracked file must not choose which host file vk reads and
+        // quotes back in an error.
+        std::os::unix::fs::symlink("/etc/passwd", f.0.join("link.env")).unwrap();
+        assert!(read_env_file(&f.0.join("link.env")).is_err());
+
+        write(&f, CONFIG_FILE, "schema = 1\n[dev]\nimage = \"x\"\n");
+        assert!(load_in(&f).unwrap().env_file.is_empty(), "no local.env");
+        std::fs::remove_file(f.0.join(CONFIG_FILE)).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", f.0.join(CONFIG_FILE)).unwrap();
+        let msg = format!("{:#}", discover(&f.0, None, None).unwrap_err());
+        assert!(
+            msg.contains("opening") && msg.contains("config.toml"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn every_value_that_could_carry_a_token_is_marked() {
+        let f = workspace("secrets");
+        write(
+            &f,
+            CONFIG_FILE,
+            "schema = 1\n\
+             [dev]\nimage = \"x\"\n\
+             [dev.exec-env]\nA = \"1\"\n\
+             [dev.container-env]\nB = \"1\"\n\
+             [dev.host]\nwrapper-env = [\"C*\"]\n\
+             [dev.editor.vscode.settings]\n\"http.proxy\" = \"http://u:p@h\"\n\
+             [dev.tasks.t]\nrun = \"true\"\n\
+             [dev.tasks.t.env]\nD = \"1\"\n\
+             [environments.built.build]\ncontext = \".\"\n\
+             [environments.built.build.args]\nE = \"1\"\n",
+        );
+        let l = load_in(&f).unwrap();
+        let secret: BTreeMap<String, bool> =
+            l.origins().into_iter().map(|o| (o.key, o.secret)).collect();
+        for key in [
+            "dev.exec-env.A",
+            "dev.container-env.B",
+            "dev.host.wrapper-env",
+            "dev.editor.vscode.settings.\"http.proxy\"",
+            "dev.tasks.t.env.D",
+            "environments.built.build.args.E",
+        ] {
+            assert!(secret[key], "{key}");
+        }
+        assert!(!secret["dev.image"] && !secret["dev.tasks.t.run"]);
+    }
+
+    #[test]
+    fn a_parent_that_cannot_be_folded_away_is_kept() {
+        let n = |p: &str| lexical_normalize(Path::new(p));
+        assert_eq!(n(".."), Path::new(".."));
+        assert_eq!(n("../.."), Path::new("../.."));
+        assert_eq!(n("../../x"), Path::new("../../x"));
+        assert_eq!(n("a/../../x"), Path::new("../x"));
+        assert_eq!(n("/.."), Path::new("/"));
+        assert_eq!(n("/../.."), Path::new("/"));
+        assert_eq!(n("a/../b"), Path::new("b"));
+        assert_eq!(n("a/./b/../c"), Path::new("a/c"));
+        assert_eq!(
+            lexical_join(Path::new("/w"), Path::new("../x")),
+            Path::new("/x")
+        );
+    }
+
+    #[test]
+    fn durations_and_paths_parse_as_expected() {
+        assert_eq!(parse_duration("90s").unwrap().as_secs(), 90);
+        assert_eq!(parse_duration("10m").unwrap().as_secs(), 600);
+        assert_eq!(parse_duration("1h").unwrap().as_secs(), 3600);
+        assert_eq!(parse_duration("5").unwrap().as_secs(), 5);
+        assert!(parse_duration("5d").is_err() && parse_duration("").is_err());
+        assert_eq!(split_path("a.b.c").unwrap(), ["a", "b", "c"]);
+        assert_eq!(
+            split_path("dev.endpoints.\"runner.https\".target").unwrap(),
+            ["dev", "endpoints", "runner.https", "target"]
+        );
+        assert!(split_path("a..b").is_err() && split_path("").is_err());
+        // A quoted key is the whole segment or a typo.
+        for bad in [r#"a"b"c"#, r#""""#, r#""a"#, r#"a."b"c"#] {
+            assert!(split_path(bad).is_err(), "{bad}");
+        }
+    }
+}

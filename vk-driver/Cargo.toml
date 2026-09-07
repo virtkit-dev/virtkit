@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+# `src/dev/schema.rs` embeds the schema from `docs/schema/`, outside the crate directory.
+publish = false
 
 # The single shipped binary is `vk` — vk-driver with the guest kernel and vk-agent
 # embedded (see build.rs + src/embed.rs, the default `embed` feature).

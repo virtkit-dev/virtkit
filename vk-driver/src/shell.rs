@@ -17,6 +17,20 @@ pub fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Quote an argument for readable POSIX `sh` commands, leaving literal words bare.
+/// Use only for arguments: a bare `a=b` in command position is an assignment, whereas
+/// [`quote`]'s `'a=b'` is a command name.
+pub fn quote_word(value: &str) -> String {
+    match !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "@%+=:,./-_".contains(c))
+    {
+        true => value.to_string(),
+        false => quote(value),
+    }
+}
+
 /// Find every executable `name` on `path` in `PATH` order. Skip `skip_dir` and its aliases
 /// by filesystem identity. Filesystem checks are lazy: callers can stop at the first
 /// match or keep looking for a path they can resolve.
@@ -90,7 +104,13 @@ mod tests {
     ];
 
     #[test]
-    fn a_value_is_quoted_losslessly_whatever_it_holds() {
+    fn a_word_is_quoted_only_where_a_shell_would_read_it_otherwise() {
+        assert_eq!(quote_word("plain/path-1.2"), "plain/path-1.2");
+        assert_eq!(quote_word("two words"), "'two words'");
+        assert_eq!(quote_word(""), "''");
+        // Lossless whatever it holds: the quote is closed, escaped and reopened.
+        assert_eq!(quote_word("a'b"), "'a'\\''b'");
+        // `quote` always quotes, for output that is parsed back.
         assert_eq!(quote("plain"), "'plain'");
         // Values without single quotes are wrapped verbatim, including metacharacters.
         assert_eq!(quote("$(rm -rf /)"), "'$(rm -rf /)'");
@@ -133,6 +153,48 @@ mod tests {
                 "1",
                 "{value:?}"
             );
+        }
+    }
+
+    /// Words the allowlist leaves bare.
+    const BARE: &[&str] = &[
+        "plain",
+        "-x",
+        "+x",
+        "a=b",
+        "%1",
+        "..",
+        "//",
+        "./x",
+        "@%+=:,./-_",
+        "a,b",
+        "a@b",
+    ];
+
+    /// The allowlist is only sound if a real shell reads each bare word as itself.
+    #[test]
+    fn a_bare_word_survives_a_real_shell_as_one_argument() {
+        for value in HOSTILE.iter().chain(BARE) {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(
+                    "set -- {}; printf '%s|%s' \"$#\" \"$1\"",
+                    quote_word(value)
+                ))
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!("1|{value}"),
+                "{value:?} did not survive sh as one word"
+            );
+        }
+        // What stays bare is the allowlist; everything else falls back to `quote`.
+        for value in BARE {
+            assert_eq!(&quote_word(value), value);
+        }
+        for value in HOSTILE.iter().filter(|v| !BARE.contains(v)) {
+            assert!(quote_word(value).starts_with('\''), "{value:?} stayed bare");
         }
     }
 

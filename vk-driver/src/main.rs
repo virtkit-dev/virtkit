@@ -32,6 +32,7 @@ mod config;
 mod consolelog;
 mod cpio;
 mod detach;
+mod dev;
 mod dockerhash;
 mod dockerimg;
 mod egress_report;
@@ -844,6 +845,15 @@ enum Cmd {
         #[arg(long)]
         to: SocketAddr,
     },
+    /// Work in the environment a project's .virtkit/config.toml describes
+    ///
+    /// Finds `.virtkit/config.toml` in the current directory or above it, no further than
+    /// the git checkout's root, layers `.virtkit/local.toml` over it, and resolves the
+    /// result against this host: which compose service, image or Dockerfile target, what it
+    /// mounts and publishes, who you are inside it, where its state directory lives. Every
+    /// key is checked; one virtkit does not know is an error rather than a silent omission.
+    #[command(display_order = 11)]
+    Dev(crate::dev::cli::Dev),
     /// SSH into a VM booted with `run --ssh-client`
     ///
     /// Runs the system ssh against the client setup in the VM's state dir — that run's
@@ -3971,6 +3981,7 @@ async fn cli_main() -> ExitCode {
                 Err(e) => fail(&e, 1),
             }
         }
+        Cmd::Dev(dev) => crate::dev::cli::run(dev).await,
         Cmd::Publish {
             action: Some(action),
             ..
@@ -5409,6 +5420,7 @@ mod tests {
                 "atop",
                 "build",
                 "check",
+                "dev",
                 "exec",
                 "export",
                 "gc",
