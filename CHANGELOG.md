@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.63.1] - 2026-09-07
+
 ### Fixed
 
 - **GitLab jobs using a `dockerfile:` image boot again.** Since 0.48.0 every job whose
@@ -2430,7 +2432,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.63.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.63.1...HEAD
+[0.63.1]: https://github.com/virtkit-dev/virtkit/compare/v0.63.0...v0.63.1
 [0.63.0]: https://github.com/virtkit-dev/virtkit/compare/v0.62.0...v0.63.0
 [0.62.0]: https://github.com/virtkit-dev/virtkit/compare/v0.61.0...v0.62.0
 [0.61.0]: https://github.com/virtkit-dev/virtkit/compare/v0.60.0...v0.61.0
