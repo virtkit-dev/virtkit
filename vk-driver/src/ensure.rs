@@ -194,7 +194,7 @@ fn reference_if_fresh(
 }
 
 /// Ensure a `build:` stage is materialized in the shared build tier, returning its cache dir
-/// (holding `runner.ext4` + its config sidecar) together with a held reference on it. On a
+/// (holding [`UNIT_IMAGE`] + its config sidecar) together with a held reference on it. On a
 /// fingerprint miss it builds under a pull lock into a tmp sibling, stamps the UUID, and
 /// promotes atomically — so a killed build never leaves a half-image a freshness check would
 /// trust, and concurrent identical builds serialize (the loser then finds it fresh). Runs idle
@@ -237,7 +237,7 @@ pub fn ensure_build_tier(
     // Wipe `tmp` the instant the build below fails (or panics) — don't leave that for a
     // later sweep to notice. `ensure_unit_build`'s `?` runs this on the way out.
     let cleanup = crate::image::TmpGuard::new(&tmp);
-    // ensure_unit_build writes the ext4 + config sidecar and stamps the UUID at the out path.
+    // ensure_unit_build writes the qcow2 + config sidecar and stamps the UUID at the out path.
     ensure_unit_build(recipe, target, stage_key, &tmp.join(UNIT_IMAGE), sink)?;
     cleanup.keep(); // built successfully: the rename below takes ownership of `tmp`.
     // The one removal that ignores references — but by construction nobody holds one: a

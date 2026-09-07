@@ -515,7 +515,7 @@ fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<BootPlan> {
         media: Media {
             rootfs,
             initrd: None,
-            config,
+            config: Some(config),
             use_guard: Some(guard),
         },
         generic: true,
@@ -536,11 +536,7 @@ fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<BootPlan> {
 fn build_git_image(
     ctx: &JobCtx,
     spec: &str,
-) -> Result<(
-    PathBuf,
-    Option<vk_core::runcfg::RunConfig>,
-    crate::cachelock::Guard,
-)> {
+) -> Result<(PathBuf, vk_core::runcfg::RunConfig, crate::cachelock::Guard)> {
     let cfg = &ctx.cfg;
     if !cfg.gitlab.as_ref().is_some_and(|g| g.host_checkout) {
         bail!(
@@ -609,11 +605,9 @@ fn build_git_image(
         None,
     )
     .with_context(|| format!("building the git-defined image {spec:?}"))?;
-    let rootfs = dir.join("runner.ext4");
+    let rootfs = dir.join(crate::ensure::UNIT_IMAGE);
     // The stage's Env/User captured by the build (applied at boot via the preinit initramfs).
-    let config = std::fs::read_to_string(crate::build::config_sidecar(&rootfs))
-        .ok()
-        .and_then(|s| vk_core::runcfg::RunConfig::from_json(&s).ok());
+    let config = crate::build::read_config_sidecar(&rootfs)?;
     Ok((rootfs, config, guard))
 }
 
@@ -1694,7 +1688,7 @@ fn plan_services(
                 let (ext4, config, guard) =
                     build_git_image(ctx, spec).with_context(|| format!("service {}", unit.name))?;
                 guards.push(guard);
-                let merged = crate::compose::merged_config(&config.unwrap_or_default(), &unit);
+                let merged = crate::compose::merged_config(&config, &unit);
                 crate::units::provisioned(&unit, ext4, merged, siting(slot, extra_ips))?
             }
             // Ask the build where it put the image, as the primary does (`resolve_media` ->

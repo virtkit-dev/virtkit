@@ -426,6 +426,18 @@ pub fn config_sidecar(out: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// The runtime config a build published beside `image` (its [`config_sidecar`]). The build
+/// tier writes the two together, so a missing or unparsable sidecar is a broken entry, not an
+/// image without config.
+pub fn read_config_sidecar(image: &Path) -> Result<vk_core::runcfg::RunConfig> {
+    let sidecar = config_sidecar(image);
+    vk_core::runcfg::RunConfig::from_json(
+        &std::fs::read_to_string(&sidecar)
+            .with_context(|| format!("reading {}", sidecar.display()))?,
+    )
+    .with_context(|| format!("parsing {}", sidecar.display()))
+}
+
 /// A stage's final [`ShellState`] as the exported [`RunConfig`].
 fn run_config(st: &ShellState) -> vk_core::runcfg::RunConfig {
     vk_core::runcfg::RunConfig {

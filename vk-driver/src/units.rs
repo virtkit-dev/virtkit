@@ -355,12 +355,7 @@ pub fn provisioned(
 /// The unit's boot config: the image's own defaults (its sidecar, written by the build /
 /// pull) layered with the unit's compose overrides.
 fn read_merged_config(unit: &crate::compose::Unit, ext4: &Path) -> Result<RunConfig> {
-    let sidecar = crate::build::config_sidecar(ext4);
-    let image_cfg = RunConfig::from_json(
-        &std::fs::read_to_string(&sidecar)
-            .with_context(|| format!("reading {}", sidecar.display()))?,
-    )
-    .with_context(|| format!("parsing {}", sidecar.display()))?;
+    let image_cfg = crate::build::read_config_sidecar(ext4)?;
     Ok(crate::compose::merged_config(&image_cfg, unit))
 }
 

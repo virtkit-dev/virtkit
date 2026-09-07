@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **GitLab jobs using a `dockerfile:` image boot again.** Since 0.48.0 every job whose
+  `MICROVM_IMAGE` (or a service's image) was a `dockerfile:` build failed preparation
+  with `image file missing`.
+
 ## [0.63.0] - 2026-09-06
 
 ### Added
