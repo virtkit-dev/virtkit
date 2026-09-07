@@ -41,11 +41,17 @@ RUN nix build "path:/src/nix#buildEnv" --out-link /opt/toolchain
 ENV PATH=/opt/toolchain/bin:/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/nix/var/nix/profiles/default/sbin \
     SSL_CERT_FILE=/opt/toolchain/etc/ssl/certs/ca-bundle.crt
 
-# `dev` (uid 1000) exists only for devcontainer.json's remoteUser; the scripts run as root
-# (vk backend) or as the host ids (Docker, dev.sh), the two identities rootless virtio-fs can
-# create files as. The base ships no adduser; a passwd line is all a user is. /tmp is
+# `dev`: devcontainer.json opens the workspace as it, and so does `vk dev` (.virtkit/config.toml).
+# The rootless virtio-fs share lets root and the host owner's ids write /work and nothing else:
+# the vk backend compiles as root, and `vk dev` runs as the non-root `dev` user, so that user is
+# built with the host ids (DEV_UID/DEV_GID). build.sh passes no build args, so the release
+# keeps the 1000/1000 defaults and its shipped binaries stay byte-identical. dev.sh does not
+# use this user; it execs as the host ids directly. The base ships no adduser; a passwd line
+# is all a user is. /tmp is
 # world-writable for the HOME=/tmp the scripts pass.
-RUN printf 'dev:x:1000:1000:dev:/home/dev:/bin/sh\n' >> /etc/passwd \
- && printf 'dev:x:1000:\n' >> /etc/group \
- && mkdir -p /home/dev && chown 1000:1000 /home/dev \
+ARG DEV_UID=1000
+ARG DEV_GID=1000
+RUN printf 'dev:x:%s:%s:dev:/home/dev:/bin/sh\n' "$DEV_UID" "$DEV_GID" >> /etc/passwd \
+ && printf 'dev:x:%s:\n' "$DEV_GID" >> /etc/group \
+ && mkdir -p /home/dev && chown "$DEV_UID:$DEV_GID" /home/dev \
  && chmod 1777 /tmp

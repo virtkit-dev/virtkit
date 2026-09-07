@@ -2127,6 +2127,15 @@ start = { redis = "redis-cli ping", db = ["mysqladmin", "ping"] }
     }
 
     #[test]
+    fn the_repos_own_dev_config_stays_valid() {
+        // Keep the repo's development config valid as the schema evolves.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        load(discover(root, None, None).unwrap()).expect(".virtkit/config.toml must stay valid");
+    }
+
+    #[test]
     fn the_illustrative_config_reads_as_written() {
         let f = workspace("wab");
         write(&f, CONFIG_FILE, WAB);

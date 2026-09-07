@@ -8,3 +8,7 @@
 *.swp
 *.rs.bk
 .DS_Store
+
+# vk dev: machine-specific overrides of .virtkit/config.toml
+/.virtkit/local.toml
+/.virtkit/local.env

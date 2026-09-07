@@ -1,0 +1,75 @@
+#:schema https://raw.githubusercontent.com/virtkit-dev/virtkit/main/docs/schema/virtkit-config.schema.json
+# Develop virtkit with the pinned build image (.devcontainer/Dockerfile), the checkout
+# at /work, and a Rust editor. The cargo environment matches build.sh and dev.sh so
+# `vk dev shell` shares target/ with `./build.sh --fast`.
+# Machine-specific overrides go in the untracked .virtkit/local.toml and local.env.
+
+schema = 1
+
+# No [requires]: the vk that dogfoods this tree is the one built from it (./dist/vk), which
+# is always at least as new as this file — a release pin would only reject a dev build.
+
+[dev]
+workspace = "/work"
+user = "dev"
+freshness = "ask"
+cpus = "host"
+mem = "8G"
+
+[dev.build]
+context = ".devcontainer"
+dockerfile = "Dockerfile"
+# The `dev` user takes the host user's ids: the rootless virtio-fs share writes /work only
+# as root or the host owner, and `vk dev` runs as this non-root user, so it needs those ids.
+args = { DEV_UID = "${VK_UID}", DEV_GID = "${VK_GID}" }
+
+# These match the fingerprint-carrying vars of build.sh's BUILD_ENV and dev.sh's DEV_ENV, so a
+# `vk dev` build shares target/ with them; any divergence changes a unit's fingerprint, so
+# change all of them together. HOME and VK_GIT_COMMIT are left out: HOME is not a fingerprint
+# input and `vk dev` sets the user's own, while VK_GIT_COMMIT cannot come from a static config
+# — so vk-driver's build script stamps VK_GIT_HASH from the shared checkout's git HEAD (the
+# `dev` user owns it via the host ids), which may diverge from a build.sh build and rebuild it.
+[dev.exec-env]
+CARGO_HOME = "/work/target/.cargo-home"
+CARGO_TARGET_DIR = "/work/target"
+SOURCE_DATE_EPOCH = "0"
+RUSTFLAGS = "--remap-path-prefix=/work=/src --remap-path-prefix=/work/target/.cargo-home=/cargo -C link-arg=-fuse-ld=mold"
+CFLAGS_x86_64_unknown_linux_musl = "-ffile-prefix-map=/work=/src -ffile-prefix-map=/work/target/.cargo-home=/cargo"
+# A vk run from inside the guest keeps its images and boot scratch on the guest's disk,
+# not the RAM-backed /tmp.
+XDG_DATA_HOME = "/var/tmp/vk/share"
+XDG_CACHE_HOME = "/var/tmp/vk/cache"
+
+[dev.mounts.gitconfig]
+source = "~/.gitconfig"
+to = "/home/dev/.gitconfig"
+read-only = true
+optional = true
+
+[dev.editor.vscode]
+state = "persistent"
+extensions = [
+  "rust-lang.rust-analyzer",
+  "tamasfe.even-better-toml",
+  "editorconfig.editorconfig",
+  "timonwong.shellcheck",
+]
+
+[dev.editor.vscode.settings]
+"extensions.autoCheckUpdates" = false
+"extensions.autoUpdate" = false
+"extensions.ignoreRecommendations" = true
+
+# `vk dev task check -- -p vk-core`, `vk dev task test -- -p vk-core --lib`: the cargo
+# gates, in the environment, booted first when it is down.
+[dev.tasks.check]
+run = ["cargo", "check", "--all-targets"]
+policy = "require"
+
+[dev.tasks.clippy]
+run = ["cargo", "clippy", "--all-targets", "--", "-D", "warnings"]
+policy = "require"
+
+[dev.tasks.test]
+run = ["cargo", "test"]
+policy = "require"
