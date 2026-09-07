@@ -37,6 +37,8 @@ pub struct Status {
     pub ssh_alias: String,
     pub ssh_config: PathBuf,
     pub published: Vec<Published>,
+    /// the durable storage items that exist, by name — what a refresh or a stop keeps
+    pub storage: Vec<String>,
     /// `${localEnv:…}` this shell could not fill
     pub unresolved: Vec<String>,
     /// the `vk` that booted what is running, when it recorded one
@@ -144,6 +146,14 @@ pub fn status(plan: &Plan) -> Result<Status> {
         ssh_alias: alias(plan),
         ssh_config: plan.state_dir.join(crate::sshclient::CONFIG),
         published,
+        // Read storage names from Compose and the config's mounts without measuring them.
+        // Keep status available even when the source cannot be read.
+        storage: crate::dev::storage::inventory(plan, false)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|i| i.exists && i.category == crate::dev::storage::Category::Durable)
+            .map(|i| i.name)
+            .collect(),
         unresolved: plan.unresolved.clone(),
     })
 }
@@ -176,6 +186,9 @@ impl Status {
         );
         line("source", self.source.clone());
         line("state", self.state_dir.display().to_string());
+        if !self.storage.is_empty() {
+            line("storage", self.storage.join(", "));
+        }
         let Some(pid) = self.pid else {
             line("status", "not running".into());
             for u in &self.unresolved {
