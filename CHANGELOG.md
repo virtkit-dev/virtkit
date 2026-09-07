@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A signal-killed guest command now fails the run.** `vk run` and `vk dev up` reported a
+  guest command killed by a signal as success; they now fail, as they already did for a
+  non-zero exit.
+
 ## [0.63.1] - 2026-09-07
 
 ### Fixed

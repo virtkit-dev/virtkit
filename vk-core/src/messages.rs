@@ -99,7 +99,7 @@ impl fmt::Display for CmdExec {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CmdResult {
     pub code: Option<i32>,
     pub signal: Option<i32>,

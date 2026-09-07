@@ -176,6 +176,24 @@ enum DevAction {
         #[command(subcommand)]
         action: DevServiceAction,
     },
+    /// Run a project task where its policy says
+    ///
+    /// `[dev.tasks.<name>]` declares the command and how it gets an environment: attach to
+    /// one that is running (`reuse`), boot one first (`require`), run in a throwaway VM
+    /// (`ephemeral`), or take the running one when there is one (`reuse-or-ephemeral`).
+    /// Arguments after `--` are appended to the command, whose exit status is reproduced:
+    /// `vk dev task pre-commit -- "$@"`.
+    Task {
+        /// the task, as `[dev.tasks.<name>]` names it
+        name: String,
+        /// arguments appended to the task's command
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARG"
+        )]
+        args: Vec<String>,
+    },
     /// Build the environment's images into the cache, without running anything
     ///
     /// The primary's, or one compose service's with `--service` — what a boot, or that
@@ -358,7 +376,10 @@ impl DevAction {
     /// silently losing its fork — a boot in the foreground would then hold the VM forever.
     fn boots(&self) -> bool {
         match self {
-            Self::Up { .. } | Self::Shell => true,
+            // A task boots only under `policy = "require"`, which is in the config rather
+            // than on the command line; the fork is where a boot *may* happen, and the
+            // policies that boot nothing leave the work to the parent (see `dev_up`).
+            Self::Up { .. } | Self::Shell | Self::Task { .. } => true,
             // A service exec reaches a running service and boots nothing.
             Self::Exec { service, .. } => service.is_none(),
             // Of the service operations only `up` boots the environment.
@@ -710,6 +731,32 @@ async fn dev_action(
                 }
             }
         },
+        // Only a `require` task boots the environment; the rest attach to what runs or boot
+        // a throwaway VM, so there is nothing for a forked child to do and this parent — the
+        // one holding the terminal — runs the task (see `dev`'s module docs and `detach`).
+        DevAction::Task { name, args } => {
+            let placement = match crate::dev::task::placement(&loaded, &plan, &name) {
+                Ok(p) => p,
+                Err(e) => return fail(&e, 2),
+            };
+            let ready = match placement.boots() {
+                Some(target) => dev_up(target, host_cfg, over, false, true).await,
+                None => dev_after_fork(),
+            };
+            match ready {
+                Ready::Done(code) => code,
+                Ready::Act => {
+                    match crate::dev::task::run(
+                        placement, &loaded, &plan, &name, &args, host_cfg, over,
+                    )
+                    .await
+                    {
+                        Ok(code) => code,
+                        Err(e) => fail(&e, 1),
+                    }
+                }
+            }
+        }
         DevAction::Build { service } => {
             match dev::build(&plan, host_cfg, over, service.as_deref()).await {
                 Ok(()) => ExitCode::SUCCESS,
@@ -930,6 +977,17 @@ async fn dev_up(
     }
 }
 
+/// The half of [`dev_up`] an action that boots nothing still needs: this fork's child has no
+/// boot to perform, so it is finished, and the parent — the one holding the terminal — is
+/// what acts.
+fn dev_after_fork() -> Ready {
+    if crate::detach::after_boot() {
+        Ready::Act
+    } else {
+        Ready::Done(ExitCode::SUCCESS)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,6 +1070,7 @@ mod tests {
         (&["service", "down", "runner"], false),
         (&["service", "reboot", "runner"], false),
         (&["service", "status"], false),
+        (&["task", "pre-commit"], true),
         (&["build"], false),
         (&["storage", "list"], false),
         (&["storage", "reset", "runner:/var/wab", "--yes"], false),

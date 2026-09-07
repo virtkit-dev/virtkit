@@ -184,6 +184,41 @@ pub enum SourceMode {
     Auto,
 }
 
+/// Preserve the guest command's non-zero exit as a typed run error so `vk dev task`
+/// reproduces its status and `vk run` reports the failure.
+#[derive(Debug)]
+pub struct GuestExit(pub vk_core::messages::CmdResult);
+
+impl std::fmt::Display for GuestExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.0.code, self.0.signal) {
+            (Some(code), _) => write!(f, "guest command exited {code}"),
+            // A signalled command carries no exit code, so the signal is what is reported.
+            (None, Some(signal)) => write!(f, "guest command was killed by signal {signal}"),
+            (None, None) => write!(f, "guest command ended without a status"),
+        }
+    }
+}
+
+impl std::error::Error for GuestExit {}
+
+/// The guest command's exit carried by `e`, when that is what failed the run.
+pub fn guest_exit(e: &anyhow::Error) -> Option<vk_core::messages::CmdResult> {
+    e.root_cause()
+        .downcast_ref::<GuestExit>()
+        .map(|g| g.0.clone())
+}
+
+/// A finished guest command as a `Result`: exit 0, or no status at all (a backgrounded
+/// command), is success; a non-zero code or a terminating signal is a typed [`GuestExit`]
+/// so a caller that stands for the command can reproduce its status, signal included.
+fn guest_status(result: vk_core::messages::CmdResult) -> Result<()> {
+    match (result.code, result.signal) {
+        (Some(0), _) | (None, None) => Ok(()),
+        _ => Err(GuestExit(result).into()),
+    }
+}
+
 pub struct RunArgs {
     /// Image to boot (a docker ref or an OCI reference). Ignored when `dockerfile` is set
     /// — the rootfs is then built from the Dockerfile target.
@@ -3651,10 +3686,10 @@ async fn drive(
             }
         };
         timings.record(Phase::Exec, "", t_exec.elapsed());
-        match result.code {
-            Some(0) | None => {}
-            Some(c) => bail!("guest command exited {c}"),
-        }
+        // A signal counts as a failure like a non-zero code: it is carried out typed so
+        // `vk dev task` re-raises it, matching the attach path, and `vk run` reports it
+        // rather than the success that swallowing the signal would have claimed.
+        guest_status(result)?;
         // Ordinarily the startup command owns the run lifetime. An inactivity-managed detached
         // run instead leaves the exec server available for later `vk exec` calls. Its status
         // requests do not count as activity, so they can also detect the watchdog exiting and
@@ -4658,6 +4693,8 @@ impl Drop for VmSession {
 
 #[cfg(test)]
 mod tests {
+    use vk_core::messages::CmdResult;
+
     use super::*;
 
     /// Minimal `RunArgs` for option-builder tests. It is not bootable: the CLI normally fills
@@ -4671,6 +4708,51 @@ mod tests {
             ssh_user: String::new(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn guest_status_is_success_only_for_exit_zero_or_no_status() {
+        // Exit 0 and a backgrounded command (no code, no signal) are the run's success.
+        assert!(
+            guest_status(CmdResult {
+                code: Some(0),
+                signal: None
+            })
+            .is_ok()
+        );
+        assert!(
+            guest_status(CmdResult {
+                code: None,
+                signal: None
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn guest_status_carries_a_non_zero_code_out() {
+        let e = guest_status(CmdResult {
+            code: Some(3),
+            signal: None,
+        })
+        .unwrap_err();
+        let result = guest_exit(&e).expect("a non-zero code is a GuestExit");
+        assert_eq!((result.code, result.signal), (Some(3), None));
+        assert!(e.to_string().contains("exited 3"), "{e}");
+    }
+
+    #[test]
+    fn guest_status_carries_a_signal_out() {
+        // A signalled command reports code = None, signal = Some(s); it must not read as
+        // success. `exec::exit` re-raises the signal from the CmdResult carried here.
+        let e = guest_status(CmdResult {
+            code: None,
+            signal: Some(9),
+        })
+        .unwrap_err();
+        let result = guest_exit(&e).expect("a signal is a GuestExit too");
+        assert_eq!((result.code, result.signal), (None, Some(9)));
+        assert!(e.to_string().contains("killed by signal 9"), "{e}");
     }
 
     // The three reclaim knobs resolve in one order everywhere: a service's own
