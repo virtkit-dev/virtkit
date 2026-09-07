@@ -702,20 +702,6 @@ mod tests {
         dir
     }
 
-    /// Write `mib` to `path` from a child, so the bytes are charged to this process's
-    /// *children* rusage the way a build's stage guests are, and flush it so a filesystem
-    /// that defers the work has still done it by the time the caller measures.
-    fn write_blob(path: &std::path::Path, mib: usize) {
-        let status = std::process::Command::new("dd")
-            .arg("if=/dev/zero")
-            .arg(format!("of={}", path.display()))
-            .args(["bs=1M", &format!("count={mib}"), "conv=fsync"])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .expect("running dd");
-        assert!(status.success(), "dd wrote {mib} MiB");
-    }
-
     /// A real `/proc/<pid>/stat` line, with a process name that would break
     /// front-to-back field splitting.
     const STAT_LINE: &str = "42 (vk:my (odd) vm) S 7 42 42 0 -1 4194560 900 0 0 0 130 27 0 0 \
@@ -954,54 +940,86 @@ mod tests {
         );
     }
 
-    /// The disk half of a meter, end to end: a child's writes are charged to this process by
-    /// `getrusage` exactly as its CPU is. Where nothing reaches a disk — a RAM-backed build tree,
-    /// or a kernel
-    /// without task I/O accounting — the figure must stay put rather than invent traffic,
-    /// which is the case the usage line documents by leaving the clause off.
+    /// A child's disk write, checked against the two counters the meter's disk figure is built
+    /// from. Its own `/proc/<pid>/io`, read while it is still alive and so isolated from every
+    /// sibling test, can never report more than the 64 MiB it wrote — the accounting invents no
+    /// traffic — and reads zero where nothing reaches a disk (tmpfs, a virtiofs share), the case
+    /// the usage line documents by leaving the clause off. Where it did reach a block device,
+    /// the same bytes must also surface in this process's `getrusage` children total once the
+    /// child is reaped. A kernel built without task I/O accounting publishes no such counter at
+    /// all, and the test bows out.
+    ///
+    /// The private counter is what keeps this isolated: `getrusage` folds in every child this
+    /// process reaps, so a sibling test's writes land there too — which once made this flaky.
+    /// Its half is asserted only as a lower bound, past which those sibling writes can push but
+    /// never pull back.
     #[test]
-    fn meter_counts_the_disk_a_child_moved() {
-        let _alone = METER_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    fn disk_accounting_counts_a_childs_write() {
+        use std::io::BufRead;
+
         let dir = scratch("meter");
-        let me = std::process::id() as i32;
-
-        // Establish which of the two the host is, by the other reader: `disk` reads
-        // `/proc/<pid>/io`, so this settles the question without asking `getrusage`, the
-        // thing under test. The calibration write happens before the meter starts, so its
-        // own bytes are not in what the meter goes on to report.
-        let before = disk(me);
-        write_blob(&dir.join("calibrate"), 32);
-        let block_backed = matches!((before, disk(me)), (Some((_, a)), Some((_, b))) if b > a);
-
-        let meter = Meter::start();
-        // A mark only ever rises, so once the first sweep has landed every later read reports;
-        // before it, a meter has nothing to attribute and says so.
-        let idle = first_reading(&meter);
-        let read = || meter.read().expect("the only meter in this process");
-        write_blob(&dir.join("blob"), 64);
-        let after = read();
-
-        // Unmeasured on a kernel with no block accounting, where there is no claim to make.
-        let (Some((_, after_written)), Some((_, idle_written))) = (after.disk, idle.disk) else {
-            return;
-        };
-        let written = after_written - idle_written;
-        match block_backed {
-            // Well under the 64 MiB asked for: a filesystem is free to charge less than a
-            // caller wrote. That it was charged at all is the claim.
-            true => assert!(
-                written >= 8 * 1024 * 1024,
-                "a 64 MiB child write must reach the meter: {after:?} vs {idle:?}"
-            ),
-            // Not exactly zero: the rest of the suite runs in this process and writes its
-            // own scratch files, which are charged here too. The claim is that the meter did
-            // not invent the 64 MiB that never reached a disk.
-            false => assert!(
-                written < 8 * 1024 * 1024,
-                "nothing reached a disk, so the meter may not report having moved any: {after:?}"
-            ),
-        }
+        // getrusage's children total before the writer joins it; the delta once it is reaped
+        // holds at least what it wrote.
+        let written_before = rusage_disk().1;
+        // Keep the writer blocked on stdin after it fills the blob, so its own
+        // `/proc/<pid>/io` is still there to read. `&&` so a failed `dd` never signals ready.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "dd if=/dev/zero of={} bs=1M count=64 conv=fsync 2>/dev/null && echo ready && read _",
+                dir.join("blob").display()
+            ))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawning the writer");
+        let pid = child.id() as i32;
+        // The `ready` line means `dd` has finished and been reaped, so its bytes are now in
+        // the shell's own counter.
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .expect("reading the writer's stdout");
+        // The child's private counter, taken while it is still alive: no sibling test's
+        // children can reach it, which is why it is read here rather than off getrusage.
+        let by_child = disk(pid).map(|(_, written)| written);
+        // Close stdin so the shell's `read` sees EOF and exits, then reap it — before any
+        // assertion below, so a failure never leaves it a zombie.
+        drop(child.stdin.take());
+        let _ = child.wait();
+        let written_after = rusage_disk().1;
         let _ = std::fs::remove_dir_all(&dir);
+
+        // `dd` short-circuits `echo ready` on failure, so a missing signal means it never wrote.
+        assert!(
+            ready.starts_with("ready"),
+            "the writer failed before it signalled: {ready:?}"
+        );
+        // No task I/O accounting on this kernel: neither counter has a claim to make.
+        if !io_accounted() {
+            return;
+        }
+        // Accounted, and the child was ours and alive when read, so its `/proc/<pid>/io` was
+        // there to read.
+        let by_child = by_child.expect("the writer's /proc/<pid>/io");
+        // The child wrote 64 MiB and its own counter is isolated from every sibling test, so it
+        // can never report materially more: the accounting invents no traffic. It reads zero
+        // where nothing reaches a disk (tmpfs, a virtiofs share) and up to the 64 MiB on a real
+        // block device — the write reaching the block layer is what the 8 MiB line below tells
+        // apart from a filesystem that passes it through, not any stray kilobytes of metadata.
+        assert!(
+            by_child <= 96 * 1024 * 1024,
+            "the counter reports more than the 64 MiB written: {by_child}"
+        );
+        // Where the write did reach a block device, the same bytes must also surface in
+        // getrusage, the source the meter's disk figure is built from — a lower bound
+        // concurrent writers can push past but never below.
+        if by_child >= 8 * 1024 * 1024 {
+            assert!(
+                written_after.saturating_sub(written_before) >= 8 * 1024 * 1024,
+                "a block-charged child write must reach getrusage: {written_before} -> {written_after}"
+            );
+        }
     }
 
     /// A sweep of a process tree picks up each member's I/O, from the same `/proc` pass that
