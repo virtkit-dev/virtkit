@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.64.0] - 2026-09-07
+
 ### Added
 
 - **`vk dev` runs a project's development environment from `.virtkit/config.toml`.** The
@@ -2515,7 +2517,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.63.1...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.64.0...HEAD
+[0.64.0]: https://github.com/virtkit-dev/virtkit/compare/v0.63.1...v0.64.0
 [0.63.1]: https://github.com/virtkit-dev/virtkit/compare/v0.63.0...v0.63.1
 [0.63.0]: https://github.com/virtkit-dev/virtkit/compare/v0.62.0...v0.63.0
 [0.62.0]: https://github.com/virtkit-dev/virtkit/compare/v0.61.0...v0.62.0
