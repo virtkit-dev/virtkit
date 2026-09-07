@@ -39,6 +39,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::dev::schema::directive;
+
 /// The tracked config, relative to the workspace root.
 pub const CONFIG_FILE: &str = ".virtkit/config.toml";
 /// This machine's overrides, under the workspace root. Gitignored.
@@ -47,6 +49,17 @@ pub const LOCAL_FILE: &str = ".virtkit/local.toml";
 pub const LOCAL_ENV_FILE: &str = ".virtkit/local.env";
 /// The schema version this build reads.
 pub const SCHEMA: i64 = 1;
+
+/// The release that ships `vk dev`, as a literal so [`TEMPLATE`] can `concat!` it.
+macro_rules! min_version {
+    () => {
+        "0.64.0"
+    };
+}
+
+/// What a written config pins as `requires.min-version`: the release that implements
+/// everything `vk dev init` writes.
+pub const MIN_VERSION: &str = min_version!();
 
 // ---------------------------------------------------------------------------
 // The schema
@@ -251,6 +264,18 @@ pub enum Freshness {
     RequireCurrent,
 }
 
+impl Freshness {
+    /// The spelling the config uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Freshness::Ask => "ask",
+            Freshness::Reuse => "reuse",
+            Freshness::Refresh => "refresh",
+            Freshness::RequireCurrent => "require-current",
+        }
+    }
+}
+
 /// `cpus = 4` or `cpus = "host"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cpus {
@@ -366,6 +391,16 @@ pub enum EditorState {
     #[default]
     Persistent,
     Ephemeral,
+}
+
+impl EditorState {
+    /// The spelling the config uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EditorState::Persistent => "persistent",
+            EditorState::Ephemeral => "ephemeral",
+        }
+    }
 }
 
 /// `[dev.host]`: what the guest may reach on the host. Everything here is off by default.
@@ -756,6 +791,192 @@ impl Environment {
         }
         Ok(())
     }
+
+    /// What this environment says, one aligned line per subject: `vk dev init`'s report for
+    /// a config that already exists, and a reader's check that vk read what they meant.
+    fn describe(&self) -> String {
+        let mut out = String::new();
+        let mut line = |k: &str, v: String| out.push_str(&format!("  {k:<12}{v}\n"));
+        match (&self.compose, &self.image, &self.build) {
+            (Some(c), _, _) => line(
+                "source",
+                format!(
+                    "compose {c}, service {}",
+                    self.service.as_deref().unwrap_or("?")
+                ),
+            ),
+            (_, Some(i), _) => line("source", format!("image {i}")),
+            (_, _, Some(b)) => line(
+                "source",
+                format!(
+                    "build {}{}{}",
+                    b.context.as_deref().unwrap_or("?"),
+                    b.dockerfile
+                        .as_deref()
+                        .map(|d| format!(", {d}"))
+                        .unwrap_or_default(),
+                    b.target
+                        .as_deref()
+                        .map(|t| format!(", target {t}"))
+                        .unwrap_or_default()
+                ),
+            ),
+            _ => line("source", "none".into()),
+        }
+        if self.cached_only || self.fallback.is_some() {
+            line(
+                "cached-only",
+                match &self.fallback {
+                    Some(f) => format!(
+                        "yes, falling back to {}",
+                        f.target.as_deref().unwrap_or("?")
+                    ),
+                    None => "yes, with no fallback".into(),
+                },
+            );
+        }
+        if !self.profiles.is_empty() {
+            line("profiles", self.profiles.join(", "));
+        }
+        if let Some(w) = &self.workspace {
+            line("workspace", w.clone());
+        }
+        if let Some(u) = &self.user {
+            line("user", u.clone());
+        }
+        if let Some(f) = self.freshness {
+            line("freshness", f.as_str().to_string());
+        }
+        if self.cpus.is_some() || self.mem.is_some() {
+            let cpus = self
+                .cpus
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "inherited".into());
+            line(
+                "size",
+                format!(
+                    "cpus {cpus}, mem {}",
+                    self.mem.as_deref().unwrap_or("inherited")
+                ),
+            );
+        }
+        if !self.exec_env.is_empty() || !self.container_env.is_empty() {
+            line(
+                "env",
+                format!(
+                    "{} for sessions, {} for the guest",
+                    self.exec_env.len(),
+                    self.container_env.len()
+                ),
+            );
+        }
+        let mounts: Vec<String> = self
+            .mounts
+            .iter()
+            .filter(|(_, m)| m.enabled)
+            .map(|(n, m)| {
+                format!(
+                    "{n} -> {}{}",
+                    m.to.as_deref().unwrap_or("?"),
+                    if m.read_only { " (ro)" } else { "" }
+                )
+            })
+            .collect();
+        if !mounts.is_empty() {
+            line("mounts", mounts.join(", "));
+        }
+        let endpoints: Vec<String> = self
+            .endpoints
+            .iter()
+            .filter(|(_, e)| e.enabled)
+            .map(|(n, e)| {
+                format!(
+                    "{n} ({}:{}{})",
+                    e.service.as_deref().unwrap_or("primary"),
+                    e.target
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "?".into()),
+                    if e.required { ", required" } else { "" }
+                )
+            })
+            .collect();
+        if !endpoints.is_empty() {
+            line("endpoints", endpoints.join(", "));
+        }
+        if let Some(r) = &self.cache.registry {
+            line(
+                "cache",
+                format!(
+                    "{r}{}",
+                    if self.cache.insecure {
+                        " (insecure)"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+        }
+        let mut host = Vec::new();
+        if self.host.git_gui {
+            host.push("git-gui".to_string());
+        }
+        if self.host.ssh_agent {
+            host.push("ssh-agent".to_string());
+        }
+        if let Some(w) = &self.host.wrapper {
+            host.push(format!("wrapper {w}"));
+        }
+        if !host.is_empty() {
+            line("host", host.join(", "));
+        }
+        let hooks: Vec<&str> = [
+            ("init", &self.hooks.init),
+            ("create", &self.hooks.create),
+            ("start", &self.hooks.start),
+        ]
+        .into_iter()
+        .filter(|(_, h)| h.is_some())
+        .map(|(n, _)| n)
+        .collect();
+        if !hooks.is_empty() {
+            line("hooks", hooks.join(", "));
+        }
+        let tasks: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|(_, t)| t.enabled)
+            .map(|(n, t)| {
+                format!(
+                    "{n} ({} in {})",
+                    t.policy.unwrap_or(Policy::ReuseOrEphemeral).as_str(),
+                    t.environment.as_deref().unwrap_or("dev")
+                )
+            })
+            .collect();
+        if !tasks.is_empty() {
+            line("tasks", tasks.join(", "));
+        }
+        if let Some(vs) = &self.editor.vscode {
+            line(
+                "vscode",
+                format!(
+                    "{} state{}{}",
+                    vs.state.unwrap_or_default().as_str(),
+                    if vs.reconcile.is_some() {
+                        ", reconcile hook"
+                    } else {
+                        ""
+                    },
+                    if vs.extensions.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {} extension(s)", vs.extensions.len())
+                    }
+                ),
+            );
+        }
+        out
+    }
 }
 
 impl Hook {
@@ -886,6 +1107,13 @@ pub fn discover(from: &Path, workspace: Option<&Path>, config: Option<&Path>) ->
         bail!("{} is not a file", config.display());
     }
     Ok(files_of(workspace, config))
+}
+
+/// The config for a caller in `from`, or `None` where there is none — the question
+/// `vk dev init` asks before writing one, so a directory it cannot resolve is an error
+/// rather than "no project here".
+pub fn discover_here(from: &Path) -> Result<Option<Files>> {
+    Ok(search(&absolute(from)?))
 }
 
 /// `.virtkit/config.toml` in `from` or an ancestor, no further up than the checkout root —
@@ -1106,6 +1334,41 @@ impl Loaded {
                 known.join(", ")
             )
         })
+    }
+
+    /// What the files describe, one environment per paragraph — `vk dev init`'s report for
+    /// a config that already exists, and a reader's check that vk read what they meant.
+    pub fn describe(&self) -> String {
+        let mut out = format!("{}: ok\n", self.files.config.display());
+        if let Some(local) = &self.files.local {
+            out.push_str(&format!("  with {}\n", local.display()));
+        }
+        if !self.env_file.is_empty() {
+            out.push_str(&format!(
+                "  {} local value(s) for ${{localEnv:…}}\n",
+                self.env_file.len()
+            ));
+        }
+        if let Some(v) = &self.schema.requires.min_version {
+            out.push_str(&format!("  requires vk {v}\n"));
+        }
+        if !self.schema.requires.features.is_empty() {
+            out.push_str(&format!(
+                "  requires features {}\n",
+                self.schema.requires.features.join(", ")
+            ));
+        }
+        for (name, env) in std::iter::once(("dev", self.schema.dev.as_ref())).chain(
+            self.schema
+                .environments
+                .iter()
+                .map(|(n, e)| (n.as_str(), Some(e))),
+        ) {
+            let Some(env) = env else { continue };
+            out.push_str(&format!("\n[{name}]\n"));
+            out.push_str(&env.describe());
+        }
+        out
     }
 }
 
@@ -1328,6 +1591,266 @@ fn trailing_ok(rest: &str, line: usize) -> Result<()> {
     )
 }
 
+// ---------------------------------------------------------------------------
+// `vk dev init`: a first config
+// ---------------------------------------------------------------------------
+
+/// The commented config `vk dev init` writes when it has nothing to translate from.
+pub const TEMPLATE: &str = concat!(
+    directive!(),
+    r#"
+# The development environment `vk dev` boots. Paths are relative to this project's root.
+# See `vk dev --help`; every key here is checked, and an unknown one is an error.
+schema = 1
+
+[requires]
+# The oldest vk release that implements everything this file uses.
+# min-version = ""#,
+    min_version!(),
+    r#""
+features = []
+
+[dev]
+# Exactly one source: a compose service, an image, or a Dockerfile target.
+image = "docker.io/library/debian:13"
+# compose = ".virtkit/compose.yaml"
+# service = "devcontainer"
+# build = { context = ".", dockerfile = "Dockerfile", target = "dev" }
+
+# Where the checkout is mounted in the guest, and who sessions run as.
+workspace = "/workdir"
+# user = "dev"
+
+# When the running environment no longer matches this file:
+# ask | reuse | refresh | require-current
+freshness = "ask"
+
+# Guest sizing. Unset inherits the compose service's x-virtkit, then vk's defaults.
+# cpus = "host"
+# mem = "8G"
+
+# Environment for exec, shell, SSH and editor sessions.
+[dev.exec-env]
+
+# Host paths in the guest, by name. `~`, `${HOME}`, `${workspace}`, `${state}`,
+# `${VK_UID}`, `${VK_GID}` and `${localEnv:NAME}` (or `${localEnv:NAME:default}`)
+# are expanded.
+# [dev.mounts.gitconfig]
+# source = "~/.gitconfig"
+# to = "/home/dev/.gitconfig"
+# read-only = true
+# optional = true
+
+# Guest ports published on the host, by name.
+# [dev.endpoints.web]
+# target = 8080
+"#
+);
+
+/// Write the template at `workspace/.virtkit/config.toml`.
+pub fn write_template(workspace: &Path, force: bool) -> Result<PathBuf> {
+    write_config(workspace, TEMPLATE, force)
+}
+
+// ---------------------------------------------------------------------------
+// Drafting a config
+// ---------------------------------------------------------------------------
+
+/// How one piece of an imported source fared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Fate {
+    /// carried into the draft
+    Translated,
+    /// needs a person: the draft says what, and an `essential` one leaves it unusable
+    Action { essential: bool },
+    /// nothing to carry, and nothing lost
+    Omitted,
+}
+
+/// One line of a conversion report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Item {
+    pub fate: Fate,
+    /// the source key, as the source spells it
+    pub key: String,
+    pub note: String,
+}
+
+/// A config being written: sections of keys, each a TOML value or a commented-out line for
+/// a choice the writer could not make, plus the report of how it came to be. Rendered in the
+/// order things were added, so a draft reads like a hand-written file.
+#[derive(Debug, Default)]
+pub(crate) struct Draft {
+    header: Vec<String>,
+    /// what stands before the first `[table]`
+    root: Vec<Entry>,
+    sections: Vec<Section>,
+    pub items: Vec<Item>,
+}
+
+#[derive(Debug)]
+struct Section {
+    /// `["dev", "mounts", "gitconfig"]`; empty for the top level
+    path: Vec<String>,
+    entries: Vec<Entry>,
+}
+
+#[derive(Debug)]
+enum Entry {
+    Set(String, toml::Value),
+    /// `# key = …` — a line for the reader to finish
+    Commented(String, String),
+    Comment(String),
+}
+
+impl Draft {
+    /// A line for the comment block at the top of the file.
+    pub(crate) fn header(&mut self, line: impl Into<String>) {
+        self.header.push(line.into());
+    }
+
+    /// Start (or continue) the table at `path`; entries go there until the next call.
+    pub(crate) fn section(&mut self, path: &[&str]) {
+        let path: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+        if self.sections.last().is_some_and(|s| s.path == path) {
+            return;
+        }
+        self.sections.push(Section {
+            path,
+            entries: Vec::new(),
+        });
+    }
+
+    /// Where the next entry goes: the section last opened, or the top of the file.
+    fn entries(&mut self) -> &mut Vec<Entry> {
+        match self.sections.last_mut() {
+            Some(section) => &mut section.entries,
+            None => &mut self.root,
+        }
+    }
+
+    pub(crate) fn set(&mut self, key: &str, value: impl Into<toml::Value>) {
+        let value = value.into();
+        self.entries().push(Entry::Set(key.to_string(), value));
+    }
+
+    /// `# key = text`, for a value the reader must supply.
+    pub(crate) fn commented(&mut self, key: &str, text: impl Into<String>) {
+        self.entries()
+            .push(Entry::Commented(key.to_string(), text.into()));
+    }
+
+    pub(crate) fn comment(&mut self, text: impl Into<String>) {
+        self.entries().push(Entry::Comment(text.into()));
+    }
+
+    pub(crate) fn translated(&mut self, key: &str, note: impl Into<String>) {
+        self.note(Fate::Translated, key, note);
+    }
+
+    pub(crate) fn action(&mut self, key: &str, note: impl Into<String>) {
+        self.note(Fate::Action { essential: false }, key, note);
+    }
+
+    /// Something without which the draft cannot describe the environment.
+    pub(crate) fn essential(&mut self, key: &str, note: impl Into<String>) {
+        self.note(Fate::Action { essential: true }, key, note);
+    }
+
+    pub(crate) fn omitted(&mut self, key: &str, note: impl Into<String>) {
+        self.note(Fate::Omitted, key, note);
+    }
+
+    fn note(&mut self, fate: Fate, key: &str, note: impl Into<String>) {
+        self.items.push(Item {
+            fate,
+            key: key.to_string(),
+            note: note.into(),
+        });
+    }
+
+    /// Whether anything essential is missing.
+    pub(crate) fn needs_work(&self) -> bool {
+        self.items
+            .iter()
+            .any(|i| i.fate == Fate::Action { essential: true })
+    }
+
+    /// The file, with the schema directive editors read on its first line.
+    pub(crate) fn render(&self) -> String {
+        let mut out = format!("{}\n", crate::dev::schema::DIRECTIVE);
+        for line in &self.header {
+            out.push_str(&format!("# {line}\n"));
+        }
+        if !self.header.is_empty() {
+            out.push('\n');
+        }
+        render_entries(&self.root, &mut out);
+        for section in &self.sections {
+            out.push('\n');
+            let keys: Vec<String> = section.path.iter().map(|k| quote_key(k)).collect();
+            out.push_str(&format!("[{}]\n", keys.join(".")));
+            render_entries(&section.entries, &mut out);
+        }
+        out
+    }
+
+    /// The opening every import writes: where the draft came from, the schema version and
+    /// the `[requires]` table, with the environment's own section open after it.
+    pub(crate) fn preamble(&mut self, from: &str) {
+        self.header(format!(
+            "Written by `vk dev init` from {from}. Paths are relative to the project root."
+        ));
+        self.set("schema", SCHEMA);
+        self.section(&["requires"]);
+        self.comment("The oldest vk release that implements everything this file uses.");
+        self.commented("min-version", format!("{MIN_VERSION:?}"));
+        self.set("features", toml::Value::Array(Vec::new()));
+        self.section(&["dev"]);
+    }
+
+    /// The report: what was carried over, what needs a person, what was left out.
+    pub(crate) fn report(&self) -> String {
+        let mut out = String::new();
+        for (fate, title) in [
+            (Fate::Translated, "translated"),
+            (
+                Fate::Action { essential: true },
+                "requires action before the environment can start",
+            ),
+            (Fate::Action { essential: false }, "requires action"),
+            (Fate::Omitted, "omitted"),
+        ] {
+            let items: Vec<&Item> = self.items.iter().filter(|i| i.fate == fate).collect();
+            if items.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("{title}:\n"));
+            for i in items {
+                match i.note.is_empty() {
+                    true => out.push_str(&format!("  {}\n", i.key)),
+                    false => out.push_str(&format!("  {}: {}\n", i.key, i.note)),
+                }
+            }
+        }
+        out
+    }
+}
+
+fn render_entries(entries: &[Entry], out: &mut String) {
+    for entry in entries {
+        match entry {
+            Entry::Set(k, v) => out.push_str(&format!("{} = {v}\n", quote_key(k))),
+            Entry::Commented(k, text) => out.push_str(&format!("# {} = {text}\n", quote_key(k))),
+            Entry::Comment(text) => {
+                for line in text.lines() {
+                    out.push_str(&format!("# {line}\n"));
+                }
+            }
+        }
+    }
+}
+
 /// A TOML key, quoted when it is not bare.
 fn quote_key(key: &str) -> String {
     if !key.is_empty()
@@ -1338,6 +1861,55 @@ fn quote_key(key: &str) -> String {
         return key.to_string();
     }
     toml::Value::String(key.to_string()).to_string()
+}
+
+/// Write `text` as `workspace/.virtkit/config.toml`. Refuses an existing file unless `force`;
+/// never touches the local files beside it.
+///
+/// Without `--force` the file is created outright: `create_new` is the refusal, so a second
+/// `init` and a symlink planted at the name are answered by the create itself rather than by
+/// a check a moment earlier. With it there is a file to replace, so the new one is written
+/// whole under a temporary name and renamed over it — an interrupted init then leaves either
+/// the old file or the new one, never half of each. Both are created `0644` rather than
+/// whatever the umask says.
+pub fn write_config(workspace: &Path, text: &str, force: bool) -> Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = workspace.join(CONFIG_FILE);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let at = match force {
+        true => path.with_extension("toml.tmp"),
+        false => path.clone(),
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&at)
+        .map_err(|e| match (e.kind(), force) {
+            (std::io::ErrorKind::AlreadyExists, false) => anyhow::anyhow!(
+                "{} exists — `vk dev init` validates it as is; --force overwrites it",
+                path.display()
+            ),
+            _ => anyhow::Error::new(e).context(format!("creating {}", at.display())),
+        })?;
+    let written = file
+        .write_all(text.as_bytes())
+        .with_context(|| format!("writing {}", at.display()))
+        .and_then(|()| match force {
+            true => std::fs::rename(&at, &path)
+                .with_context(|| format!("publishing {}", path.display())),
+            false => Ok(()),
+        });
+    if written.is_err() {
+        // Nothing readable was published, so the half-written file is only litter.
+        let _ = std::fs::remove_file(&at);
+    }
+    written?;
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -1471,6 +2043,22 @@ start = { redis = "redis-cli ping", db = ["mysqladmin", "ping"] }
             Some(Hook::Argv(argv)) => assert_eq!(argv[1], "-postcreate"),
             other => panic!("{other:?}"),
         }
+
+        let report = l.describe();
+        for expect in [
+            "config.toml: ok",
+            "requires features entrypoint, publish",
+            "[dev]",
+            "compose .virtkit/compose.yaml, service devcontainer",
+            "gitconfig -> /home/dev/.gitconfig (ro)",
+            "runner.https (runner:443, required)",
+            "vk-registry.corp",
+            "git-gui",
+            "init, create, start",
+            "persistent state, reconcile hook",
+        ] {
+            assert!(report.contains(expect), "{expect:?} in:\n{report}");
+        }
     }
 
     #[test]
@@ -1563,6 +2151,13 @@ host-port = 9443
         let e = &dev.endpoints["runner.https"];
         assert_eq!(e.host_port, Some(9443));
         assert_eq!(e.target, Some(443), "the rest of the entry is inherited");
+        let report = l.describe();
+        assert!(
+            report.contains("with ") && report.contains("local.toml"),
+            "{report}"
+        );
+        assert!(!report.contains("gitconfig ->"), "disabled: {report}");
+        assert!(report.contains("ssh -> /home/dev/.ssh"), "{report}");
 
         // Each value knows its layer, down to one field of a merged entry.
         let origins: BTreeMap<String, Layer> =
@@ -1629,6 +2224,11 @@ host-port = 9443
         let l = load_in(&f).unwrap();
         let dev = dev_of(&l);
         assert!(!dev.mounts["nothing"].enabled && !dev.endpoints["gone"].enabled);
+        let report = l.describe();
+        assert!(
+            !report.contains("nothing") && !report.contains("gone"),
+            "{report}"
+        );
     }
 
     #[test]
@@ -1697,6 +2297,7 @@ host-port = 9443
         let ci = l.environment("ci").unwrap();
         assert_eq!(ci.image.as_deref(), Some("b"));
         assert!(ci.user.is_none(), "nothing is inherited from [dev]");
+        assert!(l.describe().contains("[ci]"), "{}", l.describe());
         let msg = format!("{:#}", l.environment("qa").unwrap_err());
         assert!(msg.contains("dev, ci"), "{msg}");
 
@@ -1842,6 +2443,7 @@ host-port = 9443
         )
         .unwrap();
         assert!(discover(&outside.join("a/b"), None, None).is_err());
+        assert!(discover_here(&outside.join("a/b")).unwrap().is_none());
         assert!(discover(&outside, None, None).is_ok(), "its own directory");
         let _ = std::fs::remove_dir_all(&outside);
 
@@ -1908,6 +2510,31 @@ host-port = 9443
         );
         assert!(format!("{:#}", load_in(&f).unwrap_err()).contains("env-files"));
     }
+
+    #[test]
+    fn the_template_is_a_valid_config_and_is_not_overwritten_by_accident() {
+        let f = workspace("template");
+        let path = write_template(&f.0, false).unwrap();
+        assert_eq!(path, f.0.join(CONFIG_FILE));
+        // Asked for at creation rather than left to the umask, and published whole.
+        let mode = std::os::unix::fs::PermissionsExt::mode(&path.metadata().unwrap().permissions());
+        assert_eq!(mode & 0o777, 0o644, "{mode:o}");
+        assert!(!f.0.join(".virtkit/config.toml.tmp").exists());
+        let l = load_in(&f).unwrap();
+        assert_eq!(
+            dev_of(&l).image.as_deref(),
+            Some("docker.io/library/debian:13")
+        );
+        write(&f, LOCAL_FILE, "[dev]\nmem = \"2G\"\n");
+        assert!(write_template(&f.0, false).is_err());
+        write_template(&f.0, true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(f.0.join(LOCAL_FILE)).unwrap(),
+            "[dev]\nmem = \"2G\"\n",
+            "--force replaces the tracked file and nothing beside it"
+        );
+    }
+
     #[test]
     fn durations_and_paths_parse_as_expected() {
         assert_eq!(parse_duration("90s").unwrap().as_secs(), 90);

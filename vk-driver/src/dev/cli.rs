@@ -10,7 +10,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 
-use crate::{fail, write_report};
+use crate::{exit_code, fail, write_report};
 
 // The global flags of `vk dev` and the action they qualify. Carries no doc comment on
 // purpose: `Cmd::Dev`'s is this command's help, and one here would be a second `about` for
@@ -46,6 +46,26 @@ pub async fn run(dev: Dev) -> ExitCode {
 /// `vk dev`: drive a workspace's dev environment from its `.virtkit/config.toml`.
 #[derive(Subcommand)]
 enum DevAction {
+    /// Write a first `.virtkit/config.toml`, or validate the one that exists
+    ///
+    /// With a config already there, reads it — and `.virtkit/local.toml` beside it — and
+    /// reports what it describes; an unknown key or a value that means nothing is an error
+    /// with its location. Without one, translates what the project has: a devcontainer.json,
+    /// a compose file at the root, a Dockerfile, else a commented config booting a stock
+    /// image. The report says what was carried over, what still needs a decision, and what
+    /// was left out; a draft missing an essential choice is written but exits 1. Data
+    /// conversion only — nothing runs, downloads or boots. Never touches the local files.
+    Init {
+        /// what to translate from, instead of detecting it
+        #[arg(long, value_name = "SOURCE")]
+        from: Option<crate::dev::init::Source>,
+        /// the image reference, with `--from image`
+        #[arg(long, value_name = "REF")]
+        image: Option<String>,
+        /// replace an existing config
+        #[arg(long)]
+        force: bool,
+    },
     /// Print what the config resolves to, without doing any of it
     ///
     /// The plan is what every other `vk dev` command works from, so this is how to see
@@ -95,6 +115,16 @@ async fn dev_action(
         Ok(d) => d,
         Err(e) => return fail(&anyhow::anyhow!(e).context("resolving the current dir"), 1),
     };
+    if let DevAction::Init { from, image, force } = action {
+        let opts = crate::dev::init::Opts { from, image, force };
+        return match crate::dev::init::run(workspace.unwrap_or(&cwd), &opts) {
+            Ok(out) => {
+                let code = write_report(&out.report);
+                if out.ok { code } else { exit_code(1) }
+            }
+            Err(e) => fail(&e, 2),
+        };
+    }
     // Nothing to read at all: the schema is embedded, so this answers anywhere.
     if matches!(action, DevAction::Schema) {
         return write_report(crate::dev::schema::SCHEMA_JSON);
@@ -112,7 +142,9 @@ async fn dev_action(
         Err(e) => return fail(&e, 2),
     };
     match action {
-        DevAction::Schema => unreachable!("handled before the plan is resolved"),
+        DevAction::Init { .. } | DevAction::Schema => {
+            unreachable!("handled before the plan is resolved")
+        }
         DevAction::Plan {
             format,
             show_secrets,

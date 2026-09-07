@@ -418,6 +418,20 @@ pub struct Built {
     pub config: vk_core::runcfg::RunConfig,
 }
 
+/// The stages `text` — a Dockerfile's contents — declares, in order, each by its `AS` name.
+/// Those are the ones a `--target` can select, so a stage without a name is left out rather
+/// than offered as its index. Parsing only: nothing is resolved or built.
+pub fn dockerfile_stages(text: &str) -> Result<Vec<String>> {
+    Ok(parser::parse(text)?
+        .instructions
+        .iter()
+        .filter_map(|i| match i {
+            parser::Instruction::From(f) => f.as_name.clone(),
+            _ => None,
+        })
+        .collect())
+}
+
 /// The runtime-config sidecar path for a built ext4: `<out>.json` (appended, so
 /// `svc.ext4` maps to `svc.ext4.json`).
 pub fn config_sidecar(out: &Path) -> PathBuf {
@@ -4061,6 +4075,17 @@ fn upsert(env: &mut Vec<(String, String)>, k: &str, v: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_named_stages_are_offered_as_targets() {
+        // An unnamed stage used to be reported as its index, which `--target` cannot
+        // select — and the callers of this offer what it returns as the choices.
+        let stages =
+            dockerfile_stages("FROM scratch\nRUN a\nFROM scratch AS build\nFROM build AS dev\n")
+                .unwrap();
+        assert_eq!(stages, ["build", "dev"]);
+        assert!(dockerfile_stages("FROM scratch\n").unwrap().is_empty());
+    }
 
     /// A `[build]` section naming a gated remote cache.
     fn gated_cache() -> crate::config::Build {

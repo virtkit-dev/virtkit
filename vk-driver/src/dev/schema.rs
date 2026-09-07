@@ -3,12 +3,25 @@
 //!
 //! The schema lives in the repository at `docs/schema/virtkit-config.schema.json` and is
 //! embedded here, so a `vk` can hand out the schema it actually reads. A TOML editor that
-//! speaks JSON Schema (taplo, VS Code's Even Better TOML) picks it up from the `#:schema`
-//! comment on the first line; a checkout can point at its own copy
+//! speaks JSON Schema (taplo, VS Code's Even Better TOML) picks it up from the [`DIRECTIVE`]
+//! comment `vk dev init` writes on the first line; a checkout can point at its own copy
 //! instead, and `.virtkit/config.toml` is an ordinary comment either way.
 //!
 //! [`crate::dev::config`] is the source of truth: the tests below derive every struct's field
 //! names from serde itself and fail when the two drift apart.
+
+/// The directive as a literal, so [`crate::dev::config::TEMPLATE`] can `concat!` it into its
+/// own first line rather than spelling the URL a second time.
+macro_rules! directive {
+    () => {
+        "#:schema https://raw.githubusercontent.com/virtkit-dev/virtkit/main/docs/schema/virtkit-config.schema.json"
+    };
+}
+pub(crate) use directive;
+
+/// The line `vk dev init` writes at the top of a config, and what to paste into one written
+/// by hand.
+pub const DIRECTIVE: &str = directive!();
 
 /// The schema itself, as shipped in the repository, and what `vk dev schema` prints.
 // Embedded so the binary can hand out the schema for the config format it reads, whatever
@@ -434,6 +447,24 @@ image = "docker.io/library/debian:13"
             .collect();
         assert_eq!(expected, seen, "the examples do not exercise every key");
     }
+
+    #[test]
+    fn the_template_carries_the_directive_and_checks_out() {
+        let root = schema();
+        let template = crate::dev::config::TEMPLATE;
+        assert_eq!(
+            template.lines().next(),
+            Some(DIRECTIVE),
+            "`vk dev init`'s template must point editors at the schema"
+        );
+        against_schema(&root, template);
+        toml::from_str::<Schema>(template).expect("devconfig reads its own template");
+        assert!(
+            SCHEMA_JSON.contains(&DIRECTIVE["#:schema ".len()..]),
+            "the schema's $id is not where the directive sends editors"
+        );
+    }
+
     #[test]
     fn the_schema_uses_only_what_is_checked() {
         /// Every keyword the schema uses, walking into the places a schema node can hold
