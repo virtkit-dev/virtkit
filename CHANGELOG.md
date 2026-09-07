@@ -83,6 +83,10 @@ All notable changes to virtkit will be documented in this file.
   guest command killed by a signal as success; they now fail, as they already did for a
   non-zero exit.
 
+- **A host without KVM is refused up front.** `vk run` and a job's preparation now stop
+  with the `vk check` diagnosis — `/dev/kvm` missing, or not accessible — before pulling an
+  image, instead of the VMM aborting during boot.
+
 ## [0.63.1] - 2026-09-07
 
 ### Fixed
