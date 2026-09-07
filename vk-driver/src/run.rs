@@ -554,7 +554,7 @@ fn lock_state_dir(dir: &Path) -> Result<std::fs::File> {
 /// `/proc/locks` prints, so the line never matches. A holder that exits and has its pid
 /// recycled before the age lookup is reported with the newcomer's age — which is why this
 /// only ever garnishes a message, and nothing acts on it.
-fn flock_holder(f: &std::fs::File) -> Option<String> {
+pub(crate) fn flock_holder(f: &std::fs::File) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
 
     let md = f.metadata().ok()?;
@@ -564,11 +564,33 @@ fn flock_holder(f: &std::fs::File) -> Option<String> {
         libc::minor(md.dev()),
         md.ino()
     );
-    let pid = holder_pid(&std::fs::read_to_string("/proc/locks").ok()?, &want)?;
+    let pid = holder_pid(&proc_locks()?, &want)?;
     Some(match crate::usage::proc_age(pid) {
         Some(age) => format!("pid {pid}, up {}", crate::vms::fmt_uptime(age.as_secs())),
         None => format!("pid {pid}"),
     })
+}
+
+/// The text of `/proc/locks`, taken in one `read(2)`. The file is a `seq_file` over the
+/// kernel's lock list that re-seeks by position on every call: when a lock anywhere on the
+/// host is released between two reads, the next one starts an entry short and a live lock
+/// silently drops out of the listing. One call is one consistent pass, so the buffer grows
+/// until the whole list fits.
+fn proc_locks() -> Option<String> {
+    use std::io::{Read, Seek};
+
+    let mut f = std::fs::File::open("/proc/locks").ok()?;
+    let mut size = 64 * 1024;
+    loop {
+        let mut buf = vec![0u8; size];
+        let n = f.read(&mut buf).ok()?;
+        if n < size {
+            buf.truncate(n);
+            return String::from_utf8(buf).ok();
+        }
+        size *= 4;
+        f.rewind().ok()?;
+    }
 }
 
 /// The pid holding an `FLOCK` on `want` (`<major>:<minor>:<inode>`), out of the text of
