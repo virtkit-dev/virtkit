@@ -15,6 +15,9 @@ user = "dev"
 freshness = "ask"
 cpus = "host"
 mem = "8G"
+# vk inside vk where the host allows it: `./dist/vk run …` and `./build.sh --fast --use-virtkit=./dist`
+# work from a `vk dev shell`, images and boot scratch on the guest's own disk (XDG_* below).
+nested = "auto"
 
 [dev.build]
 context = ".devcontainer"
