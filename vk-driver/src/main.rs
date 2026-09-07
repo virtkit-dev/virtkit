@@ -985,8 +985,10 @@ enum Cmd {
         /// Requires local stdin/stdout to be a terminal; incompatible with --background.
         #[arg(short = 't', long)]
         tty: bool,
-        /// Run the remote process as this Unix user (drops uid/gid/groups)
-        #[arg(long, value_name = "NAME")]
+        /// Run the remote process as this user or uid (drops uid/gid/groups)
+        ///
+        /// A name, a uid, or either with an explicit group: `uid:gid`, `name:group`.
+        #[arg(long, value_name = "USER")]
         user: Option<String>,
         /// Command to run and its arguments, after `--` (e.g. `vk exec -- ls -la`)
         #[arg(last = true, required = true)]
