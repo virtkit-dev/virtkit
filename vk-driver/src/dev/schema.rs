@@ -2,13 +2,26 @@
 //! as it is typed rather than at the next `vk dev`.
 //!
 //! The schema lives in the repository at `docs/schema/virtkit-config.schema.json` and is
-//! embedded here, so a `vk` hands out the schema it reads, whatever the checkout beside it
-//! says. A TOML editor that speaks JSON Schema (taplo, VS Code's Even Better TOML) picks it
-//! up from the `#:schema` comment on the first line, and a checkout can point at its own
-//! copy instead; either way the directive is a comment TOML ignores.
+//! embedded here, so a `vk` hands out the schema it reads, whatever the checkout beside
+//! it says. A TOML editor that speaks JSON Schema (taplo, VS Code's Even Better TOML)
+//! picks it up from the [`DIRECTIVE`] comment `vk dev init` writes on the first line; a
+//! checkout can point at its own copy instead, and either way the directive is a comment
+//! TOML ignores.
 //!
 //! [`crate::dev::config`] is the source of truth: the tests below derive every struct's field
 //! names and every enum's variants from serde itself, and fail when the two drift apart.
+
+/// A literal for [`crate::dev::config::TEMPLATE`]'s `concat!`, avoiding a duplicate URL
+/// on its first line.
+macro_rules! directive {
+    () => {
+        "#:schema https://raw.githubusercontent.com/virtkit-dev/virtkit/main/docs/schema/virtkit-config.schema.json"
+    };
+}
+pub(crate) use directive;
+
+/// The first line of an initialized config; also suitable for handwritten configs.
+pub const DIRECTIVE: &str = directive!();
 
 /// The schema itself, as shipped in the repository, and what `vk dev schema` prints.
 pub const SCHEMA_JSON: &str = include_str!("../../../docs/schema/virtkit-config.schema.json");
@@ -592,6 +605,23 @@ image = "docker.io/library/debian:13"
                 "{def} takes keys its devconfig struct denies"
             );
         }
+    }
+
+    #[test]
+    fn the_template_carries_the_directive_and_checks_out() {
+        let root = schema();
+        let template = crate::dev::config::TEMPLATE;
+        assert_eq!(
+            template.lines().next(),
+            Some(DIRECTIVE),
+            "`vk dev init`'s template must point editors at the schema"
+        );
+        against_schema(&root, template);
+        toml::from_str::<Schema>(template).expect("devconfig reads its own template");
+        assert!(
+            SCHEMA_JSON.contains(&DIRECTIVE["#:schema ".len()..]),
+            "the schema's $id is not where the directive sends editors"
+        );
     }
 
     #[test]

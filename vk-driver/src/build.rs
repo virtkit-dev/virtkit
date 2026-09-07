@@ -418,6 +418,19 @@ pub struct Built {
     pub config: vk_core::runcfg::RunConfig,
 }
 
+/// Return the `AS` names in Dockerfile `text`, in declaration order, for `--target`
+/// selection. Omit unnamed stages. Parse only; resolve and build nothing.
+pub fn dockerfile_stages(text: &str) -> Result<Vec<String>> {
+    Ok(parser::parse(text)?
+        .instructions
+        .iter()
+        .filter_map(|i| match i {
+            parser::Instruction::From(f) => f.as_name.clone(),
+            _ => None,
+        })
+        .collect())
+}
+
 /// The runtime-config sidecar path for a built ext4: `<out>.json` (appended, so
 /// `svc.ext4` maps to `svc.ext4.json`).
 pub fn config_sidecar(out: &Path) -> PathBuf {
@@ -4073,6 +4086,25 @@ fn upsert(env: &mut Vec<(String, String)>, k: &str, v: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_named_stages_are_offered_as_targets() {
+        // Only named stages: `--target` can select nothing else, and callers offer this
+        // list as the choices.
+        let stages =
+            dockerfile_stages("FROM scratch\nRUN a\nFROM scratch AS build\nFROM build AS dev\n")
+                .unwrap();
+        assert_eq!(stages, ["build", "dev"]);
+        assert!(dockerfile_stages("FROM scratch\n").unwrap().is_empty());
+        // A malformed Dockerfile is an error, not a silent empty list.
+        assert!(
+            dockerfile_stages(
+                "FROM
+"
+            )
+            .is_err()
+        );
+    }
 
     /// A `[build]` section naming a gated remote cache.
     fn gated_cache() -> crate::config::Build {

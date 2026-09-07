@@ -5,8 +5,8 @@ use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 
-use super::{config, plan, schema};
-use crate::{fail, write_report};
+use super::{config, init, plan, schema};
+use crate::{exit_code, fail, write_report};
 
 // `Cmd::Dev` supplies the help; a doc comment here would duplicate its `about`.
 #[derive(Args)]
@@ -40,6 +40,26 @@ pub async fn run(dev: Dev) -> ExitCode {
 /// `vk dev`: drive a workspace's dev environment from its `.virtkit/config.toml`.
 #[derive(Subcommand)]
 enum DevAction {
+    /// Write a first `.virtkit/config.toml`, or validate the one that exists
+    ///
+    /// With a config already there, reads it — and `.virtkit/local.toml` beside it — and
+    /// reports what it describes; an unknown key or a value that means nothing is an error
+    /// with its location. Without one, translates what the project has: a devcontainer.json,
+    /// a compose file at the root, a Dockerfile, else a commented config booting a stock
+    /// image. The report says what was carried over, what still needs a decision, and what
+    /// was left out; a draft missing an essential choice is written but exits 1. Data
+    /// conversion only — nothing runs, downloads or boots. Never touches the local files.
+    Init {
+        /// what to translate from, instead of detecting it
+        #[arg(long, value_name = "SOURCE")]
+        from: Option<crate::dev::init::Source>,
+        /// the image reference, with `--from image`
+        #[arg(long, value_name = "REF")]
+        image: Option<String>,
+        /// replace an existing config
+        #[arg(long)]
+        force: bool,
+    },
     /// Print what the config resolves to, without doing any of it
     ///
     /// Which source, mounts, environment, endpoints and state directory the config means
@@ -91,6 +111,17 @@ async fn dev_action(
         Ok(d) => d,
         Err(e) => return fail(&anyhow::anyhow!(e).context("resolving the current dir"), 1),
     };
+    // Init writes a config rather than reading one, but still needs the workspace.
+    if let DevAction::Init { from, image, force } = action {
+        let opts = init::Opts { from, image, force };
+        return match init::run(&cwd, workspace, &opts) {
+            Ok(out) => {
+                let code = write_report(&out.report);
+                if out.ok { code } else { exit_code(1) }
+            }
+            Err(e) => fail(&e, 2),
+        };
+    }
     // A config that cannot be read or does not describe something virtkit can build is the
     // caller's to fix, like a usage error.
     let loaded = match config::discover(&cwd, workspace, config).and_then(config::load) {
@@ -102,7 +133,9 @@ async fn dev_action(
         Err(e) => return fail(&e, 2),
     };
     match action {
-        DevAction::Schema => unreachable!("handled before the plan is resolved"),
+        DevAction::Init { .. } | DevAction::Schema => {
+            unreachable!("handled before the plan is resolved")
+        }
         DevAction::Plan {
             format,
             show_secrets,
