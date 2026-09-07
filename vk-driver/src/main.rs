@@ -64,6 +64,7 @@ mod run;
 mod schedule;
 mod scratch;
 mod services;
+mod shell;
 mod shutdown;
 mod sites;
 mod source;

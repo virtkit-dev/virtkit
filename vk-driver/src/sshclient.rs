@@ -233,29 +233,12 @@ pub fn real_ssh(shim_dir: &Path, path_var: Option<&OsStr>) -> Result<PathBuf> {
 }
 
 /// Resolve `name` on `path_var`, skipping `skip_dir`, and return an absolute path suitable
-/// for a shim that may run from another directory.
+/// for a shim that may run from another directory: the shim's own line is what the resolved
+/// path goes into, and it runs from wherever the editor started it.
 fn which(name: &str, path_var: Option<&OsStr>, skip_dir: Option<&Path>) -> Result<PathBuf> {
-    let path = path_var.unwrap_or(OsStr::new(""));
-    let skip = skip_dir.and_then(|d| std::fs::canonicalize(d).ok());
-    for dir in std::env::split_paths(path) {
-        // Resolve path identity so aliases of the shim directory are skipped.
-        if skip.is_some() && std::fs::canonicalize(&dir).ok() == skip {
-            continue;
-        }
-        let candidate = dir.join(name);
-        if !is_executable(&candidate) {
-            continue;
-        }
-        if let Ok(resolved) = std::fs::canonicalize(&candidate) {
-            return Ok(resolved);
-        }
-    }
-    bail!("no `{name}` on PATH")
-}
-
-fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    crate::shell::which_all(name, path_var, skip_dir)
+        .find_map(|candidate| std::fs::canonicalize(candidate).ok())
+        .with_context(|| format!("no `{name}` on PATH"))
 }
 
 /// Reject config metacharacters and patterns in an `ssh_config` `Host` alias. For example,

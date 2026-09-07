@@ -3237,11 +3237,6 @@ fn spawn_ssh_agent_proxy(
 
 /// Wait for the in-guest virtkit-agent, run the command, relay its output. `ssh_config`, if
 /// set, is written to the guest's `~/.ssh/config` once it is ready (the `--ssh-host` stanzas).
-/// Single-quote a value for a `/bin/sh` `export` (wrap in `'…'`, escaping embedded `'`).
-fn sh_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 /// The guest script for the trailing command. Empty: a boot-info probe. One
 /// argument: a shell one-liner, taken verbatim (`-- 'echo a | nc b 1234'`).
 /// Several: an argv — each word quoted so its boundaries survive the guest's
@@ -3255,7 +3250,7 @@ fn user_script(command: &[String]) -> String {
         [script] => script.clone(),
         argv => argv
             .iter()
-            .map(|a| sh_quote(a))
+            .map(|a| crate::shell::quote(a))
             .collect::<Vec<_>>()
             .join(" "),
     }
@@ -3304,7 +3299,7 @@ fn guest_command_body(
         image_entrypoint
             .iter()
             .chain(command)
-            .map(|a| sh_quote(a))
+            .map(|a| crate::shell::quote(a))
             .collect::<Vec<_>>()
             .join(" ")
     };
@@ -3316,7 +3311,7 @@ fn guest_command_body(
         None
     };
     match cwd {
-        Some(dir) => format!("cd {} && {script}", sh_quote(dir)),
+        Some(dir) => format!("cd {} && {script}", crate::shell::quote(dir)),
         None => script,
     }
 }
@@ -3523,7 +3518,7 @@ async fn drive(
                 eprintln!("virtkit: skipping image env var with non-identifier name {k:?}");
                 continue;
             }
-            script.push_str(&format!("export {k}={}; ", sh_quote(v)));
+            script.push_str(&format!("export {k}={}; ", crate::shell::quote(v)));
         }
         script.push_str(&body);
         let t_exec = Instant::now();
@@ -5396,7 +5391,7 @@ mod tests {
         // The --workdir share overrides the image workdir (its outputs land on the host).
         assert_eq!(
             guest_command_body(&s(&["ls"]), &s(&["/entry"]), "/app", true, &[]),
-            format!("cd {} && '/entry' 'ls'", sh_quote(WORKDIR_MOUNT))
+            format!("cd {} && '/entry' 'ls'", crate::shell::quote(WORKDIR_MOUNT))
         );
         // A `/` (or empty) image workdir emits no cd — `/` is the default.
         assert_eq!(guest_command_body(&s(&["ls"]), &[], "/", false, &[]), "ls");
