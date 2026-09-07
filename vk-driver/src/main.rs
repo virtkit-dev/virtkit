@@ -43,6 +43,7 @@ mod executor;
 mod ext4;
 mod ext4_read;
 mod fullvm;
+mod hostpolicy;
 mod image;
 mod initramfs;
 mod iso9660;
@@ -881,6 +882,24 @@ enum Cmd {
         /// the run's state dir (`run --state-dir`)
         #[arg(value_name = "DIR")]
         state_dir: PathBuf,
+    },
+    /// plumbing: apply a built-in host-command policy, then exec what it allows
+    ///
+    /// `[dev.host] git-gui = true` generates a wrapper that runs this, so the guest's exec
+    /// channel reaches the host only through it. The policy allows `gitk` and `git gui` with
+    /// an allowlist of revision selectors, refuses anything else with exit 126, and rebuilds
+    /// the environment from the serving user's passwd entry plus the display and locale
+    /// settings — nothing the client sent selects what runs.
+    #[command(name = "host-policy", hide = true)]
+    HostPolicy {
+        /// which policy to apply; `git-gui` is the only one
+        policy: String,
+        /// the environment's workspace root — the command must run inside it
+        #[arg(long)]
+        workspace: PathBuf,
+        /// the command the guest asked for, after `--`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
     },
     /// plumbing: splice stdio to the target address — the SSH `ProxyCommand` shape
     ///
@@ -2525,6 +2544,17 @@ async fn cli_main(cli: Cli) -> ExitCode {
     if let Cmd::Service { cmd } = &cli.cmd {
         return service_cmd(cmd).await;
     }
+    // The host policy decides on its argv, the passwd database and its own environment —
+    // handle it before Config::load, so the wrapper a boot generated keeps working whatever
+    // the host config later becomes.
+    if let Cmd::HostPolicy {
+        policy,
+        workspace,
+        argv,
+    } = &cli.cmd
+    {
+        return host_policy_cmd(policy, workspace, argv);
+    }
     // `update` replaces the binary and reads nothing from the config — handle it before
     // Config::load, so a config file that no longer parses cannot block the upgrade that
     // fixes it.
@@ -4051,6 +4081,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         | Cmd::Stop { .. }
         | Cmd::Reboot { .. }
         | Cmd::Update { .. }
+        | Cmd::HostPolicy { .. }
         | Cmd::Service { .. } => {
             unreachable!()
         }
@@ -4079,6 +4110,46 @@ fn store_root(cfg: &Config, root: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
                 |d| d.display().to_string()
             )
         ),
+    }
+}
+
+/// `vk host-policy <policy> --workspace DIR -- <argv…>`: decide, then become the command.
+///
+/// 126 is the shell's "found but not executable" code, and what the guest sees for anything
+/// the policy turns down — with the reason on stderr, since the guest shim shows it.
+fn host_policy_cmd(policy: &str, workspace: &Path, argv: &[String]) -> ExitCode {
+    const REFUSED: i32 = 126;
+    let refuse = |why: String| {
+        eprintln!("vk host-policy: {why}");
+        exit_code(REFUSED)
+    };
+    if policy != "git-gui" {
+        return refuse(format!("unknown policy: {policy}"));
+    }
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => return refuse(format!("no working directory: {e}")),
+    };
+    let passwd = match hostpolicy::self_passwd() {
+        Ok(p) => p,
+        Err(e) => return refuse(format!("{e:#}")),
+    };
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    match hostpolicy::git_gui(workspace, &cwd, argv, &env, (&passwd.0, &passwd.1)) {
+        Err(e) => refuse(format!("{e:#}")),
+        Ok(hostpolicy::Decision::Refused(why)) => refuse(why),
+        Ok(hostpolicy::Decision::Run { program, args, env }) => {
+            use std::os::unix::process::CommandExt;
+            // env_clear + the rebuilt env is the whole environment the command gets, and the
+            // PATH in it is what resolves the program name.
+            let e = std::process::Command::new(&program)
+                .args(&args)
+                .env_clear()
+                .envs(env)
+                .exec();
+            eprintln!("vk host-policy: {program}: {e}");
+            exit_code(127)
+        }
     }
 }
 
