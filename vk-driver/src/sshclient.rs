@@ -10,9 +10,9 @@
 //! owns the private key. [`check_state_dir_is_host_only`] rejects writable guest shares
 //! that contain the state dir or target a managed artifact.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -354,28 +354,9 @@ fn generate_key(keygen: &Path, at: &Path, comment: &str) -> Result<()> {
     Ok(())
 }
 
-/// Write `contents` to `path` through a fresh temporary file in the same directory, so a
-/// reader sees either the previous file or the whole new one, and the mode is right from
-/// the moment the file exists. The directory is not fsynced: every artifact here is
-/// rewritten on the next boot, so losing the rename to a crash costs nothing.
+/// Write `contents` at `path`, private from the moment it exists and published whole.
 fn write_atomic(path: &Path, contents: &str, mode: u32) -> Result<()> {
-    let mut name = OsString::from(".");
-    name.push(path.file_name().unwrap_or(OsStr::new("tmp")));
-    name.push(format!(".{}", std::process::id()));
-    let tmp = path.with_file_name(name);
-    // A leftover from a previous run of this pid; create_new below then rejects a symlink
-    // planted at the same name.
-    let _ = std::fs::remove_file(&tmp);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(&tmp)
-        .with_context(|| format!("creating {}", tmp.display()))?;
-    f.write_all(contents.as_bytes())?;
-    f.sync_all()?;
-    drop(f);
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))
+    vk_fs::write_atomic(path, contents.as_bytes(), mode)
 }
 
 #[cfg(test)]
