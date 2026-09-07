@@ -28,6 +28,7 @@ pub mod plan;
 pub mod schema;
 mod session;
 mod status;
+pub mod storage;
 
 use std::time::Duration;
 
@@ -35,10 +36,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::dev::config::Freshness;
 
+pub(crate) use boot::lock_holder;
 pub use boot::{boot, build};
 pub use identity::plan_diff;
 pub use session::{
-    LOGIN_SHELL, after_boot, exec_in_guest, exec_in_service, exec_session, guest_cwd, service, stop,
+    LOGIN_SHELL, after_boot, ask_on_terminal, exec_in_guest, exec_in_service, exec_session,
+    guest_cwd, on_terminal, running_vm, service, stop,
 };
 pub use status::{doctor, status};
 

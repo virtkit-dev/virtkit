@@ -268,6 +268,7 @@ pub fn plan_diff(plan: &Plan) -> Result<Option<String>> {
         if create_pending {
             out.push_str(pending);
         }
+        out.push_str(&crate::dev::storage::preview(plan));
         return Ok(Some(out));
     }
     for (effect, lines) in &groups {
@@ -290,6 +291,7 @@ pub fn plan_diff(plan: &Plan) -> Result<Option<String>> {
     } else {
         out.push_str("`vk dev refresh` applies all of it\n");
     }
+    out.push_str(&crate::dev::storage::preview(plan));
     Ok(Some(out))
 }
 

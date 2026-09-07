@@ -193,6 +193,16 @@ enum DevAction {
         #[arg(long, value_name = "NAME")]
         service: Option<String>,
     },
+    /// List the environment's storage, and reset one durable item
+    ///
+    /// Storage is what the compose file's `disk` volumes and persistent roots, the config's
+    /// `${state}` mounts and the editor's server storage add up to. `list` names each item,
+    /// what it is for, where it is backed and whether it exists yet; `reset` is the only
+    /// thing here that destroys anything. Neither boots the environment.
+    Storage {
+        #[command(subcommand)]
+        action: DevStorageAction,
+    },
     /// SSH into the environment (it must already be up)
     ///
     /// The system ssh, against the setup the boot wrote into the state directory — that
@@ -281,6 +291,39 @@ enum DevAction {
         #[arg(long, default_value_t = super::boot::STOP_TIMEOUT_SECS)]
         timeout: u64,
     },
+    /// List every dev environment this host keeps state for
+    ///
+    /// Host-wide, and needs no config in the current directory: one row per state directory
+    /// under `$XDG_STATE_HOME/virtkit/dev` — which workspace and environment it belongs to,
+    /// whether it is running, which vk created it, how long ago it last booted and — with
+    /// `--sizes` — what it holds on disk. Flagged when its workspace is gone, or when it
+    /// recorded no boot at all
+    /// — the shape a task run in a throwaway environment leaves. Reads only.
+    List {
+        /// print the same facts as JSON
+        #[arg(long)]
+        json: bool,
+        /// measure what each environment holds on disk, which reads every file in it
+        #[arg(long)]
+        sizes: bool,
+    },
+    /// Remove the state of environments that are finished with
+    ///
+    /// Takes the environments named, or with `--all-stale` every one that is not running and
+    /// whose workspace is gone or that never recorded a boot. A running environment is
+    /// refused. Without `--yes`, lists what would go — including the storage inside each —
+    /// and removes nothing; on a terminal it asks instead. Also needs no config.
+    Gc {
+        /// remove without asking
+        #[arg(long)]
+        yes: bool,
+        /// every environment whose workspace is gone, or that recorded no boot
+        #[arg(long = "all-stale")]
+        all_stale: bool,
+        /// the environments to remove, as `vk dev list` names them
+        #[arg(value_name = "NAME")]
+        names: Vec<String>,
+    },
     /// Print what the config resolves to, without doing any of it
     ///
     /// The plan is what every other `vk dev` command works from, so this is how to see
@@ -334,12 +377,15 @@ impl DevAction {
             | Self::Endpoints { .. }
             | Self::Open { .. }
             | Self::Build { .. }
+            | Self::Storage { .. }
             | Self::Ssh { .. }
             | Self::SshConfig
             | Self::Status { .. }
             | Self::Logs { .. }
             | Self::Doctor
             | Self::Stop { .. }
+            | Self::List { .. }
+            | Self::Gc { .. }
             | Self::Plan { .. }
             | Self::Schema => false,
         }
@@ -369,6 +415,32 @@ enum DevServiceAction {
     Status {
         /// the service; omit to list all
         name: Option<String>,
+    },
+}
+
+/// `vk dev storage`: what the environment keeps, and the one operation that removes it.
+#[derive(Subcommand)]
+enum DevStorageAction {
+    /// List every storage item: what owns it, how long it lives, where it is backed
+    List {
+        /// print the same facts as JSON
+        #[arg(long)]
+        json: bool,
+        /// measure what each item holds on disk, which reads every file in it
+        #[arg(long)]
+        sizes: bool,
+    },
+    /// Remove a durable item's data, with whatever owns it stopped first
+    ///
+    /// Refuses an item a refresh or the editor adapter owns, and asks before stopping a
+    /// running owner — declining keeps both the owner and its data. The next start
+    /// recreates the item empty.
+    Reset {
+        /// the item, as `vk dev storage list` names it
+        name: String,
+        /// stop the owner and remove the data without asking
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -432,6 +504,26 @@ async fn dev_action(
     // Nothing to read at all: the schema is embedded, so this answers anywhere.
     if matches!(action, DevAction::Schema) {
         return write_report(crate::dev::schema::SCHEMA_JSON);
+    }
+    // Host-wide like `init`, and for the same reason: they read the state base rather than a
+    // config, so a directory with none must not turn them into a usage error.
+    if let DevAction::List { json, sizes } = action {
+        let report = match crate::dev::list::state(sizes).and_then(|rows| match json {
+            true => crate::dev::list::json(&rows),
+            false => Ok(crate::dev::list::render(&rows)),
+        }) {
+            Ok(report) => report,
+            Err(e) => return fail(&e, 1),
+        };
+        return write_report(&report);
+    }
+    if let DevAction::Gc {
+        yes,
+        all_stale,
+        names,
+    } = action
+    {
+        return dev_gc(yes, all_stale, &names);
     }
     // A config that cannot be read or does not describe something virtkit can build is the
     // caller's to fix, like a usage error.
@@ -529,6 +621,25 @@ async fn dev_action(
             )
             .await,
         ),
+        DevAction::Storage {
+            action: DevStorageAction::List { json, sizes },
+        } => match crate::dev::storage::inventory(&plan, sizes) {
+            Ok(items) if json => match serde_json::to_string_pretty(&items) {
+                Ok(text) => write_report(&(text + "\n")),
+                Err(e) => fail(&anyhow::anyhow!(e), 1),
+            },
+            Ok(items) => match crate::dev::storage::running(&plan) {
+                Ok(running) => write_report(&crate::dev::storage::render(&items, &running)),
+                Err(e) => fail(&e, 1),
+            },
+            Err(e) => fail(&e, 1),
+        },
+        DevAction::Storage {
+            action: DevStorageAction::Reset { name, yes },
+        } => match crate::dev::storage::reset(&plan, &name, yes).await {
+            Ok(report) => write_report(&(report + "\n")),
+            Err(e) => fail(&e, 1),
+        },
         DevAction::Endpoints {
             service,
             primary,
@@ -675,7 +786,10 @@ async fn dev_action(
             // set reserves for a config or usage error.
             Err(e) => fail(&e, 1),
         },
-        DevAction::Init { .. } | DevAction::Schema => {
+        DevAction::Init { .. }
+        | DevAction::List { .. }
+        | DevAction::Gc { .. }
+        | DevAction::Schema => {
             unreachable!("handled before the plan is resolved")
         }
         // Nothing running is not an error for a read-only preview — `refresh --dry-run`
@@ -746,6 +860,46 @@ enum Ready {
 /// docs). The child boots and then holds the VM, so it never gets here to act; where there
 /// was nothing to boot it is finished too, and the parent — released once the guest is ready
 /// — is what goes on to run the command.
+/// `vk dev gc`: choose what goes, show it, ask, and remove exactly that. Host-wide, so it
+/// works from a directory with no config. A run that only showed what would go did not do
+/// what it was asked, and exits 1.
+fn dev_gc(yes: bool, all_stale: bool, names: &[String]) -> ExitCode {
+    // Always measured: the preview's whole job is to show what is about to be destroyed.
+    let selected = match crate::dev::list::state(true)
+        .and_then(|rows| crate::dev::list::select_gc(rows, names, all_stale))
+    {
+        Ok(s) => s,
+        Err(e) => return fail(&e, 1),
+    };
+    if selected.is_empty() {
+        return write_report("nothing to remove\n");
+    }
+    if !yes {
+        let preview = crate::dev::list::preview(&selected);
+        if !crate::dev::on_terminal() {
+            let asked = format!("{preview}nothing was removed: --yes removes it\n");
+            return match write_report(&asked) {
+                ExitCode::SUCCESS => exit_code(1),
+                code => code,
+            };
+        }
+        match write_report(&preview) {
+            ExitCode::SUCCESS => {}
+            code => return code,
+        }
+        let question = format!("remove {} environment(s)?", selected.len());
+        match crate::dev::ask_on_terminal(&question) {
+            Ok(false) => return write_report("nothing was removed\n"),
+            Ok(true) => {}
+            Err(e) => return fail(&e, 1),
+        }
+    }
+    match crate::dev::list::remove(&selected) {
+        Ok(report) => write_report(&report),
+        Err(e) => fail(&e, 1),
+    }
+}
+
 async fn dev_up(
     plan: &crate::dev::plan::Plan,
     host_cfg: &config::Config,
@@ -818,6 +972,8 @@ mod tests {
         (&["service", "reboot", "runner"], false),
         (&["service", "status"], false),
         (&["build"], false),
+        (&["storage", "list"], false),
+        (&["storage", "reset", "runner:/var/wab", "--yes"], false),
         (&["ssh"], false),
         (&["ssh-config"], false),
         (&["refresh"], true),
@@ -826,6 +982,8 @@ mod tests {
         (&["logs", "-f"], false),
         (&["doctor"], false),
         (&["stop"], false),
+        (&["list"], false),
+        (&["gc", "--all-stale", "--yes"], false),
         (&["plan", "--diff"], false),
         (&["schema"], false),
     ];
