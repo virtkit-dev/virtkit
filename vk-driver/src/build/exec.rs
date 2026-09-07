@@ -2287,7 +2287,7 @@ impl Executor for MicroVm {
         // ENV and ARG are exported here for the shell to expand `$VAR` against.
         let mut script = String::new();
         for (k, v) in state.env.iter().chain(&state.build_args) {
-            script.push_str(&format!("export {k}={}; ", shell_single_quote(v)));
+            script.push_str(&format!("export {k}={}; ", crate::shell::quote(v)));
         }
         let wd = if state.workdir.is_empty() {
             "/"
@@ -2296,7 +2296,7 @@ impl Executor for MicroVm {
         };
         // WORKDIR creates the directory (as Docker does), so `cd` into a not-yet-existing
         // workdir succeeds; best-effort so a non-root RUN over an existing dir still runs.
-        let q = shell_single_quote(wd);
+        let q = crate::shell::quote(wd);
         script.push_str(&format!("mkdir -p {q} 2>/dev/null; cd {q} && {shell}"));
         let argv = vec!["sh".to_string(), "-c".to_string(), script];
         let user = match state.user.as_str() {
@@ -2995,11 +2995,6 @@ impl Executor for MicroVm {
             let _ = std::fs::remove_file(&boot.initramfs);
         }
     }
-}
-
-/// Single-quote a value for a `/bin/sh` script (wrap in `'…'`, escaping embedded `'`).
-fn shell_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Host backend for the no-`RUN` subset (`FROM scratch` + `COPY`): each stage is a
