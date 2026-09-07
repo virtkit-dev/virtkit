@@ -194,9 +194,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     let cfg = &ctx.cfg;
     // Cheap fail-fast checks first (crisp errors in the runner-visible process beat a
     // supervisor-log pointer).
-    if unsafe { libc::access(c"/dev/kvm".as_ptr(), libc::R_OK | libc::W_OK) } != 0 {
-        bail!("no rw access to /dev/kvm (is the runner user in the kvm group?)");
-    }
+    crate::check::require_kvm()?;
     refuse_unsupported_nesting(cfg.vm.nested, crate::vmm::host_nesting_enabled())?;
     let (cpus, mem) = vm_size(ctx)?;
     // Validate the run-phase egress narrowing here so a MICROVM_EGRESS_ALLOW_* request

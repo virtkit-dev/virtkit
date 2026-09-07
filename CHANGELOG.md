@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A host without KVM is refused up front.** `vk run` and a job's preparation now stop
+  with the `vk check` diagnosis — `/dev/kvm` missing, or not accessible — before pulling an
+  image, instead of the VMM aborting during boot with a backtrace.
+
 ## [0.63.1] - 2026-09-07
 
 ### Fixed

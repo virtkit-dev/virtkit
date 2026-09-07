@@ -364,31 +364,56 @@ fn usage() -> Outcome {
 }
 
 fn kvm() -> Outcome {
-    let dev = Path::new("/dev/kvm");
+    match kvm_ready(Path::new(KVM_DEV)) {
+        Ok(()) => ok(format!("rw access to {KVM_DEV}, KVM API v12")),
+        Err(why) => fail(why),
+    }
+}
+
+const KVM_DEV: &str = "/dev/kvm";
+
+/// Refuse to boot a microVM on a host this process cannot use KVM on, with the diagnosis
+/// `vk check` gives. `vk run` and the executor's `prepare` call this before pulling or
+/// building an image: without it a missing `/dev/kvm` surfaces only as the VMM aborting
+/// mid-boot ("Error creating the Kvm object: Error(2)"), after the pull.
+pub(crate) fn require_kvm() -> anyhow::Result<()> {
+    kvm_ready(Path::new(KVM_DEV)).map_err(|why| anyhow::anyhow!("{why} — see `vk check`"))
+}
+
+/// Whether `dev` (normally `/dev/kvm`) is a usable KVM device for this process: present,
+/// readable and writable, and answering KVM_GET_API_VERSION with the stable API. `Err` is
+/// the user-facing reason it is not.
+fn kvm_ready(dev: &Path) -> Result<(), String> {
+    let name = dev.display();
     if !dev.exists() {
-        return fail("/dev/kvm missing (is KVM enabled — kvm_intel/kvm_amd loaded?)");
+        return Err(format!(
+            "{name} missing (is KVM enabled — kvm_intel/kvm_amd loaded?)"
+        ));
     }
     if !access_ok(dev, libc::R_OK | libc::W_OK) {
-        return fail("no rw access to /dev/kvm (is the user in the kvm group?)");
+        return Err(format!(
+            "no rw access to {name} (is the user in the kvm group?)"
+        ));
     }
-    let file = match std::fs::OpenOptions::new().read(true).write(true).open(dev) {
-        Ok(f) => f,
-        Err(e) => return fail(format!("opening /dev/kvm: {e}")),
-    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dev)
+        .map_err(|e| format!("opening {name}: {e}"))?;
     // KVM_GET_API_VERSION (_IO(0xAE, 0x00)); the stable KVM API is pinned at 12.
     // KVM insists the unused ioctl argument is 0 (EINVAL otherwise), so pass it
     // explicitly rather than leaving the variadic slot to garbage.
     let version = unsafe { libc::ioctl(file.as_raw_fd(), 0xAE00 as _, 0) };
     if version < 0 {
-        return fail(format!(
-            "KVM_GET_API_VERSION on /dev/kvm failed: {} (a sandbox/seccomp profile blocking KVM ioctls?)",
+        return Err(format!(
+            "KVM_GET_API_VERSION on {name} failed: {} (a sandbox/seccomp profile blocking KVM ioctls?)",
             std::io::Error::last_os_error()
         ));
     }
     if version != 12 {
-        return fail(format!("unexpected KVM API version {version} (want 12)"));
+        return Err(format!("unexpected KVM API version {version} (want 12)"));
     }
-    ok("rw access to /dev/kvm, KVM API v12")
+    Ok(())
 }
 
 fn vmm(cfg: &Config) -> Outcome {
@@ -743,6 +768,19 @@ fn dir_writable(dir: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::config::Gitlab;
+
+    /// The pre-boot refusal names what is wrong with the device: absent, or not KVM at all
+    /// (a regular file opens rw but has no KVM ioctls — ENOTTY).
+    #[test]
+    fn kvm_readiness_says_why_a_device_is_unusable() {
+        let dir = std::env::temp_dir().join(format!("vk-kvm-ready-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dev = dir.join("kvm");
+        assert!(kvm_ready(&dev).unwrap_err().contains("missing"));
+        std::fs::write(&dev, b"").unwrap();
+        assert!(kvm_ready(&dev).unwrap_err().contains("KVM_GET_API_VERSION"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Keep the crate version compatible with `Version::own`.
     #[test]

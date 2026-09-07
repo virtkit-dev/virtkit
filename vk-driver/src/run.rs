@@ -377,6 +377,9 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
         let flag = if args.shell { "--shell" } else { "-t" };
         bail!("{flag} requires stdin and stdout to be a terminal");
     }
+    // Every path below boots a VM (a compose-only run included) and pulls or builds first,
+    // so a host without KVM is refused here rather than by the VMM aborting after the pull.
+    crate::check::require_kvm()?;
     // The VMM process-name template for every VM this run boots (the primary, plus any
     // compose siblings and Dockerfile stage builds, which reach it via the process-global).
     crate::vmm::set_vm_name_template(args.vm_name.clone());
