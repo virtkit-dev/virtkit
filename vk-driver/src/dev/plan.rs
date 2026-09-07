@@ -151,6 +151,13 @@ pub struct EndpointPlan {
     pub required: bool,
 }
 
+impl EndpointPlan {
+    /// Whether the host address is allocated rather than configured.
+    pub fn auto(&self) -> bool {
+        self.address == "auto"
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HostExecPlan {
     /// absolute: a project wrapper, or — for a `builtin` policy — the state-dir path the

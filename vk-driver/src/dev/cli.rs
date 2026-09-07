@@ -139,6 +139,43 @@ enum DevAction {
     /// `exec-env`, in the guest directory that stands for yours. Ends when the shell does;
     /// the environment stays up, so opening another costs nothing.
     Shell,
+    /// List the environment's endpoints: address, URL, and whether each is published
+    ///
+    /// An `auto` address is the stable loopback allocation this environment holds, shown
+    /// once it exists. Reads only: nothing is allocated, published or booted.
+    Endpoints {
+        /// only this compose service's endpoints
+        #[arg(long, value_name = "NAME", conflicts_with = "primary")]
+        service: Option<String>,
+        /// only the primary's endpoints — the ones no compose service claims
+        #[arg(long)]
+        primary: bool,
+        /// print as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open an endpoint's URL in the desktop's browser (or print it)
+    ///
+    /// The endpoint must name a `scheme`. Uses xdg-open when the desktop has one; prints the
+    /// URL otherwise, or with `--print`.
+    Open {
+        /// the endpoint, as `[dev.endpoints.<name>]` names it
+        name: String,
+        /// print the URL instead of opening it
+        #[arg(long)]
+        print: bool,
+    },
+    /// Control the environment's compose services from the host
+    ///
+    /// The same operations `vk service` offers inside the guest, addressed through the
+    /// config instead of a state directory: bring a profiled service up (booting the
+    /// environment first if it is down, building the service's image on first use with the
+    /// build streamed here), take it down, reboot it, or ask where it stands. Only `up`
+    /// boots anything; the rest report an environment that is down as such.
+    Service {
+        #[command(subcommand)]
+        action: DevServiceAction,
+    },
     /// SSH into the environment (it must already be up)
     ///
     /// The system ssh, against the setup the boot wrote into the state directory — that
@@ -270,9 +307,13 @@ impl DevAction {
             Self::Up { .. } | Self::Shell => true,
             // A service exec reaches a running service and boots nothing.
             Self::Exec { service, .. } => service.is_none(),
+            // Of the service operations only `up` boots the environment.
+            Self::Service { action } => matches!(action, DevServiceAction::Up { .. }),
             // A dry run only reports; forking it would report twice.
             Self::Refresh { dry_run } => !dry_run,
             Self::Init { .. }
+            | Self::Endpoints { .. }
+            | Self::Open { .. }
             | Self::Ssh { .. }
             | Self::SshConfig
             | Self::Status { .. }
@@ -285,12 +326,76 @@ impl DevAction {
     }
 }
 
+#[derive(Subcommand)]
+enum DevServiceAction {
+    /// Bring a service up, building its image on first use
+    Up {
+        /// the service, as the compose file names it
+        name: String,
+    },
+    /// Stop a running service (a no-op if already stopped)
+    Down {
+        /// the service
+        name: String,
+    },
+    /// Reboot a running service's guest in place (same VM, no image rebuild)
+    Reboot {
+        /// the service
+        name: String,
+    },
+    /// Print a service's state and address, or every service's when no name is given
+    ///
+    /// One line per service: `<name> <state> <address>`, as `vk service status` prints it.
+    Status {
+        /// the service; omit to list all
+        name: Option<String>,
+    },
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum PlanFormat {
     /// the canonical form: every resolved value, as JSON
     Json,
     /// the `vk run` the plan stands for, for reading rather than running
     Shell,
+}
+
+/// Render one `<name> <state> <address>` line per unit on stdout, followed by the
+/// reply's message on stdout for success or stderr for failure. Supply a fallback
+/// message for failures without one, so a non-zero exit is never silent.
+fn render_service_reply(reply: &vk_core::fleetctl::Reply) -> (String, Option<String>) {
+    let mut out = String::new();
+    for u in &reply.units {
+        out.push_str(&format!("{:<16} {:<9} {}\n", u.name, u.state, u.ip));
+    }
+    let note = if reply.message.is_empty() {
+        (!reply.ok).then(|| "the service manager reported a failure with no detail".to_string())
+    } else if reply.ok {
+        out.push_str(&reply.message);
+        out.push('\n');
+        None
+    } else {
+        Some(reply.message.clone())
+    };
+    (out, note)
+}
+
+/// `vk dev service`: print the manager's answer as `vk service` prints it — the unit lines,
+/// then the message — and turn its verdict into the exit code.
+fn service_reply(reply: anyhow::Result<vk_core::fleetctl::Reply>) -> ExitCode {
+    match reply {
+        Ok(reply) => {
+            let (out, note) = render_service_reply(&reply);
+            if let Some(note) = note {
+                eprintln!("{note}");
+            }
+            match write_report(&out) {
+                ExitCode::SUCCESS if !reply.ok => exit_code(1),
+                code => code,
+            }
+        }
+        Err(e) => fail(&e, 1),
+    }
 }
 
 /// `vk dev`: resolve the workspace's config, then act on the plan.
@@ -385,6 +490,86 @@ async fn dev_action(
                 Err(e) => fail(&e, 1),
             },
         },
+        DevAction::Service {
+            action: DevServiceAction::Up { name },
+        } => match dev_up(&plan, host_cfg, over, false, true).await {
+            Ready::Done(code) => code,
+            Ready::Act => service_reply(
+                dev::service(&plan, &vk_core::fleetctl::Request::Start { unit: name }).await,
+            ),
+        },
+        DevAction::Service {
+            action: DevServiceAction::Down { name },
+        } => service_reply(
+            dev::service(&plan, &vk_core::fleetctl::Request::Stop { unit: name }).await,
+        ),
+        DevAction::Service {
+            action: DevServiceAction::Reboot { name },
+        } => service_reply(
+            dev::service(&plan, &vk_core::fleetctl::Request::Reboot { unit: name }).await,
+        ),
+        DevAction::Service {
+            action: DevServiceAction::Status { name },
+        } => service_reply(
+            dev::service(
+                &plan,
+                &match name {
+                    Some(unit) => vk_core::fleetctl::Request::Status { unit },
+                    None => vk_core::fleetctl::Request::List,
+                },
+            )
+            .await,
+        ),
+        DevAction::Endpoints {
+            service,
+            primary,
+            json,
+        } => {
+            use crate::dev::endpoints::Which;
+            let which = match (&service, primary) {
+                (Some(name), _) => Which::Service(name),
+                (None, true) => Which::Primary,
+                (None, false) => Which::All,
+            };
+            let views = crate::dev::endpoints::views(&plan, which);
+            if json {
+                match serde_json::to_string_pretty(&views) {
+                    Ok(text) => write_report(&(text + "\n")),
+                    Err(e) => fail(&anyhow::anyhow!(e), 1),
+                }
+            } else {
+                write_report(&crate::dev::endpoints::render(&views))
+            }
+        }
+        DevAction::Open { name, print } => {
+            let Some(view) = crate::dev::endpoints::views(&plan, crate::dev::endpoints::Which::All)
+                .into_iter()
+                .find(|v| v.name == name)
+            else {
+                return fail(&anyhow::anyhow!("no endpoint {name:?} in the config"), 1);
+            };
+            let Some(url) = view.url else {
+                return fail(
+                    &anyhow::anyhow!(match view.listen {
+                        Some(_) => format!("endpoint {name} names no `scheme`, so it has no URL"),
+                        None => format!(
+                            "endpoint {name} has no address yet — it is allocated when published"
+                        ),
+                    }),
+                    1,
+                );
+            };
+            if !view.published {
+                eprintln!("virtkit: note: {name} is not published right now");
+            }
+            if print {
+                return write_report(&format!("{url}\n"));
+            }
+            match std::process::Command::new("xdg-open").arg(&url).status() {
+                Ok(st) if st.success() => ExitCode::SUCCESS,
+                _ => write_report(&format!("{url}\n")),
+            }
+        }
         DevAction::Shell => match dev_up(&plan, host_cfg, over, false, true).await {
             Ready::Done(code) => code,
             Ready::Act => {
@@ -604,6 +789,43 @@ mod tests {
         assert_eq!(dev.environment, "dev");
     }
 
+    #[test]
+    fn a_service_reply_renders_units_and_routes_the_message_by_verdict() {
+        use vk_core::fleetctl::{Reply, UnitStatus};
+        let unit = |name: &str, state: &str, ip: &str| UnitStatus {
+            name: name.into(),
+            state: state.into(),
+            ip: ip.into(),
+        };
+        // Success with a message: the unit lines and then the message land on stdout, with
+        // nothing on stderr.
+        let (out, note) = render_service_reply(&Reply {
+            ok: true,
+            message: "runner is up".into(),
+            units: vec![unit("runner", "running", "127.0.0.2")],
+        });
+        let line = format!("{:<16} {:<9} {}\n", "runner", "running", "127.0.0.2");
+        assert_eq!(out, format!("{line}runner is up\n"));
+        assert!(note.is_none());
+
+        // Failure with a message: the message goes to stderr, not stdout.
+        let (out, note) = render_service_reply(&Reply {
+            ok: false,
+            message: "no such service".into(),
+            units: vec![],
+        });
+        assert_eq!(out, "");
+        assert_eq!(note.as_deref(), Some("no such service"));
+
+        // Failure with no message still says something, so the non-zero exit is not silent.
+        let (_out, note) = render_service_reply(&Reply {
+            ok: false,
+            message: String::new(),
+            units: vec![],
+        });
+        assert!(note.is_some());
+    }
+
     /// Every `vk dev` action, as a command line, with whether it boots the environment.
     /// The test below asserts this covers every subcommand clap knows, so a new action
     /// cannot be added without saying which side of the fork it is on.
@@ -613,6 +835,12 @@ mod tests {
         (&["exec", "--", "true"], true),
         (&["exec", "--service", "db", "--", "true"], false),
         (&["shell"], true),
+        (&["endpoints", "--primary"], false),
+        (&["open", "app"], false),
+        (&["service", "up", "runner"], true),
+        (&["service", "down", "runner"], false),
+        (&["service", "reboot", "runner"], false),
+        (&["service", "status"], false),
         (&["ssh"], false),
         (&["ssh-config"], false),
         (&["refresh"], true),
