@@ -176,6 +176,17 @@ enum DevAction {
         #[command(subcommand)]
         action: DevServiceAction,
     },
+    /// Build the environment's images into the cache, without running anything
+    ///
+    /// The primary's, or one compose service's with `--service` — what a boot, or that
+    /// service's first start, would build, built now with the config's cache settings and
+    /// the progress streamed here. Works whether or not the environment is running, and
+    /// starts, stops and exports nothing.
+    Build {
+        /// build this compose service's image instead of the primary's
+        #[arg(long, value_name = "NAME")]
+        service: Option<String>,
+    },
     /// SSH into the environment (it must already be up)
     ///
     /// The system ssh, against the setup the boot wrote into the state directory — that
@@ -314,6 +325,7 @@ impl DevAction {
             Self::Init { .. }
             | Self::Endpoints { .. }
             | Self::Open { .. }
+            | Self::Build { .. }
             | Self::Ssh { .. }
             | Self::SshConfig
             | Self::Status { .. }
@@ -588,6 +600,12 @@ async fn dev_action(
                 }
             }
         },
+        DevAction::Build { service } => {
+            match dev::build(&plan, host_cfg, over, service.as_deref()).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, 1),
+            }
+        }
         DevAction::Ssh { args } => match sshclient::exec_ssh(&plan.state_dir, &args) {
             Ok(never) => match never {},
             Err(e) => fail(&e, 1),
@@ -841,6 +859,7 @@ mod tests {
         (&["service", "down", "runner"], false),
         (&["service", "reboot", "runner"], false),
         (&["service", "status"], false),
+        (&["build"], false),
         (&["ssh"], false),
         (&["ssh-config"], false),
         (&["refresh"], true),

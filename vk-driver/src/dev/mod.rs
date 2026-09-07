@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dev::config::Freshness;
 
-pub use boot::boot;
+pub use boot::{boot, build};
 pub use identity::plan_diff;
 pub use session::{
     LOGIN_SHELL, after_boot, exec_in_guest, exec_in_service, exec_session, guest_cwd, service, stop,
