@@ -4567,20 +4567,7 @@ fn parse_publish_to(s: &str) -> Result<String, String> {
 }
 
 fn resolve_service_addr(entry: &vms::VmEntry, service: &str) -> anyhow::Result<SocketAddr> {
-    let found = entry
-        .services
-        .iter()
-        .find(|s| s.name == service)
-        .ok_or_else(|| {
-            let names: Vec<&str> = entry.services.iter().map(|s| s.name.as_str()).collect();
-            let have = if names.is_empty() {
-                "none".to_string()
-            } else {
-                names.join(", ")
-            };
-            anyhow::anyhow!("no service {service:?} in this VM (services: {have})")
-        })?;
-    found.exec_addr.parse::<SocketAddr>()
+    vms::service_exec_addr(entry, service)
 }
 
 /// Parse a switch `--registry-proxy` value `<sentinel-ip>=<host:port>`.
