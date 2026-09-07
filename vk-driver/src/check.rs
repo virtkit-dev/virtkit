@@ -168,7 +168,7 @@ impl Version {
     /// The release number `vk --version` prints before the git hash.
     /// `the_build_version_parses` enforces the crate version's shape, so releases should
     /// not reach the error. A suffix has no defined ordering and is rejected.
-    fn own() -> Result<Version, String> {
+    pub fn own() -> Result<Version, String> {
         let raw = env!("CARGO_PKG_VERSION");
         raw.parse()
             .map_err(|_| format!("this build's version `{raw}` is not a release number"))
@@ -183,6 +183,18 @@ fn min_version(have: Version, min: Version) -> Outcome {
         ok(format!("vk {have} (at least {min} required)"))
     } else {
         fail(format!("vk {have} is older than the {min} required"))
+    }
+}
+
+/// Whether one feature is usable here, for a caller that asked for it by name: a check that
+/// would be skipped in the default sweep fails, since the caller asserted it should be usable.
+/// `Err` carries the detail a report line would show.
+pub fn probe(cfg: &Config, feature: Feature) -> Result<(), String> {
+    let outcome = evaluate(cfg, feature);
+    match outcome.status {
+        Status::Ok => Ok(()),
+        Status::Skip => Err(format!("{} — requested but not enabled", outcome.detail)),
+        Status::Fail => Err(outcome.detail),
     }
 }
 

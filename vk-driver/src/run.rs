@@ -371,6 +371,80 @@ pub struct RunArgs {
     pub command: Vec<String>,
 }
 
+/// The values `vk run`'s own flags default to, so a caller that builds a run from something
+/// other than a command line — `vk dev`, from a devcontainer config — states only what it
+/// means and cannot drift from the CLI on the rest. Kept in step with the clap defaults by
+/// `defaults_match_the_cli` in the tests.
+impl Default for RunArgs {
+    fn default() -> Self {
+        Self {
+            image: String::new(),
+            dockerfiles: Vec::new(),
+            target: None,
+            contexts: Vec::new(),
+            build_contexts: Vec::new(),
+            cache: Default::default(),
+            build_args: Vec::new(),
+            workdir: None,
+            kernel: KernelSource::Default,
+            console_serial: false,
+            pmu: false,
+            nested: false,
+            agent: None,
+            cloud_hypervisor: PathBuf::from("cloud-hypervisor"),
+            source: SourceMode::Auto,
+            ca: None,
+            username: None,
+            password: None,
+            insecure: false,
+            cpus: None,
+            mem: None,
+            service_cpus: Vec::new(),
+            nics: None,
+            service_mem: Vec::new(),
+            service_nics: Vec::new(),
+            reclaim: None,
+            dax: None,
+            boot_timeout_secs: 120,
+            vm_name: "vk:{name}".to_string(),
+            ram: false,
+            init: InitSource::Default,
+            shell: false,
+            tty: false,
+            net: false,
+            audit_egress: false,
+            build_audit_egress: false,
+            registry_proxy: None,
+            compose: None,
+            profiles: Vec::new(),
+            primary: None,
+            build_net: crate::build::BuildNet::All,
+            ssh_agent: false,
+            ssh_hosts: Vec::new(),
+            ssh: false,
+            ssh_keys: Vec::new(),
+            ssh_user: "root".to_string(),
+            ssh_client: false,
+            ssh_alias: "vk-run".to_string(),
+            state_dir: None,
+            workspace: None,
+            volumes: Vec::new(),
+            symlinks: Vec::new(),
+            extra_disks: Vec::new(),
+            atop: None,
+            env: Vec::new(),
+            host_exec: false,
+            host_exec_wrapper: None,
+            host_exec_env: Vec::new(),
+            require_cached: false,
+            detach: false,
+            inactivity_timeout_secs: None,
+            detach_log: None,
+            command: Vec::new(),
+        }
+    }
+}
+
 pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
     // SAFETY: isatty has no failure mode beyond returning 0
     if (args.shell || args.tty) && unsafe { libc::isatty(0) != 1 || libc::isatty(1) != 1 } {
@@ -554,7 +628,7 @@ fn lock_state_dir(dir: &Path) -> Result<std::fs::File> {
 /// `/proc/locks` prints, so the line never matches. A holder that exits and has its pid
 /// recycled before the age lookup is reported with the newcomer's age — which is why this
 /// only ever garnishes a message, and nothing acts on it.
-fn flock_holder(f: &std::fs::File) -> Option<String> {
+pub(crate) fn flock_holder(f: &std::fs::File) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
 
     let md = f.metadata().ok()?;
@@ -564,11 +638,33 @@ fn flock_holder(f: &std::fs::File) -> Option<String> {
         libc::minor(md.dev()),
         md.ino()
     );
-    let pid = holder_pid(&std::fs::read_to_string("/proc/locks").ok()?, &want)?;
+    let pid = holder_pid(&proc_locks()?, &want)?;
     Some(match crate::usage::proc_age(pid) {
         Some(age) => format!("pid {pid}, up {}", crate::vms::fmt_uptime(age.as_secs())),
         None => format!("pid {pid}"),
     })
+}
+
+/// The text of `/proc/locks`, taken in one `read(2)`. The file is a `seq_file` over the
+/// kernel's lock list that re-seeks by position on every call: when a lock anywhere on the
+/// host is released between two reads, the next one starts an entry short and a live lock
+/// silently drops out of the listing. One call is one consistent pass, so the buffer grows
+/// until the whole list fits.
+fn proc_locks() -> Option<String> {
+    use std::io::{Read, Seek};
+
+    let mut f = std::fs::File::open("/proc/locks").ok()?;
+    let mut size = 64 * 1024;
+    loop {
+        let mut buf = vec![0u8; size];
+        let n = f.read(&mut buf).ok()?;
+        if n < size {
+            buf.truncate(n);
+            return String::from_utf8(buf).ok();
+        }
+        size *= 4;
+        f.rewind().ok()?;
+    }
 }
 
 /// The pid holding an `FLOCK` on `want` (`<major>:<minor>:<inode>`), out of the text of
@@ -4570,69 +4666,12 @@ mod tests {
     /// the VM name, boot timeout, and SSH user. Do not pass it to `run`.
     fn bare_args() -> RunArgs {
         RunArgs {
-            image: String::new(),
-            dockerfiles: vec![],
-            target: None,
-            contexts: vec![],
-            build_contexts: vec![],
-            cache: Default::default(),
-            build_args: vec![],
-            workdir: None,
-            kernel: KernelSource::Default,
-            console_serial: false,
-            pmu: false,
-            nested: false,
-            agent: None,
-            cloud_hypervisor: PathBuf::new(),
             source: SourceMode::Oci,
-            ca: None,
-            username: None,
-            password: None,
-            insecure: false,
-            cpus: None,
-            mem: None,
-            service_cpus: vec![],
-            nics: None,
-            service_mem: vec![],
-            service_nics: vec![],
-            reclaim: None,
-            dax: None,
+            cloud_hypervisor: PathBuf::new(),
             boot_timeout_secs: 0,
             vm_name: String::new(),
-            ram: false,
-            init: InitSource::Default,
-            shell: false,
-            tty: false,
-            net: false,
-            audit_egress: false,
-            build_audit_egress: false,
-            registry_proxy: None,
-            compose: None,
-            profiles: vec![],
-            primary: None,
-            build_net: crate::build::BuildNet::All,
-            ssh_agent: false,
-            ssh_hosts: vec![],
-            ssh: false,
-            ssh_keys: vec![],
             ssh_user: String::new(),
-            ssh_client: false,
-            ssh_alias: String::new(),
-            state_dir: None,
-            workspace: None,
-            volumes: vec![],
-            symlinks: vec![],
-            extra_disks: vec![],
-            atop: None,
-            env: vec![],
-            host_exec: false,
-            host_exec_wrapper: None,
-            host_exec_env: vec![],
-            require_cached: false,
-            detach: false,
-            inactivity_timeout_secs: None,
-            detach_log: None,
-            command: vec![],
+            ..Default::default()
         }
     }
 
@@ -4879,6 +4918,50 @@ mod tests {
         accept.abort();
         let _ = std::fs::remove_file(&path);
         result
+    }
+
+    #[test]
+    fn defaults_match_the_cli() {
+        // `RunArgs::default()` exists so a caller that is not a command line still gets the
+        // CLI's behaviour. Read the defaults back off the parser, and cover *every* one of
+        // them: what this protects can only drift through a default nobody compared.
+        let d = RunArgs::default();
+        let mine: std::collections::BTreeMap<&str, String> = [
+            ("boot_timeout", d.boot_timeout_secs.to_string()),
+            ("vm_name", d.vm_name.clone()),
+            ("ssh_user", d.ssh_user.clone()),
+            ("ssh_alias", d.ssh_alias.clone()),
+            ("source", "auto".to_string()),
+            ("kernel", "default".to_string()),
+            ("init", "default".to_string()),
+            ("build_net", "all".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        // For a default that belongs to how the command line reports or selects rather
+        // than to what a run is. Every one of `vk run`'s is a run setting today.
+        const NOT_A_RUN_SETTING: &[&str] = &[];
+
+        let cmd = <crate::Cli as clap::CommandFactory>::command();
+        let run = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "run")
+            .expect("a run subcommand");
+        for arg in run.get_arguments() {
+            let Some(value) = arg.get_default_values().first() else {
+                continue;
+            };
+            let id = arg.get_id().as_str();
+            let value = value.to_string_lossy();
+            match mine.get(id) {
+                Some(ours) => assert_eq!(*ours, value, "`vk run --{id}` defaults to {value}"),
+                None => assert!(
+                    NOT_A_RUN_SETTING.contains(&id),
+                    "`vk run --{id}` has a default ({value}) that RunArgs::default() does \
+                     not mirror: add it above, or to NOT_A_RUN_SETTING"
+                ),
+            }
+        }
     }
 
     #[tokio::test]

@@ -10,7 +10,10 @@ use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 
-use crate::{exit_code, fail, write_report};
+use crate::{
+    build, config, console_log_path, consolelog, dev, exec, exit_code, fail, show_console_log,
+    sshclient, write_report,
+};
 
 // The global flags of `vk dev` and the action they qualify. Carries no doc comment on
 // purpose: `Cmd::Dev`'s is this command's help, and one here would be a second `about` for
@@ -30,15 +33,42 @@ pub struct Dev {
     /// the environment to work in: `dev`, or a name under `[environments]`
     #[arg(long, value_name = "NAME", default_value = "dev", global = true)]
     environment: String,
+    /// what to do about a running environment that no longer matches the config
+    ///
+    /// Overrides the config's own `freshness` for this invocation.
+    #[arg(long, value_name = "POLICY", global = true)]
+    freshness: Option<crate::dev::config::Freshness>,
+    /// where built stages are cached, over the config's `[dev.cache]`
+    #[arg(long = "cache-registry", value_name = "REF|DIR|none", global = true)]
+    cache_registry: Option<String>,
+    /// the cache registry speaks plain HTTP (a loopback vk-registry)
+    #[arg(long = "cache-insecure", global = true)]
+    cache_insecure: bool,
+}
+
+impl Dev {
+    /// Does this command bring the environment up? The fork `main` performs before the
+    /// runtime exists is decided here, so that the list cannot drift from the dispatch
+    /// below (see [`crate::detach`]).
+    pub fn boots(&self) -> bool {
+        self.action.boots()
+    }
 }
 
 /// `vk dev`: the entry point `main` dispatches to, holding the flags together as one.
-pub async fn run(dev: Dev) -> ExitCode {
+pub async fn run(dev: Dev, host_cfg: &config::Config) -> ExitCode {
+    let over = dev::Overrides {
+        cache_registry: dev.cache_registry,
+        cache_insecure: dev.cache_insecure,
+        freshness: dev.freshness,
+    };
     dev_action(
         dev.action,
         dev.workspace.as_deref(),
         dev.dev_config.as_deref(),
         &dev.environment,
+        &over,
+        host_cfg,
     )
     .await
 }
@@ -66,6 +96,143 @@ enum DevAction {
         #[arg(long)]
         force: bool,
     },
+    /// Bring the environment up, or confirm it already is
+    ///
+    /// Boots what the config describes and leaves it running: the build and boot are in the
+    /// foreground, and this returns once the guest is ready. An environment already running
+    /// the same configuration is a no-op; one running a different configuration is handled
+    /// as the config's `freshness` (or `--freshness`) says. To rebuild and restart one that
+    /// matches, use `vk dev refresh`.
+    Up {
+        /// fail promptly when a boot someone else started is in flight, instead of joining it
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Run a command in the environment, bringing it up first
+    ///
+    /// As the config's `user`, with its `exec-env`, in the guest directory that stands for
+    /// yours — your working directory mapped into `workspace` when it lies inside the
+    /// workspace. Arguments are passed as given: `vk dev exec -- cargo test -p vk-core`.
+    Exec {
+        /// the guest directory to run in, instead of the one standing for yours
+        #[arg(long, value_name = "DIR")]
+        dir: Option<String>,
+        /// give the command a terminal, as `vk exec -t` does
+        #[arg(short = 't', long)]
+        tty: bool,
+        /// run in this compose service instead of the primary
+        ///
+        /// The service must be running (`vk dev service up`). It gets none of the primary's
+        /// contract — no `exec-env`, no `user`, no workspace directory — only what is passed
+        /// here: the service is its own guest.
+        #[arg(long, value_name = "NAME")]
+        service: Option<String>,
+        /// run as this user, instead of the config's (or, in a service, its default)
+        #[arg(long, value_name = "USER")]
+        user: Option<String>,
+        /// the command and its arguments
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            required = true,
+            value_name = "ARG"
+        )]
+        command: Vec<String>,
+    },
+    /// Open an interactive shell in the environment, bringing it up first
+    ///
+    /// The session `vk dev exec` gives a command, with a terminal: the config's `user` and
+    /// `exec-env`, in the guest directory that stands for yours. Ends when the shell does;
+    /// the environment stays up, so opening another costs nothing.
+    Shell,
+    /// SSH into the environment (it must already be up)
+    ///
+    /// The system ssh, against the setup the boot wrote into the state directory — that
+    /// run's config, key and host alias — so none of your own identities are involved and
+    /// there is nothing to configure. Boots nothing: `vk dev shell` is the one that does.
+    Ssh {
+        /// arguments passed to ssh verbatim, after the host
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARG"
+        )]
+        args: Vec<String>,
+    },
+    /// Print the environment's ssh_config stanza
+    ///
+    /// The `Host` block `vk dev ssh` uses, for an editor, an rsync or an `Include` in your
+    /// own ssh_config. It names the state directory's key and socket, so it is good for as
+    /// long as this environment's state directory is.
+    #[command(name = "ssh-config")]
+    SshConfig,
+    /// Rebuild the environment and restart it into the result
+    ///
+    /// Unconditional, and the only command that is: `up` leaves an environment that matches
+    /// its config alone, and `--freshness` only says what one that has drifted gets. The
+    /// build runs while the current environment keeps working, so the only downtime is the
+    /// restart itself — and a build that fails leaves what is running alone. Does not ask: a
+    /// wrapper that wants to confirm first should do the asking.
+    Refresh {
+        /// say what would change (as `plan --diff` does) without building or restarting
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Say whether the environment is running, and whether it still matches its config
+    ///
+    /// Where it stands in one place: the state directory, whether a VM answers, what it was
+    /// booted from and whether that is still what the config resolves to, its images, and
+    /// what it publishes. `vk dev plan --diff` says what a difference would take to apply.
+    /// Reads only, and reports an environment that is down as such rather than failing.
+    Status {
+        /// print the same facts as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the environment's console log, or a service's
+    ///
+    /// `vk logs` for the environment's state directory: kernel, vk-agent and guest output
+    /// told apart, `--level`, `-f`. Works after the VM has exited, too.
+    Logs {
+        /// read this compose service's console instead of the primary's
+        #[arg(long, value_name = "NAME")]
+        service: Option<String>,
+        /// show the last N lines (after filtering); 0 streams the whole log
+        #[arg(short = 'n', long, default_value_t = 50, value_name = "N")]
+        lines: usize,
+        /// only lines at least this severe: error, warn, info, debug, trace
+        #[arg(long, value_name = "LEVEL")]
+        level: Option<consolelog::Level>,
+        /// only the guest kernel's lines
+        #[arg(long)]
+        kernel: bool,
+        /// only vk-agent's lines
+        #[arg(long)]
+        agent: bool,
+        /// only what the guest's programs printed
+        #[arg(long)]
+        guest: bool,
+        /// keep printing new lines as the guest writes them (until Ctrl-C or the VM ends)
+        #[arg(short = 'f', long)]
+        follow: bool,
+    },
+    /// Check that this host can run the environment, without changing anything
+    ///
+    /// The config's requirements, KVM and the VMM, the tools the commands shell out to, the
+    /// source and mount paths, free host ports for the endpoints, the state directory, and
+    /// the host variables the config refers to. Exits 1 when a check fails.
+    Doctor,
+    /// Stop the environment and everything published from it
+    ///
+    /// Powers the guest off and takes down the publishers that were reaching into it. The
+    /// state directory stays — its storage, keys and identity are what the next `vk dev up`
+    /// starts from; `vk dev gc` is what removes it. Stopping what is already stopped is the
+    /// state asked for, not a failure.
+    Stop {
+        /// seconds to wait for it to go
+        #[arg(long, default_value_t = super::boot::STOP_TIMEOUT_SECS)]
+        timeout: u64,
+    },
     /// Print what the config resolves to, without doing any of it
     ///
     /// The plan is what every other `vk dev` command works from, so this is how to see
@@ -84,8 +251,14 @@ enum DevAction {
         #[arg(long)]
         show_secrets: bool,
         /// list each configured value with the file it came from, before the plan
-        #[arg(long)]
+        #[arg(long, conflicts_with = "diff")]
         explain: bool,
+        /// compare the plan with the running environment instead of printing it
+        ///
+        /// Each difference is classified by what applying it takes: a new session, a
+        /// host-side step, a restart, or a rebuilt image.
+        #[arg(long)]
+        diff: bool,
     },
     /// Print the JSON schema for .virtkit/config.toml
     ///
@@ -94,6 +267,30 @@ enum DevAction {
     /// config's first line, which is how an editor finds it without being told. Needs no
     /// config of its own.
     Schema,
+}
+
+impl DevAction {
+    /// Whether this action needs the environment running, and so boots it. Every arm is
+    /// spelled out: an action added without a decision here fails to compile rather than
+    /// silently losing its fork — a boot in the foreground would then hold the VM forever.
+    fn boots(&self) -> bool {
+        match self {
+            Self::Up { .. } | Self::Shell => true,
+            // A service exec reaches a running service and boots nothing.
+            Self::Exec { service, .. } => service.is_none(),
+            // A dry run only reports; forking it would report twice.
+            Self::Refresh { dry_run } => !dry_run,
+            Self::Init { .. }
+            | Self::Ssh { .. }
+            | Self::SshConfig
+            | Self::Status { .. }
+            | Self::Logs { .. }
+            | Self::Doctor
+            | Self::Stop { .. }
+            | Self::Plan { .. }
+            | Self::Schema => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -110,6 +307,8 @@ async fn dev_action(
     workspace: Option<&Path>,
     config: Option<&Path>,
     environment: &str,
+    over: &dev::Overrides,
+    host_cfg: &config::Config,
 ) -> ExitCode {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
@@ -142,13 +341,164 @@ async fn dev_action(
         Err(e) => return fail(&e, 2),
     };
     match action {
+        DevAction::Up { no_wait } => match dev_up(&plan, host_cfg, over, false, !no_wait).await {
+            Ready::Act => ExitCode::SUCCESS,
+            Ready::Done(code) => code,
+        },
+        DevAction::Refresh { dry_run: true } => match dev::plan_diff(&plan) {
+            Ok(Some(report)) => write_report(&format!(
+                "{report}a refresh rebuilds the image and restarts the environment\n"
+            )),
+            Ok(None) => write_report(NOTHING_RUNNING),
+            Err(e) => fail(&e, 1),
+        },
+        // The one unconditional rebuild-and-restart: `up` never reboots an environment
+        // that matches, and `--freshness` only says what a drifted one gets.
+        DevAction::Refresh { dry_run: false } => {
+            match dev_up(&plan, host_cfg, over, true, true).await {
+                Ready::Act => ExitCode::SUCCESS,
+                Ready::Done(code) => code,
+            }
+        }
+        // Each of these needs the environment, so each is an `up` and then the thing itself
+        // — which happens in the parent, released once the boot the child performed is up.
+        // A service is its own guest: no boot, none of the primary's session contract.
+        DevAction::Exec {
+            dir,
+            tty,
+            service: Some(service),
+            user,
+            command,
+        } => match dev::exec_in_service(&plan, &service, &command, dir, tty, user).await {
+            Ok(result) => exec::exit(result),
+            Err(e) => fail(&e, 1),
+        },
+        DevAction::Exec {
+            dir,
+            tty,
+            service: None,
+            user,
+            command,
+        } => match dev_up(&plan, host_cfg, over, false, true).await {
+            Ready::Done(code) => code,
+            Ready::Act => match dev::exec_session(
+                &plan,
+                &command,
+                dir.or_else(|| dev::guest_cwd(&plan)),
+                tty,
+                user,
+            )
+            .await
+            {
+                Ok(result) => exec::exit(result),
+                Err(e) => fail(&e, 1),
+            },
+        },
+        DevAction::Shell => match dev_up(&plan, host_cfg, over, false, true).await {
+            Ready::Done(code) => code,
+            Ready::Act => {
+                let argv: Vec<String> = dev::LOGIN_SHELL.iter().map(|s| s.to_string()).collect();
+                match dev::exec_in_guest(
+                    &plan,
+                    &argv,
+                    dev::guest_cwd(&plan),
+                    true,
+                    vk_core::exec::client::Stdin::Forward,
+                )
+                .await
+                {
+                    Ok(result) => exec::exit(result),
+                    Err(e) => fail(&e, 1),
+                }
+            }
+        },
+        DevAction::Ssh { args } => match sshclient::exec_ssh(&plan.state_dir, &args) {
+            Ok(never) => match never {},
+            Err(e) => fail(&e, 1),
+        },
+        DevAction::SshConfig => match sshclient::print_config(&plan.state_dir) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        },
+        DevAction::Status { json } => match dev::status(&plan) {
+            Ok(status) if json => match serde_json::to_string_pretty(&status) {
+                Ok(text) => write_report(&(text + "\n")),
+                Err(e) => fail(&anyhow::anyhow!(e), 1),
+            },
+            Ok(status) => write_report(&status.render()),
+            Err(e) => fail(&e, 1),
+        },
+        DevAction::Logs {
+            service,
+            lines,
+            level,
+            kernel,
+            agent,
+            guest,
+            follow,
+        } => {
+            let mut sources = Vec::new();
+            if kernel {
+                sources.push(consolelog::Source::Kernel);
+            }
+            if agent {
+                sources.push(consolelog::Source::Agent);
+            }
+            if guest {
+                sources.push(consolelog::Source::Guest);
+            }
+            let target = Some(plan.state_dir.as_path());
+            // A stopped environment is no longer registered, but its state directory still
+            // says where each service kept its console: `svc-<name>/`.
+            let path = console_log_path(target, service.as_deref()).or_else(|e| match &service {
+                Some(name) => {
+                    let log = plan
+                        .state_dir
+                        .join(format!("svc-{name}"))
+                        .join(crate::run::CONSOLE_LOG);
+                    if log.is_file() { Ok(log) } else { Err(e) }
+                }
+                None => Err(e),
+            });
+            match path {
+                Ok(path) => {
+                    match show_console_log(&path, target, &sources, level, lines, follow).await {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(e) => fail(&e, 1),
+                    }
+                }
+                Err(e) => fail(&e, 2),
+            }
+        }
+        DevAction::Doctor => {
+            let (report, ok) = dev::doctor(&plan, host_cfg);
+            let code = write_report(&report);
+            if ok { code } else { exit_code(1) }
+        }
+        DevAction::Stop { timeout } => match dev::stop(&plan, timeout) {
+            Ok(stopped) => match write_report(&stopped.report) {
+                ExitCode::SUCCESS if !stopped.all_down => exit_code(1),
+                code => code,
+            },
+            // A stop that fails is a runtime failure like any other; 2 is what this command
+            // set reserves for a config or usage error.
+            Err(e) => fail(&e, 1),
+        },
         DevAction::Init { .. } | DevAction::Schema => {
             unreachable!("handled before the plan is resolved")
         }
+        // Nothing running is not an error for a read-only preview — `refresh --dry-run`
+        // prints the same report and says so in the same words.
+        DevAction::Plan { diff: true, .. } => match dev::plan_diff(&plan) {
+            Ok(Some(report)) => write_report(&report),
+            Ok(None) => write_report(NOTHING_RUNNING),
+            Err(e) => fail(&e, 1),
+        },
         DevAction::Plan {
             format,
             show_secrets,
             explain,
+            ..
         } => match format {
             _ if explain => {
                 let mut out = String::new();
@@ -185,5 +535,134 @@ async fn dev_action(
                 Err(e) => fail(&e, 1),
             },
         },
+    }
+}
+
+/// What `plan --diff` and `refresh --dry-run` say when there is no environment to compare
+/// the config against. One sentence, so the two read alike.
+const NOTHING_RUNNING: &str =
+    "not running: a refresh would build the image and boot the environment\n";
+
+/// What a `vk dev` process should do once the environment is up.
+enum Ready {
+    /// this process is the one that acts on the environment
+    Act,
+    /// nothing more to do here — exit with this
+    Done(ExitCode),
+}
+
+/// Bring the environment up, from whichever of the two processes this is (see `dev`'s module
+/// docs). The child boots and then holds the VM, so it never gets here to act; where there
+/// was nothing to boot it is finished too, and the parent — released once the guest is ready
+/// — is what goes on to run the command.
+async fn dev_up(
+    plan: &crate::dev::plan::Plan,
+    host_cfg: &config::Config,
+    over: &dev::Overrides,
+    refresh: bool,
+    wait: bool,
+) -> Ready {
+    if crate::detach::after_boot() {
+        return match dev::after_boot(plan).await {
+            Ok(_) => Ready::Act,
+            Err(e) => Ready::Done(fail(&e, 1)),
+        };
+    }
+    // getppid: the parent reads back what this boot decided, and two concurrent `up`s must
+    // not read each other's.
+    // SAFETY: getppid always succeeds and touches no memory.
+    let parent = unsafe { libc::getppid() } as u32;
+    match dev::boot(plan, host_cfg, over, refresh, wait, parent).await {
+        // Returned rather than blocked: there was nothing to boot. This process is done
+        // either way — the parent it wakes is what acts on the environment.
+        Ok(()) => Ready::Done(ExitCode::SUCCESS),
+        Err(e) if build::not_cached(&e) => Ready::Done(fail(&e, 3)),
+        Err(e) => Ready::Done(fail(&e, 1)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// The `vk dev` half of the CLI, parsed on its own.
+    #[derive(Parser)]
+    struct Harness {
+        #[command(subcommand)]
+        cmd: Which,
+    }
+
+    #[derive(Subcommand)]
+    enum Which {
+        Dev(Dev),
+    }
+
+    fn parse(args: &[&str]) -> Dev {
+        let Which::Dev(dev) = Harness::parse_from(args).cmd;
+        dev
+    }
+
+    #[test]
+    fn schema_takes_no_flags_and_needs_no_workspace() {
+        let dev = parse(&["vk", "dev", "schema"]);
+        assert!(matches!(dev.action, DevAction::Schema));
+        assert!(dev.workspace.is_none() && dev.dev_config.is_none());
+        assert_eq!(dev.environment, "dev");
+    }
+
+    /// Every `vk dev` action, as a command line, with whether it boots the environment.
+    /// The test below asserts this covers every subcommand clap knows, so a new action
+    /// cannot be added without saying which side of the fork it is on.
+    const ACTIONS: &[(&[&str], bool)] = &[
+        (&["init"], false),
+        (&["up"], true),
+        (&["exec", "--", "true"], true),
+        (&["exec", "--service", "db", "--", "true"], false),
+        (&["shell"], true),
+        (&["ssh"], false),
+        (&["ssh-config"], false),
+        (&["refresh"], true),
+        (&["refresh", "--dry-run"], false),
+        (&["status"], false),
+        (&["logs", "-f"], false),
+        (&["doctor"], false),
+        (&["stop"], false),
+        (&["plan", "--diff"], false),
+        (&["schema"], false),
+    ];
+
+    #[test]
+    fn every_action_says_whether_it_boots_the_environment() {
+        use clap::CommandFactory;
+
+        for (argv, boots) in ACTIONS {
+            let mut args = vec!["vk", "dev"];
+            args.extend_from_slice(argv);
+            assert_eq!(parse(&args).boots(), *boots, "vk dev {}", argv.join(" "));
+        }
+        // The fork happens before anything is dispatched, so an action missing from the
+        // table above is an action whose fork nobody has checked.
+        let cmd = <Harness as CommandFactory>::command();
+        let dev = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "dev")
+            .expect("the dev subcommand");
+        for sub in dev.get_subcommands() {
+            assert!(
+                ACTIONS.iter().any(|(argv, _)| argv[0] == sub.get_name()),
+                "vk dev {} is not in ACTIONS",
+                sub.get_name()
+            );
+        }
+    }
+
+    #[test]
+    fn the_global_flags_are_accepted_on_either_side_of_the_action() {
+        let dev = parse(&["vk", "dev", "--workspace", "/w", "status", "--json"]);
+        assert_eq!(dev.workspace.as_deref(), Some(Path::new("/w")));
+        assert!(matches!(dev.action, DevAction::Status { json: true }));
+        let dev = parse(&["vk", "dev", "status", "--workspace", "/w"]);
+        assert_eq!(dev.workspace.as_deref(), Some(Path::new("/w")));
     }
 }

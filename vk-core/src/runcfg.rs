@@ -13,6 +13,21 @@ use serde::{Deserialize, Serialize};
 /// real root (the pivot hides the initramfs).
 pub const INITRAMFS_PATH: &str = "virtkit-service.json";
 
+/// Guest file the embedded SSH server reads into every session's environment: how a
+/// development environment's `exec-env` reaches Remote-SSH's server process and terminals.
+/// The host writes it (as root, mode 0600) once the guest is up and again on every attach,
+/// so a changed value needs no restart — the next session sees it. Sessions the exec channel
+/// opens get their environment per call and never read it.
+///
+/// The format is one `KEY=VALUE` per line, `KEY` matching `[A-Za-z_][A-Za-z0-9_]*` and
+/// `VALUE` running to the end of the line (a CRLF ending is stripped; `=` in the value is
+/// not special). A line whose first non-blank character is `#` is a comment, and a blank
+/// line is nothing. `HOME` is the login user's and is not taken from here — the session's
+/// working directory comes from the same passwd entry and would not follow it. The agent
+/// skips anything else with a log line, and reads the file at all only once the descriptor
+/// says it is a root-owned 0600 regular file, so nothing in the guest can plant one.
+pub const SESSION_ENV_PATH: &str = "/run/virtkit-session-env";
+
 /// Who becomes PID 1 once the preinit hands the guest over, named on the guest kernel
 /// cmdline in `VIRTKIT_INIT`. The driver writes the token and the guest agent reads it
 /// back, both through this enum, so neither side spells a token of its own — a boot whose

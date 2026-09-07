@@ -48,6 +48,11 @@ pub fn which_all(
         .filter(|candidate| executable(candidate))
 }
 
+/// The first `name` on this process's `PATH`.
+pub fn which(name: &str) -> Option<PathBuf> {
+    which_all(name, std::env::var_os("PATH").as_deref(), None).next()
+}
+
 /// Whether `path` is a regular file somebody may execute.
 pub fn executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;

@@ -179,6 +179,13 @@ pub struct HookCommand {
     pub required: bool,
 }
 
+impl HookCommand {
+    /// The argv that runs.
+    pub fn argv(&self) -> Vec<String> {
+        command_argv(&self.run)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct HooksPlan {
     pub init: Option<HookPlan>,
@@ -694,6 +701,20 @@ fn tasks_of(env: &Environment, at: &str, loaded: &Loaded, vars: &Vars) -> Result
         });
     }
     Ok(tasks)
+}
+
+impl Plan {
+    /// Fail unless every `${localEnv:…}` was filled — the gate before a boot or a session,
+    /// where an empty token would be worse than a refusal.
+    pub fn require_resolved(&self) -> Result<()> {
+        if self.unresolved.is_empty() {
+            return Ok(());
+        }
+        bail!(
+            "the config refers to host variables this shell does not have:\n  {}",
+            self.unresolved.join("\n  ")
+        )
+    }
 }
 
 /// A path a config wrote, relative to the project like every other path in the file.
@@ -1507,6 +1528,8 @@ extensions = ["ms-python.python"]
             p.unresolved[0]
         );
         assert_eq!(p.exec_env[0].value, "");
+        let msg = format!("{:#}", p.require_resolved().unwrap_err());
+        assert!(msg.contains("VK_TEST_TOKEN"), "{msg}");
 
         std::fs::write(
             f.0.join(crate::dev::config::LOCAL_ENV_FILE),

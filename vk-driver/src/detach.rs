@@ -11,32 +11,89 @@
 use std::os::fd::RawFd;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 /// Write end of the readiness pipe, held by the detached child (`-1` = not detaching). Set
 /// by [`fork`] in the child; consumed once by [`signal_ready`].
 static READY_FD: AtomicI32 = AtomicI32::new(-1);
 /// PID of the child the foreground parent supervises — read by the signal forwarder.
 static CHILD_PID: AtomicI32 = AtomicI32::new(-1);
+/// Whether this process is the parent the fork released once the guest was ready, and so
+/// the side that does the work *around* the boot. Set by `main` after [`fork`] returns and
+/// read by [`crate::dev::cli`]; deliberately not an environment variable, which every
+/// process `vk dev` then spawns — the editor, a hook, a task's command — would inherit and
+/// mistake for its own.
+static AFTER_BOOT: AtomicBool = AtomicBool::new(false);
+
+/// Say that this process is the one released by the fork (see [`AFTER_BOOT`]).
+pub fn note_after_boot() {
+    AFTER_BOOT.store(true, Ordering::Relaxed);
+}
+
+/// Is this the process the fork released once the guest was ready?
+pub fn after_boot() -> bool {
+    AFTER_BOOT.load(Ordering::Relaxed)
+}
+
+/// This invocation's boot nonce. Initialized before the fork, so the child inherits the
+/// value in its copy of this memory and the two sides recognize each other's writing: the
+/// child stamps it into the note it leaves in the state dir, and the parent reads a note
+/// carrying any other nonce as an earlier run's leftovers rather than as this boot's
+/// (see [`crate::dev::boot`]).
+pub fn boot_nonce() -> &'static str {
+    static BOOT_NONCE: OnceLock<String> = OnceLock::new();
+    BOOT_NONCE.get_or_init(nonce)
+}
+
+/// A token no other invocation has: 16 bytes of `/dev/urandom`, hex — the clock and this
+/// pid where that cannot be read. What matters is that two runs differ, not that it is
+/// unguessable.
+fn nonce() -> String {
+    use std::io::Read;
+
+    let mut bytes = [0u8; 16];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .is_ok()
+    {
+        return bytes.iter().map(|b| format!("{b:02x}")).collect();
+    }
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{since_epoch}-{}", std::process::id())
+}
 
 /// Outcome of [`fork`].
 pub enum Forked {
-    /// Foreground parent: `main` should return this code (the child reported ready, exited
-    /// first, or was aborted by a forwarded signal).
-    Parent(ExitCode),
+    /// Foreground parent: the child reported ready, exited first, or was aborted by a
+    /// forwarded signal.
+    Parent {
+        /// what `main` should return
+        code: ExitCode,
+        /// whether the child got as far as it meant to — ready, or exited successfully.
+        /// `vk dev` does the steps *around* the boot here, and only when the boot worked.
+        ok: bool,
+    },
     /// The detached child: continue down the normal run path.
     Child,
 }
 
-/// Should this raw `run` invocation daemonize? True when `--detach` precedes the guest
-/// command (`--`), so the guest's own args are never mistaken for the flag.
-pub fn wants_detach(args: &[String]) -> bool {
-    args.get(1).map(String::as_str) == Some("run")
-        && args
-            .iter()
-            .skip(2)
-            .take_while(|a| a.as_str() != "--")
-            .any(|a| a == "--detach")
+/// Should this invocation daemonize? True for `vk run --detach`, and for the `vk dev`
+/// actions that boot the environment and so leave it running behind them.
+///
+/// Decided on the parsed command line rather than on raw argv: a global flag before the
+/// action (`vk --config x.toml dev up`) no longer hides it, and `--help`/`--version` never
+/// reach here at all — clap answers those and exits before the fork.
+pub fn wants_detach(cmd: &crate::Cmd) -> bool {
+    match cmd {
+        // Parsed, so a `--detach` after `--` is the guest's own argument and not this flag.
+        crate::Cmd::Run { detach, .. } => *detach,
+        crate::Cmd::Dev(dev) => dev.boots(),
+        _ => false,
+    }
 }
 
 extern "C" fn forward_signal(_sig: libc::c_int) {
@@ -53,6 +110,8 @@ extern "C" fn forward_signal(_sig: libc::c_int) {
 /// its status, so a build/boot failure surfaces in the foreground), or a signal arrives (→
 /// forwarded to the child, which aborts). A failed pipe/fork degrades to a foreground run.
 pub fn fork() -> Forked {
+    // Before the fork, so both sides end up with the same value in their own memory.
+    let _ = boot_nonce();
     let mut fds = [0 as RawFd; 2];
     // SAFETY: called from `main` before any thread or Tokio runtime exists.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -102,12 +161,22 @@ pub fn fork() -> Forked {
         break n == 1;
     };
     if ready {
+        // Supervision is over: `vk dev` goes on to do the work *around* the boot in this
+        // process, and until this is undone a Ctrl-C there would be swallowed and sent to
+        // the child holding the VM — tearing the environment down instead of the command.
+        release_child();
         eprintln!("virtkit: dev VM ready — detached (pid {pid}), still running in the background");
-        return Forked::Parent(ExitCode::SUCCESS);
+        return Forked::Parent {
+            code: ExitCode::SUCCESS,
+            ok: true,
+        };
     }
     // The child is gone without signalling ready: mirror its exit status.
     let mut status = 0i32;
     unsafe { libc::waitpid(pid, &mut status, 0) };
+    // Reaped, so its pid can be handed to something else at any moment: nothing may forward
+    // a signal to it again.
+    release_child();
     let code = if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status) as u8
     } else if libc::WIFSIGNALED(status) {
@@ -115,7 +184,27 @@ pub fn fork() -> Forked {
     } else {
         1
     };
-    Forked::Parent(ExitCode::from(code))
+    Forked::Parent {
+        code: ExitCode::from(code),
+        // A child that exited cleanly without signalling did its whole job — `vk dev up`
+        // takes that path when the environment was already running.
+        ok: code == 0,
+    }
+}
+
+/// Stop supervising the child: forget its pid and put SIGINT/SIGTERM back to their default
+/// action, so this process reacts to Ctrl-C as any other command does.
+fn release_child() {
+    CHILD_PID.store(-1, Ordering::Relaxed);
+    // SAFETY: still single-threaded — the Tokio runtime is built after `fork` returns.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_DFL;
+        sa.sa_flags = 0;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+    }
 }
 
 /// Called by the run path once the guest is up and about to enter its lifetime wait: in a
@@ -175,36 +264,54 @@ fn open_log(log: Option<&Path>) -> RawFd {
 
 #[cfg(test)]
 mod tests {
-    use super::wants_detach;
+    use clap::Parser;
 
-    fn argv(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| s.to_string()).collect()
+    /// What `main` decides on, for the argv given: the parse is what the fork now reads.
+    fn wants_detach(parts: &[&str]) -> bool {
+        super::wants_detach(&crate::Cli::parse_from(parts).cmd)
     }
 
     #[test]
     fn detach_before_double_dash_is_honored() {
-        assert!(wants_detach(&argv(&["vk", "run", "--detach"])));
-        assert!(wants_detach(&argv(&[
-            "vk", "run", "--detach", "--", "sleep", "1"
-        ])));
-        assert!(wants_detach(&argv(&[
+        assert!(wants_detach(&["vk", "run", "--detach"]));
+        assert!(wants_detach(&["vk", "run", "--detach", "--", "sleep", "1"]));
+        assert!(wants_detach(&[
             "vk", "run", "--ssh", "--detach", "--", "sh"
-        ])));
+        ]));
     }
 
     #[test]
     fn detach_after_double_dash_is_a_guest_arg() {
-        assert!(!wants_detach(&argv(&[
-            "vk", "run", "--", "cmd", "--detach"
-        ])));
-        assert!(!wants_detach(&argv(&["vk", "run", "--", "--detach"])));
+        assert!(!wants_detach(&["vk", "run", "--", "cmd", "--detach"]));
+        assert!(!wants_detach(&["vk", "run", "--", "--detach"]));
     }
 
     #[test]
     fn only_the_run_subcommand_detaches() {
-        assert!(!wants_detach(&argv(&["vk", "build", "--detach"])));
-        assert!(!wants_detach(&argv(&["vk", "run"])));
-        assert!(!wants_detach(&argv(&["vk"])));
-        assert!(!wants_detach(&argv(&[])));
+        // No other command has the flag at all — clap refuses `vk build --detach` before
+        // this is consulted — so what is left to check is that a plain `run` does not.
+        assert!(!wants_detach(&["vk", "build"]));
+        assert!(!wants_detach(&["vk", "run", "alpine"]));
+    }
+
+    #[test]
+    fn a_dev_boot_detaches_behind_any_global_flag() {
+        // The flags of `vk` itself and of `vk dev` used to hide the action from the scan
+        // this now reads off the parse.
+        assert!(wants_detach(&["vk", "dev", "shell"]));
+        assert!(wants_detach(&["vk", "--config", "/x.toml", "dev", "shell"]));
+        assert!(wants_detach(&[
+            "vk",
+            "dev",
+            "--workspace",
+            "/w",
+            "--freshness",
+            "reuse",
+            "exec",
+            "--",
+            "ls"
+        ]));
+        // `--workspace up` names a directory, not the action.
+        assert!(!wants_detach(&["vk", "dev", "--workspace", "up", "status"]));
     }
 }

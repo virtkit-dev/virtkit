@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use vk_core::fleetctl::{Frame, Request, UnitStatus};
+use vk_core::fleetctl::{Frame, Reply, Request, UnitStatus};
 
 /// One running VM's record. Serialized as `<slug(state_dir)>.json` in the registry dir.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -640,11 +640,7 @@ fn service_units(entry: &VmEntry) -> Option<Vec<UnitStatus>> {
     if entry.services.is_empty() {
         return None;
     }
-    let path = match vk_core::addr::SocketAddr::from_str(&entry.exec_addr) {
-        Ok(vk_core::addr::SocketAddr::VsockAuto { path, .. }) => path,
-        _ => return None,
-    };
-    let ctl = vk_core::net::hybrid_socket(&path, vk_core::fleetctl::CONTROL_PORT);
+    let ctl = control_socket(entry)?;
     match query_units(&ctl) {
         Ok(units) => Some(units),
         // Report the failure before falling back to declared services.
@@ -707,15 +703,46 @@ fn bare_tcp(addr: &str) -> &str {
 /// Query with `Request::List`, ignoring progress frames until `Done`; an error reply is an
 /// `Err`. Two-second I/O timeouts keep `vk list` from blocking on a wedged VMM.
 fn query_units(ctl: &Path) -> Result<Vec<UnitStatus>> {
+    let reply = control(ctl, &Request::List, Some(Duration::from_secs(2)), |_| {})?;
+    if !reply.ok {
+        bail!("service manager refused: {}", reply.message);
+    }
+    Ok(reply.units)
+}
+
+/// The host end of a compose run's service control plane — the hybrid-vsock socket its
+/// manager listens on — or `None` for a run without services.
+pub fn control_socket(entry: &VmEntry) -> Option<PathBuf> {
+    if entry.services.is_empty() {
+        return None;
+    }
+    match vk_core::addr::SocketAddr::from_str(&entry.exec_addr) {
+        Ok(vk_core::addr::SocketAddr::VsockAuto { path, .. }) => Some(vk_core::net::hybrid_socket(
+            &path,
+            vk_core::fleetctl::CONTROL_PORT,
+        )),
+        _ => None,
+    }
+}
+
+/// One request to a run's service manager over `ctl`, from the host: the same protocol
+/// `vk service` speaks from inside the guest. Progress lines (an on-demand build a `Start`
+/// streams) go to `on_progress`; the terminal reply is returned as is, refusals included.
+/// `timeout` bounds each read and write — `None` for an op that builds.
+pub fn control(
+    ctl: &Path,
+    req: &Request,
+    timeout: Option<Duration>,
+    mut on_progress: impl FnMut(&str),
+) -> Result<Reply> {
     use std::io::{BufRead, BufReader};
-    let timeout = Some(Duration::from_secs(2));
     let mut stream =
         UnixStream::connect(ctl).with_context(|| format!("control: connect {}", ctl.display()))?;
     stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(timeout)?;
-    let mut req = serde_json::to_string(&Request::List).context("encoding List request")?;
-    req.push('\n');
-    stream.write_all(req.as_bytes())?;
+    let mut text = serde_json::to_string(req).context("encoding the control request")?;
+    text.push('\n');
+    stream.write_all(text.as_bytes())?;
     let mut rd = BufReader::new(stream);
     let mut line = String::new();
     loop {
@@ -724,15 +751,28 @@ fn query_units(ctl: &Path) -> Result<Vec<UnitStatus>> {
             bail!("control peer closed before Done");
         }
         match serde_json::from_str::<Frame>(line.trim_end()).context("decoding control frame")? {
-            Frame::Progress(_) => continue,
-            Frame::Done(reply) => {
-                if !reply.ok {
-                    bail!("service manager refused: {}", reply.message);
-                }
-                return Ok(reply.units);
-            }
+            Frame::Progress(p) => on_progress(&p),
+            Frame::Done(reply) => return Ok(reply),
         }
     }
+}
+
+/// The agent exec address of the compose service `name` in this run.
+pub fn service_exec_addr(entry: &VmEntry, name: &str) -> Result<vk_core::addr::SocketAddr> {
+    let found = entry
+        .services
+        .iter()
+        .find(|s| s.name == name)
+        .ok_or_else(|| {
+            let names: Vec<&str> = entry.services.iter().map(|s| s.name.as_str()).collect();
+            let have = if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(", ")
+            };
+            anyhow::anyhow!("no service {name:?} in this VM (services: {have})")
+        })?;
+    found.exec_addr.parse::<vk_core::addr::SocketAddr>()
 }
 
 /// How many compose siblings the default table names before folding the rest into `+N`.
