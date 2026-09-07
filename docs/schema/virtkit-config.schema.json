@@ -218,7 +218,7 @@
     },
     "checkout-mode": {
       "title": "checkout mode",
-      "description": "what a task sees of the checkout: `shared` is the host's tree written through (the default), `overlay` a tmpfs over it whose writes go with the VM",
+      "description": "task checkout: `shared` writes through to the host's tree (the default); `overlay` uses a tmpfs whose writes disappear with the VM and requires the `ephemeral` policy",
       "type": "string",
       "enum": ["shared", "overlay"]
     },

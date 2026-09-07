@@ -4,6 +4,78 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk dev` runs a project's development environment from `.virtkit/config.toml`.** The
+  tracked file names the source — a compose service, an image or a Dockerfile target — and
+  the mounts, session environment, endpoints, hooks, editor settings and host integration
+  that go with it; `.virtkit/local.toml` and `.virtkit/local.env` layer a machine's overrides,
+  and every key in either file is checked, with its line. Named `[environments.<name>]`
+  tables describe further environments with state of their own. `vk dev init` writes a first
+  config from a `devcontainer.json`, a compose file, a Dockerfile or a stock image, headed by
+  a `#:schema` line an editor completes and checks against (`vk dev schema` prints it).
+  `vk dev plan [--explain|--diff]` says what the files resolve to on this host and how that
+  differs from what is running, and `vk dev doctor` whether this host can run it, without
+  doing any of it. `plan` redacts environment values and build arguments unless
+  `--show-secrets`, and nothing a host supplies through `${localEnv:…}` is recorded or printed.
+
+- **`up`, `shell`, `exec`, `code`, `ssh`, `status`, `logs`, `refresh` and `stop` are the core
+  commands.** Each brings the environment up when it needs one, or joins a boot in progress; an
+  environment counts as ready once its endpoints are published and its `create` and `start`
+  hooks have succeeded. `freshness` — `ask`, `reuse`, `refresh` or `require-current`, or
+  `--freshness` for one invocation — decides what to do with an environment booted from an
+  older configuration; a change only new sessions pick up applies without a restart, and
+  `status` and `plan --diff` name what each difference takes. `vk dev refresh` rebuilds beside
+  the running environment and restarts into the result (`--dry-run` previews). Commands run
+  as the config's user with its `exec-env`, exit status reproduced and diagnostics on stderr;
+  SSH sessions, the editor's server included, see the same variables. Ctrl-C interrupts the
+  command, not the environment.
+
+- **`init`, `create` and `start` hooks run at fixed points.** `init` on the host before
+  every attempt, `create` in the guest once per environment it is set up for — again after a
+  refresh that rebuilt the image or a storage reset — and `start` on every fresh boot. A hook
+  is a shell string, an argv list, a table with `run`, `dir`, `timeout` and `required`, or a
+  group of named hooks run in turn; a required hook that fails leaves no record of success, so
+  the next `up` runs it again.
+
+- **Services, endpoints and durable data.** `vk dev service up|down|reboot|status` controls
+  the environment's compose services from the host, and `vk dev build` fills the build cache
+  ahead of a start. `[dev.endpoints.<name>]` with `address = "auto"` gets a loopback address
+  of the environment's own — one block per environment, an octet per service, coordinated
+  across environments and stable across restarts; `vk dev endpoints [--primary|--service NAME]
+  [--json]` lists them and `vk dev open <name>` opens one. `vk dev storage list [--sizes]`
+  names every `disk` volume, managed directory and editor store with its owner and backing;
+  `vk dev storage reset <service>:<guest>[:overlay]` is the only thing that destroys any of
+  it, and stops the owner first.
+
+- **`vk dev code` reconciles the VS Code server** with `[dev.editor.vscode]` after Remote-SSH
+  installs it. A detached operation applies extensions, settings and the project's
+  `reconcile` command without blocking the editor. Follow it with `vk dev editor status [--json]`,
+  `log` and `retry`. Insiders and the other channels work; `--editor` accepts a path.
+
+- **`vk dev task <name> [-- args…]`** runs a project command under its `[dev.tasks.<name>]`
+  policy: `reuse` a running environment, `require` one, `ephemeral` in a throwaway VM, or
+  `reuse-or-ephemeral`. `env` adds variables; ephemeral tasks can use `checkout = "overlay"`
+  to keep writes off the tree. `cached-only` loads the task's or project's build environment
+  from the build cache, building the named `fallback` target on a miss.
+
+- **`vk dev list [--sizes]` and `vk dev gc`** work from any directory and cover all environment
+  state on the host, flagging deleted checkouts and leaked throwaway runs. `gc` previews
+  removal and refuses environments that are running or booting.
+
+- **`[dev.host] git-gui = true`** lets the guest open the host's `gitk` and `git gui` on the
+  checkout. vk permits only these commands, checks every option against an allowlist of
+  revision options, requires a directory inside the workspace and rebuilds the environment
+  from the host account.
+
+- **`vk toolchain` pins the team's release.** `lock` writes the release and each published
+  artifact's checksum and URLs to `.virtkit/toolchain.lock`. `install` populates a verified
+  per-version cache usable offline without changing the `vk` on PATH. `export` provides
+  paths and checksums to scripts and image builds; `status` compares them with `this vk`.
+  A host without virtkit bootstraps with
+  `curl -fsSL https://github.com/virtkit-dev/virtkit/releases/latest/download/install.sh | sh`,
+  which installs the release a checkout pins.
+
 ### Fixed
 
 - **A signal-killed guest command now fails the run.** `vk run` and `vk dev up` reported a

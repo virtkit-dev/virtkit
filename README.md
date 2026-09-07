@@ -28,6 +28,23 @@ virtkit is Linux- and KVM-specific. Release artifacts are built for x86-64 Linux
 - Network access when pulling images or using guest egress.
 - Docker or an existing `vk` binary only when building virtkit itself from source.
 
+## Install
+
+```sh
+curl -fsSL https://github.com/virtkit-dev/virtkit/releases/latest/download/install.sh | sh
+```
+
+This installs the latest `vk` into `$XDG_BIN_HOME` (else `~/.local/bin`) and verifies the
+checksum published beside it. `BINDIR` selects another directory and `VIRTKIT_VERSION` another
+release. From a checkout with `.virtkit/toolchain.lock`, it installs the pinned release.
+`vk update` updates an installed `vk` to a later release.
+
+`vk toolchain lock` pins the team's release in `.virtkit/toolchain.lock`, with each
+artifact's checksum and download URLs. `vk toolchain install` populates a per-version
+cache without changing the `vk` on PATH. `vk toolchain export` provides those paths and
+checksums to scripts and image builds; `vk toolchain status` reports what is pinned and
+installed.
+
 Run the host preflight before debugging a failed boot:
 
 ```sh
@@ -331,6 +348,82 @@ disks; `status` reports one or all. `vk run --ssh` enables SSH access for develo
 including VS Code Remote-SSH workflows. In a CI fleet a service's `environment:` may also
 carry its own egress allowlist — see [Per-service egress](docs/gitlab-ci.md#per-service-egress).
 
+### Develop in a project environment
+
+`vk dev` boots a project's development environment from `.virtkit/config.toml`.
+The same configuration drives the shell, editor, services, hooks and host integration.
+
+```sh
+vk dev init                         # write a first config from devcontainer.json, a compose file,
+                                    # a Dockerfile or a stock image; validate an existing one
+vk dev shell                        # boot if needed, then a login shell as the config's user
+vk dev exec -- cargo test           # a command in the environment, exit status reproduced
+vk dev code                         # VS Code over Remote-SSH, extensions and settings reconciled
+vk dev service up runner            # a profiled compose service, built on first use
+vk dev endpoints                    # the stable host addresses its ports are published on
+vk dev task pre-commit -- "$@"      # a project command under its declared execution policy
+vk dev status | plan | doctor       # what is running, what the config resolves to, host checks
+vk dev refresh                      # rebuild and restart into the current config
+vk dev stop
+vk dev list                         # every environment this host keeps state for, from anywhere
+vk dev gc --all-stale               # drop the state of deleted checkouts and throwaway runs
+```
+
+```toml
+# .virtkit/config.toml — tracked; .virtkit/local.toml and local.env hold machine overrides
+schema = 1
+
+[requires]
+min-version = "0.64.0"
+
+[dev]
+compose = ".virtkit/compose.yaml"   # or image = "…", or build = { context, dockerfile, target }
+service = "devcontainer"
+workspace = "/workdir"
+user = "dev"
+freshness = "ask"                   # a running VM that no longer matches: ask | reuse | refresh | require-current
+
+[dev.exec-env]                      # sessions, hooks and editor terminals
+GITLAB_TOKEN = "${localEnv:GITLAB_TOKEN:}"
+
+[dev.mounts.vscode-server]
+source = "${state}/vscode-server"   # managed storage under the environment's state directory
+to = "/home/dev/.vscode-server"
+
+[dev.endpoints."runner.https"]
+service = "runner"
+target = 443
+host-port = 8443
+address = "auto"                    # one loopback block per environment, an octet per service
+scheme = "https"
+path = "/ui"
+
+[dev.editor.vscode]
+state = "persistent"
+reconcile = ["./.devcontainer/install-extensions.sh"]
+
+[dev.host]
+git-gui = true                      # gitk and git gui from the guest run on the host, filtered
+
+[dev.tasks.pre-commit]
+run = ["./hooks/pre-commit"]
+environment = "hook"                # an [environments.hook] built on demand
+policy = "ephemeral"                # a throwaway VM, one per run
+checkout = "overlay"                # its writes never reach the checkout
+
+[environments.hook]                 # the task's own environment, with state of its own
+build = { context = ".", dockerfile = "Dockerfile", target = "hook" }
+```
+
+Unknown keys are errors. `vk dev init` adds a `#:schema` line at the top of the file for
+completion and validation as you type in JSON Schema-aware editors
+(taplo, VS Code's Even Better TOML).
+The schema is [`docs/schema/virtkit-config.schema.json`](docs/schema/virtkit-config.schema.json);
+`vk dev schema` prints it for checkouts that vendor a copy. State lives outside the
+checkout, in a directory per worktree and environment, giving worktrees distinct SSH
+identities, endpoint addresses and storage. `vk dev storage list|reset` names the durable data
+(`disk` volumes, managed directories) and is the only thing that removes any of it.
+
 ### Manage running VMs
 
 A `vk run --state-dir DIR` boots a VM that outlives a single command: its sockets and
@@ -555,6 +648,8 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk check` | Validate KVM, VMM, embedded assets, configured host features, and an optional minimum `vk` version. |
 | `vk gc` | Reclaim unused image bases, CI checkouts, and image-cache chunks. |
 | `vk update` | Check for or install a digest-verified GitHub release. |
+| `vk dev ...` | Boot, enter, refresh and stop a project's development environment from `.virtkit/config.toml`; its services, endpoints, storage, tasks and editor. `vk dev list\|gc` covers every environment on the host. |
+| `vk toolchain lock\|install\|export\|status` | Pin a project's virtkit release and install its artifacts from the lock. |
 | `vk service up\|down\|reboot\|status` | Control compose services from the primary guest. |
 | `vk registry ...` | Publish, fetch, inspect, report on, or sweep OCI stores. |
 | `vk gitlab ...` | Implement the GitLab custom-executor lifecycle. |
