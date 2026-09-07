@@ -2936,7 +2936,7 @@ async fn cli_main() -> ExitCode {
         };
         return match run::run(&args, &cfg).await {
             Ok(()) => ExitCode::SUCCESS,
-            Err(e) if is_not_cached(&e) => fail(&e, 3),
+            Err(e) if build::not_cached(&e) => fail(&e, 3),
             Err(e) => fail(&e, 1),
         };
     }
@@ -3448,7 +3448,7 @@ async fn cli_main() -> ExitCode {
             };
             return match build::build_units(units, &opts) {
                 Ok(_) => ExitCode::SUCCESS,
-                Err(e) if is_not_cached(&e) => fail(&e, 3),
+                Err(e) if build::not_cached(&e) => fail(&e, 3),
                 Err(e) => fail(&e, 1),
             };
         }
@@ -3472,7 +3472,7 @@ async fn cli_main() -> ExitCode {
                 }
                 _ => ExitCode::SUCCESS,
             },
-            Err(e) if is_not_cached(&e) => fail(&e, 3),
+            Err(e) if build::not_cached(&e) => fail(&e, 3),
             Err(e) => fail(&e, 1),
         };
     }
@@ -4614,12 +4614,6 @@ fn parse_source_egress(
         map.insert(ip, policy);
     }
     Ok(map)
-}
-
-/// `--require-cached` refusals get their own exit code (3), so scripts can branch
-/// on cached-vs-cold. Checked at the chain root — contexts may wrap the error.
-fn is_not_cached(e: &anyhow::Error) -> bool {
-    e.root_cause().downcast_ref::<build::NotCached>().is_some()
 }
 
 use crate::ensure::parse_uuid;

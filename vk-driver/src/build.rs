@@ -365,6 +365,12 @@ impl std::fmt::Display for NotCached {
 
 impl std::error::Error for NotCached {}
 
+/// Whether `e` is a `--require-cached` refusal: the CLI gives those their own exit code (3)
+/// and `vk dev task` falls back on them. Checked at the chain root — contexts wrap the error.
+pub fn not_cached(e: &anyhow::Error) -> bool {
+    e.root_cause().downcast_ref::<NotCached>().is_some()
+}
+
 /// Egress policy for the microVM build's `RUN` guests.
 #[derive(Clone, Debug, PartialEq)]
 pub enum BuildNet {
