@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use vk_core::exec::client::Stdin;
 
-use crate::dev::plan::Plan;
+use crate::dev::plan::{Plan, Source};
 
 use super::boot::take_transition;
 use super::hooks::run_start_hooks;
@@ -60,14 +60,18 @@ pub async fn after_boot(plan: &Plan) -> Result<()> {
     if transition == Transition::Reused {
         // Attaching to what is running, which may not be what the config now says: the
         // recorded identity stays the running environment's own, and the hooks that belong
-        // to a start do not run. Reusing is not relabelling.
-        return Ok(());
+        // to a start do not run. Reusing is not relabelling. Endpoints are the exception —
+        // `plan --diff` calls an endpoint edit host-side, applied without a restart, which
+        // is only true if the relays that no longer match go first.
+        reconcile_publishers(plan);
+        return publish_endpoints(plan).await;
     }
     let (digest, manifest) = identity_of(plan, booted_wrapper_digest(plan).as_deref())?;
     // What was actually booted, read off the registry entry the boot filed. `None` where
     // there is no entry to read it from, which leaves the creation hook unstamped rather
     // than stamped with something that describes nothing.
     let generation = running_vm(plan).map(|vm| generation_of(plan, &root_identity(plan, &vm)));
+    publish_endpoints(plan).await?;
     run_start_hooks(plan, generation.as_deref()).await?;
     write_identity(
         plan,
@@ -147,6 +151,194 @@ async fn sync_session_env(plan: &Plan) {
     };
     if let Err(e) = run.await {
         eprintln!("virtkit: exec-env not delivered to SSH sessions ({path}): {e:#}");
+    }
+}
+
+/// Stop the publishers an attach can no longer stand behind: one whose endpoint has gone
+/// from the config, and one whose listen address or target has moved. `publish::ensure`
+/// refuses to replace a same-named publisher that runs a different spec, so without this an
+/// endpoint edit — which `vk dev plan --diff` calls host-side, applied by the next `up`
+/// without a restart — would fail on a required endpoint and be ignored on an optional one.
+///
+/// Best effort: a registry that cannot be read leaves the relays alone, and `ensure` then
+/// reports whatever it runs into.
+fn reconcile_publishers(plan: &Plan) {
+    let live = crate::publish::live(&plan.state_dir).unwrap_or_default();
+    if live.is_empty() {
+        return;
+    }
+    // The remembered allocation, never a fresh one: an `auto` endpoint that has no address
+    // yet has nothing running for it either.
+    let alloc = crate::dev::endpoints::load(plan).unwrap_or_else(|e| {
+        eprintln!("virtkit: the endpoints' relays were left alone: {e:#}");
+        None
+    });
+    for (entry, _) in live {
+        let reason = match plan.endpoints.iter().find(|e| e.name == entry.name) {
+            None => "it is no longer in the config",
+            Some(ep) if entry.to != ep.to || entry.service.as_deref() != ep.service.as_deref() => {
+                "what it forwards to has changed"
+            }
+            Some(ep) => {
+                // Compared in the normalized spelling `publish` records, not the raw string.
+                let wanted = crate::dev::endpoints::address_of(alloc.as_ref(), ep)
+                    .map(|a| crate::dev::endpoints::listen_on(ep, &a))
+                    .and_then(|l| l.parse::<vk_core::addr::SocketAddr>().ok())
+                    .map(|l| l.to_string());
+                match wanted {
+                    Some(w) if w != entry.listen => "where it listens has changed",
+                    _ => continue,
+                }
+            }
+        };
+        eprintln!(
+            "virtkit: endpoint {}: {reason} — stopping its relay",
+            entry.name
+        );
+        if let Err(e) =
+            crate::publish::stop(&plan.state_dir, Some(&entry.name), Duration::from_secs(5))
+        {
+            eprintln!("virtkit: endpoint {}: {e:#}", entry.name);
+        }
+    }
+}
+
+/// Publish the config's endpoints. One that cannot be published is reported and the rest
+/// still are — the environment is up, and losing one optional endpoint should not read as a
+/// failed `up`; a required one is what the environment is for, so its failure is the
+/// operation's.
+/// After a boot or an attach: the primary's endpoints, and those of every service the
+/// manager reports running — a relay that died, or a `vk` that was upgraded under a running
+/// environment, is put back without anyone having to know. A required primary endpoint that
+/// cannot be published leaves the environment not ready.
+async fn publish_endpoints(plan: &Plan) -> Result<()> {
+    if plan.endpoints.is_empty() {
+        return Ok(());
+    }
+    let entry = crate::vms::resolve_one(Some(&plan.state_dir)).context("publishing endpoints")?;
+    let running: Vec<String> = match crate::vms::control_socket(&entry) {
+        Some(ctl) => crate::vms::control(
+            &ctl,
+            &vk_core::fleetctl::Request::List,
+            Some(std::time::Duration::from_secs(5)),
+            |_| {},
+        )
+        .map(|r| {
+            r.units
+                .into_iter()
+                .filter(|u| u.state == "running")
+                .map(|u| u.name)
+                .collect()
+        })
+        .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let failed = publish_for(plan, &entry, None).await?;
+    for service in running {
+        if plan
+            .endpoints
+            .iter()
+            .any(|e| e.service.as_deref() == Some(&*service))
+        {
+            // A service's required endpoint failing does not un-ready the environment; it is
+            // reported, and `vk dev service up` on that service says so in its own terms.
+            let _ = publish_for(plan, &entry, Some(&service)).await;
+        }
+    }
+    if !failed.is_empty() {
+        bail!(
+            "required endpoint(s) not published, so the environment is not ready:\n  {}",
+            failed.join("\n  ")
+        );
+    }
+    Ok(())
+}
+
+/// Publish the endpoints of `service` (the primary for `None`), allocating their host
+/// address first. Prints each URL or address as it comes up. Returns the required endpoints
+/// that failed, one message each; optional failures are reported here and forgotten.
+async fn publish_for(
+    plan: &Plan,
+    entry: &crate::vms::VmEntry,
+    service: Option<&str>,
+) -> Result<Vec<String>> {
+    let mine: Vec<&crate::dev::plan::EndpointPlan> = plan
+        .endpoints
+        .iter()
+        .filter(|e| e.service.as_deref() == service)
+        .collect();
+    if mine.is_empty() {
+        return Ok(Vec::new());
+    }
+    let addr: vk_core::addr::SocketAddr = entry.exec_addr.parse()?;
+    let live = !crate::publish::live(&plan.state_dir)
+        .unwrap_or_default()
+        .is_empty();
+    let auto_address = if mine.iter().any(|e| e.auto()) {
+        Some(
+            crate::dev::endpoints::allocate(plan, service, live)
+                .context("allocating the endpoints' host address")?
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    let mut failed = Vec::new();
+    for ep in mine {
+        let address = if ep.auto() {
+            auto_address.clone().expect("allocated above")
+        } else {
+            ep.address.clone()
+        };
+        let listen = crate::dev::endpoints::listen_on(ep, &address);
+        let result = match listen.parse() {
+            Ok(l) => {
+                crate::publish::ensure(&plan.state_dir, &ep.name, &addr, &l, &ep.to, None).await
+            }
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(crate::publish::Ensured::Started(e)) => {
+                let shown = crate::dev::endpoints::url_on(ep, &address).unwrap_or(e.listen);
+                eprintln!("published {}: {shown} -> {}", ep.name, e.to);
+            }
+            Ok(crate::publish::Ensured::AlreadyRunning(_)) => {}
+            Err(e) => {
+                // An allocated address that turns out taken is not ours after all: forget
+                // this service's octet, so its next publish picks another rather than
+                // failing the same way. The block and the other services' octets stay —
+                // relays of theirs are already up on them.
+                if ep.auto() && e.downcast_ref::<crate::publish::AddressInUse>().is_some() {
+                    crate::dev::endpoints::forget(plan, service);
+                    eprintln!(
+                        "virtkit: {address} is in use after all — the address remembered for \
+                         {} is forgotten; the next publish picks another",
+                        service.unwrap_or("the environment")
+                    );
+                }
+                if ep.required {
+                    failed.push(format!("{}: {e:#}", ep.name));
+                } else {
+                    eprintln!("virtkit: endpoint {} (optional): {e:#}", ep.name);
+                }
+            }
+        }
+    }
+    Ok(failed)
+}
+
+/// Stop the publishers of `service`'s endpoints — its relays only, not the environment's.
+fn unpublish_for(plan: &Plan, service: &str) {
+    for ep in plan
+        .endpoints
+        .iter()
+        .filter(|e| e.service.as_deref() == Some(service))
+    {
+        let _ = crate::publish::stop(
+            &plan.state_dir,
+            Some(&ep.name),
+            std::time::Duration::from_secs(5),
+        );
     }
 }
 
@@ -252,6 +444,50 @@ pub async fn exec_in_service(
         Stdin::Forward,
     )
     .await
+}
+
+/// `vk dev service …`: one request to the running environment's service manager, from the
+/// host, with an on-demand build's progress relayed to stderr. The environment must be up —
+/// this boots nothing, so `status` and `down` of an absent environment say so rather than
+/// start one (`up` is the exception, and the caller brings the environment up first).
+pub async fn service(
+    plan: &Plan,
+    req: &vk_core::fleetctl::Request,
+) -> Result<vk_core::fleetctl::Reply> {
+    let entry = running_entry(plan)?;
+    let ctl = crate::vms::control_socket(&entry).ok_or_else(|| {
+        anyhow::anyhow!(
+            "the environment has no compose services (source: {})",
+            match &plan.source {
+                Source::Compose { file, .. } => file.display().to_string(),
+                Source::Image { reference } => format!("image {reference}"),
+                Source::Build { dockerfile, .. } => dockerfile.display().to_string(),
+            }
+        )
+    })?;
+    // A start may build an image; the others answer promptly, but a stop waits for a guest to
+    // power off, so give every op a generous bound rather than none.
+    let timeout = match req {
+        vk_core::fleetctl::Request::Start { .. } => None,
+        _ => Some(std::time::Duration::from_secs(120)),
+    };
+    // A service's relays go with it: down before the stop, up once the start is confirmed.
+    if let vk_core::fleetctl::Request::Stop { unit } = req {
+        unpublish_for(plan, unit);
+    }
+    let reply = crate::vms::control(&ctl, req, timeout, |line| eprintln!("{line}"))?;
+    if let vk_core::fleetctl::Request::Start { unit } = req
+        && reply.ok
+    {
+        let failed = publish_for(plan, &entry, Some(unit)).await?;
+        if !failed.is_empty() {
+            bail!(
+                "{unit} is running, but its required endpoint(s) are not published:\n  {}",
+                failed.join("\n  ")
+            );
+        }
+    }
+    Ok(reply)
 }
 
 /// This plan's running VM, or an error that says it is down and how to bring it up.

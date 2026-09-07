@@ -539,6 +539,31 @@ pub async fn boot(
     crate::run::run(&args, cfg).await
 }
 
+/// Build the environment's images into the cache, running nothing.
+///
+/// The primary's, or — with `--service` — the named compose sibling's, the way
+/// `vk dev service up` would build it on first use. Runs `hooks.init` first, since what it
+/// prepares is what the build then reads, and works whether or not the environment is up.
+pub async fn build(
+    plan: &Plan,
+    cfg: &crate::config::Config,
+    over: &Overrides,
+    service: Option<&str>,
+) -> Result<()> {
+    plan.require_resolved()?;
+    ensure_state_dir(plan)?;
+    if let Some(hook) = &plan.hooks.init {
+        run_hook(plan, "hooks.init", hook, Where::Host, &[]).await?;
+    }
+    if service.is_none()
+        && let Source::Image { reference } = &plan.source
+    {
+        eprintln!("virtkit: nothing to build — the environment boots {reference}");
+        return Ok(());
+    }
+    build_into_cache(plan, over, cfg, service)
+}
+
 /// The [`run_args`] a build reads its inputs off: the boot's, with a named service standing
 /// in for the primary, so a service builds against the same cache and build arguments the
 /// environment does.

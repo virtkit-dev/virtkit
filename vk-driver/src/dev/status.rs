@@ -345,6 +345,49 @@ pub fn doctor(plan: &Plan, cfg: &crate::config::Config) -> (String, bool) {
             format!("{} (managed, created at boot)", dir.display()),
         );
     }
+    // Endpoints: a host port another program holds is found now, not once the VM is up.
+    let running = running_vm(plan).is_some();
+    let alloc = crate::dev::endpoints::load(plan).unwrap_or_else(|e| {
+        eprintln!("virtkit: no endpoint address to check: {e:#}");
+        None
+    });
+    for ep in &plan.endpoints {
+        // `listen` spells an unallocated auto endpoint `tcp://auto:<port>`, which is a name
+        // and not an address: what it will bind is the block the allocator hands out at the
+        // publish, so there is nothing to pre-flight until one has been remembered.
+        let Some(address) = crate::dev::endpoints::address_of(alloc.as_ref(), ep) else {
+            line(
+                true,
+                "endpoint",
+                format!(
+                    "{}: 127.0.<block>.<octet>:{} (allocated when it is published)",
+                    ep.name, ep.host_port
+                ),
+            );
+            continue;
+        };
+        let addr = format!("{address}:{}", ep.host_port);
+        if running {
+            line(
+                true,
+                "endpoint",
+                format!("{}: {addr} (environment running)", ep.name),
+            );
+            continue;
+        }
+        match std::net::TcpListener::bind(&*addr) {
+            Ok(_) => line(true, "endpoint", format!("{}: {addr} is free", ep.name)),
+            Err(e) => line(
+                !ep.required,
+                "endpoint",
+                format!(
+                    "{}: cannot bind {addr} ({e}){}",
+                    ep.name,
+                    if ep.required { "" } else { " — optional" }
+                ),
+            ),
+        }
+    }
     // The state dir must be creatable, and what lands in it must not be reachable by the
     // guest — the plan already refused that.
     let state_parent = plan
@@ -424,5 +467,44 @@ mod tests {
             "{report}"
         );
         assert!(!t.0.join("state").exists(), "nothing was created");
+    }
+
+    #[test]
+    fn doctor_pre_flights_a_configured_address_and_waits_on_an_allocated_one() {
+        let t = scratch("doctor-endpoints");
+        let mut plan = plan_in(&t.0);
+        // A `required` auto endpoint: its address is chosen by the allocator at the publish,
+        // so there is nothing to bind yet — and nothing here is a reason to FAIL the host.
+        plan.endpoints = vec![crate::dev::plan::EndpointPlan {
+            name: "web".into(),
+            service: None,
+            host_port: 48082,
+            address: "auto".into(),
+            listen: "tcp://auto:48082".into(),
+            to: "tcp://127.0.0.1:8080".into(),
+            scheme: None,
+            path: None,
+            required: true,
+        }];
+        let (report, _) = doctor(&plan, &crate::config::Config::default());
+        assert!(
+            report.contains("ok   endpoint   web: 127.0.<block>.<octet>:48082"),
+            "{report}"
+        );
+        assert!(!report.contains("FAIL endpoint"), "{report}");
+
+        // A configured address is bound now, so a port something else holds is a finding.
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        plan.endpoints[0].address = "127.0.0.1".into();
+        plan.endpoints[0].host_port = port;
+        let (report, ok) = doctor(&plan, &crate::config::Config::default());
+        assert!(!ok, "{report}");
+        assert!(
+            report.contains(&format!(
+                "FAIL endpoint   web: cannot bind 127.0.0.1:{port}"
+            )),
+            "{report}"
+        );
     }
 }
