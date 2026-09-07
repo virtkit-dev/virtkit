@@ -7,7 +7,7 @@ use vk_core::exec::client::Stdin;
 
 use crate::dev::plan::{Plan, Source};
 
-use super::boot::take_transition;
+use super::boot::{alias, take_transition};
 use super::hooks::run_start_hooks;
 use super::identity::{
     booted_wrapper_digest, generation_of, identity_of, own_version, root_identity, write_identity,
@@ -519,6 +519,41 @@ pub fn guest_cwd(plan: &Plan) -> Option<String> {
 /// terminal in the editor would.
 pub const LOGIN_SHELL: [&str; 3] = ["sh", "-lc", "exec \"${SHELL:-/bin/sh}\" -l"];
 
+/// `vk dev code`: hand the workspace to the selected editor over Remote-SSH.
+///
+/// The editor spawns a bare `ssh` with nowhere to pass a config, so the run's managed shim
+/// goes first on its PATH — which is what the shim is for. Replaces this process, so the
+/// editor's own exit is the command's.
+pub fn launch_editor(
+    plan: &Plan,
+    editor: &crate::dev::editor::Editor,
+) -> Result<std::convert::Infallible> {
+    use std::os::unix::process::CommandExt;
+    let Some(folder) = &plan.workspace_folder else {
+        bail!("the config sets no `workspace`, so there is no folder to open");
+    };
+    let managed = crate::sshclient::Managed::new(&plan.state_dir)?;
+    if !managed.config().is_file() {
+        bail!(
+            "no SSH setup in {} — bring the environment up first",
+            plan.state_dir.display()
+        );
+    }
+    let path = match std::env::var_os("PATH") {
+        Some(p) => {
+            let mut dirs = vec![managed.shim_dir()];
+            dirs.extend(std::env::split_paths(&p));
+            std::env::join_paths(dirs).context("building the editor's PATH")?
+        }
+        None => managed.shim_dir().into_os_string(),
+    };
+    let uri = format!("vscode-remote://ssh-remote+{}{folder}", alias(plan));
+    eprintln!("virtkit: {} --folder-uri={uri}", editor.binary.display());
+    let mut cmd = std::process::Command::new(&editor.binary);
+    cmd.arg(format!("--folder-uri={uri}")).env("PATH", path);
+    Err(anyhow::Error::new(cmd.exec()).context(format!("running {}", editor.binary.display())))
+}
+
 /// What a stop did, and whether it left the environment down.
 pub struct Stopped {
     /// what to print: one line per VM stopped, or why there was nothing to stop
@@ -623,5 +658,29 @@ mod tests {
         std::fs::remove_file(&identity).unwrap();
         after_boot(&plan).await.unwrap();
         assert!(!identity.exists());
+    }
+
+    #[test]
+    fn the_editor_is_only_launched_into_a_ready_environment() {
+        let t = scratch("editor");
+        let mut plan = plan_in(&t.0);
+        ensure_state_dir(&plan).unwrap();
+        let editor = crate::dev::editor::Editor {
+            binary: t.0.join("bin/code"),
+            channel: crate::dev::editor::Channel::Stable,
+            version: "1.0.0".into(),
+            commit: "0".repeat(40),
+        };
+
+        // Nothing to open: the config never said where the workspace lands in the guest.
+        plan.workspace_folder = None;
+        let err = launch_editor(&plan, &editor).unwrap_err();
+        assert!(format!("{err:#}").contains("`workspace`"), "{err:#}");
+
+        // The editor reaches the VM through the run's ssh setup, so without one there is
+        // nothing to attach to — better said here than as a Remote-SSH failure later.
+        plan.workspace_folder = Some("/workdir".into());
+        let err = launch_editor(&plan, &editor).unwrap_err();
+        assert!(format!("{err:#}").contains("SSH setup"), "{err:#}");
     }
 }

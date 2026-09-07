@@ -19,6 +19,7 @@ mod boot;
 pub mod cli;
 pub mod config;
 pub mod devcontainer;
+pub mod editor;
 pub mod endpoints;
 mod hooks;
 mod identity;
@@ -39,10 +40,11 @@ use crate::dev::config::Freshness;
 
 pub(crate) use boot::lock_holder;
 pub use boot::{boot, build, task_args};
+pub(crate) use hooks::{Where, run_hook};
 pub use identity::plan_diff;
 pub use session::{
     LOGIN_SHELL, after_boot, ask_on_terminal, exec_in_guest, exec_in_guest_with, exec_in_service,
-    exec_session, guest_cwd, on_terminal, running_vm, service, stop,
+    exec_session, guest_cwd, launch_editor, on_terminal, running_vm, service, stop,
 };
 pub use status::{doctor, status};
 

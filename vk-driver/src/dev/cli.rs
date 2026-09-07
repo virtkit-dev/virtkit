@@ -145,6 +145,30 @@ enum DevAction {
     /// `exec-env`, in the guest directory that stands for yours. Ends when the shell does;
     /// the environment stays up, so opening another costs nothing.
     Shell,
+    /// Open the workspace in VS Code, bringing the environment up first
+    ///
+    /// Attaches over Remote-SSH, with the run's own SSH setup — nothing to configure, and
+    /// none of your identities involved. Behind the editor, a detached operation brings the
+    /// guest's server to what `[dev.editor.vscode]` says (extensions, settings, the project's
+    /// reconcile command) once Remote-SSH has installed it; `vk dev editor status` follows it.
+    Code {
+        /// the editor to launch [default: the first VS Code on PATH]
+        ///
+        /// Looked for as code, code-insiders, codium, vscodium, then code-oss. Its Remote-SSH
+        /// extension must be installed.
+        #[arg(long, value_name = "BIN")]
+        editor: Option<String>,
+    },
+    /// Follow or retry the editor reconciliation, apart from the VM's own status
+    ///
+    /// `vk dev code` leaves a detached operation behind that brings the guest's VS Code
+    /// server to what `[dev.editor.vscode]` says, once Remote-SSH has installed it. These
+    /// say whether it is still running and how it went, print its log, or run it again in
+    /// the foreground. None of them boots the environment.
+    Editor {
+        #[command(subcommand)]
+        action: EditorAction,
+    },
     /// List the environment's endpoints: address, URL, and whether each is published
     ///
     /// An `auto` address is the stable loopback allocation this environment holds, shown
@@ -220,6 +244,13 @@ enum DevAction {
     Storage {
         #[command(subcommand)]
         action: DevStorageAction,
+    },
+    /// (internal) the detached reconciliation `vk dev code` starts
+    #[command(name = "editor-reconcile", hide = true)]
+    EditorReconcile {
+        /// the editor whose server to reconcile
+        #[arg(long, value_name = "BIN")]
+        editor: String,
     },
     /// SSH into the environment (it must already be up)
     ///
@@ -387,7 +418,7 @@ impl DevAction {
             // A task boots only under `policy = "require"`, which is in the config rather
             // than on the command line; the fork is where a boot *may* happen, and the
             // policies that boot nothing leave the work to the parent (see `dev_up`).
-            Self::Up { .. } | Self::Shell | Self::Task { .. } => true,
+            Self::Up { .. } | Self::Shell | Self::Code { .. } | Self::Task { .. } => true,
             // A service exec reaches a running service and boots nothing.
             Self::Exec { service, .. } => service.is_none(),
             // Of the service operations only `up` boots the environment.
@@ -395,10 +426,12 @@ impl DevAction {
             // A dry run only reports; forking it would report twice.
             Self::Refresh { dry_run } => !dry_run,
             Self::Init { .. }
+            | Self::Editor { .. }
             | Self::Endpoints { .. }
             | Self::Open { .. }
             | Self::Build { .. }
             | Self::Storage { .. }
+            | Self::EditorReconcile { .. }
             | Self::Ssh { .. }
             | Self::SshConfig
             | Self::Status { .. }
@@ -411,6 +444,28 @@ impl DevAction {
             | Self::Schema => false,
         }
     }
+}
+
+/// `vk dev editor`: the reconciliation that follows `vk dev code`.
+#[derive(Subcommand)]
+enum EditorAction {
+    /// Whether a reconciliation is running, and which servers were reconciled
+    Status {
+        /// print the same facts as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the newest reconciliation log
+    Log,
+    /// Run the reconciliation now, in the foreground, and report how it went
+    ///
+    /// The environment must be up and the editor connected, or about to be: the operation
+    /// waits for the server Remote-SSH installs.
+    Retry {
+        /// the editor whose server to reconcile [default: the first VS Code on PATH]
+        #[arg(long, value_name = "BIN")]
+        editor: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -729,6 +784,47 @@ async fn dev_action(
                 }
             }
         },
+        DevAction::Code { editor } => match dev_up(&plan, host_cfg, over, false, true).await {
+            Ready::Done(code) => code,
+            Ready::Act => {
+                let editor = match crate::dev::editor::select(editor.as_deref()) {
+                    Ok(e) => e,
+                    Err(e) => return fail(&e, 1),
+                };
+                // Started before the editor and not waited for: the server appears only
+                // once the editor connects, and the editor must not wait for this.
+                match crate::dev::editor::spawn(&plan, &editor) {
+                    Ok(crate::dev::editor::Started::Spawned { pid, log }) => eprintln!(
+                        "virtkit: editor reconciliation started (pid {pid}); log: {}",
+                        log.display()
+                    ),
+                    Ok(crate::dev::editor::Started::Joined { holder }) => {
+                        eprintln!("virtkit: editor reconciliation already running ({holder})")
+                    }
+                    Ok(crate::dev::editor::Started::Nothing) => {}
+                    Err(e) => eprintln!("virtkit: editor reconciliation not started: {e:#}"),
+                }
+                match dev::launch_editor(&plan, &editor) {
+                    Ok(never) => match never {},
+                    Err(e) => fail(&e, 1),
+                }
+            }
+        },
+        DevAction::Editor {
+            action: EditorAction::Status { json },
+        } => match json {
+            true => match serde_json::to_string_pretty(&crate::dev::editor::status_view(&plan)) {
+                Ok(text) => write_report(&(text + "\n")),
+                Err(e) => fail(&anyhow::anyhow!(e), 1),
+            },
+            false => write_report(&crate::dev::editor::status(&plan)),
+        },
+        DevAction::Editor {
+            action: EditorAction::Log,
+        } => match crate::dev::editor::latest_log(&plan) {
+            Ok(text) => write_report(&text),
+            Err(e) => fail(&e, 1),
+        },
         // Warms the cache and boots nothing, so it needs no environment and never detaches.
         // Only a `require` task boots the environment; the rest attach to what runs or boot
         // a throwaway VM, so there is nothing for the forked child to do and this parent is
@@ -762,6 +858,22 @@ async fn dev_action(
                 Err(e) => fail(&e, 1),
             }
         }
+        DevAction::Editor {
+            action: EditorAction::Retry { editor },
+        } => match crate::dev::editor::select(editor.as_deref()) {
+            Err(e) => fail(&e, 1),
+            Ok(editor) => match crate::dev::editor::reconcile(&plan, &editor).await {
+                Ok(_) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, 1),
+            },
+        },
+        DevAction::EditorReconcile { editor } => match crate::dev::editor::select(Some(&editor)) {
+            Err(e) => fail(&e, 1),
+            Ok(editor) => match crate::dev::editor::reconcile(&plan, &editor).await {
+                Ok(_) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, 1),
+            },
+        },
         DevAction::Ssh { args } => match sshclient::exec_ssh(&plan.state_dir, &args) {
             Ok(never) => match never {},
             Err(e) => fail(&e, 1),
@@ -1024,6 +1136,8 @@ mod tests {
         (&["exec", "--", "true"], true),
         (&["exec", "--service", "db", "--", "true"], false),
         (&["shell"], true),
+        (&["code"], true),
+        (&["editor", "status"], false),
         (&["endpoints", "--primary"], false),
         (&["open", "app"], false),
         (&["service", "up", "runner"], true),
@@ -1034,6 +1148,7 @@ mod tests {
         (&["build"], false),
         (&["storage", "list"], false),
         (&["storage", "reset", "runner:/var/wab", "--yes"], false),
+        (&["editor-reconcile", "--editor", "code"], false),
         (&["ssh"], false),
         (&["ssh-config"], false),
         (&["refresh"], true),

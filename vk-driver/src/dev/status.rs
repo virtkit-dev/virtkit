@@ -297,6 +297,17 @@ pub fn doctor(plan: &Plan, cfg: &crate::config::Config) -> (String, bool) {
             None => line(false, "tool", format!("{tool} is not on PATH")),
         }
     }
+    match crate::dev::editor::EDITORS
+        .iter()
+        .find_map(|e| crate::shell::which(e))
+    {
+        Some(p) => line(true, "editor", p.display().to_string()),
+        None => line(
+            true,
+            "editor",
+            "no VS Code on PATH; `vk dev code --editor` names one".into(),
+        ),
+    }
     // The source and mounts this host has to supply.
     match &plan.source {
         Source::Compose { file, .. } => line(
