@@ -955,6 +955,7 @@ mod tests {
             freshness: crate::dev::config::Freshness::Ask,
             cpus: None,
             mem: None,
+            nested: crate::dev::config::Nested::Off,
             mounts: vec![],
             container_env: vec![],
             exec_env: vec![],

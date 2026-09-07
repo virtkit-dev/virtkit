@@ -289,6 +289,32 @@ pub fn doctor(plan: &Plan, cfg: &crate::config::Config) -> (String, bool) {
             Err(why) => line(false, "host", why),
         }
     }
+    match plan.nested {
+        crate::dev::config::Nested::Off => {}
+        crate::dev::config::Nested::Required => match crate::vmm::host_nesting_enabled() {
+            true => line(true, "host", "nested virtualization enabled".into()),
+            false => line(
+                false,
+                "host",
+                "nested virtualization is not enabled (the kvm_intel/kvm_amd `nested` \
+                 module parameter), and the config requires it"
+                    .into(),
+            ),
+        },
+        // Reports the config's own `nested` only. A compose service can still force nesting
+        // with `x-virtkit.nested = true`, which is not resolved here, so a boot may be refused
+        // on a host without it even when this line passes.
+        crate::dev::config::Nested::Auto => line(
+            true,
+            "host",
+            match crate::vmm::host_nesting_enabled() {
+                true => "nested virtualization enabled".into(),
+                false => {
+                    "nested virtualization not enabled: the environment runs without it".into()
+                }
+            },
+        ),
+    }
     // Tools the daily commands shell out to.
     for tool in ["ssh", "git"] {
         match crate::shell::which(tool) {

@@ -244,6 +244,7 @@ fn run_args(
             .map(|h| h.env.clone())
             .unwrap_or_default(),
         ssh_agent: plan.ssh_agent,
+        nested: plan.nests_here(),
         // The managed client is how `vk dev shell`, `vk dev code` and the editor reach it.
         ssh: true,
         ssh_client: true,
@@ -890,6 +891,7 @@ pub(super) async fn take_transition(plan: &Plan, pid: u32) -> Option<Transition>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dev::config::Nested;
     use crate::dev::identity::marker_of;
     use crate::dev::plan::HostExecPlan;
     use crate::dev::testutil::{plan_in, scratch};
@@ -1034,6 +1036,7 @@ mod tests {
         let mut plan = plan_in(&t.0);
         plan.cpus = Some(Cpus::Count(4));
         plan.mem = Some("8G".into());
+        plan.nested = Nested::Required;
         plan.source = Source::Compose {
             file: t.0.join("repo/compose.yaml"),
             service: "devcontainer".into(),
@@ -1062,6 +1065,10 @@ mod tests {
         assert_eq!(args.workspace.as_deref(), Some(plan.workspace.as_path()));
         assert_eq!(args.cpus, Some(4));
         assert_eq!(args.mem.as_deref(), Some("8G"));
+        assert!(
+            args.nested,
+            "required nesting is asked for whatever the host says"
+        );
         assert!(args.net, "compose services need the run's LAN");
         assert!(
             args.inactivity_timeout_secs.is_none(),

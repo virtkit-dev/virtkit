@@ -377,6 +377,7 @@ freshness = "ask"
 profiles = ["tools"]
 cpus = "host"
 mem = "8G"
+nested = "auto"
 
 [dev.exec-env]
 GITLAB_TOKEN = "x"

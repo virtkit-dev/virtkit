@@ -144,6 +144,11 @@ pub struct Environment {
     pub cpus: Option<Cpus>,
     /// memory for the primary (`16G`); unset inherits like `cpus`
     pub mem: Option<String>,
+    /// nested virtualization for the primary, so it can boot microVMs of its own: `true`
+    /// requires it and a host that does not allow it refuses to boot, `"auto"` takes it
+    /// where the host allows it. Unset or `false` never asks for it.
+    #[serde(default)]
+    pub nested: Nested,
     /// environment for development sessions: exec, shell, SSH and editor processes
     #[serde(default)]
     pub exec_env: BTreeMap<String, String>,
@@ -340,6 +345,68 @@ impl Serialize for Cpus {
         match self {
             Cpus::Count(n) => se.serialize_u32(*n),
             Cpus::Host => se.serialize_str("host"),
+        }
+    }
+}
+
+/// `nested = true`, `nested = "auto"` or `nested = false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Nested {
+    /// never asked for
+    #[default]
+    Off,
+    /// where the host allows it
+    Auto,
+    /// the host must allow it
+    Required,
+}
+
+impl std::fmt::Display for Nested {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Nested::Off => "off",
+            Nested::Auto => "auto",
+            Nested::Required => "required",
+        })
+    }
+}
+
+/// By hand, as for [`Cpus`]: the error names the three spellings.
+impl<'de> Deserialize<'de> for Nested {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = Nested;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("true, false or \"auto\"")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, b: bool) -> Result<Nested, E> {
+                Ok(match b {
+                    true => Nested::Required,
+                    false => Nested::Off,
+                })
+            }
+
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Nested, E> {
+                match s {
+                    "auto" => Ok(Nested::Auto),
+                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(s), &self)),
+                }
+            }
+        }
+        de.deserialize_any(Visitor)
+    }
+}
+
+/// As the config spells it.
+impl Serialize for Nested {
+    fn serialize<S: serde::Serializer>(&self, se: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Nested::Off => se.serialize_bool(false),
+            Nested::Auto => se.serialize_str("auto"),
+            Nested::Required => se.serialize_bool(true),
         }
     }
 }
@@ -948,6 +1015,9 @@ impl Environment {
                     self.mem.as_deref().unwrap_or("inherited")
                 ),
             );
+        }
+        if self.nested != Nested::Off {
+            line("nested", self.nested.to_string());
         }
         if !self.exec_env.is_empty() || !self.container_env.is_empty() {
             line(
@@ -1755,6 +1825,9 @@ freshness = "ask"
 # Guest sizing. Unset inherits the compose service's x-virtkit, then vk's defaults.
 # cpus = "host"
 # mem = "8G"
+# Nested virtualization, for a guest that boots microVMs of its own: true requires it,
+# "auto" takes it where the host allows it.
+# nested = "auto"
 
 # Environment for exec, shell, SSH and editor sessions.
 [dev.exec-env]
@@ -2248,6 +2321,7 @@ start = { redis = "redis-cli ping", db = ["mysqladmin", "ping"] }
             r#"
 [dev]
 mem = "32G"
+nested = "auto"
 profiles = ["runner"]
 
 [dev.exec-env]
@@ -2268,6 +2342,7 @@ host-port = 9443
         let dev = dev_of(&l);
         // Scalars replace.
         assert_eq!(dev.mem.as_deref(), Some("32G"));
+        assert_eq!(dev.nested, Nested::Auto);
         assert_eq!(dev.freshness, Some(Freshness::Ask), "untouched");
         // Arrays replace.
         assert_eq!(dev.profiles, ["runner"]);
@@ -2466,6 +2541,8 @@ host-port = 9443
             ("cpus = -1", "\"host\""),
             ("cpus = 1.5", "\"host\""),
             ("mem = \"lots\"", "mem"),
+            ("nested = \"yes\"", "\"auto\""),
+            ("nested = 1", "\"auto\""),
             ("workspace = \"workdir\"", "absolute"),
             ("[dev.mounts.x]\nsource = \"/a\"\nto = \"b\"", "absolute"),
             ("[dev.mounts.x]\nsource = \"/a\"", "needs `to`"),

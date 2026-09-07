@@ -19,7 +19,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 
 use crate::dev::config::{
-    CheckoutMode, Command, Cpus, Environment, Freshness, Loaded, Policy, Requires, lexical_join,
+    CheckoutMode, Command, Cpus, Environment, Freshness, Loaded, Nested, Policy, Requires,
+    lexical_join,
 };
 
 /// Where `vk dev` keeps environment state: `$XDG_STATE_HOME/virtkit/dev`, else
@@ -231,6 +232,7 @@ pub struct Plan {
     pub freshness: Freshness,
     pub cpus: Option<Cpus>,
     pub mem: Option<String>,
+    pub nested: Nested,
     /// extra binds, in name order, vk's own among them
     pub mounts: Vec<MountPlan>,
     pub container_env: Vec<EnvVar>,
@@ -433,6 +435,7 @@ pub fn resolve(loaded: &Loaded, name: &str) -> Result<Plan> {
         freshness: env.freshness.unwrap_or(Freshness::Ask),
         cpus: env.cpus,
         mem: env.mem.clone(),
+        nested: env.nested,
         mounts,
         container_env,
         exec_env,
@@ -775,6 +778,17 @@ fn tasks_of(env: &Environment, at: &str, loaded: &Loaded, vars: &Vars) -> Result
 }
 
 impl Plan {
+    /// Whether the run asks for nested virtualization on this host: always for
+    /// `nested = true` (and `vk run` says why when the host cannot), only where the host
+    /// allows it for `"auto"`.
+    pub fn nests_here(&self) -> bool {
+        match self.nested {
+            Nested::Off => false,
+            Nested::Auto => crate::vmm::host_nesting_enabled(),
+            Nested::Required => true,
+        }
+    }
+
     /// Fail unless every `${localEnv:…}` was filled — the gate before a boot or a session,
     /// where an empty token would be worse than a refusal.
     pub fn require_resolved(&self) -> Result<()> {
@@ -1275,6 +1289,9 @@ impl Plan {
         if self.ssh_agent {
             out.push_str("  --ssh-agent \\\n");
         }
+        if self.nests_here() {
+            out.push_str("  --nested \\\n");
+        }
         if self.cached_only {
             out.push_str("  --require-cached \\\n");
         }
@@ -1496,6 +1513,7 @@ freshness = "require-current"
 profiles = ["runner"]
 cpus = "host"
 mem = "16G"
+nested = true
 
 [dev.container-env]
 WAB_IN_VM = "1"
@@ -1589,6 +1607,18 @@ extensions = ["ms-python.python"]
         assert_eq!(p.freshness, Freshness::RequireCurrent);
         assert_eq!(p.cpus, Some(Cpus::Host));
         assert_eq!(p.mem.as_deref(), Some("16G"));
+        assert_eq!(p.nested, Nested::Required);
+        assert!(
+            p.nests_here(),
+            "required nesting is asked for whatever the host says"
+        );
+        assert!(
+            p.to_shell(false).unwrap().contains("--nested"),
+            "the run it describes carries --nested"
+        );
+        let mut off = p.clone();
+        off.nested = Nested::Off;
+        assert!(!off.nests_here(), "off never asks for nesting");
         assert_eq!(p.requires.features, ["publish"]);
 
         // Mounts: a project-relative source, `~`, and `${state}`, parsed and in name order,

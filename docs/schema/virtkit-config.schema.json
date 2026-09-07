@@ -107,6 +107,10 @@
           "description": "memory for the primary (`16G`); unset inherits like `cpus`",
           "type": "string"
         },
+        "nested": {
+          "description": "nested virtualization for the primary, so it can boot microVMs of its own: `true` requires it and a host that does not allow it refuses to boot, `\"auto\"` takes it where the host allows it. Unset or `false` never asks for it.",
+          "$ref": "#/$defs/nested"
+        },
         "exec-env": {
           "description": "environment for development sessions: exec, shell, SSH and editor processes",
           "$ref": "#/$defs/string-map"
@@ -234,6 +238,13 @@
       "anyOf": [
         { "type": "integer", "minimum": 1 },
         { "type": "string", "const": "host" }
+      ]
+    },
+    "nested": {
+      "description": "`nested = true`, `nested = \"auto\"` or `nested = false`",
+      "anyOf": [
+        { "type": "boolean" },
+        { "type": "string", "const": "auto" }
       ]
     },
     "mount": {

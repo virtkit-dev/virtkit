@@ -8,8 +8,9 @@ All notable changes to virtkit will be documented in this file.
 
 - **`vk dev` runs a project's development environment from `.virtkit/config.toml`.** The
   tracked file names the source — a compose service, an image or a Dockerfile target — and
-  the mounts, session environment, endpoints, hooks, editor settings and host integration
-  that go with it; `.virtkit/local.toml` and `.virtkit/local.env` layer a machine's overrides,
+  the sizing (`cpus`, `mem`, `nested` for a guest that boots microVMs of its own), mounts,
+  session environment, endpoints, hooks, editor settings and host integration that go with
+  it; `.virtkit/local.toml` and `.virtkit/local.env` layer a machine's overrides,
   and every key in either file is checked, with its line. Named `[environments.<name>]`
   tables describe further environments with state of their own. `vk dev init` writes a first
   config from a `devcontainer.json`, a compose file, a Dockerfile or a stock image, headed by
