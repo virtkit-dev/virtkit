@@ -409,6 +409,92 @@ fn login_env(command: &mut Command, user: &str, ru: &ResolvedUser) {
     if let Some(home) = &ru.home {
         command.env("HOME", home).current_dir(home);
     }
+    // Read here, per session, so the host can change it without a restart. This runs before
+    // the user drop, which is what lets the file be root-only.
+    match read_session_env(vk_core::runcfg::SESSION_ENV_PATH) {
+        Ok(Some(text)) => {
+            for (k, v) in parse_session_env(&text) {
+                command.env(k, v);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => warn!("ssh: session environment ignored: {e:#}"),
+    }
+}
+
+/// The session environment file, when the host is the one that wrote it.
+///
+/// Anything in it lands in every later session — `LD_PRELOAD` and `PATH` included — so the
+/// file is opened with `O_NOFOLLOW` and accepted only on the evidence of the descriptor
+/// itself: a regular file owned by root and mode 0600. A guest process that got to the name
+/// first is refused here rather than trusted. Absent is not an error; anything else is.
+fn read_session_env(path: &str) -> Result<Option<String>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("opening {path}")),
+    };
+    let meta = file
+        .metadata()
+        .with_context(|| format!("inspecting {path}"))?;
+    if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o777 != 0o600 {
+        return Err(anyhow!(
+            "{path} is not a root-owned 0600 regular file, so it is not the host's"
+        ));
+    }
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut file, &mut text)
+        .with_context(|| format!("reading {path}"))?;
+    Ok(Some(text))
+}
+
+/// The session environment file's variables. The format is
+/// [`vk_core::runcfg::SESSION_ENV_PATH`]'s: one `KEY=VALUE` per line, `KEY` matching
+/// `[A-Za-z_][A-Za-z0-9_]*`, a `#` line a comment, a CRLF line ending stripped. A line that
+/// is none of those is skipped with a log line rather than turned into an unusable variable
+/// — a key with a NUL in it fails the whole spawn, in guest PID 1's session path. `HOME` is
+/// skipped too: it is the passwd entry's here, and the session's working directory is set
+/// from the same place and would not follow a different one.
+fn parse_session_env(text: &str) -> Vec<(&str, &str)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            warn!("ssh: session environment: no '=' in {line:?}, skipped");
+            continue;
+        };
+        if !env_name_ok(key) {
+            warn!("ssh: session environment: {key:?} is not a variable name, skipped");
+            continue;
+        }
+        if key == "HOME" {
+            warn!("ssh: session environment: HOME is the login user's, skipped");
+            continue;
+        }
+        if value.contains('\0') {
+            warn!("ssh: session environment: {key} has a NUL in its value, skipped");
+            continue;
+        }
+        out.push((key, value));
+    }
+    out
+}
+
+/// `[A-Za-z_][A-Za-z0-9_]*`, the shape a variable name has to have to be usable.
+fn env_name_ok(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Spawn the user's login shell on a fresh pty as `user`.
@@ -603,5 +689,75 @@ fn wait_code(status: std::io::Result<std::process::ExitStatus>) -> u32 {
             }
         }
         Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_session_env, read_session_env};
+
+    #[test]
+    fn session_env_takes_key_value_lines_and_skips_the_rest() {
+        let text = "TOKEN=glpat-x=y\n\nnot a pair\n=novalue\nEMPTY=\nURL=https://a.b/c\n";
+        assert_eq!(
+            parse_session_env(text),
+            [
+                ("TOKEN", "glpat-x=y"),
+                ("EMPTY", ""),
+                ("URL", "https://a.b/c")
+            ]
+        );
+    }
+
+    #[test]
+    fn only_usable_variable_names_survive_and_home_is_the_login_users() {
+        // CRLF is stripped, comments and blank lines are not variables, and a name that a
+        // shell could not spell is skipped rather than exported unusable.
+        let text = "# a comment\r\n  # indented\nA B=c\n1ST=x\nWITH-DASH=x\nHOME=/evil\n\
+                    PATH=/usr/bin\r\nOK_1=v\n";
+        assert_eq!(
+            parse_session_env(text),
+            [("PATH", "/usr/bin"), ("OK_1", "v")]
+        );
+        assert_eq!(parse_session_env("K=a\0b\n"), []);
+    }
+
+    #[test]
+    fn a_session_env_file_that_is_not_the_hosts_is_refused() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("vk-sshenv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let at = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let write = |name: &str, mode: u32| {
+            let path = dir.join(name);
+            let mut f = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(mode)
+                .open(&path)
+                .unwrap();
+            std::io::Write::write_all(&mut f, b"K=v\n").unwrap();
+            path
+        };
+
+        // Absent is the ordinary case: the host has not written it yet.
+        assert!(read_session_env(&at("nothing")).unwrap().is_none());
+        // Group- or world-readable is not what the host writes, whoever owns it.
+        write("loose", 0o644);
+        assert!(read_session_env(&at("loose")).is_err());
+        // A symlink planted at the name does not resolve, however tight its target.
+        let target = write("target", 0o600);
+        std::os::unix::fs::symlink(&target, dir.join("link")).unwrap();
+        assert!(read_session_env(&at("link")).is_err());
+        // A directory is not a file to read variables out of.
+        std::fs::create_dir(dir.join("adir")).unwrap();
+        assert!(read_session_env(&at("adir")).is_err());
+        // Owned by whoever runs the tests: only root's own file is the host's.
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(read_session_env(&at("target")).is_err());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

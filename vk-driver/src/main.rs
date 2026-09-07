@@ -2096,7 +2096,7 @@ enum Cmd {
 /// no async work themselves, and libkrun's qcow2 backend (imago) drives its own
 /// runtime — so dispatching them inside a `#[tokio::main]` runtime panics with
 /// "Cannot start a runtime from within a runtime". The CLI proper runs on the runtime
-/// entered in `cli_main`.
+/// [`on_runtime`] enters.
 fn main() -> ExitCode {
     // Raise this process's soft open-file limit toward its hard cap (≤1M) before anything
     // else: vk serves each guest's virtio-fs shares in-process (libkrun's built-in fs opens
@@ -2136,24 +2136,38 @@ fn main() -> ExitCode {
         };
     }
 
-    // `vk run … --detach` — daemonize once the guest is ready. The fork must precede the
-    // Tokio runtime (forking a live multi-threaded runtime is undefined behavior): the child
-    // continues as the background daemon, the parent supervises the foreground build/boot.
+    // Parsed here, before the fork below and before any runtime exists: what detaches is a
+    // property of the command, and clap answers `--help`/`--version` by printing and
+    // exiting — so neither is ever forked and printed twice.
+    let cli = Cli::parse();
+
+    // `vk run … --detach`, and the `vk dev` actions that boot — daemonize once the guest is
+    // ready. The fork must precede the Tokio runtime (forking a live multi-threaded runtime
+    // is undefined behavior): the child continues as the background daemon, the parent
+    // supervises the foreground build/boot.
+    if detach::wants_detach(&cli.cmd)
+        && let detach::Forked::Parent { code, ok } = detach::fork()
     {
-        let args: Vec<String> = std::env::args().collect();
-        if detach::wants_detach(&args)
-            && let detach::Forked::Parent(code) = detach::fork()
-        {
-            return code;
+        // For `vk dev` the boot is only the first half: the parent is released the moment
+        // the guest is ready, which is where the steps *around* the boot belong — the child
+        // is busy holding the VM for its lifetime.
+        if ok && matches!(cli.cmd, Cmd::Dev(_)) {
+            detach::note_after_boot();
+            return on_runtime(cli);
         }
+        return code;
     }
 
-    // The CLI proper runs on a Tokio runtime (formerly `#[tokio::main]`).
+    on_runtime(cli)
+}
+
+/// The CLI proper runs on a Tokio runtime (formerly `#[tokio::main]`).
+fn on_runtime(cli: Cli) -> ExitCode {
     match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
     {
-        Ok(rt) => rt.block_on(cli_main()),
+        Ok(rt) => rt.block_on(cli_main(cli)),
         Err(e) => fail(&anyhow::anyhow!("building the async runtime: {e}"), 1),
     }
 }
@@ -2492,13 +2506,12 @@ fn journal_enabled(cli_no_journal: bool, cfg_no_journal: bool) -> bool {
     !(cli_no_journal || cfg_no_journal)
 }
 
-async fn cli_main() -> ExitCode {
+async fn cli_main(cli: Cli) -> ExitCode {
     // reqwest/rustls are compiled with no built-in crypto provider (rustls-no-provider,
     // to keep aws-lc-rs out of the build); install ring — the backend russh already
     // uses — as the process default before any TLS client is constructed.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let cli = Cli::parse();
     if let Cmd::HelpAll = &cli.cmd {
         // CommandFactory::command() names the command after the package
         // (vk-driver); only the parse path picks up the argv[0] bin name.
@@ -3981,7 +3994,7 @@ async fn cli_main() -> ExitCode {
                 Err(e) => fail(&e, 1),
             }
         }
-        Cmd::Dev(dev) => crate::dev::cli::run(dev).await,
+        Cmd::Dev(dev) => crate::dev::cli::run(dev, &ctx.cfg).await,
         Cmd::Publish {
             action: Some(action),
             ..

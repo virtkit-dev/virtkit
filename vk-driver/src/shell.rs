@@ -54,6 +54,11 @@ pub fn which_all(
         .filter(|candidate| executable(candidate))
 }
 
+/// The first `name` on this process's `PATH`.
+pub fn which(name: &str) -> Option<PathBuf> {
+    which_all(name, std::env::var_os("PATH").as_deref(), None).next()
+}
+
 /// Check for a regular file with any execute bit set, regardless of the caller's rights.
 /// This distinguishes programs on `PATH` from data files.
 pub fn executable(path: &Path) -> bool {
