@@ -1,11 +1,12 @@
 name: Quality
 
-# Reusable lint + test + audit checks, called by ci.yml (push/PR) and release.yml
+# Reusable lint + test + audit + script checks, called by ci.yml (push/PR) and release.yml
 # (release gate).
 #
-# Everything runs inside the pinned virtkit-build devcontainer image (same one
+# The cargo jobs run inside the pinned virtkit-build devcontainer image (same one
 # build.sh uses), so clippy/rustfmt are the exact versions from rust-toolchain.toml
-# and the musl-native gcc our vendored C deps need is present.
+# and the musl-native gcc our vendored C deps need is present. The script checks need
+# no toolchain and run on the runner itself.
 # Audit shells out to ./audit.sh so .cargo/audit.toml (the RUSTSEC ignore list) stays
 # the single source of truth shared with local runs.
 
@@ -73,6 +74,36 @@ jobs:
             -v "$PWD":/work -w /work \
             virtkit-build \
             cargo test --workspace --locked
+
+  # Two gates that need no toolchain image, so they run beside the heavy jobs rather than
+  # inside one.
+  scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      # install.sh is a published release asset and the first thing a fresh host runs, and
+      # nothing else here would notice it stopped parsing. POSIX sh, as a bootstrap host's
+      # /bin/sh may well be.
+      - name: install.sh parses
+        run: sh -n install.sh
+
+      # `vk toolchain lock` covers DEFAULT_ARTIFACTS by default and the release publishes
+      # the list below; written down twice, adding an asset to one and not the other would
+      # silently leave the lock behind.
+      - name: the release's assets and vk toolchain's default artifacts agree
+        run: |
+          workflow=$(sed -n '/gh release create "\$TAG"/,/--title/p' .github/workflows/release.yml |
+            sed -n 's|^ *dist/\([a-z0-9-]*\) \\$|\1|p' | sort -u)
+          code=$(sed -n '/^const DEFAULT_ARTIFACTS/,/];/p' vk-driver/src/toolchain.rs |
+            grep -o '"[a-z0-9-]*"' | tr -d '"' | sort -u)
+          [ -n "$workflow" ] && [ -n "$code" ] || { echo "neither list could be read"; exit 1; }
+          [ "$workflow" = "$code" ] || {
+            echo "release.yml publishes: $workflow"
+            echo "DEFAULT_ARTIFACTS has:  $code"
+            exit 1
+          }
 
   audit:
     runs-on: ubuntu-latest

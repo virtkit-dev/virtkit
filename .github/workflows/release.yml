@@ -26,7 +26,12 @@ name: Release
 # vk that build produced (tests/release-e2e.sh). publish runs once all of them have
 # passed. Each binary ships with its own .sha256 sidecar (vk.sha256, vk-agent.sha256,
 # vk-registry.sha256, vk-runnerctl.sha256, vmlinux.sha256) so users can verify just the
-# file they downloaded without fetching a combined manifest.
+# file they downloaded without fetching a combined manifest. The repository's install.sh
+# is published alongside them — it is the documented bootstrap for a host with no vk, so
+# it has to be fetchable from the release itself. It is uploaded from the checkout rather
+# than from dist/, so unlike every other asset it is outside the reproducible-build
+# attestation; it is a tracked script the tag names, and it carries no sidecar, being the
+# script that checks the others.
 
 on:
   push:
@@ -260,6 +265,7 @@ jobs:
             dist/vmlinux.sha256 \
             dist/build-info.txt \
             dist/kernel-build-info.txt \
+            install.sh \
             --title "$TAG" \
             --verify-tag \
             --notes-file "$RUNNER_TEMP/notes.md"

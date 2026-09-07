@@ -76,6 +76,7 @@ mod sshclient;
 mod sshconf;
 mod switch;
 mod timing;
+mod toolchain;
 mod units;
 mod usage;
 #[cfg(feature = "virtiofsd")]
@@ -375,6 +376,75 @@ enum ServiceCmd {
     Status {
         /// service name; omit to list all services
         name: Option<String>,
+    },
+}
+
+/// `vk toolchain`: the release a project pins, and this host's copy of its artifacts.
+#[derive(Subcommand)]
+enum ToolchainCmd {
+    /// Write the lock for a release: its artifacts, their digests and where to get them
+    ///
+    /// Resolves the release — the latest, or `--version` — reads each artifact's published
+    /// digest, and writes `.virtkit/toolchain.lock` with the download URLs in order: the
+    /// release itself, then each `--mirror` given. Re-running with another version rewrites
+    /// the file; nothing else edits it. Track it in git.
+    Lock {
+        /// the release to pin, `0.60.0` or `v0.60.0` [default: the latest release]
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
+        /// a mirror serving `<URL>/v<version>/<artifact>`, tried after the release
+        ///
+        /// Repeatable; the order given is the order `install` tries them in.
+        #[arg(long, value_name = "URL")]
+        mirror: Vec<String>,
+        /// artifact to lock, repeatable [default: every artifact a release publishes]
+        #[arg(long, value_name = "NAME")]
+        artifact: Vec<String>,
+        /// the lock file to write [default: `.virtkit/toolchain.lock` in this checkout]
+        #[arg(long, value_name = "FILE")]
+        lock: Option<PathBuf>,
+    },
+    /// Put the locked artifacts of this platform in the toolchain cache
+    ///
+    /// Fetches each one into the cache — `$VIRTKIT_TOOLCHAIN_CACHE` when it is set, else
+    /// `$XDG_CACHE_HOME/virtkit/toolchain` or `~/.cache/virtkit/toolchain` — under the
+    /// locked version, verifying the locked digest and publishing atomically; one already
+    /// there with the right digest is left alone, so a re-run downloads nothing. Never
+    /// touches the `vk` on PATH.
+    Install {
+        /// artifact to install, repeatable [default: every artifact the lock covers]
+        #[arg(long, value_name = "NAME")]
+        artifact: Vec<String>,
+        /// fail rather than download; only what the cache already holds counts
+        #[arg(long)]
+        offline: bool,
+        /// the lock file to read [default: `.virtkit/toolchain.lock` in this checkout]
+        #[arg(long, value_name = "FILE")]
+        lock: Option<PathBuf>,
+    },
+    /// Print the lock's version, artifact paths and digests for a script to consume
+    ///
+    /// `VIRTKIT_VERSION`, then `VIRTKIT_VK`, `VIRTKIT_VK_SHA256`, `VIRTKIT_VK_AGENT`, …
+    /// A path is empty until that artifact is installed. The shell form assigns without
+    /// `export`, for `eval "$(vk toolchain export)"`.
+    Export {
+        /// how to print it
+        #[arg(long, value_enum, default_value = "shell")]
+        format: toolchain::Format,
+        /// the lock file to read [default: `.virtkit/toolchain.lock` in this checkout]
+        #[arg(long, value_name = "FILE")]
+        lock: Option<PathBuf>,
+    },
+    /// Report what is locked, what is installed, and which `vk` is answering
+    ///
+    /// One line per artifact: locked for this platform or not, installed in the cache,
+    /// or installed with contents that no longer match the lock. Then the lock's version,
+    /// the cache it resolves to, and where the `vk` running this stands against it. Reads
+    /// only — `vk toolchain install` is what fetches anything.
+    Status {
+        /// the lock file to read [default: `.virtkit/toolchain.lock` in this checkout]
+        #[arg(long, value_name = "FILE")]
+        lock: Option<PathBuf>,
     },
 }
 
@@ -1910,6 +1980,18 @@ enum Cmd {
         #[arg(long)]
         check: bool,
     },
+    /// Pin the virtkit release a project builds against, and install it
+    ///
+    /// `.virtkit/toolchain.lock` records the release and, per artifact and platform, its
+    /// digest and where to fetch it. `install` fills a versioned cache from it — verifying
+    /// the digest, whichever mirror answered — and `export` hands the cached paths to a
+    /// script, an image build or CI, so everything builds against the same bytes. This is
+    /// the team's reproducible pin; `[requires] min-version` stays the compatibility floor.
+    #[command(display_order = 10)]
+    Toolchain {
+        #[command(subcommand)]
+        cmd: ToolchainCmd,
+    },
     /// Print each stage's build-cache key, as `stage:key` lines
     ///
     /// The `stage_key` is the chained content key after the stage's last instruction — the
@@ -2578,6 +2660,14 @@ async fn cli_main(cli: Cli) -> ExitCode {
         // rename leaves running VMs on the binary they booted from.
         return match VK.update(version.as_deref(), *yes).await {
             Ok(_) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 2),
+        };
+    }
+    // The toolchain commands read the project's lock and the release API, and nothing from
+    // the host config — handle them before Config::load, like `update`.
+    if let Cmd::Toolchain { cmd } = &cli.cmd {
+        return match toolchain_cmd(cmd).await {
+            Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 2),
         };
     }
@@ -4081,9 +4171,45 @@ async fn cli_main(cli: Cli) -> ExitCode {
         | Cmd::Stop { .. }
         | Cmd::Reboot { .. }
         | Cmd::Update { .. }
+        | Cmd::Toolchain { .. }
         | Cmd::HostPolicy { .. }
         | Cmd::Service { .. } => {
             unreachable!()
+        }
+    }
+}
+
+/// `vk toolchain`: every action resolves the lock file first — the one named, or the one
+/// this checkout has, which for `lock` is the path it will write when there is none yet —
+/// since that is what all four of them are about.
+async fn toolchain_cmd(cmd: &ToolchainCmd) -> anyhow::Result<()> {
+    match cmd {
+        ToolchainCmd::Lock {
+            version,
+            mirror,
+            artifact,
+            lock,
+        } => {
+            let path = toolchain::lock_to_write(lock.as_deref())?;
+            toolchain::lock(version.as_deref(), mirror, artifact, &path).await
+        }
+        ToolchainCmd::Install {
+            artifact,
+            offline,
+            lock,
+        } => {
+            toolchain::install(
+                &toolchain::lock_to_read(lock.as_deref())?,
+                artifact,
+                *offline,
+            )
+            .await
+        }
+        ToolchainCmd::Export { format, lock } => {
+            toolchain::export(&toolchain::lock_to_read(lock.as_deref())?, *format)
+        }
+        ToolchainCmd::Status { lock } => {
+            toolchain::status(&toolchain::lock_to_read(lock.as_deref())?)
         }
     }
 }
@@ -5496,6 +5622,7 @@ mod tests {
                 "ssh-config",
                 "status",
                 "stop",
+                "toolchain",
                 "update"
             ]
         );

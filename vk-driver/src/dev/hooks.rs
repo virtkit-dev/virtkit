@@ -219,6 +219,19 @@ pub(super) fn check_requirements(plan: &Plan, cfg: &crate::config::Config) -> Re
     Ok(())
 }
 
+/// Say so when this `vk` is older than the release the project pins. Not a failure:
+/// `[requires] min-version` is what a boot is gated on, and the lock is the team's
+/// reproducible pin — a newer `vk` is a deliberate development build and stays quiet.
+pub(super) fn note_lock(plan: &Plan) {
+    if let Some(locked) = crate::toolchain::older_than_lock(&plan.workspace) {
+        eprintln!(
+            "virtkit: note: this vk ({}) is older than the project's toolchain lock ({locked}) \
+             — `vk toolchain install` fetches it",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

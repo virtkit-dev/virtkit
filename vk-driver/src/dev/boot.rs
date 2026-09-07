@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use crate::dev::config::{CheckoutMode, Cpus, Freshness};
 use crate::dev::plan::{Plan, Source};
 
-use super::hooks::{Where, check_requirements, run_hook};
+use super::hooks::{Where, check_requirements, note_lock, run_hook};
 use super::identity::{
     applied_on_attach, drift, identity_of, identity_path, live_identity, note_older_creator,
     sha256_hex,
@@ -526,6 +526,7 @@ pub async fn boot(
 ) -> Result<()> {
     plan.require_resolved()?;
     check_requirements(plan, cfg)?;
+    note_lock(plan);
     ensure_state_dir(plan)?;
     // Whatever is at this boot's note path belongs to a run that is over: this one writes
     // its own below, and until it does there is nothing for the parent to read back.

@@ -49,6 +49,9 @@ const MAX_RELEASE_JSON: usize = 1024 * 1024;
 /// The download's own length check is relative to what the release announced, so without
 /// a ceiling on that number a release claiming half a terabyte would be honoured.
 const MAX_ASSET: u64 = 512 * 1024 * 1024;
+/// How the toolchain commands identify themselves: no `Tool` is being replaced there, so
+/// there is no tool name and version to build a user agent from.
+const TOOLCHAIN_AGENT: &str = concat!("vk-toolchain/", env!("CARGO_PKG_VERSION"));
 /// Connect and per-read timeouts. `--check` is meant for cron and login banners, so a
 /// black-holed endpoint has to fail instead of hanging forever; a per-read deadline
 /// bounds a stalled connection without capping how long a large download may take.
@@ -242,15 +245,9 @@ impl Tool {
         })
     }
 
-    /// An HTTP client identifying itself: GitHub's API rejects requests without a
-    /// `User-Agent`.
+    /// An HTTP client identifying itself as this tool at this version.
     fn http_client(&self) -> Result<reqwest::Client> {
-        reqwest::Client::builder()
-            .user_agent(format!("{}/{}", self.name, self.version))
-            .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(READ_TIMEOUT)
-            .build()
-            .context("building the HTTP client")
+        client(&format!("{}/{}", self.name, self.version))
     }
 
     /// Resolve a release — `tag`'s, or the latest published one — to this tool's asset.
@@ -260,58 +257,10 @@ impl Tool {
         api: &str,
         tag: Option<&str>,
     ) -> Result<Target> {
-        // The user's tag crosses the trust boundary once, here; the checked form is what
-        // both the URL and the error message below are built from.
-        let tag = tag.map(release_tag).transpose()?;
-        let url = api_url(api, tag.as_ref());
-        let resp = client
-            .get(&url)
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await
-            .with_context(|| format!("querying {url}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            if rate_limited(&resp) {
-                bail!(
-                    "GitHub's API rate limit is exhausted for this host (HTTP {status}) — retry later"
-                );
-            }
-            // 404 on the tags endpoint is the common case: a version that was never
-            // released, or spelled differently than the tag.
-            match &tag {
-                Some(t) => bail!("no release {t} in {REPO} (HTTP {status})"),
-                None => bail!("no latest release in {REPO} (HTTP {status})"),
-            }
-        }
-        let body = bounded_body(resp, MAX_RELEASE_JSON, &url).await?;
-        let release: ApiRelease = serde_json::from_slice(&body)
-            .with_context(|| format!("parsing the release JSON from {url}"))?;
-        // The tag goes straight into the confirmation prompt the user answers, so it may not
-        // carry the control bytes that would let it rewrite the line around the question.
-        if release.tag_name.chars().any(char::is_control) {
-            bail!("the release's tag name is not printable");
-        }
-        let asset = pick(&release.assets, self.name)?;
-        let digest = pick(&release.assets, &format!("{}.sha256", self.name))?;
-        if asset.size > MAX_ASSET {
-            bail!(
-                "the release's {name} asset is {} — larger than a {name} build can be",
-                HumanBytes(asset.size),
-                name = self.name,
-            );
-        }
-        // The release told us where its assets live; require them on the scheme the API was
-        // itself reached over, so a response cannot quietly move the transfer to cleartext —
-        // the sidecar would move with it, leaving the digest gate none the wiser.
-        let scheme = format!("{}://", api.split_once("://").map_or("https", |(s, _)| s));
-        for a in [asset, digest] {
-            if !a.browser_download_url.starts_with(&scheme) {
-                bail!("the release's {} asset is not served over {scheme}", a.name);
-            }
-        }
+        let release = fetch_release(client, api, tag).await?;
+        let (asset, digest) = assets_of(&release, self.name, api)?;
         Ok(Target {
-            tag: release.tag_name,
+            tag: release.tag_name.clone(),
             url: asset.browser_download_url.clone(),
             digest_url: digest.browser_download_url.clone(),
             size: asset.size,
@@ -351,7 +300,7 @@ impl Tool {
         // Created here rather than inside `download`, so the cleanup below covers exactly the
         // window in which this file is ours: a path that already exists is refused untouched,
         // leaving the file for the user the error tells to remove it.
-        let file = self.create_tmp(&tmp, dir)?;
+        let file = create_tmp(&tmp, dir, &format!("{} update", self.name))?;
         let outcome = match self
             .download(client, target, file, &tmp, mode_of(exe))
             .await
@@ -370,31 +319,6 @@ impl Tool {
     /// The dotfile this process downloads into, beside the binary it is replacing.
     fn tmp_name(&self) -> String {
         format!(".{}-update.{}", self.name, std::process::id())
-    }
-
-    /// Create the file the download lands in, refusing to reuse anything already at that
-    /// path: 0600 while the contents are unverified — nothing else may execute this file
-    /// before the digest gate has passed — and `create_new`, so a symlink or a file planted
-    /// here is refused rather than written through.
-    fn create_tmp(&self, tmp: &Path, dir: &Path) -> Result<fs::File> {
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(tmp)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::AlreadyExists => anyhow!(
-                    "{} already exists — an interrupted {} update left it behind, and nothing \
-                     here reuses it; it is safe to remove",
-                    tmp.display(),
-                    self.name
-                ),
-                _ => anyhow::Error::new(e).context(format!(
-                    "creating {} (is {} writable?)",
-                    tmp.display(),
-                    dir.display()
-                )),
-            })
     }
 
     /// Download `target` into `tmp` and put it through both gates: it must hash to the
@@ -417,7 +341,15 @@ impl Tool {
             .error_for_status()
             .with_context(|| format!("downloading {}", target.url))?;
         let bar = progress(target.size);
-        let got = stream_asset(resp, &mut file, tmp, target, &bar).await;
+        let got = stream_asset(
+            resp,
+            &mut file,
+            tmp,
+            &target.url,
+            Limit::Announced(target.size),
+            &bar,
+        )
+        .await;
         // Cleared whether or not the body arrived, so a failure's message is not printed
         // under a stalled progress bar.
         bar.finish_and_clear();
@@ -451,18 +383,7 @@ impl Tool {
 
     /// This tool's expected sha256, from the sidecar CI publishes beside its asset.
     async fn digest(&self, client: &reqwest::Client, target: &Target) -> Result<[u8; 32]> {
-        let resp = client
-            .get(&target.digest_url)
-            .send()
-            .await
-            .with_context(|| format!("downloading {}", target.digest_url))?
-            .error_for_status()
-            .with_context(|| format!("downloading {}", target.digest_url))?;
-        let body = bounded_body(resp, MAX_SIDECAR, &target.digest_url).await?;
-        let text = std::str::from_utf8(&body)
-            .with_context(|| format!("{} is not text", target.digest_url))?;
-        parse_digest(text, self.name)
-            .with_context(|| format!("parsing the digest from {}", target.digest_url))
+        digest_at(client, &target.digest_url, self.name).await
     }
 
     /// Confirm the downloaded binary runs on this host and is the version we asked for:
@@ -557,9 +478,288 @@ fn pick<'a>(assets: &'a [ApiAsset], name: &str) -> Result<&'a ApiAsset> {
     })
 }
 
+/// Fetch a release from the API: the one `tag` names, or the latest published one.
+async fn fetch_release(
+    client: &reqwest::Client,
+    api: &str,
+    tag: Option<&str>,
+) -> Result<ApiRelease> {
+    // The user's tag crosses the trust boundary once, here; the checked form is what
+    // both the URL and the error message below are built from.
+    let tag = tag.map(release_tag).transpose()?;
+    let url = api_url(api, tag.as_ref());
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .with_context(|| format!("querying {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        if rate_limited(&resp) {
+            bail!(
+                "GitHub's API rate limit is exhausted for this host (HTTP {status}) — retry later"
+            );
+        }
+        // 404 on the tags endpoint is the common case: a version that was never
+        // released, or spelled differently than the tag.
+        match &tag {
+            Some(t) => bail!("no release {t} in {REPO} (HTTP {status})"),
+            None => bail!("no latest release in {REPO} (HTTP {status})"),
+        }
+    }
+    let body = bounded_body(resp, MAX_RELEASE_JSON, &url).await?;
+    let release: ApiRelease = serde_json::from_slice(&body)
+        .with_context(|| format!("parsing the release JSON from {url}"))?;
+    // The tag goes straight into the confirmation prompt the user answers, so it may not
+    // carry the control bytes that would let it rewrite the line around the question.
+    if release.tag_name.chars().any(char::is_control) {
+        bail!("the release's tag name is not printable");
+    }
+    Ok(release)
+}
+
+/// A release's `name` asset and the sidecar published beside it, checked to be a plausible
+/// pair to install from.
+fn assets_of<'a>(
+    release: &'a ApiRelease,
+    name: &str,
+    api: &str,
+) -> Result<(&'a ApiAsset, &'a ApiAsset)> {
+    let asset = pick(&release.assets, name)?;
+    let digest = pick(&release.assets, &format!("{name}.sha256"))?;
+    if asset.size > MAX_ASSET {
+        bail!(
+            "the release's {name} asset is {} — larger than a {name} build can be",
+            HumanBytes(asset.size),
+        );
+    }
+    // The release told us where its assets live; require them on the scheme the API was
+    // itself reached over, so a response cannot quietly move the transfer to cleartext —
+    // the sidecar would move with it, leaving the digest gate none the wiser.
+    let scheme = format!("{}://", api.split_once("://").map_or("https", |(s, _)| s));
+    for a in [asset, digest] {
+        if !a.browser_download_url.starts_with(&scheme) {
+            bail!("the release's {} asset is not served over {scheme}", a.name);
+        }
+    }
+    Ok((asset, digest))
+}
+
+/// The sha256 `url`'s sidecar publishes for `name`.
+async fn digest_at(client: &reqwest::Client, url: &str, name: &str) -> Result<[u8; 32]> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("downloading {url}"))?
+        .error_for_status()
+        .with_context(|| format!("downloading {url}"))?;
+    let body = bounded_body(resp, MAX_SIDECAR, url).await?;
+    let text = std::str::from_utf8(&body).with_context(|| format!("{url} is not text"))?;
+    parse_digest(text, name).with_context(|| format!("parsing the digest from {url}"))
+}
+
+/// One artifact of a release: where the release serves it, and what it has to hash to.
+///
+/// [`artifacts`] resolves these for a caller pinning a whole toolchain rather than
+/// replacing one running binary — `vk toolchain`, which records them in a lock file and
+/// fetches them later, possibly from a mirror and possibly on another host.
+#[derive(Clone, Debug)]
+pub struct Artifact {
+    pub name: String,
+    pub url: String,
+    /// the digest published beside it, as the hex its sidecar carries
+    pub sha256: String,
+}
+
+/// What a release resolved to: the version it turned out to be, the artifacts asked for
+/// that it publishes, and the ones it does not.
+///
+/// Which of those two lists is an error is the caller's to decide — a name the user typed
+/// is a mistake to report, while a default set is "whatever this release ships".
+#[derive(Debug)]
+pub struct Resolved {
+    /// the release's own version, without the tag's `v`, so a caller that asked for the
+    /// latest learns which it got
+    pub version: String,
+    pub artifacts: Vec<Artifact>,
+    /// names this release publishes no asset for at all
+    pub missing: Vec<String>,
+}
+
+/// Resolve the release `version` names — or the latest published one — down to `names`,
+/// each with the digest its sidecar publishes.
+///
+/// Nothing is downloaded but the sidecars: the assets themselves are fetched later, by
+/// [`fetch`], against the digests recorded here.
+pub async fn artifacts(
+    client: &reqwest::Client,
+    version: Option<&str>,
+    names: &[&str],
+) -> Result<Resolved> {
+    artifacts_at(client, API, version, names).await
+}
+
+/// The body of [`artifacts`], with the API root an argument — as [`Tool::plan`] takes it —
+/// so the tests can aim the same code at a local server.
+async fn artifacts_at(
+    client: &reqwest::Client,
+    api: &str,
+    version: Option<&str>,
+    names: &[&str],
+) -> Result<Resolved> {
+    let release = fetch_release(client, api, version).await?;
+    let has = |name: &str| release.assets.iter().any(|a| a.name == name);
+    let mut artifacts = Vec::with_capacity(names.len());
+    let mut missing = Vec::new();
+    for name in names {
+        // Neither the asset nor its sidecar: this release simply does not carry that
+        // artifact. Half of the pair is a broken release, and `assets_of` says which half.
+        if !has(name) && !has(&format!("{name}.sha256")) {
+            missing.push((*name).to_string());
+            continue;
+        }
+        let (asset, sidecar) = assets_of(&release, name, api)?;
+        let digest = digest_at(client, &sidecar.browser_download_url, name).await?;
+        artifacts.push(Artifact {
+            name: (*name).to_string(),
+            url: asset.browser_download_url.clone(),
+            sha256: digest.iter().map(|b| format!("{b:02x}")).collect(),
+        });
+    }
+    Ok(Resolved {
+        version: version_of(&release.tag_name).to_string(),
+        artifacts,
+        missing,
+    })
+}
+
+/// The client the toolchain entry points take. One for a whole install rather than one per
+/// artifact: five artifacts off the same host are five TLS handshakes otherwise.
+pub fn toolchain_client() -> Result<reqwest::Client> {
+    client(TOOLCHAIN_AGENT)
+}
+
+/// Download `url` into `dest`, requiring it to hash to `sha256` — the digest the caller
+/// already holds, rather than one fetched beside the bytes, which is what makes this
+/// usable against a mirror. Published atomically with `mode`, so `dest` never exists
+/// holding a partial or unverified file, and a failure leaves nothing behind.
+pub async fn fetch(
+    client: &reqwest::Client,
+    url: &str,
+    sha256: &str,
+    dest: &Path,
+    mode: u32,
+) -> Result<()> {
+    let want = parse_sha256(sha256).with_context(|| format!("{sha256:?} is not a sha256"))?;
+    let dir = dest
+        .parent()
+        .with_context(|| format!("{} has no parent directory", dest.display()))?;
+    // Beside the destination, so publishing it is a rename on the same filesystem; the pid
+    // keeps two fetches of the same artifact off each other's file. Built by pushing the
+    // components rather than through a `String`, so a name that is not UTF-8 keeps its
+    // bytes instead of being replaced.
+    let mut name = std::ffi::OsString::from(".");
+    name.push(dest.file_name().unwrap_or_default());
+    name.push(format!(".{}.tmp", std::process::id()));
+    let tmp = dir.join(name);
+    let outcome = fetch_into(client, url, &want, &tmp, dir, dest, mode).await;
+    if outcome.is_err() {
+        // Best-effort: an unverified download must not be left lying beside the artifact,
+        // but the original error is what the caller needs to see.
+        let _ = fs::remove_file(&tmp);
+    }
+    outcome
+}
+
+/// The body of [`fetch`], with the temporary file's cleanup left to the caller.
+async fn fetch_into(
+    client: &reqwest::Client,
+    url: &str,
+    want: &[u8; 32],
+    tmp: &Path,
+    dir: &Path,
+    dest: &Path,
+    mode: u32,
+) -> Result<()> {
+    let mut file = create_tmp(tmp, dir, "download")?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("downloading {url}"))?
+        .error_for_status()
+        .with_context(|| format!("downloading {url}"))?;
+    // No release JSON to announce a length here, so a response that announces none — or
+    // more than a release can ship — is held to the ceiling instead: an endless one must
+    // not fill the cache's filesystem.
+    let limit = match resp.content_length() {
+        Some(n) if n <= MAX_ASSET => Limit::Announced(n),
+        _ => Limit::Ceiling(MAX_ASSET),
+    };
+    let bar = progress(limit.bytes());
+    let got = stream_asset(resp, &mut file, tmp, url, limit, &bar).await;
+    bar.finish_and_clear();
+    let got = got?;
+    if got.as_slice() != want {
+        let shown = |b: &[u8]| b.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        bail!(
+            "{url} does not match the locked digest (got {}, want {})",
+            shown(&got),
+            shown(want)
+        );
+    }
+    // Through the open fd, as in `download`: `open(2)` masks its mode with the umask, so
+    // asking for it at creation would install a 0700 file under `umask 077`.
+    file.set_permissions(fs::Permissions::from_mode(mode))
+        .with_context(|| format!("setting the mode on {}", tmp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("flushing {} to disk", tmp.display()))?;
+    drop(file);
+    publish(tmp, dest, dir)
+}
+
+/// An HTTP client identifying itself: GitHub's API rejects requests without a `User-Agent`.
+fn client(user_agent: &str) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(user_agent.to_string())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .build()
+        .context("building the HTTP client")
+}
+
+/// Create the file a download lands in, refusing to reuse anything already at that path:
+/// 0600 while the contents are unverified — nothing else may execute this file before the
+/// digest gate has passed — and `create_new`, so a symlink or a file planted here is
+/// refused rather than written through. `what` names the operation a leftover came from,
+/// since the error is what tells the user it is theirs to remove.
+fn create_tmp(tmp: &Path, dir: &Path, what: &str) -> Result<fs::File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(tmp)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => anyhow!(
+                "{} already exists — an interrupted {what} left it behind, and nothing here \
+                 reuses it; it is safe to remove",
+                tmp.display(),
+            ),
+            _ => anyhow::Error::new(e).context(format!(
+                "creating {} (is {} writable?)",
+                tmp.display(),
+                dir.display()
+            )),
+        })
+}
+
 /// Swap the verified download in as `exe`, and make the swap durable: the directory
 /// fsync is what keeps a host crash from leaving the entry pointing at nothing.
-fn publish(tmp: &Path, exe: &Path, dir: &Path) -> Result<()> {
+///
+/// Public because it is the same publish `vk toolchain` needs for the lock file it writes.
+pub fn publish(tmp: &Path, exe: &Path, dir: &Path) -> Result<()> {
     fs::rename(tmp, exe)
         .with_context(|| format!("installing {} as {}", tmp.display(), exe.display()))?;
     // Best-effort, as in vk-driver's `vms::record_in`: the rename itself already succeeded,
@@ -583,29 +783,50 @@ fn mode_of(exe: &Path) -> u32 {
         .unwrap_or(INSTALL_MODE)
 }
 
+/// How many bytes a download may write before it is refused, and why that is the number:
+/// a body reported as longer than what nothing announced sends the reader looking for an
+/// announcement that was never made.
+#[derive(Clone, Copy)]
+enum Limit {
+    /// the length the release announced for this asset
+    Announced(u64),
+    /// nothing announced one: the largest asset a release can ship
+    Ceiling(u64),
+}
+
+impl Limit {
+    fn bytes(self) -> u64 {
+        match self {
+            Limit::Announced(n) | Limit::Ceiling(n) => n,
+        }
+    }
+}
+
 /// Write the asset's body into `file`, hashing it on the way past, and return the hash.
 async fn stream_asset(
     resp: reqwest::Response,
     file: &mut fs::File,
     tmp: &Path,
-    target: &Target,
+    url: &str,
+    limit: Limit,
     bar: &ProgressBar,
 ) -> Result<sha2::digest::Output<Sha256>> {
     let mut hasher = Sha256::new();
     let mut stream = resp.bytes_stream();
     let mut written = 0u64;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.with_context(|| format!("downloading {}", target.url))?;
+        let chunk = chunk.with_context(|| format!("downloading {url}"))?;
         // Stop at the length the release announced: the digest can only be checked once
         // the whole body is down, and until then an endless response would fill the
         // filesystem the installed binary lives on.
         written = written.saturating_add(chunk.len() as u64);
-        if written > target.size {
-            bail!(
-                "{} is longer than the {} bytes the release announced",
-                target.url,
-                target.size
-            );
+        if written > limit.bytes() {
+            match limit {
+                Limit::Announced(n) => {
+                    bail!("{url} is longer than the {n} bytes the release announced")
+                }
+                Limit::Ceiling(n) => bail!("{url} is longer than the {n} bytes an artifact may be"),
+            }
         }
         hasher.update(&chunk);
         file.write_all(&chunk)
@@ -1406,6 +1627,89 @@ mod tests {
         fs::set_permissions(&s.exe, fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(mode_of(&s.exe), 0o744);
         assert_eq!(mode_of(&s.dir.join("absent")), INSTALL_MODE);
+    }
+
+    // `artifacts` is the toolchain half: every name asked for resolves to the digest its
+    // sidecar publishes, and a name this release does not carry comes back as missing
+    // rather than taking the whole resolution down — the caller decides which that is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn artifacts_resolve_to_their_sidecars_and_report_what_a_release_lacks() {
+        let client = test_client();
+        let names = ["vk", "vmlinux", REGISTRY.name];
+        let resolved = artifacts_at(&client, &release_api(Fault::None), None, &names)
+            .await
+            .unwrap();
+        assert_eq!(resolved.version, "0.30.0");
+        // the fake release publishes two tools and no kernel
+        assert_eq!(resolved.missing, vec!["vmlinux".to_string()]);
+        assert_eq!(
+            resolved
+                .artifacts
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![VK.name, REGISTRY.name]
+        );
+        for a in &resolved.artifacts {
+            assert!(a.url.ends_with(&format!("/{}", a.name)), "{}", a.url);
+            assert_eq!(a.sha256, FAKE_SUM);
+        }
+        // A release with an asset but no sidecar for it is broken, not lacking it.
+        let err = format!(
+            "{:#}",
+            artifacts_at(&client, &release_api(Fault::None), None, &["vk.sha256"])
+                .await
+                .expect_err("no vk.sha256.sha256 is published")
+        );
+        assert!(err.contains("no vk.sha256.sha256 asset"), "{err}");
+    }
+
+    // `fetch` is the gate every mirror download passes: the caller's digest decides, the
+    // mode is the one asked for, and a body that is not it leaves nothing at all behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_publishes_only_a_body_matching_the_callers_digest() {
+        let client = test_client();
+        let s = Scratch::new(&VK, "fetch", 0o755);
+        let temps = |dir: &Path| -> Vec<String> {
+            fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".tmp"))
+                .collect()
+        };
+
+        // The kernel's 0644 rather than a binary's 0755, so the mode is the caller's and
+        // not something this function decides.
+        let dest = s.dir.join("vmlinux");
+        let url = format!("{}/{}", release_api(Fault::None), VK.name);
+        fetch(&client, &url, FAKE_SUM, &dest, 0o644).await.unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), FAKE_VK);
+        assert_eq!(
+            fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        // A mirror serving other bytes under the same name is refused, and `dest` is
+        // never the half-written file it served.
+        let missed = s.dir.join("mirrored");
+        let wrong = format!("{}/{}", release_api(Fault::WrongBody), VK.name);
+        let err = format!(
+            "{:#}",
+            fetch(&client, &wrong, FAKE_SUM, &missed, 0o755)
+                .await
+                .expect_err("the body is not the locked one")
+        );
+        assert!(err.contains("does not match the locked digest"), "{err}");
+        assert!(!missed.exists(), "a failed fetch left {}", missed.display());
+        assert_eq!(temps(&s.dir), Vec::<String>::new());
+
+        // And a digest that is not one is refused before anything is downloaded.
+        assert!(
+            fetch(&client, &url, "not-a-digest", &missed, 0o755)
+                .await
+                .is_err()
+        );
     }
 
     // A tag that was never released and an exhausted API quota are different problems:

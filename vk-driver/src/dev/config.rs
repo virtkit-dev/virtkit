@@ -47,6 +47,10 @@ pub const CONFIG_FILE: &str = ".virtkit/config.toml";
 pub const LOCAL_FILE: &str = ".virtkit/local.toml";
 /// Local values for `${localEnv:…}`, under the workspace root. Gitignored.
 pub const LOCAL_ENV_FILE: &str = ".virtkit/local.env";
+/// The virtkit release the project pins, under the workspace root. Tracked; see
+/// [`crate::toolchain`].
+pub const LOCK_FILE: &str = ".virtkit/toolchain.lock";
+
 /// The schema version this build reads.
 pub const SCHEMA: i64 = 1;
 
