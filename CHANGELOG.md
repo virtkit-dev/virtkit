@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Reject state directories too long for VM sockets before building the image.**
+  `vk run --state-dir` reports paths exceeding the 90-byte directory limit for unix sockets,
+  avoiding a VM startup failure after the build.
+
 ## [0.64.0] - 2026-09-07
 
 ### Added

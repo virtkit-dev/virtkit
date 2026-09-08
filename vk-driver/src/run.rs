@@ -579,6 +579,31 @@ pub(crate) fn default_scratch_base() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".cache/virtkit"))
 }
 
+/// Usable bytes in Linux `sockaddr_un.sun_path`: 108 bytes minus the terminating NUL.
+const SUN_PATH_MAX: usize = 107;
+
+/// The longest socket name bound directly in a state dir — the vsock socket of the highest
+/// port a bridged or published port can take; a virtiofsd volume socket (`vfsd-vol<i>.sock`)
+/// only overtakes it past 1000 volumes.
+const LONGEST_SOCKET_NAME: &str = "vsock.sock_65535";
+
+/// State directory byte limit, reserving room for the separator and longest socket name.
+pub(crate) const STATE_DIR_MAX: usize = SUN_PATH_MAX - 1 - LONGEST_SOCKET_NAME.len();
+
+/// Reject a state dir too long for its sockets. Measure the path as supplied for binding;
+/// canonicalizing it would measure a different string.
+pub(crate) fn check_state_dir_len(dir: &Path) -> Result<()> {
+    let len = dir.as_os_str().len();
+    ensure!(
+        len <= STATE_DIR_MAX,
+        "state directory {} is {len} bytes long, {STATE_DIR_MAX} is the most it may be: \
+         the VM's sockets are bound under it and a unix socket path holds at most \
+         {SUN_PATH_MAX} bytes. Use a shorter path.",
+        dir.display()
+    );
+    Ok(())
+}
+
 /// A launch's named scratch dir — sockets, logs, and a `-f` build's ext4 live here
 /// (an image boot's media are unlinked scratch fds). Removed on drop, so error and
 /// panic unwinds clean it up too; only a signal kill can leak it.
@@ -599,6 +624,7 @@ struct WorkDir {
 
 impl WorkDir {
     fn create(path: PathBuf) -> Result<WorkDir> {
+        check_state_dir_len(&path)?;
         std::fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
         Ok(WorkDir {
             path,
@@ -609,6 +635,7 @@ impl WorkDir {
 
     /// Create-or-reuse a caller-pinned scratch dir (`--state-dir`).
     fn pinned(path: PathBuf) -> Result<WorkDir> {
+        check_state_dir_len(&path)?;
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -2785,7 +2812,9 @@ fn plan_services(
         let unit = &units[i];
         let dir = work.join(format!("svc-{}", unit.name));
         // The switch binds each service's vsock socket under this dir at startup, and the
-        // boot writes the overlay/console here — so it must exist before either runs.
+        // boot writes the overlay/console here — so it must exist before either runs, and
+        // its own path has to leave room for those sockets.
+        check_state_dir_len(&dir)?;
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         sited.push(Sited { unit: i, dir, slot });
         slot += 1;
@@ -4165,6 +4194,7 @@ pub(crate) async fn boot_session(
     let t_boot = Instant::now();
     let stem = image.file_stem().and_then(|s| s.to_str()).unwrap_or("disk");
     let work = std::env::temp_dir().join(format!("virtkit-session-{}-{stem}", std::process::id()));
+    check_state_dir_len(&work)?;
     std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
     // The agent boots as PID 1 from a minimal initramfs (just `/init`), then pivots into
     // the ext4 root below — so the agent is never written into the built image. With
@@ -5607,6 +5637,23 @@ mod tests {
         assert!(parse_ssh_user("").is_err());
         assert!(parse_ssh_user("foo bar").is_err());
         assert!(parse_ssh_user("a=b").is_err());
+    }
+
+    #[test]
+    fn a_state_dir_is_refused_once_its_socket_paths_would_not_fit() {
+        // 90 bytes: `<dir>/vsock.sock_65535` is exactly the 107 a unix socket path holds.
+        let fits = PathBuf::from(format!("/{}", "d".repeat(STATE_DIR_MAX - 1)));
+        assert_eq!(fits.as_os_str().len(), STATE_DIR_MAX);
+        assert_eq!(
+            fits.join(LONGEST_SOCKET_NAME).as_os_str().len(),
+            SUN_PATH_MAX
+        );
+        check_state_dir_len(&fits).unwrap();
+
+        let over = PathBuf::from(format!("/{}", "d".repeat(STATE_DIR_MAX)));
+        let err = check_state_dir_len(&over).unwrap_err().to_string();
+        assert!(err.contains(over.to_str().unwrap()), "{err}");
+        assert!(err.contains(&STATE_DIR_MAX.to_string()), "{err}");
     }
 
     #[test]
