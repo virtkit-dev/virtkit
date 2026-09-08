@@ -22,6 +22,10 @@ All notable changes to virtkit will be documented in this file.
 - **A microVM's vsock control plane survives host memory pressure.** Under heavy swapping the
   VMM could drop a control connection's handshake, or permanently wedge a VM's vsock until it
   was restarted; both are hardened.
+- **Writing in place to a read-only-mode file on a shared directory no longer fails with
+  "Permission denied"** when a program holds the file open for writing. `git pull` into a
+  worktree on a share hit this — it rewrites the header of its read-only temporary pack — and
+  now succeeds.
 - **`vk dev code` works the first time Windows VS Code bootstraps its CLI from WSL2**, instead
   of failing with a commit-hash parse error when `code --version` opens with a download line.
 - **`vk dev code` no longer rejects a Windows VS Code from WSL2 over a "missing" Remote-SSH

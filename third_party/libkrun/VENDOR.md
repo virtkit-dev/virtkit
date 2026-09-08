@@ -245,3 +245,19 @@ aarch64 Linux guest reset now exits 154 as well. No caller consumes 154 yet, so 
 surfaces as a non-zero exit until the host wires it in. The MP table is retained (used with
 `acpi=off`); additive — a guest that ignores ACPI still boots via the MP table. Covered by
 `x86_64::acpi::tests`. Search for `setup_acpi`, `AcpiPm`, `reset_flag`, and `KRUN_EXIT_GUEST_RESET`.
+
+`src/devices/src/virtio/fs/linux/passthrough.rs` — `setupmapping` serves a DAX window from an
+fd already open on the inode (matched by inode and access mode), reopening the inode by
+`/proc/self/fd` path only when none is open. The guest passes `fh = u64::MAX` (no handle) with
+every DAX mapping, so the fd cannot be found by handle; the original code reopened, which
+re-derives write access from the inode's *current* mode bits, so a file the guest opened
+writable and then chmod'd to 0444 could no longer be mapped — the reopen failed with EACCES
+even though the still-open fd is valid, which POSIX requires to keep working. With `dax=always`
+every in-place write inside `i_size` is serviced through a writable DAX mapping, so that reopen
+turned such writes into EACCES (and a guest `MAP_SHARED` store into SIGBUS); an incremental
+`git fetch`, which rewrites the 12-byte header of its mode-0444 temp pack through an fd it keeps
+open, hit it on every pull. Any open fd of the right access mode for the inode establishes the
+same page-cache mapping, and mmap still enforces that a writable mapping needs a writable fd.
+The reopen fallback stays for a mapping whose inode has no open fd (a read after close). The
+lookup keys on the inode and access mode, not on the guest's handle, which is absent for DAX.
+Covered by the `setupmapping_*` tests. Search for `The guest passes fh = u64::MAX`.

@@ -2102,13 +2102,8 @@ impl FileSystem for PassthroughFs {
         host_shm_base: u64,
         shm_size: u64,
     ) -> io::Result<()> {
-        let open_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
-            libc::O_RDWR
-        } else {
-            libc::O_RDONLY
-        };
-
-        let prot_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
+        let want_write = (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0;
+        let prot_flags = if want_write {
             libc::PROT_READ | libc::PROT_WRITE
         } else {
             libc::PROT_READ
@@ -2122,8 +2117,55 @@ impl FileSystem for PassthroughFs {
 
         debug!("setupmapping: ino {inode:?} addr={addr:x} len={len}");
 
-        let file = self.open_inode(inode, open_flags)?;
-        let fd = file.as_raw_fd();
+        // The guest passes fh = u64::MAX (no handle) for DAX mappings, so serve the
+        // window from an fd already open on this inode rather than reopening it by
+        // path. A reopen re-derives access from the inode's current mode bits, so a
+        // file the guest opened writable and then chmod'd read-only (0444) can no
+        // longer be mapped writable — the reopen fails with EACCES even though the
+        // open fd is still valid, which POSIX keeps working. git's incremental fetch
+        // is exactly this: it rewrites its 0444 temp pack's header through an O_RDWR
+        // fd it keeps open, and under DAX that in-place write is serviced through a
+        // writable mapping — the reopen turned it into EACCES (and a guest MAP_SHARED
+        // store into SIGBUS). Any open fd of the right access mode for the inode
+        // establishes the same page-cache mapping; reopen only when none is open
+        // (e.g. a read mapping after the file was closed), where O_RDONLY is fine.
+        let open_handle = {
+            let handles = self.handles.read().unwrap();
+            handles
+                .values()
+                .find(|hd| {
+                    if hd.inode != inode {
+                        return false;
+                    }
+                    let fd = hd.file.read().unwrap().as_raw_fd();
+                    // On an F_GETFL error (-1) acc is O_ACCMODE, matching neither arm below,
+                    // so this handle is passed over and the reopen fallback takes it.
+                    let acc = unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_ACCMODE;
+                    if want_write {
+                        acc == libc::O_RDWR
+                    } else {
+                        acc == libc::O_RDONLY || acc == libc::O_RDWR
+                    }
+                })
+                .cloned()
+        };
+        let reopened;
+        let fd = match &open_handle {
+            // The File lives in the Arc for the rest of this call, so the fd from the
+            // dropped read guard stays valid across the mmap.
+            Some(hd) => hd.file.read().unwrap().as_raw_fd(),
+            None => {
+                reopened = self.open_inode(
+                    inode,
+                    if want_write {
+                        libc::O_RDWR
+                    } else {
+                        libc::O_RDONLY
+                    },
+                )?;
+                reopened.as_raw_fd()
+            }
+        };
 
         let ret = unsafe {
             libc::mmap(
@@ -2331,6 +2373,162 @@ mod tests {
             Err(err) => assert_eq!(err.raw_os_error(), Some(libc::ENOENT)),
         }
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // A writable DAX mapping of a file that is mode 0444 on disk but is held open
+    // writable must succeed and reach the file. The guest passes no handle
+    // (fh = u64::MAX) with a DAX mapping, so setupmapping locates an open fd for the
+    // inode; reopening the inode by path instead re-derives access from the 0444 mode
+    // and fails O_RDWR with EACCES, turning every such in-place write under
+    // `dax=always` into EACCES/SIGBUS. git's `odb_mkstemp` is exactly this file: an
+    // O_RDWR fd kept open on a 0444 temp pack whose header it rewrites in place on an
+    // incremental fetch.
+    #[test]
+    fn setupmapping_write_uses_open_fd_not_current_mode() {
+        let (fs, root) = rooted_fs(Duration::ZERO);
+        let page = 4096usize;
+
+        // Read-only on disk, but with a writable (O_RDWR) handle — as create with a
+        // 0444 mode and an O_RDWR flag yields.
+        let (entry, handle, _) = fs
+            .create(
+                ctx(),
+                fuse::ROOT_ID,
+                &CString::new("pack").unwrap(),
+                0o444,
+                false,
+                libc::O_RDWR as u32,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        let handle = handle.expect("create returned a handle");
+
+        // The guard condition behind the old bug: a fresh O_RDWR open of the 0444
+        // file is denied, so the reopen the mapping used to do could not work. Root
+        // bypasses the mode bits (CAP_DAC_OVERRIDE), so only assert this unprivileged
+        // — the harness runs the tests as a non-root uid.
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(
+                fs.open_inode(entry.inode, libc::O_RDWR)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EACCES),
+            );
+        }
+
+        // Give the mapping a page of file to back it (ftruncate via the handle).
+        let mut attr: libc::stat64 = unsafe { mem::zeroed() };
+        attr.st_size = page as libc::off64_t;
+        fs.setattr(ctx(), entry.inode, attr, Some(handle), SetattrValid::SIZE)
+            .unwrap();
+
+        // A host shm window, as the DAX path supplies to setupmapping.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(!std::ptr::eq(base, libc::MAP_FAILED));
+
+        // u64::MAX: the guest passes no handle for a DAX mapping.
+        fs.setupmapping(
+            ctx(),
+            entry.inode,
+            u64::MAX,
+            0,
+            page as u64,
+            fuse::SetupmappingFlags::WRITE.bits(),
+            0,
+            base as u64,
+            page as u64,
+        )
+        .expect("writable mapping of a 0444-but-open-writable file must succeed");
+
+        // The mapping is the file and is writable: a store lands in the file.
+        unsafe { (base as *mut u8).write(0xAB) };
+        let on_disk = std::fs::read(std::path::Path::new(&root).join("pack")).unwrap();
+        assert_eq!(on_disk.first(), Some(&0xAB));
+
+        unsafe { libc::munmap(base, page) };
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // A read mapping when the inode has no fd open (and the guest passes no handle)
+    // must fall back to an O_RDONLY reopen and map, not fail with EBADF.
+    #[test]
+    fn setupmapping_read_falls_back_to_reopen_when_no_fd_open() {
+        use std::os::unix::fs::FileExt;
+
+        let (fs, root) = rooted_fs(Duration::ZERO);
+        let page = 4096usize;
+
+        let (entry, handle, _) = fs
+            .create(
+                ctx(),
+                fuse::ROOT_ID,
+                &CString::new("rf").unwrap(),
+                0o644,
+                false,
+                libc::O_RDWR as u32,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        let handle = handle.expect("create returned a handle");
+
+        // A page of file with a known first byte, so the read mapping has something to
+        // verify. setattr zero-fills to length; the marker goes in via the same inode.
+        let mut attr: libc::stat64 = unsafe { mem::zeroed() };
+        attr.st_size = page as libc::off64_t;
+        fs.setattr(ctx(), entry.inode, attr, Some(handle), SetattrValid::SIZE)
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(std::path::Path::new(&root).join("rf"))
+            .unwrap()
+            .write_at(&[0xCD], 0)
+            .unwrap();
+
+        // Close the only handle, so the inode has no open fd and the mapping must reopen.
+        fs.release(ctx(), entry.inode, 0, handle, false, false, None)
+            .unwrap();
+
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page,
+                libc::PROT_READ,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(!std::ptr::eq(base, libc::MAP_FAILED));
+
+        // u64::MAX: the guest passes no handle for a DAX mapping.
+        fs.setupmapping(
+            ctx(),
+            entry.inode,
+            u64::MAX,
+            0,
+            page as u64,
+            fuse::SetupmappingFlags::READ.bits(),
+            0,
+            base as u64,
+            page as u64,
+        )
+        .expect("read mapping must fall back to a reopen, not fail");
+
+        assert_eq!(unsafe { (base as *const u8).read() }, 0xCD);
+
+        unsafe { libc::munmap(base, page) };
         std::fs::remove_dir_all(&root).ok();
     }
 }
