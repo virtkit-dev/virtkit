@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.66.0] - 2026-09-08
+
 ### Added
 
 - **`vk dev` forwards your SSH agent to a whitelist of keys and pre-configures matching
@@ -2603,7 +2605,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.65.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.66.0...HEAD
+[0.66.0]: https://github.com/virtkit-dev/virtkit/compare/v0.65.0...v0.66.0
 [0.65.0]: https://github.com/virtkit-dev/virtkit/compare/v0.64.1...v0.65.0
 [0.64.1]: https://github.com/virtkit-dev/virtkit/compare/v0.64.0...v0.64.1
 [0.64.0]: https://github.com/virtkit-dev/virtkit/compare/v0.63.1...v0.64.0
