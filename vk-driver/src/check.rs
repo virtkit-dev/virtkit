@@ -6,8 +6,9 @@
 //! services), and the capability probes a script asks this build about (entrypoint,
 //! publish).
 //! `--min-version` lets scripts gate on this binary's release instead of a feature name.
-//! Prints one line per check; the caller turns "any check failed" into the exit code.
-//! Failed checks print suggested repairs; `--fix` offers to apply the automated steps.
+//! Prints one line per check, with the sections this config never enabled named together at
+//! the end; the caller turns "any check failed" into the exit code. Failed checks print
+//! suggested repairs; `--fix` offers to apply the automated steps.
 
 use std::fmt;
 use std::os::fd::AsRawFd;
@@ -64,6 +65,12 @@ impl Feature {
                 | Feature::Publish
                 | Feature::Nics
         )
+    }
+
+    /// Features that require configuration. When unconfigured, they have nothing to check;
+    /// the default sweep groups them in one closing line instead of individual results.
+    fn config_gated(self) -> bool {
+        matches!(self, Feature::Docker | Feature::Registry | Feature::Share)
     }
 
     /// Parse a feature name as spelled by `--feature`.
@@ -253,10 +260,11 @@ pub fn min_version_only(min: Version) -> Result<bool, String> {
 
 /// Run the checks and print one line each; returns whether every check passed.
 /// No `--feature` = the default sweep (every feature except the CI-executor
-/// ones), where a feature the config leaves unconfigured is skipped; naming
+/// ones), where a feature the config leaves unconfigured is skipped — a
+/// [config-gated](Feature::config_gated) one without even a line of its own; naming
 /// features checks exactly those, and one that turns out unconfigured fails
 /// (the caller asserted it should be usable). `--min-version` adds a version line, and
-/// on its own asserts only that.
+/// on its own asserts only that. `--fix` offers the steps a failed check came with.
 pub fn run(
     cfg: &Config,
     requested: &[Feature],
@@ -279,10 +287,17 @@ pub fn run(
     }
     let mut offered = Vec::new();
     let mut remedy = Vec::new();
+    let mut unconfigured = Vec::new();
     for f in features {
         let mut outcome = evaluate(cfg, f);
         if explicit && outcome.status == Status::Skip {
             outcome = fail(format!("{} — requested but not enabled", outcome.detail));
+        }
+        // Unconfigured sections are not findings; group them at the end to keep individual
+        // results for checks that ran.
+        if !explicit && f.config_gated() && outcome.status == Status::Skip {
+            unconfigured.push(f.name());
+            continue;
         }
         let passed = report(f.name(), &outcome);
         if fix && !outcome.remedy.is_empty() {
@@ -291,6 +306,16 @@ pub fn run(
         } else {
             all_ok &= passed;
         }
+    }
+    if !unconfigured.is_empty() {
+        line(
+            "skip",
+            "features",
+            format!(
+                "{} not configured — name one with `--feature` to require it",
+                unconfigured.join(", ")
+            ),
+        );
     }
     // Recheck after applying repairs to report remaining steps, usually a WSL restart
     // or a new login. Declining keeps the original failure.
@@ -888,8 +913,12 @@ fn net(cfg: &Config) -> Outcome {
     let net = &cfg.net;
     let sys = Path::new("/sys/class/net");
     match net.mode.as_str() {
-        "none" => ok("mode none (no guest networking)"),
-        "switch" => ok("mode switch (userspace, no host privileges needed)"),
+        // `net.mode` wires the CI job VM's NIC and nothing else: `vk run --net` and a compose
+        // run start a switch of their own. Said outright, because "no guest networking" reads
+        // like a host that cannot do it — which the default `none` would claim of every host
+        // with no config file.
+        "none" => ok("mode none: no NIC for a CI job VM (`vk run --net` is unaffected)"),
+        "switch" => ok("mode switch for CI job VMs (userspace, no host privileges needed)"),
         "tap" => {
             if net.tap.is_empty() {
                 return fail("net.mode = \"tap\" needs net.tap set");
@@ -1397,6 +1426,19 @@ mod tests {
         let cfg = Config::default();
         for f in [Feature::Docker, Feature::Registry] {
             assert_eq!(evaluate(&cfg, f).status, Status::Skip);
+        }
+    }
+
+    // Unconfigured sections (such as `[docker]`) are not host findings, so they share one
+    // closing line. `usage` skips for a kernel limitation, not configuration, and keeps its line.
+    #[test]
+    fn only_the_config_gated_features_are_summarised() {
+        for f in [Feature::Docker, Feature::Registry, Feature::Share] {
+            assert!(f.config_gated(), "{}", f.name());
+            assert_eq!(evaluate(&Config::default(), f).status, Status::Skip);
+        }
+        for f in [Feature::Usage, Feature::Kvm, Feature::Net, Feature::Kernel] {
+            assert!(!f.config_gated(), "{}", f.name());
         }
     }
 

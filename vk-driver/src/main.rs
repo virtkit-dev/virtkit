@@ -548,7 +548,8 @@ enum Cmd {
     /// `entrypoint` (can it hand PID 1 to an image's own entrypoint) and `publish`
     /// (can it run `vk publish`). --min-version asserts the release this binary is,
     /// for a capability a release added without gaining a feature name of its own.
-    /// One line per check; exits non-zero if any fails.
+    /// One line per check, with the sections this config never enabled named together at
+    /// the end; exits non-zero if any fails.
     #[command(display_order = 5)]
     Check {
         /// check only these features (repeatable)

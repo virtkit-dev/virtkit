@@ -19,6 +19,13 @@ All notable changes to virtkit will be documented in this file.
 - **`vk dev code` names the one Windows setting Remote-SSH needs** — the
   `remote.SSH.remotePlatform` entry — so it stops asking which platform the environment runs.
 
+### Changed
+
+- **`vk check` groups unconfigured features in one closing line.** Unconfigured
+  `[docker]`, `[registry]` and `[share]` sections no longer get individual results.
+  The networking line clarifies that the setting applies to CI job VMs, avoiding the
+  implication that the host cannot provide guest networking.
+
 ## [0.64.1] - 2026-09-08
 
 ### Changed
