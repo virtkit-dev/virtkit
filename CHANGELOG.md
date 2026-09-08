@@ -31,6 +31,11 @@ All notable changes to virtkit will be documented in this file.
 - **A guest name lookup fails at once when the host's resolver does not answer**, instead of
   hanging until the guest gives up, and the switch log names the upstream and why it failed.
 
+- **`vk dev shell` opens the user's own shell, not a bare `/bin/sh`.** It used to land in dash
+  on most images — a `$` prompt with no history or arrow-key editing — because it could not
+  see the shell configured for the user. It now uses that shell (bash where that is the
+  user's), falling back to `/bin/sh` only when none is set.
+
 ## [0.64.1] - 2026-09-08
 
 ### Changed

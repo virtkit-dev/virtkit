@@ -557,10 +557,38 @@ pub fn guest_cwd(plan: &Plan) -> Option<String> {
     }
 }
 
-/// `vk dev shell`: the environment's own login shell, on a terminal. `$SHELL` is what the
-/// image says the user's shell is; a login shell so their profile runs, as opening a
-/// terminal in the editor would.
-pub const LOGIN_SHELL: [&str; 3] = ["sh", "-lc", "exec \"${SHELL:-/bin/sh}\" -l"];
+/// `vk dev shell`: the environment's own login shell, on a terminal — a login shell so the
+/// user's profile runs, as opening a terminal in the editor would.
+///
+/// The exec channel starts this with only `exec-env` for its environment — no PAM, no login,
+/// hence no passwd lookup — so `$SHELL` is unset on nearly every image, and a bare
+/// `${SHELL:-/bin/sh}` would drop every user to `/bin/sh` (dash on Debian: no line editing,
+/// arrow keys echoed as escapes). Resolve the user's actual shell from the passwd database
+/// instead, falling back to `$SHELL` then `/bin/sh` only when that finds nothing.
+pub const LOGIN_SHELL: [&str; 3] = ["sh", "-lc", LOGIN_SHELL_SCRIPT];
+
+/// The awk program in [`LOGIN_SHELL_SCRIPT`]'s passwd fallback: print the shell (field 7) of
+/// the first row whose uid (field 3) equals `u`. Keying on the numeric uid, not the login
+/// name, keeps an awk-special character in a name from skewing the match. A macro so the
+/// `concat!` below and the test share one copy of the program (`concat!` takes only literals).
+macro_rules! passwd_shell_awk {
+    () => {
+        "$3==u{print $7; exit}"
+    };
+}
+
+/// The script [`LOGIN_SHELL`] runs. `getent` covers users from any NSS source; the
+/// `/etc/passwd` scan is the fallback for images without it (busybox). The uid is resolved
+/// once into `u` and shared by both lookups; when neither finds a shell it falls back to
+/// `$SHELL`, then `/bin/sh`.
+const LOGIN_SHELL_SCRIPT: &str = concat!(
+    "u=$(id -u); ",
+    "s=$(getent passwd \"$u\" 2>/dev/null | cut -d: -f7); ",
+    "[ -n \"$s\" ] || s=$(awk -F: -v u=\"$u\" '",
+    passwd_shell_awk!(),
+    "' /etc/passwd 2>/dev/null); ",
+    "exec \"${s:-${SHELL:-/bin/sh}}\" -l",
+);
 
 /// `vk dev code`: hand the workspace to the selected editor over Remote-SSH.
 ///
@@ -801,5 +829,45 @@ mod tests {
         plan.workspace_folder = Some("/workdir".into());
         let err = launch_editor(&plan, &editor).unwrap_err();
         assert!(format!("{err:#}").contains("SSH setup"), "{err:#}");
+    }
+
+    #[test]
+    fn login_shell_script_parses_as_posix_sh() {
+        // Check LOGIN_SHELL_SCRIPT's getent/awk quoting without running the script.
+        let out = std::process::Command::new("sh")
+            .args(["-n", "-c", LOGIN_SHELL_SCRIPT])
+            .output()
+            .expect("run sh -n");
+        assert!(
+            out.status.success(),
+            "sh rejected LOGIN_SHELL_SCRIPT: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn passwd_shell_awk_selects_field7_by_uid() {
+        // `sh -n` cannot check the single-quoted awk program. Use a synthetic passwd to
+        // check that it selects field 7 of only the uid-matching row.
+        let dir = std::env::temp_dir().join(format!("vk-passwd-awk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let passwd = dir.join("passwd");
+        std::fs::write(
+            &passwd,
+            "root:x:0:0:root:/root:/bin/sh\ndev:x:1000:1000::/home/dev:/usr/bin/fish\n",
+        )
+        .unwrap();
+        let out = std::process::Command::new("awk")
+            .args(["-F:", "-v", "u=1000", passwd_shell_awk!()])
+            .arg(&passwd)
+            .output()
+            .expect("run awk");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            out.status.success(),
+            "awk failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "/usr/bin/fish");
     }
 }
