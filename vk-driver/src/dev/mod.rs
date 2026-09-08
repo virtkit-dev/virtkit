@@ -32,6 +32,7 @@ mod status;
 pub mod storage;
 mod table;
 pub mod task;
+pub mod wsl;
 
 use std::time::Duration;
 

@@ -4,6 +4,10 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk dev code` opens the workspace in Windows VS Code from WSL2** over Remote-SSH.
+
 ## [0.64.1] - 2026-09-08
 
 ### Changed

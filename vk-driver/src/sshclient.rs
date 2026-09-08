@@ -73,15 +73,14 @@ impl Managed {
 
     /// Read the run's alias from its config so `vk ssh` need not receive it separately.
     fn alias(&self) -> Result<String> {
-        let config = self.read_config()?;
-        let alias = config
-            .lines()
-            .find_map(|l| l.strip_prefix("Host ").map(|a| a.trim().to_string()))
-            .filter(|a| !a.is_empty())
-            .with_context(|| format!("{} declares no Host alias", self.config().display()))?;
-        // Revalidate the on-disk value before passing it to ssh.
-        validate_alias(&alias)?;
-        Ok(alias)
+        host_alias(&self.read_config()?).with_context(|| self.config().display().to_string())
+    }
+
+    /// The pieces of the config another ssh client needs to reach the same VM. Read back as
+    /// data and revalidated: the config is the host's, but a client built from it runs the
+    /// ProxyCommand, so nothing goes through unchecked.
+    pub fn parts(&self) -> Result<Parts> {
+        parse_parts(&self.read_config()?).with_context(|| self.config().display().to_string())
     }
 
     /// Create or reuse the keypair, rewrite the config and shim, and return the public key.
@@ -216,6 +215,64 @@ pub fn print_config(state_dir: &Path) -> Result<()> {
     std::io::stdout()
         .write_all(m.read_config()?.as_bytes())
         .context("writing the ssh config to stdout")
+}
+
+/// Connection data read from a run's config to build an equivalent host block for a client
+/// without access to that config or filesystem.
+#[derive(Debug, PartialEq)]
+pub struct Parts {
+    /// the run's `Host` alias
+    pub alias: String,
+    /// the `User` ssh connects as
+    pub user: String,
+    /// the `vk` the ProxyCommand runs
+    pub vk: PathBuf,
+    /// what that `vk connect` dials
+    pub target: String,
+}
+
+/// The run's `Host` alias, revalidated before it reaches ssh as an argument.
+fn host_alias(config: &str) -> Result<String> {
+    let alias = config
+        .lines()
+        .find_map(|l| l.strip_prefix("Host ").map(str::trim))
+        .filter(|a| !a.is_empty())
+        .context("declares no Host alias")?;
+    validate_alias(alias)?;
+    Ok(alias.to_string())
+}
+
+fn parse_parts(config: &str) -> Result<Parts> {
+    // First occurrence wins, as ssh reads it. `User ` cannot match `UserKnownHostsFile`.
+    let value = |key: &str| {
+        config
+            .lines()
+            .find_map(|l| l.trim_start().strip_prefix(key))
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    let user = value("User ").context("declares no User")?;
+    quotable_str(user, "the ssh user")?;
+    let proxy = value("ProxyCommand ").context("declares no ProxyCommand")?;
+    let (vk, target) = parse_proxy(proxy)
+        .with_context(|| format!("ProxyCommand {proxy:?} is not one this vk wrote"))?;
+    quotable(&vk, "this vk binary's path")?;
+    quotable_str(&target, "the ssh proxy target")?;
+    Ok(Parts {
+        alias: host_alias(config)?,
+        user: user.to_string(),
+        vk,
+        target,
+    })
+}
+
+/// Split `'<vk>' connect '<target>'` — what [`Managed::config_text`] writes — back into its
+/// two values. Neither can contain a single quote ([`quotable`] refuses one), so the next
+/// quote is always the closing one.
+fn parse_proxy(command: &str) -> Option<(PathBuf, String)> {
+    let (vk, rest) = command.strip_prefix('\'')?.split_once('\'')?;
+    let target = rest.strip_prefix(" connect '")?.strip_suffix('\'')?;
+    Some((PathBuf::from(vk), target.to_string()))
 }
 
 /// Resolve the system `ssh`, skipping the shim's own directory so a PATH with it prepended
@@ -650,6 +707,58 @@ mod tests {
         // A config with no Host line is a corrupt setup, not an empty alias.
         write_atomic(&m.config(), "User dev\n", 0o600).unwrap();
         assert!(m.alias().is_err());
+    }
+
+    #[test]
+    fn the_config_is_read_back_into_its_parts() {
+        let m = Managed {
+            dir: PathBuf::from("/state"),
+        };
+        let cfg = m.config_text(
+            "vm-test",
+            "dev",
+            Path::new("/usr/bin/vk"),
+            "vsock-auto:///state/vsock.sock:2222",
+        );
+        assert_eq!(
+            parse_parts(&cfg).unwrap(),
+            Parts {
+                alias: "vm-test".into(),
+                user: "dev".into(),
+                vk: PathBuf::from("/usr/bin/vk"),
+                target: "vsock-auto:///state/vsock.sock:2222".into(),
+            }
+        );
+
+        // Rebuilding a connection requires Host, User and ProxyCommand.
+        for cfg in [
+            "Host vm\n    User dev\n",
+            "Host vm\n    ProxyCommand '/usr/bin/vk' connect 'x'\n",
+            "User dev\n    ProxyCommand '/usr/bin/vk' connect 'x'\n",
+        ] {
+            assert!(parse_parts(cfg).is_err(), "{cfg:?} should be refused");
+        }
+        // Revalidate the alias and user even in a well-formed on-disk config.
+        for cfg in [
+            "Host vm*\n    User dev\n    ProxyCommand '/usr/bin/vk' connect 'x'\n",
+            "Host vm\n    User de$v\n    ProxyCommand '/usr/bin/vk' connect 'x'\n",
+        ] {
+            assert!(parse_parts(cfg).is_err(), "{cfg:?} should be refused");
+        }
+        // Reject unexpected ProxyCommand syntax and values that cannot be safely quoted.
+        for proxy in [
+            "/usr/bin/vk connect x",
+            "'/usr/bin/vk' 'connect' 'x'",
+            "'/usr/bin/vk' connect 'a b' extra",
+            "'/tmp/$(id)/vk' connect 'x'",
+        ] {
+            let cfg = format!("Host vm\n    User dev\n    ProxyCommand {proxy}\n");
+            assert!(parse_parts(&cfg).is_err(), "{proxy:?} should be refused");
+        }
+        // `UserKnownHostsFile` is not the `User` line.
+        let cfg = "Host vm\n    UserKnownHostsFile /dev/null\n    User dev\n    ProxyCommand \
+                   '/usr/bin/vk' connect 'x'\n";
+        assert_eq!(parse_parts(cfg).unwrap().user, "dev");
     }
 
     #[test]

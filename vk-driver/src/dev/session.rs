@@ -565,8 +565,9 @@ pub const LOGIN_SHELL: [&str; 3] = ["sh", "-lc", "exec \"${SHELL:-/bin/sh}\" -l"
 /// `vk dev code`: hand the workspace to the selected editor over Remote-SSH.
 ///
 /// The editor spawns a bare `ssh` with nowhere to pass a config, so the run's managed shim
-/// goes first on its PATH. Replaces this process, so the
-/// editor's own exit is the command's.
+/// goes first on its PATH — except for a Windows editor reached from WSL2, whose Remote-SSH
+/// runs on Windows and reads none of this: it gets a stanza of its own instead (see
+/// [`crate::dev::wsl`]). Replaces this process, so the editor's own exit is the command's.
 pub fn launch_editor(
     plan: &Plan,
     editor: &crate::dev::editor::Editor,
@@ -582,19 +583,33 @@ pub fn launch_editor(
             plan.state_dir.display()
         );
     }
-    let path = match std::env::var_os("PATH") {
-        Some(p) => {
-            let mut dirs = vec![managed.shim_dir()];
-            dirs.extend(std::env::split_paths(&p));
-            std::env::join_paths(dirs).context("building the editor's PATH")?
-        }
-        None => managed.shim_dir().into_os_string(),
-    };
+    // Written before anything is printed: an editor that cannot be given a working SSH setup
+    // should not be launched into a connection that will fail.
+    let bridge = crate::dev::wsl::bridge_needed(&editor.binary)
+        .then(|| crate::dev::wsl::install(&managed))
+        .transpose()?;
     let uri = format!("vscode-remote://ssh-remote+{}{folder}", alias(plan));
     eprintln!("virtkit: {} --folder-uri={uri}", editor.binary.display());
     let mut cmd = std::process::Command::new(&editor.binary);
-    cmd.arg(format!("--folder-uri={uri}")).env("PATH", path);
+    cmd.arg(format!("--folder-uri={uri}"));
+    match &bridge {
+        Some(written) => eprintln!("virtkit: {}", written.note()),
+        None => {
+            cmd.env("PATH", shimmed_path(&managed)?);
+        }
+    }
     Err(anyhow::Error::new(cmd.exec()).context(format!("running {}", editor.binary.display())))
+}
+
+/// This process's PATH with the run's `ssh` shim first, for an editor that spawns a bare
+/// `ssh`.
+fn shimmed_path(managed: &crate::sshclient::Managed) -> Result<std::ffi::OsString> {
+    let Some(path) = std::env::var_os("PATH") else {
+        return Ok(managed.shim_dir().into_os_string());
+    };
+    let mut dirs = vec![managed.shim_dir()];
+    dirs.extend(std::env::split_paths(&path));
+    std::env::join_paths(dirs).context("building the editor's PATH")
 }
 
 /// What a stop did, and whether it left the environment down.

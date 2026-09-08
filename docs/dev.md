@@ -498,6 +498,16 @@ in that order; `--editor BIN` chooses explicitly. It boots the environment and
 opens the workspace over the run's own SSH setup, without modifying your SSH
 identities or using your personal keys for the connection.
 
+Under WSL2, a VS Code found under `/mnt/<drive>/` is a Windows one: its Remote-SSH
+runs on Windows and reads `%USERPROFILE%\.ssh\config`, which knows nothing of the
+distro's setup. For that case `code` also writes `%USERPROFILE%\.ssh\vk\<alias>.conf`,
+a host block whose `ProxyCommand` re-enters the distro through `wsl.exe`, next to
+`<alias>.key`, a copy of the run's managed key — Windows OpenSSH cannot read a key
+at a Linux path. `%USERPROFILE%\.ssh` has to exist already, because the copy inherits
+its permissions. The host block is rewritten on every launch and the key refreshed
+only when it changed, and `Include vk/*.conf` is added once at the top of
+`%USERPROFILE%\.ssh\config`.
+
 ```toml
 [dev.editor.vscode]
 state = "persistent"
