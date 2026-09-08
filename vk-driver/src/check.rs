@@ -7,6 +7,7 @@
 //! publish).
 //! `--min-version` lets scripts gate on this binary's release instead of a feature name.
 //! Prints one line per check; the caller turns "any check failed" into the exit code.
+//! Failed checks print suggested repairs; `--fix` offers to apply the automated steps.
 
 use std::fmt;
 use std::os::fd::AsRawFd;
@@ -256,7 +257,12 @@ pub fn min_version_only(min: Version) -> Result<bool, String> {
 /// features checks exactly those, and one that turns out unconfigured fails
 /// (the caller asserted it should be usable). `--min-version` adds a version line, and
 /// on its own asserts only that.
-pub fn run(cfg: &Config, requested: &[Feature], min: Option<Version>) -> Result<bool, String> {
+pub fn run(
+    cfg: &Config,
+    requested: &[Feature],
+    min: Option<Version>,
+    fix: bool,
+) -> Result<bool, String> {
     let explicit = !requested.is_empty();
     let features = selected(requested, min);
 
@@ -271,14 +277,133 @@ pub fn run(cfg: &Config, requested: &[Feature], min: Option<Version>) -> Result<
     if let Some(min) = min {
         all_ok &= report("version", &min_version(Version::own()?, min));
     }
+    let mut offered = Vec::new();
+    let mut remedy = Vec::new();
     for f in features {
         let mut outcome = evaluate(cfg, f);
         if explicit && outcome.status == Status::Skip {
             outcome = fail(format!("{} — requested but not enabled", outcome.detail));
         }
-        all_ok &= report(f.name(), &outcome);
+        let passed = report(f.name(), &outcome);
+        if fix && !outcome.remedy.is_empty() {
+            offered.push(f);
+            remedy.append(&mut outcome.remedy);
+        } else {
+            all_ok &= passed;
+        }
+    }
+    // Recheck after applying repairs to report remaining steps, usually a WSL restart
+    // or a new login. Declining keeps the original failure.
+    if !remedy.is_empty() {
+        if apply(&remedy)? {
+            for f in offered {
+                all_ok &= report(f.name(), &evaluate(cfg, f));
+            }
+        } else {
+            all_ok = false;
+        }
     }
     Ok(all_ok)
+}
+
+/// Show the repair plan, ask for confirmation, and apply it. Declining returns false,
+/// not an error. Stop at the first failed step and name it in the error.
+fn apply(remedy: &[Step]) -> Result<bool, String> {
+    // Gather the steps printed under individual checks into one plan for confirmation.
+    println!();
+    println!("to apply:");
+    for step in remedy {
+        println!("  {step}");
+    }
+    if !crate::dev::on_terminal() {
+        return Err("refusing to apply without a terminal — run the steps above".to_string());
+    }
+    if !crate::dev::ask_on_terminal("apply?").map_err(|e| format!("{e:#}"))? {
+        return Ok(false);
+    }
+    let mut manual = Vec::new();
+    for step in remedy {
+        match step {
+            Step::Manual(what) => manual.push(what),
+            _ => perform(step).map_err(|e| format!("{step}: {e:#}"))?,
+        }
+    }
+    for what in manual {
+        println!("  still yours to do: {what}");
+    }
+    Ok(true)
+}
+
+/// Carry out one step. A command inherits this process's streams, so `sudo` prompts on the
+/// terminal [`apply`] has already insisted on.
+fn perform(step: &Step) -> anyhow::Result<()> {
+    use anyhow::Context;
+    match step {
+        Step::Run { argv, sudo } => {
+            let argv = sudo_argv(argv, *sudo);
+            let (prog, args) = argv.split_first().context("a step with no command")?;
+            let status = std::process::Command::new(prog)
+                .args(args)
+                .status()
+                .with_context(|| format!("running {prog}"))?;
+            anyhow::ensure!(status.success(), "{prog} exited {status}");
+            Ok(())
+        }
+        Step::EditWslconfig { .. } => {
+            let path = crate::wsl::wslconfig_set_nested(&crate::wsl::Interop)?;
+            println!("  wrote {}", path.display());
+            Ok(())
+        }
+        Step::EditWslConf { command } => write_as_root(
+            crate::wsl::WSL_CONF,
+            &crate::wsl::wsl_conf_with_boot_command(command)?,
+        ),
+        // Collected by the caller and printed at the end instead.
+        Step::Manual(_) => Ok(()),
+    }
+}
+
+/// A step's argv to spawn, with `sudo` in front when the step needs root.
+fn sudo_argv(argv: &[String], sudo: bool) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::with_capacity(argv.len() + usize::from(sudo));
+    if sudo {
+        out.push("sudo");
+    }
+    out.extend(argv.iter().map(String::as_str));
+    out
+}
+
+/// The `sudo sh -c` script that writes `path` atomically: a sibling is written, mode-set, and
+/// renamed over it, so a crash mid-write cannot leave the original truncated.
+///
+/// `path` is interpolated into the shell script unescaped, so it must be a trusted constant —
+/// never a caller-supplied path. Today only [`crate::wsl::WSL_CONF`] reaches here.
+fn write_as_root_script(path: &str) -> String {
+    format!("cat > {path}.vk-new && chmod 644 {path}.vk-new && mv {path}.vk-new {path}")
+}
+
+/// Write `contents` to a file only root can write, feeding the bytes on stdin so no value of
+/// ours reaches the shell and the file lands 0644, the mode WSL's own configuration has.
+/// [`write_as_root_script`] does the atomic sibling-and-rename.
+fn write_as_root(path: &str, contents: &[u8]) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::io::Write;
+
+    let script = write_as_root_script(path);
+    let mut child = std::process::Command::new("sudo")
+        .args(["sh", "-c", &script])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running sudo sh to write {path}"))?;
+    child
+        .stdin
+        .take()
+        .context("sudo sh has no stdin")?
+        .write_all(contents)
+        .with_context(|| format!("writing {path}"))?;
+    let status = child.wait().context("waiting for sudo sh")?;
+    anyhow::ensure!(status.success(), "sudo sh exited {status}");
+    Ok(())
 }
 
 /// Select deduplicated named features or the default sweep. A version-only request selects
@@ -643,11 +768,34 @@ fn owned_by(dev: &Path, gid: libc::gid_t) -> bool {
 /// The login name `usermod` takes. `$USER` stands in for a uid with no passwd entry, as
 /// `vk dev`'s WSL bridge does.
 fn login_name() -> String {
-    crate::hostpolicy::self_passwd()
-        .ok()
-        .map(|(name, _)| name)
+    login_name_from(
+        // SAFETY: getuid reads a thread-safe global and cannot fail.
+        unsafe { libc::getuid() },
+        std::env::var("SUDO_USER").ok(),
+        crate::hostpolicy::self_passwd().ok().map(|(name, _)| name),
+        std::env::var("USER").ok(),
+    )
+}
+
+/// Resolve the login from explicit inputs so tests need no uid or environment changes.
+/// Under `sudo`, use the invoker's `$SUDO_USER` instead of the root passwd entry. A root
+/// login without `$SUDO_USER` returns an empty name, leaving the user to complete the
+/// step instead of emitting `usermod … root`.
+fn login_name_from(
+    uid: libc::uid_t,
+    sudo_user: Option<String>,
+    passwd: Option<String>,
+    user_env: Option<String>,
+) -> String {
+    if uid == 0 {
+        return sudo_user
+            .filter(|name| !name.is_empty())
+            .unwrap_or_default();
+    }
+    passwd
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| std::env::var("USER").unwrap_or_default())
+        .or(user_env)
+        .unwrap_or_default()
 }
 
 /// Refuse to boot a microVM on a host this process cannot use KVM on, with the diagnosis
@@ -1389,6 +1537,93 @@ mod tests {
         remedy.iter().map(Step::to_string).collect()
     }
 
+    /// `usermod` has to name the invoking user, never the root `sudo vk check --fix` runs as:
+    /// under sudo that is `$SUDO_USER`, and a bare root login (no `$SUDO_USER`) names no one.
+    #[test]
+    fn the_login_to_add_is_the_invoker_not_root() {
+        // Not root: the passwd entry answers, and $USER only stands in for a uid without one.
+        assert_eq!(
+            login_name_from(1000, None, Some("dev".into()), Some("shell".into())),
+            "dev"
+        );
+        assert_eq!(
+            login_name_from(1000, None, Some(String::new()), Some("shell".into())),
+            "shell"
+        );
+        assert_eq!(login_name_from(1000, None, None, None), "");
+        // Root via sudo: the invoker, not the root the process now runs as.
+        assert_eq!(
+            login_name_from(
+                0,
+                Some("dev".into()),
+                Some("root".into()),
+                Some("root".into())
+            ),
+            "dev"
+        );
+        // A real root login has no invoker to name, so the step is left for the user.
+        assert_eq!(
+            login_name_from(0, None, Some("root".into()), Some("root".into())),
+            ""
+        );
+        assert_eq!(login_name_from(0, Some(String::new()), None, None), "");
+    }
+
+    /// An unknown invoker (root with no `$SUDO_USER`) gets the `<user>` step to complete by
+    /// hand, never a `usermod` that would add root to the group instead.
+    #[test]
+    fn an_unknown_login_leaves_the_group_step_manual() {
+        let remedy = distro_steps(
+            &Wsl2 {
+                user: String::new(),
+                ..wsl2()
+            },
+            crate::wsl::Virt::Intel,
+        );
+        assert!(
+            steps(&remedy)
+                .iter()
+                .any(|s| s.contains("usermod -aG kvm <user>")),
+            "{:?}",
+            steps(&remedy)
+        );
+        assert!(
+            !steps(&remedy)
+                .iter()
+                .any(|s| s.contains("usermod -aG kvm root")),
+            "never adds root: {:?}",
+            steps(&remedy)
+        );
+    }
+
+    /// `sudo` goes in front only when the step needs root; the program stays first otherwise.
+    #[test]
+    fn sudo_prefixes_only_privileged_steps() {
+        let argv = [
+            "usermod".to_string(),
+            "-aG".to_string(),
+            "kvm".to_string(),
+            "dev".to_string(),
+        ];
+        assert_eq!(
+            sudo_argv(&argv, true),
+            ["sudo", "usermod", "-aG", "kvm", "dev"]
+        );
+        assert_eq!(sudo_argv(&argv, false), ["usermod", "-aG", "kvm", "dev"]);
+        assert_eq!(sudo_argv(&[], false), Vec::<&str>::new());
+    }
+
+    /// The atomic-write script stages a sibling and renames it over the target, never
+    /// truncating the original in place.
+    #[test]
+    fn the_root_write_script_renames_a_sibling_into_place() {
+        assert_eq!(
+            write_as_root_script("/etc/wsl.conf"),
+            "cat > /etc/wsl.conf.vk-new && chmod 644 /etc/wsl.conf.vk-new && \
+             mv /etc/wsl.conf.vk-new /etc/wsl.conf"
+        );
+    }
+
     /// No vmx/svm is the Windows side's problem: the `.wslconfig` key, and the WSL restart
     /// that applies it. Nothing distro-side is suggested — none of it can work yet.
     #[test]
@@ -1499,6 +1734,44 @@ mod tests {
         })
         .expect("a diagnosis");
         assert!(steps(&remedy).is_empty(), "{:?}", steps(&remedy));
+    }
+
+    /// A step reads as the command to run or the edit to make, so the report is worth
+    /// pasting into a shell whether or not `--fix` is used.
+    #[test]
+    fn a_step_reads_as_what_it_does() {
+        assert_eq!(
+            sudo(&["chmod", "660", KVM_DEV]).to_string(),
+            "sudo chmod 660 /dev/kvm"
+        );
+        assert_eq!(
+            Step::Run {
+                argv: vec!["modprobe".to_string(), "kvm_intel".to_string()],
+                sudo: false,
+            }
+            .to_string(),
+            "modprobe kvm_intel"
+        );
+        assert_eq!(
+            Step::EditWslconfig {
+                path: r"C:\Users\dev\.wslconfig".to_string(),
+            }
+            .to_string(),
+            r"write `[wsl2] nestedVirtualization=true` to C:\Users\dev\.wslconfig"
+        );
+        let boot = Step::EditWslConf {
+            command: "modprobe kvm_amd".to_string(),
+        }
+        .to_string();
+        assert!(
+            boot.contains("`[boot] command = modprobe kvm_amd`"),
+            "{boot}"
+        );
+        assert!(boot.contains("/etc/wsl.conf"), "{boot}");
+        assert_eq!(
+            Step::Manual("reopen the distro".to_string()).to_string(),
+            "reopen the distro"
+        );
     }
 
     /// A refusal none of these cases explains — a device that opens but answers no KVM ioctl

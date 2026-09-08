@@ -11,6 +11,7 @@ All notable changes to virtkit will be documented in this file.
   not in place — nested virtualization off on the Windows side, the KVM module not loaded, or
   the device not open to this user — and prints the steps that remain, including the
   `/etc/wsl.conf` boot command that keeps them across a `wsl --shutdown`.
+  `vk check --fix` asks for confirmation, then applies the suggested repairs it can automate.
 
 - **`vk dev code` opens the workspace in Windows VS Code from WSL2** over Remote-SSH.
 - **`vk dev ssh-config --windows` prints the Windows SSH host block** that `vk dev code`

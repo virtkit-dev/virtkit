@@ -562,6 +562,14 @@ enum Cmd {
         /// needs no config file; with --feature it checks both.
         #[arg(long = "min-version", value_name = "VERSION")]
         min_version: Option<check::Version>,
+        /// apply the steps a failed check knows how to take
+        ///
+        /// Prints them and asks before running any, so it needs a terminal; the checks
+        /// are then reported again, leaving only what is still outstanding. Today only
+        /// the kvm check offers steps, and only on a WSL2 distro. A version-only check
+        /// (--min-version without --feature) has nothing to apply.
+        #[arg(long)]
+        fix: bool,
     },
     /// Reclaim the host caches — a cron or manual sweep
     ///
@@ -2685,6 +2693,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
     if let Cmd::Check {
         feature,
         min_version: Some(min),
+        ..
     } = &cli.cmd
         && feature.is_empty()
     {
@@ -2712,9 +2721,10 @@ async fn cli_main(cli: Cli) -> ExitCode {
     if let Cmd::Check {
         feature,
         min_version,
+        fix,
     } = &cli.cmd
     {
-        return match check::run(&cfg, feature, *min_version) {
+        return match check::run(&cfg, feature, *min_version, *fix) {
             Ok(true) => ExitCode::SUCCESS,
             Ok(false) => exit_code(1),
             Err(e) => fail(&anyhow::anyhow!(e), 2),
@@ -5387,11 +5397,12 @@ mod tests {
         let Cmd::Check {
             feature,
             min_version,
+            fix,
         } = cli.cmd
         else {
             panic!("expected Cmd::Check")
         };
-        assert!(feature.is_empty() && min_version.is_none());
+        assert!(feature.is_empty() && min_version.is_none() && !fix);
 
         let cli = Cli::try_parse_from(["vk", "check", "--min-version", "v0.45"]).unwrap();
         let Cmd::Check { min_version, .. } = cli.cmd else {
@@ -5403,6 +5414,14 @@ mod tests {
         );
 
         assert!(Cli::try_parse_from(["vk", "check", "--min-version", "next"]).is_err());
+
+        // Applying the fixes is opt-in, and takes no value.
+        let cli = Cli::try_parse_from(["vk", "check", "--fix"]).unwrap();
+        let Cmd::Check { fix, .. } = cli.cmd else {
+            panic!("expected Cmd::Check")
+        };
+        assert!(fix);
+        assert!(Cli::try_parse_from(["vk", "check", "--fix", "kvm"]).is_err());
     }
 
     /// An interval of zero would have the guest sampling without pause. Refused where every

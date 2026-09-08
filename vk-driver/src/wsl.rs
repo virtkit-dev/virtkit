@@ -100,6 +100,27 @@ pub(crate) fn wslconfig_nested(w: &impl Windows) -> Result<Option<bool>> {
     Ok(ini_get(&text, "wsl2", NESTED).and_then(ini_bool))
 }
 
+/// Enable nested virtualization in `%USERPROFILE%\.wslconfig` and return its path.
+/// Preserve all other settings, including memory and network tuning. Repeated calls
+/// leave the file unchanged.
+pub(crate) fn wslconfig_set_nested(w: &impl Windows) -> Result<PathBuf> {
+    let path = wslconfig(w)?;
+    let text = read_or_empty(&path)?;
+    let edited = ini_set(&text, "wsl2", NESTED, "true", eol(&text, "\r\n"));
+    if edited != text {
+        vk_fs::write_atomic(&path, &edited, 0o644)
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(path)
+}
+
+/// Return `/etc/wsl.conf` with `[boot] command` set to `command`, preserving the rest.
+/// The caller needs root to write the result.
+pub(crate) fn wsl_conf_with_boot_command(command: &str) -> Result<Vec<u8>> {
+    let text = read_or_empty(Path::new(WSL_CONF))?;
+    Ok(ini_set(&text, "boot", "command", command, eol(&text, "\n")))
+}
+
 /// `%USERPROFILE%\.wslconfig`, as a path this distro can open.
 fn wslconfig(w: &impl Windows) -> Result<PathBuf> {
     Ok(w.user_profile()?.join(WSLCONFIG))
@@ -156,6 +177,58 @@ fn ini_get<'a>(text: &'a [u8], section: &str, key: &str) -> Option<&'a [u8]> {
         }
     }
     None
+}
+
+/// `[section]` `key = value` set, with the section and the key added when either is absent.
+/// Every other byte is copied as it stands, line endings included. A written key goes
+/// directly under its section header, which keeps it inside the section whatever follows,
+/// and any line that already set it is dropped — so applying this twice changes nothing.
+fn ini_set(text: &[u8], section: &str, key: &str, value: &str, eol: &str) -> Vec<u8> {
+    let entry = format!("{key}={value}{eol}");
+    let mut out = Vec::with_capacity(text.len() + entry.len() + section.len() + 4);
+    let mut here = false;
+    let mut written = false;
+    for line in text.split_inclusive(|b| *b == b'\n') {
+        let body = line.trim_ascii();
+        if let Some(name) = ini_section(body) {
+            here = name.eq_ignore_ascii_case(section.as_bytes());
+            out.extend_from_slice(line);
+            if here && !written {
+                end_line(&mut out, eol);
+                out.extend_from_slice(entry.as_bytes());
+                written = true;
+            }
+            continue;
+        }
+        // The header came first, so `written` is set by now: this is the superseded line.
+        if here && ini_entry(body).is_some_and(|(k, _)| k.eq_ignore_ascii_case(key.as_bytes())) {
+            continue;
+        }
+        out.extend_from_slice(line);
+    }
+    if !written {
+        end_line(&mut out, eol);
+        out.extend_from_slice(format!("[{section}]{eol}{entry}").as_bytes());
+    }
+    out
+}
+
+/// The line ending an edit should use: the file's own, and `default` when it has none to copy.
+fn eol(text: &[u8], default: &'static str) -> &'static str {
+    if text.windows(2).any(|w| w == b"\r\n") {
+        "\r\n"
+    } else if text.contains(&b'\n') {
+        "\n"
+    } else {
+        default
+    }
+}
+
+/// Finish the last line, so what is appended starts on one of its own.
+fn end_line(out: &mut Vec<u8>, eol: &str) {
+    if !out.is_empty() && !out.ends_with(b"\n") {
+        out.extend_from_slice(eol.as_bytes());
+    }
 }
 
 /// The name in a `[section]` header line.
@@ -354,6 +427,65 @@ mod tests {
         assert_eq!(ini_bool(b"TRUE"), Some(true));
         assert_eq!(ini_bool(b"false"), Some(false));
         assert_eq!(ini_bool(b"1"), None);
+    }
+
+    /// A new file, a missing section and a missing key each end up with the one key set, and
+    /// nothing else in the file moves. The edit applied twice changes nothing.
+    #[test]
+    fn setting_an_ini_key_keeps_the_rest_of_the_file() {
+        let set = |text: &[u8]| ini_set(text, "wsl2", NESTED, "true", eol(text, "\r\n"));
+        let idempotent = |text: &[u8]| {
+            let once = set(text);
+            assert_eq!(set(&once), once, "{}", String::from_utf8_lossy(&once));
+            once
+        };
+
+        // Nothing there yet: the section and the key, in the ending a Windows file gets.
+        assert_eq!(idempotent(b""), b"[wsl2]\r\nnestedVirtualization=true\r\n");
+
+        // A file of other sections keeps them and gains this one at the end.
+        assert_eq!(
+            idempotent(b"[experimental]\nsparseVhd=true\n"),
+            b"[experimental]\nsparseVhd=true\n[wsl2]\nnestedVirtualization=true\n"
+        );
+
+        // A last line without an ending gets one before the section is appended.
+        assert_eq!(
+            idempotent(b"[boot]\r\ncommand = true"),
+            b"[boot]\r\ncommand = true\r\n[wsl2]\r\nnestedVirtualization=true\r\n"
+        );
+
+        // The section is there without the key: the key goes directly under the header, so
+        // what follows the section cannot swallow it.
+        assert_eq!(
+            idempotent(b"[wsl2]\r\nmemory=8GB\r\n\r\n[experimental]\r\nsparseVhd=true\r\n"),
+            b"[wsl2]\r\nnestedVirtualization=true\r\nmemory=8GB\r\n\r\n\
+              [experimental]\r\nsparseVhd=true\r\n"
+        );
+
+        // A key already set to the opposite is replaced, once, whatever its case.
+        assert_eq!(
+            idempotent(b"[wsl2]\nnestedVirtualization=false\nmemory=8GB\n"),
+            b"[wsl2]\nnestedVirtualization=true\nmemory=8GB\n"
+        );
+        assert_eq!(
+            idempotent(b"[wsl2]\nmemory=8GB\nNESTEDVIRTUALIZATION = false\n"),
+            b"[wsl2]\nnestedVirtualization=true\nmemory=8GB\n"
+        );
+    }
+
+    /// `/etc/wsl.conf` is a distro-side file, so a new one is written with Unix endings where
+    /// the Windows-side `.wslconfig` gets CRLF — and either file's own ending wins.
+    #[test]
+    fn a_new_files_line_ending_follows_which_side_it_is_on() {
+        assert_eq!(eol(b"", "\r\n"), "\r\n");
+        assert_eq!(eol(b"", "\n"), "\n");
+        assert_eq!(eol(b"[boot]\r\n", "\n"), "\r\n");
+        assert_eq!(eol(b"[wsl2]\n", "\r\n"), "\n");
+        assert_eq!(
+            ini_set(b"", "boot", "command", "modprobe kvm_intel", "\n"),
+            b"[boot]\ncommand=modprobe kvm_intel\n"
+        );
     }
 
     /// The path a user has to open on Windows, with the literal for a distro whose interop

@@ -59,7 +59,11 @@ host-side requirements for configured features. Scripts can require a release wi
 
 A fresh WSL2 distro cannot boot microVMs: nested virtualization is off, and nothing loads
 KVM or opens `/dev/kvm` to the user. `vk check` says which of those still holds and prints
-the steps that remain. In full, starting on the Windows side:
+the steps that remain. `vk check --fix` asks first, then takes the ones it can — the two
+files below and the commands, leaving you the WSL restart and the new login — and reports
+the checks again so what is left is visible. It needs a terminal to ask on.
+
+In full, starting on the Windows side:
 
 ```ini
 # %UserProfile%\.wslconfig — needs Windows 11, or the Store WSL on a recent Windows 10.
