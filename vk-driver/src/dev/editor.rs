@@ -152,15 +152,37 @@ pub fn select(name: Option<&str>) -> Result<Editor> {
     })
 }
 
-/// `code --version` prints the version, the commit and the arch, one per line.
+/// `code --version` prints the version, the commit and the arch, one per line — but a Windows
+/// VS Code launched from WSL2 can print a one-off `Downloading… NN%` progress line (redrawn in
+/// place with backspaces) ahead of that the first time its CLI bootstraps. Strip control
+/// characters, then find the commit by its shape — a 40-hex-digit line — and read the version
+/// from the line just before it, rather than trusting line positions. This assumes the noise is
+/// *prepended*: the version is still the line right before the commit, as it is when the CLI
+/// downloads before it can report a version.
 fn parse_version(text: &str) -> Result<(String, String)> {
-    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
-    let version = lines.next().context("printed nothing")?.to_string();
-    let commit = lines.next().context("printed no commit")?.to_string();
-    if commit.len() != 40 || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!("expected a commit hash on the second line, got {commit:?}");
-    }
-    Ok((version, commit))
+    let is_commit = |l: &str| l.len() == 40 && l.chars().all(|c| c.is_ascii_hexdigit());
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| {
+            l.chars()
+                .filter(|c| !c.is_control())
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+        .filter(|l| !l.is_empty())
+        .collect();
+    let commit_at = lines.iter().position(|l| is_commit(l)).with_context(|| {
+        format!(
+            "no commit hash (a 40-hex-digit line) in {lines:?} — the editor may still be \
+             downloading its CLI; re-run once it has finished"
+        )
+    })?;
+    let version = match commit_at.checked_sub(1) {
+        Some(i) => lines[i].clone(),
+        None => bail!("a commit hash with no version line before it"),
+    };
+    Ok((version, lines[commit_at].clone()))
 }
 
 fn has_remote_extension(listed: &str, channel: Channel) -> bool {
@@ -809,6 +831,27 @@ mod tests {
         assert!(parse_version("1.93.1\nnot-a-commit\nx64\n").is_err());
         assert!(parse_version("1.93.1\n").is_err());
         assert!(parse_version("").is_err());
+
+        // A Windows VS Code launched from WSL2 prepends a backspace-redrawn download progress
+        // line the first time its CLI bootstraps; the real three lines still parse.
+        let (v, c) = parse_version(
+            "Downloading:     \u{8}\u{8}\u{8}\u{8}  0%\u{8}\u{8}\u{8}\u{8} 50%\u{8}\u{8}\u{8}\u{8}100%\n\
+             1.93.1\n38c31bc77e0dd6ae88a4e9cc93428cc27a56ba40\nx64\n",
+        )
+        .unwrap();
+        assert_eq!(v, "1.93.1");
+        assert_eq!(c, "38c31bc77e0dd6ae88a4e9cc93428cc27a56ba40");
+
+        // A commit hash with no line before it has no version to read.
+        assert!(parse_version("38c31bc77e0dd6ae88a4e9cc93428cc27a56ba40\n").is_err());
+        // Two commit-shaped lines: the first wins, its predecessor is the version.
+        let (v, c) = parse_version(
+            "1.93.1\n38c31bc77e0dd6ae88a4e9cc93428cc27a56ba40\n\
+             0000000000000000000000000000000000000000\n",
+        )
+        .unwrap();
+        assert_eq!(v, "1.93.1");
+        assert_eq!(c, "38c31bc77e0dd6ae88a4e9cc93428cc27a56ba40");
     }
 
     #[test]
