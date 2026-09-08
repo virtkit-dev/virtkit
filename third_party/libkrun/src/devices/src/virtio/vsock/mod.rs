@@ -70,8 +70,11 @@ mod defs {
     /// Max vsock packet data/buffer size.
     pub const MAX_PKT_BUF_SIZE: usize = 64 * 1024;
 
-    /// Size of the muxer RX packet queue.
-    pub const MUXER_RXQ_SIZE: usize = 256;
+    /// Size of the muxer RX packet queue. On overflow the muxer silently drops host->guest
+    /// packets (the connect OP_RESPONSE among them), so a guest that is slow to repost RX
+    /// buffers under memory pressure sees control connections reset. Sized for headroom
+    /// through such a stall; each slot is a small `MuxerRx`.
+    pub const MUXER_RXQ_SIZE: usize = 1024;
 
     // Kernel side doesn't play nice with us supporting so many bytes
     //pub const CONN_TX_BUF_SIZE: usize = i32::MAX as usize;

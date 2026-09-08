@@ -19,6 +19,9 @@ All notable changes to virtkit will be documented in this file.
   instead of printing only a bare connection error.
 - **`--ssh-host` writes the guest `~/.ssh/config` into the session user's home.** It went to
   root's home before, so with `--ssh-user` the stanzas never reached the user that ssh ran as.
+- **A microVM's vsock control plane survives host memory pressure.** Under heavy swapping the
+  VMM could drop a control connection's handshake, or permanently wedge a VM's vsock until it
+  was restarted; both are hardened.
 
 ### Removed
 

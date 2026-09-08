@@ -84,6 +84,15 @@ listener yet, the usual case for a readiness probe during boot) only deferred th
 removal, so the host peer read EOF when the reaper dropped the proxy 5 s later; it now
 reads it at once. Search for `release: shutdown failed`.
 
+`src/devices/src/virtio/vsock/muxer.rs` + `.../vsock/mod.rs` — harden the TSI muxer against
+host memory/fd pressure. On a guest connect to a bridged host port, `process_op_request` built the
+`UnixProxy` with `.unwrap()`, so a host `socket()` failing under fd or `ENOMEM` exhaustion panicked
+the device thread and poisoned the queue mutex, wedging that VM's whole vsock until restart; it now
+resets the guest's connect instead, exactly as the listening-socket branch already does. Separately
+the muxer RX queue silently drops host->guest packets when full — a connect's `OP_RESPONSE` among
+them, seen as a reset when the guest is slow to repost RX buffers under swap — so its cap is raised
+from 256 to 1024 slots for headroom. Search for `creating a proxy for port` and `MUXER_RXQ_SIZE`.
+
 `src/devices/src/virtio/block/device.rs` + `src/devices/src/virtio/file_traits.rs` —
 serve reads from read-only raw disks out of an `mmap` of the backing file instead of a
 `pread` per request. Upstream reads every block through imago's positioned-I/O file

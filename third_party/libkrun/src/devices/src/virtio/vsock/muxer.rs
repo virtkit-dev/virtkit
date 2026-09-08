@@ -560,7 +560,7 @@ impl VsockMuxer {
                 }
                 let rxq = self.rxq.clone();
 
-                let mut unix = UnixProxy::new(
+                let mut unix = match UnixProxy::new(
                     id,
                     self.cid,
                     pkt.dst_port(),
@@ -569,8 +569,25 @@ impl VsockMuxer {
                     queue.clone(),
                     rxq,
                     path.to_path_buf(),
-                )
-                .unwrap();
+                ) {
+                    Ok(unix) => unix,
+                    Err(e) => {
+                        // Under fd/memory exhaustion the host socket() fails here. Reset the
+                        // guest's connect instead of unwrapping: a panic on the device thread
+                        // poisons the queue mutex and wedges this VM's whole vsock until it
+                        // restarts. Matches the listening-socket reset just above.
+                        error!(
+                            "creating a proxy for port {}: {e:?}; sending rst",
+                            pkt.dst_port()
+                        );
+                        let rx = MuxerRx::Reset {
+                            local_port: pkt.dst_port(),
+                            peer_port: pkt.src_port(),
+                        };
+                        push_packet(self.cid, rx, &self.rxq, queue, mem);
+                        return;
+                    }
+                };
                 let tsi = TsiConnectReq {
                     peer_port: 0,
                     addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
