@@ -100,24 +100,73 @@ enum Status {
 struct Outcome {
     status: Status,
     detail: String,
+    /// Steps to resolve a diagnosed failure; empty for other outcomes.
+    remedy: Vec<Step>,
 }
 
 fn ok(detail: impl Into<String>) -> Outcome {
     Outcome {
         status: Status::Ok,
         detail: detail.into(),
+        remedy: Vec::new(),
     }
 }
 fn skip(detail: impl Into<String>) -> Outcome {
     Outcome {
         status: Status::Skip,
         detail: detail.into(),
+        remedy: Vec::new(),
     }
 }
 fn fail(detail: impl Into<String>) -> Outcome {
     Outcome {
         status: Status::Fail,
         detail: detail.into(),
+        remedy: Vec::new(),
+    }
+}
+
+/// An ordered remedy step, printed as a command or edit the user can copy from the report.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Step {
+    /// a command to run, `sudo` where it needs root
+    Run { argv: Vec<String>, sudo: bool },
+    /// `nestedVirtualization=true` in the named `%USERPROFILE%\.wslconfig`
+    EditWslconfig { path: String },
+    /// a `[boot] command` in `/etc/wsl.conf`, which is what makes a distro-side fix last
+    EditWslConf { command: String },
+    /// something only the user can do — on the Windows side, or in a new login
+    Manual(String),
+}
+
+impl fmt::Display for Step {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Step::Run { argv, sudo } => {
+                if *sudo {
+                    f.write_str("sudo ")?;
+                }
+                f.write_str(&argv.join(" "))
+            }
+            Step::EditWslconfig { path } => {
+                write!(f, "write `[wsl2] nestedVirtualization=true` to {path}")
+            }
+            Step::EditWslConf { command } => write!(
+                f,
+                "write `[boot] command = {command}` to {} (needs root) — without it the module \
+                 and the {KVM_DEV} mode are gone after the next `wsl --shutdown`",
+                crate::wsl::WSL_CONF
+            ),
+            Step::Manual(what) => f.write_str(what),
+        }
+    }
+}
+
+/// A step run as root, which every distro-side one here is.
+fn sudo(argv: &[&str]) -> Step {
+    Step::Run {
+        argv: argv.iter().map(|a| a.to_string()).collect(),
+        sudo: true,
     }
 }
 
@@ -198,7 +247,7 @@ pub fn probe(cfg: &Config, feature: Feature) -> Result<(), String> {
 /// not look like an old `vk`. `Err` means the build cannot identify its release, distinct
 /// from a version-floor failure and its exit code.
 pub fn min_version_only(min: Version) -> Result<bool, String> {
-    Ok(report("version", min_version(Version::own()?, min)))
+    Ok(report("version", &min_version(Version::own()?, min)))
 }
 
 /// Run the checks and print one line each; returns whether every check passed.
@@ -220,14 +269,14 @@ pub fn run(cfg: &Config, requested: &[Feature], min: Option<Version>) -> Result<
 
     let mut all_ok = true;
     if let Some(min) = min {
-        all_ok &= report("version", min_version(Version::own()?, min));
+        all_ok &= report("version", &min_version(Version::own()?, min));
     }
     for f in features {
         let mut outcome = evaluate(cfg, f);
         if explicit && outcome.status == Status::Skip {
             outcome = fail(format!("{} — requested but not enabled", outcome.detail));
         }
-        all_ok &= report(f.name(), outcome);
+        all_ok &= report(f.name(), &outcome);
     }
     Ok(all_ok)
 }
@@ -251,14 +300,21 @@ fn selected(requested: &[Feature], min: Option<Version>) -> Vec<Feature> {
     }
 }
 
-/// Print one check's line; returns whether it passed.
-fn report(name: &str, outcome: Outcome) -> bool {
+/// Print one check's line, and under it the steps that would make it pass; returns whether
+/// it passed.
+fn report(name: &str, outcome: &Outcome) -> bool {
     let label = match outcome.status {
         Status::Ok => "ok",
         Status::Skip => "skip",
         Status::Fail => "FAIL",
     };
     line(label, name, &outcome.detail);
+    if !outcome.remedy.is_empty() {
+        println!("     fix:");
+        for step in &outcome.remedy {
+            println!("       {step}");
+        }
+    }
     outcome.status != Status::Fail
 }
 
@@ -380,13 +436,219 @@ fn usage() -> Outcome {
 }
 
 fn kvm() -> Outcome {
-    match kvm_ready(Path::new(KVM_DEV)) {
-        Ok(()) => ok(format!("rw access to {KVM_DEV}, KVM API v12")),
-        Err(why) => fail(why),
+    let Err(why) = kvm_ready(Path::new(KVM_DEV)) else {
+        return ok(format!("rw access to {KVM_DEV}, KVM API v12"));
+    };
+    // A fresh WSL2 distro cannot host KVM in three ways the generic reason above does not
+    // name, each with steps of its own. Anything else fails there as it does anywhere.
+    match crate::wsl::is_wsl2()
+        .then(wsl2_facts)
+        .and_then(|facts| wsl2_kvm_remedy(&facts))
+    {
+        Some((detail, remedy)) => Outcome {
+            status: Status::Fail,
+            detail,
+            remedy,
+        },
+        None => fail(why),
     }
 }
 
 const KVM_DEV: &str = "/dev/kvm";
+
+/// Host facts gathered before the pure WSL2 KVM diagnosis runs.
+struct Wsl2 {
+    /// the CPU's virtualization extension, absent until nested virtualization takes effect
+    virt: Option<crate::wsl::Virt>,
+    /// whether `/dev/kvm` is there at all, and whether this process can use it
+    kvm_present: bool,
+    kvm_rw: bool,
+    /// whether it is already `root:kvm` with the mode that lets the group use it
+    kvm_mode_ok: bool,
+    /// `%USERPROFILE%\.wslconfig` as Windows spells it, and its `nestedVirtualization`
+    wslconfig: String,
+    nested: Option<bool>,
+    /// whether a `kvm` group exists, and whether this session's credentials include it
+    kvm_group: bool,
+    in_kvm_group: bool,
+    /// the login name `usermod` takes
+    user: String,
+    /// what `/etc/wsl.conf` already runs at boot
+    boot: Boot,
+}
+
+/// `/etc/wsl.conf`'s `[boot] command`, seen from the question of adding one.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Boot {
+    /// none yet, so `vk` can write the one the fix needs
+    None,
+    /// one already there, printed for the user to extend — `vk` never rewrites it
+    Other(String),
+    /// unreadable, so what it runs cannot be judged
+    Unreadable(String),
+}
+
+/// Read the facts. An interop failure is not an error here: the diagnosis is a report, and a
+/// `.wslconfig` this distro cannot reach only leaves that step naming `%USERPROFILE%` itself.
+fn wsl2_facts() -> Wsl2 {
+    let dev = Path::new(KVM_DEV);
+    let interop = crate::wsl::Interop;
+    let kvm_gid = group_gid("kvm");
+    Wsl2 {
+        virt: crate::wsl::cpu_virt(),
+        kvm_present: dev.exists(),
+        kvm_rw: access_ok(dev, libc::R_OK | libc::W_OK),
+        kvm_mode_ok: kvm_gid.is_some_and(|gid| owned_by(dev, gid)),
+        wslconfig: crate::wsl::wslconfig_win_path(&interop),
+        nested: crate::wsl::wslconfig_nested(&interop).ok().flatten(),
+        kvm_group: kvm_gid.is_some(),
+        in_kvm_group: kvm_gid.is_some_and(in_group),
+        user: login_name(),
+        boot: match crate::wsl::wsl_conf_boot_command() {
+            Ok(None) => Boot::None,
+            Ok(Some(command)) => Boot::Other(command),
+            Err(e) => Boot::Unreadable(format!("{e:#}")),
+        },
+    }
+}
+
+/// The WSL2 diagnosis for a host [`kvm_ready`] refused, and the steps that would fix it.
+/// `None` when none of these explains the refusal, leaving the generic reason to stand.
+fn wsl2_kvm_remedy(facts: &Wsl2) -> Option<(String, Vec<Step>)> {
+    let Some(virt) = facts.virt else {
+        // Nesting is a Windows-side setting, and the distro sees it only as CPU flags that
+        // are not there. Nothing distro-side is worth suggesting until it is on.
+        return Some((
+            "nested virtualization is off in WSL2 — no vmx/svm in /proc/cpuinfo (it needs \
+             Windows 11, or the Store WSL on a recent Windows 10)"
+                .to_string(),
+            nesting_steps(facts),
+        ));
+    };
+    let detail = if !facts.kvm_present {
+        format!(
+            "{KVM_DEV} missing in WSL2 — {} is not loaded",
+            virt.module()
+        )
+    } else if !facts.kvm_rw {
+        format!("no rw access to {KVM_DEV} — WSL2 creates it root:root 0600")
+    } else {
+        return None;
+    };
+    Some((detail, distro_steps(facts, virt)))
+}
+
+/// Turning nesting on: the `.wslconfig` key, and the WSL restart that applies it. Only the
+/// user can ask for that restart — it ends every distro, this process included.
+fn nesting_steps(facts: &Wsl2) -> Vec<Step> {
+    let restart = "run `wsl --shutdown` in Windows, then reopen the distro";
+    match facts.nested {
+        Some(true) => vec![Step::Manual(format!(
+            "nestedVirtualization=true is already set in {}; {restart}",
+            facts.wslconfig
+        ))],
+        _ => vec![
+            Step::EditWslconfig {
+                path: facts.wslconfig.clone(),
+            },
+            Step::Manual(restart.to_string()),
+        ],
+    }
+}
+
+/// Loading the module and opening the device up to the `kvm` group, then what makes both
+/// survive the next `wsl --shutdown` — a WSL2 distro boots without either.
+fn distro_steps(facts: &Wsl2, virt: crate::wsl::Virt) -> Vec<Step> {
+    let module = virt.module();
+    let mut steps = Vec::new();
+    if !facts.kvm_present {
+        steps.push(sudo(&["modprobe", module]));
+    }
+    if !facts.kvm_group {
+        steps.push(sudo(&["groupadd", "kvm"]));
+    }
+    let mut usermod = false;
+    if !facts.in_kvm_group {
+        match facts.user.is_empty() {
+            false => {
+                steps.push(sudo(&["usermod", "-aG", "kvm", &facts.user]));
+                usermod = true;
+            }
+            // No passwd entry and no $USER: the name is the user's to supply.
+            true => steps.push(Step::Manual(
+                "add this login to the kvm group: sudo usermod -aG kvm <user>".to_string(),
+            )),
+        }
+    }
+    if !facts.kvm_mode_ok {
+        steps.push(sudo(&["chown", "root:kvm", KVM_DEV]));
+        steps.push(sudo(&["chmod", "660", KVM_DEV]));
+    }
+    if !steps.is_empty() {
+        let command = format!("modprobe {module}; chown root:kvm {KVM_DEV}; chmod 660 {KVM_DEV}");
+        steps.push(match &facts.boot {
+            Boot::None => Step::EditWslConf { command },
+            Boot::Other(existing) => Step::Manual(format!(
+                "add to the existing `[boot] command` in {} (`{existing}`): `{command}` — \
+                 without it the module and the {KVM_DEV} mode are gone after the next \
+                 `wsl --shutdown`",
+                crate::wsl::WSL_CONF
+            )),
+            Boot::Unreadable(why) => Step::Manual(format!(
+                "{why} — put `{command}` in its `[boot] command`, or the module and the \
+                 {KVM_DEV} mode are gone after the next `wsl --shutdown`"
+            )),
+        });
+    }
+    if usermod {
+        steps.push(Step::Manual(
+            "then log in again (or `wsl --shutdown`) so the group membership applies".to_string(),
+        ));
+    }
+    steps
+}
+
+/// A group's gid, or `None` when this host has no such group.
+fn group_gid(name: &str) -> Option<libc::gid_t> {
+    let c = std::ffi::CString::new(name).ok()?;
+    // SAFETY: `c` is a valid NUL-terminated name. `getgrnam` returns a pointer into static
+    // storage or null, and the gid is copied out before anything else can call it again.
+    unsafe { libc::getgrnam(c.as_ptr()).as_ref().map(|g| g.gr_gid) }
+}
+
+/// Check current session credentials for `gid`, so pending `usermod` changes still prompt
+/// the user to log in again.
+fn in_group(gid: libc::gid_t) -> bool {
+    // SAFETY: a size of 0 asks for the count and writes nothing; the second call fills a
+    // buffer of exactly the length it is given. `getegid` cannot fail.
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    let mut groups = vec![0; usize::try_from(count).unwrap_or(0)];
+    let len = libc::c_int::try_from(groups.len()).unwrap_or(0);
+    let filled = unsafe { libc::getgroups(len, groups.as_mut_ptr()) };
+    let egid = unsafe { libc::getegid() };
+    egid == gid
+        || groups
+            .iter()
+            .take(usize::try_from(filled).unwrap_or(0))
+            .any(|g| *g == gid)
+}
+
+/// Check root:`gid` ownership and group access so redundant `chown`/`chmod` steps are omitted.
+fn owned_by(dev: &Path, gid: libc::gid_t) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(dev)
+        .is_ok_and(|md| md.uid() == 0 && md.gid() == gid && md.mode() & 0o777 == 0o660)
+}
+
+/// The login name `usermod` takes. `$USER` stands in for a uid with no passwd entry, as
+/// `vk dev`'s WSL bridge does.
+fn login_name() -> String {
+    crate::hostpolicy::self_passwd()
+        .ok()
+        .map(|(name, _)| name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| std::env::var("USER").unwrap_or_default())
+}
 
 /// Refuse to boot a microVM on a host this process cannot use KVM on, with the diagnosis
 /// `vk check` gives. `vk run` and the executor's `prepare` call this before pulling or
@@ -1104,6 +1366,153 @@ mod tests {
         assert!(out.detail.contains("atop_interval_secs"), "{}", out.detail);
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A distro with everything still to do, which is what a fresh WSL2 install is.
+    fn wsl2() -> Wsl2 {
+        Wsl2 {
+            virt: Some(crate::wsl::Virt::Intel),
+            kvm_present: false,
+            kvm_rw: false,
+            kvm_mode_ok: false,
+            wslconfig: r"C:\Users\dev\.wslconfig".to_string(),
+            nested: None,
+            kvm_group: false,
+            in_kvm_group: false,
+            user: "dev".to_string(),
+            boot: Boot::None,
+        }
+    }
+
+    /// Every step as the report prints it.
+    fn steps(remedy: &[Step]) -> Vec<String> {
+        remedy.iter().map(Step::to_string).collect()
+    }
+
+    /// No vmx/svm is the Windows side's problem: the `.wslconfig` key, and the WSL restart
+    /// that applies it. Nothing distro-side is suggested — none of it can work yet.
+    #[test]
+    fn a_distro_without_nesting_is_pointed_at_the_wslconfig() {
+        let (detail, remedy) = wsl2_kvm_remedy(&Wsl2 {
+            virt: None,
+            ..wsl2()
+        })
+        .expect("a diagnosis");
+        assert!(detail.contains("nested virtualization is off"), "{detail}");
+        assert!(detail.contains("no vmx/svm"), "{detail}");
+        assert_eq!(
+            steps(&remedy),
+            [
+                r"write `[wsl2] nestedVirtualization=true` to C:\Users\dev\.wslconfig",
+                "run `wsl --shutdown` in Windows, then reopen the distro",
+            ]
+        );
+
+        // Already set: only WSL restarting can apply it, so that is the whole remedy.
+        let (_, remedy) = wsl2_kvm_remedy(&Wsl2 {
+            virt: None,
+            nested: Some(true),
+            ..wsl2()
+        })
+        .expect("a diagnosis");
+        assert_eq!(
+            steps(&remedy),
+            [concat!(
+                r"nestedVirtualization=true is already set in C:\Users\dev\.wslconfig; ",
+                "run `wsl --shutdown` in Windows, then reopen the distro"
+            )]
+        );
+    }
+
+    /// Nesting on but no device: the module, the group, the mode, what keeps all three across
+    /// a `wsl --shutdown`, and the new login the group membership needs.
+    #[test]
+    fn a_distro_without_the_module_is_given_every_step_in_order() {
+        let (detail, remedy) = wsl2_kvm_remedy(&wsl2()).expect("a diagnosis");
+        assert!(detail.contains("/dev/kvm missing in WSL2"), "{detail}");
+        assert!(detail.contains("kvm_intel is not loaded"), "{detail}");
+        assert_eq!(
+            steps(&remedy)[..5],
+            [
+                "sudo modprobe kvm_intel",
+                "sudo groupadd kvm",
+                "sudo usermod -aG kvm dev",
+                "sudo chown root:kvm /dev/kvm",
+                "sudo chmod 660 /dev/kvm",
+            ]
+        );
+        assert_eq!(
+            remedy[5],
+            Step::EditWslConf {
+                command: "modprobe kvm_intel; chown root:kvm /dev/kvm; chmod 660 /dev/kvm"
+                    .to_string(),
+            }
+        );
+        assert!(steps(&remedy)[5].contains("gone after the next `wsl --shutdown`"));
+        assert!(steps(&remedy)[6].contains("log in again"));
+
+        // The module named is the one this CPU needs.
+        let (detail, remedy) = wsl2_kvm_remedy(&Wsl2 {
+            virt: Some(crate::wsl::Virt::Amd),
+            ..wsl2()
+        })
+        .expect("a diagnosis");
+        assert!(detail.contains("kvm_amd is not loaded"), "{detail}");
+        assert_eq!(steps(&remedy)[0], "sudo modprobe kvm_amd");
+    }
+
+    /// A device that is there but not usable: only what is actually missing is asked for, and
+    /// a `[boot] command` that is already something else is never rewritten.
+    #[test]
+    fn a_device_without_access_is_given_only_the_steps_it_needs() {
+        let facts = Wsl2 {
+            kvm_present: true,
+            kvm_group: true,
+            boot: Boot::Other("mount -t drvfs C: /mnt/c".to_string()),
+            ..wsl2()
+        };
+        let (detail, remedy) = wsl2_kvm_remedy(&facts).expect("a diagnosis");
+        assert!(detail.contains("no rw access to /dev/kvm"), "{detail}");
+        assert_eq!(
+            steps(&remedy)[..3],
+            [
+                "sudo usermod -aG kvm dev",
+                "sudo chown root:kvm /dev/kvm",
+                "sudo chmod 660 /dev/kvm",
+            ]
+        );
+        let boot = &steps(&remedy)[3];
+        assert!(
+            boot.starts_with("add to the existing `[boot] command`"),
+            "{boot}"
+        );
+        assert!(boot.contains("mount -t drvfs C: /mnt/c"), "{boot}");
+        assert!(!remedy.iter().any(|s| matches!(s, Step::EditWslConf { .. })));
+
+        // A device already root:kvm 0660, with this session in the group: the mode and the
+        // membership steps drop out, leaving only what has to be redone after a restart.
+        let (_, remedy) = wsl2_kvm_remedy(&Wsl2 {
+            kvm_mode_ok: true,
+            in_kvm_group: true,
+            boot: Boot::None,
+            ..facts
+        })
+        .expect("a diagnosis");
+        assert!(steps(&remedy).is_empty(), "{:?}", steps(&remedy));
+    }
+
+    /// A refusal none of these cases explains — a device that opens but answers no KVM ioctl
+    /// — keeps the generic reason rather than being given steps that would not help.
+    #[test]
+    fn a_usable_device_that_still_fails_gets_no_wsl_steps() {
+        assert_eq!(
+            wsl2_kvm_remedy(&Wsl2 {
+                kvm_present: true,
+                kvm_rw: true,
+                ..wsl2()
+            }),
+            None
+        );
     }
 
     #[test]

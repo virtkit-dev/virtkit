@@ -55,6 +55,37 @@ It checks KVM access, the selected VMM backend, the guest kernel and agent, and 
 host-side requirements for configured features. Scripts can require a release with
 `vk check --min-version 0.45`, which exits non-zero on an older `vk`.
 
+### WSL2
+
+A fresh WSL2 distro cannot boot microVMs: nested virtualization is off, and nothing loads
+KVM or opens `/dev/kvm` to the user. `vk check` says which of those still holds and prints
+the steps that remain. In full, starting on the Windows side:
+
+```ini
+# %UserProfile%\.wslconfig — needs Windows 11, or the Store WSL on a recent Windows 10.
+[wsl2]
+nestedVirtualization=true
+```
+
+That key applies only when WSL itself restarts: run `wsl --shutdown` from Windows and reopen
+the distro, after which `/proc/cpuinfo` carries `vmx` or `svm`. Then, in the distro:
+
+```sh
+sudo modprobe kvm_intel          # kvm_amd on an AMD host
+sudo groupadd kvm                # only if the distro has no kvm group
+sudo usermod -aG kvm "$USER"     # log in again before it applies
+sudo chown root:kvm /dev/kvm
+sudo chmod 660 /dev/kvm
+```
+
+Neither the module nor the device's ownership survives the next `wsl --shutdown`. An
+`/etc/wsl.conf` boot command redoes both on every start of the distro:
+
+```ini
+[boot]
+command = modprobe kvm_intel; chown root:kvm /dev/kvm; chmod 660 /dev/kvm
+```
+
 ## Quick start
 
 ```sh
