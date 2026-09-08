@@ -137,12 +137,25 @@ pub fn select(name: Option<&str>) -> Result<Editor> {
     let listed_out = std::str::from_utf8(&listed.stdout)
         .with_context(|| format!("{} --list-extensions: non-UTF-8 output", binary.display()))?;
     if !has_remote_extension(listed_out, channel) {
-        bail!(
-            "{} ({version}) has no Remote-SSH extension ({}), so it cannot attach to the \
-             environment — install one, or name another editor with --editor",
-            binary.display(),
-            channel.remote_extensions().join(" or ")
-        );
+        // A Windows VS Code launched from WSL2 runs `--list-extensions` against the WSL remote's
+        // extension host, where a UI-only extension like Remote-SSH never appears — so its
+        // absence there says nothing about the Windows side, which is where it must live. Can't
+        // verify it from here: note it and go on. Remote-SSH, if truly missing, prompts to
+        // install itself when the window connects.
+        if crate::dev::wsl::bridge_needed(&binary) {
+            eprintln!(
+                "virtkit: cannot verify the Remote-SSH extension ({}) from WSL2 — make sure it \
+                 is installed in your Windows VS Code",
+                channel.remote_extensions().join(" or ")
+            );
+        } else {
+            bail!(
+                "{} ({version}) has no Remote-SSH extension ({}), so it cannot attach to the \
+                 environment — install one, or name another editor with --editor",
+                binary.display(),
+                channel.remote_extensions().join(" or ")
+            );
+        }
     }
     Ok(Editor {
         binary,
@@ -1073,8 +1086,9 @@ mod tests {
     }
 
     /// A stand-in `code` binary: `--version` prints a version, a commit and an arch, and
-    /// `--list-extensions` names the Remote-SSH extension [`select`] insists on.
-    fn fake_editor(dir: &Path, name: &str) -> PathBuf {
+    /// `--list-extensions` prints `extensions` (newline-separated, `""` for none), so a test can
+    /// drive the Remote-SSH check [`select`] runs either way.
+    fn fake_editor(dir: &Path, name: &str, extensions: &str) -> PathBuf {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join(name);
@@ -1085,15 +1099,14 @@ mod tests {
             .mode(0o755)
             .open(&path)
             .unwrap();
-        std::io::Write::write_all(
-            &mut f,
-            b"#!/bin/sh\n\
-              case \"$1\" in\n\
-              --version) printf '1.93.1\\nabcdef0123456789abcdef0123456789abcdef01\\nx64\\n' ;;\n\
-              --list-extensions) printf 'ms-vscode-remote.remote-ssh\\n' ;;\n\
-              esac\n",
-        )
-        .unwrap();
+        let script = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+             --version) printf '1.93.1\\nabcdef0123456789abcdef0123456789abcdef01\\nx64\\n' ;;\n\
+             --list-extensions) printf '{extensions}' ;;\n\
+             esac\n"
+        );
+        std::io::Write::write_all(&mut f, script.as_bytes()).unwrap();
         path
     }
 
@@ -1101,7 +1114,7 @@ mod tests {
     fn the_channel_follows_the_resolved_binary_even_when_it_is_a_path() {
         let dir = std::env::temp_dir().join(format!("vk-deveditor-path-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let path = fake_editor(&dir, "code-insiders");
+        let path = fake_editor(&dir, "code-insiders", "ms-vscode-remote.remote-ssh\\n");
 
         // The channel comes from the binary that was resolved, not from what was typed —
         // an absolute path to an insiders build is the insiders channel, and its server
@@ -1117,6 +1130,24 @@ mod tests {
         // A path that is not an executable file is refused before anything is run.
         let e = select(Some(&dir.join("nope").to_string_lossy())).unwrap_err();
         assert!(format!("{e:#}").contains("not an executable file"), "{e:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_editor_without_remote_ssh_is_refused_off_a_wsl2_bridge() {
+        let dir =
+            std::env::temp_dir().join(format!("vk-deveditor-noremote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A temp-dir editor is not a Windows binary, so `bridge_needed` is false regardless of
+        // host: `select` must hard-fail when no Remote-SSH extension is listed. The WSL2-bridge
+        // branch that warns and continues turns on `wsl::bridge_needed`, which is host-detected
+        // and not unit-testable here.
+        let path = fake_editor(&dir, "code", "");
+        let e = select(Some(&path.to_string_lossy())).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("no Remote-SSH extension"),
+            "{e:#}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -24,6 +24,9 @@ All notable changes to virtkit will be documented in this file.
   was restarted; both are hardened.
 - **`vk dev code` works the first time Windows VS Code bootstraps its CLI from WSL2**, instead
   of failing with a commit-hash parse error when `code --version` opens with a download line.
+- **`vk dev code` no longer rejects a Windows VS Code from WSL2 over a "missing" Remote-SSH
+  extension** that `code --list-extensions` cannot see from the WSL side even when it is
+  installed; it warns that it cannot verify the extension and continues.
 
 ### Removed
 
