@@ -12,36 +12,21 @@
 //! Written on every launch, like the Linux config it mirrors: the run rewrites its own setup
 //! on each boot, and the two have to agree.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::io::Write;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
 use crate::dev::editor::Channel;
 use crate::sshclient::{Managed, Parts};
+use crate::wsl::{Interop, Windows, distro, in_wsl};
 
-/// Where a WSL install keeps `wsl.exe`, for a PATH without the interop directories.
-const WSL_EXE: &str = r"C:\Windows\System32\wsl.exe";
 /// The line that makes the user's own `ssh_config` read the stanzas written here.
 const INCLUDE: &str = "Include vk/*.conf";
 /// What that line is, for whoever reads the file next.
 const INCLUDE_NOTE: &str = "# Added by vk dev code: per-environment hosts.";
-
-/// The Windows facts this module cannot work out on its own, each an interop call.
-trait Windows {
-    /// `%USERPROFILE%`, as a path this distro can open.
-    fn user_profile(&self) -> Result<PathBuf>;
-    /// `%APPDATA%`, likewise — where a Windows VS Code keeps its user settings.
-    fn app_data(&self) -> Result<PathBuf>;
-    /// The Windows spelling of a path in this distro.
-    fn to_windows(&self, path: &Path) -> Result<String>;
-    /// `wsl.exe`, as Windows spells it.
-    fn wsl_exe(&self) -> Result<String>;
-}
 
 /// What the bridge left on the Windows side.
 #[derive(Debug)]
@@ -132,13 +117,6 @@ fn platform_known(settings: &str, alias: &str) -> bool {
     settings.contains(&format!("\"{alias}\"")) || settings.contains("\"vk-*\"")
 }
 
-/// Whether this is a WSL distro. The distro name is the signal; the binfmt handler stands in
-/// where the environment does not carry it, so a shell that lost it is still recognised.
-fn in_wsl() -> bool {
-    std::env::var_os("WSL_DISTRO_NAME").is_some_and(|name| !name.is_empty())
-        || Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
-}
-
 /// Where the ProxyCommand comes back in: `wsl.exe -d <distro> -u <user>`.
 struct Entry {
     distro: String,
@@ -147,24 +125,10 @@ struct Entry {
 
 fn entry() -> Result<Entry> {
     Ok(Entry {
-        distro: distro()?,
+        // The ProxyCommand requires a distro name; stop the bridge if it is missing.
+        distro: distro().context("there is no Windows ssh to write a bridge for")?,
         user: unix_user()?,
     })
-}
-
-/// Require the distro name for `wsl.exe -d`; fail rather than guess.
-fn distro() -> Result<String> {
-    let name = std::env::var("WSL_DISTRO_NAME").unwrap_or_default();
-    if !name.is_empty() {
-        return Ok(name);
-    }
-    if in_wsl() {
-        bail!(
-            "WSL_DISTRO_NAME is not set, so the Windows ProxyCommand has no distro to enter — \
-             run this from a WSL shell"
-        );
-    }
-    bail!("this is not a WSL2 distro, so there is no Windows ssh to write a bridge for");
 }
 
 /// The distro user `wsl.exe -u` has to enter as. Named rather than left to the distro's
@@ -354,83 +318,11 @@ fn bare<'a>(value: &'a str, what: &str) -> Result<&'a str> {
     Ok(value)
 }
 
-/// The Windows side, reached through WSL interop.
-struct Interop;
-
-impl Windows for Interop {
-    fn user_profile(&self) -> Result<PathBuf> {
-        win_env("USERPROFILE")
-    }
-
-    fn app_data(&self) -> Result<PathBuf> {
-        win_env("APPDATA")
-    }
-
-    fn to_windows(&self, path: &Path) -> Result<String> {
-        let win = wslpath("-w", path.as_os_str())?;
-        String::from_utf8(win).with_context(|| {
-            format!(
-                "the Windows spelling of {} is not valid UTF-8",
-                path.display()
-            )
-        })
-    }
-
-    fn wsl_exe(&self) -> Result<String> {
-        // The well-known path covers a PATH without the interop directories, and a
-        // translation that fails on the one we found.
-        Ok(crate::shell::which("wsl.exe")
-            .and_then(|p| self.to_windows(&p).ok())
-            .unwrap_or_else(|| WSL_EXE.to_string()))
-    }
-}
-
-/// One Windows environment variable, as a path this distro can open. Only Windows knows its
-/// own environment, so cmd.exe expands it — echoing the value with a trailing CRLF, and the
-/// name back when it is unset. Bytes throughout: a directory spelled in the console codepage
-/// is not UTF-8.
-fn win_env(name: &str) -> Result<PathBuf> {
-    let out = output(Command::new("cmd.exe").args(["/c", &format!("echo %{name}%")]))
-        .with_context(|| format!("asking Windows for %{name}% (WSL interop has to be enabled)"))?;
-    let value = out.trim_ascii();
-    if value.is_empty() || value == format!("%{name}%").as_bytes() {
-        bail!("Windows reports no %{name}%");
-    }
-    Ok(PathBuf::from(OsString::from_vec(wslpath(
-        "-u",
-        OsStr::from_bytes(value),
-    )?)))
-}
-
-fn wslpath(flag: &str, value: &OsStr) -> Result<Vec<u8>> {
-    let out = output(Command::new("wslpath").arg(flag).arg(value))?;
-    let path = out.trim_ascii();
-    if path.is_empty() {
-        bail!("wslpath {flag} {value:?} returned nothing");
-    }
-    Ok(path.to_vec())
-}
-
-/// Run an interop helper and return its stdout, reporting its own complaint on failure.
-fn output(cmd: &mut Command) -> Result<Vec<u8>> {
-    let out = cmd
-        .output()
-        .with_context(|| format!("running {:?}", cmd.get_program()))?;
-    if !out.status.success() {
-        bail!(
-            "{:?} failed ({}): {}",
-            cmd.get_program(),
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(out.stdout)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dev::testutil::{TmpDir, scratch};
+    use crate::wsl::WSL_EXE;
 
     /// Fake interop with a real scratch profile and test-supplied Windows paths.
     struct Fake {

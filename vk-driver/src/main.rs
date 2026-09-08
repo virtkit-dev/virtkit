@@ -85,6 +85,7 @@ mod vm;
 mod vmdk;
 mod vmm;
 mod vms;
+mod wsl;
 
 use std::borrow::Cow;
 use std::num::NonZeroUsize;
