@@ -5,7 +5,7 @@
 //! service VMs. One newline-delimited JSON request, one reply. Scoped to the
 //! VM by construction — only the VM's vsock reaches the control socket.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -104,7 +104,13 @@ where
 {
     let mut line = String::new();
     if r.read_line(&mut line).await? == 0 {
-        bail!("control peer closed the connection");
+        // A clean EOF: report it as an io::Error so callers can classify a peer hangup by
+        // kind rather than by matching this string.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "control peer closed the connection",
+        )
+        .into());
     }
     serde_json::from_str(line.trim_end()).context("decoding control message")
 }

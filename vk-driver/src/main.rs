@@ -2348,6 +2348,14 @@ async fn service_cmd(cmd: &ServiceCmd) -> ExitCode {
                 exit_code(1)
             }
         }
+        Err(e) if control_plane_unreachable(&e) => fail(
+            &e.context(
+                "the environment's service control plane is unresponsive — restart the \
+                 environment from the host (`vk dev refresh`, or `vk dev stop` then bring it \
+                 back up) and retry",
+            ),
+            1,
+        ),
         Err(e) => fail(&e, 1),
     }
 }
@@ -4303,6 +4311,23 @@ fn fail(e: &anyhow::Error, code: i32) -> ExitCode {
     exit_code(code)
 }
 
+/// Whether `e` is a control-plane transport failure — the VM's vsock link was refused, reset,
+/// broke, hit EOF, or timed out — rather than a refusal the manager sent back. Retrying the same
+/// wedged VM will not help, so `vk service` appends a restart hint when this holds.
+fn control_plane_unreachable(e: &anyhow::Error) -> bool {
+    use std::io::ErrorKind::{
+        BrokenPipe, ConnectionRefused, ConnectionReset, TimedOut, UnexpectedEof,
+    };
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                ConnectionReset | ConnectionRefused | BrokenPipe | UnexpectedEof | TimedOut
+            )
+        })
+    })
+}
+
 /// Write a report to stdout and flush it, treating a closed pipe as the reader having seen
 /// enough (`… | head`). `print!` panics there instead, and a report long enough to page is a
 /// report somebody will pipe.
@@ -5868,5 +5893,25 @@ mod tests {
         assert!(parse_cpus("").is_err());
         assert!(parse_cpus("Host").is_err());
         assert!(parse_cpus("-1").is_err());
+    }
+
+    #[test]
+    fn control_plane_unreachable_detects_transport_failures() {
+        // A reset io::Error anywhere in the chain — a wedged VM's vsock link — is a transport
+        // failure worth a restart hint.
+        let reset = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+            .context("connecting to the service manager (vsock host:1099)");
+        assert!(control_plane_unreachable(&reset));
+        // A peer hangup — read_msg reports it as UnexpectedEof — is transport, not a refusal.
+        let eof = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "control peer closed the connection",
+        ))
+        .context("reading the service manager's reply");
+        assert!(control_plane_unreachable(&eof));
+        // A refusal the manager sent back is not a transport failure — no restart hint.
+        assert!(!control_plane_unreachable(&anyhow::anyhow!(
+            "service manager refused: no such unit \"redis\""
+        )));
     }
 }
