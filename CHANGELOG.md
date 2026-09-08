@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **A LAN that fails to come up now reports why.** Its underlying error is shown instead of
+  only a timeout.
+
 ### Fixed
 
 - **Reject state directories too long for VM sockets before building the image.**

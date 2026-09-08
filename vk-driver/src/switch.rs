@@ -17,7 +17,7 @@
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -671,15 +671,50 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
     let deadline = Instant::now() + Duration::from_secs(5);
     for (l, _, _) in &opts.listen {
         while !l.exists() {
+            // A switch that cannot bind — a path past the `sun_path` limit, an address
+            // already in use — writes why to its log and exits. That is the error to
+            // report, not this poll running out.
+            if let Some(status) = child.try_wait().context("checking on the switch")? {
+                bail!(
+                    "the switch exited ({status}) before binding {}{}",
+                    l.display(),
+                    log_tail(&opts.log, 5)
+                );
+            }
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                bail!("the switch did not bind {}", l.display());
+                bail!(
+                    "the switch did not bind {}{}",
+                    l.display(),
+                    log_tail(&opts.log, 5)
+                );
             }
             std::thread::sleep(Duration::from_millis(50));
         }
     }
     Ok(child)
+}
+
+/// Return the last `lines` non-blank log lines, trimmed and each prefixed with
+/// a newline for appending to an error. Return an empty string if the log is
+/// unreadable or has no content to show, keeping the error on one line.
+fn log_tail(path: &Path, lines: usize) -> String {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let tail: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .rev()
+        .take(lines)
+        .collect();
+    tail.iter().rev().fold(String::new(), |mut out, l| {
+        out.push('\n');
+        out.push_str(l);
+        out
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1765,6 +1800,24 @@ fn nth_host(gateway: Ipv4Addr, prefix: u8, index: u32) -> Result<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_tail_shows_the_last_lines_and_nothing_when_there_are_none() {
+        let dir = std::env::temp_dir().join(format!("vk-switch-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("switch.log");
+        assert_eq!(
+            log_tail(&log, 5),
+            "",
+            "a log that is not there adds nothing"
+        );
+        std::fs::write(&log, "  \n\n").unwrap();
+        assert_eq!(log_tail(&log, 5), "", "blank lines are nothing to show");
+        std::fs::write(&log, "one\n\n  two  \nthree\nfour\n").unwrap();
+        assert_eq!(log_tail(&log, 2), "\nthree\nfour");
+        assert_eq!(log_tail(&log, 9), "\none\ntwo\nthree\nfour");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn tcp_syn_reject_builds_rst() {
