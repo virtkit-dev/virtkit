@@ -575,7 +575,7 @@ mod tests {
             exec_env: vec![],
             endpoints: vec![],
             host_exec: None,
-            ssh_agent: false,
+            ssh: Default::default(),
             cache: Default::default(),
             requires: Default::default(),
             cached_only: false,

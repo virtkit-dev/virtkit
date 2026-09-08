@@ -4,6 +4,23 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk dev` forwards your SSH agent to a whitelist of keys and pre-configures matching
+  hosts.** Name the identities under `[dev.ssh]` and the hosts they reach; git and ssh to
+  those hosts then work in shell and Remote-SSH sessions alike. No private keys or `~/.ssh`
+  enter the guest — only the agent socket is forwarded.
+
+### Fixed
+
+- **`--ssh-host` writes the guest `~/.ssh/config` into the session user's home.** It went to
+  root's home before, so with `--ssh-user` the stanzas never reached the user that ssh ran as.
+
+### Removed
+
+- **`[dev.host] ssh-agent` is gone**, replaced by `[dev.ssh]`, which forwards a whitelisted
+  agent rather than the whole one and writes a matching guest `~/.ssh/config`.
+
 ## [0.65.0] - 2026-09-08
 
 ### Added

@@ -20,8 +20,10 @@ pub struct HostEntry {
 }
 
 impl HostEntry {
-    /// A minimal guest stanza: the alias mapped to its host/user/port. No `IdentityFile`
-    /// (the keys reach the guest through the forwarded agent, not as files).
+    /// A minimal guest stanza: the alias mapped to its host/user/port, and `IdentityAgent`
+    /// pointing at the forwarded agent socket so an SSH-server session (where `SSH_AUTH_SOCK`
+    /// is unset) authenticates too. No `IdentityFile` — the keys reach the guest through the
+    /// forwarded agent, not as files.
     pub fn stanza(&self) -> String {
         let mut s = format!("Host {}\n    HostName {}\n", self.alias, self.hostname);
         if let Some(u) = &self.user {
@@ -30,6 +32,10 @@ impl HostEntry {
         if let Some(p) = self.port {
             s.push_str(&format!("    Port {p}\n"));
         }
+        s.push_str(&format!(
+            "    IdentityAgent {}\n",
+            crate::run::GUEST_SSH_AGENT_SOCK
+        ));
         s
     }
 }
@@ -178,12 +184,17 @@ Host nokey
             .unwrap();
         assert_eq!(
             e.stanza(),
-            "Host github\n    HostName github.com\n    User git\n"
+            "Host github\n    HostName github.com\n    User git\n    \
+             IdentityAgent /run/virtkit-ssh-agent.sock\n"
         );
         let n = resolve(CFG, &["nokey".into()], Path::new("/home/u"))
             .pop()
             .unwrap();
-        assert_eq!(n.stanza(), "Host nokey\n    HostName plain.example.com\n");
+        assert_eq!(
+            n.stanza(),
+            "Host nokey\n    HostName plain.example.com\n    \
+             IdentityAgent /run/virtkit-ssh-agent.sock\n"
+        );
     }
 
     #[test]

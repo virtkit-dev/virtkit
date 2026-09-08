@@ -678,13 +678,10 @@ Host integration is off by default:
 ```toml
 [dev.host]
 git-gui = true
-ssh-agent = true
 ```
 
 `git-gui` enables the built-in policy for running `gitk` and `git gui` on the host
 against the mapped workspace, with argument and environment filtering.
-`ssh-agent` forwards the host agent into the guest. Enable it when guest tools
-need to authenticate through your host agent.
 
 For other host commands, `wrapper` names a project dispatcher relative to the
 workspace and `wrapper-env` lists environment-variable patterns it accepts.
@@ -694,6 +691,35 @@ can call `vk host-policy git-gui` itself.
 These are explicit host capabilities. A strict config schema does not sandbox a
 host hook or custom dispatcher, and a writable host mount lets guest code modify
 that data. Keep the shared config's mounts and host commands reviewable.
+
+### SSH agent forwarding
+
+A present `[dev.ssh]` forwards the host SSH agent into the guest and writes a
+matching guest `~/.ssh/config`:
+
+```toml
+[dev.ssh]
+keys = ["work"]
+
+[dev.ssh.host."gitlab.example.com"]
+user = "git"
+key = "work"
+```
+
+Only the agent socket crosses into the guest — no private keys and no `~/.ssh`.
+List `keys` (and/or a host's `key`) to restrict which identities the agent offers;
+with none listed, the whole agent is forwarded. The whitelist is the union of
+`keys` and every host's `key`, and each token is a key comment, a `SHA256:…`
+fingerprint (as `ssh-add -l` prints), or a `.pub` path or `~/.ssh` basename.
+
+The generated config sets `IdentityAgent` on `Host *` and on each listed host, so
+`git` and `ssh` authenticate in both shell sessions and Remote-SSH / `vk dev ssh`
+sessions (where `SSH_AUTH_SOCK` is not set). `IdentityAgent` needs an **OpenSSH**
+client in the image; busybox and dropbear ignore it, though exec-session
+forwarding through `SSH_AUTH_SOCK` still works with them.
+
+Forwarding needs a running host agent — check with `ssh-add -l` — and takes effect
+on the next boot, so run `vk dev refresh` after enabling it.
 
 ## Importing a devcontainer
 

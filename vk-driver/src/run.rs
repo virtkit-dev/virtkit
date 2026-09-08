@@ -111,6 +111,9 @@ impl KernelSource {
 const VSOCK_PORT: u32 = 4444;
 /// vsock port the guest SSH-agent forwarder dials; the host splices it to `$SSH_AUTH_SOCK`.
 pub(crate) const SSH_AGENT_VSOCK_PORT: u32 = 2223;
+/// Guest path the forwarded agent socket binds at — must match vk-agent's `SSH_AGENT_SOCK`
+/// (vk-agent/src/init.rs). Emitted as `IdentityAgent` in generated `~/.ssh/config`.
+pub const GUEST_SSH_AGENT_SOCK: &str = "/run/virtkit-ssh-agent.sock";
 /// Guest vsock port the agent's ssh-serve listens on (`--ssh`); mirrors the
 /// agent's `SSH_VSOCK_PORT`.
 const SSH_VSOCK_PORT: u32 = 2222;
@@ -343,6 +346,12 @@ pub struct RunArgs {
     /// expose only these ~/.ssh/config host aliases (filtered agent + injected config);
     /// implies SSH-agent forwarding
     pub ssh_hosts: Vec<String>,
+    /// pre-resolved agent-filter allowlist (.pub paths): `None` forwards the whole agent,
+    /// `Some(v)` filters to `v` (an empty `v` fails closed, offering no key). Set by the dev
+    /// `[dev.ssh]` path; `--ssh-host` still builds its own inside `ssh_agent_setup`.
+    pub ssh_allow_pub: Option<Vec<PathBuf>>,
+    /// pre-resolved guest ~/.ssh/config text to inject; set by `[dev.ssh]`.
+    pub ssh_guest_config: Option<String>,
     /// serve SSH into the guest (the agent's ssh-serve over vsock; no sshd in the
     /// image) and print the ready-to-paste ssh command; sessions run as `ssh_user`
     pub ssh: bool,
@@ -456,6 +465,8 @@ impl Default for RunArgs {
             build_net: crate::build::BuildNet::All,
             ssh_agent: false,
             ssh_hosts: Vec::new(),
+            ssh_allow_pub: None,
+            ssh_guest_config: None,
             ssh: false,
             ssh_keys: Vec::new(),
             ssh_user: "root".to_string(),
@@ -2308,13 +2319,13 @@ async fn build_and_boot(
     }
 
     // Host side of the SSH-agent forward: the guest dials vsock port SSH_AGENT_VSOCK_PORT,
-    // surfaced by cloud-hypervisor as <vsock.sock>_<port>. With --ssh-host a filtering proxy
-    // exposes only the chosen keys; a bare --ssh-agent splices the whole agent through.
+    // surfaced by cloud-hypervisor as <vsock.sock>_<port>. `allow_pub` None splices the whole
+    // agent through; Some(keys) runs a filtering proxy exposing only those keys.
     let ssh_forward_result = match &ssh {
-        Some(s) if s.allow_pub.is_empty() && s.guest_config.is_none() => {
-            spawn_ssh_agent_forward(&vsock, &s.upstream, work).map(Some)
-        }
-        Some(s) => spawn_ssh_agent_proxy(&vsock, &s.upstream, &s.allow_pub, work).map(Some),
+        Some(s) => match &s.allow_pub {
+            None => spawn_ssh_agent_forward(&vsock, &s.upstream, work).map(Some),
+            Some(paths) => spawn_ssh_agent_proxy(&vsock, &s.upstream, paths, work).map(Some),
+        },
         None => Ok(None),
     };
     match ssh_forward_result {
@@ -3246,12 +3257,12 @@ fn host_exec_serve_args(
     argv
 }
 
-/// How `--ssh-agent`/`--ssh-host` resolve for a launch: the host agent socket to expose,
-/// the public keys it may offer (empty = the whole agent), and the `~/.ssh/config` stanzas
-/// to inject into the guest (only for `--ssh-host`).
+/// How `--ssh-agent`/`--ssh-host`/`[dev.ssh]` resolve for a launch: the host agent socket to
+/// expose, the public keys it may offer (`None` = the whole agent, `Some(v)` = filter to `v`),
+/// and the `~/.ssh/config` stanzas to inject into the guest.
 struct SshAgentSetup {
     upstream: std::ffi::OsString,
-    allow_pub: Vec<PathBuf>,
+    allow_pub: Option<Vec<PathBuf>>,
     guest_config: Option<String>,
 }
 
@@ -3324,17 +3335,31 @@ fn ssh_pubkeys_in(ssh_dir: &Path) -> Vec<String> {
 }
 
 fn ssh_agent_setup(args: &RunArgs) -> Option<SshAgentSetup> {
-    if !args.ssh_agent && args.ssh_hosts.is_empty() {
+    if !args.ssh_agent
+        && args.ssh_hosts.is_empty()
+        && args.ssh_allow_pub.is_none()
+        && args.ssh_guest_config.is_none()
+    {
         return None;
     }
     let Some(upstream) = std::env::var_os("SSH_AUTH_SOCK") else {
         eprintln!("virtkit: SSH agent requested but SSH_AUTH_SOCK is unset — not forwarding");
         return None;
     };
-    if args.ssh_hosts.is_empty() {
+    // The dev `[dev.ssh]` path resolves its own allowlist and guest config; take them as-is
+    // (`allow_pub` None ⇒ whole agent, Some ⇒ filtered).
+    if args.ssh_allow_pub.is_some() || args.ssh_guest_config.is_some() {
         return Some(SshAgentSetup {
             upstream,
-            allow_pub: Vec::new(),
+            allow_pub: args.ssh_allow_pub.clone(),
+            guest_config: args.ssh_guest_config.clone(),
+        });
+    }
+    if args.ssh_hosts.is_empty() {
+        // Bare `--ssh-agent`: forward the whole agent, no injected config.
+        return Some(SshAgentSetup {
+            upstream,
+            allow_pub: None,
             guest_config: None,
         });
     }
@@ -3367,7 +3392,7 @@ fn ssh_agent_setup(args: &RunArgs) -> Option<SshAgentSetup> {
     }
     Some(SshAgentSetup {
         upstream,
-        allow_pub,
+        allow_pub: Some(allow_pub),
         guest_config: Some(guest_config),
     })
 }
@@ -3634,7 +3659,7 @@ async fn drive(
             timings.record(Phase::Boot, "", t_boot.elapsed());
         }
         if let Some(cfg) = ssh_config {
-            write_guest_ssh_config(addr, cfg).await?;
+            write_guest_ssh_config(addr, cfg, Some(&args.ssh_user)).await?;
         }
         // The guest has answered its status probe (booted, agent serving) and its ssh config
         // is in place. For a `--detach` run this is the moment to daemonize: redirect output
@@ -3752,9 +3777,10 @@ async fn drive(
     }
 }
 
-/// Write the `--ssh-host` stanzas into the guest's `~/.ssh/config` (0600, dir 0700) so
-/// `ssh <alias>` resolves there. The config is piped on the command's stdin into `cat`.
-async fn write_guest_ssh_config(addr: &SocketAddr, config: &str) -> Result<()> {
+/// Write the SSH `Host` stanzas into the guest's `~/.ssh/config` (0600, dir 0700) so
+/// `ssh <alias>` resolves there. The config is piped on the command's stdin into `cat`, and
+/// runs as `user` so it lands in the session user's home (both `--ssh-host` and `[dev.ssh]`).
+async fn write_guest_ssh_config(addr: &SocketAddr, config: &str, user: Option<&str>) -> Result<()> {
     let cmd = vec![
         "sh".to_string(),
         "-c".into(),
@@ -3764,7 +3790,7 @@ async fn write_guest_ssh_config(addr: &SocketAddr, config: &str) -> Result<()> {
         addr,
         &cmd,
         config.as_bytes().to_vec(),
-        None,
+        user.map(str::to_string),
         &crate::executor::OutputSink::Inherit,
         None,
     )

@@ -239,7 +239,10 @@ pub struct Plan {
     pub exec_env: Vec<EnvVar>,
     pub endpoints: Vec<EndpointPlan>,
     pub host_exec: Option<HostExecPlan>,
-    pub ssh_agent: bool,
+    /// `[dev.ssh]` when written: agent forwarding (whole, or restricted to a whitelist) plus a
+    /// synthetic guest `~/.ssh/config`, resolved into `vk run` inputs at boot (see
+    /// [`crate::dev::sshsetup`]). `None` = no forwarding.
+    pub ssh: Option<crate::dev::config::Ssh>,
     pub cache: crate::dev::config::Cache,
     pub requires: Requires,
     /// the image is restored from the cache and never built (a `build` source only)
@@ -441,7 +444,7 @@ pub fn resolve(loaded: &Loaded, name: &str) -> Result<Plan> {
         exec_env,
         endpoints,
         host_exec,
-        ssh_agent: env.host.ssh_agent,
+        ssh: env.ssh.clone(),
         cache: env.cache.clone(),
         requires: loaded.schema.requires.clone(),
         cached_only: env.cached_only,
@@ -1390,9 +1393,6 @@ impl Plan {
         if let Some(u) = &self.user {
             arg(&mut out, "--ssh-user", u);
         }
-        if self.ssh_agent {
-            out.push_str("  --ssh-agent \\\n");
-        }
         if self.nests_here() {
             out.push_str("  --nested \\\n");
         }
@@ -1400,6 +1400,17 @@ impl Plan {
             out.push_str("  --require-cached \\\n");
         }
         out.push_str("  --ssh-client\n");
+        if let Some(ssh) = &self.ssh {
+            comment(
+                &mut out,
+                &format!(
+                    "[dev.ssh]: forward the host agent ({} host(s), {} key(s)) and write \
+                     ~/.ssh/config — resolved at boot",
+                    ssh.host.len(),
+                    ssh.keys.len(),
+                ),
+            );
+        }
         if let Some(h) = &self.host_exec
             && let Some(builtin) = &h.builtin
         {
@@ -1642,7 +1653,14 @@ to = "/home/dev/.vscode-server"
 [dev.host]
 wrapper = "virtkit/host-dispatch.sh"
 wrapper-env = ["LC_*"]
-ssh-agent = true
+
+[dev.ssh]
+keys = ["work"]
+
+[dev.ssh.host.gitlab]
+hostname = "gitlab.example.com"
+user = "git"
+key = "work"
 
 [dev.cache]
 registry = "127.0.0.1:5000/cache"
@@ -1793,7 +1811,12 @@ extensions = ["ms-python.python"]
         assert_eq!(he.wrapper, root.join("virtkit/host-dispatch.sh"));
         assert_eq!(he.builtin, None);
         assert_eq!(he.env, ["LC_*"]);
-        assert!(p.ssh_agent);
+        let ssh = p.ssh.as_ref().unwrap();
+        assert_eq!(ssh.keys, ["work"]);
+        assert_eq!(
+            ssh.host["gitlab"].hostname.as_deref(),
+            Some("gitlab.example.com")
+        );
         assert_eq!(p.cache.registry.as_deref(), Some("127.0.0.1:5000/cache"));
 
         // Hooks: a string through a shell, a detailed command with its options, a group.
@@ -1866,7 +1889,10 @@ extensions = ["ms-python.python"]
             shell.contains("--compose") && shell.contains("--primary devcontainer"),
             "{shell}"
         );
-        assert!(shell.contains("--ssh-agent"), "{shell}");
+        assert!(
+            shell.contains("# [dev.ssh]: forward the host agent"),
+            "{shell}"
+        );
         assert!(shell.contains("# vk publish ensure"), "{shell}");
         assert!(shell.contains("# hooks.start"), "{shell}");
         assert!(shell.contains("(best effort)"), "{shell}");
@@ -2156,7 +2182,7 @@ extensions = ["ms-python.python"]
         let path = f.0.join(crate::dev::config::CONFIG_FILE);
         let text = std::fs::read_to_string(&path)
             .unwrap()
-            .replace("ssh-agent = true", "ssh-agent = true\ngit-gui = true");
+            .replace("[dev.host]", "[dev.host]\ngit-gui = true");
         std::fs::write(&path, text).unwrap();
         let msg = format!("{:#}", plan_of(&f.0, "dev").unwrap_err());
         assert!(msg.contains("choose one"), "{msg}");

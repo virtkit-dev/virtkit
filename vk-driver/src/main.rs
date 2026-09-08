@@ -3058,6 +3058,8 @@ async fn cli_main(cli: Cli) -> ExitCode {
             build_net: bnet,
             ssh_agent: *ssh_agent,
             ssh_hosts: ssh_host.clone(),
+            ssh_allow_pub: None,
+            ssh_guest_config: None,
             ssh: *ssh || *ssh_client || !ssh_key.is_empty(),
             ssh_keys: ssh_key.clone(),
             ssh_client: *ssh_client,

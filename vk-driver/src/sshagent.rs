@@ -42,6 +42,51 @@ pub fn load_allow(pub_files: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
     Ok(out)
 }
 
+/// One identity the agent holds: its wire blob and comment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Identity {
+    pub blob: Vec<u8>,
+    pub comment: String,
+}
+
+/// Ask the agent at `upstream` for its identities (`REQUEST_IDENTITIES` → `IDENTITIES_ANSWER`).
+pub fn list_identities(upstream: &Path) -> Result<Vec<Identity>> {
+    let mut up = UnixStream::connect(upstream)
+        .with_context(|| format!("connecting to the agent at {}", upstream.display()))?;
+    write_msg(&mut up, &[SSH_AGENTC_REQUEST_IDENTITIES])?;
+    let answer = read_msg(&mut up)?
+        .ok_or_else(|| anyhow::anyhow!("the agent closed the connection before answering"))?;
+    parse_identities(&answer)
+}
+
+/// Parse an `IDENTITIES_ANSWER`: the type byte, a `u32` count, then that many `(blob, comment)`
+/// string pairs.
+fn parse_identities(answer: &[u8]) -> Result<Vec<Identity>> {
+    if answer.first().copied() != Some(SSH_AGENT_IDENTITIES_ANSWER) {
+        bail!("the agent did not answer REQUEST_IDENTITIES with an identities list");
+    }
+    let (nkeys, mut rest) = answer
+        .get(1..)
+        .and_then(read_u32)
+        .context("truncated identities answer")?;
+    // `nkeys` is untrusted: never let it drive a preallocation (a bogus 0xFFFFFFFF would try a
+    // multi-GB reserve). Grow as we actually read, like `filter_identities`.
+    let mut out = Vec::new();
+    for _ in 0..nkeys {
+        let (blob, r1) = read_string(rest).context("truncated key blob in identities answer")?;
+        let (comment, r2) =
+            read_string(r1).context("truncated key comment in identities answer")?;
+        rest = r2;
+        // Agent comments are conventionally UTF-8; lossy decoding only risks a benign token
+        // mismatch (a comment token that no longer compares equal), never memory unsafety.
+        out.push(Identity {
+            blob: blob.to_vec(),
+            comment: String::from_utf8_lossy(comment).into_owned(),
+        });
+    }
+    Ok(out)
+}
+
 /// Serve the filtering proxy on `listen`, relaying to the real agent at `upstream`, exposing
 /// only keys in `allow`. One thread per client connection; runs until the socket is removed.
 pub fn run_proxy(listen: &Path, upstream: &Path, allow: &[Vec<u8>]) -> Result<()> {
@@ -171,8 +216,35 @@ fn put_string(out: &mut Vec<u8>, s: &[u8]) {
     out.extend_from_slice(s);
 }
 
+/// Encode bytes as standard base64 with `=` padding.
+pub(crate) fn b64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        out.push(ALPHABET[(n >> 18 & 0x3f) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// Decode standard base64 (with optional `=` padding); `None` on any invalid input.
-fn b64_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn b64_decode(s: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u32> {
         match c {
             b'A'..=b'Z' => Some((c - b'A') as u32),
@@ -266,5 +338,45 @@ mod tests {
         assert_eq!(b64_decode("Zm9v").unwrap(), b"foo");
         assert_eq!(b64_decode("Zm9vYmFy").unwrap(), b"foobar");
         assert!(b64_decode("not base64!").is_none());
+    }
+
+    #[test]
+    fn base64_encodes_known_vectors_and_round_trips() {
+        assert_eq!(b64_encode(b""), "");
+        assert_eq!(b64_encode(b"f"), "Zg==");
+        assert_eq!(b64_encode(b"fo"), "Zm8=");
+        assert_eq!(b64_encode(b"foo"), "Zm9v");
+        assert_eq!(b64_encode(b"foobar"), "Zm9vYmFy");
+        for v in [
+            b"".to_vec(),
+            b"\x00\x01\x02\xff".to_vec(),
+            b"a longer blob".to_vec(),
+        ] {
+            assert_eq!(b64_decode(&b64_encode(&v)).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn parses_an_identities_answer() {
+        let answer = ident_answer(&[(b"BLOB1", b"a@host"), (b"BLOB2", b"b@host")]);
+        let got = parse_identities(&answer).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                Identity {
+                    blob: b"BLOB1".to_vec(),
+                    comment: "a@host".into()
+                },
+                Identity {
+                    blob: b"BLOB2".to_vec(),
+                    comment: "b@host".into()
+                },
+            ]
+        );
+        // Empty list, and a wrong type byte, are handled.
+        assert!(parse_identities(&ident_answer(&[])).unwrap().is_empty());
+        assert!(parse_identities(&[SSH_AGENT_FAILURE]).is_err());
+        // A count larger than the body carries is a truncation error, not a panic.
+        assert!(parse_identities(&[SSH_AGENT_IDENTITIES_ANSWER, 0, 0, 0, 2]).is_err());
     }
 }

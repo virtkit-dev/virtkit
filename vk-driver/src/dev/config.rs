@@ -162,6 +162,9 @@ pub struct Environment {
     pub editor: Editor,
     #[serde(default)]
     pub host: Host,
+    /// `[dev.ssh]` when written: `None` is off, `Some` (even empty) turns agent forwarding on.
+    #[serde(default)]
+    pub ssh: Option<Ssh>,
     #[serde(default)]
     pub cache: Cache,
     /// guest ports published on the host, by name
@@ -484,15 +487,39 @@ pub struct Host {
     /// workspace, with their arguments and environment filtered
     #[serde(default)]
     pub git_gui: bool,
-    /// forward the host's SSH agent into the guest
-    #[serde(default)]
-    pub ssh_agent: bool,
     /// a project's own host-command dispatcher, relative to the workspace root — the escape
     /// hatch for what the built-in policies do not cover
     pub wrapper: Option<String>,
     /// environment variable patterns passed through to the wrapper
     #[serde(default)]
     pub wrapper_env: Vec<String>,
+}
+
+/// `[dev.ssh]` enables host SSH-agent forwarding and writes a matching guest `~/.ssh/config`.
+/// Only the agent socket is forwarded; private keys stay on the host. `keys` and per-host
+/// `key` restrict the offered identities; with none listed, the whole agent is forwarded.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Ssh {
+    /// identities the forwarded agent may offer: a key comment, a `SHA256:…` fingerprint, or a
+    /// `.pub` path / `~/.ssh` basename. Union with every host `key`. Empty union ⇒ whole agent.
+    #[serde(default)]
+    pub keys: Vec<String>,
+    /// guest `~/.ssh/config` targets, keyed by `Host` alias.
+    #[serde(default)]
+    pub host: BTreeMap<String, SshHost>,
+}
+
+/// `[dev.ssh.host."<alias>"]`: one guest `~/.ssh/config` target.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct SshHost {
+    /// the real host to connect to (defaults to the alias)
+    pub hostname: Option<String>,
+    pub user: Option<String>,
+    pub port: Option<u16>,
+    /// the identity for this host: added to the whitelist (same token forms as `keys`).
+    pub key: Option<String>,
 }
 
 /// `[dev.cache]`: where built stages are cached.
@@ -1079,14 +1106,21 @@ impl Environment {
         if self.host.git_gui {
             host.push("git-gui".to_string());
         }
-        if self.host.ssh_agent {
-            host.push("ssh-agent".to_string());
-        }
         if let Some(w) = &self.host.wrapper {
             host.push(format!("wrapper {w}"));
         }
         if !host.is_empty() {
             line("host", host.join(", "));
+        }
+        if let Some(ssh) = &self.ssh {
+            line(
+                "ssh",
+                format!(
+                    "agent forwarding, {} host(s), {} key(s)",
+                    ssh.host.len(),
+                    ssh.keys.len()
+                ),
+            );
         }
         let hooks: Vec<&str> = [
             ("init", &self.hooks.init),
@@ -1844,6 +1878,17 @@ freshness = "ask"
 # Guest ports published on the host, by name.
 # [dev.endpoints.web]
 # target = 8080
+
+# Forward your SSH agent into the guest and pre-configure matching hosts. No private
+# keys or `~/.ssh` enter the guest. A present [dev.ssh] turns forwarding on; list `keys`
+# (and/or a host's `key`) to restrict which identities are offered — with none listed,
+# the whole agent is forwarded. A token is a key comment, a `SHA256:…` fingerprint, or a
+# `.pub` path. Needs a running host agent (`ssh-add -l`).
+# [dev.ssh]
+# keys = ["work"]
+# [dev.ssh.host."gitlab.example.com"]
+# user = "git"
+# key = "work"
 "#
 );
 
@@ -2157,7 +2202,13 @@ reconcile = ["/workdir/.devcontainer/install-extensions.sh", "-postcreate"]
 
 [dev.host]
 git-gui = true
-ssh-agent = false
+
+[dev.ssh]
+keys = ["work"]
+
+[dev.ssh.host."gitlab.corp.wallix.com"]
+user = "git"
+key = "work"
 
 [dev.cache]
 registry = "https://vk-registry.corp:5000"
@@ -2226,6 +2277,11 @@ start = { redis = "redis-cli ping", db = ["mysqladmin", "ping"] }
             (Some(443), Some(8443), true)
         );
         assert!(dev.host.git_gui);
+        let ssh = dev.ssh.as_ref().unwrap();
+        assert_eq!(ssh.keys, ["work"]);
+        let sh = &ssh.host["gitlab.corp.wallix.com"];
+        assert_eq!(sh.user.as_deref(), Some("git"));
+        assert_eq!(sh.key.as_deref(), Some("work"));
         assert_eq!(
             dev.hooks.init,
             Some(Hook::Shell("./scripts/prepare.sh".into()))
@@ -2260,11 +2316,61 @@ start = { redis = "redis-cli ping", db = ["mysqladmin", "ping"] }
             "runner.https (runner:443, required)",
             "vk-registry.corp",
             "git-gui",
+            "agent forwarding, 1 host(s), 1 key(s)",
             "init, create, start",
             "persistent state, reconcile hook",
         ] {
             assert!(report.contains(expect), "{expect:?} in:\n{report}");
         }
+    }
+
+    #[test]
+    fn a_dev_ssh_block_parses_and_refuses_unknown_keys() {
+        let f = workspace("ssh");
+        write(
+            &f,
+            CONFIG_FILE,
+            "schema = 1\n[dev]\nimage = \"x\"\n\
+             [dev.ssh]\nkeys = [\"SHA256:abc\", \"work\"]\n\
+             [dev.ssh.host.\"gitlab.example.com\"]\n\
+             hostname = \"gitlab.internal\"\nuser = \"git\"\nport = 2222\nkey = \"work\"\n",
+        );
+        let l = load_in(&f).unwrap();
+        let ssh = dev_of(&l).ssh.as_ref().unwrap();
+        assert_eq!(ssh.keys, ["SHA256:abc", "work"]);
+        let h = &ssh.host["gitlab.example.com"];
+        assert_eq!(h.hostname.as_deref(), Some("gitlab.internal"));
+        assert_eq!(h.user.as_deref(), Some("git"));
+        assert_eq!(h.port, Some(2222));
+        assert_eq!(h.key.as_deref(), Some("work"));
+
+        // A present but empty [dev.ssh] is Some(default) — forwarding on, whole agent.
+        write(
+            &f,
+            CONFIG_FILE,
+            "schema = 1\n[dev]\nimage = \"x\"\n[dev.ssh]\n",
+        );
+        assert_eq!(dev_of(&load_in(&f).unwrap()).ssh, Some(Ssh::default()));
+
+        // An absent [dev.ssh] is None — forwarding off.
+        write(&f, CONFIG_FILE, "schema = 1\n[dev]\nimage = \"x\"\n");
+        assert_eq!(dev_of(&load_in(&f).unwrap()).ssh, None);
+
+        // Unknown keys under [dev.ssh] and [dev.ssh.host] are refused with their location.
+        write(
+            &f,
+            CONFIG_FILE,
+            "schema = 1\n[dev]\nimage = \"x\"\n[dev.ssh]\nkyes = []\n",
+        );
+        let msg = format!("{:#}", load_in(&f).unwrap_err());
+        assert!(msg.contains("kyes") && msg.contains("config.toml"), "{msg}");
+        write(
+            &f,
+            CONFIG_FILE,
+            "schema = 1\n[dev]\nimage = \"x\"\n[dev.ssh.host.h]\nprot = 22\n",
+        );
+        let msg = format!("{:#}", load_in(&f).unwrap_err());
+        assert!(msg.contains("prot"), "{msg}");
     }
 
     #[test]

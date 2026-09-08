@@ -126,6 +126,7 @@
         },
         "editor": { "$ref": "#/$defs/editor" },
         "host": { "$ref": "#/$defs/host" },
+        "ssh": { "$ref": "#/$defs/ssh" },
         "cache": { "$ref": "#/$defs/cache" },
         "endpoints": {
           "description": "guest ports published on the host, by name",
@@ -326,10 +327,6 @@
           "description": "the built-in Git GUI policy: `gitk` and `git gui` on the host, over the mapped workspace, with their arguments and environment filtered",
           "type": "boolean"
         },
-        "ssh-agent": {
-          "description": "forward the host's SSH agent into the guest",
-          "type": "boolean"
-        },
         "wrapper": {
           "description": "a project's own host-command dispatcher, relative to the workspace root — the escape hatch for what the built-in policies do not cover",
           "type": "string"
@@ -338,6 +335,50 @@
           "description": "environment variable patterns passed through to the wrapper",
           "type": "array",
           "items": { "type": "string" }
+        }
+      }
+    },
+    "ssh": {
+      "title": "ssh",
+      "description": "`[dev.ssh]`: forward the host SSH agent into the guest and drop a matching `~/.ssh/config` there. Private keys never enter the guest — only the agent socket is forwarded. A present `[dev.ssh]` turns agent forwarding on; list `keys` (and/or a host's `key`) to restrict which identities are offered, and with none listed the whole agent is forwarded.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "keys": {
+          "description": "identities the forwarded agent may offer: a key comment, a `SHA256:…` fingerprint, or a `.pub` path / `~/.ssh` basename. Union with every host `key`. An empty union forwards the whole agent.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "host": {
+          "description": "guest `~/.ssh/config` targets, keyed by `Host` alias",
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/ssh-host" }
+        }
+      }
+    },
+    "ssh-host": {
+      "title": "ssh host",
+      "description": "`[dev.ssh.host.\"<alias>\"]`: one guest `~/.ssh/config` target",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hostname": {
+          "description": "the real host to connect to (defaults to the alias)",
+          "type": "string"
+        },
+        "user": {
+          "description": "the login user for this host",
+          "type": "string"
+        },
+        "port": {
+          "description": "the port for this host",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "key": {
+          "description": "the identity for this host: added to the whitelist (same token forms as `keys`)",
+          "type": "string"
         }
       }
     },

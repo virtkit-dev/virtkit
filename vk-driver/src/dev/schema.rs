@@ -31,7 +31,8 @@ mod tests {
     use super::*;
     use crate::dev::config::{
         Build, Cache, CheckoutMode, Editor, EditorState, Egress, Endpoint, Environment, Fallback,
-        Freshness, HookSpec, Hooks, Host, Mount, Network, Policy, Requires, Schema, Task, VsCode,
+        Freshness, HookSpec, Hooks, Host, Mount, Network, Policy, Requires, Schema, Ssh, SshHost,
+        Task, VsCode,
     };
     use serde::de::DeserializeOwned;
     use serde_json::Value as Json;
@@ -58,6 +59,8 @@ mod tests {
             ("editor", || rust_fields::<Editor>()),
             ("vscode", || rust_fields::<VsCode>()),
             ("host", || rust_fields::<Host>()),
+            ("ssh", || rust_fields::<Ssh>()),
+            ("ssh-host", || rust_fields::<SshHost>()),
             ("cache", || rust_fields::<Cache>()),
             ("endpoint", || rust_fields::<Endpoint>()),
             ("network", || rust_fields::<Network>()),
@@ -403,9 +406,17 @@ extensions = ["rust-lang.rust-analyzer"]
 
 [dev.host]
 git-gui = false
-ssh-agent = true
 wrapper = "dev/tools/host.sh"
 wrapper-env = ["DISPLAY"]
+
+[dev.ssh]
+keys = ["work"]
+
+[dev.ssh.host."gitlab.example.com"]
+hostname = "gitlab.internal"
+user = "git"
+port = 2222
+key = "work"
 
 [dev.cache]
 registry = "https://vk-registry.corp:5000"

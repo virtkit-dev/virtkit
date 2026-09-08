@@ -243,7 +243,6 @@ fn run_args(
             .as_ref()
             .map(|h| h.env.clone())
             .unwrap_or_default(),
-        ssh_agent: plan.ssh_agent,
         nested: plan.nests_here(),
         // The managed client is how `vk dev shell`, `vk dev code` and the editor reach it.
         ssh: true,
@@ -361,7 +360,10 @@ pub fn task_args(
     });
     args.ssh = false;
     args.ssh_client = false;
-    args.ssh_agent = false;
+    // Tasks have no session or `[dev.ssh]` forwarding. Only the main-env boot resolves it;
+    // clear these defensively even though they are already unset.
+    args.ssh_allow_pub = None;
+    args.ssh_guest_config = None;
     args.host_exec = false;
     args.host_exec_wrapper = None;
     args.host_exec_env.clear();
@@ -635,13 +637,31 @@ pub async fn boot(
     // joining `vk dev` waits on (see `wait_for_boot`); a removal that fails — including the
     // first boot's, where there is no file — only leaves that wait to time out.
     let _ = std::fs::remove_file(identity_path(plan));
-    let args = run_args(
+    let mut args = run_args(
         plan,
         snapshot.as_ref().map(|(p, _)| p.as_path()),
         over,
         cfg,
         CheckoutMode::Shared,
     )?;
+    // Resolve `[dev.ssh]` here using the host agent and $HOME: forward the whole agent or
+    // whitelisted keys and inject a matching guest ~/.ssh/config. Keep `run_args` pure so
+    // builds and tasks that reuse it neither enumerate the agent nor write files.
+    if let Some(ssh) = &plan.ssh {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let upstream = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from);
+        let scratch = plan.state_dir.join("ssh-agent-allow");
+        match crate::dev::sshsetup::resolve(ssh, &home, upstream.as_deref(), &scratch) {
+            Ok((allow, guest_config, warnings)) => {
+                for w in warnings {
+                    eprintln!("virtkit: [dev.ssh] {w}");
+                }
+                args.ssh_allow_pub = allow;
+                args.ssh_guest_config = guest_config;
+            }
+            Err(e) => eprintln!("virtkit: [dev.ssh] agent forwarding disabled: {e:#}"),
+        }
+    }
     crate::run::run(&args, cfg).await
 }
 
@@ -1034,7 +1054,6 @@ mod tests {
             service: "devcontainer".into(),
             profiles: vec!["runner".into()],
         };
-        plan.ssh_agent = true;
         let cfg = crate::config::Config::default();
         let over = Overrides::default();
         let args = run_args(
@@ -1066,7 +1085,8 @@ mod tests {
             args.inactivity_timeout_secs.is_none(),
             "the service's own command holds the VM"
         );
-        assert!(args.ssh_agent, "an explicit host capability");
+        // `[dev.ssh]` is resolved on the boot path, not in the pure `run_args`.
+        assert!(args.ssh_allow_pub.is_none() && args.ssh_guest_config.is_none());
         assert!(
             args.volumes.is_empty(),
             "a compose service mounts the checkout itself"
@@ -1470,6 +1490,7 @@ mod tests {
         assert_eq!(args.state_dir.as_deref(), Some(scratch_dir.as_path()));
         // Nothing that belongs to an environment someone works in.
         assert!(!args.ssh && !args.ssh_client && !args.ssh_agent);
+        assert!(args.ssh_allow_pub.is_none() && args.ssh_guest_config.is_none());
         assert!(!args.host_exec);
         assert!(args.host_exec_wrapper.is_none());
         assert!(args.host_exec_env.is_empty());
