@@ -43,6 +43,14 @@ const DHCP_LEASE_SECS: u32 = 86400;
 const DNS_PORT: u16 = 53;
 /// Upstream resolver used when /etc/resolv.conf yields no nameserver.
 const FALLBACK_DNS: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+/// How long a forwarded query waits for the upstream resolver's reply.
+const DNS_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
+/// At most one upstream-failure line per distinct fault per window: a resolver that is
+/// down fails every lookup a guest makes, and switch.log is read as a whole.
+const DNS_LOG_WINDOW: Duration = Duration::from_secs(30);
+/// Response codes the gateway resolver answers with itself.
+const RCODE_SERVFAIL: u8 = 2;
+const RCODE_NXDOMAIN: u8 = 3;
 /// First host index handed out by DHCP (.1 is the gateway).
 const FIRST_LEASE: u32 = 2;
 /// Host-side connect timeout for a guest egress flow. ipstack completes the guest's
@@ -261,6 +269,8 @@ struct EgressGuard {
     received: AtomicU64,
     /// What the last publish wrote out, so each one appends only what is new.
     published: Mutex<(u64, u64)>,
+    /// Throttles the upstream-resolver failure log (see `log_dns_upstream`).
+    dns_log: LogLimiter,
 }
 
 impl EgressGuard {
@@ -278,6 +288,7 @@ impl EgressGuard {
             sent: AtomicU64::new(0),
             received: AtomicU64::new(0),
             published: Mutex::new((0, 0)),
+            dns_log: LogLimiter::default(),
         }
     }
     fn with_per_source(mut self, per_source: HashMap<Ipv4Addr, Egress>) -> Self {
@@ -375,6 +386,20 @@ impl EgressGuard {
         if let Some(path) = &self.denied_log {
             crate::egress_report::append(path, proto, target);
         }
+    }
+    /// Name the upstream resolver and the reason it failed a guest's lookup, throttled to
+    /// one line per fault per [`DNS_LOG_WINDOW`]: nothing else in the switch says why a
+    /// guest's name resolution stopped working, and a host with no resolver fails every
+    /// lookup every VM makes.
+    fn log_dns_upstream(&self, upstream: SocketAddr, question: &str, err: &UpstreamError) {
+        let Some(suppressed) = self.dns_log.admit((upstream, err.kind()), Instant::now()) else {
+            return;
+        };
+        let more = match suppressed {
+            0 => String::new(),
+            n => format!(" ({n} more since the last line)"),
+        };
+        eprintln!("switch: dns upstream {upstream} failed for {question}: {err}{more}");
     }
     /// Record an allowed external domain the guest resolved to the audit channel, for the
     /// end-of-job "domains contacted" summary and the standing list of names a job reaches
@@ -494,6 +519,36 @@ impl EgressGuard {
             return tcp_rst_frame(&syn, client_mac);
         }
         None
+    }
+}
+
+/// Logs once per [`DNS_LOG_WINDOW`] per fault, counting suppressed lines so the operator
+/// sees the scale. Keying by fault rather than query keeps one entry per upstream failure kind.
+#[derive(Default)]
+struct LogLimiter {
+    /// Per key: when it last printed, and how many lines it has suppressed since.
+    seen: Mutex<HashMap<(SocketAddr, std::io::ErrorKind), (Instant, u64)>>,
+}
+
+impl LogLimiter {
+    /// Returns the suppressed count if `key` can print now, or `None` to stay quiet.
+    /// Passing `now` lets tests run without sleeping.
+    fn admit(&self, key: (SocketAddr, std::io::ErrorKind), now: Instant) -> Option<u64> {
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        match seen.get_mut(&key) {
+            None => {
+                seen.insert(key, (now, 0));
+                Some(0)
+            }
+            Some((last, suppressed)) if now.duration_since(*last) < DNS_LOG_WINDOW => {
+                *suppressed += 1;
+                None
+            }
+            Some((last, suppressed)) => {
+                *last = now;
+                Some(std::mem::take(suppressed))
+            }
+        }
     }
 }
 
@@ -1289,11 +1344,19 @@ async fn handle_dns(
     let response = if let Some(r) = local_answer(&query, &hosts) {
         Some(r) // service name: on-subnet, not subject to egress pinning
     } else if let Some((name, qtype, qend)) = parse_question(&query) {
+        // Format the lookup only when reporting a failure.
+        let question = || format!("{name} ({})", qtype_name(qtype));
         if is_reverse_dns(&name) {
             // A PTR lookup resolves an IP to a name; it never opens a flow, so it
             // needn't be allowlisted. Forward it without pinning (its answer is a
             // name, not an A-record to admit for egress).
-            forward_upstream(&query, upstream).await
+            match forward_upstream(&query, upstream).await {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    egress.log_dns_upstream(upstream, &question(), &e);
+                    Some(dns_servfail(&query, qend))
+                }
+            }
         } else if egress.name_allowed(client_ip, &name) {
             // Audit: count the guest's A-record lookups as its external contacts (egress
             // is IPv4, so an A query is what precedes a connection); the paired AAAA query
@@ -1303,23 +1366,35 @@ async fn handle_dns(
             }
             // forward, then pin the A-records (scoped to this resolving guest) so its
             // connection is allowed — and only its, not another VM's with a different policy.
-            let resp = forward_upstream(&query, upstream).await;
-            if let Some(r) = &resp {
-                let (ips, ttl) = parse_a_records(r);
-                egress.record(client_ip, &ips, ttl);
-                // Audit: these IPs are now attributable to `name` for this VM, so a later
-                // connection from it is counted under the domains summary, not re-logged as a
-                // direct-IP contact.
-                egress.record_dns_ips(client_ip, &ips);
+            match forward_upstream(&query, upstream).await {
+                Ok(r) => {
+                    let (ips, ttl) = parse_a_records(&r);
+                    egress.record(client_ip, &ips, ttl);
+                    // Audit: these IPs are now attributable to `name` for this VM, so a later
+                    // connection from it is counted under the domains summary, not re-logged as
+                    // a direct-IP contact.
+                    egress.record_dns_ips(client_ip, &ips);
+                    Some(r)
+                }
+                // SERVFAIL rather than silence: the guest's resolver gives up on the lookup
+                // at once instead of sitting out its whole retry schedule for every name.
+                Err(e) => {
+                    egress.log_dns_upstream(upstream, &question(), &e);
+                    Some(dns_servfail(&query, qend))
+                }
             }
-            resp
         } else {
             eprintln!("switch: dns refused (egress allowlist): {name}");
             egress.record_denial(crate::egress_report::Proto::Dns, &name);
             Some(dns_nxdomain(&query, qend))
         }
     } else {
-        forward_upstream(&query, upstream).await
+        // An unparsable question leaves nothing to echo back, so a failure can only be
+        // dropped — but it is still logged.
+        forward_upstream(&query, upstream)
+            .await
+            .inspect_err(|e| egress.log_dns_upstream(upstream, "an unparsable question", e))
+            .ok()
     };
     if let Some(resp) = response
         && let Some(frame) = dns_frame(gateway, client_ip, client_port, client_mac, &resp)
@@ -1328,8 +1403,59 @@ async fn handle_dns(
     }
 }
 
+/// Why forwarding a query to the upstream resolver failed. The upstream is the host's
+/// own resolver, so every variant is a host-side fault the operator has to see — the
+/// guest only ever learns that the lookup failed.
+enum UpstreamError {
+    /// Socket setup or I/O toward the upstream: bind, connect, send, or recv (which on
+    /// a connected UDP socket reports the ICMP error a closed port answers with).
+    Io(std::io::Error),
+    /// No reply within the deadline.
+    Timeout(Duration),
+    /// A reply too short to be a DNS message (the header alone is 12 bytes).
+    Short(usize),
+}
+
+impl UpstreamError {
+    /// The fault, without its message — the log limiter's key, so a burst of the same
+    /// failure collapses to one line. Timeout and a short reply borrow the io kinds
+    /// that name them.
+    fn kind(&self) -> std::io::ErrorKind {
+        match self {
+            UpstreamError::Io(e) => e.kind(),
+            UpstreamError::Timeout(_) => std::io::ErrorKind::TimedOut,
+            UpstreamError::Short(_) => std::io::ErrorKind::InvalidData,
+        }
+    }
+}
+
+impl From<std::io::Error> for UpstreamError {
+    fn from(e: std::io::Error) -> Self {
+        UpstreamError::Io(e)
+    }
+}
+
+impl std::fmt::Display for UpstreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpstreamError::Io(e) => write!(f, "{e}"),
+            UpstreamError::Timeout(d) => write!(f, "no reply in {d:?}"),
+            UpstreamError::Short(n) => write!(f, "reply too short ({n} bytes)"),
+        }
+    }
+}
+
 /// Forward a raw DNS query to the upstream resolver and return its raw response.
-async fn forward_upstream(query: &[u8], upstream: SocketAddr) -> Option<Vec<u8>> {
+async fn forward_upstream(query: &[u8], upstream: SocketAddr) -> Result<Vec<u8>, UpstreamError> {
+    forward_upstream_with(query, upstream, DNS_UPSTREAM_TIMEOUT).await
+}
+
+/// [`forward_upstream`] with a configurable reply deadline for faster tests.
+async fn forward_upstream_with(
+    query: &[u8],
+    upstream: SocketAddr,
+    timeout: Duration,
+) -> Result<Vec<u8>, UpstreamError> {
     let bind: SocketAddr = if upstream.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -1337,16 +1463,31 @@ async fn forward_upstream(query: &[u8], upstream: SocketAddr) -> Option<Vec<u8>>
     }
     .parse()
     .unwrap();
-    let sock = UdpSocket::bind(bind).await.ok()?;
-    sock.connect(upstream).await.ok()?;
-    sock.send(query).await.ok()?;
+    let sock = UdpSocket::bind(bind).await?;
+    sock.connect(upstream).await?;
+    sock.send(query).await?;
     let mut buf = vec![0u8; MAX_FRAME];
-    let n = tokio::time::timeout(Duration::from_secs(5), sock.recv(&mut buf))
+    let n = tokio::time::timeout(timeout, sock.recv(&mut buf))
         .await
-        .ok()?
-        .ok()?;
+        .map_err(|_| UpstreamError::Timeout(timeout))??;
+    if n < 12 {
+        return Err(UpstreamError::Short(n));
+    }
     buf.truncate(n);
-    Some(buf)
+    Ok(buf)
+}
+
+/// A query type as its mnemonic where the guest resolvers use one, else the number —
+/// an A and an AAAA failing are different symptoms, so the log names which.
+fn qtype_name(qtype: u16) -> std::borrow::Cow<'static, str> {
+    match qtype {
+        1 => "A".into(),
+        5 => "CNAME".into(),
+        12 => "PTR".into(),
+        16 => "TXT".into(),
+        28 => "AAAA".into(),
+        other => other.to_string().into(),
+    }
 }
 
 /// If the query's name is a known service name, build the answer locally (an A record
@@ -1427,17 +1568,31 @@ fn dns_response(query: &[u8], qend: usize, qtype: u16, ip: Ipv4Addr) -> Vec<u8> 
     out
 }
 
-/// An NXDOMAIN response echoing the question — refuses a name outside the egress
-/// allowlist (the guest sees "could not resolve"; the name never leaks upstream).
-fn dns_nxdomain(query: &[u8], qend: usize) -> Vec<u8> {
+/// An answerless response echoing the question, carrying `rcode`. AA is set only where the
+/// switch is the name's authority: it owns the allowlist namespace it NXDOMAINs, but a
+/// SERVFAIL means it could not reach the real resolver, so it must not claim authority.
+fn dns_error(query: &[u8], qend: usize, rcode: u8) -> Vec<u8> {
+    let aa = if rcode == RCODE_SERVFAIL { 0 } else { 0x04 };
     let mut out = Vec::with_capacity(qend);
     out.extend_from_slice(&query[0..2]); // transaction id
-    out.push(0x84 | (query[2] & 0x01)); // QR=1, AA=1, RD copied
-    out.push(0x83); // RA=1, rcode=3 (NXDOMAIN)
+    out.push(0x80 | aa | (query[2] & 0x01)); // QR=1, AA per authority, RD copied
+    out.push(0x80 | rcode); // RA=1
     out.extend_from_slice(&[0, 1]); // QDCOUNT
     out.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // ANCOUNT + NSCOUNT + ARCOUNT
     out.extend_from_slice(&query[12..qend]); // echo the question
     out
+}
+
+/// An NXDOMAIN response — refuses a name outside the egress allowlist (the guest sees
+/// "could not resolve"; the name never leaks upstream).
+fn dns_nxdomain(query: &[u8], qend: usize) -> Vec<u8> {
+    dns_error(query, qend, RCODE_NXDOMAIN)
+}
+
+/// A SERVFAIL response — the upstream resolver did not answer, and saying so is what
+/// makes the guest's resolver fail the lookup now rather than retry until it times out.
+fn dns_servfail(query: &[u8], qend: usize) -> Vec<u8> {
+    dns_error(query, qend, RCODE_SERVFAIL)
 }
 
 /// Advance past a DNS name at `i`, returning the offset just after it. A compression
@@ -2586,6 +2741,105 @@ mod tests {
         assert!(dns_query(&udp(gw.octets(), 53), gw).is_some());
         assert!(dns_query(&udp(gw.octets(), 80), gw).is_none()); // wrong port
         assert!(dns_query(&udp([8, 8, 8, 8], 53), gw).is_none()); // not the gateway
+    }
+
+    #[test]
+    fn dns_error_echoes_the_question_with_the_rcode() {
+        let query = dns_question(0xbeef, "pool.ntp.org", 1);
+        let (_, _, qend) = parse_question(&query).expect("question parses");
+        for (build, rcode, aa) in [
+            (
+                dns_servfail as fn(&[u8], usize) -> Vec<u8>,
+                RCODE_SERVFAIL,
+                0,
+            ),
+            (
+                dns_nxdomain as fn(&[u8], usize) -> Vec<u8>,
+                RCODE_NXDOMAIN,
+                0x04,
+            ),
+        ] {
+            let resp = build(&query, qend);
+            assert_eq!(&resp[0..2], &[0xbe, 0xef]); // echoed id
+            assert_eq!(resp[2] & 0x80, 0x80); // QR=1
+            assert_eq!(resp[2] & 0x04, aa); // AA only where the switch is authoritative
+            assert_eq!(resp[2] & 0x01, 0x01); // RD copied from the query
+            assert_eq!(resp[3] & 0x80, 0x80); // RA=1
+            assert_eq!(resp[3] & 0x0f, rcode);
+            assert_eq!(u16::from_be_bytes([resp[4], resp[5]]), 1); // QDCOUNT
+            assert_eq!(&resp[6..12], &[0, 0, 0, 0, 0, 0]); // no answers, NS or additional
+            assert_eq!(&resp[12..], &query[12..qend]); // the question, verbatim
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_upstream_reports_why_it_failed() {
+        let query = dns_question(1, "pool.ntp.org", 1);
+        // A bound socket that never answers: the deadline expires.
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let err = forward_upstream_with(
+            &query,
+            silent.local_addr().unwrap(),
+            Duration::from_millis(150),
+        )
+        .await
+        .expect_err("a silent upstream times out");
+        assert!(matches!(err, UpstreamError::Timeout(_)), "{err}");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(err.to_string(), "no reply in 150ms");
+
+        // Nothing bound: the ICMP port-unreachable surfaces on the connected socket's recv.
+        let closed = {
+            let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            s.local_addr().unwrap()
+        };
+        let err = forward_upstream_with(&query, closed, Duration::from_secs(2))
+            .await
+            .expect_err("a closed port is refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused, "{err}");
+
+        // A reply shorter than a DNS header is not a reply the switch can relay.
+        let stub = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stub_addr = stub.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_, from) = stub.recv_from(&mut buf).await.unwrap();
+            stub.send_to(&[0u8; 4], from).await.unwrap();
+        });
+        let err = forward_upstream_with(&query, stub_addr, Duration::from_secs(2))
+            .await
+            .expect_err("a truncated reply is rejected");
+        assert!(matches!(err, UpstreamError::Short(4)), "{err}");
+        assert_eq!(err.to_string(), "reply too short (4 bytes)");
+    }
+
+    #[test]
+    fn qtype_name_is_the_mnemonic_or_the_number() {
+        assert_eq!(qtype_name(1), "A");
+        assert_eq!(qtype_name(28), "AAAA");
+        assert_eq!(qtype_name(255), "255"); // ANY: no mnemonic, so the number
+    }
+
+    #[test]
+    fn log_limiter_collapses_a_burst_into_one_line() {
+        let limiter = LogLimiter::default();
+        let up: SocketAddr = "127.0.0.53:53".parse().unwrap();
+        let refused = (up, std::io::ErrorKind::ConnectionRefused);
+        let t0 = Instant::now();
+        assert_eq!(limiter.admit(refused, t0), Some(0)); // first of its kind: print it
+        assert_eq!(limiter.admit(refused, t0 + Duration::from_secs(1)), None);
+        assert_eq!(limiter.admit(refused, t0 + Duration::from_secs(29)), None);
+        // A different fault on the same upstream is its own line.
+        assert_eq!(
+            limiter.admit((up, std::io::ErrorKind::TimedOut), t0),
+            Some(0)
+        );
+        // Past the window: print again, carrying the two lines swallowed in between.
+        let past = t0 + DNS_LOG_WINDOW + Duration::from_secs(1);
+        assert_eq!(limiter.admit(refused, past), Some(2));
+        // …and the count starts over.
+        assert_eq!(limiter.admit(refused, past + Duration::from_secs(1)), None);
+        assert_eq!(limiter.admit(refused, past + DNS_LOG_WINDOW), Some(1));
     }
 
     #[test]

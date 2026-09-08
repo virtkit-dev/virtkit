@@ -26,6 +26,11 @@ All notable changes to virtkit will be documented in this file.
   The networking line clarifies that the setting applies to CI job VMs, avoiding the
   implication that the host cannot provide guest networking.
 
+### Fixed
+
+- **A guest name lookup fails at once when the host's resolver does not answer**, instead of
+  hanging until the guest gives up, and the switch log names the upstream and why it failed.
+
 ## [0.64.1] - 2026-09-08
 
 ### Changed
