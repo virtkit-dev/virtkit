@@ -19,7 +19,7 @@ members = [
 exclude = ["third_party/libkrun", "third_party/imago"]
 
 [workspace.package]
-version = "0.64.0"
+version = "0.64.1"
 edition = "2024"
 authors = [
     "Vincent Vanackere <vincent.vanackere@gmail.com>",
