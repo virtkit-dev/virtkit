@@ -9,6 +9,8 @@ All notable changes to virtkit will be documented in this file.
 - **`vk dev code` opens the workspace in Windows VS Code from WSL2** over Remote-SSH.
 - **`vk dev ssh-config --windows` prints the Windows SSH host block** that `vk dev code`
   writes, for a Windows client set up by hand, without writing anything.
+- **`vk dev code` names the one Windows setting Remote-SSH needs** — the
+  `remote.SSH.remotePlatform` entry — so it stops asking which platform the environment runs.
 
 ## [0.64.1] - 2026-09-08
 

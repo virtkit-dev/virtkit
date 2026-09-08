@@ -21,6 +21,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
+use crate::dev::editor::Channel;
 use crate::sshclient::{Managed, Parts};
 
 /// Where a WSL install keeps `wsl.exe`, for a PATH without the interop directories.
@@ -34,6 +35,8 @@ const INCLUDE_NOTE: &str = "# Added by vk dev code: per-environment hosts.";
 trait Windows {
     /// `%USERPROFILE%`, as a path this distro can open.
     fn user_profile(&self) -> Result<PathBuf>;
+    /// `%APPDATA%`, likewise — where a Windows VS Code keeps its user settings.
+    fn app_data(&self) -> Result<PathBuf>;
     /// The Windows spelling of a path in this distro.
     fn to_windows(&self, path: &Path) -> Result<String>;
     /// `wsl.exe`, as Windows spells it.
@@ -85,6 +88,48 @@ pub fn print_stanza(state_dir: &Path) -> Result<()> {
     std::io::stdout()
         .write_all(text.as_bytes())
         .context("writing the stanza to stdout")
+}
+
+/// The quick pick Remote-SSH stops on before installing its server: it asks what platform a
+/// host it has not seen runs, and hangs on "Initializing VS Code Server" until answered. Best
+/// effort — a settings file this cannot locate or read yields no hint, never an error.
+pub fn platform_hint(alias: &str, channel: Channel) -> Option<String> {
+    hint_for(&Interop, alias, channel)
+}
+
+fn hint_for(w: &impl Windows, alias: &str, channel: Channel) -> Option<String> {
+    let settings = settings_path(&w.app_data().ok()?, channel)?;
+    let text = match std::fs::read_to_string(&settings) {
+        Ok(text) => text,
+        // No settings file yet is a fresh install — the launch that most surely meets the
+        // prompt — so treat it as unanswered. An unreadable one stays silent instead.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return None,
+    };
+    (!platform_known(&text, alias)).then(|| {
+        format!(
+            "Remote-SSH will ask for the platform of '{alias}' (a quick pick at the top of \
+             the window); answer Linux, or add to the Windows VS Code user settings: \
+             \"remote.SSH.remotePlatform\": {{ \"vk-*\": \"linux\" }}"
+        )
+    })
+}
+
+/// Windows VS Code user settings for `channel`, under `%APPDATA%`.
+/// Return `None` rather than guess an unknown build's settings directory.
+fn settings_path(app_data: &Path, channel: Channel) -> Option<PathBuf> {
+    let dir = match channel {
+        Channel::Stable => "Code",
+        Channel::Insiders => "Code - Insiders",
+        Channel::Codium | Channel::Oss => return None,
+    };
+    Some(app_data.join(dir).join("User/settings.json"))
+}
+
+/// Whether the settings already answer the platform question for `alias`: named outright, or
+/// covered by the `vk-*` pattern every alias written here matches.
+fn platform_known(settings: &str, alias: &str) -> bool {
+    settings.contains(&format!("\"{alias}\"")) || settings.contains("\"vk-*\"")
 }
 
 /// Whether this is a WSL distro. The distro name is the signal; the binfmt handler stands in
@@ -314,19 +359,11 @@ struct Interop;
 
 impl Windows for Interop {
     fn user_profile(&self) -> Result<PathBuf> {
-        // Only Windows knows its own environment; this distro sees none of it. cmd.exe echoes
-        // the value with a trailing CRLF, and echoes the name back when it is unset.
-        let out = output(Command::new("cmd.exe").args(["/c", "echo %USERPROFILE%"]))
-            .context("asking Windows for %USERPROFILE% (WSL interop has to be enabled)")?;
-        let profile = out.trim_ascii();
-        if profile.is_empty() || profile == b"%USERPROFILE%" {
-            bail!("Windows reports no %USERPROFILE%, so there is no `.ssh` to write into");
-        }
-        // Bytes throughout: a profile directory spelled in the console codepage is not UTF-8.
-        Ok(PathBuf::from(OsString::from_vec(wslpath(
-            "-u",
-            OsStr::from_bytes(profile),
-        )?)))
+        win_env("USERPROFILE")
+    }
+
+    fn app_data(&self) -> Result<PathBuf> {
+        win_env("APPDATA")
     }
 
     fn to_windows(&self, path: &Path) -> Result<String> {
@@ -346,6 +383,23 @@ impl Windows for Interop {
             .and_then(|p| self.to_windows(&p).ok())
             .unwrap_or_else(|| WSL_EXE.to_string()))
     }
+}
+
+/// One Windows environment variable, as a path this distro can open. Only Windows knows its
+/// own environment, so cmd.exe expands it — echoing the value with a trailing CRLF, and the
+/// name back when it is unset. Bytes throughout: a directory spelled in the console codepage
+/// is not UTF-8.
+fn win_env(name: &str) -> Result<PathBuf> {
+    let out = output(Command::new("cmd.exe").args(["/c", &format!("echo %{name}%")]))
+        .with_context(|| format!("asking Windows for %{name}% (WSL interop has to be enabled)"))?;
+    let value = out.trim_ascii();
+    if value.is_empty() || value == format!("%{name}%").as_bytes() {
+        bail!("Windows reports no %{name}%");
+    }
+    Ok(PathBuf::from(OsString::from_vec(wslpath(
+        "-u",
+        OsStr::from_bytes(value),
+    )?)))
 }
 
 fn wslpath(flag: &str, value: &OsStr) -> Result<Vec<u8>> {
@@ -388,6 +442,10 @@ mod tests {
     impl Windows for Fake {
         fn user_profile(&self) -> Result<PathBuf> {
             Ok(self.profile.clone())
+        }
+
+        fn app_data(&self) -> Result<PathBuf> {
+            Ok(self.profile.join("AppData/Roaming"))
         }
 
         fn to_windows(&self, path: &Path) -> Result<String> {
@@ -613,6 +671,44 @@ mod tests {
             assert!(!ensure_include(&config).unwrap());
             assert_eq!(std::fs::read_to_string(&config).unwrap(), content);
         }
+    }
+
+    #[test]
+    fn the_platform_quick_pick_is_pointed_out_until_the_settings_answer_it() {
+        let t = scratch("wsl-hint");
+        let w = fake(&t.0, r"C:\Users\dev", WSL_EXE);
+        let settings = settings_path(&w.app_data().unwrap(), Channel::Stable).unwrap();
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+
+        // No settings file yet — a fresh install, the launch that most surely meets the
+        // prompt — is unanswered, so it gets the hint (and never fails on the missing file).
+        let hint = hint_for(&w, "vk-dev", Channel::Stable).expect("a hint on a missing file");
+        assert!(hint.contains("platform of 'vk-dev'"), "{hint}");
+
+        std::fs::write(&settings, "{\n  \"editor.formatOnSave\": true\n}\n").unwrap();
+        let hint = hint_for(&w, "vk-dev", Channel::Stable).expect("a hint");
+        assert!(hint.contains("platform of 'vk-dev'"), "{hint}");
+        assert!(hint.contains("\"vk-*\": \"linux\""), "{hint}");
+
+        // Either the alias itself or the pattern that covers every one of these aliases is
+        // an answer already given.
+        for answered in [
+            "{ \"remote.SSH.remotePlatform\": { \"vk-*\": \"linux\" } }",
+            "{ \"remote.SSH.remotePlatform\": { \"vk-dev\": \"linux\" } }",
+        ] {
+            std::fs::write(&settings, answered).unwrap();
+            assert_eq!(hint_for(&w, "vk-dev", Channel::Stable), None, "{answered}");
+        }
+
+        // Insiders uses a separate settings directory. Do not guess the other channels'
+        // directories; they get no hint.
+        assert!(
+            settings_path(Path::new("/a"), Channel::Insiders)
+                .unwrap()
+                .ends_with("Code - Insiders/User/settings.json")
+        );
+        assert_eq!(settings_path(Path::new("/a"), Channel::Codium), None);
+        assert_eq!(hint_for(&w, "vk-dev", Channel::Oss), None);
     }
 
     #[test]

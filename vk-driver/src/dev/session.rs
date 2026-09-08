@@ -588,12 +588,18 @@ pub fn launch_editor(
     let bridge = crate::dev::wsl::bridge_needed(&editor.binary)
         .then(|| crate::dev::wsl::install(&managed))
         .transpose()?;
-    let uri = format!("vscode-remote://ssh-remote+{}{folder}", alias(plan));
+    let alias = alias(plan);
+    let uri = format!("vscode-remote://ssh-remote+{alias}{folder}");
     eprintln!("virtkit: {} --folder-uri={uri}", editor.binary.display());
     let mut cmd = std::process::Command::new(&editor.binary);
     cmd.arg(format!("--folder-uri={uri}"));
     match &bridge {
-        Some(written) => eprintln!("virtkit: {}", written.note()),
+        Some(written) => {
+            eprintln!("virtkit: {}", written.note());
+            if let Some(hint) = crate::dev::wsl::platform_hint(&alias, editor.channel) {
+                eprintln!("virtkit: {hint}");
+            }
+        }
         None => {
             cmd.env("PATH", shimmed_path(&managed)?);
         }

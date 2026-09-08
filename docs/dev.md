@@ -507,7 +507,10 @@ at a Linux path. `%USERPROFILE%\.ssh` has to exist already, because the copy inh
 its permissions. The host block is rewritten on every launch and the key refreshed
 only when it changed, and `Include vk/*.conf` is added once at the top of
 `%USERPROFILE%\.ssh\config`. `vk dev ssh-config --windows` prints the same block
-without writing anything.
+without writing anything. Remote-SSH asks which platform a host it has not seen runs
+and waits for the answer before installing its server;
+`"remote.SSH.remotePlatform": { "vk-*": "linux" }` in the Windows VS Code user
+settings answers it once for every environment, and `code` says so while it is missing.
 
 ```toml
 [dev.editor.vscode]
