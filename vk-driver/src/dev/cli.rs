@@ -264,9 +264,15 @@ enum DevAction {
     ///
     /// The `Host` block `vk dev ssh` uses, for an editor, an rsync or an `Include` in your
     /// own ssh_config. It names the state directory's key and socket, so it is good for as
-    /// long as this environment's state directory is.
+    /// long as this environment's state directory is. `--windows` prints the block a Windows
+    /// `ssh.exe` needs instead, for a Windows editor driven from WSL2 — the same block
+    /// `vk dev code` writes there, without writing it.
     #[command(name = "ssh-config")]
-    SshConfig,
+    SshConfig {
+        /// print the block for a Windows `ssh.exe` reached from this WSL2 distro
+        #[arg(long)]
+        windows: bool,
+    },
     /// Rebuild the environment and restart it into the result
     ///
     /// Unconditional, and the only command that is: `up` leaves an environment that matches
@@ -425,7 +431,7 @@ impl DevAction {
             | Self::Storage { .. }
             | Self::EditorReconcile { .. }
             | Self::Ssh { .. }
-            | Self::SshConfig
+            | Self::SshConfig { .. }
             | Self::Status { .. }
             | Self::Logs { .. }
             | Self::Doctor
@@ -879,10 +885,16 @@ async fn dev_action(
             Ok(never) => match never {},
             Err(e) => fail(&e, 1),
         },
-        DevAction::SshConfig => match sshclient::print_config(&plan.state_dir) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => fail(&e, 1),
-        },
+        DevAction::SshConfig { windows } => {
+            let printed = match windows {
+                true => dev::wsl::print_stanza(&plan.state_dir),
+                false => sshclient::print_config(&plan.state_dir),
+            };
+            match printed {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, 1),
+            }
+        }
         DevAction::Status { json } => match dev::status(&plan) {
             Ok(status) if json => match serde_json::to_string_pretty(&status) {
                 Ok(text) => write_report(&(text + "\n")),

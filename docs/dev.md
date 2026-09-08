@@ -506,7 +506,8 @@ a host block whose `ProxyCommand` re-enters the distro through `wsl.exe`, next t
 at a Linux path. `%USERPROFILE%\.ssh` has to exist already, because the copy inherits
 its permissions. The host block is rewritten on every launch and the key refreshed
 only when it changed, and `Include vk/*.conf` is added once at the top of
-`%USERPROFILE%\.ssh\config`.
+`%USERPROFILE%\.ssh\config`. `vk dev ssh-config --windows` prints the same block
+without writing anything.
 
 ```toml
 [dev.editor.vscode]
@@ -774,7 +775,7 @@ individual options.
 | `endpoints` | Show publication state; `--primary`, `--service`, `--json`. |
 | `open NAME` | Open an endpoint URL, or `--print` it. |
 | `task NAME -- ARG…` | Run a declared project task. |
-| `ssh -- ARG…`, `ssh-config` | Connect through or print the run's SSH setup. |
+| `ssh -- ARG…`, `ssh-config` | Connect through or print the run's SSH setup; `--windows` for a Windows client. |
 | `refresh` | Rebuild and restart; `--dry-run` only reports changes. |
 | `status` | Running state and configuration match; `--json`. |
 | `logs` | Read or follow primary/service console output. |

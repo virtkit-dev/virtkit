@@ -13,6 +13,7 @@
 //! on each boot, and the two have to agree.
 
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Component, Path, PathBuf};
@@ -67,6 +68,23 @@ pub fn bridge_needed(editor: &Path) -> bool {
 /// Write this run's Windows-side setup and say where it landed.
 pub fn install(managed: &Managed) -> Result<Written> {
     write_bridge(&Interop, &entry()?, &managed.parts()?, &managed.key())
+}
+
+/// `vk dev ssh-config --windows`: print the Windows SSH stanza and its key-copy path
+/// without writing the config or copying the key.
+pub fn print_stanza(state_dir: &Path) -> Result<()> {
+    let interop = Interop;
+    let managed = Managed::new(state_dir)?;
+    let text = stanza(
+        &interop,
+        &entry()?,
+        &managed.parts()?,
+        &interop.user_profile()?,
+    )?;
+    // Report a closed pipe as an error instead of panicking.
+    std::io::stdout()
+        .write_all(text.as_bytes())
+        .context("writing the stanza to stdout")
 }
 
 /// Whether this is a WSL distro. The distro name is the signal; the binfmt handler stands in
