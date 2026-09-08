@@ -580,7 +580,7 @@ pub(crate) fn default_scratch_base() -> Result<PathBuf> {
 }
 
 /// Usable bytes in Linux `sockaddr_un.sun_path`: 108 bytes minus the terminating NUL.
-const SUN_PATH_MAX: usize = 107;
+pub(crate) const SUN_PATH_MAX: usize = 107;
 
 /// The longest socket name bound directly in a state dir — the vsock socket of the highest
 /// port a bridged or published port can take; a virtiofsd volume socket (`vfsd-vol<i>.sock`)

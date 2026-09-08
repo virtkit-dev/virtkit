@@ -305,27 +305,19 @@ fn run_args(
     Ok(args)
 }
 
-/// Where an ephemeral task's VM keeps its sockets and scratch: `<environment state
-/// dir>-task-<name>-<token>`, created here and removed by the caller once the run ends.
+/// Where an ephemeral task's VM keeps its sockets and scratch:
+/// `<readable>{-env}-task-<name>-<token>`, a sibling of the environment's own directory,
+/// created here and removed by the caller once the run ends.
 ///
 /// Named with a random token, not this pid, so a leaked directory is never adopted by a
 /// later run the OS gives the same pid.
 fn task_state_dir(plan: &Plan, task: &crate::dev::plan::TaskPlan) -> Result<PathBuf> {
-    // Bounded like the token below: the name goes into the same vsock socket path, so a long
-    // `[dev.tasks.<name>]` must not be what overruns the 108-byte `sun_path` limit either.
-    let name: String = task
-        .name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .take(32)
-        .collect();
     for _ in 0..8 {
         // Eight hex digits: the directory name goes into the VM's vsock socket path, which
         // must stay under the 108-byte `sun_path` limit; the full token would overrun it.
         let token: String = generation_token().chars().take(8).collect();
-        let mut dir = plan.state_dir.clone().into_os_string();
-        dir.push(format!("-task-{name}-{token}"));
-        let dir = PathBuf::from(dir);
+        let name = crate::dev::plan::task_state_dir_name(plan, &task.name, &token)?;
+        let dir = plan.state_dir.with_file_name(name);
         // Fails if anything is already there, symlink included, so this run's directory is
         // one it made itself.
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
@@ -1380,6 +1372,8 @@ mod tests {
         assert_ne!(first, second, "a leaked directory is never inherited");
         let suffix = first.to_str().unwrap().rsplit('-').next().unwrap();
         assert_eq!(suffix.len(), 8, "short enough for the vsock socket path");
+        // Named after the workspace, like the environment's own directory.
+        let workspace = plan.workspace.file_name().unwrap().to_str().unwrap();
         for dir in [&first, &second] {
             assert!(dir.is_dir(), "created, not merely named");
             assert_eq!(
@@ -1390,7 +1384,10 @@ mod tests {
             // `vk dev gc` removes it.
             assert_eq!(dir.parent(), plan.state_dir.parent());
             let name = dir.file_name().unwrap().to_string_lossy().to_string();
-            assert!(name.starts_with("state-task-pre-commit-"), "{name}");
+            assert!(
+                name.starts_with(&format!("{workspace}-task-pre-commit-")),
+                "{name}"
+            );
         }
     }
 
@@ -1409,16 +1406,29 @@ mod tests {
             checkout: CheckoutMode::Shared,
         };
         let dir = task_state_dir(&plan, &task).unwrap();
-        let base = dir.file_name().unwrap().to_str().unwrap();
-        // `state-task-<name>-<8 hex>`: drop the fixed prefix and the trailing token to read
-        // back the sanitized name, which is bounded so the path stays under the limit.
-        let name = base
-            .strip_prefix("state-task-")
+        let leaf = dir.file_name().unwrap().to_str().unwrap();
+        // The whole point of the bound: every socket the VM binds under this directory has
+        // to fit what `sun_path` holds.
+        let socket = dir.join("vsock.sock_65535");
+        assert!(
+            socket.as_os_str().len() <= 107,
+            "{} bytes: {socket:?}",
+            socket.as_os_str().len()
+        );
+        // `<workspace>-task-<name>-<8 hex>`: drop the fixed prefix and the trailing token to
+        // read back the sanitized name. It is cut to at most TASK_NAME_MAX, and further when
+        // the temp base is long — either way it is truncated from the 100 given, and fits.
+        let workspace = plan.workspace.file_name().unwrap().to_str().unwrap();
+        let name = leaf
+            .strip_prefix(&format!("{workspace}-task-"))
             .unwrap()
             .rsplit_once('-')
             .unwrap()
             .0;
-        assert_eq!(name.chars().count(), 32, "a long name is truncated: {base}");
+        assert!(
+            (1..=32).contains(&name.chars().count()),
+            "a long name is truncated to fit: {leaf}"
+        );
     }
 
     #[test]

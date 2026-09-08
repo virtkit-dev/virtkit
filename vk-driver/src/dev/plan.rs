@@ -882,45 +882,149 @@ fn resolve_hook(h: &crate::dev::config::Hook) -> Result<HookPlan> {
     })
 }
 
+/// State directory name components: workspace, environment, and their digest.
+struct NameParts {
+    /// the workspace's basename, everything but `[A-Za-z0-9.-]` turned into `-`
+    readable: String,
+    /// `-<environment>`, empty for `dev`
+    suffix: String,
+    /// 16 hex digits of sha256(canonical workspace, NUL, environment)
+    slug: String,
+}
+
+impl NameParts {
+    fn of(workspace: &Path, environment: &str) -> Result<NameParts> {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::ffi::OsStrExt;
+        let mut hasher = Sha256::new();
+        hasher.update(workspace.as_os_str().as_bytes());
+        hasher.update([0]);
+        hasher.update(environment.as_bytes());
+        let digest = hasher.finalize();
+        let slug: String = digest
+            .get(..8)
+            .context("sha256 returned fewer than 8 bytes")?
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let name = workspace
+            .file_name()
+            .filter(|n| !n.as_bytes().is_empty())
+            .unwrap_or_else(|| std::ffi::OsStr::new("workspace"));
+        // One ASCII byte per input byte: truncation before or after conversion is equivalent.
+        let readable: String = name
+            .as_bytes()
+            .iter()
+            .take(READABLE_MAX)
+            .map(|&b| match b {
+                b'.' | b'-' => char::from(b),
+                b if b.is_ascii_alphanumeric() => char::from(b),
+                _ => '-',
+            })
+            .collect();
+        Ok(NameParts {
+            readable,
+            suffix: match environment {
+                "dev" => String::new(),
+                e => format!("-{e}"),
+            },
+            slug,
+        })
+    }
+
+    /// `{readable}{suffix}-{slug}`, with the workspace name truncated to fit under `base`.
+    fn environment_dir(&self, base: &Path) -> Result<String> {
+        let room = state_dir_room(base)?;
+        // Reject names with no room for at least one workspace byte.
+        let fits = room
+            .checked_sub(self.suffix.len() + 1 + self.slug.len())
+            .filter(|r| *r >= 1)
+            .ok_or_else(|| no_room(base))?;
+        let readable = &self.readable[..fits.min(self.readable.len())];
+        Ok(format!("{readable}{}-{}", self.suffix, self.slug))
+    }
+
+    /// `{readable}{suffix}-task-{name}-{token}`, the workspace name given up before the task
+    /// name: the environment's own directory sits beside this one and still spells the
+    /// workspace out, while the task name is what tells one ephemeral run from another.
+    ///
+    /// No digest here. The token already makes the name unique, and the 17 bytes a slug
+    /// would take are what keep both names readable within the socket path limit.
+    ///
+    /// `name` is byte-truncated, so the caller passes it already folded to ASCII.
+    fn task_dir(&self, base: &Path, name: &str, token: &str) -> Result<String> {
+        debug_assert!(
+            name.is_ascii(),
+            "task name must be folded to ASCII: {name:?}"
+        );
+        let room = state_dir_room(base)?;
+        let fixed = self.suffix.len() + "-task-".len() + 1 + token.len();
+        // At least one byte of each name.
+        let avail = room
+            .checked_sub(fixed)
+            .filter(|a| *a >= 2)
+            .ok_or_else(|| no_room(base))?;
+        let mut readable = self.readable.len();
+        let mut task = name.len().min(TASK_NAME_MAX);
+        if readable + task > avail {
+            readable = readable.min(avail.saturating_sub(task)).max(1);
+            task = task.min(avail - readable);
+        }
+        Ok(format!(
+            "{}{}-task-{}-{token}",
+            &self.readable[..readable],
+            self.suffix,
+            &name[..task]
+        ))
+    }
+}
+
+/// Maximum workspace basename bytes in a directory name, subject to available room.
+const READABLE_MAX: usize = 64;
+
+/// Maximum `[dev.tasks.<name>]` bytes in an ephemeral run's directory name.
+const TASK_NAME_MAX: usize = 32;
+
+/// Directory name budget: [`crate::run::STATE_DIR_MAX`] minus `base` and its separator.
+fn state_dir_room(base: &Path) -> Result<usize> {
+    crate::run::STATE_DIR_MAX
+        .checked_sub(base.as_os_str().len() + 1)
+        .filter(|room| *room >= 1)
+        .ok_or_else(|| no_room(base))
+}
+
+fn no_room(base: &Path) -> anyhow::Error {
+    anyhow!(
+        "{} leaves no room for a VM's own state directory: its sockets are bound under \
+         that directory and a unix socket path holds at most {} bytes. Point XDG_STATE_HOME \
+         at a shorter path.",
+        base.display(),
+        crate::run::SUN_PATH_MAX
+    )
+}
+
 /// The state dir an environment gets: a readable name plus a digest of what identifies it —
 /// the canonical workspace path and the environment name — so two worktrees of one repo,
 /// and two environments of one workspace, never share a VM, and the same one always resolves
 /// to the same directory.
 fn derived_state_dir(workspace: &Path, environment: &str) -> Result<PathBuf> {
-    use sha2::{Digest, Sha256};
-    use std::os::unix::ffi::OsStrExt;
-    let mut hasher = Sha256::new();
-    hasher.update(workspace.as_os_str().as_bytes());
-    hasher.update([0]);
-    hasher.update(environment.as_bytes());
-    let digest = hasher.finalize();
-    let slug: String = digest
-        .get(..8)
-        .context("sha256 returned fewer than 8 bytes")?
-        .iter()
-        .map(|b| format!("{b:02x}"))
+    let base = dev_state_base()?;
+    let name = NameParts::of(workspace, environment)?.environment_dir(&base)?;
+    Ok(base.join(name))
+}
+
+/// Name of an ephemeral task's state directory, beside the environment's directory.
+pub(super) fn task_state_dir_name(plan: &Plan, task_name: &str, token: &str) -> Result<String> {
+    let base = plan
+        .state_dir
+        .parent()
+        .with_context(|| format!("{} has no parent directory", plan.state_dir.display()))?;
+    // Non-alphanumerics folded away, so the name is one ASCII byte per character here too.
+    let name: String = task_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    let name = workspace
-        .file_name()
-        .filter(|n| !n.as_bytes().is_empty())
-        .unwrap_or_else(|| std::ffi::OsStr::new("workspace"));
-    // Capped: `NAME_MAX` is 255 bytes, and a long directory name must not be what makes
-    // `mkdir` fail once the digest has already told two of them apart.
-    let readable: String = name
-        .as_bytes()
-        .iter()
-        .take(64)
-        .map(|&b| match b {
-            b'.' | b'-' => char::from(b),
-            b if b.is_ascii_alphanumeric() => char::from(b),
-            _ => '-',
-        })
-        .collect();
-    let suffix = match environment {
-        "dev" => String::new(),
-        e => format!("-{e}"),
-    };
-    Ok(dev_state_base()?.join(format!("{readable}{suffix}-{slug}")))
+    NameParts::of(&plan.workspace, &plan.environment)?.task_dir(base, &name, token)
 }
 
 /// `path` with the symlinks it does have resolved, keeping the tail that does not exist
@@ -2557,5 +2661,110 @@ environment = \"hook\"
             Some(v) => unsafe { std::env::set_var("HOME", v) },
             None => unsafe { std::env::remove_var("HOME") },
         }
+    }
+
+    /// A state base of the length `$XDG_STATE_HOME` unset gives a `/home/<user>` account.
+    const BASE: &str = "/home/alice/.local/state/virtkit/dev";
+
+    /// The longest path the directory `name` under `base` ever has to bind.
+    fn socket_len(base: &Path, name: &str) -> usize {
+        base.join(name).join("vsock.sock_65535").as_os_str().len()
+    }
+
+    #[test]
+    fn an_environment_directory_that_fits_keeps_its_whole_name() {
+        let base = Path::new(BASE);
+        let parts = NameParts::of(Path::new("/home/alice/src/my-project"), "hook").unwrap();
+        let name = parts.environment_dir(base).unwrap();
+        assert_eq!(name, format!("my-project-hook-{}", parts.slug));
+        assert!(socket_len(base, &name) <= crate::run::SUN_PATH_MAX);
+    }
+
+    #[test]
+    fn a_long_workspace_name_is_cut_to_what_the_base_leaves() {
+        let base = Path::new(BASE);
+        let parts = NameParts::of(&PathBuf::from(format!("/w/{}", "n".repeat(200))), "hook")
+            .expect("a name is derived from any workspace");
+        let name = parts.environment_dir(base).unwrap();
+        assert_eq!(socket_len(base, &name), crate::run::SUN_PATH_MAX);
+        // The digest still tells this workspace from another cut to the same prefix.
+        assert!(name.ends_with(&format!("-hook-{}", parts.slug)), "{name}");
+        assert!(name.starts_with("nnn"), "{name}");
+    }
+
+    #[test]
+    fn an_ephemeral_task_directory_leaves_room_for_its_sockets() {
+        let base = Path::new(BASE);
+        let parts = NameParts::of(Path::new("/home/alice/src/my-project"), "hook").unwrap();
+        let name = parts.task_dir(base, "pre-commit", "34e89283").unwrap();
+        assert_eq!(name, "my-project-hook-task-pre-commit-34e89283");
+        assert!(socket_len(base, &name) <= crate::run::SUN_PATH_MAX);
+    }
+
+    #[test]
+    fn a_task_directory_gives_up_the_workspace_name_before_the_task_name() {
+        let base = Path::new(BASE);
+        let parts = NameParts::of(&PathBuf::from(format!("/w/{}", "w".repeat(200))), "hook")
+            .expect("a name is derived from any workspace");
+        let name = parts.task_dir(base, "pre-commit", "34e89283").unwrap();
+        assert_eq!(socket_len(base, &name), crate::run::SUN_PATH_MAX);
+        assert!(name.starts_with("www"), "{name}");
+        assert!(name.ends_with("-hook-task-pre-commit-34e89283"), "{name}");
+
+        // A base that leaves less than the two names want: the workspace is down to a
+        // single byte before the task name gives up anything.
+        let tight = PathBuf::from(format!("/{}", "b".repeat(59)));
+        let name = parts.task_dir(&tight, "pre-commit", "34e89283").unwrap();
+        assert_eq!(socket_len(&tight, &name), crate::run::SUN_PATH_MAX);
+        assert_eq!(name, "w-hook-task-pre-comm-34e89283");
+    }
+
+    #[test]
+    fn a_base_with_no_room_for_a_state_directory_says_what_to_do() {
+        let base = PathBuf::from(format!("/{}", "b".repeat(120)));
+        let parts = NameParts::of(Path::new("/w/repo"), "dev").unwrap();
+        for err in [
+            parts.environment_dir(&base).unwrap_err().to_string(),
+            parts
+                .task_dir(&base, "check", "34e89283")
+                .unwrap_err()
+                .to_string(),
+        ] {
+            assert!(err.contains(base.to_str().unwrap()), "{err}");
+            assert!(err.contains("XDG_STATE_HOME"), "{err}");
+            assert!(err.contains(&crate::run::SUN_PATH_MAX.to_string()), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_workspace_named_in_any_bytes_folds_to_an_ascii_readable_name() {
+        // The byte-truncation of `readable` is safe only because it is ASCII whatever the
+        // workspace is called — a multibyte, punctuation-laden basename included.
+        let parts = NameParts::of(Path::new("/w/café münster+x"), "dev").unwrap();
+        assert!(parts.readable.is_ascii(), "{}", parts.readable);
+        assert!(
+            parts
+                .readable
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'),
+            "{}",
+            parts.readable
+        );
+        // ASCII alphanumerics survive; every other byte becomes '-'.
+        assert!(parts.readable.starts_with("caf"), "{}", parts.readable);
+        assert!(parts.readable.ends_with("nster-x"), "{}", parts.readable);
+    }
+
+    #[test]
+    fn a_base_that_fits_a_state_dir_but_not_a_readable_name_is_refused() {
+        // 68 bytes: `state_dir_room` still returns a positive budget, but the fixed parts of
+        // each name — suffix and digest for an environment, suffix, `-task-` and token for a
+        // task — leave no room for even one byte of the workspace name, so both directories
+        // refuse rather than emit a name with nothing legible left.
+        let base = PathBuf::from(format!("/{}", "b".repeat(67)));
+        assert!(state_dir_room(&base).is_ok());
+        let parts = NameParts::of(Path::new("/w/repo"), "hook").unwrap();
+        assert!(parts.environment_dir(&base).is_err());
+        assert!(parts.task_dir(&base, "pre-commit", "34e89283").is_err());
     }
 }

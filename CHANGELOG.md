@@ -11,6 +11,12 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **An ephemeral `vk dev task` VM boots whatever the workspace, environment and task are
+  called.** Together those names could push the VM's socket paths past what a unix socket
+  path holds, and the run died with "the switch did not bind …". State directory names are
+  now fitted to that limit, and a host whose state directory base leaves no room for one is
+  told to point `XDG_STATE_HOME` somewhere shorter.
+
 - **Reject state directories too long for VM sockets before building the image.**
   `vk run --state-dir` reports paths exceeding the 90-byte directory limit for unix sockets,
   avoiding a VM startup failure after the build.
