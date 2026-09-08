@@ -107,9 +107,24 @@ impl Manager {
         }
     }
 
+    /// Lock the units map, recovering the guard even when a previous holder panicked. Every
+    /// request already runs on its own task whose panic is caught into a `Reply::err`, but a
+    /// panic under this lock would otherwise poison it and turn every *later* request into a
+    /// failure until the whole run restarts. The map is a set of independent unit entries, so
+    /// serving on from the recovered state beats bricking the control plane.
+    fn units_guard(&self) -> std::sync::MutexGuard<'_, HashMap<String, UnitState>> {
+        self.units.lock().unwrap_or_else(|e| {
+            // Report recovery once and clear the poison so later requests lock normally.
+            // Continue with the recovered guard.
+            eprintln!("virtkit: recovered the units lock a panicking request had poisoned");
+            self.units.clear_poison();
+            e.into_inner()
+        })
+    }
+
     /// Number of declared units.
     pub fn declared(&self) -> usize {
-        self.units.lock().unwrap().len()
+        self.units_guard().len()
     }
 
     /// Dispatch a request to a single (non-streaming) reply. `handle_control` intercepts
@@ -131,7 +146,7 @@ impl Manager {
     }
 
     fn list(&self) -> Reply {
-        let mut u = self.units.lock().unwrap();
+        let mut u = self.units_guard();
         let mut names: Vec<String> = u.keys().cloned().collect();
         names.sort();
         let units = names
@@ -149,7 +164,7 @@ impl Manager {
     }
 
     fn status(&self, name: &str) -> Reply {
-        let mut u = self.units.lock().unwrap();
+        let mut u = self.units_guard();
         match u.get_mut(name) {
             Some(st) => Reply::list(vec![UnitStatus {
                 name: name.into(),
@@ -177,7 +192,7 @@ impl Manager {
     pub fn start_streamed(&self, name: &str, sink: Option<crate::build::ProgressSink>) -> Reply {
         // Snapshot the unit under the lock, then release it for the (possibly long) build.
         let unit = {
-            let mut u = self.units.lock().unwrap();
+            let mut u = self.units_guard();
             let Some(st) = u.get_mut(name) else {
                 return Reply::err(format!("no such unit {name:?}"));
             };
@@ -212,7 +227,7 @@ impl Manager {
         }
 
         // Re-take the lock for the boot; re-check running in case a concurrent start won.
-        let mut u = self.units.lock().unwrap();
+        let mut u = self.units_guard();
         let Some(st) = u.get_mut(name) else {
             return Reply::err(format!("no such unit {name:?}"));
         };
@@ -268,7 +283,7 @@ impl Manager {
     /// there is an entry for [`crate::vms::note_service_image`] to correct, and are folded in
     /// here instead. Later, control-plane starts go through that function.
     pub fn refresh_service_images(&self, entries: &mut [crate::vms::ServiceEntry]) {
-        let units = self.units.lock().unwrap();
+        let units = self.units_guard();
         for e in entries {
             if let Some(st) = units.get(&e.name)
                 && let Some(recipe) = e.stale_recipe.as_mut()
@@ -282,7 +297,7 @@ impl Manager {
     /// for up to `shutdown::STOP_GRACE` so another start cannot race the stopping guest for its
     /// overlay and sockets.
     pub fn stop(&self, name: &str) -> Reply {
-        let mut u = self.units.lock().unwrap();
+        let mut u = self.units_guard();
         let Some(st) = u.get_mut(name) else {
             return Reply::err(format!("no such unit {name:?}"));
         };
@@ -313,7 +328,7 @@ impl Manager {
     /// through the VMM keeper (SIGUSR1). The VM process — and so the unit's pid — stays put;
     /// the guest comes back on the same disks. Unlike `Restart`, no image rebuild.
     fn reboot(&self, name: &str) -> Reply {
-        let mut u = self.units.lock().unwrap();
+        let mut u = self.units_guard();
         let Some(st) = u.get_mut(name) else {
             return Reply::err(format!("no such unit {name:?}"));
         };
@@ -334,7 +349,7 @@ impl Manager {
     /// Power off all guests concurrently within one `shutdown::STOP_GRACE`, then kill and reap their
     /// VMMs and helpers.
     pub fn stop_all(&self) {
-        let mut units = self.units.lock().unwrap();
+        let mut units = self.units_guard();
         // Compute addresses while borrowing the map immutably. It is unchanged before `iter_mut`,
         // so both iterators have the same order and `zip` aligns.
         let addrs: Vec<_> = units.values().map(|st| unit_addr(&st.dir)).collect();
@@ -360,7 +375,7 @@ impl Manager {
     }
 
     fn logs(&self, name: &str, lines: usize) -> Reply {
-        let u = self.units.lock().unwrap();
+        let u = self.units_guard();
         let Some(st) = u.get(name) else {
             return Reply::err(format!("no such unit {name:?}"));
         };
@@ -529,6 +544,41 @@ mod tests {
             std::time::Duration::from_secs(1800),
             provisioned,
         )
+    }
+
+    /// The panic hook is process-wide, so the test that swaps it takes its turn rather than
+    /// swallowing another test's panic message. Guards `()`, so a poisoning carries nothing.
+    static HOOK_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_poisoned_units_lock_is_recovered_not_fatal() {
+        let _serial = HOOK_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mgr = manager_over_two_units();
+        // Poison the lock by unwinding while holding its guard.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // keep the expected panic out of the test log
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = mgr.units.lock().unwrap();
+            panic!("boom while holding the units lock");
+        }));
+        std::panic::set_hook(prev);
+        assert!(r.is_err(), "the closure must panic to poison the lock");
+        assert!(
+            mgr.units.is_poisoned(),
+            "the lock is poisoned after the panic"
+        );
+        // Recovered, not fatal: the manager keeps answering over the poisoned lock instead of
+        // failing every later request until the run restarts — on both a read-only guard and a
+        // mutating one — and the first recovery clears the poison so later requests take the
+        // normal path.
+        assert_eq!(mgr.declared(), 2);
+        assert!(
+            mgr.status("db").ok,
+            "a mutating-guard request also recovers"
+        );
+        assert!(!mgr.units.is_poisoned(), "recovery clears the poison flag");
     }
 
     fn entry(name: &str, recipe: bool) -> crate::vms::ServiceEntry {

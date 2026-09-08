@@ -13,6 +13,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **`vk service` keeps working after an internal service-manager error**, instead of failing
+  every later command until the environment is restarted.
 - **`--ssh-host` writes the guest `~/.ssh/config` into the session user's home.** It went to
   root's home before, so with `--ssh-user` the stanzas never reached the user that ssh ran as.
 
