@@ -60,7 +60,7 @@ pub const SCHEMA: i64 = 1;
 /// The release that ships `vk dev`, as a literal so [`TEMPLATE`] can `concat!` it.
 macro_rules! min_version {
     () => {
-        "0.64.1"
+        "0.65.0"
     };
 }
 
