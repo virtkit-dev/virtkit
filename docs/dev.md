@@ -790,6 +790,7 @@ shape for inspection, not a complete script to execute.
 | Upgrade causes guest protocol/image incompatibility | Refresh the environment so its guest components match the current `vk`. |
 | Runner endpoint is unpublished | Check `service status`, start the service, then inspect `endpoints` and `doctor`. |
 | Editor opens without extensions | Inspect `editor status` and `editor log`, then `editor retry` with the editor connected. |
+| Editor stuck on "Copying VS Code Server to host with scp" | Add GNU `wget` or `curl` to the image—BusyBox's `wget` rejects Remote-SSH's flags—then run `refresh`. |
 | "The remote host does not meet the prerequisites for running VS Code Server", or extension installs fail with "Signature verification failed with 'ENOENT'" | The image has no FHS loader or libraries for the prebuilt glibc binaries Remote-SSH installs (Nix images in particular). Provide `/lib64/ld-linux-x86-64.so.2`, `/usr/lib64/libstdc++.so.6`, and libssl/libcrypto on the loader's search path, then run `refresh`; this repo's `.devcontainer/Dockerfile` does it with nix-ld. |
 | Startup hook fails | Read its output and guest logs; fix the command, user or working directory before retrying. |
 | Pre-commit overlay is refused | Pair `checkout = "overlay"` with `policy = "ephemeral"`. |
