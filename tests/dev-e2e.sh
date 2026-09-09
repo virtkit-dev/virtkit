@@ -14,7 +14,8 @@
 #   3. `dev up` runs hooks.init on the host, boots, and runs hooks.create/start in the guest;
 #      exec lands where it should, with `exec-env`, and reproduces the exit status.
 #   4. the named endpoint is published on its remembered loopback address and answers.
-#   5. a changed `${localEnv:…}` value is session-only: new sessions see it, nothing reboots.
+#   5. a changed `${localEnv:…}` value is session-only: new sessions see it, nothing reboots;
+#      bare `ssh`, `scp` and `sftp` reach the VM with only the run's `bin/` put on PATH.
 #   6. `storage reset` stops the owner and empties the item; the next start recreates it.
 #   7. a `reuse` task runs in the running environment, reproducing its exit status.
 #   8. `dev stop` takes the VM and its published endpoints away, and leaves nothing behind.
@@ -257,6 +258,36 @@ grep -q "session-only" <<<"$(vkd plan --diff)" \
 said "$(vkd ssh -- printenv E2E_TOKEN 2>/dev/null)" xyz \
   && ok "an ssh session gets exec-env too" || bad "ssh did not see E2E_TOKEN=xyz"
 grep -q '^Host ' <<<"$(vkd ssh-config)" && ok "ssh-config prints a Host stanza" || bad "ssh-config printed no Host line"
+# VS Code Remote-SSH connects with bare `ssh` and copies its server with bare `scp`, with
+# nowhere to pass a config: each OpenSSH connection tool must reach the VM through the
+# run's shim alone, and the copy must land where the guest reads it.
+alias=$(sed -n 's/^Host //p' <<<"$(vkd ssh-config)" | head -n 1)
+for tool in ssh scp sftp; do
+  [ -x "$STATE/bin/$tool" ] && ok "the run ships a $tool shim" || bad "no executable $tool shim in $STATE/bin"
+done
+shimmed() { PATH="$STATE/bin:$PATH" timeout -k 30 "${STEP_TIMEOUT:-600}" "$@"; }
+said "$(shimmed ssh "$alias" printenv E2E_TOKEN 2>/dev/null)" xyz \
+  && ok "bare ssh through the shim reaches the VM" || bad "bare ssh through the shim did not see E2E_TOKEN=xyz"
+# scp treats a channel that ends without an exit status as a failed copy, so its own exit
+# status is the check here, not the file alone — repeated, since the guest once lost the
+# race between that status and its close only some of the time.
+echo "copied by scp $$" > "$WORK/scp-in.txt"
+scp_ok=true
+for _ in $(seq 1 10); do
+  shimmed scp -q "$WORK/scp-in.txt" "$alias:/tmp/scp-in.txt" 2> "$WORK/scp.err" || { scp_ok=false; break; }
+done
+if $scp_ok; then
+  said "$(vkd exec -- cat /tmp/scp-in.txt)" "copied by scp $$" \
+    && ok "bare scp through the shim copied a file into the guest, 10 times over" || bad "the guest's /tmp/scp-in.txt is not what scp sent"
+else
+  bad "bare scp through the shim failed"; cat "$WORK/scp.err"
+fi
+if shimmed sftp -q -b - "$alias" <<<"get /tmp/scp-in.txt $WORK/sftp-out.txt" > "$WORK/sftp.err" 2>&1 \
+  && cmp -s "$WORK/scp-in.txt" "$WORK/sftp-out.txt"; then
+  ok "bare sftp through the shim read the file back"
+else
+  bad "bare sftp through the shim did not read the file back"; cat "$WORK/sftp.err"
+fi
 
 echo
 echo "== 6. storage reset stops the owner and empties the item =="

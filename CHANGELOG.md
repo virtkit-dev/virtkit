@@ -9,6 +9,12 @@ All notable changes to virtkit will be documented in this file.
 - **`scp` into a VM no longer fails after a complete copy.** The guest could end the
   channel before its exit status reached the client, so `scp` sometimes reported a copy it
   had just finished as failed. The status now always goes out first.
+- **`vk run --ssh-client` also shims `scp` and `sftp`.** `<state-dir>/bin` now holds all
+  three OpenSSH connection tools, so a program that copies files with bare `scp` or `sftp`
+  reaches the VM like one that spawns bare `ssh`. This fixes `vk dev code` hanging at
+  "Copying VS Code Server to host with scp" on a guest without `wget`/`curl`, where VS Code
+  copies its server from the host. Provisioning now needs `scp` and `sftp` installed
+  alongside `ssh`.
 
 ## [0.66.0] - 2026-09-08
 
