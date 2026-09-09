@@ -152,6 +152,16 @@ enum DevAction {
         /// extension must be installed.
         #[arg(long, value_name = "BIN")]
         editor: Option<String>,
+        /// Start the guest's VS Code server over before opening
+        ///
+        /// Stops the server and empties its data directory in the guest (`~/.vscode-server`
+        /// for a stable build; the channel's own directory otherwise) — installed server,
+        /// extensions, machine settings, caches — and forgets its reconciliation, so
+        /// Remote-SSH installs the server again and `[dev.editor.vscode]` is applied afresh.
+        /// Windows already attached lose their server and reconnect. Works whatever holds the
+        /// directory: vk's managed storage, a mount of your own, or the environment itself.
+        #[arg(long)]
+        reset_server: bool,
     },
     /// Follow or retry the editor reconciliation, apart from the VM's own status
     ///
@@ -792,13 +802,28 @@ async fn dev_action(
                 }
             }
         },
-        DevAction::Code { editor } => match dev_up(&plan, host_cfg, over, false, true).await {
+        DevAction::Code {
+            editor,
+            reset_server,
+        } => match dev_up(&plan, host_cfg, over, false, true).await {
             Ready::Done(code) => code,
             Ready::Act => {
                 let editor = match crate::dev::editor::select(editor.as_deref()) {
                     Ok(e) => e,
                     Err(e) => return fail(&e, 1),
                 };
+                // Before the reconciliation starts: it would otherwise find a server that is
+                // about to go, and stamp what it applied to it. And only for an editor that
+                // can then be launched: emptying the server for nothing helps no one.
+                if reset_server {
+                    if let Err(e) = dev::launch_checks(&plan) {
+                        return fail(&e, 1);
+                    }
+                    match crate::dev::editor::reset_server(&plan, &editor).await {
+                        Ok(done) => eprintln!("virtkit: editor: {done}"),
+                        Err(e) => return fail(&e, 1),
+                    }
+                }
                 // Started before the editor and not waited for: the server appears only
                 // once the editor connects, and the editor must not wait for this.
                 match crate::dev::editor::spawn(&plan, &editor) {

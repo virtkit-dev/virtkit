@@ -590,6 +590,22 @@ const LOGIN_SHELL_SCRIPT: &str = concat!(
     "exec \"${s:-${SHELL:-/bin/sh}}\" -l",
 );
 
+/// What launching the editor needs: a folder to open, and the SSH setup it connects with.
+/// Returns them, so a caller about to do something irreversible can check first.
+pub fn launch_checks(plan: &Plan) -> Result<(&str, crate::sshclient::Managed)> {
+    let Some(folder) = &plan.workspace_folder else {
+        bail!("the config sets no `workspace`, so there is no folder to open");
+    };
+    let managed = crate::sshclient::Managed::new(&plan.state_dir)?;
+    if !managed.config().is_file() {
+        bail!(
+            "no SSH setup in {} — bring the environment up first",
+            plan.state_dir.display()
+        );
+    }
+    Ok((folder, managed))
+}
+
 /// `vk dev code`: hand the workspace to the selected editor over Remote-SSH.
 ///
 /// The editor spawns bare `ssh` and `scp` with nowhere to pass a config, so the run's shims
@@ -601,16 +617,7 @@ pub fn launch_editor(
     editor: &crate::dev::editor::Editor,
 ) -> Result<std::convert::Infallible> {
     use std::os::unix::process::CommandExt;
-    let Some(folder) = &plan.workspace_folder else {
-        bail!("the config sets no `workspace`, so there is no folder to open");
-    };
-    let managed = crate::sshclient::Managed::new(&plan.state_dir)?;
-    if !managed.config().is_file() {
-        bail!(
-            "no SSH setup in {} — bring the environment up first",
-            plan.state_dir.display()
-        );
-    }
+    let (folder, managed) = launch_checks(plan)?;
     // Written before anything is printed: an editor that cannot be given a working SSH setup
     // should not be launched into a connection that will fail.
     let bridge = crate::dev::wsl::bridge_needed(&editor.binary)

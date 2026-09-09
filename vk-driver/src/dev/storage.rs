@@ -347,8 +347,8 @@ pub async fn reset(plan: &Plan, name: &str, yes: bool) -> Result<String> {
              is what resets it — not this"
         ),
         Category::Editor => bail!(
-            "{name} is the editor adapter's storage; it reconciles the server itself \
-             (`vk dev editor retry`)"
+            "{name} is the editor's server storage, which `vk dev code --reset-server` starts \
+             over without stopping the environment — not this"
         ),
         Category::Durable => {}
     }

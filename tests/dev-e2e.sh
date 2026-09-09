@@ -16,7 +16,8 @@
 #   4. the named endpoint is published on its remembered loopback address and answers.
 #   5. a changed `${localEnv:…}` value is session-only: new sessions see it, nothing reboots;
 #      bare `ssh`, `scp` and `sftp` reach the VM with only the run's `bin/` put on PATH, and
-#      a killed ssh client takes its remote command, or its hang-up-proof shell, with it.
+#      a killed ssh client takes its remote command, or its hang-up-proof shell, with it;
+#      `code --reset-server` empties the guest's server directory and opens the editor.
 #   6. `storage reset` stops the owner and empties the item; the next start recreates it.
 #   7. a `reuse` task runs in the running environment, reproducing its exit status.
 #   8. `dev stop` takes the VM and its published endpoints away, and leaves nothing behind.
@@ -324,6 +325,32 @@ client_death_ends 271 "its remote command" "" \
 # closing its pty and, failing that, killing the group gets rid of it.
 client_death_ends 272 "a shell that ignores the hang-up" 'trap "" HUP; exec sleep 272' \
   env PATH="$STATE/bin:$PATH" timeout -k 30 "${STEP_TIMEOUT:-600}" ssh -tt "$alias"
+
+# `code --reset-server`: the guest's server directory is emptied — not removed, it may be a
+# mount point — and the editor opened. The editor is a stand-in that reports a version and the
+# Remote-SSH extension, then records how it was launched; `vk dev code` execs into it.
+cat > "$WORK/fake-code" <<'FAKE'
+#!/bin/sh
+case "$1" in
+  --version) printf '1.93.1\nabcdef0123456789abcdef0123456789abcdef01\nx64\n' ;;
+  --list-extensions) printf 'ms-vscode-remote.remote-ssh\n' ;;
+  *) printf '%s\n' "$@" > "$(dirname "$0")/code-args" ;;
+esac
+FAKE
+chmod +x "$WORK/fake-code"
+# Seeded with a server's leftovers and the generation marker managed storage carries: the
+# marker is the boot's, not the server's, and stays — or `hooks.create` would run again.
+vkd exec -- sh -c 'mkdir -p /root/.vscode-server/bin/old && touch /root/.vscode-server/bin/old/node /root/.vscode-server/.stale && echo gen > /root/.vscode-server/.vk-generation' >/dev/null \
+  || bad "could not seed a server directory in the guest"
+if vkd code --reset-server --editor "$WORK/fake-code" > "$WORK/code.txt" 2>&1; then
+  grep -q 'emptied /root/.vscode-server' "$WORK/code.txt" && ok "code --reset-server reported the reset" || { bad "code --reset-server did not report the reset"; cat "$WORK/code.txt"; }
+  # The whole listing, not a line of it: one entry left, and that one the marker.
+  [ "$(vkd exec -- ls -A /root/.vscode-server)" = .vk-generation ] && ok "the server directory holds nothing but the generation marker" || { bad "the server directory was not emptied down to the marker"; vkd exec -- ls -A /root/.vscode-server; }
+  grep -q '^--folder-uri=vscode-remote://ssh-remote+.*/w$' "$WORK/code-args" 2>/dev/null \
+    && ok "the editor was opened on the workspace" || { bad "the editor was not opened on the workspace"; cat "$WORK/code-args" 2>/dev/null; }
+else
+  bad "code --reset-server failed"; cat "$WORK/code.txt"
+fi
 
 echo
 echo "== 6. storage reset stops the owner and empties the item =="

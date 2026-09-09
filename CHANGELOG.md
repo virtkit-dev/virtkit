@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk dev code --reset-server` starts the guest's VS Code server over.** It stops the
+  server, empties its data directory in the guest — installed server, extensions, machine
+  settings, caches — and forgets the reconciliation, then opens the editor as usual;
+  Remote-SSH installs the server again and `[dev.editor.vscode]` is applied afresh. The
+  environment keeps running.
+
 ### Fixed
 
 - **`scp` into a VM no longer fails after a complete copy.** The guest could end the
