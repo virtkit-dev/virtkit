@@ -536,11 +536,12 @@ pub async fn reconcile(plan: &Plan, editor: &Editor) -> Result<Outcome> {
     let mut failures = Vec::new();
     for ext in &missing {
         println!("virtkit: editor: installing {ext}");
-        // Under its own session (where `setsid` exists) so an attaching window's cleanup
-        // cannot kill the install's process group.
+        // Run installs in their own session when `setsid -w` is available, so an attaching window
+        // cannot kill their process group. BusyBox `setsid` lacks `-w`, so run the install in
+        // the current session instead.
         let ok = run_in_guest(
             plan,
-            "if command -v setsid >/dev/null 2>&1; then exec setsid -w \"$0\" \"$@\"; fi; \
+            "if setsid -w true >/dev/null 2>&1; then exec setsid -w \"$0\" \"$@\"; fi; \
              exec \"$0\" \"$@\"",
             &[cli.as_str(), "--install-extension", ext, "--force"],
             &[],

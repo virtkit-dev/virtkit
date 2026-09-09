@@ -45,6 +45,8 @@ All notable changes to virtkit will be documented in this file.
 - **`vk dev exec`, `shell`, `code`, `service up` and `task` no longer announce that the
   environment is already running.** That note is `vk dev up`'s answer; ahead of a command's
   own output it read like an error.
+- **`vk dev code` installs extensions in BusyBox guests.** Probe `setsid -w`; when unavailable,
+  install in the current session.
 
 ## [0.66.0] - 2026-09-08
 
