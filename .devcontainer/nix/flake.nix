@@ -75,6 +75,7 @@
           ugrep         # dev.sh VM source search
           bfs
           busybox
+          wget          # Remote-SSH uses GNU wget to download its server in the guest
           cargo-audit   # audit.sh (RUSTSEC scan)
           cargo-sweep   # sweep.sh (reclaim stale target/)
           # Without these tools, qcow2 and ext4 cross-checks skip and CI still passes.
