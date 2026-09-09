@@ -172,7 +172,10 @@ struct ServerHandler {
     authed_user: Option<String>,
     channels: HashMap<ChannelId, Channel<Msg>>,
     ptys: HashMap<ChannelId, PtyReq>,
-    pty_fds: HashMap<ChannelId, std::os::fd::RawFd>,
+    /// Send window changes to the bridge while it owns the pty master. Keeping a raw fd
+    /// here could resize another terminal after the master closes and its fd is reused.
+    /// Only the latest size matters, so bursts of changes coalesce.
+    resizes: HashMap<ChannelId, watch::Sender<(u16, u16)>>,
     /// Handed to every bridge this connection spawns.
     gone: ConnectionGone,
 }
@@ -189,7 +192,7 @@ impl ServerHandler {
             authed_user: None,
             channels: HashMap::new(),
             ptys: HashMap::new(),
-            pty_fds: HashMap::new(),
+            resizes: HashMap::new(),
             gone,
         }
     }
@@ -267,12 +270,17 @@ impl Handler for ServerHandler {
         _pix_height: u32,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(&fd) = self.pty_fds.get(&channel) {
-            let _ = pty::set_winsize(
-                fd,
-                row_height.min(u32::from(u16::MAX)) as u16,
-                col_width.min(u32::from(u16::MAX)) as u16,
-            );
+        let size = (
+            row_height.min(u32::from(u16::MAX)) as u16,
+            col_width.min(u32::from(u16::MAX)) as u16,
+        );
+        if self
+            .resizes
+            .get(&channel)
+            .is_some_and(|bridge| bridge.send(size).is_err())
+        {
+            // The bridge has ended: no later change can reach it.
+            self.resizes.remove(&channel);
         }
         Ok(())
     }
@@ -294,13 +302,15 @@ impl Handler for ServerHandler {
         match self.ptys.remove(&channel) {
             Some(pty) => match spawn_shell(&user, &pty) {
                 Ok((child, master)) => {
-                    self.pty_fds.insert(channel, master.as_raw_fd());
+                    let (resize_tx, resizes) = watch::channel((pty.rows, pty.cols));
+                    self.resizes.insert(channel, resize_tx);
                     session.channel_success(channel)?;
                     let handle = session.handle();
                     tokio::spawn(shell_bridge(
                         chan,
                         child,
                         master,
+                        resizes,
                         handle,
                         channel,
                         self.gone.clone(),
@@ -349,6 +359,20 @@ impl Handler for ServerHandler {
                 session.channel_failure(channel)?;
             }
         }
+        Ok(())
+    }
+
+    /// The client closed a channel before anything ran on it: forget what was kept for it.
+    /// A channel a bridge closed is already gone from russh by the time the client's close
+    /// arrives, so it does not land here; its resize sender goes with the handler.
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.channels.remove(&channel);
+        self.ptys.remove(&channel);
+        self.resizes.remove(&channel);
         Ok(())
     }
 
@@ -649,13 +673,14 @@ async fn hangup_and_reap(child: &mut Child) -> u32 {
 }
 
 /// Bridge a session channel to a pty shell until either side closes or the connection
-/// goes; report the exit status and close the channel. A shell left behind by its client
-/// is hung up on the way a terminal would: its pty master closes first, then its group is
-/// signalled, then killed if it stays.
+/// goes, applying the client's window changes meanwhile; report the exit status and close
+/// the channel. A shell left behind by its client is hung up on the way a terminal would:
+/// its pty master closes first, then its group is signalled, then killed if it stays.
 async fn shell_bridge(
     chan: Channel<Msg>,
     mut child: Child,
     mut master: PtyMaster,
+    mut resizes: watch::Receiver<(u16, u16)>,
     handle: Handle,
     id: ChannelId,
     mut gone: ConnectionGone,
@@ -665,18 +690,29 @@ async fn shell_bridge(
     // The shell's exit status if it exited on its own; the copy's borrow of the master
     // ends with this block, so the master can be closed before the shell is hung up on.
     let exited = {
+        // The ioctl wants the number; the master itself is the copy's for the duration.
+        let master_fd = master.as_raw_fd();
         let mut copy = std::pin::pin!(tokio::io::copy_bidirectional(&mut stream, &mut master));
-        tokio::select! {
-            // client gone or pty EOF (shell exited and closed the master)
-            _ = &mut copy => None,
-            // shell exited: let the copy drain trailing output briefly
-            status = child.wait() => {
-                // Whatever did not drain in time is going to a client that is not reading.
-                let _ = tokio::time::timeout(Duration::from_millis(300), &mut copy).await;
-                Some(status_or_default(status))
+        loop {
+            tokio::select! {
+                // client gone or pty EOF (shell exited and closed the master)
+                _ = &mut copy => break None,
+                // shell exited: let the copy drain trailing output briefly
+                status = child.wait() => {
+                    // Whatever did not drain in time is going to a client that is not reading.
+                    let _ = tokio::time::timeout(Duration::from_millis(300), &mut copy).await;
+                    break Some(status_or_default(status));
+                }
+                // connection gone while the copy sat parked on the channel window
+                _ = gone.wait() => break None,
+                // the client's terminal changed size; the master is open for as long as
+                // this loop runs, so the number still names it
+                Ok(()) = resizes.changed() => {
+                    let (rows, cols) = *resizes.borrow_and_update();
+                    // A size the pty refuses is not worth ending the session over.
+                    let _ = pty::set_winsize(master_fd, rows, cols);
+                }
             }
-            // connection gone while the copy sat parked on the channel window
-            _ = gone.wait() => None,
         }
     };
     let code: u32 = match exited {

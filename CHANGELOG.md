@@ -14,6 +14,9 @@ All notable changes to virtkit will be documented in this file.
   port forward running in the guest.** Such a session could once linger forever when the
   guest still had output to send; its shell or command is now hung up on as sshd does, and
   killed if it ignores that.
+- **A terminal resize can no longer land on another session's terminal.** A resize that
+  arrived after its shell had ended was applied to whatever had since taken its terminal's
+  place.
 
 ## [0.66.0] - 2026-09-08
 
