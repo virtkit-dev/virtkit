@@ -133,11 +133,14 @@ enum DevAction {
         )]
         command: Vec<String>,
     },
-    /// Open an interactive shell in the environment, bringing it up first
+    /// Open an interactive shell in the dev environment
     ///
-    /// The session `vk dev exec` gives a command, with a terminal: the config's `user` and
-    /// `exec-env`, in the guest directory that stands for yours. Ends when the shell does;
-    /// the environment stays up, so opening another costs nothing.
+    /// Starts the environment if needed, then opens a login shell as the configured `user`
+    /// with the environment variables from `exec-env`. Starts in the guest directory
+    /// corresponding to your current workspace directory, or the guest workspace root
+    /// if you are outside the workspace.
+    ///
+    /// Exiting the shell leaves the environment running.
     Shell,
     /// Open the workspace in VS Code, bringing the environment up first
     ///
