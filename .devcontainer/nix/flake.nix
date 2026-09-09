@@ -127,6 +127,32 @@
         # hashes leak into the Dockerfile. No image is built or pushed by Nix itself.
         packages.buildEnv = binEnv;
 
+        # Prebuilt, glibc-linked binaries that VS Code Remote-SSH installs into the guest home
+        # after connecting — its bundled node, rust-analyzer — expect an FHS system: the
+        # interpreter at /lib64/ld-linux-x86-64.so.2 and glibc/libstdc++ on its default search
+        # path. The nixos/nix base has neither, so the server fails VS Code's "prerequisites for
+        # running VS Code Server" check. This closure is what .devcontainer/Dockerfile wires up
+        # the way NixOS' programs.nix-ld does: nix-ld becomes /lib64/ld-linux-x86-64.so.2 and
+        # execs the real loader (NIX_LD) with NIX_LD_LIBRARY_PATH (this closure's /lib) as the
+        # library path. nixpkgs' own ld.so cannot be the /lib64 loader directly: it is patched
+        # to read its ld.so.cache from its store path, never /etc, so no ldconfig setup in the
+        # image would let it find libstdc++. Runtime only: out-linked to /opt/fhs, never on the
+        # build PATH; the two variables only affect binaries whose interpreter is the shim, so
+        # the musl release build (static) and the nix-store toolchain (own loader + RPATH) never
+        # see it.
+        packages.fhsRuntime = pkgs.buildEnv {
+          name = "virtkit-fhs-runtime";
+          pathsToLink = [ "/lib" "/libexec" ];
+          # nix-ld: the shim (libexec/nix-ld); glibc.out: loader + libc — spelled `.out` because
+          # buildEnv installs meta.outputsToInstall, which for glibc is its `bin` output alone
+          # (ldconfig, ldd...) and no libraries at all; cc.cc.lib: libstdc++.so.6 / libgcc_s.so.1;
+          # zlib: node dlopens it; openssl.out: libssl/libcrypto, which the server's .NET
+          # extension-signature verifier dlopens — without them every extension install fails
+          # with "Signature verification failed with 'ENOENT'". Extend if a later extension's
+          # binary needs more (e.g. gmp).
+          paths = with pkgs; [ nix-ld glibc.out stdenv.cc.cc.lib zlib openssl.out ];
+        };
+
         # The kernel-build deps, installed on top of the build image by kernel/Dockerfile
         # (`FROM virtkit-build`). gcc/binutils are the kernel's own C toolchain here — NOT the
         # musl cross cc the Rust build uses; the kernel links no libc, so a glibc gcc builds it.

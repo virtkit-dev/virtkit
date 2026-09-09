@@ -55,3 +55,35 @@ RUN printf 'dev:x:%s:%s:dev:/home/dev:/bin/sh\n' "$DEV_UID" "$DEV_GID" >> /etc/p
  && printf 'dev:x:%s:\n' "$DEV_GID" >> /etc/group \
  && mkdir -p /home/dev && chown "$DEV_UID:$DEV_GID" /home/dev \
  && chmod 1777 /tmp
+
+# VS Code Remote-SSH downloads prebuilt, glibc-linked binaries (the server's node,
+# rust-analyzer) into ~/.vscode-server after connecting. They carry no RPATH and expect
+# an FHS system: the interpreter at /lib64/ld-linux-x86-64.so.2 and libstdc++ & co. on the
+# loader's default search path. The nixos/nix base has neither, so Remote-SSH reports the
+# host "does not meet the prerequisites for running VS Code Server".
+#
+# Fix, the NixOS way (programs.nix-ld): /lib64/ld-linux-x86-64.so.2 is nix-ld, a shim that
+# execs the real glibc loader (NIX_LD) with NIX_LD_LIBRARY_PATH as the library search path.
+# Both come from nix/flake.nix#fhsRuntime. Only foreign binaries name that interpreter, so the
+# nix-store toolchain (its own store loader + RPATH) and the static musl release build are
+# untouched, and the two variables are inert for them — unlike a global LD_LIBRARY_PATH.
+# nixpkgs' glibc is NOT an option as the loader itself: its ld.so and ldconfig are patched to
+# read <glibc-store-path>/etc/ld.so.cache, never /etc/ld.so.cache, so no ld.so.conf/ldconfig
+# setup in the image can teach it where libstdc++ is.
+#
+# The CLI's prerequisites probe (vscode cli/src/util/prereqs.rs) needs, on x86_64:
+# `ldd --version` on PATH >= 2.28 (the toolchain's glibc ldd, already there) and a
+# /usr/lib64/libstdc++.so.6 to scan for GLIBCXX_ tags — it tries that exact path before
+# falling back to `/sbin/ldconfig -p`, which nixpkgs' ldconfig cannot serve for the same
+# cache-path reason. Hence the one symlink.
+RUN nix build "path:/src/nix#fhsRuntime" --out-link /opt/fhs \
+ && test -x /opt/fhs/libexec/nix-ld \
+ && test -x /opt/fhs/lib/ld-linux-x86-64.so.2 \
+ && test -e /opt/fhs/lib/libstdc++.so.6 \
+ && mkdir -p /lib64 /usr/lib64 \
+ && ln -sf /opt/fhs/libexec/nix-ld /lib64/ld-linux-x86-64.so.2 \
+ && ln -sf /opt/fhs/lib/libstdc++.so.6 /usr/lib64/libstdc++.so.6
+# `vk dev` and devcontainers hand the image environment to every guest session, ssh included,
+# which is how these reach the server the Remote-SSH install script spawns.
+ENV NIX_LD=/opt/fhs/lib/ld-linux-x86-64.so.2 \
+    NIX_LD_LIBRARY_PATH=/opt/fhs/lib
