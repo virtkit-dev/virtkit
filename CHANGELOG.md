@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`scp` into a VM no longer fails after a complete copy.** The guest could end the
+  channel before its exit status reached the client, so `scp` sometimes reported a copy it
+  had just finished as failed. The status now always goes out first.
+
 ## [0.66.0] - 2026-09-08
 
 ### Added
