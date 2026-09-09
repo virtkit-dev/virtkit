@@ -1661,9 +1661,10 @@ enum Cmd {
         ///
         /// Implies --ssh and needs --state-dir. Generates a keypair of its own (reused on
         /// later boots, so nothing else is authorised by default), and writes `ssh-config`
-        /// plus a `bin/ssh` shim beside it: connect with `vk ssh <state-dir>`, `ssh -F
-        /// <state-dir>/ssh-config <alias>`, or by putting `<state-dir>/bin` first on PATH
-        /// for a program that spawns bare `ssh` (VS Code Remote-SSH, Emacs TRAMP).
+        /// plus `ssh`, `scp` and `sftp` shims in `bin/` beside it: connect with `vk ssh
+        /// <state-dir>`, `ssh -F <state-dir>/ssh-config <alias>`, or by putting
+        /// `<state-dir>/bin` first on PATH for a program that spawns the bare tools (VS Code
+        /// Remote-SSH, Emacs TRAMP). Needs `ssh`, `scp` and `sftp` on the host's PATH.
         #[arg(long = "ssh-client", requires = "state_dir", help_heading = "SSH")]
         ssh_client: bool,
         /// Host alias the --ssh-client config declares

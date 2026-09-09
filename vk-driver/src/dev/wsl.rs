@@ -3,7 +3,7 @@
 //!
 //! A `code` under `/mnt/<drive>/` is a Windows program, so Remote-SSH runs on Windows: it
 //! spawns `C:\Windows\System32\OpenSSH\ssh.exe`, which reads `%USERPROFILE%\.ssh\config` and
-//! sees neither this distro's PATH — so not the run's `ssh` shim — nor the run's config. The
+//! sees neither this distro's PATH — so not the run's shims — nor the run's config. The
 //! alias then resolves to nothing at all. This writes the same host block where that ssh.exe
 //! does read it, dialling back into this distro through `wsl.exe -d <distro> -e vk connect`,
 //! and points it at a copy of the run's managed key, since a Linux path is not one Windows
@@ -48,7 +48,7 @@ impl Written {
 }
 
 /// Whether `vk dev code` has to bridge for `editor`: a Windows VS Code launched from a WSL2
-/// distro. Anything else reaches the VM through the run's PATH shim, as it always has.
+/// distro. Anything else reaches the VM through the run's PATH shims, as it always has.
 pub fn bridge_needed(editor: &Path) -> bool {
     in_wsl() && is_windows_binary(editor)
 }

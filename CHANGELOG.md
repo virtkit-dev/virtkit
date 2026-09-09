@@ -7,6 +7,9 @@ All notable changes to virtkit will be documented in this file.
 ### Fixed
 
 - **`scp`/`sftp` into a VM no longer fails after a complete copy.**
+- **Copying files into a VM with bare `scp`/`sftp` now works** — including VS Code
+  Remote-SSH installing its server on a guest without `wget`/`curl`. `vk run --ssh-client`
+  now requires `scp` and `sftp` on the host alongside `ssh`.
 
 ## [0.66.0] - 2026-09-08
 
