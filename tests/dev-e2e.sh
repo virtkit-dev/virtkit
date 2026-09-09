@@ -17,7 +17,8 @@
 #   5. a changed `${localEnv:…}` value is session-only: new sessions see it, nothing reboots;
 #      bare `ssh`, `scp` and `sftp` reach the VM with only the run's `bin/` put on PATH, and
 #      a killed ssh client takes its remote command, or its hang-up-proof shell, with it;
-#      `code --reset-server` empties the guest's server directory and opens the editor.
+#      `code --reset-server` empties the guest's server directory and opens the editor, and
+#      `editor reset` does the same without one.
 #   6. `storage reset` stops the owner and empties the item; the next start recreates it.
 #   7. a `reuse` task runs in the running environment, reproducing its exit status.
 #   8. `dev stop` takes the VM and its published endpoints away, and leaves nothing behind.
@@ -351,6 +352,18 @@ if vkd code --reset-server --editor "$WORK/fake-code" > "$WORK/code.txt" 2>&1; t
     && ok "the editor was opened on the workspace" || { bad "the editor was not opened on the workspace"; cat "$WORK/code-args" 2>/dev/null; }
 else
   bad "code --reset-server failed"; cat "$WORK/code.txt"
+fi
+# `editor reset` is the same without an editor to open: seed again, and only the marker stays,
+# while the editor — which records every launch — is not launched again.
+vkd exec -- sh -c 'mkdir -p /root/.vscode-server/bin/old && touch /root/.vscode-server/bin/old/node' >/dev/null \
+  || bad "could not seed the server directory again"
+rm -f "$WORK/code-args"
+if vkd editor reset --editor "$WORK/fake-code" > "$WORK/editor-reset.txt" 2>&1; then
+  grep -q 'emptied /root/.vscode-server' "$WORK/editor-reset.txt" && ok "editor reset reported the reset" || { bad "editor reset did not report the reset"; cat "$WORK/editor-reset.txt"; }
+  [ "$(vkd exec -- ls -A /root/.vscode-server)" = .vk-generation ] && ok "editor reset emptied the server directory down to the marker" || { bad "editor reset left more than the marker"; vkd exec -- ls -A /root/.vscode-server; }
+  [ -e "$WORK/code-args" ] && bad "editor reset launched the editor" || ok "editor reset opened no editor"
+else
+  bad "editor reset failed"; cat "$WORK/editor-reset.txt"
 fi
 
 echo

@@ -10,7 +10,7 @@ All notable changes to virtkit will be documented in this file.
   server, empties its data directory in the guest — installed server, extensions, machine
   settings, caches — and forgets the reconciliation, then opens the editor as usual;
   Remote-SSH installs the server again and `[dev.editor.vscode]` is applied afresh. The
-  environment keeps running.
+  environment keeps running. `vk dev editor reset` does the same without opening an editor.
 
 ### Fixed
 

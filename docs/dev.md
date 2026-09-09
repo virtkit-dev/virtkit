@@ -553,7 +553,8 @@ installs the server again when the window connects, and the reconciliation appli
 storage, a mount you declared, or the environment itself. The environment keeps
 running: nothing else in the guest is touched, `hooks.create` does not run again, and
 windows already attached lose their server and reconnect. A reconciliation already
-running must finish first; the command does not wait for it.
+running must finish first; the command does not wait for it. `vk dev editor reset
+[--editor BIN]` does the same without opening an editor; the environment must be up.
 
 For other SSH clients and editors:
 
@@ -810,7 +811,7 @@ individual options.
 | `exec -- ARG…` | Run a command; `--dir`, `--user`, `--service`, `-t`. |
 | `shell` | Boot if needed and open an interactive shell. |
 | `code` | Boot if needed and open VS Code; `--editor`. |
-| `editor status`, `editor log`, `editor retry` | Follow or retry editor reconciliation without booting. |
+| `editor status`, `editor log`, `editor retry`, `editor reset` | Follow or retry editor reconciliation, or start the server over, without booting. |
 | `build` | Build the primary or `--service NAME` into cache. |
 | `service up/down/reboot NAME`, `service status [NAME]` | Control compose services. |
 | `endpoints` | Show publication state; `--primary`, `--service`, `--json`. |
