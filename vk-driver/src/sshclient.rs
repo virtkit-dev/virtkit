@@ -1,10 +1,11 @@
 //! Managed SSH client artifacts created by `vk run --ssh-client`: a keypair,
-//! `ssh-config`, and an `ssh` shim in the run's state dir.
+//! `ssh-config`, and `ssh`, `scp` and `sftp` shims in the run's state dir.
 //!
 //! Unlike `vk run --ssh`, which authorises the user's `~/.ssh` keys and prints a command,
 //! this mode supports tools that cannot pass `-F` (such as VS Code Remote-SSH and Emacs
-//! TRAMP). The shim supplies a config containing the managed key and `vsock-auto://`
-//! ProxyCommand.
+//! TRAMP). The shims supply a config containing the managed key and `vsock-auto://`
+//! ProxyCommand. VS Code connects with bare `ssh` but copies its server with bare `scp`,
+//! so all three OpenSSH client programs are shimmed, not `ssh` alone.
 //!
 //! The state dir must remain host-owned because the host executes the ProxyCommand and
 //! owns the private key. [`check_state_dir_is_host_only`] rejects writable guest shares
@@ -21,8 +22,12 @@ use anyhow::{Context, Result, bail};
 const KEY: &str = "id_ed25519";
 /// The generated client config — what `ssh -F` (and `vk ssh`) reads.
 pub const CONFIG: &str = "ssh-config";
-/// Directory holding the `ssh` shim, meant to be prepended to PATH.
+/// Directory holding the client shims, meant to be prepended to PATH.
 const SHIM_DIR: &str = "bin";
+/// The OpenSSH client programs shimmed into [`SHIM_DIR`]. VS Code Remote-SSH spawns
+/// bare `ssh` to connect and bare `scp` to copy its server; TRAMP and others reach for
+/// `sftp`. Each takes `-F`, so every shim points the system tool at this run's config.
+const SHIMMED: [&str; 3] = ["ssh", "scp", "sftp"];
 
 /// The managed client artifacts of one run, addressed by its state dir.
 pub struct Managed {
@@ -49,14 +54,11 @@ impl Managed {
         self.dir.join(CONFIG)
     }
 
-    /// The directory to prepend to PATH so a program that spawns bare `ssh` reaches this
-    /// run's VM.
+    /// The directory to prepend to PATH so a program that spawns bare `ssh`, `scp` or
+    /// `sftp` reaches this run's VM. Each program is shimmed as a file of the same name
+    /// under here.
     pub fn shim_dir(&self) -> PathBuf {
         self.dir.join(SHIM_DIR)
-    }
-
-    pub fn shim(&self) -> PathBuf {
-        self.shim_dir().join("ssh")
     }
 
     /// The config as written by the run that owns this state dir.
@@ -114,8 +116,11 @@ impl Managed {
             .mode(0o700)
             .create(self.shim_dir())
             .with_context(|| format!("creating {}", self.shim_dir().display()))?;
-        write_atomic(&self.shim(), &self.shim_text(path_var)?, 0o755)
-            .with_context(|| format!("writing {}", self.shim().display()))?;
+        for tool in SHIMMED {
+            let path = self.shim_dir().join(tool);
+            write_atomic(&path, &self.shim_text(tool, path_var)?, 0o755)
+                .with_context(|| format!("writing {}", path.display()))?;
+        }
         Ok(pubkey)
     }
 
@@ -178,16 +183,16 @@ impl Managed {
         )
     }
 
-    /// Build an `ssh` shim that supplies this run's config. Resolve the real client to an
-    /// absolute path now so later PATH changes cannot recurse into the shim.
-    fn shim_text(&self, path_var: Option<&OsStr>) -> Result<String> {
-        let real = real_ssh(&self.shim_dir(), path_var)?;
-        quotable(&real, "the system ssh path")?;
+    /// Build a shim for one OpenSSH tool that supplies this run's config. Resolve the real
+    /// client to an absolute path now so later PATH changes cannot recurse into the shim.
+    fn shim_text(&self, tool: &str, path_var: Option<&OsStr>) -> Result<String> {
+        let real = real_tool(tool, &self.shim_dir(), path_var)?;
+        quotable(&real, "the system OpenSSH client path")?;
         Ok(format!(
             "#!/bin/sh\n\
-             # Written by `vk run --ssh-client`: the system ssh, pointed at this run's VM.\n\
-             # Put this directory first on PATH for a program that spawns bare `ssh`.\n\
-             # A caller passing its own -F wins: ssh takes the last one.\n\
+             # Written by `vk run --ssh-client`: the system {tool}, pointed at this run's VM.\n\
+             # Put this directory first on PATH for a program that spawns bare `{tool}`.\n\
+             # A caller passing its own -F wins: {tool} takes the last one.\n\
              exec '{real}' -F '{config}' \"$@\"\n",
             real = real.display(),
             config = self.config().display(),
@@ -275,18 +280,23 @@ fn parse_proxy(command: &str) -> Option<(PathBuf, String)> {
     Some((PathBuf::from(vk), target.to_string()))
 }
 
-/// Resolve the system `ssh`, skipping the shim's own directory so a PATH with it prepended
-/// resolves to the real client rather than back into the shim. Directories are compared as
-/// paths after resolution, not as strings: `bin`, `./bin` and a symlink to it are the same
-/// directory.
-pub fn real_ssh(shim_dir: &Path, path_var: Option<&OsStr>) -> Result<PathBuf> {
-    which("ssh", path_var, Some(shim_dir)).map_err(|_| {
+/// Resolve a system OpenSSH client program (`ssh`, `scp` or `sftp`), skipping the shim's
+/// own directory so a PATH with it prepended resolves to the real tool rather than back
+/// into the shim. Directories are compared as paths after resolution, not as strings:
+/// `bin`, `./bin` and a symlink to it are the same directory.
+pub fn real_tool(tool: &str, shim_dir: &Path, path_var: Option<&OsStr>) -> Result<PathBuf> {
+    which(tool, path_var, Some(shim_dir)).map_err(|_| {
         anyhow::anyhow!(
-            "no `ssh` on PATH (other than the shim in {}) — the managed SSH client needs \
-             an OpenSSH client installed",
+            "no `{tool}` on PATH (other than the shim in {}) — the managed SSH client needs \
+             an OpenSSH client (ssh, scp and sftp) installed",
             shim_dir.display()
         )
     })
+}
+
+/// The system `ssh`. See [`real_tool`].
+pub fn real_ssh(shim_dir: &Path, path_var: Option<&OsStr>) -> Result<PathBuf> {
+    real_tool("ssh", shim_dir, path_var)
 }
 
 /// Resolve `name` on `path_var`, skipping `skip_dir`, and return an absolute path suitable
@@ -450,13 +460,25 @@ mod tests {
         p
     }
 
-    fn fake_ssh(dir: &Path) -> PathBuf {
+    fn fake_tool(dir: &Path, name: &str) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
-        let p = dir.join("ssh");
+        let p = dir.join(name);
         std::fs::write(&p, "#!/bin/sh\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p
+    }
+
+    fn fake_ssh(dir: &Path) -> PathBuf {
+        fake_tool(dir, "ssh")
+    }
+
+    // Stand-ins for every OpenSSH client program the shims point at, so `provision` can
+    // resolve `scp` and `sftp` as well as `ssh`.
+    fn fake_openssh(dir: &Path) {
+        for tool in SHIMMED {
+            fake_tool(dir, tool);
+        }
     }
 
     #[test]
@@ -589,7 +611,7 @@ mod tests {
     fn provisioning_writes_a_reusable_key_and_a_config_that_pins_it() {
         let t = tmpdir("provision");
         let system = t.0.join("usr/bin");
-        let real = fake_ssh(&system);
+        fake_openssh(&system);
         fake_ssh_keygen(&system);
         // Pass a private PATH to avoid the host's OpenSSH without mutating process state.
         let path = std::env::join_paths([&system]).unwrap();
@@ -605,7 +627,24 @@ mod tests {
         let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(m.key()), 0o600);
         assert_eq!(mode(m.config()), 0o600);
-        assert_eq!(mode(m.shim()), 0o755);
+        // Every OpenSSH client program is shimmed, not `ssh` alone: VS Code Remote-SSH
+        // copies its server with bare `scp`, which reads the user's ~/.ssh/config and
+        // cannot resolve the run's alias unless it too goes through the shim. Each shim
+        // runs the system tool with the config applied — single quotes, so nothing in
+        // either path is expanded by the shell that runs it.
+        for tool in SHIMMED {
+            let shim = m.shim_dir().join(tool);
+            assert_eq!(mode(shim.clone()), 0o755, "{tool} shim");
+            let text = std::fs::read_to_string(&shim).unwrap();
+            assert!(
+                text.contains(&format!(
+                    "exec '{}' -F '{}'",
+                    system.join(tool).display(),
+                    m.config().display()
+                )),
+                "{tool} shim points at the system {tool} with -F: {text}"
+            );
+        }
 
         let cfg = std::fs::read_to_string(m.config()).unwrap();
         assert!(cfg.contains("Host vm-test\n"));
@@ -617,18 +656,6 @@ mod tests {
         let (host_block, rest) = cfg.split_once("Match all").expect("a Match all");
         assert!(!host_block.contains("Include"));
         assert!(rest.contains("Include ~/.ssh/config"));
-
-        // The shim runs the system ssh, not itself, with the config applied — single
-        // quotes, so nothing in either path is expanded by the shell that runs it.
-        let shim = std::fs::read_to_string(m.shim()).unwrap();
-        assert!(
-            shim.contains(&format!(
-                "exec '{}' -F '{}'",
-                real.display(),
-                m.config().display()
-            )),
-            "{shim}"
-        );
 
         // Re-provisioning keeps the key (the alias stays reachable across reboots) and
         // rewrites the config.
@@ -647,7 +674,7 @@ mod tests {
     fn a_relative_state_dir_still_yields_absolute_paths() {
         let t = tmpdir("relative");
         let system = t.0.join("usr/bin");
-        fake_ssh(&system);
+        fake_openssh(&system);
         fake_ssh_keygen(&system);
         let path = std::env::join_paths([&system]).unwrap();
 
@@ -669,7 +696,9 @@ mod tests {
             }
         }
         assert!(
-            std::fs::read_to_string(m.shim()).unwrap().contains("-F '/"),
+            std::fs::read_to_string(m.shim_dir().join("ssh"))
+                .unwrap()
+                .contains("-F '/"),
             "the shim must name the config absolutely"
         );
     }

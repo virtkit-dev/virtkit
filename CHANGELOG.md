@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`vk dev code` copies its server to a guest that cannot fetch it itself.** VS Code
+  Remote-SSH connects with the managed `ssh` shim but copies its server with bare `scp`,
+  which was not shimmed. On a guest with no working `wget`/`curl`, VS Code falls back to
+  copying from the host, and that `scp` could not resolve the run's alias — the copy hung
+  forever at "Copying VS Code Server to host with scp". `scp` and `sftp` are now shimmed
+  alongside `ssh`.
+
 ## [0.66.0] - 2026-09-08
 
 ### Added
