@@ -21,6 +21,8 @@ use russh_sftp::protocol::{
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+use crate::ssh::ConnectionGone;
+
 /// Bytes buffered each way between the channel and russh-sftp: one client packet's worth
 /// (russh-sftp and OpenSSH cap it at 256 KiB), so a large read or write rarely waits on
 /// the pipe while the copy on the other side drains it.
@@ -39,8 +41,8 @@ const PIPE_BUF: usize = 256 * 1024;
 /// them. (On the wire, russh may still send the status ahead of data it holds back for
 /// the window; EOF and close stay behind both, which is what the client relies on.)
 ///
-/// Returns after ending the channel; the caller spawns it.
-pub async fn serve(chan: Channel<Msg>, uid: u32, gid: u32) {
+/// Returns after ending the channel, or once the connection is gone; the caller spawns it.
+pub(crate) async fn serve(chan: Channel<Msg>, uid: u32, gid: u32, mut gone: ConnectionGone) {
     let (mut read_half, write_half) = chan.split();
     // A duplex, not two simplex pipes: only `DuplexStream` closes both directions when
     // russh-sftp drops its end, and that close is what ends the outbound copy below.
@@ -59,9 +61,15 @@ pub async fn serve(chan: Channel<Msg>, uid: u32, gid: u32) {
         copied
     };
     let outbound = tokio::io::copy(&mut from_sftp, &mut to_client);
-    let (inbound, outbound) = tokio::join!(inbound, outbound);
-    if let Err(e) = inbound.and(outbound) {
-        debug!("sftp: splice ended early: {e}");
+    // The copies end with the client's EOF — or with the connection, should that go first
+    // while a writer sits parked on a window no one will adjust again.
+    match gone.bound(async { tokio::join!(inbound, outbound) }).await {
+        Some((inbound, outbound)) => {
+            if let Err(e) = inbound.and(outbound) {
+                debug!("sftp: splice ended early: {e}");
+            }
+        }
+        None => debug!("sftp: connection gone mid-session"),
     }
 
     // The client may already be gone; there is no one left to tell.
