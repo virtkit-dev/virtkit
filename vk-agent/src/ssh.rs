@@ -303,9 +303,8 @@ impl Handler for ServerHandler {
         Ok(())
     }
 
-    /// Subsystem request — we serve `sftp` by spawning `vk-agent sftp-server` as
-    /// the logged-in user (so transferred files are theirs) and splicing it to the
-    /// channel. This is how scp/sftp — and VS Code's server copy — land files.
+    /// Serve `sftp` in-process on the channel as the logged-in user, who owns the
+    /// transferred files. Used by scp/sftp and VS Code's server copy.
     async fn subsystem_request(
         &mut self,
         channel: ChannelId,
@@ -324,16 +323,9 @@ impl Handler for ServerHandler {
         match resolve_user(&user) {
             Ok(ru) => {
                 session.channel_success(channel)?;
-                // russh-sftp serves the channel on its own task; when it ends,
-                // send the channel's exit-status (scp/VS Code need it) and close.
-                let done = crate::sftp::serve(chan.into_stream(), ru.uid, ru.gid).await;
-                let handle = session.handle();
-                tokio::spawn(async move {
-                    let _ = done.await;
-                    let _ = handle.exit_status_request(channel, 0).await;
-                    let _ = handle.eof(channel).await;
-                    let _ = handle.close(channel).await;
-                });
+                // Serves until the client is done, then ends the channel with the
+                // exit-status scp and VS Code need — see `sftp::serve` for the order.
+                tokio::spawn(crate::sftp::serve(chan, ru.uid, ru.gid));
             }
             Err(e) => {
                 warn!("ssh: sftp for {user:?}: {e}");

@@ -14,76 +14,57 @@ use std::ffi::CString;
 use std::path::PathBuf;
 
 use log::debug;
+use russh::Channel;
+use russh::server::Msg;
 use russh_sftp::protocol::{
     File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-/// Serve SFTP over `stream` (a session channel) as the given user. russh-sftp
-/// serves on its own task until the client disconnects; the returned receiver
-/// fires when that task ends, so the caller can send the channel's exit-status
-/// (scp/VS Code treat a missing exit-status as failure).
-pub async fn serve<S>(stream: S, uid: u32, gid: u32) -> tokio::sync::oneshot::Receiver<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    russh_sftp::server::run(
-        OnDrop {
-            inner: stream,
-            tx: Some(tx),
-        },
-        SftpFs::new(uid, gid),
-    )
-    .await;
-    rx
-}
+/// Bytes buffered each way between the channel and russh-sftp: one client packet's worth
+/// (russh-sftp and OpenSSH cap it at 256 KiB), so a large read or write rarely waits on
+/// the pipe while the copy on the other side drains it.
+const PIPE_BUF: usize = 256 * 1024;
 
-/// Wraps the channel stream to fire a oneshot when russh-sftp drops it (session
-/// end) — russh-sftp's `run` spawns detached and hands back no completion handle.
-struct OnDrop<S> {
-    inner: S,
-    tx: Option<tokio::sync::oneshot::Sender<()>>,
-}
+/// Serve SFTP over a session channel as the given user, then end the channel the way
+/// scp and VS Code expect: exit-status, EOF and close, in that order.
+///
+/// russh-sftp owns its stream and drops it on client EOF. A channel stream spawns
+/// a close on drop, racing a later exit-status; scp reports a completed copy as failed
+/// if the close arrives first. Give russh-sftp an in-memory pipe instead and retain
+/// the channel halves here. After client EOF drains through, queue exit-status, EOF
+/// and close behind all replies on the same sender. On the wire, russh may send the
+/// status before window-blocked data; EOF and close still follow both, as clients need.
+///
+/// Returns after ending the channel; the caller spawns it.
+pub async fn serve(chan: Channel<Msg>, uid: u32, gid: u32) {
+    let (mut read_half, write_half) = chan.split();
+    // A duplex, not two simplex pipes: only `DuplexStream` closes both directions when
+    // russh-sftp drops its end, and that close is what ends the outbound copy below.
+    let (ours, theirs) = tokio::io::duplex(PIPE_BUF);
+    russh_sftp::server::run(theirs, SftpFs::new(uid, gid)).await;
 
-impl<S> Drop for OnDrop<S> {
-    fn drop(&mut self) {
-        if let Some(tx) = self.tx.take() {
-            let _ = tx.send(());
-        }
+    let (mut from_sftp, mut to_sftp) = tokio::io::split(ours);
+    let mut from_client = read_half.make_reader();
+    let mut to_client = write_half.make_writer();
+    // The client's EOF ends the inbound copy; shutting the pipe passes it on, russh-sftp
+    // stops and drops its end, and the outbound copy ends once its last reply is through.
+    let inbound = async {
+        let copied = tokio::io::copy(&mut from_client, &mut to_sftp).await;
+        // Shutting a pipe russh-sftp already dropped has nothing left to tell.
+        let _ = to_sftp.shutdown().await;
+        copied
+    };
+    let outbound = tokio::io::copy(&mut from_sftp, &mut to_client);
+    let (inbound, outbound) = tokio::join!(inbound, outbound);
+    if let Err(e) = inbound.and(outbound) {
+        debug!("sftp: splice ended early: {e}");
     }
-}
 
-impl<S: AsyncRead + Unpin> AsyncRead for OnDrop<S> {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for OnDrop<S> {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
-    }
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
+    // The client may already be gone; there is no one left to tell.
+    let _ = write_half.exit_status(0).await;
+    let _ = write_half.eof().await;
+    let _ = write_half.close().await;
 }
 
 struct SftpFs {

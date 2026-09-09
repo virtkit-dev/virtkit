@@ -4,6 +4,10 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`scp`/`sftp` into a VM no longer fails after a complete copy.**
+
 ## [0.66.0] - 2026-09-08
 
 ### Added
