@@ -778,6 +778,7 @@ shape for inspection, not a complete script to execute.
 | Runner endpoint is unpublished | Check `service status`, start the service, then inspect `endpoints` and `doctor`. |
 | Editor opens without extensions | Inspect `editor status` and `editor log`, then `editor retry` with the editor connected. |
 | Editor stuck on "Copying VS Code Server to host with scp" | Add GNU `wget` or `curl` to the image—BusyBox's `wget` rejects Remote-SSH's flags—then run `refresh`. |
+| "The remote host does not meet the prerequisites for running VS Code Server", or extension installs fail with "Signature verification failed with 'ENOENT'" | Nix images lack the loader and libraries VS Code needs. Link the loader at `/lib64/ld-linux-x86-64.so.2`, add `libstdc++.so.6` under `/usr/lib64`, and set `LD_LIBRARY_PATH` in `exec-env`; see this repo's `.devcontainer/Dockerfile` and `.virtkit/config.toml`. |
 | Startup hook fails | Read its output and guest logs; fix the command, user or working directory before retrying. |
 | Pre-commit overlay is refused | Pair `checkout = "overlay"` with `policy = "ephemeral"`. |
 | Disk use keeps growing | Inspect `storage list --sizes` and host-wide `list --sizes`; reset or GC only data you intend to discard. |

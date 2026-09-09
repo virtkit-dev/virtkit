@@ -33,6 +33,14 @@ COPY nix /src/nix
 # cargo-audit/-sweep + busybox sh — into /opt/toolchain. The analogue of an `apk add`.
 RUN nix build "path:/src/nix#buildEnv" --out-link /opt/toolchain
 
+# VS Code's server, signature verifier, and language servers are foreign glibc binaries. The nix
+# image has no /lib64 loader or libstdc++ path. Link the loader and libc; LD_LIBRARY_PATH from
+# .virtkit/config.toml exposes the remaining libraries.
+RUN mkdir -p /lib64 /usr/lib64 \
+ && ln -s /opt/toolchain/lib/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2 \
+ && ln -s /opt/toolchain/lib/libc.so.6 /lib64/libc.so.6 \
+ && ln -s /opt/toolchain/lib/libstdc++.so.6 /usr/lib64/libstdc++.so.6
+
 # PATH prepends /opt/toolchain/bin to the base image's own (nix's profile dirs, spelled out
 # because the base is pinned): kernel/Dockerfile chains `FROM virtkit-build` and still needs
 # `nix` to install its closure. SSL_CERT_FILE lets cargo reach crates.io as any uid — the

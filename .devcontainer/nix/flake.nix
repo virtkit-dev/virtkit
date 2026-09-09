@@ -76,6 +76,12 @@
           bfs
           busybox
           wget          # Remote-SSH uses GNU wget to download its server in the guest
+          # What a foreign glibc binary (the VS Code server, an extension's language server) links
+          # against, gathered into /opt/toolchain/lib: the Dockerfile links the loader from /lib64
+          # and exec-env points LD_LIBRARY_PATH here.
+          glibc.out        # ld-linux-x86-64.so.2 + libc; bare `glibc` would install only its bin output
+          stdenv.cc.cc.lib # libstdc++.so.6 + libgcc_s
+          openssl.out      # libssl/libcrypto, which the server's .NET extension-signature verifier dlopens
           cargo-audit   # audit.sh (RUSTSEC scan)
           cargo-sweep   # sweep.sh (reclaim stale target/)
           # Without these tools, qcow2 and ext4 cross-checks skip and CI still passes.

@@ -42,6 +42,9 @@ CFLAGS_x86_64_unknown_linux_musl = "-ffile-prefix-map=/work=/src -ffile-prefix-m
 # not the RAM-backed /tmp.
 XDG_DATA_HOME = "/var/tmp/vk/share"
 XDG_CACHE_HOME = "/var/tmp/vk/cache"
+# Expose the glibc and C++ libraries used by foreign binaries such as the VS Code server; the nix
+# loader does not use /etc/ld.so.cache, so dev sessions need this explicit library path.
+LD_LIBRARY_PATH = "/opt/toolchain/lib"
 
 [dev.mounts.gitconfig]
 source = "~/.gitconfig"
