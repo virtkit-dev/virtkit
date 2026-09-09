@@ -592,8 +592,8 @@ const LOGIN_SHELL_SCRIPT: &str = concat!(
 
 /// `vk dev code`: hand the workspace to the selected editor over Remote-SSH.
 ///
-/// The editor spawns a bare `ssh` with nowhere to pass a config, so the run's managed shim
-/// goes first on its PATH — except for a Windows editor reached from WSL2, whose Remote-SSH
+/// The editor spawns bare `ssh` and `scp` with nowhere to pass a config, so the run's shims
+/// go first on its PATH — except for a Windows editor reached from WSL2, whose Remote-SSH
 /// runs on Windows and reads none of this: it gets a stanza of its own instead (see
 /// [`crate::dev::wsl`]). Replaces this process, so the editor's own exit is the command's.
 pub fn launch_editor(
@@ -635,8 +635,8 @@ pub fn launch_editor(
     Err(anyhow::Error::new(cmd.exec()).context(format!("running {}", editor.binary.display())))
 }
 
-/// This process's PATH with the run's `ssh` shim first, for an editor that spawns a bare
-/// `ssh`.
+/// This process's PATH with the run's shims first, for an editor that spawns bare `ssh` or
+/// `scp`.
 fn shimmed_path(managed: &crate::sshclient::Managed) -> Result<std::ffi::OsString> {
     let Some(path) = std::env::var_os("PATH") else {
         return Ok(managed.shim_dir().into_os_string());

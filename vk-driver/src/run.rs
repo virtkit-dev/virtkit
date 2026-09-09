@@ -361,8 +361,8 @@ pub struct RunArgs {
     /// user `ssh` sessions log in as (root unless the image has better — a dev
     /// image's unprivileged user keeps shared-tree ownership coherent)
     pub ssh_user: String,
-    /// write the managed SSH client setup (key, config, `bin/ssh` shim) into the state
-    /// dir and authorise its key; implies `ssh` and requires `state_dir`
+    /// write the managed SSH client setup (key, config, `bin/{ssh,scp,sftp}` shims) into
+    /// the state dir and authorise its key; implies `ssh` and requires `state_dir`
     pub ssh_client: bool,
     /// the `Host` alias the `ssh_client` config declares
     pub ssh_alias: String,
@@ -3526,8 +3526,8 @@ fn provision_ssh_client(
 ) -> Result<String> {
     if args.state_dir.is_none() {
         bail!(
-            "--ssh-client needs --state-dir: its key, config and ssh shim live there and \
-             are meant to outlast the run"
+            "--ssh-client needs --state-dir: its key, config and client shims live there \
+             and are meant to outlast the run"
         );
     }
     crate::sshclient::check_state_dir_is_host_only(
