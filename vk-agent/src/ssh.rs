@@ -623,15 +623,35 @@ fn spawn_exec(user: &str, cmdline: &str) -> Result<Child> {
     Ok(command.spawn()?)
 }
 
-/// Hang up on the whole process group `child` leads, as sshd does when its client leaves.
-fn hangup(child: &Child) {
+/// How long a hung-up process group gets to leave before it is killed outright.
+const HANGUP_GRACE: Duration = Duration::from_secs(5);
+
+/// Send `signal` to the whole process group `child` leads.
+fn signal_group(child: &Child, signal: libc::c_int) {
     if let Some(pid) = child.id().and_then(|p| libc::pid_t::try_from(p).ok()) {
-        unsafe { libc::kill(-pid, libc::SIGHUP) };
+        unsafe { libc::kill(-pid, signal) };
+    }
+}
+
+/// Hang up on `child`'s process group, as sshd does when its client leaves, and reap it.
+/// A group still there when the grace period ends is killed: its client is gone, so
+/// nothing it runs is still wanted, and a bridge must not wait forever on a process that
+/// ignores the hang-up.
+async fn hangup_and_reap(child: &mut Child) -> u32 {
+    signal_group(child, libc::SIGHUP);
+    match tokio::time::timeout(HANGUP_GRACE, child.wait()).await {
+        Ok(status) => wait_code(status),
+        Err(_) => {
+            signal_group(child, libc::SIGKILL);
+            wait_code(child.wait().await)
+        }
     }
 }
 
 /// Bridge a session channel to a pty shell until either side closes or the connection
-/// goes; report the exit status and close the channel.
+/// goes; report the exit status and close the channel. A shell left behind by its client
+/// is hung up on the way a terminal would: its pty master closes first, then its group is
+/// signalled, then killed if it stays.
 async fn shell_bridge(
     chan: Channel<Msg>,
     mut child: Child,
@@ -640,24 +660,33 @@ async fn shell_bridge(
     id: ChannelId,
     mut gone: ConnectionGone,
 ) {
+    // The stream outlives the trailer below: dropping it closes the channel.
     let mut stream = chan.into_stream();
-    let mut copy = std::pin::pin!(tokio::io::copy_bidirectional(&mut stream, &mut master));
-    let code: u32 = tokio::select! {
-        // client gone or pty EOF (shell exited and closed the master)
-        _ = &mut copy => {
-            hangup(&child);
-            wait_code(child.wait().await)
+    // The shell's exit status if it exited on its own; the copy's borrow of the master
+    // ends with this block, so the master can be closed before the shell is hung up on.
+    let exited = {
+        let mut copy = std::pin::pin!(tokio::io::copy_bidirectional(&mut stream, &mut master));
+        tokio::select! {
+            // client gone or pty EOF (shell exited and closed the master)
+            _ = &mut copy => None,
+            // shell exited: let the copy drain trailing output briefly
+            status = child.wait() => {
+                // Whatever did not drain in time is going to a client that is not reading.
+                let _ = tokio::time::timeout(Duration::from_millis(300), &mut copy).await;
+                Some(status_or_default(status))
+            }
+            // connection gone while the copy sat parked on the channel window
+            _ = gone.wait() => None,
         }
-        // shell exited: let the copy drain trailing output briefly
-        status = child.wait() => {
-            // Whatever did not drain in time is going to a client that is not reading.
-            let _ = tokio::time::timeout(Duration::from_millis(300), &mut copy).await;
-            wait_code(Ok(status_or_default(status)))
-        }
-        // connection gone while the copy sat parked on the channel window
-        _ = gone.wait() => {
-            hangup(&child);
-            wait_code(child.wait().await)
+    };
+    let code: u32 = match exited {
+        Some(status) => wait_code(Ok(status)),
+        None => {
+            // Closing the master is the hang-up a shell cannot ignore: the kernel HUPs the
+            // session and ends its tty (reads see EOF, writes EIO), so even a shell that
+            // traps SIGHUP comes off the pty. The signals are for whatever stays anyway.
+            drop(master);
+            hangup_and_reap(&mut child).await
         }
     };
     let _ = handle.exit_status_request(id, code).await;
@@ -667,7 +696,8 @@ async fn shell_bridge(
 
 /// Bridge a session channel to a piped command: client->stdin, stdout+stderr->
 /// client (merged — no extended-data split yet), then report the exit status. If the
-/// connection goes first, hang up on the command's process group instead.
+/// connection goes first, hang up on the command's process group instead, and kill it if
+/// it stays.
 async fn exec_bridge(
     chan: Channel<Msg>,
     mut child: Child,
@@ -706,10 +736,8 @@ async fn exec_bridge(
         stdin_task.abort();
         out_task.abort();
         err_task.abort();
-        hangup(&child);
-        // Reaped here so the group's leader does not wait on kill_on_drop's SIGKILL; the
-        // status has no one to go to.
-        let _ = child.wait().await;
+        // The status has no one to go to.
+        hangup_and_reap(&mut child).await;
         return;
     };
     // Let the pumps drain the command's last output, unless the connection goes first.

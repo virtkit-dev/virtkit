@@ -12,7 +12,8 @@ All notable changes to virtkit will be documented in this file.
   now requires `scp` and `sftp` on the host alongside `ssh`.
 - **A client that vanishes mid-session no longer leaves its shell, command, transfer or
   port forward running in the guest.** Such a session could once linger forever when the
-  guest still had output to send; a running command is now hung up on, as sshd does.
+  guest still had output to send; its shell or command is now hung up on as sshd does, and
+  killed if it ignores that.
 
 ## [0.66.0] - 2026-09-08
 

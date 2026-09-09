@@ -16,7 +16,7 @@
 #   4. the named endpoint is published on its remembered loopback address and answers.
 #   5. a changed `${localEnv:…}` value is session-only: new sessions see it, nothing reboots;
 #      bare `ssh`, `scp` and `sftp` reach the VM with only the run's `bin/` put on PATH, and
-#      a killed ssh client takes its remote command with it.
+#      a killed ssh client takes its remote command, or its hang-up-proof shell, with it.
 #   6. `storage reset` stops the owner and empties the item; the next start recreates it.
 #   7. a `reuse` task runs in the running environment, reproducing its exit status.
 #   8. `dev stop` takes the VM and its published endpoints away, and leaves nothing behind.
@@ -289,27 +289,42 @@ if shimmed sftp -q -b - "$alias" <<<"get /tmp/scp-in.txt $WORK/sftp-out.txt" > "
 else
   bad "bare sftp through the shim did not read the file back"; cat "$WORK/sftp.err"
 fi
-# A client that dies mid-command takes the command with it: the guest hangs up on the
-# command's process group, as sshd does, rather than leaving it to run to completion.
+# A client that dies takes what it ran with it: the guest hangs up on the process group, as
+# sshd does, and kills what ignores that — rather than leaving it to run to completion.
 # `grep -c` exits 1 on a count of zero, which is an answer here, not a failure. A failed
 # exec prints nothing, which no numeric test accepts — so a guest that stops answering after
 # the disconnect cannot pass as "no sleep left".
-remote_sleeps() { vkd exec -- sh -c 'ps -o args | grep -c "^sleep 271$" || true' 2>/dev/null; }
+remote_sleeps() { vkd exec -- sh -c "ps -o args | grep -c '^sleep $1\$' || true" 2>/dev/null; }
+# Run the ssh client given as the rest of the arguments in the background with `$3` on its
+# stdin, wait for its `sleep $1` to show up in the guest, kill the client, and expect the
+# sleep gone within 20 s (the guest gives a hung-up group 5 s before killing it). The stdin
+# redirect has to sit on the command itself: a background command otherwise reads /dev/null.
+client_death_ends() {
+  local mark=$1 what=$2 input=$3 pid
+  shift 3
+  "$@" <<< "$input" > /dev/null 2>&1 &
+  pid=$!
+  for _ in $(seq 1 50); do [ "$(remote_sleeps "$mark")" -gt 0 ] 2>/dev/null && break; sleep 0.2; done
+  if [ "$(remote_sleeps "$mark")" -gt 0 ] 2>/dev/null; then
+    # A client that already died is reaped, and kill on it fails: still nothing to end.
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    for _ in $(seq 1 100); do [ "$(remote_sleeps "$mark")" -eq 0 ] 2>/dev/null && break; sleep 0.2; done
+    [ "$(remote_sleeps "$mark")" -eq 0 ] 2>/dev/null && ok "killing the ssh client took $what with it" || bad "$what outlived its ssh client"
+  else
+    bad "$what never started"
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+}
 # Not via `shimmed`: a backgrounded function is a subshell, and killing that would orphan
-# the client rather than end it. `timeout` forwards the signal to ssh.
-PATH="$STATE/bin:$PATH" timeout -k 30 "${STEP_TIMEOUT:-600}" ssh "$alias" 'sleep 271' > /dev/null 2>&1 &
-ssh_pid=$!
-for _ in $(seq 1 50); do [ "$(remote_sleeps)" -gt 0 ] 2>/dev/null && break; sleep 0.2; done
-if [ "$(remote_sleeps)" -gt 0 ] 2>/dev/null; then
-  # A client that already died is reaped, and kill on it fails: still nothing to end.
-  kill "$ssh_pid" 2>/dev/null || true
-  wait "$ssh_pid" 2>/dev/null || true
-  for _ in $(seq 1 50); do [ "$(remote_sleeps)" -eq 0 ] 2>/dev/null && break; sleep 0.2; done
-  [ "$(remote_sleeps)" -eq 0 ] 2>/dev/null && ok "killing the ssh client took its remote command with it" || bad "the remote sleep outlived its ssh client"
-else
-  bad "the remote sleep never started"
-  kill "$ssh_pid" 2>/dev/null || true
-fi
+# the client rather than end it. `env` execs `timeout`, which forwards the signal to ssh.
+client_death_ends 271 "its remote command" "" \
+  env PATH="$STATE/bin:$PATH" timeout -k 30 "${STEP_TIMEOUT:-600}" ssh -n "$alias" 'sleep 271'
+# An interactive shell that ignores SIGHUP, running a command that inherits that: only
+# closing its pty and, failing that, killing the group gets rid of it.
+client_death_ends 272 "a shell that ignores the hang-up" 'trap "" HUP; exec sleep 272' \
+  env PATH="$STATE/bin:$PATH" timeout -k 30 "${STEP_TIMEOUT:-600}" ssh -tt "$alias"
 
 echo
 echo "== 6. storage reset stops the owner and empties the item =="
