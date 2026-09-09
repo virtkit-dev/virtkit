@@ -13,6 +13,9 @@ All notable changes to virtkit will be documented in this file.
   port forward running in the guest.** If the connection dropped while the guest still had
   output to send, that session could linger forever; it now ends with the connection. Its
   shell or command is hung up on as sshd would, and killed if it ignores that.
+- **A terminal resize can no longer land on another session's terminal.** A window change
+  that arrived after its shell had ended was applied to whatever had since taken its
+  terminal's place.
 - **`vk run --ssh-client` also shims `scp` and `sftp`.** `<state-dir>/bin` now holds all
   three OpenSSH connection tools, so a program that copies files with bare `scp` or `sftp`
   reaches the VM like one that spawns bare `ssh`. This fixes `vk dev code` hanging at
