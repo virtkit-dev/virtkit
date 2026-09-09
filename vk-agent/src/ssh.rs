@@ -30,6 +30,7 @@
 //! its existing pty (`pty.rs`) and user-drop (`exec::server`) plumbing.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -43,6 +44,7 @@ use russh::{Channel, ChannelId, ChannelOpenFailure};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
+use tokio::sync::watch;
 
 use vk_core::addr::SocketAddr;
 use vk_core::exec::server::{ResolvedUser, resolve_user};
@@ -91,7 +93,8 @@ pub async fn run_ssh_server(
                 continue;
             }
         };
-        let handler = ServerHandler::new(Arc::clone(&keys), force_user.clone());
+        let (gone_tx, gone) = ConnectionGone::pair();
+        let handler = ServerHandler::new(Arc::clone(&keys), force_user.clone(), gone);
         let config = Arc::clone(&config);
         tokio::spawn(async move {
             match russh::server::run_stream(config, conn, handler).await {
@@ -102,6 +105,9 @@ pub async fn run_ssh_server(
                 }
                 Err(e) => debug!("ssh: handshake failed: {e}"),
             }
+            // Every bridge of this connection ends now, whatever it sits parked on. Err
+            // means no bridge is left listening, which is the same outcome.
+            let _ = gone_tx.send(true);
         });
     }
 }
@@ -129,6 +135,35 @@ struct PtyReq {
     cols: u16,
 }
 
+/// Fires once the client connection is gone; every task bridging one of its channels
+/// selects against it. A channel writer parked on an exhausted flow-control window is
+/// woken by the session's window adjustments alone, so once the session is gone it would
+/// wait forever and keep its bridge, child process and fds with it.
+#[derive(Clone)]
+pub(crate) struct ConnectionGone(watch::Receiver<bool>);
+
+impl ConnectionGone {
+    /// The signal and its trigger: `send(true)` fires it, and so does dropping the sender.
+    fn pair() -> (watch::Sender<bool>, Self) {
+        let (tx, rx) = watch::channel(false);
+        (tx, Self(rx))
+    }
+
+    /// Resolves once the connection is gone.
+    async fn wait(&mut self) {
+        // Err means the sender went with the connection's task: gone either way.
+        let _ = self.0.wait_for(|gone| *gone).await;
+    }
+
+    /// Run `work` to completion, or return `None` if the connection goes first.
+    pub(crate) async fn bound<F: Future>(&mut self, work: F) -> Option<F::Output> {
+        tokio::select! {
+            out = work => Some(out),
+            _ = self.wait() => None,
+        }
+    }
+}
+
 /// One per client connection. russh delivers channel requests on it in order;
 /// session channels are stashed at open time and consumed by shell/exec.
 struct ServerHandler {
@@ -138,10 +173,16 @@ struct ServerHandler {
     channels: HashMap<ChannelId, Channel<Msg>>,
     ptys: HashMap<ChannelId, PtyReq>,
     pty_fds: HashMap<ChannelId, std::os::fd::RawFd>,
+    /// Handed to every bridge this connection spawns.
+    gone: ConnectionGone,
 }
 
 impl ServerHandler {
-    fn new(authorized: Arc<Vec<PublicKey>>, force_user: Option<String>) -> Self {
+    fn new(
+        authorized: Arc<Vec<PublicKey>>,
+        force_user: Option<String>,
+        gone: ConnectionGone,
+    ) -> Self {
         ServerHandler {
             authorized,
             force_user,
@@ -149,6 +190,7 @@ impl ServerHandler {
             channels: HashMap::new(),
             ptys: HashMap::new(),
             pty_fds: HashMap::new(),
+            gone,
         }
     }
 
@@ -255,7 +297,14 @@ impl Handler for ServerHandler {
                     self.pty_fds.insert(channel, master.as_raw_fd());
                     session.channel_success(channel)?;
                     let handle = session.handle();
-                    tokio::spawn(shell_bridge(chan, child, master, handle, channel));
+                    tokio::spawn(shell_bridge(
+                        chan,
+                        child,
+                        master,
+                        handle,
+                        channel,
+                        self.gone.clone(),
+                    ));
                 }
                 Err(e) => {
                     warn!("ssh: shell for {user:?}: {e}");
@@ -266,7 +315,7 @@ impl Handler for ServerHandler {
                 Ok(child) => {
                     session.channel_success(channel)?;
                     let handle = session.handle();
-                    tokio::spawn(exec_bridge(chan, child, handle, channel));
+                    tokio::spawn(exec_bridge(chan, child, handle, channel, self.gone.clone()));
                 }
                 Err(e) => {
                     warn!("ssh: shell (no pty) for {user:?}: {e}");
@@ -293,7 +342,7 @@ impl Handler for ServerHandler {
             Ok(child) => {
                 session.channel_success(channel)?;
                 let handle = session.handle();
-                tokio::spawn(exec_bridge(chan, child, handle, channel));
+                tokio::spawn(exec_bridge(chan, child, handle, channel, self.gone.clone()));
             }
             Err(e) => {
                 warn!("ssh: exec for {user:?}: {e}");
@@ -325,7 +374,7 @@ impl Handler for ServerHandler {
                 session.channel_success(channel)?;
                 // Serves until the client is done, then ends the channel with the
                 // exit-status scp and VS Code need — see `sftp::serve` for the order.
-                tokio::spawn(crate::sftp::serve(chan, ru.uid, ru.gid));
+                tokio::spawn(crate::sftp::serve(chan, ru.uid, ru.gid, self.gone.clone()));
             }
             Err(e) => {
                 warn!("ssh: sftp for {user:?}: {e}");
@@ -353,7 +402,7 @@ impl Handler for ServerHandler {
         match TcpStream::connect((host_to_connect, port)).await {
             Ok(tcp) => {
                 reply.accept().await;
-                tokio::spawn(tcpip_bridge(channel, tcp));
+                tokio::spawn(tcpip_bridge(channel, tcp, self.gone.clone()));
             }
             Err(e) => {
                 warn!("ssh: direct-tcpip {host_to_connect}:{port}: {e}");
@@ -365,10 +414,13 @@ impl Handler for ServerHandler {
 }
 
 /// Splice a forwarded-channel stream to an in-guest TCP connection until either
-/// side closes.
-async fn tcpip_bridge(channel: Channel<Msg>, mut tcp: TcpStream) {
+/// side closes, or the connection goes.
+async fn tcpip_bridge(channel: Channel<Msg>, mut tcp: TcpStream, mut gone: ConnectionGone) {
     let mut stream = channel.into_stream();
-    let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
+    // Either end closing is the normal way out; there is nothing to report to.
+    let _ = gone
+        .bound(tokio::io::copy_bidirectional(&mut stream, &mut tcp))
+        .await;
 }
 
 /// Register a pre_exec that drops privileges to `ru` (groups, gid, uid in that
@@ -571,30 +623,41 @@ fn spawn_exec(user: &str, cmdline: &str) -> Result<Child> {
     Ok(command.spawn()?)
 }
 
-/// Bridge a session channel to a pty shell until either side closes; report the
-/// exit status and close the channel.
+/// Hang up on the whole process group `child` leads, as sshd does when its client leaves.
+fn hangup(child: &Child) {
+    if let Some(pid) = child.id().and_then(|p| libc::pid_t::try_from(p).ok()) {
+        unsafe { libc::kill(-pid, libc::SIGHUP) };
+    }
+}
+
+/// Bridge a session channel to a pty shell until either side closes or the connection
+/// goes; report the exit status and close the channel.
 async fn shell_bridge(
     chan: Channel<Msg>,
     mut child: Child,
     mut master: PtyMaster,
     handle: Handle,
     id: ChannelId,
+    mut gone: ConnectionGone,
 ) {
     let mut stream = chan.into_stream();
-    let pid = child.id();
     let mut copy = std::pin::pin!(tokio::io::copy_bidirectional(&mut stream, &mut master));
     let code: u32 = tokio::select! {
         // client gone or pty EOF (shell exited and closed the master)
         _ = &mut copy => {
-            if let Some(p) = pid {
-                unsafe { libc::kill(-(p as i32), libc::SIGHUP); }
-            }
+            hangup(&child);
             wait_code(child.wait().await)
         }
         // shell exited: let the copy drain trailing output briefly
         status = child.wait() => {
+            // Whatever did not drain in time is going to a client that is not reading.
             let _ = tokio::time::timeout(Duration::from_millis(300), &mut copy).await;
             wait_code(Ok(status_or_default(status)))
+        }
+        // connection gone while the copy sat parked on the channel window
+        _ = gone.wait() => {
+            hangup(&child);
+            wait_code(child.wait().await)
         }
     };
     let _ = handle.exit_status_request(id, code).await;
@@ -603,8 +666,15 @@ async fn shell_bridge(
 }
 
 /// Bridge a session channel to a piped command: client->stdin, stdout+stderr->
-/// client (merged — no extended-data split yet), then report the exit status.
-async fn exec_bridge(chan: Channel<Msg>, mut child: Child, handle: Handle, id: ChannelId) {
+/// client (merged — no extended-data split yet), then report the exit status. If the
+/// connection goes first, hang up on the command's process group instead.
+async fn exec_bridge(
+    chan: Channel<Msg>,
+    mut child: Child,
+    handle: Handle,
+    id: ChannelId,
+    mut gone: ConnectionGone,
+) {
     let stream = chan.into_stream();
     let (mut reader, writer) = tokio::io::split(stream);
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
@@ -618,24 +688,45 @@ async fn exec_bridge(chan: Channel<Msg>, mut child: Child, handle: Handle, id: C
     });
     let stdout = child.stdout.take();
     let w_out = Arc::clone(&writer);
-    let out_task = tokio::spawn(async move {
+    let mut out_task = tokio::spawn(async move {
         if let Some(mut o) = stdout {
             pump(&mut o, w_out).await;
         }
     });
     let stderr = child.stderr.take();
     let w_err = Arc::clone(&writer);
-    let err_task = tokio::spawn(async move {
+    let mut err_task = tokio::spawn(async move {
         if let Some(mut e) = stderr {
             pump(&mut e, w_err).await;
         }
     });
 
-    let status = child.wait().await;
-    let _ = out_task.await;
-    let _ = err_task.await;
+    let Some(status) = gone.bound(child.wait()).await else {
+        // Connection gone: no one to report to, and a pump may sit parked on the window.
+        stdin_task.abort();
+        out_task.abort();
+        err_task.abort();
+        hangup(&child);
+        // Reaped here so the group's leader does not wait on kill_on_drop's SIGKILL; the
+        // status has no one to go to.
+        let _ = child.wait().await;
+        return;
+    };
+    // Let the pumps drain the command's last output, unless the connection goes first.
+    let drained = gone
+        .bound(async {
+            // Only a panic or an abort surfaces here, and neither has anyone to tell.
+            let _ = (&mut out_task).await;
+            let _ = (&mut err_task).await;
+        })
+        .await;
+    if drained.is_none() {
+        out_task.abort();
+        err_task.abort();
+    }
     stdin_task.abort();
 
+    // The client may already be gone; there is no one left to tell.
     let _ = handle.exit_status_request(id, wait_code(status)).await;
     let _ = handle.eof(id).await;
     let _ = handle.close(id).await;
@@ -686,7 +777,25 @@ fn wait_code(status: std::io::Result<std::process::ExitStatus>) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_session_env, read_session_env};
+    use super::{ConnectionGone, parse_session_env, read_session_env};
+
+    #[tokio::test]
+    async fn bound_work_ends_when_its_connection_goes() {
+        let (tx, mut gone) = ConnectionGone::pair();
+        // Work that finishes while the connection is up comes back as is.
+        assert_eq!(gone.bound(async { 7 }).await, Some(7));
+
+        // Work that would never finish ends when the connection goes.
+        let mut parked = gone.clone();
+        let bridge = tokio::spawn(async move { parked.bound(std::future::pending::<()>()).await });
+        tx.send(true).unwrap();
+        assert_eq!(bridge.await.unwrap(), None);
+
+        // A connection task that is simply gone, sender and all, counts too.
+        let (tx, mut gone) = ConnectionGone::pair();
+        drop(tx);
+        assert_eq!(gone.bound(std::future::pending::<()>()).await, None);
+    }
 
     #[test]
     fn session_env_takes_key_value_lines_and_skips_the_rest() {

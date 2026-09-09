@@ -10,6 +10,9 @@ All notable changes to virtkit will be documented in this file.
 - **Copying files into a VM with bare `scp`/`sftp` now works** — including VS Code
   Remote-SSH installing its server on a guest without `wget`/`curl`. `vk run --ssh-client`
   now requires `scp` and `sftp` on the host alongside `ssh`.
+- **A client that vanishes mid-session no longer leaves its shell, command, transfer or
+  port forward running in the guest.** Such a session could once linger forever when the
+  guest still had output to send; a running command is now hung up on, as sshd does.
 
 ## [0.66.0] - 2026-09-08
 
