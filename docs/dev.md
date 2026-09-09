@@ -456,7 +456,8 @@ vk dev storage reset 'runner:/var/lib/runner'
 Use the exact item name printed by `list`. Reset destroys a durable item's data,
 with its owner stopped first; `--yes` authorizes stopping and removal without a
 prompt. The next start recreates the item empty. Reset refuses image-generation
-storage owned by refresh and storage owned by the editor adapter.
+storage owned by refresh, and the editor's server storage, which
+`vk dev code --reset-server` starts over instead.
 
 ### Environment state and cleanup
 
@@ -542,6 +543,17 @@ and runs `reconcile` in the guest. Project reconciliation scripts can use
 from VM readiness: check its status and log if the editor opens before extensions
 are ready. `vk dev editor retry [--editor BIN]` retries in the foreground; the
 environment must be up and the editor connected or connecting.
+
+`vk dev code --reset-server` starts the guest's server over: it stops the server,
+empties its data directory in the guest (`~/.vscode-server` for a stable build, the
+channel's own directory otherwise — installed server, extensions, machine settings and
+caches), forgets the reconciliation, and opens the editor. Remote-SSH
+installs the server again when the window connects, and the reconciliation applies
+`[dev.editor.vscode]` afresh. It works whatever holds the directory — vk's managed
+storage, a mount you declared, or the environment itself. The environment keeps
+running: nothing else in the guest is touched, `hooks.create` does not run again, and
+windows already attached lose their server and reconnect. A reconciliation already
+running must finish first; the command does not wait for it.
 
 For other SSH clients and editors:
 

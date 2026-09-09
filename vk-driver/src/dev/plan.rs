@@ -821,7 +821,7 @@ fn guest_path(to: &str) -> Result<String> {
 }
 
 /// The guest home for a user, overridable as `editor.vscode.home`.
-fn guest_home(user: Option<&str>) -> String {
+pub(crate) fn guest_home(user: Option<&str>) -> String {
     match user {
         None | Some("root") => "/root".to_string(),
         Some(u) => format!("/home/{u}"),

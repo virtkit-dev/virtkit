@@ -372,6 +372,111 @@ pub fn spawn(plan: &Plan, editor: &Editor) -> Result<Started> {
 }
 
 // ---------------------------------------------------------------------------
+// Starting the server over
+// ---------------------------------------------------------------------------
+
+/// Empty the server's data directory in the guest, stopping the server first. Invoked as
+/// `sh -c <script> <data> <keep>`, so `$0` is the directory and `$1` an entry to leave in
+/// place: the generation marker managed storage carries, which says the create hook
+/// initialised it, not what the server put there. The server's processes are found by the
+/// directory in their command line — its `node`, extension hosts and CLI all run from under
+/// it (a shell opened in the editor's terminal does not, and stays). They are told to leave,
+/// given a moment to, and killed if they take longer, before their files go. The contents go,
+/// not the directory itself, which may be a mount point. What is left behind is reported, and
+/// a non-zero exit says so.
+const RESET_SERVER: &str = r#"[ -d "$0" ] || exit 0
+pids=
+for c in /proc/[0-9]*/cmdline; do
+    p=${c#/proc/}; p=${p%/cmdline}
+    [ "$p" = "$$" ] && continue
+    [ -r "$c" ] || continue
+    if tr '\0' ' ' 2>/dev/null < "$c" | grep -qF -- "$0/"; then
+        kill "$p" 2>/dev/null && pids="$pids $p"
+    fi
+done
+tries=0
+while [ -n "$pids" ] && [ "$tries" -lt 3 ]; do
+    sleep 1
+    alive=
+    for p in $pids; do kill -0 "$p" 2>/dev/null && alive="$alive $p"; done
+    pids=$alive
+    tries=$((tries + 1))
+done
+for p in $pids; do kill -9 "$p" 2>/dev/null; done
+for e in "$0"/* "$0"/.[!.]* "$0"/..?*; do
+    [ -e "$e" ] || [ -L "$e" ] || continue
+    [ "${e##*/}" = "$1" ] && continue
+    rm -rf -- "$e"
+done
+left=$(ls -A -- "$0" | grep -vxF -- "$1")
+[ -z "$left" ] || { printf 'still in %s: %s\n' "$0" "$left" >&2; exit 1; }"#;
+
+/// Start the guest's server for `editor` over: remove its data directory's contents in the
+/// guest and the channel's reconciliation stamps on the host, so Remote-SSH installs the
+/// server afresh and the next reconciliation applies everything again. Every stamp of the
+/// channel goes, whatever server commit it names: they all describe the directory just
+/// emptied.
+/// The environment must be up, and no reconciliation running — one mid-install would be
+/// working on files that are going. Returns what was done, for the caller to print.
+pub async fn reset_server(plan: &Plan, editor: &Editor) -> Result<String> {
+    // Hold the reconciliation lock for the whole reset: a reconcile slipping in between a
+    // check and the guest exec would install into the directory being emptied.
+    let Some(_lock) = try_lock(plan)? else {
+        let holder = lock_holder(plan).unwrap_or_else(|| "unknown pid".into());
+        bail!(
+            "an editor reconciliation is running ({holder}); let it finish (`vk dev editor \
+             status`) before starting the server over"
+        );
+    };
+    let data = server_data_dir(plan, editor);
+    run_in_guest(
+        plan,
+        RESET_SERVER,
+        &[data.as_str(), crate::dev::GENERATION_MARKER],
+        &[],
+    )
+    .await
+    .with_context(|| format!("emptying {data} in the guest"))?;
+    forget_stamps(plan, editor.channel)?;
+    Ok(format!(
+        "emptied {data} in the guest and forgot its reconciliation; Remote-SSH installs the \
+         server again when the editor connects"
+    ))
+}
+
+/// Remove every reconciliation stamp of `channel`, whatever server commit it names.
+fn forget_stamps(plan: &Plan, channel: Channel) -> Result<()> {
+    let dir = editor_dir(plan);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        // No operation ever ran here: nothing to forget.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    use std::os::unix::ffi::OsStrExt;
+    let prefix = format!("{}-", channel.label());
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+        let name = entry.file_name();
+        let name = name.as_bytes();
+        if name.starts_with(prefix.as_bytes()) && name.ends_with(b".done") {
+            std::fs::remove_file(entry.path())
+                .with_context(|| format!("removing {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Where the server keeps itself in the guest: the configured home, or the session user's.
+fn server_data_dir(plan: &Plan, editor: &Editor) -> String {
+    let home = match &plan.vscode {
+        Some(vs) => vs.home.clone(),
+        None => crate::dev::plan::guest_home(plan.user.as_deref()),
+    };
+    format!("{home}/{}", editor.channel.data_dir())
+}
+
+// ---------------------------------------------------------------------------
 // The reconciliation
 // ---------------------------------------------------------------------------
 
@@ -401,7 +506,7 @@ pub async fn reconcile(plan: &Plan, editor: &Editor) -> Result<Outcome> {
         return Ok(Outcome::Joined { holder });
     };
     let want = digest(vs, editor)?;
-    let data = format!("{}/{}", vs.home, editor.channel.data_dir());
+    let data = server_data_dir(plan, editor);
     println!(
         "virtkit: editor: {} {} ({}), server data {data}, {} extension(s), {} setting(s){}",
         editor.channel.label(),
@@ -1108,6 +1213,119 @@ mod tests {
         );
         std::io::Write::write_all(&mut f, script.as_bytes()).unwrap();
         path
+    }
+
+    #[test]
+    fn resetting_the_server_stops_it_and_empties_its_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::ExitStatusExt;
+        let dir = std::env::temp_dir().join(format!("vk-deveditor-reset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join(".vscode-server");
+        std::fs::create_dir_all(data.join("bin/abc")).unwrap();
+        std::fs::write(data.join(".hidden"), b"").unwrap();
+        std::fs::write(data.join("..dots"), b"").unwrap();
+        std::fs::write(data.join(crate::dev::GENERATION_MARKER), b"gen").unwrap();
+        // A "server": a process run by its path under the directory, as the real one's
+        // `node` is, so its command line names the directory. A script rather than a link
+        // to `sleep`, so that argv[0] stays the path (busybox would dispatch on it).
+        let node = data.join("bin/abc/node");
+        std::fs::write(&node, "#!/bin/sh\nsleep 5\n").unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut server = std::process::Command::new(&node).spawn().unwrap();
+
+        let reset = |data: &Path| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(RESET_SERVER)
+                .arg(data)
+                .arg(crate::dev::GENERATION_MARKER)
+                .status()
+                .unwrap()
+        };
+        let status = reset(&data);
+        assert!(status.success(), "{status}");
+        assert!(
+            data.is_dir(),
+            "the directory itself stays: it may be a mount point"
+        );
+        let left: Vec<_> = std::fs::read_dir(&data)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            left,
+            [crate::dev::GENERATION_MARKER],
+            "the generation marker is the boot's, not the server's"
+        );
+        // Stopped by the reset, not gone on its own: the signal says which.
+        let status = server.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status}");
+
+        // No directory: nothing to do, and not a failure.
+        std::fs::remove_dir_all(&data).unwrap();
+        let status = reset(&data);
+        assert!(status.success(), "{status}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forgetting_stamps_takes_the_channels_and_leaves_the_rest() {
+        let dir = std::env::temp_dir().join(format!("vk-deveditor-stamps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plan = plan_in(&dir);
+        // Never reconciled: nothing to forget, and no directory to complain about.
+        forget_stamps(&plan, Channel::Stable).unwrap();
+        let editor_dir = ensure_dir(&plan).unwrap();
+        for name in [
+            "stable-1111.done",
+            "stable-2222.done",
+            "stable-1111.log",
+            "insiders-1111.done",
+        ] {
+            std::fs::write(editor_dir.join(name), b"x").unwrap();
+        }
+        forget_stamps(&plan, Channel::Stable).unwrap();
+        let mut left: Vec<_> = std::fs::read_dir(&editor_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["insiders-1111.done", "stable-1111.log"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_server_data_dir_follows_the_configured_home_or_the_user() {
+        let ed = |channel| Editor {
+            binary: PathBuf::from("/usr/bin/code"),
+            channel,
+            version: "1.93.1".into(),
+            commit: "abc".into(),
+        };
+        let mut plan = plan_in(Path::new("/tmp/x"));
+        plan.vscode = None;
+        plan.user = Some("dev".into());
+        assert_eq!(
+            server_data_dir(&plan, &ed(Channel::Stable)),
+            "/home/dev/.vscode-server"
+        );
+        plan.user = None;
+        assert_eq!(
+            server_data_dir(&plan, &ed(Channel::Insiders)),
+            "/root/.vscode-server-insiders"
+        );
+        plan.vscode = Some(VsCodePlan {
+            persistent: true,
+            home: "/srv/me".into(),
+            reconcile: None,
+            extensions: vec![],
+            settings: serde_json::Value::Null,
+        });
+        assert_eq!(
+            server_data_dir(&plan, &ed(Channel::Codium)),
+            "/srv/me/.vscodium-server"
+        );
     }
 
     #[test]
