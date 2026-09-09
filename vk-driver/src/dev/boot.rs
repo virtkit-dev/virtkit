@@ -528,12 +528,18 @@ fn short(digest: &str) -> String {
 /// Boot the environment. Runs in the detached child (see the module docs): it returns only
 /// when the VM stops, so anything that should happen once the guest is up belongs in
 /// [`after_boot`](super::after_boot).
+///
+/// An environment found running is reused; `announce_reuse` says whether to say so. The
+/// note is `vk dev up`'s whole answer, and noise ahead of the output of a command that
+/// brings the environment up on the way to something else — `exec`, `shell`, `code`,
+/// `service up`, a task — which is what a running environment is for.
 pub async fn boot(
     plan: &Plan,
     cfg: &crate::config::Config,
     over: &Overrides,
     refresh: bool,
     wait: bool,
+    announce_reuse: bool,
     parent_pid: u32,
 ) -> Result<()> {
     plan.require_resolved()?;
@@ -559,26 +565,29 @@ pub async fn boot(
         // no reason to offer one.
         let session_only = drifted && applied_on_attach(&drift(&running.manifest, &manifest));
         if (!drifted || session_only) && !refresh {
-            eprintln!(
-                "dev environment already running ({})",
-                plan.state_dir.display()
-            );
-            if session_only {
+            if announce_reuse {
                 eprintln!(
-                    "its config changed only in what attaching applies (exec-env, editor, \
-                     endpoints, tasks) — no restart needed"
+                    "virtkit: dev environment already running ({})",
+                    plan.state_dir.display()
                 );
-            }
-            note_older_creator(&running);
-            // Its configuration still matches; the images it was built from may not. Say
-            // so rather than leave a caller to find out, and leave the decision to them.
-            if let Some(vm) = running_vm(plan)
-                && crate::vms::freshness_all(&vm) == crate::vms::Freshness::Stale
-            {
-                eprintln!(
-                    "its image no longer matches the sources — `vk dev refresh` rebuilds \
-                     and restarts it"
-                );
+                if session_only {
+                    eprintln!(
+                        "virtkit: its config changed only in what attaching applies (exec-env, \
+                         editor, endpoints, tasks) — no restart needed"
+                    );
+                }
+                note_older_creator(&running);
+                // Its configuration still matches; the images it was built from may not.
+                // Say so rather than leave a caller to find out, and leave the decision to
+                // them.
+                if let Some(vm) = running_vm(plan)
+                    && crate::vms::freshness_all(&vm) == crate::vms::Freshness::Stale
+                {
+                    eprintln!(
+                        "virtkit: its image no longer matches the sources — `vk dev refresh` \
+                         rebuilds and restarts it"
+                    );
+                }
             }
             note_transition(plan, parent_pid, Transition::Reused);
             return Ok(());

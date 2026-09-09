@@ -75,7 +75,7 @@ bad() { echo "FAIL: $*"; fail=$((fail + 1)); }
 # A step that would take the whole gate down with it if the guest never answered.
 vkd() { timeout -k 30 "${STEP_TIMEOUT:-600}" "$VK" dev "$@"; }
 
-# `vk dev` writes its lifecycle notes ("dev environment already running …") on stderr and
+# `vk dev up` writes its lifecycle notes ("dev environment already running …") on stderr and
 # leaves stdout to the command; checks on a note capture both, checks on output only stdout.
 said() { grep -qxF -- "$2" <<<"$1"; }
 status_is() { grep -qE "^status +$1\$" <<<"$(vkd status)"; }
@@ -200,6 +200,9 @@ said "$(vkd exec -- sh -c 'echo $E2E_TOKEN')" abc \
 said "$(vkd exec --dir / -- pwd)" / && ok "exec --dir / runs in /" || bad "exec --dir / did not run in /"
 [ "$(vkd exec -- echo clean 2>/dev/null)" = clean ] \
   && ok "exec stdout carries the command's output alone" || bad "exec stdout carried more than the command's output"
+# The running environment is what exec came for, not news: that note is `up`'s answer.
+grep -q "already running" <<<"$(vkd exec -- true 2>&1)" \
+  && bad "exec announced the environment it attached to" || ok "exec attaches without a word about the running environment"
 rc=0; vkd exec -- sh -c 'exit 7' >/dev/null 2>&1 || rc=$?
 [ "$rc" -eq 7 ] && ok "exec reproduces the guest's exit status (7)" || bad "exec returned $rc, want 7"
 

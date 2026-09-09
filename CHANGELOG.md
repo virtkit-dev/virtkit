@@ -14,6 +14,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **`vk dev exec`, `shell`, `code`, `service up` and `task` no longer announce that the
+  environment is already running.** The note is `vk dev up`'s answer; ahead of a command's
+  own output it read like an error. It stays with `up`, prefixed `virtkit:` like the notes
+  around it.
 - **`scp` into a VM no longer fails after a complete copy.** The guest could end the
   channel before its exit status reached the client, so `scp` sometimes reported a copy it
   had just finished as failed. The status now always goes out first.
