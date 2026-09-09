@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`vk dev code` installs extensions in BusyBox guests.** Probe `setsid -w`; when unavailable,
+  install in the current session.
+
 ## [0.66.0] - 2026-09-08
 
 ### Added
