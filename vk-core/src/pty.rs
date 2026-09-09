@@ -11,25 +11,30 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// Async wrapper around the master side of a pty.
 pub struct PtyMaster(AsyncFd<OwnedFd>);
 
-/// Open a pty pair with an initial window size.
+/// Open a pty pair with an initial window size. Both ends are opened close-on-exec at the
+/// open call, so a fork on another thread can't inherit either before the flag is set: the
+/// slave reaches a child only as its stdio, and the master never does — a copy left in a
+/// child would keep the pty open after this process closes its own, so the hang-up would
+/// never reach the shell.
 pub fn openpty(rows: u16, cols: u16) -> io::Result<(PtyMaster, OwnedFd)> {
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    let ws = winsize(rows, cols);
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            &ws,
-        )
-    };
-    if rc != 0 {
+    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    let master = unsafe { libc::posix_openpt(flags) };
+    if master < 0 {
         return Err(io::Error::last_os_error());
     }
     let master = unsafe { OwnedFd::from_raw_fd(master) };
+    if unsafe { libc::grantpt(master.as_raw_fd()) } != 0
+        || unsafe { libc::unlockpt(master.as_raw_fd()) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // The slave straight from the master, not by name: nothing to look up, nothing to race.
+    let slave = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGPTPEER, flags) };
+    if slave < 0 {
+        return Err(io::Error::last_os_error());
+    }
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+    set_winsize(slave.as_raw_fd(), rows, cols)?;
     set_nonblocking(master.as_raw_fd())?;
     Ok((PtyMaster(AsyncFd::new(master)?), slave))
 }
@@ -182,8 +187,51 @@ impl Drop for RawModeGuard {
 #[cfg(test)]
 mod tests {
     use super::openpty;
+    use std::os::fd::AsRawFd;
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn the_pair_is_close_on_exec() {
+        let (master, slave) = openpty(24, 80).unwrap();
+        for (name, fd) in [("master", master.as_raw_fd()), ("slave", slave.as_raw_fd())] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0);
+            assert!(
+                flags & libc::FD_CLOEXEC != 0,
+                "{name} would leak into children"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_child_inherits_the_master() {
+        let (mut master, slave) = openpty(24, 80).unwrap();
+        let mut cmd = tokio::process::Command::new("sh");
+        // The child's own fds: its stdio is the slave, and a master would show as ptmx.
+        cmd.arg("-c")
+            .arg("ls -l /proc/self/fd")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        let mut child = cmd.spawn().unwrap();
+        drop(cmd);
+        tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+            .await
+            .expect("wait timed out")
+            .unwrap();
+        let mut out = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            master.read_to_end(&mut out),
+        )
+        .await
+        .expect("read timed out")
+        .unwrap();
+        let out = String::from_utf8_lossy(&out);
+        assert!(out.contains("/dev/pts/"), "no listing: {out}");
+        assert!(!out.contains("ptmx"), "the master reached the child: {out}");
+    }
 
     #[tokio::test]
     async fn pty_spawn_read_roundtrip() {
