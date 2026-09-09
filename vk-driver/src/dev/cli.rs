@@ -643,10 +643,12 @@ async fn dev_action(
         Err(e) => return fail(&e, 2),
     };
     match action {
-        DevAction::Up { no_wait } => match dev_up(&plan, host_cfg, over, false, !no_wait).await {
-            Ready::Act => ExitCode::SUCCESS,
-            Ready::Done(code) => code,
-        },
+        DevAction::Up { no_wait } => {
+            match dev_up(&plan, host_cfg, over, false, !no_wait, true).await {
+                Ready::Act => ExitCode::SUCCESS,
+                Ready::Done(code) => code,
+            }
+        }
         DevAction::Refresh { dry_run: true } => match dev::plan_diff(&plan) {
             Ok(Some(report)) => write_report(&format!(
                 "{report}a refresh rebuilds the image and restarts the environment\n"
@@ -657,7 +659,7 @@ async fn dev_action(
         // The one unconditional rebuild-and-restart: `up` never reboots an environment
         // that matches, and `--freshness` only says what a drifted one gets.
         DevAction::Refresh { dry_run: false } => {
-            match dev_up(&plan, host_cfg, over, true, true).await {
+            match dev_up(&plan, host_cfg, over, true, true, true).await {
                 Ready::Act => ExitCode::SUCCESS,
                 Ready::Done(code) => code,
             }
@@ -681,7 +683,7 @@ async fn dev_action(
             service: None,
             user,
             command,
-        } => match dev_up(&plan, host_cfg, over, false, true).await {
+        } => match dev_up(&plan, host_cfg, over, false, true, false).await {
             Ready::Done(code) => code,
             Ready::Act => match dev::exec_session(
                 &plan,
@@ -698,7 +700,7 @@ async fn dev_action(
         },
         DevAction::Service {
             action: DevServiceAction::Up { name },
-        } => match dev_up(&plan, host_cfg, over, false, true).await {
+        } => match dev_up(&plan, host_cfg, over, false, true, false).await {
             Ready::Done(code) => code,
             Ready::Act => service_reply(
                 dev::service(&plan, &vk_core::fleetctl::Request::Start { unit: name }).await,
@@ -795,7 +797,7 @@ async fn dev_action(
                 _ => write_report(&format!("{url}\n")),
             }
         }
-        DevAction::Shell => match dev_up(&plan, host_cfg, over, false, true).await {
+        DevAction::Shell => match dev_up(&plan, host_cfg, over, false, true, false).await {
             Ready::Done(code) => code,
             Ready::Act => {
                 let argv: Vec<String> = dev::LOGIN_SHELL.iter().map(|s| s.to_string()).collect();
@@ -816,7 +818,7 @@ async fn dev_action(
         DevAction::Code {
             editor,
             reset_server,
-        } => match dev_up(&plan, host_cfg, over, false, true).await {
+        } => match dev_up(&plan, host_cfg, over, false, true, false).await {
             Ready::Done(code) => code,
             Ready::Act => {
                 let editor = match crate::dev::editor::select(editor.as_deref()) {
@@ -878,7 +880,7 @@ async fn dev_action(
                 Err(e) => return fail(&e, 2),
             };
             let ready = match placement.boots() {
-                Some(target) => dev_up(target, host_cfg, over, false, true).await,
+                Some(target) => dev_up(target, host_cfg, over, false, true, false).await,
                 None => dev_after_fork(),
             };
             match ready {
@@ -1135,12 +1137,15 @@ fn dev_gc(yes: bool, all_stale: bool, names: &[String]) -> ExitCode {
 /// docs). The child boots and then holds the VM, so it never gets here to act; where there
 /// was nothing to boot it is finished too, and the parent — released once the guest is ready
 /// — is what goes on to run the command.
+///
+/// `announce_reuse` prints the already-running note for `up`; other commands suppress it.
 async fn dev_up(
     plan: &crate::dev::plan::Plan,
     host_cfg: &crate::config::Config,
     over: &dev::Overrides,
     refresh: bool,
     wait: bool,
+    announce_reuse: bool,
 ) -> Ready {
     if crate::detach::after_boot() {
         return match dev::after_boot(plan).await {
@@ -1152,7 +1157,7 @@ async fn dev_up(
     // not read each other's.
     // SAFETY: getppid always succeeds and touches no memory.
     let parent = unsafe { libc::getppid() } as u32;
-    match dev::boot(plan, host_cfg, over, refresh, wait, parent).await {
+    match dev::boot(plan, host_cfg, over, refresh, wait, announce_reuse, parent).await {
         // Returned rather than blocked: there was nothing to boot. This process is done
         // either way — the parent it wakes is what acts on the environment.
         Ok(()) => Ready::Done(ExitCode::SUCCESS),

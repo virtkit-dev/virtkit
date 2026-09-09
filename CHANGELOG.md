@@ -25,6 +25,9 @@ All notable changes to virtkit will be documented in this file.
 - **A terminal resize can no longer land on another session's terminal.** A resize that
   arrived after its shell had ended was applied to whatever had since taken its terminal's
   place.
+- **`vk dev exec`, `shell`, `code`, `service up` and `task` no longer announce that the
+  environment is already running.** That note is `vk dev up`'s answer; ahead of a command's
+  own output it read like an error.
 
 ## [0.66.0] - 2026-09-08
 

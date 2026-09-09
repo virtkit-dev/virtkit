@@ -30,8 +30,8 @@ fn older_creator(created_by: &str) -> Option<String> {
 pub(super) fn note_older_creator(identity: &Identity) {
     if let Some(older) = older_creator(&identity.created_by) {
         eprintln!(
-            "it was created by vk {older}; this is {} — `vk dev refresh` restarts it with \
-             this one (needed when the two disagree on image or protocol formats)",
+            "virtkit: it was created by vk {older}; this is {} — `vk dev refresh` restarts it \
+             with this one (needed when the two disagree on image or protocol formats)",
             env!("CARGO_PKG_VERSION")
         );
     }
