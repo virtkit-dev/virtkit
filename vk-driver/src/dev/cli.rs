@@ -163,12 +163,12 @@ enum DevAction {
         #[arg(long)]
         reset_server: bool,
     },
-    /// Follow or retry the editor reconciliation, apart from the VM's own status
+    /// Follow or retry the editor reconciliation, or start the server over
     ///
     /// `vk dev code` leaves a detached operation behind that brings the guest's VS Code
     /// server to what `[dev.editor.vscode]` says, once Remote-SSH has installed it. These
-    /// say whether it is still running and how it went, print its log, or run it again in
-    /// the foreground. None of them boots the environment.
+    /// say whether it is still running and how it went, print its log, run it again in the
+    /// foreground, or start the guest's server over. None of them boots the environment.
     Editor {
         #[command(subcommand)]
         action: EditorAction,
@@ -454,7 +454,7 @@ impl DevAction {
     }
 }
 
-/// `vk dev editor`: the reconciliation that follows `vk dev code`.
+/// `vk dev editor`: the reconciliation that follows `vk dev code`, and the server it works on.
 #[derive(Subcommand)]
 enum EditorAction {
     /// Whether a reconciliation is running, and which servers were reconciled
@@ -471,6 +471,17 @@ enum EditorAction {
     /// waits for the server Remote-SSH installs.
     Retry {
         /// the editor whose server to reconcile [default: the first VS Code on PATH]
+        #[arg(long, value_name = "BIN")]
+        editor: Option<String>,
+    },
+    /// Start the guest's server over, without opening the editor
+    ///
+    /// What `vk dev code --reset-server` does before it opens the editor: stops the server,
+    /// empties its data directory in the guest and forgets its reconciliation, so the next
+    /// window to connect gets a fresh install and `[dev.editor.vscode]` applied afresh. The
+    /// environment must be up.
+    Reset {
+        /// the editor whose server to start over [default: the first VS Code on PATH]
         #[arg(long, value_name = "BIN")]
         editor: Option<String>,
     },
@@ -899,6 +910,30 @@ async fn dev_action(
                 Err(e) => fail(&e, 1),
             },
         },
+        DevAction::Editor {
+            action: EditorAction::Reset { editor },
+        } => {
+            if dev::running_vm(&plan).is_none() {
+                return fail(
+                    &anyhow::anyhow!(
+                        "{} is not running — `vk dev up` first, or `vk dev code --reset-server` \
+                         to boot, reset and open in one go",
+                        plan.environment
+                    ),
+                    1,
+                );
+            }
+            match crate::dev::editor::select(editor.as_deref()) {
+                Err(e) => fail(&e, 1),
+                Ok(editor) => match crate::dev::editor::reset_server(&plan, &editor).await {
+                    Ok(done) => {
+                        eprintln!("virtkit: editor: {done}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => fail(&e, 1),
+                },
+            }
+        }
         DevAction::EditorReconcile { editor } => match crate::dev::editor::select(Some(&editor)) {
             Err(e) => fail(&e, 1),
             Ok(editor) => match crate::dev::editor::reconcile(&plan, &editor).await {
@@ -1215,6 +1250,7 @@ mod tests {
         (&["shell"], true),
         (&["code"], true),
         (&["editor", "status"], false),
+        (&["editor", "reset"], false),
         (&["endpoints", "--primary"], false),
         (&["open", "app"], false),
         (&["service", "up", "runner"], true),
