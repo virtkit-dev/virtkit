@@ -11,8 +11,8 @@ All notable changes to virtkit will be documented in this file.
   had just finished as failed. The status now always goes out first.
 - **A client that vanishes mid-session no longer leaves its shell, command, transfer or
   port forward running in the guest.** If the connection dropped while the guest still had
-  output to send, that session could linger forever; it now ends with the connection, and
-  a running command is hung up on as sshd would.
+  output to send, that session could linger forever; it now ends with the connection. Its
+  shell or command is hung up on as sshd would, and killed if it ignores that.
 - **`vk run --ssh-client` also shims `scp` and `sftp`.** `<state-dir>/bin` now holds all
   three OpenSSH connection tools, so a program that copies files with bare `scp` or `sftp`
   reaches the VM like one that spawns bare `ssh`. This fixes `vk dev code` hanging at
