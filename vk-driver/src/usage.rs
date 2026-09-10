@@ -61,7 +61,7 @@ pub struct Usage {
     pub network: Option<(u64, u64)>,
     /// `(the high-water mark, the capacity)` of the guest's writable layer, in bytes — the
     /// tmpfs a job's writes land on where its checkout is built on an in-guest overlay
-    /// (`[gitlab] checkout_overlay`). The pair reads as "how close the build tree came to the
+    /// (`[executor] checkout_overlay`). The pair reads as "how close the build tree came to the
     /// wall": the capacity is half the VM memory, so a job can fail with `ENOSPC` at a peak
     /// well under the ceiling beside it while `disk` says it wrote nothing at all — those
     /// pages are RAM, and no host counter is in a position to see them.

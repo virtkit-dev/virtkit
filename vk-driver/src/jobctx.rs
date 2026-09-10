@@ -50,7 +50,7 @@ pub struct JobCtx {
     /// Exit code telling gitlab-runner the *environment* failed (retryable)
     pub system_failure: i32,
 
-    // `[gitlab] host_checkout`: the job's git sources, checked out on the host at prepare and
+    // `[executor] host_checkout`: the job's git sources, checked out on the host at prepare and
     // shared into the guest, instead of the in-guest `get_sources` clone (see checkout.rs).
     /// CI_REPOSITORY_URL (GitLab embeds the job token) — the clone source.
     pub ci_repo_url: Option<String>,
@@ -64,7 +64,7 @@ pub struct JobCtx {
     concurrent_id: String,
     project_slug: String,
     /// CI_JOB_NAME — with the project, what makes two runs "the same job" for the memory
-    /// history (`[schedule] from_history`). The job id cannot: it is unique per run.
+    /// history (`[executor.schedule] from_history`). The job id cannot: it is unique per run.
     job_name: Option<String>,
     /// CI_PROJECT_ID — unique on the GitLab instance, where the slug beside it is not: it is
     /// lower-cased, punctuation-folded and cut to 63 characters, so two projects can share
@@ -172,8 +172,8 @@ impl JobCtx {
         })
     }
 
-    /// The root every `[gitlab] host_checkout` tree on this host lives under — the unit the idle
-    /// checkout sweep walks. `[gitlab] checkout_dir` (e.g. the RAM-backed /builds tmpfs) puts it
+    /// The root every `[executor] host_checkout` tree on this host lives under — the unit the idle
+    /// checkout sweep walks. `[executor] checkout_dir` (e.g. the RAM-backed /builds tmpfs) puts it
     /// in a private subtree there, so the clone and the job's writes stay in host RAM without
     /// bringing sibling trees from another executor into the sweep.
     pub fn host_checkout_root(&self) -> PathBuf {
@@ -232,7 +232,7 @@ impl JobCtx {
             .join(job_component(self.job_name.as_deref().unwrap_or("job")))
     }
 
-    /// The host-wide memory ledger (`[schedule] mem_budget`), shared by every job on this
+    /// The host-wide memory ledger (`[executor.schedule] mem_budget`), shared by every job on this
     /// host — including those of another runner sharing the state dir. Outside the job dir
     /// on purpose: a job's own dir is wiped and recreated by its prepare.
     pub fn admit_dir(&self) -> PathBuf {
@@ -275,9 +275,9 @@ impl JobCtx {
     pub fn vfsd_log(&self) -> PathBuf {
         self.job_dir.join("vfsd.log")
     }
-    /// Second virtiofsd, read-only, exporting the `[gitlab] dir` CI tools into the
+    /// Second virtiofsd, read-only, exporting the `[executor] tools_dir` CI tools into the
     /// job VM (the agent links them onto the guest PATH). Separate socket/pid/log
-    /// from the dev `[share]` virtiofsd.
+    /// from the dev `[executor.share]` virtiofsd.
     pub fn tools_vfsd_sock(&self) -> PathBuf {
         self.job_dir.join("tools-vfsd.sock")
     }
@@ -285,7 +285,7 @@ impl JobCtx {
         self.job_dir.join("tools-vfsd.log")
     }
     /// Where prepare records the archive directory this job's guest statistics go to
-    /// (`[gitlab] atop`), for the supervisor and the final stage — separate processes,
+    /// (`[executor] atop`), for the supervisor and the final stage — separate processes,
     /// which must not each derive a date of their own around midnight.
     pub fn atop_dir_file(&self) -> PathBuf {
         self.job_dir.join("atop.dir")
@@ -535,7 +535,7 @@ pub(crate) fn pipeline_identity() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Gitlab;
+    use crate::config::Executor;
     use std::path::Path;
 
     /// The identity a job keys its stored state on comes from the runner's account of the
@@ -782,11 +782,11 @@ mod tests {
     fn host_checkout_dir_honors_checkout_dir_override() {
         let cfg = Config {
             state_dir: Some(PathBuf::from("/var/lib/vk")),
-            gitlab: Some(Gitlab {
+            executor: Executor {
                 host_checkout: true,
                 checkout_dir: Some(PathBuf::from("/builds")),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         // The override replaces the `<state_dir>/checkouts` root; the slot/project key is unchanged.

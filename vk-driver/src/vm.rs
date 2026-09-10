@@ -49,7 +49,7 @@ struct BootPlan {
     /// rather than the image booting its own init.
     generic: bool,
     /// The compose primary's own `x-virtkit.nested`; the boot ORs it with the runner's
-    /// `[vm] nested` through [`crate::run::effective_nested`]. False for every non-compose
+    /// `[executor.vm] nested` through [`crate::run::effective_nested`]. False for every non-compose
     /// form: nothing else carries the marker.
     nested: bool,
 }
@@ -162,7 +162,7 @@ fn checkout_virtiofs_cmdline(mount: &str, overlay: bool, size: &str) -> String {
     s
 }
 
-/// `[gitlab] checkout_overlay_size` as a tmpfs `size=` token: a percentage (`80%`) or an
+/// `[executor] checkout_overlay_size` as a tmpfs `size=` token: a percentage (`80%`) or an
 /// absolute size (`12G`), the units `mount` itself takes.
 ///
 /// Rejected rather than passed on when it is anything else. The value is spliced into the
@@ -179,13 +179,13 @@ fn checkout_overlay_size(spec: &str) -> Result<&str> {
     // to at all, which is a misconfiguration rather than a policy anyone means.
     if !sized || digits.trim_start_matches('0').is_empty() {
         bail!(
-            "[gitlab] checkout_overlay_size {spec:?} is not a tmpfs size: \
+            "[executor] checkout_overlay_size {spec:?} is not a tmpfs size: \
              want a percentage of the VM memory (e.g. \"80%\") or an absolute size (e.g. \"12G\")"
         );
     }
     // A parse failure on all-digit input is u32 overflow, which is even more than 100%.
     if unit == "%" && !digits.parse::<u32>().is_ok_and(|pct| pct <= 100) {
-        bail!("[gitlab] checkout_overlay_size {spec:?} is more than all of the VM's memory");
+        bail!("[executor] checkout_overlay_size {spec:?} is more than all of the VM's memory");
     }
     Ok(spec)
 }
@@ -195,7 +195,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // Cheap fail-fast checks first (crisp errors in the runner-visible process beat a
     // supervisor-log pointer).
     crate::check::require_kvm()?;
-    refuse_unsupported_nesting(cfg.vm.nested, crate::vmm::host_nesting_enabled())?;
+    refuse_unsupported_nesting(cfg.executor.vm.nested, crate::vmm::host_nesting_enabled())?;
     let (cpus, mem) = vm_size(ctx)?;
     // Validate the run-phase egress narrowing here so a MICROVM_EGRESS_ALLOW_* request
     // outside the `[egress]` cap fails with a crisp job-visible error — the switch itself is
@@ -204,9 +204,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     effective_run_egress(cfg, ctx)?;
     // Same fail-fast rationale for the writable-layer size: it is pure config, and the
     // authoritative check runs in the detached supervisor whose log the job never sees.
-    if let Some(gl) = &cfg.gitlab {
-        checkout_overlay_size(&gl.checkout_overlay_size)?;
-    }
+    checkout_overlay_size(&cfg.executor.checkout_overlay_size)?;
 
     // A leftover job (failed cleanup, retried job id) must not leak: signal its
     // supervisor — everything it owns cascades by PDEATHSIG — and drop the state. Done before
@@ -220,7 +218,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     std::fs::create_dir_all(&ctx.job_dir)
         .with_context(|| format!("creating {}", ctx.job_dir.display()))?;
 
-    // [gitlab] atop: give this job somewhere to record what its guest does, and remember
+    // [executor] atop: give this job somewhere to record what its guest does, and remember
     // where — the supervisor shares that directory into the guest, and the last stage
     // reports the log's path. Validated here (a job-visible error names the setting) but
     // never fatal beyond that: a host whose archive cannot be written still runs jobs,
@@ -238,13 +236,13 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         }
     }
 
-    // Memory admission (`[schedule] mem_budget`): claim the guest RAM this job is about to
+    // Memory admission (`[executor.schedule] mem_budget`): claim the guest RAM this job is about to
     // boot before booting it, waiting for room on a full host. Held for the rest of prepare;
     // the supervisor takes its own hold on the same reservation, so it never lapses between
     // the two. After the stale-job teardown above, which frees a predecessor's claim.
     let _reservation = admit_memory(ctx, &mem)?;
 
-    // [gitlab] host_checkout: check the sources out on the host NOW — before resolving the
+    // [executor] host_checkout: check the sources out on the host NOW — before resolving the
     // image (a `dockerfile:`/`compose:` image is built from these sources) and before the
     // guest boots — so supervise can share the tree in and the git token never enters the
     // guest (the job sets GIT_STRATEGY: none). Crisp errors here (the runner-visible prepare)
@@ -252,7 +250,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // system_failure.
     // Held to the end of prepare, which outlasts the supervisor taking its own hold below, so the
     // tree is referenced continuously from the clone until the job's VM is gone.
-    let _checkout_use = if cfg.gitlab.as_ref().is_some_and(|g| g.host_checkout) {
+    let _checkout_use = if cfg.executor.host_checkout {
         let url = ctx
             .ci_repo_url
             .as_deref()
@@ -357,9 +355,9 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
 
     // Ready = the in-guest virtkit-agent answers on vsock. The supervisor exiting
     // during boot (the VMM died, a helper failed to start) fails the poll fast.
-    let addr = crate::vmm::exec_addr(&ctx.vsock_sock(), cfg.vm.vsock_port);
+    let addr = crate::vmm::exec_addr(&ctx.vsock_sock(), cfg.executor.vm.vsock_port);
     let start = Instant::now();
-    let deadline = start + Duration::from_secs(cfg.vm.boot_timeout_secs);
+    let deadline = start + Duration::from_secs(cfg.executor.vm.boot_timeout_secs);
     loop {
         if let Some(status) = sup.try_wait()? {
             log_tail(&ctx.supervisor_log(), 15);
@@ -408,7 +406,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
                     log_tail(&ctx.vmm_log(), 20);
                     bail!(
                         "VM not ready after {}s ({e}) — console tail above, logs in {}",
-                        cfg.vm.boot_timeout_secs,
+                        cfg.executor.vm.boot_timeout_secs,
                         ctx.job_dir.display()
                     );
                 }
@@ -433,7 +431,7 @@ async fn wait_for_services(ctx: &JobCtx, names: &[String]) -> Result<()> {
     // The siblings boot concurrently in the supervisor, so a single readiness budget spans them
     // all rather than a fresh one per service.
     let start = Instant::now();
-    let deadline = start + Duration::from_secs(cfg.vm.boot_timeout_secs);
+    let deadline = start + Duration::from_secs(cfg.executor.vm.boot_timeout_secs);
     for name in names {
         let dir = ctx.job_dir.join(format!("svc-{name}"));
         let addr = crate::vmm::exec_addr(&dir.join("vsock.sock"), crate::units::VSOCK_PORT);
@@ -453,7 +451,7 @@ async fn wait_for_services(ctx: &JobCtx, names: &[String]) -> Result<()> {
                         log_tail(&dir.join(crate::run::CONSOLE_LOG), 30);
                         bail!(
                             "service {name} not ready after {}s ({e}) — console tail above",
-                            cfg.vm.boot_timeout_secs
+                            cfg.executor.vm.boot_timeout_secs
                         );
                     }
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -496,7 +494,7 @@ fn resolve_media(ctx: &JobCtx) -> Result<BootPlan> {
                 use_guard: None,
             },
             generic,
-            // A plain image ref carries no compose marker; only `[vm] nested` can grant it.
+            // A plain image ref carries no compose marker; only `[executor.vm] nested` can grant it.
             nested: false,
         }),
     }
@@ -526,7 +524,7 @@ fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<BootPlan> {
 /// checkout into the shared build tier and return its rootfs, captured runtime config, and a
 /// held reference on the entry (see [`crate::ensure::ensure_build_tier`]). Shared
 /// by the job's primary (`resolve_dockerfile_form`) and its git-defined services
-/// (`plan_services`). Requires `[gitlab] host_checkout`: the Dockerfile + context are the
+/// (`plan_services`). Requires `[executor] host_checkout`: the Dockerfile + context are the
 /// checked-out sources. The context defaults to the Dockerfile's directory; `?context=<dir>`
 /// overrides it. `--build-arg`s come from `?arg=<NAME>=<VALUE>` parameters (repeatable), and
 /// `?buildcontext=<NAME>=<DIR>` (repeatable) names an extra context directory — every path
@@ -536,9 +534,9 @@ fn build_git_image(
     spec: &str,
 ) -> Result<(PathBuf, vk_core::runcfg::RunConfig, crate::cachelock::Guard)> {
     let cfg = &ctx.cfg;
-    if !cfg.gitlab.as_ref().is_some_and(|g| g.host_checkout) {
+    if !cfg.executor.host_checkout {
         bail!(
-            "a git-defined (dockerfile:/compose:) image requires [gitlab] host_checkout — the \
+            "a git-defined (dockerfile:/compose:) image requires [executor] host_checkout — the \
              Dockerfile and its context are the checked-out sources"
         );
     }
@@ -817,13 +815,13 @@ struct ComposeFleet {
 }
 
 /// Parse `compose:<file>#<primary>` and load the fleet from the host checkout. Requires
-/// `[gitlab] host_checkout` (the compose file + its build contexts are the checked-out
+/// `[executor] host_checkout` (the compose file + its build contexts are the checked-out
 /// sources) and a `#<primary>` naming the job VM. `MICROVM_PROFILE` (space/comma separated)
 /// selects extra services.
 fn load_compose_fleet(ctx: &JobCtx, spec: &str) -> Result<ComposeFleet> {
-    if !ctx.cfg.gitlab.as_ref().is_some_and(|g| g.host_checkout) {
+    if !ctx.cfg.executor.host_checkout {
         bail!(
-            "a compose: image requires [gitlab] host_checkout — the compose file and its build \
+            "a compose: image requires [executor] host_checkout — the compose file and its build \
              contexts are the checked-out sources"
         );
     }
@@ -887,7 +885,7 @@ fn load_compose_fleet(ctx: &JobCtx, spec: &str) -> Result<ComposeFleet> {
                 unit.name
             );
         }
-        refuse_job_nesting(ctx.cfg.vm.nested, unit)?;
+        refuse_job_nesting(ctx.cfg.executor.vm.nested, unit)?;
         resolve_job_env_files(&root, unit)?;
         if let crate::compose::Source::Build {
             context,
@@ -1035,7 +1033,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // process has booted the VM it is polling for — so taking ours here leaves no window in
     // which the tree is unreferenced. Taken before resolving any git-defined image out of it,
     // and kept until the VM and its virtio-fs share are gone.
-    let _checkout_use = if cfg.gitlab.as_ref().is_some_and(|g| g.host_checkout) {
+    let _checkout_use = if cfg.executor.host_checkout {
         let dest = ctx.host_checkout_dir();
         Some(
             crate::checkout::acquire_use_lock(&dest)
@@ -1098,7 +1096,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             format!(
                 "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda \
                  VIRTKIT_HOSTNAME={} VIRTKIT_VSOCK_PORT={}",
-                cfg.vm.hostname, cfg.vm.vsock_port
+                cfg.executor.vm.hostname, cfg.executor.vm.vsock_port
             ),
             Some(cpio),
         )
@@ -1110,18 +1108,18 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             format!(
                 "console=ttyS0 root=/dev/vda rw rootfstype=ext4 init=/usr/local/bin/vk-agent \
                  VIRTKIT_MODE=service VIRTKIT_HOSTNAME={}",
-                cfg.vm.hostname
+                cfg.executor.vm.hostname
             ),
             media.initrd.clone(),
         )
     };
 
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
-    // `[vm] dax`: the window each directory share gets, so the guest reads a shared tree
+    // `[executor.vm] dax`: the window each directory share gets, so the guest reads a shared tree
     // out of the host page cache rather than copying it into its own. Same window for every
     // share here — the tools tree is the one several job VMs read at once.
     let dax = crate::run::dax_window(vm_dax(cfg)?, None, crate::vmm::libkrun_selected());
-    if let Some(share) = &cfg.share {
+    if let Some(share) = &cfg.executor.share {
         let vfsd_sock = ctx.vfsd_sock();
         // libkrun mounts the host dir directly (built-in virtio-fs); only
         // cloud-hypervisor needs an external virtiofsd on the socket.
@@ -1148,12 +1146,10 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         });
     }
 
-    // GitLab CI tools ([gitlab] dir): a second, read-only virtio-fs share. The
+    // GitLab CI tools ([executor] tools_dir): a second, read-only virtio-fs share. The
     // in-guest agent links the tools the job image lacks onto its PATH — dynamic,
     // so nothing is baked into the bundle and a host update needs no re-conversion.
-    if let Some(gl) = &cfg.gitlab
-        && let Some(dir) = &gl.dir
-    {
+    if let Some(dir) = &cfg.executor.tools_dir {
         let sock = ctx.tools_vfsd_sock();
         if !crate::vmm::libkrun_selected() {
             let mut vfsd = cfg.virtiofsd_command();
@@ -1179,14 +1175,14 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         cmdline.push_str(" VIRTKIT_TOOLS=vktools:/run/virtkit-tools");
     }
 
-    // [gitlab] host_checkout: the sources checked out on the host in prepare, shared
+    // [executor] host_checkout: the sources checked out on the host in prepare, shared
     // into the guest at CI_PROJECT_DIR. The job sets GIT_STRATEGY: none so its
     // get_sources reuses this tree — the git token never enters the guest. With
     // checkout_overlay (the default) the share is exported read-only and the guest
     // builds on an overlay above it; checkout_overlay = false exports it read-write,
     // which is added attack surface toward an untrusted guest.
-    if let Some(gl) = cfg.gitlab.as_ref().filter(|g| g.host_checkout) {
-        let overlay = gl.checkout_overlay;
+    if cfg.executor.host_checkout {
+        let overlay = cfg.executor.checkout_overlay;
         let mount = ctx
             .ci_project_dir
             .as_deref()
@@ -1244,11 +1240,11 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         cmdline.push_str(&checkout_virtiofs_cmdline(
             mount,
             overlay,
-            checkout_overlay_size(&gl.checkout_overlay_size)?,
+            checkout_overlay_size(&cfg.executor.checkout_overlay_size)?,
         ));
     }
 
-    // [gitlab] atop: this job's statistics archive (created by prepare), shared
+    // [executor] atop: this job's statistics archive (created by prepare), shared
     // read-write — the guest's own sampler writes the log, so this is the one share a
     // job guest must be able to write. Only its own directory is exported, and the
     // knob on the cmdline is what starts the sampler at all.
@@ -1304,15 +1300,15 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS_DAX={dax_tags}"));
     }
 
-    // Idle page-cache trimming (`[vm] reclaim`): the job guest gives file cache it stopped
+    // Idle page-cache trimming (`[executor.vm] reclaim`): the job guest gives file cache it stopped
     // using back to the host whenever it is not under memory pressure, so a job's read-once
     // trees stop counting against the box once it moves on. The job guest always keeps the
-    // agent as PID 1, so `[vm] balloon` is the only axis that can take the knob away —
+    // agent as PID 1, so `[executor.vm] balloon` is the only axis that can take the knob away —
     // without free-page reporting the job would lose its cache and the host would gain
     // nothing. Its services keep a balloon of their own whatever this says, so `plan_services`
-    // hands them `[vm] reclaim` regardless.
+    // hands them `[executor.vm] reclaim` regardless.
     let reclaim = vm_reclaim(cfg)?;
-    if crate::run::wants_reclaim(crate::run::InitSource::Default, cfg.vm.balloon) {
+    if crate::run::wants_reclaim(crate::run::InitSource::Default, cfg.executor.vm.balloon) {
         crate::run::push_knob(&mut cmdline, &crate::run::reclaim_cmdline(reclaim, &mem)?);
     }
 
@@ -1419,10 +1415,10 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
 
     // RAM scratch mounts (e.g. CI /builds): the agent mounts these (VIRTKIT_TMPFS)
     // before handing off to the payload, in any mode.
-    if !cfg.guest.tmpfs.is_empty() {
+    if !cfg.executor.guest.tmpfs.is_empty() {
         // lands on the kernel cmdline: a space or comma in an entry would split
         // or corrupt the VIRTKIT_TMPFS list the agent parses
-        for entry in &cfg.guest.tmpfs {
+        for entry in &cfg.executor.guest.tmpfs {
             if !entry.starts_with('/')
                 || !entry.contains(':')
                 || entry.contains(|c: char| c.is_whitespace() || c == ',')
@@ -1430,10 +1426,13 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                 bail!("invalid guest.tmpfs entry {entry:?} (want \"/path:size\")");
             }
         }
-        cmdline.push_str(&format!(" VIRTKIT_TMPFS={}", cfg.guest.tmpfs.join(",")));
+        cmdline.push_str(&format!(
+            " VIRTKIT_TMPFS={}",
+            cfg.executor.guest.tmpfs.join(",")
+        ));
     }
 
-    // SSH-agent forwarding ([auth] ssh_agent): tell the guest agent to present
+    // SSH-agent forwarding ([executor.auth] ssh_agent): tell the guest agent to present
     // SSH_AUTH_SOCK and relay it over a vsock port to the host side (the forward from
     // ssh_agent_forward_command, started by the supervisor). A no-op if the runner has
     // no agent — warn so a misconfig is visible.
@@ -1442,13 +1441,15 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             " VIRTKIT_SSH_AGENT_PORT={}",
             crate::run::SSH_AGENT_VSOCK_PORT
         ));
-    } else if cfg.auth.ssh_agent {
-        eprintln!("virtkit: [auth] ssh_agent set but SSH_AUTH_SOCK is unset — not forwarding");
+    } else if cfg.executor.auth.ssh_agent {
+        eprintln!(
+            "virtkit: [executor.auth] ssh_agent set but SSH_AUTH_SOCK is unset — not forwarding"
+        );
     }
 
-    if !cfg.vm.cmdline_extra.is_empty() {
+    if !cfg.executor.vm.cmdline_extra.is_empty() {
         cmdline.push(' ');
-        cmdline.push_str(&cfg.vm.cmdline_extra);
+        cmdline.push_str(&cfg.executor.vm.cmdline_extra);
     }
 
     // kernel is common; the boot medium is the CoW disk overlay plus a
@@ -1463,7 +1464,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // not vsock. Only the libkrun backend consumes this; cloud-hypervisor derives it.
     let mut vsock_ports = vec![crate::vmm::VsockPort::exec(
         &ctx.vsock_sock(),
-        cfg.vm.vsock_port,
+        cfg.executor.vm.vsock_port,
     )];
     let nics = job_attach
         .map(|attach| attach.apply(&mut vsock_ports))
@@ -1489,24 +1490,24 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         shared_mem: true,
         net,
         nics,
-        balloon: cfg.vm.balloon,
+        balloon: cfg.executor.vm.balloon,
         serial_log: ctx.console_log(),
         // an image (stock) kernel keeps serial via the VIRTKIT_KERNEL=image cmdline token;
         // the executor has no BYO-kernel flag, so nothing forces it otherwise.
         console_serial: false,
         pmu: false,
-        // `[vm] nested`, the runner's grant (checked against the host in prepare), ORed
+        // `[executor.vm] nested`, the runner's grant (checked against the host in prepare), ORed
         // with the compose primary's own marker exactly as `vk run` does it. The grant is
         // what let that marker past `refuse_job_nesting`, so today the OR only ever agrees
         // with the grant — it is here so the two paths cannot drift apart.
-        nested: crate::run::effective_nested(cfg.vm.nested, primary_nested),
+        nested: crate::run::effective_nested(cfg.executor.vm.nested, primary_nested),
         // libkrun has no API socket (it is driven as a subprocess); cloud-hypervisor
         // uses one for graceful shutdown in graceful_vmm_stop.
         api_socket: (!crate::vmm::libkrun_selected()).then(|| ctx.api_sock()),
         pass_fds: Vec::new(),
         // The CI job runs in its own process (no `--vm-name`), so the default template
         // applies: `vk:<hostname>`.
-        proc_name: crate::vmm::resolve_proc_name(&cfg.vm.hostname),
+        proc_name: crate::vmm::resolve_proc_name(&cfg.executor.vm.hostname),
         // A CI job VM ends on a guest reset rather than rebooting in place.
         reboot: false,
     };
@@ -1566,14 +1567,14 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     }
 }
 
-/// SSH-agent forwarding is on when `[auth] ssh_agent` is set AND the runner actually has an
+/// SSH-agent forwarding is on when `[executor.auth] ssh_agent` is set AND the runner actually has an
 /// agent (`$SSH_AUTH_SOCK`). The guest side is driven by the cmdline var; the host side is
 /// the forward started below.
 fn ssh_agent_forwarding(cfg: &crate::config::Config) -> bool {
-    cfg.auth.ssh_agent && std::env::var_os("SSH_AUTH_SOCK").is_some()
+    cfg.executor.auth.ssh_agent && std::env::var_os("SSH_AUTH_SOCK").is_some()
 }
 
-/// Host side of the SSH-agent forward ([auth] ssh_agent): the guest dials vsock
+/// Host side of the SSH-agent forward ([executor.auth] ssh_agent): the guest dials vsock
 /// port SSH_AGENT_VSOCK_PORT, surfaced by the VMM as `<vsock.sock>_<port>`; a
 /// `vk forward` binds it and splices to the runner's `$SSH_AUTH_SOCK`. Only agent
 /// protocol bytes cross — the keys never enter the guest. `None` when forwarding
@@ -1994,29 +1995,31 @@ fn narrow_ips(cap: Option<&[String]>, req: &str, var: &str) -> Result<Vec<String
     Ok(requested)
 }
 
-/// `[vm] dax` as a policy, `None` where the host set none; a misspelt value fails naming
+/// `[executor.vm] dax` as a policy, `None` where the host set none; a misspelt value fails naming
 /// the key.
 fn vm_dax(cfg: &crate::config::Config) -> Result<Option<crate::vmm::Dax>> {
-    cfg.vm
+    cfg.executor
+        .vm
         .dax
         .as_deref()
-        .map(|s| s.parse().map_err(|e| anyhow!("[vm] dax: {e}")))
+        .map(|s| s.parse().map_err(|e| anyhow!("[executor.vm] dax: {e}")))
         .transpose()
 }
 
-/// `[vm] reclaim` as a policy; a misspelt value fails prepare naming the key.
+/// `[executor.vm] reclaim` as a policy; a misspelt value fails prepare naming the key.
 fn vm_reclaim(cfg: &crate::config::Config) -> Result<vk_core::reclaim::Policy> {
-    cfg.vm
+    cfg.executor
+        .vm
         .reclaim
         .parse()
-        .map_err(|e| anyhow!("[vm] reclaim: {e}"))
+        .map_err(|e| anyhow!("[executor.vm] reclaim: {e}"))
 }
 
 /// Effective vCPU count and memory size: the job's MICROVM_CPUS/MICROVM_MEM
 /// requests, silently clamped to the host ceilings (vm.max_cpus/max_mem,
 /// defaulting to the base values — config opt-in for any elevation).
 fn vm_size(ctx: &JobCtx) -> Result<(u32, String)> {
-    let vm = &ctx.cfg.vm;
+    let vm = &ctx.cfg.executor.vm;
     let cpus = match &ctx.cpus_req {
         None => vm.cpus,
         Some(s) => {
@@ -2036,7 +2039,7 @@ fn vm_size(ctx: &JobCtx) -> Result<(u32, String)> {
                 Some(m) => parse_gib(m).context("invalid vm.max_mem")?,
                 None => parse_gib(&vm.mem).context("invalid vm.mem")?,
             };
-            // `[schedule] mem_budget` is a host ceiling like the others: a request above the
+            // `[executor.schedule] mem_budget` is a host ceiling like the others: a request above the
             // whole budget could never be admitted, and failing prepare over it would be a
             // *system* failure — the retryable class, which no retry could ever satisfy.
             let max = match budget_mib(&ctx.cfg) {
@@ -2050,7 +2053,7 @@ fn vm_size(ctx: &JobCtx) -> Result<(u32, String)> {
 }
 
 /// A compose file may ask a service to nest only where the runner granted nesting
-/// (`[vm] nested`). Nesting widens the guest's attack surface on host KVM (see
+/// (`[executor.vm] nested`). Nesting widens the guest's attack surface on host KVM (see
 /// `VmSpec::nested`), so the grant is the host admin's and not a job-authored compose
 /// file's — the same reason the executor never hands a job the PMU. Once granted, the
 /// marker is honoured, so a fleet can put its nesting builder wherever it belongs instead
@@ -2063,21 +2066,21 @@ fn refuse_job_nesting(granted: bool, unit: &crate::compose::Unit) -> Result<()> 
     if unit.nested && !granted {
         bail!(
             "compose service {:?}: x-virtkit.nested needs a runner that allows nesting — it \
-             reaches host KVM, so `[vm] nested` is the host admin's grant to make, not a job's",
+             reaches host KVM, so `[executor.vm] nested` is the host admin's grant to make, not a job's",
             unit.name
         );
     }
     Ok(())
 }
 
-/// `[vm] nested` on a host whose KVM will not nest boots a job guest that advertises VMX/SVM
+/// `[executor.vm] nested` on a host whose KVM will not nest boots a job guest that advertises VMX/SVM
 /// and cannot use it, so the jobs counting on it fail deep inside themselves instead of at
 /// the misconfiguration. Refused in `prepare`, whose error reaches the job trace, rather than
 /// in the detached supervisor's log.
 pub(crate) fn refuse_unsupported_nesting(requested: bool, host_nests: bool) -> Result<()> {
     if requested && !host_nests {
         bail!(
-            "[vm] nested is set but this host does not allow nesting — load kvm_intel or \
+            "[executor.vm] nested is set but this host does not allow nesting — load kvm_intel or \
              kvm_amd with nested=1, or unset it"
         );
     }
@@ -2090,7 +2093,7 @@ pub(crate) fn refuse_unsupported_nesting(requested: bool, host_nests: bool) -> R
 /// not size a service past what the runner's config lets a job declare. Silent, like
 /// `vm_size`; an undeclared axis stays `None` (the service default), not the job base.
 fn clamp_service_size(cfg: &crate::config::Config, unit: &mut crate::compose::Unit) -> Result<()> {
-    let vm = &cfg.vm;
+    let vm = &cfg.executor.vm;
     if let Some(n) = unit.cpus {
         unit.cpus = Some(n.min(vm.max_cpus.unwrap_or(vm.cpus)));
     }
@@ -2104,7 +2107,7 @@ fn clamp_service_size(cfg: &crate::config::Config, unit: &mut crate::compose::Un
         }
         .checked_mul(1024)
         .context("guest memory ceiling is absurdly large")?;
-        // `[schedule] mem_budget` is a host ceiling like the others (see `vm_size`): a service
+        // `[executor.schedule] mem_budget` is a host ceiling like the others (see `vm_size`): a service
         // sized above the whole budget could never boot healthily on this runner.
         let max_mib = match budget_mib(cfg) {
             Some(b) => max_mib.min(b?),
@@ -2125,7 +2128,7 @@ pub(crate) fn declared_mem_mib(ctx: &JobCtx) -> Result<u64> {
         .context("guest memory size is absurdly large")
 }
 
-/// Reserve this job's guest RAM against the host's `[schedule] mem_budget`, blocking until
+/// Reserve this job's guest RAM against the host's `[executor.schedule] mem_budget`, blocking until
 /// there is room for it (see admit). `None` when no budget is configured — the host then
 /// admits every job the runner hands it, as it did before. A job that never gets room fails
 /// prepare, which exits `SYSTEM_FAILURE_EXIT_CODE`: a system failure, not the job's fault.
@@ -2134,14 +2137,14 @@ fn admit_memory(ctx: &JobCtx, mem: &str) -> Result<Option<crate::admit::Reservat
         return Ok(None);
     };
     let budget_mib = budget?;
-    let timeout = Duration::from_secs(ctx.cfg.schedule.wait_timeout_secs.unwrap_or(600));
+    let timeout = Duration::from_secs(ctx.cfg.executor.schedule.wait_timeout_secs.unwrap_or(600));
     let declared_mib = parse_gib(mem)
         .context("invalid guest memory size")?
         .checked_mul(1024)
         .context("guest memory size is absurdly large")?;
-    // `[schedule] from_history`: reserve what this job has been using rather than what it
+    // `[executor.schedule] from_history`: reserve what this job has been using rather than what it
     // declares. Announced, because it is the difference between a job waiting and not.
-    let want_mib = match ctx.cfg.schedule.from_history {
+    let want_mib = match ctx.cfg.executor.schedule.from_history {
         true => crate::admit::expect_mib(&ctx.history_dir(), &ctx.usage_key(), declared_mib)
             .inspect(|mib| {
                 // Only worth saying when it changes the reservation: a job whose peak fills
@@ -2161,14 +2164,14 @@ fn admit_memory(ctx: &JobCtx, mem: &str) -> Result<Option<crate::admit::Reservat
     Ok(Some(reservation))
 }
 
-/// The host's `[schedule] mem_budget` in MiB, resolving a percentage against this host, for a
+/// The host's `[executor.schedule] mem_budget` in MiB, resolving a percentage against this host, for a
 /// report that says there is no budget rather than inventing one. `None` when no budget is set,
 /// `Some(Err(..))` when one is set that this host cannot resolve — it does not parse, or it is a
 /// percentage and `/proc/meminfo` is unreadable — which the report has to tell apart, since a
 /// budget it cannot resolve is one every job's prepare is already failing on, not the absence of
 /// a budget. The error names the setting, so callers add no context of their own.
 pub(crate) fn budget_mib(cfg: &crate::config::Config) -> Option<Result<u64>> {
-    let raw = cfg.schedule.mem_budget.as_deref()?;
+    let raw = cfg.executor.schedule.mem_budget.as_deref()?;
     // Only a percentage needs the host measured, and a `<n>G` budget must keep working on a host
     // whose `/proc/meminfo` cannot be read.
     let host_total_mib = raw
@@ -2179,7 +2182,7 @@ pub(crate) fn budget_mib(cfg: &crate::config::Config) -> Option<Result<u64>> {
         // "cannot resolve", not "invalid": a percentage is a valid setting on a host whose
         // memory this process simply cannot read.
         parse_budget_mib(raw, host_total_mib)
-            .with_context(|| format!("cannot resolve [schedule] mem_budget {raw:?}")),
+            .with_context(|| format!("cannot resolve [executor.schedule] mem_budget {raw:?}")),
     )
 }
 
@@ -2274,7 +2277,7 @@ pub fn stop_supervisor(ctx: &JobCtx) {
     unsafe { libc::kill(pid, libc::SIGTERM) };
     // the supervisor's own teardown runs the graceful guest shutdown; give it
     // that budget plus margin before the hammer.
-    let grace = Duration::from_secs(ctx.cfg.vm.shutdown_timeout_secs + 15);
+    let grace = Duration::from_secs(ctx.cfg.executor.vm.shutdown_timeout_secs + 15);
     if !wait_gone(pid, &tag, grace) {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         wait_gone(pid, &tag, Duration::from_secs(3));
@@ -2285,7 +2288,7 @@ pub fn stop_supervisor(ctx: &JobCtx) {
 /// socket, then vm.shutdown, then SIGTERM/SIGKILL — each step only if the previous
 /// one did not end the process. libkrun has no API socket: TERM then KILL.
 fn graceful_vmm_stop(ctx: &JobCtx, child: &mut std::process::Child) {
-    let timeout = Duration::from_secs(ctx.cfg.vm.shutdown_timeout_secs);
+    let timeout = Duration::from_secs(ctx.cfg.executor.vm.shutdown_timeout_secs);
     if crate::vmm::libkrun_selected() {
         unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
         if !wait_child_gone(child, timeout) {
@@ -2460,24 +2463,24 @@ mod tests {
     fn vm_dax_is_unset_by_default_and_names_its_key_when_misspelt() {
         let mut cfg = Config::default();
         assert_eq!(vm_dax(&cfg).unwrap(), None);
-        cfg.vm.dax = Some("4G".into());
+        cfg.executor.vm.dax = Some("4G".into());
         assert_eq!(
             vm_dax(&cfg).unwrap(),
             Some(crate::vmm::Dax::Window(4 << 30))
         );
-        cfg.vm.dax = Some("off".into());
+        cfg.executor.vm.dax = Some("off".into());
         assert_eq!(vm_dax(&cfg).unwrap(), Some(crate::vmm::Dax::Off));
-        cfg.vm.dax = Some("lots".into());
+        cfg.executor.vm.dax = Some("lots".into());
         let err = vm_dax(&cfg).unwrap_err().to_string();
-        assert!(err.contains("[vm] dax"), "{err}");
+        assert!(err.contains("[executor.vm] dax"), "{err}");
     }
 
     fn ctx(cpus_req: Option<&str>, mem_req: Option<&str>) -> JobCtx {
         let mut cfg = Config::default();
-        cfg.vm.cpus = 4;
-        cfg.vm.mem = "8G".into();
-        cfg.vm.max_cpus = Some(16);
-        cfg.vm.max_mem = Some("64G".into());
+        cfg.executor.vm.cpus = 4;
+        cfg.executor.vm.mem = "8G".into();
+        cfg.executor.vm.max_cpus = Some(16);
+        cfg.executor.vm.max_mem = Some("64G".into());
         let mut ctx = JobCtx::new_for_job(cfg, "42".into()).unwrap();
         ctx.cpus_req = cpus_req.map(String::from);
         ctx.mem_req = mem_req.map(String::from);
@@ -2779,18 +2782,18 @@ mod tests {
     fn sizing_clamps_to_the_memory_budget() {
         let mut ctx = ctx(None, Some("64G"));
         assert_eq!(vm_size(&ctx).unwrap().1, "64G", "max_mem alone");
-        ctx.cfg.schedule.mem_budget = Some("48G".into());
+        ctx.cfg.executor.schedule.mem_budget = Some("48G".into());
         assert_eq!(vm_size(&ctx).unwrap().1, "48G");
         // The lower of the two ceilings wins whichever it is.
-        ctx.cfg.schedule.mem_budget = Some("256G".into());
+        ctx.cfg.executor.schedule.mem_budget = Some("256G".into());
         assert_eq!(vm_size(&ctx).unwrap().1, "64G");
         // A job that asked for nothing keeps the configured default, budget or not.
         let mut plain = self::ctx(None, None);
-        plain.cfg.schedule.mem_budget = Some("2G".into());
+        plain.cfg.executor.schedule.mem_budget = Some("2G".into());
         assert_eq!(vm_size(&plain).unwrap().1, "8G");
     }
 
-    /// A compose service's declared sizing obeys the same `[vm] max_*` ceilings a job's
+    /// A compose service's declared sizing obeys the same `[executor.vm] max_*` ceilings a job's
     /// own MICROVM_CPUS/MICROVM_MEM requests are clamped to; an undeclared axis stays
     /// `None` (the service default), never the job base size.
     #[test]
@@ -2812,10 +2815,10 @@ mod tests {
         clamp_service_size(&ctx.cfg, &mut unit).unwrap();
         assert_eq!(unit.cpus, Some(16));
         assert_eq!(unit.mem.as_deref(), Some("65536M"));
-        // a `[schedule] mem_budget` below `max_mem` is the effective ceiling: a service
+        // a `[executor.schedule] mem_budget` below `max_mem` is the effective ceiling: a service
         // sized above the whole budget could never boot healthily.
         let mut budgeted = self::ctx(None, None);
-        budgeted.cfg.schedule.mem_budget = Some("32G".into());
+        budgeted.cfg.executor.schedule.mem_budget = Some("32G".into());
         let mut unit = service("    x-virtkit: { cpus: 2, mem: 100G }\n");
         clamp_service_size(&budgeted.cfg, &mut unit).unwrap();
         assert_eq!(unit.mem.as_deref(), Some("32768M"));
@@ -2914,8 +2917,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut ctx = ctx(None, Some("8G"));
         ctx.cfg.state_dir = Some(dir.clone());
-        ctx.cfg.schedule.mem_budget = Some("48G".into());
-        ctx.cfg.schedule.from_history = true;
+        ctx.cfg.executor.schedule.mem_budget = Some("48G".into());
+        ctx.cfg.executor.schedule.from_history = true;
 
         let ceiling_mib = declared_mem_mib(&ctx).unwrap();
         assert_eq!(ceiling_mib, 8192, "the job declares what the test set");
@@ -2948,7 +2951,7 @@ mod tests {
             ..Config::default()
         };
         let ctx = JobCtx::new_for_job(cfg, "42".into()).unwrap();
-        assert!(ctx.cfg.schedule.mem_budget.is_none());
+        assert!(ctx.cfg.executor.schedule.mem_budget.is_none());
         assert!(admit_memory(&ctx, "8G").unwrap().is_none());
         assert!(!ctx.admit_dir().exists(), "no ledger without a budget");
         let _ = std::fs::remove_dir_all(&dir);

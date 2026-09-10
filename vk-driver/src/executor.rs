@@ -94,7 +94,7 @@ pub async fn run_stage(ctx: &JobCtx, script_path: &Path, stage: Option<&str>) ->
     result
 }
 
-/// End this job's statistics log on a whole sample and say where it is (`[gitlab] atop`).
+/// End this job's statistics log on a whole sample and say where it is (`[executor] atop`).
 ///
 /// The guest sampler takes SIGUSR2 as "one last sample, then exit", so asking for that here —
 /// the last stage whose output the trace keeps, with the guest still alive — means the log
@@ -299,7 +299,7 @@ fn report_contacted_names(ctx: &JobCtx) {
 /// measurement.
 ///
 /// The same figure is what the next run of this job is admitted against where the host
-/// reserves from history (`[schedule] from_history`), so it is recorded here too.
+/// reserves from history (`[executor.schedule] from_history`), so it is recorded here too.
 async fn report_resource_usage(ctx: &JobCtx) {
     // Asked of the guest before the tree is read, so the memory marks stay the last thing
     // measured and cover as much of the job as they can.
@@ -341,7 +341,7 @@ async fn report_resource_usage(ctx: &JobCtx) {
 }
 
 /// How full the guest's writable layer got, asked of the guest's own agent (`vk-agent fsmark`):
-/// with `[gitlab] checkout_overlay` the job's writes land on a tmpfs inside the VM, which is
+/// with `[executor] checkout_overlay` the job's writes land on a tmpfs inside the VM, which is
 /// guest RAM and so invisible to every host counter — the agent is the only thing that can
 /// measure it, and it keeps the high-water mark rather than what happens to be left now.
 ///
@@ -349,8 +349,8 @@ async fn report_resource_usage(ctx: &JobCtx) {
 /// read-write costs no round-trip at all. A guest whose agent predates the subcommand answers
 /// non-zero and reads the same way: unmeasured, which is not a layer that stayed empty.
 async fn overlay_mark(ctx: &JobCtx) -> Option<(u64, u64)> {
-    let gitlab = ctx.cfg.gitlab.as_ref()?;
-    if !(gitlab.host_checkout && gitlab.checkout_overlay) {
+    let ex = &ctx.cfg.executor;
+    if !(ex.host_checkout && ex.checkout_overlay) {
         return None;
     }
     let (out, sink) = stdout_capture();
@@ -401,11 +401,11 @@ pub(crate) fn parse_mark(out: &[u8]) -> Option<(u64, u64)> {
 }
 
 /// Follow the run's own figures with what runs of this job have been using lately — the
-/// number `[schedule] mem_budget` has to be sized against, and what a host reserving from
+/// number `[executor.schedule] mem_budget` has to be sized against, and what a host reserving from
 /// history sizes the next run's reservation from. Printed whether or not the host reserves
 /// that way: seeing it is how an operator decides to.
 fn report_job_history(ctx: &JobCtx, declared_mib: u64) {
-    let schedule = &ctx.cfg.schedule;
+    let schedule = &ctx.cfg.executor.schedule;
     if let Some(line) = crate::admit::history_summary(
         &ctx.history_dir(),
         &ctx.usage_key(),
@@ -446,7 +446,7 @@ fn report_project_usage(ctx: &JobCtx) {
         &ctx.history_dir(),
         &ctx.usage_project(),
         crate::vm::budget_mib(&ctx.cfg).map(|r| r.map_err(|e| format!("{e:#}"))),
-        ctx.cfg.schedule.from_history,
+        ctx.cfg.executor.schedule.from_history,
     ) {
         Some(report) => eprint!("{report}"),
         None => eprintln!("virtkit: no job of this project has run on this host yet"),
@@ -456,7 +456,7 @@ fn report_project_usage(ctx: &JobCtx) {
 /// The exec-channel connect address for this job's VM, matching the selected backend
 /// (hybrid vsock-mux for cloud-hypervisor, a plain unix socket for libkrun).
 pub fn vsock_addr(ctx: &JobCtx) -> SocketAddr {
-    crate::vmm::exec_addr(&ctx.vsock_sock(), ctx.cfg.vm.vsock_port)
+    crate::vmm::exec_addr(&ctx.vsock_sock(), ctx.cfg.executor.vm.vsock_port)
 }
 
 /// The shell stage scripts are piped into: the configured run_command (bash) when
@@ -469,7 +469,7 @@ pub fn guest_shell(ctx: &JobCtx) -> Vec<String> {
     if sh {
         vec!["sh".into()]
     } else {
-        ctx.cfg.guest.run_command.clone()
+        ctx.cfg.executor.guest.run_command.clone()
     }
 }
 

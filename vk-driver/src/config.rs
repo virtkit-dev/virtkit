@@ -20,7 +20,7 @@ pub struct Config {
     pub state_dir: Option<PathBuf>,
     /// Path of the cloud-hypervisor binary (a bare name resolves through PATH)
     pub cloud_hypervisor: Option<PathBuf>,
-    /// virtiofsd binary, only needed when [share] is set
+    /// virtiofsd binary, only needed when [executor.share] is set
     pub virtiofsd: Option<PathBuf>,
     /// VMM backend: `libkrun` (the default, embedded in `vk`) or `cloud-hypervisor` (an
     /// external binary — e.g. for Windows guests, which libkrun cannot boot). The
@@ -37,12 +37,6 @@ pub struct Config {
     /// (A scalar, so it must stay ahead of the table-typed fields below for TOML
     /// serialization — a bare key after a `[section]` would bind to that section.)
     pub image_cache_idle_secs: Option<u64>,
-    pub vm: Vm,
-    pub guest: Guest,
-    /// Dev only: host dir shared as the guest's /workdir over virtio-fs (the POC
-    /// runner image assembles itself from the repo). CI images must NOT use this:
-    /// the job clones into the VM, nothing of the host is exposed.
-    pub share: Option<Share>,
     pub net: Net,
     /// Egress allowlist for `net.mode = "switch"`: the per-job switch refuses DNS
     /// names outside `allow_name` and direct connections outside `allow_ip` (plus
@@ -60,18 +54,16 @@ pub struct Config {
     /// Local guest bundles on the host filesystem, backing the
     /// `MICROVM_IMAGE: local/<name>` form (and the `local/default` default).
     pub local: Local,
-    /// CI tools shared into GitLab job VMs over virtio-fs; see [`Gitlab`]. Absent =
-    /// no share (the job image must carry its own git/git-lfs/gitlab-runner).
-    pub gitlab: Option<Gitlab>,
-    /// Host credentials forwarded into job VMs (currently the SSH agent); see [`Auth`].
-    pub auth: Auth,
     /// Defaults for `vk build` so a runner need not pass them every invocation;
     /// see [`Build`]. A CLI flag always overrides the matching config value.
     pub build: Build,
-    /// How many CI jobs this host lets run at once, by the memory they boot; see
-    /// [`Schedule`]. Off by default — jobs are admitted the moment gitlab-runner hands
-    /// them over, exactly as before.
-    pub schedule: Schedule,
+    /// The GitLab custom executor: read by `vk gitlab
+    /// config|prepare|run|cleanup|usage|supervise`, and — each for the subset it needs —
+    /// by `vk gc` (the checkout-cache settings) and `vk tune` (the VM template and
+    /// `[executor.schedule]`); never read by `vk run` /
+    /// `vk build`. See [`Executor`]. Always present; an empty file is enough for its
+    /// defaults (not for `prepare`, which validates the image paths).
+    pub executor: Executor,
     /// The file this config was loaded from; None = built-in defaults (no file
     /// found). Set by [`Config::load`], not a config key.
     #[serde(skip)]
@@ -225,16 +217,24 @@ pub struct Auth {
     pub ssh_agent: bool,
 }
 
-/// GitLab job tooling. `dir` is a host directory of static tool binaries (e.g.
-/// `git`, `git-lfs`, `gitlab-runner`) that virtkit shares **read-only over
-/// virtio-fs** into every job VM; the in-guest agent links each one onto the guest
-/// PATH (`/usr/local/bin`), but only for a tool the job image does not already
-/// provide (per-image opt-out, checked in-guest). Dynamic: the binaries stay on the
-/// host and are baked into no bundle, so updating them needs no re-conversion.
+/// The GitLab custom executor. Read by `vk gitlab
+/// config|prepare|run|cleanup|usage|supervise`, and — each for the subset it needs — by
+/// `vk gc` (the checkout-cache settings) and `vk tune` (the VM template and
+/// `[executor.schedule]`); nothing here is touched by `vk run` or
+/// `vk build`. The scalar keys and the nested `[executor.vm]` / `[executor.guest]` /
+/// `[executor.share]` / `[executor.auth]` / `[executor.schedule]` tables together
+/// describe the CI job VM and how jobs are admitted.
+///
+/// `tools_dir` is a host directory of static tool binaries (e.g. `git`, `git-lfs`,
+/// `gitlab-runner`) that virtkit shares **read-only over virtio-fs** into every job
+/// VM; the in-guest agent links each one onto the guest PATH (`/usr/local/bin`), but
+/// only for a tool the job image does not already provide (per-image opt-out, checked
+/// in-guest). Dynamic: the binaries stay on the host and are baked into no bundle, so
+/// updating them needs no re-conversion.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct Gitlab {
-    pub dir: Option<PathBuf>,
+pub struct Executor {
+    pub tools_dir: Option<PathBuf>,
     /// Check the job's git sources out on the HOST at prepare and share the tree into the
     /// guest over virtio-fs, instead of the in-guest `get_sources` clone. The job then sets
     /// `GIT_STRATEGY: none` so the checkout is reused and the git token never enters the guest
@@ -291,7 +291,8 @@ pub struct Gitlab {
     /// guest kernel is booted with `psi=1`, which the guest's own scheduler pays for in
     /// exchange for the pressure figures. `false` gives up the recording and the share; idle
     /// page-cache trimming asks for `psi=1` as well, so the guest keeps paying for it unless
-    /// `[vm] reclaim` is `"off"` (or `[vm] balloon` is, which stops the trimming too).
+    /// `[executor.vm] reclaim` is `"off"` (or `[executor.vm] balloon` is, which stops the
+    /// trimming too).
     pub atop: bool,
     /// Seconds between samples. Must be at least 1. Default 30, matching the interval the
     /// runner hosts' own atop uses, so the two logs read at the same resolution.
@@ -302,16 +303,34 @@ pub struct Gitlab {
     /// only jobs recorded today — and drops the log of a job still running from the day
     /// before out from under it. Any job outliving the window loses its log the same way.
     pub atop_retention_days: u64,
+    /// `[executor.vm]` — the job VM template: cpus/mem/hostname and the per-job
+    /// MICROVM_CPUS/MICROVM_MEM ceilings. Only the CI job path reads it; `vk run` takes
+    /// its sizing from flags and service VMs from the service name.
+    pub vm: Vm,
+    /// `[executor.guest]` — paths and the run command inside the job VM, reported to
+    /// gitlab-runner by `vk gitlab config`.
+    pub guest: Guest,
+    /// `[executor.share]` — dev only: host dir shared as the guest's /workdir over
+    /// virtio-fs (the POC runner image assembles itself from the repo). CI images must
+    /// NOT use this: the job clones into the VM, nothing of the host is exposed.
+    pub share: Option<Share>,
+    /// `[executor.auth]` — host credentials forwarded into job VMs (currently the SSH
+    /// agent); see [`Auth`].
+    pub auth: Auth,
+    /// `[executor.schedule]` — how many CI jobs this host lets run at once, by the memory
+    /// they boot; see [`Schedule`]. Off by default — jobs are admitted the moment
+    /// gitlab-runner hands them over.
+    pub schedule: Schedule,
 }
 
 /// The default `checkout_overlay_size`. Named because the guest applies the kernel's own tmpfs
 /// default when it is told nothing, so this is the policy and that is only the fallback.
 pub const CHECKOUT_OVERLAY_SIZE: &str = "80%";
 
-impl Default for Gitlab {
+impl Default for Executor {
     fn default() -> Self {
-        Gitlab {
-            dir: None,
+        Executor {
+            tools_dir: None,
             host_checkout: false,
             checkout_dir: None,
             checkout_cache_idle_secs: None,
@@ -320,6 +339,11 @@ impl Default for Gitlab {
             atop: true,
             atop_interval_secs: 10,
             atop_retention_days: 14,
+            vm: Vm::default(),
+            guest: Guest::default(),
+            share: None,
+            auth: Auth::default(),
+            schedule: Schedule::default(),
         }
     }
 }
@@ -716,10 +740,38 @@ fn load_resolved(explicit: Option<PathBuf>, fallbacks: &[PathBuf]) -> Result<Con
     };
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let mut cfg: Config =
+    let table: toml::Table =
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    reject_migrated_keys(&table).with_context(|| format!("parsing {}", path.display()))?;
+    let mut cfg: Config = table
+        .try_into()
+        .with_context(|| format!("parsing {}", path.display()))?;
     cfg.source = Some(path);
     Ok(cfg)
+}
+
+/// Reject old top-level sections with their new `[executor]` locations instead of bare
+/// `deny_unknown_fields` errors. Report all stale keys at once so migration takes one pass.
+fn reject_migrated_keys(table: &toml::Table) -> Result<()> {
+    let hints: Vec<&str> = table
+        .keys()
+        .filter_map(|key| match key.as_str() {
+            "vm" => Some("[vm] moved to [executor.vm]"),
+            "guest" => Some("[guest] moved to [executor.guest]"),
+            "share" => Some("[share] moved to [executor.share]"),
+            "auth" => Some("[auth] moved to [executor.auth]"),
+            "schedule" => Some("[schedule] moved to [executor.schedule]"),
+            "gitlab" => {
+                Some("[gitlab] keys now live directly under [executor] (dir is now tools_dir)")
+            }
+            "services" => Some("[services] is obsolete; remove it"),
+            _ => None,
+        })
+        .collect();
+    if !hints.is_empty() {
+        anyhow::bail!("{}", hints.join("\n"));
+    }
+    Ok(())
 }
 
 impl Config {
@@ -754,7 +806,7 @@ impl Config {
         }
     }
 
-    /// The GitLab host-checkout root: a private `vk` subtree of `[gitlab] checkout_dir` if set,
+    /// The GitLab host-checkout root: a private `vk` subtree of `[executor] checkout_dir` if set,
     /// else `<state_dir>/checkouts`. The namespace confines the sweep to virtkit's own trees, so
     /// an explicit root such as `/builds` can stay shared with another executor. The default root
     /// gets no such subtree: it is already virtkit's own directory, so
@@ -763,7 +815,7 @@ impl Config {
     /// checkouts are the executor's alone, so no caller can hand this the dev root `vk run`
     /// caches under and leave the idle sweep walking a tree nothing checks out into.
     pub fn checkout_root(&self) -> PathBuf {
-        match self.gitlab.as_ref().and_then(|g| g.checkout_dir.as_ref()) {
+        match self.executor.checkout_dir.as_ref() {
             Some(dir) => dir.join("vk"),
             None => self.state_dir().join("checkouts"),
         }
@@ -780,9 +832,8 @@ impl Config {
     /// keep checkouts longer without also pinning extracted image bases.
     pub fn checkout_cache_idle(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
-            self.gitlab
-                .as_ref()
-                .and_then(|g| g.checkout_cache_idle_secs)
+            self.executor
+                .checkout_cache_idle_secs
                 .unwrap_or_else(|| self.image_cache_idle().as_secs()),
         )
     }
@@ -835,17 +886,17 @@ mod tests {
     #[test]
     fn load_explicit_file_wins_over_fallbacks() {
         let dir = Dir::new("explicit");
-        let explicit = dir.file("explicit.toml", "[vm]\ncpus = 7\n");
-        let fallback = dir.file("fallback.toml", "[vm]\ncpus = 9\n");
+        let explicit = dir.file("explicit.toml", "[executor.vm]\ncpus = 7\n");
+        let fallback = dir.file("fallback.toml", "[executor.vm]\ncpus = 9\n");
         let cfg = load_resolved(Some(explicit.clone()), std::slice::from_ref(&fallback)).unwrap();
-        assert_eq!(cfg.vm.cpus, 7);
+        assert_eq!(cfg.executor.vm.cpus, 7);
         assert_eq!(cfg.source.as_deref(), Some(explicit.as_path()));
     }
 
     #[test]
     fn load_explicit_missing_is_an_error() {
         let dir = Dir::new("explicit-missing");
-        let fallback = dir.file("fallback.toml", "[vm]\ncpus = 9\n");
+        let fallback = dir.file("fallback.toml", "[executor.vm]\ncpus = 9\n");
         // The caller named the file; silently falling back would mask the typo.
         assert!(load_resolved(Some(dir.0.join("nope.toml")), &[fallback]).is_err());
     }
@@ -853,11 +904,11 @@ mod tests {
     #[test]
     fn load_first_existing_fallback_wins() {
         let dir = Dir::new("fallbacks");
-        let user = dir.file("user.toml", "[vm]\ncpus = 2\n");
-        let system = dir.file("system.toml", "[vm]\ncpus = 3\n");
+        let user = dir.file("user.toml", "[executor.vm]\ncpus = 2\n");
+        let system = dir.file("system.toml", "[executor.vm]\ncpus = 3\n");
         let missing = dir.0.join("missing.toml");
         let cfg = load_resolved(None, &[missing, user.clone(), system]).unwrap();
-        assert_eq!(cfg.vm.cpus, 2);
+        assert_eq!(cfg.executor.vm.cpus, 2);
         assert_eq!(cfg.source.as_deref(), Some(user.as_path()));
     }
 
@@ -865,7 +916,7 @@ mod tests {
     fn load_nothing_found_yields_defaults() {
         let dir = Dir::new("none");
         let cfg = load_resolved(None, &[dir.0.join("a.toml"), dir.0.join("b.toml")]).unwrap();
-        assert_eq!(cfg.vm.cpus, Vm::default().cpus);
+        assert_eq!(cfg.executor.vm.cpus, Vm::default().cpus);
         assert!(cfg.source.is_none());
     }
 
@@ -876,6 +927,16 @@ mod tests {
         assert!(load_resolved(None, &[bad]).is_err());
     }
 
+    /// The migration hint reaches the real file-load path, not just `reject_migrated_keys`:
+    /// a loaded file still carrying `[vm]` fails with the new location named.
+    #[test]
+    fn load_names_where_a_migrated_section_moved() {
+        let dir = Dir::new("migrated");
+        let stale = dir.file("stale.toml", "[vm]\ncpus = 1\n");
+        let err = format!("{:#}", load_resolved(Some(stale), &[]).unwrap_err());
+        assert!(err.contains("[executor.vm]"), "{err}");
+    }
+
     // `vk config` serializes the effective config to TOML; the defaults must
     // round-trip, and a scalar like image_cache_idle_secs must stay ahead of the
     // `[section]` tables (a value emitted after a table would re-parse into it).
@@ -883,26 +944,26 @@ mod tests {
     fn effective_config_round_trips() {
         let text = toml::to_string(&Config::default()).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
-        assert_eq!(back.vm.cpus, Config::default().vm.cpus);
+        assert_eq!(back.executor.vm.cpus, Config::default().executor.vm.cpus);
 
         let populated: Config = toml::from_str(
             r#"
             image_cache_idle_secs = 900
-            [vm]
-            cpus = 6
             [docker]
             repo = "reg.example.com/team"
             [registry]
             repo = "reg.example.com/bundles"
             [build]
             build_cache = "layers"
+            [executor.vm]
+            cpus = 6
             "#,
         )
         .unwrap();
         let text = toml::to_string(&populated).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.image_cache_idle_secs, Some(900));
-        assert_eq!(back.vm.cpus, 6);
+        assert_eq!(back.executor.vm.cpus, 6);
         assert_eq!(
             back.docker.as_ref().unwrap().repo.as_deref(),
             Some("reg.example.com/team")
@@ -910,17 +971,18 @@ mod tests {
         assert_eq!(back.build.build_cache, crate::build::BuildCache::Layers);
     }
 
-    /// `[vm] nested` is a host grant, so the default matters as much as the parse: a
+    /// `[executor.vm] nested` is a host grant, so the default matters as much as the parse: a
     /// serde name that drifted would reject every runner config that sets it
     /// (`deny_unknown_fields`), and a default that drifted would grant it unasked.
     #[test]
     fn vm_nested_parses_and_defaults_off() {
-        assert!(!Config::default().vm.nested);
-        let cfg: Config = toml::from_str("[vm]\nnested = true\n").unwrap();
-        assert!(cfg.vm.nested);
+        assert!(!Config::default().executor.vm.nested);
+        let cfg: Config = toml::from_str("[executor.vm]\nnested = true\n").unwrap();
+        assert!(cfg.executor.vm.nested);
         assert!(
-            !toml::from_str::<Config>("[vm]\nnested = false\n")
+            !toml::from_str::<Config>("[executor.vm]\nnested = false\n")
                 .unwrap()
+                .executor
                 .vm
                 .nested
         );
@@ -944,47 +1006,47 @@ mod tests {
     }
 
     #[test]
-    fn gitlab_tools_dir_parses() {
+    fn executor_tools_dir_parses() {
         let cfg: Config = toml::from_str(
             r#"
-            [gitlab]
-            dir = "/usr/local/lib/vk/ci-tools"
+            [executor]
+            tools_dir = "/usr/local/lib/vk/ci-tools"
             "#,
         )
         .unwrap();
         assert_eq!(
-            cfg.gitlab.as_ref().unwrap().dir.as_deref(),
+            cfg.executor.tools_dir.as_deref(),
             Some(Path::new("/usr/local/lib/vk/ci-tools"))
         );
     }
 
     #[test]
-    fn gitlab_checkout_dir_parses() {
+    fn executor_checkout_dir_parses() {
         let cfg: Config = toml::from_str(
             r#"
-            [gitlab]
+            [executor]
             host_checkout = true
             checkout_dir = "/builds"
             checkout_cache_idle_secs = 7200
             "#,
         )
         .unwrap();
-        let g = cfg.gitlab.as_ref().unwrap();
-        assert!(g.host_checkout);
-        assert_eq!(g.checkout_dir.as_deref(), Some(Path::new("/builds")));
+        let ex = &cfg.executor;
+        assert!(ex.host_checkout);
+        assert_eq!(ex.checkout_dir.as_deref(), Some(Path::new("/builds")));
         assert_eq!(cfg.checkout_root(), Path::new("/builds/vk"));
         assert_eq!(cfg.checkout_cache_idle().as_secs(), 7200);
         // absent = None: the on-disk `<state_dir>/checkouts` default is preserved, and the
         // checkout lifetime is the image cache's.
-        let bare: Config = toml::from_str("[gitlab]\ndir = \"/x\"\n").unwrap();
-        assert!(bare.gitlab.as_ref().unwrap().checkout_dir.is_none());
+        let bare: Config = toml::from_str("[executor]\ntools_dir = \"/x\"\n").unwrap();
+        assert!(bare.executor.checkout_dir.is_none());
         assert_eq!(
             bare.checkout_root(),
             Path::new("/var/lib/virtkit/checkouts"),
             "the default root is the executor's state dir, which is what `vk gc` must sweep"
         );
         assert_eq!(bare.checkout_cache_idle(), bare.image_cache_idle());
-        // No `[gitlab]` at all still resolves a root, and a configured state dir moves it.
+        // No `[executor]` table at all still resolves a root, and a configured state dir moves it.
         assert_eq!(
             Config::default().checkout_root(),
             Path::new("/var/lib/virtkit/checkouts")
@@ -997,20 +1059,64 @@ mod tests {
     }
 
     #[test]
-    fn no_gitlab_section_means_no_tools() {
-        let cfg = Config::default();
-        assert!(cfg.gitlab.is_none());
+    fn executor_tools_dir_defaults_unset() {
+        assert!(Config::default().executor.tools_dir.is_none());
     }
 
     #[test]
-    fn gitlab_checkout_overlay_defaults_on() {
+    fn executor_checkout_overlay_defaults_on() {
         // Both construction paths must agree: serde with the field absent, and Default.
-        let cfg: Config = toml::from_str("[gitlab]\nhost_checkout = true\n").unwrap();
-        assert!(cfg.gitlab.as_ref().unwrap().checkout_overlay);
-        assert!(Gitlab::default().checkout_overlay);
+        let cfg: Config = toml::from_str("[executor]\nhost_checkout = true\n").unwrap();
+        assert!(cfg.executor.checkout_overlay);
+        assert!(Executor::default().checkout_overlay);
         let off: Config =
-            toml::from_str("[gitlab]\nhost_checkout = true\ncheckout_overlay = false\n").unwrap();
-        assert!(!off.gitlab.as_ref().unwrap().checkout_overlay);
+            toml::from_str("[executor]\nhost_checkout = true\ncheckout_overlay = false\n").unwrap();
+        assert!(!off.executor.checkout_overlay);
+    }
+
+    /// The nested tables parse under `[executor.*]` and round-trip through `vk config`.
+    #[test]
+    fn executor_nested_tables_parse_and_round_trip() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [executor.vm]
+            cpus = 6
+            [executor.guest]
+            builds_dir = "/work"
+            [executor.auth]
+            ssh_agent = true
+            [executor.schedule]
+            mem_budget = "48G"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.executor.vm.cpus, 6);
+        assert_eq!(cfg.executor.guest.builds_dir, "/work");
+        assert!(cfg.executor.auth.ssh_agent);
+        assert_eq!(cfg.executor.schedule.mem_budget.as_deref(), Some("48G"));
+        let back: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.executor.vm.cpus, 6);
+        assert_eq!(back.executor.schedule.mem_budget.as_deref(), Some("48G"));
+    }
+
+    /// Every section that moved under `[executor]` is refused at load with a hint
+    /// pointing at the new location, rather than silently ignored.
+    #[test]
+    fn migrated_top_level_sections_are_refused_with_a_hint() {
+        let refuse = |text: &str| -> String {
+            let table: toml::Table = toml::from_str(text).unwrap();
+            format!("{:#}", reject_migrated_keys(&table).unwrap_err())
+        };
+        assert!(refuse("[vm]\ncpus = 1\n").contains("[executor.vm]"));
+        assert!(refuse("[guest]\nbuilds_dir = \"/w\"\n").contains("[executor.guest]"));
+        assert!(refuse("[share]\ndir = \"/w\"\n").contains("[executor.share]"));
+        assert!(refuse("[auth]\nssh_agent = true\n").contains("[executor.auth]"));
+        assert!(refuse("[schedule]\nmem_budget = \"1G\"\n").contains("[executor.schedule]"));
+        assert!(refuse("[gitlab]\ndir = \"/x\"\n").contains("tools_dir"));
+        assert!(refuse("[services]\nstore_dir = \"/x\"\n").contains("obsolete"));
+        // A config already on the new layout passes the check.
+        let ok: toml::Table = toml::from_str("[executor.vm]\ncpus = 1\n").unwrap();
+        assert!(reject_migrated_keys(&ok).is_ok());
     }
 
     /// Reject `[services]` so obsolete keys cannot appear to take effect.
@@ -1104,10 +1210,10 @@ mod tests {
 
     #[test]
     fn auth_ssh_agent_parses() {
-        let cfg: Config = toml::from_str("[auth]\nssh_agent = true\n").unwrap();
-        assert!(cfg.auth.ssh_agent);
-        // absent [auth] = off
-        assert!(!Config::default().auth.ssh_agent);
+        let cfg: Config = toml::from_str("[executor.auth]\nssh_agent = true\n").unwrap();
+        assert!(cfg.executor.auth.ssh_agent);
+        // absent [executor.auth] = off
+        assert!(!Config::default().executor.auth.ssh_agent);
     }
 
     #[test]

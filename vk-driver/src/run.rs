@@ -857,7 +857,7 @@ async fn resolve_source(args: &RunArgs) -> Result<Source> {
 }
 
 /// Whether the VM booted as the primary nests: the caller's own request — `vk run --nested`,
-/// or the runner's `[vm] nested` on the CI executor — or the primary service's own
+/// or the runner's `[executor.vm] nested` on the CI executor — or the primary service's own
 /// `x-virtkit.nested`. Nesting is a capability, not a setting with a default to override, so
 /// the two are ORed rather than ranked the way the sizing and init/kernel axes are, which
 /// also means a primary service declaring it nests with or without the request. Shared with
@@ -2566,7 +2566,7 @@ fn default_dax(units: &mut [crate::compose::Unit], policy: Option<crate::vmm::Da
     }
 }
 
-/// Prefer the guest's `x-virtkit.dax`, then the run's `--dax` / `[vm] dax`, then the
+/// Prefer the guest's `x-virtkit.dax`, then the run's `--dax` / `[executor.vm] dax`, then the
 /// default window.
 pub(crate) fn effective_dax(
     declared: Option<crate::vmm::Dax>,
@@ -2621,7 +2621,7 @@ pub(crate) fn wants_reclaim(init: InitSource, balloon: bool) -> bool {
     !init.is_image() && balloon
 }
 
-/// Prefer the guest's `x-virtkit.reclaim`, then the run's `--reclaim` / `[vm] reclaim`,
+/// Prefer the guest's `x-virtkit.reclaim`, then the run's `--reclaim` / `[executor.vm] reclaim`,
 /// then `auto`.
 pub(crate) fn effective_reclaim(
     declared: Option<vk_core::reclaim::Policy>,

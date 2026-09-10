@@ -1130,7 +1130,7 @@ mod tests {
 
     /// A minimal guest: agent initramfs + a rw qcow2 stage disk + a read-only raw
     /// source disk (COPY --from style), with API/net/balloon off and unshared memory —
-    /// the balloon-off spelling `[vm] balloon = false` selects, gating `--balloon` away.
+    /// the balloon-off spelling `[executor.vm] balloon = false` selects, gating `--balloon` away.
     #[test]
     fn build_session_initramfs_and_source_disks() {
         let ch = CloudHypervisor {

@@ -59,11 +59,11 @@ pub fn acquire(
 ) -> Result<Reservation> {
     if want_mib > budget_mib {
         // A per-job MICROVM_MEM is clamped to the budget before it reaches here, so a size
-        // that still exceeds it came from the host's own `[vm] mem` default: name both, or the
+        // that still exceeds it came from the host's own `[executor.vm] mem` default: name both, or the
         // message sends the reader after a job variable that is not the cause.
         bail!(
             "this job's {want_mib} MiB of guest memory exceeds the host's whole {budget_mib} MiB \
-             budget ([schedule] mem_budget vs [vm] mem) — it can never be admitted"
+             budget ([executor.schedule] mem_budget vs [executor.vm] mem) — it can never be admitted"
         );
     }
     std::fs::DirBuilder::new()
@@ -148,7 +148,7 @@ pub fn acquire(
             let _ = std::fs::remove_file(&path);
             bail!(
                 "no room in the host's {budget_mib} MiB memory budget for this job's \
-                 {want_mib} MiB within {}s ([schedule] wait_timeout_secs)",
+                 {want_mib} MiB within {}s ([executor.schedule] wait_timeout_secs)",
                 timeout.as_secs()
             );
         }
@@ -208,7 +208,7 @@ const HEADROOM_PCT: u64 = 25;
 /// trivially may not next time.
 const FLOOR_MIB: u64 = 512;
 /// Bytes to a MiB, for the boundary between a history in bytes and the reservation
-/// arithmetic in MiB — which is the unit the ledger, `[vm] mem` and `MICROVM_MEM` all use.
+/// arithmetic in MiB — which is the unit the ledger, `[executor.vm] mem` and `MICROVM_MEM` all use.
 const MIB: u64 = 1024 * 1024;
 
 /// One remembered run: when it ended, the peak it reached, the ceiling it ran under, how full
@@ -630,7 +630,7 @@ fn history_summary_at(
 
 /// What every job of a project has been using, as a table for an operator sizing a host:
 /// one row per job, heaviest first, and a closing line saying what the lot would reserve if
-/// they all ran at once — the figure `[schedule] mem_budget` has to cover.
+/// they all ran at once — the figure `[executor.schedule] mem_budget` has to cover.
 ///
 /// `project` narrows it to the projects whose directory (`<id>-<slug>`) contains it, so the
 /// slug alone will do; empty reports every project this host remembers. `None` when nothing
@@ -860,11 +860,11 @@ fn together(
         // A budget this host cannot read is not the absence of one: every job's prepare is
         // already failing on it, and saying "no budget" would send the reader the wrong way.
         Some(Err(why)) => {
-            format!(", against a [schedule] mem_budget this host cannot read ({why})")
+            format!(", against a [executor.schedule] mem_budget this host cannot read ({why})")
         }
         // Nothing to compare against, and saying so beats an unqualified total: without
-        // `[schedule] mem_budget` nothing is held back whatever the figure says.
-        None => ", with no [schedule] mem_budget to hold them back".to_string(),
+        // `[executor.schedule] mem_budget` nothing is held back whatever the figure says.
+        None => ", with no [executor.schedule] mem_budget to hold them back".to_string(),
     };
     format!(
         "virtkit: {} {plural}; all at once they would reserve {}{budget}\n",
@@ -944,7 +944,7 @@ fn label_rows(jobs: &mut [JobUsage]) {
 }
 
 fn fmt_mib(mib: u64) -> String {
-    // Saturating: a `[schedule] mem_budget` absurd enough to survive its own `checked_mul` is
+    // Saturating: a `[executor.schedule] mem_budget` absurd enough to survive its own `checked_mul` is
     // still a figure this has to print rather than wrap on.
     crate::usage::fmt_bytes(mib.saturating_mul(MIB))
 }
@@ -1977,7 +1977,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
         assert!(
             all.ends_with(
                 "virtkit: 3 jobs; all at once they would reserve 8.4 GiB, \
-                 with no [schedule] mem_budget to hold them back\n"
+                 with no [executor.schedule] mem_budget to hold them back\n"
             ),
             "{all}"
         );

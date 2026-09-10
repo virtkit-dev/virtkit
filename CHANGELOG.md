@@ -6,8 +6,15 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
-- **A CI job's guest is named `vk` by default, not `runner`.** Set `[vm] hostname` to keep
-  the old name.
+- **The GitLab executor's host config moved under one `[executor]` table.** `[vm]`, `[guest]`,
+  `[share]`, `[auth]` and `[schedule]` are now `[executor.vm]`, `[executor.guest]`,
+  `[executor.share]`, `[executor.auth]` and `[executor.schedule]`; the former `[gitlab]` keys
+  live directly under `[executor]`, where `dir` is now `tools_dir`. Nothing under `[executor]`
+  is read by `vk run` or `vk build`. A config still carrying any old top-level key is refused
+  at load, naming where it moved. Guest-stats recording (`[executor] atop`) is now on by
+  default even without an `[executor]` table.
+- **A CI job's guest is named `vk` by default, not `runner`.** Set `[executor.vm] hostname`
+  to keep the old name.
 
 ### Removed
 

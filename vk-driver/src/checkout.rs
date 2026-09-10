@@ -1,4 +1,4 @@
-//! Host-side git checkout for the GitLab executor's `[gitlab] host_checkout` mode.
+//! Host-side git checkout for the GitLab executor's `[executor] host_checkout` mode.
 //!
 //! `prepare` checks the job's sources out ON THE HOST and shares the tree into the guest, so
 //! the git credential (embedded by GitLab in `CI_REPOSITORY_URL`) never enters the guest and

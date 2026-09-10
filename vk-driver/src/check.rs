@@ -35,7 +35,7 @@ pub enum Feature {
     Registry,
     /// gitlab executor: state and tools dirs usable, guest stats and nesting supported
     Gitlab,
-    /// [share]: shared dir readable, a virtiofsd available when needed
+    /// [executor.share]: shared dir readable, a virtiofsd available when needed
     Share,
     /// CI `services:`: the shared image cache they pull into is writable
     Services,
@@ -1091,21 +1091,21 @@ fn gitlab(cfg: &Config) -> Outcome {
     if let Err(e) = dir_writable(&jobs) {
         return fail(format!("{e} (per-job state lives there; see state_dir)"));
     }
-    if let Some(gl) = &cfg.gitlab
-        && let Some(dir) = &gl.dir
+    if let Some(dir) = &cfg.executor.tools_dir
         && let Err(e) = std::fs::read_dir(dir)
     {
         return fail(format!(
-            "[gitlab] tools dir {} unreadable: {e}",
+            "[executor] tools_dir {} unreadable: {e}",
             dir.display()
         ));
     }
-    // `[vm] nested` needs host KVM loaded with nested=1. vm::prepare refuses each job it
+    // `[executor.vm] nested` needs host KVM loaded with nested=1. vm::prepare refuses each job it
     // would boot; failing here too catches the runner before any of them, as the atop
     // interval below does.
-    if let Err(e) =
-        crate::vm::refuse_unsupported_nesting(cfg.vm.nested, crate::vmm::host_nesting_enabled())
-    {
+    if let Err(e) = crate::vm::refuse_unsupported_nesting(
+        cfg.executor.vm.nested,
+        crate::vmm::host_nesting_enabled(),
+    ) {
         return fail(format!("{e:#}"));
     }
     // Guest statistics recording: whether jobs are recorded, and whether the archive they
@@ -1125,10 +1125,10 @@ fn gitlab(cfg: &Config) -> Outcome {
             },
         }
     } else {
-        "guest stats off (`[gitlab] atop`)".to_string()
+        "guest stats off (`[executor] atop`)".to_string()
     };
-    let nesting = if cfg.vm.nested {
-        "job VMs may nest (`[vm] nested`)"
+    let nesting = if cfg.executor.vm.nested {
+        "job VMs may nest (`[executor.vm] nested`)"
     } else {
         "no nesting"
     };
@@ -1139,8 +1139,8 @@ fn gitlab(cfg: &Config) -> Outcome {
 }
 
 fn share(cfg: &Config) -> Outcome {
-    let Some(s) = &cfg.share else {
-        return skip("[share] not configured");
+    let Some(s) = &cfg.executor.share else {
+        return skip("[executor.share] not configured");
     };
     if let Err(e) = std::fs::read_dir(&s.dir) {
         return fail(format!("share dir {} unreadable: {e}", s.dir.display()));
@@ -1222,7 +1222,7 @@ fn dir_writable(dir: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Gitlab;
+    use crate::config::Executor;
 
     /// The pre-boot refusal names what is wrong with the device: absent, or not KVM at all
     /// (a regular file opens rw but has no KVM ioctls — ENOTTY).
@@ -1510,15 +1510,15 @@ mod tests {
     fn the_gitlab_check_reports_the_guest_statistics_archive() {
         let root = std::env::temp_dir().join(format!("vk-check-atop-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let with = |gl: Gitlab| Config {
+        let with = |ex: Executor| Config {
             source: Some(root.join("config.toml")),
             state_dir: Some(root.clone()),
-            gitlab: Some(gl),
+            executor: ex,
             ..Default::default()
         };
 
         // On by default: the interval and where the days of recordings go.
-        let out = gitlab(&with(Gitlab::default()));
+        let out = gitlab(&with(Executor::default()));
         assert_eq!(out.status, Status::Ok, "{}", out.detail);
         assert!(
             out.detail.contains("guest stats every 10s"),
@@ -1540,7 +1540,7 @@ mod tests {
         assert!(out.detail.contains("no nesting"), "{}", out.detail);
 
         // Turned off, the check says so rather than going quiet about it.
-        let out = gitlab(&with(Gitlab {
+        let out = gitlab(&with(Executor {
             atop: false,
             ..Default::default()
         }));
@@ -1548,7 +1548,7 @@ mod tests {
         assert!(out.detail.contains("guest stats off"), "{}", out.detail);
 
         // An interval no job could sample at fails the check, naming the setting.
-        let out = gitlab(&with(Gitlab {
+        let out = gitlab(&with(Executor {
             atop_interval_secs: 0,
             ..Default::default()
         }));

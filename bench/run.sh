@@ -3,7 +3,7 @@
 #
 # Boots a throwaway microVM with a host tmpfs shared read-write at /work, then runs the
 # per-op microbench (the fsbench crate) against the raw share, against an overlay whose
-# lower is the share and whose upper/work are guest tmpfs (what `[gitlab] checkout_overlay`
+# lower is the share and whose upper/work are guest tmpfs (what `[executor] checkout_overlay`
 # mounts), and against a plain in-guest tmpfs (the "shmfs" floor). fsbench is executed
 # from /work so a noexec target dir does not bite.
 #

@@ -191,7 +191,7 @@ Exit codes follow the custom-executor contract: script failures exit with
   the native OCI client and booted directly (embedded kernel + agent; see below).
 - `dockerfile:<path>[?context=<dir>&buildcontext=NAME=DIR&arg=NAME=VALUE][#<stage>]` — a
   git-defined image: built from the job's host-side checkout (the `vk build` path, cached
-  and shared across jobs and runners) and booted. Requires `[gitlab] host_checkout`.
+  and shared across jobs and runners) and booted. Requires `[executor] host_checkout`.
 - `compose:<file>#<primary>` — a fleet from a compose file in the checkout: `<primary>`
   becomes the job VM, the rest boot as siblings. Same `host_checkout` requirement.
 

@@ -616,7 +616,7 @@ enum Cmd {
     /// Measures the memory its jobs have committed and leaves the concurrency that fits where
     /// the root-side `vk-runnerctl` applies it. Run from a timer every half minute or so (see
     /// the GitLab CI guide), so it is hidden from the everyday help like `vk gitlab`. Needs
-    /// `[schedule] mem_budget`.
+    /// `[executor.schedule] mem_budget`.
     #[command(hide = true)]
     Tune,
     /// GitLab custom executor
@@ -2582,8 +2582,8 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
             "  jobs dir      {} (per-job runtime state, removed at job cleanup)",
             exec_state.join("jobs").display()
         )?;
-        let checkouts_note = match cfg.gitlab.as_ref().and_then(|g| g.checkout_dir.as_ref()) {
-            Some(_) => "private subtree of `[gitlab] checkout_dir`",
+        let checkouts_note = match cfg.executor.checkout_dir.as_ref() {
+            Some(_) => "private subtree of `[executor] checkout_dir`",
             None => "default: <executor state dir>/checkouts",
         };
         writeln!(
@@ -2596,20 +2596,23 @@ fn paths_report(cfg: &Config, gitlab: bool) -> anyhow::Result<String> {
                 "per-job guest stats in `atop -P` format, one directory per day, {}",
                 atop::retention_note(cfg)
             ),
-            false => "off (`[gitlab] atop`)".to_string(),
+            false => "off (`[executor] atop`)".to_string(),
         };
         writeln!(
             out,
             "  atop archive  {} ({stats_note})",
             atop::archive_root(cfg).display()
         )?;
-        match cfg.gitlab.as_ref().and_then(|g| g.dir.as_ref()) {
+        match cfg.executor.tools_dir.as_ref() {
             Some(d) => writeln!(
                 out,
-                "  tools dir     {} (`[gitlab] dir`) — static tools shared read-only into job VMs",
+                "  tools dir     {} (`[executor] tools_dir`) — static tools shared read-only into job VMs",
                 d.display()
             )?,
-            None => writeln!(out, "  tools dir     (unset; override: `[gitlab] dir`)")?,
+            None => writeln!(
+                out,
+                "  tools dir     (unset; override: `[executor] tools_dir`)"
+            )?,
         }
     } else {
         writeln!(out)?;
@@ -3850,8 +3853,8 @@ async fn cli_main(cli: Cli) -> ExitCode {
                         "name": "virtkit",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
-                    "builds_dir": ctx.cfg.guest.builds_dir,
-                    "cache_dir": ctx.cfg.guest.cache_dir,
+                    "builds_dir": ctx.cfg.executor.guest.builds_dir,
+                    "cache_dir": ctx.cfg.executor.guest.cache_dir,
                     "builds_dir_is_shared": false,
                 });
                 println!("{info}");
@@ -3895,7 +3898,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                     &history,
                     project.as_deref().unwrap_or(""),
                     budget,
-                    ctx.cfg.schedule.from_history,
+                    ctx.cfg.executor.schedule.from_history,
                 ) {
                     Some(report) => print!("{report}"),
                     // Not a failure either way, but say which: a runner that has run nothing

@@ -1,4 +1,4 @@
-//! Host side of the per-job guest statistics recording (`[gitlab] atop`).
+//! Host side of the per-job guest statistics recording (`[executor] atop`).
 //!
 //! A CI job gets its own microVM, so the guest is the job: the in-guest agent samples
 //! its own `/proc` and appends the samples in the text format `atop -P` prints (the schema
@@ -24,39 +24,28 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use vk_core::atop::{LOG_NAME, date_dir, day_of, now_epoch, parse_date_dir};
 
-use crate::config::{Config, Gitlab};
+use crate::config::Config;
 use crate::jobctx::JobCtx;
 
-/// Whether this host records what its jobs' guests do (`[gitlab] atop`, on by
-/// default). Off for a host with no `[gitlab]` table at all: it runs no executor.
+/// Whether this host records what its jobs' guests do (`[executor] atop`, on by default).
 pub fn enabled(cfg: &Config) -> bool {
-    cfg.gitlab.as_ref().is_some_and(|g| g.atop)
+    cfg.executor.atop
 }
 
 /// The configured sampling interval. An interval of zero would have the guest sampling
 /// without pause, so it is rejected here — where the error names the setting — rather
 /// than clamped to something the operator did not ask for.
 pub fn interval_secs(cfg: &Config) -> Result<u64> {
-    // A host with no [gitlab] table configured nothing, so it gets the default rather than a
-    // zero that would name a setting the operator never wrote.
-    let secs = cfg.gitlab.as_ref().map_or_else(
-        || Gitlab::default().atop_interval_secs,
-        |g| g.atop_interval_secs,
-    );
+    let secs = cfg.executor.atop_interval_secs;
     if secs == 0 {
-        bail!("[gitlab] atop_interval_secs must be at least 1 second (got 0)");
+        bail!("[executor] atop_interval_secs must be at least 1 second (got 0)");
     }
     Ok(secs)
 }
 
-/// How many days of recorded jobs the archive keeps (`[gitlab] atop_retention_days`).
+/// How many days of recorded jobs the archive keeps (`[executor] atop_retention_days`).
 pub fn retention_days(cfg: &Config) -> u64 {
-    // A host with no [gitlab] table configured nothing, so it gets the default rather than a
-    // zero that would read as an explicit "keep only today".
-    cfg.gitlab.as_ref().map_or_else(
-        || Gitlab::default().atop_retention_days,
-        |g| g.atop_retention_days,
-    )
+    cfg.executor.atop_retention_days
 }
 
 /// How the retention window reads in a report. `0` still keeps what is being recorded now, so
@@ -121,7 +110,7 @@ pub fn job_archive_dir(ctx: &JobCtx) -> Option<PathBuf> {
 /// would charge every job on a busy runner for a recursive removal of trees that earlier
 /// jobs' guests filled, on the path where the job is waiting to boot.
 ///
-/// Tied to recording being on, so `[gitlab] atop = false` stops the reclamation with it: an
+/// Tied to recording being on, so `[executor] atop = false` stops the reclamation with it: an
 /// archive already on disk then stays until it is removed by hand.
 pub fn prune_archive_daily(cfg: &Config) {
     prune_archive_daily_as_of(cfg, now_epoch());
@@ -159,7 +148,7 @@ pub fn resolve(cfg: &Config, target: &str) -> Result<PathBuf> {
     // the alternative is an ENOENT on a path the operator never configured. A path target
     // is exempt — it names its recording itself, wherever that host got it from.
     if !is_path_target(target) && !root.exists() && !enabled(cfg) {
-        bail!("nothing recorded on this host (`[gitlab] atop` is off)");
+        bail!("nothing recorded on this host (`[executor] atop` is off)");
     }
     resolve_in(&root, target)
 }
@@ -285,7 +274,7 @@ fn resolve_in(root: &Path, target: &str) -> Result<PathBuf> {
     }
     bail!(
         "no recorded job matches {target:?} in {} (a job id, or part of a recorded job's \
-         directory name; the archive keeps only the last `[gitlab] atop_retention_days` days)",
+         directory name; the archive keeps only the last `[executor] atop_retention_days` days)",
         root.display()
     );
 }
@@ -355,29 +344,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recording_is_on_for_an_executor_host_and_off_without_one() {
+    fn recording_is_on_by_default_and_off_when_turned_off() {
         let mut cfg = Config::default();
-        assert!(!enabled(&cfg), "no [gitlab] table: no executor here");
-        cfg.gitlab = Some(Gitlab::default());
-        assert!(enabled(&cfg), "on by default once the executor is set up");
+        assert!(
+            enabled(&cfg),
+            "on by default, even without an [executor] table"
+        );
         assert_eq!(interval_secs(&cfg).unwrap(), 10);
         assert_eq!(retention_days(&cfg), 14);
-        // Neither figure is read off a host that configured nothing: the default window, not
-        // a zero that would sweep everything but today.
-        assert_eq!(retention_days(&Config::default()), 14);
-        assert_eq!(interval_secs(&Config::default()).unwrap(), 10);
 
-        cfg.gitlab = Some(Gitlab {
-            atop: false,
-            ..Default::default()
-        });
+        cfg.executor.atop = false;
         assert!(!enabled(&cfg));
 
         // A zero interval would have the guest sampling in a loop: name the setting.
-        cfg.gitlab = Some(Gitlab {
-            atop_interval_secs: 0,
-            ..Default::default()
-        });
+        cfg.executor.atop_interval_secs = 0;
         let e = interval_secs(&cfg).expect_err("zero is rejected");
         assert!(format!("{e:#}").contains("atop_interval_secs"), "{e:#}");
     }
@@ -443,7 +423,6 @@ mod tests {
         // The lookup is rooted at the archive under the state dir, not at the cwd.
         let cfg = Config {
             state_dir: Some(state.clone()),
-            gitlab: Some(Gitlab::default()),
             ..Default::default()
         };
         assert_eq!(archive_root(&cfg), root);
@@ -451,12 +430,12 @@ mod tests {
         std::fs::remove_dir_all(&state).unwrap();
     }
 
-    /// A path target answers on any host — a machine with no executor configured can still
-    /// be handed the path a run printed — while a job lookup on such a host still says
-    /// plainly that nothing is recorded here.
+    /// A path target answers even with recording off — a host that turned it off can still
+    /// be handed the path a run printed — while a job lookup there still says plainly that
+    /// nothing is recorded here.
     #[test]
     fn a_path_target_answers_with_recording_off() {
-        let state = std::env::temp_dir().join(format!("vk-atop-nogitlab-{}", std::process::id()));
+        let state = std::env::temp_dir().join(format!("vk-atop-off-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&state);
         let dir = state.join("somewhere");
         std::fs::create_dir_all(&dir).unwrap();
@@ -464,10 +443,13 @@ mod tests {
         std::fs::write(&log, b"RESET\nSEP\n").unwrap();
         let cfg = Config {
             state_dir: Some(state.clone()),
-            gitlab: None,
+            executor: crate::config::Executor {
+                atop: false,
+                ..Default::default()
+            },
             ..Default::default()
         };
-        assert!(!enabled(&cfg), "no [gitlab] table: no recording here");
+        assert!(!enabled(&cfg), "recording off: nothing recorded here");
         assert_eq!(resolve(&cfg, &log.to_string_lossy()).unwrap(), log);
         assert_eq!(
             resolve(&cfg, &dir.to_string_lossy()).unwrap(),
@@ -475,21 +457,6 @@ mod tests {
             "the directory holding the log answers too"
         );
         let e = resolve(&cfg, "42137").expect_err("a job lookup has no archive to search");
-        assert!(format!("{e:#}").contains("nothing recorded"), "{e:#}");
-
-        // The same on the other host the refusal names: one that has the table and turned
-        // recording off, which is the case its message actually describes.
-        let off = Config {
-            state_dir: Some(state.clone()),
-            gitlab: Some(Gitlab {
-                atop: false,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(!enabled(&off));
-        assert_eq!(resolve(&off, &log.to_string_lossy()).unwrap(), log);
-        let e = resolve(&off, "42137").expect_err("a job lookup has no archive to search");
         assert!(format!("{e:#}").contains("nothing recorded"), "{e:#}");
         std::fs::remove_dir_all(&state).unwrap();
     }
@@ -509,7 +476,6 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, &planted).unwrap();
         let cfg = Config {
             state_dir: Some(dir.clone()),
-            gitlab: None,
             ..Default::default()
         };
         // Named directly, and found by naming the directory holding it: refused either way.
@@ -667,7 +633,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let cfg = Config {
             state_dir: Some(root.clone()),
-            gitlab: Some(Gitlab::default()),
             ..Default::default()
         };
         let archive = archive_root(&cfg);
@@ -699,7 +664,6 @@ mod tests {
     fn the_archive_is_a_dated_directory_under_the_state_dir() {
         let cfg = Config {
             state_dir: Some(PathBuf::from("/var/lib/vk")),
-            gitlab: Some(Gitlab::default()),
             ..Default::default()
         };
         assert_eq!(archive_root(&cfg), PathBuf::from("/var/lib/vk/atop"));
@@ -715,7 +679,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let cfg = Config {
             state_dir: Some(root.clone()),
-            gitlab: Some(Gitlab::default()),
             ..Default::default()
         };
         let ctx = JobCtx::new_for_job(cfg, "job1".into()).expect("a job context");

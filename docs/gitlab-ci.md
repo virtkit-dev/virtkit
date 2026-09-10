@@ -39,7 +39,7 @@ Job VMs mask VMX/SVM, so a job cannot boot microVMs of its own. A runner that
 hosts jobs which build or test virtkit itself grants them that:
 
 ```toml
-[vm]
+[executor.vm]
 nested = true
 ```
 
@@ -77,7 +77,7 @@ sources on the runner instead of in the guest. Point `checkout_dir` at the runne
 tmpfs when the state disk is too slow:
 
 ```toml
-[gitlab]
+[executor]
 host_checkout = true
 checkout_dir = "/builds"
 checkout_cache_idle_secs = 1800
@@ -115,8 +115,8 @@ does not override the host default.
 | Variable | Effect |
 | --- | --- |
 | `MICROVM_IMAGE` | Guest image (prefix-based source; see below). Unset → `local/default`. |
-| `MICROVM_CPUS` | vCPU count, clamped to the host `[vm] max_cpus` ceiling. |
-| `MICROVM_MEM` | Guest RAM as `<n>G`, clamped to `[vm] max_mem`. |
+| `MICROVM_CPUS` | vCPU count, clamped to the host `[executor.vm] max_cpus` ceiling. |
+| `MICROVM_MEM` | Guest RAM as `<n>G`, clamped to `[executor.vm] max_mem`. |
 | `MICROVM_USER` | User to run the job as inside the guest. |
 | `MICROVM_EGRESS_ALLOW_IP` / `_ALLOW_NAME` / `_AUDIT` | Narrow the run-phase egress cap (see [Egress](#egress-control)). |
 | `MICROVM_BUILD_EGRESS_ALLOW_IP` / `_ALLOW_NAME` / `_AUDIT` | Narrow the build-phase egress cap. |
@@ -144,15 +144,15 @@ job's plain GitLab `image:` is read the same way):
   declares an extra repo-root-relative directory a `COPY --from=NAME` or
   `RUN --mount=…,from=NAME` may read, and `#<stage>` selects a stage. Every path stays
   inside the checkout. Built images are cached and shared across
-  jobs and runners. Requires `[gitlab] host_checkout`;
+  jobs and runners. Requires `[executor] host_checkout`;
 - `compose:<file>#<primary>` — a whole fleet from a compose file in the checkout:
   boots `<primary>` as the job VM and the other services (built or pulled the
   same way) as siblings on the job network. Same `host_checkout` requirement.
   A service sizes its own guest with an `x-virtkit: { cpus:, mem: }` marker
-  (default 2 vCPUs / 1G), clamped to the host `[vm] max_cpus`/`max_mem` ceilings
+  (default 2 vCPUs / 1G), clamped to the host `[executor.vm] max_cpus`/`max_mem` ceilings
   like the job's own `MICROVM_CPUS`/`MICROVM_MEM`; the primary keeps following
   those job variables. `x-virtkit: { nested: true }` needs the runner to have set
-  [`[vm] nested`](#nested-virtualization) and is refused when the fleet loads
+  [`[executor.vm] nested`](#nested-virtualization) and is refused when the fleet loads
   otherwise: nesting reaches host KVM, so it is the runner's decision rather than
   a job's, the same way the executor never hands a job the guest PMU. A service's
   persistent state — `x-virtkit: { persist_root: true }`, `overlay,persist` volumes
@@ -234,10 +234,10 @@ shared the host process with another (both would be charged for each other's gue
 the host could spare no sampler thread for.
 
 `overlay` is how full the job filled its **writable layer**, against what that layer held.
-With `[gitlab] checkout_overlay` (the default) a job builds on an overlay above its checkout
+With `[executor] checkout_overlay` (the default) a job builds on an overlay above its checkout
 whose upper layer is a tmpfs inside the VM, so every write under `CI_PROJECT_DIR` — the build
 tree, a package cache pointed there, an unpacked archive — is guest RAM, capped at
-`[gitlab] checkout_overlay_size` (80% of the VM's memory by default). That cap is a wall a job
+`[executor] checkout_overlay_size` (80% of the VM's memory by default). That cap is a wall a job
 can hit: it fails with `ENOSPC` while every disk on the host sits empty, and the `written`
 figure beside it says the job wrote nothing at all, because none of those pages ever reached a
 block device. Read the pair as the room the job had left — `4.2 GiB of 16.0 GiB` has plenty,
@@ -251,7 +251,7 @@ none — as does one on a guest whose agent is older than the figure.
 
 ### Sizing the writable layer
 
-`[gitlab] checkout_overlay_size` is where the two failures either side of that wall are traded
+`[executor] checkout_overlay_size` is where the two failures either side of that wall are traded
 off, and the mark above is what to size it from:
 
 - **too low** and a job dies for want of a partition on a VM that had the memory for it — the
@@ -262,7 +262,7 @@ off, and the mark above is what to size it from:
 
 It costs nothing below the cap: tmpfs pages are allocated on use, so a job that never fills the
 layer is unaffected by how large it was allowed to grow. Nor does raising it commit host memory
-— `[schedule]` admission reserves `MICROVM_MEM` either way, so the host is already sized for a
+— `[executor.schedule]` admission reserves `MICROVM_MEM` either way, so the host is already sized for a
 job that uses all of its VM.
 
 The default is 80% rather than the kernel's own 50% tmpfs default. That default exists to keep
@@ -278,7 +278,7 @@ was handed over to be written out. Two consequences are worth expecting rather t
 discovering:
 
 - work that never reaches a disk is not counted, because there is nothing to count: a
-  `[gitlab] checkout_dir` pointed at the runner's builds tmpfs, or a guest write absorbed by
+  `[executor] checkout_dir` pointed at the runner's builds tmpfs, or a guest write absorbed by
   its overlay, is RAM, and a tmpfs page never reaches the block layer;
 - a job re-run on a warm host reads far less than the same job on a cold one, which is the
   cache doing its job rather than the measurement wavering.
@@ -482,13 +482,13 @@ share of its own archive directory — the one directory it can write, and it ca
 and any amount into it until the job ends — and it boots with `psi=1`, which its own scheduler
 pays for in exchange for the `PSI` label. `atop = false` gives up the recording and the share;
 the guest still boots with `psi=1`, since idle page-cache trimming asks for the same figures —
-only turning that off as well (`[vm] reclaim` or `[vm] balloon`) gives the scheduler it back.
+only turning that off as well (`[executor.vm] reclaim` or `[executor.vm] balloon`) gives the scheduler it back.
 
-Set `[gitlab] atop_interval_secs` for a finer or coarser resolution, and `atop = false` to
+Set `[executor] atop_interval_secs` for a finer or coarser resolution, and `atop = false` to
 record nothing:
 
 ```toml
-[gitlab]
+[executor]
 atop = true                # default
 atop_interval_secs = 10    # default; at least 1
 atop_retention_days = 14   # default; 0 keeps only today's jobs
@@ -515,8 +515,8 @@ build by the host.
 
 | | Run phase | Build phase |
 | --- | --- | --- |
-| vCPUs | `[vm] cpus`, per job `MICROVM_CPUS` (capped by `[vm] max_cpus`) | `[build] cpus`, per stage guest — unset = the host's CPUs shared out among the stages running at once, between 2 and 4 each |
-| RAM | `[vm] mem`, per job `MICROVM_MEM` (capped by `[vm] max_mem`) | `[build] mem`, per stage guest — unset = `4G`; a stage overrides it with `# vk: mem=…` or `--stage-mem` |
+| vCPUs | `[executor.vm] cpus`, per job `MICROVM_CPUS` (capped by `[executor.vm] max_cpus`) | `[build] cpus`, per stage guest — unset = the host's CPUs shared out among the stages running at once, between 2 and 4 each |
+| RAM | `[executor.vm] mem`, per job `MICROVM_MEM` (capped by `[executor.vm] max_mem`) | `[build] mem`, per stage guest — unset = `4G`; a stage overrides it with `# vk: mem=…` or `--stage-mem` |
 | Concurrency | one VM per job (the runner's own `concurrent`) | `[build] jobs` stages at once — unset = as many of this build's stages, smallest first, as fit in 80% of host `MemTotal`, capped at 16 |
 
 Build sizing is host configuration only — there are no `MICROVM_*` equivalents, because
@@ -586,7 +586,7 @@ live is always admitted, whatever the host looks like: a build with no way to ma
 be slow, not stuck. Stages that do wait are admitted oldest first, so a large stage is not
 overtaken indefinitely by the smaller ones queued behind it.
 
-The measurement is of memory actually in use, so it lags a job VM that `[schedule]
+The measurement is of memory actually in use, so it lags a job VM that `[executor.schedule]
 mem_budget` has just granted but which has not faulted its RAM in yet — the same trap the
 gate avoids for the build's own guests, one level out. Where jobs and builds share a host,
 that is a reason to bound both up front rather than to rely on the gate alone. Set
@@ -601,10 +601,10 @@ read it — duplicated in the host's own page cache, or, on a busy runner, in it
 guest *frees* already come back through the balloon's free-page reporting; the file cache
 does not.
 
-`[vm] reclaim` makes it come back too:
+`[executor.vm] reclaim` makes it come back too:
 
 ```toml
-[vm]
+[executor.vm]
 reclaim = "auto"      # the default
 ```
 
@@ -615,20 +615,20 @@ guest's RAM (`"5%"`) keeps that much cache as a fixed floor instead, and `"off"`
 guest alone. Compose services follow the job VM's setting unless they declare their own
 `x-virtkit.reclaim`.
 
-It rides on the balloon, so `[vm] balloon = false` stops the **job VM** trimming: without
+It rides on the balloon, so `[executor.vm] balloon = false` stops the **job VM** trimming: without
 free-page reporting the trimmed pages never reach the host, and the job would lose its cache
-for nothing. Compose services attach a balloon of their own whatever `[vm] balloon` says, so
+for nothing. Compose services attach a balloon of their own whatever `[executor.vm] balloon` says, so
 they go on trimming under the setting they inherited.
 
 ### Sharing the host page cache with the guests
 
-Job virtio-fs shares — the checkout (`host_checkout`), tools tree and `[vm] share` — use
+Job virtio-fs shares — the checkout (`host_checkout`), tools tree and `[executor.share]` — use
 DAX windows to read the host page cache directly. Previously, each guest cached its own
 copy: ten concurrent job VMs reading a tools tree held eleven copies on the host.
-`[vm] dax` sets the window size:
+`[executor.vm] dax` sets the window size:
 
 ```toml
-[vm]
+[executor.vm]
 dax = "8G"            # per share; the default
 ```
 
@@ -650,7 +650,7 @@ Set a **memory budget** and a job instead claims the guest RAM it is about to bo
 waits when the host is full:
 
 ```toml
-[schedule]
+[executor.schedule]
 mem_budget = "50%"        # total guest RAM admitted at once; exact "48G" also works
 wait_timeout_secs = 600   # then the job gives up
 ```
@@ -690,12 +690,12 @@ heavy-job:
     when: runner_system_failure
 ```
 
-A `MICROVM_MEM` above the whole budget is clamped to it, the same way `[vm] max_mem` clamps
+A `MICROVM_MEM` above the whole budget is clamped to it, the same way `[executor.vm] max_mem` clamps
 one: a job asking for more than the host can ever admit would otherwise fail every attempt.
-Keep `[vm] mem` itself at or under the budget, though — a *default* no job can fit in makes
+Keep `[executor.vm] mem` itself at or under the budget, though — a *default* no job can fit in makes
 every job on the host fail admission.
 
-By default the budget counts what a job **declares** (`MICROVM_MEM`, or `[vm] mem`), which
+By default the budget counts what a job **declares** (`MICROVM_MEM`, or `[executor.vm] mem`), which
 is nearly always far more than it uses — so a runner gated this way runs fewer jobs than it
 could.
 
@@ -705,7 +705,7 @@ Turn on `from_history` and a job is instead admitted against its own recent peak
 same figures its trace reports:
 
 ```toml
-[schedule]
+[executor.schedule]
 mem_budget = "50%"
 from_history = true
 ```
@@ -778,7 +778,7 @@ a step change. Leave it off until a few pipelines have been measured.
 
 One job's trace says what that job needs. `vk gitlab usage` says what a whole project does —
 every job this host remembers, heaviest first, with what its next run would reserve and what
-the lot would reserve if they all ran at once, which is the figure `[schedule] mem_budget` has
+the lot would reserve if they all ran at once, which is the figure `[executor.schedule] mem_budget` has
 to cover:
 
 ```console
@@ -792,7 +792,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
 
 The argument is any part of a project's `<id>-<slug>` directory name, so the slug alone will
 do; without one it reports every project on the host. `reserves` is what each job's next run
-would claim: its declared size, or — with `[schedule] from_history` on, as above — what its
+would claim: its declared size, or — with `[executor.schedule] from_history` on, as above — what its
 history says it needs. `overlay` is the writable layer against its capacity, the one column
 holding a figure a job can *fail* against rather than merely be sized by: `build` above has
 150 MiB of room left. A `-` is a figure no run could measure

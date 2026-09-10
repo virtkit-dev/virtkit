@@ -82,10 +82,10 @@ pub struct Unit {
     /// identically primary or sibling; `None` = the consumer's default.
     pub mem: Option<String>,
     /// How this unit's guest trims idle file cache (compose `x-virtkit.reclaim`); `None` =
-    /// the consumer's default (`--reclaim`, `[vm] reclaim`, else `auto`).
+    /// the consumer's default (`--reclaim`, `[executor.vm] reclaim`, else `auto`).
     pub reclaim: Option<vk_core::reclaim::Policy>,
     /// The DAX window this unit's virtio-fs shares get (compose `x-virtkit.dax`); `None` =
-    /// the consumer's default (`--dax`, `[vm] dax`, else 8G).
+    /// the consumer's default (`--dax`, `[executor.vm] dax`, else 8G).
     pub dax: Option<crate::vmm::Dax>,
     /// Whether this unit's guest runs microVMs of its own (compose `x-virtkit.nested`),
     /// applied identically primary or sibling — a service that is itself a hypervisor

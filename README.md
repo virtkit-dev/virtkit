@@ -270,7 +270,7 @@ two (by age, through the kernel's multi-gen LRU) and hands those pages back, so 
 read a few gigabytes while building stops holding them once it idles, while what a running
 build keeps re-reading stays cached. That is `reclaim: auto`; `off` keeps everything, a size
 (`512M`) or share (`5%`) keeps that much as a fixed floor. `vk run --reclaim` sets it for the
-primary and any service without its own, `[vm] reclaim` for the GitLab executor. It needs the
+primary and any service without its own, `[executor.vm] reclaim` for the GitLab executor. It needs the
 agent as PID 1, so an `init` of `image` or `entrypoint` opts out; `vk build` stage guests are
 left alone as well, since trimming would move the peak-memory mark they are measured by.
 
@@ -282,7 +282,7 @@ file no longer re-reads it. Mappings are 4 KiB-granular, so the win is in memory
 in per-fault latency.
 
 The window reserves address space, not memory, and costs nothing until mapped. It defaults
-to 8G per share; `vk run --dax`, a service's `x-virtkit.dax` and the executor's `[vm] dax`
+to 8G per share; `vk run --dax`, a service's `x-virtkit.dax` and the executor's `[executor.vm] dax`
 resize it or turn it `off`. Each guest supports 64G of windows — eight at the default size,
 with further shares served without DAX. Guests with more than 63.25G of RAM have no room
 for windows and receive none. DAX requires the built-in VMM. Under

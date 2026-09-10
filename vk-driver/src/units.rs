@@ -56,7 +56,7 @@ pub struct Provisioned {
     pub egress_allow_name_req: Option<String>,
     /// Guest vCPUs / RAM (its compose `x-virtkit.cpus`/`.mem`, possibly overridden by
     /// the owner); `None` = [`DEFAULT_CPUS`]/[`DEFAULT_MEM`]. Clamped to the host
-    /// `[vm] max_*` ceilings by the executor before it reaches here.
+    /// `[executor.vm] max_*` ceilings by the executor before it reaches here.
     pub cpus: Option<u32>,
     pub mem: Option<String>,
     /// How the guest trims idle file cache (its compose `x-virtkit.reclaim`, else the

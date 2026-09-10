@@ -39,7 +39,7 @@ pub fn desired_file(cfg: &Config) -> PathBuf {
 pub fn tune(cfg: &Config) -> Result<()> {
     let Some(budget) = crate::vm::budget_mib(cfg) else {
         bail!(
-            "[schedule] mem_budget is unset: there is no budget to schedule against \
+            "[executor.schedule] mem_budget is unset: there is no budget to schedule against \
              (see the GitLab CI guide)"
         );
     };
@@ -47,10 +47,10 @@ pub fn tune(cfg: &Config) -> Result<()> {
     // Propagated, not defaulted: a reading of "nothing committed" would offer the whole
     // budget again, which is the one answer that overcommits the host.
     let held = crate::admit::committed(&cfg.state_dir().join("admit"))?;
-    let declared_mib = crate::vm::parse_gib(&cfg.vm.mem)
-        .context("invalid [vm] mem")?
+    let declared_mib = crate::vm::parse_gib(&cfg.executor.vm.mem)
+        .context("invalid [executor.vm] mem")?
         .checked_mul(1024)
-        .context("[vm] mem is absurdly large")?;
+        .context("[executor.vm] mem is absurdly large")?;
     let typical = typical_job_mib(cfg, declared_mib);
 
     let path = desired_file(cfg);
@@ -177,7 +177,7 @@ pub fn concurrency(i: Inputs) -> u32 {
 /// costs. Otherwise every job reserves what it declares, and the default declared size is
 /// the answer.
 fn typical_job_mib(cfg: &Config, declared_mib: u64) -> u64 {
-    if !cfg.schedule.from_history {
+    if !cfg.executor.schedule.from_history {
         return declared_mib;
     }
     let mut seen = crate::admit::all_expected(&cfg.state_dir().join("history"));
@@ -200,7 +200,7 @@ pub(crate) fn host_memory() -> Option<HostMemory> {
     })
 }
 
-/// This host's `MemTotal` in MiB — what a percentage `[schedule] mem_budget` is a share of,
+/// This host's `MemTotal` in MiB — what a percentage `[executor.schedule] mem_budget` is a share of,
 /// and what a build fits its stages' declared sizes into to pick an auto `[build] jobs`
 /// (`build::resolve_build_jobs`), and measures against to admit them. `None` on a host whose
 /// memory cannot be read, which each caller answers its own way: the budget is a share that
@@ -278,8 +278,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let cfg = Config {
             state_dir: Some(dir.clone()),
-            schedule: crate::config::Schedule {
-                mem_budget: Some("32G".into()),
+            executor: crate::config::Executor {
+                schedule: crate::config::Schedule {
+                    mem_budget: Some("32G".into()),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             ..Config::default()
@@ -480,8 +483,11 @@ mod tests {
 
         let cfg = Config {
             state_dir: Some(dir.clone()),
-            schedule: crate::config::Schedule {
-                from_history: true,
+            executor: crate::config::Executor {
+                schedule: crate::config::Schedule {
+                    from_history: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             ..Default::default()

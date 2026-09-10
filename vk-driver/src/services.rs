@@ -73,7 +73,7 @@ pub fn to_units(services: Vec<Service>) -> Vec<crate::compose::Unit> {
             // boot at the default size, not nesting, on one NIC, with a throwaway root (a CI
             // job's services are as ephemeral as the job). Declare a service in a compose
             // fleet (`MICROVM_IMAGE: compose:...`) to size it, to give it more interfaces, to
-            // let it nest on a runner that set `[vm] nested`, or to persist its root.
+            // let it nest on a runner that set `[executor.vm] nested`, or to persist its root.
             init: crate::run::InitSource::Default,
             kernel: crate::run::KernelSource::Default,
             cpus: None,
