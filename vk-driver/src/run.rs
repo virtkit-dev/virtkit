@@ -3210,6 +3210,7 @@ fn spawn_ssh_agent_forward(vsock: &Path, host_sock: &OsStr, work: &Path) -> Resu
         .arg(&listen)
         .arg("--to")
         .arg(host_sock)
+        .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
     // self-reap if virtkit dies before teardown (spawn_tied)
@@ -3240,7 +3241,9 @@ fn spawn_host_exec_serve(vsock: &Path, agent: &Path, args: &RunArgs, work: &Path
     if let Some(dir) = &args.workdir {
         cmd.current_dir(dir);
     }
-    cmd.stdout(log.try_clone()?).stderr(log);
+    cmd.stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
     crate::spawn::spawn_tied(cmd).context("spawning the host-exec serve")
 }
 
@@ -3427,7 +3430,9 @@ fn spawn_ssh_agent_proxy(
         cmd.arg("--allow").arg(p);
     }
     // self-reap if virtkit dies before teardown (spawn_tied)
-    cmd.stdout(log.try_clone()?).stderr(log);
+    cmd.stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
     crate::spawn::spawn_tied(cmd).context("spawning the ssh-agent proxy")
 }
 
