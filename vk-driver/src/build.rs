@@ -771,6 +771,8 @@ fn make_microvm(
     agent: &Path,
     timings: &Arc<Timings>,
 ) -> Result<MicroVm> {
+    // Sweep dead builds' stage session dirs under $TMPDIR before booting new guests.
+    sweep_stale_sessions(&std::env::temp_dir());
     let cache = cache_repo(opts.cache_registry.as_deref())?.map(|repo| {
         crate::config::Registry::for_share(
             repo,
@@ -3507,6 +3509,45 @@ fn sweep_stale_scratch(dir: &Path, prefix: &str) {
     }
 }
 
+/// Name prefix of a stage guest's session dir: `run::boot_session` creates
+/// `$TMPDIR/virtkit-session-<pid>-<stem>` for the guest's sockets and logs, and removes it
+/// when the session ends.
+const SESSION_PREFIX: &str = "virtkit-session-";
+
+/// Remove session dirs in `dir` left by builds that died before their stage guests could
+/// clean up (Ctrl-C mid-stage, SIGKILL, OOM, panic). Nothing locks these the way a build
+/// locks its scratch — they hold only sockets and logs — so the pid in the name is the
+/// only owner there is, and a dir goes once that pid is gone. A live build in another PID
+/// namespace sharing this `$TMPDIR` would read as dead here, which is why the same scheme
+/// is not good enough for the scratch dir: that one sits in the caller's output directory,
+/// routinely shared across such a boundary, where `$TMPDIR` is per-container. Best-effort:
+/// any error (unreadable dir, racing removal, another user's dir) is ignored.
+fn sweep_stale_sessions(dir: &Path) {
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(SESSION_PREFIX))
+            .and_then(|rest| rest.split_once('-'))
+            .and_then(|(pid, _stem)| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        // Ours (a sibling stage of this very build), or a build still running.
+        if pid == me || crate::spawn::pid_alive(pid) {
+            continue;
+        }
+        // A directory only: a symlink wearing the name is not a session dir of ours.
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Claim the scratch dir at `path` if it belongs to no live build, returning the handle
 /// whose lock the caller must hold for as long as it acts on the dir. It is abandoned when
 /// its directory can be locked exclusively — the owner is gone and the kernel released the
@@ -4375,6 +4416,44 @@ mod tests {
         );
         assert!(own_dir.exists(), "this process's own scratch must be kept");
         assert!(unrelated.exists(), "a non-scratch dir must be untouched");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A stage guest's session dir outlives a build killed mid-stage; the next build's sweep
+    /// takes the ones whose owner is gone, and only those.
+    #[test]
+    fn sweep_removes_only_orphaned_session_dirs() {
+        let root = tmpdir("sweep-session");
+        let orphan = root.join(format!("{SESSION_PREFIX}{}-stage0", dead_pid()));
+        let own_dir = root.join(format!("{SESSION_PREFIX}{}-stage0", std::process::id()));
+        let live = root.join(format!("{SESSION_PREFIX}1-stage0")); // pid 1 is always alive, never us
+        let unrelated = root.join("virtkit-session-notapid-stage0");
+        for d in [&orphan, &own_dir, &live, &unrelated] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(orphan.join("console.log"), "boot").unwrap();
+        // A symlink wearing a dead pid's name must be neither followed nor removed.
+        let victim = root.join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        let link = root.join(format!("{SESSION_PREFIX}{}-link", dead_pid()));
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        sweep_stale_sessions(&root);
+        assert!(!orphan.exists(), "a dead build's session dir must be swept");
+        assert!(
+            own_dir.exists(),
+            "this build's own session dir must be kept"
+        );
+        assert!(live.exists(), "a live build's session dir must be kept");
+        assert!(unrelated.exists(), "an unparseable name must be untouched");
+        assert!(
+            link.symlink_metadata().is_ok(),
+            "a symlink wearing a dead pid's name must not be removed"
+        );
+        assert!(
+            victim.exists(),
+            "a symlink's target must not be followed and removed"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
