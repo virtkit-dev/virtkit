@@ -365,6 +365,20 @@ repeating an expensive build that a peer has already shown to fail. Records are 
 pipeline ID, default to six hours, are capped at 24 hours, and hold at most 4 KiB of reason
 text. A new pipeline ID always gets a fresh build attempt.
 
+## Batched manifest probe
+
+`POST /vk/manifests/exists?name=<repo>` with body `{"tags": [...]}` answers
+`{"present": [...]}`, one boolean per tag in the order asked. It is the batched form of
+`HEAD /v2/<repo>/manifests/<tag>`: `vk build` asks about every step of a stage at once to
+find the newest snapshot it can resume from, instead of a request per step.
+
+Read access to the repository is authorized once for the batch, as a tag `HEAD` is. Only
+tags are accepted — a digest is not scoped to a repository, and is refused as absent. A tag
+that resolves has its last-used time bumped, as a `HEAD` hit does. The answer comes from
+this server's store alone; a pull-through mirror reports what it holds and does not relay.
+At most 4096 tags per request. A client that receives 404 or 405 is talking to a registry
+without the endpoint and falls back to one `HEAD` per tag.
+
 The normal build-once sequence for content key `K` is:
 
 1. Check the cache and return on a hit.

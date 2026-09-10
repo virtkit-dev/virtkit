@@ -19,8 +19,8 @@
 //! Instruction-level cache: each instruction advances a chained content key; for a
 //! filesystem-changing instruction (RUN/COPY) the resulting ext4 snapshot is pushed
 //! to / pulled from virtkit's own `[registry]` keyed by that key (the CDC chunk dedup
-//! makes successive snapshots share almost all blobs). On a rebuild the longest cached
-//! prefix is restored and only the changed tail re-runs; a stage whose last key is
+//! makes successive snapshots share almost all blobs). On a rebuild the newest cached
+//! snapshot is restored and only the tail after it re-runs; a stage whose last key is
 //! cached restores that one snapshot directly (no per-instruction probes), and a stage
 //! only such fully-cached consumers read is skipped entirely. How many intermediate
 //! snapshots a cold build actually pushes is set by [`BuildCache`] (`--build-cache`):
@@ -66,10 +66,10 @@ use crate::timing::{Phase, Timings};
 
 /// How aggressively a build populates the instruction cache.
 ///
-/// Restoring a cached prefix and the fully-cached-stage fast path both work at stage
-/// granularity in every mode, so a build whose target is unchanged costs the same
-/// regardless. The mode only changes *which* intermediate `RUN`/`COPY` snapshots are
-/// pushed on a cold or partial build — trading the per-instruction commit overhead (a
+/// Resuming from the newest cached snapshot and the fully-cached-stage fast path both
+/// work at stage granularity in every mode, so a build whose target is unchanged costs
+/// the same regardless. The mode only changes *which* intermediate `RUN`/`COPY` snapshots
+/// are pushed on a cold or partial build — trading the per-instruction commit overhead (a
 /// guest freeze + diff + push per step) against how much of a stage a later edit re-runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -87,8 +87,8 @@ pub enum BuildCache {
     /// snapshots and no partial-prefix restore. Fastest cold build; any mid-stage change
     /// re-runs the whole stage.
     Layers,
-    /// Cache every `RUN`/`COPY` snapshot, so a rebuild restores the longest cached prefix
-    /// and re-runs only the changed tail — at the cost of a commit per instruction.
+    /// Cache every `RUN`/`COPY` snapshot, so a rebuild resumes right at the changed
+    /// instruction and re-runs only the tail — at the cost of a commit per instruction.
     Instructions,
 }
 
@@ -2287,11 +2287,22 @@ fn build_stage(
         // step lines — so a cached prefix does not leave the FROM line trailing at the first
         // miss; materialization of the base itself stays lazy (deferred to that first miss).
         let mut base_shown = false;
-        let mut last_hit: Option<String> = None;
-        // `layers` never writes intermediate snapshots, so their keys can't hit — skip the
-        // per-step probe (a registry round-trip each) and build the whole stage from base.
-        // The fully-cached stage was already short-circuited above via `cached_final`.
-        let probe = !matches!(cache, BuildCache::Layers);
+        // Resume from the newest cached step, searching backwards from the penultimate.
+        // Chained keys make a snapshot at step k cover every step through k, including
+        // trivial steps `auto` folded into that checkpoint. A prefix walk from step 0
+        // would stop at the first uncommitted step and miss the later checkpoint.
+        // `cached_final` already missed the final step; probe all others in one round-trip.
+        // `layers` writes no intermediate snapshots, so skip probes and build from base.
+        let resume_at: Option<usize> = if matches!(cache, BuildCache::Layers) {
+            None
+        } else {
+            let keys: Vec<&str> = steps[..steps.len().saturating_sub(1)]
+                .iter()
+                .map(|s| s.key.as_str())
+                .collect();
+            ex.cache_has_many(&keys).iter().rposition(|&hit| hit)
+        };
+        let last_hit: Option<String> = resume_at.map(|i| steps[i].key.clone());
         // `auto`: uncommitted run time accrued since the last checkpoint, and the threshold
         // it must cross to force one. Reset on every commit.
         let checkpoint = Duration::from_secs(checkpoint_secs());
@@ -2304,19 +2315,18 @@ fn build_stage(
             {
                 bail!("build stopped after an earlier stage failed");
             }
-            if probe && !building && ex.cache_has(&step.key) {
-                // A cached prefix restores the base as part of it, so the FROM line is CACHED;
-                // emit it before this step's line so it prints in order.
+            if resume_at.is_some_and(|r| i <= r) {
+                // Covered by the snapshot the build resumes from, base included, so the FROM
+                // line is CACHED; emit it before this step's line so it prints in order.
                 if !base_shown {
                     progress.base_done(display, Outcome::Cached);
                     base_shown = true;
                 }
                 progress.step_done(display, i, Outcome::Cached);
-                last_hit = Some(step.key.clone());
                 continue;
             }
-            // first miss: materialize the rootfs — restore the last cached snapshot if there
-            // was a cached prefix (the base folds into that restore, already shown above), else
+            // first step to run: materialize the rootfs — restore the snapshot resumed from
+            // if there is one (the base folds into that restore, already shown above), else
             // build the base from scratch/image/stage (shown here, in order, before this step).
             if !building {
                 fs = Some(match &last_hit {
@@ -2372,30 +2382,20 @@ fn build_stage(
             }
             progress.step_done(display, i, Outcome::Ran);
         }
-        // Nothing ran: the whole instruction run was cached → restore the final snapshot; or
-        // there were no fs-changing instructions → the stage is the base.
+        // Fully cached stages return earlier via `cached_final`; otherwise the last step
+        // always runs (`resume_at` excludes it). If nothing ran, the stage has no fs-changing
+        // instructions: it is its base, and `last_hit` is None.
         let final_fs = match fs {
             Some(f) => f,
-            None => match &last_hit {
-                // Every step was a cache hit: the FROM line was already shown (CACHED) at the
-                // first hit in the loop, so just restore the final snapshot.
-                Some(k) => {
-                    progress.restore_start(display, &name);
-                    let t_restore = Instant::now();
-                    let f = restore_into(ex, &name, k)?;
-                    timings.record(Phase::CachePull, &name, t_restore.elapsed());
-                    progress.restore_done(display);
-                    f
-                }
-                None => {
-                    progress.base_start(display);
-                    let t_base = Instant::now();
-                    let f = materialize_base(ex, &stage.base, &name, committed)?;
-                    timings.record(Phase::BasePull, &name, t_base.elapsed());
-                    progress.base_done(display, Outcome::Ran);
-                    f
-                }
-            },
+            None => {
+                debug_assert!(last_hit.is_none());
+                progress.base_start(display);
+                let t_base = Instant::now();
+                let f = materialize_base(ex, &stage.base, &name, committed)?;
+                timings.record(Phase::BasePull, &name, t_base.elapsed());
+                progress.base_done(display, Outcome::Ran);
+                f
+            }
         };
         // Finalize the stage: tear down its long-lived guest (if any) and commit its overlay
         // back into the stage ext4 so forks / COPY --from / export see the writes. This joins the
@@ -5195,6 +5195,186 @@ mod tests {
         assert!(!t.iter().any(|l| l.starts_with("run ")), "{t:?}");
     }
 
+    /// `auto` commits a checkpoint mid-stage and folds the trivial steps before it, so the
+    /// cache holds the checkpoint's snapshot and none of its predecessors'. A rebuild whose
+    /// last step changed restores that checkpoint and re-runs only the tail — the keys
+    /// chain, so the missing predecessors do not matter. (A walk of the cached prefix from
+    /// step 0 would miss at the first folded step and rebuild the stage from its base.)
+    #[test]
+    fn auto_resumes_from_a_checkpoint_whose_earlier_steps_were_never_committed() {
+        let src = "FROM alpine\nRUN one\nRUN two\nRUN three\nRUN four\n";
+        let ba = Vars::new();
+        let plan = plan_one(src, &ba);
+        let order = plan
+            .build_order(plan.resolve_target(None).unwrap())
+            .unwrap();
+        // cold `instructions` run to learn every step key, in order.
+        let mut ex = CachedDry::default();
+        drive(
+            &plan,
+            &order,
+            &ba,
+            &mut ex,
+            false,
+            BuildCache::Instructions,
+            &Progress::disabled(),
+            &Arc::new(Timings::new()),
+        )
+        .unwrap();
+        let saved: Vec<String> = ex
+            .inner
+            .transcript
+            .iter()
+            .filter_map(|l| l.strip_prefix("cache-save ").map(str::to_string))
+            .collect();
+        assert_eq!(saved.len(), 4);
+        // the cache an `auto` cold run leaves when only step three crossed the checkpoint,
+        // and step four has since been edited: exactly one snapshot, three's.
+        let mut ex = CachedDry {
+            inner: DryRun::new(),
+            cache: HashSet::from([saved[2].clone()]),
+            ..Default::default()
+        };
+        drive(
+            &plan,
+            &order,
+            &ba,
+            &mut ex,
+            false,
+            BuildCache::Auto,
+            &Progress::disabled(),
+            &Arc::new(Timings::new()),
+        )
+        .unwrap();
+        let t = &ex.inner.transcript;
+        let count = |p: &str| t.iter().filter(|l| l.starts_with(p)).count();
+        // probes: the final key (miss), then steps one to three together (miss, miss, hit).
+        assert_eq!(count("cache-has "), 4, "{t:?}");
+        assert_eq!(count("cache-restore "), 1, "{t:?}");
+        assert!(t.iter().any(|l| l.ends_with(" four")), "{t:?}");
+        assert_eq!(count("run "), 1, "{t:?}");
+        assert_eq!(count("from-image "), 0, "{t:?}");
+    }
+
+    /// Nothing cached: the rebuild probes every candidate, finds no hit (`resume_at` None),
+    /// restores nothing, and runs the whole stage from its base.
+    #[test]
+    fn a_rebuild_with_an_empty_cache_runs_the_stage_from_base() {
+        let src = "FROM alpine\nRUN one\nRUN two\nRUN three\n";
+        let ba = Vars::new();
+        let plan = plan_one(src, &ba);
+        let order = plan
+            .build_order(plan.resolve_target(None).unwrap())
+            .unwrap();
+        let mut ex = CachedDry::default();
+        drive(
+            &plan,
+            &order,
+            &ba,
+            &mut ex,
+            false,
+            BuildCache::Auto,
+            &Progress::disabled(),
+            &Arc::new(Timings::new()),
+        )
+        .unwrap();
+        let t = &ex.inner.transcript;
+        let count = |p: &str| t.iter().filter(|l| l.starts_with(p)).count();
+        // probes: the final key (cached_final), then steps one and two together — all miss.
+        assert_eq!(count("cache-has "), 3, "{t:?}");
+        assert_eq!(count("cache-restore "), 0, "{t:?}");
+        assert_eq!(count("run "), 3, "{t:?}");
+        assert_eq!(count("from-image "), 1, "{t:?}");
+    }
+
+    /// Every step but the last is cached: the rebuild resumes from the newest of them (the
+    /// last-but-one) and re-runs only the final, edited step.
+    #[test]
+    fn a_rebuild_resumes_from_the_newest_cached_step() {
+        let src = "FROM alpine\nRUN one\nRUN two\nRUN three\nRUN four\n";
+        let ba = Vars::new();
+        let plan = plan_one(src, &ba);
+        let order = plan
+            .build_order(plan.resolve_target(None).unwrap())
+            .unwrap();
+        // cold `instructions` run to learn every step key, in order.
+        let mut ex = CachedDry::default();
+        drive(
+            &plan,
+            &order,
+            &ba,
+            &mut ex,
+            false,
+            BuildCache::Instructions,
+            &Progress::disabled(),
+            &Arc::new(Timings::new()),
+        )
+        .unwrap();
+        let keys: Vec<String> = ex
+            .inner
+            .transcript
+            .iter()
+            .filter_map(|l| l.strip_prefix("cache-save ").map(str::to_string))
+            .collect();
+        assert_eq!(keys.len(), 4);
+        // the cache holds every step but the last; the last was edited and so is not cached.
+        let mut ex = CachedDry {
+            inner: DryRun::new(),
+            cache: keys[..3].iter().cloned().collect(),
+            ..Default::default()
+        };
+        drive(
+            &plan,
+            &order,
+            &ba,
+            &mut ex,
+            false,
+            BuildCache::Auto,
+            &Progress::disabled(),
+            &Arc::new(Timings::new()),
+        )
+        .unwrap();
+        let t = &ex.inner.transcript;
+        let count = |p: &str| t.iter().filter(|l| l.starts_with(p)).count();
+        // probes: the final key (miss), then steps one to three together (all hit).
+        assert_eq!(count("cache-has "), 4, "{t:?}");
+        // resumes from step three's snapshot, the newest cached.
+        assert_eq!(count("cache-restore "), 1, "{t:?}");
+        assert!(t.iter().any(|l| l.contains(&keys[2])), "{t:?}");
+        assert_eq!(count("run "), 1, "{t:?}");
+        assert_eq!(count("from-image "), 0, "{t:?}");
+    }
+
+    /// A single-step stage has no interior steps to probe — its one step is the final, asked
+    /// about by `cached_final` — so the batch is empty and, on a miss, it runs from base.
+    #[test]
+    fn a_single_step_stage_probes_only_its_final_key() {
+        let src = "FROM alpine\nRUN only\n";
+        let ba = Vars::new();
+        let plan = plan_one(src, &ba);
+        let order = plan
+            .build_order(plan.resolve_target(None).unwrap())
+            .unwrap();
+        let mut ex = CachedDry::default();
+        drive(
+            &plan,
+            &order,
+            &ba,
+            &mut ex,
+            false,
+            BuildCache::Auto,
+            &Progress::disabled(),
+            &Arc::new(Timings::new()),
+        )
+        .unwrap();
+        let t = &ex.inner.transcript;
+        let count = |p: &str| t.iter().filter(|l| l.starts_with(p)).count();
+        // only the final key is probed; there is no interior batch to probe.
+        assert_eq!(count("cache-has "), 1, "{t:?}");
+        assert_eq!(count("cache-restore "), 0, "{t:?}");
+        assert_eq!(count("run "), 1, "{t:?}");
+    }
+
     #[test]
     fn partially_cached_build_fast_paths_cached_stages() {
         let src = "FROM alpine AS builder\nRUN one\nRUN two\n\n\
@@ -5239,9 +5419,10 @@ mod tests {
         let t = &ex.inner.transcript;
         let count = |p: &str| t.iter().filter(|l| l.starts_with(p)).count();
         // probes: the target's last key (miss), the builder's last key (hit), then the
-        // target per-step (hit, miss) — the builder's per-step keys are never probed
-        assert_eq!(count("cache-has "), 4, "{t:?}");
-        // restores: the builder's final snapshot + the target's cached prefix
+        // target's first step (hit) — its last was already probed, and the builder's
+        // per-step keys are never asked about
+        assert_eq!(count("cache-has "), 3, "{t:?}");
+        // restores: the builder's final snapshot + the snapshot the target resumes from
         assert_eq!(count("cache-restore "), 2, "{t:?}");
         // only the evicted COPY re-runs; no RUN and no base pull anywhere
         assert_eq!(count("copy "), 1, "{t:?}");

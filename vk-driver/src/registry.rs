@@ -310,6 +310,93 @@ pub fn exists(rg: &Registry, name: &str, tag: &str) -> bool {
     })
 }
 
+/// [`exists`] for every tag at once, in order — so a stage of thirty steps learns where it
+/// resumes in one request, not thirty. A vk-registry answers the whole batch from one
+/// `POST /vk/manifests/exists`; a registry without that endpoint (an older vk-registry, a
+/// generic OCI one) gets the manifest HEADs instead, in flight together. A registry error
+/// reads as "absent" per tag.
+pub fn exists_many(rg: &Registry, name: &str, tags: &[&str]) -> Vec<bool> {
+    if tags.is_empty() {
+        // Every single-step stage asks this (its only step is the final, probed elsewhere);
+        // answer without opening a client or the local store.
+        return Vec::new();
+    }
+    if let Some(root) = rg.local_root() {
+        return local::exists_many(&root, name, tags);
+    }
+    block_on(async {
+        if let Some(present) = exists_batch(rg, name, tags).await {
+            return present;
+        }
+        let Ok((client, auth)) = client(rg) else {
+            return vec![false; tags.len()];
+        };
+        use futures::StreamExt;
+        // Bounded like the chunk fetches: a long stage must not open a connection per step.
+        const PROBE_CONCURRENCY: usize = 16;
+        // The references are built up front so the stream owns what it hands each probe;
+        // borrowing `tags`' items through the closure trips the compiler's lifetime check
+        // on the async block.
+        let images: Vec<Option<OciReference>> = tags
+            .iter()
+            .map(|tag| make_ref(rg, name, tag).ok())
+            .collect();
+        let (client, auth) = (&client, &auth);
+        futures::stream::iter(images)
+            .map(|image| async move {
+                match image {
+                    Some(image) => client.fetch_manifest_digest(&image, auth).await.is_ok(),
+                    None => false,
+                }
+            })
+            .buffered(PROBE_CONCURRENCY)
+            .collect()
+            .await
+    })
+}
+
+/// Registries keyed by `lock_base` that returned 404 or 405 for `POST /vk/manifests/exists`
+/// (older vk-registry or another registry). Remember them for this process so each stage
+/// does not repeat the unsupported request before falling back.
+static NO_EXISTS_BATCH: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The whole batch in one request, or `None` to fall back to a HEAD per tag: the registry
+/// has no such endpoint (remembered), or the request failed for any other reason — the
+/// per-tag HEADs then decide, as they would have without this.
+async fn exists_batch(rg: &Registry, name: &str, tags: &[&str]) -> Option<Vec<bool>> {
+    let base = lock_base(rg)?;
+    if NO_EXISTS_BATCH.lock().unwrap().contains(&base) {
+        return None;
+    }
+    let http = http_client(rg).ok()?;
+    let auth = cred(rg).ok()?;
+    let resp = auth
+        .apply(http.post(format!("{base}{}", vk_registry::EXISTS_PATH)))
+        .query(&[("name", name)])
+        .json(&serde_json::json!({ "tags": tags }))
+        .send()
+        .await
+        .ok()?;
+    if matches!(
+        resp.status(),
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+    ) {
+        NO_EXISTS_BATCH.lock().unwrap().insert(base);
+        return None;
+    }
+    if !resp.status().is_success() {
+        return None;
+    }
+    #[derive(serde::Deserialize)]
+    struct Answer {
+        present: Vec<bool>,
+    }
+    let answer: Answer = resp.json().await.ok()?;
+    // An answer of the wrong shape is no answer.
+    (answer.present.len() == tags.len()).then_some(answer.present)
+}
+
 /// Try to pull a bundle tagged `<name>:<tag>` (a content fingerprint) and place its
 /// `runner.ext4` at `dest`, for the build-sharing path: a
 /// worktree reuses a bundle another already built+pushed instead of rebuilding.
@@ -2158,6 +2245,13 @@ mod local {
         inner().unwrap_or(false)
     }
 
+    /// [`exists`] for every tag under one store open and one shared lock.
+    pub(super) fn exists_many(root: &Path, name: &str, tags: &[&str]) -> Vec<bool> {
+        Store::new(root.to_path_buf())
+            .and_then(|store| store.has_manifests(name, tags))
+            .unwrap_or_else(|_| vec![false; tags.len()])
+    }
+
     pub(super) fn fetch_chunks(
         root: &Path,
         name: &str,
@@ -2726,6 +2820,29 @@ mod local {
     mod tests {
         use super::*;
 
+        /// `exists_many` answers one bool per tag, in the order asked, present tags true and
+        /// absent ones false — the mapping the resume probe relies on.
+        #[test]
+        fn exists_many_answers_each_tag_in_order() {
+            let dir = std::env::temp_dir().join(format!("vk-exists-many-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let root = dir.join("store");
+            let store = Store::new(root.clone()).unwrap();
+            store
+                .put_manifest("cache", "a", OCI_IMAGE_MEDIA_TYPE, b"{}")
+                .unwrap();
+            store
+                .put_manifest("cache", "c", OCI_IMAGE_MEDIA_TYPE, b"{}")
+                .unwrap();
+            // present, absent, present, absent — kept in the order asked.
+            assert_eq!(
+                exists_many(&root, "cache", &["a", "b", "c", "d"]),
+                vec![true, false, true, false],
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// Deterministic non-zero filler (a chunk of zeros is legitimately dropped as a
         /// hole, which would mask data loss).
         fn filler(len: usize, seed: u32) -> Vec<u8> {
@@ -3024,6 +3141,52 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&p);
         p
+    }
+
+    /// `exists_many` against a real `vk-registry` answers the whole batch from its
+    /// `POST /vk/manifests/exists` endpoint — held tags true, the rest false, in order — and
+    /// short-circuits an empty batch without a request.
+    #[test]
+    fn exists_many_batches_against_a_real_registry() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = retry_tmpdir("exists-batch");
+        let store = vk_registry::Store::new(dir.join("store")).unwrap();
+        let blob = store.put_blob(&[7u8; 64]).unwrap();
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{blob}","size":64}},"layers":[]}}"#
+        );
+        for tag in ["snap-a", "snap-c"] {
+            store
+                .put_manifest(
+                    "build-cache",
+                    tag,
+                    "application/vnd.oci.image.manifest.v1+json",
+                    manifest.as_bytes(),
+                )
+                .unwrap();
+        }
+        let url = spawn_registry(std::sync::Arc::new(vk_registry::ServerState {
+            store: std::sync::Arc::new(store),
+            upstreams: vec![],
+            locks: vk_registry::lock::LockManager::new(),
+            auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
+            tls: None,
+        }));
+        let rg = Registry::for_share(url, true, None, String::new(), None, None, None);
+        assert_eq!(
+            exists_many(&rg, "build-cache", &["snap-a", "snap-b", "snap-c"]),
+            vec![true, false, true],
+        );
+        // The endpoint answered, so the HEAD fallback was not taken: this registry is not
+        // remembered as lacking it (a 404/405 would have recorded it here).
+        let base = lock_base(&rg).unwrap();
+        assert!(
+            !NO_EXISTS_BATCH.lock().unwrap().contains(&base),
+            "the batch endpoint should have answered, not fallen back to HEADs"
+        );
+        // an empty batch is answered without a request.
+        assert_eq!(exists_many(&rg, "build-cache", &[]), Vec::<bool>::new());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The forced push the retry re-runs, end to end against a real `vk-registry`: every

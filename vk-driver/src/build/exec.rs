@@ -204,6 +204,11 @@ pub trait Executor {
     fn cache_has(&mut self, _key: &str) -> bool {
         false
     }
+    /// [`Executor::cache_has`] for every key, in order. The default asks one at a time; a
+    /// backend whose probe is a round-trip answers them all in one.
+    fn cache_has_many(&mut self, keys: &[&str]) -> Vec<bool> {
+        keys.iter().map(|k| self.cache_has(k)).collect()
+    }
     /// Restore the snapshot keyed `key` as `fs`'s current state.
     fn cache_restore(&mut self, _fs: &Rootfs, _key: &str) -> Result<()> {
         Ok(())
@@ -2640,6 +2645,22 @@ impl Executor for MicroVm {
             Some(rg) => crate::registry::exists(rg, CACHE_REPO, key),
             None => false,
         }
+    }
+    fn cache_has_many(&mut self, keys: &[&str]) -> Vec<bool> {
+        let Some(rg) = &self.cache else {
+            return vec![false; keys.len()];
+        };
+        // Non-cacheable keys never hit (see `cache_has`); the rest go to the registry in
+        // one round-trip, and the answers are put back in the callers' order.
+        let asked: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|k| !self.uncacheable_keys.contains(*k))
+            .collect();
+        let mut found = crate::registry::exists_many(rg, CACHE_REPO, &asked).into_iter();
+        keys.iter()
+            .map(|k| !self.uncacheable_keys.contains(*k) && found.next().unwrap_or(false))
+            .collect()
     }
     fn build_lock(
         &mut self,

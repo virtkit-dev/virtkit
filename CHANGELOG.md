@@ -26,6 +26,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **`vk build` resumes a rebuild from the newest cached step, not the first miss.** Under
+  the default `--build-cache auto`, editing a step late in a stage used to re-run the whole
+  stage from its base; a rebuild now restarts at the last unchanged step and re-runs only
+  the tail after it, regardless of which earlier steps are cached. `--build-cache
+  instructions` and `layers` are unaffected.
 - **`scp`/`sftp` into a VM no longer fails after a complete copy.**
 - **Copying files into a VM with bare `scp`/`sftp` now works** — including VS Code
   Remote-SSH installing its server on a guest without `wget`/`curl`. `vk run --ssh-client`

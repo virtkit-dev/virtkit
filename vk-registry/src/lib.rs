@@ -648,6 +648,39 @@ impl Store {
         Ok(Some((digest, data, ctype)))
     }
 
+    /// Whether each of `tags` resolves in `name`, in order — a manifest `HEAD` for every
+    /// tag under one shared lock, without reading a single manifest body. A tag that
+    /// resolves is bumped like a `HEAD` hit would bump it: the caller is about to build on
+    /// it, which is the use [`Store::gc`]'s tag retention keys on. An invalid tag, like an
+    /// invalid name, reads as absent rather than failing the batch: the caller asks about
+    /// content keys and only wants to know which ones it can restore.
+    pub fn has_manifests(&self, name: &str, tags: &[&str]) -> Result<Vec<bool>> {
+        if !valid_name(name) {
+            return Ok(vec![false; tags.len()]);
+        }
+        let _lock = self.lock_shared()?;
+        Ok(tags
+            .iter()
+            .map(|tag| {
+                if !valid_reference(tag) || tag.starts_with("sha256:") {
+                    return false;
+                }
+                let path = self.tag_path(name, tag);
+                let Ok(digest) = std::fs::read_to_string(&path) else {
+                    return false;
+                };
+                let hex = digest.trim().trim_start_matches("sha256:");
+                // The same check `get_manifest` makes: a manifest is stored uncompressed, so
+                // read the identity blob rather than the zstd form `find_blob` also accepts.
+                let present = self.blob_path(hex).is_file();
+                if present {
+                    touch(&path);
+                }
+                present
+            })
+            .collect())
+    }
+
     /// Record that `hex` belongs to repository `name` — an empty marker, so membership
     /// costs one inode per (repo, blob) pair. Idempotent.
     ///
@@ -1539,6 +1572,83 @@ where
     }
 }
 
+/// `POST /vk/manifests/exists?name=<repo>` — the batched form of `HEAD
+/// /v2/<repo>/manifests/<tag>`. Body `{"tags":[…]}`, answer `{"present":[…]}` in the same
+/// order. Read access to the repository is authorized once for the whole batch, exactly as
+/// a tag `HEAD` is (a tag lives in the repository, so it is already scoped); digests are
+/// not accepted, since a digest is not. Answers from this store only — a pull-through
+/// mirror says what it holds, and never relays.
+pub const EXISTS_PATH: &str = "/vk/manifests/exists";
+
+/// Longest `POST /vk/manifests/exists` body read: [`MAX_MANIFEST_REFERENCES`] tags of the
+/// longest valid reference, with JSON around them, is well under this.
+const MAX_EXISTS_BODY: usize = 1 << 20;
+
+async fn manifests_exist(
+    store: &Store,
+    authz: &Authz<'_>,
+    req: Request<Incoming>,
+) -> Result<Response<Body>> {
+    if req.method() != Method::POST {
+        return Ok(error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "UNSUPPORTED",
+            "use POST",
+        ));
+    }
+    let name = query_param(req.uri().query().unwrap_or(""), "name").unwrap_or_default();
+    if !valid_name(&name) {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "NAME_INVALID",
+            &name,
+        ));
+    }
+    if let Some(resp) = authorize_or_forbidden(authz, accounts::Action::Read, &name) {
+        return Ok(resp);
+    }
+    #[derive(serde::Deserialize)]
+    struct Ask {
+        tags: Vec<String>,
+    }
+    let ask: Ask = match collect_capped(req, MAX_EXISTS_BODY).await {
+        Ok(body) => match serde_json::from_slice(&body) {
+            Ok(ask) => ask,
+            Err(_) => {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "UNSUPPORTED",
+                    r#"body must be {"tags":[…]}"#,
+                ));
+            }
+        },
+        Err(_) => {
+            return Ok(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "UNSUPPORTED",
+                "body over the cap",
+            ));
+        }
+    };
+    // The same bound a manifest's references have: the work is a `stat` per tag under
+    // the store lock, which is not something one caller gets an unbounded amount of.
+    if ask.tags.len() > MAX_MANIFEST_REFERENCES {
+        return Ok(error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "UNSUPPORTED",
+            &format!("more than {MAX_MANIFEST_REFERENCES} tags"),
+        ));
+    }
+    let tags: Vec<&str> = ask.tags.iter().map(String::as_str).collect();
+    let present = store.has_manifests(&name, &tags)?;
+    let body = serde_json::json!({ "present": present }).to_string();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(body_of(Bytes::from(body)))
+        .map_err(Into::into)
+}
+
 /// Wrap `route`, turning any internal error into a 500 (a handler never fails the
 /// connection).
 async fn handle(
@@ -1710,6 +1820,11 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
     // `/v2/` OCI namespace; names are `?name=` params.
     if path.starts_with("/lock/") {
         return lock::route(&state.locks, req).await;
+    }
+    // The batched manifest probe, also outside `/v2/`: `vk build` asks about every step
+    // of a stage in one request instead of a `HEAD` per step.
+    if path == EXISTS_PATH {
+        return manifests_exist(&state.store, &authz, req).await;
     }
     let store = state.store.clone();
     let method = req.method().clone();
