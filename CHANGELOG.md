@@ -12,6 +12,18 @@ All notable changes to virtkit will be documented in this file.
   Remote-SSH installs the server again and `[dev.editor.vscode]` is applied afresh. The
   environment keeps running. `vk dev editor reset` does the same without opening an editor.
 
+### Changed
+
+- **`vk build` shares the host's CPUs out among the stages it runs at once.** Every stage
+  guest used to get the host's full CPU count (capped at 16), so six stages building
+  together on a 12-core host ran 72 vCPUs on 12 cores — costly, since idle vCPUs still make
+  the host work, the more so under nested virtualization (WSL2, a VM host), and a build of
+  many small stages ran measurably faster with fewer vCPUs each. Unset, `[build] cpus` now
+  gives each stage the host's CPUs shared among the stages running at once, between 2 and 4:
+  4 when it boots alone, 2 beside five others on a 12-CPU host. `# vk: cpus=` or
+  `--stage-cpus` pins a stage that needs more, and a set `[build] cpus` still goes to every
+  stage as-is. The build's opening line reports `cpus=2..4 (shared)` for the new default.
+
 ### Fixed
 
 - **`scp`/`sftp` into a VM no longer fails after a complete copy.**

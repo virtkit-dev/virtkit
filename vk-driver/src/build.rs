@@ -993,7 +993,7 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
             let jobs = resolve_build_jobs(opts, &sizes, host_total_mib);
             progress.note(&concurrency_line(
                 jobs,
-                mv.cpus(),
+                mv.build_cpus(),
                 mv.mem(),
                 opts.build_jobs.is_some(),
                 &sized_stages(&plan, &order, ""),
@@ -1383,7 +1383,7 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
             .collect();
         progress.note(&concurrency_line(
             jobs,
-            mv.cpus(),
+            mv.build_cpus(),
             mv.mem(),
             opts.build_jobs.is_some(),
             &sized,
@@ -2260,13 +2260,14 @@ fn build_stage(
             hint.mem = Some(held_to);
         }
         ex.set_stage_guest(&hint);
-        let _admission = budget.admit(
+        let admission = budget.admit(
             ex.stage_mem_mib().unwrap_or(0),
             cancel,
             progress,
             display,
             &name,
         );
+        ex.stage_admitted(admission.active);
         // Declare the stage's inputs — the source stages it copies/mounts from, and its
         // build context — so the backend can attach them before the guest boots. Read off the
         // resolved steps, not the raw plan: a `--from=$VAR` reaches the backend interpolated, so
@@ -2554,6 +2555,8 @@ struct Dag<R> {
 struct Semaphore {
     permits: Mutex<usize>,
     cv: Condvar,
+    /// Initial permit count, used by [`Self::in_use`] to count held permits.
+    capacity: usize,
 }
 
 impl Semaphore {
@@ -2561,6 +2564,7 @@ impl Semaphore {
         Self {
             permits: Mutex::new(permits),
             cv: Condvar::new(),
+            capacity: permits,
         }
     }
 
@@ -2571,6 +2575,11 @@ impl Semaphore {
         }
         *n -= 1;
         SemaphorePermit(self)
+    }
+
+    /// How many permits are held right now.
+    fn in_use(&self) -> usize {
+        self.capacity - *self.permits.lock().unwrap()
     }
 }
 
@@ -2963,9 +2972,12 @@ impl BuildBudget {
         if wait != MemWait::No {
             progress.wait_mem_done(stage, name, wait == MemWait::Admitted);
         }
+        // Count after the memory wait to avoid using a stale stage count.
+        let active = self.permits.in_use();
         BuildAdmission {
             _mem: mem,
             _permit: permit,
+            active,
         }
     }
 }
@@ -2979,6 +2991,9 @@ impl BuildBudget {
 struct BuildAdmission<'a> {
     _mem: MemReservation<'a>,
     _permit: SemaphorePermit<'a>,
+    /// Slots held at admission, including this stage: the divisor for the shared CPU
+    /// budget ([`Executor::stage_admitted`]).
+    active: usize,
 }
 
 /// Run a DAG of tasks with bounded concurrency. `nodes` is the set to run; `deps[n]`
@@ -3314,7 +3329,7 @@ fn sized_stages(plan: &Plan, order: &[usize], prefix: &str) -> Vec<String> {
 /// guest.
 fn concurrency_line(
     jobs: usize,
-    cpus: u32,
+    cpus: exec::BuildCpus,
     mem: &str,
     configured: bool,
     sized: &[String],
@@ -6702,6 +6717,36 @@ RUN ship
     }
 
     #[test]
+    fn semaphore_counts_the_permits_held() {
+        let sem = Semaphore::new(3);
+        assert_eq!(sem.in_use(), 0);
+        let a = sem.acquire();
+        let b = sem.acquire();
+        assert_eq!(sem.in_use(), 2);
+        drop(a);
+        assert_eq!(sem.in_use(), 1);
+        drop(b);
+        assert_eq!(sem.in_use(), 0);
+    }
+
+    /// The shared CPU divisor includes this stage: one for the first admission,
+    /// and one again after all other stages finish.
+    #[test]
+    fn admission_reports_the_stages_holding_a_slot() {
+        let budget = BuildBudget::new(3, None);
+        let progress = Progress::disabled();
+        let admit = |n| budget.admit(0, None, &progress, 0, n);
+        let a = admit("a");
+        assert_eq!(a.active, 1);
+        let b = admit("b");
+        assert_eq!(b.active, 2);
+        drop(a);
+        drop(b);
+        let c = admit("c");
+        assert_eq!(c.active, 1);
+    }
+
+    #[test]
     fn a_stage_size_hint_never_reaches_a_cache_key() {
         // The guarantee that makes the hint safe to add to a Dockerfile at all: sizing a
         // stage is not editing it, so every key stays what it was and no cache is thrown
@@ -7620,7 +7665,7 @@ RUN ship
     fn concurrency_line_names_where_its_budget_came_from() {
         // The whole point of announcing the budget: a build pinned to one stage on purpose
         // must not read like one the RAM-derived default squeezed down to it.
-        let pinned = concurrency_line(1, 2, "4G", true, &[]);
+        let pinned = concurrency_line(1, exec::BuildCpus::Fixed(2), "4G", true, &[]);
         assert!(pinned.starts_with("virtkit: build: "), "{pinned}");
         assert!(
             pinned.contains("up to 1 stage(s) at once (configured)"),
@@ -7628,17 +7673,19 @@ RUN ship
         );
         assert!(pinned.contains("each cpus=2, mem=4G"), "{pinned}");
         assert!(!pinned.contains("sized apart"), "{pinned}");
-        let auto = concurrency_line(6, 2, "4G", false, &[]);
+        // A shared CPU budget says so, rather than promising every stage the host.
+        let auto = concurrency_line(6, exec::BuildCpus::Shared { host: 12 }, "4G", false, &[]);
         assert!(
             auto.contains("up to 6 stage(s) at once (from host memory)"),
             "{auto}"
         );
+        assert!(auto.contains("each cpus=2..4 (shared), mem=4G"), "{auto}");
         // With stages sized individually, "each mem=4G" is no longer the whole story, so the
         // ones that differ are named — a trace showing 2 stages where the ceiling says 4 is
         // otherwise unreadable.
         let mixed = concurrency_line(
             4,
-            2,
+            exec::BuildCpus::Fixed(2),
             "4G",
             false,
             &["compile mem=8G cpus=16".into(), "tools mem=512M".into()],

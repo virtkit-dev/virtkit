@@ -149,6 +149,11 @@ pub trait Executor {
     /// restore the build-wide default rather than keep the last stage's. No-op for a
     /// backend that boots no guest.
     fn set_stage_guest(&mut self, _hint: &super::parser::GuestHint) {}
+    /// The stage holds a build slot, one of `active` held right now (itself included).
+    /// Called after [`Self::set_stage_guest`] and before the guest boots, so a backend
+    /// sharing the host's CPUs out among the stages running at once can size this one
+    /// ([`BuildCpus::Shared`]). No-op for a backend that boots no guest.
+    fn stage_admitted(&mut self, _active: usize) {}
     /// Guest RAM reserved before this backend starts a stage, in MiB.
     ///
     /// Guest-less backends return `None` and bypass memory admission.
@@ -493,13 +498,17 @@ pub struct MicroVm {
     agent: PathBuf,
     scratch: PathBuf,
     /// The current stage's guest size — the build-wide default, or what its `# vk:` line
-    /// asked for ([`Executor::set_stage_guest`]).
+    /// asked for ([`Executor::set_stage_guest`]); the vCPUs also settle at admission
+    /// ([`Executor::stage_admitted`]) when the build shares the host's CPUs out.
     cpus: u32,
     mem: String,
+    /// The current stage asked for its own vCPU count (`# vk: cpus=`, `--stage-cpus`), so
+    /// admission leaves `cpus` alone.
+    cpus_pinned: bool,
     /// The build-wide `[build] cpus` / `[build] mem`, kept so a stage with no hint (or a
     /// hint that sets only one of the two) goes back to them rather than inheriting the
     /// last stage's size.
-    build_cpus: u32,
+    build_cpus: BuildCpus,
     build_mem: String,
     boot_timeout_secs: u64,
     /// `--debug`: e2fsck each stage snapshot as it crosses the cache (after a load, before
@@ -1087,20 +1096,80 @@ pub(super) fn base_cache_key(image: &str) -> String {
     Ns::Base.key(&super::hex(&h.finalize()))
 }
 
-/// The host's logical CPU count (fallback 4) — the default per-stage build guest vCPUs
-/// before the [`resolve_build_cpus`] clamp.
+/// The host's logical CPU count (fallback 4) — what [`BuildCpus::Shared`] shares out.
 pub(crate) fn host_cpus() -> u32 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(4)
 }
 
+/// The most vCPUs a stage gets from a shared budget, however few stages run beside it.
+const SHARED_CPUS_MAX: u32 = 4;
+
+/// The fewest vCPUs a stage gets from a shared budget, however many stages run beside it
+/// (a host with fewer CPUs than this gives what it has).
+const SHARED_CPUS_MIN: u32 = 2;
+
+/// The build-wide per-stage vCPU default (`[build] cpus`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BuildCpus {
+    /// A configured count, given to every stage as-is.
+    Fixed(u32),
+    /// Unset: the host's CPUs, shared out among the stages holding a build slot when each
+    /// is admitted. A stage that boots alone gets [`SHARED_CPUS_MAX`] of them; one that
+    /// boots beside five others gets a sixth (never under [`SHARED_CPUS_MIN`]). vCPUs
+    /// are not free: each one costs the guest kernel boot time, and every idle one still
+    /// costs the host exits and IPIs — several times over under nested virtualization
+    /// (WSL2, a VM host) — so a build of many small stages ran measurably slower with
+    /// every guest at the host's full count than with a couple of vCPUs each, while a
+    /// lone compile stage still wants a few — and past four the return on a build's
+    /// mostly single-threaded steps is small next to what the vCPUs cost.
+    Shared { host: u32 },
+}
+
+impl BuildCpus {
+    /// The vCPUs for a stage admitted while `active` stages (itself included) hold a slot.
+    pub(crate) fn for_active(self, active: usize) -> u32 {
+        match self {
+            BuildCpus::Fixed(n) => n,
+            BuildCpus::Shared { host } => {
+                let (floor, cap) = Self::shared_bounds(host);
+                host.max(1).div_ceil(active.max(1) as u32).clamp(floor, cap)
+            }
+        }
+    }
+
+    /// The `(floor, cap)` a shared stage's vCPUs land between on this host: the cap is
+    /// [`SHARED_CPUS_MAX`], or the whole host when smaller; the floor is [`SHARED_CPUS_MIN`],
+    /// or the cap when the host is smaller still.
+    fn shared_bounds(host: u32) -> (u32, u32) {
+        let cap = host.clamp(1, SHARED_CPUS_MAX);
+        (SHARED_CPUS_MIN.min(cap), cap)
+    }
+}
+
+impl std::fmt::Display for BuildCpus {
+    /// `8` for a fixed count; `2..4 (shared)` for a host whose CPUs are shared out — the
+    /// vCPUs a stage lands between, or one number when the two coincide on a small host.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            BuildCpus::Fixed(n) => write!(f, "{n}"),
+            BuildCpus::Shared { host } => match Self::shared_bounds(host) {
+                (floor, cap) if floor == cap => write!(f, "{cap} (shared)"),
+                (floor, cap) => write!(f, "{floor}..{cap} (shared)"),
+            },
+        }
+    }
+}
+
 /// Per-stage build guest vCPUs: the configured `[build] cpus` verbatim when it is `>= 1`
-/// (an explicit request is honoured uncapped); unset falls back to `host` clamped to 16,
-/// bounding per-stage oversubscription. CPU oversubscribes across concurrent stages by
-/// design (see `resolve_build_jobs`), so each heavy stage gets real parallelism.
-pub(crate) fn resolve_build_cpus(cfg: Option<u32>, host: u32) -> u32 {
-    cfg.filter(|&n| n >= 1).unwrap_or(host.min(16))
+/// (an explicit request is honoured uncapped); unset shares `host` out among the stages
+/// running at once ([`BuildCpus::Shared`]).
+pub(crate) fn resolve_build_cpus(cfg: Option<u32>, host: u32) -> BuildCpus {
+    match cfg.filter(|&n| n >= 1) {
+        Some(n) => BuildCpus::Fixed(n),
+        None => BuildCpus::Shared { host },
+    }
 }
 
 /// Per-stage build guest RAM: the configured `[build] mem` (trimmed, non-blank) else 4G —
@@ -1121,7 +1190,7 @@ impl MicroVm {
         kernel: PathBuf,
         agent: PathBuf,
         scratch: PathBuf,
-        cpus: u32,
+        cpus: BuildCpus,
         mem: String,
         cache: Option<crate::config::Registry>,
         net: crate::build::BuildNet,
@@ -1137,7 +1206,8 @@ impl MicroVm {
             scratch,
             build_cpus: cpus,
             build_mem: mem.clone(),
-            cpus,
+            cpus: cpus.for_active(1),
+            cpus_pinned: false,
             mem,
             boot_timeout_secs: 120,
             debug,
@@ -1198,9 +1268,9 @@ impl MicroVm {
         crate::run::parse_mem_mib(&self.mem).unwrap_or(2048)
     }
 
-    /// Each stage guest's vCPUs.
-    pub fn cpus(&self) -> u32 {
-        self.cpus
+    /// The build-wide vCPU default every stage without a hint of its own starts from.
+    pub fn build_cpus(&self) -> BuildCpus {
+        self.build_cpus
     }
 
     /// Each stage guest's memory as passed to the VMM (`4G`) — the build-wide default, which
@@ -1263,6 +1333,7 @@ impl MicroVm {
             scratch: self.scratch.clone(),
             cpus: self.cpus,
             mem: self.mem.clone(),
+            cpus_pinned: self.cpus_pinned,
             build_cpus: self.build_cpus,
             build_mem: self.build_mem.clone(),
             boot_timeout_secs: self.boot_timeout_secs,
@@ -2063,7 +2134,14 @@ pub(crate) fn resolve_copy_dest(dest: &str, workdir: &str) -> String {
 impl Executor for MicroVm {
     fn set_stage_guest(&mut self, hint: &super::parser::GuestHint) {
         self.mem = hint.mem.clone().unwrap_or_else(|| self.build_mem.clone());
-        self.cpus = hint.cpus.unwrap_or(self.build_cpus);
+        // A shared budget settles at admission; until then, size as if alone.
+        self.cpus = hint.cpus.unwrap_or_else(|| self.build_cpus.for_active(1));
+        self.cpus_pinned = hint.cpus.is_some();
+    }
+    fn stage_admitted(&mut self, active: usize) {
+        if !self.cpus_pinned {
+            self.cpus = self.build_cpus.for_active(active);
+        }
     }
     fn stage_mem_mib(&self) -> Option<u64> {
         Some(self.mem_mib())
@@ -3391,14 +3469,52 @@ mod tests {
 
     #[test]
     fn resolve_build_cpus_prefers_configured_over_host() {
-        // A configured positive value wins and is honoured uncapped.
-        assert_eq!(resolve_build_cpus(Some(8), 4), 8);
-        assert_eq!(resolve_build_cpus(Some(64), 8), 64);
-        // Unset or zero falls back to the host count.
-        assert_eq!(resolve_build_cpus(None, 8), 8);
-        assert_eq!(resolve_build_cpus(Some(0), 8), 8);
-        // The host-derived default is clamped to 16; an explicit value is not.
-        assert_eq!(resolve_build_cpus(None, 64), 16);
+        // A configured positive value wins, honoured uncapped and however many stages run.
+        assert_eq!(resolve_build_cpus(Some(8), 4), BuildCpus::Fixed(8));
+        assert_eq!(resolve_build_cpus(Some(64), 8), BuildCpus::Fixed(64));
+        assert_eq!(BuildCpus::Fixed(64).for_active(6), 64);
+        // Unset or zero shares the host out.
+        assert_eq!(resolve_build_cpus(None, 8), BuildCpus::Shared { host: 8 });
+        assert_eq!(
+            resolve_build_cpus(Some(0), 8),
+            BuildCpus::Shared { host: 8 }
+        );
+    }
+
+    #[test]
+    fn shared_cpus_divide_the_host_among_the_stages_running_at_once() {
+        let host12 = BuildCpus::Shared { host: 12 };
+        // Alone, or beside few: the cap. Beside more: its share, rounded up so the host
+        // stays fully used (12 over 5 stages is 3 each, not 2).
+        assert_eq!(host12.for_active(1), 4);
+        assert_eq!(host12.for_active(3), 4);
+        assert_eq!(host12.for_active(4), 3);
+        assert_eq!(host12.for_active(5), 3);
+        assert_eq!(host12.for_active(6), 2);
+        // Never under the floor, however wide the build; `0` reads as alone.
+        assert_eq!(host12.for_active(12), 2);
+        assert_eq!(host12.for_active(40), 2);
+        assert_eq!(host12.for_active(0), 4);
+        // The cap bounds every share, however big the host.
+        let host64 = BuildCpus::Shared { host: 64 };
+        assert_eq!(host64.for_active(1), 4);
+        assert_eq!(host64.for_active(8), 4);
+        assert_eq!(host64.for_active(32), 2);
+        // A host inside the cap gives what it has when alone.
+        assert_eq!(BuildCpus::Shared { host: 3 }.for_active(1), 3);
+        // A host under the floor gives what it has.
+        assert_eq!(BuildCpus::Shared { host: 1 }.for_active(1), 1);
+        assert_eq!(BuildCpus::Shared { host: 1 }.for_active(4), 1);
+        assert_eq!(BuildCpus::Shared { host: 0 }.for_active(4), 1);
+    }
+
+    #[test]
+    fn build_cpus_display_tells_a_shared_budget_from_a_fixed_count() {
+        assert_eq!(BuildCpus::Fixed(8).to_string(), "8");
+        assert_eq!(BuildCpus::Shared { host: 12 }.to_string(), "2..4 (shared)");
+        assert_eq!(BuildCpus::Shared { host: 3 }.to_string(), "2..3 (shared)");
+        // A host at or under the floor gives one number, not a degenerate `1..1`.
+        assert_eq!(BuildCpus::Shared { host: 1 }.to_string(), "1 (shared)");
     }
 
     #[test]

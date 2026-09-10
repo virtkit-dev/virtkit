@@ -123,7 +123,8 @@
 #                        # default: auto, bounded by the host's total RAM). 1 = sequential
 # no_mem_gate = true     # let `jobs` alone bound the build: stages stop also waiting for
 #                        # the host to have room for the guest they are about to boot
-# cpus = 8               # per-stage build guest vCPUs (default: host CPUs, capped 16)
+# cpus = 8               # per-stage build guest vCPUs (default: the host's CPUs shared out
+#                        # among the stages running at once, between 2 and 4 each)
 # mem = "8G"             # per-stage build guest RAM (default: 4G; a stage overrides it
 #                        # with a `# vk: mem=…` comment above its FROM)
 # cache_checkpoint_secs = 20  # `auto` cache mode: seconds of run time before a checkpoint

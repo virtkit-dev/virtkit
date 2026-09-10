@@ -515,7 +515,7 @@ build by the host.
 
 | | Run phase | Build phase |
 | --- | --- | --- |
-| vCPUs | `[vm] cpus`, per job `MICROVM_CPUS` (capped by `[vm] max_cpus`) | `[build] cpus`, per stage guest — unset = the host's CPU count, capped at 16 |
+| vCPUs | `[vm] cpus`, per job `MICROVM_CPUS` (capped by `[vm] max_cpus`) | `[build] cpus`, per stage guest — unset = the host's CPUs shared out among the stages running at once, between 2 and 4 each |
 | RAM | `[vm] mem`, per job `MICROVM_MEM` (capped by `[vm] max_mem`) | `[build] mem`, per stage guest — unset = `4G`; a stage overrides it with `# vk: mem=…` or `--stage-mem` |
 | Concurrency | one VM per job (the runner's own `concurrent`) | `[build] jobs` stages at once — unset = as many of this build's stages, smallest first, as fit in 80% of host `MemTotal`, capped at 16 |
 

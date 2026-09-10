@@ -151,7 +151,9 @@ pub struct Build {
     /// `1` forces a sequential build; `0` is refused when the config loads rather than read
     /// as a request for a build that runs nothing.
     pub jobs: Option<NonZeroUsize>,
-    /// per-stage build guest vCPUs. Unset = the host's logical CPU count, clamped to 16.
+    /// per-stage build guest vCPUs. Unset = the host's logical CPUs shared out among the
+    /// stages running at once: a stage booting alone gets 4, one booting beside five
+    /// others on a 12-CPU host 2 (never under 2). A set value goes to every stage as-is.
     pub cpus: Option<u32>,
     /// per-stage build guest RAM, e.g. "8G". Unset = 4G. A larger value lowers the
     /// RAM-derived `jobs` count, trading stage concurrency for per-stage throughput.
