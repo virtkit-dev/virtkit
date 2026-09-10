@@ -1579,15 +1579,9 @@ impl HookPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The process environment is shared by every test in this binary, and these tests set
-    /// variables a config reads. Hold this while doing so, and take it back after a panic
-    /// rather than failing every later test with a poisoned lock.
-    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        ENV.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    // Shared with the other dev test modules that fork: a set_var here and a fork there must
+    // never overlap. See `crate::dev::testutil::env_guard`.
+    use crate::dev::testutil::env_guard;
 
     struct Fixture(PathBuf);
     impl Drop for Fixture {

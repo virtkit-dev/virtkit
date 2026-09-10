@@ -126,6 +126,16 @@ pub(super) mod testutil {
         TmpDir(dir)
     }
 
+    /// Serializes every test that mutates the environment, forks a process, or holds a file
+    /// lock across an assertion. A `set_var` racing another thread's `fork`, which copies
+    /// `environ`, is undefined behaviour; a lock held here is inherited by any child forked
+    /// meanwhile and stays held until that child execs, outliving its `drop`. Poison is taken
+    /// back rather than failing every later test after one panics under it.
+    pub(super) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub(super) fn plan_in(dir: &Path) -> Plan {
         Plan {
             workspace: dir.join("repo"),

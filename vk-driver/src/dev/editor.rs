@@ -926,6 +926,9 @@ pub fn latest_log(plan: &Plan) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Tests here fork: `select` runs the editor, the reset test spawns a shell.
+    // See `crate::dev::testutil::env_guard`.
+    use crate::dev::testutil::env_guard;
 
     #[test]
     fn channels_follow_the_binary_name_and_name_their_server_directory() {
@@ -991,6 +994,7 @@ mod tests {
 
     #[test]
     fn the_extension_probes_check_every_id_over_a_real_shell() {
+        let _env = env_guard();
         use std::os::unix::fs::OpenOptionsExt;
         // The probes run in the guest as `sh -c <script> <cli> <ext…>`, so `$0` is the server
         // CLI and `$1..` the extension ids. Run the real scripts through the host `/bin/sh`
@@ -1138,6 +1142,8 @@ mod tests {
 
     #[test]
     fn the_operation_has_a_lock_a_log_and_a_stamp_under_the_state_dir() {
+        // Holds a lock across the release check below; a concurrent fork must not inherit it.
+        let _env = env_guard();
         let dir = std::env::temp_dir().join(format!("vk-deveditor-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let plan = plan_in(&dir);
@@ -1217,6 +1223,7 @@ mod tests {
 
     #[test]
     fn resetting_the_server_stops_it_and_empties_its_directory() {
+        let _env = env_guard();
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::process::ExitStatusExt;
         let dir = std::env::temp_dir().join(format!("vk-deveditor-reset-{}", std::process::id()));
@@ -1330,6 +1337,7 @@ mod tests {
 
     #[test]
     fn the_channel_follows_the_resolved_binary_even_when_it_is_a_path() {
+        let _env = env_guard();
         let dir = std::env::temp_dir().join(format!("vk-deveditor-path-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = fake_editor(&dir, "code-insiders", "ms-vscode-remote.remote-ssh\\n");
@@ -1353,6 +1361,7 @@ mod tests {
 
     #[test]
     fn an_editor_without_remote_ssh_is_refused_off_a_wsl2_bridge() {
+        let _env = env_guard();
         let dir =
             std::env::temp_dir().join(format!("vk-deveditor-noremote-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

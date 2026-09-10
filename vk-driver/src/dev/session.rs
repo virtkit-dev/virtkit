@@ -689,7 +689,7 @@ mod tests {
     use super::*;
     use crate::dev::boot::ensure_state_dir;
     use crate::dev::plan::EnvVar;
-    use crate::dev::testutil::{plan_in, scratch};
+    use crate::dev::testutil::{env_guard, plan_in, scratch};
 
     fn env(name: &str, value: &str) -> EnvVar {
         EnvVar {
@@ -840,6 +840,7 @@ mod tests {
 
     #[test]
     fn login_shell_script_parses_as_posix_sh() {
+        let _env = env_guard();
         // Check LOGIN_SHELL_SCRIPT's getent/awk quoting without running the script.
         let out = std::process::Command::new("sh")
             .args(["-n", "-c", LOGIN_SHELL_SCRIPT])
@@ -854,6 +855,7 @@ mod tests {
 
     #[test]
     fn passwd_shell_awk_selects_field7_by_uid() {
+        let _env = env_guard();
         // `sh -n` cannot check the single-quoted awk program. Use a synthetic passwd to
         // check that it selects field 7 of only the uid-matching row.
         let dir = std::env::temp_dir().join(format!("vk-passwd-awk-{}", std::process::id()));

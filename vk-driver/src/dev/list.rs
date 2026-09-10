@@ -579,6 +579,8 @@ mod tests {
 
     #[test]
     fn a_directory_somebody_is_booting_is_not_removed() {
+        // Holds a state-dir lock across the assertions; a concurrent fork must not inherit it.
+        let _env = crate::dev::testutil::env_guard();
         let tmp = scratch("locked");
         let base = tmp.0.join("state");
         std::fs::create_dir_all(&base).unwrap();

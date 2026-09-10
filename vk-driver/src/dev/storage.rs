@@ -518,7 +518,7 @@ mod tests {
     use super::*;
     use crate::dev::config::Freshness;
     use crate::dev::plan::VsCodePlan;
-    use crate::dev::testutil::mount;
+    use crate::dev::testutil::{env_guard, mount};
 
     struct TmpDir(PathBuf);
     impl Drop for TmpDir {
@@ -793,6 +793,9 @@ mod tests {
 
     #[test]
     fn a_reset_refuses_while_the_environment_is_being_booted() {
+        // Holds the state-dir lock, then asserts a reset succeeds once it drops; a lock
+        // inherited by a concurrent fork would outlive that drop and fail the retry.
+        let _env = env_guard();
         let (t, plan) = fixture("locked");
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
