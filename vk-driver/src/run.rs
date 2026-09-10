@@ -2373,9 +2373,12 @@ async fn build_and_boot(
     let ssh_probe = args
         .ssh
         .then(|| crate::vmm::exec_addr(&vsock, SSH_VSOCK_PORT));
-    // `vk stop` and an abort relayed by a `--detach` parent send SIGTERM. Its default action
-    // would terminate the run and let the VMM parent-death signal cut guest power. Route it
-    // through teardown so the guests power off cleanly.
+    // `vk stop` and the `--detach` parent's relay of an external kill send SIGTERM; a Ctrl-C
+    // reaches a `--detach` child as SIGINT (it shares the terminal's foreground group until
+    // the guest is ready). Either signal's default action would end the run at once, leaving
+    // the guests to the VMM's parent-death signal and skipping the host-side teardown (the
+    // poweroff request, the registry and mount cleanup, the summaries). Route both through
+    // teardown instead.
     let mut stopped = false;
     let result = tokio::select! {
         r = drive(
@@ -2392,6 +2395,11 @@ async fn build_and_boot(
             &timings,
         ) => r,
         _ = crate::shutdown::terminate_signal() => {
+            println!("virtkit: stopping ...");
+            stopped = true;
+            Ok(())
+        }
+        _ = crate::detach::interrupt() => {
             println!("virtkit: stopping ...");
             stopped = true;
             Ok(())

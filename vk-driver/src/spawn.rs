@@ -67,22 +67,40 @@ pub(crate) fn spawn_socket_forward(
 /// and kill a perfectly healthy guest mid-boot. So the spawn is done from a dedicated
 /// process-lifetime thread, leaving the signal tied to a thread that lives exactly as long
 /// as virtkit. The caller configures `cmd` (args + stdio) first, then hands it over.
+///
+/// A `--detach` child (`detach::is_child`) also gives each helper a session of its own. That
+/// child stays in the terminal's foreground group until the guest is ready and `setsid`s out
+/// of it only then, which moves the child alone: a helper left behind in that group would keep
+/// taking the terminal's Ctrl-C/Ctrl-Z after the run detached — `vk dev` goes on working in
+/// that group, and so does a script run without job control — and a VMM ends on SIGINT. Off
+/// the terminal from the start, the helper hears nothing from it; PDEATHSIG still ties it
+/// to this process.
 pub(crate) fn spawn_tied(mut cmd: Command) -> std::io::Result<Child> {
-    // SAFETY: prctl(PR_SET_PDEATHSIG) is async-signal-safe, so it is valid in a pre-exec
-    // hook (which runs in the forked child between fork and exec).
+    // SAFETY: `tie`'s hook calls only async-signal-safe functions, so it is valid in a
+    // pre-exec hook (which runs in the forked child between fork and exec).
     unsafe {
-        cmd.pre_exec(
-            || match libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) {
-                0 => Ok(()),
-                _ => Err(std::io::Error::last_os_error()),
-            },
-        );
+        cmd.pre_exec(tie(crate::detach::is_child()));
     }
     let (rtx, rrx) = std::sync::mpsc::channel();
     spawner()
         .send((cmd, rtx))
         .expect("vk-helper-spawner thread alive");
     rrx.recv().expect("vk-helper-spawner thread replied")
+}
+
+/// The pre-exec hook of a tied helper: PR_SET_PDEATHSIG, and its own session when `isolate`.
+/// A freshly forked child is never a process-group leader, so `setsid` cannot fail on it.
+fn tie(isolate: bool) -> impl Fn() -> std::io::Result<()> {
+    move || {
+        // SAFETY: setsid(2) and prctl(2) take no pointers and are async-signal-safe.
+        if isolate && unsafe { libc::setsid() } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        match unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) } {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    }
 }
 
 type Reply = std::sync::mpsc::Sender<std::io::Result<Child>>;
@@ -179,4 +197,41 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
     }
     // Read errno only on the failure branch: EPERM = alive but not ours; ESRCH = gone.
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The session id of `pid`, from `/proc/<pid>/stat`.
+    fn sid_of(pid: u32) -> u32 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("proc stat");
+        // The comm field may hold spaces; the numeric fields follow its closing paren.
+        let rest = &stat[stat.rfind(')').unwrap() + 2..];
+        rest.split_whitespace().nth(3).unwrap().parse().unwrap()
+    }
+
+    fn sleep_with(isolate: bool) -> Child {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").stdin(Stdio::null());
+        // SAFETY: the hook only calls async-signal-safe functions.
+        unsafe { cmd.pre_exec(tie(isolate)) };
+        cmd.spawn().expect("spawning sleep")
+    }
+
+    #[test]
+    fn an_isolated_helper_leads_its_own_session() {
+        let mut child = sleep_with(true);
+        assert_eq!(sid_of(child.id()), child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn a_plain_helper_keeps_its_parents_session() {
+        let mut child = sleep_with(false);
+        assert_eq!(sid_of(child.id()), sid_of(std::process::id()));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }

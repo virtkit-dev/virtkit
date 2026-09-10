@@ -29,6 +29,12 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Ctrl-C and Ctrl-Z work while a `--detach` run (or a `vk dev` boot) is still building or
+  booting.** Ctrl-Z did nothing before and Ctrl-C only forced the run down indirectly; now
+  Ctrl-C ends it and Ctrl-Z suspends it like any foreground job. During the build a Ctrl-C
+  takes the run and its helper processes down together; once the run is booting the guest it
+  routes through the same graceful teardown as `vk stop`. Once the guest is up the terminal is
+  freed and the VM keeps running in the background.
 - **A guest's default user gets its passwd `HOME`, as `docker run` does.** A rootful guest's
   `HOME` is now `/root` rather than the inherited `/`, and a non-root image `USER` gets its home
   directory the same way. An `ENV HOME`, or a run's `HOME`, still wins — unless it is `/` or

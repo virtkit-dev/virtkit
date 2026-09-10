@@ -1,12 +1,32 @@
 //! `vk run --detach`: run the build + boot in the foreground, then daemonize once the
-//! guest is ready — so a Ctrl-C during the build tears it down cleanly, but on success the
-//! terminal is freed while the microVM keeps running in the background.
+//! guest is ready — so Ctrl-C/Ctrl-Z during the build reach it like any foreground job, but
+//! on success the terminal is freed while the microVM keeps running in the background.
 //!
 //! The CLI runs on a multi-threaded Tokio runtime, and forking a live runtime is undefined
 //! behavior — so the fork happens in `main()` *before* the runtime is built. The child does
 //! the real run (build, boot, hold the VM) and signals readiness over a pipe once the guest
-//! is up; the foreground parent relays the child's exit until then, forwarding Ctrl-C so an
-//! aborted build tears the child down instead of orphaning it.
+//! is up. It stays in the terminal's foreground process group while it builds and boots — so
+//! Ctrl-C aborts it and Ctrl-Z suspends it directly, no terminal-signal forwarding needed —
+//! and `setsid`s into its own session only at [`signal_ready`], detaching once the VM is up.
+//! The foreground parent just relays the child's exit status until then.
+//!
+//! Deferring the `setsid` is what makes the job-control signals work: a new session cannot be
+//! the controlling terminal's foreground group, so a child that detached at fork was an
+//! orphaned group the kernel *discards* SIGTSTP for (Ctrl-Z did nothing) and that terminal
+//! signals never reached. It also means only the child changes group at readiness — `setsid`
+//! moves its caller, not the caller's children — so the VMM/switch/virtiofsd it spawns before
+//! then get sessions of their own at spawn ([`crate::spawn::spawn_tied`], keyed on
+//! [`is_child`]). Left in the foreground group, they would keep taking the terminal's
+//! Ctrl-C/Ctrl-Z after the run detached: `vk dev` goes on working in that group, and so does
+//! a script run without job control. So job control reaches the driver alone: Ctrl-Z suspends
+//! it while the build's guests run on, and Ctrl-C ends it — through teardown once the run is
+//! waiting on the guest ([`interrupt`]), by default before that, either way taking the
+//! PDEATHSIG-tied helpers with it.
+//!
+//! The parent still relays one thing: an external SIGTERM aimed at the supervisor alone — a
+//! `timeout` wrapper or process manager that signals the pid, not the group — is forwarded to
+//! the child so an aborted build tears down instead of orphaning. Terminal Ctrl-C/Ctrl-Z reach
+//! the child directly and need no relay.
 
 use std::os::fd::RawFd;
 use std::path::Path;
@@ -17,8 +37,13 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 /// Write end of the readiness pipe, held by the detached child (`-1` = not detaching). Set
 /// by [`fork`] in the child; consumed once by [`signal_ready`].
 static READY_FD: AtomicI32 = AtomicI32::new(-1);
-/// PID of the child the foreground parent supervises — read by the signal forwarder.
+/// PID of the child the parent supervises, for the SIGTERM relay (`-1` = none). Terminal
+/// signals reach the child directly through the shared foreground group; this relays only an
+/// external SIGTERM aimed at the parent alone. Cleared once the child detaches or exits.
 static CHILD_PID: AtomicI32 = AtomicI32::new(-1);
+/// Set for good by [`fork`] in the child: this process is the `--detach` child, before and
+/// after it detaches. Read by [`crate::spawn::spawn_tied`] and [`interrupt`].
+static IS_CHILD: AtomicBool = AtomicBool::new(false);
 /// Marks the parent released when the guest is ready to run the post-boot steps. Set by
 /// `main` after [`fork`] returns and read by [`crate::dev::cli`]. An environment variable
 /// would be inherited by editors, hooks and task commands and mistaken for their own state.
@@ -32,6 +57,30 @@ pub fn note_after_boot() {
 /// Is this the process the fork released once the guest was ready?
 pub fn after_boot() -> bool {
     AFTER_BOOT.load(Ordering::Relaxed)
+}
+
+/// Is this the `--detach` child (see [`IS_CHILD`])?
+pub fn is_child() -> bool {
+    IS_CHILD.load(Ordering::Relaxed)
+}
+
+/// Wait for a Ctrl-C (SIGINT) in the `--detach` child; never resolves in any other process.
+/// Until it detaches, the child shares the terminal's foreground group, so a Ctrl-C reaches it
+/// as SIGINT and must tear the run down the way a SIGTERM does, rather than end it by default
+/// and leave the guests to the VMM's parent-death signal. A foreground run keeps SIGINT's
+/// default action: there, the helpers share the terminal's group and take the Ctrl-C too. If
+/// the handler cannot be installed, wait forever and leave the default in place. Once
+/// installed the handler stays, as SIGTERM's does: a second Ctrl-C during teardown is ignored.
+pub async fn interrupt() {
+    if !is_child() {
+        return std::future::pending().await;
+    }
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+        Ok(mut sig) => {
+            sig.recv().await;
+        }
+        Err(_) => std::future::pending().await,
+    }
 }
 
 /// This invocation's boot nonce, initialized before the fork so both processes share it.
@@ -92,19 +141,21 @@ pub fn wants_detach(cmd: &crate::Cmd) -> bool {
     }
 }
 
-extern "C" fn forward_signal(_sig: libc::c_int) {
+extern "C" fn forward_term(_sig: libc::c_int) {
     let pid = CHILD_PID.load(Ordering::Relaxed);
     if pid > 0 {
-        // async-signal-safe: just relay the abort to the child.
+        // async-signal-safe: relay the abort to the child, which tears down and EOFs our pipe.
         unsafe { libc::kill(pid, libc::SIGTERM) };
     }
 }
 
-/// Fork for `--detach`. The child `setsid`s (so it outlives the terminal), keeps the
-/// readiness pipe, and returns [`Forked::Child`] to run normally. The parent blocks until
-/// the child reports readiness (→ exit 0, VM left running), the child exits first (→ mirror
-/// its status, so a build/boot failure surfaces in the foreground), or a signal arrives (→
-/// forwarded to the child, which aborts). A failed pipe/fork degrades to a foreground run.
+/// Fork for `--detach`. The child keeps the readiness pipe and returns [`Forked::Child`] to
+/// run normally, staying in the terminal's foreground process group until it detaches at
+/// [`signal_ready`]. The parent blocks until the child reports readiness (→ exit 0, VM left
+/// running) or the child exits first (→ mirror its status, so a build/boot failure surfaces
+/// in the foreground). Both share the foreground group, so the terminal delivers Ctrl-C /
+/// Ctrl-Z to the child directly and the parent reacts to them by default. A failed pipe/fork
+/// degrades to a foreground run.
 pub fn fork() -> Forked {
     // Before the fork, so both sides end up with the same value in their own memory.
     let _ = boot_nonce();
@@ -123,56 +174,55 @@ pub fn fork() -> Forked {
         return Forked::Child;
     }
     if pid == 0 {
-        // Child: new session (immune to the terminal's SIGHUP once the parent exits); keep
-        // the write end for the readiness signal. stdout/stderr still point at the terminal,
-        // so build progress shows until `signal_ready` redirects them.
-        unsafe {
-            libc::setsid();
-            libc::close(read_fd);
-        }
+        // Keep the foreground group until `signal_ready` so Ctrl-C aborts and Ctrl-Z suspends
+        // the build/boot. Keep the readiness writer and terminal stdout/stderr for progress.
+        unsafe { libc::close(read_fd) };
         READY_FD.store(write_fd, Ordering::Relaxed);
+        IS_CHILD.store(true, Ordering::Relaxed);
         return Forked::Child;
     }
-    // Parent: supervise the child until it is ready or gone.
+    // Parent: supervise the child until it is ready or gone. It shares this process's
+    // foreground group while it builds and boots, so the terminal delivers Ctrl-C / Ctrl-Z to
+    // it directly and this process reacts to them by default: Ctrl-C ends both, Ctrl-Z suspends
+    // both and `fg` resumes both. The only relay is SIGTERM — an external kill of this
+    // supervisor alone, which `forward_term` passes to the child so the build is not orphaned.
     unsafe { libc::close(write_fd) };
     CHILD_PID.store(pid, Ordering::Relaxed);
-    // Install via `sigaction` (not `signal`, whose reset-on-delivery semantics vary): no
-    // `SA_RESTART` so the readiness `read` returns EINTR to re-forward, and no `SA_RESETHAND`
-    // so a second Ctrl-C keeps forwarding. Safe: still single-threaded (pre-runtime).
+    // SAFETY: still single-threaded (pre-runtime). No `SA_RESTART`, so the readiness `read`
+    // returns EINTR to loop; no `SA_RESETHAND`, so a second SIGTERM keeps relaying.
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = forward_signal as *const () as libc::sighandler_t;
+        sa.sa_sigaction = forward_term as *const () as libc::sighandler_t;
         sa.sa_flags = 0;
         libc::sigemptyset(&mut sa.sa_mask);
-        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
         libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
     }
-    // Block until the child writes the readiness byte or closes the pipe (EOF on exit).
+    // Block until the child writes the readiness byte or closes the pipe (EOF on exit). A
+    // Ctrl-Z stops this read and SIGCONT transparently resumes it; a relayed SIGTERM or a stray
+    // EINTR just loops back to waiting for the child to react.
     let mut byte = [0u8; 1];
     let ready = loop {
         let n = unsafe { libc::read(read_fd, byte.as_mut_ptr() as *mut libc::c_void, 1) };
         if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-            continue; // a forwarded signal — keep waiting for the child to react
+            continue;
         }
         break n == 1;
     };
     if ready {
-        // Supervision is over: `vk dev` goes on to do the work *around* the boot in this
-        // process, and until this is undone a Ctrl-C there would be swallowed and sent to
-        // the child holding the VM — tearing the environment down instead of the command.
-        release_child();
+        // Detached and running: a SIGTERM here now ends this process's own post-boot work
+        // (`vk dev` steps) rather than tearing the VM down.
+        stop_forwarding_term();
         eprintln!("virtkit: dev VM ready — detached (pid {pid}), still running in the background");
         return Forked::Parent {
             code: ExitCode::SUCCESS,
             ok: true,
         };
     }
-    // The child is gone without signalling ready: mirror its exit status.
+    // The child is gone without signalling ready: mirror its exit status. Stop relaying first —
+    // its pid can be reused the moment it is reaped.
+    stop_forwarding_term();
     let mut status = 0i32;
     unsafe { libc::waitpid(pid, &mut status, 0) };
-    // Reaped, so its pid can be handed to something else at any moment: nothing may forward
-    // a signal to it again.
-    release_child();
     let code = if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status) as u8
     } else if libc::WIFSIGNALED(status) {
@@ -188,9 +238,9 @@ pub fn fork() -> Forked {
     }
 }
 
-/// Stop supervising the child: forget its pid and put SIGINT/SIGTERM back to their default
-/// action, so this process reacts to Ctrl-C as any other command does.
-fn release_child() {
+/// Stop relaying SIGTERM to the child: forget its pid and restore SIGTERM's default action, so
+/// once the child has detached (or exited) a SIGTERM here ends this process's own work instead.
+fn stop_forwarding_term() {
     CHILD_PID.store(-1, Ordering::Relaxed);
     // SAFETY: still single-threaded — the Tokio runtime is built after `fork` returns.
     unsafe {
@@ -198,19 +248,26 @@ fn release_child() {
         sa.sa_sigaction = libc::SIG_DFL;
         sa.sa_flags = 0;
         libc::sigemptyset(&mut sa.sa_mask);
-        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
         libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
     }
 }
 
 /// Called by the run path once the guest is up and about to enter its lifetime wait: in a
-/// detached child, redirect stdout/stderr to `log` (so post-detach output does not spill
-/// into the terminal the parent hands back) and wake the parent. A no-op otherwise.
+/// detached child, detach into a new session and redirect stdout/stderr to `log` (so
+/// post-detach output does not spill into the terminal the parent hands back), then wake the
+/// parent. A no-op otherwise.
 pub fn signal_ready(log: Option<&Path>) {
     let fd = READY_FD.swap(-1, Ordering::Relaxed);
     if fd < 0 {
         return; // not a detached run
     }
+    // The guest is up: leave the terminal's foreground group for our own session now, so the
+    // freed terminal's hang-up never reaches the VM we hold — but only now, having stayed in
+    // the foreground through the build/boot so Ctrl-C/Ctrl-Z reached it. Safe: a forked child
+    // is never its own group's leader, so `setsid` succeeds. It moves this process alone: the
+    // VMM/switch/virtiofsd already spawned left the terminal's group at spawn (`spawn_tied`)
+    // and stay our PDEATHSIG-tied children.
+    unsafe { libc::setsid() };
     use std::io::Write;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
