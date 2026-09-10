@@ -1287,7 +1287,23 @@ pub fn discover(from: &Path, workspace: Option<&Path>, config: Option<&Path>) ->
         }
     };
     // A better error than the read's, nothing more: the open in `load` is what decides.
+    // `open_regular` reports `None` for any missing component of the path, so name the one
+    // that is actually absent rather than blaming the config file for a mistyped workspace.
     if open_regular(&config)?.is_none() {
+        // Only the workspace's own config points back at the workspace: an explicit
+        // `--dev-config` names its own file, so a missing one there stays "is not a file".
+        if config == workspace.join(CONFIG_FILE) {
+            if !workspace.is_dir() {
+                bail!(
+                    "workspace {} does not exist or is not a directory",
+                    workspace.display()
+                );
+            }
+            bail!(
+                "no {CONFIG_FILE} in {} — `vk dev init` writes one",
+                workspace.display()
+            );
+        }
         bail!("{} is not a file", config.display());
     }
     Ok(files_of(workspace, config))
@@ -2821,6 +2837,38 @@ host-port = 9443
         write(&f, LOCAL_ENV_FILE, "TOKEN=x\n");
         let l = load(discover(&deep, None, None).unwrap()).unwrap();
         assert_eq!(l.env_file["TOKEN"], "x");
+    }
+
+    #[test]
+    fn discovery_names_which_path_is_missing() {
+        let f = workspace("discover-missing");
+        let msg = |e: anyhow::Error| format!("{e:#}");
+
+        // A `--workspace` that is not a directory is blamed by name, not the config file.
+        let gone = f.0.join("nope-dir");
+        assert!(
+            msg(discover(&f.0, Some(&gone), None).unwrap_err()).contains("does not exist"),
+            "missing --workspace"
+        );
+
+        // A workspace that exists but carries no config points at `vk dev init`.
+        assert!(
+            msg(discover(&f.0, Some(&f.0), None).unwrap_err()).contains("vk dev init"),
+            "workspace without a config"
+        );
+
+        // An explicit `--dev-config` keeps "is not a file" — whether its parent exists or
+        // not; the workspace diagnostics are only for the workspace's own config path.
+        assert!(
+            msg(discover(&f.0, None, Some(&f.0.join("nope.toml"))).unwrap_err())
+                .contains("is not a file"),
+            "--dev-config under an existing dir"
+        );
+        assert!(
+            msg(discover(&f.0, None, Some(std::path::Path::new("/nope/dir/x.toml"))).unwrap_err())
+                .contains("is not a file"),
+            "--dev-config whose parent is absent"
+        );
     }
 
     #[test]
