@@ -431,8 +431,24 @@ service; an operator can still stop the server and use direct database access.
 
 ## Garbage collection and reporting
 
-`status` reports physical storage, compression and deduplication savings, in-progress
-uploads, and per-repository counts for tags, manifests, and membership records.
+`status` reports stored blob bytes split by whether tags reference them, with in-progress
+uploads counted separately. The repository table lists tag counts. Bytes without tag
+references are not a prediction of what `gc` will reclaim: its retention and grace windows
+still apply.
+
+`Stage data` is the uncompressed data in recorded completed build stages, including builder
+stages but excluding intermediate instruction checkpoints. It sums the chunk placement
+lengths per stage tag: shared chunks count again for each stage and each placement, while
+sparse holes, config metadata, and unused disk capacity are excluded. This is not a sum of
+guest file lengths; filesystem metadata and padding within stored chunks count as data.
+Missing size metadata makes the total unavailable rather than silently partial.
+
+On successful stage completion or restore, `vk build` adds a `stage-<hash>` tag in
+`build-cache` pointing to the stage's immutable snapshot manifest. A pending upload records
+the tag only after it succeeds. These aliases add no image data and follow ordinary tag
+retention; the tag counts include them. Existing snapshots do not record stage boundaries,
+so the total covers stages built or restored with this tracking in place. With no stage
+tags in an existing cache, status reports the stage data size as unknown.
 
 `gc` applies two windows:
 

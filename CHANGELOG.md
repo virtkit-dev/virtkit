@@ -6,6 +6,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **`vk registry status` separates disk usage from completed stages' uncompressed data.**
+  Stage totals include builder stages and exclude intermediate instruction checkpoints and
+  empty disk regions. Stages become identifiable as they are built or restored; existing
+  caches without that information show an unknown total. The report also offers a cleanup
+  preview, with simpler repository rows and no internal record counts.
 - **The GitLab executor's host config moved under one `[executor]` table.** `[vm]`, `[guest]`,
   `[share]`, `[auth]` and `[schedule]` are now `[executor.vm]`, `[executor.guest]`,
   `[executor.share]`, `[executor.auth]` and `[executor.schedule]`; the former `[gitlab]` keys

@@ -310,6 +310,40 @@ pub fn exists(rg: &Registry, name: &str, tag: &str) -> bool {
     })
 }
 
+/// Give a completed stage's immutable snapshot a tag that status can distinguish
+/// from instruction checkpoints. Aliasing the manifest adds no image data.
+pub fn record_build_stage(rg: &Registry, snapshot_tag: &str, digest: &str) -> Result<()> {
+    let tag = vk_registry::build_stage_tag(snapshot_tag).context("invalid stage snapshot tag")?;
+    let name = vk_registry::BUILD_CACHE_REPO;
+    if let Some(root) = rg.local_root() {
+        let store = vk_registry::Store::open(&root)?.context("stage cache store is absent")?;
+        let _lock = store.lock_shared()?;
+        let (_, body, ctype) = store
+            .get_manifest(name, digest)?
+            .context("completed stage manifest is absent")?;
+        store.put_manifest(name, &tag, &ctype, &body)?;
+        return Ok(());
+    }
+    block_on(async {
+        let (client, auth) = client(rg)?;
+        let source = make_digest_ref(rg, name, digest)?;
+        let target = make_ref(rg, name, &tag)?;
+        // Preserve the bytes: reserializing a manifest can change its digest.
+        let (manifest, _) = client
+            .pull_manifest_raw(&source, &auth, &[OCI_IMAGE_MEDIA_TYPE])
+            .await
+            .context("reading the completed stage manifest")?;
+        client
+            .store_auth_if_needed(target.resolve_registry(), &auth)
+            .await;
+        client
+            .push_manifest_raw(&target, manifest, OCI_IMAGE_MEDIA_TYPE.parse()?)
+            .await
+            .context("recording the completed stage")?;
+        Ok(())
+    })
+}
+
 /// [`exists`] for every tag at once, in order — so a stage of thirty steps learns where it
 /// resumes in one request, not thirty. A vk-registry answers the whole batch from one
 /// `POST /vk/manifests/exists`; a registry without that endpoint (an older vk-registry, a
@@ -3448,6 +3482,52 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn completed_stage_tags_alias_pinned_manifests_locally_and_over_http() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = retry_tmpdir("completed-stage");
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("store");
+        let local = local_registry(&root);
+        let ext4 = dir.join("image.ext4");
+        std::fs::write(&ext4, vec![7; 4096]).unwrap();
+        let key = format!("snap-{:064x}", 1);
+        let name = vk_registry::BUILD_CACHE_REPO;
+        let digest = push_ext4(&local, name, &key, &ext4, "generic-disk").unwrap();
+        // Another build has moved the mutable snapshot tag. Stage completion must
+        // still record the image it actually built or restored.
+        std::fs::write(&ext4, vec![8; 4096]).unwrap();
+        let newer = push_ext4(&local, name, &key, &ext4, "generic-disk").unwrap();
+        assert_ne!(digest, newer);
+        let store = std::sync::Arc::new(vk_registry::Store::open(&root).unwrap().unwrap());
+        let before = store.stats().unwrap();
+        let url = spawn_registry(std::sync::Arc::new(vk_registry::ServerState {
+            store: store.clone(),
+            upstreams: vec![],
+            locks: vk_registry::lock::LockManager::new(),
+            auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
+            tls: None,
+        }));
+        let remote = Registry::for_share(url, true, None, String::new(), None, None, None);
+        for rg in [&local, &remote] {
+            record_build_stage(rg, &key, &digest).unwrap();
+            let stage_tag = vk_registry::build_stage_tag(&key).unwrap();
+            assert_eq!(
+                store.get_manifest(name, &stage_tag).unwrap().unwrap().0,
+                digest
+            );
+            assert_eq!(store.get_manifest(name, &key).unwrap().unwrap().0, newer);
+            let after = store.stats().unwrap();
+            assert_eq!(
+                after.identity_bytes + after.zstd_bytes,
+                before.identity_bytes + before.zstd_bytes
+            );
+            assert_eq!(after.completed_stages, 1);
+            assert_eq!(after.stage_data_bytes, 4096);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Build a `Registry` with the auth-relevant fields set (the rest defaulted).

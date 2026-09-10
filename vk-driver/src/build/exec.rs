@@ -667,13 +667,40 @@ struct PushInflight {
     /// the snapshot raw the push reads; freed after it is joined (and used as the next
     /// instruction's `content_diff` baseline).
     snap: PathBuf,
+    completed_stage: Option<CompletedStage>,
+}
+
+/// Recorded only after stage shutdown succeeds; a parked upload carries this until
+/// its manifest exists. Failures affect reporting, not the cached snapshot itself.
+struct CompletedStage {
+    registry: crate::config::Registry,
+    key: String,
+}
+
+impl CompletedStage {
+    fn record(&self, digest: &str) {
+        if let Err(e) = crate::registry::record_build_stage(&self.registry, &self.key, digest) {
+            eprintln!(
+                "virtkit: could not record completed stage {} ({e:#})",
+                self.key
+            );
+        }
+    }
 }
 
 /// Join a background push and turn upload errors or thread panics into messages. Cache
 /// failures stay non-fatal: rebuilding an instruction is cheaper than aborting the run.
-fn join_push(handle: std::thread::JoinHandle<PushOutput>) -> Result<PushResult, String> {
+fn join_push(
+    handle: std::thread::JoinHandle<PushOutput>,
+    completed_stage: Option<CompletedStage>,
+) -> Result<PushResult, String> {
     match handle.join() {
-        Ok(Ok(out)) => Ok(out),
+        Ok(Ok(out)) => {
+            if let Some(stage) = completed_stage {
+                stage.record(&out.1);
+            }
+            Ok(out)
+        }
         Ok(Err(e)) => Err(format!("build async push failed ({e:#})")),
         Err(_) => Err("cache push thread panicked".to_string()),
     }
@@ -726,7 +753,7 @@ impl Drop for PushPool {
             let Some(inf) = slot.lock().unwrap_or_else(PoisonError::into_inner).take() else {
                 continue;
             };
-            if let Err(msg) = join_push(inf.handle) {
+            if let Err(msg) = join_push(inf.handle, inf.completed_stage) {
                 eprintln!("virtkit: {msg} — not cached");
             }
             let _ = std::fs::remove_file(&inf.snap);
@@ -949,7 +976,7 @@ fn source_dev_path(index: usize, has_out_disk: bool) -> String {
 /// Cache repo (under the registry's repo prefix) holding the instruction snapshots and
 /// the base filesystems they chain from. Named for what it is, not for how it is keyed:
 /// it is what `vk registry status` and a shared registry's listings show.
-const CACHE_REPO: &str = "build-cache";
+const CACHE_REPO: &str = vk_registry::BUILD_CACHE_REPO;
 
 /// Source-disk budget for a build guest. libkrun has 31 usable PCI bus 0 slots (slot 0 is
 /// the host bridge), replacing the old MMIO/INTx IOAPIC limit. Six fixed devices (rootfs,
@@ -1977,7 +2004,7 @@ impl MicroVm {
         let Some(inf) = self.inflight.take() else {
             return;
         };
-        match join_push(inf.handle) {
+        match join_push(inf.handle, inf.completed_stage) {
             Ok((layers, digest)) => {
                 self.parent_layers = Some(layers);
                 self.record_stage_digest(label, &digest);
@@ -2008,7 +2035,7 @@ impl MicroVm {
         let Some(inf) = slot.take() else {
             return;
         };
-        match join_push(inf.handle) {
+        match join_push(inf.handle, inf.completed_stage) {
             Ok((_, digest)) => self.record_stage_digest(label, &digest),
             Err(msg) => {
                 eprintln!("virtkit: {msg} — not cached");
@@ -2027,6 +2054,31 @@ impl MicroVm {
             .lock()
             .unwrap()
             .insert(label.to_string(), digest.to_string());
+    }
+
+    fn record_completed_stage(&self, label: &str, key: &str) {
+        let Some(registry) = self
+            .cache
+            .as_ref()
+            .filter(|_| !self.uncacheable_keys.contains(key))
+        else {
+            return;
+        };
+        let stage = CompletedStage {
+            registry: registry.clone(),
+            key: key.to_string(),
+        };
+        if let Some(slot) = self.pending.slot(label) {
+            let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(inf) = slot.as_mut() {
+                inf.completed_stage = Some(stage);
+                return;
+            }
+        }
+        let digest = self.stage_last_digest.lock().unwrap().get(label).cloned();
+        if let Some(digest) = digest {
+            stage.record(&digest);
+        }
     }
 
     /// Remove `label`'s digest after a push fails to publish its changes. The previous digest
@@ -2053,7 +2105,7 @@ impl Drop for MicroVm {
             let _ = std::fs::remove_file(scratch);
         }
         if let Some(inf) = self.inflight.take() {
-            if let Err(msg) = join_push(inf.handle) {
+            if let Err(msg) = join_push(inf.handle, inf.completed_stage) {
                 eprintln!("virtkit: {msg} — not cached");
             }
             let _ = std::fs::remove_file(&inf.snap);
@@ -2851,7 +2903,11 @@ impl Executor for MicroVm {
                 timings.probe("cache.push", t.elapsed());
                 Ok(((layers, total), digest))
             });
-            self.inflight = Some(PushInflight { handle, snap });
+            self.inflight = Some(PushInflight {
+                handle,
+                snap,
+                completed_stage: None,
+            });
             return Ok(());
         }
 
@@ -2924,7 +2980,11 @@ impl Executor for MicroVm {
             timings.probe("cache.push", t.elapsed());
             Ok(((layers, total), digest))
         });
-        self.inflight = Some(PushInflight { handle, snap });
+        self.inflight = Some(PushInflight {
+            handle,
+            snap,
+            completed_stage: None,
+        });
         Ok(())
     }
 
@@ -3056,6 +3116,9 @@ impl Executor for MicroVm {
                 self.cache_save(fs, key)?;
             }
             self.timings.probe("cache.repush", t_repush.elapsed());
+        }
+        if let Some(key) = final_key {
+            self.record_completed_stage(&fs.label, key);
         }
         self.last_saved_key.remove(&fs.label);
         if let Some(tmp) = self.tmp_disk.take() {
@@ -3319,6 +3382,100 @@ mod tests {
     // Temp dirs are minted over in `build`'s tests, so the tags here share one namespace with
     // the tags there — keep any tag added here distinct from both.
     use crate::build::tests::tmpdir;
+
+    #[test]
+    fn completed_stages_are_recorded_after_restore_or_successful_upload() {
+        let dir = tmpdir("completed-stage");
+        let root = dir.join("store");
+        let store = vk_registry::Store::new(root.clone()).unwrap();
+        let registry = crate::config::Registry::for_share(
+            root.display().to_string(),
+            false,
+            None,
+            String::new(),
+            None,
+            None,
+            None,
+        );
+        let mut ex = MicroVm::new(
+            PathBuf::new(),
+            PathBuf::new(),
+            PathBuf::new(),
+            dir.clone(),
+            BuildCpus::Fixed(1),
+            "1G".into(),
+            Some(registry),
+            crate::build::BuildNet::None,
+            false,
+            false,
+            None,
+            Arc::new(Timings::new()),
+        );
+        let body = br#"{"artifactType":"application/vnd.wallix.microvm.bundle","layers":[]}"#;
+        let key = format!("snap-{:064x}", 1);
+        let digest = store
+            .put_manifest(
+                CACHE_REPO,
+                &key,
+                "application/vnd.oci.image.manifest.v1+json",
+                body,
+            )
+            .unwrap();
+        assert_eq!(store.stats().unwrap().completed_stages, 0);
+
+        // A cached restore has no upload to wait on.
+        ex.record_stage_digest("restored", &digest);
+        ex.stage_end(
+            &Rootfs {
+                label: "restored".into(),
+            },
+            Some(&key),
+        )
+        .unwrap();
+        assert_eq!(store.stats().unwrap().completed_stages, 1);
+
+        // Stage end must not block on an outstanding upload. The pool records the
+        // stage only once that upload has returned its immutable digest.
+        let key = format!("snap-{:064x}", 2);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pushed = digest.clone();
+        ex.inflight = Some(PushInflight {
+            handle: std::thread::spawn(move || {
+                rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                Ok(((Vec::new(), 0), pushed))
+            }),
+            snap: dir.join("pending"),
+            completed_stage: None,
+        });
+        ex.stage_end(
+            &Rootfs {
+                label: "uploaded".into(),
+            },
+            Some(&key),
+        )
+        .unwrap();
+        assert_eq!(store.stats().unwrap().completed_stages, 1);
+        tx.send(()).unwrap();
+        ex.join_pending("uploaded");
+        assert_eq!(store.stats().unwrap().completed_stages, 2);
+
+        ex.inflight = Some(PushInflight {
+            handle: std::thread::spawn(|| anyhow::bail!("upload failed")),
+            snap: dir.join("failed"),
+            completed_stage: None,
+        });
+        ex.stage_end(
+            &Rootfs {
+                label: "failed".into(),
+            },
+            Some(&format!("snap-{:064x}", 3)),
+        )
+        .unwrap();
+        // The build-wide drain takes the same path as a dependent stage's join.
+        drop(ex);
+        assert_eq!(store.stats().unwrap().completed_stages, 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// `base_cache_key` must actually fold in `CACHE_KEY_VERSION`, not just carry it in a
     /// doc comment — mirrors `build::tests::hash_key_is_salted_by_the_cache_key_version`

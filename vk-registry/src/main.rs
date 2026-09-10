@@ -109,8 +109,8 @@ enum Cmd {
     },
     /// Report the store's usage and content
     ///
-    /// On-disk size, dedup savings, and a per-repository breakdown. Read-only — it creates no
-    /// store.
+    /// Stored bytes, space referenced by tags, uncompressed data in recorded completed
+    /// stages, and each repository's tag count. Read-only — it creates no store.
     Status {
         /// Store directory [default: VK_REGISTRY_ROOT, then --config, then the shared store]
         ///

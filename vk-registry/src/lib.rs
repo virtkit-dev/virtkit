@@ -1113,11 +1113,24 @@ impl Store {
                 .count();
             // distinct manifests reachable from this repo's tags, and the latest tag.
             let mut manifest_hexes: BTreeSet<String> = BTreeSet::new();
+            let mut stage_hexes = Vec::new();
             let mut latest: Option<(SystemTime, String)> = None;
             for tag in dir_files(&repo_dir.join("tags")) {
                 r.tags += 1;
+                let stage = r.name.rsplit('/').next() == Some(BUILD_CACHE_REPO)
+                    && tag
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.strip_prefix("stage-").is_some_and(is_blob_hex));
+                if stage {
+                    s.completed_stages += 1;
+                }
                 if let Ok(digest) = std::fs::read_to_string(&tag) {
-                    manifest_hexes.insert(digest.trim().trim_start_matches("sha256:").to_string());
+                    let hex = digest.trim().trim_start_matches("sha256:").to_string();
+                    if stage {
+                        stage_hexes.push(hex.clone());
+                    }
+                    manifest_hexes.insert(hex);
                 }
                 if let Some(n) = tag.file_name().and_then(|n| n.to_str()) {
                     let m = std::fs::metadata(&tag)
@@ -1146,6 +1159,15 @@ impl Store {
                     if repo_seen.insert(dhex) {
                         r.logical_bytes += size;
                     }
+                }
+            }
+            for hex in stage_hexes {
+                if let Some(bytes) = self.get_blob(&hex)?
+                    && let Some(size) = stage_data_size(&bytes)
+                    && let Some(total) = s.stage_data_bytes.checked_add(size)
+                {
+                    s.stage_data_bytes = total;
+                    s.sized_stages += 1;
                 }
             }
             s.total_tags += r.tags;
@@ -1275,7 +1297,51 @@ pub struct StoreStats {
     /// the distinct referenced blobs' actual on-disk bytes (compressed, deduped);
     /// `logical_naive` over this is the combined dedup+zstd packing factor
     pub referenced_ondisk: u64,
+    /// Completed-stage tags, including any whose manifest could not be sized.
+    pub completed_stages: usize,
+    pub sized_stages: usize,
+    /// Uncompressed chunk lengths, summed per completed-stage tag without deduplication.
+    /// Complete only when `sized_stages == completed_stages`; excludes sparse holes.
+    pub stage_data_bytes: u64,
     pub repos: Vec<RepoStat>,
+}
+
+/// Instruction snapshots and completed-stage aliases share this repository.
+pub const BUILD_CACHE_REPO: &str = "build-cache";
+
+/// A completed stage's alias for its last instruction snapshot. Kept as an ordinary
+/// OCI tag so remote stores and retention apply the same rules as for other images.
+pub fn build_stage_tag(snapshot_tag: &str) -> Option<String> {
+    let hex = snapshot_tag
+        .strip_prefix("snap-")
+        .filter(|h| is_blob_hex(h))?;
+    Some(format!("stage-{hex}"))
+}
+
+/// Data represented by a stage image, excluding sparse holes. Descriptor sizes may
+/// describe compressed blobs, so use the placement lengths the image is restored with.
+fn stage_data_size(manifest: &[u8]) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_slice(manifest).ok()?;
+    if v.get("artifactType")?.as_str()? != "application/vnd.wallix.microvm.bundle" {
+        return None;
+    }
+    v.get("layers")?
+        .as_array()?
+        .iter()
+        .try_fold(0u64, |sum, layer| {
+            match layer.get("mediaType")?.as_str()? {
+                "application/vnd.wallix.microvm.ext4.chunk"
+                | "application/vnd.wallix.microvm.ext4.chunk.zstd" => {}
+                _ => return None,
+            }
+            let size = layer
+                .get("annotations")?
+                .get("vnd.wallix.microvm.chunk.length")?
+                .as_str()?
+                .parse::<u64>()
+                .ok()?;
+            sum.checked_add(size)
+        })
 }
 
 /// One repository's line in a [`StoreStats`].
@@ -3055,7 +3121,7 @@ pub fn gc(root: PathBuf, retention: Duration, grace: Duration, dry_run: bool) ->
 }
 
 /// `vk registry status` — print a read-only usage + content report for the store at
-/// `root`: on-disk size, dedup savings, and a per-repository breakdown; see
+/// `root`: stored bytes, tag references, and a per-repository breakdown; see
 /// [`Store::stats`].
 pub fn status(root: PathBuf) -> Result<()> {
     let Some(store) = Store::open(&root)? else {
@@ -3070,57 +3136,53 @@ pub fn status(root: PathBuf) -> Result<()> {
     let blob_bytes = s.identity_bytes + s.zstd_bytes;
     println!("vk registry: {}", store.root.display());
     println!(
-        "  on disk:  {} in {} blob(s) ({} zstd + {} identity)",
+        "  Stored blobs:       {} ({} files)",
         human_bytes(blob_bytes),
         blobs,
-        human_bytes(s.zstd_bytes),
-        human_bytes(s.identity_bytes),
     );
+    println!("  Referenced by tags: {}", human_bytes(s.referenced_ondisk));
+    let unreferenced = blob_bytes.saturating_sub(s.referenced_ondisk);
+    println!("  No tag references:  {}", human_bytes(unreferenced));
+    if s.completed_stages > 0 {
+        if s.sized_stages == s.completed_stages {
+            println!(
+                "  Stage data:         {} uncompressed ({} recorded stage snapshots)",
+                human_bytes(s.stage_data_bytes),
+                s.completed_stages,
+            );
+            println!(
+                "                      Shared data counts per stage; empty disk regions are excluded."
+            );
+        } else {
+            println!("  Stage data:         unavailable (some stage manifests could not be sized)");
+        }
+    } else if s
+        .repos
+        .iter()
+        .any(|r| r.name.rsplit('/').next() == Some(BUILD_CACHE_REPO) && r.tags > 0)
+    {
+        println!("  Stage data:         unknown (no completed stages recorded yet)");
+    }
     if s.uploads > 0 {
         println!(
-            "  uploads:  {} in flight ({})",
-            s.uploads,
+            "  Uploads in progress: {} ({} files, separate from stored blobs)",
             human_bytes(s.upload_bytes),
-        );
-    }
-    println!(
-        "  content:  {} repo(s), {} tag(s), {} manifest(s), {} membership record(s)",
-        s.repos.len(),
-        s.total_tags,
-        s.total_manifests,
-        s.total_members,
-    );
-    if s.referenced_ondisk > 0 {
-        println!(
-            "  packing:  {} of content in {} on disk ({:.1}x by dedup + zstd)",
-            human_bytes(s.logical_naive),
-            human_bytes(s.referenced_ondisk),
-            s.logical_naive as f64 / s.referenced_ondisk as f64,
-        );
-    }
-    let reclaimable = blob_bytes.saturating_sub(s.referenced_ondisk);
-    if reclaimable > 1 << 20 {
-        println!(
-            "  gc:       {} in blobs no tag references (vk registry gc)",
-            human_bytes(reclaimable),
+            s.uploads,
         );
     }
     if !s.repos.is_empty() {
         println!();
-        println!(
-            "  {:<40} {:>5} {:>7} {:>10}  LATEST",
-            "REPOSITORY", "TAGS", "MEMBERS", "SIZE"
-        );
+        println!("  {:<40} {:>5}", "REPOSITORY", "TAGS");
         for r in &s.repos {
-            println!(
-                "  {:<40} {:>5} {:>7} {:>10}  {}",
-                r.name,
-                r.tags,
-                r.members,
-                human_bytes(r.logical_bytes),
-                r.latest_tag.as_deref().unwrap_or("-"),
-            );
+            println!("  {:<40} {:>5}", r.name, r.tags);
         }
+    } else {
+        println!("  No repositories.");
+    }
+    if unreferenced > 0 {
+        println!();
+        println!("  Blobs without tag references may still be protected by GC's grace period.");
+        println!("  Preview cleanup with `vk registry gc --dry-run` (use the same store root).");
     }
     Ok(())
 }
@@ -5487,5 +5549,94 @@ mod tests {
         assert!(s.referenced_ondisk > 0 && s.referenced_ondisk < raw);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stats_counts_uncompressed_data_per_completed_stage() {
+        let dir = std::env::temp_dir().join(format!("vk-stage-stats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        // One compressed blob occupies two positions in each image. Both placements
+        // count, and two completed stages count the image twice, even if it is identical.
+        let digest = store.put_blob(&[1; 100]).unwrap();
+        let layer = serde_json::json!({
+            "mediaType": "application/vnd.wallix.microvm.ext4.chunk.zstd",
+            "digest": digest, "size": 7,
+            "annotations": {"vnd.wallix.microvm.chunk.length": "100"}
+        });
+        let body = serde_json::to_vec(&serde_json::json!({
+            "artifactType": "application/vnd.wallix.microvm.bundle",
+            "layers": [layer.clone(), layer]
+        }))
+        .unwrap();
+        for i in 0..3 {
+            let snap = format!("snap-{i:064x}");
+            store
+                .put_manifest(BUILD_CACHE_REPO, &snap, DEFAULT_MANIFEST_TYPE, &body)
+                .unwrap();
+            if i > 0 {
+                store
+                    .put_manifest(
+                        BUILD_CACHE_REPO,
+                        &build_stage_tag(&snap).unwrap(),
+                        DEFAULT_MANIFEST_TYPE,
+                        &body,
+                    )
+                    .unwrap();
+            }
+        }
+        let s = store.stats().unwrap();
+        assert_eq!(s.total_tags, 5);
+        assert_eq!(s.completed_stages, 2);
+        assert_eq!(s.sized_stages, 2);
+        assert_eq!(s.stage_data_bytes, 400);
+
+        let stage_tag = build_stage_tag(&format!("snap-{:064x}", 4)).unwrap();
+        for name in ["team/build-cache", "ordinary-images"] {
+            store
+                .put_manifest(name, &stage_tag, DEFAULT_MANIFEST_TYPE, &body)
+                .unwrap();
+        }
+        let s = store.stats().unwrap();
+        assert_eq!(s.completed_stages, 3);
+        assert_eq!(s.stage_data_bytes, 600);
+
+        // An unreadable stage remains in the count, so status cannot call a partial
+        // sum the total. An ordinary instruction tag never contributed to it.
+        let tag = build_stage_tag(&format!("snap-{:064x}", 3)).unwrap();
+        store
+            .put_manifest(BUILD_CACHE_REPO, &tag, DEFAULT_MANIFEST_TYPE, b"{}")
+            .unwrap();
+        let s = store.stats().unwrap();
+        assert_eq!(s.completed_stages, 4);
+        assert_eq!(s.sized_stages, 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stage_data_size_requires_uncompressed_lengths() {
+        let mut manifest = serde_json::json!({
+            "artifactType": "application/vnd.wallix.microvm.bundle", "layers": []
+        });
+        let size = |v: &serde_json::Value| stage_data_size(&serde_json::to_vec(v).unwrap());
+        assert_eq!(size(&manifest), Some(0));
+        manifest["layers"] = serde_json::json!([{
+            "mediaType": "application/vnd.wallix.microvm.ext4.chunk",
+            "size": 42,
+            "annotations": {"vnd.wallix.microvm.chunk.length": "100"}
+        }]);
+        assert_eq!(size(&manifest), Some(100));
+        for length in [serde_json::Value::Null, serde_json::json!("bad")] {
+            manifest["layers"][0]["annotations"]["vnd.wallix.microvm.chunk.length"] = length;
+            assert_eq!(size(&manifest), None);
+        }
+        manifest["layers"][0]["annotations"]["vnd.wallix.microvm.chunk.length"] =
+            serde_json::json!(u64::MAX.to_string());
+        let layer = manifest["layers"][0].clone();
+        manifest["layers"] = serde_json::json!([layer.clone(), layer]);
+        assert_eq!(size(&manifest), None);
+        assert_eq!(stage_data_size(b"not json"), None);
+        assert!(build_stage_tag("snap-not-a-hash").is_none());
+        assert!(build_stage_tag(&format!("base-{:064x}", 1)).is_none());
     }
 }

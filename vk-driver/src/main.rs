@@ -309,8 +309,8 @@ enum RegistryCmd {
     // `vk` accesses its local filesystem store in-process (registry.rs `mod local`).
     /// Report a registry store's usage and content
     ///
-    /// On-disk size (both storage forms), dedup savings, and a per-repository breakdown
-    /// (tags, latest tag, logical size). Read-only — it creates no store.
+    /// Stored bytes, space referenced by tags, uncompressed data in recorded completed
+    /// stages, and each repository's tag count. Read-only — it creates no store.
     Status {
         /// store directory [default: the store the build cache uses]
         ///
