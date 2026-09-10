@@ -9,6 +9,12 @@ All notable changes to virtkit will be documented in this file.
 - **A CI job's guest is named `vk` by default, not `runner`.** Set `[vm] hostname` to keep
   the old name.
 
+### Removed
+
+- **The `[services]` config section is gone.** Its `store_dir` stopped being consulted once
+  CI service images moved to the job's image cache; a config that still sets it now fails to
+  load — delete the section.
+
 ## [0.67.0] - 2026-09-10
 
 ### Added

@@ -96,7 +96,7 @@
 # [auth]                 # host credentials forwarded into job VMs.
 # ssh_agent = true       # forward the runner's $SSH_AUTH_SOCK so the guest's ssh/git use
 #                        # the host keys; keys never enter the guest (no-op if unset on
-#                        # the runner). Same vsock-forward model as [services].
+#                        # the runner). Same vsock-forward model as the services registry proxy.
 
 # [build]                # defaults for `vk build` (a CLI flag always overrides).
 # cloud_hypervisor = "/usr/local/bin/cloud-hypervisor"  # default: top-level cloud_hypervisor
@@ -254,12 +254,3 @@
 # token_file = "/etc/virtkit/mirror-token"   # static bearer token instead of Basic;
 #                                  # wins over username. Sent over TLS — see ca_file.
 # insecure = false                 # plain HTTP
-
-# [services]            # CI `services:` support. Each declared service boots as a
-#                       # sibling microVM on the per-job switch, resolvable by its
-#                       # alias over the switch DNS — job images no longer need
-#                       # docker. Requires the job's [net] mode = "switch". This
-#                       # section is optional; services work with its defaults.
-# store_dir = "/var/lib/virtkit/services"  # shared content-addressed image store,
-#                       # one entry per image digest, shared by every job on the
-#                       # runner. Default: <state_dir>/services.

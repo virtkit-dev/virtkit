@@ -37,7 +37,7 @@ pub enum Feature {
     Gitlab,
     /// [share]: shared dir readable, a virtiofsd available when needed
     Share,
-    /// [services]: the shared image cache CI services pull into is writable
+    /// CI `services:`: the shared image cache they pull into is writable
     Services,
     /// the kernel accounts what jobs use, so their traces can report it
     Usage,

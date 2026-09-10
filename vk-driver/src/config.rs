@@ -60,11 +60,6 @@ pub struct Config {
     /// Local guest bundles on the host filesystem, backing the
     /// `MICROVM_IMAGE: local/<name>` form (and the `local/default` default).
     pub local: Local,
-    /// CI `services:` support: each declared service runs as a container inside
-    /// the job VM, its image pulled through the host registry proxy over a vsock
-    /// forward (so the registry credential never enters the guest). Absent = a
-    /// job that declares services fails in prepare.
-    pub services: Option<Services>,
     /// CI tools shared into GitLab job VMs over virtio-fs; see [`Gitlab`]. Absent =
     /// no share (the job image must carry its own git/git-lfs/gitlab-runner).
     pub gitlab: Option<Gitlab>,
@@ -637,15 +632,6 @@ impl Registry {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct Services {
-    /// Retained for config compatibility; no longer consulted. CI service images now
-    /// share the job's digest-keyed image cache under `<state_dir>` (see image.rs),
-    /// rather than a separate per-service store.
-    pub store_dir: Option<PathBuf>,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Share {
@@ -1025,6 +1011,13 @@ mod tests {
         let off: Config =
             toml::from_str("[gitlab]\nhost_checkout = true\ncheckout_overlay = false\n").unwrap();
         assert!(!off.gitlab.as_ref().unwrap().checkout_overlay);
+    }
+
+    /// Reject `[services]` so obsolete keys cannot appear to take effect.
+    #[test]
+    fn services_section_is_rejected() {
+        let err = toml::from_str::<Config>("[services]\nstore_dir = \"/x\"\n").unwrap_err();
+        assert!(err.to_string().contains("services"), "{err}");
     }
 
     #[test]
