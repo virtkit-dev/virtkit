@@ -29,6 +29,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **`persist_root` and `overlay,persist` backings no longer nest a second `.virtkit`.**
+  They were anchored on the compose file's own directory, so a compose file kept at
+  `.virtkit/compose.yaml` (the vk layout) stored them under `.virtkit/.virtkit/roots|overlays/`.
+  They now live under the workspace's `.virtkit/roots|overlays/`. After upgrading, move an
+  existing `.virtkit/.virtkit/` into place, or let the generation-bound backing recreate fresh.
 - **Ctrl-C and Ctrl-Z work while a `--detach` run (or a `vk dev` boot) is still building or
   booting.** Ctrl-Z did nothing before and Ctrl-C only forced the run down indirectly; now
   Ctrl-C ends it and Ctrl-Z suspends it like any foreground job. During the build a Ctrl-C

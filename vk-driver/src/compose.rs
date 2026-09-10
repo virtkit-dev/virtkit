@@ -816,8 +816,8 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
         .filter(|spec| !spec.is_empty())
         .filter_map(|spec| parse_volume(spec, base).transpose())
         .collect::<Result<_>>()?;
-    // Settle each `overlay,persist` upper's auto-managed backing file — anchored on the compose
-    // file and keyed by this service's name, which `parse_volume` (shared with `run -v`) lacks.
+    // Settle each `overlay,persist` upper's auto-managed backing file — anchored on the workspace
+    // `.virtkit/` and keyed by the service name, which `parse_volume` (shared with `run -v`) lacks.
     for vol in &mut volumes {
         if vol.overlay && vol.persist {
             vol.persist_backing = Some(persist_backing_path(base, name, &vol.guest));
@@ -866,8 +866,8 @@ fn map_service(name: &str, svc: ComposeService, base: &Path) -> Result<Unit> {
             false,
         ),
     };
-    // Settled here, like a persistent overlay's backing above: anchored on the compose dir and
-    // keyed by service name, so the primary and a sibling read the same stable path.
+    // Settled here, like a persistent overlay's backing above: anchored on the workspace
+    // `.virtkit/` and keyed by service name, so the primary and a sibling read the same stable path.
     let persist_root_backing = persist_root.then(|| persist_root_path(base, name));
     // Resolve host paths but leave them unread so callers can vet untrusted compose input
     // before calling `resolve_env_files`.
@@ -1219,15 +1219,25 @@ fn create_qcow2_ext4(target: &Path, size_mib: Option<u64>) -> Result<()> {
     publish
 }
 
-/// The auto-managed backing file for one service's `overlay,persist` upper: under the compose
-/// file's `.virtkit/overlays/<service>/`, named `<guest-slug>-<hash>.qcow2`. The service is its
+/// Anchor auto-managed backings at `<compose dir>/.virtkit`. For the vk convention
+/// `.virtkit/compose.yaml`, reuse the compose directory to avoid `.virtkit/.virtkit/`.
+fn virtkit_dir(base: &Path) -> PathBuf {
+    if base.ends_with(".virtkit") {
+        base.to_path_buf()
+    } else {
+        base.join(".virtkit")
+    }
+}
+
+/// The auto-managed backing file for one service's `overlay,persist` upper: under the workspace
+/// `.virtkit/overlays/<service>/`, named `<guest-slug>-<hash>.qcow2`. The service is its
 /// own path component (a DNS label, so unique and collision-free) rather than a `<service>-`
 /// prefix, so a hyphenated name can't collide with a sibling's slug (`db-primary` with `/data`
 /// vs `db` with `/primary/data`); the guest-path hash disambiguates two paths that fold to the
 /// same lossy slug within one service (`/a/b` vs `/a-b`). Lives in the (stable) compose directory
 /// rather than the per-boot job dir so it survives restart and down/up.
 fn persist_backing_path(base: &Path, service: &str, guest: &str) -> PathBuf {
-    base.join(".virtkit")
+    virtkit_dir(base)
         .join("overlays")
         .join(service)
         .join(format!("{}-{}.qcow2", guest_slug(guest), short_hash(guest)))
@@ -1245,11 +1255,11 @@ fn short_hash(s: &str) -> String {
         .collect()
 }
 
-/// The auto-managed backing file for one service's `persist_root` root: under the compose
-/// file's `.virtkit/roots/`, named `<service>.qcow2`. Same stable anchor as
+/// The auto-managed backing file for one service's `persist_root` root: under the workspace
+/// `.virtkit/roots/`, named `<service>.qcow2`. Same stable anchor as
 /// [`persist_backing_path`], for the same reason.
 fn persist_root_path(base: &Path, service: &str) -> PathBuf {
-    base.join(".virtkit")
+    virtkit_dir(base)
         .join("roots")
         .join(format!("{service}.qcow2"))
 }
@@ -2660,6 +2670,22 @@ mod tests {
         assert_eq!(
             persist_root_path(Path::new("/proj"), "db"),
             Path::new("/proj/.virtkit/roots/db.qcow2")
+        );
+        // A compose file kept inside `.virtkit/` (the vk convention) anchors on that same
+        // directory rather than nesting a second `.virtkit` under it.
+        assert_eq!(
+            persist_root_path(Path::new("/proj/.virtkit"), "db"),
+            Path::new("/proj/.virtkit/roots/db.qcow2")
+        );
+        assert_eq!(
+            persist_backing_path(Path::new("/proj/.virtkit"), "db", "/var/lib/pgsql").parent(),
+            Some(Path::new("/proj/.virtkit/overlays/db"))
+        );
+        // Only a directory literally named `.virtkit` folds; one merely ending in that text
+        // (component-wise `ends_with`, not a string suffix) still nests its own `.virtkit`.
+        assert_eq!(
+            persist_root_path(Path::new("/proj/foo.virtkit"), "db"),
+            Path::new("/proj/foo.virtkit/.virtkit/roots/db.qcow2")
         );
         assert_eq!(guest_slug("/var/lib/pgsql"), "var-lib-pgsql");
         assert_eq!(guest_slug("/"), "root");
