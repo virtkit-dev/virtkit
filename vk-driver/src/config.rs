@@ -424,7 +424,7 @@ impl Default for Vm {
         Vm {
             cpus: 4,
             mem: "4G".into(),
-            hostname: "runner".into(),
+            hostname: "vk".into(),
             vsock_port: 4444,
             balloon: true,
             reclaim: "auto".into(),

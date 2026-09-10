@@ -13,7 +13,7 @@
 [vm]
 # cpus = 4
 # mem = "4G"           # lazily allocated (memfd); size it for the job + [guest] tmpfs
-# hostname = "runner"
+# hostname = "vk"
 # vsock_port = 4444
 # balloon = true       # free_page_reporting: freed guest RAM returns to the host
 # reclaim = "auto"     # idle file cache a guest gives back to the host: "auto" evicts what

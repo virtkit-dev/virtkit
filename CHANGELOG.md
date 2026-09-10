@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **A CI job's guest is named `vk` by default, not `runner`.** Set `[vm] hostname` to keep
+  the old name.
+
 ## [0.67.0] - 2026-09-10
 
 ### Added
