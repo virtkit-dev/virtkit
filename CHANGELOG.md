@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.67.0] - 2026-09-10
+
 ### Added
 
 - **`vk dev code --reset-server` starts the guest's VS Code server over.** It stops the
@@ -2649,7 +2651,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.66.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.67.0...HEAD
+[0.67.0]: https://github.com/virtkit-dev/virtkit/compare/v0.66.0...v0.67.0
 [0.66.0]: https://github.com/virtkit-dev/virtkit/compare/v0.65.0...v0.66.0
 [0.65.0]: https://github.com/virtkit-dev/virtkit/compare/v0.64.1...v0.65.0
 [0.64.1]: https://github.com/virtkit-dev/virtkit/compare/v0.64.0...v0.64.1
