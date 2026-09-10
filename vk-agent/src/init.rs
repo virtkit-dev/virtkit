@@ -182,6 +182,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     load_image_env(); // so served/exec'd commands inherit the image PATH etc.
     export_default_run_user(); // so served stages drop to the image's USER
     apply_boot_config(boot_config.as_ref()); // the boot config wins over any capture
+    ensure_home_for_default_user(); // default user's passwd HOME, not the kernel's inherited /
     materialize_env(boot_config.as_ref()); // persist the merged env for login shells
     // Filesystems to freeze clean at poweroff: disk volumes and any persistent overlay uppers
     // (both host-backed ext4); see [`DISK_MOUNTS`].
@@ -516,6 +517,25 @@ fn passwd_ids(user: &str) -> Option<(u32, u32)> {
             return None;
         }
         Some(((*p).pw_uid, (*p).pw_gid))
+    }
+}
+
+/// The image's own passwd home (`pw_dir`) for `user` — a name via `getpwnam`, a number via
+/// `getpwuid`. `None` when the passwd has no entry or it carries no home.
+fn passwd_home(user: &str) -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: as passwd_ids — the returned pointer is into a static buffer (single-threaded,
+    // short-lived process); we read pw_dir before any further libc call.
+    unsafe {
+        let p = match user.parse::<u32>() {
+            Ok(uid) => libc::getpwuid(uid),
+            Err(_) => libc::getpwnam(CString::new(user).ok()?.as_ptr()),
+        };
+        if p.is_null() || (*p).pw_dir.is_null() {
+            return None;
+        }
+        let bytes = std::ffi::CStr::from_ptr((*p).pw_dir).to_bytes();
+        (!bytes.is_empty()).then(|| std::ffi::OsStr::from_bytes(bytes).to_os_string())
     }
 }
 
@@ -1032,6 +1052,51 @@ fn export_default_run_user() {
         unsafe { std::env::set_var("VIRTKIT_DEFAULT_RUN_USER", &user) };
         info!("vk-agent init: VIRTKIT_DEFAULT_RUN_USER={user}");
     }
+}
+
+/// Give the guest's default run user its passwd home in `HOME`. The kernel starts PID 1 with
+/// `HOME=/` (init/main.c `envp_init`), which every process that then runs as that user without
+/// dropping privileges inherits — the image entrypoint, a compose service, an exec'd root shell
+/// — where `docker run` hands the user its home. Correct it once here, unless the image `ENV`
+/// or the boot config already set `HOME` to a real path (a `/` or empty setting reads as the
+/// kernel default and is replaced; see [`home_for_default_user`]). Runs after both so those
+/// win; the default user is `VIRTKIT_DEFAULT_RUN_USER` (a non-root image USER) or root.
+fn ensure_home_for_default_user() {
+    let user = std::env::var("VIRTKIT_DEFAULT_RUN_USER").unwrap_or_default();
+    let user = if user.is_empty() {
+        "root"
+    } else {
+        user.as_str()
+    };
+    if let Some(home) =
+        home_for_default_user(std::env::var_os("HOME").as_deref(), user, passwd_home(user))
+    {
+        // SAFETY: still single-threaded init, before any serve/service fork.
+        unsafe { std::env::set_var("HOME", &home) };
+        info!(
+            "vk-agent init: HOME={} (default user {user})",
+            home.display()
+        );
+    }
+}
+
+/// The HOME to export for the default run `user`, or `None` to keep the inherited one.
+/// `current` is the inherited `HOME` and `resolved` the user's passwd home. A `HOME` that is
+/// unset, empty, or `/` is replaced; any other value is kept. That target is the kernel's own
+/// `HOME=/`, but an image `ENV` or boot config that sets `HOME` to `/` or empty is
+/// indistinguishable from it and so is not preserved either. A rootful guest whose image
+/// carries no passwd falls back to `/root`, as docker does.
+fn home_for_default_user(
+    current: Option<&std::ffi::OsStr>,
+    user: &str,
+    resolved: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    if current.is_some_and(|h| !h.is_empty() && h != std::ffi::OsStr::new("/")) {
+        return None;
+    }
+    resolved
+        .or_else(|| (user == "root").then(|| std::ffi::OsString::from("/root")))
+        .map(std::path::PathBuf::from)
 }
 
 /// The boot-time service config carried in the agent initramfs — `None` when the
@@ -3453,6 +3518,43 @@ mod tests {
             image_init_candidates(ImageInit::Entrypoint, &handoff, None, None),
             [vec!["/lib/systemd/systemd"], vec!["/bin/sh"]]
         );
+    }
+
+    #[test]
+    fn the_default_user_gets_its_home_only_when_the_image_set_none() {
+        use std::ffi::{OsStr, OsString};
+        use std::path::PathBuf;
+        let home = |current: Option<&str>, user: &str, resolved: Option<&str>| {
+            home_for_default_user(current.map(OsStr::new), user, resolved.map(OsString::from))
+        };
+        // A HOME that is unset, empty, or `/` is replaced with the passwd home — whether it is
+        // the kernel's inherited HOME=/ or an image/boot-config `/` or empty, which cannot be
+        // told apart from it. Root falls back to /root when the image carries no passwd, as
+        // docker does.
+        assert_eq!(
+            home(Some("/"), "root", Some("/root")),
+            Some(PathBuf::from("/root"))
+        );
+        assert_eq!(home(Some("/"), "root", None), Some(PathBuf::from("/root")));
+        assert_eq!(home(None, "root", None), Some(PathBuf::from("/root")));
+        assert_eq!(
+            home(Some(""), "root", Some("/root")),
+            Some(PathBuf::from("/root"))
+        );
+        assert_eq!(
+            home(Some("/"), "app", Some("/home/app")),
+            Some(PathBuf::from("/home/app"))
+        );
+        assert_eq!(
+            home(None, "app", Some("/home/app")),
+            Some(PathBuf::from("/home/app"))
+        );
+        // Any other HOME the image ENV or boot config set is kept, root or not (an explicit
+        // `/` or empty is the exception above — replaced, not preserved).
+        assert_eq!(home(Some("/root"), "root", Some("/root")), None);
+        assert_eq!(home(Some("/home/dev"), "dev", Some("/home/dev")), None);
+        // A non-root user the passwd does not know is not guessed at.
+        assert_eq!(home(Some("/"), "app", None), None);
     }
 
     #[test]

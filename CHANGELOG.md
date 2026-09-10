@@ -22,6 +22,13 @@ All notable changes to virtkit will be documented in this file.
   CI service images moved to the job's image cache; a config that still sets it now fails to
   load — delete the section.
 
+### Fixed
+
+- **A guest's default user gets its passwd `HOME`, as `docker run` does.** A rootful guest's
+  `HOME` is now `/root` rather than the inherited `/`, and a non-root image `USER` gets its home
+  directory the same way. An `ENV HOME`, or a run's `HOME`, still wins — unless it is `/` or
+  empty, which is indistinguishable from the kernel's inherited value and is replaced too.
+
 ## [0.67.0] - 2026-09-10
 
 ### Added
