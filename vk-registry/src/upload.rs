@@ -22,7 +22,7 @@
 //! CSRF check or the write check is refused after a few hundred bytes rather than after
 //! the whole upload; a body that puts `file` first is refused for that reason.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
@@ -31,14 +31,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use crate::accounts::{self, Db, Principal};
 use crate::html::{self, page, respond};
 use crate::{Body, body_of};
-use crate::{DEFAULT_MANIFEST_TYPE, Store, html_escape, valid_name, valid_tag};
-
-/// The manifest's config blob: fixed, empty content — a raw-file upload has no build
-/// config, but the OCI manifest schema requires a config descriptor. Every upload
-/// therefore references the *same* config blob, which dedups after the first one.
-const EMPTY_CONFIG: &[u8] = b"{}";
-const RAW_FILE_MEDIA_TYPE: &str = "application/vnd.virtkit.raw-file";
-const RAW_FILE_CONFIG_MEDIA_TYPE: &str = "application/vnd.virtkit.raw-file.config.v1+json";
+use crate::{Store, html_escape, valid_name, valid_tag};
 
 /// The largest file this form accepts. The bytes are held in memory to hash them, so
 /// this is a real ceiling and not a formality; anything bigger belongs in
@@ -315,8 +308,8 @@ async fn submit(
         .map_err(Into::into)
 }
 
-/// The blob, the shared empty config, and the single-layer manifest tying them together
-/// — the same three writes a `/v2/` push makes.
+/// Store the blob, then write the shared empty config and single-layer manifest through
+/// [`Store::put_raw_file`], as a `/v2/` push does.
 fn store_upload(
     store: &Store,
     name: &str,
@@ -325,41 +318,16 @@ fn store_upload(
     file_name: Option<&str>,
 ) -> Result<()> {
     let _lock = store.lock_shared()?;
-    let config_digest = store.put_blob(EMPTY_CONFIG)?;
     let layer_digest = store.put_blob(file_bytes)?;
-    // These bytes arrived through this form, for this repository, so they are readable
-    // through it. `put_manifest` records only the manifest itself — a reference is not
-    // evidence that the referrer holds the content — so the two blobs are recorded here,
-    // where we do hold them.
-    for digest in [&config_digest, &layer_digest] {
-        store.record_blob(name, digest.trim_start_matches("sha256:"))?;
-    }
-    let mut layer = serde_json::json!({
-        "mediaType": RAW_FILE_MEDIA_TYPE,
-        "digest": layer_digest,
-        "size": file_bytes.len(),
-    });
-    // Only when the browser actually sent one: an empty title is worse than none.
-    if let Some(title) = file_name.map(clamp_name).filter(|t| !t.is_empty()) {
-        layer["annotations"] = serde_json::json!({
-            "org.opencontainers.image.title": title,
-        });
-    }
-    let manifest = serde_json::json!({
-        "schemaVersion": 2,
-        "mediaType": DEFAULT_MANIFEST_TYPE,
-        "config": {
-            "mediaType": RAW_FILE_CONFIG_MEDIA_TYPE,
-            "digest": config_digest,
-            "size": EMPTY_CONFIG.len(),
-        },
-        "layers": [layer],
-    });
-    store.put_manifest(
+    // Only when the browser actually sent one; `put_raw_file` drops an empty one.
+    let title = file_name.map(clamp_name);
+    let size = u64::try_from(file_bytes.len()).context("sizing the upload")?;
+    store.put_raw_file(
         name,
         tag,
-        DEFAULT_MANIFEST_TYPE,
-        serde_json::to_vec(&manifest)?.as_slice(),
+        layer_digest.trim_start_matches("sha256:"),
+        size,
+        title.as_deref(),
     )?;
     Ok(())
 }

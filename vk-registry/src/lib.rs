@@ -432,6 +432,54 @@ impl Store {
         self.root.join("repos").join(name).join("blobs").join(hex)
     }
 
+    /// Reference a stored blob as `name:tag` by writing the shared empty config, both blob
+    /// membership records and a single-layer raw-file manifest, as a `/v2/` push does.
+    /// `size` is the blob's canonical length; a non-empty `title` becomes the OCI title
+    /// annotation. The caller must hold the shared lock across the check and reference.
+    /// Returns the manifest digest.
+    pub(crate) fn put_raw_file(
+        &self,
+        name: &str,
+        tag: &str,
+        layer_hex: &str,
+        size: u64,
+        title: Option<&str>,
+    ) -> Result<String> {
+        let config_digest = self.put_blob(RAW_FILE_EMPTY_CONFIG)?;
+        // Record both blobs here: this server received their bytes for this repository.
+        // `put_manifest` records only the manifest's membership; a reference alone does not
+        // prove that the repository holds the content.
+        self.record_blob(name, config_digest.trim_start_matches("sha256:"))?;
+        self.record_blob(name, layer_hex)?;
+        let mut layer = serde_json::json!({
+            "mediaType": RAW_FILE_MEDIA_TYPE,
+            "digest": format!("sha256:{layer_hex}"),
+            "size": size,
+        });
+        // An empty title is worse than none.
+        if let Some(title) = title.filter(|t| !t.is_empty()) {
+            layer["annotations"] = serde_json::json!({
+                "org.opencontainers.image.title": title,
+            });
+        }
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": DEFAULT_MANIFEST_TYPE,
+            "config": {
+                "mediaType": RAW_FILE_CONFIG_MEDIA_TYPE,
+                "digest": config_digest,
+                "size": RAW_FILE_EMPTY_CONFIG.len(),
+            },
+            "layers": [layer],
+        });
+        self.put_manifest(
+            name,
+            tag,
+            DEFAULT_MANIFEST_TYPE,
+            serde_json::to_vec(&manifest)?.as_slice(),
+        )
+    }
+
     fn manifest_type_path(&self, name: &str, hex: &str) -> PathBuf {
         self.root
             .join("repos")
@@ -1350,6 +1398,17 @@ const MAX_MANIFEST_BYTES: usize = 4 << 20;
 /// layers; this is far above that, and it is what bounds the `stat`s a single `PUT` can
 /// ask for (references × repositories the caller may read).
 const MAX_MANIFEST_REFERENCES: usize = 4096;
+
+/// The layer media type of a file stored as one blob under a single-layer manifest — what
+/// `/upload` writes, and what `vk registry pull` refuses: a raw file is for fetching, not for
+/// booting.
+pub(crate) const RAW_FILE_MEDIA_TYPE: &str = "application/vnd.virtkit.raw-file";
+pub(crate) const RAW_FILE_CONFIG_MEDIA_TYPE: &str =
+    "application/vnd.virtkit.raw-file.config.v1+json";
+
+/// Shared empty config: raw files have no build config, but OCI manifests require a
+/// config descriptor. Every raw file references this blob, so it is stored only once.
+pub(crate) const RAW_FILE_EMPTY_CONFIG: &[u8] = b"{}";
 
 /// What a [`Store::gc`] pass removed (or, on a dry run, would remove).
 #[derive(Default)]
