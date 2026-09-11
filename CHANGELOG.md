@@ -4,6 +4,18 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk-registry` serves its store over WebDAV under `/dav/`.** `/dav/repos/` is a
+  read-only view of every repository the credential may read — tags and manifests download
+  as manifests, blobs as their bytes — and `/dav/files/` is a plain-file area any WebDAV
+  client can write to, scoped per top-level directory (`write:files/sccache`). Point
+  `SCCACHE_WEBDAV_ENDPOINT` at `https://<registry>/dav/files/<dir>` and every runner's jobs
+  share one cache of compiled units over the registry's existing TLS and credentials; a
+  read-only credential gives a pipeline the hits without letting it write. Objects are
+  stored in the OCI pool as raw-file manifests under `files/<dir>/…`, dedup and compress
+  with everything else, and expire under `gc`'s tag retention like any other tag.
+
 ## [0.72.0] - 2026-09-15
 
 ### Added
