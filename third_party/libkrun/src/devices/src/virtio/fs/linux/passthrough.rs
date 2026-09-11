@@ -877,6 +877,27 @@ fn forget_one(
     }
 }
 
+/// Coalesce the `(moffset, len)` window ranges of a REMOVEMAPPING batch: sorted by offset,
+/// touching or overlapping ranges merged, so each run costs one mmap. Zero-length ranges drop
+/// out. Callers bounds-check `moffset + len` against the window first; the `saturating_add`
+/// only keeps an unchecked caller from overflowing.
+pub(crate) fn merge_mappings(requests: &[fuse::RemovemappingOne]) -> Vec<(u64, u64)> {
+    let mut ranges: Vec<(u64, u64)> = requests
+        .iter()
+        .filter(|r| r.len > 0)
+        .map(|r| (r.moffset, r.moffset.saturating_add(r.len)))
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some((_, last_end)) if start <= *last_end => *last_end = (*last_end).max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged.into_iter().map(|(s, e)| (s, e - s)).collect()
+}
+
 impl FileSystem for PassthroughFs {
     type Inode = Inode;
     type Handle = Handle;
@@ -2191,16 +2212,25 @@ impl FileSystem for PassthroughFs {
         host_shm_base: u64,
         shm_size: u64,
     ) -> io::Result<()> {
-        for req in requests {
-            let addr = host_shm_base + req.moffset;
-            if (req.moffset + req.len) > shm_size {
+        for req in &requests {
+            if req
+                .moffset
+                .checked_add(req.len)
+                .is_none_or(|end| end > shm_size)
+            {
                 return Err(einval());
             }
-            debug!("removemapping: addr={:x} len={:?}", addr, req.len);
+        }
+        // The guest reclaims DAX ranges in batches; each range torn down is one mmap over
+        // the window and one KVM invalidation of that guest-physical span. Adjacent ranges
+        // in a batch are torn down with a single call.
+        for (moffset, len) in merge_mappings(&requests) {
+            let addr = host_shm_base + moffset;
+            debug!("removemapping: addr={addr:x} len={len}");
             let ret = unsafe {
                 libc::mmap(
                     addr as *mut libc::c_void,
-                    req.len as usize,
+                    len as usize,
                     libc::PROT_NONE,
                     libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_FIXED,
                     -1,
@@ -2530,5 +2560,25 @@ mod tests {
 
         unsafe { libc::munmap(base, page) };
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Touching and overlapping window ranges of one REMOVEMAPPING batch collapse into single
+    /// runs, in offset order; zero-length entries drop out.
+    #[test]
+    fn removemapping_batches_merge_adjacent_ranges() {
+        let r = |moffset, len| fuse::RemovemappingOne { moffset, len };
+        let two_mib = 2u64 << 20;
+        let merged = merge_mappings(&[
+            r(4 * two_mib, two_mib),
+            r(0, two_mib),
+            r(two_mib, two_mib),
+            r(9 * two_mib, 0),
+            r(4 * two_mib + 4096, two_mib),
+        ]);
+        assert_eq!(
+            merged,
+            vec![(0, 2 * two_mib), (4 * two_mib, two_mib + 4096)]
+        );
+        assert!(merge_mappings(&[]).is_empty());
     }
 }

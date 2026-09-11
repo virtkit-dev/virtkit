@@ -261,3 +261,13 @@ same page-cache mapping, and mmap still enforces that a writable mapping needs a
 The reopen fallback stays for a mapping whose inode has no open fd (a read after close). The
 lookup keys on the inode and access mode, not on the guest's handle, which is absent for DAX.
 Covered by the `setupmapping_*` tests. Search for `The guest passes fh = u64::MAX`.
+
+`src/devices/src/virtio/fs/read_only.rs` + `src/devices/src/virtio/fs/linux/passthrough.rs` —
+REMOVEMAPPING on a read-only share keeps the DAX mapping in place (bounds still checked):
+tearing a range down was one mmap over the window plus a KVM invalidation, and a guest reading
+a source tree reclaims a range for nearly every file once its window is full — 30k files cost
+57k host mmaps, 47% of them removals. The next SETUPMAPPING replaces a kept mapping with
+MAP_FIXED, and a read-only share cannot be written through it. The read-write path merges the
+adjacent ranges of a batch into one mmap (`merge_mappings`). Covered by
+`removemapping_keeps_the_mapping_but_checks_bounds` and
+`removemapping_batches_merge_adjacent_ranges`.

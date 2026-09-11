@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Reading a large tree from a read-only share is faster.** A guest that reads many small
+  files — from an `:overlay` volume or the executor's host checkout — no longer pays a
+  per-file host cost that could dominate file-heavy jobs.
+
 ### Fixed
 
 - **A stalled network transfer inside a guest now fails fast instead of hanging for the rest
