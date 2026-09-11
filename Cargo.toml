@@ -16,7 +16,7 @@ members = [
 #
 # third_party/imago is a single vendored leaf crate (see third_party/imago/VENDOR.md), a
 # dependency of third_party/libkrun's block device — excluded for the same reason.
-exclude = ["third_party/libkrun", "third_party/imago"]
+exclude = ["third_party/libkrun", "third_party/imago", "third_party/ipstack"]
 
 [workspace.package]
 version = "0.68.0"
@@ -161,3 +161,9 @@ indicatif = "0.18"
 unicode-width = "0.2"
 # Use indicatif's transitive ANSI classifier in dashboard layout tests.
 console = { version = "0.16", default-features = false, features = ["ansi-parsing"] }
+
+# Vendored ipstack (third_party/ipstack/VENDOR.md): 1.0.1 plus one local patch — a TCP
+# connection whose retransmissions are exhausted is reset instead of left Established with
+# a hole in its stream.
+[patch.crates-io]
+ipstack = { path = "third_party/ipstack" }
